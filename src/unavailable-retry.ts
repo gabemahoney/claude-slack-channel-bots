@@ -1,6 +1,6 @@
 /**
- * unavailable-retry.ts — The per-persona UNAVAILABLE retry timer (b.jg5
- * SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306).
+ * unavailable-retry.ts — The per-persona UNAVAILABLE retry timer (
+ * code line).
  *
  * `createUnavailableRetryController(deps)` builds a controller that keeps at
  * most one retry timer per persona key:
@@ -41,8 +41,8 @@
  *   a later timer. `stopAll(reason)` stops every persona. `close(reason)`,
  *   the server's shutdown, stops every persona and refuses every later `arm`
  *   (one `not armed` line each), so no timer is pending after it.
- * - `runNow(key, cause, why)`: the persona's retry runs at once (b.jg5
- *   SRJ-810: an old-life hold that ends retries each persona that waited on
+ * - `runNow(key, cause, why)`: the persona's retry runs at once (
+ * an old-life hold that ends retries each persona that waited on
  *   it at once). A waiting timer is cleared and its retry runs now in its
  *   mode, its wait count carrying on; a retry already running is left to
  *   re-arm the timer; a persona not armed is armed with `cause` and run at
@@ -50,7 +50,7 @@
  * - `conditionEnded(key, condition, reading?)`: the end of
  *   `tmux-unresponsive` or the clearing of `tmux-unavailable` stops the
  *   timer, unless its last row read was `pending` or a `kill-failed` cause is
- *   recorded (b.jg5 SRJ-306); then it is kept with its due time and one kept
+ * recorded; then it is kept with its due time and one kept
  *   line says why. A `reading` the end brings (a health tick or a retry that
  *   found the row live out of `pending`, connected, or
  *   `pending` from a successful launch call) becomes the last row read
@@ -83,7 +83,7 @@
  *   other stop is unaffected.
  * - The optional retry observer (`UnavailableRetryDeps.onRetryFire`) is
  *   called once at every retry, a retry the action skips for work in flight
- *   included, before the action runs (b.jg5 SRJ-308: the
+ * included, before the action runs (the
  *   `tmux-unresponsive` onset with the health check off). It reads nothing
  *   back and changes nothing here.
  * - The optional stop observer (`UnavailableRetryDeps.onStopped`) is called
@@ -93,11 +93,11 @@
  *   failed (`UNAVAILABLE_RETRY_STOP_RUN_FAILED`). A no-op call (nothing
  *   armed), a first arm that failed (no timer ever ran) and a pending-only
  *   stop that yielded to a full-mode cause are not stops. It runs before a
- *   stop's hand-off (b.jg5 SRJ-305, SRJ-308, SRJ-309: the
+ * stop's hand-off (the
  *   `tmux-unresponsive` onset is held back and its alert check cancelled with
  *   the timer, since both say CSCB keeps retrying, and a later refusal
  *   allows the onset and arms the check again unless the reason is one of
- *   `UNAVAILABLE_RETRY_TERMINAL_STOPS`; b.jg5 SRJ-313: the persona's
+ * `UNAVAILABLE_RETRY_TERMINAL_STOPS`; the persona's
  *   unclassified-error episode ends on the stops that mean the retries are
  *   over because the persona's state got better:
  *   `UNAVAILABLE_RETRY_STOP_RECOVERED`, `UNAVAILABLE_RETRY_STOP_ROW_LIVE`,
@@ -109,7 +109,7 @@
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop, and a stop's hand-off.
  *
- * Modes (b.jg5 SRJ-301, SRJ-303, SRJ-305). Each timer runs in full mode or
+ * Modes. Each timer runs in full mode or
  * pending-only mode; the action is told the mode at each retry. A timer
  * enters pending-only mode through `armPendingOnly`, or when a full-mode
  * retry's answer sets `switchToPendingOnly` (a launch that succeeded), with
@@ -142,7 +142,7 @@
  * timers, the log sink and the retry action are injected; the real clock is
  * the default.
  *
- * What arms a timer (b.jg5 SRJ-301). A launch attempt (a run of a persona's
+ * What arms a timer. A launch attempt (a run of a persona's
  * collision ladder, whoever starts it) and a recovery attempt (a run of its
  * restart work) run through `runInAttempt(key, kind, fn)`, an attempt context
  * carried by `AsyncLocalStorage` across the attempt's awaits and timers; it
@@ -150,19 +150,19 @@
  * attempt for another persona, or a call outside every attempt (the health
  * tick, the permission poller, the JSONL safeguard, the start sweep, a
  * persona teardown, and the dialog approver, which a launch attempt starts
- * through `runOutsideAttempts`, b.jg5 SRJ-401), is not inside one.
+ * through `runOutsideAttempts`), is not inside one.
  * `reportAttemptError(key, value, verb, sink)` is the one reporting step,
  * which the agent-director wrappers and the liveness adapter reach through
  * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
  * `unavailableRetryCauseFor(value, verb)` decides the cause (UNAVAILABLE from
  * any verb, `ErrTmuxKillFailed` told apart by class; ENVIRONMENT from any
  * verb; CONFIG from any verb; UNCLASSIFIED from any verb but the reads,
- * b.jg5 SRJ-313; any other `status`, `get` or `list` error but
+ * any other `status`, `get` or `list` error but
  * `ErrSpawnNotFound` and UNUSABLE NAME), the trigger sink
  * (`UnavailableRetryTriggerSink`, which the controller is) arms the persona's
  * timer with it, and the innermost attempt records the error as its last,
- * with whether it armed. The ENVIRONMENT cause (`ErrTmuxNotAvailable`, b.jg5
- * SRJ-311) and the CONFIG cause (`ErrConfigMalformed`, SRJ-316) arm the
+ * with whether it armed. The ENVIRONMENT cause (`ErrTmuxNotAvailable`
+ *) and the CONFIG cause (`ErrConfigMalformed`) arm the
  * persona's timer outside an attempt for it too; no other cause does. A
  * trigger while armed keeps the due time (`arm` above). A second arming path is the restart work's arm hook,
  * `RestartDeps.armRetryTimer` (wired in `main()`): it arms the persona's
@@ -170,8 +170,8 @@
  * reading at the restart work, the re-probe's included, that leaves the
  * persona unlatched (a probe that throws included, which the arming predicate
  * above does not arm on). The restart work asks the latch first: an UNUSABLE
- * NAME answer (b.jg5 SRJ-512), or the persona's own row reading `pending`
- * with no launch start (SRJ-513), latches the persona, so its `unknown` reading
+ * NAME answer, or the persona's own row reading `pending`
+ * with no launch start, latches the persona, so its `unknown` reading
  * stops there and arms nothing. A third is
  * the health tick's (`HealthCheckDeps.armRetryTimer`, wired in `main()`): a
  * persona held off on its `tmux-unavailable` outage that the tick does not
@@ -183,19 +183,19 @@
  * persona, a launch's `ErrTmuxSessionCreate` (a plain spawn's, a reuse's or
  * a `resume`'s, the collision ladder's and the live-row sequence's alike)
  * arms its timer at once in pending-only mode through the sink's optional
- * `armPendingOnly` (b.jg5 SRJ-111, SRJ-112, SRJ-113, SRJ-301, SRJ-409). It records
+ * `armPendingOnly`. It records
  * no attempt error, so the counted launch failure stays counted.
  *
- * The retry action (b.jg5 SRJ-303, SRJ-305). The server's action is
+ * The retry action. The server's action is
  * `createFullModeRetryAction(deps)`, for both modes: at each retry, before
  * any call, the shutdown flag, the applied-persona lookup, the optional
- * latched query (b.jg5 SRJ-303: no attempt while the persona is latched), the
- * optional held query (b.jg5 SRJ-207, SRJ-303: no attempt while the persona
+ * latched query (no attempt while the persona is latched), the
+ * optional held query (no attempt while the persona
  * is held on `ErrInvalidFlags`), the not-up gate (the relaunch gate) and the
  * at-cap check each stop the timer with their reason
  * (`UNAVAILABLE_RETRY_STOP_*`).
  *
- * The latch (b.jg5 SRJ-305, SRJ-502). When a persona latches, whatever the
+ * The latch. When a persona latches, whatever the
  * case, its timer stops through `stop` with `UNAVAILABLE_RETRY_STOP_LATCHED`
  * (`main()`'s latch hold), in either mode and whatever its causes: the
  * condition-end entry's `pending` and kill-failure exceptions never keep a
@@ -203,7 +203,7 @@
  * retry on the latched query, with no agent-director call, and a full-mode
  * retry whose restart work answers `latched` stops the same way.
  *
- * The latch re-check scope (b.jg5 SRJ-505). A latched persona's re-check
+ * The latch re-check scope. A latched persona's re-check
  * runs through `runInLatchRecheck(scope, fn)`, a third context beside the
  * attempt context and the retry marker, carried the same way. While the
  * persona is still latched (`isInsideLatchRecheck`), the reporting step arms
@@ -215,7 +215,7 @@
  * (`src/outage-state.ts`). `latchRecheckScopeOf` hands the caller's scope
  * object back. `runOutsideAttempts` leaves it.
  *
- * The `ErrInvalidFlags` hold (b.jg5 SRJ-207, SRJ-303, SRJ-305). When a
+ * The `ErrInvalidFlags` hold. When a
  * persona is held, its timer stops through `stop` with
  * `UNAVAILABLE_RETRY_STOP_HELD` (`main()`'s hold reaction), never the
  * condition-end entry, so neither of its exceptions keeps it. A timer armed
@@ -230,15 +230,15 @@
  * reconnected, has nothing left to recover (stop; a persona already
  * connected, whose row read `live`, also ends its
  * `tmux-unresponsive` condition through the optional end hook,
- * `FullModeRetryDeps.endTmuxUnresponsive`, b.jg5 SRJ-310); capped, not up, a declined
+ * `FullModeRetryDeps.endTmuxUnresponsive`); capped, not up, a declined
  * launch or shutting down stop too; a launch in flight, a refused launch, a
  * counted launch failure below the cap, a deferred reconnect, a row found
  * `pending` (by the liveness probe, whatever the session's connection shows,
- * or by the reconnect's or b.d61's re-probe's read; recorded as the last row
- * read, and never "nothing left to recover"), a liveness reading of `unknown` (b.jg5
- * SRJ-314; it read no row, so the last row read is kept), a run that found
- * the persona's live-row sequence running (`sequence-waiting`, b.jg5
- * SRJ-706) and a successful
+ * or by the reconnect's or re-probe's read; recorded as the last row
+ * read, and never "nothing left to recover"), a liveness reading of `unknown` (
+ * it read no row, so the last row read is kept), a run that found
+ * the persona's live-row sequence running (`sequence-waiting`
+ *) and a successful
  * launch retry again at the next wait. A successful launch records the row
  * read `pending` and
  * switches the timer to pending-only mode, the wait count carrying on,
@@ -262,7 +262,7 @@
  * the persona, and the state decides:
  * still `pending`, a refusal (`row-pending`) with no other call, or, with the
  * pending-row step given (`FullModeRetryDeps.stepPendingRow`, bound in
- * `main()`), one `get` that decides the row (b.jg5 SRJ-409, SRJ-411): a
+ * `main()`), one `get` that decides the row: a
  * covered or undecided row is armed pending-only and kept (`row-pending`); a
  * row that is not covered (a retired key's old life before its new life, a
  * `cwd` or `config_dir` mismatch) starts the live-row sequence, a refusal
@@ -327,16 +327,16 @@ import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './
 import type { RestartRetryOutcome } from './restart.ts'
 
 // ---------------------------------------------------------------------------
-// SRJ-302 constants
+// constants
 // ---------------------------------------------------------------------------
 
-/** First retry wait after the arming outcome, in seconds (b.jg5 SRJ-302). */
+/** First retry wait after the arming outcome, in seconds. */
 export const UNAVAILABLE_RETRY_BASE_S = 30
 
-/** Retry wait ceiling, in seconds (b.jg5 SRJ-302). There is no attempt cap. */
+/** Retry wait ceiling, in seconds. There is no attempt cap. */
 export const UNAVAILABLE_RETRY_CEILING_S = 300
 
-/** The cause of an UNAVAILABLE outcome from any verb in an attempt (b.jg5 SRJ-301). */
+/** The cause of an UNAVAILABLE outcome from any verb in an attempt. */
 export const UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE = 'unavailable'
 
 /** The cause of an `ErrTmuxKillFailed` in an attempt: UNAVAILABLE, told apart by class. */
@@ -344,12 +344,12 @@ export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
 
 /**
  * The cause of an ENVIRONMENT answer (`ErrTmuxNotAvailable`) from any verb
- * for the persona (b.jg5 SRJ-301, SRJ-311, SRJ-105), in or out of an attempt:
+ * for the persona, in or out of an attempt:
  * the only cause that arms outside a launch or recovery attempt for the
  * persona (`reportAttemptError`), and the cause the health tick arms with
  * for a raised `tmux-unavailable` outage that has no timer
  * (`HealthCheckDeps.armRetryTimer`). Never counted, and it never starts or
- * continues the `tmux-unresponsive` condition (SRJ-307: only UNAVAILABLE
+ * continues the `tmux-unresponsive` condition (only UNAVAILABLE
  * does).
  */
 export const UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT = 'environment'
@@ -357,29 +357,28 @@ export const UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT = 'environment'
 /**
  * The cause of a CONFIG answer (`ErrConfigMalformed`, an
  * `ErrUnknownErrorName` recognised by its `unknownName`) from any verb for the persona
- * (b.jg5 SRJ-301, SRJ-316, SRJ-105), in or out of an attempt, as the
+ * in or out of an attempt, as the
  * ENVIRONMENT cause arms: the persona is retried on its timer whatever
  * `session_restart_delay` and `health_check_interval` are. Never counted, and
- * it never starts or continues the `tmux-unresponsive` condition (SRJ-307:
+ * it never starts or continues the `tmux-unresponsive` condition (
  * only UNAVAILABLE does).
  */
 export const UNAVAILABLE_RETRY_CAUSE_CONFIG = 'config'
 
 /**
- * The cause of an UNCLASSIFIED outcome (b.jg5 SRJ-104: an `ErrInternal` other
+ * The cause of an UNCLASSIFIED outcome (an `ErrInternal` other
  * than an unusable recorded name, a store-open name, `ErrSystemInstallDisappeared`
  * or any name CSCB gives no handling) from any verb but `status`, `get` and
- * `list`, inside a launch or recovery attempt for the persona (b.jg5 SRJ-301,
- * SRJ-313). A read's UNCLASSIFIED answer keeps the read-error cause. Never
+ * `list`, inside a launch or recovery attempt for the persona. A read's UNCLASSIFIED answer keeps the read-error cause. Never
  * counted, it arms nothing outside an attempt for the persona, and it never
- * starts or continues the `tmux-unresponsive` condition (SRJ-307: only
+ * starts or continues the `tmux-unresponsive` condition (only
  * UNAVAILABLE does).
  */
 export const UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED = 'unclassified'
 
 /**
  * The causes that arm the persona's timer in any context
- * (`reportAttemptError`): ENVIRONMENT (b.jg5 SRJ-311) and CONFIG (SRJ-316).
+ * (`reportAttemptError`): ENVIRONMENT and CONFIG.
  * Every other cause arms only inside a launch or recovery attempt for the
  * persona.
  */
@@ -389,32 +388,30 @@ export const UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES: ReadonlySet<string> = new Set
 ])
 
 /**
- * The cause of any other `status`, `get` or `list` error in an attempt (b.jg5
- * SRJ-301, SRJ-105), CONFIG excepted (its own cause, above). Also the cause
+ * The cause of any other `status`, `get` or `list` error in an attempt, CONFIG excepted (its own cause, above). Also the cause
  * the restart work's arm hook (`RestartDeps.armRetryTimer`, wired in
  * `main()`) arms with, on every `unknown` liveness reading at the restart
- * work that leaves the persona unlatched, a thrown probe included (b.jg5
- * SRJ-314); an UNUSABLE NAME answer (b.jg5 SRJ-512), or the persona's own
- * row reading `pending` with no launch start (SRJ-513), latches the persona and
+ * work that leaves the persona unlatched, a thrown probe included; an UNUSABLE NAME answer, or the persona's own
+ * row reading `pending` with no launch start, latches the persona and
  * the restart work stops at its latch check first, arming nothing; a CONFIG
  * `status` has armed the CONFIG cause first through the reporting point, and
  * a trigger while armed keeps the due time.
  */
 export const UNAVAILABLE_RETRY_CAUSE_READ_ERROR = 'read-error'
 
-/** The cause `armPendingOnly` records: a covered `pending` row (b.jg5 SRJ-303, SRJ-409). */
+/** The cause `armPendingOnly` records: a covered `pending` row. */
 export const UNAVAILABLE_RETRY_CAUSE_PENDING_ROW = 'pending-row'
 
 /**
  * The cause a live-row sequence arms with when a run left its `pending` row
- * in neither `ids` nor `unverified_ids` and the episode stopped (b.jg5
- * SRJ-717, SRJ-301; `src/live-row-sequence.ts`). Never counted.
+ * in neither `ids` nor `unverified_ids` and the episode stopped (
+ * `src/live-row-sequence.ts`). Never counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
 
 /**
  * The cause a live-row sequence arms with when it ends without its launch for
- * any other reason (b.jg5 SRJ-705, SRJ-301): a failed `get`, a refused run,
+ * any other reason: a failed `get`, a refused run,
  * a kill's abort that did not latch the persona, step 5 (with or without its
  * alert), no kill under the `ad-config-malformed` rule, a launch not made, or
  * a final launch that failed or threw. A stop for a latch, a teardown or
@@ -422,20 +419,19 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
  * collision (`UNAVAILABLE_RETRY_CAUSE_COLLISION`), a final `resume`'s
  * `ErrSpawnNotResumable` whose re-read found a lost race
  * (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`; one whose re-read found the row
- * `pending` arms this cause, b.jg5 SRJ-710) and a final launch
+ * `pending` arms this cause) and a final launch
  * whose `ErrTmuxSessionCreate` armed the timer in pending-only mode
- * (`armPendingOnly`; SRJ-112, SRJ-113, SRJ-409) arm nothing with it. Never
+ * (`armPendingOnly`) arm nothing with it. Never
  * counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-launch'
 
 /**
- * The cause of a launch's collision (`ErrInstanceIdCollision`, b.jg5
- * SRJ-112, SRJ-111, SRJ-301): the row is live, so the reuse spawn or plain
+ * The cause of a launch's collision (`ErrInstanceIdCollision`
+ *): the row is live, so the reuse spawn or plain
  * spawn launched nothing. Armed when a collision at the live-row sequence's
  * final launch (its reuse, or the plain spawn after its `resume`'s
- * `ErrSpawnNotFound`) ends the sequence without its launch (SRJ-705,
- * SRJ-706), when a second collision at a collision ladder reuse site (the
+ * `ErrSpawnNotFound`) ends the sequence without its launch, when a second collision at a collision ladder reuse site (the
  * replace step's or the no-transcript step's, in the one re-run of
  * get-then-act the first gave) ends the launch attempt, and when a plain
  * spawn's collision in the one re-run of get-then-act a plain spawn's
@@ -445,8 +441,7 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-la
 export const UNAVAILABLE_RETRY_CAUSE_COLLISION = 'collision'
 
 /**
- * The cause of a lost race on `resume`'s `ErrSpawnNotResumable` (b.jg5
- * SRJ-710, SRJ-301): the row was not finished when the `resume` ran, so
+ * The cause of a lost race on `resume`'s `ErrSpawnNotResumable`: the row was not finished when the `resume` ran, so
  * nothing was killed, deleted or launched, and the persona is re-evaluated
  * at its next health tick or retry. Armed when the collision ladder's
  * not-resumable step, or a resume site's replacement after its re-read,
@@ -458,8 +453,7 @@ export const UNAVAILABLE_RETRY_CAUSE_COLLISION = 'collision'
 export const UNAVAILABLE_RETRY_CAUSE_LOST_RACE = 'spawn-not-resumable-lost-race'
 
 /**
- * The cause of a persona held for an old life (b.jg5 SRJ-811, SRJ-810,
- * SRJ-301): an old-life wait it waits on ended with its hold going on (an
+ * The cause of a persona held for an old life: an old-life wait it waits on ended with its hold going on (an
  * UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED answer, a kill failure, a
  * CONFLICT or an unusable recorded name met for the old key, a run that did
  * not judge the old row, or the old row still live after runs that judged
@@ -468,12 +462,12 @@ export const UNAVAILABLE_RETRY_CAUSE_LOST_RACE = 'spawn-not-resumable-lost-race'
  * persona, by the session manager's old-life wait (`src/session-manager.ts`;
  * the same string as `OLD_LIFE_WAIT_ARM_CAUSE`, `src/old-life-wait.ts`).
  * Never counted, and it never starts or continues the `tmux-unresponsive`
- * condition. No timer is ever armed with it for the old key itself (SRJ-1512).
+ * condition. No timer is ever armed with it for the old key itself.
  */
 export const UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD = 'held-for-old-life'
 
 // ---------------------------------------------------------------------------
-// Modes (b.jg5 SRJ-301, SRJ-303)
+// Modes
 // ---------------------------------------------------------------------------
 
 /** Full mode: each retry reruns the restart path's decision. */
@@ -496,7 +490,7 @@ export const UNAVAILABLE_RETRY_ROW_ABSENT = 'absent'
 export const UNAVAILABLE_RETRY_ROW_PENDING = 'pending'
 
 /**
- * What the row read answers (b.jg5 SRJ-303, SRJ-115): the row's `state` as
+ * What the row read answers: the row's `state` as
  * agent-director reports it, or `UNAVAILABLE_RETRY_ROW_ABSENT` when there is
  * no row, and, on a `pending` row only, its launch start as the `status`
  * result showed it (raw, never parsed or aged here; absent when not shown).
@@ -510,7 +504,7 @@ export interface UnavailableRetryRowRead {
 const GONE_ROW_STATES: ReadonlySet<string> = new Set(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT])
 
 // ---------------------------------------------------------------------------
-// Conditions whose end the condition-end entry is told of (b.jg5 SRJ-306)
+// Conditions whose end the condition-end entry is told of
 // ---------------------------------------------------------------------------
 
 /** The `tmux-unresponsive` condition, which ends. */
@@ -542,36 +536,35 @@ export const UNAVAILABLE_RETRY_KEPT_KILL_FAILED = 'a kill-failed cause is record
 // never recorded as causes
 // ---------------------------------------------------------------------------
 
-/** A retry, in either mode, that found a launch call in flight for the persona, and made no call (b.jg5 SRJ-302, SRJ-303: a refusal). */
+/** A retry, in either mode, that found a launch call in flight for the persona, and made no call (a refusal). */
 export const UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT = 'launch-in-flight'
 
 /**
  * A retry, in either mode, that found the persona's live-row sequence running
- * (its "blocks a retry" check, b.jg5 SRJ-303, SRJ-706), and made no call: a
- * refusal (SRJ-302).
+ * (its "blocks a retry" check), and made no call: a
+ * refusal.
  */
 export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT = 'live-row-sequence-in-flight'
 
 /**
  * A retry, in either mode, that found an old-life wait step running for a
- * hold the persona waits on (its "blocks a retry" check, b.jg5 SRJ-303,
- * SRJ-811), and made no call: a refusal (SRJ-302).
+ * hold the persona waits on (its "blocks a retry" check,
+ *), and made no call: a refusal.
  */
 export const UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT = 'old-life-wait-in-flight'
 
-/** "Blocks a retry" cause: a launch call is in flight for the persona (b.jg5 SRJ-303). */
+/** "Blocks a retry" cause: a launch call is in flight for the persona. */
 export const RETRY_BLOCK_LAUNCH = 'launch'
-/** "Blocks a retry" cause: the persona's live-row sequence runs (b.jg5 SRJ-303, SRJ-706). */
+/** "Blocks a retry" cause: the persona's live-row sequence runs. */
 export const RETRY_BLOCK_LIVE_ROW_SEQUENCE = 'live-row-sequence'
-/** "Blocks a retry" cause: an old-life wait step runs for a hold the persona waits on (b.jg5 SRJ-303, SRJ-811). */
+/** "Blocks a retry" cause: an old-life wait step runs for a hold the persona waits on. */
 export const RETRY_BLOCK_OLD_LIFE_WAIT = 'old-life-wait'
 
-/** Which work in flight blocks a retry of the persona's timer (b.jg5 SRJ-303). */
+/** Which work in flight blocks a retry of the persona's timer. */
 export type RetryBlockCause = typeof RETRY_BLOCK_LAUNCH | typeof RETRY_BLOCK_LIVE_ROW_SEQUENCE | typeof RETRY_BLOCK_OLD_LIFE_WAIT
 
 /**
- * The again-reason of a retry skipped because `cause` blocks it (b.jg5
- * SRJ-302, SRJ-303): `launch-in-flight`, `live-row-sequence-in-flight` or
+ * The again-reason of a retry skipped because `cause` blocks it: `launch-in-flight`, `live-row-sequence-in-flight` or
  * `old-life-wait-in-flight`; `launch-in-flight` when the cause is not known.
  * Pure.
  */
@@ -587,7 +580,7 @@ export function retryBlockAgainReason(cause: RetryBlockCause | undefined): strin
 }
 
 /**
- * What the restart retry's skip line says blocks it (b.jg5 SRJ-303; the
+ * What the restart retry's skip line says blocks it (the
  * line's `<what>`): `a launch is in flight`, `its live-row sequence runs` or
  * `an old-life wait step it waits on runs`; the first when the cause is not
  * known. Pure.
@@ -605,7 +598,7 @@ export function retryBlockSkipText(cause: RetryBlockCause | undefined): string {
 
 /**
  * The again-reason of a full-mode retry whose restart run answered
- * `sequence-waiting` (b.jg5 SRJ-302, SRJ-706, SRJ-810), by what blocks a
+ * `sequence-waiting`, by what blocks a
  * retry once the run is over (`cause`): `old-life-wait-in-flight` when it is
  * an old-life wait step the persona waits on (the restart path's old-life
  * gate started it, or the wait runs on the persona's own row), otherwise
@@ -643,24 +636,24 @@ export const UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED = 'restart-not-init
 /**
  * A full-mode retry whose run found the row `pending` and deferred it (the
  * liveness probe read it `pending`, whatever the session's connection showed,
- * or the reconnect's or b.d61's re-probe's read did): no reconnect, kill or
+ * or the reconnect's or re-probe's read did): no reconnect, kill or
  * launch.
  */
 export const UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED = 'pending-deferred'
 
 /**
- * A full-mode retry whose liveness read `unknown` (b.jg5 SRJ-314, SRJ-302: a
+ * A full-mode retry whose liveness read `unknown` (a
  * refusal): agent-director could not report on the persona, so nothing was
  * done and no row was read.
  */
 export const UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN = 'liveness-unknown'
 
-/** A pending-only retry that read the row still `pending` (b.jg5 SRJ-302: a refusal). */
+/** A pending-only retry that read the row still `pending` (a refusal). */
 export const UNAVAILABLE_RETRY_AGAIN_ROW_PENDING = 'row-pending'
 
 /**
  * A full-mode retry whose restart run found the persona's live-row sequence
- * running (`sequence-waiting`, b.jg5 SRJ-706, SRJ-303, SRJ-302: a refusal):
+ * running (`sequence-waiting`, a refusal):
  * no agent-director call, nothing recorded; the timer re-arms at the doubled
  * wait and never stops for it.
  */
@@ -668,26 +661,26 @@ export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING = 'live-row-sequence-waiti
 
 /**
  * A pending-only retry whose row read `pending` and whose pending-row step
- * started the live-row sequence for it: the row was not covered (b.jg5
- * SRJ-411: a retired key's old life before its new life, or a `cwd` or
+ * started the live-row sequence for it: the row was not covered (
+ * a retired key's old life before its new life, or a `cwd` or
  * `config_dir` mismatch), or the pending-row rule aborted CSCB's own stuck
- * launch, whose sequence enters at its second step (b.jg5 SRJ-412). No
+ * launch, whose sequence enters at its second step. No
  * launch or approver of the retry's own; the last row read stays `pending`,
- * and the timer re-arms at the doubled wait (SRJ-302: a refusal). Kept apart
+ * and the timer re-arms at the doubled wait (a refusal). Kept apart
  * from `live-row-sequence-waiting`, a full-mode run that found a sequence
  * already running.
  */
 export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED = 'live-row-sequence-started'
 
 // ---------------------------------------------------------------------------
-// The pending-only retry's pending-row step (b.jg5 SRJ-409, SRJ-411)
+// The pending-only retry's pending-row step
 // ---------------------------------------------------------------------------
 
 /** The step kept the row: covered or undecided (P armed pending-only), or its read was refused. */
 export const UNAVAILABLE_RETRY_PENDING_STEP_KEPT = 'kept'
-/** The step started the live-row sequence: the row was not covered (SRJ-411), or the pending-row rule aborted CSCB's own stuck launch (SRJ-412). */
+/** The step started the live-row sequence: the row was not covered, or the pending-row rule aborted CSCB's own stuck launch. */
 export const UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED = 'sequence-started'
-/** The step's read latched the persona (SRJ-114, SRJ-513), or found it latched. */
+/** The step's read latched the persona, or found it latched. */
 export const UNAVAILABLE_RETRY_PENDING_STEP_LATCHED = 'latched'
 /** The step's read found the row in another state, or no row (`UNAVAILABLE_RETRY_ROW_ABSENT`). */
 export const UNAVAILABLE_RETRY_PENDING_STEP_ROW = 'row'
@@ -704,7 +697,7 @@ export type UnavailableRetryPendingStep =
   | { readonly kind: typeof UNAVAILABLE_RETRY_PENDING_STEP_ROW; readonly state: string }
 
 // ---------------------------------------------------------------------------
-// Stop reasons (b.jg5 SRJ-305)
+// Stop reasons
 // ---------------------------------------------------------------------------
 
 /** A retry found the persona connected, or its reconnect succeeded. */
@@ -744,9 +737,9 @@ export const UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED = 'the tmux-unavail
 export const UNAVAILABLE_RETRY_STOP_RUN_FAILED = 'its retry run failed'
 
 /**
- * The persona latched, whatever the case (b.jg5 SRJ-305, SRJ-502): the
+ * The persona latched, whatever the case: the
  * latch's hold stops its timer through `stop` (never the condition-end
- * entry, so neither SRJ-306 exception keeps it), and a retry that finds it
+ * entry, so neither exception keeps it), and a retry that finds it
  * latched, before any call, stops with it too. Not terminal (not in
  * `UNAVAILABLE_RETRY_TERMINAL_STOPS`): a later refusal may arm the timer
  * again; while the persona is latched that timer stops at its first retry,
@@ -756,9 +749,8 @@ export const UNAVAILABLE_RETRY_STOP_RUN_FAILED = 'its retry run failed'
 export const UNAVAILABLE_RETRY_STOP_LATCHED = 'the persona is latched'
 
 /**
- * The persona is held on `ErrInvalidFlags` (b.jg5 SRJ-207, SRJ-303,
- * SRJ-305): the hold's reaction stops its timer through `stop` (never the
- * condition-end entry, so neither SRJ-306 exception keeps it), and a retry
+ * The persona is held on `ErrInvalidFlags`: the hold's reaction stops its timer through `stop` (never the
+ * condition-end entry, so neither exception keeps it), and a retry
  * that finds it held, before any call, stops with it too, as does a
  * full-mode retry whose restart work answers `held`. Not terminal (not in
  * `UNAVAILABLE_RETRY_TERMINAL_STOPS`): once the hold ends, a later refusal
@@ -767,11 +759,11 @@ export const UNAVAILABLE_RETRY_STOP_LATCHED = 'the persona is latched'
 export const UNAVAILABLE_RETRY_STOP_HELD = 'the persona is held on ErrInvalidFlags'
 
 /**
- * The terminal stop reasons (b.jg5 SRJ-309): the persona is going away or the
+ * The terminal stop reasons: the persona is going away or the
  * server is, so no later refusal may bring its retrying back. The
  * `tmux-unresponsive` condition's `cancelAlert` (`src/persona-episodes.ts`)
  * never arms the alert check again, and never lets the onset post again in
- * the episode, after a stop for one of these (SRJ-305, SRJ-308). Every other
+ * the episode, after a stop for one of these. Every other
  * stop reason (the cap, not up, a pending-only row read, a failed run, ...)
  * leaves a later refusal free to arm the timer, and the check, again, and to
  * allow the onset again.
@@ -783,7 +775,7 @@ export const UNAVAILABLE_RETRY_TERMINAL_STOPS: ReadonlySet<string> = new Set([
 ])
 
 // ---------------------------------------------------------------------------
-// Run now (b.jg5 SRJ-810)
+// Run now
 // ---------------------------------------------------------------------------
 
 /** `runNow`: the pending retry was run at once, its wait count carried on. */
@@ -802,7 +794,7 @@ export type UnavailableRetryRunNowResult =
   | typeof UNAVAILABLE_RETRY_RUN_NOW_RUNNING
   | typeof UNAVAILABLE_RETRY_RUN_NOW_CLOSED
 
-/** `runNow`'s label when an old-life hold the persona waited on has ended (b.jg5 SRJ-810). */
+/** `runNow`'s label when an old-life hold the persona waited on has ended. */
 export const UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED = 'old-life-hold-ended'
 
 /** What `runNow` did, with what its line names beside it (`unavailableRetryRunNowLine`). */
@@ -818,7 +810,7 @@ function unavailableRetryLineHead(key: string): string {
 }
 
 /**
- * The arm line (b.jg5 SRJ-302, SRJ-1014), `description` the cause's
+ * The arm line, `description` the cause's
  * description (`<kind>`, or `<kind>: <one-line error>` with no stack frame):
  *
  *   [slack] unavailable-retry: persona=<key> armed[ in pending-only mode] (<description>) — first retry in <s> s
@@ -831,7 +823,7 @@ export function unavailableRetryArmedLine(key: string, pendingOnly: boolean, des
 }
 
 /**
- * The retry line (b.jg5 SRJ-302, SRJ-1014), at the start of retry `retry`:
+ * The retry line, at the start of retry `retry`:
  *
  *   [slack] unavailable-retry: persona=<key> retry <n> — rerunning its recovery
  *   [slack] unavailable-retry: persona=<key> retry <n> (pending-only) — reading its row
@@ -845,7 +837,7 @@ export function unavailableRetryRetryLine(key: string, retry: number, pendingOnl
 }
 
 /**
- * The re-armed line (b.jg5 SRJ-302, SRJ-1014): retry `retry`, run in
+ * The re-armed line: retry `retry`, run in
  * pending-only mode when `ranPendingOnly`, answered `reason`; `newMode` names
  * the mode when the retry changed it:
  *
@@ -867,7 +859,7 @@ export function unavailableRetryReArmedLine(
 }
 
 /**
- * The mode line (b.jg5 SRJ-301, SRJ-1014): a full-mode arm promoted a
+ * The mode line: a full-mode arm promoted a
  * pending-only timer, `description` the cause's:
  *
  *   [slack] unavailable-retry: persona=<key> promoted to full mode (<description>) — its due time is kept
@@ -879,7 +871,7 @@ export function unavailableRetryPromotedLine(key: string, description: string | 
 }
 
 /**
- * The stop line (b.jg5 SRJ-305, SRJ-1014), naming a pending-only mode and the
+ * The stop line, naming a pending-only mode and the
  * row read, when given:
  *
  *   [slack] unavailable-retry: persona=<key> stopped[ (pending-only[, row <state>])] — <reason>
@@ -895,7 +887,7 @@ export function unavailableRetryStoppedLine(key: string, pendingOnly: boolean, r
 }
 
 /**
- * The kept line (b.jg5 SRJ-306, SRJ-1014): a condition ended, but the timer
+ * The kept line: a condition ended, but the timer
  * is kept for `kept` (its last row read `pending`, a `kill-failed` cause):
  *
  *   [slack] unavailable-retry: persona=<key> kept — <condition ended>, but <why>[ and <why>]
@@ -922,7 +914,7 @@ export function unavailableRetryNotArmedClosedLine(key: string, cause: string, c
 
 /**
  * The line of an arm of persona `key` refused inside its latch re-check
- * (b.jg5 SRJ-505), `cause` the refused cause's description (its kind, with
+ * `cause` the refused cause's description (its kind, with
  * its error's description when it carries one):
  *
  *   [slack] unavailable-retry: persona=<key> not armed (<cause>) — inside its latch re-check, an answer gives no information
@@ -934,7 +926,7 @@ export function unavailableRetryNotArmedInLatchRecheckLine(key: string, cause: s
 }
 
 /**
- * The one line of a `runNow` of persona `key` (b.jg5 SRJ-810), `why` its
+ * The one line of a `runNow` of persona `key`, `why` its
  * label (a label that is not a short lower-case one is logged as `unnamed`):
  *
  *   [slack] unavailable-retry: persona=<key> not retried now (<why>) — <closed reason>
@@ -1011,7 +1003,7 @@ export interface UnavailableRetryCause {
  *   run, keeps it as it is when the answer `keepsLastRow`, and clears it
  *   otherwise. A `stop` answer's is named in the stopped line.
  * - `keepsLastRow` (`again`): true when the retry read no row (a liveness
- *   reading of `unknown`, b.jg5 SRJ-314), so an answer without `row` keeps
+ * reading of `unknown`), so an answer without `row` keeps
  *   the timer's last row read instead of clearing it.
  * - `switchToPendingOnly` (`again`): true switches the timer to pending-only
  *   mode, the wait count carrying on (a full-mode retry whose launch
@@ -1072,27 +1064,27 @@ export interface UnavailableRetryDeps {
   action: UnavailableRetryAction
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: UnavailableRetryClock
-  /** The first wait, in seconds; {@link UNAVAILABLE_RETRY_BASE_S} when absent (b.2nr: the test-only override block sets it). */
+  /** The first wait, in seconds; {@link UNAVAILABLE_RETRY_BASE_S} when absent (the test-only override block sets it). */
   baseS?: number
-  /** The longest wait, in seconds; {@link UNAVAILABLE_RETRY_CEILING_S} when absent (b.2nr: the test-only override block sets it). */
+  /** The longest wait, in seconds; {@link UNAVAILABLE_RETRY_CEILING_S} when absent (the test-only override block sets it). */
   ceilingS?: number
   /**
-   * b.jg5 SRJ-308: called once at every retry of a persona's timer, in
+   * called once at every retry of a persona's timer, in
    * either mode, with the clock's time, after its retry line and before its
-   * action runs, so a retry the action skips for work in flight (SRJ-303)
+   * action runs, so a retry the action skips for work in flight
    * is observed too (production: the `tmux-unresponsive` condition's
    * `onsetAtRetry`). A timer stopped before its retry runs is not observed.
    * A throw is swallowed. Absent: nothing is called.
    */
   onRetryFire?: (key: string, firedAt: number) => unknown
   /**
-   * b.jg5 SRJ-309: called once per real stop of a persona's timer, with the
+   * called once per real stop of a persona's timer, with the
    * stop's reason (the stopped line's, or `UNAVAILABLE_RETRY_STOP_RUN_FAILED`
    * for a timer forgotten because its re-arm failed), after the stopped line
    * and before any hand-off. Production binds two consumers in one observer:
    * the `tmux-unresponsive` condition's `cancelAlert` (which holds the
    * condition's onset back and cancels its pending alert check), then the
-   * unclassified-error episodes' `retryStopped` (b.jg5 SRJ-313), which ends
+   * unclassified-error episodes' `retryStopped`, which ends
    * the persona's episode only for the stops that mean the retries are over
    * because the persona's state got better (`UNAVAILABLE_RETRY_STOP_RECOVERED`,
    * `UNAVAILABLE_RETRY_STOP_ROW_LIVE`,
@@ -1127,8 +1119,7 @@ export interface UnavailableRetryView {
 }
 
 /**
- * Where a trigger inside a launch or recovery attempt is sent (b.jg5
- * SRJ-301): the persona key and the cause the arming predicate answered. The
+ * Where a trigger inside a launch or recovery attempt is sent: the persona key and the cause the arming predicate answered. The
  * controller is one: its `arm` arms the persona's timer with the cause.
  * `arm` answers true when the persona has a timer after the call (armed now,
  * or already armed or running), false when nothing is armed (refused after
@@ -1143,8 +1134,7 @@ export interface UnavailableRetryTriggerSink {
    * Arm persona `key`'s timer in pending-only mode with the `pending-row`
    * cause (the controller's `armPendingOnly`). The outage state's
    * launch-failure arm (`armPendingOnlyAfterLaunchFailure`) calls it for a
-   * launch's `ErrTmuxSessionCreate` (b.jg5 SRJ-112, SRJ-113, SRJ-301,
-   * SRJ-409). Optional: a sink without it arms nothing that way. Must not
+   * launch's `ErrTmuxSessionCreate`. Optional: a sink without it arms nothing that way. Must not
    * throw; a throw counts as not armed.
    */
   armPendingOnly?(key: string): void
@@ -1163,7 +1153,7 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * the first timer, the persona is forgotten and one arm failed line is
    * logged. Answers true when the persona has a timer after the call; false
    * after `close` and when the first timer could not be set. Inside a latch
-   * re-check of the latched persona (`isInsideLatchRecheck`, b.jg5 SRJ-505)
+   * re-check of the latched persona (`isInsideLatchRecheck`)
    * nothing is armed or recorded and one not-armed line is logged; the
    * answer is false, even when a timer is already armed, which is left as
    * it was: the call armed nothing.
@@ -1171,7 +1161,7 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
   arm(key: string, cause: UnavailableRetryCause): boolean
   /**
    * Arm persona `key`'s timer in pending-only mode, for a covered `pending`
-   * row (b.jg5 SRJ-303, SRJ-409): the `pending-row` cause is recorded and the
+   * row: the `pending-row` cause is recorded and the
    * last row read is `pending`. When not armed, its first retry is due
    * `UNAVAILABLE_RETRY_BASE_S` from now, in pending-only mode, and one armed
    * line is logged. When armed or running, the due time, the wait count and
@@ -1183,7 +1173,7 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
   armPendingOnly(key: string): void
   /**
    * The end of a condition for persona `key` (the end of `tmux-unresponsive`,
-   * the clearing of `tmux-unavailable`; b.jg5 SRJ-306). Stops the timer, as
+   * the clearing of `tmux-unavailable`). Stops the timer, as
    * `stop` does with the condition's reason, unless its last row read was
    * `pending` or a `kill-failed` cause is recorded: then the timer is kept
    * with its due time, and one kept line names why. While the persona's
@@ -1206,7 +1196,7 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * or a retry that found the row live out of `pending` (a row state, or the
    * `live` reading), or from a successful launch call (`spawn` or `resume`,
    * whose row it leaves `pending`, so the `pending` exception keeps the
-   * timer; b.jg5 SRJ-305): it becomes the last row read before the rule is
+   * timer): it becomes the last row read before the rule is
    * applied, now. While a run is in flight it is applied after the run's
    * answer has set the last row read, and only when that answer carries no
    * row of its own or the reading is `pending` (the run's own row is the
@@ -1215,7 +1205,7 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    */
   conditionEnded(key: string, condition: UnavailableRetryCondition, reading?: string): UnavailableRetryConditionEndResult
   /**
-   * Run persona `key`'s retry at once (b.jg5 SRJ-810: once an old-life hold
+   * Run persona `key`'s retry at once (once an old-life hold
    * ends, each persona that waited on it is retried at once), with `why`, a
    * short CSCB-written label, named in its one line:
    *   - waiting for its due time: the pending timer is cleared and the retry
@@ -1484,8 +1474,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
 
   /**
    * Whether the reading a condition end deferred to a run brought becomes
-   * the last row read once the run's answer is applied (b.jg5 SRJ-305,
-   * SRJ-306). The run's answer is applied at the run's end, so the row it
+   * the last row read once the run's answer is applied. The run's answer is applied at the run's end, so the row it
    * carries (`answerRow`: an `again` answer's `row`, such as a successful
    * launch's `pending` row, or a yielded pending-only stop's row read) wins
    * over the deferred reading, and the reading applies only when the answer
@@ -1495,7 +1484,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
    * answer carries, since the run cannot order its own row read against a
    * launch that ended the condition meanwhile. Keeping the timer on a
    * `pending` row costs one more retry, which reads the row again and stops
-   * when it is live; dropping it would lose SRJ-305's pending-only watch on
+   * when it is live; dropping it would lose pending-only watch on
    * that row, which nothing restores. An end outside a run is not affected:
    * its reading replaces the last row read at once (`conditionEnded`).
    */
@@ -1504,8 +1493,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   }
 
   /**
-   * Whether a run's `switchToPendingOnly` answer is taken (b.jg5 SRJ-301,
-   * SRJ-306): only when no `arm` (full mode) landed during the run and no
+   * Whether a run's `switchToPendingOnly` answer is taken: only when no `arm` (full mode) landed during the run and no
    * `kill-failed` cause is recorded.
    */
   function mayTakeSwitch(entry: RetryEntry): boolean {
@@ -1513,8 +1501,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   }
 
   /**
-   * Whether a run's `stop` answer yields to a full-mode cause (b.jg5 SRJ-301,
-   * SRJ-303): only when the retry ran in pending-only mode, the stop rests on
+   * Whether a run's `stop` answer yields to a full-mode cause: only when the retry ran in pending-only mode, the stop rests on
    * its row read (`yieldsToFullMode`), and `arm` (full mode) landed during the
    * run. Then the stop is taken as `again` in full mode.
    */
@@ -1523,7 +1510,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   }
 
   /**
-   * The condition-end rule (b.jg5 SRJ-306) for `entry`, now: keep the timer,
+   * The condition-end rule for `entry`, now: keep the timer,
    * with one kept line, when its last row read is `pending` or a
    * `kill-failed` cause is recorded; else stop it with the condition's
    * reason. Answers true when the timer is kept.
@@ -1628,7 +1615,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       log(unavailableRetryNotArmedClosedLine(key, describeCause(cause), closedReason))
       return false
     }
-    // b.jg5 SRJ-505: inside a latch re-check of a latched persona no cause
+    // inside a latch re-check of a latched persona no cause
     // arms its timer, whichever path asks (the reporting step, the restart
     // work's arm hook, a gate's own arm).
     if (isInsideLatchRecheck(key)) {
@@ -1643,7 +1630,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
         if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
           // A covered `pending` row is no refusal: a condition end deferred
           // to this run still applies, and the row this arm marks `pending`
-          // keeps the timer when it does (b.jg5 SRJ-306).
+          // keeps the timer when it does.
           existing.pendingArmedInRun = true
         } else {
           existing.fullArmedInRun = true
@@ -1750,7 +1737,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
 }
 
 // ---------------------------------------------------------------------------
-// The full-mode retry action (b.jg5 SRJ-303, SRJ-305)
+// The full-mode retry action
 // ---------------------------------------------------------------------------
 
 /** Dependencies of `createFullModeRetryAction`, each read at every retry. */
@@ -1767,7 +1754,7 @@ export interface FullModeRetryDeps {
    * The restart module's retry entry (`runRestartRetry`): the restart path's
    * decision for the persona, through its serializer, without the delay gate,
    * with `isInFlight` as its first step; `blockCause`, when given, names what
-   * blocks it in the entry's skip line (b.jg5 SRJ-303).
+   * blocks it in the entry's skip line.
    */
   retry: (
     key: string,
@@ -1784,7 +1771,7 @@ export interface FullModeRetryDeps {
   /** Whether the server is shutting down (the flag `shutdown()` raises). */
   isShuttingDown: () => boolean
   /**
-   * The latched query (b.jg5 SRJ-303, SRJ-305; production: the server's
+   * The latched query (production: the server's
    * latch's `isLatched`): a retry, in either mode, that finds the persona
    * latched makes no agent-director call and stops the timer with
    * `UNAVAILABLE_RETRY_STOP_LATCHED`, so a timer armed after the latch (a
@@ -1796,7 +1783,7 @@ export interface FullModeRetryDeps {
    */
   isLatched?: (key: string) => boolean
   /**
-   * The held query (b.jg5 SRJ-207, SRJ-303, SRJ-305; production: the
+   * The held query (production: the
    * server's `ErrInvalidFlags` hold's `isHeld`): a retry, in either mode,
    * that finds the persona held makes no agent-director call and stops the
    * timer with `UNAVAILABLE_RETRY_STOP_HELD`, so a timer armed while the
@@ -1808,18 +1795,18 @@ export interface FullModeRetryDeps {
    */
   isHeld?: (key: string) => boolean
   /**
-   * Whether work in flight for the persona blocks a retry (b.jg5 SRJ-303;
+   * Whether work in flight for the persona blocks a retry (
    * production: the server's `isPersonaRetryBlocked`: a launch call,
    * `isLaunchInFlight`, a running live-row sequence,
    * `isLiveRowSequenceRunning`, or an old-life wait step for a hold the
    * persona waits on, `isOldLifeWaitRunningFor`). A running dialog approver never counts here: it
    * runs after its launch call has returned and never blocks a retry
-   * (SRJ-401). A retry in either mode that finds it true makes no
+   * A retry in either mode that finds it true makes no
    * agent-director call and is a refusal; a throw counts as in flight.
    */
   isInFlight: (key: string) => boolean
   /**
-   * Which work in flight blocks a retry (b.jg5 SRJ-303; production: the
+   * Which work in flight blocks a retry (production: the
    * session manager's `personaRetryBlockCause`): a launch call, the
    * persona's live-row sequence, or an old-life wait step for a hold it waits
    * on. Asked only when `isInFlight` answered true (or a full-mode run
@@ -1837,25 +1824,25 @@ export interface FullModeRetryDeps {
   isSessionConnected?: (key: string) => boolean
 
   /**
-   * End the persona's `tmux-unresponsive` condition (b.jg5 SRJ-310 rule 2,
+   * End the persona's `tmux-unresponsive` condition (rule 2,
    * retry half), with the live reading the retry found: called when a
    * full-mode retry finds the persona already connected on a
    * `live` reading (`LIVENESS_LIVE`), and when a pending-only retry reads the
    * row live out of `pending` (its state) with the session connected. Production binds the condition's end (reason `retry`) and the
    * clear of the persona's `tmux-unavailable` outage with the same reading
-   * (b.jg5 SRJ-311, SRJ-312). Absent: nothing is called. A throw is
+   * Absent: nothing is called. A throw is
    * swallowed and changes nothing about the retry's answer.
    */
   endTmuxUnresponsive?: (key: string, reading: string) => void
   /**
-   * The pending-row step (b.jg5 SRJ-409, SRJ-411; production: the session
+   * The pending-row step (production: the session
    * manager's `retryPendingRowStep` over the applied persona): called by a
    * pending-only retry, inside its recovery attempt, when its `status` read
    * answered `pending`. It makes one `get` through the shared own-row read
    * (its note and launch-start latches and its old-life read entry applying)
    * and decides whether the row is covered: a covered or undecided row arms
    * the persona's timer pending-only; a covered row then gets the
-   * pending-row rule's one run of this retry (b.jg5 SRJ-410), whose answer
+   * pending-row rule's one run of this retry, whose answer
    * maps here: a refusal or the held post is `kept`, a row the rule read
    * gone or live is `row` with that state, a latch is `latched`, and the
    * own-launch abort's sequence is `sequence-started`; an undecided row is
@@ -1872,7 +1859,7 @@ export interface FullModeRetryDeps {
 }
 
 /**
- * The server's retry action, for both modes (b.jg5 SRJ-303, SRJ-305; see
+ * The server's retry action, for both modes (see
  * the module comment). Before any call, in either mode, stops on shutdown, a
  * persona not applied, latched, held on `ErrInvalidFlags`, not up or at the
  * cap, in that order. Then, in full
@@ -1880,14 +1867,14 @@ export interface FullModeRetryDeps {
  * pending-only mode, answers a `launch-in-flight` refusal with no call when
  * the in-flight predicate answers true or throws, else reads the row inside
  * a recovery attempt for the persona, asks the latched query again (a read
- * that latched the persona, b.jg5 SRJ-512, SRJ-513, stops with the latch's reason and
+ * that latched the persona, stops with the latch's reason and
  * hands nothing on) and answers from its state (`pendingOnlyAnswer`); a
  * `pending` state goes to the optional pending-row step, inside a recovery
  * attempt too, and its answer decides (`pendingStepAnswer`). The launch start
  * the `status` read carried is superseded by the step's `get`; ageing the row
  * at the retries is the pending-row rule's, not this action's: the step runs
  * it on a covered row. The whole run, in either mode, is marked as a retry
- * of the persona's timer (`runInTimerRetry`, b.jg5 SRJ-410): the pending-row
+ * of the persona's timer (`runInTimerRetry`): the pending-row
  * rule runs only inside one, at most once per retry, whether reached here
  * (pending-only) or through the restart path's deferral or the ladder's
  * `pending` step (full mode). A latched query that throws counts as latched
@@ -1898,7 +1885,7 @@ export interface FullModeRetryDeps {
  * the controller counts as `again`.
  */
 export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableRetryAction {
-  // b.jg5 SRJ-410: the whole run is a retry of the persona's timer, in either
+  // the whole run is a retry of the persona's timer, in either
   // mode (`runInTimerRetry`), so the pending-row rule may run once in it.
   return (key, attempt) => runInTimerRetry(key, () => retryActionRun(deps, key, attempt))
 }
@@ -1915,8 +1902,7 @@ export type RetryRunGateDeps = Pick<
 >
 
 /**
- * The gate before any call of a run for persona `key` (b.jg5 SRJ-303,
- * SRJ-305; b.av2 SR-8.6), in order: the server shutting down, the persona
+ * The gate before any call of a run for persona `key`, in order: the server shutting down, the persona
  * not in the applied configuration, latched, held on `ErrInvalidFlags`, not
  * up, at the restart cap. Answers the stop reason of the first that holds
  * (`UNAVAILABLE_RETRY_STOP_SHUTDOWN`, `…_NOT_APPLIED`, `…_LATCHED`,
@@ -1928,14 +1914,14 @@ export type RetryRunGateDeps = Pick<
  */
 export function retryRunGateStop(deps: RetryRunGateDeps, key: string): string | undefined {
   if (deps.isShuttingDown()) return UNAVAILABLE_RETRY_STOP_SHUTDOWN
-  // b.av2 SR-8.6 (b.jg5 SRJ-1512): a retry does nothing for a key outside
+  // a retry does nothing for a key outside
   // the applied set. Its one exception, an old-life wait's kill and
-  // find-missing steps on a retired key (SRJ-811), runs in the session
+  // find-missing steps on a retired key, runs in the session
   // manager's live-row sequence registry, never on this timer, and never
   // launches that key; no timer is armed for the old key.
   if (deps.appliedPersona(key) === undefined) return UNAVAILABLE_RETRY_STOP_NOT_APPLIED
   if (latched(key, deps.isLatched)) return UNAVAILABLE_RETRY_STOP_LATCHED
-  // b.jg5 SRJ-207, SRJ-303: no attempt while the persona is held on ErrInvalidFlags.
+  // no attempt while the persona is held on ErrInvalidFlags.
   if (held(key, deps.isHeld)) return UNAVAILABLE_RETRY_STOP_HELD
   if (!deps.canRelaunch(key)) return UNAVAILABLE_RETRY_STOP_NOT_UP
   if (deps.isAtCap(key)) return UNAVAILABLE_RETRY_STOP_CAPPED
@@ -1955,12 +1941,12 @@ async function retryActionRun(
   const cwd = persona.working_directory
   if (attempt.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
     if (inFlight(key, deps.isInFlight)) {
-      // b.jg5 SRJ-303: the again-reason names what blocks the retry.
+      // the again-reason names what blocks the retry.
       const reason = retryBlockAgainReason(readRetryBlockCause(key, deps.retryBlockCause))
       return { kind: 'again', reason, row: UNAVAILABLE_RETRY_ROW_PENDING }
     }
     const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
-    // b.jg5 SRJ-305, SRJ-512, SRJ-513: a row read that latched the persona
+    // a row read that latched the persona
     // stops the timer with the latch's reason; nothing is handed to the
     // restart path. A configured persona's own `pending` row with no launch
     // start latches at that read, so it never reaches `pendingOnlyAnswer`;
@@ -1970,7 +1956,7 @@ async function retryActionRun(
       endCondition(key, row.state, deps.endTmuxUnresponsive)
     }
     const restart = (): Promise<unknown> => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
-    // b.jg5 SRJ-409, SRJ-411: a `pending` row is decided by the pending-row
+    // a `pending` row is decided by the pending-row
     // step's one `get`, whose row supersedes this `status` read's (the
     // carried launch start included; ageing at the retries is the
     // pending-row rule's).
@@ -1982,7 +1968,7 @@ async function retryActionRun(
     return pendingOnlyAnswer(row.state, restart)
   }
   const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
-  // b.jg5 SRJ-303, SRJ-310: `already-connected` is answered only for a `live`
+  // `already-connected` is answered only for a `live`
   // reading (never `pending`) whose session is connected.
   if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
   return answerFor(outcome, () => readRetryBlockCause(key, deps.retryBlockCause))
@@ -2012,8 +1998,7 @@ function endCondition(key: string, reading: string, end: ((key: string, reading:
 }
 
 /**
- * What a pending-only retry answers for the row read's `row` (b.jg5
- * SRJ-303, SRJ-305): still `pending`, a refusal with no other call; `ended`,
+ * What a pending-only retry answers for the row read's `row`: still `pending`, a refusal with no other call; `ended`,
  * `missing` or absent, a stop whose hand-off is `restart` (one run of the
  * restart path's decision, after the timer is stopped, so that a refused
  * launch in it arms a fresh timer); any other state, live out of `pending`, a
@@ -2033,9 +2018,9 @@ function pendingOnlyAnswer(row: string, restart: () => Promise<unknown>): Unavai
 
 /**
  * What a pending-only retry answers for its pending-row step's `step`
- * (b.jg5 SRJ-409, SRJ-411, SRJ-305): `kept` is today's refusal
+ * `kept` is today's refusal
  * (`row-pending`, the row kept `pending`); `sequence-started` (an uncovered
- * row's sequence, or the abort of CSCB's own stuck launch, b.jg5 SRJ-412) is
+ * row's sequence, or the abort of CSCB's own stuck launch) is
  * a refusal naming the sequence it started (`live-row-sequence-started`),
  * the row kept `pending`, with no launch or approver of its own; `latched`, or a persona
  * the latched query now answers latched, stops with the latch's reason and
@@ -2064,8 +2049,8 @@ function pendingStepAnswer(
 
 /**
  * The optional latched query for persona `key`: exactly `true` is latched;
- * absent is not; a query that throws counts as latched (fail safe, b.jg5
- * SRJ-502), with one `[slack] unavailable-retry: persona=<key> …` line
+ * absent is not; a query that throws counts as latched (fail safe
+ *), with one `[slack] unavailable-retry: persona=<key> …` line
  * naming what it threw (`describeThrownValue`). Never throws.
  */
 function latched(key: string, isLatched: ((key: string) => boolean) | undefined): boolean {
@@ -2083,7 +2068,7 @@ function latched(key: string, isLatched: ((key: string) => boolean) | undefined)
 }
 
 /**
- * The optional held query for persona `key` (b.jg5 SRJ-207): exactly `true`
+ * The optional held query for persona `key`: exactly `true`
  * is held; absent is not; a query that throws counts as held (fail safe),
  * with one `[slack] unavailable-retry: persona=<key> …` line naming what it
  * threw (`describeThrownValue`). Never throws.
@@ -2122,15 +2107,14 @@ function againWith(reason: string | undefined): UnavailableRetryOutcome {
 /**
  * What a full-mode retry answers for the retry entry's outcome. A run
  * skipped for work in flight, and a run the old-life gate or a running
- * live-row sequence held, name what blocks the retry (b.jg5 SRJ-303,
- * SRJ-810, SRJ-302): `blockCause` reads it (`readRetryBlockCause`), asked
+ * live-row sequence held, name what blocks the retry: `blockCause` reads it (`readRetryBlockCause`), asked
  * only for those two outcomes. A refused
  * launch gives no reason of its own: the UNAVAILABLE outcome that refused it
  * armed the timer during the run, and the re-armed line names that cause. A
- * run that found the row `pending` and deferred it (b.jg5 SRJ-302, SRJ-305:
+ * run that found the row `pending` and deferred it (
  * a refusal, never "nothing left to recover", even for a session connected
  * with its stream) records the row read `pending`. A
- * liveness reading of `unknown` (b.jg5 SRJ-314) is a refusal that read no
+ * liveness reading of `unknown` is a refusal that read no
  * row: the last row read is kept as it is. A successful launch records the row read `pending` too (the launch's row,
  * whether or not the switch is taken) and asks to switch the timer to
  * pending-only mode; the controller takes the switch only when no other
@@ -2150,19 +2134,19 @@ function answerFor(outcome: RestartRetryOutcome, blockCause: () => RetryBlockCau
     case 'shutting-down':
       return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
     case 'latched':
-      // b.jg5 SRJ-305: the persona is latched, or latched during this retry.
+      // the persona is latched, or latched during this retry.
       return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
     case 'held':
-      // b.jg5 SRJ-207, SRJ-305: the persona is held on ErrInvalidFlags, or
+      // the persona is held on ErrInvalidFlags, or
       // held during this retry.
       return stopWith(UNAVAILABLE_RETRY_STOP_HELD)
     case 'in-flight':
-      // b.jg5 SRJ-303: a run skipped for work in flight names what blocked it.
+      // a run skipped for work in flight names what blocked it.
       return againWith(retryBlockAgainReason(blockCause()))
     case 'sequence-waiting':
-      // b.jg5 SRJ-706, SRJ-303: the restart path made no call while P's
-      // live-row sequence runs; a refusal (SRJ-302), never a stop. b.jg5
-      // SRJ-810, SRJ-302: a run the old-life gate held, which started the
+      // the restart path made no call while P's
+      // live-row sequence runs; a refusal, never a stop.
+      // a run the old-life gate held, which started the
       // hold's wait, names that wait, as a run skipped for it does.
       return againWith(sequenceWaitingAgainReason(blockCause()))
     case 'refused':
@@ -2183,7 +2167,7 @@ function answerFor(outcome: RestartRetryOutcome, blockCause: () => RetryBlockCau
     case 'not-initialised':
       return againWith(UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED)
     case 'liveness-unknown':
-      // b.jg5 SRJ-302, SRJ-305: a refusal, never "nothing left to recover".
+      // a refusal, never "nothing left to recover".
       // It read no row, so the last row read is kept as it is.
       return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true }
     default: {
@@ -2298,12 +2282,12 @@ function describeCause(cause: UnavailableRetryCause): string {
 }
 
 // ---------------------------------------------------------------------------
-// The arming predicate (b.jg5 SRJ-301)
+// The arming predicate
 // ---------------------------------------------------------------------------
 
 /**
  * What arms persona P's retry timer when `value` is thrown by an
- * agent-director call made with `verb` for P (b.jg5 SRJ-301), classified by
+ * agent-director call made with `verb` for P, classified by
  * `classifyAdError`, in this order:
  *
  * - UNAVAILABLE from any verb: an `unavailable` cause, or a `kill-failed`
@@ -2311,22 +2295,22 @@ function describeCause(cause: UnavailableRetryCause): string {
  *   `ErrUnknownErrorName` carrying that name is an `unavailable` cause);
  * - ENVIRONMENT (`ErrTmuxNotAvailable`) from any verb, `kill` and the read
  *   verbs included: an `environment` cause
- *   (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`, SRJ-311). It is decided before
+ * (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`). It is decided before
  *   the read-error rule, so a `status`, `get` or `list` answering it records
  *   this cause, not `read-error`;
  * - CONFIG (`ErrConfigMalformed`) from any verb, `kill` and the read verbs
- *   included: a `config` cause (`UNAVAILABLE_RETRY_CAUSE_CONFIG`, SRJ-316),
+ * included: a `config` cause (`UNAVAILABLE_RETRY_CAUSE_CONFIG`),
  *   also decided before the read-error rule;
  * - UNCLASSIFIED from any declared verb but `status`, `get` and `list` (an
  *   unknown verb, which might be a read, arms nothing): an `unclassified` cause
- *   (`UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`, SRJ-301, SRJ-313). An
+ * (`UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`). An
  *   `ErrInvalidFlags` is STATE here; the resume path, the shared pane reader
  *   and the reconnect's `send-keys`, which give it no meaning, arm through
  *   the outage state's site entry (`reportUnclassifiedAtSite`) after their
  *   re-check;
  * - any other `status`, `get` or `list` error: a `read-error` cause, except
  *   `ErrSpawnNotFound` (each site keeps its meaning) and an UNUSABLE NAME
- *   answer (its own handling, SRJ-105);
+ * answer (its own handling);
  * - `undefined` (nothing arms) otherwise.
  *
  * The ENVIRONMENT and CONFIG causes (`UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES`)
@@ -2363,7 +2347,7 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
 }
 
 // ---------------------------------------------------------------------------
-// The attempt context (b.jg5 SRJ-301)
+// The attempt context
 // ---------------------------------------------------------------------------
 
 /**
@@ -2442,7 +2426,7 @@ export async function runInAttempt<T>(
  * no attempt is running, for any persona, whatever attempt the caller runs
  * in. For work that is part of no attempt but is started from one: the
  * dialog approver, which a launch attempt starts as its launch call returns
- * (b.jg5 SRJ-401). An agent-director error met there then arms a retry
+ * An agent-director error met there then arms a retry
  * timer only with the ENVIRONMENT or CONFIG cause, and starts no
  * `tmux-unresponsive` condition and no unclassified-error episode (both are
  * attempt-scoped, `src/outage-state.ts`).
@@ -2451,7 +2435,7 @@ export function runOutsideAttempts<T>(fn: () => T): T {
   // Outside every retry too: work a retry starts and does not await (a
   // dialog approver, a live-row sequence) is no retry of the timer. And
   // outside every latch re-check: such work is no part of the re-check, so
-  // it gets no re-check scope and no re-check permit (b.jg5 SRJ-502, SRJ-505).
+  // it gets no re-check scope and no re-check permit.
   return attemptContext.exit(() => timerRetryContext.exit(() => latchRecheckContext.exit(fn)))
 }
 
@@ -2461,7 +2445,7 @@ export function runOutsideAttempts<T>(fn: () => T): T {
  * `runInAttempt`): an error met in it is recorded there only and arms by the
  * attempt rule for `key`, never turning the caller's launch into `retrying`. For
  * work a caller starts in the background and does not await: each live-row
- * sequence (b.jg5 SRJ-706, the registry's attempt runner in
+ * sequence (the registry's attempt runner in
  * `src/live-row-sequence.ts`).
  */
 export function runDetachedRecoveryAttempt<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -2469,7 +2453,7 @@ export function runDetachedRecoveryAttempt<T>(key: string, fn: () => Promise<T>)
 }
 
 // ---------------------------------------------------------------------------
-// The retry marker (b.jg5 SRJ-410, SRJ-303)
+// The retry marker
 // ---------------------------------------------------------------------------
 
 /**
@@ -2486,8 +2470,8 @@ interface TimerRetryFrame {
 }
 
 /**
- * The retry of a persona's retry timer the current call runs in (b.jg5
- * SRJ-410: the pending-row rule runs only inside one, in either mode),
+ * The retry of a persona's retry timer the current call runs in (
+ * the pending-row rule runs only inside one, in either mode),
  * carried across awaits, timers and microtasks by `AsyncLocalStorage`, as
  * the attempt context is. Set by the retry action (`createFullModeRetryAction`)
  * around its whole run, in both modes; `runOutsideAttempts` leaves it, so a
@@ -2497,8 +2481,7 @@ interface TimerRetryFrame {
 const timerRetryContext = new AsyncLocalStorage<TimerRetryFrame>()
 
 /**
- * Run `fn` as a retry of persona `key`'s retry timer (b.jg5 SRJ-303,
- * SRJ-410), and settle with its result: inside `fn`, and in every await it
+ * Run `fn` as a retry of persona `key`'s retry timer, and settle with its result: inside `fn`, and in every await it
  * makes, `isInsideTimerRetry(key)` answers true, and the pending-row rule
  * may be run once (`claimTimerRetryRuleRun`). A continuation of `fn` that
  * outlives it (a timer it set, the hand-off run the controller makes after
@@ -2525,7 +2508,7 @@ function innermostRetryFrame(key: string): TimerRetryFrame | undefined {
 
 /**
  * True when the current call runs inside a retry of persona `key`'s retry
- * timer, in either mode (b.jg5 SRJ-410: the restart path's deferral and the
+ * timer, in either mode (the restart path's deferral and the
  * ladder's `pending` step run the pending-row rule only then; reached from
  * any other origin they only arm). Read-only; never throws.
  */
@@ -2539,7 +2522,7 @@ export function isInsideTimerRetry(key: string): boolean {
 
 /**
  * Claim the one pending-row rule run of the retry of persona `key`'s timer
- * the current call runs in (b.jg5 SRJ-410: at most one rule run per retry,
+ * the current call runs in (at most one rule run per retry,
  * even when a retry reaches both the restart path's deferral and the
  * ladder's `pending` step): true the first time in a retry, false after,
  * and false outside every retry for `key`. Never throws.
@@ -2556,7 +2539,7 @@ export function claimTimerRetryRuleRun(key: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// The latch re-check scope (b.jg5 SRJ-505, SRJ-307, SRJ-313)
+// The latch re-check scope
 // ---------------------------------------------------------------------------
 
 /**
@@ -2573,7 +2556,7 @@ export interface LatchRecheckScope {
   /** The latch's own query (never one a re-check permit passes). A throw counts as latched. */
   readonly isLatched: (key: string) => boolean
   /**
-   * The re-check's permit (b.jg5 SRJ-502's "beyond the re-check"), present
+   * The re-check's permit ("beyond the re-check"), present
    * only in the scope of the re-check's own run of the restart path's
    * decision (`runRestartWorkInTurn`, `src/restart.ts`).
    */
@@ -2582,7 +2565,7 @@ export interface LatchRecheckScope {
 
 /**
  * The latch re-check's permit for one run of the restart path's decision
- * (b.jg5 SRJ-502, SRJ-505): while `holds()` answers true, the latched gates
+ * while `holds()` answers true, the latched gates
  * and mid-path stops that run reaches let it through for the persona; the
  * re-check revokes it at the run's first refusal (any latch set for the
  * persona) and when the run's launch answers with no information while the
@@ -2595,7 +2578,7 @@ export interface LatchRecheckPermit {
 
 /**
  * True when the current call runs inside a latch re-check of persona `key`
- * whose scope carries a permit that still holds (b.jg5 SRJ-502, SRJ-505):
+ * whose scope carries a permit that still holds:
  * the re-check's own run of the restart path's decision, until its first
  * refusal. Every latched gate asks it, and only such a call passes; the
  * retry timer, the health tick, the start sweep, the live-row sequence, the
@@ -2622,7 +2605,7 @@ interface LatchRecheckFrame {
 }
 
 /**
- * The latch re-check the current call runs in (b.jg5 SRJ-505), carried
+ * The latch re-check the current call runs in, carried
  * across awaits, timers and microtasks by `AsyncLocalStorage`, as the attempt
  * context is, so it covers every agent-director call the re-check makes for
  * its persona, a call inside a launch or recovery attempt opened within it
@@ -2632,14 +2615,14 @@ interface LatchRecheckFrame {
 const latchRecheckContext = new AsyncLocalStorage<LatchRecheckFrame>()
 
 /**
- * Run `fn` as a latch re-check of persona `scope.key` (b.jg5 SRJ-505), and
+ * Run `fn` as a latch re-check of persona `scope.key`, and
  * settle with its result. While `fn` runs, and in every await it makes, the
  * persona is inside its re-check scope (`latchRecheckScopeOf`), and, while
  * it is latched, the reporting point and the outage wrappers treat each of
  * its answers as giving no information (`isInsideLatchRecheck`): no retry
  * timer is armed for any cause, no `tmux-unresponsive` condition starts or
  * continues, no `tmux-unavailable` outage is raised (a `find-missing` run's
- * excepted, b.jg5 SRJ-506) and no unclassified-error episode is fed. The
+ * excepted) and no unclassified-error episode is fed. The
  * CONFIG outage, `ad-unreachable` and `cwd-unreachable` are raised as ever,
  * and every clear on a success is made as ever. A continuation of `fn` that
  * outlives it (a timer it set) is outside the re-check.
@@ -2674,10 +2657,10 @@ export function latchRecheckScopeOf(key: string): LatchRecheckScope | undefined 
 
 /**
  * True when the current call runs inside a latch re-check of persona `key`
- * and the persona is still latched (b.jg5 SRJ-505): an answer met here gives
+ * and the persona is still latched: an answer met here gives
  * no information, so nothing is armed, started, raised (CONFIG's outage
  * aside) or fed for it, and no further call follows a launch's UNAVAILABLE
- * answer (SRJ-407's `get`). A latch query that throws counts as latched.
+ * answer (`get`). A latch query that throws counts as latched.
  * False outside every re-check of `key`, and once the latch has cleared.
  * Never throws.
  */
@@ -2720,7 +2703,7 @@ export function isInsideAttempt(key: string): boolean {
  * `key` recorded so far, or `undefined` when the current call runs inside no
  * attempt for `key` or none was recorded. For a step that makes a further
  * call after a launch's error and must know what that error armed before the
- * further call's answer is recorded in its place (b.jg5 SRJ-407). Read-only;
+ * further call's answer is recorded in its place. Read-only;
  * never throws.
  */
 export function currentAttemptLastError(key: string): AttemptErrorRecord | undefined {
@@ -2733,10 +2716,10 @@ export function currentAttemptLastError(key: string): AttemptErrorRecord | undef
 
 /**
  * Report an agent-director error for persona `key`, thrown by a call made
- * with `verb` (b.jg5 SRJ-301, SRJ-311). When the arming predicate answers a
+ * with `verb`. When the arming predicate answers a
  * cause and `sink` is given, the sink is called once with `key` and the
  * cause, inside an attempt for `key`, and for the ENVIRONMENT and CONFIG
- * causes (`UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES`, b.jg5 SRJ-311, SRJ-316) in
+ * causes (`UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES`) in
  * any context too: inside another persona's attempt or outside every attempt
  * (the health tick, the permission poller and click handler, the JSONL
  * safeguard, a teardown's kill). A stray
@@ -2745,7 +2728,7 @@ export function currentAttemptLastError(key: string): AttemptErrorRecord | undef
  * Outside an attempt for `key`, any other cause arms nothing. Inside one,
  * the innermost attempt then records the error as its last, armed when the
  * sink answered true (the persona has a timer after the call), so a launch
- * ended by it answers `retrying` (b.jg5 SRJ-1015); a sink that answers anything else, or throws, armed
+ * ended by it answers `retrying`; a sink that answers anything else, or throws, armed
  * nothing. Answers whether the sink armed. Never throws.
  */
 export function reportAttemptError(
@@ -2766,12 +2749,12 @@ export function reportAttemptError(
 /**
  * The reporting step of {@link reportAttemptError} for a cause the caller
  * decided itself: a site that classifies an outcome on its own (the resume
- * path's `ErrInvalidFlags`, UNCLASSIFIED after its re-check, b.jg5 SRJ-104,
- * SRJ-313) passes `UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`. The same context
+ * path's `ErrInvalidFlags`, UNCLASSIFIED after its re-check,
+ *) passes `UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`. The same context
  * rule applies: inside an attempt for `key` the sink arms with `cause` and
  * the innermost attempt records it as its last error; outside one, only the
  * ENVIRONMENT and CONFIG causes arm. Inside a latch re-check of a latched
- * persona (`isInsideLatchRecheck`, b.jg5 SRJ-505) no cause arms, in any
+ * persona (`isInsideLatchRecheck`) no cause arms, in any
  * context: the sink is not called, and an attempt records the error as not
  * armed. Answers whether the sink armed. Never throws.
  */
@@ -2783,7 +2766,7 @@ export function reportAttemptCause(
 ): boolean {
   try {
     const frame = innermostFrame(key)
-    // b.jg5 SRJ-505: inside a latch re-check of a latched persona an answer
+    // inside a latch re-check of a latched persona an answer
     // gives no information, so no cause arms its timer, in any context.
     const noInformation = isInsideLatchRecheck(key)
     if (frame === undefined && (noInformation || cause === undefined || !UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES.has(cause.kind))) return false

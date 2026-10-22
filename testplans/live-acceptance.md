@@ -1,36 +1,11 @@
----
-id: b.yko
-type: bee
-title: 'Live acceptance: multi-persona CSCB on a test workspace (b.av2)'
-tags:
-- cscb
-- personas
-- live-acceptance
-parent: null
-egg: null
-created_at: '2026-09-24T04:01:05.074749'
-status: pupa
-schema_version: '0.1'
-reference_materials: null
-guid: ykop6szcwyxafzsq57223oihvnrz5h5y
----
-
 # Live acceptance: multi-persona CSCB on a test workspace
 
-Live acceptance run for idea b.av2 (personas), built by plan b.ob2. It is one
-ordered run on the finished feature. It starts from a clean install and sets
-up three persona apps in a real test Slack workspace using only the README,
-the setup wizard (`/setup-slack-channel-bots`) and `config.json`. The AC
-coverage table below maps every acceptance criterion that b.av2 SR-14 (as
-amended by b.deo SRI-1501 to SRI-1507) marks as live-verified, b.deo's live-verified criteria (invited channels, b.deo
-SRI-1501 to SRI-1507), and the extra live evidence the run gives, to the
-check that verifies it.
+An ordered acceptance run starting from a clean install, with three persona
+apps in a test Slack workspace configured through the README, setup wizard
+and `config.json`. The coverage tables map behavior to the checks below.
 
-This plan is **manual**. The operator runs it by hand, on a test host and a
-test Slack workspace only, never on the production install. It has no
-integration-script transcription and is not a docker integration test.
-`/ci` and `/release-test` never run it: `/release-test` selects only tickets
-whose title starts with "Test ", and this title deliberately does not.
+Run manually only on a test host and workspace, never on a production
+install. This scenario is separate from `/ci` and `/release-test`.
 
 `/ci-live` (`bun ci-live/run.ts`) automates this plan. It runs the checks in
 this order against the test workspace, in a throwaway docker container that
@@ -42,75 +17,71 @@ recorded in its results' Notes. See `docker/README.md` under "/ci-live".
 
 ---
 
-## AC coverage
+## Behavior coverage
 
-Each row names the numbered check, and where it matters the step, that
-verifies the criterion. Rows labelled `b.deo AC <n>` use b.deo's PRD
-numbering; every other AC number is b.av2's PRD order (1–74).
+Each row maps a behavior to its numbered check and, where needed, step.
 
-Live-verified in b.av2 SR-14 (as amended by b.deo SRI-1501 to SRI-1507):
+| What the run shows | Verified by |
+   |---|---|
+| Two personas reply under their own names and avatars; a mention of A in the shared channel gets A's reply and nothing from mention-only B | Checks 2 and 3 |
+| One persona in two channels runs one instance; each delivery carries its source channel as `chat_id`; its replies reach each channel | Check 4 |
+| Never two instances of a persona: one row per persona after the crash cycle and after the reboot | Checks 6, 7 (step 3) and 28 (step 5) |
+| A mentions B and B replies as itself | Check 12 |
+| A persona receive-all in two channels sees every message of both in one instance | Check 13 |
+| After a host reboot every applied persona comes back with no manual action | Check 28 (steps 4–7) |
+| The whole setup is `config.json` and the credentials files, with no code edit | Check S2; every later change is a `config.json` or credentials-file edit confirmed by the rename (Part 2.2) |
+| A DM to A's app is answered by A, a DM to B's app by B, and neither reaches the other | Check 17 |
+| Any workspace user reaches a persona in a channel and by DM, with no allowlist and no pairing step | Check 14; Check 17 in passing |
+| Two personas exchange messages past several round trips with no limit | Check 12 |
+| A persona added on the running server comes up after the confirmation, with the existing persona's conversation undisturbed | Check 25 |
+| The added persona's credentials file is created on disk while the server runs, and it posts as itself with no restart and no change to the server's environment | Check 25 (steps 1, 4 and 7–8) |
+| A channel destination: the prompt is posted there under the persona's identity and its button resolves the request | Check 5 (steps 1–2) |
+| A DM destination: the prompt arrives as a DM from the persona's app and its button resolves it there | Check 22 |
+| Work arriving from the coordination channel prompts in A's destination channel, not in the coordination channel | Check 5 (step 3) |
+| Two personas with different prompt settings each prompt at their own destination in one run | Check 23 |
+| A persona with DMs off opens no DM and posts in none | Check 16 |
+| A channel persona with DMs on answers a DM in that DM | Check 17 |
+| A persona with DMs on opens a DM with a user it has none with and posts as itself | Check 20 |
+| A DM-only persona answers in the same DM | Check 19 |
+| A zero-channel persona starts, connects, handles a DM and is in no channel | Check 19 |
+| A DM-only persona's first prompt opens the DM with its contact | Check 18 |
+| An unconfirmed destructive edit survives the restart and stays pending | Check 28 (steps 3 and 6) |
+| With no record, the first start applies `config.json` as it stands with no confirmation; an invalid file doesn't start | Check S3 (invalid) and Check 1 (valid) |
+| A credentials change still pending when the server stops is applied at the next start | Check 28 (steps 2, 5, 6 and 7) |
+| One crash of A's instance and its automatic recovery | Check 7 |
+| The plan's only reboot | Check 28 |
+| One of A's posts captured as B's connection receives it | Check 8 |
 
-| AC or item | What the run shows | Verified by |
-|---|---|---|
-| 1 | Two personas reply under their own names and avatars; a mention of A in the shared channel gets A's reply and nothing from mention-only B | Checks 2 and 3 |
-| 2 | One persona in two channels runs one instance; each delivery carries its source channel as `chat_id`; its replies reach each channel | Check 4 |
-| 4 | Never two instances of a persona: one row per persona after the crash cycle and after the reboot | Checks 6, 7 (step 3) and 28 (step 5) |
-| 11 | A mentions B and B replies as itself | Check 12 |
-| 12 | A persona receive-all in two channels sees every message of both in one instance | Check 13 |
-| 13 | After a host reboot every applied persona comes back with no manual action | Check 28 (steps 4–7) |
-| 14 | The whole setup is `config.json` and the credentials files, with no code edit | Check S2; every later change is a `config.json` or credentials-file edit confirmed by the rename (Part 2.2) |
-| 15 | A DM to A's app is answered by A, a DM to B's app by B, and neither reaches the other | Check 17 |
-| 17 | Any workspace user reaches a persona in a channel and by DM, with no allowlist and no pairing step | Check 14; Check 17 in passing |
-| 18 | Two personas exchange messages past several round trips with no limit | Check 12 |
-| 19 | A persona added on the running server comes up after the confirmation, with the existing persona's conversation undisturbed | Check 25 |
-| 22 | The added persona's credentials file is created on disk while the server runs, and it posts as itself with no restart and no change to the server's environment | Check 25 (steps 1, 4 and 7–8) |
-| 28 | A channel destination: the prompt is posted there under the persona's identity and its button resolves the request | Check 5 (steps 1–2) |
-| 29 | A DM destination: the prompt arrives as a DM from the persona's app and its button resolves it there | Check 22 |
-| 31 | Work arriving from the coordination channel prompts in A's destination channel, not in the coordination channel | Check 5 (step 3) |
-| 34 | Two personas with different prompt settings each prompt at their own destination in one run | Check 23 |
-| 36 | A persona with DMs off opens no DM and posts in none | Check 16 |
-| 37 | A channel persona with DMs on answers a DM in that DM | Check 17 |
-| 38 | A persona with DMs on opens a DM with a user it has none with and posts as itself | Check 20 |
-| 40 | A DM-only persona answers in the same DM | Check 19 |
-| 41 | A zero-channel persona starts, connects, handles a DM and is in no channel | Check 19 |
-| 44 | A DM-only persona's first prompt opens the DM with its contact | Check 18 |
-| 70 | An unconfirmed destructive edit survives the restart and stays pending | Check 28 (steps 3 and 6) |
-| 71 | With no record, the first start applies `config.json` as it stands with no confirmation; an invalid file doesn't start | Check S3 (invalid) and Check 1 (valid) |
-| 72 | A credentials change still pending when the server stops is applied at the next start | Check 28 (steps 2, 5, 6 and 7) |
-| Crash-and-recover cycle | One crash of A's instance and its automatic recovery | Check 7 |
-| Host reboot | The plan's only reboot | Check 28 |
-| Persona-post event shape | One of A's posts captured as B's connection receives it | Check 8 |
+Invited-channel behavior:
 
-Live-verified in b.deo (SRI-1501 to SRI-1507):
+| What the run shows | Verified by |
+   |---|---|
+| With the invited-channel switch on, a persona answers a mention in a channel its app was invited to; asked there, it switches the channel to `all`; with the switch off it is silent there; after a kick, Slack refuses its `reply` and `fetch_messages` on the channel; the configuration and the channel are restored | Checks 30 (invite then mention), 31 (the switch to `all`), 32 (switch off), 33 (after a kick) and 34 (restored) |
+| Every check before Check 30 passes with the switch absent; the only additions are agent-visible ones, `set_channel_delivery` in the tool list (refused) and the session instructions | Every check before Check 30 |
 
-| AC or item | What the run shows | Verified by |
-|---|---|---|
-| b.deo AC 46 | With the invited-channel switch on, a persona answers a mention in a channel its app was invited to; asked there, it switches the channel to `all`; with the switch off it is silent there; after a kick, Slack refuses its `reply` and `fetch_messages` on the channel; the configuration and the channel are restored | Checks 30 (invite then mention), 31 (the switch to `all`), 32 (switch off), 33 (after a kick) and 34 (restored) |
-| b.deo AC 47 | Every check before Check 30 passes with the switch absent; the only additions are b.deo SRI-106's agent-visible ones, `set_channel_delivery` in the tool list (refused) and the session instructions (SRI-1507) | Every check before Check 30 |
+Additional live evidence:
 
-Extra live evidence (unit-verified in SR-14 as amended by b.deo SRI-1301 to SRI-1308, checked here too):
+| What the run shows | Verified by |
+   |---|---|
+| `@here` and `@channel` reach each mention-only persona once | Check 10 |
+| A persona's own broadcast doesn't wake it; the other persona gets it once | Check 11 |
+| No credential value in the config file, the record, the pending file, the wizard session, the persona transcripts or any log line | Check 29a; also Checks S1, S2, 25 (step 5) and 28 (steps 2 and 7) |
+| A down persona retains the original message, posts one Messages waiting notice at its destination, then confirms that same item after recovery | Check 24 and its blocking teardown |
+| A DM to a persona with DMs off is dropped with a `persona-dm-dropped` line | Check 15 |
+| The server starts and serves with the token environment variables unset | Part 1.4 and Check 1; `guard` refuses every start in a shell that has one (Part 1.3) |
+| A confirmed removal tears down only that persona | Check 27 |
+| Tokens are typed only into the terminal command, never shown; the file is written with mode 0600; the wizard refuses a token offered in the chat | Check S1 |
+| The wizard adds D, explains the pending file and the rename, and D comes up only after the operator confirms | Check 25 (steps 4–7) |
+| No WebSocket `wss://` or `ticket=` URL in any log the run wrote | Check 29a (step 2) |
+| A real Socket Mode handshake failure logs no WebSocket `ticket=` URL; the `[slack] persona Socket Mode: …` health lines appear | Check 29b |
+| The first Web API auth error marks the persona credentials-broken, its instance keeps running, and a confirmed credentials change brings it back | Check 26 |
 
-| AC or item | What the run shows | Verified by |
-|---|---|---|
-| 7 | `@here` and `@channel` reach each mention-only persona once | Check 10 |
-| 8 | A persona's own broadcast doesn't wake it; the other persona gets it once | Check 11 |
-| 20 | No credential value in the config file, the record, the pending file, the wizard session, the persona transcripts or any log line | Check 29a; also Checks S1, S2, 25 (step 5) and 28 (steps 2 and 7) |
-| 26 (b.omv SR-13.6) | A down persona retains the original message, posts one Messages waiting notice at its destination, then confirms that same item after recovery | Check 24 and its blocking teardown |
-| 35 | A DM to a persona with DMs off is dropped with a `persona-dm-dropped` line | Check 15 |
-| 47 | The server starts and serves with the token environment variables unset | Part 1.4 and Check 1; `guard` refuses every start in a shell that has one (Part 1.3) |
-| 57 | A confirmed removal tears down only that persona | Check 27 |
-| Wizard credentials command (b.av2 SR-12 as amended by b.deo SRI-1101 to SRI-1110; b.av2 SR-1.4 part) | Tokens are typed only into the terminal command, never shown; the file is written with mode 0600; the wizard refuses a token offered in the chat | Check S1 |
-| Persona added through the wizard on a running server (E14 sprint demo) | The wizard adds D, explains the pending file and the rename, and D comes up only after the operator confirms | Check 25 (steps 4–7) |
-| Leak check (E13 carry) | No WebSocket `wss://` or `ticket=` URL in any log the run wrote | Check 29a (step 2) |
-| Handshake failure (E13 carry, optional) | A real Socket Mode handshake failure logs no WebSocket `ticket=` URL; the `[slack] persona Socket Mode: …` health lines appear | Check 29b |
-| Revoked bot token (bug b.ujn, optional) | The first Web API auth error marks the persona credentials-broken, its instance keeps running, and a confirmed credentials change brings it back | Check 26 |
-
-Not checked live: the E13 dry-run leg (a `working_directory` change giving one
+Not checked live: the dry-run leg (a `working_directory` change giving one
 `DESTRUCTIVE:` line with one teardown and one bring-up; a `port` change giving
 a preview line while the listener stays on the old port). It needs no live
 Slack, so the docker scenario
-`tests/integration/test-9-reload-destructive-and-server-wide.sh` (Task 4 of
-E14) checks it.
+`tests/integration/test-9-reload-destructive-and-server-wide.sh` (section 4 of
+) checks it.
 
 ---
 
@@ -174,7 +145,7 @@ A leftover `config.json.last-applied` fails it because a start runs that record 
 ```sh
 cat > ~/cscb-live-preflight.sh <<'EOF'
 #!/usr/bin/env bash
-# b.yko pre-flight. Usage: bash ~/cscb-live-preflight.sh setup|check1
+# pre-flight. Usage: bash ~/cscb-live-preflight.sh setup|check1
 set -u
 TEST_HOST='<TEST_HOST>'   # the test host's name, exactly as `hostname` prints it
 PHASE="${1:?usage: bash ~/cscb-live-preflight.sh setup|check1}"
@@ -228,13 +199,13 @@ If it fails, stop: this is not a clean test host. Rows left by an earlier run al
 
 ## Part 1: Setup
 
-The run's single setup. It verifies AC 14 (the whole persona setup is
+The run's single setup. It verifies (the whole persona setup is
 `config.json` plus the credentials files, with no persona-specific code edit),
-AC 47 (no token environment variable is an input) and AC 71 (the first start
+(no token environment variable is an input) and (the first start
 with no record applies the file as it stands; an invalid file doesn't start),
-and the live side of b.av2 SR-12 (as amended by b.deo SRI-1101 to SRI-1110)
-and SR-1.4 for the setup wizard (the credentials command). Checks S1 to S3 record these results; Check 1 finishes
-AC 71.
+and the live side of the contract
+and for the setup wizard (the credentials command). Checks S1 to S3 record these results; Check 1 finishes
+.
 
 Every detail the tester needs comes from the README (`$PKG/README.md`, Part
 1.4) or the wizard. A tester who needs a detail neither gives, and gets it
@@ -304,7 +275,7 @@ text only after counting zero token-shaped matches in it.
 
 ```sh
 cat > ~/cscb-live-helpers.sh <<'EOF'
-# b.yko shell helpers. Load in every shell: source ~/cscb-live-helpers.sh
+# shell helpers. Load in every shell: source ~/cscb-live-helpers.sh
 TEST_HOST='<TEST_HOST>'   # the test host's name, exactly as `hostname` prints it
 TEST_USER='<TEST_USER>'   # the test host's user, exactly as `whoami` prints it
 S=~/.config/claude-slack-channel-bots
@@ -319,7 +290,7 @@ for d in "$HOME/.bun/install/global/node_modules/claude-slack-channel-bots" \
 done
 
 # guard: succeeds only on the test host, as its user, in a shell with no
-# SLACK_STATE_DIR and no token variable (AC 47). It counts variable names
+# SLACK_STATE_DIR and no token variable. It counts variable names
 # and never prints a value. Every step that starts, stops or changes
 # something runs behind it.
 guard() {
@@ -466,7 +437,7 @@ checks use them.
 
 ### 1.4 Install from the README
 
-1. Run the pre-flight's setup phase, then load the helpers and check the shell (AC 47):
+1. Run the pre-flight's setup phase, then load the helpers and check the shell:
 
    ```sh
    bash ~/cscb-live-preflight.sh setup    # must print "pre-flight passed (setup)"
@@ -494,7 +465,7 @@ checks use them.
      bun pm -g trust claude-slack-channel-bots
      ```
 
-     Bun runs this install's postinstall in the worktree itself, a git checkout, so it writes the config skeletons but leaves `~/.claude/skills/` alone (b.669): it neither links `debug-slack-channel-bots` nor removes the retired skill's link. Record the time of the install in the results; Check 14 step 1 judges the skill link against it.
+     Bun runs this install's postinstall in the worktree itself, a git checkout, so it writes the config skeletons but leaves `~/.claude/skills/` alone: it neither links `debug-slack-channel-bots` nor removes the retired skill's link. Record the time of the install in the results; Check 14 step 1 judges the skill link against it.
 
    Then, for either source:
 
@@ -601,10 +572,10 @@ In Slack: three apps, "CSCB Test A", "CSCB Test B" and "CSCB Test C", each
 with its own avatar. A is a member of A-home and coordination, B of
 coordination only, and C of no channel.
 
-### Check S1: the credentials command in a real terminal (b.av2 SR-12, SR-1.4)
+### Check S1: the credentials command in a real terminal
 
-Its heading cites b.av2 SR-12 (as amended by b.deo SRI-1101 to SRI-1110) and
-b.av2 SR-1.4.
+Its heading cites and
+.
 
 Run it during A's wizard run, at step 4.10, after the wizard has declared A in
 `config.json` (4.9). The operator runs the command in a real terminal on the
@@ -652,7 +623,7 @@ Slack checks reported ok, the file has mode 0600, no token-shaped text is in
 the terminal output, the shell history or the wizard transcript, and the
 wizard refused the offer to paste a token in the chat.
 
-### Check S2: the setup is only `config.json` and the credentials files (AC 14)
+### Check S2: the setup is only `config.json` and the credentials files
 
 Run it after the three wizard runs, before any start.
 
@@ -682,7 +653,7 @@ system-prompt file (through the wizard) and the empty working directories.
 
 Pass: every expected item holds.
 
-### Check S3: an invalid configuration doesn't start (AC 71, invalid half)
+### Check S3: an invalid configuration doesn't start (invalid half)
 
 Run it now, before the first valid start, while no CSCB server runs on the
 test host and agent-director lists no `service=cscb` row. It uses a scratch
@@ -690,7 +661,7 @@ state directory with no record and a deliberately invalid copy of
 `config.json`: B's working directory is set to A's, which the load-time rules
 reject. It never points at the test host's own state directory. Running it
 before any persona is up means that a regression letting an invalid file
-through could not sweep A, B or C (b.av2 SR-6.3).
+through could not sweep A, B or C.
 
 Steps:
 
@@ -759,7 +730,7 @@ tag's attributes give its `chat_id`, `via` and the author's `user_id` or
 FIFO with one item in flight per persona; confirmation requires transcript
 evidence. Delivery is at least once: an unconfirmed attempt may be retyped.
 The normal one-tag checks below exercise a successful attempt, not an
-exactly-once guarantee across failures (b.omv SR-13.6 and the review answers).
+exactly-once guarantee across failures (and the review answers).
 
 - **Delivered tags:** `tags <persona> <TS>` (Part 1.3). For an edited message, whose tag may not carry the `<TS>` from its link, `tagstext <persona> '<text>'`. Both read only `type == "user"` entries and `queued_command` attachments: the transcript also records a `queue-operation` entry for each incoming message, which would double the count.
 - **Tool calls and tool errors:** `replies <persona>`. Each line is one `reply` call, with its `chat_id`, whether the result was an error, and the result text the server returned. A check picks out its call by target, for example `replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1`. A refusal is returned to the persona only, never logged, so the transcript is where it is read. Claude Code may wrap an MCP error's text, so a check matches the expected text with "contains", not as the whole result.
@@ -828,14 +799,14 @@ file, and never delete `config.json.last-applied` while the server runs.
 
 What the apply does:
 
-- **Per-persona changes** take effect at the apply. An added persona is brought up, and a removed one is torn down (a `DESTRUCTIVE:` line). `dm.enabled` and `dm.contact` are updated in place. The mode the edited `config.json` turns on (its `allow_invited_channels`) decides which channel section is in force (b.deo SRI-802, SRI-804): `channels`, `delivery` and `permission_prompts` in declarative mode, `invited.permission_prompts` in fungible mode. A change to the section in force is updated in place; a change to the other section previews a `… changed in the <section> section: recorded, with no effect until allow_invited_channels selects <section> mode.` line and is only recorded. An edit made only of recorded changes previews `no effective change`, and its confirmation logs one `[slack] reload-noop: …` line in place of `reload-applied`. A persona whose credentials file changed at the same path is reconnected with it, or brought up again when it was down because of its credentials.
+- **Per-persona changes** take effect at the apply. An added persona is brought up, and a removed one is torn down (a `DESTRUCTIVE:` line). `dm.enabled` and `dm.contact` are updated in place. The mode the edited `config.json` turns on (its `allow_invited_channels`) decides which channel section is in force: `channels`, `delivery` and `permission_prompts` in declarative mode, `invited.permission_prompts` in fungible mode. A change to the section in force is updated in place; a change to the other section previews a `… changed in the <section> section: recorded, with no effect until allow_invited_channels selects <section> mode.` line and is only recorded. An edit made only of recorded changes previews `no effective change`, and its confirmation logs one `[slack] reload-noop: …` line in place of `reload-applied`. A persona whose credentials file changed at the same path is reconnected with it, or brought up again when it was down because of its credentials.
 - **Server-wide settings**, such as `session_restart_delay` or `port`, are only recorded at the apply. Their preview line says `once applied, it is recorded and takes effect at the next server start after that.` For such an edit, confirm it, then run the "Guarded restart" (Part 2.3), which starts the server from the record. The one exception is the invited-channel switch, `allow_invited_channels`: it applies in place at the confirmation, with no restart, and its preview line says `applied in place at once, from the next event, tool call, prompt and notice`.
 
 The run uses this gesture in Checks 13 and 24 (and Check 24's teardown),
 "Turn A's DMs on", Checks 25 to 27, and Checks 30, 32, 33 and 34. Check 28 leaves its edits unconfirmed
 on purpose. No check moves a persona's `credentials_file` or
 `working_directory`, or changes `claude_config_dir` or `stop_hook_bootstrap`:
-b.av2 SR-14 (as amended by b.deo SRI-1507) gives those paths (AC 59, 60 and
+gives those paths (60 and
 61) no live leg.
 
 ### 2.3 Guarded restart
@@ -857,7 +828,7 @@ last-applied record.
 
    If it prints `NOT THE TEST HOST - stop` (or another guard message), do nothing more in the check that called for the restart, and record that in Notes.
 
-2. Start the test server, again only if the guard passes. The guard also refuses a shell with a token variable, so the start runs with none (AC 47):
+2. Start the test server, again only if the guard passes. The guard also refuses a shell with a token variable, so the start runs with none:
 
    ```sh
    if guard; then claude-slack-channel-bots start; fi
@@ -893,14 +864,14 @@ called for the restart and record the failure in Notes.
 
 ## Part 3: First start and channel checks
 
-These checks verify AC 1, 2, 4, 28, 31, 47 and 71 (the valid half). Each
-check lists its steps, the expected observation and a pass line. Record every
+These checks verify startup and channel delivery. Each check lists its
+steps, the expected observation and a pass line. Record every
 result in the results table at the end.
 
 In this layout B is only in coordination, and C is in no channel: Part 7
 checks B and C over DMs.
 
-### Check 1: the first start applies `config.json` as it stands, with no token variables (AC 71, AC 47)
+### Check 1: the first start applies `config.json` as it stands, with no token variables
 
 Steps:
 
@@ -950,7 +921,7 @@ Expected:
 
 Pass: each reply comes from the addressed persona's own app identity.
 
-### Check 3: a mention reaches only the persona mentioned (AC 1)
+### Check 3: a mention reaches only the persona mentioned
 
 Steps: in coordination, post a message that @mentions A only, for example "@CSCB Test A reply with the word here." Wait two minutes.
 
@@ -958,7 +929,7 @@ Expected: A replies in coordination under A's name and avatar. B posts nothing, 
 
 Pass: A's reply is present and nothing from B appears.
 
-### Check 4: one instance hears both of A's channels and replies in each (AC 2)
+### Check 4: one instance hears both of A's channels and replies in each
 
 Steps:
 
@@ -980,12 +951,12 @@ Expected:
 - The two `replies a` lines have `chat_id=<A_HOME_CHANNEL_ID>` and `chat_id=<COORDINATION_CHANNEL_ID>`, each with `error=false` and a result containing `Sent`.
 - The list shows a single row for A, `cscb_persona_a`.
 
-Check 13 verifies AC 12, the receive-all-in-every-channel case.
+Check 13 verifies the receive-all-in-every-channel case.
 
 Pass: one instance of A received both messages, each tagged with its own
 channel, and replied in each source channel.
 
-### Check 5: permission prompts go to A's destination (AC 28, AC 31)
+### Check 5: permission prompts go to A's destination
 
 Steps:
 
@@ -1010,7 +981,7 @@ Expected:
 Pass: both prompts appear in A-home only, under A's identity, and both
 resolve on **Allow**.
 
-### Check 6: one agent-director row per persona (AC 4)
+### Check 6: one agent-director row per persona
 
 Steps:
 
@@ -1022,7 +993,7 @@ Expected: exactly three rows, with instance IDs `cscb_persona_a`, `cscb_persona_
 
 Pass: one row per persona, with the expected instance ID and `persona` label.
 
-### Check 7: crash and recover (AC 4)
+### Check 7: crash and recover
 
 The run's one crash-and-recover cycle.
 
@@ -1046,11 +1017,9 @@ Pass: one row per persona after the cycle, and A answers the new message.
 ## Part 4: Bot-to-bot, broadcast and persona-post event capture
 
 These checks run with the invited-channel switch absent (declarative mode).
-They verify AC 7, 8, 11 and 18 and b.av2 SR-4.1 as amended by b.deo
-SRI-301, SRI-302 (per-persona dedupe), b.av2 SR-4.2 as amended by b.deo
-SRI-308 (the delivery decision, including own-post exclusion and no limit on
-bot-to-bot delivery) and b.av2 SR-4.4 as amended by b.deo SRI-306 (the
-`user_id` / `bot_id` and `via` tag attributes). They also capture the real Slack event shape of a persona's post.
+They verify per-persona deduplication, own-post exclusion, unlimited
+bot-to-bot delivery, and the `user_id`, `bot_id` and `via` tag attributes.
+They also capture the real Slack event shape of a persona's post.
 That shape is the evidence behind the delivery module's self-exclusion by bot
 user ID or bot ID, and behind its handling of the `bot_message` subtype.
 
@@ -1068,9 +1037,9 @@ copy its member ID). They replace the placeholders below:
 
 Check 8 records A's bot ID (`B…`) as `<A_BOT_ID>`.
 
-### Check 8: persona-post event shape (SR-4.2, the event-shape capture)
+### Check 8: persona-post event shape (the event-shape capture)
 
-Its heading cites b.av2 SR-4.2 (as amended by b.deo SRI-308).
+Its heading cites.
 
 Steps:
 
@@ -1094,7 +1063,7 @@ Record from the RAW line, in the Notes column (IDs are not secrets):
 
 - `user`: present or absent, and its value.
 - `bot_id`: present or absent, and its value. Its value is `<A_BOT_ID>` from here on.
-- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (SR-4.2 step 1, as amended by b.deo SRI-308, in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
+- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (step 1, , in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
 - `app_id` and any `bot_profile` field, if visible within the prefix.
 
 Expected:
@@ -1115,9 +1084,9 @@ delivery module assumes (the expectations above), file a bug with the RAW
 line (it holds no token) instead of passing. No server code or logging is
 changed for this check.
 
-### Check 9: one mention is delivered once (SR-4.1)
+### Check 9: one mention is delivered once
 
-Its heading cites b.av2 SR-4.1 (as amended by b.deo SRI-301, SRI-302).
+Its heading cites.
 
 Steps:
 
@@ -1138,7 +1107,7 @@ Expected:
 
 Pass: Slack sent two events, and A received the message exactly once.
 
-### Check 10: `@here` and `@channel` wake the mention-only personas (AC 7)
+### Check 10: `@here` and `@channel` wake the mention-only personas
 
 Steps:
 
@@ -1154,7 +1123,7 @@ Expected, for each of the two posts:
 
 Pass: A and B each receive both broadcasts once with `via="broadcast"`, and C receives neither.
 
-### Check 11: a persona's own `@here` does not wake it (AC 8)
+### Check 11: a persona's own `@here` does not wake it
 
 Steps:
 
@@ -1170,9 +1139,9 @@ Expected:
 
 Pass: A drops its own broadcast, and B, the only other persona in coordination, receives it once.
 
-### Check 12: two personas converse with no limit (AC 11, AC 18, SR-4.2)
+### Check 12: two personas converse with no limit
 
-Its heading cites b.av2 SR-4.2 (as amended by b.deo SRI-308). It starts a
+Its heading cites. It starts a
 conversation between two bots. The tester ends it (step 4); nothing in the
 server stops it.
 
@@ -1219,9 +1188,9 @@ throttle message.
 
 ## Part 5: A receive-all in both channels
 
-This check verifies AC 12: a persona receive-all in several channels sees
-every message of all of them in one instance. It also shows b.av2 SR-8.6's
-in-place row (b.av2 SR-8.6 as amended by b.deo SRI-802, SRI-805) live: a confirmed `delivery` change keeps the persona's
+This check verifies a persona receive-all in several channels sees
+every message of all of them in one instance. It also shows
+in-place row live: a confirmed `delivery` change keeps the persona's
 instance, Slack connection and conversation.
 
 State at the start: the Check 12 exchange has stopped and its stop has been
@@ -1230,7 +1199,7 @@ check switches A's coordination
 `delivery` to `all` with a confirmed edit (Part 2.2), and switches it back
 before it ends, so A is mentions-only in coordination again for Check 21.
 
-### Check 13: a persona receive-all in two channels hears both in one instance (AC 12)
+### Check 13: a persona receive-all in two channels hears both in one instance
 
 Steps:
 
@@ -1327,14 +1296,14 @@ A is mentions-only in coordination again.
 
 ## Part 6: Open access
 
-This check verifies the live leg of AC 17: a workspace user the server has
+This check verifies the live leg of a workspace user the server has
 never seen gets answers from a persona in a channel and by DM,
-with no allowlist and no pairing step. It covers b.av2 SR-10.1 (the server
+with no allowlist and no pairing step. It covers (the server
 neither reads nor writes `access.json`, and a stale one is ignored and left
-in place) and SR-10.2's access rows, and checks what postinstall left on the
+in place) and access rows, and checks what postinstall left on the
 test host: no `access.json`, and, for a published prerelease, a
 `debug-slack-channel-bots` skill link and no `claude-slack-channels-config`
-link (a local worktree's postinstall leaves `~/.claude/skills/` alone, b.669).
+link (a local worktree's postinstall leaves `~/.claude/skills/` alone).
 
 State at the start: the applied set is A, B and C as the wizard wrote them
 (A mentions-only in coordination again after Check 13, B's DMs on), and
@@ -1345,7 +1314,7 @@ nothing is pending.
 - **The first-time user** (Part 1.1). Before step 1, `if guard; then cat "$S"/server.log* 2>/dev/null | grep -cF '<FIRST_TIME_USER_ID>'; fi` prints `0`, and no persona's transcripts hold a delivered `<channel …>` tag with `user_id="<FIRST_TIME_USER_ID>"`. Otherwise this run's server has already seen the account: record Check 14 as "not verified" with the reason in Notes, and skip it. Invite it to A-home (already a member is fine).
 - **Nothing added for it.** No config edit, allowlist entry or approval of any kind is made for this user, before or during the check.
 
-### Check 14: a first-time user reaches a persona in a channel and by DM, with no approval step (AC 17)
+### Check 14: a first-time user reaches a persona in a channel and by DM, with no approval step
 
 Steps:
 
@@ -1409,18 +1378,16 @@ Pass: a user the server had never seen got answers from A in its channel and fro
 
 ## Part 7: DMs and DM prompts
 
-The DM checks verify AC 15, 35, 36 (outbound leg), 37, 38, 40 and 41, and
-AC 17 in passing: the DM sender has no allowlist entry and gets no pairing
-step. They cover b.av2 SR-4.3 (a DM is decided only against the persona whose
-app received it, by its DMs switch) and SR-5.1 as amended by b.deo SRI-601
-(a persona's DM posting targets). Check 21 also covers the edited-event dedupe: an edit that adds a
-persona's mention wakes it once.
+The DM checks cover delivery and posting targets. The sender needs no
+allowlist entry or pairing step. A DM is decided only against the persona
+whose app received it, according to that persona's DMs switch. Check 21
+also covers edited-event deduplication: an edit adding a persona's mention
+wakes it once.
 
-The DM-prompt checks (18, 22 and 23) verify AC 29, 34 and 44 and b.av2 SR-7.1
-as amended by b.deo SRI-701, SRI-702 (a persona's permission prompts go to its
-own destination, a channel or the DM with its contact) and b.av2 SR-3.1 (each persona posts under its own app
-identity). A prompt in a DM is answered with its buttons like a channel
-prompt.
+The DM-prompt checks (18, 22 and 23) require each persona's permission
+prompts to reach its own destination: a channel or the DM with its contact.
+Each persona posts under its own app identity. A prompt in a DM is answered
+with its buttons, like a channel prompt.
 
 State at the start: the server Check 14's restart started, with the applied
 set A, B and C as the wizard wrote them. The checks run in number order, with
@@ -1437,8 +1404,8 @@ The DMs switch per persona, as these checks use it:
 | C (`persona_c`) | on, `dm` destination, `dm.contact` set | on |
 
 Only A changes, and only through a confirmed `config.json` edit, so the setup
-stays config-file only (AC 14). B and C cannot be switched off: a `dm`
-destination, or zero channels, needs DMs on (b.av2 SR-1.5 as amended by b.deo SRI-103, SRI-104), so the config
+stays config-file only. B and C cannot be switched off: a `dm`
+destination, or zero channels, needs DMs on, so the config
 would be refused.
 
 Confirm that B and C have DMs on, the operator as `dm.contact` and a `dm`
@@ -1477,7 +1444,7 @@ shell command that writes the current date to a named file in the persona's
 working directory. Answer every prompt in Slack, promptly, and never in a
 persona's terminal.
 
-### Check 15: a DM to a persona with DMs off is dropped with a log line (AC 35)
+### Check 15: a DM to a persona with DMs off is dropped with a log line
 
 A's DMs are off, as the wizard configured them.
 
@@ -1506,7 +1473,7 @@ A silent drop fails this check: no reply and no `persona-dm-dropped` line is a f
 
 Pass: exactly one `persona-dm-dropped` line naming `persona_a` and `dm.enabled`, and every other command prints nothing.
 
-### Check 16: a persona with DMs off refuses to message a user (AC 36, outbound leg)
+### Check 16: a persona with DMs off refuses to message a user (outbound leg)
 
 A's DMs are still off. Check 20, later, opens the DM between A and the second
 test user.
@@ -1600,7 +1567,7 @@ If any of that is missing, or another line is present, stop the section and reco
 A's DMs stay on for the rest of this run.
 
 
-### Check 17: each DM is answered by the persona whose app received it (AC 15, AC 37, AC 17)
+### Check 17: each DM is answered by the persona whose app received it
 
 Steps:
 
@@ -1623,12 +1590,12 @@ Expected:
 - `tags a <TS_A>` prints exactly one tag, with `chat_id="<A_DM_ID>"`, `via="dm"` and `user_id="<OPERATOR_USER_ID>"`. `tags b <TS_B>` prints exactly one, with `chat_id="<B_DM_ID>"`, `via="dm"` and `user_id="<OPERATOR_USER_ID>"`.
 - The other four `tags` commands and both `grep` commands print nothing: the other personas received nothing.
 - The last line of `replies a` has `chat_id=<A_DM_ID>`, and the last line of `replies b` has `chat_id=<B_DM_ID>`, each with `error=false` and a result containing `Sent`.
-- Neither DM gets a pairing code, allowlist prompt or any message other than the persona's answer (AC 17: the operator has no allowlist entry).
+- Neither DM gets a pairing code, allowlist prompt or any message other than the persona's answer (the operator has no allowlist entry).
 
 Pass: each DM is delivered once with `via="dm"` to the persona whose app received it, answered there under that persona's identity, and received by no other persona.
 
 
-### Check 18: C's first prompt opens the DM with its contact (AC 44)
+### Check 18: C's first prompt opens the DM with its contact
 
 It runs before Check 19, which sends the operator's first DM to C.
 
@@ -1640,7 +1607,7 @@ Steps:
 1. In the operator's Slack sidebar and **Apps** list, look for a conversation with "CSCB Test C", and compare with what Part 1.2 recorded before the run:
    - None now: this is a **first run**.
    - One now, and Part 1.2 recorded "yes" (an earlier run of this plan opened it; Slack DMs can't be deleted): this is a **rerun**. Note its ID as `<C_DM_ID>` from any message's **Copy link** URL.
-   - One now, but Part 1.2 recorded "no": something in this run opened it before C's first prompt. Record Check 18 as "not verified (AC 44)", with what opened it if known, and don't rerun the check: the DM can't be deleted, so no rerun on this workspace can verify AC 44. Note `<C_DM_ID>` as for a rerun and do steps 2–6 as on a rerun, so Check 19 has the DM.
+   - One now, but Part 1.2 recorded "no": something in this run opened it before C's first prompt. Record Check 18 as "not verified", with what opened it if known, and don't rerun the check: the DM can't be deleted, so no rerun on this workspace can verify. Note `<C_DM_ID>` as for a rerun and do steps 2–6 as on a rerun, so Check 19 has the DM.
 
    Record "first run", "rerun" or "not verified" in Notes.
 2. Record where the log and the trail end: `MARK=$(mark); TMARK=$(wc -l < "$TRAIL")`.
@@ -1669,7 +1636,7 @@ A `persona-destination-failed` line naming `missing_scope` and `im:write` means 
 Pass: C's prompt was delivered as a DM from C's app to the operator (opening the DM on a first run, into the existing DM on a rerun), appeared in no channel, and its button resolved the request. A DM opened earlier in this run makes the check "not verified", never a pass.
 
 
-### Check 19: a DM-only persona starts, connects and answers DMs (AC 40, AC 41)
+### Check 19: a DM-only persona starts, connects and answers DMs
 
 C has zero channels, DMs on, a `dm` destination and `dm.contact` set.
 
@@ -1715,7 +1682,7 @@ Expected:
 Pass: C started and connected with no failure line, answered the DM in place with `via="dm"`, and is in no channel and has posted nowhere but DMs.
 
 
-### Check 20: a persona with DMs on opens a DM with a user and posts as itself (AC 38)
+### Check 20: a persona with DMs on opens a DM with a user and posts as itself
 
 A's DMs are now on. Check 16 posted nothing to the second test user; its DM
 with A may exist from an earlier run.
@@ -1782,7 +1749,7 @@ second edit woke A again) and whether A replied again.
 Pass: the edit that added the mention woke A exactly once with `via="mention"`, and B received nothing.
 
 
-### Check 22: B's prompt arrives by DM and its button resolves it (AC 29)
+### Check 22: B's prompt arrives by DM and its button resolves it
 
 The DM between the operator and B exists since Check 17 (`<B_DM_ID>`).
 
@@ -1809,7 +1776,7 @@ Expected:
 
 Pass: B's prompt arrived only in the DM with B, under B's identity, and **Allow** resolved it there.
 
-### Check 23: A's channel prompt and B's DM prompt each go to their own persona's destination (AC 34)
+### Check 23: A's channel prompt and B's DM prompt each go to their own persona's destination
 
 Steps:
 
@@ -1842,8 +1809,8 @@ Pass: both prompts were pending at once, each at its own persona's destination u
 
 ## Part 8: Retained message
 
-This check verifies b.omv SR-13.6's replacement for AC 26: a message to a
-down persona stays durably queued. One fixed E5 *Messages waiting* notice
+This check verifies replacement for a message to a
+down persona stays durably queued. One fixed *Messages waiting* notice
 goes to the persona's permission-prompt destination under its identity,
 without the message body. No receipt reaction or delivery is reported before
 transcript confirmation. Recovery must deliver the original retained item.
@@ -1881,7 +1848,7 @@ then restarts the test server with the "Guarded restart" (Part 2.3):
 A's destination is A-home (`"permission_prompts": "<A_HOME_CHANNEL_ID>"`). A
 is mentions-only in coordination, so the message must mention A.
 
-### Check 24: a downed persona retains the message and reports it at its destination (AC 26, b.omv SR-13.6)
+### Check 24: a downed persona retains the message and reports it at its destination
 
 Steps:
 
@@ -1920,7 +1887,7 @@ Expected:
 - Step 3 prints A's `Session disconnected` and `Auto-restart disabled (delay=0)` lines. A stays down throughout the observation.
 - Exactly one `message-received` diagnostic matches the original persona, channel, timestamp and sender. The queue has exactly one full acceptance of that item and no sent attempt, receipt or compacted delivered key for it. No correlated `message-delivered` line or transcript tag exists yet.
 - The lifecycle grep and `tags` print nothing: no destination failure, scheduled restart, relaunch, spawn, reconnect or premature delivery.
-- Exactly one new message appears in A-home, posted by app A with A's name and avatar. Its exact fixed E5 mrkdwn is `:warning: *Messages waiting* — 1 message(s) for "persona_a" (key=persona_a) are waiting; the oldest has waited <AGE>. The persona is down with automatic restarts off. The messages are kept and delivered once the persona is up.` The age uses the server's elapsed-age format (`<n>s`, `<n>m` or `<n>h <n>m`).
+- Exactly one new message appears in A-home, posted by app A with A's name and avatar. Its exact fixed mrkdwn is `:warning: *Messages waiting* — 1 message(s) for "persona_a" (key=persona_a) are waiting; the oldest has waited <AGE>. The persona is down with automatic restarts off. The messages are kept and delivered once the persona is up.` The age uses the server's elapsed-age format (`<n>s`, `<n>m` or `<n>h <n>m`).
 - The notice contains neither `waiting-marker-7Q3Z` nor any message-body words, and does not @-mention the sender.
 - Coordination gets no post from A, B, C or the server, including threaded posts. The original message has no `eyes` reaction from A before recovery.
 
@@ -1962,17 +1929,14 @@ the original routing tag; the alert stays private to A-home.
 
 ## Part 9: Runtime add and remove
 
-These checks verify the live legs of AC 19 and AC 22 (a new persona, with a
-freshly created credentials file and config entry, comes up at a confirmed
-apply and posts as itself, with no restart and no change to the server's
-environment) and AC 57 (a confirmed removal tears down only that persona).
-They cover b.av2 SR-14's runtime addition and confirmed removal (b.av2 SR-14
-as amended by b.deo SRI-1507), and b.av2 SR-8.5 and b.av2 SR-8.6 as amended by
-b.deo SRI-805 (the confirmation and the apply), and the E14 demo of adding a
-persona with the setup wizard on a running server. In passing, they check
-SR-7.2 (reload output never reaches Slack) and b.av2 SR-10.3 as amended by
-b.deo SRI-901 to SRI-906 (no token in the pending file or the log). The optional Check 26 checks a revoked bot token
-live (bug b.ujn) on the disposable persona D.
+These checks verify that a new persona with freshly created credentials
+and a config entry comes up at a confirmed apply and posts as itself,
+without restarting the server or changing its environment. A confirmed
+removal tears down only that persona. They exercise confirmation, apply,
+and adding a persona through the setup wizard while the server runs.
+Reload output must never reach Slack, and no token may appear in the
+pending file or log. Optional Check 26 exercises a revoked bot token on
+the disposable persona D.
 
 State at the start: the server Check 24's teardown restarted, with A, B and C
 applied and nothing pending. Part 9 ends with D removed, the applied set back
@@ -2001,7 +1965,7 @@ agent-director template's memory-read rules before D is brought up (one
 permission prompt for each of D's memory reads and note them; they don't
 fail these checks.
 
-### Check 25: a persona added with the wizard on the running server comes up after the confirmation, with no restart (AC 19, AC 22)
+### Check 25: a persona added with the wizard on the running server comes up after the confirmation, with no restart
 
 Steps:
 
@@ -2096,12 +2060,12 @@ entry, came up only after the operator's rename, with one row, and answered
 as itself, with the same server PID, no token in its environment, no
 lifecycle change for A, B and C, and A still recalling the word.
 
-### Check 26 (optional): a revoked bot token marks the persona credentials-broken, and a confirmed credentials change brings it back (bug b.ujn)
+### Check 26 (optional): a revoked bot token marks the persona credentials-broken, and a confirmed credentials change brings it back
 
 Optional: run it when the run has time, and record "not run" otherwise. It
 runs on the disposable persona D, between Checks 25 and 27, and never
 touches A's, B's or C's apps. Detection depends on the error shape real
-Slack returns, which unit tests can only stub. It also checks the E5 carry:
+Slack returns, which unit tests can only stub. It also checks the carry:
 a refused MCP session registration for a persona that is not up must not
 loop without bound.
 
@@ -2133,8 +2097,8 @@ Steps:
 Expected:
 
 - Step 4: exactly one `[slack] persona-credentials-refused: personas[3] "persona_d" (key=persona_d) path="<home>/.config/claude-slack-channel-bots/persona_d-credentials.json": bot_token refused by a Web API call (<method>): Slack error <code>` line, where `<method>` is the refused call (for example `chat.postMessage`) and `<code>` is one of `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`. `instance running` is printed and the list still has D's row, `cscb_persona_d`: the instance keeps running. The last `replies d` line has `error=true`. No token-shaped text is in the line.
-- If Slack closed D's Socket Mode connection first and the refusal line instead names `the Socket Mode open` or `auth.test`, record that in Notes: the Web API path (b.ujn) was not exercised.
-- Step 5: the restart's start logs `[slack] persona "persona_d" (key=persona_d) not brought up: …` and a summary ending `0 failed, 1 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and A, B and C connect as usual. Each refusal reads `[slack] Session refused: persona "persona_d" (key=persona_d) is not up (…) — not registered; its instance is kept and may register once the persona is up`. Record both counts in Notes. A count that keeps climbing at a steady rate (a refusal every few seconds for the whole five minutes) is the unbounded loop the E5 carry describes: file a bug with the counts, and the check still passes on the other items.
+- If Slack closed D's Socket Mode connection first and the refusal line instead names `the Socket Mode open` or `auth.test`, record that in Notes: the Web API path was not exercised.
+- Step 5: the restart's start logs `[slack] persona "persona_d" (key=persona_d) not brought up: …` and a summary ending `0 failed, 1 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and A, B and C connect as usual. Each refusal reads `[slack] Session refused: persona "persona_d" (key=persona_d) is not up (…) — not registered; its instance is kept and may register once the persona is up`. Record both counts in Notes. A count that keeps climbing at a steady rate (a refusal every few seconds for the whole five minutes) is the unbounded loop the carry describes: file a bug with the counts, and the check still passes on the other items.
 - Step 7: the preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d): credentials file "<home>/.config/claude-slack-channel-bots/persona_d-credentials.json" changed: it is broken by its credentials now, so it will be brought up.` After the rename, one `[slack] reload-applied: …` line with the same counts, and D's `Session connected` line. D replies "restored" in D-home under D's own name and avatar.
 
 Pass: the first refused Web API call marked D credentials-broken with one
@@ -2142,7 +2106,7 @@ Pass: the first refused Web API call marked D credentials-broken with one
 running, and the confirmed credentials change brought D back with no
 restart of the server beyond step 5's.
 
-### Check 27: a confirmed removal tears down only that persona (AC 57)
+### Check 27: a confirmed removal tears down only that persona
 
 Run it right after Check 25, or after Check 26 when that optional check ran,
 on the same server.
@@ -2193,7 +2157,7 @@ Steps:
 Expected:
 
 - Step 4: the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `DESTRUCTIVE: persona "persona_d" (key=persona_d) is removed: the persona will be retired: its session stopped and never resumed; 0 open queued items kept, delivered only if a persona with the same key is added again.` The `grep` prints the same two lines once each, prefixed `[slack] reload-preview: `. Nothing about it appears in Slack.
-- Step 6 prints `[slack] persona teardown of "persona_d" (key=persona_d): starting`, `[slack] persona teardown of "persona_d" (key=persona_d): complete` (not `complete, with <n> failed step(s)`), exactly one `[slack] persona teardown of "persona_d" (key=persona_d): agent-director kill of cscb_persona_d: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)` line (a `… kill of cscb_persona_d failed: …` line is not one), and one `[slack] reload-applied: …` line whose counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`. A `Session disconnected` line for `persona "persona_d" (key=persona_d)` may also appear; record it in Notes. No line names `persona_a`, `persona_b` or `persona_c`, and there is no `persona-start` line.
+- Step 6 prints `[slack] persona teardown of "persona_d" (key=persona_d): starting`, `[slack] persona teardown of "persona_d" (key=persona_d): complete` (not `complete, with <n> failed step(s)`), exactly one `[slack] persona teardown of "persona_d" (key=persona_d): agent-director kill of cscb_persona_d: <outcome> after <n> kill(s); the row is kept` line (a `… kill of cscb_persona_d failed: …` line is not one), and one `[slack] reload-applied: …` line whose counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`. A `Session disconnected` line for `persona "persona_d" (key=persona_d)` may also appear; record it in Notes. No line names `persona_a`, `persona_b` or `persona_c`, and there is no `persona-start` line.
 - `recorded` and `same server` are printed, `find-missing` exits 0, and `ls` reports that neither `config.json.pending` nor `config.json.apply` exists.
 - The list has exactly four rows: `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, with the instance IDs recorded in Check 25 step 1, each with its persona label and still live; and exactly one `cscb_persona_d` row, carrying a `persona` label naming `persona_d`, kept and not live: its state is `ended` or `missing`. The teardown killed D's row and kept it.
 - Step 7: D posts nothing in D-home or in the DM, and the `grep` prints nothing: D's Slack connection is closed, so its events no longer reach the server.
@@ -2211,18 +2175,14 @@ After Check 27, the applied set is A, B and C again, and nothing is pending, as 
 
 ## Part 10: Reboot
 
-This check verifies AC 13 (after a host reboot, every persona in the last
-applied configuration comes back with no manual action), the live side of
-AC 70 (an unconfirmed destructive edit survives the restart and stays
-pending) and AC 72 (a credentials change still pending when the server stops
-is applied at the next start: the persona connects with its credentials file
-as it stands). It covers b.av2 SR-14's host reboot (b.av2 SR-14 as
-amended by b.deo SRI-1507) and b.av2 SR-8.7 as amended by b.deo SRI-403,
-SRI-407 (every start, a start after a reboot included, runs
-`config.json.last-applied`, and reads the credentials files as they stand). In
-passing, it checks SR-7.2 (reload output never reaches Slack) and b.av2 SR-10.3
-as amended by b.deo SRI-901 to SRI-906 (no token in the pending file or the
-log).
+After a host reboot, every persona in the last applied configuration must
+return without manual action. An unconfirmed destructive edit must survive
+the restart and remain pending. A pending credentials change takes effect
+at the next start: the persona connects using its credentials file as it
+stands. Every start, including one after reboot, runs
+`config.json.last-applied` and reads the current credentials files.
+Reload output must never reach Slack, and no token may appear in the
+pending file or log.
 
 This is the plan's only reboot. It runs only on the test host and the test
 workspace, never on the production install. The Safety section applies
@@ -2243,11 +2203,11 @@ Notes.
 
   ```sh
   if guard; then
-    ( crontab -l 2>/dev/null | grep -vF '# cscb-live-b.yko'
-      printf "@reboot PATH='%s' claude-slack-channel-bots start >> '%s/cscb-live/boot-start.log' 2>&1  # cscb-live-b.yko\n" "$PATH" "$HOME"
+    ( crontab -l 2>/dev/null | grep -vF '# cscb-live-'
+      printf "@reboot PATH='%s' claude-slack-channel-bots start >> '%s/cscb-live/boot-start.log' 2>&1 # cscb-live-\n" "$PATH" "$HOME"
     ) | crontab -
   fi
-  crontab -l | grep -F '# cscb-live-b.yko'                               # the one @reboot line
+  crontab -l | grep -F '# cscb-live-' # the one @reboot line
   crontab -l | grep -cE 'SLACK_(BOT|APP)_TOKEN|SLACK_STATE_DIR'           # must print 0
   ```
 
@@ -2259,7 +2219,7 @@ including the one opened after the reboot. Shell variables don't survive the
 reboot, so the marks this check needs later are saved in files under
 `~/cscb-live/`.
 
-### Check 28: after a host reboot every applied persona comes back, an unconfirmed edit stays pending, and a pending credentials change is applied (AC 13, AC 70, AC 72)
+### Check 28: after a host reboot every applied persona comes back, an unconfirmed edit stays pending, and a pending credentials change is applied
 
 Steps:
 
@@ -2285,7 +2245,7 @@ Steps:
       showpending
       since "$MARK1" | grep -F 'reload-preview:' | showsafe
       since "$MARK1" | grep -E 'persona-start:|Session disconnected|persona teardown|reload-applied'
-      tokcount "$S/config.json.pending"   # must print 0
+      tokcount "$S/config.json.pending"                              # must print 0
       ```
 
       In coordination, post "@CSCB Test B reply with the word still-here."
@@ -2400,17 +2360,17 @@ and the revert cleared it with one `reload-nothing-pending` line.
 
 ## Part 11: Invited channels
 
-These checks verify b.deo AC 46 live: with the invited-channel switch
+These checks verify live: with the invited-channel switch
 (`allow_invited_channels`) on, a persona answers in a channel its app was
-invited to, with no `channels` entry for it (b.deo SRI-1501 to SRI-1506). In
-order, they cover the invite and the mention (Check 30, SRI-1502), the
-persona switching the channel to `all` (Check 31, SRI-1503), the switch off
-(Check 32, SRI-1504), the calls after a kick (Check 33, SRI-1505) and the
-restore (Check 34, SRI-1506).
+invited to, with no `channels` entry for it. In
+order, they cover the invite and the mention (Check 30), the
+persona switching the channel to `all` (Check 31), the switch off
+(Check 32), the calls after a kick (Check 33) and the
+restore (Check 34).
 
 The test persona is C: in no channel, DMs on, the operator its DM contact
 (Part 1.5). The switch is absent from `config.json` until Check 30: every
-check before it runs with the switch absent (b.deo SRI-1507). Each run uses
+check before it runs with the switch absent. Each run uses
 one public channel of its own, which the operator creates in Check 30 and
 Check 34 archives.
 
@@ -2431,7 +2391,7 @@ second only when C said done but made no call. C never saying done fails the
 check; no call after the second ask is recorded "not run", with the reason in
 Notes. It is not a pass.
 
-### Check 30: an invite is enough: with the switch on, C answers a mention in a channel its app was invited to (b.deo AC 46)
+### Check 30: an invite is enough: with the switch on, C answers a mention in a channel its app was invited to
 
 Steps:
 
@@ -2493,7 +2453,7 @@ invite C answered the mention in the run channel as itself, with one
 `persona-invited-channel` line naming C and the channel (public,
 `mentions`).
 
-### Check 31: asked in the channel, C switches it to all with set_channel_delivery, then answers a message that does not mention it (b.deo AC 46)
+### Check 31: asked in the channel, C switches it to all with set_channel_delivery, then answers a message that does not mention it
 
 Steps:
 
@@ -2532,7 +2492,7 @@ Pass: C stored `all` for the run channel with one accepted
 `set_channel_delivery` call and one `persona-channel-delivery-set` line, and
 answered a message that does not mention it.
 
-### Check 32: with the switch off and C's app still in the channel, a mention is not delivered, and one unclaimed-channel line says so (b.deo AC 46)
+### Check 32: with the switch off and C's app still in the channel, a mention is not delivered, and one unclaimed-channel line says so
 
 Steps:
 
@@ -2567,7 +2527,7 @@ Expected:
 Pass: with the switch off, the mention got no reply, and one
 `unclaimed-channel` line with the declarative cause named C and the channel.
 
-### Check 33: after C's app is kicked, reply and fetch_messages on the channel are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded (b.deo AC 46)
+### Check 33: after C's app is kicked, reply and fetch_messages on the channel are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded
 
 Steps:
 
@@ -2599,7 +2559,7 @@ Expected:
   - `refused with no Slack code` (any other error);
   - `made, with no result` (`"outcome":"none"`);
   - `not made` (no new call).
-- Every call Slack accepted is a residual the README states (b.deo SRI-603, RN-2).
+- Every call Slack accepted is a residual the README states (RN-2).
 
 C never saying done to step 4's ask fails this check. So does C neither
 saying done to step 5's ask nor making its three calls. If C says done to
@@ -2614,7 +2574,7 @@ Pass: after the kick, C's `reply` and `fetch_messages` without `thread_ts`
 on the channel each returned the tool error naming C, the channel and
 Slack's code, and step 5's three outcomes are in Notes.
 
-### Check 34: the cast is restored: config.json as Check 30 found it, nothing pending, the run channel archived, C in no channel (b.deo AC 46)
+### Check 34: the cast is restored: config.json as Check 30 found it, nothing pending, the run channel archived, C in no channel
 
 Run it whenever Check 30 copied `config.json` or created the run channel,
 whatever Checks 30 to 33 found. With `--only`, the runner runs it whenever
@@ -2681,21 +2641,21 @@ archived channels included.
 
 ## Part 12: Closing secrecy check
 
-Check 29a verifies AC 20 live (no credential value appears in the config
+Check 29a verifies live (no credential value appears in the config
 file, the record, the pending file, the stored-choice file
 `channel-delivery.json`, any log line the feature produces, or the tool
-results in the persona transcripts, b.av2 SR-10.3 as amended by b.deo SRI-901
-to SRI-906) and the first
-half of the E13 leak check: no WebSocket `wss://` or `ticket=` URL in any
-log. AC 20 is unit-verified; the acceptance run is where a real token could
+results in the persona transcripts
+to) and the first
+half of the leak check: no WebSocket `wss://` or `ticket=` URL in any
+log. is unit-verified; the acceptance run is where a real token could
 leak, so the check counts across everything the run wrote. It is required,
 and needs no `sudo`.
 
-The optional Check 29b is the second half of the E13 leak check: a real
+The optional Check 29b is the second half of the leak check: a real
 Socket Mode handshake failure logs no WebSocket `ticket=` URL, and the
 `[slack] persona Socket Mode: …` connection-health lines appear. It needs
 `sudo`, `iptables` and `systemd-run`. The docker scenario
-`tests/integration/test-10-credentials-change.sh` (Task 4 of E14) also covers
+`tests/integration/test-10-credentials-change.sh` (section 4 of ) also covers
 the handshake failure: it produces a real
 one against a loopback Slack stub and checks `server.log` for `wss://`,
 `ticket=` and a sentinel. So Check 29b is extra evidence, not the only proof.
@@ -2704,7 +2664,7 @@ Every count counts matches and never prints one. The leak markers are the
 run's own tokens: `leakcount` (Part 1.3) reads them from the credentials
 files inside bun and prints only counts. `tokcount` counts token-shaped text:
 a Slack prefix followed by a digit. A bare prefix can legitimately appear in
-a log line that names the rule a bad token broke (b.av2 SR-10.3 as amended by b.deo SRI-901 to SRI-906), so bare
+a log line that names the rule a bad token broke, so bare
 prefixes are not counted.
 
 Error messages are logged redacted (`message="…"` fields, for example), so
@@ -2715,7 +2675,7 @@ State at the start: what Check 34 leaves. The server Check 28's reboot
 started runs, with A, B and C applied and nothing pending, `config.json`
 holding the bytes Check 30 copied, and C in no channel.
 
-### Check 29a: no credential in any file the run wrote (AC 20)
+### Check 29a: no credential in any file the run wrote
 
 Run it after every other required check.
 
@@ -2809,9 +2769,9 @@ Steps:
    if guard; then
      cp /etc/hosts ~/cscb-live/hosts.before \
        && sudo systemd-run --on-active=600s --unit=cscb-live-hosts sed -i '/# cscb-live-b\.yko$/d' /etc/hosts \
-       && printf '127.0.0.1 wss-primary.slack.com wss-backup.slack.com  # cscb-live-b.yko\n' | sudo tee -a /etc/hosts >/dev/null
+       && printf '127.0.0.1 wss-primary.slack.com wss-backup.slack.com # cscb-live-\n' | sudo tee -a /etc/hosts >/dev/null
    fi
-   grep -F '# cscb-live-b.yko' /etc/hosts
+   grep -F '# cscb-live-' /etc/hosts
    ```
 
 4. Schedule the rule's removal in 90 seconds, then add the rule, only if the guard passes. The `&&` chain adds no rule unless the removal is scheduled:
@@ -2819,8 +2779,8 @@ Steps:
    ```sh
    if guard; then
      sudo systemd-run --on-active=90s --unit=cscb-live-fw \
-         "$IPT" -D OUTPUT -p tcp --dport 443 -m owner --uid-owner "$TEST_USER" -j DROP -m comment --comment cscb-live-b.yko \
-       && sudo "$IPT" -I OUTPUT -p tcp --dport 443 -m owner --uid-owner "$TEST_USER" -j DROP -m comment --comment cscb-live-b.yko \
+         "$IPT" -D OUTPUT -p tcp --dport 443 -m owner --uid-owner "$TEST_USER" -j DROP -m comment --comment cscb-live-\
+       && sudo "$IPT" -I OUTPUT -p tcp --dport 443 -m owner --uid-owner "$TEST_USER" -j DROP -m comment --comment cscb-live-\
        && date -u +%Y-%m-%dT%H:%M:%SZ
    fi
    sudo "$IPT" -S OUTPUT | grep -c 'cscb-live-b\.yko'   # 1 while the rule is in
@@ -2844,7 +2804,7 @@ Steps:
        && date -u +%Y-%m-%dT%H:%M:%SZ
      sudo systemctl stop cscb-live-hosts.timer 2>/dev/null; sudo systemctl reset-failed cscb-live-hosts.service 2>/dev/null
    fi
-   grep -c 'cscb-live-b\.yko' /etc/hosts   # must print 0
+   grep -c 'cscb-live-b\.yko' /etc/hosts                # must print 0
    systemctl is-active cscb-live-hosts.timer   # must print inactive
    ```
 
@@ -2904,9 +2864,9 @@ results, and also when the run stopped early.
 
    ```sh
    if guard; then
-     crontab -l 2>/dev/null | grep -vF '# cscb-live-b.yko' | crontab -
+     crontab -l 2>/dev/null | grep -vF '# cscb-live-' | crontab -
    fi
-   crontab -l 2>/dev/null | grep -cF '# cscb-live-b.yko'   # must print 0
+   crontab -l 2>/dev/null | grep -cF '# cscb-live-' # must print 0
    ```
 
    Then, if Check 29b ran or was started, its part: stop the firewall job if it hasn't fired, delete the firewall rule until none is left, delete the tagged `/etc/hosts` line, then stop the `/etc/hosts` backstop job if it hasn't fired:
@@ -2916,7 +2876,7 @@ results, and also when the run stopped early.
      IPT=$(sudo sh -c 'command -v iptables')
      sudo systemctl stop cscb-live-fw.timer 2>/dev/null; sudo systemctl reset-failed cscb-live-fw.service 2>/dev/null
      while sudo "$IPT" -S OUTPUT | grep -q 'cscb-live-b\.yko'; do
-       sudo "$IPT" -D OUTPUT -p tcp --dport 443 -m owner --uid-owner "$TEST_USER" -j DROP -m comment --comment cscb-live-b.yko || break
+       sudo "$IPT" -D OUTPUT -p tcp --dport 443 -m owner --uid-owner "$TEST_USER" -j DROP -m comment --comment cscb-live-|| break
      done
      sudo sed -i '/# cscb-live-b\.yko$/d' /etc/hosts
      sudo systemctl stop cscb-live-hosts.timer 2>/dev/null; sudo systemctl reset-failed cscb-live-hosts.service 2>/dev/null

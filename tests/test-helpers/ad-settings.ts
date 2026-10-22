@@ -1,5 +1,5 @@
 /**
- * ad-settings.ts — agent-director's settings file for tests (b.jg5 SRJ-1304):
+ * ad-settings.ts — agent-director's settings file for tests:
  * `writeAgentDirectorConfig`, the shared table of refused forms and the
  * defaults and minimums, re-exported from `src/ad-settings.ts`.
  *
@@ -15,16 +15,16 @@
  * put a fake token there.
  *
  * `settingsLinesOtherThanValues(lines, home)` drops the settings reader's
- * values lines (b.jg5 SRJ-1014) for the settings file under `home`.
+ * values lines for the settings file under `home`.
  *
- * `REFUSED_AD_CONFIG_FORMS` is SRJ-1304's list of refused forms, one entry
+ * `REFUSED_AD_CONFIG_FORMS` is list of refused forms, one entry
  * each, for `test.each`. Every threshold in it is derived from
  * `DEFAULT_AD_SETTINGS`, `AD_SETTING_MINIMUMS` and
  * `pendingGraceMinimumSeconds`, never typed, so a change to a default or a
  * minimum moves every form with it.
  *
  * The helper refuses the real home and any directory not under the OS temp
- * directory (host safety, b.jg5 SRJ-1301): it never writes under the real
+ * directory (host safety): it never writes under the real
  * `~/.config/agent-director`. It holds no module-scope state and starts no process.
  *
  * SPDX-License-Identifier: MIT
@@ -141,7 +141,7 @@ export const RAISED_GRACE_MINIMUM_SECONDS = pendingGraceMinimumSeconds(
   DEFAULT_AD_SETTINGS.tmux.pipe_close_wait_ms,
 )
 
-/** One refused form of SRJ-1304. */
+/** One refused form of the contract. */
 export interface RefusedAdConfigForm {
   /** What makes the read refused. */
   readonly name: string
@@ -152,7 +152,7 @@ export interface RefusedAdConfigForm {
 }
 
 /**
- * SRJ-1304's refused forms, each of which agent-director refuses: text that
+ * refused forms, each of which agent-director refuses: text that
  * is not TOML, a string, a float, a zero-fraction float, a negative value,
  * each fixed minimum broken by one, a `pending_grace_seconds` one below the
  * minimum a raised `create_timeout_ms` gives, and that raised
@@ -211,7 +211,7 @@ export const REFUSED_AD_CONFIG_FORMS: readonly RefusedAdConfigForm[] = Object.fr
 ])
 
 /**
- * The settings reader's lines other than its values lines (b.jg5 SRJ-1014),
+ * The settings reader's lines other than its values lines,
  * which it writes at its first accepted read and at each change of the nine
  * values: a values line starts as `buildAdSettingsValuesLine` renders it for
  * the settings file under `home`, up to the first key. With no `home`, every

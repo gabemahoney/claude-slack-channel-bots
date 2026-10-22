@@ -1,4 +1,4 @@
-/** Decision 22: names-only scratch-config admission, using synthetic TOML only. */
+/** names-only scratch-config admission, using synthetic TOML only. */
 import { describe, expect, spyOn, test } from 'bun:test'
 import {
   CODEX_CONFIG_KEYS_MAX_BYTES, CODEX_CONFIG_MAX_BYTES, CODEX_CONFIG_MAX_KEYS,

@@ -85,7 +85,7 @@ const SERVING_CONNECTION: PersonaConnectionStatus = { state: 'up', identity: { b
 // ---------------------------------------------------------------------------
 
 /**
- * Every recovery state a lost-message notice reports, in SRJ-1011's order:
+ * Every recovery state a lost-message notice reports, in the contract order:
  * the list `src/lost-message.ts` exports, re-exported, never a copy.
  */
 export { LOST_MESSAGE_STATES }
@@ -127,7 +127,7 @@ function arranged(ok: boolean, what: string): void {
 }
 
 /**
- * Put persona `key` at the restart cap (SRJ-305) through the real backoff
+ * Put persona `key` at the restart cap through the real backoff
  * state: `RESTART_FAILURE_CAP` failures recorded with `recordFailure`, as
  * counted launch failures record them. Throws unless `isAtCap` then answers
  * true. `resetRoutingState()` undoes it, as the recovery harness's
@@ -141,7 +141,7 @@ export function putAtRestartCap(key: string): void {
 
 /**
  * Make persona `key` wait on an old-life hold whose old key's kill failed
- * (b.jg5 SRJ-809, SRJ-812), as production reaches it: a real hold set
+ * as production reaches it: a real hold set
  * (`createOldLifeHoldSet`) installed in the session manager
  * (`setOldLifeHolds`) with the old-life wait's bindings over the harness's
  * applied config (`setOldLifeWaitBindings`: the waiting personas are read
@@ -164,14 +164,13 @@ export function waitOnKillFailedHold(h: RoutingHarness, key: string): void {
 }
 
 /**
- * The one per-state table for a lost message's recovery state (b.jg5
- * SRJ-1011, SRJ-1501): each state of `LOST_MESSAGE_STATES` arranged through
+ * The one per-state table for a lost message's recovery state: each state of `LOST_MESSAGE_STATES` arranged through
  * the harness's real inputs, with what it leaves. Only `starting-now`
  * schedules a restart from the message; `session-starting`'s launch and
  * `restarting`'s timer were arranged before it.
  */
 export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup>> = {
-  // Bug b.g57: P's bring-up outcome is not up while its connection still
+  // P's bring-up outcome is not up while its connection still
   // delivers the message, through the real up predicate.
   'not-up': {
     opts: { upCheck: true },
@@ -179,7 +178,7 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
     pending: false,
     launches: 0,
   },
-  // E13's set entry, on a CONFLICT.
+  // set entry, on a CONFLICT.
   'held-for-human': {
     opts: {},
     arrange: (h, key) => {
@@ -189,7 +188,7 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
     pending: false,
     launches: 0,
   },
-  // The hold's set, as a reuse spawn's ErrInvalidFlags whose re-check passed sets it (SRJ-207).
+  // The hold's set, as a reuse spawn's ErrInvalidFlags whose re-check passed sets it.
   'cannot-launch': {
     opts: {},
     arrange: (h, key) => {
@@ -199,13 +198,13 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
     pending: false,
     launches: 0,
   },
-  // SRJ-812's old-life half, through the session manager's real query
+  // old-life half, through the session manager's real query
   // (`waitsOnKillFailedHold`, as main() binds it): P waits on a hold of its
   // own row whose old key's kill failed (`waitOnKillFailedHold`).
   'kill-failed': { opts: {}, arrange: (h, key) => { waitOnKillFailedHold(h, key) }, pending: false, launches: 0 },
-  // E10's entry: a refusal from a tmux-touching verb starts the condition,
-  // with P's retry timer armed (state 5 applies only while it is, b.jg5
-  // SRJ-1011 as amended; production arms it at the same refusal).
+  // entry: a refusal from a tmux-touching verb starts the condition,
+  // with P's retry timer armed (state 5 applies only while it is
+  // production arms it at the same refusal).
   'not-answering': {
     opts: {},
     arrange: (h, key) => {
@@ -252,7 +251,7 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
 }
 
 // ---------------------------------------------------------------------------
-// The lost-message row read (b.jg5 SRJ-1011)
+// The lost-message row read
 // ---------------------------------------------------------------------------
 
 /** A scripted row read that rejects (see `ROW_READ_REJECTION_MESSAGE`). */
@@ -355,7 +354,7 @@ export interface SessionHandle {
 export interface RegisterSessionOptions {
   /** Distinguishes this session's cwd and MCP session ID from the persona's first one. */
   tag?: string
-  /** The session has lost its `_GET_stream` (b.9cj). */
+  /** The session has lost its `_GET_stream`. */
   streamless?: boolean
   /** The session reads `connected: false`. */
   disconnected?: boolean
@@ -395,8 +394,8 @@ export interface RestartFakeCaptures {
 
 /**
  * Restart deps whose session always reads `dead`, whose kill answers the
- * success outcome (`killed` with `kill_sent: true`, `src/checked-kill.ts`; b.jg5
- * SRJ-701: only a success lets the launch follow), whose launches are recorded
+ * success outcome (`killed` with `kill_sent: true`, `src/checked-kill.ts`
+ * only a success lets the launch follow), whose launches are recorded
  * in `launches` (and counted in flight until their outcome settles) and whose
  * relaunch-gate asks are recorded in `restartAsks`.
  */
@@ -451,7 +450,7 @@ export interface PersonaHandle {
 export interface RoutingHarnessOptions {
   /** Names with a registered session; default every persona. */
   sessions?: readonly string[]
-  /** Names whose registered session has lost its `_GET_stream` (b.9cj). */
+  /** Names whose registered session has lost its `_GET_stream`. */
   streamless?: readonly string[]
   /** Names whose registered session reads `connected: false`. */
   disconnected?: readonly string[]
@@ -479,7 +478,7 @@ export interface RoutingHarnessOptions {
   dedupeClock?: () => number
   /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
   notify?: PersonaNotifier['notify']
-  /** The routing's up predicate (b.av2 SR-6.4, bug b.g57); absent, as by default (and without `upCheck`), every persona counts as up. */
+  /** The routing's up predicate; absent, as by default (and without `upCheck`), every persona counts as up. */
   isPersonaUp?: PersonaRoutingDeps['isPersonaUp']
   /**
    * Bind the up check (see the file comment): the real up predicate, not up
@@ -492,7 +491,7 @@ export interface RoutingHarnessOptions {
   /** Hold every restart launch's outcome open until `h.releaseLaunches()` (ignored when `launchSession` is given). */
   holdLaunches?: boolean
   /**
-   * Bind the routing's `armRetryTimerIfMissing` (b.jg5 SRJ-311) as a member
+   * Bind the routing's `armRetryTimerIfMissing` as a member
    * that records each ask in `h.retryTimerArms` and arms P's timer (adds the
    * key to `h.retryArmed`). Absent, as by default: the member is absent.
    */
@@ -521,11 +520,11 @@ export interface RoutingHarnessOptions {
   /**
    * Names with work in flight that is not a launch first (`h.workInFlight`),
    * read by the routing's in-flight gate beside the harness's own launches
-   * in flight (b.jg5 SRJ-1011).
+   * in flight.
    */
   workInFlight?: readonly string[]
   /**
-   * Give the routing its lost-message row read (b.jg5 SRJ-1011), scripted
+   * Give the routing its lost-message row read, scripted
    * per persona name: an answer, or a script with a `during` callback (see
    * the file comment). `{}` binds the read with every persona unscripted
    * (`UNSCRIPTED_ROW_READING`). Absent, as by default: no read is bound, so
@@ -534,13 +533,13 @@ export interface RoutingHarnessOptions {
   rowRead?: Readonly<Record<string, RowReadAnswer | RowReadScript>>
   /**
    * The channel mode `h.config` is built in, through its
-   * `allow_invited_channels` switch (b.deo SRI-101); it replaces a switch in
+   * `allow_invited_channels` switch; it replaces a switch in
    * `overrides`. Absent: the switch as `overrides` sets it, else declarative
    * mode.
    */
   mode?: ChannelMode
   /**
-   * Per-name fungible destinations (b.deo SRI-102, SRI-305, SRI-701): each
+   * Per-name fungible destinations: each
    * named persona's `invited.permission_prompts` (`"dm"` or a channel ID),
    * set on its spec, so `h.config` holds it in fungible mode and the
    * decision's fungible destinations and the notifier read it there. Absent:
@@ -548,15 +547,15 @@ export interface RoutingHarnessOptions {
    */
   fungibleDestinations?: Readonly<Record<string, string>>
   /**
-   * Load the stored-choice store the routing reads (`h.channelDelivery`;
-   * b.deo SRI-305, SRI-403) over the caller's state directory (see
+   * Load the stored-choice store the routing reads (`h.channelDelivery`
+   * ) over the caller's state directory (see
    * `RoutingChannelDeliveryOptions`). Absent: no store, so no stored choice
    * applies.
    */
   channelDelivery?: RoutingChannelDeliveryOptions
 }
 
-/** The stored-choice store a routing harness loads (b.deo SRI-403, SRI-1203). */
+/** The stored-choice store a routing harness loads. */
 export interface RoutingChannelDeliveryOptions {
   /**
    * The caller's own `mkdtempSync` state directory, under the OS temp
@@ -624,7 +623,7 @@ export interface RoutingHarness {
   restartAsks: string[]
   /** Whether one of the harness's restart launches for `key` is in flight (issued, outcome not settled). */
   isLaunchInFlight(key: string): boolean
-  /** The latch the routing's latched query reads: E13's factory, bare (no set observer, so a set posts nothing). */
+  /** The latch the routing's latched query reads: factory, bare (no set observer, so a set posts nothing). */
   latch: ConflictLatch
   /** The episodes instance on `episodesClock`; its sink records into `episodeNotices`, never a Slack stub. */
   episodes: PersonaEpisodes
@@ -632,7 +631,7 @@ export interface RoutingHarness {
   episodesClock: FakeClock
   /** Every notice `episodes` handed to its sink (the condition's onset, alert or recovery), in order. */
   episodeNotices: RaisedNotice[]
-  /** E10's `tmux-unresponsive` condition over `episodes`; the routing asks its `holds`. No alert threshold, so no timer. */
+  /** `tmux-unresponsive` condition over `episodes`; the routing asks its `holds`. No alert threshold, so no timer. */
   tmuxUnresponsive: TmuxUnresponsiveCondition
   /** Every onset or all-clear the outage state emitted (with the `outageState` option), in order; never a Slack post. */
   outageNotices: RaisedNotice[]
@@ -669,7 +668,7 @@ export interface RoutingHarness {
   /**
    * Feed one event to the named personas (default: all), with a recording ack
    * unless `ack` is given, and the envelope flag an envelope with `envelope`
-   * overrides carries (b.deo SRI-301; `envelopeFlagOf`, default `false`; one
+   * overrides carries (`envelopeFlagOf`, default `false`; one
    * of `ENVELOPE_FLAG_FORMS` for each form).
    */
   receive(
@@ -682,22 +681,22 @@ export interface RoutingHarness {
   receiveKeys(event: unknown, keys: readonly string[], envelope?: EnvelopeOverrides): Promise<void>
   /**
    * Replace `h.config` with the same personas built under `mode`'s switch
-   * (b.deo SRI-201, SRI-203), as a confirmed switch change applies in place:
+   * as a confirmed switch change applies in place:
    * the next event is decided in that mode. Edits a case made to `h.config`
    * are not carried over; `h.p(name).persona` keeps the persona as first built.
    */
   setMode(mode: ChannelMode): void
   /**
    * The stored choices the routing reads at each fungible-mode event
-   * (`getChannelDelivery`; b.deo SRI-305): the store the `channelDelivery`
+   * (`getChannelDelivery`): the store the `channelDelivery`
    * option loaded, else null. A case may replace it.
    */
   channelDelivery: ChannelDeliveryStore | null
-  /** The path of every write the store made, in order; the routing makes none (b.deo SRI-304). */
+  /** The path of every write the store made, in order; the routing makes none. */
   channelDeliveryWrites: string[]
-  /** Persona `key`'s heard set, through the routing's own `heardChannels` (b.deo SRI-307). */
+  /** Persona `key`'s heard set, through the routing's own `heardChannels`. */
   heardChannels(key: string): ReadonlySet<string>
-  /** The routing's own per-key forget, as the persona teardown calls it (b.deo SRI-307). */
+  /** The routing's own per-key forget, as the persona teardown calls it. */
   forget(key: string): void
   /** Keys of the named personas. */
   keys(names: readonly string[]): string[]
@@ -739,7 +738,7 @@ export function makeRoutingHarness(
 ): RoutingHarness {
   if (opts.channelDelivery !== undefined) requireTempStateDir(opts.channelDelivery.stateDir)
   // Each persona's fungible destination set on its spec, by the name the
-  // builders give it, so the one configuration holds it (b.deo SRI-1203).
+  // builders give it, so the one configuration holds it.
   const builtNames = makeMultiPersonaConfig(specs, baseDir, opts.overrides).personas.map((p) => p.name)
   for (const name of Object.keys(opts.fungibleDestinations ?? {})) {
     if (!builtNames.includes(name)) throw new Error(`no persona ${name}`)
@@ -822,7 +821,7 @@ export function makeRoutingHarness(
     }
     : undefined
 
-  // The lost-message state inputs (b.jg5 SRJ-1011), as main() builds them:
+  // The lost-message state inputs, as main builds them:
   // one latch, bare; one episodes instance on its own fake clock with the
   // condition over it (no alert threshold, so no timer); the outage state
   // only with `outageState`. Every sink records apart from the Slack stubs.
@@ -873,7 +872,7 @@ export function makeRoutingHarness(
       consumeAck,
       serverPort: 0,
       // The mode of the configuration in effect, read on every call from
-      // `h.config` as src/server.ts reads it (b.deo SRI-201, SRI-601).
+      // `h.config` as src/server.ts reads it.
       getChannelMode: () => channelModeOf(h.config),
     }
     const entry: SessionEntry = {
@@ -985,7 +984,7 @@ export function makeRoutingHarness(
     const client = webClientFor(key)
     return client ? createNameResolver(client as unknown as NameResolverWebClient).resolveUserName(userId) : userId
   }
-  // The one lost-message row read (b.jg5 SRJ-1011), only with `rowRead`:
+  // The one lost-message row read, only with `rowRead`:
   // recorded at its start, then the script's `during`, then its answer.
   const readRowLiveness: PersonaRoutingDeps['readRowLiveness'] = opts.rowRead === undefined
     ? undefined
@@ -997,7 +996,7 @@ export function makeRoutingHarness(
       if (script.answer === ROW_READ_REJECTS) throw rowReadRejection()
       return script.answer
     }
-  // The stored-choice store (b.deo SRI-403), loaded once as main() loads it,
+  // The stored-choice store, loaded once as main loads it,
   // its lines in `h.logs` and each write recorded before it is made.
   if (opts.channelDelivery !== undefined) {
     h.channelDelivery = loadChannelDeliveryStore(opts.channelDelivery.stateDir, {
@@ -1017,7 +1016,7 @@ export function makeRoutingHarness(
       h.order.push('config')
       return h.config
     },
-    // As main() binds it (b.deo SRI-305): the one store, read at call time.
+    // As main binds it: the one store, read at call time.
     getChannelDelivery: () => h.channelDelivery,
     getBotIdentity: (key) => {
       h.order.push(`identity:${key}`)
@@ -1034,19 +1033,19 @@ export function makeRoutingHarness(
     isLatched: (key) => h.latch.isLatched(key),
     isTmuxUnresponsive: (key) => h.tmuxUnresponsive.holds(key),
     isRetryArmed: (key) => h.retryArmed.has(key),
-    // As main() binds it (b.jg5 SRJ-401): a launch call, or the dialog
+    // As main binds it: a launch call, or the dialog
 
     isLaunchRunning: opts.isLaunchRunning ?? ((key) => h.isLaunchInFlight(key)),
-    // As main() binds it (b.jg5 SRJ-207, SRJ-1011 state 3): the one hold's
+    // As main binds it (state 3): the one hold's
     // isHeld, read at call time.
     isHeldOnInvalidFlags: (key) => h.invalidFlagsHold.isHeld(key) === true,
-    // As main() composes it (b.jg5 SRJ-1011 state 4, SRJ-812): P's
+    // As main composes it (state 4): P's
     // kill-failure episode is open (a case's own arrangement, `h.killFailed`;
     // production binds the kill-failure alerts' episode) or P waits on an
     // old-life hold whose old key's kill failed (the session manager's
     // `waitsOnKillFailedHold`, as main() binds it), read at call time.
     isKillFailed: (key) => h.killFailed.has(key) || waitsOnKillFailedHold(key),
-    // As main() binds it (b.jg5 SRJ-706, SRJ-811, SRJ-1011): the session
+    // As main binds it: the session
     // manager's `isSequenceOrOldLifeWaitRunning` (P's live-row sequence, or an
     // old-life wait step for a hold P waits on), read at call time, or a
     // case's own arrangement, `h.sequenceOrWaitRunning`.

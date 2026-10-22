@@ -1,5 +1,5 @@
 /**
- * publish-prepare-changelog.test.ts — bug b.689: `/publish prepare` versions
+ * publish-prepare-changelog.test.ts — `/publish prepare` versions
  * CHANGELOG.md's unreleased entry.
  *
  * Before the fix, `scripts/publish-prepare.sh` bumped package.json but never
@@ -24,14 +24,14 @@
  * The repo has no remote and the script pushes nothing: nothing reaches npm,
  * a registry or origin.
  *
- * Bug b.42j: the rollback (SR-3.2) had no entry in the script's exit-code
+ * the rollback (SR-3.2) had no entry in the script's exit-code
  * header. The header cases read the real script as text, through
  * `tests/test-helpers/shell-header.ts`, and check the entry against the
  * rollback's code; one fixture case makes the rollback's own `git checkout`
  * fail and checks the SR-3.2 diagnostic, its place after the failing step's,
  * and the exit code the entry describes.
  *
- * Bug b.1ba: the rollback ran `git checkout -- …`, which restores from the
+ * the rollback ran `git checkout -- …`, which restores from the
  * index. When the SR-5.1 release commit failed (exit 30) after `git add` had
  * staged the bump, it restored nothing, though the diagnostic said the tree
  * was rolled back. It now checks out from HEAD, restoring the tree and the
@@ -40,7 +40,7 @@
  * then fails), record what was staged when the step failed, and check exit 30
  * and a repo back at HEAD; the header case pins the rollback's command.
  *
- * Bug b.pwg: both SR-8.1 (exit 90) diagnostics say the tarball is still on
+ * both SR-8.1 (exit 90) diagnostics say the tarball is still on
  * disk, but the exit cleanup deleted it. It is now kept once the release tag
  * lands. Two fixture cases fail SR-8.1 after the tag (a stub `sha1sum` that
  * fails, and a directory where `.publish-state.json` would be written) and
@@ -83,7 +83,7 @@ const FIXTURE_USER_EMAIL = 'test@example.invalid'
 /** Keeps the host's system git configuration out, as the temp HOME keeps the global one out. */
 const FIXTURE_GIT_EXTRAS: Readonly<Record<string, string>> = Object.freeze({ GIT_CONFIG_NOSYSTEM: '1' })
 
-/** The SR-3.2 rollback's command: from HEAD, so it restores the index as well as the tree (b.1ba). */
+/** The SR-3.2 rollback's command: from HEAD, so it restores the index as well as the tree. */
 const ROLLBACK_CHECKOUT = 'git checkout HEAD -- package.json bun.lock CHANGELOG.md'
 
 const RUN_TIMEOUT_MS = 20_000
@@ -289,7 +289,7 @@ function expectRolledBack(fx: Fixture, head: string): void {
 // Success: the release commit carries the versioned CHANGELOG.md
 // ---------------------------------------------------------------------------
 
-describe('b.689: prepare turns the unreleased entry into the release entry', () => {
+describe('prepare turns the unreleased entry into the release entry', () => {
   test.each(['## Unreleased', '## Unreleased (next minor version)'])(
     'from "%s": the tagged release commit carries a fresh unreleased entry above the dated release entry, written before the pack',
     (heading) => {
@@ -302,7 +302,7 @@ describe('b.689: prepare turns the unreleased entry into the release entry', () 
       expect(git(fx, 'rev-parse', `v${NEXT_VERSION}^{commit}`)).toBe(git(fx, 'rev-parse', 'HEAD'))
       // Rewritten before SR-4.1, so every failure from the pack on rolls it back.
       expect(readFileSync(fx.changelogAtPack, 'utf-8')).toBe(RELEASED_CHANGELOG)
-      // The tarball is kept for promote (b.pwg); it and the manifest are ignored, as in the real repo.
+      // The tarball is kept for promote; it and the manifest are ignored, as in the real repo.
       expect(existsSync(tarballPath(fx))).toBe(true)
       expect(git(fx, 'status', '--porcelain')).toBe('')
     },
@@ -314,7 +314,7 @@ describe('b.689: prepare turns the unreleased entry into the release entry', () 
 // Failures: every one leaves the repo as it was
 // ---------------------------------------------------------------------------
 
-describe('b.689: a failure at or after the CHANGELOG.md rewrite rolls it back', () => {
+describe('a failure at or after the CHANGELOG.md rewrite rolls it back', () => {
   const STOPS_AT_SR31: [string, FixtureOptions][] = [
     ['CHANGELOG.md has no "## Unreleased" heading', { changelog: NO_UNRELEASED_CHANGELOG }],
     ['the release date cannot be read', { changelog: unreleasedChangelog('## Unreleased'), date: 'fail' }],
@@ -352,10 +352,10 @@ describe('b.689: a failure at or after the CHANGELOG.md rewrite rolls it back', 
 })
 
 // ---------------------------------------------------------------------------
-// A failed release commit, with the bump staged (b.1ba)
+// A failed release commit, with the bump staged
 // ---------------------------------------------------------------------------
 
-describe('b.1ba: a failed SR-5.1 release commit rolls the bump back out of the tree and the index', () => {
+describe('a failed SR-5.1 release commit rolls the bump back out of the tree and the index', () => {
   const CASES: [string, FixtureOptions['release'], string][] = [
     ["'git commit' (its pre-commit hook fails)", 'commit-fails', `SR-5.1 (release commit): 'git commit -m "Release v${NEXT_VERSION}"' did not succeed`],
     ["'git add' (it stages the files, then fails)", 'add-fails', "SR-5.1 (release commit): 'git add package.json bun.lock CHANGELOG.md' did not succeed"],
@@ -381,10 +381,10 @@ describe('b.1ba: a failed SR-5.1 release commit rolls the bump back out of the t
 })
 
 // ---------------------------------------------------------------------------
-// The tarball after a failure once the release commit landed (b.pwg)
+// The tarball after a failure once the release commit landed
 // ---------------------------------------------------------------------------
 
-describe('b.pwg: after a failure past the release commit, the tarball is on disk exactly when the diagnostic says so', () => {
+describe('after a failure past the release commit, the tarball is on disk exactly when the diagnostic says so', () => {
   const MANIFEST_FAILURES: [string, FixtureOptions['manifest'], string][] = [
     ['sha1sum fails', 'sha1-fails', 'SR-8.1 (manifest write): could not compute sha1 of'],
     ['.publish-state.json cannot be written', 'write-fails', 'SR-8.1 (manifest write): could not write .publish-state.json.'],
@@ -421,10 +421,10 @@ describe('b.pwg: after a failure past the release commit, the tarball is on disk
 })
 
 // ---------------------------------------------------------------------------
-// The SR-3.2 rollback's own failure (b.42j)
+// The SR-3.2 rollback's own failure
 // ---------------------------------------------------------------------------
 
-describe("b.42j: the SR-3.2 rollback's own checkout fails", () => {
+describe("the SR-3.2 rollback's own checkout fails", () => {
   test(
     "after a pack failure: the SR-3.2 diagnostic follows the pack's, and the exit code is still the pack's 21",
     () => {
@@ -445,10 +445,10 @@ describe("b.42j: the SR-3.2 rollback's own checkout fails", () => {
 })
 
 // ---------------------------------------------------------------------------
-// The exit-code header documents the SR-3.2 rollback (b.42j)
+// The exit-code header documents the SR-3.2 rollback
 // ---------------------------------------------------------------------------
 
-describe("b.42j: publish-prepare.sh's exit-code header documents the SR-3.2 rollback", () => {
+describe("publish-prepare.sh's exit-code header documents the SR-3.2 rollback", () => {
   const script = readFileSync(PREPARE_SCRIPT, 'utf-8')
   const entries = headerEntries(shellHeader(script), 'SR-3.2')
   /** The `git checkout` the rollback runs. */

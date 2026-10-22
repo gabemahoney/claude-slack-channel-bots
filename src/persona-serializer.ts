@@ -1,5 +1,5 @@
 /**
- * persona-serializer.ts — Per-persona lifecycle serialization (b.av2 SR-6.6).
+ * persona-serializer.ts — Per-persona lifecycle serialization.
  *
  * Lifecycle operations on one persona run strictly in sequence; operations on
  * different personas are independent. `createPersonaSerializer()` returns a
@@ -7,7 +7,7 @@
  * only after every operation already submitted for that key has settled
  * (resolved or rejected), and resolves or rejects with the operation's own
  * result. The per-key state is one promise chain, the tail of the key's
- * queue; no lock, queue or timer spans two keys (b.av2 SR-3.3), so an
+ * queue; no lock, queue or timer spans two keys, so an
  * operation for one persona never waits on another persona's.
  *
  * What runs through it (production wires one shared instance in server.ts):
@@ -37,7 +37,7 @@
  *   directly in the same turn, never through `run` again);
  * - the connection manager's network close of the socket it detached when
  *   a running persona's Web API call was refused for its bot token
- *   (`persona-connections.ts`, bug b.ujn). It is submitted, never awaited,
+ * (`persona-connections.ts`). It is submitted, never awaited,
  *   because the refusal can arrive inside an operation already holding the
  *   persona's turn; the credentials-broken mark itself is synchronous and
  *   never waits for the serializer.
@@ -72,7 +72,7 @@
  * work for K without awaiting it (it runs after the operation settles), and
  * may freely await operations for other keys.
  *
- * Pure module (b.av2 SR-13.1): importing it creates nothing, and all state
+ * Pure module: importing it creates nothing, and all state
  * lives in the instance `createPersonaSerializer` returns, so tests build a
  * fresh one instead of resetting module state.
  *

@@ -1,4 +1,4 @@
-/** Shared appended system prompt, regenerated before launches (b.omv SR-7.2). */
+/** Shared appended system prompt, regenerated before launches. */
 import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'

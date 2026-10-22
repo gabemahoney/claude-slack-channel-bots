@@ -1,6 +1,6 @@
 /**
  * container-logs.ts — the test container's own logs, copied into the results
- * before the container is removed or stopped (b.1cx). Without them a failed
+ * before the container is removed or stopped. Without them a failed
  * check can't be traced once the container is gone: run.log and
  * container.log (docker logs, the entrypoint's output) hold neither CSCB's
  * nor agent-director's logs. Copied, from the test user's home:

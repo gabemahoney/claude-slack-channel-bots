@@ -3,12 +3,12 @@
  * 1-based line and column, without echoing any of the text.
  *
  * Bun's `JSON.parse` error carries no position and can quote file content,
- * such as a token pasted into the configuration file (b.av2 SR-10.3). The
+ * such as a token pasted into the configuration file. The
  * persona loader therefore drops the parser's message and reports only where
  * the text first stops being JSON, found here by a small validating scan of
  * the RFC 8259 grammar. The result holds numbers only.
  *
- * Pure (b.av2 SR-13.1): no I/O, no module-scope side effects. The scan is
+ * Pure: no I/O, no module-scope side effects. The scan is
  * iterative, so deep nesting cannot overflow the stack.
  *
  * SPDX-License-Identifier: MIT

@@ -1,7 +1,7 @@
 /**
  * persona-connections.ts — The supervised per-persona Slack connection
- * manager (b.av2 SR-3.1 module part, SR-3.2, SR-3.3, SR-3.4, SR-10.3,
- * SR-13.1).
+ * manager (module part,
+ *).
  *
  * `createPersonaConnectionManager(deps)` returns a handle that brings each
  * persona up, keeps its connection open and answers queries about it. Per
@@ -9,7 +9,7 @@
  * one long-lived Web API client (two of each only while a credentials
  * reconnect overlaps); a short-lived validation client exists only during
  * `auth.test`. All clients are built through the injected
- * `PersonaSlackClientFactory` with the SR-3.3 option sets
+ * `PersonaSlackClientFactory` with the option sets
  * (`persona-slack-clients.ts`), each with the integration suite's
  * `slackApiUrl` added only when the server passes one (`deps.slackApiUrl`).
  *
@@ -29,7 +29,7 @@
  * refused. The validation client's own request timeout starts only once the
  * connection is made, so it does not bound a DNS or TCP-connect stall.
  *
- * The 10 s bound (SR-3.3): a timer on the injected clock starts when `start()`
+ * The 10 s bound: a timer on the injected clock starts when `start()`
  * is called and restarts when the library signals the WebSocket phase has
  * begun (`authenticated`, `connecting`), so a slow `apps.connections.open`
  * does not eat into the WebSocket phase's 10 s. On expiry the client is
@@ -41,7 +41,7 @@
  * `apps.connections.open` answers after `disconnect()`); a late rejection is
  * caught.
  *
- * Supervision (SR-3.2, SR-3.3):
+ * Supervision:
  * - Bring-up runs the first attempt at once and resolves with its outcome
  *   (up, retrying or broken) without waiting for retries.
  * - Slack-unreachable: retried on the persona's own timer with its own
@@ -60,17 +60,17 @@
  * - Log lines go through each persona's `createSlackEpisodeTracker`, so they
  *   are written when a cause starts and when it clears, never per attempt.
  *
- * Credentials reconnect (b.av2 SR-8.6 credentials row; `reconnectCredentials`):
+ * Credentials reconnect (credentials row; `reconnectCredentials`):
  * a confirmed change of an up persona's credentials content opens a second
  * connection with the new tokens through the same attempt code (validation
  * client and `auth.test`, a new long-lived Web API client, a new socket under
  * the 10 s bound). Only once it reached `hello` does the persona switch to
  * the new tokens, identity, client and socket together; the old socket is
  * then closed as the manager's own close and any reopen of it cancelled.
- * SR-3.1 allows the two sockets and two Web API clients only during this
+ * allows the two sockets and two Web API clients only during this
  * overlap. A refusal discards the new clients and leaves the old connection
  * untouched; Slack-unreachable keeps the old connection while the new one
- * retries on its own SR-3.2 schedule and its own episode latch, and a later
+ * retries on its own schedule and its own episode latch, and a later
  * swap or refusal is reported to the reconnect's listener. The reconnect's
  * `beforeSwap` hook runs right before every swap (first attempt or later),
  * before any status listener sees the persona up on the new connection. A
@@ -81,7 +81,7 @@
  * Slack-unreachable and retrying takes a new token pair instead
  * (`replaceRetryTokens`): every later attempt uses it.
  *
- * Revoked bot token while running (bug b.ujn): every long-lived Web API
+ * Revoked bot token while running: every long-lived Web API
  * client the manager hands out is wrapped by `watchWebClientAuth`
  * (`persona-web-api-watch.ts`). The first call refused with `invalid_auth`,
  * `token_revoked`, `account_inactive` or `not_authed` on a client latches
@@ -119,7 +119,7 @@
  * Socket Mode client exists per persona, plus, during a credentials
  * reconnect, the reconnect's one attempt and socket.
  *
- * Dry run (SR-3.4): bring-up calls no factory method, needs no credentials
+ * Dry run: bring-up calls no factory method, needs no credentials
  * value and reports up at once with a placeholder identity derived from the
  * key (`dryRunPersonaIdentity`); there is no Web API client.
  *
@@ -129,7 +129,7 @@
  * or re-read. Log lines carry only sanitized outcome fields or
  * `describeThrownValue` output.
  *
- * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
+ * Pure module: nothing is created, read or scheduled at
  * import or at `createPersonaConnectionManager`; no environment access
  * (dry run is passed in). It imports nothing from the agent-director modules.
  * `server.ts` constructs one manager in `main()` and brings each persona up
@@ -232,7 +232,7 @@ export type PersonaAttemptPhase = 'bring-up' | 'reopen'
 /**
  * Where a refusal that made a persona broken was found: an attempt
  * (`PersonaAttemptPhase`), or `running`: a Web API call of the running
- * persona was refused for its bot token (bug b.ujn), with no attempt.
+ * persona was refused for its bot token, with no attempt.
  */
 export type PersonaBrokenPhase = PersonaAttemptPhase | 'running'
 
@@ -260,7 +260,7 @@ export type PersonaConnectionStatus =
 /** Receives every status change, with the persona's key. */
 export type PersonaStatusListener = (key: string, status: PersonaConnectionStatus) => void
 
-/** How the first attempt of a credentials reconnect ended (b.av2 SR-8.6 credentials row). */
+/** How the first attempt of a credentials reconnect ended (credentials row). */
 export type PersonaReconnectOutcome =
   /**
    * The new connection reached `hello`: the persona now uses the new tokens,
@@ -273,7 +273,7 @@ export type PersonaReconnectOutcome =
   /**
    * Slack could not be reached with the new tokens (a `start()` abandoned at
    * its 10 s bound included): the old connection stays, and the new one is
-   * retried after `retryInMs` on its own SR-3.2 schedule.
+   * retried after `retryInMs` on its own schedule.
    */
   | { kind: 'retrying'; outcome: SlackUnreachableOutcome; retryInMs: number }
   /**
@@ -316,7 +316,7 @@ export interface PersonaConnectionManagerDeps {
    * forwards (`socketModeSlackLogger`).
    */
   log: PersonaDiagnosticLogger
-  /** Dry run (SR-3.4): no credentials, no Slack call, every persona up with a placeholder identity. */
+  /** Dry run: no credentials, no Slack call, every persona up with a placeholder identity. */
   dryRun: boolean
   /** Receives every status change. */
   onStatus?: PersonaStatusListener
@@ -333,9 +333,9 @@ export interface PersonaConnectionManagerDeps {
   /** Clock and timers; default `SYSTEM_PERSONA_CONNECTION_CLOCK`. */
   clock?: PersonaConnectionClock
   /**
-   * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
+   * The per-persona lifecycle serializer's `run` (
    * `persona-serializer.ts`): after a running persona is marked
-   * credentials-broken by a refused Web API call (bug b.ujn), the network
+   * credentials-broken by a refused Web API call, the network
    * close of its detached socket is submitted through it, never awaited (the
    * call may come from inside an operation already holding the persona's
    * turn). The mark itself never waits for it. Without it the close runs at
@@ -361,10 +361,10 @@ export interface PersonaConnectionManager {
   /** The persona's long-lived Web API client once it has been up; always `undefined` in dry run. */
   webClient(key: string): WebClient | undefined
   /**
-   * Reconnect a managed persona with a new, locally valid token pair (b.av2
-   * SR-8.6 credentials row, SR-3.1, SR-3.3): a new validation client
+   * Reconnect a managed persona with a new, locally valid token pair (
+   * credentials row): a new validation client
    * (`auth.test`), a new long-lived Web API client and a new Socket Mode
-   * client, through the factory with the SR-3.3 option sets, the socket
+   * client, through the factory with the option sets, the socket
    * `start()` under the 10 s bound. Only once the new socket reached `hello`
    * are the persona's tokens, identity, Web API client and socket switched to
    * the new ones together, any reopen of the old connection cancelled and the
@@ -374,7 +374,7 @@ export interface PersonaConnectionManager {
    * delivers a message once).
    *
    * Resolves with the first attempt's outcome. `refused` discards the new
-   * clients. `retrying` keeps retrying the new tokens on their own SR-3.2
+   * clients. `retrying` keeps retrying the new tokens on their own
    * schedule (its Slack-unreachable episode logged through its own tracker);
    * a later swap or refusal is reported to `onLaterOutcome`, and a refusal
    * ends the retries. A new reconnect, `stop` and `stopAll` cancel a pending
@@ -393,11 +393,11 @@ export interface PersonaConnectionManager {
   ): Promise<PersonaReconnectOutcome>
   /**
    * Hand a persona whose bring-up is Slack-unreachable and retrying (or whose
-   * first attempt is in flight) a new, locally valid token pair (b.av2
-   * SR-8.6: a retrying persona retries with the new content). Every later
+   * first attempt is in flight) a new, locally valid token pair (
+   * a retrying persona retries with the new content). Every later
    * attempt uses only the new pair: an attempt in flight with the old one is
    * cancelled and a new one starts at once; a pending retry timer is kept.
-   * Two attempts never run at once, and the SR-3.2 schedule and episode
+   * Two attempts never run at once, and the schedule and episode
    * logging carry on. Returns whether the pair was taken: false in dry run,
    * for an unknown or stopped persona, and for a persona in any other state
    * (one that has been up is reconnected instead).
@@ -420,7 +420,7 @@ export interface PersonaConnectionManager {
 }
 
 /**
- * The dry-run placeholder identity (SR-3.4): derived from the key alone, and
+ * The dry-run placeholder identity: derived from the key alone, and
  * distinct for distinct keys (the key is embedded verbatim).
  */
 export function dryRunPersonaIdentity(key: string): SlackBotIdentity {
@@ -487,7 +487,7 @@ interface Attempt {
 interface PendingReconnect extends AttemptSlot {
   /** The new token pair. Never logged. */
   readonly tokens: PersonaSlackTokens
-  /** Its own SR-3.2 schedule. */
+  /** Its own schedule. */
   readonly schedule: PersonaRetrySchedule
   /** Its own episode latch, for its Slack-unreachable start and cleared lines. */
   readonly tracker: SlackEpisodeTracker
@@ -518,7 +518,7 @@ interface PersonaEntry extends AttemptSlot {
   reconnect: PendingReconnect | undefined
   /**
    * The socket detached when a refused Web API call marked the persona
-   * broken (bug b.ujn), until its network close, submitted through the
+   * broken, until its network close, submitted through the
    * serializer, runs; `stop` closes it at once.
    */
   refusedSocket: SocketBinding | undefined
@@ -619,7 +619,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     eventName: PersonaSocketEventName,
     payload: PersonaSocketEventPayload,
   ): Promise<void> {
-    // A persona marked broken (a refused Web API call, bug b.ujn) gets no
+    // A persona marked broken (a refused Web API call) gets no
     // delivery, even from a pending reconnect's socket, until a swap.
     if (binding.retired || entry.stopped || entry.status.state === 'broken') return
     try {
@@ -887,7 +887,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   // -------------------------------------------------------------------------
-  // Credentials reconnect (b.av2 SR-8.6 credentials row, SR-3.1, SR-3.3)
+  // Credentials reconnect (credentials row)
   // -------------------------------------------------------------------------
 
   async function reconnectCredentials(
@@ -1071,7 +1071,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   // -------------------------------------------------------------------------
-  // Revoked bot token while running (bug b.ujn)
+  // Revoked bot token while running
   // -------------------------------------------------------------------------
 
   /** The persona's long-lived Web API client for `tokens`, wrapped by the auth-failure watch. */
@@ -1106,7 +1106,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   /**
-   * Mark a running persona credentials-broken (bug b.ujn), synchronously:
+   * Mark a running persona credentials-broken, synchronously:
    * cancel its attempt in flight and retry timer (a reopen cannot bring it
    * back up), detach its live socket (it forwards nothing more), log one
    * `persona-credentials-refused` line and report `broken`, so every gate

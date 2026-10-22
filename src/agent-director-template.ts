@@ -1,8 +1,8 @@
 /**
- * agent-director-template.ts — SR-3.2 boot-time template install, and its
- * apply-time refresh (b.av2 SR-8.6 step 5).
+ * agent-director-template.ts — boot-time template install, and its
+ * apply-time refresh (step 5).
  *
- * Builds the SR-3.1 `MakeTemplateParams` from the resolved PersonaConfig and calls
+ * Builds the `MakeTemplateParams` from the resolved PersonaConfig and calls
  * `client.makeTemplate({ ..., overwrite: true })`, giving us "ensure
  * post-state" semantics — the slack-channel-bot template exists with
  * the right contents after every boot, regardless of prior state.
@@ -79,11 +79,11 @@ function mergeDeps(overrides?: Partial<TemplateInstallDeps>): TemplateInstallDep
 }
 
 // ---------------------------------------------------------------------------
-// b.fae F5 — memory-read allow-rule derivation
+// F5 — memory-read allow-rule derivation
 // ---------------------------------------------------------------------------
 
 /**
- * b.fae F5 — derive the distinct effective Claude config directories across all
+ * F5 — derive the distinct effective Claude config directories across all
  * personas and emit one memory-subdir Read allow rule per dir (the emitted rule
  * is `Read(//<abs-config-dir>/projects/[STAR]/memory/[STARSTAR])`, scoped to
  * the per-project memory subdirectory only — see the security note at the call
@@ -122,7 +122,7 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
 }
 
 // ---------------------------------------------------------------------------
-// SR-3.1 params builder
+// params builder
 // ---------------------------------------------------------------------------
 
 /** Reply reminders must not need a human to approve the Slack reply they request. */
@@ -130,12 +130,12 @@ export const REPLY_TOOL_ALLOW_RULE = `mcp__${MCP_SERVER_NAME}__reply`
 
 /**
  * Build the `MakeTemplateParams` for the slack-channel-bot template per
- * SR-3.1. Exported for direct testing.
+ * Exported for direct testing.
  *
- * b.omv SR-7.1, SR-7.2: MCP tools without channel arguments, and one
+ * MCP tools without channel arguments, and one
  * mandatory appended prompt file shared by every persona.
  *
- * Then appends `--system-prompt-snapshot off` (b.b1j SR-2) unless
+ * Then appends `--system-prompt-snapshot off` unless
  * `fresh_system_prompt` is exactly `false`; a configuration without the field
  * gets the pair. It does not depend on `system_prompt_mode`, on the append
  * file probe or on dry run, and is always the last two elements.
@@ -149,13 +149,13 @@ export function buildTemplateParams(
     personaConfig.mcp_config_path,
   ]
 
-  // b.omv SR-7.2: the shared composed file is mandatory in every mode.
+  // the shared composed file is mandatory in every mode.
   agent_args.push('--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()))
 
   // AD preserves agent_args on resume, but not the template's allow overlay.
   agent_args.push('--allowedTools', REPLY_TOOL_ALLOW_RULE)
 
-  // b.b1j SR-2: last, after the mandatory composed prompt, so a
+  // last, after the mandatory composed prompt, so a
   // resumed or restarted bot reloads the current system prompt file and
   // CLAUDE.md. Only a `fresh_system_prompt` of exactly `false` leaves it out.
   if (personaConfig.fresh_system_prompt !== false) {
@@ -170,9 +170,9 @@ export function buildTemplateParams(
     // Pre-allow Read of the per-project MEMORY subdirectory only, so
     // memory-note reads (which always require confirmation) never round-trip
     // to a human as a native TUI prompt — the prompt class that wedged the
-    // relay in b.fae. This template is a single shared artifact installed once
+    // relay in the contract. This template is a single shared artifact installed once
     // at boot and used by every persona, so we emit ONE rule per DISTINCT
-    // effective config dir across all personas. b.fae F5 code-review fix: the
+    // effective config dir across all personas. F5 code-review fix: the
     // dirs are DERIVED from `personaConfig` (each persona carries its
     // effective `claude_config_dir`: per-persona, else top-level — see
     // src/config.ts) by `deriveMemoryReadAllowRules`, the same directory
@@ -191,7 +191,7 @@ export function buildTemplateParams(
     // `Read(//Users/alice/secrets/**)`).
     //
     // SECURITY — SCOPE IS DELIBERATELY NARROW. Do NOT widen this to the
-    // config-dir ROOT (e.g. `Read(//<config-dir>/**)`), which the b.fae ticket
+    // config-dir ROOT (e.g. `Read(//<config-dir>/**)`), which the ticket
     // originally proposed. That root holds LIVE CREDENTIALS: `settings.json`
     // can carry an API gateway key as ANTHROPIC_API_KEY, and `.claude.json`
     // can carry credential-shaped OAuth/token
@@ -207,14 +207,14 @@ export function buildTemplateParams(
     // `extra_env` is omitted: no installation-wide env-var source in today's
     // config schema. Per-persona CLAUDE_CONFIG_DIR and CSCB_CRONTABLE_PATH,
     // and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false for every persona, are
-    // supplied at spawn time via SpawnParams.extra_env (SR-1.1; see
+    // supplied at spawn time via SpawnParams.extra_env (see
     // buildSpawnParams in session-manager.ts). agent-director
     // stores that env with the row at spawn, and a resume restores it.
   }
 }
 
 // ---------------------------------------------------------------------------
-// SR-3.2 installer
+// installer
 // ---------------------------------------------------------------------------
 
 /** What the boot install wrote: agent-director's result and the params it installed. */
@@ -292,7 +292,7 @@ export async function installSlackChannelBotTemplate(
 }
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-8.6 step 5 — apply-time refresh
+// step 5 — apply-time refresh
 // ---------------------------------------------------------------------------
 
 /** Dependencies of `refreshSlackChannelBotTemplate`. */
@@ -313,7 +313,7 @@ export type TemplateRefreshResult =
 
 /**
  * Refresh the slack-channel-bot template after a confirmed configuration
- * change (b.av2 SR-8.6 step 5): `installed` with its memory-read `allow`
+ * change (step 5): `installed` with its memory-read `allow`
  * rules derived afresh from `applied`'s personas (`deriveMemoryReadAllowRules`,
  * the boot install's derivation, so the rule shape and its per-project
  * memory scope are the same, never a config-dir root). The reply-tool allow

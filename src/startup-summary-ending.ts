@@ -1,6 +1,6 @@
 /**
  * startup-summary-ending.ts — The start summary line's ending, from the failed
- * count on (b.f2b, b.jg5 SRJ-1015, SRJ-1111).
+ * count on.
  *
  * Callers:
  * - `src/session-manager.ts` ends `startupSummaryLine` with
@@ -30,8 +30,8 @@ export interface StartupSummaryEndingCounts {
 }
 
 /**
- * The start summary line's ending, from `failed` on (b.f2b, b.jg5 SRJ-1015):
- * `<n> failed, <n> not brought up, <n> not reconnected`, then SRJ-1015's
+ * The start summary line's ending, from `failed` on:
+ * `<n> failed, <n> not brought up, <n> not reconnected`, then
  * five counts in its order and words: `, <n> latched, <n> retrying, <n>
  * waiting on a live-row sequence, <n> held on invalid flags, <n> fresh as
  * retired keys`.

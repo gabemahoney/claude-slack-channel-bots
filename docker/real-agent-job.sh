@@ -1,5 +1,5 @@
 #!/bin/bash
-# One contained matrix job (b.omv SR-14.4/14.6). No /test-results artifacts.
+# One contained matrix job. No /test-results artifacts.
 set -euo pipefail
 [[ -e /etc/cscb-ci-image ]] || exit 2
 version="$1"
@@ -18,7 +18,7 @@ actual="$("/opt/claude-code/$version/claude" --version)"
 printf 'recorded: matrix native Claude %s\n' "$actual"
 export REAL_AGENT_CLAUDE_VERSION="$version"
 [[ -n "${ANTHROPIC_MODEL:-}" ]] || exit 64
-# Decision 19: only AI invocations may use an explicitly selected model.
+# only AI invocations may use an explicitly selected model.
 # Refusal fallback stays disabled; a classifier stop never selects a model.
 default_model="$ANTHROPIC_MODEL"
 ai_model="${REAL_AGENT_AI_MODEL-$default_model}"

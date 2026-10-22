@@ -1,24 +1,24 @@
 /**
  * lost-message.test.ts — The pure parts of src/lost-message.ts called
- * directly (b.av2 SR-4.6, SR-7.3; b.jg5 SRJ-1011, SRJ-1501, SRJ-1509).
+ * directly.
  *
- * decideLostMessageState: the ten states in SRJ-1011's order (not up, held
+ * decideLostMessageState: the ten states in the contract order (not up, held
  * for a human, cannot launch, kill failed, not answering, session starting,
  * restarting, auto-restart disabled, restart limit reached, starting now),
  * with the one input asked out of that order: a live-row sequence or
  * old-life wait step running answers `restarting` after states 1 to 5 and
- * before the row-`pending` input (b.jg5 SRJ-706, SRJ-410, SRJ-812). A
+ * before the row-`pending` input. A
  * recording query set asserts the result and exactly which queries were
  * asked, so swapping two adjacent checks or asking a later query early fails
  * a case. Absent optional queries answer false, so with only today's queries
- * the decision is today's (bug b.g57: with no not-up query the persona counts
+ * the decision is today's (with no not-up query the persona counts
  * as up). decideEarlyLostMessageState answers the first of states 1 to 5 or
  * none; firesHumanTriggeredRestart is true for `starting-now` only.
  *
  * The wordings and the order are imported from src/. One pin case holds
- * SRJ-1011's five new texts and its ten state names as literals; it is the
+ * five new texts and its ten state names as literals; it is the
  * file's only literal notice text. The `auto-restart-disabled` wording is
- * checked by keyword for what SRJ-1011 (hatch A3) requires it to name.
+ * checked by keyword for what (design A3) requires it to name.
  *
  * The retired notice builder is absent; the decision table remains.
  * wording and no other state's, and a sender label with line breaks still
@@ -107,11 +107,11 @@ function recordingQueries(trueFor: readonly Query[], provided: readonly Query[] 
   return { asked, queries: bound as LostMessageRecoveryQueries }
 }
 
-describe('decideLostMessageState: the first state that applies, in SRJ-1011\'s order (b.jg5 SRJ-1011, SRJ-1509)', () => {
-  // The seqWait row is SRJ-706: a sequence or wait step running while the
+describe('decideLostMessageState: the first state that applies, in the contract order', () => {
+  // The seqWait row is a sequence or wait step running while the
   // row reads pending gives restarting, and the row is never asked.
-  const srj706 = (q: Query) => (q === 'seqWait' ? ' (SRJ-706: never session-starting over a pending row)' : '')
-  test.each(QUERY_ORDER.map((q, i) => [q, STATE_FOR[q], srj706(q), i] as const))(
+  const sequenceStopped = (q: Query) => (q === 'seqWait' ? ' (never session-starting over a pending row)' : '')
+  test.each(QUERY_ORDER.map((q, i) => [q, STATE_FOR[q], sequenceStopped(q), i] as const))(
     '%s and every later input true gives %s, asking only the inputs up to it%s',
     (_q, state, _note, i) => {
       const r = recordingQueries(QUERY_ORDER.slice(i))
@@ -153,7 +153,7 @@ describe('decideLostMessageState: absent optional inputs answer false, so today\
     [[], 'starting-now'],
     [['restartPending'], 'restarting'],
     [['cap'], 'restart-limit-reached'],
-  ])('b.g57: with no not-up query the persona counts as up: true for %j gives %s', (trueFor, state) => {
+  ])('with no not-up query the persona counts as up: true for %j gives %s', (trueFor, state) => {
     const r = recordingQueries(trueFor, REQUIRED)
     expect(decideLostMessageState(r.queries)).toBe(state)
     expect(r.asked[0]).toBe('restartPending')
@@ -183,7 +183,7 @@ describe('decideEarlyLostMessageState: the first of states 1 to 5, or none', () 
   })
 })
 
-describe('firesHumanTriggeredRestart (b.jg5 SRJ-1501)', () => {
+describe('firesHumanTriggeredRestart', () => {
   test('of every exported state, only starting-now fires the human-triggered restart', () => {
     expect(LOST_MESSAGE_STATES.filter((s) => firesHumanTriggeredRestart(s))).toEqual(['starting-now'])
   })

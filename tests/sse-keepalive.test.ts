@@ -1,12 +1,12 @@
 /**
- * sse-keepalive.test.ts — Tests for SSE keep-alive heartbeat (b.qzm)
+ * sse-keepalive.test.ts — Tests for SSE keep-alive heartbeat
  *
  * The keep-alive mechanism sends `:ping\n\n` SSE comments every ~30s on the
  * GET SSE stream to prevent idle-connection disconnects.
  *
  * The keep-alive functions are imported straight from src/server.ts: importing
  * it reads no Slack token, builds no Slack client and creates no directory
- * (b.av2 SR-3.1); `main()` runs only behind `if (import.meta.main)`.
+ * `main()` runs only behind `if (import.meta.main)`.
  *
  * Since Bun's fake-timer support does not intercept setInterval callbacks
  * reliably, we monkey-patch globalThis.setInterval within each test to capture
@@ -68,7 +68,7 @@ afterEach(() => {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('SSE keep-alive heartbeat (b.qzm)', () => {
+describe('SSE keep-alive heartbeat', () => {
   test('sends :ping\\n\\n to the SSE stream when the interval fires', () => {
     const enqueueCalls: Uint8Array[] = []
     const encoder = new TextEncoder()

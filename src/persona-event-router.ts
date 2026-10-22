@@ -1,6 +1,6 @@
 /**
  * persona-event-router.ts — The handler each persona's Slack connection
- * forwards its events to (b.av2 SR-3.1, SR-4.1, SR-7.1).
+ * forwards its events to.
  *
  * The connection manager (`persona-connections.ts`) calls one injected
  * handler with the key of the persona whose connection received the event,
@@ -10,8 +10,7 @@
  * - `message` and `app_mention`: one RAW log line carrying the receiving
  *   persona's key, then the event, its `ack` and the envelope flag go to the
  *   persona-routing intake (`persona-routing.ts` `receive`) with the
- *   receiving persona as the only receiver. The envelope flag (b.av2 SR-4.1,
- *   b.deo SRI-301) is the `is_ext_shared_channel` field of the listener
+ * receiving persona as the only receiver. The envelope flag is the `is_ext_shared_channel` field of the listener
  *   argument's `body` (the Events API payload), passed exactly as received:
  *   `true`, `false`, any other value, or undefined when there is no body or
  *   no such field. It is read from the envelope only, never from the event,
@@ -36,7 +35,7 @@
  * `redactSlackLogText`, since it can hold a token or a URL), and never
  * escapes to the manager.
  *
- * Side-effect free (b.av2 SR-13.1): importing this module creates no client,
+ * Side-effect free: importing this module creates no client,
  * reads no file, environment variable or token and starts no timer. Every
  * dependency is injected through `createPersonaEventRouter`.
  *
@@ -59,7 +58,7 @@ import {
 /** Characters of the raw event JSON the RAW log line shows (as before personas). */
 const RAW_EVENT_LOG_LENGTH = 300
 
-/** The envelope field that marks an event from an externally shared channel (b.deo SRI-301). */
+/** The envelope field that marks an event from an externally shared channel. */
 const ENVELOPE_FLAG_FIELD = 'is_ext_shared_channel'
 
 // ---------------------------------------------------------------------------
@@ -103,7 +102,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
     const { ack } = payload
     const p = (payload.body ?? payload['payload'] ?? payload) as Record<string, unknown>
     const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
-    // SR-V-2.6 / SR-V-2.9 envelope: the inbound channel, message ts and
+    // envelope: the inbound channel, message ts and
     // clicking user, shared by every action in this payload.
     const channelId = ((p['channel'] as { id?: string } | undefined)?.id) ?? undefined
     const messageTs = ((p['message'] as { ts?: string } | undefined)?.ts) ?? undefined
@@ -121,7 +120,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
       for (const [index, action] of actions.entries()) {
         try {
           const actionId = action.action_id
-          // SR-V-2.9: one cscb.block_action.received per action, whether or
+          // one cscb.block_action.received per action, whether or
           // not the click handler engages; decode failures are diagnostically
           // critical.
           emitBlockActionReceived(actionId, { channel: channelId, messageTs, user: userId }, deps.emitTrail)
@@ -172,7 +171,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
 }
 
 /**
- * The envelope flag (b.deo SRI-301): the `is_ext_shared_channel` field of the
+ * The envelope flag: the `is_ext_shared_channel` field of the
  * listener argument's `body`, the Events API payload, exactly as received
  * (`true`, `false` or any other value). Undefined when there is no body or the
  * body has no such field. Read from the envelope only, never from the event.

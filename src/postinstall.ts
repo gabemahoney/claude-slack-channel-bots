@@ -7,9 +7,9 @@
  * Safe to re-run: existing files are never modified. Migrates
  * routing.json → config.json if the old file is present. The retired
  * access-control file of earlier releases is neither created nor touched
- * (b.av2 SR-10.1).
  *
- * Skill links are managed only for an installed copy of the package (b.669):
+ *
+ * Skill links are managed only for an installed copy of the package:
  * its root (the directory above src/) holds no .git entry and lies inside a
  * node_modules directory (a global install such as
  * ~/.bun/install/global/node_modules/claude-slack-channel-bots), and CI is
@@ -33,7 +33,7 @@
  * other path at that name is left untouched.
  *
  * The config.json skeleton is the empty persona configuration
- * `{"personas": []}` (b.av2 SR-1.7): it loads with zero personas. An existing
+ * `{"personas": []}`: it loads with zero personas. An existing
  * config.json is never touched, whatever its shape; a pre-persona one gets
  * the conversion error when the server starts.
  *
@@ -41,7 +41,7 @@
  * ({@link runAgentDirectorPostinstallProbe}): the install check
  * (`src/install-check.ts`) once, with one OK line (and the Phase 1 note when
  * the check carries one) or one warning. It builds no agent-director client
- * and opens no agent-director store (b.jg5 SRJ-121), and it never fails the
+ * and opens no agent-director store, and it never fails the
  * install.
  *
  * SPDX-License-Identifier: MIT
@@ -134,7 +134,7 @@ function isCiRun(env: NodeJS.ProcessEnv): boolean {
 /**
  * Why postinstall must leave the skill links in ~/.claude/skills/ alone for
  * the package rooted at `packageDir`, or undefined when it manages them
- * (b.669). The first rule that applies wins:
+ * The first rule that applies wins:
  * - a .git entry (directory, worktree file or link) at the root: a repo
  *   checkout or git worktree, not an installed package;
  * - the root does not lie inside a node_modules directory: not an installed
@@ -206,7 +206,7 @@ function manageSkillLinks(skillsTarget: string, packageSkillsDir: string): void 
 
 export function runPostinstall(options: PostinstallOptions = {}): void {
   // The server's state directory: an empty SLACK_STATE_DIR means unset, and a
-  // relative one resolves the same way. Bug b.fc4: npm runs this on an upgrade,
+  // relative one resolves the same way. npm runs this on an upgrade,
   // before the server restarts and moves its old state directory to the new
   // default; while the configuration is still in the old one, that is the
   // directory used (resolveCliStateDir), so no empty skeleton config.json is
@@ -302,7 +302,7 @@ async function settleInstallCheck(
 }
 
 /**
- * Best-effort agent-director probe at npm install time (b.jg5 SRJ-121): runs
+ * Best-effort agent-director probe at npm install time: runs
  * the install check once and logs what it found. It builds no client, opens
  * no agent-director store and resolves the host binary only through the
  * install check.
@@ -346,8 +346,8 @@ export async function runAgentDirectorPostinstallProbe(deps: AgentDirectorPostin
 
 if (import.meta.main) {
   runPostinstall()
-  // SR-5.2: best-effort agent-director probe through the install check
-  // (b.jg5 SRJ-121: no client built, no store opened). Bun blocks
+  // best-effort agent-director probe through the install check
+  // (no client built, no store opened). Bun blocks
   // postinstall by default — this script only runs when the operator has
   // added claude-slack-channel-bots to `trustedDependencies`. A failure is
   // one warning line and does NOT fail the install; the startup gate at

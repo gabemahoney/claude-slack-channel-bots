@@ -1,7 +1,7 @@
 /**
  * secrets.ts — reading and writing /ci-live's host-side secrets.
  *
- * Rules (b.1cx design, "Secrets & state"):
+ * Rules (design, "Secrets & state"):
  * - A secret file, and the directory holding it, must not be group- or
  *   other-accessible; otherwise the run refuses (exit 2), names the path and
  *   the `chmod` that fixes it, and says a VM reboot can loosen these modes

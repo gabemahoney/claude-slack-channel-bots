@@ -18,7 +18,7 @@ import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 
 let tempDir: string
 let pidFile: string
-/** The `server.port` record beside {@link pidFile} (b.jg5 SRJ-510). */
+/** The `server.port` record beside {@link pidFile}. */
 let portFile: string
 
 /** Capture arrays for stubbed side effects. */
@@ -197,7 +197,7 @@ describe('checkPidConflict — stale PID file', () => {
     expect(exitCodes).toHaveLength(0)
   })
 
-  test('the server.port record beside a stale PID file is removed with it (b.jg5 SRJ-510)', () => {
+  test('the server.port record beside a stale PID file is removed with it', () => {
     writeFileSync(pidFile, '999999999\n', 'utf-8')
     writeServerPortRecord(portFile, { pid: 999999999, port: 40123 })
     runCheckPidConflict(pidFile)
@@ -243,7 +243,7 @@ describe('checkPidConflict — running PID (conflict)', () => {
     expect(existsSync(pidFile)).toBe(true)
   })
 
-  test('the running server\'s server.port record stays beside its PID file (b.jg5 SRJ-510)', () => {
+  test('the running server\'s server.port record stays beside its PID file', () => {
     writeFileSync(pidFile, `${process.pid}\n`, 'utf-8')
     writeServerPortRecord(portFile, { pid: process.pid, port: 40123 })
     runCheckPidConflict(pidFile)

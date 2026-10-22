@@ -2,25 +2,25 @@
  * ad-description-phrases.ts — agent-director's description words that CSCB
  * matches.
  *
- * These are agent-director's own words (ADSRD SR-1.4; HO section 2), copied
+ * These are agent-director's own words (agent-director contract; HO section 2), copied
  * here so CSCB matches exactly what agent-director writes in an error's
  * description. CSCB only looks for them in a description it has received;
  * none is ever used to build a command. The stub's error builders
  * (`tests/test-helpers/agent-director-stub.ts`) take the words from here
- * (SRJ-1303), and the error classifier (`src/ad-error-class.ts`; b.jg5
- * SRJ-104) matches `UNUSABLE_RECORDED_NAME_PHRASE` and
+ * and the error classifier (`src/ad-error-class.ts`
+ *) matches `UNUSABLE_RECORDED_NAME_PHRASE` and
  * `DIFFERENT_TMUX_SERVER_PHRASE` from here, and its launch-timeout predicate
- * (`isLaunchTimeoutError`; b.jg5 SRJ-407) matches `LAUNCH_TIMEOUT_PHRASE`;
+ * (`isLaunchTimeoutError`) matches `LAUNCH_TIMEOUT_PHRASE`;
  * the conflict latch
- * (`src/conflict-latch.ts`; b.jg5 SRJ-507) matches the nine CONFLICT case
+ * (`src/conflict-latch.ts`) matches the nine CONFLICT case
  * words from here, in the order it defines; and the bounded kill retry
- * (`src/kill-retry.ts`; b.jg5 SRJ-702) and the kill-failure alert
- * (`src/kill-failure-alert.ts`; SRJ-1007) match the survivor-naming form
+ * (`src/kill-retry.ts`) and the kill-failure alert
+ * (`src/kill-failure-alert.ts`) match the survivor-naming form
  * through `survivorPids` from here, in the `ErrTmuxKillFailed` description
  * that `killFailedDescriptionOf` (`src/ad-error-class.ts`) reads. No `src/`
  * module matches the other words yet.
  *
- * The CONFLICT case words number nine (b.jg5 SRJ-507), "another
+ * The CONFLICT case words number nine, "another
  * agent-director store" among them. The other description words below (the
  * plain spawn's label wordings, "the new row was ended", "nothing was written
  * and no row was created", "the agent's pane was not adopted", "retry kill
@@ -29,32 +29,32 @@
  * (`ErrTmuxUnresponsive`) or ENVIRONMENT (`ErrTmuxNotAvailable`) error: "the
  * new row was ended" also rides on a plain spawn's `ErrTmuxUnresponsive` or
  * `ErrTmuxNotAvailable` after "duplicate session" whose re-lookup could not
- * answer, beside a retry with `reuse_finished` (HO rev 26; b.jg5 SRJ-111).
+ * answer, beside a retry with `reuse_finished` (HO rev 26).
  * CSCB keys no behaviour on those words there: the error's class decides,
  * and the row the `get` after it reads.
  *
  * Besides words, this module holds one pattern and its one helper: the
- * survivor-naming form of a kill failure (`SURVIVOR_PID_PATTERN`, b.jg5
- * SRJ-702, SRJ-1303), built from the survivor clause's words, and
+ * survivor-naming form of a kill failure (`SURVIVOR_PID_PATTERN`
+ *), built from the survivor clause's words, and
  * `survivorPids`, which lists the pids a description's survivor clause names.
  * No other module defines the form.
  *
  * It defines no order in which the CONFLICT case words are checked; that
- * order (b.jg5 SRJ-507) belongs to the code that resolves a CONFLICT case, and
+ * order belongs to the code that resolves a CONFLICT case, and
  * the order of the declarations below means nothing.
  *
  * SPDX-License-Identifier: MIT
  */
 
 // ---------------------------------------------------------------------------
-// Unusable recorded session name (b.jg5 SRJ-104, SRJ-512)
+// Unusable recorded session name
 // ---------------------------------------------------------------------------
 
 /** Carried by an `ErrInternal` whose row's recorded tmux session name cannot be used. */
 export const UNUSABLE_RECORDED_NAME_PHRASE = 'the recorded tmux session name'
 
 // ---------------------------------------------------------------------------
-// CONFLICT case words (b.jg5 SRJ-507)
+// CONFLICT case words
 // ---------------------------------------------------------------------------
 
 /** CONFLICT case "conflicting labels". */
@@ -86,7 +86,7 @@ export const CONFLICT_ANOTHER_STORE_PHRASE = 'another agent-director store'
 
 // ---------------------------------------------------------------------------
 // Words beside a CONFLICT case phrase, or on an UNAVAILABLE or ENVIRONMENT
-// error (b.jg5 SRJ-507, SRJ-111, SRJ-1303; not case phrases)
+// error (not case phrases)
 // ---------------------------------------------------------------------------
 
 /**
@@ -101,7 +101,7 @@ export const PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE = 'its label does not name thi
 
 /**
  * Written by a plain spawn that ended its new row after its session-creating
- * call met "duplicate session" (b.jg5 SRJ-111, SRJ-713): beside the case
+ * call met "duplicate session": beside the case
  * phrase of its `ErrTmuxSessionConflict`, or, when its re-lookup of the
  * holder could not answer, in its `ErrTmuxUnresponsive` (UNAVAILABLE) or
  * `ErrTmuxNotAvailable` (ENVIRONMENT) description, which also names a retry
@@ -119,7 +119,7 @@ export const PANE_NOT_ADOPTED_PHRASE = "the agent's pane was not adopted"
 export const NO_KILL_SENT_PHRASE = 'no kill was sent'
 
 // ---------------------------------------------------------------------------
-// Kill failure (b.jg5 SRJ-702, SRJ-1303)
+// Kill failure
 // ---------------------------------------------------------------------------
 
 /** Written by `kill` in every `ErrTmuxKillFailed` description. */
@@ -129,19 +129,18 @@ export const RETRY_KILL_LATER_PHRASE = 'retry kill later'
 export const NEVER_DELETE_ROW_PHRASE = 'never delete this row'
 
 /**
- * The survivor clause's words for one survivor (b.jg5 SRJ-702, SRJ-1303),
+ * The survivor clause's words for one survivor,
  * written by `kill` before "(pid S)".
  */
 export const SURVIVOR_CLAUSE_ONE_PHRASE = 'another process of a pane of the labelled session'
 
 /**
- * The survivor clause's words for two or more survivors (b.jg5 SRJ-702,
- * SRJ-1303), written by `kill` before "(pids S1, S2)".
+ * The survivor clause's words for two or more survivors, written by `kill` before "(pids S1, S2)".
  */
 export const SURVIVOR_CLAUSE_MANY_PHRASE = 'other processes of panes of the labelled session'
 
 /**
- * The survivor-naming form (b.jg5 SRJ-702, SRJ-1303, SRJ-1007): the survivor
+ * The survivor-naming form: the survivor
  * clause of an `ErrTmuxKillFailed` description, which names the processes of
  * the labelled session's panes that outlived the kill exit wait. Checked
  * against agent-director 0.11.0 (tag `v0.11.0`,
@@ -162,7 +161,7 @@ export const SURVIVOR_CLAUSE_MANY_PHRASE = 'other processes of panes of the labe
  * Reading the pids from the description is interim: a description is text
  * for humans, agent-director's structured `survivor_pids` is on the
  * `ad.kill.called` trail, and CSCB has asked agent-director for the survivor
- * pids on the error itself (SRJ-702).
+ * pids on the error itself.
  *
  * It has no `g` flag, so `.test()` keeps no state between calls.
  */
@@ -183,21 +182,21 @@ export function survivorPids(description: string): number[] {
 }
 
 // ---------------------------------------------------------------------------
-// Different tmux server (b.jg5 SRJ-311, SRJ-1021)
+// Different tmux server
 // ---------------------------------------------------------------------------
 
 /** Carried when the tmux server on the row's recorded socket is not the one the agent was launched on. */
 export const DIFFERENT_TMUX_SERVER_PHRASE = 'not the tmux server the agent was launched on'
 
 // ---------------------------------------------------------------------------
-// Launch timeout (b.jg5 SRJ-407)
+// Launch timeout
 // ---------------------------------------------------------------------------
 
 /** Carried by an `ErrTmuxUnresponsive` that ends a launch call as a launch timeout. */
 export const LAUNCH_TIMEOUT_PHRASE = 'the session may have been created'
 
 // ---------------------------------------------------------------------------
-// Still stopping, still starting (b.jg5 SRJ-104, SRJ-1303)
+// Still stopping, still starting
 // ---------------------------------------------------------------------------
 
 /** Carried by an `ErrTmuxUnresponsive` for a row that appears to still be stopping. */

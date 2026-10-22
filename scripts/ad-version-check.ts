@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * scripts/ad-version-check.ts — `/publish`'s agent-director host check, the
- * check `scripts/preflight.sh` gate SR-2.5 runs (b.jg5 SRJ-211).
+ * check `scripts/preflight.sh` gate SR-2.5 runs.
  *
  * Usage:  bun scripts/ad-version-check.ts <patch|minor|major>
  *
@@ -78,8 +78,7 @@ const RUNBOOK_POINTER = `the switch-over runbook in ${PHASE1_RUNBOOK_DOC} (secti
 
 /**
  * Where the not-found and below-client-minimum diagnostics point the
- * operator: the runbook section's publishing-host block (b.jg5 SRJ-211,
- * SRJ-1108), which covers a host with no agent-director and one below the
+ * operator: the runbook section's publishing-host block, which covers a host with no agent-director and one below the
  * client's minimum and names no upgrade.
  */
 const PUBLISHING_HOST_POINTER = `the block "${PUBLISHING_HOST_BLOCK_HEADING}" of ${RUNBOOK_POINTER}`
@@ -169,7 +168,7 @@ function clientMinimumUnreadable(found: string, bumpKind: string): string {
 }
 
 /**
- * Run SR-2.5's check once (b.jg5 SRJ-211): read the client minimum, make one
+ * Run SR-2.5's check once: read the client minimum, make one
  * resolver call and apply `decideHostAdVersion`. Returns the exit status and
  * the lines; never writes, exits or rejects. A client minimum that cannot be
  * read fails before the resolver is called.

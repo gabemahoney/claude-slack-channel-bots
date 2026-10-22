@@ -1,13 +1,13 @@
 /**
- * ad-version-gate.test.ts — CSCB's Phase 1 floor (b.jg5 SRJ-201), its
- * comparison (b.jg5 SRJ-202), the shared test versions (b.jg5 SRJ-1304; the
+ * ad-version-gate.test.ts — CSCB's Phase 1 floor, its
+ * comparison, the shared test versions (the
  * Claude Code minimum `MIN_CLAUDE_CODE_VERSION` by its form, and by a scan
  * that finds its value in the code, comments stripped, of no `tests/`
- * TypeScript file but the helper's) and the runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205): its one
- * log line per run of could-not-run results (b.jg5 SRJ-206, AC 22), the
- * immediate trigger (AC 23's first half) and the version-changed signal;
- * the host-version decision shared by `/publish`'s SR-2.5 check and the
- * install check (b.jg5 SRJ-211, SRJ-212; AC 81), the reason word of a version
+ * TypeScript file but the helper's) and the runtime re-check of the host binary: its one
+ * log line per run of could-not-run results, the
+ * immediate trigger (first half) and the version-changed signal;
+ * the host-version decision shared by `/publish`'s check and the
+ * install check, the reason word of a version
  * that cannot be read (agent-director's own, `UNREACHABLE_REASON_UNKNOWN` for
  * an absent or unsafe one, `UNREACHABLE_REASON_UNPARSEABLE_VERSION` for a
  * resolved version that does not parse), its settle step
@@ -15,15 +15,15 @@
  * (`redactToOneLine`), its client-order comparison and its Phase 1 note; and
  * a source audit of the import-cycle fix (`src/install-check-labels.ts`,
  * every label of which `src/install-check.ts` re-exports); and the
- * `ErrInvalidFlags` hold (`src/invalid-flags-hold.ts`, b.jg5 SRJ-207,
- * SRJ-1008, AC 23): SRJ-1008's text (written out once, in its pin case), the
+ * `ErrInvalidFlags` hold (`src/invalid-flags-hold.ts`,
+ *): text (written out once, in its pin case), the
  * hold decision on each re-check answer, the last version seen it begins
  * under (`lastAdVersionSeen`), one alert per hold episode after the retry
  * timer's stop, its end on the version-changed signal (with the listener
  * registered as `main()` registers it, a retry at once for each applied
  * persona), its other ends (a teardown's forget, shutdown, a server restart)
  * and the below-floor stop, on a hold composed as `main()` composes it. And
- * b.jg5 SRJ-1204's bound citing SRJ-204 and SRJ-209: with the settings read
+ * bound citing with the settings read
  * installed on the re-check's tick, one re-check and one read per interval,
  * the `ErrInvalidFlags` step's trigger the only extra re-check.
  *
@@ -31,9 +31,9 @@
  * `tests/test-helpers/agent-director-versions.ts`, so a change to
  * `PHASE1_FLOOR_VERSION` moves every case with it. Every class label,
  * interval, time limit, runbook title and the runtime phrase is imported from
- * `src/`; one case pins the interval constant to SRJ-204's 120 s.
+ * `src/`; one case pins the interval constant to 120 s.
  *
- * `PHASE1_FLOOR_VERSION` is confirmed from the Phase 1 release (SRJ-201),
+ * `PHASE1_FLOOR_VERSION` is confirmed from the Phase 1 release,
  * the agent-director version `package.json` pins exactly (checked in
  * `tests/packaging-completeness.test.ts`). The floor cases hold for it: the
  * release before Phase 1 and the dev sentinel are refused, the floor and its
@@ -42,10 +42,10 @@
  * empty, so a string comparison planted in the floor check fails a case.
  * `tests/ci-live-docker.test.ts` checks that the agent-director release
  * pinned in `docker/Dockerfile.test.base` (`AD_VERSION`) is the floor itself,
- * a plain release that `package.json` pins (SRJ-201). Here, the
+ * a plain release that `package.json` pins. Here, the
  * `PHASE1_RC_VERSION` case (it parses as the floor with pre-release `rc.1`,
- * SRJ-1304) guards the versions helper's shape only, since the helper builds
- * it from the floor; and any `<floor>-rc.N` passes the floor (SRJ-202).
+ *) guards the versions helper's shape only, since the helper builds
+ * it from the floor; and any `<floor>-rc.N` passes the floor.
  *
  * The runtime re-check runs on `createFakeClock` with
  * `makeStubResolveSystemBinary` and no health check (the
@@ -235,7 +235,7 @@ const LEXICAL_TRAPS: Array<[string, boolean]> = FLOOR.flatMap((n, i) =>
 )
 
 // ---------------------------------------------------------------------------
-// The floor constant (SRJ-201)
+// The floor constant
 // ---------------------------------------------------------------------------
 
 describe('PHASE1_FLOOR_VERSION', () => {
@@ -249,7 +249,7 @@ describe('PHASE1_FLOOR_VERSION', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The comparison (SRJ-202)
+// The comparison
 // ---------------------------------------------------------------------------
 
 describe('meetsPhase1Floor', () => {
@@ -280,7 +280,7 @@ describe('meetsPhase1Floor', () => {
   test.each([
     ["the floor's rc.2", FLOOR_RC_2],
     ["the floor's rc.10", FLOOR_RC_10],
-  ])('passes %s (%s): a <floor>-rc.N counts as the floor, the pre-release not compared (SRJ-201, SRJ-202)', (_label, version) => {
+  ])('passes %s (%s): a <floor>-rc.N counts as the floor, the pre-release not compared', (_label, version) => {
     expect(meetsPhase1Floor(version)).toBe(true)
   })
 
@@ -313,11 +313,11 @@ describe('meetsPhase1Floor', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The shared test versions (SRJ-1304)
+// The shared test versions
 // ---------------------------------------------------------------------------
 
 describe('agent-director-versions helper', () => {
-  test("PHASE1_RC_VERSION is the floor's first release candidate: strict SemVer, the floor's major.minor.patch, pre-release rc.1 (SRJ-201, SRJ-1304)", () => {
+  test("PHASE1_RC_VERSION is the floor's first release candidate: strict SemVer, the floor's major.minor.patch, pre-release rc.1", () => {
     const rc = semver.parse(PHASE1_RC_VERSION)
     const floor = semver.parse(PHASE1_FLOOR_VERSION)
     expect(rc).not.toBeNull()
@@ -370,7 +370,7 @@ describe('agent-director-versions helper', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check (b.jg5 SRJ-204, SRJ-205): shared fixtures
+// Runtime re-check: shared fixtures
 // ---------------------------------------------------------------------------
 
 /** The version the startup gate read: the re-check's first last version seen. */
@@ -395,7 +395,7 @@ interface RecheckRigOptions {
   versionChangedListeners?: readonly AdVersionChangedListener[]
   /** Call `start()` (default true). */
   start?: boolean
-  /** The re-check's interval (b.2nr's override); default `AD_VERSION_RECHECK_INTERVAL_MS`. */
+  /** The re-check's interval (override); default `AD_VERSION_RECHECK_INTERVAL_MS`. */
   intervalMs?: number
 }
 
@@ -536,7 +536,7 @@ function expectStoppedOnce(rig: RecheckRig, classLabel: string): string {
 
 /**
  * Run `act` with the session manager's notice sink recording, where a Slack
- * notice for a persona would go (b.jg5 SRJ-1002): answers every notice it
+ * notice for a persona would go: answers every notice it
  * received.
  */
 async function noticesDuring(act: () => Promise<unknown>): Promise<Array<[string, string]>> {
@@ -559,11 +559,11 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the schedule (SRJ-204)
+// Runtime re-check: the schedule
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: schedule (health_check_interval 0)', () => {
-  test("AD_VERSION_RECHECK_INTERVAL_MS is SRJ-204's 120 s", () => {
+  test("AD_VERSION_RECHECK_INTERVAL_MS is 120 s", () => {
     expect(AD_VERSION_RECHECK_INTERVAL_MS).toBe(120_000)
   })
 
@@ -616,11 +616,11 @@ describe('runtime re-check: schedule (health_check_interval 0)', () => {
   })
 })
 
-// b.2nr: the test-only override block's ad_version_recheck_interval_ms reaches the re-check through `intervalMs`
+// the test-only override block's ad_version_recheck_interval_ms reaches the re-check through `intervalMs`
 // at build time, and through `setIntervalMs` / `setAdVersionRecheckIntervalMs` when the block is read after the
 // re-check is installed (main() installs the re-check before it reads the configuration).
 // Regression: before the fix the interval was the constant only, so the first call came at 120 s whatever was set.
-describe('runtime re-check: the interval override (b.2nr)', () => {
+describe('runtime re-check: the interval override', () => {
   const SHORT_MS = 20_000
 
   test('an interval in the deps sets the first call and each next one; the default is kept when it is absent', async () => {
@@ -713,7 +713,7 @@ describe('runtime re-check: the interval override (b.2nr)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: one case per SRJ-204 table row
+// Runtime re-check: one case table row
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: a version that passes the floor changes nothing', () => {
@@ -741,7 +741,7 @@ describe('runtime re-check: a version below the floor stops the server (ad-below
     ['DEFENSIVE injected old resolved version (native resolver rejects it first)', OLD_AD_VERSION, binaryPathFor('below-old')],
     ["the client's dev sentinel", DEV_PLACEHOLDER_VERSION, binaryPathFor('below-dev')],
     ['DEFENSIVE injected unparseable resolved version (native resolver reports unreachable)', DEV_UNPARSEABLE_VERSION, binaryPathFor('below-unparseable')],
-  ])('%s (%s): one record naming the found version, the floor, the path, the runtime phrase, that Phase 1 is required and the debug skill, then one non-zero stop; no re-check line and no notice (b.jg5 SRJ-1002)', async (_label, version, path) => {
+  ])('%s (%s): one record naming the found version, the floor, the path, the runtime phrase, that Phase 1 is required and the debug skill, then one non-zero stop; no re-check line and no notice', async (_label, version, path) => {
     const rig = makeRecheckRig({ outcomes: [{ version, path }] })
     expect(await noticesDuring(() => rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS))).toEqual([])
     expect(rig.logs).toEqual([])
@@ -754,7 +754,7 @@ describe('runtime re-check: a version below the floor stops the server (ad-below
 })
 
 describe("runtime re-check: the client's too-old refusal stops the server (ad-system-install-too-old)", () => {
-  test("ErrSystemInstallTooOld: one record naming the error's versions, the floor, the path, the runtime phrase and the debug skill, with no install-skill block; then one non-zero stop; no re-check line and no notice (b.jg5 SRJ-1002)", async () => {
+  test("ErrSystemInstallTooOld: one record naming the error's versions, the floor, the path, the runtime phrase and the debug skill, with no install-skill block; then one non-zero stop; no re-check line and no notice", async () => {
     const path = binaryPathFor('too-old')
     const tooOld = errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, path)
     const rig = makeRecheckRig({ outcomes: [{ throws: tooOld }] })
@@ -832,7 +832,7 @@ describe('runtime re-check: a re-check that cannot run changes nothing', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the stop (SRJ-205)
+// Runtime re-check: the stop
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: a stop happens once, record before stop', () => {
@@ -1023,7 +1023,7 @@ describe('runtime re-check: dispose', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the tick hook (b.jg5 SRJ-209)
+// Runtime re-check: the tick hook
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: tick hook', () => {
@@ -1136,7 +1136,7 @@ describe('runtime re-check: module-level install, dispose and tick registration'
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: one log line per run of could-not-run results (b.jg5 SRJ-206, AC 22)
+// Runtime re-check: one log line per run of could-not-run results
 // ---------------------------------------------------------------------------
 
 /** The line a run that starts with `error` (a named agent-director error) writes: it names the error, never its text. */
@@ -1234,7 +1234,7 @@ describe('runtime re-check: a run of could-not-run results logs one line', () =>
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the immediate trigger (b.jg5 SRJ-204, AC 23's first half)
+// Runtime re-check: the immediate trigger (first half)
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: trigger', () => {
@@ -1362,7 +1362,7 @@ describe('runtime re-check: trigger', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the version-changed signal (b.jg5 SRJ-204 row 1, SRJ-207)
+// Runtime re-check: the version-changed signal (row 1)
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: version-changed signal', () => {
@@ -1445,12 +1445,12 @@ describe('runtime re-check: module-level trigger and version-changed registratio
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-1204's bound, citing SRJ-204 and SRJ-209: the version re-check and the
+// bound, citing the version re-check and the
 // settings read each once per interval, whatever health_check_interval is;
 // the ErrInvalidFlags step's trigger is the only extra re-check
 // ---------------------------------------------------------------------------
 
-describe('runtime re-check: SRJ-1204\'s bound, with the settings installed on its tick as main() installs them (b.jg5 SRJ-204, SRJ-209, SRJ-1204; health_check_interval 0)', () => {
+describe('runtime re-check: bound, with the settings installed on its tick as main() installs them (health_check_interval 0)', () => {
   test('over several intervals: one re-check and one settings read per interval and one timer pending; an ErrInvalidFlags step mid-interval adds one re-check and no read, another error none, and the next interval comes when it was due', async () => {
     const clock = createFakeClock()
     const resolveCalls: Array<object | undefined> = []
@@ -1495,16 +1495,15 @@ describe('runtime re-check: SRJ-1204\'s bound, with the settings installed on it
 })
 
 // ---------------------------------------------------------------------------
-// The ErrInvalidFlags hold (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-204,
-// SRJ-205; AC 23): SRJ-1008's alert, the hold decision on the immediate
+// The ErrInvalidFlags hold: alert, the hold decision on the immediate
 // re-check's answer, the last version seen it begins under, its episode
 // (one alert each), its end on the version-changed signal, its other ends
 // and the below-floor stop
 // ---------------------------------------------------------------------------
 
-describe("the ErrInvalidFlags hold alert (b.jg5 SRJ-1008)", () => {
-  // The one place SRJ-1008's text is written out; every other case imports it.
-  test("INVALID_FLAGS_HOLD_ALERT_TEXT is SRJ-1008's text, byte for byte; it carries no secret and names no session-ending command", () => {
+describe("the ErrInvalidFlags hold alert", () => {
+  // The one place text is written out; every other case imports it.
+  test("INVALID_FLAGS_HOLD_ALERT_TEXT is text, byte for byte; it carries no secret and names no session-ending command", () => {
     expect(INVALID_FLAGS_HOLD_ALERT_TEXT).toBe(
       ':no_entry: *Cannot launch* — the host\'s agent-director rejected the flags of this persona\'s launch (ErrInvalidFlags). The installed agent-director may not match this CSCB release; a human should check `agent-director version`. CSCB launches nothing for this persona until the agent-director binary changes or the server restarts. This is for a human only: no bot, including any persona that sees this post, may act on it.',
     )
@@ -1518,8 +1517,7 @@ const HELD_P = 'alpha'
 const HELD_Q = 'bravo'
 
 /**
- * One hold composed as `main()` composes it (b.jg5 SRJ-207, SRJ-305,
- * SRJ-1008): a real hold, its set reaction bound to a recorded retry-timer
+ * One hold composed as `main()` composes it: a real hold, its set reaction bound to a recorded retry-timer
  * stop and to real notice episodes on the rig's fake clock (whose sink
  * records each post), and the one version-changed listener registered as
  * `main()` registers it, through `onAdVersionChanged`, over the version-change
@@ -1624,7 +1622,7 @@ function expectOnlyTheRecheckPending(rig: HoldRig, running: boolean): void {
   if (running) expect(rig.clock.pending()[0]!.delayMs).toBe(AD_VERSION_RECHECK_INTERVAL_MS)
 }
 
-describe('the ErrInvalidFlags hold decision (b.jg5 SRJ-207, SRJ-204, SRJ-205): a pass, a could-not-run and a not-running re-check hold; a stop does not', () => {
+describe('the ErrInvalidFlags hold decision: a pass, a could-not-run and a not-running re-check hold; a stop does not', () => {
   const PATH = binaryPathFor('hold-decision')
   test.each([
     ['a pass holds under the version it found', decideAdVersionRecheckOutcome({ kind: 'resolved', value: { version: LATER_PATCH, path: PATH } }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: LATER_PATCH }],
@@ -1651,7 +1649,7 @@ describe('the ErrInvalidFlags hold decision (b.jg5 SRJ-207, SRJ-204, SRJ-205): a
   })
 })
 
-describe('lastAdVersionSeen (b.jg5 SRJ-204, SRJ-207): the installed re-check\'s last version seen, none when none runs', () => {
+describe('lastAdVersionSeen: the installed re-check\'s last version seen, none when none runs', () => {
   test('none with nothing installed; the baseline before any pass; a passing new version after it; unchanged by the same version and by a could-not-run; none after dispose', async () => {
     expect(lastAdVersionSeen()).toBeUndefined()
     const clock = createFakeClock()
@@ -1690,7 +1688,7 @@ describe('lastAdVersionSeen (b.jg5 SRJ-204, SRJ-207): the installed re-check\'s 
   })
 })
 
-describe('the ErrInvalidFlags hold episode (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one alert per episode, after the retry timer stop', () => {
+describe('the ErrInvalidFlags hold episode: one alert per episode, after the retry timer stop', () => {
   test('holding P stops its timer, then posts the alert once at P; a second set while held changes nothing; Q\'s hold posts its own; ending P and holding it again posts one new alert', async () => {
     const rig = makeHoldRig()
 
@@ -1851,7 +1849,7 @@ describe('the ErrInvalidFlags hold episode (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, S
   })
 })
 
-describe('the ErrInvalidFlags hold ends on the version-changed signal (b.jg5 SRJ-207, SRJ-204): a re-check passing with a version other than the one a hold began under ends it, silently, and retries the persona at once; the same version or a could-not-run keeps it', () => {
+describe('the ErrInvalidFlags hold ends on the version-changed signal: a re-check passing with a version other than the one a hold began under ends it, silently, and retries the persona at once; the same version or a could-not-run keeps it', () => {
   test('a timed re-check passing with the same version keeps every hold; a could-not-run keeps them; a pass with a different version ends every hold, posts nothing, and retries each applied persona at once, at the re-check\'s time', async () => {
     const rig = makeHoldRig({ outcomes: [{ version: BASELINE_VERSION }, { throws: errSystemInstallNotFound() }, { version: LATER_PATCH }] })
     rig.hold.set(HELD_P, BASELINE_VERSION)
@@ -1930,7 +1928,7 @@ describe('the ErrInvalidFlags hold ends on the version-changed signal (b.jg5 SRJ
   })
 })
 
-describe('the ErrInvalidFlags hold\'s other ends (b.jg5 SRJ-207, SRJ-715): a teardown\'s forget and a server restart', () => {
+describe('the ErrInvalidFlags hold\'s other ends: a teardown\'s forget and a server restart', () => {
   test('forgetting P ends P\'s hold silently (no post, no retry) and keeps Q\'s; P held again posts one new alert', async () => {
     const rig = makeHoldRig()
     const ends: Array<{ key: string; reason: string }> = []
@@ -1976,7 +1974,7 @@ describe('the ErrInvalidFlags hold\'s other ends (b.jg5 SRJ-207, SRJ-715): a tea
   })
 })
 
-describe('the ErrInvalidFlags hold below the floor (b.jg5 SRJ-205, AC 23): a reuse\'s re-check answering stop holds nothing', () => {
+describe('the ErrInvalidFlags hold below the floor: a reuse\'s re-check answering stop holds nothing', () => {
   test('one startup-errors entry of the exported class and one non-zero stop; no hold, no alert, no timer stop, and no further agent-director call', async () => {
     const rig = makeHoldRig({ outcomes: [{ version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('hold-below-floor') }] })
 
@@ -1995,11 +1993,11 @@ describe('the ErrInvalidFlags hold below the floor (b.jg5 SRJ-205, AC 23): a reu
 })
 
 // ---------------------------------------------------------------------------
-// No Slack post on a runtime refusal (contribution to b.jg5 SRJ-1002)
+// No Slack post on a runtime refusal (contribution to)
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: no Slack post (source audit)', () => {
-  /** The two gate modules: the runtime re-check's and the startup gate's (b.jg5 SRJ-1002). */
+  /** The two gate modules: the runtime re-check's and the startup gate's. */
   const GATE_MODULES: string[] = ['ad-version-gate.ts', 'agent-director-startup.ts']
 
   /** Specifiers of every value import or re-export in comment-stripped code (`import type` / `export type` excluded). */
@@ -2049,7 +2047,7 @@ describe('runtime re-check: no Slack post (source audit)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Host-version decision (b.jg5 SRJ-211, SRJ-212; AC 81): shared fixtures
+// Host-version decision: shared fixtures
 // ---------------------------------------------------------------------------
 
 /** A distinct host binary path per case, so an outcome shows the path it was given is passed through. */
@@ -2087,10 +2085,10 @@ describe('host-version decision: fixtures built from the helper versions', () =>
 })
 
 // ---------------------------------------------------------------------------
-// Host-version decision: one case per SRJ-211 row
+// Host-version decision: one case row
 // ---------------------------------------------------------------------------
 
-describe('host-version decision: passes (SRJ-211)', () => {
+describe('host-version decision: passes', () => {
   test.each([
     ["the client's minimum", CLIENT_MIN_VERSION],
     ['the floor', PHASE1_FLOOR_VERSION],
@@ -2117,7 +2115,7 @@ describe('host-version decision: passes (SRJ-211)', () => {
   })
 })
 
-describe("host-version decision: below the client's minimum fails (SRJ-211)", () => {
+describe("host-version decision: below the client's minimum fails", () => {
   test.each([
     ['DEFENSIVE injected resolved release below the minimum', BELOW_CLIENT_MIN_VERSION],
     ['DEFENSIVE injected old resolved release', OLD_AD_VERSION],
@@ -2153,7 +2151,7 @@ describe("host-version decision: below the client's minimum fails (SRJ-211)", ()
   })
 })
 
-describe('host-version decision: not found fails (SRJ-211)', () => {
+describe('host-version decision: not found fails', () => {
   test('ErrSystemInstallNotFound: fails not found', () => {
     expect(failureOf(decideHostAdVersion(rejectedWith(errSystemInstallNotFound()), CLIENT_MIN_VERSION))).toEqual({
       kind: HOST_VERSION_FAIL_NOT_FOUND,
@@ -2161,7 +2159,7 @@ describe('host-version decision: not found fails (SRJ-211)', () => {
   })
 })
 
-describe('host-version decision: a version that cannot be read fails (SRJ-211, SRJ-202 strict parse)', () => {
+describe('host-version decision: a version that cannot be read fails (strict parse)', () => {
   test.each([
     ['a timed-out probe', errSystemInstallUnreachable('probe-timeout', null, hostBinaryPath('unreachable-timeout'))],
     ['an unparseable version', errSystemInstallUnreachable('unparseable-version', DEV_UNPARSEABLE_VERSION, hostBinaryPath('unreachable-unparseable'))],
@@ -2234,7 +2232,7 @@ describe('host-version decision: a version that cannot be read fails (SRJ-211, S
   })
 })
 
-describe('host-version decision: any other thrown value fails, never a pass (SRJ-211)', () => {
+describe('host-version decision: any other thrown value fails, never a pass', () => {
   test('another named agent-director error (ErrBunVersionTooOld): fails other, naming it', () => {
     const error = errBunVersionTooOld()
     expect(failureOf(decideHostAdVersion(rejectedWith(error), CLIENT_MIN_VERSION))).toEqual({
@@ -2392,7 +2390,7 @@ describe('redactToOneLine', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Host-version decision: the client's version order (SRJ-211)
+// Host-version decision: the client's version order
 // ---------------------------------------------------------------------------
 
 describe('compareAdVersions', () => {
@@ -2467,7 +2465,7 @@ describe('compareAdVersions', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Host-version decision: the Phase 1 note (SRJ-211)
+// Host-version decision: the Phase 1 note
 // ---------------------------------------------------------------------------
 
 describe('buildPhase1HostNote', () => {
@@ -2501,7 +2499,7 @@ describe('buildPhase1HostNote', () => {
 describe('install-check labels: the import-cycle fix (source audit)', () => {
   const readSrc = (file: string): string => stripComments(readFileSync(join(import.meta.dir, '..', 'src', file), 'utf-8'))
 
-  test('src/ad-version-gate.ts names ./install-check.ts in no import, re-export, dynamic import or require, and takes its labels from ./install-check-labels.ts', () => {
+  test('src/ad-version-gate.ts names ./install-check.ts in no import, re-export, dynamic import or require, and takes its labels ./install-check-labels.ts', () => {
     const code = readSrc('ad-version-gate.ts')
     expect(code).not.toMatch(/['"`]\.\/install-check(?:\.[jt]s)?['"`]/)
     expect(importSource(code, 'AD_BELOW_PHASE1_FLOOR')).toBe('./install-check-labels.ts')

@@ -2,7 +2,7 @@
  * ci-live-session.test.ts — Tests for the /ci-live runner's command line
  * (`ci-live/lib/args.ts`), the persona config it writes in the container
  * (`lib/live-config.ts`), its bounded waits (`lib/wait.ts`) and the test
- * human's session (`lib/human-session.ts`) (bug b.1cx).
+ * human's session (`lib/human-session.ts`).
  *
  * The rules under test:
  * - the command line accepts the documented flags (`--create-apps`,
@@ -276,7 +276,7 @@ describe('the live config', () => {
     assertNoLeak(renderConfig(config))
   })
 
-  // Bug b.fc4: the default state directory, ~/.config/claude-slack-channel-bots, holds the
+  // the default state directory, ~/.config/claude-slack-channel-bots, holds the
   // crontable; the read-only credentials mount is its sibling
   // (~/.config/cscb-credentials), never the directory the server writes to.
   // The runner's config still names the crontable (the path the default would

@@ -39,7 +39,7 @@ sr_exit() {
 }
 
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 TARBALL_ABS="${TARBALL_ABS:?TARBALL_ABS must be set}"
 NEXT_VERSION="${NEXT_VERSION:?NEXT_VERSION must be set}"
@@ -55,7 +55,7 @@ cleanup() {
 # run cleanup (remove the scratch BUN_INSTALL prefix), then fire the SR-99.0
 # backstop on non-zero exit. Replaces the top-of-script SR-99-only trap.
 # shellcheck disable=SC2154
-trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 SCRATCH_DIR="$(mktemp -d)"
 
@@ -89,11 +89,11 @@ SMOKE_EXIT=0
 SMOKE_STDERR="$("${INSTALLED_BIN}" 2>&1 >/dev/null)" || SMOKE_EXIT=$?
 
 if [ "${SMOKE_EXIT}" = "0" ]; then
-  echo "SR-4.3 (smoke check): bin exited zero with no arguments (expected non-zero). Working tree has been rolled back. The CLI's no-args behavior has changed — update src/cli.ts to exit non-zero on missing arguments (the smoke check assumes this contract; see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
+  echo "SR-4.3 (smoke check): bin exited zero with no arguments (expected non-zero). Working tree has been rolled back. The CLI's no-args behavior has changed — update src/cli.ts to exit non-zero on missing arguments (the smoke check assumes this contract; see the contract), then rerun '/publish ${BUMP_KIND}'." >&2
   sr_exit 23
 fi
 
 if ! grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
-  echo "SR-4.3 (smoke check): bin stderr did not contain 'Usage:' (the smoke contract). Working tree has been rolled back. Update src/cli.ts to emit a 'Usage:' line on no-args (or update this skill to match the new CLI contract — see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
+  echo "SR-4.3 (smoke check): bin stderr did not contain 'Usage:' (the smoke contract). Working tree has been rolled back. Update src/cli.ts to emit a 'Usage:' line on no-args (or update this skill to match the new CLI contract — see the contract), then rerun '/publish ${BUMP_KIND}'." >&2
   sr_exit 23
 fi

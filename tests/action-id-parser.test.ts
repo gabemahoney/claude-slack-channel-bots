@@ -1,5 +1,5 @@
 /**
- * action-id-parser.test.ts — SR-2.2 / SR-8.4 invariant tests for the
+ * action-id-parser.test.ts — invariant tests for the
  * permission action_id encoder/decoder under the request_token wire.
  *
  * Covers:
@@ -9,7 +9,7 @@
  *   - Decoder yields null (not throw) on malformed inputs.
  *   - Regex anchors on outer UUIDv4 shape only — the token's bytes are
  *     opaque to CSCB.
- *   - Persona instance ids (b.av2 SR-2.1 / SR-2.2): `cscb_<key>` for keys
+ * - Persona instance ids: `cscb_<key>` for keys
  *     from `personaKey` round-trips within Slack's 255-character action_id
  *     limit.
  *
@@ -25,7 +25,7 @@ import {
 import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 
 // ---------------------------------------------------------------------------
-// Shared fixtures — no inline magic strings (SR-8.1)
+// Shared fixtures — no inline magic strings
 // ---------------------------------------------------------------------------
 
 /** A handful of representative UUIDv4-shaped tokens. The bytes are opaque to CSCB. */
@@ -204,7 +204,7 @@ describe('encodePermissionActionId — argument validation', () => {
   })
 
   test('accepts opaque token bytes that are NOT UUIDv4 — encoder does not validate token shape', () => {
-    // SR-1.3: CSCB treats the token as opaque. The encoder does not parse
+    // CSCB treats the token as opaque. The encoder does not parse
     // or validate the bytes — only the regex enforces outer UUIDv4 shape
     // at decode time, and only to fix the rightmost capture boundary.
     expect(() => encodePermissionActionId('allow', INSTANCE_SIMPLE, 'not-a-uuid')).not.toThrow()
@@ -216,7 +216,7 @@ describe('encodePermissionActionId — argument validation', () => {
 // ---------------------------------------------------------------------------
 
 describe('PERMISSION_ACTION_ID_RE — invariant', () => {
-  test('exposed regex matches the SR-2.2 anchored shape with UUIDv4 trailing group', () => {
+  test('exposed regex matches the anchored shape with UUIDv4 trailing group', () => {
     expect(PERMISSION_ACTION_ID_RE.source.startsWith('^perm_')).toBe(true)
     expect(PERMISSION_ACTION_ID_RE.source).toContain('(allow|deny)')
     expect(PERMISSION_ACTION_ID_RE.source).toContain('cscb_')
@@ -226,7 +226,7 @@ describe('PERMISSION_ACTION_ID_RE — invariant', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Persona instance ids — cscb_<key> (b.av2 SR-2.1 / SR-2.2)
+// Persona instance ids — cscb_<key>
 // ---------------------------------------------------------------------------
 
 /** Slack's maximum length for a Block Kit element's `action_id`. */

@@ -1,6 +1,6 @@
 /**
  * permission-relay-wiring.test.ts — Static audit of the permission relay's
- * persona wiring in src/server.ts (b.av2 SR-7.1, SR-3.1).
+ * persona wiring in src/server.ts.
  *
  * What the event router does with a click (the receiving connection's key as
  * `receivingPersonaKey`, the default `handlePermissionClick`, no key derived
@@ -15,7 +15,7 @@
  *   a persona's DM is opened once for both;
  * - it gives the poller and the notifier the one destination hold, built over
  *   that resolver on the real clock, so a persona's prompts and notices share
- *   one `persona-destination-failed` episode (b.av2 SR-7.1), and `shutdown()`
+ * one `persona-destination-failed` episode, and `shutdown()`
  *   cancels it;
  * - it derives no persona key from an action ID.
  *
@@ -33,7 +33,7 @@ import { callsOf, indicesOf, objectProperties, onlyCallArguments, shutdownBody, 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
 
-describe('server.ts wires the click path by persona (b.av2 SR-7.1, SR-3.1)', () => {
+describe('server.ts wires the click path by persona', () => {
   test('server.ts derives no persona key from an action ID', () => {
     expect(indicesOf(/\bpersonaKeyFromActionId\b/g, SERVER_CODE)).toEqual([])
   })
@@ -49,7 +49,7 @@ describe('server.ts wires the click path by persona (b.av2 SR-7.1, SR-3.1)', () 
   })
 })
 
-describe('server.ts wires the permission poller by persona (b.av2 SR-7.1)', () => {
+describe('server.ts wires the permission poller by persona', () => {
   test('the poller gets clientFor and getPersona', () => {
     const props = objectProperties(onlyCallArguments(SERVER_CODE, 'startPermissionPoller'))
     expect(props.get('clientFor')).toBe('clientFor')

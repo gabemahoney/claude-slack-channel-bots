@@ -1,4 +1,4 @@
-/** Deterministic typed tags, with no I/O or module state (b.omv SR-2). */
+/** Deterministic typed tags, with no I/O or module state. */
 export const TAG_MAX_BYTES = 1900
 export const TAG_MIN_BODY_BYTES = 400
 export const NAME_LOOKUP_TIMEOUT_MS = 2000
@@ -16,9 +16,9 @@ export function replaceLoneSurrogates(value: string): string {
 export function escapeAttr(value: unknown): string {
   return replaceLoneSurrogates(String(value)).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
-/** Python whitespace and alphanumeric boundaries, plus SR-2.2's extended openers. */
+/** Python whitespace and alphanumeric boundaries, plus extended openers. */
 export function escapeBody(value: string): string {
-  // b.omv SR-14.2 case 10: native Claude 2.1.296 rewrites U+2028 to
+  // case 10: native Claude 2.1.296 rewrites U+2028 to
   // LF and composes U+0301/U+0308 with their preceding letters. Escape
   // those observed characters in the body before fixing parts;
   // receipt matching stays exact, with no normalization in the matcher.
@@ -81,7 +81,7 @@ function cutBody(body: string, budget: number): [string, string] {
   if (cut === 0) throw new Error('No room for a tag body code point')
   return [body.slice(0, cut), body.slice(cut)]
 }
-/** Escape once, then split losslessly, accounting for the widest part index (SR-2.3). */
+/** Escape once, then split losslessly, accounting for the widest part index. */
 export function buildTagParts(message: TagMessage): string[] {
   const body = escapeBody(message.text ?? '')
   const singleAttrs = boundedAttrs(message)

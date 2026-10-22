@@ -1,6 +1,6 @@
 /**
  * reload-timer.ts — The production driver of the reload detection tick
- * (b.av2 SR-8.2): one serialized, self-re-arming 5 s timer, in the
+ * one serialized, self-re-arming 5 s timer, in the
  * `cron-scheduler.ts` pattern. There is no file watcher.
  *
  * `createReloadTickDriver(deps)` returns a `ReloadTickDriver` (the interface
@@ -20,7 +20,7 @@
  * - single-use, like `createCronScheduler`'s handle: a second `start`, or a
  *   `start` after `stop`, is a logged no-op. To restart, build a new driver.
  *
- * Importable without side effects (b.av2 SR-13.1): nothing is armed, read or
+ * Importable without side effects: nothing is armed, read or
  * logged at import or at `createReloadTickDriver`. The clock and the log sink
  * are injected; the real timers are the default.
  *
@@ -31,7 +31,7 @@ import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import type { ReloadTick, ReloadTickDriver } from './reload.ts'
 
-/** Time from the end of one detection pass to the start of the next (b.av2 SR-8.2). */
+/** Time from the end of one detection pass to the start of the next. */
 export const RELOAD_TICK_INTERVAL_MS = 5_000
 
 /** The timers the driver arms (the shared fake clock satisfies it in tests). */

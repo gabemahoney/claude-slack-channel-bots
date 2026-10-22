@@ -492,7 +492,7 @@ function lazyRow(pred: (row: ConflictCaseRow) => boolean): () => ConflictCaseRow
 /** The case-phrase entries of `CONFLICT_CASE_ORDER` a description carries, in that order. */
 const casePhrasesIn = (description: string) => CONFLICT_CASE_ORDER.filter((entry) => description.includes(entry.phrase))
 
-/** The two cases whose description points to no "Operator actions" (ADSRD SR-1.4; SRJ-1004). */
+/** The two cases whose description points to no "Operator actions" (ADSRD). */
 const NO_POINTER_CASES: ReadonlySet<string> = new Set([LATCH_CASE_DIFFERENT_ID, LATCH_CASE_ANOTHER_STORE])
 
 /**
@@ -509,7 +509,7 @@ function operatorActionsTitle(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Recognition (SRJ-507, SRJ-1303)
+// Recognition
 // ---------------------------------------------------------------------------
 
 describe('case recognition', () => {
@@ -570,8 +570,8 @@ describe('case recognition', () => {
     expect(recogniseConflictCase(`${laterPhrase}; ${firstPhrase}`)).toBe(firstCase)
   })
 
-  test('the exported order is SRJ-507\'s, each case on its own phrase, with "no pane 0.0" absent', () => {
-    // The file's only literal block: SRJ-507's case words, in its order.
+  test('the exported order is, each case on its own phrase, with "no pane 0.0" absent', () => {
+    // The file's only literal block: case words, in its order.
     expect(CONFLICT_CASE_ORDER.map((entry) => entry.phrase)).toEqual([
       'conflicting labels',
       "the agent's pane was not found",
@@ -621,7 +621,7 @@ describe('case recognition', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The record (SRJ-501)
+// The record
 // ---------------------------------------------------------------------------
 
 describe('the latch record', () => {
@@ -776,7 +776,7 @@ describe('the latch record', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Relatch and same case (SRJ-501, SRJ-506)
+// Relatch and same case
 // ---------------------------------------------------------------------------
 
 describe('relatch', () => {
@@ -805,7 +805,7 @@ describe('relatch', () => {
       [CONFLICT_LATCH_SET_RELATCHED, second, previous],
     ])
     expect(run.lines).toEqual([conflictLatchSetLine(KEY, previous!), conflictLatchSetLine(KEY, run.latch.record(KEY)!, LATCH_CASE_OWN_ID)])
-    // The pin (SRJ-1014): the set and relatch lines' words, with the case, the session, the refused operation, the state and the description.
+    // The pin: the set and relatch lines' words, with the case, the session, the refused operation, the state and the description.
     expect(run.lines).toEqual([
       `[slack] conflict-latch: persona=${KEY} latched — case=${LATCH_CASE_OWN_ID} session=${JSON.stringify(personaTmuxSessionName(KEY))} refused=${REFUSED_OPERATION_RESUME} state=ended message=${JSON.stringify(CONFLICT_OWN_ID_PHRASE)}`,
       `[slack] conflict-latch: persona=${KEY} relatched — case=${LATCH_CASE_LEFTOVER} (was ${LATCH_CASE_OWN_ID}) session=${JSON.stringify(STUB_TMUX_SESSION_NAME)} refused=${REFUSED_OPERATION_PLAIN_SPAWN} state=${LATCH_ROW_STATE_KIND_NO_ROW} message=${JSON.stringify(CONFLICT_LEFTOVER_PHRASE)}`,
@@ -945,7 +945,7 @@ describe('set observers', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The CONFLICT notice and its episode: fixtures (SRJ-1004, SRJ-508, SRJ-1016)
+// The CONFLICT notice and its episode: fixtures
 // ---------------------------------------------------------------------------
 
 interface NoticeRun extends LatchRun {
@@ -1016,12 +1016,12 @@ const RECOVERY_REASONS: ReadonlyArray<readonly [string, LatchRecoveryReason]> = 
 ]
 
 // ---------------------------------------------------------------------------
-// Pin: SRJ-1004's and SRJ-1005's texts
+// Pin: and texts
 // ---------------------------------------------------------------------------
 
 describe('notice texts: pin', () => {
-  test('every case\'s CONFLICT notice, every fixed line and both recovery templates with each reason are SRJ-1004\'s and SRJ-1005\'s words', () => {
-    // The file's only literal block for these texts: SRJ-1004 and SRJ-1005 as written.
+  test('every case\'s CONFLICT notice, every fixed line and both recovery templates with each reason are and words', () => {
+    // The file's only literal block for these texts: and as written.
     const FIRST_WITH_CASE =
       ":no_entry: *Held: tmux session conflict* — agent-director will not act on this persona's tmux session <session>: <case sentence>. CSCB takes no action for this persona until the conflict clears, and messages sent to it meanwhile are lost."
     const FIRST_WITHOUT_CASE =
@@ -1110,7 +1110,7 @@ describe('notice texts: pin', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The CONFLICT notice by row (SRJ-1004, SRJ-508; AC 40, AC 77)
+// The CONFLICT notice by row
 // ---------------------------------------------------------------------------
 
 describe('the CONFLICT notice by row', () => {
@@ -1125,7 +1125,7 @@ describe('the CONFLICT notice by row', () => {
     for (const latchCase of HOLD_LATCH_CASES) expect(conflictCaseSentence(latchCase)).toBeUndefined()
   })
 
-  test.each(ROWS)('%s: the latch posts the row\'s notice once to the persona, its lines in SRJ-1004\'s order', (_name, row) => {
+  test.each(ROWS)('%s: the latch posts the row\'s notice once to the persona, its lines in the contract order', (_name, row) => {
     const run = makeNoticeRun()
     expect(latchOnRow(run.latch, KEY, row)).toBe(CONFLICT_LATCH_SET_LATCHED)
     expect(run.posts).toEqual([[KEY, row.notice.text]])
@@ -1172,7 +1172,7 @@ describe('the CONFLICT notice by row', () => {
 })
 
 // ---------------------------------------------------------------------------
-// No session-ending command in CSCB's own lines (SRJ-1001, SRJ-1004; AC 40)
+// No session-ending command in CSCB's own lines
 // ---------------------------------------------------------------------------
 
 describe('no session-ending command', () => {
@@ -1238,7 +1238,7 @@ describe('no session-ending command', () => {
     expect(sessionEndingCommandsIn(text)).toContain(form)
   })
 
-  test('the forms cover SRJ-1001\'s five commands, and none matches agent-director\'s own words or any stub description', () => {
+  test('the forms cover five commands, and none matches agent-director\'s own words or any stub description', () => {
     expect(SESSION_ENDING_COMMAND_FORMS.map((form) => form.name)).toEqual([
       'kill as a command',
       'pause',
@@ -1252,7 +1252,7 @@ describe('no session-ending command', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Redaction, the cap and Slack escaping (SRJ-1001, SRJ-508; E12 hatch note)
+// Redaction, the cap and Slack escaping ( design note)
 // ---------------------------------------------------------------------------
 
 describe('the quoted description and session in the notice', () => {
@@ -1314,7 +1314,7 @@ describe('the quoted description and session in the notice', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The list line's shell-quoted name (SRJ-1004; Epic hatch note "orchestrator ruling after E13")
+// The list line's shell-quoted name (component design note "orchestrator ruling after ")
 // ---------------------------------------------------------------------------
 
 /**
@@ -1481,7 +1481,7 @@ describe('the list line\'s session name is shell-quoted', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The record's listLineUnsafe through the latch (final-review fix #3, SRJ-501, SRJ-1004)
+// The record's listLineUnsafe through the latch (final-review fix #3)
 // ---------------------------------------------------------------------------
 
 describe('the record\'s listLineUnsafe: decided by set from the quoted name as given, and followed by the posted notice', () => {
@@ -1599,7 +1599,7 @@ describe('the record\'s listLineUnsafe: decided by set from the quoted name as g
 })
 
 // ---------------------------------------------------------------------------
-// The episode: once per latch episode (SRJ-508, SRJ-1016; AC 41)
+// The episode: once per latch episode
 // ---------------------------------------------------------------------------
 
 describe('the CONFLICT notice\'s episode', () => {
@@ -1642,7 +1642,7 @@ describe('the CONFLICT notice\'s episode', () => {
     expect(run.episodes.view(KEY, PERSONA_EPISODE_KIND_CONFLICT)).toEqual(first)
   })
 
-  test('a hold case opens no CONFLICT episode and posts no CONFLICT notice: each hold opens its own kind, and the unusable-name hold posts SRJ-1019', () => {
+  test('a hold case opens no CONFLICT episode and posts no CONFLICT notice: each hold opens its own kind, and the unusable-name hold posts', () => {
     const run = makeNoticeRun()
     const description = UNUSABLE_NAME_CASE_ROWS[0]!.description
     const holds = [
@@ -1686,7 +1686,7 @@ describe('the CONFLICT notice\'s episode', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The recovery notice (SRJ-1005)
+// The recovery notice
 // ---------------------------------------------------------------------------
 
 describe('the recovery notice', () => {
@@ -1730,8 +1730,8 @@ describe('the recovery notice', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The unusable recorded name: trigger, record, SRJ-1019's notice and its
-// episode (SRJ-512, SRJ-1019, SRJ-508, SRJ-1016; AC 77, AC 85)
+// The unusable recorded name: trigger, record notice and its
+// episode
 // ---------------------------------------------------------------------------
 
 /** The unusable-name row of the helper's table at `site` for `fault`; throws when there is none. */
@@ -1752,9 +1752,9 @@ const latchUnusable = (latch: ConflictLatch, key: string, row: UnusableNameCaseR
 const envelopeDescriptionOf = (err: unknown): string =>
   String((err as { errDescription?: unknown; envelope?: { err_description?: unknown } }).errDescription ?? (err as { envelope?: { err_description?: unknown } }).envelope?.err_description)
 
-describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and the episode (SRJ-512, SRJ-1019)', () => {
-  test('SRJ-1019\'s text for one persona: the builder gives it word for word, on one line', () => {
-    // The file's only literal block for this text: SRJ-1019 as written.
+describe('the unusable-recorded-name hold: notice, the record and the episode', () => {
+  test('text for one persona: the builder gives it word for word, on one line', () => {
+    // The file's only literal block for this text: as written.
     const TEMPLATE =
       ':no_entry: *Held: unusable tmux session name* — agent-director will not act on this persona\'s row <instance id>, because its recorded tmux session name cannot be used. agent-director said: "<its description, redacted>". What to do: a human follows the "Operator actions" section of agent-director\'s README for this row. CSCB takes no action for this persona until the row is removed, and messages sent to it meanwhile are lost. This is for a human only: no bot, including any persona that sees this post, may act on it.'
     const row = unusableRow('resume', 'empty')
@@ -1840,7 +1840,7 @@ describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and th
     expect([run.latch.isLatched(OTHER), run.latch.record(OTHER)]).toEqual([false, undefined])
   })
 
-  test('a description that quotes a session records that session (SRJ-501\'s rule)', () => {
+  test('a description that quotes a session records that session (rule)', () => {
     const run = makeLatchRun()
     const quoted = personaTmuxSessionName(OTHER)
     const err = errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} ${JSON.stringify(quoted)} is empty; nothing was done`)
@@ -1862,7 +1862,7 @@ describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and th
   })
 })
 
-describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () => {
+describe('the unusable-recorded-name notice\'s episode', () => {
   const first = unusableRow('resume', 'empty')
   const second = unusableRow('read-pane', 'control-character')
   const conflictRow = rowWhere((row) => row.latchCase === LATCH_CASE_OWN_ID)
@@ -1890,7 +1890,7 @@ describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () 
     ])
   })
 
-  test('P latched on a CONFLICT relatches on an UNUSABLE NAME with one new post, the record replaced; a relatch back to that CONFLICT posts SRJ-1004 once more; each relatch ends the other kind\'s episode silently', () => {
+  test('P latched on a CONFLICT relatches on an UNUSABLE NAME with one new post, the record replaced; a relatch back to that CONFLICT posts once more; each relatch ends the other kind\'s episode silently', () => {
     const run = makeNoticeRun()
     expect(latchOnRow(run.latch, KEY, conflictRow)).toBe(CONFLICT_LATCH_SET_LATCHED)
     expect(kindsOpen(run, KEY)).toEqual([true, false])
@@ -1917,7 +1917,7 @@ describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () 
 })
 
 // ---------------------------------------------------------------------------
-// The holds' set observer (SRJ-502; SRJ-610 and SRJ-1016's slow-recovery end)
+// The holds' set observer (and slow-recovery end)
 // ---------------------------------------------------------------------------
 
 /**
@@ -1941,7 +1941,7 @@ function recordingHolds(
   }
 }
 
-describe('the holds\' set observer: the slow-recovery end is the fourth hold (SRJ-502, SRJ-610, SRJ-1016)', () => {
+describe('the holds\' set observer: the slow-recovery end is the fourth hold', () => {
   test('on a set the four holds run for the persona in order, before a notice observer bound after them; a hold that throws is logged and the slow-recovery end still runs', () => {
     const { latch, lines } = makeLatchRun()
     const calls: Array<readonly [string, string]> = []
@@ -1970,7 +1970,7 @@ describe('the holds\' set observer: the slow-recovery end is the fourth hold (SR
   })
 })
 
-describe('the holds\' set observer: the stuck-launch end is the fifth hold (SRJ-502, SRJ-1016)', () => {
+describe('the holds\' set observer: the stuck-launch end is the fifth hold', () => {
   test('on a latch, a relatch and a same-case set the five holds run for the persona in order, the stuck-launch end last, before a notice observer bound after them; a throwing slow-recovery end is logged and the stuck-launch end still runs', () => {
     const { latch, lines } = makeLatchRun()
     const calls: Array<readonly [string, string]> = []
@@ -2014,7 +2014,7 @@ describe('the holds\' set observer: the stuck-launch end is the fifth hold (SRJ-
 })
 
 // ---------------------------------------------------------------------------
-// AC 46's automated half, on the recovery harness (SRJ-502, SRJ-501, SRJ-508)
+// automated half, on the recovery harness
 // ---------------------------------------------------------------------------
 
 /** Every recovery harness of this test, leak-checked and cleaned up in `afterEach`. */
@@ -2044,7 +2044,7 @@ interface AutomatedPathsRun {
   readonly killRow: (key: string) => void
   /** Persona `key`'s row reads `working` from now on, whatever its spawns answer. */
   readonly readWorking: (key: string) => void
-  /** Persona `key`'s row reads `pending` with no launch start from now on, whatever its spawns answer (b.jg5 SRJ-513). */
+  /** Persona `key`'s row reads `pending` with no launch start from now on, whatever its spawns answer. */
   readonly readPendingNoLaunchStart: (key: string) => void
   /**
    * Persona `key`'s row reads `pending` with the stub's launch start while
@@ -2074,7 +2074,7 @@ function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDep
   const working = new Set<string>()
   const noLaunchStart = new Set<string>()
   const pending = new Set<string>()
-  // b.omv SR-7.6: startup's fresh get proofs see the status script's row.
+  // startup's fresh get proofs see the status script's row.
   const get = h.stub.client.get.bind(h.stub.client)
   h.stub.client.get = async params => {
     const row = await get(params)
@@ -2156,8 +2156,8 @@ const CLEARED: RecoveryStubScript = { spawnError: undefined, spawnQueue: undefin
 /**
  * One relaunch of a row read `ended`: its liveness read, the spawn and the
  * launch's own read. No kill: the liveness read read the row finished, and
- * no automated path kills a row it has just read `ended` (b.jg5 SRJ-110,
- * SRJ-314, option A).
+ * no automated path kills a row it has just read `ended` (
+ * option A).
  */
 const RELAUNCH = { statusCalls: 1, spawnCalls: 1 }
 
@@ -2174,7 +2174,7 @@ const latchSteps = (h: RecoveryHarness) =>
 
 /** The one line a restart request for latched persona `key` logs instead of arming a timer. */
 const notSchedulingLine = (key: string) =>
-  `[slack] Not scheduling restart for persona=${key} — the persona is latched; no timer armed (b.jg5 SRJ-502)`
+  `[slack] Not scheduling restart for persona=${key} — the persona is latched; no timer armed`
 
 /** What `driveEveryPath` saw. */
 interface EveryPathRun {
@@ -2286,7 +2286,7 @@ const Q_CALLS_ON_EVERY_PATH = [
 
 /**
  * The retry timer path's attempts after `attemptsBefore`, as `[key, retry]`
- * (b.jg5 SRJ-301, SRJ-409): Q's successful launches on the earlier paths left
+ * Q's successful launches on the earlier paths left
  * its timer armed in pending-only mode, so it fires first while P's timer is
  * driven, reads Q's row live out of pending and stops; P's timer fires once
  * and stops latched, with no call; then Q's own timer runs its relaunch,
@@ -2295,7 +2295,7 @@ const Q_CALLS_ON_EVERY_PATH = [
  */
 const retryTimerAttempts = (p: string, q: string): Array<[string, number]> => [[q, 1], [p, 1], [q, 1], [q, 2]]
 
-describe('AC 46: no automated path kills, launches or recovers a latched persona (recovery harness)', () => {
+describe('no automated path kills, launches or recovers a latched persona (recovery harness)', () => {
   const plainSpawnRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
   )
@@ -2323,7 +2323,7 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
     // Each request for P logged the not-scheduling line once, and nothing else naming P.
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
-    // The new launch met the latched gate: its one line, naming P and the latch's case (SRJ-502, SRJ-1014).
+    // The new launch met the latched gate: its one line, naming P and the latch's case.
     expect(h.errors.filter((line) => line === latchedLaunchSkipLine(`[slack] ${COLLISION_GET_SITE.site}:`, personaRefOf(h, p), row.latchCase))).toHaveLength(1)
 
     const { scheduled, qCalls: qTickCalls } = await runHealthTick(run)
@@ -2424,7 +2424,7 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-1002 (SRJ-501, SRJ-512): a CONFLICT or an UNUSABLE NAME met for a
+// a CONFLICT or an UNUSABLE NAME met for a
 // persona no longer in the applied configuration latches nothing, on the
 // recovery harness (its configured-persona query over the live applied set)
 // ---------------------------------------------------------------------------
@@ -2462,7 +2462,7 @@ const NOT_CONFIGURED_ENTRIES: ReadonlyArray<readonly [string, LatchEntryRun, () 
   ],
 ]
 
-describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer in the applied configuration sets no latch, posts nothing and writes no startup-errors entry, with one line naming the persona, the case and the refused operation; a configured persona beside it latches (recovery harness; SRJ-501, SRJ-512, SRJ-1002, SRJ-1014)', () => {
+describe('a CONFLICT or an UNUSABLE NAME met for a persona no longer in the applied configuration sets no latch, posts nothing and writes no startup-errors entry, with one line naming the persona, the case and the refused operation; a configured persona beside it latches (recovery harness)', () => {
   const CASES = NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow, unusableRow]) => [
     [entry, 'a CONFLICT', run, (): Error => conflictRow().build(), (): LatchCase => conflictRow().latchCase, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY],
     [entry, 'an UNUSABLE NAME', run, (): Error => unusableRow().build(), (): LatchCase => LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE],
@@ -2488,7 +2488,7 @@ describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer i
     expect([h.notices, h.startupErrors()]).toEqual([[], []])
   })
 
-  // b.jg5 SRJ-1002: a throwing query latches as a configured persona, with
+  // a throwing query latches as a configured persona, with
   // one line naming the persona and the thrown value (`latchEntryQueryFailedLine`).
   const QUERY_BROKE = new Error('the query broke')
   test.each(NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow, unusableRow]) => [
@@ -2510,7 +2510,7 @@ describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer i
     expect(h.errors.filter((line) => line === latchEntryQueryFailedLine(p, describeThrownValue(QUERY_BROKE)))).toHaveLength(queryFailedLines)
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003: the guard reads P's teardown window through the
+  // the guard reads P's teardown window through the
   // installed notice episodes (`setStuckLaunchEpisodes`; here real episodes
   // whose teardown query answers `window`). Inside an open window a removed P
   // latches as a configured persona (its notice goes through the latch's
@@ -2542,12 +2542,12 @@ describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer i
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-610, SRJ-1016, SRJ-502: a latch ends P's open slow-recovery episode
+// a latch ends P's open slow-recovery episode
 // silently and resets its count, through the harness's hold observer as
 // main() binds it; Q's episode is left as it is
 // ---------------------------------------------------------------------------
 
-describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery episode silently and resets its count; Q\'s is untouched (recovery harness)', () => {
+describe('P\'s latch ends its open slow-recovery episode silently and resets its count; Q\'s is untouched (recovery harness)', () => {
   /** The working-row verdict's `read-pane` CONFLICT row: P's next run latches P through the latch's set entry. */
   const reconnectConflict = reconnectConflictRowsAt('working')[0]!
   const SLOW = PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY
@@ -2634,13 +2634,13 @@ describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery epi
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-1016, SRJ-502: a latch, and a relatch with a new case, end P's open
+// a latch, and a relatch with a new case, end P's open
 // stuck-launch episode silently, through the harness's hold observer as
 // main() binds it; a later post of the same text posts again; Q's episode is
 // left as it is
 // ---------------------------------------------------------------------------
 
-describe('SRJ-1016, SRJ-502: P\'s latch and relatch end its open stuck-launch episode silently; a later post posts again; Q\'s is untouched (recovery harness)', () => {
+describe('P\'s latch and relatch end its open stuck-launch episode silently; a later post posts again; Q\'s is untouched (recovery harness)', () => {
   const STUCK = PERSONA_EPISODE_KIND_STUCK_LAUNCH
   /** P's first latch: the plain first spawn meets the pre-spawn scan's leftover. */
   const leftoverRow = rowWhere(
@@ -2728,7 +2728,7 @@ describe('SRJ-1016, SRJ-502: P\'s latch and relatch end its open stuck-launch ep
     ])
     expect([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(q, STUCK)]).toEqual([true, true])
 
-    // An `ended` read ends no stuck-launch episode by itself (SRJ-1016), so the end below is the relatch's.
+    // An `ended` read ends no stuck-launch episode by itself, so the end below is the relatch's.
     const atNotice = stateAtNotice(h, p, q)
     const linesBefore = h.lines.length
     h.script({ spawnError: undefined, getResult: cannedGetResult({ state: 'ended', liveness_note: provenanceNote }, personaOf(h, p), h.home) })
@@ -2749,13 +2749,13 @@ describe('SRJ-1016, SRJ-502: P\'s latch and relatch end its open stuck-launch ep
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-502, SRJ-1011: a message lost while P is latched reports held for a
-// human, and no restart fires (AC 68), through the recovery harness's
+// a message lost while P is latched reports held for a
+// human, and no restart fires, through the recovery harness's
 // lost-message driver: the real routing's no-session branch with the
 // harness's latch's latched query bound as `main()` binds it
 // ---------------------------------------------------------------------------
 
-describe('SRJ-502, SRJ-1011: an accepted message while P is latched stays queued and fires no restart (recovery harness)', () => {
+describe('an accepted message while P is latched stays queued and fires no restart (recovery harness)', () => {
   const leftoverRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
   )
@@ -2784,7 +2784,7 @@ describe('SRJ-502, SRJ-1011: an accepted message while P is latched stays queued
 
     // Q is not latched: its message reports the state that applies to it at
     // the delay 0. States 1 to 5 are clear for Q and nothing is in flight, so
-    // its message makes the routing's one row read (SRJ-1011), a `status` of
+    // its message makes the routing's one row read, a `status` of
     // Q's instance, which reads no row (dead), not `pending`.
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
     expect(h.slack(q).calls.postMessage).toHaveLength(0)
@@ -2797,17 +2797,17 @@ describe('SRJ-502, SRJ-1011: an accepted message while P is latched stays queued
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-512, SRJ-502: an UNUSABLE NAME from `resume` and from the working-row
-// evidence `read-pane` latches P once, posts SRJ-1019 once, and is followed
+// an UNUSABLE NAME from `resume` and from the working-row
+// evidence `read-pane` latches P once, posts once, and is followed
 // by no tmux-touching call, delete or counted failure on any
-// automated path; a lost message then reports held for a human (AC 68, AC 77)
+// automated path; a lost message then reports held for a human
 // ---------------------------------------------------------------------------
 
 /** The instance id a stub call's params name, if any. */
 const instanceOf = (params: unknown): unknown => (params as { instance_id?: unknown } | undefined)?.instance_id
 
 // ---------------------------------------------------------------------------
-// SRJ-118, SRJ-505, SRJ-502, SRJ-512: the reconnect is a latch site. P
+// the reconnect is a latch site. P
 // launches onto a colliding `waiting` row and its reconnect's one `send-keys`
 // answers CONFLICT (a case-table reconnect row for `waiting`) or UNUSABLE
 // NAME: P latches once with one post, and no path that could retry it (a new
@@ -2842,7 +2842,7 @@ const RECONNECT_LATCH_WAYS: ReadonlyArray<
   ] as const),
 ]
 
-describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send-keys holds P, and no automated path retries it (recovery harness)', () => {
+describe('a CONFLICT or UNUSABLE NAME at the reconnect\'s send-keys holds P, and no automated path retries it (recovery harness)', () => {
   test.each(RECONNECT_LATCH_WAYS)('P latched by its reconnect\'s %s: one post; then a new launch, the retry entry, a scheduled and a human-triggered restart, the retry timer and the health tick make no send-keys, other tmux-touching call or delete for P and count nothing; the retry timer is stopped; Q launches and reconnects as before', async (_label, record, notice, latchScript) => {
     const run = makeAutomatedPathsRun()
     const { h, outcomes } = run
@@ -2920,7 +2920,7 @@ const KILL_LATCH_WAYS: ReadonlyArray<
 
 ]
 
-describe('SRJ-110, SRJ-505 (AC 9): a CONFLICT or UNUSABLE NAME at P\'s kill holds P, and no automated path sends the kill again (recovery harness)', () => {
+describe('a CONFLICT or UNUSABLE NAME at P\'s kill holds P, and no automated path sends the kill again (recovery harness)', () => {
   test.each(KILL_LATCH_WAYS)('P latched by %s: one post; P\'s retry timer stops; then a new launch, the retry entry, a scheduled and a human-triggered restart, the retry timer and the health tick make no kill, delete, spawn, resume or other tmux-touching call for P and count nothing: exactly one kill of P; Q goes on as before', async (_label, record, notice, latch) => {
     const run = makeAutomatedPathsRun()
     const { h, outcomes } = run
@@ -2973,11 +2973,11 @@ describe('SRJ-110, SRJ-505 (AC 9): a CONFLICT or UNUSABLE NAME at P\'s kill hold
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-504: a server restart drops every latch; the next attempt meeting the
-// same condition latches again with exactly one post (AC 45)
+// a server restart drops every latch; the next attempt meeting the
+// same condition latches again with exactly one post
 // ---------------------------------------------------------------------------
 
-describe('SRJ-504: after a server restart a persona that was latched latches again with exactly one post (recovery harness)', () => {
+describe('after a server restart a persona that was latched latches again with exactly one post (recovery harness)', () => {
   const scanRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
   )
@@ -2987,7 +2987,7 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
   /**
    * Each leg: the row its refusal is (whose refused operation the latch
    * records), the stub's answers (the same in both lifetimes: the condition
-   * still holds after the restart), the row state the latch records by T3's
+   * still holds after the restart), the row state the latch records by
    * rule, and the calls the bring-up's launch makes.
    */
   const RESTART_LEGS: ReadonlyArray<
@@ -3003,7 +3003,7 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
       ['spawn', 'status'],
     ],
     [
-      // b.jg5 SRJ-504, SRJ-707: the row reads ended with no session id, so the
+      // the row reads ended with no session id, so the
       // resume answers ErrNoSessionId and the bring-up's reuse spawn of the
       // same id meets the session with no valid label; nothing is deleted, and
       // the collision get's ended is the last read before the reuse (no
@@ -3095,13 +3095,13 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-507 at a real reuse site (the E13 hatch note; b.jg5 SRJ-707): the
+// at a real reuse site (the design note): the
 // collision ladder's reuse spawn after `resume`'s `ErrNoSessionId`, on
 // `makeRecoveryHarness`. The reuse meets another agent-director store's
 // session at "duplicate session", in both forms of the stub's description.
 // ---------------------------------------------------------------------------
 
-describe('SRJ-507: the another-store description at the ladder\'s ErrNoSessionId reuse site latches P with "another agent-director store" and "reuse spawn" (recovery harness)', () => {
+describe('the another-store description at the ladder\'s ErrNoSessionId reuse site latches P with "another agent-director store" and "reuse spawn" (recovery harness)', () => {
   /** Both forms of the another-store description, each a reuse row: the reuse's own wording, then the plain spawn's. */
   const ANOTHER_STORE_REUSE_ROWS = [false, true].map((plainSpawn) =>
     REUSE_SPAWN_CONFLICT_CASE_ROWS.find((row) => row.latchCase === LATCH_CASE_ANOTHER_STORE && (row.options.plainSpawn === true) === plainSpawn)!,
@@ -3137,8 +3137,8 @@ describe('SRJ-507: the another-store description at the ladder\'s ErrNoSessionId
 })
 
 // ---------------------------------------------------------------------------
-// The note rules (SRJ-114; SRJ-501's note trigger; SRJ-1004's note notice;
-// AC 40, AC 45, AC 85)
+// The note rules (note trigger note notice;
+//)
 // ---------------------------------------------------------------------------
 
 /**
@@ -3172,7 +3172,7 @@ const NON_LATCHING_NOTES: ReadonlyArray<readonly [string, string | null | undefi
   ['an empty note', ''],
 ]
 
-describe('the note rules: the pure decision over one read of a persona\'s own row (SRJ-114)', () => {
+describe('the note rules: the pure decision over one read of a persona\'s own row', () => {
   test.each(ROW_STATES)('a configured persona\'s own row in state %s with the latching note decides a latch: conflicting labels, P\'s bring-up and the state read', (state) => {
     expect(decideOwnRowRead({ key: KEY, row: rowRead(personaInstanceId(KEY), provenanceNote, state), configured: true })).toEqual({
       latch: { latchCase: LATCH_CASE_CONFLICTING_LABELS, refusedOperation: REFUSED_OPERATION_BRING_UP, rowState: latchRowStateRead(state) },
@@ -3199,7 +3199,7 @@ describe('the note rules: the pure decision over one read of a persona\'s own ro
   })
 })
 
-describe('the note latch through the own-row read: record, notice, relatch and who latches (recovery harness; SRJ-114, SRJ-501, SRJ-1004)', () => {
+describe('the note latch through the own-row read: record, notice, relatch and who latches (recovery harness)', () => {
   /** The reading site the log lines name; any site reads the same way. */
   const SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'own-row get' }
 
@@ -3250,7 +3250,7 @@ describe('the note latch through the own-row read: record, notice, relatch and w
     expect(personaCallCounts(h, p)).toEqual({ getCalls: 2 })
   })
 
-  test('the note latch\'s notice is SRJ-1004\'s conflicting-labels notice for slack_bot_<key>: the first line with the case sentence, the pointer, the list and the human-only lines, and no "agent-director said" line', async () => {
+  test('the note latch\'s notice is conflicting-labels notice for slack_bot_<key>: the first line with the case sentence, the pointer, the list and the human-only lines, and no "agent-director said" line', async () => {
     const { h, p } = makeNoteRun()
     h.script(ownRowAnswer(h, p, provenanceNote))
     await readPersonaOwnRow(p, SITE)
@@ -3350,8 +3350,7 @@ describe('the note latch through the own-row read: record, notice, relatch and w
 })
 
 // ---------------------------------------------------------------------------
-// A `pending` row with no launch start (SRJ-513, SRJ-1020, SRJ-508, SRJ-1016;
-// AC 8, AC 68, AC 86): the decision, the notice, the record and episode, the
+// A `pending` row with no launch start: the decision, the notice, the record and episode, the
 // hold on every automated path, the latch-time read's precedence and the
 // lost message
 // ---------------------------------------------------------------------------
@@ -3406,7 +3405,7 @@ function latchFromLaunchStartRead(latch: ConflictLatch, key: string, row: Launch
   return latch.setLaunchStartNotRecorded(key, decision.latch.rowState)
 }
 
-describe('the launch-start decision over one read of a persona\'s own row (SRJ-513, SRJ-408)', () => {
+describe('the launch-start decision over one read of a persona\'s own row', () => {
   test.each(LAUNCH_START_ROWS)('%s: the decision latches with "launch start not recorded", "none" and pending; latched from it, P records that with slack_bot_<key> and the post is the row\'s notice, once', (_name, row) => {
     expect(launchStartDecision(row)).toEqual({
       latch: { latchCase: row.latchCase, refusedOperation: row.refusedOperation, rowState: row.rowState },
@@ -3433,9 +3432,9 @@ describe('the launch-start decision over one read of a persona\'s own row (SRJ-5
   })
 })
 
-describe('SRJ-1020\'s notice for a launch start not recorded', () => {
-  test('SRJ-1020\'s text for one persona: the builder gives it word for word, on one line', () => {
-    // The file's only literal block for this text: SRJ-1020 as written.
+describe('notice for a launch start not recorded', () => {
+  test('text for one persona: the builder gives it word for word, on one line', () => {
+    // The file's only literal block for this text: as written.
     const TEMPLATE =
       ':no_entry: *Held: launch start not recorded* — this persona\'s agent-director row reads pending but records no launch start, so it was written by an agent-director process older than the install, and agent-director will not act on its session <session>. A human should look: follow the "Operator actions" section of agent-director\'s README. CSCB takes no action for this persona until the row reads ended or missing, or is removed, and messages sent to it meanwhile are lost. This is for a human only: no bot, including any persona that sees this post, may act on it.'
     const expected = TEMPLATE.replace('<session>', () => JSON.stringify(`slack_bot_${KEY}`))
@@ -3489,7 +3488,7 @@ describe('SRJ-1020\'s notice for a launch start not recorded', () => {
   })
 })
 
-describe('the launch-start latch\'s record and episode (SRJ-513, SRJ-508, SRJ-1016)', () => {
+describe('the launch-start latch\'s record and episode', () => {
   const kindsOpen = (run: NoticeRun, key: string) => [
     run.episodes.isOpen(key, PERSONA_EPISODE_KIND_CONFLICT),
     run.episodes.isOpen(key, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME),
@@ -3619,8 +3618,8 @@ const LAUNCH_START_ORIGINS: ReadonlyArray<readonly [string, (run: AutomatedPaths
   ],
 ]
 
-describe('SRJ-513: a pending row with no launch start holds P for a human on every automated path (recovery harness)', () => {
-  test.each(LAUNCH_START_ORIGINS)('P latched by %s: then the retry timer over several waits, a scheduled and a human-triggered restart, the retry entry and a new launch make no send-keys, kill, read-pane, find-missing, spawn or resume for P, count nothing and leave no timer armed; one SRJ-1020 post; Q\'s paths reach the stub as before', async (_label, origin) => {
+describe('a pending row with no launch start holds P for a human on every automated path (recovery harness)', () => {
+  test.each(LAUNCH_START_ORIGINS)('P latched by %s: then the retry timer over several waits, a scheduled and a human-triggered restart, the retry entry and a new launch make no send-keys, kill, read-pane, find-missing, spawn or resume for P, count nothing and leave no timer armed; one post; Q\'s paths reach the stub as before', async (_label, origin) => {
     const run = makeAutomatedPathsRun()
     const { h, outcomes } = run
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -3655,7 +3654,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
     expect(h.stops.filter((stop) => stop.key === p).slice(pStopsAtLatch)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect([h.controller.isArmed(p), h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([false, [], false])
-    // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post: SRJ-1020.
+    // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post:.
     expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
     expect(h.notices).toEqual([])
     expect(h.startupErrors()).toEqual([])
@@ -3666,8 +3665,8 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
   })
 
-  // SRJ-513's list leg at the real start sweep (SRJ-116, SRJ-714; the E16
-  // hatch note): the sweep lists P's own row reading pending with no launch
+  // list leg at the real start sweep (the
+  // design note): the sweep lists P's own row reading pending with no launch
   // start, as `main()` runs it before the start pass. Another existing cwd
   // is a row the sweep kills when P is not latched.
   const LISTED_NO_LAUNCH_START: ReadonlyArray<readonly [string, (h: RecoveryHarness) => Partial<ListRow>]> = [
@@ -3676,7 +3675,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     ['in another existing cwd', (h) => ({ cwd: h.home })],
   ]
 
-  test.each(LISTED_NO_LAUNCH_START)('the start sweep lists P\'s own pending row with no launch start %s: P latches with "launch start not recorded" and one SRJ-1020 post; no kill, send-keys or delete of P\'s row follows from the sweep or the start pass after it; a lost message for P reports held for a human', async (_label, overrides) => {
+  test.each(LISTED_NO_LAUNCH_START)('the start sweep lists P\'s own pending row with no launch start %s: P latches with "launch start not recorded" and one post; no kill, send-keys or delete of P\'s row follows from the sweep or the start pass after it; a lost message for P reports held for a human', async (_label, overrides) => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p, q] = h.keys as [string, string]
@@ -3701,7 +3700,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
   })
 
-  // b.jg5 SRJ-305, SRJ-301: a launch that returned success arms P's
+  // a launch that returned success arms P's
   // pending-only watch, but never for a latched persona. P latches while its
   // spawn is in flight (an own-row read of its pending row with no launch
   // start); the spawn then returns: no pending-only arm, one line saying why.
@@ -3760,7 +3759,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
   })
 })
 
-describe('SRJ-513, A2: a CONFLICT or an UNUSABLE NAME whose latch-time status read finds P\'s own row pending with no launch start leaves P latched with "launch start not recorded" alone, with one post (recovery harness)', () => {
+describe(', A2: a CONFLICT or an UNUSABLE NAME whose latch-time status read finds P\'s own row pending with no launch start leaves P latched with "launch start not recorded" alone, with one post (recovery harness)', () => {
   const plainSpawnConflict = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
   )
@@ -3769,7 +3768,7 @@ describe('SRJ-513, A2: a CONFLICT or an UNUSABLE NAME whose latch-time status re
   test.each([
     ['a CONFLICT (a case-table row)', (): Error => plainSpawnConflict.build()],
     ['an UNUSABLE NAME', (): Error => plainSpawnUnusable.build()],
-  ] as const)('P\'s first spawn refused with %s: the latch-time read latches P with the launch-start case, no other case is set on top, and the one post is SRJ-1020\'s', async (_label, spawnError) => {
+  ] as const)('P\'s first spawn refused with %s: the latch-time read latches P with the launch-start case, no other case is set on top, and the one post is', async (_label, spawnError) => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p, q] = h.keys as [string, string]
@@ -3785,7 +3784,7 @@ describe('SRJ-513, A2: a CONFLICT or an UNUSABLE NAME whose latch-time status re
   })
 })
 
-describe('SRJ-513, SRJ-512: P latched on another case relatches through a real own-row status read with one new post (recovery harness)', () => {
+describe('P latched on another case relatches through a real own-row status read with one new post (recovery harness)', () => {
   /** The reading site the step's lines name. */
   const SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'own-row status read' }
   const conflictRow = rowWhere(
@@ -3829,7 +3828,7 @@ describe('SRJ-513, SRJ-512: P latched on another case relatches through a real o
     ],
   ]
 
-  test.each(FIRST_LATCHES)('P latched first on %s: a status read of P\'s own pending row with no launch start relatches it with "launch start not recorded", ends the first episode, posts SRJ-1020 once and logs the relatched line', async (_label, latchFirst, firstCase, firstPost, firstKind) => {
+  test.each(FIRST_LATCHES)('P latched first on %s: a status read of P\'s own pending row with no launch start relatches it with "launch start not recorded", ends the first episode, posts once and logs the relatched line', async (_label, latchFirst, firstCase, firstPost, firstKind) => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p, q] = h.keys as [string, string]
@@ -3849,12 +3848,12 @@ describe('SRJ-513, SRJ-512: P latched on another case relatches through a real o
       { key: p, text: launchStartNotRecordedNoticeText(p) },
     ])
     expect(stepLinesSince(h, p, from)).toEqual([
-      `${stepHead(p)}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — the persona relatched; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`,
+      `${stepHead(p)}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — the persona relatched; nothing more is called for it`,
     ])
     expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
   })
 
-  test('P latched on "launch start not recorded" by a status read: a status read answering UNUSABLE NAME relatches it with "unusable recorded name", ends the launch-start episode, posts SRJ-1019 once and logs the relatched line', async () => {
+  test('P latched on "launch start not recorded" by a status read: a status read answering UNUSABLE NAME relatches it with "unusable recorded name", ends the launch-start episode, posts once and logs the relatched line', async () => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p, q] = h.keys as [string, string]
@@ -3880,12 +3879,12 @@ describe('SRJ-513, SRJ-512: P latched on another case relatches through a real o
     // The answer is rendered by the redacting describer between the head and the outcome.
     const lines = stepLinesSince(h, p, from)
     expect(lines).toHaveLength(1)
-    expect(lines[0]!.endsWith(' — UNUSABLE NAME: the persona relatched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)')).toBe(true)
+    expect(lines[0]!.endsWith(' — UNUSABLE NAME: the persona relatched; nothing more is called for it')).toBe(true)
     expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
   })
 })
 
-describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with no launch start (AC 68, recovery harness)', () => {
+describe('a message lost for P whose row reads pending with no launch start (recovery harness)', () => {
   /** A harness (both settings 0) whose `status` answers `script`, with its two personas. */
   function makeLostRun(script: (p: string) => RecoveryStubScript): { h: RecoveryHarness; p: string; q: string } {
     const h = makeRecoveryHarness()
@@ -3903,7 +3902,7 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
     expect(getFailureCount(p)).toBe(0)
   }
 
-  test('with nothing latched, the message\'s one status read latches P and the accepted message stays queued with no intake notice or restart; one SRJ-1020 episode post; Q makes its own row read', async () => {
+  test('with nothing latched, the message\'s one status read latches P and the accepted message stays queued with no intake notice or restart; one episode post; Q makes its own row read', async () => {
     const { h, p, q } = makeLostRun(pNoLaunchStartStatus)
     await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
     expect(posts(h.slack(p))).toEqual([])
@@ -3915,7 +3914,7 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
     expect(h.latch.isLatched(q)).toBe(false)
   })
 
-  test('the same lost-message read answering UNUSABLE NAME latches P with "unusable recorded name"; the message reports held for a human, with no restart; one SRJ-1019 post', async () => {
+  test('the same lost-message read answering UNUSABLE NAME latches P with "unusable recorded name"; the message reports held for a human, with no restart; one post', async () => {
     const row = unusableRow('status', 'empty')
     const { h, p, q } = makeLostRun((key) => ({
       statusFn: (params) => (params.instance_id === personaInstanceId(key) ? errUnusableName('empty') : errSpawnNotFound()),
@@ -4003,8 +4002,7 @@ const OTHER_LATCH_PATHS: ReadonlyArray<readonly [string, (run: AutomatedPathsRun
 ]
 
 // ---------------------------------------------------------------------------
-// The live-row sequence's own latches (E21; b.jg5 SRJ-110, SRJ-501, SRJ-512,
-// SRJ-513, SRJ-114, SRJ-613; the E13, E14, E16 and E20 hatch notes)
+// The live-row sequence's own latches (// the and design notes)
 //
 // On `makeRecoveryHarness` with its sequence driver (`runSequence`): P's
 // sequence meets each of the case table's sequence-kill rows at its step-1 or
@@ -4035,7 +4033,7 @@ function stateReadOf(rowState: LatchRowState): string {
 
 const SEQUENCE_LATCH_WAYS: ReadonlyArray<readonly [string, SequenceLatchWay]> = [
   ...SEQUENCE_KILL_CONFLICT_CASE_ROWS.map((row) => [
-    `CONFLICT (${row.name}${row.killBackstop === true ? ", SRJ-613's kill backstop" : ''})`,
+    `CONFLICT (${row.name}${row.killBackstop === true ? "kill backstop" : ''})`,
     {
       site: row.site as SequenceKillSite,
       state: stateReadOf(row.rowState),
@@ -4074,7 +4072,7 @@ async function scriptSequenceKill(h: RecoveryHarness, key: string, site: Sequenc
   return callsBeforeSequenceKill(step)
 }
 
-describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME, a note at a get, a pending row with no launch start (recovery harness; SRJ-110, SRJ-501, SRJ-512, SRJ-513, SRJ-114, SRJ-613)', () => {
+describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME, a note at a get, a pending row with no launch start (recovery harness)', () => {
   /** A recovery harness, cleaned up and leak-checked in `afterEach`. */
   function makeSequenceRun(): { h: RecoveryHarness; p: string; q: string } {
     const h = makeRecoveryHarness()
@@ -4193,15 +4191,14 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
 })
 
 // ---------------------------------------------------------------------------
-// The reuse spawn's latches at the live-row sequence's final launch (E22;
-// b.jg5 SRJ-112, SRJ-501, SRJ-507, SRJ-512; HO rev 15, rev 20; AC 77, AC 85)
+// The reuse spawn's latches at the live-row sequence's final launch (// HO rev 15, rev 20)
 //
 // On `makeRecoveryHarness`, P's sequence ending in the session manager's
 // reuse spawn: step 3's `get` reads P's row `ended` (a reuse of a finished
 // row) or, for the pre-spawn scan's rows, no row (a reuse of an id with no
 // row, an ordinary fresh spawn). The reuse at the collision ladder's
 // no-transcript site is tests/session-manager.test.ts's CONFLICT site table,
-// with SRJ-504's restart leg and SRJ-507's another-store case above.
+// with restart leg and another-store case above.
 // ---------------------------------------------------------------------------
 
 /** How a reuse meets its latch: whether its id has no row, its answer, and what it records and posts. */
@@ -4240,7 +4237,7 @@ function reuseRowRead(h: RecoveryHarness, key: string, noRow: boolean): Recovery
   return noRow ? { getError: errSpawnNotFound() } : { getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, key), h.home) }
 }
 
-describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT with the reuse spawn refused, UNUSABLE NAME with none (recovery harness; SRJ-112, SRJ-501, SRJ-507, SRJ-512; AC 77, AC 85)', () => {
+describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT with the reuse spawn refused, UNUSABLE NAME with none (recovery harness)', () => {
   /** A recovery harness, cleaned up and leak-checked in `afterEach`. */
   function makeReuseRun(): { h: RecoveryHarness; p: string; q: string } {
     const h = makeRecoveryHarness()
@@ -4269,7 +4266,7 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
     expect([getFailureCount(p), h.notices, h.startupErrors()]).toEqual([0, [], []])
   })
 
-  test.each(REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('SRJ-512\'s reuse case (%s): the one post points to "Operator actions" and CSCB\'s own words name no session-ending command; a message lost then reports held for a human with no call and no restart', async (_name, row) => {
+  test.each(REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('reuse case (%s): the one post points to "Operator actions" and CSCB\'s own words name no session-ending command; a message lost then reports held for a human with no call and no restart', async (_name, row) => {
     const { h, p, q } = makeReuseRun()
     h.script({ ...reuseRowRead(h, p, false), spawnError: row.build() })
     await h.runSequence(p, { lastReadState: cannedStatusResult().state })
@@ -4313,8 +4310,8 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
 })
 
 // ---------------------------------------------------------------------------
-// A running live-row sequence stops when P latches from another path (E21
-// T2; b.jg5 SRJ-502, SRJ-706; the E13 hatch note)
+// A running live-row sequence stops when P latches from another path (
+// the design note)
 //
 // On `makeAutomatedPathsRun`'s recovery harness, whose registry is installed
 // after the latch as main() installs it, with P's and Q's sequences started
@@ -4323,13 +4320,13 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
 // and retry's `status` read of P's own `pending` row with no launch start):
 // the latch's set observer stops P's sequence, so once its run is released
 // it makes no further `get`, kill or launch, and no kill of `cscb_<key>`
-// follows the latch (AC 46); Q's sequence, not latched, runs on to its
+// follows the latch; Q's sequence, not latched, runs on to its
 // launch. A start of a latched P's sequence (no call at all) is
 // tests/live-row-sequence.test.ts's; a latch installed after the registry,
 // tests/session-manager.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('a running live-row sequence stops when P latches from another path: no further get, kill or launch for P, and one post (recovery harness; SRJ-502, SRJ-706, AC 46)', () => {
+describe('a running live-row sequence stops when P latches from another path: no further get, kill or launch for P, and one post (recovery harness)', () => {
   test.each(OTHER_LATCH_PATHS.filter(([name]) => name.startsWith('an own-row')))('P latched by %s while its first run is held: a launch of P meanwhile answers latched; once the run is released the sequence ends stopped for the latch and makes no further call for P, with only the latch\'s own post and no alert or timer left; Q\'s sequence beside it runs on to its launch', async (_name, latchP, latchCase) => {
     const run = makeAutomatedPathsRun()
     const { h } = run
@@ -4366,7 +4363,7 @@ describe('a running live-row sequence stops when P latches from another path: no
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
     expect(killFailureLines(h, p)).toEqual([])
 
-    // Q's sequence's launch left Q's timer armed pending-only (b.jg5 SRJ-301, SRJ-409); P has none. Once it is stopped, nothing is pending.
+    // Q's sequence's launch left Q's timer armed pending-only; P has none. Once it is stopped, nothing is pending.
     expectPendingOnlyWatch(h, q)
     expect(h.controller.armedKeys()).toEqual([q])
     h.controller.stop(q, 'the case is over')
@@ -4375,7 +4372,7 @@ describe('a running live-row sequence stops when P latches from another path: no
 })
 
 // ---------------------------------------------------------------------------
-// The not-resumable step's re-read latches (b.jg5 SRJ-710, SRJ-114, SRJ-513)
+// The not-resumable step's re-read latches
 //
 // On `makeRecoveryHarness`. The re-read after `resume`'s ErrSpawnNotResumable
 // goes through the shared own-row read, so its latch rules apply: P's launch
@@ -4389,7 +4386,7 @@ describe('a running live-row sequence stops when P latches from another path: no
 // and the sequence-launch entry's).
 // ---------------------------------------------------------------------------
 
-describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, SRJ-114, SRJ-513)', () => {
+describe('the not-resumable step\'s re-read latches (recovery harness)', () => {
   /** A recovery harness, cleaned up and leak-checked in `afterEach`, with P's timer armed so its latch's stop shows. */
   function makeRun(): { h: RecoveryHarness; p: string; q: string } {
     const h = makeRecoveryHarness()
@@ -4455,16 +4452,16 @@ describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, 
 })
 
 // ---------------------------------------------------------------------------
-// The latch re-check (b.jg5 SRJ-505; E30 T1). The decision for every row of
+// The latch re-check . The decision for every row of
 // the case table (every site kind's CONFLICT rows, the "this row's own id"
 // rows once their probe is dropped, the UNUSABLE NAME rows, the launch-start
 // rows and the note rows), against the columns `conflict-cases.ts` writes
-// from SRJ-505's text; then, on the recovery harness with the re-check bound
+// from the contract text; then, on the recovery harness with the re-check bound
 // as main() binds it and `health_check_interval` 0, one case per row: each
 // round, one interval apart, makes step 1's read and exactly the call the
 // row's columns name, a still-latched answer keeping the record with no
 // post and no call between rounds. A clear's recovery post and what follows
-// it (SRJ-506) are the cases of "The clear" section below: these assert that
+// it are the cases of "The clear" section below: these assert that
 // P is no longer latched and its timer stopped.
 // ---------------------------------------------------------------------------
 
@@ -4489,8 +4486,8 @@ interface RecheckTableRow {
 /**
  * Every CONFLICT row of the case table: {@link CONFLICT_CASE_ROWS}, then the
  * rows kept out of it because only their recorded state differs (the
- * live-row sequence's step-6 `resume`, E21/E23; the plain spawn recorded
- * unreadable or live, hatch A3).
+ * live-row sequence's step-6 `resume`, ; the plain spawn recorded
+ * unreadable or live, design A3).
  */
 const EVERY_CONFLICT_ROW: readonly ConflictCaseRow[] = [...CONFLICT_CASE_ROWS, ...SEQUENCE_RESUME_CONFLICT_CASE_ROWS, ...PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS]
 
@@ -4548,7 +4545,7 @@ const RECHECK_TABLE: readonly RecheckTableRow[] = [
 /** `test.each` rows over the re-check table: the row name, then the row. */
 const RECHECK_ROWS = RECHECK_TABLE.map((row) => [row.name, row] as const)
 
-describe('the latch re-check\'s decision for every row of the case table (SRJ-505, SRJ-1304; pure)', () => {
+describe('the latch re-check\'s decision for every row of the case table (pure)', () => {
   test('the re-check table holds every row of every site kind once, the probe-dropped columns only on the resume and reuse "this row\'s own id" rows, every answer a column scripts builds (a CONFLICT one recognised as its case), and no description names "no pane 0.0"', () => {
     const ownIdLaunchRows = EVERY_CONFLICT_ROW.filter(
       (row) => row.latchCase === LATCH_CASE_OWN_ID && (row.refusedOperation === REFUSED_OPERATION_RESUME || row.refusedOperation === REFUSED_OPERATION_REUSE_SPAWN),
@@ -4558,13 +4555,13 @@ describe('the latch re-check\'s decision for every row of the case table (SRJ-50
       EVERY_CONFLICT_ROW.length + ownIdLaunchRows.length + UNUSABLE_NAME_CASE_ROWS.length + LAUNCH_START_CASE_ROWS.length + 1 + NOTE_LATCH_CASE_ROWS.length,
     )
     expect(new Set(RECHECK_TABLE.map((row) => row.name)).size).toBe(RECHECK_TABLE.length)
-    // b.jg5 SRJ-507 (rev 17): "no pane 0.0" is withdrawn; no row's description, nor any answer a column scripts, names it.
+    // (rev 17): "no pane 0.0" is withdrawn; no row's description, nor any answer a column scripts, names it.
     const answers = RECHECK_TABLE.flatMap((row) => row.recheck.entries.flatMap((entry) => recheckAnswersOf(entry)))
     const texts = [...CONFLICT_CASE_ROWS.map(descriptionOf), ...UNUSABLE_NAME_CASE_ROWS.map((row) => row.description), ...answers.map((answer) => String(answer.answer()?.message ?? ''))]
     expect(texts.filter((text) => text.includes('pane 0.0'))).toEqual([])
   })
 
-  test.each(RECHECK_ROWS)('%s: every step-1 reading decides SRJ-505\'s step and call, and a retired key\'s resume or plain spawn is the reuse', (_name, row) => {
+  test.each(RECHECK_ROWS)('%s: every step-1 reading decides step and call, and a retired key\'s resume or plain spawn is the reuse', (_name, row) => {
     const record = row.record(KEY)
     const decided = (retiredKeyRecorded: boolean) =>
       row.recheck.entries.map((entry) => [entry.name, decideLatchRecheck({ record, reading: entry.reading, retiredKeyRecorded })] as const)
@@ -4572,14 +4569,14 @@ describe('the latch re-check\'s decision for every row of the case table (SRJ-50
     expect(decided(true).map(([name, decision]) => [name, decision.call])).toEqual(row.recheck.entries.map((entry) => [entry.name, entry.retiredKeyCall]))
   })
 
-  test.each(FINISHED_ROW_RETRY_ENTRIES.map((entry) => [entry.name, entry] as const))('a "not this launch\'s session" latch\'s finished-row retry whose get reads %s launches as SRJ-505 says (never a kill, never a plain spawn over a row), and the reuse for a retired key', (_name, entry) => {
+  test.each(FINISHED_ROW_RETRY_ENTRIES.map((entry) => [entry.name, entry] as const))('a "not this launch\'s session" latch\'s finished-row retry whose get reads %s launches as says (never a kill, never a plain spawn over a row), and the reuse for a retired key', (_name, entry) => {
     expect(decideFinishedRowLaunch(entry.reading, entry.hasSessionId, false)).toBe(entry.call)
     expect(decideFinishedRowLaunch(entry.reading, entry.hasSessionId, true)).toBe(entry.retiredKeyCall)
   })
 
-  test('every site kind has its rows, and every row carries every re-check column: its read, its table action, and one entry per state step 1 can read, each with its decision, its retired-key call and, for a call one verb answers, its answers (SRJ-1304)', () => {
+  test('every site kind has its rows, and every row carries every re-check column: its read, its table action, and one entry per state step 1 can read, each with its decision, its retired-key call and, for a call one verb answers, its answers', () => {
 
-    // E19's reconnect and prompt rows, E20's restart kill, E21's sequence kills and step-6 resume, E29's abort kill.
+    // reconnect and prompt rows, restart kill, sequence kills and step-6 resume, abort kill.
     const siteKinds = [
       'plain spawn',
       REUSE_SPAWN_SITE,
@@ -4595,7 +4592,7 @@ describe('the latch re-check\'s decision for every row of the case table (SRJ-50
 
     const sitesWithRows = new Set<string>([...EVERY_CONFLICT_ROW, ...UNUSABLE_NAME_CASE_ROWS].map((row) => row.site))
     expect(siteKinds.filter((site) => !sitesWithRows.has(site))).toEqual([])
-    // E16's holds: an unusable-name row at every site kind that can answer UNUSABLE NAME, and the launch-start rows.
+    // holds: an unusable-name row at every site kind that can answer UNUSABLE NAME, and the launch-start rows.
     expect(UNUSABLE_NAME_SITES.filter((site) => !UNUSABLE_NAME_CASE_ROWS.some((row) => row.site === site))).toEqual([])
     expect(LAUNCH_START_CASE_ROWS.length).toBeGreaterThan(0)
     const statusReadings: RecheckReadingName[] = ['read fails', 'no row', 'pending', 'waiting', 'ended', 'missing']
@@ -4744,7 +4741,7 @@ function recheckCallMethods(entry: RecheckEntry): string[] {
   }
 }
 
-/** E4 adds a fresh provenance proof immediately before each resume retry. */
+/** adds a fresh provenance proof immediately before each resume retry. */
 function guardedLaunchCalls(verb: string): string[] {
   return verb === 'resume' ? ['get', 'resume'] : [verb]
 }
@@ -4803,7 +4800,7 @@ function stillLatchedRounds(row: RecheckTableRow): StillLatchedRound[] {
     })
 }
 
-describe('the latch re-check by row of the case table: one read, then exactly the row\'s call, every 120 s (recovery harness, health_check_interval 0; SRJ-505)', () => {
+describe('the latch re-check by row of the case table: one read, then exactly the row\'s call, every 120 s (recovery harness, health_check_interval 0)', () => {
   test.each(RECHECK_ROWS)('%s', async (_name, row) => {
     const rounds = stillLatchedRounds(row)
     const { h, p, q, model } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
@@ -4901,17 +4898,17 @@ function expectStillLatched(run: LatchedRecheckRun, at: number): void {
   expect([h.latch.record(p), h.episodeNotices.length, h.latchRecheck.nextDueAt()]).toEqual([record, 1, at + LATCH_RECHECK_INTERVAL_MS])
 }
 
-describe('the re-check timer: its cadence, P\'s serializer turn and its stops (recovery harness; SRJ-505)', () => {
-  // The one pin case: SRJ-505's numbers, as SRJ-1204 bounds them; every other case imports them.
-  test('SRJ-1204\'s pin: LATCH_RECHECK_INTERVAL_MS is SRJ-505\'s 120 s and PROBE_PANE_READ_LINES its one-line read-pane', () => {
+describe('the re-check timer: its cadence, P\'s serializer turn and its stops (recovery harness)', () => {
+  // The one pin case: numbers, as bounds them; every other case imports them.
+  test('pin: LATCH_RECHECK_INTERVAL_MS is 120 s and PROBE_PANE_READ_LINES its one-line read-pane', () => {
     expect([LATCH_RECHECK_INTERVAL_MS, PROBE_PANE_READ_LINES]).toEqual([120_000, 1])
   })
 
-  // b.2nr: the test-only override block's latch_recheck_interval_ms reaches the rounds through `buildLatchRecheck`'s `intervalMs`.
+  // the test-only override block's latch_recheck_interval_ms reaches the rounds through `buildLatchRecheck`'s `intervalMs`.
   // Regression: before the fix `buildLatchRecheck` ignored any interval, so the 45 s row saw 120 s rounds.
   test.each<[string, number | undefined, number]>([
     ['no interval handed: LATCH_RECHECK_INTERVAL_MS (120 s)', undefined, LATCH_RECHECK_INTERVAL_MS],
-    ['an interval handed to buildLatchRecheck (b.2nr): 45 s', 45_000, 45_000],
+    ['an interval handed to buildLatchRecheck: 45 s', 45_000, 45_000],
   ])('health_check_interval 0, %s: no call before one interval after the latch, then one status read every interval over four intervals', async (_label, handed, intervalMs) => {
     const run = latchForRecheck(statusOnlyRow(), { state: rowStateOfReading('waiting') }, { healthCheckInterval: 0, latchRecheckIntervalMs: handed })
     const { h, p } = run
@@ -5018,7 +5015,7 @@ describe('the re-check timer: its cadence, P\'s serializer turn and its stops (r
   })
 })
 
-describe('HO rev 28: a latched resume or reuse is probed or retried only when step 1 reads its row ended or missing (recovery harness; SRJ-505)', () => {
+describe('HO rev 28: a latched resume or reuse is probed or retried only when step 1 reads its row ended or missing (recovery harness)', () => {
   /** The resume and reuse latches HO rev 28 gates: "this row's own id" (the probe), "another agent-director store" and "no valid instance id" (the retry). */
   const GATED = [REFUSED_OPERATION_RESUME, REFUSED_OPERATION_REUSE_SPAWN].flatMap((op) =>
     ([LATCH_CASE_OWN_ID, LATCH_CASE_ANOTHER_STORE, LATCH_CASE_NO_VALID_ID] as LatchCase[]).map((latchCase) => [`a ${op} latched on "${latchCase}"`, launchRow(op, latchCase)] as const),
@@ -5049,7 +5046,7 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
     expect(round.verbs.slice(0, 1 + callMethods.length)).toEqual(['status', ...callMethods])
   })
 
-  // Every resume and reuse case (HO rev 28; SRJ-1304): the resume rows of every site kind, and the reuse rows.
+  // Every resume and reuse case (HO rev 28): the resume rows of every site kind, and the reuse rows.
   const launchRowsRefusing = (refusedOperation: string) =>
     EVERY_CONFLICT_ROW.filter((row) => row.refusedOperation === refusedOperation).map((row) => [row.name, row] as const)
 
@@ -5070,8 +5067,8 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
     expectStillLatched(run, round.at)
   })
 
-  // A retired key's retry being the reuse, never a resume (E24-E25), is tests/session-manager.test.ts's.
-  test('E24: a round\'s status read of a recorded, marked key\'s live row clears its retired-key entry', async () => {
+  // A retired key's retry being the reuse, never a resume , is tests/session-manager.test.ts's.
+  test(': a round\'s status read of a recorded, marked key\'s live row clears its retired-key entry', async () => {
     const run = latchForRecheck(statusOnlyRow(), { state: rowStateOfReading('waiting') })
     const { h, p } = run
     h.retireKey(p, { mark: true })
@@ -5083,7 +5080,7 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
   })
 })
 
-describe('"not this launch\'s session": status only, the refused call never repeated, a live reading never clears; on a finished or gone row one finished-row retry with P still latched (recovery harness; SRJ-505, SRJ-506)', () => {
+describe('"not this launch\'s session": status only, the refused call never repeated, a live reading never clears; on a finished or gone row one finished-row retry with P still latched (recovery harness)', () => {
   /** The latch from a refused kill, a reconnect's send-keys and a read-pane (the waiting-row check's). */
   const SITES = ['kill', 'reconnect send-keys'].map(
     (site) => [site, lazyRow((candidate) => candidate.latchCase === LATCH_CASE_NOT_THIS_LAUNCH && candidate.site === site)] as const,
@@ -5137,7 +5134,7 @@ describe('"not this launch\'s session": status only, the refused call never repe
 })
 
 /**
- * A latch whose refused operation and case match no row of SRJ-505's table
+ * A latch whose refused operation and case match no row of the contract table
  * ("left over from an earlier life" refused at P's next check or recovery,
  * which no latching site records), set through the latch's own `set` entry
  * on a row recorded `waiting`, so step 1 never clears it on a live reading.
@@ -5152,7 +5149,7 @@ const UNMATCHED_LATCH: RecheckLatchRow = {
     }),
 }
 
-describe('a latch matching no row of the re-check table gets step 1 only, with one line naming the pair (SRJ-505; hatch A3)', () => {
+describe('a latch matching no row of the re-check table gets step 1 only, with one line naming the pair (hatch A3)', () => {
   test('the decision: every reading of a row decides no call, marked unmatched; a gone row still clears and a failed read gives no information', () => {
     const run = makeLatchRun()
     UNMATCHED_LATCH.latchOn(run.latch, KEY)
@@ -5242,7 +5239,7 @@ function noInformationState(h: RecoveryHarness, p: string): unknown {
 
 const NO_INFORMATION_STATE = { tmuxUnresponsive: false, outages: [], outageNotices: [], armed: false, triggers: [], unclassifiedOpen: false, notices: [] }
 
-describe('AC 71: an answer that gives a re-check no information keeps the latch and starts, raises, arms and posts nothing; CONFIG keeps it and raises the outage; UNUSABLE NAME relatches (recovery harness; SRJ-505, SRJ-307, SRJ-313, SRJ-316)', () => {
+describe('an answer that gives a re-check no information keeps the latch and starts, raises, arms and posts nothing; CONFIG keeps it and raises the outage; UNUSABLE NAME relatches (recovery harness)', () => {
   const NO_INFORMATION = RECHECK_ANSWER_SITES.flatMap((site) =>
     recheckNoInformationAnswers(site.verb).map((answer) => [`${site.name}, ${answer.name}`, site, answer] as const),
   )
@@ -5313,7 +5310,7 @@ function roundLineHead(h: RecoveryHarness, key: string, latchCase: LatchCase, st
   return latchRecheckRoundLine(personaRefOf(h, key), latchCase, step, call, '')
 }
 
-describe('the round line names step 1\'s outcome and the call: a spawn latch\'s retry after step 1 found no row and a "not this launch\'s session" latch\'s finished-row retry each say so (HO rev 15), and so do a read that gave no information and one that relatched (recovery harness; SRJ-505, SRJ-1014)', () => {
+describe('the round line names step 1\'s outcome and the call: a spawn latch\'s retry after step 1 found no row and a "not this launch\'s session" latch\'s finished-row retry each say so (HO rev 15), and so do a read that gave no information and one that relatched (recovery harness)', () => {
 
   test.each([
     ['missing', RECHECK_CALL_RESUME, ['status', 'get', 'get', 'resume']],
@@ -5372,9 +5369,9 @@ describe('the round line names step 1\'s outcome and the call: a spawn latch\'s 
   })
 })
 
-describe('a round\'s launch asks the gates every launch path asks: a persona not up, held on ErrInvalidFlags or held back for an old life gets no launch and stays latched with no post (recovery harness; b.av2 SR-6.4; SRJ-505, SRJ-207, SRJ-810)', () => {
+describe('a round\'s launch asks the gates every launch path asks: a persona not up, held on ErrInvalidFlags or held back for an old life gets no launch and stays latched with no post (recovery harness)', () => {
 
-  test('held: a reuse retry answering ErrInvalidFlags holds P (SRJ-207), and the next round makes no spawn: its status read and the held line, P still latched with no further post', async () => {
+  test('held: a reuse retry answering ErrInvalidFlags holds P, and the next round makes no spawn: its status read and the held line, P still latched with no further post', async () => {
     const { h, p, record } = latchForRecheck(anotherStoreReuseRow(), { state: LIVENESS_DEAD_ROW_ENDED, reuseSpawns: [errInvalidFlags('spawn')] })
     let round = await recheckRound(h, p)
     expect(round.verbs).toEqual(['status', 'spawn'])
@@ -5403,7 +5400,7 @@ describe('a round\'s launch asks the gates every launch path asks: a persona not
   })
 })
 
-describe('AC 46 with the re-check bound: while P is latched no automated path calls agent-director for it; its only calls are the re-check\'s, one status read per 120 s (recovery harness; SRJ-502, SRJ-505)', () => {
+describe('with the re-check bound: while P is latched no automated path calls agent-director for it; its only calls are the re-check\'s, one status read per 120 s (recovery harness)', () => {
   test('a new launch, the retry entry, a scheduled and a human-triggered restart and the retry timer make no call for P; each of P\'s calls is a round\'s status read, 120 s apart; Q\'s paths reach the stub as before', async () => {
     const run = makeAutomatedPathsRun({ latchRecheck: true })
     const { h } = run
@@ -5426,7 +5423,7 @@ describe('AC 46 with the re-check bound: while P is latched no automated path ca
 })
 
 // ---------------------------------------------------------------------------
-// The clear (b.jg5 SRJ-506, SRJ-1005, SRJ-1016; E30 T2). Pure: the one clear
+// The clear . Pure: the one clear
 // entry (`createLatchClear`) over a real latch and real notice episodes, its
 // line (`latchClearedLine`), the single retry after a cleared probe
 // (`decideClearedProbeRetry`) and the clears that launched nothing. Then, on
@@ -5477,7 +5474,7 @@ const CLEAR_KIND_LATCHES: ReadonlyArray<readonly [string, () => Pick<RecheckTabl
   ['a "launch start not recorded" latch', () => LAUNCH_START_CASE_ROWS[0]!],
 ]
 
-describe('the clear entry: one recovery post with its reason in the episode of the latch\'s kind, every latch episode ended, the timer stopped and one line (SRJ-506, SRJ-1005, SRJ-1016; pure)', () => {
+describe('the clear entry: one recovery post with its reason in the episode of the latch\'s kind, every latch episode ended, the timer stopped and one line (pure)', () => {
   const CASES = CLEAR_KIND_LATCHES.flatMap(([latchName, row]) => RECOVERY_REASONS.map(([reasonName, reason]) => [latchName, reasonName, row, reason] as const))
 
   test.each(CASES)('%s cleared for %s: answers true, the record gone, the timer stopped once, exactly one recovery post after the latch\'s own, no latch episode left open and the one cleared line', (_latch, _reason, rowOf, reason) => {
@@ -5593,7 +5590,7 @@ describe('the clear entry: one recovery post with its reason in the episode of t
     expect(run.latch.record(OTHER)).toBeUndefined()
   })
 
-  test('the cleared line (SRJ-506, SRJ-1014): the persona, the case, the quoted session, the reason unescaped with its state rendered as a description is (redacted, on one line), and whether the notice was posted', () => {
+  test('the cleared line: the persona, the case, the quoted session, the reason unescaped with its state rendered as a description is (redacted, on one line), and whether the notice was posted', () => {
     const record = ownIdRecordFor(KEY)
     const state = `stale\n${sentinelInMessage('state')}`
     const line = latchClearedLine(KEY, record, latchRecoveryReasonRowReads(state), true)
@@ -5615,8 +5612,8 @@ function ownIdRecordFor(key: string): ConflictLatchRecord {
 }
 
 /**
- * The single retry after a cleared probe, written from SRJ-506 (HO rev 28;
- * hatch A3) for the refused operation and step 1's reading: the same
+ * The single retry after a cleared probe, written from the contract (HO rev 28;
+ * design A3) for the refused operation and step 1's reading: the same
  * `resume` or reuse only on a row read `ended` or `missing`; a plain spawn as
  * the plain-spawn row keys on step 1's row (no row: the plain spawn; `ended`
  * or `missing`: the reuse; live: none); a pane verb's, a kill's, a note's or a
@@ -5643,7 +5640,7 @@ function expectedClearedProbeRetry(refusedOperation: string, reading: LatchReche
   }
 }
 
-describe('the single retry after a cleared probe, and the clears that launched nothing (SRJ-506; HO rev 28; hatch A3; pure)', () => {
+describe('the single retry after a cleared probe, and the clears that launched nothing (HO rev 28; hatch A3; pure)', () => {
   const READINGS: ReadonlyArray<readonly [string, LatchRecheckReading]> = [
     ['no row', RECHECK_READING_NO_ROW_VALUE],
     ...[AGENT_DIRECTOR_PENDING_STATE, 'waiting', 'working', LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING].map(
@@ -5660,7 +5657,7 @@ describe('the single retry after a cleared probe, and the clears that launched n
   ] as const
   const CASES = OPERATIONS.flatMap((op) => READINGS.flatMap(([name, reading]) => [false, true].map((retired) => [op, name, retired, reading] as const)))
 
-  test.each(CASES)('a latch refusing %s, step 1 reading %s, key retired %p: the latched operation as SRJ-506 names it, or none', (op, _name, retired, reading) => {
+  test.each(CASES)('a latch refusing %s, step 1 reading %s, key retired %p: the latched operation as names it, or none', (op, _name, retired, reading) => {
     expect(decideClearedProbeRetry({ refusedOperation: op }, reading, retired)).toBe(expectedClearedProbeRetry(op, reading, retired))
   })
 
@@ -5697,7 +5694,7 @@ const RECHECK_CLEARS = RECHECK_TABLE.flatMap((row) =>
   row.recheck.entries.filter((entry) => entry.decision.clear !== undefined).map((entry) => [`${row.name}, step 1 reading ${entry.name}`, row, entry] as const),
 )
 
-describe('a clear by step 1 or by a "launch start not recorded" row read finished: one recovery post with the column\'s reason, then the retry at once, after one bypassing find-missing for a step-1 clear only (recovery harness; SRJ-505, SRJ-506, SRJ-1005, SRJ-120; AC 43, AC 85, AC 86)', () => {
+describe('a clear by step 1 or by a "launch start not recorded" row read finished: one recovery post with the column\'s reason, then the retry at once, after one bypassing find-missing for a step-1 clear only (recovery harness)', () => {
   test('the table has a step-1 clear for every kind of latch that clears at step 1, and a finished-row clear for every launch-start row', () => {
     expect(RECHECK_CLEARS.length).toBeGreaterThan(RECHECK_TABLE.length / 2)
     const launchStartClears = RECHECK_CLEARS.filter(([, row, entry]) => row.noLaunchStart && entry.decision.step === RECHECK_STEP_TABLE)
@@ -5739,7 +5736,7 @@ describe('a clear by step 1 or by a "launch start not recorded" row read finishe
 
 })
 
-describe('AC 42, AC 43: a latch set while the row read live is not cleared by a live reading and posts nothing more; one set on a pending row clears once the row reports in (recovery harness; SRJ-505, SRJ-506)', () => {
+describe('a latch set while the row read live is not cleared by a live reading and posts nothing more; one set on a pending row clears once the row reports in (recovery harness)', () => {
   const LIVE_STATES = ['waiting', 'working', 'ask_user', 'check_permission'] as const
   const SET_LIVE = RECHECK_TABLE.filter((row) => {
     const record = row.record(KEY)
@@ -5747,7 +5744,7 @@ describe('AC 42, AC 43: a latch set while the row read live is not cleared by a 
     return rowStateCountsAsLive(record.rowState) && record.rowState.kind === LATCH_ROW_STATE_KIND_READ && waiting.decision.call === RECHECK_CALL_NONE && waiting.decision.clear === undefined
   }).map((row) => [row.name, row] as const)
 
-  test('every live state a latch of the case table records has its rows in the AC 42 table', () => {
+  test('every live state a latch of the case table records has its rows in the table', () => {
     const liveRecorded = (rows: readonly RecheckTableRow[]): string[] => [
       ...new Set(
         rows.flatMap((row) => {
@@ -5761,7 +5758,7 @@ describe('AC 42, AC 43: a latch set while the row read live is not cleared by a 
     expect(liveRecorded(SET_LIVE.map(([, row]) => row))).toEqual(recorded)
   })
 
-  test.each(SET_LIVE)('AC 42, %s: rounds reading waiting, working, ask_user and check_permission each read only, keep the record and post nothing; no round clears it', async (_name, row) => {
+  test.each(SET_LIVE)(', %s: rounds reading waiting, working, ask_user and check_permission each read only, keep the record and post nothing; no round clears it', async (_name, row) => {
     const run = latchForRecheck(row, { state: 'waiting' })
     const { h, p, model } = run
     for (const state of LIVE_STATES) {
@@ -5783,7 +5780,7 @@ const CADENCE_RETRY_CLEARS = RECHECK_TABLE.filter((row) => !row.probeDropped).fl
   return entry === undefined ? [] : entry.answers!.cleared.map((answer) => [`${row.name}, step 1 reading ${entry.name}, ${answer.name}`, row, entry, answer] as const)
 })
 
-describe('a retry at the cadence that is not refused: no post before it, no find-missing, one recovery post with "a retry of the refused operation was not refused", and no second launch (recovery harness; SRJ-506, SRJ-1005; hatch A3)', () => {
+describe('a retry at the cadence that is not refused: no post before it, no find-missing, one recovery post with "a retry of the refused operation was not refused", and no second launch (recovery harness; hatch A3)', () => {
   test.each(CADENCE_RETRY_CLEARS)('%s', async (_name, row, entry, answer) => {
     const { h, p, q, model, record } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
     scriptRecheckReading(model, row.recheck.readVerb, entry)
@@ -5818,7 +5815,7 @@ const FINISHED_ROW_CLEARS = FINISHED_ROW_RETRY_ENTRIES.filter((entry) => LAUNCH_
   entry.answers!.cleared.map((answer) => [`get reading ${entry.name}, ${answer.name}`, entry, answer] as const),
 )
 
-describe('"not this launch\'s session": no post before its finished-row retry or when that retry relatches; one "its row finished and a relaunch was not refused" post when it clears (recovery harness; SRJ-505, SRJ-506, SRJ-1005)', () => {
+describe('"not this launch\'s session": no post before its finished-row retry or when that retry relatches; one "its row finished and a relaunch was not refused" post when it clears (recovery harness)', () => {
   test.each(FINISHED_ROW_CLEARS)('%s', async (_name, entry, answer) => {
     const noRow = entry.reading.kind === RECHECK_READING_NO_ROW_VALUE.kind
     const state = noRow ? PENDING_ROW_MODEL_NO_ROW : (entry.reading as { state: string }).state
@@ -5866,7 +5863,7 @@ function failFindMissing(h: RecoveryHarness, err: Error): void {
   h.script({ findMissingFn: () => err })
 }
 
-describe('the cleared probe\'s find-missing and single retry: a refused run holds the retry back, the latched answer goes on, a collision gives no information, and a "this row\'s own id" retry refused again drops the probe (recovery harness; SRJ-505, SRJ-506, SRJ-120; AC 8; E14 build)', () => {
+describe('the cleared probe\'s find-missing and single retry: a refused run holds the retry back, the latched answer goes on, a collision gives no information, and a "this row\'s own id" retry refused again drops the probe (recovery harness; build)', () => {
   test.each(CLEARED_PROBES)('%s', async (_name, row, entry, answer) => {
     const { h, p, q, model, record } = latchForRecheck(row)
     scriptRecheckReading(model, row.recheck.readVerb, entry)
@@ -5937,7 +5934,7 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     expect(round.verbs).toEqual(['status', 'readPane', 'findMissing', 'spawn'])
     expectStillLatched(run, round.at)
     expect(noInformationState(h, p)).toEqual(NO_INFORMATION_STATE)
-    // Its one line (SRJ-1014), the launch it names left open.
+    // Its one line, the launch it names left open.
     const collision = builtAround((what) => latchRecheckCollisionNoInformationLine(personaRefOf(h, p), what))
     expect(h.errors.filter((line) => collision.test(line))).toHaveLength(1)
     round = await recheckRound(h, p)
@@ -5955,13 +5952,13 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
 
 })
 
-// Bug b.xkd (b.av2 SR-6.3; SRJ-505, SRJ-506): the restart cap wins over the
+// the restart cap wins over the
 // re-check. At the cap a round still reads (step 1, the probe), so a reading
 // can still clear the latch, but a probe that finds the condition cleared
 // leads to no bypassing find-missing (which serves only the retry) and no
 // single retry. The retry sites' launches and the run of the restart path's
 // decision at the cap are tests/session-manager.test.ts's.
-describe('bug b.xkd: at the restart cap a round still reads, so the latch can still clear, but a cleared probe gets no find-missing and no single retry until the cap resets (recovery harness, the re-check bound with the restart cap as main() binds it; b.av2 SR-6.3, SRJ-505, SRJ-506)', () => {
+describe('at the restart cap a round still reads, so the latch can still clear, but a cleared probe gets no find-missing and no single retry until the cap resets (recovery harness, the re-check bound with the restart cap as main() binds it)', () => {
   /** The single retry a cleared probe of `row` on step 1's `entry` makes. */
   const retryOf = (row: RecheckTableRow, entry: RecheckEntry): LatchRecheckCall => expectedClearedProbeRetry(row.record(KEY).refusedOperation, entry.reading, false)
   // The cap is one gate whatever the row: one cleared probe per retry it
@@ -5993,7 +5990,7 @@ describe('bug b.xkd: at the restart cap a round still reads, so the latch can st
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, getFailureCount(p)]).toEqual([[], [], RESTART_FAILURE_CAP])
   })
 
-  // Bug b.ebi: only a clear by hand resets the restart failure count; the
+  // only a clear by hand resets the restart failure count; the
   // re-check's own clears (a step-1 clear and a "launch start not recorded"
   // clear on its row read finished, both through its clear hand-off) leave it
   // at the cap, though the harness's re-check is handed the reset as main()'s
@@ -6045,7 +6042,7 @@ function latchWithNote(removes: typeof PENDING_ROW_FIND_MISSING_REMOVES_NOTE | t
   return { h, p, q, model, record: h.latch.record(p)! }
 }
 
-describe('after a clear by step 1: the bypassing find-missing comes before the next read; a note it removes does not relatch P, one still there relatches with one new post; a refused run makes no launch and leaves P to its retry timer (recovery harness; SRJ-506, SRJ-114, SRJ-120; E14 build)', () => {
+describe('after a clear by step 1: the bypassing find-missing comes before the next read; a note it removes does not relatch P, one still there relatches with one new post; a refused run makes no launch and leaves P to its retry timer (recovery harness; build)', () => {
 
   test('a note still there after the run: P latches again on "conflicting labels" with one new post and no retry; its re-check timer is armed anew', async () => {
     const { h, p, record } = latchWithNote(PENDING_ROW_FIND_MISSING_REMOVES_NOTHING)
@@ -6076,7 +6073,7 @@ describe('after a clear by step 1: the bypassing find-missing comes before the n
   })
 })
 
-describe('"conflicting labels" on a pending row: a read-pane answering GONE (or a pane) clears with one recovery post and, with session_restart_delay 0 and health_check_interval 0, the retry at once finds the row pending and arms P\'s retry timer, with no find-missing (recovery harness; SRJ-506, SRJ-409, SRJ-410)', () => {
+describe('"conflicting labels" on a pending row: a read-pane answering GONE (or a pane) clears with one recovery post and, with session_restart_delay 0 and health_check_interval 0, the retry at once finds the row pending and arms P\'s retry timer, with no find-missing (recovery harness)', () => {
   const pendingLabelsRow = lazyRow(
     (row) =>
       row.latchCase === LATCH_CASE_CONFLICTING_LABELS &&
@@ -6101,7 +6098,7 @@ describe('"conflicting labels" on a pending row: a read-pane answering GONE (or 
   })
 })
 
-describe('E18: after a clear, three escalate-dead runs begin a new slow-recovery episode and post once (recovery harness; SRJ-610, SRJ-1016, SRJ-506)', () => {
+describe(': after a clear, three escalate-dead runs begin a new slow-recovery episode and post once (recovery harness)', () => {
   test('P\'s slow-recovery episode ended at its latch; once the latch clears, three escalate-dead runs whose re-probe reads the row live post the slow-recovery notice once more', async () => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
@@ -6131,7 +6128,7 @@ describe('E18: after a clear, three escalate-dead runs begin a new slow-recovery
   })
 })
 
-describe('the after-clear job runs in P\'s serializer turn right after the round: no other serialized work and no health-tick read of P between the clear and its find-missing, and P is held active until the job ends (recovery harness; SRJ-506)', () => {
+describe('the after-clear job runs in P\'s serializer turn right after the round: no other serialized work and no health-tick read of P between the clear and its find-missing, and P is held active until the job ends (recovery harness)', () => {
 
   test('P latched again between the round\'s clear and the run it owes: the run calls nothing for P and logs one "latched again" line, and the new latch stays with its one post and its re-check timer', async () => {
     const { h, p, q, model, record } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
@@ -6171,7 +6168,7 @@ describe('the after-clear job runs in P\'s serializer turn right after the round
   })
 })
 
-describe('the exported after-clear sequence (runLatchClearSequence) and the builder\'s clear entries (buildLatchRecheck\'s clear and clearAndRecover), as a clear by hand uses them (recovery harness; SRJ-506, SRJ-120)', () => {
+describe('the exported after-clear sequence (runLatchClearSequence) and the builder\'s clear entries (buildLatchRecheck\'s clear and clearAndRecover), as a clear by hand uses them (recovery harness)', () => {
   /** The sequence's dependencies over the harness: the builder's clear entry, the live configuration and P's serializer. */
   function sequenceDeps(h: RecoveryHarness, overrides: Partial<LatchClearSequenceDeps> = {}): LatchClearSequenceDeps & { readonly submitted: string[] } {
     const submitted: string[] = []
@@ -6188,7 +6185,7 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     }
   }
 
-  test('for an unlatched P: one submission whose clear answers false, and nothing else: not-latched, no post, no call, no hold, and no call of the reset handed in (bug b.ebi)', async () => {
+  test('for an unlatched P: one submission whose clear answers false, and nothing else: not-latched, no post, no call, no hold, and no call of the reset handed in', async () => {
     const h = makeRecheckHarness()
     const [p] = h.keys as [string]
     const resets: string[] = []
@@ -6239,9 +6236,9 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expect([h.episodeNotices.slice(1), h.timedCalls.length - calls, isRestartPendingOrActive(p)]).toEqual([[recoveryPost(p, record, LATCH_RECOVERY_REASON_ROW_GONE)], 0, false])
   })
 
-  // Bug b.ebi (b.av2 SR-6.3; SRJ-509): the reset of P's restart failure
+  // the reset of P's restart failure
   // count a clear by hand is handed (`resetRestartFailures`).
-  test('bug b.ebi: with a reset handed in, a clear that clears P calls it once, for P, in the job\'s turn: after the clear\'s post with P unlatched, before cleared settles and before the find-missing', async () => {
+  test('with a reset handed in, a clear that clears P calls it once, for P, in the job\'s turn: after the clear\'s post with P unlatched, before cleared settles and before the find-missing', async () => {
     const { h, p } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
     /** At each reset: the key, the posts made, whether P was latched, P's calls made since `from` and `cleared`'s status. */
@@ -6261,7 +6258,7 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expect(resets).toHaveLength(1)
   })
 
-  test('bug b.ebi: with no reset handed in, a clear of a P at the restart cap resets nothing: cleared true with its count kept, and the retry at once answers capped with nothing launched', async () => {
+  test('with no reset handed in, a clear of a P at the restart cap resets nothing: cleared true with its count kept, and the retry at once answers capped with nothing launched', async () => {
     const { h, p } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
     putAtRestartCap(p)
     const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, sequenceDeps(h))
@@ -6353,7 +6350,7 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expect(isRestartPendingOrActive(p)).toBe(false)
   })
 
-  test('bug b.ebi: a reset that throws: one "reset … failed" line, and nothing else changes: cleared true with its one post, then the find-missing and the retry at once, which launches', async () => {
+  test('a reset that throws: one "reset … failed" line, and nothing else changes: cleared true with its one post, then the find-missing and the retry at once, which launches', async () => {
     const { h, p, record } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
     const resetError = new Error('reset failed')
@@ -6435,8 +6432,8 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
 })
 
 // ---------------------------------------------------------------------------
-// The clear by hand (E31 T1; b.jg5 SRJ-510, SRJ-506's clear-latch leg,
-// SRJ-509's server-side bullets, SRJ-1005, SRJ-120): the `/clear-latch`
+// The clear by hand ( T1clear-latch leg,
+// server-side bullets): the `/clear-latch`
 // route's clear, `clearByHandOf` over the re-check as `main()` binds it (the
 // harness's `latchRecheck.clearByHand`), driven through the real handler
 // where the route's answer matters.
@@ -6509,7 +6506,7 @@ const CLEAR_BY_HAND_ROWS = RECHECK_TABLE.filter(
 /** An "another agent-director store" latch at a plain spawn over P's row read `ended`: the launch the retry at once makes over such a row. */
 const anotherStorePlainSpawnRow = launchRow(REFUSED_OPERATION_PLAIN_SPAWN, LATCH_CASE_ANOTHER_STORE)
 
-describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared by hand" post, one bypassing find-missing before P\'s next row read, P retried at once; the route answers once the clear has run (recovery harness; SRJ-510, SRJ-506, SRJ-509, SRJ-1005, SRJ-120)', () => {
+describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared by hand" post, one bypassing find-missing before P\'s next row read, P retried at once; the route answers once the clear has run (recovery harness)', () => {
   test('the rows cover every latch kind and case once: every CONFLICT case, unrecognised text included, the "conflicting labels" note latch, the unusable recorded name and the launch start not recorded', () => {
     expect(CLEAR_BY_HAND_ROWS.filter(([, row]) => row.record(KEY).latchCase !== row.latchCase).map(([name]) => name)).toEqual([])
     const cases = new Set(CLEAR_BY_HAND_ROWS.map(([, row]) => row.record(KEY).latchCase))
@@ -6711,7 +6708,7 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect([h.latchRecheck.isArmed(p), h.latchRecheck.nextDueAt()]).toEqual([true, h.clock.now() + LATCH_RECHECK_INTERVAL_MS])
   })
 
-  test('an unlatched P, at the restart cap: cleared false, with no post, no find-missing, no retry, no call for P and no timer, and its restart failure count kept (bug b.ebi: only a clear that clears resets it)', async () => {
+  test('an unlatched P, at the restart cap: cleared false, with no post, no find-missing, no retry, no call for P and no timer, and its restart failure count kept (only a clear that clears resets it)', async () => {
     const h = makeRecheckHarness()
     const [p] = h.keys as [string]
     putAtRestartCap(p)
@@ -6740,7 +6737,7 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
   test.each([
     ['not latched', false],
     ['latched', true],
-  ] as const)('another persona Q beside P, %s, is untouched by P\'s clear by hand: its latch, posts, timer, calls and restart failure count (Q at the cap; bug b.ebi) as they were', async (_label, latchQ) => {
+  ] as const)('another persona Q beside P, %s, is untouched by P\'s clear by hand: its latch, posts, timer, calls and restart failure count (Q at the cap) as they were', async (_label, latchQ) => {
     const { h, p, q } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
     if (latchQ) statusOnlyRow().latchOn(h.latchSet, q)
     putAtRestartCap(q)
@@ -6776,13 +6773,13 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(retryAtOnceLinesOf(h, p)).toEqual([])
   })
 
-  // Bug b.xkd: the cap wins over the re-check, which no longer relaunches a
+  // the cap wins over the re-check, which no longer relaunches a
   // capped P, but not over a human: the clear by hand still releases it.
-  // Bug b.ebi (b.av2 SR-6.3; SRJ-509): a clear by hand that clears P's latch
+  // a clear by hand that clears P's latch
   // also resets P's restart failure count, before the route answers and
   // before the retry at once, so the cap does not refuse that retry and P is
   // launched.
-  test('bug b.ebi: a P at the restart cap, after a round that made no launch, is released by hand: 200 with cleared true, its restart failure count already 0 when the route answers (the bypassing find-missing held open, nothing launched yet), one "cleared by hand" post, no re-check timer left; then the retry at once launches P, with no cap line', async () => {
+  test('a P at the restart cap, after a round that made no launch, is released by hand: 200 with cleared true, its restart failure count already 0 when the route answers (the bypassing find-missing held open, nothing launched yet), one "cleared by hand" post, no re-check timer left; then the retry at once launches P, with no cap line', async () => {
     const run = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
     const { h, p, record } = run
     putAtRestartCap(p)
@@ -6809,7 +6806,7 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
 })
 
 // ---------------------------------------------------------------------------
-// The recovery harness with overlapping lifetimes (E30 T3; SRJ-1304): a case
+// The recovery harness with overlapping lifetimes : a case
 // that builds a second harness before it cleans the first up, cleaned up in
 // any order, leaves SLACK_STATE_DIR and console.error pointing at the newest
 // harness still live, and at what was in effect before the first build once
@@ -6817,7 +6814,7 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
 // capture.
 // ---------------------------------------------------------------------------
 
-describe('the recovery harness: overlapping harnesses give SLACK_STATE_DIR and console.error up last in, first out, whatever order they are cleaned up in (SRJ-1304)', () => {
+describe('the recovery harness: overlapping harnesses give SLACK_STATE_DIR and console.error up last in, first out, whatever order they are cleaned up in', () => {
   test.each([
     ['two, cleaned up in creation order', 2, [0, 1]],
     ['two, cleaned up newest first', 2, [1, 0]],

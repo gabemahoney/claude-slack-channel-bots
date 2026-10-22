@@ -2,7 +2,7 @@
  * Dry-run detection (`SLACK_DRY_RUN`).
  *
  * The server reads no Slack token from the environment: each persona's
- * tokens come only from its credentials file (b.av2 SR-1.4, SR-10.2). This
+ * tokens come only from its credentials file. This
  * module keeps its name so its importers need no change.
  *
  * Side-effect free: importing it reads nothing; `isDryRun` reads the variable

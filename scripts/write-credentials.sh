@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/write-credentials.sh — write one persona's credentials file from the
-# operator's own terminal (b.av2 SR-12, SR-1.4 part).
+# operator's own terminal (part).
 #
 # Usage: write-credentials.sh <credentials file path>
 #

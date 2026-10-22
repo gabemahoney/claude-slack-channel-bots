@@ -403,7 +403,7 @@ shard container.
 - **Measurement guard.** Packing/builds and shard work outside test-32 share an
   account-local performance lock. Test-32 first clears its baseline daemon
   and verifies cleanup, then takes the lock exclusively for its native
-  AC76 measurement script. This coordinates participating `/ci` runs;
+  measurement script. This coordinates participating `/ci` runs;
   resource admission, deadlines and the 20-sample 2 s/10 s p95 limits remain.
 - **Final cleanup.** Uncertain final cleanup emits no `done`, even if all
   script END records passed. The container retains its performance lock
@@ -648,7 +648,7 @@ requires the file absent before first spawn. Later preparation/recovery
 admits native-written config only with durable successful-spawn provenance
 bound to that private home's device/inode. Only the fixed native leaf
 `tui.screen_reader_detection_done` and genuine parent tables with only
-allowed descendants are permitted. Amended decision 22 permits those native
+allowed descendants are permitted. The scratch-config policy permits those native
 key/parent names to overlap host keys, without decoding or copying their
 host values. Every other host key and all model, reasoning, profile/profiles,
 provider/auth and unknown keys fail. Checks record key names and unknown-key
@@ -684,11 +684,12 @@ the whole-run end; it never rereads a released login.
 Test 41 now implements native observations and the final receipt-only
 D1 gate, including fault/FIFO/fidelity and actual child SIGKILL/recovery
 checks. Gate delivery assertions do not require model prose or completed
-answers. The five separate heavy criteria AC11/12/15/20/106 require exact
-completed native answers on the admitted model, three independent trials
-each; no stop or fallback counts as acceptance. All 15 AC11 cases run in
-every trial, AC15 uses decision 20's deterministic 5,000-byte body, and
-AC106 requires two actual identical DM take-ins before counting one.
+answers. The separate field-readback, command-prefix, multipart, sender-identity
+and duplicate-DM scenarios require exact completed native answers on the
+admitted model, three independent trials each; no stop or fallback counts as
+acceptance. All 15 field-readback cases run in every trial. Multipart delivery
+uses the deterministic 5,000-byte body, and duplicate-DM acceptance requires
+two actual identical DM take-ins before counting one.
 Report actual verdicts; completed native observation and synthetic controls
 are not final gate, full CI or heavy acceptance.
 

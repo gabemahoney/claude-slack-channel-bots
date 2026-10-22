@@ -1,6 +1,6 @@
 /**
  * persona-diagnostics.ts — Persona diagnostic class labels and the
- * broken-persona log line (b.av2 SR-10.3, with b.deo SRI-901 to SRI-903).
+ * broken-persona log line (with to).
  *
  * Every persona diagnostic line carries exactly one class label. This module
  * owns the closed set of labels and the one formatter that turns a structured
@@ -13,7 +13,7 @@
  * "bot_token must start with xoxb-"), never by its value. The formatter takes
  * no file contents and renders nothing but the fields below.
  *
- * Pure module (b.av2 SR-13.1): no module-scope side effects, no file-system,
+ * Pure module: no module-scope side effects, no file-system,
  * environment, network or console access. Building a line never emits it;
  * emitting is the caller's job, through an injected `PersonaDiagnosticLogger`.
  * These lines never go to `startup-errors.log`, and no log file is added.
@@ -22,8 +22,7 @@
  * and restored, the unclaimed channel and the DM drop, the per-persona start
  * line, the destination failure, the failed credentials change, the
  * unresolvable claude_config_dir, the channel a persona hears in fungible
- * mode, and the channel delivery its agent stores (b.av2 SR-10.3; b.deo
- * SRI-901). The channel causes (b.deo SRI-902, SRI-903) are built here once:
+ * mode, and the channel delivery its agent stores. The channel causes are built here once:
  * `invitedChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause`
  * for declarative mode, and `fungibleUnclaimedChannelCause` with its exported
  * reason texts for fungible mode. None carries message text, a user ID or a
@@ -39,7 +38,7 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
-// Class labels (b.av2 SR-10.3)
+// Class labels
 // ---------------------------------------------------------------------------
 
 /** The credentials file does not exist. */
@@ -60,13 +59,13 @@ export const PERSONA_CREDENTIALS_REFUSED = 'persona-credentials-refused'
 
 /**
  * Slack could not be reached while validating a token; retried with backoff
- * (b.av2 SR-3.2). Logged when the cause starts and when it clears.
+ * Logged when the cause starts and when it clears.
  */
 export const PERSONA_SLACK_UNREACHABLE = 'persona-slack-unreachable'
 
 /**
  * A persona's Socket Mode connection that was up closed without the server
- * closing it; the server reopens it (b.av2 SR-3.3). Logged once per outage,
+ * closing it; the server reopens it. Logged once per outage,
  * when the connection drops, not on each reopen attempt.
  */
 export const PERSONA_CONNECTION_LOST = 'persona-connection-lost'
@@ -82,7 +81,7 @@ export const PERSONA_DIRECTORY_UNUSABLE = 'persona-directory-unusable'
 
 /**
  * A channel message was not delivered because no persona serves its channel
- * (b.av2 SR-4.2, SR-10.3; b.deo SRI-303, SRI-903). Declarative mode: a message in a
+ * Declarative mode: a message in a
  * channel that no applied persona lists, logged by each receiving persona,
  * and not logged when another applied persona lists the channel
  * (`unclaimedChannelCause`). Fungible mode: a `message` event refused on the
@@ -93,13 +92,13 @@ export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
 
 /**
  * A direct message reached a persona whose DMs switch (`dm.enabled`) is off,
- * and was dropped (b.av2 SR-4.3). The cause names the conversation, the ts and
+ * and was dropped. The cause names the conversation, the ts and
  * `dm.enabled`, never the message text.
  */
 export const PERSONA_DM_DROPPED = 'persona-dm-dropped'
 
 /**
- * A persona's bring-up is starting (b.av2 SR-10.3): one line per applied
+ * A persona's bring-up is starting: one line per applied
  * persona at start, naming the persona and its key, before any line about
  * the persona's bring-up outcome.
  */
@@ -108,7 +107,7 @@ export const PERSONA_START = 'persona-start'
 /**
  * A post to a persona's destination (its `permission_prompts` channel, or its
  * DM with `dm.contact`) failed: the open (`conversations.open`) or the post
- * (`chat.postMessage`) was refused or did not go through (b.av2 SR-7.1). The
+ * (`chat.postMessage`) was refused or did not go through. The
  * persona's prompts and notices are held and retried with backoff. Logged
  * once when the episode starts, naming the destination, the failed step and
  * the Slack error code (and `im:write` for `missing_scope` on the open), and
@@ -117,18 +116,18 @@ export const PERSONA_START = 'persona-start'
 export const PERSONA_DESTINATION_FAILED = 'persona-destination-failed'
 
 /**
- * A confirmed change to a persona's credentials file cannot be used (b.av2
- * SR-8.6 credentials row, SR-10.3): the new file is missing, unreadable,
+ * A confirmed change to a persona's credentials file cannot be used (
+ * credentials row): the new file is missing, unreadable,
  * locally invalid or another applied persona's credentials file, or Slack
  * refused a token in it. The old connection (or the held content of a
  * persona that is retrying) stays in use and the change stays pending
- * (SR-8.3). Built with `formatCredentialsChangeFailed`.
+ * Built with `formatCredentialsChangeFailed`.
  */
 export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-failed'
 
 /**
  * A persona's effective `claude_config_dir` cannot be resolved to a real path
- * (bug b.g57): a symlink on its path points to nothing, or resolving it failed
+ * a symlink on its path points to nothing, or resolving it failed
  * (an unmounted drive, a dropped network mount). The persona is not up
  * (retrying), has no Slack connection and is not launched; its
  * agent-director row is kept, and it connects and launches once the
@@ -138,7 +137,7 @@ export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-fai
 export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
 
 /**
- * A persona heard a channel in fungible mode (b.deo SRI-307, SRI-902): the
+ * A persona heard a channel in fungible mode: the
  * first event in the persona's life that took its fungible path for that
  * channel, delivered or not. Logged once per persona life and channel, to
  * `server.log` only. The cause (`invitedChannelCause`) names the channel ID,
@@ -149,7 +148,7 @@ export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
 
 /**
  * A persona's agent stored a channel delivery with `set_channel_delivery`
- * (b.deo SRI-505, SRI-901, SRI-902): one line per accepted call, logged after
+ * one line per accepted call, logged after
  * the store's write succeeded, to `server.log` only; nothing is posted to
  * Slack. The cause (`channelDeliverySetCause`) names the channel ID, the
  * stored choice before the call (`none` when there was none) and after it,
@@ -180,7 +179,7 @@ export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: 
   return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
 }
 export function buildQueuedMessageRetryLine(key: string): string {
-  return `[slack] Queued message: persona=${safe(key)} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`
+  return `[slack] Queued message: persona=${safe(key)} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one`
 }
 export function queueErrorCode(error: unknown): string {
   try { const code = (error as { code?: unknown })?.code; return typeof code === 'string' && /^[A-Z0-9_]+$/.test(code) ? code : 'unknown' } catch { return 'unknown' }
@@ -223,7 +222,7 @@ export interface PersonaDiagnostic {
   class: PersonaDiagnosticClass
   /** Persona name as configured; rendered JSON-quoted. */
   name: string
-  /** Persona key (b.av2 SR-2.1). */
+  /** Persona key. */
   key: string
   /** Position of the persona's entry in the config file's `personas` array. */
   index: number
@@ -237,7 +236,7 @@ export interface PersonaDiagnostic {
 export type PersonaDiagnosticLogger = (line: string) => void
 
 /**
- * Format a persona diagnostic as one server-log line (b.av2 SR-10.3):
+ * Format a persona diagnostic as one server-log line:
  *
  *   `[slack] <class>: personas[<i>] "<name>" (key=<key>) path="<path>": <cause>`
  *
@@ -289,7 +288,7 @@ const CREDENTIALS_CHANGE_KEPT_TEXT: Readonly<Record<CredentialsChangeKept, strin
 }
 
 /**
- * Format the `persona-credentials-change-failed` line (b.av2 SR-8.6, SR-10.3)
+ * Format the `persona-credentials-change-failed` line
  * through `formatPersonaDiagnostic`:
  *
  *   `[slack] persona-credentials-change-failed: personas[<i>] "<name>" (key=<key>) path="<path>": the confirmed credentials change cannot be used: <cause>; <kept>, and the change stays pending`
@@ -313,11 +312,11 @@ export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure)
 }
 
 // ---------------------------------------------------------------------------
-// Channel causes (b.deo SRI-902, SRI-903)
+// Channel causes
 // ---------------------------------------------------------------------------
 
 /**
- * The `persona-invited-channel` cause (b.deo SRI-902), formatted through
+ * The `persona-invited-channel` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
  *   `hears <public|private> channel <channel> in fungible mode, at channel delivery <mentions|all>`
@@ -332,11 +331,11 @@ export function invitedChannelCause(
   return `hears ${channelType} channel ${channel} in fungible mode, at channel delivery ${delivery}`
 }
 
-/** How a `persona-channel-delivery-set` line names the absence of a stored choice before the call (b.deo SRI-902). */
+/** How a `persona-channel-delivery-set` line names the absence of a stored choice before the call. */
 export const NO_STORED_CHOICE = 'none'
 
 /**
- * The `persona-channel-delivery-set` cause (b.deo SRI-902), formatted through
+ * The `persona-channel-delivery-set` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
  *   `stored choice for channel <channel> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
@@ -358,8 +357,7 @@ export function channelDeliverySetCause(
 }
 
 /**
- * The declarative-mode `unclaimed-channel` cause (b.av2 SR-10.3, b.deo
- * SRI-903), formatted through `formatPersonaDiagnostic` with no path:
+ * The declarative-mode `unclaimed-channel` cause, formatted through `formatPersonaDiagnostic` with no path:
  *
  *   `message in channel <channel> not delivered: no applied persona lists this channel`
  *
@@ -369,22 +367,22 @@ export function unclaimedChannelCause(channel: string): string {
   return `message in channel ${channel} not delivered: no applied persona lists this channel`
 }
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope flag is `true` (b.deo SRI-303, SRI-903). */
+/** Fungible-mode `unclaimed-channel` reason: the envelope flag is `true`. */
 export const UNCLAIMED_REASON_EXTERNALLY_SHARED = 'the channel is externally shared'
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel` (b.deo SRI-903). */
+/** Fungible-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel`. */
 export const UNCLAIMED_REASON_FLAG_MISSING = 'the event envelope carries no is_ext_shared_channel flag'
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean (b.deo SRI-903). */
+/** Fungible-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean. */
 export const UNCLAIMED_REASON_FLAG_NOT_BOOLEAN = "the event envelope's is_ext_shared_channel flag is not a boolean"
 
-/** Fungible-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE` (b.deo SRI-903). */
+/** Fungible-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE`. */
 export const UNCLAIMED_REASON_CHANNEL_ID_MALFORMED = 'the channel ID is malformed'
 
-/** Fungible-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group` (b.deo SRI-903). */
+/** Fungible-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group`. */
 export const UNCLAIMED_REASON_NOT_A_CHANNEL = 'the conversation is not a public or private channel'
 
-/** Each fungible-path refusal's reason text (b.deo SRI-903): a closed mapping, one text per refusal. */
+/** Each fungible-path refusal's reason text: a closed mapping, one text per refusal. */
 export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> = {
   'not-a-channel': UNCLAIMED_REASON_NOT_A_CHANNEL,
   'channel-id-malformed': UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
@@ -394,7 +392,7 @@ export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> =
 }
 
 /**
- * The fungible-mode `unclaimed-channel` cause (b.deo SRI-903), formatted
+ * The fungible-mode `unclaimed-channel` cause, formatted
  * through `formatPersonaDiagnostic` with no path:
  *
  *   `message in channel <channel> not delivered in fungible mode: <reason>; to serve this channel, use declarative mode with the channel listed`

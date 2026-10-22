@@ -1,5 +1,5 @@
 /** Case 8 preparation only: observe the denied Agent settling before item six.
- * b.omv SR-14.2 case 8 / SR-14.6; never infer completion from elapsed time.
+ * case 8 /; never infer completion from elapsed time.
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'

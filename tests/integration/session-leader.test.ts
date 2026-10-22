@@ -1,5 +1,5 @@
 /**
- * session-leader.test.ts — Integration coverage for the b.acn session-leader
+ * session-leader.test.ts — Integration coverage for the session-leader
  * detection on a REAL detached process.
  *
  * The unit tests in tests/cli.test.ts exercise the leaked-marker (NOT a session
@@ -42,7 +42,7 @@ const session = parseInt(fields[3] ?? '', 10)
 process.stdout.write(JSON.stringify({ pid: process.pid, session }) + '\\n')
 `
 
-describe('isSessionLeader stat parsing on a real detached child (b.acn)', () => {
+describe('isSessionLeader stat parsing on a real detached child', () => {
   let scratchDir: string
   let scriptPath: string
 

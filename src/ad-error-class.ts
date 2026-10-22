@@ -1,6 +1,5 @@
 /**
- * ad-error-class.ts — The one classifier of agent-director errors (b.jg5
- * SRJ-104), and the `ErrInvalidFlags` step beside it.
+ * ad-error-class.ts — The one classifier of agent-director errors, and the `ErrInvalidFlags` step beside it.
  *
  * {@link classifyAdError} maps any value thrown by an agent-director call to
  * exactly one class:
@@ -56,15 +55,15 @@
  *
  * {@link conflictDescriptionOf} answers the description of a value that
  * classifies as CONFLICT (an `ErrTmuxSessionConflict` instance's
- * `errDescription`), and nothing for any other value; the conflict latch (`src/conflict-latch.ts`; b.jg5
- * SRJ-501, SRJ-507) reads its quoted session and its case from it. A CONFLICT
+ * `errDescription`), and nothing for any other value; the conflict latch (`src/conflict-latch.ts`
+ *) reads its quoted session and its case from it. A CONFLICT
  * classification itself carries no description, so
  * `describeAdErrorClassification` never logs the raw text. Never throws.
  *
  * {@link killFailedDescriptionOf} answers the description of an
  * `ErrTmuxKillFailed` instance, and nothing for any other value (an
  * `ErrUnknownErrorName` carrying that name included); the kill outcome
- * (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-702) carries it raw, and every
+ * (`src/checked-kill.ts`) carries it raw, and every
  * log line renders it redacted. An UNAVAILABLE classification carries no
  * description either. Never throws.
  *
@@ -77,21 +76,21 @@
  * is its use for `ErrInvalidFlags`. Never throws.
  *
  * {@link isDifferentTmuxServerError} answers whether a value is the
- * re-bound-socket form of ENVIRONMENT (b.jg5 SRJ-1021): ENVIRONMENT by the
+ * re-bound-socket form of ENVIRONMENT: ENVIRONMENT by the
  * classifier, its description carrying `DIFFERENT_TMUX_SERVER_PHRASE`
  * (`src/ad-description-phrases.ts`). Never throws.
  *
  * {@link isLaunchTimeoutError} answers whether a value ends a declared launch
- * call as a launch timeout (b.jg5 SRJ-407): an `ErrCallTimeout` instance, or
+ * call as a launch timeout: an `ErrCallTimeout` instance, or
  * an `ErrTmuxUnresponsive` instance whose description carries
  * `LAUNCH_TIMEOUT_PHRASE` (class plus phrase);
  * {@link launchTimeoutFormOf} names the form. Both forms keep their
  * UNAVAILABLE class. Never throws.
  *
  * {@link classifyWithInvalidFlagsRecheck} is the step for a site that gives
- * `ErrInvalidFlags` no meaning (b.jg5 SRJ-104: any site but a plain or reuse
+ * `ErrInvalidFlags` no meaning (any site but a plain or reuse
  * spawn): an `ErrInvalidFlags` gets exactly one immediate version re-check
- * through `triggerAdVersionRecheck` (`src/ad-version-gate.ts`, b.jg5 SRJ-204;
+ * through `triggerAdVersionRecheck` (`src/ad-version-gate.ts`;
  * injectable) and answers UNCLASSIFIED with the re-check's answer; any other
  * value answers its pure class with no re-check. A stop the re-check decides
  * ends the process as the re-check defines. Its callers: the resume path of
@@ -101,14 +100,14 @@
  *
  * {@link unclassifiedClassificationOf} is the UNCLASSIFIED classification,
  * reported name and rendered message included, of a value a site takes as
- * UNCLASSIFIED although the classifier gives it another class (b.jg5 SRJ-110:
+ * UNCLASSIFIED although the classifier gives it another class (
  * a class a kill has no row for). Pure; never throws.
  *
  * {@link describeAgentDirectorFailure} renders a failed call for a log line by
  * the same name rule: the `errName` when it is a safe identifier, then the
  * redacted description.
  *
- * Verbs (b.jg5 glossary, SRJ-307, SRJ-310). Every agent-director call made
+ * Verbs (glossary). Every agent-director call made
  * through the outage wrappers (`src/outage-state.ts`) declares its verb
  * (`AdCall`): one of `AD_VERBS`, and for `kill` whether the site kills a row
  * it read live (`AdKillCall`). The tmux-touching verbs are
@@ -172,7 +171,7 @@ import {
 } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
-// Verbs (b.jg5 glossary, SRJ-307, SRJ-310)
+// Verbs (glossary)
 // ---------------------------------------------------------------------------
 
 /** Every agent-director verb a wrapped call declares, as agent-director names it. */
@@ -199,7 +198,7 @@ export type AdVerb = (typeof AD_VERBS)[number]
 export const AD_VERB_KILL = 'kill'
 
 /**
- * The tmux-touching verbs (the b.jg5 glossary): `spawn` (plain or reuse),
+ * The tmux-touching verbs (the glossary): `spawn` (plain or reuse),
  * `resume`, `read-pane`, `send-keys`, `pause`, and `kill` of a live row. A
  * `kill` call counts only when declared as a kill of a row read live
  * ({@link isTmuxTouchingCall}).
@@ -214,7 +213,7 @@ export const TMUX_TOUCHING_VERBS: ReadonlySet<string> = new Set<AdVerb>([
 ])
 
 /**
- * The launch verbs (b.jg5 SRJ-301, SRJ-305): `spawn` (plain or reuse) and
+ * The launch verbs: `spawn` (plain or reuse) and
  * `resume`. A successful launch call leaves its row `pending`
  * ({@link isLaunchCall}).
  */
@@ -226,7 +225,7 @@ export function isLaunchCall(call: AdCall): boolean {
   return verb !== undefined && AD_LAUNCH_VERBS.has(verb)
 }
 
-/** The read verbs (b.jg5 SRJ-301, SRJ-105): `status`, `get` and `list`. */
+/** The read verbs: `status`, `get` and `list`. */
 export const AD_READ_VERBS: ReadonlySet<string> = new Set<AdVerb>(['status', 'get', 'list'])
 
 /**
@@ -268,7 +267,7 @@ export function adCallVerb(call: AdCall): AdVerb | undefined {
 }
 
 /**
- * True when the declared call is tmux-touching (the b.jg5 glossary): its verb
+ * True when the declared call is tmux-touching (the glossary): its verb
  * is in `TMUX_TOUCHING_VERBS`, and a `kill` only when declared as a kill of a
  * row read live (`rowReadLive` exactly true). Never throws.
  */
@@ -308,7 +307,7 @@ export const AD_ERROR_CLASS_DIRECTORY = 'DIRECTORY'
 /** UNCLASSIFIED: an agent-director error CSCB gives no handling. */
 export const AD_ERROR_CLASS_UNCLASSIFIED = 'UNCLASSIFIED'
 
-/** Every class label, in the order of b.jg5 SRJ-104's table. */
+/** Every class label, in the order of the contract table. */
 export const AD_ERROR_CLASSES = [
   AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_UNAVAILABLE,
@@ -422,7 +421,7 @@ export interface AdErrorClassification {
 }
 
 /**
- * The class of any value thrown by an agent-director call (b.jg5 SRJ-104);
+ * The class of any value thrown by an agent-director call;
  * see the module comment. Pure; never throws.
  */
 export function classifyAdError(value: unknown): AdErrorClassification {
@@ -461,7 +460,7 @@ export function classifyAdError(value: unknown): AdErrorClassification {
  * CONFLICT, an `ErrTmuxSessionConflict` instance: its `errDescription`, raw as
  * agent-director wrote it, when it is a string. `undefined` for a value of any
  * other class (an `ErrUnknownErrorName` included, whatever its `unknownName`:
- * SRJ-104 classes it by that name, never as CONFLICT; a base
+ * classes it by that name, never as CONFLICT; a base
  * `AgentDirectorError` merely named `ErrTmuxSessionConflict` included), for a
  * value that is not an agent-director error, and when the read throws or
  * finds no string. The caller redacts it before it reaches a log line, a
@@ -481,7 +480,7 @@ export function conflictDescriptionOf(value: unknown): string | undefined {
  * The description of an `ErrTmuxKillFailed` instance: its `errDescription`,
  * raw as agent-director wrote it, when it is a string. `undefined` for a value
  * of any other class (an `ErrUnknownErrorName` included, whatever its
- * `unknownName`: SRJ-104 classes it UNAVAILABLE, never a kill failure; a base
+ * `unknownName`: classes it UNAVAILABLE, never a kill failure; a base
  * `AgentDirectorError` merely named `ErrTmuxKillFailed` included), for a value
  * that is not an agent-director error, and when a read throws or finds no
  * string. The kill outcome (`src/checked-kill.ts`) carries it; the caller
@@ -533,9 +532,9 @@ export function isAdErrorInstance<T extends AdErrorConstructor>(value: unknown, 
   }
 }
 
-/** A launch timeout's form: the client's own `ErrCallTimeout` for the launch call (b.jg5 SRJ-407). */
+/** A launch timeout's form: the client's own `ErrCallTimeout` for the launch call. */
 export const LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT = ERR_CALL_TIMEOUT_NAME
-/** A launch timeout's form: agent-director's `ErrTmuxUnresponsive` carrying `LAUNCH_TIMEOUT_PHRASE` (b.jg5 SRJ-407). */
+/** A launch timeout's form: agent-director's `ErrTmuxUnresponsive` carrying `LAUNCH_TIMEOUT_PHRASE`. */
 export const LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE = ERR_TMUX_UNRESPONSIVE_NAME
 
 /** The two forms of a launch timeout. */
@@ -543,7 +542,7 @@ export type LaunchTimeoutForm = typeof LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT | typeof
 
 /**
  * The form in which `value` ends the declared launch call `call` as a launch
- * timeout (b.jg5 SRJ-407), or `undefined` when it does not: `call` is a
+ * timeout, or `undefined` when it does not: `call` is a
  * launch call ({@link isLaunchCall}: `spawn`, plain or reuse, or `resume`),
  * and either the client threw an `ErrCallTimeout` instance for it
  * ({@link LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT}), or agent-director answered an
@@ -571,7 +570,7 @@ export function launchTimeoutFormOf(value: unknown, call: AdCall): LaunchTimeout
 
 /**
  * True when `value` ends the declared launch call `call` as a launch timeout
- * (b.jg5 SRJ-407), in either form ({@link launchTimeoutFormOf}). Pure; never
+ * in either form ({@link launchTimeoutFormOf}). Pure; never
  * throws.
  */
 export function isLaunchTimeoutError(value: unknown, call: AdCall): boolean {
@@ -579,8 +578,7 @@ export function isLaunchTimeoutError(value: unknown, call: AdCall): boolean {
 }
 
 /**
- * True when `value` is the re-bound-socket form of ENVIRONMENT (b.jg5
- * SRJ-311, SRJ-1021): it classifies as ENVIRONMENT by {@link classifyAdError}
+ * True when `value` is the re-bound-socket form of ENVIRONMENT: it classifies as ENVIRONMENT by {@link classifyAdError}
  * and its `errDescription` contains `DIFFERENT_TMUX_SERVER_PHRASE`.
  * Recognition is by class and phrase only. A missing or non-string description
  * answers false. Pure; never throws.
@@ -630,7 +628,7 @@ export function describeAgentDirectorFailure(err: unknown): string {
 
 /**
  * Token-safe description of a failed agent-director call that names what
- * agent-director reported (b.jg5 SRJ-104): for a value {@link classifyAdError}
+ * agent-director reported: for a value {@link classifyAdError}
  * gives a reported name or message (an UNCLASSIFIED, UNUSABLE NAME or CONFIG
  * error), `<reported name>[ message="<message>"]` in
  * {@link describeAgentDirectorFailure}'s form, so an `ErrUnknownErrorName`
@@ -649,7 +647,7 @@ export function describeReportedAdFailure(err: unknown): string {
 
 /**
  * A server-log description of a failed agent-director call that names the
- * reported name whenever the classifier gives one (b.jg5 SRJ-104, SRJ-1014):
+ * reported name whenever the classifier gives one:
  * {@link describeReportedAdFailure}'s description for a value with a
  * reported name (an `ErrUnknownErrorName` shows its `unknownName` and the
  * envelope's `err_description`, never the client's placeholder); otherwise
@@ -668,7 +666,7 @@ export function describeAdFailureForLog(err: unknown): string {
 /**
  * The UNCLASSIFIED classification of `value`, for a site that takes a value
  * of another class as UNCLASSIFIED because it gives that class no meaning
- * (b.jg5 SRJ-104, SRJ-110: at a kill, a STATE name other than
+ * (at a kill, a STATE name other than
  * `ErrSpawnNotFound`, LAUNCH FAILURE or DIRECTORY): class UNCLASSIFIED, with
  * the reported name (`errName`, or `unknownName` of an `ErrUnknownErrorName`)
  * when it is a safe identifier and the rendered message (`errDescription`,
@@ -761,7 +759,7 @@ export interface AdInvalidFlagsStepAnswer extends AdErrorStepAnswer {
 
 /**
  * The `ErrInvalidFlags` step for a site that gives `ErrInvalidFlags` no
- * meaning (b.jg5 SRJ-104, SRJ-204): for an `ErrInvalidFlags`, await exactly
+ * meaning: for an `ErrInvalidFlags`, await exactly
  * one immediate version re-check through `trigger` (default: the installed
  * re-check's `triggerAdVersionRecheck`) and answer UNCLASSIFIED with the
  * re-check's answer, whatever it is; for any other value, answer its pure

@@ -13,7 +13,7 @@
  *   tokens 1-5 : standard 5-field cron expression (validated via croner)
  *   token 6    : prompt-file path, kept VERBATIM (no expansion/resolution)
  *   token 7    : optional comma-separated persona target list — persona names
- *                or keys (b.av2 SR-9.3), kept VERBATIM: this parser never
+ * or keys, kept VERBATIM: this parser never
  *                resolves or validates a target against any config (the cron
  *                dispatcher resolves them at fire time)
  *                (a literal `*` is a PARSE ERROR — omission is the all-bots form)
@@ -33,7 +33,7 @@ import { Cron } from 'croner'
 
 /**
  * Closed union of parse-error reason classes. One distinct class per bad-line
- * kind so downstream triage (E3 parse-error logging) can distinguish them.
+ * kind so downstream triage ( parse-error logging) can distinguish them.
  */
 export type CronParseErrorReason =
   /** tokens 1-5 did not form a valid 5-field cron expression (croner rejected). */
@@ -205,8 +205,8 @@ function parseLine(rawLine: string, lineNumber: number): LineOutcome {
 
 /**
  * Derive the basename of a path without its final extension.
- *   /a/b/grooming-tick.md → grooming-tick
- *   .env                  → .env   (leading-dot dotfile keeps its name)
+ *   /a/b/grooming-tick.md → grooming-tick.
+ *   env                  → .env   (leading-dot dotfile keeps its name)
  *   report                → report (no extension → basename as-is)
  *   archive.tar.gz        → archive.tar (only the final extension is dropped)
  *

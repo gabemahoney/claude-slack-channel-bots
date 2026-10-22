@@ -1,7 +1,7 @@
 /**
  * agent-director-versions.ts — the shared agent-director versions tests check
  * against CSCB's Phase 1 floor, and the minimum Claude Code version
- * CSCB supports with agent-director (b.9v8; b.jg5 SRJ-1304).
+ * CSCB supports with agent-director.
  *
  * Tests import every agent-director version they check from here or from
  * `src/`, never as a literal, so a change to the floor constant
@@ -26,7 +26,7 @@
  * module loads.
  *
  * `MIN_CLAUDE_CODE_VERSION` is CSCB's supported minimum with agent-director
- * 0.12.0, and the version the fleet runs (b.9v8). This helper is its one definition: no `src/` module defines or
+ * 0.12.0, and the version the fleet runs. This helper is its one definition: no `src/` module defines or
  * reads a Claude Code version, and every test that needs it (a fixture's
  * recorded version, the runbook and supported-minimum docs)
  * imports it from here. `tests/ad-version-gate.test.ts` checks that no other
@@ -34,7 +34,7 @@
  * in code (comments stripped).
  *
  * Starts no process and holds no value import of `Client` or
- * `resolveSystemBinary` (host-safety audit, b.jg5 SRJ-1301). It imports only
+ * `resolveSystemBinary` (host-safety audit). It imports only
  * `src/ad-version-gate.ts` and the client's sentinel, so the agent-director
  * stub can import it without a cycle.
  *
@@ -63,13 +63,13 @@ export const DEV_UNPARSEABLE_VERSION = 'dev'
 /**
  * CSCB's supported minimum with agent-director 0.12.0, verified by its
  * install, spawn, reuse and resume checks, and the version the fleet runs
- * (b.9v8). Exec-form hooks
+ * Exec-form hooks
  * (`command` with `args`) need Claude Code 2.1.139 or later. The one place
  * this value is written in `tests/` or `src/` code.
  */
 export const MIN_CLAUDE_CODE_VERSION = '2.1.280'
 
-/** The independent /ci-live target (b.omv SR-13.6), not the supported minimum. */
+/** The independent /ci-live target, not the supported minimum. */
 export const LIVE_CLAUDE_CODE_VERSION = '2.1.296'
 
 /** The frozen 0.11.0 runbooks' Claude Code version, independent of today's supported floor. */

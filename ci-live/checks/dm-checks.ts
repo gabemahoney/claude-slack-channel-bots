@@ -1,5 +1,5 @@
 /**
- * dm-checks.ts — testplans/b.yko Parts 6–7: open access (14), DMs and DM
+ * dm-checks.ts — testplans/live-acceptance.md Parts 6–7: open access (14), DMs and DM
  * prompts (15–23), and the "Turn A's DMs on" gesture between 16 and 17.
  *
  * Checks 14, 16 and 20 need a second workspace user (live.json
@@ -246,7 +246,7 @@ function silentReason(asks: readonly Exchange[], target: string): string {
 
 export const check14: CheckDef<CheckContext> = {
   id: '14',
-  title: 'Check 14: a first-time user reaches a persona in a channel and by DM, with no approval step (AC 17)',
+  title: 'Check 14: a first-time user reaches a persona in a channel and by DM, with no approval step',
   needs: LIVE2,
   row: '14',
   async run(ctx) {
@@ -327,7 +327,7 @@ export const check14: CheckDef<CheckContext> = {
 
 export const check15: CheckDef<CheckContext> = {
   id: '15',
-  title: 'Check 15: a DM to a persona with DMs off is dropped with a log line (AC 35)',
+  title: 'Check 15: a DM to a persona with DMs off is dropped with a log line',
   needs: LIVE,
   row: '15',
   async run(ctx) {
@@ -356,7 +356,7 @@ export const check15: CheckDef<CheckContext> = {
 
 export const check16: CheckDef<CheckContext> = {
   id: '16',
-  title: 'Check 16: a persona with DMs off refuses to message a user (AC 36, outbound leg)',
+  title: 'Check 16: a persona with DMs off refuses to message a user (outbound leg)',
   needs: LIVE2,
   row: '16',
   async run(ctx) {
@@ -421,7 +421,7 @@ export const aDmsOn: CheckDef<CheckContext> = {
 
 export const check17: CheckDef<CheckContext> = {
   id: '17',
-  title: 'Check 17: each DM is answered by the persona whose app received it (AC 15, AC 37, AC 17)',
+  title: 'Check 17: each DM is answered by the persona whose app received it',
   needs: LIVE,
   row: '17',
   async run(ctx) {
@@ -464,7 +464,7 @@ export const CHECK23_B_EXTRA = /[\s\S]*/
 
 export const check18: CheckDef<CheckContext> = {
   id: '18',
-  title: "Check 18: C's first prompt opens the DM with its contact (AC 44)",
+  title: "Check 18: C's first prompt opens the DM with its contact",
   needs: LIVE,
   row: '18',
   async run(ctx) {
@@ -501,14 +501,14 @@ export const check18: CheckDef<CheckContext> = {
     }
     if (ts) await clickPrompt(ctx, post.channel, ts, 'Allow', f)
     f.expect(await waitFile(ctx, '~/cscb-live/c/dm-prompt-c.txt', REPLY_TIMEOUT_MS), 'dm-prompt-c.txt does not exist')
-    if (kind === 'not verified') return skipped('not verified (AC 44): a DM with C existed before its first prompt in this run', f.evidence)
+    if (kind === 'not verified') return skipped('not verified: a DM with C existed before its first prompt in this run', f.evidence)
     return f.result()
   },
 }
 
 export const check19: CheckDef<CheckContext> = {
   id: '19',
-  title: 'Check 19: a DM-only persona starts, connects and answers DMs (AC 40, AC 41)',
+  title: 'Check 19: a DM-only persona starts, connects and answers DMs',
   needs: LIVE,
   row: '19',
   async run(ctx) {
@@ -541,7 +541,7 @@ export const check19: CheckDef<CheckContext> = {
 
 export const check20: CheckDef<CheckContext> = {
   id: '20',
-  title: 'Check 20: a persona with DMs on opens a DM with a user and posts as itself (AC 38)',
+  title: 'Check 20: a persona with DMs on opens a DM with a user and posts as itself',
   needs: LIVE2,
   row: '20',
   async run(ctx) {
@@ -577,7 +577,7 @@ export const check20: CheckDef<CheckContext> = {
       const firstAsk = o.asks[0]!.ts
       const msgs = await second.human.history(dm!, firstAsk)
       f.expect(postsAfter(msgs, firstAsk, bot(ctx, 'a'), 'DMs-on outbound check').length > 0, "the DM does not hold A's message from this check")
-      // Whether AC 38's "opens a DM" was met by a new DM or an earlier run's: judged on what is older than the first ask.
+      // Whether "opens a DM" was met by a new DM or an earlier run's: judged on what is older than the first ask.
       f.note(
         heldBefore(await second.human.history(dm!, '0'), firstAsk)
           ? "Check 20: the DM with A already held messages older than the first ask (an earlier run's DM, reused)"
@@ -609,7 +609,7 @@ export const check21: CheckDef<CheckContext> = {
     const tagA = await tagstext(ctx, 'a', 'edit check')
     expectOneTag(f, tagA, "tagstext a 'edit check'", { via: 'mention', user_id: ctx.ids.humanUserId })
     f.expect((await tagstext(ctx, 'b', 'edit check')).length === 0, 'B received the edit')
-    // An edited event may carry an edited timestamp; use the received tag's identity (b.omv SR-13.6).
+    // An edited event may carry an edited timestamp; use the received tag's identity.
     const deliveryTs = tagA[0] ? tagAttr(tagA[0], 'ts') : null
     if (f.expect(deliveryTs !== null, 'the edit tag has no delivery timestamp')) {
       for (const kind of ['message-received', 'message-delivered'] as const) {
@@ -639,7 +639,7 @@ async function promptMessage(ctx: CheckContext, channel: string, ts: string | un
 
 export const check22: CheckDef<CheckContext> = {
   id: '22',
-  title: "Check 22: B's prompt arrives by DM and its button resolves it (AC 29)",
+  title: "Check 22: B's prompt arrives by DM and its button resolves it",
   needs: LIVE,
   row: '22',
   async run(ctx) {
@@ -671,7 +671,7 @@ export const check22: CheckDef<CheckContext> = {
 
 export const check23: CheckDef<CheckContext> = {
   id: '23',
-  title: "Check 23: A's channel prompt and B's DM prompt each go to their own persona's destination (AC 34)",
+  title: "Check 23: A's channel prompt and B's DM prompt each go to their own persona's destination",
   needs: LIVE,
   row: '23',
   async run(ctx) {

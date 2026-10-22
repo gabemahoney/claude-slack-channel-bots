@@ -1,6 +1,6 @@
 /**
  * ci-live-prompt-guard.test.ts — Tests for the /ci-live runner's prompt guard
- * (bug b.1cx, run 6's recommendation): `ci-live/checks/prompt-guard.ts`.
+ * (run 6's recommendation): `ci-live/checks/prompt-guard.ts`.
  *
  * The rules under test:
  * - the guard reads the permission trail from where it left off, groups the

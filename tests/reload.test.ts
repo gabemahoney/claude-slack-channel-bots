@@ -1,8 +1,8 @@
 import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
 /**
- * reload.test.ts — The reload controller's start rules (b.av2 SR-8.7), the
- * record-start real-path collisions (SR-1.5, record-start part), the SR-5.2
- * guard source and pending-change detection (SR-8.2, SR-8.3: the pending
+ * reload.test.ts — The reload controller's start rules, the
+ * record-start real-path collisions (record-start part), the
+ * guard source and pending-change detection (the pending
  * file's lifecycle, its fingerprint and the held credentials compare),
  * driven end to end through `makeReloadHarness`: the
  * real controller over a temp configuration directory, the real bring-up
@@ -14,32 +14,32 @@ import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
  * with them: which file it applies, what it writes, what it brings up and
  * what it logs. Detection cases assert pending state, the pending file's
  * presence and fingerprint, lifecycle calls and the log; the preview itself
- * (b.av2 SR-8.4) is asserted as the tick writes and logs it: the pending
+ * is asserted as the tick writes and logs it: the pending
  * file's body, its logged emission (the same lines, each classed
  * `reload-preview`, once per pending-state change), the INVALID form
  * (`reload-invalid`), an added persona that cannot come up, a changed
  * claude_config_dir (own or the top-level default) that cannot be resolved,
  * warned about and still applied once confirmed, and a fact the tick could
  * not gather. The plan and renderer on their own are
- * `reload-preview.test.ts`'s. Confirmation and apply (SR-8.5, SR-8.6): the
- * rename that applies (AC 73), invalid (AC 63), stale (AC 69), malformed,
+ * `reload-preview.test.ts`'s. Confirmation and apply: the
+ * rename that applies, invalid, stale, malformed,
  * unreadable and undeletable confirmations, step 1's record write and its
  * failures (an apply that removes a persona writes the retired-key record
- * first, b.jg5 SRJ-803, and a failed rewrite puts it back, SRJ-804: here
+ * first, and a failed rewrite puts it back, here
  * only as the writes, deletes and lines each case asserts exactly; what step
  * 1 records and restores is `reload-apply.test.ts`'s), the pending file
- * rewritten after a consumed confirmation (AC 56),
+ * rewritten after a consumed confirmation,
  * `reload-noop`, and the order of the step 2–6 slots. Confirmed credentials
- * changes end to end (SR-6.4, SR-8.3, SR-8.6): a persona credentials-broken
+ * changes end to end: a persona credentials-broken
  * at start comes up once its file is fixed and the change confirmed, and
- * only then (AC 65); a failed change stays pending; the held content follows
+ * only then; a failed change stays pending; the held content follows
  * the outcome. The 64 KiB read cap on
  * the start, tick and confirmation paths. Token secrecy on the reload path
- * (SR-10.3, AC 20): a Slack token pasted under a `bot_token` or `app_token`
+ * a Slack token pasted under a `bot_token` or `app_token`
  * key is an INVALID candidate on a running server, a confirmed one and a
  * refused start (from the config file or a hand-edited record), with every
  * server-side file under the temp root leak-checked. A token-shaped persona
- * name is not a secret (b.av2 SR-1.2, no format rule): renaming a persona to
+ * name is not a secret (no format rule): renaming a persona to
  * one, or adding one, is a valid candidate previewed and applied with the
  * name as written, and a start from the config file or the record with one
  * starts. Every test runs `assertNoLeak` over what each run captured and
@@ -50,7 +50,7 @@ import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
  * sentinel), so they run `assertNoLeak` with the name and its key masked
  * (`withoutName`): the rest, credential values included, is still checked.
  *
- * The channel modes (b.deo SRI-105, SRI-801, SRI-907): a start without a
+ * The channel modes: a start without a
  * record, and the tick, judge a configuration by the mode its own switch
  * picks, so a candidate that turns fungible mode on or off is INVALID when the
  * section it puts in force breaks that mode's rules, naming the persona and
@@ -172,9 +172,9 @@ function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
 
 /**
  * The loader's rejection of `alpha` then `alpha_2`, whose key starts with
- * `alpha`'s (the prefix-related key rule, b.1ix follow-up), after the
+ * `alpha`'s (the prefix-related key rule follow-up), after the
  * `Persona config validation error: ` prefix. The reason sentence is
- * b.jg5 SRJ-1102's, built by the loader's own reason builder for
+ * built by the loader's own reason builder for
  * `slack_bot_alpha` and `slack_bot_alpha_2`.
  */
 function prefixRelatedKeysRejection(): string {
@@ -238,7 +238,7 @@ function expectOutcomeConfigIsStartPass(run: ReloadRun, ...names: string[]): voi
   expect(config?.personas.map((p) => p.key)).toEqual(names.map((n) => h.key(n)))
 }
 
-/** Every test's closing check, per run: nothing posted to Slack (b.av2 SR-7.2) and no token in anything captured. */
+/** Every test's closing check, per run: nothing posted to Slack and no token in anything captured. */
 function expectNoPostNoLeak(...runs: ReloadRun[]): void {
   for (const run of runs) {
     expect(run.slackPosts()).toEqual([])
@@ -263,7 +263,7 @@ function previewFileSuffix(pendingFile: string = h.paths.pending): string {
 }
 
 /**
- * The log lines of one preview emission (b.av2 SR-8.4, SR-10.3): each of
+ * The log lines of one preview emission: each of
  * `lines` (the pending file's preview body by default) classed
  * `reload-preview`, the first pointing at the pending file (`pendingFile`,
  * `h.paths.pending` by default) unless `written` is false (the write failed).
@@ -301,7 +301,7 @@ function countsText(c: PreviewCounts): string {
   )
 }
 
-/** A valid candidate's preview header (b.av2 SR-8.4) with these counts. */
+/** A valid candidate's preview header with these counts. */
 function previewHeader(c: PreviewCounts = {}): string {
   return `A configuration change is pending; nothing has been applied. ${countsText(c)}.`
 }
@@ -333,15 +333,14 @@ function personaRef(name: string): string {
   return `persona ${JSON.stringify(name)} (key=${h.key(name)})`
 }
 
-/** The `DESTRUCTIVE:` line of a removed persona: it will be retired (b.jg5 SRJ-1510), from the exported clause. */
+/** The `DESTRUCTIVE:` line of a removed persona: it will be retired, from the exported clause. */
 function removedLine(name: string): string {
   return `${DESTRUCTIVE_PREFIX} ${personaRef(name)} is removed: ${REMOVED_RETIRED_CLAUSE}; ${queueRetentionClause(0)}.`
 }
 
 /**
  * The `DESTRUCTIVE:` line of a persona whose one destructive `setting`
- * changed to `path`: it will be retired and brought up fresh (b.jg5
- * SRJ-1510), from the exported clause.
+ * changed to `path`: it will be retired and brought up fresh, from the exported clause.
  */
 function destructiveLine(name: string, setting: 'credentials_file' | 'working_directory', path: string): string {
   return `${DESTRUCTIVE_PREFIX} ${personaRef(name)} ${setting} changed to ${JSON.stringify(path)}: ${DESTRUCTIVE_RETIRED_CLAUSE}.`
@@ -400,7 +399,7 @@ function runHarnessInChild<T>(body: string): { result: T; stderr: string } {
 }
 
 /**
- * A credentials change's previewed effect (b.av2 SR-8.6, credentials row), by
+ * A credentials change's previewed effect (credentials row), by
  * the persona's bring-up state and whether the new content can be used:
  * - `reconnect`: up, content valid (a new connection, then the old one closes);
  * - `kept`: up, content unusable (the current connection is kept);
@@ -493,11 +492,11 @@ function expectNothingApplied(run: ReloadRun): void {
 }
 
 // ---------------------------------------------------------------------------
-// No record (AC 71)
+// No record
 // ---------------------------------------------------------------------------
 
 describe('a start without a record applies the configuration file or refuses', () => {
-  test('AC 71: a valid configuration file is recorded byte for byte and exactly its personas are brought up', async () => {
+  test('a valid configuration file is recorded byte for byte and exactly its personas are brought up', async () => {
     const personas = materialized('alpha', 'bravo')
     const configBytes = h.writeConfig(configOf(...personas))
 
@@ -527,22 +526,22 @@ describe('a start without a record applies the configuration file or refuses', (
       expected: () => `malformed JSON in "${h.paths.config}" at line 3, column 5.`,
     },
     {
-      label: 'an SR-1.5 violation (two personas sharing a working directory)',
+      label: 'an violation (two personas sharing a working directory)',
       bytes: () =>
         JSON.stringify(configOf(h.persona('alpha'), h.persona('bravo', { working_directory: h.persona('alpha').working_directory }))),
       expected: () => `invalid persona config in "${h.paths.config}": `,
     },
     {
-      label: 'two personas whose keys are prefix-related (alpha and alpha_2, b.1ix follow-up)',
+      label: 'two personas whose keys are prefix-related (alpha and alpha_2follow-up)',
       bytes: () => JSON.stringify(configOf(h.persona('alpha'), h.persona('alpha_2'))),
       expected: () => `invalid persona config in "${h.paths.config}": Persona config validation error: ${prefixRelatedKeysRejection()}`,
     },
     {
-      label: 'a pre-persona file (routes, default_route, default_dm_session): the SR-1.7 conversion message',
+      label: 'a pre-persona file (routes, default_route, default_dm_session): the conversion message',
       bytes: () => JSON.stringify({ routes: {}, default_route: 'C0OLD', default_dm_session: 'C0OLD' }),
       expected: () => prePersonaConversionMessage('routes'),
     },
-  ])('AC 71: an invalid configuration file refuses the start and logs why: $label', async ({ bytes, expected }) => {
+  ])('an invalid configuration file refuses the start and logs why: $label', async ({ bytes, expected }) => {
     materialized('alpha', 'bravo')
     const written = h.writeConfigBytes(bytes())
 
@@ -568,7 +567,7 @@ describe('a start without a record applies the configuration file or refuses', (
       setUp: () => void h.writeOversized(h.paths.config, { prefix: JSON.stringify(configOf(h.persona('alpha'))) }),
       expected: 'is larger than the 64 KiB limit',
     },
-  ])('AC 71: a configuration file that is $label refuses the start and names the file', async ({ setUp, expected }) => {
+  ])('a configuration file that is $label refuses the start and names the file', async ({ setUp, expected }) => {
     setUp()
 
     const run = await h.start()
@@ -643,8 +642,7 @@ describe('a start without a record applies the configuration file or refuses', (
 })
 
 // ---------------------------------------------------------------------------
-// The channel modes at a start and in the reload tick (b.deo SRI-105, SRI-801,
-// SRI-907): shared helpers
+// The channel modes at a start and in the reload tick: shared helpers
 // ---------------------------------------------------------------------------
 
 /** A public channel no persona lists, and one no persona names as a destination. */
@@ -685,8 +683,7 @@ function configWith(top: Record<string, unknown>, personas: PersonaInput[]): Rec
 }
 
 /**
- * The loader's own error for `file` as the configuration file (b.deo
- * SRI-105): `parsePersonaConfigBytes` over its bytes, as the start and the
+ * The loader's own error for `file` as the configuration file: `parsePersonaConfigBytes` over its bytes, as the start and the
  * tick parse it. Throws when `file` is valid.
  */
 function loaderErrorFor(file: unknown): string {
@@ -698,7 +695,7 @@ function loaderErrorFor(file: unknown): string {
   throw new Error('loaderErrorFor: the configuration is valid')
 }
 
-/** Assert `error` names bravo (`personas[1]` and its `renderPersonaRef`) and `setting`, as every SRI-104 rejection does. */
+/** Assert `error` names bravo (`personas[1]` and its `renderPersonaRef`) and `setting`, as every rejection does. */
 function expectNamesBravoAnd(error: string, setting: string): void {
   expect(error).toContain(`personas[1] ${renderPersonaRef('bravo', h.key('bravo'))}: `)
   expect(error).toContain(setting)
@@ -724,8 +721,8 @@ async function runningIn(
   return { run, recordBytes }
 }
 
-describe('b.deo SRI-105: a start without a record judges the configuration file by the mode its own switch picks', () => {
-  test("a configuration file whose switch is on and whose bravo breaks SRI-104 (no invited, so a dm destination by default, with DMs off) refuses the start, naming bravo and invited.permission_prompts", async () => {
+describe('a start without a record judges the configuration file by the mode its own switch picks', () => {
+  test("a configuration file whose switch is on and whose bravo breaks (no invited, so a dm destination by default, with DMs off) refuses the start, naming bravo and invited.permission_prompts", async () => {
     // bravo's declarative section is valid: only the fungible rules reject it.
     const personas = [bothSections('alpha'), h.persona('bravo')]
     h.materialize(...personas)
@@ -769,7 +766,7 @@ describe('b.deo SRI-105: a start without a record judges the configuration file 
 })
 
 // ---------------------------------------------------------------------------
-// Record present (AC 13, AC 72)
+// Record present
 // ---------------------------------------------------------------------------
 
 describe('a start with a record runs the record', () => {
@@ -780,13 +777,13 @@ describe('a start with a record runs the record', () => {
 
   test.each([
     { label: 'a persona added', config: () => configOf(h.persona('alpha'), h.persona('bravo'), h.persona('charlie')) },
-    { label: 'a persona removed (AC 70, start half: the applied set comes back)', config: () => configOf(h.persona('alpha')) },
+    { label: 'a persona removed (start half: the applied set comes back)', config: () => configOf(h.persona('alpha')) },
     {
       label: 'a persona modified',
       config: () =>
         configOf(h.persona('alpha', { channels: [{ id: 'C0RLDEDIT', delivery: 'mentions' }], permission_prompts: 'C0RLDEDIT' }), h.persona('bravo')),
     },
-  ])('AC 13: the config file differs ($label): exactly the record set comes up and neither file changes', async ({ config }) => {
+  ])('the config file differs ($label): exactly the record set comes up and neither file changes', async ({ config }) => {
     const [alpha, bravo] = materialized('alpha', 'bravo', 'charlie')
     const recordBytes = h.writeRecord(configOf(alpha!, bravo!))
     const configBytes = h.writeConfig(config())
@@ -813,7 +810,7 @@ describe('a start with a record runs the record', () => {
     { label: 'missing', setUp: () => h.remove(h.paths.config) },
     { label: 'malformed', setUp: () => void h.writeConfigBytes(malformedWithSentinel()) },
     { label: 'a directory', setUp: () => h.replaceWithDirectory(h.paths.config) },
-  ])('AC 13: the config file is $label: the record alone suffices and the start runs it', async ({ setUp }) => {
+  ])('the config file is $label: the record alone suffices and the start runs it', async ({ setUp }) => {
     const personas = materialized('alpha')
     const recordBytes = h.writeRecord(configOf(...personas))
     setUp()
@@ -829,7 +826,7 @@ describe('a start with a record runs the record', () => {
     assertNoLeak(run.captured())
   })
 
-  test('AC 72: credentials files are read as they stand at a start from the record', async () => {
+  test('credentials files are read as they stand at a start from the record', async () => {
     const [alpha, bravo, charlie] = materialized('alpha', 'bravo', 'charlie')
     h.writeConfig(configOf(alpha!, bravo!, charlie!))
     const first = await h.start()
@@ -877,12 +874,12 @@ describe('a start with a record runs the record', () => {
       expected: () => `malformed JSON in "${h.paths.lastApplied}" at line 3, column 5.`,
     },
     {
-      label: 'breaks an SR-1.5 rule record mode keeps (a duplicate name)',
+      label: 'breaks an rule record mode keeps (a duplicate name)',
       setUp: () => void h.writeRecord(configOf(h.persona('alpha'), h.persona('alpha', { credentials_file: join(h.root, 'other.json') }))),
       expected: () => `invalid persona config in "${h.paths.lastApplied}": `,
     },
     {
-      label: 'breaks the prefix-related key rule, which record mode keeps (alpha and alpha_2, b.1ix follow-up)',
+      label: 'breaks the prefix-related key rule, which record mode keeps (alpha and alpha_2follow-up)',
       setUp: () => void h.writeRecord(configOf(h.persona('alpha'), h.persona('alpha_2'))),
       expected: () => `invalid persona config in "${h.paths.lastApplied}": Persona config validation error: ${prefixRelatedKeysRejection()}`,
     },
@@ -1008,11 +1005,11 @@ describe('a start with a record runs the record', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Zero personas (AC 54)
+// Zero personas
 // ---------------------------------------------------------------------------
 
 describe('a start with zero personas runs', () => {
-  test('AC 54: a config with an empty personas array and no record starts, is recorded and brings nobody up', async () => {
+  test('a config with an empty personas array and no record starts, is recorded and brings nobody up', async () => {
     const configBytes = h.writeConfig(configOf())
 
     const run = await h.start()
@@ -1024,7 +1021,7 @@ describe('a start with zero personas runs', () => {
     assertNoLeak(run.captured())
   })
 
-  test('AC 54: a record with zero personas starts and brings nobody up, whatever the config file holds', async () => {
+  test('a record with zero personas starts and brings nobody up, whatever the config file holds', async () => {
     materialized('alpha')
     const recordBytes = h.writeRecord(configOf())
     h.writeConfig(configOf(h.persona('alpha')))
@@ -1040,7 +1037,7 @@ describe('a start with zero personas runs', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Record-start real-path collisions (b.av2 SR-1.5, record-start part)
+// Record-start real-path collisions (record-start part)
 // ---------------------------------------------------------------------------
 
 describe('a record-start real-path collision is a bring-up failure of each persona involved', () => {
@@ -1075,7 +1072,7 @@ describe('a record-start real-path collision is a bring-up failure of each perso
     }
     expect(run.lifecycle.outcome(h.key('charlie'))).toBe('up')
     expect(run.lifecycle.keys('launch')).toEqual([h.key('charlie')])
-    // No Slack client is built for either involved persona, so nothing is posted (SR-7.2).
+    // No Slack client is built for either involved persona, so nothing is posted.
     expect([...new Set(run.slack.builds.map((b) => b.persona))]).toEqual([h.key('charlie')])
     expect(run.slackPosts()).toEqual([])
     // A directory collision re-checks on the fake clock; it still never comes up.
@@ -1088,10 +1085,10 @@ describe('a record-start real-path collision is a bring-up failure of each perso
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.2 guard source
+// guard source
 // ---------------------------------------------------------------------------
 
-describe('the file guard source (b.av2 SR-5.2)', () => {
+describe('the file guard source', () => {
   test('lists the applied and the current config file credentials paths, and only the applied ones once the config is malformed', () => {
     const alpha = h.persona('alpha')
     const bravo = h.persona('bravo')
@@ -1321,7 +1318,7 @@ describe('a record or config file that is not a regular file refuses the start u
 })
 
 // ---------------------------------------------------------------------------
-// Detection: the config file (b.av2 SR-8.2, SR-8.3, SR-8.7; AC 55, 62, 70)
+// Detection: the config file (62, 70)
 // ---------------------------------------------------------------------------
 
 describe('detection keeps the pending file in step with the config file and applies nothing', () => {
@@ -1371,7 +1368,7 @@ describe('detection keeps the pending file in step with the config file and appl
       edit: (a: PersonaInput, b: PersonaInput) => configOf({ ...a, channels: [{ id: a.channels![0]!.id, delivery: 'mentions' }] }, b),
     },
     { label: 'a server-wide setting changed', edit: (a: PersonaInput, b: PersonaInput) => ({ ...configOf(a, b), stop_timeout: 45 }) },
-  ])('AC 55: an edit held over many ticks ($label) causes no lifecycle call and nothing reaches Slack', async ({ edit }) => {
+  ])('an edit held over many ticks ($label) causes no lifecycle call and nothing reaches Slack', async ({ edit }) => {
     materialized('charlie')
     const { run, personas, recordBytes } = await running(['alpha', 'bravo'])
     const cp = run.checkpoint()
@@ -1387,7 +1384,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expectNoPostNoLeak(run)
   })
 
-  test('AC 62: a revert deletes the pending file and logs reload-nothing-pending exactly once, leaving no temporary file', async () => {
+  test('a revert deletes the pending file and logs reload-nothing-pending exactly once, leaving no temporary file', async () => {
     const { run, personas, recordBytes } = await running(['alpha', 'bravo'])
     h.writeConfig(configOf(personas[0]!))
     await run.ticks.tick()
@@ -1409,7 +1406,7 @@ describe('detection keeps the pending file in step with the config file and appl
       label: "a persona's working_directory changed",
       edit: (a: PersonaInput, b: PersonaInput) => configOf({ ...a, working_directory: join(dirname(a.working_directory), 'moved') }, b),
     },
-  ])('AC 70: an unconfirmed destructive edit ($label) survives a restart: the applied set comes back and the first check leaves the edit pending', async ({ edit }) => {
+  ])('an unconfirmed destructive edit ($label) survives a restart: the applied set comes back and the first check leaves the edit pending', async ({ edit }) => {
     const [alpha, bravo] = materialized('alpha', 'bravo')
     h.makeWorkingDirectory({ working_directory: join(dirname(alpha!.working_directory), 'moved') })
     const recordBytes = h.writeRecord(configOf(alpha!, bravo!))
@@ -1531,7 +1528,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expectNoPostNoLeak(run)
   })
 
-  // b.av2 SR-8.4, SR-10.3: a pending invalid candidate reads INVALID with the loader's full error (or the missing or
+  // a pending invalid candidate reads INVALID with the loader's full error (or the missing or
   // unreadable file) and logs exactly one reload-invalid line per pending-state change, never reload-preview.
   test.each<{ label: string; edit: (alpha: PersonaInput) => void; error: (alpha: PersonaInput) => string }>([
     {
@@ -1547,7 +1544,7 @@ describe('detection keeps the pending file in step with the config file and appl
         `personas[0] "alpha" (key=${h.key('alpha')}): channels[0].delivery is invalid. Allowed values are: all, mentions.`,
     },
     {
-      label: 'has the pre-persona shape (the SR-1.7 conversion text)',
+      label: 'has the pre-persona shape (the conversion text)',
       edit: () => void h.writeConfig({ routes: {}, default_route: 'C0OLD' }),
       error: () =>
         `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
@@ -1569,7 +1566,7 @@ describe('detection keeps the pending file in step with the config file and appl
         `this one both resolve to ${JSON.stringify(alpha.working_directory)}. Each persona needs its own working_directory.`,
     },
     {
-      label: 'adds a persona whose key starts with an applied persona’s key (alpha_2 beside alpha, b.1ix follow-up)',
+      label: 'adds a persona whose key starts with an applied persona’s key (alpha_2 beside alpha follow-up)',
       edit: (alpha) => void h.writeConfig(configOf(alpha, h.persona('alpha_2'))),
       error: () =>
         `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
@@ -1612,7 +1609,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expectNoPostNoLeak(run)
   })
 
-  // Director decision 5: the tick writes loader errors into the pending file and the log on every
+  // the tick writes loader errors into the pending file and the log on every
   // pending-state change, so a key named with a pasted token must never be echoed there.
   test.each<{ level: string; edit: (alpha: PersonaInput) => Record<string, unknown> }>([
     { level: 'top-level', edit: (alpha) => ({ ...configOf(alpha), [LEAK_SENTINEL]: 1, chanels: [] }) },
@@ -1678,7 +1675,7 @@ describe('detection keeps the pending file in step with the config file and appl
 })
 
 // ---------------------------------------------------------------------------
-// Detection: the channel modes (b.deo SRI-105, SRI-801, SRI-907)
+// Detection: the channel modes
 // ---------------------------------------------------------------------------
 
 /**
@@ -1733,7 +1730,7 @@ async function expectHeldInvalidAppliesNothing(
   expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
 }
 
-/** One SRI-105 row: the running mode, alpha and bravo as started, bravo as the candidate writes it, and the setting the error names. */
+/** One row: the running mode, alpha and bravo as started, bravo as the candidate writes it, and the setting the error names. */
 interface ModeTurnRow {
   label: string
   from: ChannelMode
@@ -1744,7 +1741,7 @@ interface ModeTurnRow {
   setting: string
 }
 
-describe('b.deo SRI-105: the reload tick judges a candidate by the mode its own switch turns on', () => {
+describe('the reload tick judges a candidate by the mode its own switch turns on', () => {
   test.each<ModeTurnRow>([
     {
       label: 'turns fungible mode on, the switch the only edit, while bravo has no invited (a dm destination by default) and DMs off',
@@ -1825,7 +1822,7 @@ describe('b.deo SRI-105: the reload tick judges a candidate by the mode its own 
 type Delivered = Array<{ chat_id: string; via: string | undefined }>
 
 /**
- * What bravo's consumers do now (b.deo SRI-801), probed in this order: the
+ * What bravo's consumers do now, probed in this order: the
  * mode in effect; a mention in the unlisted channel (in fungible mode this
  * also puts the channel in bravo's heard set); `set_channel_delivery` of
  * `all` for that channel; a plain message there; a plain message in bravo's
@@ -1902,13 +1899,13 @@ function fungibleConsumers({ destination = invitedDestination('bravo'), heldByLo
   }
 }
 
-describe('b.deo SRI-801: an edit of the switch or of invited is held until confirmation (b.av2 SR-8.3 to SR-8.5)', () => {
+describe('an edit of the switch or of invited is held until confirmation', () => {
   /**
    * Each row's `changed`: the one consumer field its edit changes once
    * confirmed (the mode, the notice destination, or the loop guard's result
    * for `set_channel_delivery`). The whole consumer state after a switch
    * change or an in-place `invited` change is pinned in
-   * `tests/reload-apply.test.ts` (b.deo SRI-203, SRI-703, SRI-805).
+   * `tests/reload-apply.test.ts`.
    */
   test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; changed: () => Partial<ConsumersNow> }>([
     {
@@ -1977,7 +1974,7 @@ describe('b.deo SRI-801: an edit of the switch or of invited is held until confi
   })
 })
 
-describe('b.deo SRI-907: a pasted value in the switch or in invited.permission_prompts reaches no preview, pending file or log line', () => {
+describe('a pasted value in the switch or in invited.permission_prompts reaches no preview, pending file or log line', () => {
   test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; setting: string; bravoNamed: boolean }>([
     {
       label: 'the switch as a string',
@@ -2006,11 +2003,11 @@ describe('b.deo SRI-907: a pasted value in the switch or in invited.permission_p
 })
 
 // ---------------------------------------------------------------------------
-// Detection: credentials files (b.av2 SR-8.3; AC 67 detection half, AC 72)
+// Detection: credentials files (detection half)
 // ---------------------------------------------------------------------------
 
 describe('detection compares each referenced credentials file with what its persona holds', () => {
-  test("AC 67: a token rotated inside an up persona's credentials file (config.json byte-equal to the record) is previewed as a credentials line naming the persona and path, with no token anywhere and no reconnect before confirmation", async () => {
+  test("a token rotated inside an up persona's credentials file (config.json byte-equal to the record) is previewed as a credentials line naming the persona and path, with no token anywhere and no reconnect before confirmation", async () => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const [alpha] = personas
     const filesBefore = readdirSync(h.root, { recursive: true }).map(String).sort()
@@ -2047,12 +2044,11 @@ describe('detection compares each referenced credentials file with what its pers
   const notJson: Edit = (p) => void h.writeCredentialsContent(p, `{${LEAK_SENTINEL}`)
   const badPrefix: Edit = (p) => void h.writeCredentialsContent(p, { bot_token: fakeToken('xoxp-') })
 
-  // The preview's effect is decided by the persona's bring-up state and whether the new content can be used (b.av2
-  // SR-8.6): up is reconnected when it can, else keeps its current connection; retrying retries with the new content
+  // The preview's effect is decided by the persona's bring-up state and whether the new content can be used: up is reconnected when it can, else keeps its current connection; retrying retries with the new content
   // when it can, else keeps retrying with its current content;
   // broken by its credentials (a local credentials failure, or Slack refusing a token) is brought up when it can,
   // else stays broken. The cause is the credentials check's own wording over the bytes the tick read. A persona
-  // broken by a missing file that is then created, or by invalid content that is then fixed, is the AC 65 (preview
+  // broken by a missing file that is then created, or by invalid content that is then fixed, is the (preview
   // half) case below.
   test.each<{
     label: string
@@ -2186,7 +2182,7 @@ describe('detection compares each referenced credentials file with what its pers
 
   /**
    * A running server whose record and config file (byte-equal) hold alpha,
-   * bravo sharing alpha's credentials file (an SR-1.5 record-start
+   * bravo sharing alpha's credentials file (an record-start
    * collision) and charlie; detection started and its first check run.
    */
   async function sharedCredentialsRunning(): Promise<{ run: ReloadRun; alpha: PersonaInput; bravo: PersonaInput; charlie: PersonaInput }> {
@@ -2201,7 +2197,7 @@ describe('detection compares each referenced credentials file with what its pers
     return { run, alpha: alpha!, bravo, charlie: charlie! }
   }
 
-  test("decision 1 reversed: two personas broken by a shared credentials file each hold its bytes' digest, so re-saving it is pending for both; putting the bytes back clears it", async () => {
+  test("the current rule reversed: two personas broken by a shared credentials file each hold its bytes' digest, so re-saving it is pending for both; putting the bytes back clears it", async () => {
     const { run, alpha, bravo, charlie } = await sharedCredentialsRunning()
     for (const name of ['alpha', 'bravo']) {
       expect(run.lifecycle.outcome(h.key(name))).toBe('broken')
@@ -2238,7 +2234,7 @@ describe('detection compares each referenced credentials file with what its pers
 
   // The case behind the reversal: once the collision is fixed by giving bravo its own file, alpha's
   // declaration is unchanged, so only its held digest lets a re-save of its file show as pending.
-  test("decision 1 reversed: with the collision fixed in the config file (bravo given its own file), a re-save of alpha's file adds alpha's credentials change to what is pending; reverting its bytes takes it out again", async () => {
+  test("the current rule reversed: with the collision fixed in the config file (bravo given its own file), a re-save of alpha's file adds alpha's credentials change to what is pending; reverting its bytes takes it out again", async () => {
     const { run, alpha, bravo, charlie } = await sharedCredentialsRunning()
     const bravoOwn = h.persona('bravo')
     h.writeCredentials(bravoOwn)
@@ -2310,7 +2306,7 @@ describe('detection compares each referenced credentials file with what its pers
     expectNoPostNoLeak(run)
   })
 
-  test('AC 72 (pending half): the next start from the record applies a pending credentials rotation, and its first check removes the leftover pending file', async () => {
+  test('(pending half): the next start from the record applies a pending credentials rotation, and its first check removes the leftover pending file', async () => {
     const { run: first, personas } = await running(['alpha'])
     const rotated = h.writeCredentials(personas[0]!)
     await first.ticks.tick()
@@ -2386,11 +2382,11 @@ describe('detection compares each referenced credentials file with what its pers
 })
 
 // ---------------------------------------------------------------------------
-// The pending-change preview (b.av2 SR-8.4, SR-10.3; AC 56, AC 65 preview half, AC 13)
+// The pending-change preview (preview half)
 // ---------------------------------------------------------------------------
 
 describe('the pending-change preview in the pending file and the server log', () => {
-  test('AC 56: removing B and moving C’s working_directory writes a preview with a DESTRUCTIVE line for each, logged once as reload-preview lines equal to the file’s body, and nothing is applied over many ticks', async () => {
+  test('removing B and moving C’s working_directory writes a preview with a DESTRUCTIVE line for each, logged once as reload-preview lines equal to the file’s body, and nothing is applied over many ticks', async () => {
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
     const [alpha, , charlie] = personas
     const moved = join(dirname(charlie!.working_directory), 'moved')
@@ -2414,7 +2410,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
-  test('AC 13 (tick path): a restart from the record with an unconfirmed edit brings back every recorded persona with no operator step, and its first check previews the edit', async () => {
+  test('(tick path): a restart from the record with an unconfirmed edit brings back every recorded persona with no operator step, and its first check previews the edit', async () => {
     const [alpha, bravo] = materialized('alpha', 'bravo')
     // The first start has no record: it applies and records config.json.
     const configBytes = h.writeConfig(configOf(alpha!, bravo!))
@@ -2445,7 +2441,7 @@ describe('the pending-change preview in the pending file and the server log', ()
   test.each<{ label: string; broken: (persona: PersonaInput) => void }>([
     { label: 'a missing credentials file, then created', broken: () => undefined },
     { label: 'invalid credentials content, then fixed', broken: (p) => void h.writeCredentialsContent(p, 'not json') },
-  ])('AC 65 (preview half): a persona broken by $label is previewed as brought up, not reconnected, stays broken before confirmation, and putting the broken file back clears it', async ({ broken }) => {
+  ])('(preview half): a persona broken by $label is previewed as brought up, not reconnected, stays broken before confirmation, and putting the broken file back clears it', async ({ broken }) => {
     const [bravo] = materialized('bravo')
     const alpha = h.persona('alpha')
     h.makeWorkingDirectory(alpha)
@@ -2644,7 +2640,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
-  // Bug b.g57: the bring-up checks an added persona's claude_config_dir before
+  // the bring-up checks an added persona's claude_config_dir before
   // its Slack step (resolveRealPathStrict: no lexical fallback), so the
   // preview lists an unresolvable one, worded as the check's `problem`
   // (without the held persona's consequence), after the credentials and
@@ -2682,7 +2678,7 @@ describe('the pending-change preview in the pending file and the server log', ()
       configDir: () => danglingLink('dangling-config'),
       causes: ['credentials file does not exist', 'working directory does not exist', DANGLING_CONFIG_DIR],
     },
-  ])('bug b.g57: an added persona with $label is previewed with every cause that stops it coming up', async ({ state, configDir, causes }) => {
+  ])('an added persona with $label is previewed with every cause that stops it coming up', async ({ state, configDir, causes }) => {
     const { run, personas } = await running(['alpha'])
     const dir = configDir()
     const delta = h.preparePersona('delta', state, { claude_config_dir: dir })
@@ -2699,7 +2695,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
-  test('bug b.g57: once the dangling claude_config_dir link\'s target exists, the added persona is previewed as able to come up', async () => {
+  test('once the dangling claude_config_dir link\'s target exists, the added persona is previewed as able to come up', async () => {
     const { run, personas } = await running(['alpha'])
     const target = join(h.root, 'config-target')
     const link = join(h.root, 'config-link')
@@ -2718,7 +2714,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
-  // Bug b.g57, E14 merge-prep: a confirmed claude_config_dir change to a
+  // merge-prep: a confirmed claude_config_dir change to a
   // directory that cannot be resolved holds the persona at its next launch
   // (its Slack connection closed, its launch waiting), so the preview warns on
   // the change's own line, with the added persona's check and wording. It is
@@ -2728,7 +2724,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     { label: 'a symlink pointing to nothing', configDir: () => danglingLink('dangling-config'), warned: true },
     { label: 'a directory under a symlink pointing to nothing', configDir: () => join(danglingLink('dangling-parent'), 'claude'), warned: true },
     { label: 'a directory not created yet under an existing ancestor (the control)', configDir: () => join(h.root, 'not-created-yet', 'claude'), warned: false },
-  ])("bug b.g57: a persona's own claude_config_dir changed to $label is previewed with the warning exactly when it cannot be resolved, and the confirmation applies it", async ({ configDir, warned }) => {
+  ])("a persona's own claude_config_dir changed to $label is previewed with the warning exactly when it cannot be resolved, and the confirmation applies it", async ({ configDir, warned }) => {
     const { run, personas } = await running(['alpha'])
     const [alpha] = personas
     const dir = configDir()
@@ -2753,7 +2749,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
-  test('bug b.g57: a changed top-level claude_config_dir that cannot be resolved warns on its settings line, naming every persona that inherits it', async () => {
+  test('a changed top-level claude_config_dir that cannot be resolved warns on its settings line, naming every persona that inherits it', async () => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const dir = danglingLink('dangling-default')
     const cp = run.checkpoint()
@@ -2773,7 +2769,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
-  test("bug b.g57: once the changed claude_config_dir's link target exists, the preview drops the warning", async () => {
+  test("once the changed claude_config_dir's link target exists, the preview drops the warning", async () => {
     const { run, personas } = await running(['alpha'])
     const [alpha] = personas
     const target = join(h.root, 'config-target')
@@ -2835,7 +2831,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 })
 
 // ---------------------------------------------------------------------------
-// Detection in dry run (b.av2 SR-8.2)
+// Detection in dry run
 // ---------------------------------------------------------------------------
 
 describe('in dry run, detection ignores credentials files', () => {
@@ -3044,7 +3040,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
 })
 
 // ---------------------------------------------------------------------------
-// Confirmation and apply (b.av2 SR-8.5, SR-8.6; AC 63, AC 69, AC 73, AC 56 last clause)
+// Confirmation and apply (last clause)
 // ---------------------------------------------------------------------------
 
 /** The `reload-applied` line of a confirmed change with these counts (the preview header's terms). */
@@ -3098,7 +3094,7 @@ function applyNotRemoved(): ReloadRunActivity['removes'][number] {
   return { path: h.paths.apply, ok: false, removed: undefined, unsynced: false }
 }
 
-/** The retired-key record removed durably: a failed rewrite's restore to the empty record held before the apply (b.jg5 SRJ-804). */
+/** The retired-key record removed durably: a failed rewrite's restore to the empty record held before the apply. */
 function retiredKeysRemoved(): ReloadRunActivity['removes'][number] {
   return { path: h.retiredKeysFile, ok: true, removed: true, unsynced: false }
 }
@@ -3115,7 +3111,7 @@ function retiredKeysLogged(action: 'recorded' | 'restored'): string {
 
 /**
  * The hold set's begin line for the key apply step 1 recorded, once the
- * last-applied rewrite succeeded (b.jg5 SRJ-809): its wording is pinned in
+ * last-applied rewrite succeeded: its wording is pinned in
  * `tests/reload-apply.test.ts`, so it is matched by the hold set's prefix
  * only.
  */
@@ -3135,7 +3131,7 @@ function outsideLifecycle(activity: ReloadRunActivity): ReloadRunActivity {
 
 /**
  * What one step's inputs name, by class: the keys of each class the step
- * binds to (b.av2 SR-8.6), or the config-directories flag for the template
+ * binds to, or the config-directories flag for the template
  * refresh.
  */
 type SlotActedOn = boolean | string[] | Record<string, string[]>
@@ -3267,8 +3263,8 @@ async function pendingRemoval(names: string[], opts?: ReloadRunOptions) {
   return { ...started, configBytes, fingerprint: h.pendingFingerprint()! }
 }
 
-describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
-  test('AC 73: one rename of the pending file applies a removal: the record becomes the config bytes, the applied set shrinks, the confirmation is gone, nothing is pending and one reload-applied line is logged', async () => {
+describe('confirmation and apply', () => {
+  test('one rename of the pending file applies a removal: the record becomes the config bytes, the applied set shrinks, the confirmation is gone, nothing is pending and one reload-applied line is logged', async () => {
     const { run, configBytes } = await pendingRemoval(['alpha', 'bravo'])
     const cp = run.checkpoint()
 
@@ -3295,7 +3291,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run)
   })
 
-  test('AC 73: a confirmed addition rewrites the record and puts the new key in the applied set, with one reload-applied line', async () => {
+  test('a confirmed addition rewrites the record and puts the new key in the applied set, with one reload-applied line', async () => {
     const [charlie] = materialized('charlie')
     const { run, personas } = await running(['alpha'])
     const configBytes = h.writeConfig(configOf(personas[0]!, charlie!))
@@ -3362,7 +3358,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run)
   })
 
-  // AC 63: an invalid candidate, confirmed, changes nothing and logs the loader's full error.
+  // an invalid candidate, confirmed, changes nothing and logs the loader's full error.
   test.each<{ label: string; edit: (alpha: PersonaInput) => void; error: () => string }>([
     {
       label: 'a JSON syntax error',
@@ -3384,14 +3380,14 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
         prePersonaConversionMessage('routes'),
     },
     {
-      label: 'an added persona whose key starts with an applied persona’s key (b.1ix follow-up)',
+      label: 'an added persona whose key starts with an applied persona’s key (follow-up)',
       edit: (alpha) => void h.writeConfig(configOf(alpha, h.persona('alpha_2'))),
       error: () =>
         `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
         prefixRelatedKeysRejection(),
     },
     { label: 'the config file missing', edit: () => h.deleteConfig(), error: () => `the configuration file "${h.paths.config}" does not exist.` },
-  ])('AC 63: a confirmed INVALID candidate ($label) applies nothing, deletes the confirmation, logs one reload-invalid line with the full error and rewrites the INVALID preview', async ({ edit, error }) => {
+  ])('a confirmed INVALID candidate ($label) applies nothing, deletes the confirmation, logs one reload-invalid line with the full error and rewrites the INVALID preview', async ({ edit, error }) => {
     let run!: ReloadRun
     const slots = recordingSlots(() => run, () => h.readConfig())
     const started = await running(['alpha'], { applySteps: slots.slots })
@@ -3426,7 +3422,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
   })
 
-  test('AC 63: a confirmation of an INVALID candidate present at a start is logged as exactly one reload-invalid line on the first check', async () => {
+  test('a confirmation of an INVALID candidate present at a start is logged as exactly one reload-invalid line on the first check', async () => {
     const { run, recordBytes } = await running(['alpha'])
     h.writeConfigBytes(malformedWithSentinel())
     await run.ticks.tick()
@@ -3446,7 +3442,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run, next)
   })
 
-  test('AC 69: a confirmation made stale by an edit before the next check applies nothing and is logged once, and (AC 56) the pending file is rewritten on that check; a revert to its content needs a fresh rename, which then applies', async () => {
+  test('a confirmation made stale by an edit before the next check applies nothing and is logged once, and the pending file is rewritten on that check; a revert to its content needs a fresh rename, which then applies', async () => {
     const { run, personas, recordBytes, configBytes, fingerprint } = await pendingRemoval(['alpha', 'bravo'])
     const [alpha, bravo] = personas
     const applied = run.controller.applied()
@@ -3456,7 +3452,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     const cp = run.checkpoint()
     await run.ticks.tick()
 
-    // AC 56 (last clause): the pending file is written again on the same check, with the current fingerprint and preview.
+    // (last clause): the pending file is written again on the same check, with the current fingerprint and preview.
     expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
     expect(h.pendingFingerprint()).not.toBe(fingerprint)
     expect(run.since(cp)).toEqual({ ...pendingWritten([staleLogged(STALE_MISMATCH), ...loggedPreview()]), removes: [applyRemoved()] })
@@ -3743,7 +3739,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run)
   })
 
-  test('AC 56: after a consumed confirmation whose change stays pending in the same state (its fingerprint line damaged after the rename), the pending file is rewritten on the same check with no second preview', async () => {
+  test('after a consumed confirmation whose change stays pending in the same state (its fingerprint line damaged after the rename), the pending file is rewritten on the same check with no second preview', async () => {
     const { run } = await pendingRemoval(['alpha', 'bravo'])
     const pendingBytes = h.readPending()!
     h.confirm()
@@ -3763,7 +3759,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run)
   })
 
-  // Step 1 writes the retired-key record first (b.jg5 SRJ-803): that durable write opens and fsyncs its
+  // Step 1 writes the retired-key record first: that durable write opens and fsyncs its
   // temporary file and its directory, so the last-applied write's own open is the third openSync and its
   // directory fsync the fourth fsyncSync, counted from failWrites.
   test.each([
@@ -3780,7 +3776,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
       line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote `, h.paths.lastApplied, 'EIO'),
       recordWrites: [false, true],
     },
-  ] as const)('AC 56: a record write failing $label applies nothing, logs one reload-record-write-failed line and rewrites the pending file on the same check', async ({ failure, line, recordWrites }) => {
+  ] as const)('a record write failing $label applies nothing, logs one reload-record-write-failed line and rewrites the pending file on the same check', async ({ failure, line, recordWrites }) => {
     let run!: ReloadRun
     const slots = recordingSlots(() => run, () => h.readConfig())
     const started = await pendingRemoval(['alpha', 'bravo'], { applySteps: slots.slots })
@@ -3793,7 +3789,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 
     await run.ticks.tick()
 
-    // The retired-key record step 1 wrote is put back to the empty record held before the apply: removed (b.jg5 SRJ-804).
+    // The retired-key record step 1 wrote is put back to the empty record held before the apply: removed.
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [retiredKeysLogged('recorded'), retiredKeysLogged('restored'), line()],
@@ -4089,10 +4085,10 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Confirmed credentials changes end to end (b.av2 SR-6.4, SR-8.3, SR-8.4, SR-8.6; AC 65)
+// Confirmed credentials changes end to end
 // ---------------------------------------------------------------------------
 
-describe('confirmed credentials changes: recovery of a credentials-broken persona (AC 65) and the pending state end to end', () => {
+describe('confirmed credentials changes: recovery of a credentials-broken persona and the pending state end to end', () => {
   /** How the persona starts credentials-broken, and the class of its start-time line. */
   interface StartCause {
     label: string
@@ -4183,13 +4179,13 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
   const notJson = (p: PersonaInput) => void h.writeCredentialsContent(p, `{${LEAK_SENTINEL}`)
 
   // Over the recorder's stand-in and over the real lifecycle composition (persona-lifecycle.ts's recovery).
-  const AC65_ROWS = [MISSING_AT_START, INVALID_AT_START, REFUSED_AT_START].flatMap((cause) => [
+  const RELOAD_EVENT_ROWS = [MISSING_AT_START, INVALID_AT_START, REFUSED_AT_START].flatMap((cause) => [
     { cause, label: cause.label, realLifecycle: false, over: "the recorder's stand-in lifecycle" },
     { cause, label: cause.label, realLifecycle: true, over: 'the real lifecycle composition' },
   ])
 
-  test.each(AC65_ROWS)(
-    'AC 65: a persona credentials-broken at start by $label ($over) is previewed as brought up once a good file is placed, stays broken over many ticks and a long clock advance, and after one rename comes up with the new tokens, with no restart and nothing done to the healthy persona',
+  test.each(RELOAD_EVENT_ROWS)(
+    'a persona credentials-broken at start by $label ($over) is previewed as brought up once a good file is placed, stays broken over many ticks and a long clock advance, and after one rename comes up with the new tokens, with no restart and nothing done to the healthy persona',
     async ({ cause, realLifecycle }) => {
       const { run, alpha } = await brokenBesideHealthy(cause, { realLifecycle })
       const key = h.key('alpha')
@@ -4249,7 +4245,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     },
   )
 
-  test("SR-6.4: a persona Slack refused at start, whose app is then fixed on Slack's side, stays broken with no auth.test retry over ticks and backoff periods; a byte-only re-save of its file, confirmed, brings it up", async () => {
+  test("a persona Slack refused at start, whose app is then fixed on Slack's side, stays broken with no auth.test retry over ticks and backoff periods; a byte-only re-save of its file, confirmed, brings it up", async () => {
     const { run, alpha } = await brokenBesideHealthy(REFUSED_AT_START)
     const key = h.key('alpha')
     const stub = run.stub('alpha')
@@ -4258,7 +4254,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     expect(stub.calls.authTest).toHaveLength(1)
     const cp = run.checkpoint()
 
-    // Well past the SR-3.2 schedule's steps (5 s doubling to 300 s), with checks in between.
+    // Well past the schedule's steps (5 s doubling to 300 s), with checks in between.
     for (let i = 0; i < 12; i++) {
       await run.clock.advance(300_000)
       await run.ticks.ticks(5)
@@ -4299,7 +4295,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
       edit: (p) => void h.rotateCredentials(p, { slack: SLACK_AUTH_REJECTED }),
       effect: 'reconnect',
     },
-  ])('SR-8.3: a confirmed credentials change of an up persona whose new file is $label is not used: one persona-credentials-change-failed line, the old connection keeps serving, the change stays pending with its credentials line, and a good file confirmed afresh reconnects', async ({ edit, effect, cause }) => {
+  ])('a confirmed credentials change of an up persona whose new file is $label is not used: one persona-credentials-change-failed line, the old connection keeps serving, the change stays pending with its credentials line, and a good file confirmed afresh reconnects', async ({ edit, effect, cause }) => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const alpha = personas[0]!
     const key = h.key('alpha')
@@ -4360,7 +4356,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     expectNoPostNoLeak(run)
   })
 
-  test('SR-8.3: a retrying persona (Slack unreachable) whose confirmed new file is unusable keeps retrying with its current content and the change stays pending; a good file confirmed then is what its next retry comes up with', async () => {
+  test('a retrying persona (Slack unreachable) whose confirmed new file is unusable keeps retrying with its current content and the change stays pending; a good file confirmed then is what its next retry comes up with', async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { slack: { alpha: SLACK_UNREACHABLE } })
     const alpha = personas[0]!
     const key = h.key('alpha')
@@ -4424,7 +4420,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
       slack: SLACK_UNREACHABLE,
       change: { kind: 'retrying', connection: 'kept' },
     },
-  ])('SR-8.3: after a confirmed rotation of an up persona with $label, it holds the new file’s content, so nothing is pending and later checks do nothing', async ({ slack, change }) => {
+  ])('after a confirmed rotation of an up persona with $label, it holds the new file’s content, so nothing is pending and later checks do nothing', async ({ slack, change }) => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const alpha = personas[0]!
     const key = h.key('alpha')
@@ -4468,7 +4464,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
       preview: (p) => credentialsChangedLine(p, 'bring-up'),
       cls: PERSONA_CREDENTIALS_REFUSED,
     },
-  ])('SR-8.3: a credentials-broken persona ($label) whose confirmed new file is still bad stays credentials-broken with its start-rules line, not persona-credentials-change-failed, and holds the new file’s content, so nothing is pending', async ({ start, edit, preview, cls }) => {
+  ])('a credentials-broken persona ($label) whose confirmed new file is still bad stays credentials-broken with its start-rules line, not persona-credentials-change-failed, and holds the new file’s content, so nothing is pending', async ({ start, edit, preview, cls }) => {
     const { run, alpha } = await brokenBesideHealthy(start)
     const key = h.key('alpha')
     const bravoBefore = bravoSide(run)
@@ -4490,7 +4486,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     expect(run.isUp('alpha')).toBe(false)
     expect(since.logs.filter((line) => line.startsWith(brokenLinePrefix(cls, alpha)))).toHaveLength(1)
     expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
-    // The held digest is the content that broke it (b.av2 SR-8.3): nothing is pending.
+    // The held digest is the content that broke it: nothing is pending.
     expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
     expect(reloadLines(since)).toEqual([appliedLogged({ credentials: 1 })])
     expect(h.pendingExists()).toBe(false)
@@ -4504,7 +4500,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 })
 
 // ---------------------------------------------------------------------------
-// The 64 KiB read cap on the tick and confirmation paths (b.av2 SR-8.1)
+// The 64 KiB read cap on the tick and confirmation paths
 // ---------------------------------------------------------------------------
 
 describe('a file larger than the 64 KiB read cap is unreadable to the tick', () => {
@@ -4558,7 +4554,7 @@ describe('a file larger than the 64 KiB read cap is unreadable to the tick', () 
 })
 
 // ---------------------------------------------------------------------------
-// Token secrecy on the reload path (b.av2 SR-10.3; AC 20)
+// Token secrecy on the reload path
 // ---------------------------------------------------------------------------
 
 /** The loader's error for `source` (the config file or the record) with this validation `detail`. */
@@ -4658,7 +4654,7 @@ async function expectInvalidCandidateStaysClean(
   return run
 }
 
-// A token pasted as a setting's value: the loader names the key (a plain setting name, E11 decision 5 left intact)
+// A token pasted as a setting's value: the loader names the key (a plain setting name, the current rule left intact)
 // and never the value; the tick carries that error into the pending file and the log, the confirmation into the log,
 // and the start into its refusal. The token-named keys are the unknown-key block's above.
 describe('a Slack token pasted under a bot_token or app_token key never reaches the pending file, the log, the record or a start refusal', () => {
@@ -4693,7 +4689,7 @@ describe('a Slack token pasted under a bot_token or app_token key never reaches 
   )
 })
 
-// Operator decision A (E14 Task 0, b.av2 SR-1.2 "no format rule"): a persona name shaped like a Slack token is an
+// Operator decision A ( section 0"no format rule"): a persona name shaped like a Slack token is an
 // ordinary name. It loads unmasked, and the pending file, the log, the record and the applied set carry it as written.
 // The name comes from fakeToken, so it holds the sentinel: these runs' artifacts are asserted to contain it, so their
 // leak check masks the name and its key first (withoutName) and checks the rest, the credentials files these runs read
@@ -4792,7 +4788,7 @@ describe('a token-shaped persona name is an ordinary name: previewed, applied an
 })
 
 // ---------------------------------------------------------------------------
-// No import side effects (b.av2 SR-13.1)
+// No import side effects
 // ---------------------------------------------------------------------------
 
 describe('module import', () => {

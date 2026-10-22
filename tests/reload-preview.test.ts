@@ -1,40 +1,39 @@
 /**
  * reload-preview.test.ts — Tests for the structured change plan and the
- * pending-change preview (b.av2 SR-8.4 and SR-8.6, b.deo SRI-802 to SRI-804;
- * b.av2 SR-10.3, b.deo SRI-901 to SRI-906) in src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
+ * pending-change preview in src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
  * `renderChangePlanCounts`, `renderPreviewLines`, `renderPreview`,
  * `renderPreviewLogLines`, `renderInvalidLogLine` and `isCredentialsBroken`,
  * plus the plan's `configDirsChanged` flag (the agent-director template
- * refresh, SR-8.6 step 5, never rendered) and facts the caller could not
+ * refresh step 5, never rendered) and facts the caller could not
  * gather (`FACT_UNKNOWN`). A changed claude_config_dir (own, inherited from a
  * changed top-level default, or alongside a destructive modify) that cannot
  * be resolved, or could not be checked, gets a warning on its line, as an
- * added persona that cannot come up does (bug b.g57); only such a persona is
+ * added persona that cannot come up does; only such a persona is
  * asked about.
  *
  * Every function here is pure, so the tests call them directly: configs are
  * resolved from file-form JSON with `parsePersonaConfigBytes` (defaults and
  * inheritance as the loader applies them), and every I/O fact (real paths,
  * credentials digests, bring-up states, why an added persona cannot come up)
- * is injected as data. One row per SR-8.6 change kind pins its class, its
+ * is injected as data. One row change kind pins its class, its
  * effect wording, the `DESTRUCTIVE:` prefix exactly when the persona is
  * retired, and its header count. Every server-wide setting has a wording
  * group; the `allow_invited_channels` switch's line is built through
- * `modeSwitchLine` (b.deo SRI-803), with one pin case per direction that
- * checks the whole line against the builder and each element SRI-803
+ * `modeSwitchLine`, with one pin case per direction that
+ * checks the whole line against the builder and each element
  * requires. Across a switch change each persona is classified by the
- * candidate's section in force (SRI-802); a change to the section not in
- * force gets the line `recordedLine` builds (SRI-804), checked element by
+ * candidate's section in force; a change to the section not in
+ * force gets the line `recordedLine` builds, checked element by
  * element in one case and built through the builder everywhere else. What the
  * detection tick gathers and when
  * it writes and logs the preview is covered in tests/reload.test.ts.
  *
- * The retired lines (b.jg5 SRJ-1510): one case pins a removal's line and a
+ * The retired lines: one case pins a removal's line and a
  * destructive modify's line literally, character for character, and checks
  * `removedLine` and `destructiveLine` against them; every other case builds
  * its expected removal or destructive line through those two builders, from
  * a plan entry the case states itself. No line of any kind says "destroyed"
- * (AC 76).
+ *
  *
  * Every rendered output (preview lines, the joined text and both log forms)
  * goes through `render`, which runs `assertNoLeak` over it; fixtures carry
@@ -296,7 +295,7 @@ const bravoWork = (): string => join(root, 'personas', 'bravo', 'work')
 /**
  * bravo's destructive-modify plan entry: `settings` changed, its paths the
  * base ones unless `overrides` moves them. The expected line of a case is
- * `destructiveLine` of this entry (b.jg5 SRJ-1510).
+ * `destructiveLine` of this entry.
  */
 function bravoDestructive(
   settings: DestructivePersonaChange['settings'],
@@ -313,7 +312,7 @@ function bravoDestructive(
 
 /**
  * `baseInput()` made valid in both channel modes, each persona's own channel
- * being its fungible destination (b.deo SRI-104), with the switch at `value`
+ * being its fungible destination, with the switch at `value`
  * (absent when undefined), then `mutate` applied; resolved.
  */
 function switched(value: boolean | undefined, mutate: (c: EditableInput) => void = () => {}): PersonaConfig {
@@ -389,7 +388,7 @@ describe('added personas', () => {
       ['credentials file does not exist', 'working directory does not exist'],
     ],
     [
-      // Bug b.g57: the check's `problem`, without the held persona's consequence.
+      // the check's `problem`, without the held persona's consequence.
       'an unresolvable claude_config_dir',
       () => [{ step: 'claude-config-dir', cause: 'claude_config_dir cannot be resolved to a real path (ENOENT: a symlink on its path points to nothing)' }],
       ['claude_config_dir cannot be resolved to a real path (ENOENT: a symlink on its path points to nothing)'],
@@ -429,7 +428,7 @@ describe('added personas', () => {
 // ---------------------------------------------------------------------------
 
 describe('removed and renamed personas', () => {
-  test("SRJ-1510's exact lines: a removal says the persona will be retired, a destructive modify that it will be retired and brought up fresh", () => {
+  test("exact lines: a removal says the persona will be retired, a destructive modify that it will be retired and brought up fresh", () => {
     // Fixed paths, compared through the identity real path: nothing is read from disk.
     const ops = { key: 'ops', credentials_file: '/srv/ops/credentials.json', working_directory: '/srv/ops/work' }
     const before = makeMultiPersonaConfig([{ name: 'Ops', ...ops }, { name: 'bravo' }], root)
@@ -599,7 +598,7 @@ describe('credentials changed', () => {
   })
 
   const failure = (step: PersonaBringUpStep, cls: string) => ({ step, class: cls, cause: 'x' })
-  /** Held for an unresolvable claude_config_dir (bug b.g57): its Slack connection is closed, its launch waits. */
+  /** Held for an unresolvable claude_config_dir: its Slack connection is closed, its launch waits. */
   const configDirHold = () => failure('claude-config-dir', PERSONA_CONFIG_DIR_UNRESOLVABLE)
 
   /** The bring-up states a credentials-changed persona can be in. */
@@ -615,7 +614,7 @@ describe('credentials changed', () => {
     up: { outcome: 'up', causes: {} },
     /** Its first Slack attempt is in flight: no outcome yet, so no connection yet. */
     firstAttempt: { outcome: undefined, causes: {} },
-    /** Held for its claude_config_dir (bug b.g57): no connection, its launch waits for the directory. */
+    /** Held for its claude_config_dir: no connection, its launch waits for the directory. */
     heldConfigDir: { outcome: 'retrying', causes: { configDir: configDirHold() } },
     /** Slack unreachable at its bring-up and held for its claude_config_dir too. */
     heldAndRetryingSlack: {
@@ -632,7 +631,7 @@ describe('credentials changed', () => {
     ['retrying: working directory missing', STATES.retryingDirectory, false, true],
     ['up', STATES.up, false, false],
     ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, false, true],
-    ['held for its claude_config_dir (b.g57), with no connection', STATES.heldConfigDir, false, true],
+    ['held for its claude_config_dir, with no connection', STATES.heldConfigDir, false, true],
     ['retrying for Slack and held for its claude_config_dir', STATES.heldAndRetryingSlack, false, true],
     [
       'held for its claude_config_dir with its working directory missing too',
@@ -668,7 +667,7 @@ describe('credentials changed', () => {
   const EXTRA_KEY = (): string => causeOf(JSON.stringify(makeCredentials({ [fakeToken(BOT_TOKEN_PREFIX)]: 'pasted' })))
 
   /**
-   * Every credentials effect (b.av2 SR-8.6, credentials row): the bring-up
+   * Every credentials effect (credentials row): the bring-up
    * state (`FACT_UNKNOWN` when it could not be queried) by whether the new
    * content can be used (`problem`, undefined when it can). `rest` is the
    * line after `credentials file "<path>" changed`, spelled out in full.
@@ -742,13 +741,13 @@ describe('credentials changed', () => {
       (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
     ],
     [
-      'held for its claude_config_dir (b.g57), content valid: it has no connection, so it retries with the new content',
+      'held for its claude_config_dir, content valid: it has no connection, so it retries with the new content',
       STATES.heldConfigDir,
       undefined,
       () => ': it has no connection yet, so it retries with the new content, instance kept.',
     ],
     [
-      'held for its claude_config_dir (b.g57), file missing',
+      'held for its claude_config_dir, file missing',
       STATES.heldConfigDir,
       () => MISSING,
       (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
@@ -1100,7 +1099,7 @@ describe('stop_hook_bootstrap is the immediate reply-reminder switch', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A changed claude_config_dir that cannot be resolved (bug b.g57, E14 merge-prep)
+// A changed claude_config_dir that cannot be resolved ( merge-prep)
 // ---------------------------------------------------------------------------
 
 describe('a changed claude_config_dir that cannot be resolved warns, as an added persona that cannot come up does', () => {
@@ -1269,7 +1268,7 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
 // ---------------------------------------------------------------------------
 
 describe('server-wide settings', () => {
-  /** The E11 line of a server-wide setting the running server reads: recorded, effective at the next start. */
+  /** The line of a server-wide setting the running server reads: recorded, effective at the next start. */
   const nextStartLine = (name: string) =>
     `server-wide setting ${name} changed: once applied, it is recorded and takes effect at the next server start after that.`
   /** The line of a setting only the CLI reads, from the last-applied record (`stop_timeout`, `exit_timeout`). */
@@ -1279,7 +1278,7 @@ describe('server-wide settings', () => {
   /**
    * The line of a setting both the CLI (from the last-applied record) and the
    * running server (from its next start) read (`agent_director_call_timeout_ms`,
-   * b.jg5 SRJ-213).
+   *).
    */
   const cliRecordAndNextStartLine = (name: string) =>
     `server-wide setting ${name} changed: once applied, it is recorded, the CLI takes it from the record ` +
@@ -1330,7 +1329,7 @@ describe('server-wide settings', () => {
     ['append_system_prompt_file', () => join(root, 'prompt.md')],
     ['cozempic_prescription', () => 'gentle'],
     ['system_prompt_mode', () => 'none'],
-    ['fresh_system_prompt', () => false], // b.b1j SR-3
+    ['fresh_system_prompt', () => false], //
     ['message_archive_db', () => join(root, 'archive.db')],
     ['resume_enabled', () => false],
     ['agent_director_poll_interval_ms', () => 2000],
@@ -1365,7 +1364,7 @@ describe('server-wide settings', () => {
     expect(lines).toEqual([header({ settings: 1 }), nextStartLine(name)])
   })
 
-  // The switch's wording group (b.deo SRI-803): its line comes from
+  // The switch's wording group: its line comes from
   // modeSwitchLine. Both configurations give every persona the same channel
   // fungible destination, which declarative mode does not read, so the
   // candidate is valid with the switch on and the switch is the only change.
@@ -1420,10 +1419,10 @@ describe('server-wide settings', () => {
     expect(lines.slice(1)).toEqual(expected)
   })
 
-  describe("the switch's line, in each direction (b.deo SRI-803)", () => {
-    // The SRD gives this line's elements, not its text: each direction's pin
+  describe("the switch's line, in each direction", () => {
+    // The contract gives this line's elements, not its text: each direction's pin
     // case checks the whole line against modeSwitchLine and each element
-    // SRI-803 requires; every other case builds the line through modeSwitchLine.
+    // requires; every other case builds the line through modeSwitchLine.
     test.each(SWITCH_DIRECTIONS)(
       'pin, %s: the line names the mode turned on, applies in place at once from the next event, tool call, prompt and notice, names every persona in candidate order and no restart',
       (_label, from, to) => {
@@ -1507,10 +1506,10 @@ describe('server-wide settings', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Sections across a switch change, and recorded changes (b.deo SRI-802, SRI-804)
+// Sections across a switch change, and recorded changes
 // ---------------------------------------------------------------------------
 
-describe('classification across a switch change, the resolved and section comparisons, and the recorded lines (b.deo SRI-802, SRI-804)', () => {
+describe('classification across a switch change, the resolved and section comparisons, and the recorded lines', () => {
   /** bravo's DMs on with a contact, so `dm` is a valid fungible destination for it. */
   const dmOn = (b: PersonaInput): void => {
     b.dm = { enabled: true, contact: 'U0B0001' }
@@ -1590,15 +1589,15 @@ describe('classification across a switch change, the resolved and section compar
     expect(lines).toEqual([NO_EFFECT_LINE])
   })
 
-  // b.2nr: the test-only timer override block is read once at start; a reload never applies a change of it live, and its preview says so.
+  // the test-only timer override block is read once at start; a reload never applies a change of it live, and its preview says so.
   test.each<[string, Record<string, number> | undefined, Record<string, number> | undefined]>([
     ['the block added', undefined, { dialog_ready_timeout_ms: 120_000 }],
     ['the block removed', { dialog_ready_timeout_ms: 120_000 }, undefined],
     ['a value changed', { unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 }, { unavailable_retry_base_s: 6, unavailable_retry_ceiling_s: 60 }],
-    ['delivery-stuck timer added (b.omv SR-14.1)', undefined, { delivery_stuck_after_ms: 7_000 }],
-    ['delivery-stuck timer removed (b.omv SR-14.1)', { delivery_stuck_after_ms: 7_000 }, undefined],
-    ['delivery-stuck timer changed (b.omv SR-14.1)', { delivery_stuck_after_ms: 7_000 }, { delivery_stuck_after_ms: 9_000 }],
-  ])('test_timer_overrides %s is no effective change (b.2nr)', (_label, from, to) => {
+    ['delivery-stuck timer added', undefined, { delivery_stuck_after_ms: 7_000 }],
+    ['delivery-stuck timer removed', { delivery_stuck_after_ms: 7_000 }, undefined],
+    ['delivery-stuck timer changed', { delivery_stuck_after_ms: 7_000 }, { delivery_stuck_after_ms: 9_000 }],
+  ])('test_timer_overrides %s is no effective change', (_label, from, to) => {
     const withBlock = (block: Record<string, number> | undefined) => edited((c) => { if (block !== undefined) (c as Record<string, unknown>)['test_timer_overrides'] = block })
     const { plan, lines } = previewBetween(withBlock(from), withBlock(to))
 
@@ -1606,7 +1605,7 @@ describe('classification across a switch change, the resolved and section compar
     expect(lines).toEqual([NO_EFFECT_LINE])
   })
 
-  test('a delivery-stuck override beside a real change stays out of the settings count and preview (b.omv SR-14.1)', () => {
+  test('a delivery-stuck override beside a real change stays out of the settings count and preview', () => {
     const { plan, lines } = preview(edited((c) => {
       c.port = 3200
       c.test_timer_overrides = { delivery_stuck_after_ms: 7_000 }
@@ -1821,7 +1820,7 @@ describe('no effective change', () => {
 })
 
 // ---------------------------------------------------------------------------
-// configDirsChanged: the template refresh (SR-8.6 step 5), never rendered
+// configDirsChanged: the template refresh (step 5), never rendered
 // ---------------------------------------------------------------------------
 
 describe('configDirsChanged', () => {
@@ -2172,7 +2171,7 @@ describe('a combined edit', () => {
 })
 
 // ---------------------------------------------------------------------------
-// No preview line says "destroyed" (b.jg5 SRJ-1510, AC 76)
+// No preview line says "destroyed"
 // ---------------------------------------------------------------------------
 
 describe('no preview line says "destroyed"', () => {

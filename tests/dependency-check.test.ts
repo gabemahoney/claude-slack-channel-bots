@@ -1,5 +1,5 @@
 /**
- * dependency-check.test.ts — SR-5.1 startup-gate sub-case matrix.
+ * dependency-check.test.ts — startup-gate sub-case matrix.
  *
  * Exercises src/agent-director-startup.ts via the dep-injection seam — never
  * touches the real Bun FFI or the real ~/.config/agent-director/state.db, and never
@@ -10,14 +10,13 @@
  *      ErrSystemInstallUnreachable from `Client.create` (the client's
  *      system-install discovery errors).
  *   3. Non-typed construct-step throws surface verbatim.
- *   4. CSCB's Phase 1 floor on the client's `binaryVersion` (b.jg5 SRJ-203,
- *      SRJ-1513), the refusal kind every failure carries, and the
+ * 4. CSCB's Phase 1 floor on the client's `binaryVersion`, the refusal kind every failure carries, and the
  *      floor-exempt `skipPhase1Floor` option.
- *   4a. The floor and too-old refusal messages (b.jg5 SRJ-208): the runbook
+ * 4a. The floor and too-old refusal messages: the runbook
  *      section title, no upgrade instruction, the install-skill block only on
  *      the too-old message.
- *   4b. The remedies (b.jg5 SRJ-208, SRJ-1101; the E2-gate, E4 and E35
- *      hatch notes): the three API-surface probes carry the client-package
+ * 4b. The remedies (the -gate, and
+ * design notes): the three API-surface probes carry the client-package
  *      remedy (`CLIENT_PACKAGE_REMEDY`) naming the runbook section; the
  *      catalog clause names `ErrUnknownErrorName` and misclassification, not
  *      the base `AgentDirectorError`; not found names the runbook section
@@ -30,7 +29,7 @@
  *      no `INSTALL_OR_REMOVAL_FORMS` row, once the two allowed spans
  *      (`ALLOWED_SPANS`) are removed.
  *   5. API-surface probes (getPermission / error catalog / decide argv).
- *   5a. The error-catalogue check (b.jg5 SRJ-102): the pure
+ * 5a. The error-catalogue check: the pure
  *      `checkErrorCatalog` over dist text built in the test from
  *      `REQUIRED_ERR_NAMES`, never the installed client's dist, and a
  *      probe built from it through the gate and its wrapper.
@@ -39,7 +38,7 @@
  *      module-level singleton via setClient(...).
  *   8. `runAgentDirectorStartupGate`: one record call and one exit per
  *      refusal, none on a pass.
- *   9. The call timeout (b.jg5 SRJ-213, SRJ-121): `runStartupGate`'s
+ * 9. The call timeout: `runStartupGate`'s
  *      `callTimeoutMs` option reaches the client's options (absent without
  *      it), and the server's persona client (`buildPersonaClient`, exiting
  *      form `buildPersonaClientOrExit`) is built with the value, passes the
@@ -124,7 +123,7 @@ import { flat } from './test-helpers/markdown.ts'
 import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------
-// Helpers for SR-5.1 sub-cases
+// Helpers for sub-cases
 // ---------------------------------------------------------------------------
 
 /**
@@ -167,7 +166,7 @@ const REINSTALL_ROW = (() => {
   return row
 })()
 
-/** The `ad-same-user` remedy's one removal wording, as the E36 T2 ruling words it ("never remove or recreate it"). */
+/** The `ad-same-user` remedy's one removal wording, as the ruling words it ("never remove or recreate it"). */
 const SAME_USER_NEVER_REMOVE = 'never remove or recreate the file'
 
 /**
@@ -213,10 +212,10 @@ function optionsBesideCallTimeout(opts: RecordedClientOptions[number]): Record<s
 }
 
 // ---------------------------------------------------------------------------
-// SR-5.1 — construct-step failure modes
+// construct-step failure modes
 // ---------------------------------------------------------------------------
 
-describe('SR-5.1: Client constructor failure modes', () => {
+describe('Client constructor failure modes', () => {
   test('ErrBunVersionTooOld → ok=false, classLabel=ad-bun-version-too-old', async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errBunVersionTooOld('0.9.0', '1.0.21') }),
@@ -229,7 +228,7 @@ describe('SR-5.1: Client constructor failure modes', () => {
       expect(outcome.phase).toBe('construct')
       expect(outcome.classLabel).toBe('ad-bun-version-too-old')
       expect(outcome.message).toContain('Bun >= 1.0.21')
-      // SR-4.5: ad-bun-version-too-old does NOT append the manual-skill-install block.
+      // ad-bun-version-too-old does NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
@@ -251,10 +250,10 @@ describe('SR-5.1: Client constructor failure modes', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.1 — same-user check
+// same-user check
 // ---------------------------------------------------------------------------
 
-describe('SR-5.1: same-user check', () => {
+describe('same-user check', () => {
   test('UID mismatch → ok=false, classLabel=ad-same-user', async () => {
     const stub = makeStubClient()
     const outcome = await runStartupGate({
@@ -272,12 +271,12 @@ describe('SR-5.1: same-user check', () => {
       expect(outcome.message).toContain('UID 7777')
       expect(outcome.message).toContain('UID 1000')
       expect(outcome.message).toContain(DEFAULT_STATE_DB_PATH)
-      // SR-4.5: same-user mismatch does NOT append the manual-skill-install block.
+      // same-user mismatch does NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
-  test('UID mismatch: run the server as the file\'s owner, never remove or recreate it, see the runbook section (E2-gate ruling)', async () => {
+  test('UID mismatch: run the server as the file\'s owner, never remove or recreate it, see the runbook section (-gate ruling)', async () => {
     const outcome = await runStartupGate(makePassingGateDeps({ statSync: () => ({ uid: 7777 }) }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
@@ -323,7 +322,7 @@ describe('SR-5.1: same-user check', () => {
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe('ad-same-user-stat')
       expect(outcome.message).toContain('EACCES')
-      // SR-4.5: same-user-stat does NOT append the manual-skill-install block.
+      // same-user-stat does NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
@@ -347,10 +346,10 @@ describe('SR-5.1: same-user check', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.1 — happy path
+// happy path
 // ---------------------------------------------------------------------------
 
-describe('SR-5.1: happy path', () => {
+describe('happy path', () => {
   test('valid binary + ENOENT state.db → ok=true', async () => {
     const stub = makeStubClient()
     const outcome = await runStartupGate({
@@ -382,7 +381,7 @@ describe('SR-5.1: happy path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.1 — API surface probes (b.avw)
+// API surface probes
 // ---------------------------------------------------------------------------
 //
 // `Client.create()` confirms the AD binary meets its declared
@@ -397,7 +396,7 @@ describe('SR-5.1: happy path', () => {
 // plus override the specific probe(s) under test. Same-user deps default to
 // a passing config (geteuid=1000, statSync=ENOENT).
 
-describe('SR-5.1: API surface probes', () => {
+describe('API surface probes', () => {
   /** Stage the deps shared by every probe sub-case. The caller overrides the
    *  probe under test plus any additional knobs. */
   function probeRunDeps(stub: ReturnType<typeof makeStubClient>) {
@@ -427,17 +426,17 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.phase).toBe('api-surface')
       expect(outcome.classLabel).toBe('ad-shim-missing-get-permission')
       expect(outcome.message).toContain('getPermission')
-      // The client-package remedy (SRJ-208): check the package, see the runbook section.
+      // The client-package remedy: check the package, see the runbook section.
       expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
       expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
-      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      // ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
   // -------------------------------------------------------------------------
   // Probe 2 — error catalog is missing required err_names (one missing name
-  // through the pure check: the b.jg5 SRJ-102 describe below)
+  // through the pure check: the describe below)
   // -------------------------------------------------------------------------
 
   test('probeErrorCatalog reports every required name missing → message lists each', async () => {
@@ -458,7 +457,7 @@ describe('SR-5.1: API surface probes', () => {
     }
   })
 
-  test('probeErrorCatalog fails → the names would arrive as ErrUnknownErrorName and be misclassified, not the base error; the client-package remedy (E4)', async () => {
+  test('probeErrorCatalog fails → the names would arrive as ErrUnknownErrorName and be misclassified, not the base error; the client-package remedy ()', async () => {
     const outcome = await runStartupGate(makePassingGateDeps({ probeErrorCatalog: () => ({ ok: false, missing: [ERR_TMUX_KILL_FAILED_NAME] }) }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
@@ -492,10 +491,10 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.classLabel).toBe('ad-shim-decide-drops-token')
       expect(outcome.message).toContain('--request-token')
       expect(outcome.message).toContain(detail)
-      // The client-package remedy (SRJ-208): check the package, see the runbook section.
+      // The client-package remedy: check the package, see the runbook section.
       expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
       expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
-      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      // ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
@@ -628,7 +627,7 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Production-default integration probe — regression lock for b.avw
+  // Production-default integration probe — regression lock for
   // -------------------------------------------------------------------------
   //
   // This test calls runStartupGate WITHOUT overriding probeDecideArgv, so the
@@ -642,7 +641,7 @@ describe('SR-5.1: API surface probes', () => {
   // assertion (not a `Client.prototype` shape check) keeps the canary and the
   // assertion guaranteed to agree: any future release that fixes
   // `getPermission` but still drops `--request-token` will keep this test
-  // active, preserving the regression-pin for the exact bug b.avw was filed
+  // active, preserving the regression-pin for the exact was filed
   // for.
   //
   // FAILS-BEFORE-FIX / PASSES-AFTER-FIX: this is the test that locks in the
@@ -689,17 +688,17 @@ describe('SR-5.1: API surface probes', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-102 — the error-catalogue check over supplied dist text
+// the error-catalogue check over supplied dist text
 // ---------------------------------------------------------------------------
 //
 // The dist text is built here in the shape the shipped client has: a
 // metadata array naming every error, then one class declaration per error.
 // No case reads the installed client's dist or calls the production probe.
-// The three Phase-1-only names are written out once, as the SRD's
+// The three Phase-1-only names are written out once, as the contract's
 // requirement; every other value comes from `src/`.
 
-/** The Phase-1-only names b.jg5 SRJ-102 requires, as the SRD writes them. */
-const SRD_PHASE1_ONLY_NAMES = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive', 'ErrTmuxSessionConflict']
+/** The Phase-1-only names requires, as the contract writes them. */
+const PHASE1_ONLY_CLASS_NAMES = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive', 'ErrTmuxSessionConflict']
 
 /** The Phase-1-only names as `src/` exports them. */
 const PHASE1_ONLY_NAMES = [ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_UNRESPONSIVE_NAME, ERR_TMUX_SESSION_CONFLICT_NAME]
@@ -717,11 +716,11 @@ function distText(undeclared: readonly string[] = [], { metadata = false } = {})
   return ['const ERROR_CATALOG = [', ...entries, '];', ...classes].join('\n')
 }
 
-describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
-  test('the required names include the SRD\'s three Phase-1-only names, as src/ exports them', () => {
-    expect(PHASE1_ONLY_NAMES).toEqual(SRD_PHASE1_ONLY_NAMES)
-    expect<readonly string[]>(PHASE1_ONLY_ERR_NAMES).toEqual(SRD_PHASE1_ONLY_NAMES)
-    expect(REQUIRED_ERR_NAMES).toEqual(expect.arrayContaining(SRD_PHASE1_ONLY_NAMES))
+describe('checkErrorCatalog over supplied dist text', () => {
+  test('the required names include the contract\'s three Phase-1-only names, as src/ exports them', () => {
+    expect(PHASE1_ONLY_NAMES).toEqual(PHASE1_ONLY_CLASS_NAMES)
+    expect<readonly string[]>(PHASE1_ONLY_ERR_NAMES).toEqual(PHASE1_ONLY_CLASS_NAMES)
+    expect(REQUIRED_ERR_NAMES).toEqual(expect.arrayContaining(PHASE1_ONLY_CLASS_NAMES))
   })
 
   test.each([false, true])('every required name declared (metadata entries: %p) → ok', (metadata) => {
@@ -756,14 +755,14 @@ describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
       expect(outcome.refusalKind).toBe(REFUSAL_KIND_OTHER)
       expect(outcome.message).toContain(ERR_TMUX_SESSION_CONFLICT_NAME)
       expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
-      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      // ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain(renderInstallSkillInstructions())
     }
   })
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.2 — system-install discovery typed-error branches
+// system-install discovery typed-error branches
 // ---------------------------------------------------------------------------
 //
 // `Client.create()` (production) / `makeStubCreateClient(...)` (tests) is the
@@ -775,7 +774,7 @@ describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
 // classLabel on the construct phase so the startup-errors.log entry tells the
 // operator exactly which install action to take.
 
-describe('SR-4.2: system-install typed-error branches', () => {
+describe('system-install typed-error branches', () => {
   test(`ErrSystemInstallNotFound → ${AD_SYSTEM_INSTALL_NOT_FOUND}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }),
@@ -799,16 +798,16 @@ describe('SR-4.2: system-install typed-error branches', () => {
       expect(outcome.message).not.toContain(PUBLISHING_HOST_BLOCK_HEADING)
       const rest = withoutAllowedSpans(outcome.message)
       expect([...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS].filter(([, pattern]) => pattern.test(rest)).map(([label]) => label)).toEqual([])
-      // SR-4.5: appends the manual-skill-install instructions block.
+      // appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
   })
 
   // ErrSystemInstallTooOld's label, phase and message are covered in the
-  // b.jg5 SRJ-203 floor matrix and the SRJ-208 refusal-message cases below.
+  // floor matrix and the refusal-message cases below.
 
   // ErrSystemInstallUnreachable: one test per reason value. The 8 reasons are
-  // the full closed-with-escape-hatch enum from AD's UnreachableReason type;
+  // the full closed-with-escape-design enum from AD's UnreachableReason type;
   // each is a distinct failure signature that translates directly into the
   // operator-facing remediation step.
 
@@ -823,12 +822,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('not-executable')
-      // The remedy: the install-cscb skill and the runbook section, no re-install (E2-gate note).
+      // The remedy: the install-cscb skill and the runbook section, no re-install (-gate note).
       expect(outcome.message).toContain('Diagnose with the install-cscb skill')
       expect(outcome.message).toContain(RUNBOOK_SECTION_POINTER)
       expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
       expect(outcome.message).not.toMatch(REINSTALL_ROW[1])
-      // SR-4.5: appends the manual-skill-install instructions block.
+      // appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
   })
@@ -933,7 +932,7 @@ describe('SR-4.2: system-install typed-error branches', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.1 — async createClient injection seam
+// async createClient injection seam
 // ---------------------------------------------------------------------------
 //
 // The startup gate calls `await d.createClient(opts)` exactly once and (on
@@ -944,7 +943,7 @@ describe('SR-4.2: system-install typed-error branches', () => {
 // arm's `outcome.adVersion` is sourced directly from `client.binaryVersion`.
 // The final test pins the catch-all path for an unknown (non-typed) error.
 
-describe('SR-4.1: async createClient injection', () => {
+describe('async createClient injection', () => {
   beforeEach(() => {
     // Each test installs (or fails to install) its own Client into the
     // module-level singleton; reset between tests so identity-equality
@@ -1021,7 +1020,7 @@ describe('SR-4.1: async createClient injection', () => {
     }
   })
 
-  // b.jg5 SRJ-213 / SRJ-121: the CLI's client carries the call timeout through
+  // the CLI's client carries the call timeout through
   // the gate's option; the server's gate passes none (the client's default).
   test.each(CALL_TIMEOUTS_MS)('callTimeoutMs %d reaches the one create call; without it the options have no callTimeoutMs key and are otherwise the same', async (ms) => {
     const withCalls: RecordedClientOptions = []
@@ -1044,7 +1043,7 @@ describe('SR-4.1: async createClient injection', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Epic AC #7 — non-TTY behavior is identical to TTY behavior
+// component non-TTY behavior is identical to TTY behavior
 // ---------------------------------------------------------------------------
 //
 // The gate does NOT branch on `process.stdin.isTTY` (there is no readline
@@ -1054,7 +1053,7 @@ describe('SR-4.1: async createClient injection', () => {
 // Any future change that adds a TTY-conditional branch (e.g. interactive
 // prompts) would fail this test and force an explicit design decision.
 
-describe('SR-4.4 / Epic AC #7: non-TTY behavior identical to TTY', () => {
+describe('/ section non-TTY behavior identical to TTY', () => {
   test('failure outcome identical with process.stdin.isTTY=false', async () => {
     // Interactive (TTY=true) reference run.
     const interactiveOutcome = await runStartupGate({
@@ -1096,7 +1095,7 @@ describe('SR-4.4 / Epic AC #7: non-TTY behavior identical to TTY', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-203 / SRJ-1513 — CSCB's Phase 1 floor in runStartupGate
+// CSCB's Phase 1 floor in runStartupGate
 // ---------------------------------------------------------------------------
 //
 // The floor runs after construction, on the client's `binaryVersion`, and
@@ -1104,7 +1103,7 @@ describe('SR-4.4 / Epic AC #7: non-TTY behavior identical to TTY', () => {
 // refusal and its unparseable-version refusal stay construction failures with
 // their own labels and kinds.
 
-describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
+describe('Phase 1 floor in runStartupGate', () => {
   beforeEach(() => {
     resetClientForTests()
   })
@@ -1200,7 +1199,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-208 — the two version refusal messages
+// the two version refusal messages
 // ---------------------------------------------------------------------------
 //
 // Both name the switch-over runbook section by its title and carry none of
@@ -1210,10 +1209,10 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
 // required version. The too-old message keeps the install-skill block; the
 // floor message has none. Each binary path is a non-default value, so the message shows it is
 // passed through. The startup gate's message is the startup form: it never
-// carries the runtime re-check phrase (b.jg5 SRJ-1013). `outcome.message` is
+// carries the runtime re-check phrase. `outcome.message` is
 // the text runAgentDirectorStartupGate records unchanged.
 
-describe('b.jg5 SRJ-208: version refusal messages', () => {
+describe('version refusal messages', () => {
   beforeEach(() => {
     resetClientForTests()
   })
@@ -1256,7 +1255,7 @@ describe('b.jg5 SRJ-208: version refusal messages', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-203 / SRJ-1513 — every other failure carries refusal kind `other`
+// every other failure carries refusal kind `other`
 // ---------------------------------------------------------------------------
 
 /** A stat failing with EACCES: the same-user check cannot read the file. */
@@ -1279,7 +1278,7 @@ const OTHER_FAILURE_BRANCHES: ReadonlyArray<[classLabel: string, overrides: Part
   ['ad-same-user-stat', { statSync: eacces }],
 ]
 
-describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch', () => {
+describe('refusal kind of every other failure branch', () => {
   beforeEach(() => {
     resetClientForTests()
   })
@@ -1295,8 +1294,8 @@ describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch',
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-208 / SRJ-1101 — no message advises upgrading, re-installing or
-// installing agent-director, or removing a file (E2-gate and E5 hatch notes)
+// no message advises upgrading, re-installing or
+// installing agent-director, or removing a file (-gate and design notes)
 // ---------------------------------------------------------------------------
 
 /** `text` with each `ALLOWED_SPANS` span removed, whitespace collapsed. */
@@ -1304,7 +1303,7 @@ function withoutAllowedSpans(text: string): string {
   return ALLOWED_SPANS.reduce((rest, [, span]) => rest.replace(span, ''), flat(text))
 }
 
-describe('b.jg5 SRJ-208 / SRJ-1101: every message the gate builds names no upgrade, re-install, install or removal', () => {
+describe('every message the gate builds names no upgrade, re-install, install or removal', () => {
   beforeEach(() => {
     resetClientForTests()
   })
@@ -1364,10 +1363,10 @@ describe('b.jg5 SRJ-208 / SRJ-1101: every message the gate builds names no upgra
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-203 / SRJ-1513 — the floor-exempt option
+// the floor-exempt option
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
+describe('skipPhase1Floor option', () => {
   beforeEach(() => {
     resetClientForTests()
   })
@@ -1418,13 +1417,13 @@ describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-203 / SRJ-1513 — runAgentDirectorStartupGate records and exits
+// runAgentDirectorStartupGate records and exits
 // ---------------------------------------------------------------------------
 //
 // The wrapper always runs the floor. The exit hook throws to stop control,
 // as production's `process.exit` does.
 
-describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
+describe('runAgentDirectorStartupGate', () => {
   class ExitCalled extends Error {
     constructor(readonly code: number) {
       super(`exit(${code})`)
@@ -1516,7 +1515,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-213 / SRJ-121 — the server's persona client
+// the server's persona client
 // ---------------------------------------------------------------------------
 //
 // The server's gate builds its client before the configuration is read, so
@@ -1528,7 +1527,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
 // close-counting stub, then the builder over a different stub, so a closed
 // client is never reinstalled.
 
-describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrExit', () => {
+describe('buildPersonaClient and buildPersonaClientOrExit', () => {
   class ExitCalled extends Error {
     constructor(readonly code: number) {
       super(`exit(${code})`)
@@ -1688,7 +1687,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
   })
 })
 
-// b.omv SR-5.1 / D8: engines own independent clients and never replace the
+// / D8: engines own independent clients and never replace the
 // recovery singleton. Pending construction is also owned by shutdown.
 describe('delivery client factory', () => {
   afterEach(() => resetClientForTests())

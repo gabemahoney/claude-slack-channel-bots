@@ -1,6 +1,6 @@
 /**
  * test-helpers/host-safety-preload.ts — The `bun test` preload guard
- * (b.jg5 SRJ-1301). The `[test]` preload of `bunfig.toml` (the repository
+ * The `[test]` preload of `bunfig.toml` (the repository
  * root's, and that of each directory holding test files, for a run started
  * there) loads it once, before any test file; it runs for its side effects
  * only, exports nothing, and no test file imports it.
@@ -55,7 +55,7 @@
  *    because the state-directory resolvers and the crontable's default in
  *    `src/` fall back to `os.homedir()` (the launch-time HOME) when they are
  *    unset, and an inherited `XDG_CONFIG_HOME` would put that default in the
- *    operator's own configuration directory (bug b.avm).
+ * operator's own configuration directory.
  *    `CLAUDE_CONFIG_DIR` is unset because it names a Claude configuration
  *    directory (a run started from a bot's session can inherit its
  *    persona's) that Claude Code, a hook or any code honouring it would read

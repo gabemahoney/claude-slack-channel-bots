@@ -12,7 +12,7 @@
  *
  * This catches accidental deletion of branches or frontmatter drift.
  *
- * Persona pointer (b.av2 SR-12): the "Next steps" section names personas and
+ * Persona pointer: the "Next steps" section names personas and
  * their `cscb_<key>` instances and points to the setup wizard and the
  * debugging skill (both existing skills); the Notes say the skill never
  * touches the persona configuration; and nothing calls CSCB's configuration
@@ -21,7 +21,7 @@
  * forbidden-term audit over shipped text lives in tests/shipped-docs.test.ts;
  * it is not repeated here.
  *
- * Too-old branch (b.jg5 SRJ-208, C8): the `ad-system-install-too-old` branch,
+ * Too-old branch (C8): the `ad-system-install-too-old` branch,
  * found by its `###` heading naming the exported label, names the
  * switch-over runbook section in docs/migration.md (title from `PHASE1_RUNBOOK_SECTION_TITLE`) and
  * carries no agent-director upgrade or install command and no instruction to
@@ -31,8 +31,8 @@
  * fails (the shared rows' self-checks live in shipped-docs.test.ts). The
  * checks read that branch alone and it never names the not-found label.
  *
- * The other branches (the E2-gate hatch note; b.jg5 SRJ-208, SRJ-1101; E36
- * T2): no branch names an install, re-install or upgrade command or runs the
+ * The other branches (the -gate design note
+ * ): no branch names an install, re-install or upgrade command or runs the
  * installer, and each points to the switch-over runbook in docs/migration.md.
  *   - `ad-system-install-not-found` names the runbook section's publishing-host
  *     block by its heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
@@ -55,11 +55,11 @@
  * that branch's case.
  *
  * The pinned client, the install check's note, the coupling and the runbooks
- * (b.jg5 SRJ-1110, AC 15, AC 20, AC 81; SRJ-101's skill clause; hatch notes
- * E5, E35, E36):
+ * (skill clause; design notes
+ * ):
  *   - The pin: every `agent-director@<spec>` in the whole skill (a file-local
  *     extractor) equals `PHASE1_FLOOR_VERSION`, and equals `package.json`'s
- *     `dependencies['agent-director']`, read from the file (SRJ-101); there is
+ * `dependencies['agent-director']`, read from the file; there is
  *     at least one. No
  *     `@latest` and no other dist-tag appears anywhere in the skill. Self-checks
  *     build `@latest`, a caret range of the floor, the floor's release
@@ -81,7 +81,7 @@
  *     count. Step 4 ends the loop on such a pass. "Next
  *     steps" says agent-director is ready only for a pass with no note line,
  *     and says it is not ready on a pass with one.
- *   - The coupling: one case per clause of SRJ-1110's statement (installed
+ * - The coupling: one case per clause of the contract statement (installed
  *     together; rolled back together; every agent on the host and every
  *     long-running agent-director process stopped before either binary
  *     change; started again after it), each self-checked against the
@@ -91,7 +91,7 @@
  *     tests/test-helpers/runbooks.ts). No step title of either runbook section
  *     (collected with the helper's step matcher) appears in the skill, and the
  *     skill has no heading in the runbook step form.
- * The too-old clause of SRJ-1110 is the too-old branch's block above; the
+ * The too-old clause of the contract is the too-old branch's block above; the
  * `access.json` ban for skills lives in tests/access-file-retired.test.ts.
  *
  * SPDX-License-Identifier: MIT
@@ -221,7 +221,7 @@ function section(title: string, text: string = skillContent): string {
   return flat(rawSection(title, text))
 }
 
-describe('install-cscb skill: persona pointer (b.av2 SR-12)', () => {
+describe('install-cscb skill: persona pointer', () => {
   test('the "Next steps" section names personas and their cscb_<key> instances', () => {
     const next = section('Next steps')
     expect(next).toContain('persona')
@@ -256,7 +256,7 @@ function classBranch(label: string, text: string = skillContent): string {
 }
 
 /**
- * The install skill's own forbidden forms (b.jg5 SRJ-208, C8): an offer to run
+ * The install skill's own forbidden forms (C8): an offer to run
  * an upgrade or install command, beyond the shared upgrade forms. Each with a
  * synthetic string it must match; checked over the branch's text with
  * whitespace collapsed.
@@ -272,7 +272,7 @@ const RUN_OFFER_FORMS: ForbiddenForm[] = [
 /** Every form the too-old branch must not carry: the shared upgrade forms and the skill's own. */
 const FORBIDDEN_TOO_OLD_FORMS: ForbiddenForm[] = [...UPGRADE_FORMS, ...RUN_OFFER_FORMS]
 
-describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the runbook and runs nothing (b.jg5 SRJ-208)`, () => {
+describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the runbook and runs nothing`, () => {
   const branch = () => flat(classBranch(AD_SYSTEM_INSTALL_TOO_OLD))
 
   test('the branch names the switch-over runbook section and its doc by title', () => {
@@ -321,7 +321,7 @@ describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the 
 })
 
 /**
- * SRJ-208's client-package check: the first clause of `CLIENT_PACKAGE_REMEDY`
+ * client-package check: the first clause of `CLIENT_PACKAGE_REMEDY`
  * (src/install-check.ts), before its pointer to the runbook section, which
  * the skill words as the docs/migration.md section.
  */
@@ -333,7 +333,7 @@ const CLIENT_PACKAGE_CHECK = (() => {
 
 /**
  * The skill's own forbidden forms in a branch beyond the shared upgrade forms
- * (the E2-gate hatch note; b.jg5 SRJ-1101): a re-install of anything, even
+ * (the -gate design note): a re-install of anything, even
  * one that names no agent-director ("then reinstall."), and the removal or
  * re-creation of a file ("removal of the bad entry"). Each with a synthetic
  * string it must match; checked with whitespace collapsed.
@@ -424,7 +424,7 @@ function pointerBranchProblems(label: string, required: readonly string[], text:
   ]
 }
 
-describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_NOT_FOUND} and ${AD_VERSION_FLOOR_UNREADABLE} branches point to the runbook and run nothing (E2 gate; b.jg5 SRJ-208, SRJ-1101)`, () => {
+describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_NOT_FOUND} and ${AD_VERSION_FLOOR_UNREADABLE} branches point to the runbook and run nothing (gate)`, () => {
   test.each(POINTER_BRANCHES)('the %s branch names the runbook section and %p, and holds no command, upgrade, re-install or removal', (label, required) => {
     expect(pointerBranchProblems(label, required)).toEqual([])
   })
@@ -446,7 +446,7 @@ describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_NOT_FOUND} and ${AD_VERSIO
   })
 })
 
-describe(`install-cscb skill: each ${AD_SYSTEM_INSTALL_UNREACHABLE} reason points to the runbook and names no install, re-install or removal (E2 gate; b.jg5 SRJ-208, SRJ-1101)`, () => {
+describe(`install-cscb skill: each ${AD_SYSTEM_INSTALL_UNREACHABLE} reason points to the runbook and names no install, re-install or removal (gate)`, () => {
   test.each(UNREACHABLE_REASONS.map((reason) => [reason] as const))('reason %s', (reason) => {
     expect(reasonBranchProblems(reason)).toEqual([])
   })
@@ -528,7 +528,7 @@ const CLIENT_INSTALL_SECTIONS: [title: string, heading: string][] = [
   ['Notes', '## Notes\n'],
 ]
 
-describe('install-cscb skill: the pinned agent-director client (b.jg5 SRJ-1110, SRJ-101; hatch notes E5, E36)', () => {
+describe('install-cscb skill: the pinned agent-director client (hatch notes , )', () => {
   test('removing the pin: the skill names the client as agent-director@<version> at least once', () => {
     expect(clientPins(skillContent).length).toBeGreaterThan(0)
   })
@@ -634,7 +634,7 @@ function unqualifiedReady(text: string): string[] {
   return text.split(/(?<=\.)\s+/).filter((sentence) => READY.test(sentence) && !NO_NOTE.test(sentence))
 }
 
-describe("install-cscb skill: the install check and its note (b.jg5 SRJ-1110, SRJ-212; hatch note E5)", () => {
+describe("install-cscb skill: the install check and its note (hatch note )", () => {
   test('Step 1 runs the package.json script that runs scripts/install-check.ts, in its one fenced block', () => {
     expect(INSTALL_CHECK_SCRIPTS).toHaveLength(1)
     expect(splitFences(rawSection(STEP1_TITLE)).blocks.map((block) => block.body.trim())).toEqual([`bun run ${INSTALL_CHECK_SCRIPTS[0]}`])
@@ -691,7 +691,7 @@ describe("install-cscb skill: the install check and its note (b.jg5 SRJ-1110, SR
   })
 })
 
-/** SRJ-1110's coupling statement, as the clauses' self-checks read it. */
+/** coupling statement, as the clauses' self-checks read it. */
 const COUPLING_STATEMENT =
   'This CSCB release and agent-director Phase 1 are installed, and rolled back, together. ' +
   'Every agent on the host, with every long-running agent-director process, is stopped before either binary change and started again after it.'
@@ -720,7 +720,7 @@ const COUPLING_CLAUSES: [label: string, pattern: RegExp, without: string][] = [
   ],
 ]
 
-describe('install-cscb skill: the coupled install and rollback (b.jg5 SRJ-1110; HO C15)', () => {
+describe('install-cscb skill: the coupled install and rollback (HO C15)', () => {
   test.each(COUPLING_CLAUSES)('the skill states the clause: %s', (_label, pattern) => {
     expect(skillProse).toMatch(pattern)
   })
@@ -754,7 +754,7 @@ function repeatedSteps(text: string): string[] {
   return RUNBOOKS.flatMap(([, title]) => runbookStepTitles(title).filter((step) => prose.includes(step.toLowerCase())).map((step) => `"${title}": ${step}`))
 }
 
-describe('install-cscb skill: the runbooks by title, their steps not repeated (b.jg5 SRJ-1110, SRJ-1516; hatch note E35)', () => {
+describe('install-cscb skill: the runbooks by title, their steps not repeated (hatch note )', () => {
   test.each(RUNBOOKS)('dropping a runbook title: the skill names the %s runbook section of docs/migration.md by its title', (_which, title) => {
     expect(skillProse).toContain(`${PHASE1_RUNBOOK_DOC} section "${title}"`)
   })

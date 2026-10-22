@@ -1,5 +1,5 @@
 /**
- * sse-timeout.test.ts — Regression test for b.2hd
+ * sse-timeout.test.ts — Regression test for
  *
  * Bun's global idleTimeout: 255 kills SSE connections after ~4 minutes of
  * inactivity. The fix calls server.timeout(req, 0) for GET requests to disable
@@ -58,7 +58,7 @@ beforeEach(() => {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('SSE idle timeout disabled for GET requests (b.2hd)', () => {
+describe('SSE idle timeout disabled for GET requests', () => {
   test('GET request calls server.timeout(req, 0) to disable idle timeout', async () => {
     await fetch(`http://localhost:${testServer.port}/mcp`)
     expect(timeoutCalls.length).toBe(1)

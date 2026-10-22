@@ -1,6 +1,5 @@
 /**
- * test-helpers/retired-keys.ts — The retired-key record for tests (b.jg5
- * SRJ-1304): `writeRetiredKeysRecord` seeds the record in a state directory
+ * test-helpers/retired-keys.ts — The retired-key record for tests: `writeRetiredKeysRecord` seeds the record in a state directory
  * and `readRetiredKeysRecord` reads it back.
  *
  * Both go through `src/retired-keys.ts` itself: the file's name and path
@@ -21,7 +20,7 @@
  * - `RFC3339_UTC`: the form the server writes a time in, to match a
  *   `retired_at` or a mark the server wrote.
  *
- * Isolation (b.jg5 SRJ-1301): both take the state directory explicitly and
+ * Isolation: both take the state directory explicitly and
  * never resolve a default one; the writer writes only the record in that
  * directory, and refuses the real home and any directory not under the OS
  * temp directory. No module-scope state, no process started.

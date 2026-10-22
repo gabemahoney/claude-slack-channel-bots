@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 6 (E5, b.av2 SR-6.4 directory-broken; bug b.g57 claude_config_dir hold):
+# Test 6 (E5directory-brokenclaude_config_dir hold):
 # a persona whose working directory does not exist stays down and is
 # re-checked on its own timer while a healthy persona serves; it comes up,
 # with no confirmation, once the directory is created. A second leg does the
@@ -23,7 +23,7 @@
 # line's own timestamp (server.log lines are "[<ISO time>] <message>").
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
-# (E14 decision 14; lib/scenario.sh "Matchers"), never as whole sentences.
+# ( the current rule; lib/scenario.sh "Matchers"), never as whole sentences.
 # "…" marks text the match skips:
 #   [slack] Loaded persona config: 3 persona(s)                      src/server.ts
 #   [slack] persona-start: personas[<i>] "<name>" (key=<key>) …

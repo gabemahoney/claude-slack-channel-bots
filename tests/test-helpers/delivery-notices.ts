@@ -1,4 +1,4 @@
-/** E5 reporting composition over the real queue, episodes and persona notifier. */
+/** reporting composition over the real queue, episodes and persona notifier. */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

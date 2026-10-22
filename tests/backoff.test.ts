@@ -1,5 +1,5 @@
 /**
- * backoff.test.ts — Pure-module tests for src/backoff.ts (SR-29.3).
+ * backoff.test.ts — Pure-module tests for src/backoff.ts.
  *
  * All assertions are deterministic: no sleeps, no timers, no mock.module.
  * Delay assertions use getFailureCount/nextBackoffDelay directly.
@@ -131,7 +131,7 @@ describe('nextBackoffDelay — exponential ladder (base from makePersonaConfig)'
 // doublingBackoffDelay — pure, stateless arithmetic
 //
 // Formula: min(base * 2^priorAttempts, ceiling). The ceiling is a parameter,
-// not the restart ladder's fixed 900. Slack retry-schedule rows (SR-3.2) are
+// not the restart ladder's fixed 900. Slack retry-schedule rows are
 // covered by the retry-schedule tests, not here.
 // ---------------------------------------------------------------------------
 
@@ -271,10 +271,10 @@ describe('per-channel isolation', () => {
 })
 
 // ---------------------------------------------------------------------------
-// forgetFailures — per-persona forget at a teardown (b.av2 SR-6.5)
+// forgetFailures — per-persona forget at a teardown
 // ---------------------------------------------------------------------------
 
-describe('forgetFailures — per-persona forget (b.av2 SR-6.5)', () => {
+describe('forgetFailures — per-persona forget', () => {
   const CAP = 5
 
   /** Run `fn` with console.error/log/warn recorded; returns every line. */

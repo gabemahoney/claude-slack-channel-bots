@@ -1,20 +1,20 @@
 /**
- * publish-promote-shadow-prefix.test.ts — behavioral + guard tests for bug b.r6x.
+ * publish-promote-shadow-prefix.test.ts — behavioral + guard tests for.
  *
- * Bug b.r6x: Phase 7 of `scripts/publish-promote.sh` assumed the only global
+ * Phase 7 of `scripts/publish-promote.sh` assumed the only global
  * install that can exist is the one under `${BUN_INSTALL:-$HOME/.bun}/install/global`.
  * On the 0.10.0 release host a stale install in a SECOND bun prefix
  * (`~/.cache/.bun`) won on PATH through a `~/.local/bin` shim, so promote
  * installed correctly, then failed its own SR-7.4 check with a diagnostic
  * blaming this prefix's layout — sending the operator after the wrong cause.
  *
- * The fix takes the AC-2 "accurate diagnostic" option (report, never delete):
+ * The fix takes the "accurate diagnostic" option (report, never delete):
  *   - SR-7.0 warns BEFORE the install when the command already resolves outside
  *     the canonical prefix (warn only; it does not exit).
  *   - SR-7.4's outside-prefix arm emits the same report and still exits 72.
- *   - SR-7.4b closes the fresh-prefix trust gap (AC-7), non-fatally.
+ * - SR-7.4b closes the fresh-prefix trust gap (), non-fatally.
  *
- * Bug b.42j: SR-7.0's warning said SR-7.4 "will fail the release". SR-7.4 runs
+ * SR-7.0's warning said SR-7.4 "will fail the release". SR-7.4 runs
  * after the release has published, so the warning now says SR-7.4 will exit 72
  * AFTER the release has published and that the fix is to remove the shadowing
  * copy, and the cases below run SR-7.0 and then SR-7.4 on the same layout to
@@ -133,7 +133,7 @@ let SR70: string
 let SR74: string
 let SR74_ARM: string
 let SR74B: string
-/** SR-7.4b's `resolve_state_dir` function (b.fc4): the state directory the CLI would use. */
+/** SR-7.4b's `resolve_state_dir` function: the state directory the CLI would use. */
 let RESOLVE_STATE_DIR: string
 /** SR-8.1, the daemon-bounce handoff, which reads the PID file in that state directory. */
 let SR81: string
@@ -250,7 +250,7 @@ afterAll(() => {
 // Harness environment: the test's directories win on PATH
 // ---------------------------------------------------------------------------
 
-describe('b.r6x harness: the child PATH puts the test directories first', () => {
+describe('harness: the child PATH puts the test directories first', () => {
   // One case: every harness below builds its child PATH with the same helper
   // (runBash → hostSafeChildEnv), whatever its tool list, so the ordering is
   // proven once, with the SR-7.0 tools.
@@ -271,10 +271,10 @@ describe('b.r6x harness: the child PATH puts the test directories first', () => 
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.0 — pre-install shadow detection (AC-1, AC-2)
+// SR-7.0 — pre-install shadow detection (, )
 // ---------------------------------------------------------------------------
 
-describe('b.r6x: SR-7.0 detects an install shadowing the canonical prefix on PATH', () => {
+describe('SR-7.0 detects an install shadowing the canonical prefix on PATH', () => {
   test('the ticket layout (.local/bin shim → .cache/.bun → repo cli) is reported in full', () => {
     // Reproduces the state observed on the 0.10.0 release host.
     const home = makeHome()
@@ -299,10 +299,10 @@ describe('b.r6x: SR-7.0 detects an install shadowing the canonical prefix on PAT
     expect(r.stderr).toContain(join(home, '.bun/install/global'))
     expect(r.stderr).toContain(`rm -rf ${join(stale, 'install/global')}`)
     expect(r.stderr).toContain(`rm -f  ${staleBin}`)
-    // AC-4: the shim is REPOINTED, never deleted.
+    // the shim is REPOINTED, never deleted.
     expect(r.stderr).toContain(`ln -sfn ${join(home, '.bun/bin', PKG)} ${shim}`)
     expect(r.stderr).not.toContain(`rm -f  ${shim}`)
-    // AC-3: bun's shared download cache is never named as a deletion target.
+    // bun's shared download cache is never named as a deletion target.
     const removals = r.stderr.split('\n').filter((l) => /^\s*rm\s/.test(l))
     expect(removals.filter((l) => l.includes('install/cache'))).toEqual([])
   })
@@ -317,7 +317,7 @@ describe('b.r6x: SR-7.0 detects an install shadowing the canonical prefix on PAT
     expect(r.code).toBe(0)
     expect(r.stderr).toContain(`rm -rf ${join(home, '.cache/.bun/install/global')}`)
     // The path on PATH is the stale bin itself: the ln -sfn below repoints it,
-    // so deleting it first would break the only reachable name (AC-4).
+    // so deleting it first would break the only reachable name ().
     expect(r.stderr).not.toMatch(/^\s*rm -f/m)
     expect(r.stderr).toContain(`ln -sfn ${join(home, '.bun/bin', PKG)} ${staleBin}`)
   })
@@ -325,7 +325,7 @@ describe('b.r6x: SR-7.0 detects an install shadowing the canonical prefix on PAT
   test('a shim that is not a bun prefix is never mistaken for one (no rm of the shim)', () => {
     // ~/.local/bin/<pkg> matches the <prefix>/bin/<pkg> shape by accident. If it
     // were treated as a bun prefix the report would tell the operator to delete
-    // the very shim AC-4 says to repoint — and to rm -rf ~/.local/install/global.
+    // the very shim says to repoint — and to rm -rf ~/.local/install/global.
     const home = makeHome()
     makePrefixInstall(join(home, '.bun'))
     const repoCli = makeRepoCli(home)
@@ -382,7 +382,7 @@ describe('b.r6x: SR-7.0 detects an install shadowing the canonical prefix on PAT
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.0 — prefix identity is normalized, not spelled (AC-2)
+// SR-7.0 — prefix identity is normalized, not spelled ()
 // ---------------------------------------------------------------------------
 //
 // cscb_shadow_prefix compares `readlink -f`-normalized paths on both sides. A
@@ -390,7 +390,7 @@ describe('b.r6x: SR-7.0 detects an install shadowing the canonical prefix on PAT
 // prefix a second prefix and tell the operator to `rm -rf` the tree promote just
 // installed — the single most damaging thing this report could get wrong.
 
-describe('b.r6x: an aliased spelling of the canonical prefix is not a second prefix', () => {
+describe('an aliased spelling of the canonical prefix is not a second prefix', () => {
   test('resolving through a directory symlink to the canonical prefix stays silent', () => {
     const home = makeHome()
     makePrefixInstall(join(home, '.bun'))
@@ -460,16 +460,16 @@ describe('b.r6x: an aliased spelling of the canonical prefix is not a second pre
 })
 
 // ---------------------------------------------------------------------------
-// AC-3 — what the report proposes when the stale prefix holds other packages
+// — what the report proposes when the stale prefix holds other packages
 // ---------------------------------------------------------------------------
 
-describe('b.r6x AC-3: a stale prefix with unrelated dependencies', () => {
+describe('a stale prefix with unrelated dependencies', () => {
   test('the rm -rf is emitted unconditionally, and the manifest is never read', () => {
     // PINNED CURRENT BEHAVIOR, not an endorsement. cscb_shadow_report proposes
     // `rm -rf <stale>/install/global` without inspecting that prefix's manifest,
     // so a prefix that also holds unrelated global packages gets the same advice.
     // That is tolerable only because the report is advice to a human and the
-    // script is forbidden from executing it (AC-2: report, never delete). If a
+    // script is forbidden from executing it (report, never delete). If a
     // future change ever lets automation run these commands, this test must be
     // revisited FIRST: an unconditional rm -rf would then destroy other packages.
     const home = makeHome()
@@ -489,16 +489,16 @@ describe('b.r6x AC-3: a stale prefix with unrelated dependencies', () => {
     // the operator is expected to look before running the command.
     expect(r.stderr).not.toContain('unrelated-global-pkg')
     expect(r.stderr).not.toContain('bun remove -g')
-    // The remediation still repoints rather than deletes the PATH entry (AC-4).
+    // The remediation still repoints rather than deletes the PATH entry ().
     expect(r.stderr).toContain(`ln -sfn ${join(home, '.bun/bin', PKG)} ${staleBin}`)
   })
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.4 — the exit-72 arm (AC-6, AC-9)
+// SR-7.4 — the exit-72 arm (, )
 // ---------------------------------------------------------------------------
 
-describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72', () => {
+describe('SR-7.4 outside-prefix arm reports the shadow and still exits 72', () => {
   test('exit code is unchanged and the diagnostic names found vs expected', () => {
     const home = makeHome()
     makePrefixInstall(join(home, '.bun'))
@@ -520,7 +520,7 @@ describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72
 
     const r = runBash(harness, home, { tools: SHADOW_TOOLS })
 
-    expect(r.code).toBe(72) // AC-9: exit-code values unchanged
+    expect(r.code).toBe(72) // exit-code values unchanged
     expect(r.stderr).toContain('SR-7.4')
     expect(r.stderr).toContain(shim) // what was found on PATH
     expect(r.stderr).toContain(repoCli) // what it really resolves to
@@ -550,7 +550,7 @@ describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.0's warning states what SR-7.4 then does (b.42j)
+// SR-7.0's warning states what SR-7.4 then does
 // ---------------------------------------------------------------------------
 //
 // Each row runs SR-7.0 on the layout as promote finds it, makes the change the
@@ -569,7 +569,7 @@ interface WarningLayout {
 
 const WARNING_LAYOUTS: WarningLayout[] = [
   {
-    layout: 'a second bun prefix behind a ~/.local/bin shim (b.r6x)',
+    layout: 'a second bun prefix behind a ~/.local/bin shim',
     build: (home) => {
       makePrefixInstall(join(home, '.bun'))
       link(join(home, '.local/bin', PKG), makePrefixInstall(join(home, '.cache/.bun')))
@@ -596,7 +596,7 @@ const WARNING_LAYOUTS: WarningLayout[] = [
   },
 ]
 
-describe('b.42j: the SR-7.0 warning states what SR-7.4 then does', () => {
+describe('the SR-7.0 warning states what SR-7.4 then does', () => {
   test.each(WARNING_LAYOUTS)(
     '$layout: the warning says SR-7.4 exits 72 after the release has published and the fix is to remove the shadowing copy, and SR-7.4 then exits $sr74Exit',
     ({ build, sr74Exit }) => {
@@ -637,7 +637,7 @@ describe('b.42j: the SR-7.0 warning states what SR-7.4 then does', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.4b — postinstall trust gap (AC-7)
+// SR-7.4b — postinstall trust gap ()
 // ---------------------------------------------------------------------------
 //
 // Driven against a stub `bun` at the front of PATH that records its argv and
@@ -660,7 +660,7 @@ interface Sr74bOpts {
   artifacts?: boolean | { config: boolean; mcp: boolean }
   /** Write a leftover file with this name into the state dir (not an artifact). */
   leftover?: string
-  /** Point SLACK_STATE_DIR at a temp state dir instead of the default (~/.config/claude-slack-channel-bots, bug b.fc4). */
+  /** Point SLACK_STATE_DIR at a temp state dir instead of the default (~/.config/claude-slack-channel-bots). */
   stateDirOverride?: boolean
   /**
    * Where the run's state dir is, with SLACK_STATE_DIR unset: `default` is
@@ -669,7 +669,7 @@ interface Sr74bOpts {
    * host whose server has not yet moved it. `stateDir` in the run is that
    * directory (and `artifacts` are written there). The 0.14 and 0.15 default,
    * ~/.config/cscb, is a directory beside it: `cscbFiles`, `cscbLivePid`,
-   * `legacyLinkToCscb` (b.smv).
+   * `legacyLinkToCscb`.
    */
   layout?: 'default' | 'xdg' | 'legacy'
   /** Files written into the old default directory (a real directory) next to wherever `layout` puts the state dir; not for `layout: 'legacy'`. */
@@ -836,7 +836,7 @@ function runDaemonNote(opts: {
   return { ...r, home }
 }
 
-describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI would use', () => {
+describe('SR-8.1 reads the daemon PID file from the state dir the CLI would use', () => {
   // A PID that is alive: this test process's own.
   const ALIVE = process.pid
   const NO_DAEMON = 'no daemon currently running'
@@ -916,9 +916,9 @@ describe('b.fc4: SR-8.1 reads the daemon PID file from the state dir the CLI wou
   })
 })
 
-describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
+describe('SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
   test('a trusted manifest with config.json + MCP config present and no access.json runs no bun and warns nothing', () => {
-    // b.av2 SR-12: pins the fix for a false warning on every release after
+    // SR-12: pins the fix for a false warning on every release after
     // postinstall stopped creating access.json.
     const r = runSr74b({ manifest: 'trusted', artifacts: true })
     expect(readdirSync(r.stateDir)).toEqual(['config.json'])
@@ -931,7 +931,7 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     const r = runSr74b({ manifest: 'untrusted', artifacts: true })
     expect(r.code).toBe(0)
     expect(r.bunCalls).toEqual([`pm -g trust ${PKG}`])
-    // b.bpp: every global bun call runs with $HOME as CWD so bun cannot resolve
+    // every global bun call runs with $HOME as CWD so bun cannot resolve
     // (and rewrite) the repo's own package.json.
     expect(r.bunCwds).toEqual([r.home])
     expect(r.stderr).toBe('')
@@ -948,7 +948,7 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     expect(r.code).toBe(0) // non-fatal by design: the release IS delivered
     expect(r.stderr).toContain(join(r.stateDir, 'config.json'))
     expect(r.stderr).toContain(r.mcpConfig)
-    // b.av2 SR-12: postinstall no longer creates access.json, so it is not on the list.
+    // SR-12: postinstall no longer creates access.json, so it is not on the list.
     expect(r.stderr).not.toContain('access.json')
   })
 
@@ -970,7 +970,7 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     },
   )
 
-  test('b.av2 SR-12: a leftover access.json does not stand in for a missing config.json', () => {
+  test('SR-12: a leftover access.json does not stand in for a missing config.json', () => {
     const r = runSr74b({
       manifest: 'trusted',
       artifacts: { config: false, mcp: true },
@@ -997,7 +997,7 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     expect(missing.stderr).not.toContain(join(missing.home, '.claude/channels/slack'))
   })
 
-  // b.fc4: the state dir is the CLI's choice (src/state-dir-migration.ts
+  // the state dir is the CLI's choice (src/state-dir-migration.ts
   // resolveCliStateDir): the new default, ~/.config/claude-slack-channel-bots, unless the old one
   // is still a real directory holding config.json or server.pid while the new
   // one holds no config.json (the promote runs before the daemon's first start
@@ -1070,10 +1070,10 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     expect(r.stderr).not.toContain('.claude/channels/slack')
   })
 
-  // b.smv: 0.14 and 0.15 kept the state in ~/.config/cscb; the new default is
+  // 0.14 and 0.15 kept the state in ~/.config/cscb; the new default is
   // ~/.config/claude-slack-channel-bots. A promote that runs before the new
   // server's first start has moved it finds the state under the old name.
-  describe('b.smv: ~/.config/cscb, the 0.14 and 0.15 default, is an old directory too', () => {
+  describe('~/.config/cscb, the 0.14 and 0.15 default, is an old directory too', () => {
     const CSCB = (r: Sr74bRun) => join(r.home, '.config/cscb')
     const L1 = (r: Sr74bRun) => join(r.home, '.claude/channels/slack')
 
@@ -1195,10 +1195,10 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
 })
 
 // ---------------------------------------------------------------------------
-// sanitize-global.sh — AC-5 (scoped to the canonical prefix, still exits 0)
+// sanitize-global.sh — (scoped to the canonical prefix, still exits 0)
 // ---------------------------------------------------------------------------
 
-describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits 0', () => {
+describe('sanitize-global.sh stays canonical-prefix-scoped and exits 0', () => {
   /**
    * A stub `bun` that reports a PRE-sunset version and hands `bun -e` to node.
    *
@@ -1293,8 +1293,8 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
     // One assignment, the canonical expansion; no PATH lookup, no second prefix.
     expect(prefixLines).toEqual(['GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"'])
     expect(script).not.toContain('command -v')
-    // AC-5's alternative to awareness: an explicit recorded scope decision.
-    expect(script).toMatch(/#.*SCOPE[\s\S]*b\.r6x/)
+    // 's alternative to awareness: an explicit recorded scope decision.
+    expect(script).toMatch(/#.*SCOPE[\s\S]*CANONICAL prefix only/)
   })
 })
 
@@ -1305,7 +1305,7 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
 // These prove the behavioral tests above have teeth: against a pre-fix-shaped
 // source the blocks they exercise do not exist (so every extracting test in this
 // file fails outright), and the SR-7.4 arm that source does have carries none of
-// the shadow information AC-2/AC-6 require.
+// the shadow information /require.
 //
 // The fixture is embedded (PRE_FIX_PHASE7) rather than read from git history on
 // purpose — a `git show HEAD:…` guard inverts and fails the moment the fix is
@@ -1317,7 +1317,7 @@ const phase7Order = (s: string): string[] =>
     .map((l) => l.match(/^# (SR-7\.\d[a-z]?) — /)?.[1])
     .filter((x): x is string => Boolean(x))
 
-describe('b.r6x: a pre-fix-shaped script lacks every surface these tests assert on', () => {
+describe('a pre-fix-shaped script lacks every surface these tests assert on', () => {
   test('extracting the helper / SR-7.0 / SR-7.4b blocks throws on a pre-fix-shaped source', () => {
     expect(() =>
       extractSection(PRE_FIX_PHASE7, /^# Phase 7 prefix resolution/, /^# SR-7\.0 — /),
@@ -1373,7 +1373,7 @@ describe('b.r6x: a pre-fix-shaped script lacks every surface these tests assert 
       { tools: ['bash'] },
     )
 
-    expect(r.code).toBe(72) // AC-9: the exit code is the one thing that matches
+    expect(r.code).toBe(72) // the exit code is the one thing that matches
     expect(r.stderr).not.toContain(shim) // never names the shim on PATH
     expect(r.stderr).not.toContain('Symlink chain')
     // It quotes the resolved path, but never identifies the prefix that owns it,
@@ -1384,7 +1384,7 @@ describe('b.r6x: a pre-fix-shaped script lacks every surface these tests assert 
     expect(r.stderr).toContain('bun install -g')
   })
 
-  test('AC-9: phase ordering and the Phase 7 exit-code table match their pinned values', () => {
+  test('phase ordering and the Phase 7 exit-code table match their pinned values', () => {
     // Pinned expectations, not a diff against git HEAD: post-commit, HEAD is this
     // script and such a comparison would be a vacuous self-comparison.
     const fixed = readPromote()

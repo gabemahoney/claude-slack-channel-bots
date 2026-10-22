@@ -166,7 +166,7 @@ export function appendTranscript(path: string, entries: readonly TranscriptEntry
 }
 
 /** Concrete composer drawings, shared by delivery, replay and reconnect tests
- * (b.omv SR-5.3/5.4). No long/tall-paste research assumptions are added here. */
+ * No long/tall-paste research assumptions are added here. */
 export function queuedCommandEntry(text: string, extra: TranscriptEntry = {}): TranscriptEntry {
   return { ...hookAttachmentEntry('queued_command'), attachment: { type: 'queued_command', prompt: text }, ...extra }
 }

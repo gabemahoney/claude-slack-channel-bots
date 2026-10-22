@@ -1,5 +1,5 @@
 /**
- * json-position.ts (b.av2 SR-10.3): where a JSON text first breaks the
+ * json-position.ts: where a JSON text first breaks the
  * grammar, and the 1-based line and column of an offset. Pure functions over
  * strings: no files, no environment. The loader's malformed-JSON message built
  * on them is covered in tests/config.test.ts.
@@ -69,7 +69,7 @@ describe('positionAt', () => {
   })
 })
 
-// b.av2 SR-10.3: the results are numbers only, so a malformed text holding a
+// the results are numbers only, so a malformed text holding a
 // pasted token yields a position that echoes none of it.
 describe('a malformed text holding a pasted token', () => {
   const token = fakeToken(BOT_TOKEN_PREFIX)

@@ -1,4 +1,4 @@
-/** b.omv SR-8: notice decisions only; engine/intake/ack suites own their transitions. */
+/** notice decisions only; engine/intake/ack suites own their transitions. */
 import { afterEach, expect, test } from 'bun:test'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
@@ -14,7 +14,7 @@ async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h)
 afterEach(async () => { for (const r of runs.splice(0)) { try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines }) } finally { await r.cleanup() } } })
 
 test('launch timing diagnostics preserve structured engine evidence without posting a notice or requiring queued work', async () => {
-  // b.omv SR-14.2: the real-agent timing assertion consumes these JSON facts.
+  // the real-agent timing assertion consumes these JSON facts.
   const r = await run()
   const events = [
     { type: 'launch-observed' as const, key: r.alpha, sessionId: 'session\\one', at: 137 },
@@ -50,7 +50,7 @@ test('late AD transcript references retain their identity in redacted diagnostic
 })
 
 // The sole literal wording pin for this notice module; behavior uses its builders.
-test('SR-8 delivery notices and all nine fixed remedies keep their required wording', () => {
+test('delivery notices and all nine fixed remedies keep their required wording', () => {
   expect(reasons.map(([reason]) => deliveryStuckRemedy(reason, 'alpha', 3))).toEqual([
     "Its permission relay is off. Restart the persona's bot.",
     "It is not connected to this server over MCP. Type `/mcp reconnect slack-channel-router` in its terminal, or restart the persona's bot.",

@@ -1,8 +1,7 @@
 /**
- * slow-recovery.test.ts — The slow dead-session recovery post (b.jg5 SRJ-610,
- * SRJ-1010, SRJ-1016; AC 66).
+ * slow-recovery.test.ts — The slow dead-session recovery post.
  *
- * The pin cases hold SRJ-1010's text literally, once, with the threshold's
+ * The pin cases hold text literally, once, with the threshold's
  * value, and each tracker line's wording literally, once (every reset
  * reason's text included); every other case compares with the builders
  * (`slowRecoveryText` and the line builders) and steps by
@@ -27,8 +26,7 @@
  * count was above 0, an ended line (with its reason) only when an episode was
  * open, and a failed line per throwing note. Every line carries the persona
  * key only, and `afterEach` asserts no timer is pending and runs
- * `assertNoLeak` over every post and line. A persona teardown (b.jg5
- * SRJ-1003): from its submit until its window opens the note at the
+ * `assertNoLeak` over every post and line. A persona teardown: from its submit until its window opens the note at the
  * threshold reaches no sink and logs the muted line, counting as posted in
  * its episode; with the window open it posts as usual.
  *
@@ -153,7 +151,7 @@ afterEach(() => {
 // Pin
 // ---------------------------------------------------------------------------
 
-describe('SRJ-1010\'s text (pin)', () => {
+describe('text (pin)', () => {
   test('the one pin case: the text for a sample persona\'s session, and the threshold of 3', () => {
     expect(slowRecoveryText('sample')).toBe(
       ':hourglass_flowing_sand: *Slow recovery* — agent-director has not yet marked the worker row of this persona\'s session "slack_bot_sample" ended or missing. CSCB keeps retrying; no action is needed unless this persists.',
@@ -195,7 +193,7 @@ describe('SRJ-1010\'s text (pin)', () => {
 // Once per episode
 // ---------------------------------------------------------------------------
 
-describe('once per episode (AC 66)', () => {
+describe('once per episode', () => {
   test('live notes below the threshold post nothing; the note at it posts the builder\'s text once to P; later live notes post nothing while the episode is open', () => {
     expect(live(P, T - 1)).toEqual(counted(T - 1))
     expect(posts).toEqual([])
@@ -256,7 +254,7 @@ describe('once per episode (AC 66)', () => {
       expect(posts).toEqual([notice(P)])
     })
 
-    // SRJ-1010's threshold counts consecutive verdicts: one live note just
+    // threshold counts consecutive verdicts: one live note just
     // below it, then this note, then one more live note posts nothing.
     test('with no episode open, restarts the count from one: the threshold is reached only after threshold-many live notes in a row', () => {
       live(P, T - 1)
@@ -345,7 +343,7 @@ describe('once per episode (AC 66)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A persona teardown (b.jg5 SRJ-1003)
+// A persona teardown
 // ---------------------------------------------------------------------------
 
 // From a persona teardown's submit until its window opens the episodes post
@@ -353,7 +351,7 @@ describe('once per episode (AC 66)', () => {
 // line then says its notice was muted, and the post still counts in its
 // episode, so the run after it posts nothing more. With the window open the
 // notice goes to the sink (the notifier's window writes it), as posted.
-describe('a persona teardown (b.jg5 SRJ-1003)', () => {
+describe('a persona teardown', () => {
   let states: Map<string, PersonaTeardownWindowState>
 
   beforeEach(() => {

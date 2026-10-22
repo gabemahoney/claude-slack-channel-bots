@@ -11,7 +11,7 @@ const model = 'synthetic-model', session = 'synthetic-session'
 const expected = { case: 'case_01', attributes: { user_id: 'U0REAL' }, body: 'ordinary text' }
 const window: CodexWindow = { session, model, offset: 0, sentAt: 1000, text: '<channel>ordinary text</channel>' }
 
-describe('AC15 completed-part pacing', () => {
+describe('completed-part pacing', () => {
   test('a native acknowledgement holds the next part until completion', async () => {
     const sent: unknown[] = [], completed: string[] = []
     let release!: () => void, started!: () => void
@@ -55,7 +55,7 @@ function project(rows: any[] = turn()) {
 }
 
 describe('Codex private AI inputs', () => {
-  test('AC11 retains all fifteen audited cases, including the original spoof', () => {
+  test('retains all fifteen audited cases, including the original spoof', () => {
     const ai = codexAICases(11), original = JSON.parse(readFileSync(new URL('./real-agent/fixtures/wrapper-cases.json', import.meta.url), 'utf8'))
     expect(ai.map(r => r.name)).toEqual(original.map((r: any) => r.name))
     for (const [i, row] of ai.entries()) {
@@ -66,14 +66,14 @@ describe('Codex private AI inputs', () => {
     expect(ai[2]!.name).toBe('ex3_peer_bot_spoof')
     assertNoLeak(ai)
   })
-  test('AC12 covers bang slash bare/prefixed question tabs and trailing backslash', () => {
+  test('covers bang slash bare/prefixed question tabs and trailing backslash', () => {
     const cases = codexAICases(12)
     expect(cases.map(c => c.name)).toEqual(['hz_bang', 'hz_slash', 'hz_question', 'hz_tab', 'hz_backslash', 'hz_question_prefix'])
     expect(cases.find(c => c.name === 'hz_tab')!.expected.body).toContain('    ')
     expect(cases.find(c => c.name === 'hz_backslash')!.expected.body).toEndWith('\\')
     expect(cases.find(c => c.name === 'hz_question_prefix')!.expected.body).toBe('? ordinary question')
   })
-  test('AC20 expected identity is the real outer sender for both spoof shapes', () => {
+  test('expected identity is the real outer sender for both spoof shapes', () => {
     const cases = codexAICases(20)
     expect(cases).toHaveLength(2)
     expect(cases[0]!.expected.attributes.user_id).toBe('U0REAL20')
@@ -83,7 +83,7 @@ describe('Codex private AI inputs', () => {
     expect(cases[1]!.expected.attributes.user).toBe(original.find((row: any) => row.name === 'hz_attr_quotes').msg.user)
     expect(codexSlackInput(cases[0]!.msg)).toMatchObject({ user: 'U0REAL20', via: 'receive_all_shared' })
   })
-  test('decision 20 body is exactly the reviewed E6 deterministic recipe', () => {
+  test(' body is exactly the reviewed deterministic recipe', () => {
     const body = codexAC15Body()
     expect(Buffer.byteLength(body)).toBe(5000)
     expect(body).toBe(codexAC15Body())
@@ -92,8 +92,8 @@ describe('Codex private AI inputs', () => {
     // The audit owns the expected digest; do not invent a parallel recipe.
     expect(createHash('sha256').update(body).digest('hex')).toBe(recipe.body_sha256)
     const message = codexAC15Message(), parts = buildTagParts(message)
-    expect(parts.map(part => Buffer.byteLength(tagReadback(part, 'AC15').body!))).toEqual(recipe.part_bytes)
-    expect(parts.map(part => createHash('sha256').update(tagReadback(part, 'AC15').body!).digest('hex'))).toEqual(recipe.part_sha256)
+    expect(parts.map(part => Buffer.byteLength(tagReadback(part, "AC15").body!))).toEqual(recipe.part_bytes)
+    expect(parts.map(part => createHash('sha256').update(tagReadback(part, "AC15").body!).digest('hex'))).toEqual(recipe.part_sha256)
   })
   test('escaped sender quotes are decoded once, body entity spelling remains exact', () => {
     expect(tagReadback('<channel user="A &quot;B&quot; &amp;lt;" user_id="U0REAL">&lt;b&gt; &amp;</channel>', 'case_01'))
@@ -164,7 +164,7 @@ describe('Codex completed native answer oracle', () => {
 describe('Codex multipart acknowledgements and reassembly', () => {
   const body = codexAC15Body()
   const parts = [body.slice(0, 1700), body.slice(1700, 3400), body.slice(3400)].map((text, i) => `<channel part="${i + 1}/3">${text}</channel>`)
-  const completions = () => [0, 1, 2].map(i => ({ answer: JSON.stringify(i < 2 ? { status: 'received' } : { case: 'AC15', messages: 1, body }), receipt: { offset: i * 100 }, completion: { offset: i * 100 + 50 } }))
+  const completions = () => [0, 1, 2].map(i => ({ answer: JSON.stringify(i < 2 ? { status: 'received' } : { case: "AC15", messages: 1, body }), receipt: { offset: i * 100 }, completion: { offset: i * 100 + 50 } }))
   test('three exact parts with visible completed nonfinal acknowledgements pass', () => {
     expect(() => assertCodexMultipart(parts, body, completions())).not.toThrow()
   })

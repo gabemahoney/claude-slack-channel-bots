@@ -1,4 +1,4 @@
-/** Decision 19 hazard isolation, checked against packed-production receipts. */
+/**  hazard isolation, checked against packed-production receipts. */
 import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'

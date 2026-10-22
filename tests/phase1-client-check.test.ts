@@ -1,7 +1,7 @@
 /**
  * phase1-client-check.test.ts — the pure checker `checkPhase1Client` of the
  * image-side fixture `tests/integration/fixtures/phase1-client-check.ts`
- * (b.jg5 SRJ-101, SRJ-103, SRJ-104).
+ *
  *
  * Only the checker, its problem kinds and its fail-line helper are imported;
  * the fixture's entry point never runs (it runs only when the file is executed

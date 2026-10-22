@@ -1,17 +1,17 @@
 /**
- * epic2-legacy-hooks-removed.test.ts — b.hdk regression guard.
+ * legacy-hooks-removed.test.ts — regression guard.
  *
- * Asserts that the Epic-2 legacy hook install instructions removed in b.hdk
+ * Asserts that the legacy hook install instructions removed in the contract
  * do NOT re-appear in shipping artifacts. Each test would fail against the
  * pre-fix state and passes against the post-fix state.
  *
- *   1. package.json `files` array does NOT contain "hooks/"
- *   2. hooks/ directory does NOT exist at the repo root
- *   3. skills/setup-slack-channel-bots/SKILL.md has no hook install instructions
- *   4. README.md and the user docs have no hook install instructions outside the
- *      upgrade-notes section, and the ## Upgrading from pre-Epic-2 section exists
- *      in docs/migration.md
- *   5. docs/architecture.md describes the .sh files only as deleted/absent
+ * 1. package.json `files` array does NOT contain "hooks/"
+ * 2. hooks/ directory does NOT exist at the repo root
+ * 3. skills/setup-slack-channel-bots/SKILL.md has no hook install instructions
+ * 4. README.md and the user docs have no hook install instructions outside the
+ * upgrade-notes section, and the ## Upgrading from pre-v0.6 section exists
+ * in docs/migration.md
+ * 5. docs/architecture.md describes the .sh files only as deleted/absent
  *
  * SPDX-License-Identifier: MIT
  */
@@ -30,7 +30,7 @@ function read(relPath: string): string {
 // 1. package.json — "hooks/" must not appear in the `files` array
 // ---------------------------------------------------------------------------
 
-describe('b.hdk: package.json has no hooks/ in files array', () => {
+describe('package.json has no hooks/ in files array', () => {
   test('"hooks/" is absent from the files array', () => {
     const pkg = JSON.parse(read('package.json')) as { files?: string[] }
     expect(pkg.files ?? []).not.toContain('hooks/')
@@ -41,7 +41,7 @@ describe('b.hdk: package.json has no hooks/ in files array', () => {
 // 2. hooks/ directory must not exist at repo root
 // ---------------------------------------------------------------------------
 
-describe('b.hdk: hooks/ directory does not exist at repo root', () => {
+describe('hooks/ directory does not exist at repo root', () => {
   test('hooks/ directory is absent', () => {
     const hooksDir = resolve(REPO_ROOT, 'hooks')
     expect(existsSync(hooksDir)).toBe(false)
@@ -54,19 +54,19 @@ describe('b.hdk: hooks/ directory does not exist at repo root', () => {
 // After the fix, permission-relay.sh / ask-relay.sh still appear in the
 // *verification* section (Step 7 tells operators to check for orphan entries).
 // That is intentional. The banned patterns are install-instruction forms:
-//   - cp ... permission-relay.sh / ask-relay.sh
-//   - ln -sf ... permission-relay.sh / ask-relay.sh
-//   - chmod +x ~/.claude/hooks/permission-relay.sh (or ask-relay.sh)
-//   - "type": "command" block paired with the .sh paths
-//   - "matcher": "PermissionRequest" paired with the .sh paths
-//   - cp "$(npm root -g)/claude-slack-channel-bots/hooks/... copy-from-package
+// - cp ... permission-relay.sh / ask-relay.sh
+// - ln -sf ... permission-relay.sh / ask-relay.sh
+// - chmod +x ~/.claude/hooks/permission-relay.sh (or ask-relay.sh)
+// - "type": "command" block paired with the .sh paths
+// - "matcher": "PermissionRequest" paired with the .sh paths
+// - cp "$(npm root -g)/claude-slack-channel-bots/hooks/... copy-from-package
 // ---------------------------------------------------------------------------
 
-describe('b.hdk: SKILL.md has no legacy hook install instructions', () => {
+describe('SKILL.md has no legacy hook install instructions', () => {
   const skill = read('skills/setup-slack-channel-bots/SKILL.md')
 
   test('no `cp` install command targeting permission-relay.sh', () => {
-    // Matches e.g.  cp ... permission-relay.sh
+    // Matches e.g. cp ... permission-relay.sh
     expect(skill).not.toMatch(/\bcp\b[^\n]*permission-relay\.sh/)
   })
 
@@ -93,7 +93,7 @@ describe('b.hdk: SKILL.md has no legacy hook install instructions', () => {
   })
 
   test('no JSON "type":"command" block wiring the .sh relay hooks', () => {
-    // Matches e.g.  "command": "~/.claude/hooks/permission-relay.sh"
+    // Matches e.g. "command": "~/.claude/hooks/permission-relay.sh"
     expect(skill).not.toMatch(/"command"\s*:\s*"[^"]*permission-relay\.sh"/)
     expect(skill).not.toMatch(/"command"\s*:\s*"[^"]*ask-relay\.sh"/)
   })
@@ -111,21 +111,21 @@ describe('b.hdk: SKILL.md has no legacy hook install instructions', () => {
 // ---------------------------------------------------------------------------
 // 4. README.md and the user docs — no hook install instructions; upgrade section exists
 //
-// docs/migration.md has a legitimate "Upgrading from pre-Epic-2" section that tells
+// docs/migration.md has a legitimate "Upgrading from pre-v0.6" section that tells
 // operators to *delete* old files. Deletion commands are fine — we only ban
 // install (cp / ln / chmod) instructions for these hooks.
-// The "## Upgrading from pre-Epic-2" heading must be present.
+// The "## Upgrading from pre-v0.6" heading must be present.
 // ---------------------------------------------------------------------------
 
 /** The README and every user doc under docs/ that the README's documentation table lists. */
 const USER_DOCS = ['README.md', 'docs/configuration.md', 'docs/reload.md', 'docs/cli.md', 'docs/bots.md', 'docs/scheduled-prompts.md', 'docs/agent-director.md', 'docs/troubleshooting.md', 'docs/migration.md']
 
-describe('b.hdk: README.md and the user docs have no legacy hook install instructions', () => {
+describe('README.md and the user docs have no legacy hook install instructions', () => {
   const readme = USER_DOCS.map(read).join('\n')
 
-  test('## Upgrading from pre-Epic-2 section exists in docs/migration.md', () => {
+  test('## Upgrading from pre-v0.6 section exists in docs/migration.md', () => {
     // Anchored regex so the heading must be an exact complete line (no extra text appended).
-    expect(read('docs/migration.md')).toMatch(/^## Upgrading from pre-Epic-2 \(v0\.5\.x → v0\.6\.x\)$/m)
+    expect(read('docs/migration.md')).toMatch(/^## Upgrading from pre-v0.6 \(v0\.5\.x → v0\.6\.x\)$/m)
   })
 
   test('no `cp` install command targeting permission-relay.sh', () => {
@@ -156,13 +156,13 @@ describe('b.hdk: README.md and the user docs have no legacy hook install instruc
 // ---------------------------------------------------------------------------
 // 5. docs/architecture.md — .sh files described only as deleted/absent
 //
-// Line 34 legitimately lists them as "deleted files from the pre-Epic-2
+// Line 34 legitimately lists them as "deleted files from the pre-v0.6
 // architecture". That's the one allowed mention. We assert that every line
 // referencing these filenames contains at least one of the historical markers
 // that confirms they are described as gone, not active.
 // ---------------------------------------------------------------------------
 
-describe('b.hdk: architecture.md describes .sh hooks as deleted, not active', () => {
+describe('architecture.md describes .sh hooks as deleted, not active', () => {
   test('every line mentioning permission-relay.sh or ask-relay.sh uses a historical/deleted framing', () => {
     const lines = read('docs/architecture.md').split('\n')
     const HISTORICAL_MARKERS = [
@@ -170,7 +170,7 @@ describe('b.hdk: architecture.md describes .sh hooks as deleted, not active', ()
       'removed',
       'absent',
       'no longer',
-      'pre-Epic-2',
+      'pre-v0.6',
       'not shipped',
     ]
 

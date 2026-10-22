@@ -54,7 +54,7 @@ export const hostCheck: CheckDef<CheckContext> = {
  * The testplan's checks in run order (Parts 1–12): Part 11's invited-channel
  * checks (30–34) run after Check 28 and before the closing secrecy check, so
  * 29a, then the optional 29b, stay last and 29a scans every file the run
- * writes (b.deo SRI-1501).
+ * writes.
  */
 export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   preflightCheck,

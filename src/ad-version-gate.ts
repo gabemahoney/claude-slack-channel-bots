@@ -1,17 +1,16 @@
 /**
  * ad-version-gate.ts — CSCB's own Phase 1 floor for the agent-director binary.
  *
- * Role: holds the one named Phase 1 floor constant (b.jg5 SRJ-201), the floor
- * comparison over a version string (b.jg5 SRJ-202), the doc and title of the
+ * Role: holds the one named Phase 1 floor constant, the floor
+ * comparison over a version string, the doc and title of the
  * switch-over runbook section that the startup gate's messages point the
  * operator to, the debug skill's path and section that a runtime re-check's
- * stop points to instead, the `ad-below-phase1-floor` message (b.jg5 SRJ-203,
- * SRJ-208, SRJ-1013) and the `ad-system-install-too-old` message for the
- * client's own too-old refusal (b.jg5 SRJ-208), each in a startup and a
+ * stop points to instead, the `ad-below-phase1-floor` message and the `ad-system-install-too-old` message for the
+ * client's own too-old refusal, each in a startup and a
  * runtime form (startup refusals name the switch-over runbook; runtime stops
  * name the debug skill, and neither the runbook nor the install skill), the
- * runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205), the
- * host-version decision (b.jg5 SRJ-211, SRJ-212) and the Phase 1 notes its
+ * runtime re-check of the host binary, the
+ * host-version decision and the Phase 1 notes its
  * callers build: {@link buildPhase1HostNote} for `/publish` and
  * {@link buildInstallCheckPhase1Note} for the install check.
  *
@@ -33,7 +32,7 @@
  * {@link compareAdVersions} mirrors the client's version order (which it does
  * not export either), including its sentinel {@link CLIENT_DEV_SENTINEL_VERSION}.
  *
- * Host-version decision (b.jg5 SRJ-211, SRJ-212): {@link decideHostAdVersion}
+ * Host-version decision: {@link decideHostAdVersion}
  * judges one settled `resolveSystemBinary()` call against the installed
  * client's minimum (supplied by the caller) and then CSCB's floor: pass,
  * pass below the floor with a Phase 1 note naming the switch-over runbook
@@ -41,7 +40,7 @@
  * {@link buildInstallCheckPhase1Note} for the install check), or fail (not found, version
  * unreadable, below the client minimum, client minimum unreadable, other).
  * Its two callers are `/publish`'s preflight check `scripts/ad-version-check.ts`
- * (gate SR-2.5) and the install check in `src/install-check.ts`. Each
+ * (gate) and the install check in `src/install-check.ts`. Each
  * reads the client minimum and makes its own resolver call, settled by
  * {@link settleHostVersionCall}; the decision itself does neither. A version
  * that cannot be read fails with a short reason word:
@@ -51,7 +50,7 @@
  * short safe word. The install check copies a thrown error's text fields into
  * its detail only through {@link redactToOneLine}.
  *
- * Runtime re-check (b.jg5 SRJ-204): every {@link AD_VERSION_RECHECK_INTERVAL_MS}
+ * Runtime re-check: every {@link AD_VERSION_RECHECK_INTERVAL_MS}
  * on its own serialized, self-re-arming timer (the `src/reload-timer.ts`
  * pattern; never `setInterval`), whatever `health_check_interval` is, the
  * server calls the injected `resolveSystemBinary()` once, bounded by
@@ -60,22 +59,22 @@
  * pass (the version becomes the last version seen), stop (below the floor or
  * unparseable: `ad-below-phase1-floor`; the client's too-old refusal:
  * `ad-system-install-too-old`) or could not run (nothing changes; the first
- * of each run of them writes one server-log line, b.jg5 SRJ-206). A stop
+ * of each run of them writes one server-log line). A stop
  * ends the chain, records one startup-errors entry and calls the stop
- * callback with {@link AD_VERSION_RECHECK_STOP_EXIT_CODE} (b.jg5 SRJ-205).
+ * callback with {@link AD_VERSION_RECHECK_STOP_EXIT_CODE}.
  * After each timed re-check that did not stop, the tick listeners run
- * (b.jg5 SRJ-209: `installAdSettings` in `src/ad-settings.ts` re-reads
+ * (`installAdSettings` in `src/ad-settings.ts` re-reads
  * agent-director's timing settings from this hook).
  * {@link triggerAdVersionRecheck} re-checks at once and answers with the
- * outcome (b.jg5 SRJ-204). Its caller is the `ErrInvalidFlags` step in
- * `src/ad-error-class.ts` (SRJ-104), which the reuse spawn
+ * outcome. Its caller is the `ErrInvalidFlags` step in
+ * `src/ad-error-class.ts`, which the reuse spawn
  * (`reuseSpawnForPersona`, `src/session-manager.ts`; its answer decides the
- * `ErrInvalidFlags` hold, SRJ-207), the resume path of `resumeOrFreshSpawn`
+ * `ErrInvalidFlags` hold), the resume path of `resumeOrFreshSpawn`
  * (`src/session-manager.ts`) and the click handler's `decide`
  * (`src/permission-click-handler.ts`) run on an `ErrInvalidFlags`.
  * {@link onAdVersionChanged} listeners hear of each passing re-check whose
  * version differs from the last version seen; the `ErrInvalidFlags` hold
- * (`src/invalid-flags-hold.ts`, SRJ-207) is its consumer: `main()` ends every
+ * (`src/invalid-flags-hold.ts`) is its consumer: `main()` ends every
  * hold whose version differs on it. {@link lastAdVersionSeen} answers the
  * installed re-check's last version seen, under which a hold begins when the
  * immediate re-check could not run.
@@ -93,7 +92,7 @@
  * The module starts no process and
  * reads no file. A stop holds no Slack sink: it reaches only the injected
  * `recordStartupError` (a startup-errors entry and its server-log line) and
- * `stop` (b.jg5 SRJ-1002). Nothing is armed, read or logged at import or at
+ * `stop`. Nothing is armed, read or logged at import or at
  * {@link createAdVersionRecheck}; the module-level state is a handle, a
  * disposed flag and the tick- and version-changed-listener registries, cleared by
  * {@link resetAdVersionRecheckForTests}.
@@ -113,7 +112,7 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
  *
  * The released agent-director 0.12.0 client requires a CLI of at least
  * 0.12.0, with prereleases below that minimum. CSCB's own comparison uses
- * only major.minor.patch (SRJ-202), so `0.12.0-rc.1` meets this floor but
+ * only major.minor.patch, so `0.12.0-rc.1` meets this floor but
  * is refused by the released client's earlier check.
  */
 export const PHASE1_FLOOR_VERSION = '0.12.0'
@@ -130,8 +129,7 @@ export const PHASE1_RUNBOOK_SECTION_TITLE = 'Switching over to agent-director Ph
 
 /**
  * Heading of the publishing-host block inside the
- * {@link PHASE1_RUNBOOK_SECTION_TITLE} section (b.jg5 SRJ-1108, SRJ-211,
- * SRJ-212): the host that publishes the release, or one with no
+ * {@link PHASE1_RUNBOOK_SECTION_TITLE} section: the host that publishes the release, or one with no
  * agent-director. The runbook's block heading must equal this constant. The
  * install check's not-found message (`src/install-check.ts`) and `/publish`'s
  * not-found and below-client-minimum diagnostics
@@ -145,29 +143,28 @@ export const PUBLISHING_HOST_BLOCK_HEADING = 'The publishing host'
 
 /**
  * The phrase every `ad-below-phase1-floor` entry carries, from the startup
- * gate and from a runtime re-check (b.jg5 SRJ-1013).
+ * gate and from a runtime re-check.
  */
 export const PHASE1_REQUIRED_PHRASE = 'this CSCB release requires agent-director Phase 1 or later'
 
 /**
  * The operator instruction the startup gate's `ad-below-phase1-floor` entry
- * carries (b.jg5 SRJ-1013). It names the switch-over runbook and gives no
- * instruction to upgrade agent-director (b.jg5 SRJ-208). A runtime re-check's
+ * carries. It names the switch-over runbook and gives no
+ * instruction to upgrade agent-director. A runtime re-check's
  * entry carries {@link PHASE1_REQUIRED_PHRASE} and
  * {@link DEBUG_SKILL_RUNTIME_STOP_POINTER} in its place.
  */
 export const PHASE1_SWITCH_OVER_INSTRUCTION = `${PHASE1_REQUIRED_PHRASE}: follow the switch-over runbook in ${PHASE1_RUNBOOK_DOC}`
 
-/** The debug skill's path in the package, which a runtime re-check's entry points to (b.jg5 SRJ-205, SRJ-208). */
+/** The debug skill's path in the package, which a runtime re-check's entry points to. */
 export const DEBUG_SKILL_PATH = 'skills/debug-slack-channel-bots/SKILL.md'
 
-/** The debug skill's section for a stop by the runtime re-check (b.jg5 SRJ-1104). */
+/** The debug skill's section for a stop by the runtime re-check. */
 export const DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE = 'Found while the server was running'
 
 /**
  * The pointer a runtime re-check's entry of either class ends with, in place
- * of the switch-over runbook and the install skill (b.jg5 SRJ-205, SRJ-208,
- * SRJ-1013): the debug skill's path and its section for this stop. It carries
+ * of the switch-over runbook and the install skill: the debug skill's path and its section for this stop. It carries
  * no instruction to upgrade or install agent-director.
  */
 export const DEBUG_SKILL_RUNTIME_STOP_POINTER =
@@ -225,7 +222,7 @@ function parseClientVersion(input: string): ClientOrderedVersion | null {
 
 /**
  * Compare two versions in the agent-director client's own order (the order
- * its too-old refusal applies against its minimum, b.jg5 SRJ-211): -1, 0 or
+ * its too-old refusal applies against its minimum): -1, 0 or
  * 1 as `a` is below, equal to or above `b`, or `null` when either does not
  * parse under the client's strict rule (a leading `v` included).
  *
@@ -261,7 +258,7 @@ const FLOOR_CORE: VersionCore = (() => {
 })()
 
 /**
- * True when `version` meets CSCB's Phase 1 floor (b.jg5 SRJ-202).
+ * True when `version` meets CSCB's Phase 1 floor.
  *
  * The version's major.minor.patch is compared numerically, part by part,
  * against the floor's; a pre-release suffix is ignored, so
@@ -278,8 +275,7 @@ export function meetsPhase1Floor(version: string): boolean {
 }
 
 /**
- * The phrase every runtime re-check refusal carries (b.jg5 SRJ-205,
- * SRJ-1013): the binary was found by the runtime re-check while the server
+ * The phrase every runtime re-check refusal carries: the binary was found by the runtime re-check while the server
  * ran, not by the startup check. The startup forms never contain it.
  */
 export const RUNTIME_RECHECK_PHRASE = 'found by a runtime re-check while the server was running'
@@ -287,7 +283,7 @@ export const RUNTIME_RECHECK_PHRASE = 'found by a runtime re-check while the ser
 /** A refusal found by the startup gate (the messages' default form). */
 export const FOUND_BY_STARTUP_CHECK = 'startup-check'
 
-/** A refusal found by the runtime re-check (b.jg5 SRJ-205). */
+/** A refusal found by the runtime re-check. */
 export const FOUND_BY_RUNTIME_RECHECK = 'runtime-recheck'
 
 /** Which check found a refused binary; selects a refusal message's form. */
@@ -302,8 +298,7 @@ export interface BelowPhase1FloorParts {
 }
 
 /**
- * The `ad-below-phase1-floor` message (b.jg5 SRJ-203, SRJ-205, SRJ-208,
- * SRJ-1013): the version found, the version required (the floor or later,
+ * The `ad-below-phase1-floor` message: the version found, the version required (the floor or later,
  * its release candidates included), the binary path and which check found it.
  * The startup form (the default) says the startup check found it and ends
  * with {@link PHASE1_SWITCH_OVER_INSTRUCTION} and the runbook section's
@@ -349,7 +344,7 @@ export interface SystemInstallTooOldParts {
 }
 
 /**
- * The `ad-system-install-too-old` message (b.jg5 SRJ-208): the version found,
+ * The `ad-system-install-too-old` message: the version found,
  * the version the client requires (its minimum, taken from the error), that
  * this CSCB release needs {@link PHASE1_FLOOR_VERSION} or later (release
  * candidates included) so the operator does not install a version between
@@ -362,11 +357,10 @@ export interface SystemInstallTooOldParts {
  *   switch-over runbook section's title as the way to install
  *   agent-director; the startup gate appends the install-skill block to it.
  * - The runtime form adds {@link RUNTIME_RECHECK_PHRASE} and that the server
- *   stopped (b.jg5 SRJ-205), and ends with
+ * stopped, and ends with
  *   {@link DEBUG_SKILL_RUNTIME_STOP_POINTER} in place of the switch-over
  *   runbook; nothing is appended to it, so it names neither the runbook nor
- *   the install skill and carries no instruction to install agent-director
- *   (b.jg5 SRJ-208, SRJ-1013).
+ *   the install skill and carries no instruction to install agent-director.
  * Built from versions, a path and fixed text only.
  */
 export function buildSystemInstallTooOldMessage(
@@ -391,7 +385,7 @@ export function buildSystemInstallTooOldMessage(
 }
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the outcome of one call (b.jg5 SRJ-204)
+// Runtime re-check: the outcome of one call
 // ---------------------------------------------------------------------------
 
 /** The agent-director client's too-old refusal, by name. */
@@ -424,10 +418,10 @@ export const UNREACHABLE_REASON_UNPARSEABLE_VERSION: UnreachableReason = 'unpars
 /** The re-check found a passing binary. */
 export const RECHECK_OUTCOME_PASS = 'pass'
 
-/** The re-check refused the binary: the server stops (b.jg5 SRJ-205). */
+/** The re-check refused the binary: the server stops. */
 export const RECHECK_OUTCOME_STOP = 'stop'
 
-/** The re-check could not run: nothing changes (b.jg5 SRJ-206). */
+/** The re-check could not run: nothing changes. */
 export const RECHECK_OUTCOME_COULD_NOT_RUN = 'could-not-run'
 
 /** The settled result of one `resolveSystemBinary()` call under the time limit. */
@@ -439,7 +433,7 @@ export type AdVersionRecheckCallResult =
 /** The class label of a re-check stop's startup-errors entry. */
 export type AdVersionRecheckStopClass = typeof AD_BELOW_PHASE1_FLOOR | typeof AD_SYSTEM_INSTALL_TOO_OLD
 
-/** What one re-check decides (b.jg5 SRJ-204's table). */
+/** What one re-check decides (table). */
 export type AdVersionRecheckOutcome =
   | {
       readonly kind: typeof RECHECK_OUTCOME_PASS
@@ -526,7 +520,7 @@ function safeReason(error: unknown): string {
 }
 
 /**
- * Decide what one settled `resolveSystemBinary()` call means (b.jg5 SRJ-204):
+ * Decide what one settled `resolveSystemBinary()` call means:
  *
  * - resolved with a version that meets {@link meetsPhase1Floor}: pass, with
  *   the version and path;
@@ -539,7 +533,7 @@ function safeReason(error: unknown): string {
  *   points to the debug skill and has no install-skill block;
  * - anything else (`ErrSystemInstallUnreachable`, `ErrSystemInstallNotFound`,
  *   any other named error, a non-error throw, the time limit expiring): could
- *   not run (b.jg5 SRJ-206).
+ * not run.
  *
  * The released resolver admits `0.0.0-dev`, so that version reaches the
  * resolved floor stop. It rejects ordinary old versions and prereleases
@@ -591,7 +585,7 @@ export function decideAdVersionRecheckOutcome(result: AdVersionRecheckCallResult
 }
 
 // ---------------------------------------------------------------------------
-// Host-version decision: /publish's preflight and the install check (b.jg5 SRJ-211, SRJ-212)
+// Host-version decision: /publish's preflight and the install check
 // ---------------------------------------------------------------------------
 
 /** The agent-director client's no-binary-found refusal, by name. */
@@ -672,7 +666,7 @@ export type HostVersionFailure =
       readonly description: string
     }
 
-/** What the host-version decision decides (b.jg5 SRJ-211). */
+/** What the host-version decision decides. */
 export type HostVersionOutcome =
   | {
       readonly kind: typeof HOST_VERSION_OUTCOME_PASS | typeof HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR
@@ -730,7 +724,7 @@ function hostVersionThrownFailure(error: unknown, clientMinimum: string): HostVe
 }
 
 /**
- * The one host-version decision (b.jg5 SRJ-211; SRJ-212 reuses it): judge one
+ * The one host-version decision (reuses it): judge one
  * settled `resolveSystemBinary()` call against the installed client's
  * minimum (`min_binary_version`, supplied by the caller, never hard-coded
  * here), in the client's own order ({@link compareAdVersions}), then against
@@ -792,14 +786,13 @@ export function decideHostAdVersion(result: HostVersionCallResult, clientMinimum
 }
 
 /**
- * The fixed phrase every Phase 1 host note carries (b.jg5 SRJ-211): this
+ * The fixed phrase every Phase 1 host note carries: this
  * CSCB release needs agent-director Phase 1 on the host.
  */
 export const PHASE1_HOST_NOTE_PHRASE = 'this CSCB release needs agent-director Phase 1 on the host'
 
 /**
- * The Phase 1 note for a host binary that passes below the floor (b.jg5
- * SRJ-211): the version found and its path, the floor, that
+ * The Phase 1 note for a host binary that passes below the floor: the version found and its path, the floor, that
  * {@link PHASE1_HOST_NOTE_PHRASE}, that the binary meets the client's
  * minimum so it is accepted, and the switch-over runbook section's title
  * ({@link PHASE1_RUNBOOK_SECTION_TITLE}). No upgrade instruction, no command
@@ -815,7 +808,7 @@ export function buildPhase1HostNote(parts: BelowPhase1FloorParts): string {
 }
 
 /**
- * The fixed phrase every install-check Phase 1 note carries (b.jg5 SRJ-212):
+ * The fixed phrase every install-check Phase 1 note carries:
  * the server refuses to start on the binary until agent-director Phase 1 is
  * installed.
  */
@@ -824,7 +817,7 @@ export const INSTALL_CHECK_PHASE1_NOTE_PHRASE =
 
 /**
  * The install check's Phase 1 note for a host binary that passes below the
- * floor (b.jg5 SRJ-212): the version found, CSCB's floor, that
+ * floor: the version found, CSCB's floor, that
  * {@link INSTALL_CHECK_PHASE1_NOTE_PHRASE}, and the switch-over runbook
  * section's title ({@link PHASE1_RUNBOOK_SECTION_TITLE}). No upgrade
  * instruction, no command and no link. Built from a version and fixed text
@@ -841,12 +834,12 @@ export function buildInstallCheckPhase1Note(foundVersion: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the 120 s timer (b.jg5 SRJ-204, SRJ-205, SRJ-209)
+// Runtime re-check: the 120 s timer
 // ---------------------------------------------------------------------------
 
 /**
  * Time from the end of one timed re-check to the start of the next, and from
- * the startup gate passing to the first (b.jg5 SRJ-204). Independent of
+ * the startup gate passing to the first. Independent of
  * `health_check_interval`.
  */
 export const AD_VERSION_RECHECK_INTERVAL_MS = 120_000
@@ -859,12 +852,12 @@ export const AD_VERSION_RECHECK_INTERVAL_MS = 120_000
  */
 export const AD_VERSION_RECHECK_TIME_LIMIT_MS = 30_000
 
-/** The exit code of a server stopped by the runtime re-check (b.jg5 SRJ-205). */
+/** The exit code of a server stopped by the runtime re-check. */
 export const AD_VERSION_RECHECK_STOP_EXIT_CODE = 1
 
 /**
  * The start of the one server-log line a run of could-not-run re-checks
- * writes (b.jg5 SRJ-206, SRJ-1014). {@link buildAdVersionRecheckCouldNotRunLine}
+ * writes. {@link buildAdVersionRecheckCouldNotRunLine}
  * builds the whole line.
  */
 export const AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX =
@@ -872,7 +865,7 @@ export const AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX =
 
 /**
  * The one server-log line written at the first could-not-run re-check after
- * start or after a passing re-check (b.jg5 SRJ-206): it names the runtime
+ * start or after a passing re-check: it names the runtime
  * re-check, the failure's token-free `description` (from
  * {@link decideAdVersionRecheckOutcome}) and that the server keeps running and
  * checks again at the next {@link AD_VERSION_RECHECK_INTERVAL_MS} re-check.
@@ -892,7 +885,7 @@ export function buildAdVersionRecheckCouldNotRunLine(
 export const RECHECK_OUTCOME_NOT_RUNNING = 'not-running'
 
 /**
- * What a triggered re-check answers (b.jg5 SRJ-204, SRJ-104, SRJ-207): the
+ * What a triggered re-check answers: the
  * outcome it acted on (passed with the version, stopped, could not run), or
  * {@link RECHECK_OUTCOME_NOT_RUNNING} when no call was made or, at once, when
  * the re-check was disposed while the check it joined was in flight.
@@ -914,7 +907,7 @@ const REAL_TIMER_CLOCK: AdVersionRecheckClock = {
 }
 
 /**
- * Runs after each timed re-check that did not stop (b.jg5 SRJ-209's hook).
+ * Runs after each timed re-check that did not stop (hook).
  * Not awaited: a returned promise's rejection is logged.
  */
 export type AdVersionRecheckTickListener = () => void | Promise<void>
@@ -922,7 +915,7 @@ export type AdVersionRecheckTickListener = () => void | Promise<void>
 /**
  * Runs when a passing re-check (timed or triggered) finds a version that
  * differs from the last version seen, with that previous version and the new
- * one (b.jg5 SRJ-204's first row, SRJ-207). Not awaited: a returned promise's
+ * one (first row). Not awaited: a returned promise's
  * rejection is logged.
  */
 export type AdVersionChangedListener = (previousVersion: string, newVersion: string) => void | Promise<void>
@@ -941,7 +934,7 @@ export interface AdVersionRecheckDeps {
   log: (line: string) => void
   /** Timers; the real ones by default. */
   clock?: AdVersionRecheckClock
-  /** The interval between re-checks; {@link AD_VERSION_RECHECK_INTERVAL_MS} when absent (b.2nr: the test-only override block sets it). */
+  /** The interval between re-checks; {@link AD_VERSION_RECHECK_INTERVAL_MS} when absent (the test-only override block sets it). */
   intervalMs?: number
   /** The tick listeners, read at each tick; none by default. */
   tickListeners?: () => readonly AdVersionRecheckTickListener[]
@@ -964,14 +957,14 @@ export interface AdVersionRecheck {
   /** True from `start` until `dispose` or a stop ends the chain. */
   isRunning(): boolean
   /**
-   * Set the interval of the re-checks (b.2nr, test-only: the override block is
+   * Set the interval of the re-checks (test-only: the override block is
    * read after this re-check starts). A timer pending between re-checks is
    * moved to a full new interval from now; a check in flight arms its next
    * timer at the new interval. A no-op after `dispose` or a stop.
    */
   setIntervalMs(intervalMs: number): void
   /**
-   * Re-check at once (b.jg5 SRJ-204) and answer with the outcome acted on.
+   * Re-check at once and answer with the outcome acted on.
    * Joins a call in flight (timed or triggered) instead of making a second
    * one; leaves the next timed re-check's due time alone; runs no tick
    * listener. Answers {@link RECHECK_OUTCOME_NOT_RUNNING} with no call before
@@ -986,7 +979,7 @@ interface TimerBox {
 }
 
 /**
- * Build the runtime re-check (b.jg5 SRJ-204); see the module comment.
+ * Build the runtime re-check; see the module comment.
  *
  * - `start` arms one timer and runs nothing at once. Each timed re-check makes
  *   one call under {@link AD_VERSION_RECHECK_TIME_LIMIT_MS} and feeds
@@ -997,7 +990,7 @@ interface TimerBox {
  *   may still be running when a later check makes the next call) and its
  *   answer is ignored.
  * - `trigger` runs one re-check at once through the same call, decision,
- *   failure run and stop path (b.jg5 SRJ-204). It and the timer share one
+ * failure run and stop path. It and the timer share one
  *   check in flight: a trigger during a timed or triggered check joins it,
  *   and a timed re-check that comes due during a triggered check joins it
  *   too (then arms the next and runs the tick listeners as usual). Either way
@@ -1006,11 +999,11 @@ interface TimerBox {
  * - Pass: the failure run ends; when the version differs from the last
  *   version seen, it becomes the last version seen and then each
  *   version-changed listener runs once, in order, with the previous and the
- *   new version (b.jg5 SRJ-207's signal); a listener that throws or rejects
+ * new version (signal); a listener that throws or rejects
  *   is logged as one token-free line and the rest still run.
  * - Could not run: nothing changes, except that the first one after start or
  *   after a pass writes {@link buildAdVersionRecheckCouldNotRunLine} to the
- *   server log (b.jg5 SRJ-206). The rest of the run write nothing. Never a
+ * server log. The rest of the run write nothing. Never a
  *   startup-errors entry.
  * - Stop: the chain ends, then `recordStartupError` is called once with the
  *   class and message, then `stop` once with
@@ -1026,7 +1019,7 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
   let lastVersionSeen = deps.baselineVersion
   let started = false
   let ended = false
-  /** Set by the first could-not-run after start or after a pass; cleared by every pass (b.jg5 SRJ-206). */
+  /** Set by the first could-not-run after start or after a pass; cleared by every pass. */
   let inFailureRun = false
   let timer: TimerBox | undefined
   let limitTimer: TimerBox | undefined
@@ -1290,7 +1283,7 @@ function registeredVersionChangedListeners(): readonly AdVersionChangedListener[
 
 /**
  * Build and start the server's runtime re-check with the registered tick and
- * version-changed listeners (b.jg5 SRJ-204). `main()` calls it once, right
+ * version-changed listeners. `main()` calls it once, right
  * after the startup gate passes. A second install, or one after
  * {@link disposeAdVersionRecheck}, is a logged no-op returning the installed
  * handle (or `undefined`).
@@ -1317,7 +1310,7 @@ export function installAdVersionRecheck(
 }
 
 /**
- * Set the installed re-check's interval (b.2nr, test-only: `installTestTimerOverrides`
+ * Set the installed re-check's interval (test-only: `installTestTimerOverrides`
  * calls it once at server start, when the override block sets
  * `ad_version_recheck_interval_ms`; the block is read after the re-check is
  * installed). A no-op when none is installed. See `AdVersionRecheck.setIntervalMs`.
@@ -1339,7 +1332,7 @@ export function disposeAdVersionRecheck(): void {
 
 /**
  * Register a listener run after each timed re-check that did not stop
- * (b.jg5 SRJ-209: `installAdSettings` in `src/ad-settings.ts` re-reads
+ * (`installAdSettings` in `src/ad-settings.ts` re-reads
  * agent-director's timing settings from it). Independent of install order.
  * Returns its unsubscribe.
  */
@@ -1352,11 +1345,11 @@ export function onAdVersionRecheckTick(listener: AdVersionRecheckTickListener): 
 }
 
 /**
- * Re-check the host binary at once on the installed re-check (b.jg5 SRJ-204)
+ * Re-check the host binary at once on the installed re-check
  * and answer with the outcome it acted on. Called by the `ErrInvalidFlags`
- * step in `src/ad-error-class.ts` (SRJ-104) for an `ErrInvalidFlags` from the
+ * step in `src/ad-error-class.ts` for an `ErrInvalidFlags` from the
  * reuse spawn (`reuseSpawnForPersona`, `src/session-manager.ts`, whose hold
- * it decides, SRJ-207), from the resume path of `resumeOrFreshSpawn` and from
+ * it decides), from the resume path of `resumeOrFreshSpawn` and from
  * the click handler's `decide` (`src/permission-click-handler.ts`). The answer:
  * passed (with the version), stopped, could not run, or
  * {@link RECHECK_OUTCOME_NOT_RUNNING} when none is installed, it was disposed
@@ -1371,8 +1364,8 @@ export function triggerAdVersionRecheck(): Promise<AdVersionRecheckTriggerAnswer
 /**
  * Register a listener run when a passing re-check (timed or triggered) finds
  * a version that differs from the last version seen, with the previous and
- * the new version (b.jg5 SRJ-204's first row). Its consumer is the
- * `ErrInvalidFlags` hold (`src/invalid-flags-hold.ts`, SRJ-207): `main()`
+ * the new version (first row). Its consumer is the
+ * `ErrInvalidFlags` hold (`src/invalid-flags-hold.ts`): `main()`
  * registers one listener that ends every hold whose version differs from the
  * new one and retries each ended persona at once.
  * Listeners run in registration order. Independent of install order. Returns
@@ -1387,7 +1380,7 @@ export function onAdVersionChanged(listener: AdVersionChangedListener): () => vo
 }
 
 /**
- * The installed re-check's last version seen (b.jg5 SRJ-204, SRJ-207): the
+ * The installed re-check's last version seen: the
  * version of its last passing re-check, else its baseline (the version the
  * startup gate read). `undefined` when none is installed, it was disposed or
  * a stop ended it. The reuse spawn's `ErrInvalidFlags` hold begins under it

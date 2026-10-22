@@ -315,7 +315,7 @@ round_call_is() {
 
 # latch_rounds <step> <instance-id> <call> <from-mark>: the re-check rounds
 # of a persona latched with the re-check call <call> (as round_call_is reads
-# it), from E42 T1's reader (`ad_cscb_calls`): its CSCB-parented calls after
+# it), from reader (`ad_cscb_calls`): its CSCB-parented calls after
 # <from-mark> must be, in log order, one `status` then one <call> per round,
 # with one fresh provenance `get` immediately before a `resume` and no other
 # call; fails otherwise. Prints one line per round,
@@ -686,7 +686,7 @@ s19_seed() {
     echo "${TEST_NAME}: ${step}: ${session} (${S19_SID[${key}]}, pane ${S19_PANE[${key}]}${SEEDED_TOKEN:+, token ${SEEDED_TOKEN}}${SEEDED_STORE_ID:+, store ${SEEDED_STORE_ID}})"
 }
 
-# Scenario 19, the `pending` variant [harness]: the leftover, then E39's
+# Scenario 19, the `pending` variant [harness]: the leftover, then
 # scenario 19 statement makes the persona's row `pending` beside it, with a
 # launch start and a launch token other than the leftover's, and then
 # s19_pend_no_session clears the row's session_id. Records the launch
@@ -714,7 +714,7 @@ s19_seed_pending() {
     [[ "$(jq -r '.[0].state' <<< "${json}")" == pending && "$(jq -r '.[0].launch_token' <<< "${json}")" == "${token}" ]] \
         || fail "${step}: the row does not read pending with launch token ${token}: ${json}"
     [[ "${token}" != "${SEEDED_TOKEN}" ]] || fail "${step}: the row's launch token is the leftover's"
-    # E39's statement keeps the first life's session_id; the launch it
+    # statement keeps the first life's session_id; the launch it
     # seeds recorded none, so s19_pend_no_session clears it.
     [[ "$(jq -r '.[0].session_id // ""' <<< "${json}")" == "${PERSONA_SID[${PEND_KEY}]}" ]] \
         || fail "${step}: after E39's statement the row's session_id is not its first life's ${PERSONA_SID[${PEND_KEY}]}"
@@ -730,7 +730,7 @@ s19_seed_pending() {
 # and its row_version as read just before; the store read after it shows
 # those two columns changed and every other as the seed set it. With no
 # session_id, the restart path's decision on the row once it reads
-# `missing` is a reuse spawn (b.jg5 SRJ-1420).
+# `missing` is a reuse spawn.
 s19_pend_no_session() {
     local step="$1: session_id cleared" id="$2" before after rv out
     before="$(ad_store_row "${id}")" || exit 1
@@ -804,7 +804,7 @@ posts_since() {
 
 # s19_check_notice <step> <key> <session> <from-index>: exactly one post on
 # persona <key>'s channel from <from-index> on holds the CONFLICT notice head,
-# and its lines are, in SRJ-1004's order: the persona prefix and the first
+# and its lines are, in the contract order: the persona prefix and the first
 # line for the persona's case quoting <session>; the description line (head
 # and tail as printed, holding the case's phrase and <session>); for
 # "another agent-director store", its must-not-be-ended line; the pointer
@@ -1276,7 +1276,7 @@ phase4_second_life() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 5: the restart leg (scenario 19, E13; AC 45)
+# Phase 5: the restart leg (scenario 19, )
 # ---------------------------------------------------------------------------
 
 # latch_line_count <key>: how many conflict-latch lines name persona <key>

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 30 (b.smv): the state directory at its first start of this build, from
+# Test 30: the state directory at its first start of this build, from
 # each layout an earlier release left, in a fresh HOME each.
 #
 # The state directory's default is $HOME/.config/claude-slack-channel-bots. An

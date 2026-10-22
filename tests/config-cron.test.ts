@@ -20,7 +20,7 @@ const CONFIG_MODULE = join(import.meta.dir, '..', 'src', 'config.ts')
 // Helpers
 //
 // Every case works in its own mkdtempSync config directory and loads with an
-// injected mkdtempSync home (b.av2 SR-13.2); both are removed after each case.
+// injected mkdtempSync home; both are removed after each case.
 // ---------------------------------------------------------------------------
 
 let dir: string
@@ -124,7 +124,7 @@ describe('cron config keys — cron_log_max_bytes rejection', () => {
     )
   })
 
-  // The persona loader never echoes a rejected value (b.av2 SR-10.3); the
+  // The persona loader never echoes a rejected value; the
   // route loader's message ended "got <value>.".
   test('rejection message does not embed the offending JSON value', () => {
     let message = ''
@@ -142,11 +142,11 @@ describe('cron config keys — cron_log_max_bytes rejection', () => {
 // Defaults track the actual loaded config dir (through loadPersonaConfig)
 // ---------------------------------------------------------------------------
 
-// E6 (cron dispatch / buildSpawnParams) relies on this resolved-path coverage:
+// (cron dispatch / buildSpawnParams) relies on this resolved-path coverage:
 // absent cron_table_path → the default (below: beside the config with
-// SLACK_STATE_DIR set; outside ~/.claude without it, bug b.avm), and present
+// SLACK_STATE_DIR set; outside ~/.claude without it), and present
 // with leading tilde → expanded absolute path (see 'tilde expansion' block).
-// No E6 gap-fill needed — both halves are proven here.
+// No gap-fill needed — both halves are proven here.
 describe('cron config keys — defaults track loaded config dir', () => {
   // The preload guard sets SLACK_STATE_DIR (tests/test-helpers/host-safety-preload.ts),
   // so the loader's own read of process.env takes the state-dir branch.
@@ -165,15 +165,15 @@ describe('cron config keys — defaults track loaded config dir', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Bug b.avm: the crontable's default sits outside ~/.claude
+// the crontable's default sits outside ~/.claude
 //
 // Every case passes its environment as an explicit object (never a copy of
 // process.env) and its home as the case's mkdtempSync home, so no default can
 // resolve under the real ~/.config.
 // ---------------------------------------------------------------------------
 
-describe('crontable default outside ~/.claude (bug b.avm)', () => {
-  /** A default install's state directory under the case's home (b.fc4: outside ~/.claude). */
+describe('crontable default outside ~/.claude', () => {
+  /** A default install's state directory under the case's home (outside ~/.claude). */
   const stateDirUnder = (h: string): string => join(h, '.config', 'claude-slack-channel-bots')
   /** A configuration directory that is not the default state directory, so a crontable beside it is told from the default. */
   const configDirUnder = (h: string): string => join(h, 'cfg')

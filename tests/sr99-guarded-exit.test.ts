@@ -1,7 +1,7 @@
 /**
- * sr99-guarded-exit.test.ts — tests for bug b.vqy.
+ * sr99-guarded-exit.test.ts — tests for.
  *
- * Bug b.vqy: the SR-99.0 EXIT trap in the release scripts fired on the script's
+ * the SR-99.0 EXIT trap in the release scripts fired on the script's
  * OWN deliberate exits, so every guarded SR path printed its specific SR-X.Y
  * diagnostic and then a contradictory "SR-99.0 (uncaught) … state of the release
  * is indeterminate" right after it.
@@ -9,7 +9,7 @@
  * The fix gives each affected script an `SR_GUARDED_EXIT` flag plus an
  * `sr_exit()` wrapper that raises the flag before exiting; the trap only speaks
  * when the flag is still 0. SR-99.0 therefore keeps firing for genuinely
- * unguarded failures (AC-2) and stays silent on guarded ones (AC-1/AC-4).
+ * unguarded failures () and stays silent on guarded ones (/).
  *
  * Everything here runs the REAL scripts, but only on paths that fail before any
  * release machinery is touched (bad argument; missing/corrupt manifest in a
@@ -113,7 +113,7 @@ function copyWithInjectedFailure(scriptName: string, destDir: string): string {
   const lines = readFileSync(join(SCRIPTS_DIR, scriptName), 'utf-8').split('\n')
   const trapLine = lines.findIndex((l) => l.startsWith('trap ') && l.includes(' EXIT'))
   if (trapLine < 0) throw new Error(`no trap installation found in ${scriptName}`)
-  lines.splice(trapLine + 1, 0, 'false  # injected unguarded failure (b.vqy test)')
+  lines.splice(trapLine + 1, 0, 'false  # injected unguarded failure (test)')
   const dest = join(destDir, scriptName)
   writeFileSync(dest, lines.join('\n'))
   return dest
@@ -128,13 +128,13 @@ afterAll(() => {
 })
 
 // ---------------------------------------------------------------------------
-// AC-4 / AC-1 — guarded paths print exactly one diagnostic
+// / — guarded paths print exactly one diagnostic
 // ---------------------------------------------------------------------------
 
-describe('b.vqy: a guarded SR exit prints its own diagnostic and no SR-99.0', () => {
+describe('a guarded SR exit prints its own diagnostic and no SR-99.0', () => {
   test('preflight.sh with an invalid bump argument: one SR-X.Y block, no SR-99.0', () => {
     const { code, stderr } = runScript(join(SCRIPTS_DIR, 'preflight.sh'), ['banana'], tmpRoot)
-    expect(code).toBe(2) // AC-6: exit code unchanged
+    expect(code).toBe(2) // exit code unchanged
     expect(stderr).toContain('SR-1.2 (argument)')
     expect(srCodes(stderr)).toEqual(['SR-1.2']) // exactly one SR identifier
     expect(countSr99(stderr)).toBe(0)
@@ -163,10 +163,10 @@ describe('b.vqy: a guarded SR exit prints its own diagnostic and no SR-99.0', ()
 })
 
 // ---------------------------------------------------------------------------
-// AC-2 — genuinely unguarded failures still get SR-99.0
+// — genuinely unguarded failures still get SR-99.0
 // ---------------------------------------------------------------------------
 
-describe('b.vqy: an unguarded failure still produces exactly one SR-99.0', () => {
+describe('an unguarded failure still produces exactly one SR-99.0', () => {
   test.each(GUARDED_SCRIPTS)('%s dies at an injected unguarded `false`', (scriptName) => {
     const dir = mkdtempSync(join(tmpRoot, 'inject-'))
     const copy = copyWithInjectedFailure(scriptName, dir)
@@ -181,7 +181,7 @@ describe('b.vqy: an unguarded failure still produces exactly one SR-99.0', () =>
 // Teeth check — the assertions above would fail on the pre-fix trap
 // ---------------------------------------------------------------------------
 
-describe('b.vqy: the no-double-diagnostic assertion has teeth', () => {
+describe('the no-double-diagnostic assertion has teeth', () => {
   test('a pre-fix-shaped script (unguarded trap + deliberate exit) emits both diagnostics', () => {
     // Self-contained reproduction of the pre-fix shape: the original trap
     // condition (`if [ $rc -ne 0 ]` with no guard flag) plus a guarded SR path
@@ -200,7 +200,7 @@ describe('b.vqy: the no-double-diagnostic assertion has teeth', () => {
     )
     const { code, stderr } = runScript(script, [], dir)
     expect(code).toBe(60)
-    // Both diagnostics present — exactly the contradiction b.vqy reports, and
+    // Both diagnostics present — exactly the contradiction reports, and
     // exactly what the guarded-path tests above assert must not happen.
     expect(srCodes(stderr)).toEqual(['SR-6.1', 'SR-99.0'])
     expect(countSr99(stderr)).toBe(1)
@@ -261,7 +261,7 @@ function releaseScripts(): string[] {
     .filter((f) => readFileSync(join(SCRIPTS_DIR, f), 'utf-8').includes('SR-99.0 (uncaught)'))
 }
 
-describe('b.vqy: rot guard on every script that installs the SR-99.0 trap', () => {
+describe('rot guard on every script that installs the SR-99.0 trap', () => {
   test('the fixed scripts are all discovered by the scanner (scanner sanity)', () => {
     const found = releaseScripts()
     for (const s of GUARDED_SCRIPTS) expect(found).toContain(s)

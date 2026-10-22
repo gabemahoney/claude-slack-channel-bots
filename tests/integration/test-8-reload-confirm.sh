@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 8 (t3.ob2.5e.u7.k3; E11/E12): the confirmed reload, in dry run.
+# Test 8 : the confirmed reload, in dry run.
 #
 # A running server with two personas:
 # 1. Apply. An in-place edit of config.json (a channel added to one persona)
@@ -18,7 +18,7 @@
 #    for the newest edit, which is then confirmed and applied.
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
-# (E14 decision 14; lib/scenario.sh "Matchers"), each quoted from src/: the
+# ( the current rule; lib/scenario.sh "Matchers"), each quoted from src/: the
 # reload file names (src/reload.ts reloadFilePaths), the pending file's
 # layout (src/reload-fingerprint.ts composePendingFile), the preview lines
 # (src/reload-plan.ts renderPreviewLines, renderPreviewLogLines), the apply

@@ -1,5 +1,5 @@
 /**
- * setup-checks.ts — testplans/b.yko Part 1 in the container: the pre-flight,
+ * setup-checks.ts — testplans/live-acceptance.md Part 1 in the container: the pre-flight,
  * the install from the README (1.4), the persona setup (1.5, written by the
  * runner as the wizard's answers would be), and Checks S1–S3. After the
  * install, the image's client-under-test check (`AD_CLIENT_CHECK`) checks
@@ -164,7 +164,7 @@ export const s1Check: CheckDef<CheckContext> = {
 
 export const s2Check: CheckDef<CheckContext> = {
   id: 'S2',
-  title: 'Check S2: the setup is only config.json and the credentials files (AC 14)',
+  title: 'Check S2: the setup is only config.json and the credentials files',
   needs: [],
   row: 'S2',
   async run(ctx) {
@@ -197,7 +197,7 @@ const S3_ERROR_PARTS = [
 
 export const s3Check: CheckDef<CheckContext> = {
   id: 'S3',
-  title: "Check S3: an invalid configuration doesn't start (AC 71, invalid half)",
+  title: "Check S3: an invalid configuration doesn't start (invalid half)",
   needs: [],
   row: 'S3',
   async run(ctx) {

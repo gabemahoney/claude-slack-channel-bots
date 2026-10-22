@@ -1,6 +1,6 @@
 import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
- * relay-repro.test.ts — Epic 3 SR-8.4 capstone acceptance scenario.
+ * relay-repro.test.ts — component 3 capstone acceptance scenario.
  *
  * Drives the full two-row permission-relay flow end-to-end against stubs:
  *
@@ -29,7 +29,7 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  *     └── exactly two chat.update calls (one per row), each on its own
  *         messageTs, with verdict-distinct text
  *
- * Coverage of SR-8.4 capstone bullets:
+ * Coverage of the contract capstone bullets:
  *   - Two concurrent `permission_requests` entries → two distinct prompts
  *   - One allow + one deny click → two decide calls, each carrying the
  *     matching `request_token`
@@ -37,11 +37,11 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  *   - Two `chat.update` calls land on the correct Slack message timestamps
  *   - livePermissions empty at the end
  *   - No `chat.update` ever targets a sibling's messageTs in response to a
- *     single-row event (SR-4.5 / SR-5.3 compounded)
+ * single-row event (compounded)
  *
  * The spawn row carries the persona label; the poller and the click handler
  * reach Slack through that persona's own client, and every post and update
- * lands on its destination channel (b.av2 SR-7.1). A second persona's client
+ * lands on its destination channel. A second persona's client
  * stays untouched.
  *
  * SPDX-License-Identifier: MIT
@@ -85,7 +85,7 @@ import {
 } from './test-helpers/permission-relay-harness.ts'
 
 // ---------------------------------------------------------------------------
-// Pinned constants (no inline magic strings per SR-8.1)
+// Pinned constants (no inline magic strings)
 // ---------------------------------------------------------------------------
 
 // The owning persona: its key differs from its destination channel ID, and
@@ -161,10 +161,10 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-8.4 capstone
+// capstone
 // ---------------------------------------------------------------------------
 
-describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
+describe('capstone — two-row plural projection end-to-end', () => {
   test('two prompts → one allow + one deny click → next tick reconciles both via getPermission', async () => {
     stubA.script.post.push(
       { kind: 'ok', result: { ts: POST_TS_A } },
@@ -324,7 +324,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     expect(byTs.get(POST_TS_A)).toBe('*Permission* — Allowed')
     expect(byTs.get(POST_TS_B)).toBe('*Permission* — Denied by operator')
 
-    // SR-5.3 sanity: no closure-tick chat.update accidentally targeted the
+    // sanity: no closure-tick chat.update accidentally targeted the
     // wrong sibling's ts.
     for (const u of tickNPlus1Updates) {
       expect(u.ts === POST_TS_A || u.ts === POST_TS_B).toBe(true)

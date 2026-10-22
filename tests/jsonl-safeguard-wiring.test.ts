@@ -1,22 +1,22 @@
 /**
  * jsonl-safeguard-wiring.test.ts — Static audit of the start-time passes in
- * src/server.ts (b.zak regression guard; b.av2 SR-6.2).
+ * src/server.ts (regression guard).
  *
- * The b.zak fix is a NEW module whose value is realised only if main() actually
+ * The fix is a NEW module whose value is realised only if main actually
  * invokes it BEFORE the resume path (the start bring-up, which runs
  * startupSessionManager) that silently deletes+fresh-spawns on
  * ErrJsonlMissing. If the call is dropped or reordered, the preventative
  * warning never fires and every bot can lose memory silently — exactly the
  * 2026-09-20 incident.
  *
- * b.av2 SR-6.2 widens the audit to every start-time pass: the trust patch, the
+ * widens the audit to every start-time pass: the trust patch, the
  * legacy-hook cleanup and the JSONL safeguard all run over the applied persona
- * config before the per-persona bring-up (b.av2 SR-6.1), the agent-director
+ * config before the per-persona bring-up, the agent-director
  * template install covers the personas' config dirs, and the session manager's
  * pre-launch trust patcher is installed before anything can launch (the
  * persona Slack connections, Bun.serve, initRestart, the per-persona bring-up).
  *
- * b.av2 SR-8.7 routes the start through the reload controller: main() resolves
+ * routes the start through the reload controller: main resolves
  * the start (`const start = reload.resolveStart()`), sets the applied config
  * from it (`personaConfig = start.config`, the last-applied record's at a start
  * from the record, never the edited config file), and requests the bring-up
@@ -26,7 +26,7 @@
  * invocation; `startupSessionManager`'s text now sits in the controller's
  * construction, above the passes, and is no ordering anchor (that its
  * argument is the controller's applied config is pinned in
- * tests/server-startup-wiring.test.ts). Bug b.js7 removes the pre-launch
+ * tests/server-startup-wiring.test.ts). removes the pre-launch
  * reply guard; startup and launches remove only legacy settings entries.
  *
  * Why a static audit: main() cannot run in a unit test (the agent-director
@@ -86,7 +86,7 @@ function startBringUpAt(): number {
   return bringUpAt
 }
 
-/** Every start-time pass SR-6.2 requires to run over the applied personas. */
+/** Every start-time pass requires to run over the applied personas. */
 const START_PASSES = [
   'installSlackChannelBotTemplate',
   'runJsonlPersistenceSafeguard',
@@ -121,7 +121,7 @@ describe('server.ts wires the JSONL-persistence safeguard', () => {
   })
 })
 
-describe('server.ts runs every start-time pass over the applied personas (b.av2 SR-6.2)', () => {
+describe('server.ts runs every start-time pass over the applied personas', () => {
   test.each(['runJsonlPersistenceSafeguard'])(
     'every %s call comes BEFORE the start bring-up (`<controller>.runStartBringUp()` in main())',
     (pass) => {

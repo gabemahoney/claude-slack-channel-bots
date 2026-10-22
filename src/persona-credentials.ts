@@ -1,12 +1,12 @@
 /**
  * persona-credentials.ts — Persona credentials-file reader and local validity
- * check (b.av2 SR-1.4; step 1 of the SR-6.1 bring-up).
+ * check (step 1 of the bring-up).
  *
  * A persona's Slack tokens live only in its own credentials file: a JSON
  * object with exactly two string keys, `bot_token` (prefix `xoxb-`) and
  * `app_token` (prefix `xapp-`). The file is locally valid when its real path
  * is no other applied persona's credentials file, and it exists, is readable,
- * parses and has that shape. Outcomes map to the b.av2 SR-10.3 classes
+ * parses and has that shape. Outcomes map to the classes
  * `persona-credentials-missing` / `-unreadable` / `-invalid`.
  *
  * Secrets rules:
@@ -41,7 +41,7 @@
  * `/dev/zero` would never end. A file larger than `MAX_RELOAD_FILE_BYTES`
  * (64 KiB) is unreadable too, and never read in full (a bounded read).
  *
- * Reader and digest (b.av2 SR-8.3): the stat-first read is its own export,
+ * Reader and digest: the stat-first read is its own export,
  * `readCredentialsFile`, and `credentialsDigest` turns a read into what is
  * held for it: the SHA-256 of the exact bytes, or a marker for a missing or an
  * unreadable file. The check returns that digest beside its result, whatever
@@ -51,7 +51,7 @@
  * reload detection tick reads and digests each referenced file the same way.
  * A digest is held in memory only and never logged.
  *
- * Pure module (b.av2 SR-13.1): nothing runs at import and no token is read at
+ * Pure module: nothing runs at import and no token is read at
  * module scope. The server runs it as step 1 of each persona's start
  * (`checkPersonaLocalSteps` in `persona-start.ts`).
  *
@@ -322,7 +322,7 @@ const INVALID_CONTENT_CAUSE_PREFIX = 'credentials file is invalid: '
 
 /**
  * Why a credentials read (`readCredentialsFile`) is not locally valid
- * (b.av2 SR-1.4, SR-6.1 step 1), or undefined when it is: the read's own
+ * (step 1), or undefined when it is: the read's own
  * cause for a missing or unreadable file, otherwise the content check's
  * cause, worded as `checkPersonaCredentials` words it. For a caller that
  * already holds the bytes (the reload tick's check of an added persona), so
@@ -337,7 +337,7 @@ export function credentialsReadProblem(read: CredentialsFileRead): string | unde
 }
 
 // ---------------------------------------------------------------------------
-// Stat-first read and digest (b.av2 SR-8.3)
+// Stat-first read and digest
 // ---------------------------------------------------------------------------
 
 /**
@@ -420,10 +420,10 @@ export function readCredentialsFile(path: string, fs?: Partial<CredentialsFs>): 
   }
 }
 
-/** The held value of a credentials file that does not exist (b.av2 SR-8.3). */
+/** The held value of a credentials file that does not exist. */
 export const CREDENTIALS_MISSING_MARKER = 'missing'
 
-/** The held value of a credentials file that exists but cannot be read (b.av2 SR-8.3). */
+/** The held value of a credentials file that exists but cannot be read. */
 export const CREDENTIALS_UNREADABLE_MARKER = 'unreadable'
 
 /** Start of a credentials digest: `sha256:` then 64 lower-case hex digits. */
@@ -466,8 +466,8 @@ export interface CredentialsCheckWithDigest {
 
 /**
  * Read a persona's credentials file and check it is locally valid
- * (b.av2 SR-1.4, SR-6.1 step 1), returning the check's result and the digest
- * of the bytes it read (b.av2 SR-8.3). Checks, in order:
+ * (step 1), returning the check's result and the digest
+ * of the bytes it read. Checks, in order:
  *
  *   1. its real path (`resolveRealPath`, lexical fallback) is no other
  *      applied persona's credentials file → else `persona-credentials-invalid`,
@@ -476,7 +476,7 @@ export interface CredentialsCheckWithDigest {
  *      (by `readCredentialsFile`, stat-first) only to hash it, and the
  *      digest or marker is returned beside the failure, so a re-save of the
  *      file can make a change pending once the collision is gone
- *      (b.av2 SR-8.3);
+ * ;
  *   2. it exists → else `persona-credentials-missing` (the missing marker);
  *   3. it is a regular file (after following symlinks; not a directory, FIFO,
  *      socket or device) and can be read (permitted) → else
@@ -521,7 +521,7 @@ export function checkPersonaCredentialsAndDigest(
 
 /**
  * Read a persona's credentials file and check it is locally valid
- * (b.av2 SR-1.4, SR-6.1 step 1): `checkPersonaCredentialsAndDigest` without
+ * (step 1): `checkPersonaCredentialsAndDigest` without
  * the digest. See it for the checks, their order and the failure classes.
  */
 export function checkPersonaCredentials(

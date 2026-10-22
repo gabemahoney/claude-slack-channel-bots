@@ -8,26 +8,25 @@
  * requests on the same spawn each get their own Slack prompt without
  * colliding.
  *
- * Rows are mapped to personas by their `persona` label (b.av2 SR-7.1). A
+ * Rows are mapped to personas by their `persona` label. A
  * persona's prompts go to its destination through that persona's own Web
  * client (`clientFor`), never to a channel taken from the row: its channel, or
  * its DM with `dm.contact`, opened with `conversations.open` on that client
  * and cached by the destination resolver (`persona-destination.ts`, shared
  * with the per-persona notifier). Which destination that is comes from the
- * one destination rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701),
+ * one destination rule (`personaDestinationOf`),
  * through the resolver, its DM refusal (`refusalOf`) and the destination
  * hold, with the persona and the configuration in effect read at each attempt
- * (b.deo SRI-201); the poller reads no destination setting and no switch
- * itself. In fungible mode that is the fungible destination (b.deo
- * SRI-702), and after a confirmed switch change the next prompt goes to the
- * destination of the mode turned on (b.deo SRI-703). The refusal line of a
+ * the poller reads no destination setting and no switch
+ * itself. In fungible mode that is the fungible destination, and after a confirmed switch change the next prompt goes to the
+ * destination of the mode turned on. The refusal line of a
  * `dm` destination names the setting in force, `permission_prompts` or
  * `invited.permission_prompts`, asked of the resolver
- * (`destinationSettingFrom`, b.deo SRI-906). Each live entry records the
+ * (`destinationSettingFrom`). Each live entry records the
  * conversation the prompt was posted in (the `D…` ID for a DM) and the
  * posting persona; closing updates and clicks go there, whatever the
- * persona's destination, DMs switch or channel mode is now (b.av2 SR-5.1: an
- * update is not a post; b.deo SRI-703: a prompt posted before a switch
+ * persona's destination, DMs switch or channel mode is now (an
+ * update is not a post; a prompt posted before a switch
  * change stays where it is and stays answerable). Outage state is keyed by
  * the persona key.
  *
@@ -44,23 +43,23 @@
  *      Else post a fresh Block Kit prompt to the persona's destination and
  *      register the live entry. The prompt shows the tool input cut to fit
  *      Slack's section-text limit (`SLACK_SECTION_TEXT_MAX`, the tool-name
- *      header included), with a marker saying how much is shown (b.zmq). A
+ * header included), with a marker saying how much is shown. A
  *      persona whose client is unavailable, or whose `dm` destination is
  *      refused (DMs off or no contact), is logged once per open request and
  *      not tracked. A failed open or post is trailed and not tracked. A later
  *      tick retries all of these, except that a persona held by the
  *      destination hold (below) is not attempted until its retry is due, and
  *      a message Slack rejects is not posted again as it is (below).
- *   4. Newly-closed reconciliation (SR-2.4): for each live entry whose
+ * 4. Newly-closed reconciliation: for each live entry whose
  *      composite key was NOT observed this tick (excluding non-conforming
  *      spawns), call `get-permission`, render the verdict-distinct
  *      chat.update through the posting persona's client against that row's
  *      channel and messageTs, and drop the entry.
  *      `ErrPermissionRequestNotFound` → render generic deny + drop + no
  *      retry. Other transient errors → leave entry alive, retry next tick.
- *      Unknown `decision_reason` → fail-closed generic deny (SR-5.2).
+ * Unknown `decision_reason` → fail-closed generic deny.
  *
- * One failure stays with its row or request (b.zmq): a throw while handling
+ * One failure stays with its row or request: a throw while handling
  * one open request (its prompt built, posted or trailed), one row outside its
  * requests (its persona, its `get` result, its stuck-prompt warning) or one
  * closed entry is caught there and logged once, and the tick goes on with the
@@ -78,18 +77,18 @@
  * composite key means a "new" token simply appears as an unseen entry and
  * the old token naturally falls out of the seen-set on the next tick.
  *
- * Destination failures (b.av2 SR-7.1): every new prompt and stuck-prompt
+ * Destination failures: every new prompt and stuck-prompt
  * warning goes through the destination hold (`persona-destination-hold.ts`,
  * shared with the notifier), which answers whether the persona may be
  * attempted now. When a post fails at the destination (`missing_scope` on the
  * DM open, `not_in_channel`, Slack unreachable, …) the persona is held: no
  * Slack call is made for it, and no `post_attempted` row decision emitted,
- * until its retry is due on the SR-3.2 backoff, and the prompt stays
+ * until its retry is due on the backoff, and the prompt stays
  * untracked, so a later tick derives it again. The hold logs one
  * `persona-destination-failed` line per episode instead of a line per
  * attempt; every real attempt still emits its trail event. A failure of the
  * message itself (`MESSAGE_PAYLOAD_ERRORS`: `invalid_blocks`, `msg_too_long`,
- * …) does not hold the persona, and the message is never posted again (b.zmq):
+ * …) does not hold the persona, and the message is never posted again:
  * the failure is logged and trailed once, and the request's next attempt posts
  * a short prompt instead, naming the tool and the error, with the same Allow
  * and Deny buttons. Once posted it is tracked like any prompt, so its closing
@@ -98,16 +97,16 @@
  * until it is no longer observed. Closing updates and clicks are never gated
  * (an update is not a post).
  *
- * A persona teardown (b.jg5 SRJ-1003): while the persona's teardown window is
+ * A persona teardown: while the persona's teardown window is
  * open (the injected `teardownNotices`), its stuck-prompt warning is not
  * posted: it is handed to the notifier's `notify`, whose window writes it as
  * one log line and one `persona-teardown-notice` entry, and the warning's
  * latch is set, so it is written once and never dropped. Outside a window it
  * routes as above:
  *
- *   [slack] permission-poller: stuck-prompt warning for "<name>" (key=<key>) (<id>) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)
+ * [slack] permission-poller: stuck-prompt warning for "<name>" (key=<key>) (<id>) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted
  *
- * A persona that is not up (b.av2 SR-6.4, the injected `isPersonaUp`) keeps
+ * A persona that is not up (the injected `isPersonaUp`) keeps
  * its instance, but the poller leaves it alone: its rows get no `get`, no
  * prompt and no wedge-detector tick, and its tracked prompts and wedge state
  * are held as they are (not treated as closed, not re-armed) until it is up,
@@ -211,7 +210,7 @@ type UnpostedReason = 'client-unavailable' | 'destination-refused'
 
 /**
  * What became of an open request's prompt after Slack rejected its message
- * (a payload error, b.zmq): `fallback`, the full prompt was rejected with
+ * (a payload error): `fallback`, the full prompt was rejected with
  * `code`, so its next attempt posts the short prompt; `skipped`, the short
  * prompt was rejected too, so nothing more is posted for the request.
  */
@@ -237,13 +236,13 @@ export type PollerSlackClient = DestinationSlackClient
  * `destinations` is the destination resolver (per-persona DM cache) shared
  * with the notifier. The poller asks it whether a persona's `dm` destination
  * is refused (`refusalOf`, over the configuration in effect at that attempt)
- * and which setting names it (`settingOf`, b.deo SRI-906), and builds the
+ * and which setting names it (`settingOf`), and builds the
  * default destination hold over it when `destinationHold` is not given (the
  * poller posts through the hold, never through this directly); a
  * `destinationHold` that is given must be built over this same resolver.
  * When `destinations` is not given, `getPersonaConfig` is
  * (`PersonaDestinationsSource`): the default is a module-level instance over
- * it, reading the configuration in effect at each attempt (b.deo SRI-201),
+ * it, reading the configuration in effect at each attempt,
  * reset by `_resetPollerState`.
  */
 export type PollerDeps = PollerOwnDeps & PersonaDestinationsSource
@@ -255,7 +254,7 @@ interface PollerOwnDeps {
     list: (params: import('agent-director').ListParams) => Promise<import('agent-director').ListResult>
     get: (params: import('agent-director').GetParams) => Promise<import('agent-director').GetResult>
     /**
-     * AD `get-permission` verb (SR-7.1; shipped in `^0.6.0`). Optional on the
+     * AD `get-permission` verb (shipped in `^0.6.0`). Optional on the
      * structural type so the runtime path compiles against the locked
      * `0.5.6` Client types (which have no such method) and so tests can
      * supply a stub.
@@ -276,7 +275,7 @@ interface PollerOwnDeps {
    */
   destinationHold?: PersonaDestinationHold
   /**
-   * The persona notifier (b.jg5 SRJ-1003): while the key's persona teardown
+   * The persona notifier: while the key's persona teardown
    * window is open (`teardownWindowState` answers `open`), the stuck-prompt
    * warning is handed to its `notify`, whose window writes it as a teardown
    * notice (one log line and one `persona-teardown-notice` entry), never
@@ -290,7 +289,7 @@ interface PollerOwnDeps {
    */
   getPersona: (key: string) => Persona | undefined
   /**
-   * Whether the persona with this key is up (b.av2 SR-6.4); production passes
+   * Whether the persona with this key is up; production passes
    * `createPersonaUpPredicate`. An applied persona that is not up is skipped.
    */
   isPersonaUp: (key: string) => boolean
@@ -302,7 +301,7 @@ interface PollerOwnDeps {
   setInterval?: (cb: () => void, ms: number) => ReturnType<typeof setInterval>
   clearInterval?: (handle: ReturnType<typeof setInterval>) => void
   /**
-   * Trail emitter hook (SR-V). Defaults to `emitTrail` from
+   * Trail emitter hook. Defaults to `emitTrail` from
    * `permission-trail.ts`. Tests override with a capture stub to assert
    * emission shape without touching the on-disk JSONL.
    */
@@ -312,12 +311,12 @@ interface PollerOwnDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Wedge-detector tuning (b.fae F4)
+// Wedge-detector tuning (F4)
 // ---------------------------------------------------------------------------
 
 /**
  * Wall-clock a spawn must sit in check_permission with ZERO open
- * `permission_requests` rows before we declare it wedged (b.fae F4).
+ * `permission_requests` rows before we declare it wedged (F4).
  *
  * Sizing rationale: the poll interval defaults to 1 s
  * (DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS) but is operator-configurable in
@@ -365,14 +364,14 @@ interface WedgeState {
   /** Consecutive ticks observed empty-in-check_permission. */
   emptyTicks: number
   /** One-shot latch: true only once the warning has SUCCESSFULLY posted for
-   * this episode, suppressing per-tick spam until the spawn recovers (b.vfx dedupe shape:
-   * in-memory first-occurrence, reset on recovery / daemon restart). b.fae
+   * this episode, suppressing per-tick spam until the spawn recovers (dedupe shape:
+   * in-memory first-occurrence, reset on recovery / daemon restart).
    * F3: set only after a successful chat.postMessage, so a transient Slack
    * failure retries on a later tick instead of permanently swallowing the
    * episode's one warning. */
   warningFired: boolean
   /**
-   * b.fae F3 — throttle for warning-post RETRIES while the latch is unset (the
+   * F3 — throttle for warning-post RETRIES while the latch is unset (the
    * post keeps failing). Once the tick threshold is crossed we attempt a post;
    * on failure `warningFired` stays false so we retry, but attempting every
    * tick would hammer Slack (intervals go as low as 200 ms). This records the
@@ -385,7 +384,7 @@ interface WedgeState {
 }
 
 /**
- * b.fae F3 — minimum wall-clock (ms) between warning-post retries while the
+ * F3 — minimum wall-clock (ms) between warning-post retries while the
  * latch is unset. Converted to a tick count against the live interval, same
  * pattern as {@link wedgeTripTicks}. 30 s keeps a Slack outage from producing
  * a per-tick storm of failing posts while still recovering promptly once Slack
@@ -412,13 +411,13 @@ const livePermissions = new Map<string, LivePermission>()
  */
 const unpostedPrompts = new Map<string, UnpostedReason>()
 /**
- * Composite key → the payload rejection of an open request's prompt (b.zmq),
+ * Composite key → the payload rejection of an open request's prompt,
  * so a message Slack rejected is never posted again. Forgotten as
  * `unpostedPrompts` is: once the request is posted or no longer observed.
  */
 const payloadRejections = new Map<string, PayloadRejection>()
 /**
- * Composite keys of open requests whose prompt handling threw (b.zmq), so the
+ * Composite keys of open requests whose prompt handling threw, so the
  * line is logged once per request. A post forgets the key, but a throw after
  * it (its trail event) records it again; a key is kept while its request is
  * observed or tracked, and forgotten once it is neither or at the persona's
@@ -426,7 +425,7 @@ const payloadRejections = new Map<string, PayloadRejection>()
  */
 const failedRequests = new Set<string>()
 /**
- * Composite keys of tracked entries whose closing threw (b.zmq), so the line is
+ * Composite keys of tracked entries whose closing threw, so the line is
  * logged once per entry. Apart from `failedRequests`, so a prompt failure's
  * key cannot silence a closing failure. A key is forgotten once its entry is
  * dropped (`dropPermission`, `forgetPersonaPrompts`).
@@ -434,11 +433,11 @@ const failedRequests = new Set<string>()
 const failedClosings = new Set<string>()
 /**
  * Instance IDs of listed rows whose handling threw outside their requests
- * (b.zmq), so the line is logged once while the row keeps failing; an ID is
+ * so the line is logged once while the row keeps failing; an ID is
  * forgotten at the first tick that does not see its row throw.
  */
 const failedRows = new Set<string>()
-/** A tick threw past its catches (b.zmq): logged once until a tick runs to its end. */
+/** A tick threw past its catches: logged once until a tick runs to its end. */
 let tickFailing = false
 
 /** A record keyed by composite key, as the forgetting passes see it. */
@@ -451,18 +450,18 @@ interface PerRequestRecord {
 function perRequestRecords(): PerRequestRecord[] {
   return [unpostedPrompts, payloadRejections, failedRequests, failedClosings]
 }
-/** instance_id → wedge-detector state (b.fae F4). */
+/** instance_id → wedge-detector state (F4). */
 const wedgeStates = new Map<string, WedgeState>()
-/** Authoritative warning latch for delivery notice suppression (b.omv SR-8.2). */
+/** Authoritative warning latch for delivery notice suppression. */
 export function hasNativePromptWarning(key: string): boolean {
   return [...wedgeStates.values()].some(state => state.personaKey === key && state.warningFired)
 }
 
-/** Keys of the personas in a not-up skip episode, for its start and end lines (b.av2 SR-6.4). */
+/** Keys of the personas in a not-up skip episode, for its start and end lines. */
 const notUpSkipping = new Set<string>()
 /**
  * Instance IDs of listed rows with no `persona` label whose skip line has been
- * logged (b.1ix). The start sweep keeps a pre-persona row, so one can sit in
+ * logged. The start sweep keeps a pre-persona row, so one can sit in
  * `check_permission` for good; its line is logged once while it stays listed,
  * not every tick. An ID a successful list no longer holds (the row left
  * `check_permission`, or it gained a label) is forgotten, so the row logs
@@ -499,7 +498,7 @@ export function markHandled(instanceId: string, requestToken: string): boolean {
 }
 
 /**
- * Drop the entry, and its closing-failure record (b.zmq) — the tick is the
+ * Drop the entry, and its closing-failure record — the tick is the
  * sole owner of clearing entries.
  */
 export function dropPermission(instanceId: string, requestToken: string): void {
@@ -510,7 +509,7 @@ export function dropPermission(instanceId: string, requestToken: string): void {
 
 /**
  * Forget everything the poller keeps for persona `key` and its instance
- * (`cscb_<key>`; b.av2 SR-6.5, a teardown): its tracked prompts, their
+ * (`cscb_<key>`, a teardown): its tracked prompts, their
  * not-posted, payload-rejection and failure records, its wedge and
  * stuck-prompt state and its not-up skip episode. Makes no Slack call and
  * renders no closing update: the posted prompts stay as they are, and a later
@@ -575,7 +574,7 @@ export function _resetPollerState(): void {
 // Block Kit builder
 // ---------------------------------------------------------------------------
 
-/** Slack's limit on a section block's text, in characters (b.zmq). */
+/** Slack's limit on a section block's text, in characters. */
 export const SLACK_SECTION_TEXT_MAX = 3000
 
 /** The longest tool name a prompt shows (its header and its `text`); a longer one is cut, ending `…`. */
@@ -610,7 +609,7 @@ function truncationMarker(shown: number, total: number): string {
 }
 
 /**
- * A prompt's section text (b.zmq): the header (`🤖🛠️ *<tool>*`, the name cut
+ * A prompt's section text: the header (`🤖🛠️ *<tool>*`, the name cut
  * to `PROMPT_TOOL_NAME_MAX`), then `content` in backticks. When `content` is
  * longer than `max`, or the whole would pass `SLACK_SECTION_TEXT_MAX`, it is
  * cut so the whole, header, backticks and marker included, fits both, and the
@@ -632,7 +631,7 @@ function promptSectionText(toolName: string, content: string, max: number): stri
  * summary is Bash's `command`, Edit's or Write's `file_path`, else the input's
  * JSON (at most `PROMPT_JSON_SUMMARY_MAX` characters of it). A summary too long
  * for Slack's section-text limit is cut with a marker saying how much is shown
- * (`promptSectionText`, b.zmq). The action_id encodes the opaque
+ * (`promptSectionText`). The action_id encodes the opaque
  * request_token. Throws when `encodePermissionActionId` rejects the instance
  * ID or the token.
  */
@@ -652,7 +651,7 @@ export function buildPermissionBlocks(
 
 /**
  * The short prompt posted instead of one whose message Slack rejected (a
- * payload error, `code`; b.zmq): the tool's header, then a line saying the
+ * payload error, `code`): the tool's header, then a line saying the
  * input is not shown and why, then the same Allow and Deny buttons. Throws as
  * `buildPermissionBlocks` does.
  */
@@ -704,7 +703,7 @@ function logViaDeps(deps: PollerDeps, ...args: unknown[]): void {
 }
 
 /**
- * Log a caught failure's line from a catch (b.zmq): through `logViaDeps`, else,
+ * Log a caught failure's line from a catch: through `logViaDeps`, else,
  * when the injected logger throws, to `console.error`. Never throws, so a
  * catch that logs cannot throw again.
  */
@@ -720,7 +719,7 @@ function logFailureSafely(deps: PollerDeps, line: string): void {
   }
 }
 
-// b.zmq (b.jg5 SRJ-1014): the lines of a caught failure and of a payload
+// the lines of a caught failure and of a payload
 // rejection. `description` is `describeThrownValue` of the thrown value;
 // `failureTail` is `describeDestinationFailure`'s ` (reason=<reason>): …`.
 
@@ -799,9 +798,9 @@ function destinationHoldFor(deps: PollerDeps): PersonaDestinationHold {
 }
 
 /**
- * SR-V-2.3 row-decision emitter. Builds a `cscb.poller.row_decision` event
+ * row-decision emitter. Builds a `cscb.poller.row_decision` event
  * with the canonical envelope fields and the action identifier. `request_token`
- * is omitted (not empty) when absent per SR-V-1.1.
+ * is omitted (not empty) when absent .
  */
 function emitRowDecision(
   deps: PollerDeps,
@@ -820,13 +819,13 @@ function emitRowDecision(
 }
 
 /**
- * b.fae F4 / b.jg5 SRJ-1012 — one-shot warning for a spawn wedged in
- * check_permission with zero open rows: the persona prefix (b.av2 SR-7.2)
+ * F4 / one-shot warning for a spawn wedged in
+ * check_permission with zero open rows: the persona prefix
  * followed by {@link buildWedgeWarningBody}. The text names agent-director
  * verbs only, as a human's steps: `read-pane` to see the native prompt, then
  * `kill` with "check the result", after which the server brings the persona
  * up again on its own. It names no tmux command and no respawn as a human's
- * step, and carries SRJ-1001's human-only sentence. `send-keys` is NOT
+ * step, and carries human-only sentence. `send-keys` is NOT
  * offered: AD's relay guard hard-rejects send-keys whenever relay_mode=on &&
  * state=check_permission, with no open-row exemption.
  */
@@ -835,8 +834,8 @@ export function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, in
 }
 
 /**
- * b.jg5 SRJ-1012 — the wedge warning's body, with no persona reference (the
- * notifier adds its own): SRJ-1012's text, with `instanceId` in both
+ * the wedge warning's body, with no persona reference (the
+ * notifier adds its own): text, with `instanceId` in both
  * places it names the instance id. Used by the post and by the
  * teardown-window notice alike.
  */
@@ -856,7 +855,7 @@ export function buildWedgeWarningBody(instanceId: string): string {
 }
 
 /**
- * b.jg5 SRJ-1003 — while the persona's teardown window is open, hand the
+ * while the persona's teardown window is open, hand the
  * wedge warning to the notifier, whose window writes it as a teardown notice
  * (never posted, held or dropped), and answer true; answer false (nothing
  * done) when no notifier is given or no window is open. A failing notifier
@@ -875,7 +874,7 @@ function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, instanc
   logViaDeps(
     deps,
     `[slack] permission-poller: stuck-prompt warning for ${ref} (${instanceId}) raised during its persona teardown — ` +
-      'handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)',
+      'handed to the notifier, which writes it to the server log and startup-errors.log, not posted',
   )
   notifySafely(notices.notify, persona.key, buildWedgeWarningBody(instanceId), undefined, (err) =>
     logViaDeps(deps, `[slack] permission-poller: stuck-prompt warning for ${ref} (${instanceId}) failed at the notifier: ${describeThrownValue(err)}`),
@@ -884,7 +883,7 @@ function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, instanc
 }
 
 /**
- * b.fae F4 / b.av2 SR-7.2 — deliver the one-shot wedge warning to the
+ * F4 / deliver the one-shot wedge warning to the
  * persona's destination (its channel, or its DM, opened if needed) as one
  * top-level message (no thread_ts) through the persona's client, as the
  * destination hold's `attempt` (which the caller obtained and releases).
@@ -928,7 +927,7 @@ async function postWedgeWarning(
     })
     return true
   }
-  // b.emk convention: failures land in BOTH server.log and the trail JSONL.
+  // convention: failures land in BOTH server.log and the trail JSONL.
   // A destination failure reaches server.log as the hold's episode line.
   if (!isDestinationFailure(result)) {
     logViaDeps(
@@ -950,18 +949,18 @@ async function postWedgeWarning(
 }
 
 /**
- * b.fae F4 — advance the wedge detector for one spawn observed this tick in
+ * F4 — advance the wedge detector for one spawn observed this tick in
  * check_permission with an EMPTY `permission_requests` array. Increments the
  * per-spawn consecutive-empty-tick counter; when it crosses the K threshold
  * (`wedgeTripTicks`) for the first time this episode, logs, and sends the
  * one-shot warning to the persona's destination. The `warningFired` latch
- * suppresses per-tick spam thereafter (the operator-hostile behavior b.vfx
- * documents) — but b.fae F3: it latches ONLY after a successful post, so a
+ * suppresses per-tick spam thereafter (the operator-hostile behavior
+ * documents) — but F3: it latches ONLY after a successful post, so a
  * transient chat.postMessage failure retries on a later tick instead of
  * permanently swallowing the episode's one warning. Retries are throttled to
  * one per {@link wedgeWarnRetryTicks} so a Slack outage cannot storm the API
  * at a 200 ms interval. A retry is also attempted only when the destination
- * hold allows (b.av2 SR-7.1): while the persona is held nothing is attempted
+ * hold allows: while the persona is held nothing is attempted
  * or logged, and the throttle is left as it is. The detector is re-armed by
  * `reconcileWedgeStates` dropping the spawn's state the moment it leaves the
  * wedged condition.
@@ -990,7 +989,7 @@ async function observeWedgeCandidate(
   ) {
     return
   }
-  // b.jg5 SRJ-1003: inside the persona's teardown window the warning is a
+  // inside the persona's teardown window the warning is a
   // teardown notice, written once and latched as delivered.
   if (writeWedgeWarningInTeardown(deps, persona, instanceId)) {
     state.warningFired = true
@@ -1008,7 +1007,7 @@ async function observeWedgeCandidate(
       `[slack] permission-poller: spawn ${instanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
     )
     const warned = await postWedgeWarning(deps, attempt, instanceId, persona, text)
-    // b.fae F3: latch only on success; a failed post leaves warningFired false so
+    // F3: latch only on success; a failed post leaves warningFired false so
     // a subsequent tick retries and exactly one message lands on recovery.
     if (warned) state.warningFired = true
   } finally {
@@ -1017,19 +1016,19 @@ async function observeWedgeCandidate(
 }
 
 /**
- * b.fae F4 — re-arm the detector for any tracked spawn POSITIVELY observed
+ * F4 — re-arm the detector for any tracked spawn POSITIVELY observed
  * non-wedged this tick. A spawn leaves the wedged condition when it exits
  * check_permission, an open row appears, or it disappears entirely; in every
  * such case its instance id is absent from `observedEmpty`, so we drop its
  * state (counter AND fired flag) and a later genuine wedge alarms afresh.
  *
- * b.fae F4 follow-up: a spawn merely SKIPPED this tick due to a transient `get`
+ * F4 follow-up: a spawn merely SKIPPED this tick due to a transient `get`
  * error or a non-conforming response (`skippedThisTick`) is NOT a positive
  * observation — resetting on it would let a single flaky AD connection zero the
  * counter and defer detection indefinitely. Such spawns are exempted (mirrors
  * the closed-row sweep's `nonConformingInstanceIds` exemption): their state is
  * preserved so the empty-tick count accumulates across transient read gaps.
- * The state of a spawn whose persona is not up (`isHeld`, b.av2 SR-6.4) is
+ * The state of a spawn whose persona is not up (`isHeld`) is
  * preserved the same way, listed this tick or not.
  */
 function reconcileWedgeStates(
@@ -1074,12 +1073,12 @@ async function runTick(deps: PollerDeps): Promise<void> {
 
     const seenComposite = new Set<string>()
     const nonConformingInstanceIds = new Set<string>()
-    // b.fae F4: spawns observed this tick in check_permission with an empty
+    // F4: spawns observed this tick in check_permission with an empty
     // (conforming) permission_requests array. Any tracked wedge state NOT in
     // this set at tick-end is re-armed (the spawn left the wedged condition)…
     const wedgeObservedEmpty = new Set<string>()
     // …UNLESS the spawn was merely SKIPPED this tick due to a transient `get`
-    // error or a non-conforming (null/undefined) open-rows response. b.fae F4
+    // error or a non-conforming (null/undefined) open-rows response. F4
     // follow-up: a single flaky AD connection must not zero the wedge counter
     // and defer detection indefinitely. This is the analogue of the closed-row
     // sweep exempting `nonConformingInstanceIds`: we only reset wedge state for
@@ -1087,10 +1086,10 @@ async function runTick(deps: PollerDeps): Promise<void> {
     // via ErrSpawnNotFound), never for spawns we simply could not read this
     // tick. Spawns in this set keep their prior emptyTicks/warningFired.
     const wedgeSkippedThisTick = new Set<string>()
-    // b.zmq: instance IDs of the rows that threw this tick (`failedRows`).
+    // instance IDs of the rows that threw this tick (`failedRows`).
     const rowsFailedThisTick = new Set<string>()
     for (const row of rows) {
-      // b.zmq: a throw while handling this row, outside its requests, is caught
+      // a throw while handling this row, outside its requests, is caught
       // below; the tick goes on with the next row.
       try {
         const resolved = resolveRowPersona(deps, row)
@@ -1120,7 +1119,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           return false
         }
         if (!deps.isPersonaUp(persona.key)) {
-          // b.av2 SR-6.4: no get, no prompt, no wedge tick for a persona that is
+          // no get, no prompt, no wedge tick for a persona that is
           // not up; its requests stay open, so hold its live entries and wedge
           // state exactly as for a spawn that could not be read this tick.
           noteNotUpSkip(deps, persona)
@@ -1130,12 +1129,12 @@ async function runTick(deps: PollerDeps): Promise<void> {
         }
 
         let got: GetResultWithPermissionRequests
-        // b.jg5 SRJ-122: this `get` (like the `list` above) is not one of
-        // SRJ-114's sites, so none of the decisions of `src/row-read-rules.ts`
+        // this `get` (like the `list` above) is not one of
+        // sites, so none of the decisions of `src/row-read-rules.ts`
         // applies here: a liveness note on the row, `provenance_conflict`
-        // included, and a `pending` row with no launch start (SRJ-513) latch
+        // included, and a `pending` row with no launch start latch
         // no one, and a retired key's row read live with its mark set clears
-        // no retired-key entry (SRJ-807); they change nothing.
+        // no retired-key entry; they change nothing.
         try {
           got = (await withOutageDetection(persona.key, undefined, 'get', () =>
             client.get({ instance_id: row.instance_id })
@@ -1158,15 +1157,15 @@ async function runTick(deps: PollerDeps): Promise<void> {
         if (got.permission_requests === null || got.permission_requests === undefined) {
           logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.instance_id} — skipping`)
           nonConformingInstanceIds.add(row.instance_id)
-          // b.fae F4 follow-up: a non-conforming response is a read we could not
+          // F4 follow-up: a non-conforming response is a read we could not
           // trust, not a positive non-wedged observation — exempt from re-arming.
           wedgeSkippedThisTick.add(row.instance_id)
-          // SR-V-2.3: request_token omitted (no row was readable) per SR-V-1.1.
+          // request_token omitted (no row was readable) .
           emitRowDecision(deps, 'non_conforming_skipped', row.instance_id, undefined)
           continue
         }
 
-        // b.fae F4: an EMPTY (but conforming) array is a spawn sitting in
+        // F4: an EMPTY (but conforming) array is a spawn sitting in
         // check_permission with zero open rows — the silent-wedge signature.
         // Feed it to the detector; a non-empty array means the spawn is NOT
         // wedged, so it is intentionally excluded from wedgeObservedEmpty and
@@ -1180,7 +1179,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
         for (const perm of got.permission_requests) {
           const key = makeCompositeKey(row.instance_id, perm.request_token)
           seenComposite.add(key)
-          // b.zmq: a throw while handling this request is its own; the row's
+          // a throw while handling this request is its own; the row's
           // other requests go on. The key is already observed, so the request
           // is not swept as closed.
           try {
@@ -1204,7 +1203,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           }
         }
       } catch (err) {
-        // b.zmq: the row counts as one not read this tick: its tracked prompts
+        // the row counts as one not read this tick: its tracked prompts
         // are not swept as closed and its wedge state is kept.
         nonConformingInstanceIds.add(row.instance_id)
         wedgeSkippedThisTick.add(row.instance_id)
@@ -1219,16 +1218,16 @@ async function runTick(deps: PollerDeps): Promise<void> {
       if (!rowsFailedThisTick.has(id)) failedRows.delete(id)
     }
 
-    // b.fae F4: re-arm the wedge detector for spawns no longer wedged (left
+    // F4: re-arm the wedge detector for spawns no longer wedged (left
     // check_permission, gained an open row, or disappeared), but NOT for spawns
     // merely skipped by a transient read error this tick.
-    // b.av2 SR-6.4: a not-up persona's wedge state and tracked prompts are
+    // a not-up persona's wedge state and tracked prompts are
     // held even when its spawn was not listed this tick.
     const isHeld = (personaKey: string) => isHeldForNotUpPersona(deps, personaKey)
     reconcileWedgeStates(wedgeObservedEmpty, wedgeSkippedThisTick, isHeld)
     forgetUnobservedUnposted(seenComposite, wedgeSkippedThisTick)
 
-    // SR-2.4 newly-closed reconciliation. Collect first, then reconcile —
+    // newly-closed reconciliation. Collect first, then reconcile —
     // avoids mutating the map while iterating it.
     const closedEntries: LivePermission[] = []
     for (const [key, entry] of livePermissions) {
@@ -1240,7 +1239,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
     endNotUpSkips(deps)
 
     for (const entry of closedEntries) {
-      // b.zmq: a throw while closing this entry is its own: the entry is kept
+      // a throw while closing this entry is its own: the entry is kept
       // (tried again next tick) and the other closed entries go on.
       try {
         let info: GetPermissionResult
@@ -1261,7 +1260,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
             continue
           }
           logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.instanceId} token=${entry.requestToken}: ${describeAgentDirectorFailure(err)}`)
-          // SR-2.4 transient retry: leave entry alive; next tick will retry.
+          // transient retry: leave entry alive; next tick will retry.
           emitRowDecision(deps, 'transient_retry', entry.instanceId, entry.requestToken)
           continue
         }
@@ -1291,7 +1290,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
         )
       }
     }
-    // b.zmq: this tick ran to its end, so the next tick that throws is logged.
+    // this tick ran to its end, so the next tick that throws is logged.
     tickFailing = false
   } finally {
     tickInFlight = false
@@ -1299,7 +1298,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Not-up personas (b.av2 SR-6.4)
+// Not-up personas
 // ---------------------------------------------------------------------------
 
 /** Open the persona's not-up skip episode, logging its start line once. */
@@ -1347,9 +1346,9 @@ type RowPersona =
   | { kind: 'not_applied' }
 
 /**
- * Resolve a listed row's persona from its `persona` label (b.av2 SR-7.1). A row
+ * Resolve a listed row's persona from its `persona` label. A row
  * with no `persona` label (`no_label`) is logged once while it stays listed
- * (`noLabelLogged`, b.1ix), and one naming no applied persona (`not_applied`)
+ * (`noLabelLogged`), and one naming no applied persona (`not_applied`)
  * is logged; the caller skips both. The `channel` label is never read.
  */
 function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
@@ -1397,7 +1396,7 @@ function logUnpostedOnce(deps: PollerDeps, compositeKey: string, reason: Unposte
 }
 
 /**
- * Log a failure line once per composite key in `record` (b.zmq):
+ * Log a failure line once per composite key in `record`:
  * `failedRequests` for a prompt, `failedClosings` for a closing. While the key
  * stays in the record, a later throw of the same kind for it is silent. The
  * key is recorded before the line, and the line never throws.
@@ -1409,7 +1408,7 @@ function logFailureOnce(deps: PollerDeps, record: Set<string>, compositeKey: str
 }
 
 /**
- * Forget the not-posted, payload-rejection and failure records (b.zmq) of
+ * Forget the not-posted, payload-rejection and failure records of
  * every request no longer observed, except for spawns that could not be read
  * this tick (their requests may still be open). A record of a request still
  * tracked (its prompt's trail event threw, or its closing threw) is kept; a
@@ -1427,8 +1426,7 @@ function forgetUnobservedUnposted(seenComposite: Set<string>, skippedThisTick: S
 }
 
 /**
- * Route one untracked open request to the persona's destination (b.av2
- * SR-7.1). A `dm` destination the resolver would refuse (DMs off or no
+ * Route one untracked open request to the persona's destination. A `dm` destination the resolver would refuse (DMs off or no
  * contact; the loader rejects both) is logged once and not tracked, with no
  * Slack call. A persona whose client is unavailable is logged once and not
  * tracked, so a later tick retries it. A persona the destination hold is
@@ -1437,7 +1435,7 @@ function forgetUnobservedUnposted(seenComposite: Set<string>, skippedThisTick: S
  * Otherwise the `post_attempted` row decision is emitted and the prompt is
  * posted through the persona's client to its destination: the channel, or
  * the DM (opened if needed). The prompt is the full one, or, once Slack has
- * rejected the full prompt's message (`payloadRejections`, b.zmq), the short
+ * rejected the full prompt's message (`payloadRejections`), the short
  * one; once Slack has rejected the short one's too, nothing is done for the
  * request, with no line. A throw (the builder rejecting the row, a throwing
  * trail emitter or logger) propagates to the tick's per-request catch, after
@@ -1457,7 +1455,7 @@ async function dispatchPermissionPrompt(
   const refusal = destinations.refusalOf(persona)
   if (refusal) {
     // Names the destination setting in force, read in the same step as the
-    // refusal (b.av2 SR-7.1, b.deo SRI-906).
+    // refusal.
     logUnpostedOnce(
       deps,
       compositeKey,
@@ -1506,7 +1504,7 @@ interface PromptMessage {
   blocks: ReturnType<typeof buildPermissionBlocks>
   /** `tool_input` was not a JSON object string; the raw string was used (logged once the attempt is begun). */
   toolInputUnparsed: boolean
-  /** The short prompt posted after Slack rejected the full prompt's message (b.zmq). */
+  /** The short prompt posted after Slack rejected the full prompt's message. */
   fallback: boolean
 }
 
@@ -1555,7 +1553,7 @@ function buildPromptMessage(row: ListRow, permission: PermissionRequestRow): Pro
 
 /**
  * Build the short prompt posted after Slack rejected the full prompt's
- * message with the payload error `code` (b.zmq): the same `text`, and the
+ * message with the payload error `code`: the same `text`, and the
  * blocks of `buildFallbackPermissionBlocks`. Throws as `buildPromptMessage`
  * does; logs nothing.
  */
@@ -1582,7 +1580,7 @@ function buildFallbackPromptMessage(row: ListRow, permission: PermissionRequestR
  * was posted in. Every attempt emits one `cscb.chat_post.attempted`; a failed
  * DM open emits it with `ok: false` and no `channel`. A destination failure
  * is logged by the hold, once per episode. A failure of the message itself (a
- * payload error) is recorded in `payloadRejections` and logged here (b.zmq):
+ * payload error) is recorded in `payloadRejections` and logged here:
  * the full prompt's moves the request to the short prompt, the short
  * prompt's ends its posting; so each is logged once per request. A refusal
  * (logged by the resolver) makes no Slack call and emits nothing. A posted
@@ -1604,13 +1602,13 @@ async function postPermissionPrompt(
   const result = await attempt.post(persona, web, { text, blocks })
   if (result.outcome === 'refused') return
   if (result.outcome === 'failed') {
-    // b.emk: failures land in BOTH server.log (real-time visibility) AND the
+    // failures land in BOTH server.log (real-time visibility) AND the
     // trail JSONL (after-the-fact debugging). Success paths stay trail-only,
-    // preserving the SR-V-2.4 asymmetric-behavior fix. A destination failure
-    // reaches server.log as the hold's episode line (b.av2 SR-7.1), so a
+    // preserving the asymmetric-behavior fix. A destination failure
+    // reaches server.log as the hold's episode line, so a
     // held persona's retries don't log one line each.
     if (!isDestinationFailure(result)) {
-      // b.zmq: a payload error fails the same way however often the message
+      // a payload error fails the same way however often the message
       // is posted, so it is never posted again. Recorded before the line, so a
       // throwing logger cannot bring the message back next tick.
       const tail = describeDestinationFailure(result)
@@ -1641,7 +1639,7 @@ async function postPermissionPrompt(
   const channelId = result.channelId
   const messageTs = result.ts
   if (messageTs) {
-    // b.zmq: registered before the trail event, so a throwing emitter cannot
+    // registered before the trail event, so a throwing emitter cannot
     // leave a posted prompt untracked (and posted again next tick).
     livePermissions.set(compositeKey, {
       instanceId: row.instance_id,
@@ -1657,8 +1655,8 @@ async function postPermissionPrompt(
     payloadRejections.delete(compositeKey)
     failedRequests.delete(compositeKey)
   }
-  // SR-V-2.4: emit on success (and on the no-ts edge case below) with the
-  // Slack-returned ts. Full text + blocks pass through verbatim (SR-V-3.1).
+  // emit on success (and on the no-ts edge case below) with the
+  // Slack-returned ts. Full text + blocks pass through verbatim.
   emit({
     event: 'cscb.chat_post.attempted',
     instance_id: row.instance_id,
@@ -1675,7 +1673,7 @@ async function postPermissionPrompt(
 }
 
 // ---------------------------------------------------------------------------
-// Verdict classification + closure rendering (SR-5.1, SR-5.2, SR-5.3, SR-5.4)
+// Verdict classification + closure rendering
 // ---------------------------------------------------------------------------
 
 /** Discriminated verdict tag produced from a `get-permission` response. */
@@ -1692,7 +1690,7 @@ export type VerdictTag =
  * Map the AD `decision` + `decision_reason` pair to a verdict tag. The mapping
  * is intentionally strict: ANY combination outside the four canonical pairs
  * (including allow with non-null reason, or deny with an unrecognized reason)
- * collapses to `'unknown'` — the SR-5.2 fail-closed generic deny path.
+ * collapses to `'unknown'` — the fail-closed generic deny path.
  */
 export function classifyVerdict(info: GetPermissionResult): VerdictTag {
   if (info.delivery !== 'delivered' && !(info.delivery === 'fallen_back' && ['sent', 'outside', 'tool_ran'].includes(info.pane_answer))) return 'unknown'
@@ -1708,13 +1706,13 @@ export function classifyVerdict(info: GetPermissionResult): VerdictTag {
 /**
  * Block Kit body + text for a closure verdict. Each tag yields a visually
  * distinct text so operators can tell from the message why the prompt closed
- * (SR-5.1). The `not_found` and `unknown` tags share the generic-deny
- * rendering (SR-2.4 not-found path and SR-5.2 fail-closed path).
+ * The `not_found` and `unknown` tags share the generic-deny
+ * rendering (not-found path and fail-closed path).
  *
  * The poller-side `operator_allow` / `operator_deny` renderings stand in for
  * the case where the click handler's chat.update did not land (e.g. failure,
  * or the click came in too late and AD already had the row closed). The
- * click handler's "by X" rendering (SR-5.4) is still authoritative for the
+ * click handler's "by X" rendering is still authoritative for the
  * happy path; the verdict surface only carries the closure state since the
  * operator identity is unknown to the poller.
  */
@@ -1757,10 +1755,10 @@ function buildVerdictRendering(tag: VerdictTag): { text: string; blocks: unknown
  * against this entry's messageTs, through the client of the persona that
  * posted it: a prompt stays where it was posted. The destination is never
  * resolved again and the DMs switch is not read: a DM prompt is updated in
- * its `D…` conversation even after DMs were turned off (b.av2 SR-5.1: an
+ * its `D…` conversation even after DMs were turned off (an
  * update is not a post), and no `conversations.open` is made. Sibling-independent by
  * construction: the call only ever names `entry.channelId` +
- * `entry.messageTs` (SR-5.3). When that persona's client is unavailable, one
+ * `entry.messageTs`. When that persona's client is unavailable, one
  * line is logged and no update is made (the caller still drops the entry:
  * agent-director has already closed the request).
  */
@@ -1803,7 +1801,7 @@ async function renderClosureUpdate(
     emit({ ...envelope, ok: true })
     return true
   } catch (err) {
-    // b.emk: failures land in BOTH server.log and the trail JSONL.
+    // failures land in BOTH server.log and the trail JSONL.
     logViaDeps(
       deps,
       `[slack] permission-poller: closure chat.update failed for ${entry.instanceId} token=${entry.requestToken} ` +
@@ -1819,7 +1817,7 @@ async function renderClosureUpdate(
 // ---------------------------------------------------------------------------
 
 /**
- * The interval's last-resort catch (b.zmq): a tick that threw past its
+ * The interval's last-resort catch: a tick that threw past its
  * per-row, per-request and per-closed-entry catches (e.g. the `list` result
  * not iterable, or a throw in the wedge re-arm) is logged once until a tick
  * runs to its end. Never throws, so the tick's promise never rejects unhandled.
@@ -1844,7 +1842,7 @@ export function startPermissionPoller(deps: PollerDeps): void {
     // row the prompt builder rejects: an instance ID without the `cscb_`
     // prefix, or an empty `request_token`; a throwing injected `emitTrail` or
     // `log`) is caught there, logged once and the tick goes on with the rest
-    // (b.zmq). Anything that still escapes ends that tick only and is caught
+    //. Anything that still escapes ends that tick only and is caught
     // here (`noteTickFailure`), so the promise never rejects unhandled. The
     // tick's `finally` still clears the in-flight flag, and any hold attempt
     // begun is released, so the next tick runs as usual.

@@ -1,26 +1,25 @@
 /**
  * tests/ci-run-interface.test.ts — The sharded `/ci` runner's interface
- * (`scripts/ci-run.ts`, b.uqm SR-21.6).
+ * (`scripts/ci-run.ts`).
  *
- * E1 region: the runner's module properties (b.uqm SR-1.3); command lines,
- * argument rules and run kinds (SR-2.1, SR-2.2, SR-2.5; the argument half of
- * PRD AC 15); fault forms, normalization, de-duplication and the faults that
- * are bad arguments (SR-2.4, the argument stage); canonical order (SR-3.3);
+ * region: the runner's module properties; command lines,
+ * argument rules and run kinds (the argument half of
+ * contract); fault forms, normalization, de-duplication and the faults that
+ * are bad arguments (the argument stage); canonical order;
  * child process environments, the secret-credential set and the base-build
- * token lookup (SR-15.4, SR-15.1); and one pin case per runner constant
- * (SR-21.5).
+ * token lookup; and one pin case per runner constant
  *
- * E2 region: validation stages 2–8 (SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-3.4,
- * SR-15.1), added by E2.
+ *
+ * region: validation stages 2–8, added .
  *
  * Everything runs in process through the runner's exports and injected
  * dependencies: no child process, no docker, no `/proc` or cgroup read
- * (b.uqm SR-21.7). Spawns are answered by the spawn recorder and the fake
+ * Spawns are answered by the spawn recorder and the fake
  * container interface (`tests/test-helpers/ci-run.ts`); credentials are built
  * with `fakeToken`; real script names come from the repository's
  * `tests/integration` listing, looked up by number. Only the constants block
  * types a runner constant's value; every other case imports it, except the
- * b.uqm SR-2.2 example message case, which types 1 and 6 as the SRD's example
+ * example message case, which types 1 and 6 as the contract's example
  * line does.
  *
  * SPDX-License-Identifier: MIT
@@ -212,7 +211,7 @@ function runnerSource(): string {
   return readFileSync(join(REPO_ROOT, RUNNER_PATH_SUFFIX), 'utf-8')
 }
 
-/** The repository's real file name for script number `n` (b.uqm SR-21.2). */
+/** The repository's real file name for script number `n`. */
 function scriptFile(n: number): string {
   return realScriptFileName(n)
 }
@@ -239,11 +238,11 @@ function refusedFailures(args: readonly string[]): readonly ArgumentFailure[] {
 }
 
 // ===========================================================================
-// E1 region
+// region
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Module properties (b.uqm SR-1.3)
+// Module properties
 // ---------------------------------------------------------------------------
 
 /** One top-level expression the audit flags: a call, a `new` or an `await` that would run at import. */
@@ -278,7 +277,7 @@ function isStaticMember(member: ts.ClassElement): boolean {
 }
 
 /**
- * The top-level audit of b.uqm SR-1.3: every call, `new` and `await` at the
+ * The top-level audit of every call, `new` and `await` at the
  * top level of `source`, outside function bodies, class bodies (whose static
  * initializers and static blocks run at import, so they are audited) and the
  * main-module entry block. Parsed with the repository's `typescript`.
@@ -321,7 +320,7 @@ function listenerCounts(): Record<string, number> {
   return Object.fromEntries(PROCESS_EVENTS.map((event) => [event, process.listenerCount(event)]))
 }
 
-describe('module properties (b.uqm SR-1.3)', () => {
+describe('module properties', () => {
   test('the runner has no top-level call, new or await outside function and class bodies and its one entry block, which is last', () => {
     const audit = auditTopLevel(runnerSource())
 
@@ -374,10 +373,10 @@ describe('module properties (b.uqm SR-1.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Arguments, command lines and run kinds (b.uqm SR-2.1, SR-2.2, SR-2.5)
+// Arguments, command lines and run kinds
 // ---------------------------------------------------------------------------
 
-/** The run-kind predicates of an invocation (b.uqm Terms, SR-2.5, SR-6.2). */
+/** The run-kind predicates of an invocation (Terms). */
 interface RunKinds {
   readonly defaultFull: boolean
   readonly full: boolean
@@ -417,19 +416,19 @@ const SHARDS_ABOVE_RANGE = String(MAX_SHARDS + 1)
 const TIMEOUT_ABOVE_RANGE = String(MAX_SHARD_TIMEOUT_MINUTES + 1)
 
 /**
- * The rules of b.uqm SR-2.2 a bad argument's reason must name. The two value
+ * The rules of the contract a bad argument's reason must name. The two value
  * ranges are built from the runner's bounds; the others are short phrases of
- * SR-2.2's wording that the reason states.
+ * wording that the reason states.
  */
 const SHARDS_RANGE_RULE = `from ${OPTION_RANGE_MIN} to ${MAX_SHARDS}`
 const SHARD_TIMEOUT_RANGE_RULE = `from ${OPTION_RANGE_MIN} to ${MAX_SHARD_TIMEOUT_MINUTES}`
-/** SR-2.2: each option takes the next argument as its value. */
+/** each option takes the next argument as its value. */
 const NEXT_ARGUMENT_RULE = 'the next argument'
-/** SR-2.2: an unknown option is a bad argument. */
+/** an unknown option is a bad argument. */
 const UNKNOWN_OPTION_RULE = 'an unknown option'
-/** SR-2.2: any other argument beginning `-` is a bad argument. */
+/** any other argument beginning `-` is a bad argument. */
 const NOT_AN_OPTION_RULE = 'argument beginning -'
-/** SR-2.2: `--shards` and `--shard-timeout` may each appear once. */
+/** `--shards` and `--shard-timeout` may each appear once. */
 const GIVEN_ONCE_RULE = 'once'
 
 /** One bad-argument row: the arguments, the failures in argument order, the argument the reason must name, and the rule it must name. */
@@ -469,7 +468,7 @@ const BAD_ARGUMENT_ROWS: readonly BadArgumentsRow[] = [
   { label: '--shard-timeout with a leading zero', args: ['--shard-timeout', '045'], failures: [{ position: 0, reason: notWholeNumberReason('--shard-timeout', '045') }], names: '--shard-timeout 045', rule: SHARD_TIMEOUT_RANGE_RULE },
 ]
 
-/** One run-kind row (b.uqm SR-2.5); its arguments are built when the case runs, from the repository's listing. */
+/** One run-kind row; its arguments are built when the case runs, from the repository's listing. */
 interface RunKindRow {
   readonly label: string
   readonly args: () => readonly string[]
@@ -494,7 +493,7 @@ const RUN_KIND_ROWS: readonly RunKindRow[] = [
   { label: 'a SCRIPT and --inject: an injected selective run', args: () => [scriptFile(3), '--inject', `fail:${numberForm(3)}`], kinds: { ...SELECTIVE, injected: true } },
 ]
 
-describe('arguments and command lines (b.uqm SR-2.1, SR-2.2)', () => {
+describe('arguments and command lines', () => {
   test('a SCRIPT before or after --shards parses to the same invocation', () => {
     const before = parsedInvocation([numberForm(3), '--shards', '2'])
     const after = parsedInvocation(['--shards', '2', numberForm(3)])
@@ -532,7 +531,7 @@ describe('arguments and command lines (b.uqm SR-2.1, SR-2.2)', () => {
     }
   })
 
-  test('--shards 7 is refused with b.uqm SR-2.2 example reason', () => {
+  test('--shards 7 is refused with example reason', () => {
     expect(refusedFailures(['--shards', '7'])).toEqual([{ position: 0, reason: '--shards 7 is out of range: N must be a whole number from 1 to 6' }])
   })
 
@@ -594,7 +593,7 @@ describe('arguments and command lines (b.uqm SR-2.1, SR-2.2)', () => {
   })
 })
 
-describe('run kinds and gate eligibility (b.uqm SR-2.5)', () => {
+describe('run kinds and gate eligibility', () => {
   test.each([...RUN_KIND_ROWS])('$label', ({ args, kinds }) => {
     expect(runKinds(parsedInvocation(args()))).toEqual(kinds)
   })
@@ -608,7 +607,7 @@ describe('run kinds and gate eligibility (b.uqm SR-2.5)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Faults: forms, normalization, de-duplication and bad arguments (b.uqm SR-2.4)
+// Faults: forms, normalization, de-duplication and bad arguments
 // ---------------------------------------------------------------------------
 
 /** One accepted fault form; built when the case runs, from the repository's listing. */
@@ -634,7 +633,7 @@ const FAULT_FORM_ROWS: readonly FaultFormRow[] = [
 /** A whole number past 2^53, whose digits a `Number` would not keep. */
 const HUGE_DIGITS = '9'.repeat(20)
 
-describe('fault forms and normalization (b.uqm SR-2.4)', () => {
+describe('fault forms and normalization', () => {
   test.each([...FAULT_FORM_ROWS])('$label parses', ({ value, fault }) => {
     const given = value()
     const invocation = parsedInvocation(['--inject', given])
@@ -724,7 +723,7 @@ const FAIL_TIMEOUT_ROWS: readonly (readonly [string, () => readonly string[], ()
   ],
 ]
 
-describe('faults that are bad arguments (b.uqm SR-2.4)', () => {
+describe('faults that are bad arguments', () => {
   test.each(BAD_FAULT_ROWS)('%s is a bad argument', (_label, value, reason) => {
     expect(parseFault(value)).toEqual({ ok: false, reason })
     expect(refusedFailures(['--inject', value])).toEqual([{ position: 0, reason }])
@@ -736,10 +735,10 @@ describe('faults that are bad arguments (b.uqm SR-2.4)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Canonical order (b.uqm SR-3.3)
+// Canonical order
 // ---------------------------------------------------------------------------
 
-/** Script numbers in canonical order, as b.uqm SR-3.3 states it: test-1; test-2 to test-4 when present; then the rest ascending. */
+/** Script numbers in canonical order, as states it: test-1; test-2 to test-4 when present; then the rest ascending. */
 function expectedCanonicalNumbers(numbers: readonly number[]): number[] {
   const early = [2, 3, 4].filter((n) => numbers.includes(n))
   const rest = numbers.filter((n) => n !== 1 && !early.includes(n)).sort((a, b) => a - b)
@@ -751,7 +750,7 @@ function scriptListing(dir: string): string[] {
   return readdirSync(dir).filter(isScriptFileName).reverse()
 }
 
-describe('canonical order (b.uqm SR-3.3)', () => {
+describe('canonical order', () => {
   let root: string
 
   beforeEach(() => {
@@ -788,10 +787,10 @@ describe('canonical order (b.uqm SR-3.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Child process environments, the secret set and the token lookup (b.uqm SR-15.4, SR-15.1)
+// Child process environments, the secret set and the token lookup
 // ---------------------------------------------------------------------------
 
-/** Fake credentials, each with its own suffix (b.uqm SR-21.2). */
+/** Fake credentials, each with its own suffix. */
 function credentials(): { rawKey: string; gatewayKey: string; ghToken: string; baseBuildToken: string; tooShort: string; shardKey: string } {
   return {
     rawKey: fakeToken(RAW_KEY_PREFIX, 'raw'),
@@ -817,7 +816,7 @@ function scriptLookups(recorder: SpawnRecorder, first: SpawnAnswer, second?: Spa
   recorder.answer(GH_AUTH_TOKEN_ARGV, first, { times: 1 })
 }
 
-describe('child process environments, the secret set and the token lookup (b.uqm SR-15.4, SR-15.1)', () => {
+describe('child process environments, the secret set and the token lookup', () => {
   let root: string
   let recorder: SpawnRecorder
 
@@ -1020,18 +1019,18 @@ describe('child process environments, the secret set and the token lookup (b.uqm
 })
 
 // ---------------------------------------------------------------------------
-// Constants (b.uqm SR-21.5): one pin case per constant
+// Constants: one pin case per constant
 // ---------------------------------------------------------------------------
 //
-// The only place E1's constant values are typed. Byte figures are written
-// from the PRD's GiB figures through `gib`, on the pinned `GIB_BYTES`.
+// The only place constant values are typed. Byte figures are written
+// under the documented contract's GiB figures through `gib`, on the pinned `GIB_BYTES`.
 
 /** `n` GiB in bytes. */
 function gib(n: number): number {
   return n * GIB_BYTES
 }
 
-/** One pin: the constant's name, its value as the runner exports it, and the PRD's or SRD's value. */
+/** One pin: the constant's name, its value as the runner exports it, and the contract's or contract's value. */
 const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
   // Section 1: entry and dependencies.
   ['REAL_PASSWORD_FILE', REAL_PASSWORD_FILE, '/etc/passwd'],
@@ -1144,7 +1143,7 @@ const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
   ['CI_REQUIRES_KEYWORD', CI_REQUIRES_KEYWORD, 'ci-requires:'],
   // Modes and child exits.
   ['RUN_DIR_MODE', RUN_DIR_MODE, 0o700],
-  // No PRD or SRD value: the runner's choice for the files it writes, owner-only.
+  // No contract or contract value: the runner's choice for the files it writes, owner-only.
   ['WRITTEN_FILE_MODE', WRITTEN_FILE_MODE, 0o600],
   ['SIGNAL_EXIT_STATUS_BASE', SIGNAL_EXIT_STATUS_BASE, 128],
   // Credentials.
@@ -1152,7 +1151,7 @@ const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
 ]
 
 /** The banner that opens the runner's section 3; every constant this block pins is exported above it. */
-const DATA_MODEL_BANNER = /^\/\/ 3\. Data model \(E1\)$/m
+const DATA_MODEL_BANNER = /^\/\/ 3\. Data model$/m
 
 /** The names of the `export const` declarations above section 3 of the runner (sections 1 and 2). */
 function exportedConstantsAboveDataModel(source: string): string[] {
@@ -1171,7 +1170,7 @@ function exportedConstantsAboveDataModel(source: string): string[] {
   return names
 }
 
-describe('constants (b.uqm SR-21.5)', () => {
+describe('constants', () => {
   test.each(CONSTANT_PINS)('pins %s', (_name, actual, expected) => {
     expect(actual).toEqual(expected)
   })
@@ -1186,12 +1185,12 @@ describe('constants (b.uqm SR-21.5)', () => {
 })
 
 // ===========================================================================
-// E2 region
+// region
 // ===========================================================================
 //
-// Validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-3.4,
-// SR-15.1; stage 7 of SR-2.4), PRD AC 15's validation half, AC 40 and AC 69.
-// Each case builds its worktree under its own `mkdtempSync` root with E1's
+// Validation stages 2–8 (
+// stage 7 of), contract validation half and.
+// Each case builds its worktree under its own `mkdtempSync` root with
 // worktree builder; texts the builder has no variant for (CRLF line ends, a
 // prerequisite line on line 1, an uppercase keyword, an unlistable directory,
 // an unreadable script) are written by this region's own factories, and a
@@ -1202,7 +1201,7 @@ describe('constants (b.uqm SR-21.5)', () => {
 // refused one through `main` with injected dependencies, its refusal read
 // back from `status.json`.
 
-// The E2 region's own imports: the names the file's first import block does not hold.
+// The region's own imports: the names the file's first import block does not hold.
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import {
   badCredentialReason,
@@ -1254,12 +1253,12 @@ import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
 
 /** Test data: the RUN_ID of every driven run, each in its own temp directory. */
-const E2_RUN_ID = '20261008t120000z-e2valid1'
+const VALIDATION_RUN_ID = '20261008t120000z-e2valid1'
 /** Test data: the runner's PID and user. */
-const E2_RUNNER_PID = 4343
-const E2_RUNNER_UID = 1000
+const VALIDATION_RUNNER_PID = 4343
+const VALIDATION_RUNNER_UID = 1000
 /** Test data: the runner's start. */
-const E2_START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
+const VALIDATION_START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
 
 /** The file names of real scripts `ns`, looked up by number in the repository's listing. */
 function files(...ns: readonly number[]): string[] {
@@ -1275,7 +1274,7 @@ function unitsOf(run: ValidatedRun): string[][] {
   return run.units.map((unit) => namesOf(unit.scripts))
 }
 
-/** The refusal a stage's failures give (b.uqm SR-2.6): kind null, the first reason the summary, each other one a detail line. */
+/** The refusal a stage's failures give: kind null, the first reason the summary, each other one a detail line. */
 function stageRefusalOf(reasons: readonly string[]): Refusal {
   const [summary, ...details] = reasons
   if (summary === undefined) throw new Error('stageRefusalOf: no reason')
@@ -1330,7 +1329,7 @@ function errorMessageOf(read: () => unknown): string {
   throw new Error('errorMessageOf: the read did not fail')
 }
 
-/** Fake credentials for a valid run (b.uqm SR-21.2). */
+/** Fake credentials for a valid run. */
 function validEnv(): ChildEnvironmentSource {
   return { ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: fakeToken('', 'gh') }
 }
@@ -1347,7 +1346,7 @@ function secretOfLength(suffix: string, length: number): string {
 
 const isRoot = process.getuid?.() === 0
 
-describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-3.4, SR-15.1)', () => {
+describe('validation: validation stages 2–8', () => {
   let root: string
   let recorders: SpawnRecorder[] = []
 
@@ -1383,7 +1382,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   /**
    * Main's world for one refused run: every dependency validation must not
    * reach records its use and throws. `signals` is the `onSignal`: main
-   * registers E13 T2's traps right after step 1, before validation, so every
+   * registers traps right after step 1, before validation, so every
    * run, a refused one included, registers them, and removes them before it
    * resolves.
    */
@@ -1399,7 +1398,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
 
   function mainRig(worktreeRoot: string, env: ChildEnvironmentSource): MainRig {
     const tempDir = mkdtempSync(join(root, 'tmp-'))
-    const clock = createFakeClock({ start: E2_START_MS })
+    const clock = createFakeClock({ start: VALIDATION_START_MS })
     const recorder = createSpawnRecorder({ clock })
     recorders.push(recorder)
     const forbiddenCalls: string[] = []
@@ -1415,8 +1414,8 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     const deps: RunnerDeps = {
       spawn: recorder.spawn,
       env: { ...env, TMPDIR: tempDir },
-      pid: E2_RUNNER_PID,
-      uid: E2_RUNNER_UID,
+      pid: VALIDATION_RUNNER_PID,
+      uid: VALIDATION_RUNNER_UID,
       worktreeRoot,
       lockDir,
       readPasswordFile: forbidden('readPasswordFile'),
@@ -1434,7 +1433,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
         stderr.push(text)
       },
     }
-    return { deps, recorder, forbiddenCalls, stderr, lockDir, runDir: runDirPath(deps.env, E2_RUN_ID), signals }
+    return { deps, recorder, forbiddenCalls, stderr, lockDir, runDir: runDirPath(deps.env, VALIDATION_RUN_ID), signals }
   }
 
   /**
@@ -1458,7 +1457,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   }
 
   /**
-   * The E2 driver for a refused run: steps 1 and 2 through `main` with injected
+   * The driver for a refused run: steps 1 and 2 through `main` with injected
    * dependencies over the worktree, arguments and environment. Fails the case
    * unless main exits with the refusal status, `status.json` holds phase
    * `refused` and the refusal `validateRun` gives, nothing was spawned and no
@@ -1469,7 +1468,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     const validation = validateRun(args, worktreeRoot, env)
     if (validation.ok) throw new Error(`validated: ${JSON.stringify(namesOf(validation.validated.runScripts))}`)
     const rig = mainRig(worktreeRoot, env)
-    const exit = await main([E2_RUN_ID, ...args], rig.deps)
+    const exit = await main([VALIDATION_RUN_ID, ...args], rig.deps)
     const status = readStatusFile(rig.runDir)
     const logText = readFileSync(join(rig.runDir, RUNNER_LOG_FILE_NAME), 'utf-8')
     assertNoLeak({ validation, status, stderr: rig.stderr, runDir: writtenFile(rig.runDir) })
@@ -1500,10 +1499,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   }
 
   // -------------------------------------------------------------------------
-  // T5.S1: discovery, naming, duplicate numbers and a missing test-1 (SR-2.3; stages 2–4)
+  // .S1: discovery, naming, duplicate numbers and a missing test-1 (stages 2–4)
   // -------------------------------------------------------------------------
 
-  describe('discovery, naming, duplicate numbers and a missing test-1 (b.uqm SR-2.3)', () => {
+  describe('discovery, naming, duplicate numbers and a missing test-1', () => {
     test('only regular files matching test-*.sh are scripts: other files, directories and links in tests/integration are ignored', () => {
       const wt = worktree({
         extraScripts: ['helper.sh', 'notes.txt', 'xtest-3.sh'],
@@ -1622,10 +1621,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 
   // -------------------------------------------------------------------------
-  // T5.S2: the selection stage and the run's scripts (SR-2.3; stage 5)
+  // .S2: the selection stage and the run's scripts (stage 5)
   // -------------------------------------------------------------------------
 
-  describe("the selection and the run's scripts (b.uqm SR-2.3, Terms)", () => {
+  describe("the selection and the run's scripts (Terms)", () => {
     test('a number form matches only exactly that number: test-2 selects test-2, never test-20', () => {
       expect(realScriptNumbers()).toContain(20)
 
@@ -1676,10 +1675,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 
   // -------------------------------------------------------------------------
-  // T5.S3: prerequisite lines and header refusals (SR-3.1, SR-3.2; stage 6)
+  // .S3: prerequisite lines and header refusals (stage 6)
   // -------------------------------------------------------------------------
 
-  describe('prerequisite lines and header refusals (b.uqm SR-3.1, SR-3.2)', () => {
+  describe('prerequisite lines and header refusals', () => {
     const ACCEPTED_LINE_ROWS: readonly (readonly [string, () => PrerequisiteLine, readonly number[]])[] = [
       ['spaces between # and the keyword', () => ({ names: [5], afterHash: '   ' }), [5]],
       ['tabs between # and the keyword', () => ({ names: [5], afterHash: '\t\t' }), [5]],
@@ -1800,10 +1799,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 
   // -------------------------------------------------------------------------
-  // T5.S4: scheduling units, the effective N and the current tree (SR-3.4, SR-3.5)
+  // .S4: scheduling units, the effective N and the current tree
   // -------------------------------------------------------------------------
 
-  describe('scheduling units, the effective N and the current tree (b.uqm SR-3.4, SR-3.5)', () => {
+  describe('scheduling units, the effective N and the current tree', () => {
     const UNIT_ROWS: readonly (readonly [string, Readonly<Record<number, readonly PrerequisiteLine[]>>, () => readonly string[], () => readonly (readonly number[])[]])[] = [
       [
         'scripts with no link are one unit each, and test-1 is in none',
@@ -1826,9 +1825,9 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     })
 
     test.each([
-      // PRD AC 15: `/ci test-1` gets an effective N of 1, the lowest N.
+      // contract `/ci test-1` gets an effective N of 1, the lowest N.
       ['/ci test-1: no units, so the lowest N', () => [numberForm(1)], () => ({ requested: MAX_SHARDS, units: 0, effective: OPTION_RANGE_MIN })],
-      // PRD AC 15: the inputs of `shards: 2 of 4 (2 scheduling unit(s))`.
+      // contract the inputs of `shards: 2 of 4 (2 scheduling unit(s))`.
       ['--shards 4 over 2 units: the unit count', () => ['--shards', '4', numberForm(5), numberForm(6)], () => ({ requested: 4, units: 2, effective: 2 })],
       ['--shards 2 over 3 units: the requested N', () => ['--shards', '2', numberForm(5), numberForm(6), numberForm(7)], () => ({ requested: 2, units: 3, effective: 2 })],
       ['a default run over many units: the default', () => [], () => ({ requested: MAX_SHARDS, units: realScriptNumbers().length - 1, effective: MAX_SHARDS })],
@@ -1857,10 +1856,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 
   // -------------------------------------------------------------------------
-  // T5.S5: stage 7, the faults' scripts and shard numbers (SR-2.4)
+  // .S5: stage 7, the faults' scripts and shard numbers
   // -------------------------------------------------------------------------
 
-  describe("stage 7: the faults' scripts and shard numbers (b.uqm SR-2.4)", () => {
+  describe("stage 7: the faults' scripts and shard numbers", () => {
     /** A fault-script failure: its reason builder, the fault as typed and its script as typed. */
     type FaultScriptFailure = readonly [typeof faultScriptMissingReason, string, string]
 
@@ -1944,10 +1943,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 
   // -------------------------------------------------------------------------
-  // T5.S6: the step-2 credentials (SR-15.1; stage 8)
+  // .S6: the step-2 credentials (stage 8)
   // -------------------------------------------------------------------------
 
-  describe('the step-2 credentials (b.uqm SR-15.1)', () => {
+  describe('the step-2 credentials', () => {
     /** The variable a missing credential names. */
     const API_KEY_NAME = 'ANTHROPIC_API_KEY'
 
@@ -2011,12 +2010,12 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       const env: ChildEnvironmentSource = { ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: GATEWAY_URL }
       expect(validated(wt, [], env).effectiveShards).toBe(MAX_SHARDS)
       const rig = mainRig(wt, env)
-      // The valid run goes on to step 3 (E13); docker answering down refuses it there, so its first child is
+      // The valid run goes on to step 3 ; docker answering down refuses it there, so its first child is
       // step 3's docker check and every child before that one is validation's.
       const dockerDown = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'
       rig.recorder.answer(dockerAnswersArgs(), { exitCode: 1, stderr: dockerDown }, { times: 1 })
 
-      const exit = await main([E2_RUN_ID], rig.deps)
+      const exit = await main([VALIDATION_RUN_ID], rig.deps)
 
       expect(exit).toBe(REFUSAL_EXIT_STATUS)
       expect(readStatusFile(rig.runDir)?.refusal).toEqual(dockerDownRefusal(dockerDown))
@@ -2029,10 +2028,10 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 
   // -------------------------------------------------------------------------
-  // T5.S7: stage order, detail-line order and the recorded refusal (SR-2.6, SR-5.3 step 2)
+  // .S7: stage order, detail-line order and the recorded refusal (step 2)
   // -------------------------------------------------------------------------
 
-  describe('stage order, detail-line order and the recorded refusal (b.uqm SR-2.6, SR-5.3)', () => {
+  describe('stage order, detail-line order and the recorded refusal', () => {
     /** A cycle between test-5 and test-6. */
     const CYCLE_5_6: Readonly<Record<number, readonly PrerequisiteLine[]>> = { 5: [{ names: [6] }], 6: [{ names: [5] }] }
 
@@ -2134,7 +2133,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
         reasons: () => [unmatchedScriptReason('test-999'), unmatchedScriptReason(wrongSlugFileName(5)), unmatchedScriptReason('test-998')],
       },
       {
-        label: "stage 6, the headers: the declaring script's canonical order, then b.uqm SR-3.2's order, a cycle declared by its first script",
+        label: "stage 6, the headers: the declaring script's canonical order, then order, a cycle declared by its first script",
         options: () => ({
           prerequisites: {
             3: [{ names: [7, 'test-996'] }],
@@ -2199,9 +2198,9 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
   })
 })
 
-// b.omv SR-14.7: the selected model is public routing data, never a scan value.
+// the selected model is public routing data, never a scan value.
 import { SHARD_ENV_NAMES, NON_SECRET_VARIABLES, scannedSecretValues } from '../scripts/ci-run.ts'
-test('E7: Codex model has one plain shard variable and cannot enter the secret set', () => {
+test('the memory guard: Codex model has one plain shard variable and cannot enter the secret set', () => {
   const env = { CODEX_TEST_MODEL: 'test/model:1', ANTHROPIC_API_KEY: fakeToken('', 'model-control') }
   expect(SHARD_ENV_NAMES.filter(name => name === 'CODEX_TEST_MODEL')).toHaveLength(1)
   expect(NON_SECRET_VARIABLES).toContain('CODEX_TEST_MODEL')

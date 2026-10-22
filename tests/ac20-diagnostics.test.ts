@@ -30,7 +30,7 @@ async function observe(options: { initial?: number; start?: number; completion?:
   safe(rows); return { result, now, rows, checks }
 }
 
-describe('AC20 original completion deadline and diagnostic-only observation', () => {
+describe('original completion deadline and diagnostic-only observation', () => {
   test.each([0, 179000, 180000])('completion at %i stays within the original assertion', async completion => {
     const result = await observe({ completion }); expect(result.result).toBe(true); expect(result.now).toBe(completion)
     expect(result.rows.at(-1)?.event).toBe('completed_within_180s'); expect(result.rows.some(row => row.event === 'failed_180s')).toBe(false)
@@ -192,7 +192,7 @@ describe('passive local diagnostic gateway', () => {
 })
 
 describe('scenario and original oracle wiring', () => {
-  test('diagnostic scope precedes intake; only AC20 explicit gate changes its wait', () => {
+  test('diagnostic scope precedes intake; only explicit gate changes its wait', () => {
     const scope = scenario.indexOf('real_ac20_diagnostic_case "${n}"'), push = scenario.indexOf('slack_stub_push "${REAL_LABEL}" "${EVENT}"'), delivery = scenario.indexOf('real_wait_delivery "${REAL_KEY}" "${n}"'), wait = scenario.indexOf('real_ac20_diagnostic_readback "${EXPECTED}/${n}.json" "${n}"')
     expect(scope).toBeGreaterThan(0); expect(scope).toBeLessThan(push); expect(push).toBeLessThan(delivery); expect(delivery).toBeLessThan(wait)
     expect(scenario.match(/\[\[ "\$\{AI_CRITERION\}" == 20 && "\$\{REAL_AGENT_AC20_DIAGNOSTICS:-\}" == decision21c \]\]/g)).toHaveLength(2)

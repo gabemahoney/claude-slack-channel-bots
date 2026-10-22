@@ -1,6 +1,6 @@
 /**
- * secrecy-audit.test.ts — Repo-level credential-secrecy audit (b.av2 SR-10.3
- * closing audit, SR-13.2; AC 20; b.deo SRI-907).
+ * secrecy-audit.test.ts — Repo-level credential-secrecy audit (
+ * closing audit).
  *
  * A static audit of the repository's test and source files, in the pattern
  * of the getClient() allowlist audit (tests/outage-state.test.ts case 22). It
@@ -11,7 +11,7 @@
  *
  * Rules:
  *
- * 1. Named legs (AC 20). The config, connection (`persona-connections`),
+ * 1. Named legs. The config, connection (`persona-connections`),
  *    reload and reload-apply suites each import `assertNoLeak` from the
  *    credentials helper and call it. On top of that: `config` rejects a
  *    persona entry holding a fake token under `bot_token` and under
@@ -45,7 +45,7 @@
  *    unusable-name answers, the pending-row rule, whose lines quote
  *    the lap's and the run's agent-director outcomes, the clear-latch
  *    route, whose clear-failed line carries a clear by hand's rejection, and
- *    the stored-choice store (b.deo SRI-907), whose record holds each
+ * the stored-choice store, whose record holds each
  *    persona's declaration, a credentials file's path among them, and which
  *    logs its read and write failures), a value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
@@ -66,8 +66,8 @@
  *    letter case) appears only in tests/test-helpers/credentials.ts. This file
  *    builds its patterns from identifiers and imported constants, so it holds
  *    neither.
- * 5. A caught error's text reaches a log line only redacted (E14 Task 0,
- *    operator decision B1, replacing E13 Director decision 16's "messages
+ * 5. A caught error's text reaches a log line only redacted ( section 0,
+ * operator decision B1, replacing The current rule's "messages
  *    dropped"). Log lines keep an error's message, but only through
  *    `redactSlackLogText` (URL-like and token-like text replaced) or a safe
  *    describer that applies it (`SAFE_DESCRIBERS`: `describeThrownValue` and
@@ -131,8 +131,8 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-lifecycle\.ts$/, 'the persona lifecycle, which tears down, brings up and reconnects personas on a confirmed change'],
   [/^src\/slack-log-redaction\.ts$/, 'the Slack log redactor, whose input can hold tokens and URLs'],
   [/^src\/reload[\w-]*\.ts$/, 'the reload controller, preview or apply'],
-  // The modules the E13 raw-error sweep touched whose output carries an agent-director or Slack failure's text (now
-  // kept, redacted) to a log, a startup error, a Slack post or an MCP tool result (E13 carry, E14 Task 0).
+  // The modules the raw-error sweep touched whose output carries an agent-director or Slack failure's text (now
+  // kept, redacted) to a log, a startup error, a Slack post or an MCP tool result ( carry, section 0).
   [/^src\/registry\.ts$/, "the MCP registry, whose tool results carry a Slack call's failure text back to the session"],
   [/^src\/session-manager\.ts$/, "the session manager, whose launch lines, startup errors and spawn-failure notices carry agent-director failure text"],
   [/^src\/restart\.ts$/, "the restart path, whose lines and notices carry agent-director failure text"],
@@ -160,9 +160,9 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/pending-row\.ts$/, "the pending-row rule, whose round, gate and failure lines quote the lap's and the bypassing run's agent-director outcomes (described, redacted) and whose lap Enter outcomes keep the thrown agent-director error raw"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
   [/^src\/clear-latch\.ts$/, "the clear-latch route and the server.port record, whose clear-failed line carries a clear by hand's rejection (described, redacted), which can be agent-director failure text"],
-  // b.fc4: the state directory move walks the directory that holds the credentials files and the config, and logs paths and errors.
+  // the state directory move walks the directory that holds the credentials files and the config, and logs paths and errors.
   [/^src\/state-dir-migration\.ts$/, "the state directory move, which compares and moves the files of the state directory (the credentials files among them) and logs only their names and errors"],
-  // b.deo SRI-907: the stored-choice file holds the credentials file's path, never its content.
+  // the stored-choice file holds the credentials file's path, never its content.
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
 ]
 
@@ -210,7 +210,7 @@ const EXEMPT: Record<string, string> = {
     "the click handler's emitBlockActionReceived over encoded action IDs and fixed channel and user IDs, captured as trail events; no input holds a token or credentials content",
 }
 
-/** The AC 20 named legs: suites that must call `assertNoLeak`, with their extra content rules. */
+/** The named legs: suites that must call `assertNoLeak`, with their extra content rules. */
 const NAMED_LEGS = [
   'tests/config.test.ts',
   'tests/persona-connections.test.ts',
@@ -379,7 +379,7 @@ const LEG_RULES: Record<string, [string, (code: string, file: string) => boolean
   'tests/reload-apply.test.ts': [["a run's captured() artifacts are leak-checked", (_code, file) => leakChecksCaptured(file)]],
 }
 
-describe('AC 20 named legs (b.av2 SR-10.3 closing audit)', () => {
+describe('named legs (closing audit)', () => {
   test.each(NAMED_LEGS)('%s imports assertNoLeak from the credentials helper, calls it, and holds its leg', (file) => {
     const failures = SUITES.includes(file)
       ? [
@@ -446,7 +446,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(consumers.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(consumers.map(file => [file, true, false]))
   })
 
-  // b.jg5 SRJ-501, SRJ-507: the conflict latch's lines and record carry text from agent-director's CONFLICT description.
+  // the conflict latch's lines and record carry text from agent-director's CONFLICT description.
   const LATCH_SUITE = 'tests/some-latch-user.test.ts'
   test.each<[string, string, boolean]>([
     ['a named value import of its factory', "import { createConflictLatch } from '../src/conflict-latch.ts'", true],
@@ -470,7 +470,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(exemptForLatch).toEqual([])
   })
 
-  // b.jg5 SRJ-110, SRJ-701: a kill outcome keeps the thrown agent-director error and its description raw, and its
+  // a kill outcome keeps the thrown agent-director error and its description raw, and its
   // rendering carries the described failure text to log lines and startup errors.
   test('src/checked-kill.ts is a source surface: its functions touch, its constants alone do not, and its suite leak-checks with no exemption', () => {
     const suite = 'tests/checked-kill.test.ts'
@@ -485,7 +485,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(exemptForKill).toEqual([])
   })
 
-  // b.jg5 SRJ-702, SRJ-1014: each try's and each read's line carries the described agent-director failure, and the
+  // each try's and each read's line carries the described agent-director failure, and the
   // alert decision keeps the kill-failure descriptions raw for the alert to redact.
   test('src/kill-retry.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/kill-retry.test.ts'
@@ -500,7 +500,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  // b.jg5 SRJ-704, SRJ-1007: the alert's texts quote agent-director's kill-failure descriptions (redacted) in posts,
+  // the alert's texts quote agent-director's kill-failure descriptions (redacted) in posts,
   // log lines and startup-errors entries.
   test('src/kill-failure-alert.ts is a source surface: its builders touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/kill-failure-alert.test.ts'
@@ -515,7 +515,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  // b.jg5 SRJ-705, SRJ-1014: each step's line carries the described agent-director failure (a failed get, a kill's
+  // each step's line carries the described agent-director failure (a failed get, a kill's
   // outcome), and a kill's result keeps the kill-failure descriptions raw for the alert to redact.
   test('src/live-row-sequence.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/live-row-sequence.test.ts'
@@ -530,7 +530,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
   })
 
-  // b.jg5 SRJ-811, SRJ-1002, SRJ-1013: a round's CONFLICT and unusable-name answers reach a log line and a
+  // a round's CONFLICT and unusable-name answers reach a log line and a
   // `persona-teardown-notice` entry (described, redacted), and its answers keep the thrown errors raw.
   test('src/old-life-wait.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/some-old-life-wait-user.test.ts'
@@ -543,7 +543,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  // b.jg5 SRJ-207, SRJ-1008: the hold posts its operator alert and logs the versions agent-director reported, and
+  // the hold posts its operator alert and logs the versions agent-director reported, and
   // its reactions log a failing step's error, described.
   test('src/invalid-flags-hold.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/ad-version-gate.test.ts'
@@ -558,7 +558,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  // b.jg5 SRJ-117: a read-pane failure outcome carries the described agent-director failure to its callers' log lines.
+  // a read-pane failure outcome carries the described agent-director failure to its callers' log lines.
   test('src/pane-read.ts is a source surface: its mapper touches, its constants alone do not, and its suite leak-checks with no exemption', () => {
     const suite = 'tests/pane-read.test.ts'
     expect(touchReasonsOf(suite, "import { paneReadFailureOf } from '../src/pane-read.ts'").length).toBe(1)
@@ -567,7 +567,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
   })
 
-  // b.jg5 SRJ-410, SRJ-117: the pending-row rule's round, gate and failure lines quote the lap's and the run's
+  // the pending-row rule's round, gate and failure lines quote the lap's and the run's
   // agent-director outcomes (described, redacted), and a lap Enter's latching outcome keeps the thrown error raw.
   test('src/pending-row.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/pending-row.test.ts'
@@ -583,7 +583,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  // b.jg5 SRJ-901, SRJ-903: a precheck failure line, and a teardown verdict or outcome, carries the described
+  // a precheck failure line, and a teardown verdict or outcome, carries the described
   // agent-director failure to the terminal and clean_restart.log.
   test('src/cli-teardown.ts is a source surface: its verdict and line builders touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/cli-teardown.test.ts'
@@ -599,7 +599,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  // b.deo SRI-907: the stored-choice store's record holds each persona's declaration (a credentials file's path,
+  // the stored-choice store's record holds each persona's declaration (a credentials file's path,
   // never its content), and its read and write failures reach log lines.
   test('src/channel-delivery.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/channel-delivery.test.ts'
@@ -620,7 +620,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
   })
 
-  // b.deo SRI-907: the stored-choice file the helper writes holds persona declarations.
+  // the stored-choice file the helper writes holds persona declarations.
   test("the stored-choice helper's writeChannelDeliveryRecord touches, its other exports do not, and every suite that imports it leak-checks with no exemption", () => {
     const suite = 'tests/channel-delivery.test.ts'
     expect(touchReasonsOf(suite, "import { writeChannelDeliveryRecord as seed } from './test-helpers/channel-delivery.ts'")).toEqual([
@@ -668,7 +668,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
   })
 })
 
-describe('no token literal under tests/ (b.av2 SR-13.2, TEST-1)', () => {
+describe('no token literal under tests/ (TEST-1)', () => {
   const tokenLike = new RegExp(TOKEN_LIKE.source)
   const sentinel = LEAK_SENTINEL.toLowerCase()
 
@@ -701,7 +701,7 @@ describe('no token literal under tests/ (b.av2 SR-13.2, TEST-1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Rule 5: a caught error's text reaches a log line under src/ only redacted (E14 Task 0, decision B1)
+// Rule 5: a caught error's text reaches a log line under src/ only redacted ( section 0, decision B1)
 // ---------------------------------------------------------------------------
 
 /** Every `.ts` file under src/, repo-relative, in sorted order. */
@@ -976,7 +976,7 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
   },
 ]
 
-describe("a caught error's text reaches a log line under src/ only redacted (E14 Task 0, decision B1)", () => {
+describe("a caught error's text reaches a log line under src/ only redacted (section 0, decision B1)", () => {
   const findings = SOURCE_FILES.flatMap((file) => rawErrorFindings(codeOf(file)).map((finding) => ({ file, ...finding })))
   const allows = (entry: (typeof RAW_ERROR_ALLOWED)[number], f: (typeof findings)[number]): boolean =>
     entry.file === f.file && f.call.includes(entry.anchor)

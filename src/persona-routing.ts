@@ -1,4 +1,4 @@
-/** Durable Slack intake and existing message-triggered recovery (b.omv SR-4.1/4.2). */
+/** Durable Slack intake and existing message-triggered recovery. */
 import {
   CHANNEL_ID_RE,
   DEFAULT_QUEUED_ACK_REACTION,
@@ -52,7 +52,7 @@ const NO_AUTHOR_PLACEHOLDER = '(none)'
 /** The `type` of an `app_mention` event. */
 const APP_MENTION_EVENT_TYPE = 'app_mention'
 
-/** The channel mode in which a persona serves the channels its app is in (b.deo SRI-101). */
+/** The channel mode in which a persona serves the channels its app is in. */
 const FUNGIBLE_MODE: ChannelMode = 'fungible'
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ export type SlackAck = () => Promise<void> | void
 /**
  * The persona config fields this module reads: the personas, the restart
  * delay, and the `allow_invited_channels` switch, read through
- * `channelModeOf` at each event (b.deo SRI-201).
+ * `channelModeOf` at each event.
  */
 export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'allow_invited_channels'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
 
@@ -78,9 +78,9 @@ export interface PersonaRoutingDeps {
    * run), or undefined when it is not known.
    */
   getBotIdentity(key: string): SlackBotIdentity | undefined
-  /** Shared queue; acceptance does no network I/O (b.omv SR-3.3). */
+  /** Shared queue; acceptance does no network I/O. */
   queue: Pick<DeliveryQueue, 'accept' | 'lookupSlackKey'>
-  /** Fix stored text after the envelope ack; E3's wake follows durable fixation. */
+  /** Fix stored text after the envelope ack; wake follows durable fixation. */
   prepare(key: string, item: QueueItem): Promise<void>
   /** Durable retained acceptance: after envelope ack, or after partial-fanout
    * failure suppresses it. Reporting must not await Slack or authorize delivery. */
@@ -92,7 +92,7 @@ export interface PersonaRoutingDeps {
   /** Intake clock in epoch milliseconds. */
   now?: () => number
   /**
-   * The stored choices (b.deo SRI-305, SRI-403): the store's readability and
+   * The stored choices: the store's readability and
    * its read-only lookup, which the one store `main()` loads
    * (`src/channel-delivery.ts`) satisfies as it is. Read at each
    * fungible-mode event, never held across events; the routing never writes
@@ -102,24 +102,24 @@ export interface PersonaRoutingDeps {
    */
   getChannelDelivery?(): StoredChoices | null | undefined
   /**
-   * Whether persona P is up (b.av2 SR-6.4; production: the server's one
+   * Whether persona P is up (production: the server's one
    * `isPersonaUp` predicate), asked for a lost message only: a message lost
    * for a persona that is not up schedules no restart and reports the
    * `not-up` recovery state. Without it every persona counts as up.
    */
   isPersonaUp?(key: string): boolean
-  // The lost-message state inputs (b.jg5 SRJ-1011), each asked for a lost
+  // The lost-message state inputs, each asked for a lost
   // message only, with P's key at that time. An absent member answers false,
   // except `isRetryArmed`, whose absence leaves state 5 without its
   // armed-timer gate (its restart-cap gate is always asked).
   /**
-   * Whether persona P is latched (b.jg5 SRJ-502; production: the server's one
+   * Whether persona P is latched (production: the server's one
    * latch's `isLatched`, which covers every declared case): a message lost
    * while it is latched reports `held-for-human`.
    */
   isLatched?(key: string): boolean
   /**
-   * Whether persona P's `tmux-unresponsive` condition holds (b.jg5 SRJ-307;
+   * Whether persona P's `tmux-unresponsive` condition holds (
    * production: the condition's `holds`): a message lost while it holds
    * reports `not-answering`, as does one lost while P's `tmux-unavailable` or
    * `ad-config-malformed` outage is raised (read from the outage state), in
@@ -128,11 +128,11 @@ export interface PersonaRoutingDeps {
    */
   isTmuxUnresponsive?(key: string): boolean
   /**
-   * Whether persona P's retry timer is armed, waiting or running (b.jg5
-   * SRJ-1011 as amended: "state 5 applies only while P's retry timer is
+   * Whether persona P's retry timer is armed, waiting or running (
+   * : "state 5 applies only while P's retry timer is
    * armed"; production: the retry controller's `isArmed`, false when there
    * is no controller). State 5 (`not-answering`) is decided only while it
-   * answers exactly true and P is below the restart cap (SRJ-305), so a P
+   * answers exactly true and P is below the restart cap, so a P
    * whose retry timer stopped, or one at the cap whose timer is still armed
    * until its next retry, is not reported as being retried and falls
    * through to the later states. Asked by the read gate's check of states 1
@@ -144,7 +144,7 @@ export interface PersonaRoutingDeps {
   /**
    * Whether a launch or dialog approver for persona P is running, so its row
    * reads `pending` (production: the session manager's `isLaunchInFlight`
-   * or `isDialogApproverRunning`, b.jg5 SRJ-401): a message lost then reports
+   * or `isDialogApproverRunning`): a message lost then reports
    * `session-starting`, unless an earlier state applies.
    */
   isLaunchRunning?(key: string): boolean
@@ -162,7 +162,7 @@ export interface PersonaRoutingDeps {
    */
   isSequenceOrWaitRunning?(key: string): boolean
   /**
-   * Whether anything is in flight for persona P (b.jg5 SRJ-1011, "in flight
+   * Whether anything is in flight for persona P ("in flight
    * for P"; production: the server's `isPersonaWorkInFlight`, the one the
    * health tick receives, which counts a running dialog approver; the retry
    * timer receives the narrower "blocks a retry" check instead). While it
@@ -172,7 +172,7 @@ export interface PersonaRoutingDeps {
   isWorkInFlight?(key: string): boolean
   /**
    * One read of persona P's row, answering one of the four liveness readings
-   * (b.jg5 SRJ-314, SRJ-1011; production: the liveness adapter main() builds,
+   * (production: the liveness adapter main builds,
    * whose `status` is made outside any launch or recovery attempt here; the
    * answer is read with `livenessKindOf`, so a value that is not a reading
    * counts as `unknown`). Made
@@ -183,7 +183,7 @@ export interface PersonaRoutingDeps {
    */
   readRowLiveness?(key: string): Promise<LivenessReading>
   /**
-   * b.jg5 SRJ-311: arm persona P's retry timer when its `tmux-unavailable`
+   * arm persona P's retry timer when its `tmux-unavailable`
    * outage is raised and it has none (production: the server's one check,
    * shared with the session-disconnect handler, which arms only when no
    * timer is armed, P is not latched and nothing is in flight for P, and
@@ -191,12 +191,12 @@ export interface PersonaRoutingDeps {
    * is decided, only when none of states 1 to 4 applies, state 5's condition
    * holds (P's `tmux-unresponsive` condition, or its `tmux-unavailable` or
    * `ad-config-malformed` flag), P's `tmux-unavailable` flag is raised and P
-   * is below the restart cap (SRJ-305): so a P whose retry stopped with the
+   * is below the restart cap: so a P whose retry stopped with the
    * flag still raised gets its timer armed and reports `not-answering`
    * (state 5 applies only while P's retry timer is armed, `isRetryArmed`).
    * At the cap nothing is armed: a timer armed there would stop at its first
    * retry, and a P at the cap is never in state 5. It never schedules a
-   * restart (SRJ-1501). Absent: nothing is armed.
+   * restart. Absent: nothing is armed.
    */
   armRetryTimerIfMissing?(key: string): void
 }
@@ -209,7 +209,7 @@ export interface PersonaRouting {
    * targets, ack only after every store succeeds, then recover and fix text.
    * Each target is isolated; a failed store suppresses the aggregate ack.
    *
-   * `isExtSharedChannel` is the envelope flag (b.deo SRI-301): the Events API
+   * `isExtSharedChannel` is the envelope flag: the Events API
    * payload's `is_ext_shared_channel`, exactly as the event router received
    * it (`true`, `false`, any other value), or undefined when it was absent. A
    * caller that omits it passes "absent". It is handed unchanged to the
@@ -223,11 +223,11 @@ export interface PersonaRouting {
   ): Promise<void>
   /**
    * Forget ephemeral heard-channel state on teardown. Durable queue records
-   * and Slack keys remain under their original persona key (b.omv SR-3.7).
+   * and Slack keys remain under their original persona key.
    */
   forget(key: string): void
   /**
-   * A snapshot of the persona's heard set (b.deo SRI-307): the channels whose
+   * A snapshot of the persona's heard set: the channels whose
    * events took its fungible path in its current persona life. Empty for an
    * unknown or forgotten key; creates no state. The "heard" half of
    * `set_channel_delivery`'s known channels.
@@ -323,7 +323,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             if (result.item && !result.item.delivered) { report(result.item); afterAck.push(post(result.item)) }
           } catch { storeFailed = true }
         } catch (err) {
-          // Decision/routing failures keep the historical ack behavior (SR-4.1).
+          // Decision/routing failures keep the historical ack behavior.
           deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
         }
       }))
@@ -339,7 +339,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * The decision's fungible-mode inputs (b.deo SRI-301, SRI-305, SRI-309),
+   * The decision's fungible-mode inputs,
    * built only in fungible mode, from the configuration in effect and the
    * stored choices read now: the mode, the envelope flag as received,
    * `CHANNEL_ID_RE`, the stored choices, and each applied persona's
@@ -363,7 +363,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * b.deo SRI-307: the first event in P's life that took P's fungible path
+   * the first event in P's life that took P's fungible path
    * for `channel` adds it to P's heard set and logs one
    * `persona-invited-channel` line, before any drop line or dispatch. Later
    * events from that channel log nothing here.
@@ -389,7 +389,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const channel = String(ev['channel'])
     switch (decision.reason) {
       case 'channel-not-configured':
-        // A channel another applied persona lists is that persona's: no line (AC 52).
+        // A channel another applied persona lists is that persona's: no line.
         if (!decision.unclaimed) return
         deps.log(formatPersonaDiagnostic({
           class: UNCLAIMED_CHANNEL,
@@ -400,7 +400,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         }))
         return
       case 'fungible-refused':
-        // b.deo SRI-903: one line naming the refusal's reason.
+        // one line naming the refusal's reason.
         deps.log(formatPersonaDiagnostic({
           class: UNCLAIMED_CHANNEL,
           name: persona.name,
@@ -426,7 +426,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
   }
 
-  /** Existing recovery state/row read, only after durable acceptance and ack (SR-4.2). */
+  /** Existing recovery state/row read, only after durable acceptance and ack. */
   async function handleLostMessage(
     persona: Persona,
     cwd: string,
@@ -434,7 +434,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   ): Promise<void> {
     const key = persona.key
     const early = earlyQueries(key)
-    // b.jg5 SRJ-311: arm a stopped retry first, so the gated check sees it.
+    // arm a stopped retry first, so the gated check sees it.
     armStoppedRetryBeforeDecision(key)
     const readRow = shouldReadRow(key, early)
     const rowReadPending = readRow ? await readRowOnce(persona) : false
@@ -454,7 +454,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * The queries of states 1 to 5 (b.jg5 SRJ-1011) for persona `key`, each
+   * The queries of states 1 to 5 for persona `key`, each
    * asked at call time, so the gate and the final decision both read fresh
    * answers. State 5's query is gated on the restart cap and P's retry
    * timer (`isNotAnswering`).
@@ -466,7 +466,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
   }
 
-  /** The queries of states 1 to 4 (b.jg5 SRJ-1011) for persona `key`, each asked at call time. */
+  /** The queries of states 1 to 4 for persona `key`, each asked at call time. */
   function earlyQueriesBeforeState5(key: string): EarlyLostMessageQueries {
     return {
       isNotUp: () => deps.isPersonaUp?.(key) === false,
@@ -477,14 +477,14 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * b.jg5 SRJ-311, asked before a lost message's state is decided: when the
+   * asked before a lost message's state is decided: when the
    * state would be `not-answering` but for the retry-timer gate (none of
    * states 1 to 4 applies and state 5's condition holds), P's
    * `tmux-unavailable` flag is raised and P is below the restart cap
-   * (SRJ-305), ask `armRetryTimerIfMissing` for P, so the gated decision
+   * ask `armRetryTimerIfMissing` for P, so the gated decision
    * that follows sees the timer it armed. At the cap nothing is armed: a
    * timer armed there would stop at its first retry, and P reports
-   * `restart-limit-reached`. Never schedules a restart (SRJ-1501).
+   * `restart-limit-reached`. Never schedules a restart.
    */
   function armStoppedRetryBeforeDecision(key: string): void {
     const arm = deps.armRetryTimerIfMissing
@@ -497,7 +497,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * The read gate (b.jg5 SRJ-1011): true when the row read is injected, none
+   * The read gate: true when the row read is injected, none
    * of states 1 to 5 applies (`decideEarlyLostMessageState`), no launch or
    * approver for P runs, no live-row sequence or old-life wait step runs for
    * P, and nothing is in flight for P.
@@ -511,12 +511,12 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * The one row read of P for a lost message (b.jg5 SRJ-1011): true when it
+   * The one row read of P for a lost message: true when it
    * answers `pending` (the `session-starting` input). Any other reading
    * (`live`, `dead`, `unknown`) leaves that state out, and so does a
    * rejection, which is caught, logged once with its description redacted
    * (`describeAgentDirectorFailure`) and never thrown. The read is outside
-   * any launch or recovery attempt (b.jg5 SRJ-105, SRJ-115): the reader
+   * any launch or recovery attempt: the reader
    * decides what its answer raises or arms, and this module only reads the
    * reading. The restart path's own read still keeps any launch off a
    * `pending` row after a failed read here.
@@ -537,9 +537,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * b.jg5 SRJ-1011 state 5 (as amended: "state 5 applies only while P's
+   * state 5 ("state 5 applies only while P's
    * retry timer is armed"): state 5's condition holds for persona `key`
-   * (`notAnsweringConditionHolds`), P is below the restart cap (SRJ-305,
+   * (`notAnsweringConditionHolds`), P is below the restart cap (
    * `isAtCap(key, RESTART_FAILURE_CAP)`) and its retry timer is armed
    * (`isRetryArmed` answers exactly true). A P at the cap is never in state
    * 5, even while a timer is still armed for it (that timer stops at its
@@ -554,10 +554,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * State 5's condition (b.jg5 SRJ-1011), before the cap and retry-timer gates:
+   * State 5's condition, before the cap and retry-timer gates:
    * persona `key`'s `tmux-unresponsive` condition holds, or its
-   * `tmux-unavailable` or `ad-config-malformed` outage flag is raised (b.jg5
-   * SRJ-311, SRJ-316). No other outage class and no unclassified-error
+   * `tmux-unavailable` or `ad-config-malformed` outage flag is raised. No other outage class and no unclassified-error
    * episode counts.
    */
   function notAnsweringConditionHolds(key: string): boolean {
@@ -575,7 +574,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 }
 
-/** The fungible-path part of a decision (b.deo SRI-309), or undefined when the event did not take the path. */
+/** The fungible-path part of a decision, or undefined when the event did not take the path. */
 function fungiblePathOf(decision: DeliveryDecision): FungiblePath | undefined {
   return 'fungible' in decision ? decision.fungible : undefined
 }

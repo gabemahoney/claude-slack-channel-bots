@@ -1,17 +1,17 @@
 /**
  * test-helpers/credentials.ts — Shared credentials fixtures and leak checks
- * (b.av2 SR-13.4).
+ *
  *
  * - `LEAK_SENTINEL` is a marker every fake token embeds, so a leaked value is
  *   easy to spot in any captured artifact.
  * - `fakeToken` builds a sentinel-bearing fake token at runtime from a prefix,
- *   so no file (this one included) needs a token literal (b.av2 SR-13.2).
+ * so no file (this one included) needs a token literal.
  * - `sentinelInMessage` / `REDACTED_SENTINEL_TAIL` are the one way a test
  *   error's message carries the sentinel (inside a fake token and a Socket
  *   Mode `?ticket=` URL, never bare) and what that text reads as once
  *   redacted; `sentinelTicketUrl` builds the URL on its own.
  * - `makeCredentials` / `writeCredentialsFile` build and write a credentials
- *   file: by default a valid SR-1.4 object, with overrides for every invalid
+ * file: by default a valid object, with overrides for every invalid
  *   shape the credentials tests need.
  * - `assertNoLeak` fails the test when the sentinel or a token-like value
  *   appears in captured log lines, errors, results or files the code wrote.
@@ -21,7 +21,7 @@
  *   `assertNoLeak` applies, exported so a repo-level audit (e.g. no token
  *   literal in any test file) uses exactly the same rule.
  *
- * Isolation (b.av2 SR-13.2): the helper writes only into the directory the
+ * Isolation: the helper writes only into the directory the
  * caller passes, which must be the test's own `mkdtempSync` directory, and
  * reads only the paths the caller marks with `writtenFile`. It never touches
  * the real home. Its one source import is the redaction placeholders from
@@ -44,10 +44,10 @@ import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../../src/
  */
 export const LEAK_SENTINEL = 'LEAKSENTINEL7Q2X9'
 
-/** Prefix a `bot_token` must start with (SR-1.4). A bare prefix is not a token. */
+/** Prefix a `bot_token` must start with. A bare prefix is not a token. */
 export const BOT_TOKEN_PREFIX = 'xoxb-'
 
-/** Prefix an `app_token` must start with (SR-1.4). A bare prefix is not a token. */
+/** Prefix an `app_token` must start with. A bare prefix is not a token. */
 export const APP_TOKEN_PREFIX = 'xapp-'
 
 /** File name `writeCredentialsFile` uses when the caller passes none. */
@@ -140,7 +140,7 @@ export const REDACTED_SENTINEL_TAIL = `${REDACTED_TOKEN_PLACEHOLDER} ${REDACTED_
 export type CredentialsOverrides = Readonly<Record<string, unknown>> | string
 
 /**
- * A credentials object: by default a valid SR-1.4 object, exactly `bot_token`
+ * A credentials object: by default a valid object, exactly `bot_token`
  * (`xoxb-`) and `app_token` (`xapp-`), both sentinel-bearing and distinct.
  * An override set to `undefined` removes that key.
  */
@@ -232,7 +232,7 @@ export function assertNoLeak(captured: unknown, label = 'captured'): void {
  *
  * For a persona whose name is shaped like a Slack token (built with
  * `fakeToken`, so it holds the sentinel), where the artifacts are meant to
- * carry the name as written (b.av2 SR-1.2, no format rule). The masked copy
+ * carry the name as written (no format rule). The masked copy
  * still fails `assertNoLeak` on anything else token-like, such as a
  * credential value, even one whose text holds the name or the key.
  *

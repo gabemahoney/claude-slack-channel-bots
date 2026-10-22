@@ -1,5 +1,5 @@
 
-/** Production timing and load bounds (b.omv SR-5/6); replay injects these. */
+/** Production timing and load bounds; replay injects these. */
 export const ENTER_DELAY_MS = 500
 export const RECEIPT_WAIT_MS = 10000
 export const RETYPE_BACKOFF_MS = [10000, 30000, 60000, 120000, 300000, 900000] as const

@@ -2,10 +2,10 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * persona-connection-wiring.test.ts — Each persona's connection feeds its own
  * pipeline and click handler, and the server's Slack seams resolve to the
- * persona's own clients (b.av2 SR-3.1 wiring, SR-3.4, SR-4.1 with b.deo
- * SRI-301, SR-7.1 with b.deo SRI-701 to SRI-703, SR-7.2).
+ * persona's own clients (wiring with
+ * with to).
  *
- * b.av2 SR-4.1 / b.deo SRI-301 (b.deo AC 6): for a `message` and an `app_mention`,
+ * for a `message` and an `app_mention`,
  * the envelope's `is_ext_shared_channel` reaches the routing intake exactly as
  * the envelope carried it in each of its four forms (`false`, `true`, a
  * non-boolean, absent, which arrives as absent), with no other envelope field;
@@ -33,18 +33,18 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  * server.
  *
  * Carries pinned here:
- * - Task 7: each connection's receiver passes its own persona key, and one
+ * - section 7: each connection's receiver passes its own persona key, and one
  *   event no longer reaches every persona (the single-socket fan-out is gone);
- * - Task 6: a click arriving on persona B's connection for A's prompt is not
+ * - section 6: a click arriving on persona B's connection for A's prompt is not
  *   decided (real `handlePermissionClick`, receiving key B);
- * - E2 Task 3: `clientFor` serves on `up`, `lost` and a `reopen` retry, and
+ * - section 3: `clientFor` serves on `up`, `lost` and a `reopen` retry, and
  *   nothing on `connecting`, a bring-up retry, `broken` (also after a refused
  *   reopen, where the manager still holds the Web client), `stopped`, an
  *   unknown key or dry run;
- * - E2 Task 3 / README "File attachment fails after a long wait": `reply`
+ * - section 3 / README "File attachment fails after a long wait": `reply`
  *   uploads go through the manager's long-lived client, built with the 30 s
  *   options;
- * - E13 decisions 12 and 15: the production factory hands the socket logger
+ * - decisions 12 and 15: the production factory hands the socket logger
  *   of `socketModeClientOptions()` to the real
  *   `SocketModeClient` and its own `apps.connections.open` client. Against
  *   local stand-ins (port 0, fake tokens), a real client whose pings get no
@@ -54,14 +54,14 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  *   real validation and long-lived WebClients hold their redacting logger, so
  *   a Slack warning holding an upload URL and a fake token reaches the
  *   console with both replaced;
- * - Task 2: a persona's held notices are flushed on its transition to `up`,
+ * - section 2: a persona's held notices are flushed on its transition to `up`,
  *   and only that persona's (the hold-and-flush walk-through is in
  *   tests/persona-bringup.test.ts).
  *
  * The server's own wiring of these seams (`main()` and module scope) is
  * audited in tests/server-startup-wiring.test.ts.
  *
- * Isolation (b.av2 SR-13.2): every path is under a `mkdtempSync` directory
+ * Isolation: every path is under a `mkdtempSync` directory
  * removed after each test; `SLACK_STATE_DIR` points into it for the trail;
  * `SLACK_DRY_RUN` is cleared for the tool cases and restored. Tokens are
  * sentinel-bearing fakes; captured log lines are leak-checked. No server is
@@ -365,14 +365,14 @@ function blockActions(actionIds: readonly string[], channel = CA): Record<string
 }
 
 // ---------------------------------------------------------------------------
-// SR-3.1: `message` and `app_mention` on each connection
+// `message` and `app_mention` on each connection
 // ---------------------------------------------------------------------------
 
-describe('SR-3.1: each connection\'s inbound events reach the intake with its own persona key', () => {
+describe('each connection\'s inbound events reach the intake with its own persona key', () => {
   test.each<[PersonaSocketEventName, (overrides: Record<string, unknown>) => SlackEvent]>([
     ['message', (o) => makeChannelMessage(o)],
     ['app_mention', (o) => makeAppMention(o)],
-  ])('a `%s` event on A\'s connection reaches the intake once, with A\'s key alone, and is acked once on A\'s socket; the same on B\'s names only B (Task 7 carry)', async (eventName, build) => {
+  ])('a `%s` event on A\'s connection reaches the intake once, with A\'s key alone, and is acked once on A\'s socket; the same on B\'s names only B', async (eventName, build) => {
     const h = harness()
     await bringUpBoth(h)
     const intake = recordingIntake()
@@ -510,10 +510,10 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-4.1 / b.deo SRI-301: the envelope flag at the intake
+// the envelope flag at the intake
 // ---------------------------------------------------------------------------
 
-describe('b.av2 SR-4.1 / b.deo SRI-301: the envelope flag reaches the intake exactly as sent, and the RAW line is unchanged', () => {
+describe('the envelope flag reaches the intake exactly as sent, and the RAW line is unchanged', () => {
   /** A value carried only by envelope fields, so any of them reaching the intake or the RAW line shows. */
   const ENVELOPE_MARK = 'EC0WIREENVELOPEONLY'
   /** Envelope fields beside the flag, as Slack's Events API payload carries them, each holding the mark. */
@@ -618,10 +618,10 @@ describe('b.av2 SR-4.1 / b.deo SRI-301: the envelope flag reaches the intake exa
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.1: `interactive` on each connection
+// `interactive` on each connection
 // ---------------------------------------------------------------------------
 
-describe('SR-7.1: interactive payloads reach the click handler with the receiving persona\'s key', () => {
+describe('interactive payloads reach the click handler with the receiving persona\'s key', () => {
   test('a payload on A\'s connection: one block_action.received per action with the envelope, each action to the click handler with A\'s key and the server lookups, and one ack', async () => {
     const h = harness()
     await bringUpBoth(h)
@@ -730,10 +730,10 @@ describe('SR-7.1: interactive payloads reach the click handler with the receivin
 })
 
 // ---------------------------------------------------------------------------
-// Task 6 carry: the fail-closed click, end to end
+// section 6 carry: the fail-closed click, end to end
 // ---------------------------------------------------------------------------
 
-describe('Task 6 carry: a click is decided only through the persona whose connection received it (real handlePermissionClick)', () => {
+describe('section 6 carry: a click is decided only through the persona whose connection received it (real handlePermissionClick)', () => {
   /**
    * Bring A and B up, seed a live prompt for A through a poller tick (posted
    * on A's long-lived client via `clientFor`), and install an agent-director
@@ -806,10 +806,10 @@ describe('Task 6 carry: a click is decided only through the persona whose connec
 })
 
 // ---------------------------------------------------------------------------
-// E2 carry: `clientFor` and the identity getter by connection status
+// carry: `clientFor` and the identity getter by connection status
 // ---------------------------------------------------------------------------
 
-describe('E2 carry: clientFor serves A\'s long-lived client only while A is serving', () => {
+describe('carry: clientFor serves A\'s long-lived client only while A is serving', () => {
   test('up: clientFor(A) is the one long-lived Web client the manager built for A (not the validation client), distinct from B\'s', async () => {
     const h = harness()
     await bringUpBoth(h)
@@ -946,10 +946,10 @@ describe('E2 carry: clientFor serves A\'s long-lived client only while A is serv
 })
 
 // ---------------------------------------------------------------------------
-// E2 carry: `reply` uploads on the long-lived client (README 30 s note)
+// carry: `reply` uploads on the long-lived client (README 30 s note)
 // ---------------------------------------------------------------------------
 
-describe('E2 carry: reply file uploads go through the manager\'s long-lived client (README "File attachment fails after a long wait")', () => {
+describe('carry: reply file uploads go through the manager\'s long-lived client (README "File attachment fails after a long wait")', () => {
   test('each persona\'s long-lived Web client is built once with longLivedWebClientOptions(): a 30 s per-attempt timeout, the library\'s default retries and a logger of its own', async () => {
     const h = harness()
     await bringUpBoth(h)
@@ -1016,7 +1016,7 @@ describe('E2 carry: reply file uploads go through the manager\'s long-lived clie
 })
 
 // ---------------------------------------------------------------------------
-// E13 decisions 12 and 15: the Slack libraries' own log output
+// decisions 12 and 15: the Slack libraries' own log output
 // ---------------------------------------------------------------------------
 
 /**
@@ -1075,8 +1075,8 @@ function rawWebSocketEndpoint(mode: 'silent' | 'refuse'): { port: number; closeA
 }
 
 // What the manager builds each socket client with is checked in tests/persona-connections.test.ts
-// (the AC 20 connection-leg occasion table); these cases take the production factory's real clients.
-describe('E13 decisions 12 and 15: the production factory\'s real socket client holds its persona\'s socket logger, each real Web API client a redacting logger', () => {
+// (the connection-leg occasion table); these cases take the production factory's real clients.
+describe('decisions 12 and 15: the production factory\'s real socket client holds its persona\'s socket logger, each real Web API client a redacting logger', () => {
   test('the production factory hands socketModeClientOptions() to a real SocketModeClient unchanged: the client and its apps.connections.open WebClient hold the persona\'s socket logger, and the library\'s own WebSocket error line writes nothing', async () => {
     const A = harness().A
     const lines: string[] = []
@@ -1189,10 +1189,10 @@ describe('E13 decisions 12 and 15: the production factory\'s real socket client 
 })
 
 // ---------------------------------------------------------------------------
-// SR-7.2: held notices flushed on each transition to up
+// held notices flushed on each transition to up
 // ---------------------------------------------------------------------------
 
-describe('SR-7.2: the up listener flushes exactly the persona that came up', () => {
+describe('the up listener flushes exactly the persona that came up', () => {
   test('the listener flushes the key on `up` only, never on any other status', () => {
     const flushed: string[] = []
     const listener = createPersonaUpFlushListener({ flush: async (key) => void flushed.push(key) })
@@ -1239,10 +1239,10 @@ describe('SR-7.2: the up listener flushes exactly the persona that came up', () 
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.1: the archive name lookups use the receiving persona's client
+// the archive name lookups use the receiving persona's client
 // ---------------------------------------------------------------------------
 
-describe('SR-4.1: archive rows are written with the receiving persona\'s name resolver', () => {
+describe('archive rows are written with the receiving persona\'s name resolver', () => {
   interface ArchiveRowView {
     channel_id: string
     channel_name: string

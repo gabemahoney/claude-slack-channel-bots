@@ -1,5 +1,5 @@
 /**
- * agent-director-logger.test.ts — Tests for the AD verbosity filter (b.brv).
+ * agent-director-logger.test.ts — Tests for the AD verbosity filter.
  *
  * The agent-director Client emits per-poll `SubprocessClient: <verb> ok { ... }`
  * success dumps that flooded server.log. makeFilteredAdLogger() drops those

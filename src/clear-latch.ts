@@ -1,13 +1,13 @@
 /**
  * clear-latch.ts — The `clear-latch` command's names, the server's
  * `POST /clear-latch` request handler, the `server.port` record and the
- * CLI's request to the route (b.jg5 SRJ-509, SRJ-510, SRJ-511).
+ * CLI's request to the route.
  *
- * The route and the command are for the operator only (SRJ-511): no MCP
+ * The route and the command are for the operator only: no MCP
  * tool, no text of the MCP instructions, no tool description and no notice
  * may name them. Every user of the names imports the one spelling below.
  *
- * The route (SRJ-510) answers on the server's MCP listener, loopback only,
+ * The route answers on the server's MCP listener, loopback only,
  * as `/interject` does:
  *
  *   405  any method but POST
@@ -15,7 +15,7 @@
  *   400  a UTF-8 body over INTERJECT_BODY_CAP_BYTES, invalid JSON, or a
  *        missing, empty or non-string `persona`
  *   404  no applied persona has that name or key (the argument is never
- *        repeated, SRJ-509: it may be a token typed by mistake)
+ * repeated, it may be a token typed by mistake)
  *   500  the clear rejected unexpectedly (one leak-free line)
  *   200  `{ ok: true, persona: <name>, cleared: true | false }` once the
  *        clear has run in the persona's lifecycle serializer turn (for
@@ -270,7 +270,7 @@ export function clearLatchRequestOptions(port: number, bodyBytes: number): Reque
 }
 
 /**
- * The production dial of the `clear-latch` command (b.jg5 SRJ-510): one
+ * The production dial of the `clear-latch` command: one
  * `POST` of `{ "persona": <persona> }` to the route on `127.0.0.1` at `port`,
  * answering the status and the body text once the whole body is read.
  *
@@ -398,7 +398,7 @@ function safeLog(log: (line: string) => void, line: string): void {
 }
 
 /**
- * Handle one `POST /clear-latch` request (b.jg5 SRJ-510). `remoteAddress` is
+ * Handle one `POST /clear-latch` request. `remoteAddress` is
  * the caller's address (from `server.requestIP(req)`); absent means not local
  * (403). Checks, in order: the method, the loopback rule, the body cap, the
  * JSON, the `persona` field and its resolution against the applied config;

@@ -1,16 +1,16 @@
 /**
  * start-sweep-wiring.test.ts — Static audit of the start sweep's wiring in
  * src/server.ts, and of the sweep's own path in src/session-manager.ts
- * (b.av2 SR-6.3 as amended by b.jg5 SRJ-1506; b.jg5 SRJ-714).
  *
- * SR-6.3, SRJ-714, SRJ-1506: at start, BEFORE any bring-up, the server runs
+ *
+ * at start, BEFORE any bring-up, the server runs
  * the persona start sweep. It reads every `service=cscb` row, latches from
  * the configured personas' own rows, records the keys of absent personas as
  * retired, kills the live strays (rows with no `persona` label, an absent
  * persona, the wrong instance ID or the wrong `cwd`) with each kill's result
  * checked, and deletes none: a killed row is kept until agent-director's
  * `expire` removes it. The sweep reads the applied persona set main()'s start
- * resolution chose (b.av2 SR-8.7: `personaConfig = start.config`, the
+ * resolution chose (`personaConfig = start.config`, the
  * last-applied record's at a start from the record). If the call is dropped,
  * moved before that assignment or after the start bring-up
  * (`reload.runStartBringUp()`, whose pass brings each persona up and launches
@@ -18,13 +18,13 @@
  * collision ladder, or the sweep kills the rows of a persona set that does
  * not run.
  *
- * b.jg5 SRJ-702 (AC 56): the sweep's kills are each a bounded retry, so
+ * the sweep's kills are each a bounded retry, so
  * main() hands the sweep the production kill-retry clock (imported from
  * src/kill-retry.ts, never a copy or a test clock). That each
  * `reconcileOrphans` call has its own pass budget is shown by behaviour in
  * tests/session-manager.test.ts.
  *
- * b.jg5 SRJ-205, SRJ-714: main() hands the sweep a shutdown query that reads
+ * main hands the sweep a shutdown query that reads
  * the module's `shuttingDown` flag each time it is asked, so a shutdown begun
  * during the sweep stops its agent-director calls. What the sweep does once
  * the query answers true is shown by behaviour in
@@ -36,7 +36,7 @@
  * startup gate, a real port, real Slack connections). This follows the
  * tests/jsonl-safeguard-wiring.test.ts precedent: it reads the source with
  * comments stripped and anchors on content, never on line numbers. The
- * no-delete pin is the sweep's own; the `src/`-wide one is E34's.
+ * no-delete pin is the sweep's own; the `src/`-wide one is .
  *
  * SPDX-License-Identifier: MIT
  */
@@ -63,7 +63,7 @@ const SERVER_CODE = stripComments(SERVER_SRC)
 /** session-manager.ts with every comment removed (see stripComments). */
 const SESSION_MANAGER_CODE = stripComments(readFileSync(new URL('../src/session-manager.ts', import.meta.url), 'utf-8'))
 
-/** The production kill-retry clock (b.jg5 SRJ-702); renaming it fails the typecheck. */
+/** The production kill-retry clock; renaming it fails the typecheck. */
 const PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
 
 /** Any call of the sweep in code, awaited or not, whatever its argument. */
@@ -123,7 +123,7 @@ function reachedDeclarations(code: string, entry: string): Map<string, string> {
   return reached
 }
 
-describe('server.ts wires the persona start sweep (b.av2 SR-6.3, b.jg5 SRJ-714)', () => {
+describe('server.ts wires the persona start sweep', () => {
   test('imports reconcileOrphans from the session manager', () => {
     expect(SERVER_SRC).toMatch(
       /import\s*\{[^}]*\breconcileOrphans\b[^}]*\}\s*from\s*['"]\.\/session-manager\.ts['"]/,
@@ -140,7 +140,7 @@ describe('server.ts wires the persona start sweep (b.av2 SR-6.3, b.jg5 SRJ-714)'
     ])
   })
 
-  test('b.jg5 SRJ-205: the flag the shutdown query reads is server.ts\'s one module-level `let shuttingDown`, never re-declared in main(), so the query sees a shutdown begun after the call', () => {
+  test('the flag the shutdown query reads is server.ts\'s one module-level `let shuttingDown`, never re-declared in main(), so the query sees a shutdown begun after the call', () => {
     const decls = indicesOf(/\b(?:let|const|var)\s+shuttingDown\b/g, SERVER_CODE)
     expect(decls).toHaveLength(1)
     expect(SERVER_CODE.slice(decls[0]!)).toMatch(/^let\s/)
@@ -155,13 +155,13 @@ describe('server.ts wires the persona start sweep (b.av2 SR-6.3, b.jg5 SRJ-714)'
     expect(sweep!).toBeLessThan(bringUpAt)
   })
 
-  test('b.jg5 SRJ-702: the clock handed to the sweep is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
+  test('the clock handed to the sweep is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
     expect(importSource(SERVER_CODE, PRODUCTION_CLOCK)).toBe('./kill-retry.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${PRODUCTION_CLOCK}\\b`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
 
-describe('the start sweep deletes no row (b.jg5 SRJ-714, SRJ-1506 beside b.av2 SR-6.3; HO C2, C17; AC 77)', () => {
+describe('the start sweep deletes no row (beside; HO C2, C17)', () => {
   test('reconcileOrphans and every session-manager function it reaches (its kills, their retry and the post-kill find-missing run included) make no agent-director `delete` call and name no kill-and-delete helper', () => {
     const reached = reachedDeclarations(SESSION_MANAGER_CODE, 'reconcileOrphans')
     const path = [...reached.values()].join('\n')

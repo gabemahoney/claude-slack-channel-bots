@@ -1,6 +1,6 @@
 /**
  * access-file-retired.test.ts — Regression guard for the retired access.json
- * model (b.av2 SR-10.1, SR-10.2 access rows; AC 17).
+ * model (access rows).
  *
  * The server no longer reads or writes `access.json`, and there is no
  * allowlist, pairing or `SLACK_ACCESS_MODE` static mode. This guard keeps them
@@ -12,10 +12,10 @@
  *      the debugging skill (skills/debug-slack-channel-bots/SKILL.md) that
  *      replaced it exists.
  *   4. The release tooling (the promote script, its skill and the registry
- *      install runbook) no longer expects `access.json` (SR-12).
+ * install runbook) no longer expects `access.json`.
  *   5. The internal docs (engineering guide, architecture) name none of the
  *      retired access terms, and `access.json` only in the one allowed note
- *      that a leftover file is ignored and left in place (SR-12).
+ * that a leftover file is ignored and left in place.
  *   6. CONTRIBUTING.md's Release section ("## Release process", the H2
  *      starting "Release") does not mention `access.json`. The release process
  *      lives in CONTRIBUTING.md, not the README. Beyond this section, the
@@ -23,8 +23,7 @@
  *      tests/shipped-docs.test.ts, whose audit exceptions allow `access.json`
  *      only inside the two runbook sections of docs/migration.md, "Switching
  *      over to agent-director Phase 1" and "Rolling back the switch-over", by
- *      name, where the previous CSCB's file is saved and restored (b.jg5
- *      SRJ-1516); it stays banned in every other section. That exemption
+ * name, where the previous CSCB's file is saved and restored; it stays banned in every other section. That exemption
  *      reaches no file read here: the skills stay fully in this file's scope
  *      (they point to the runbooks and do not repeat their steps), and no
  *      scope, term or matcher here is narrowed.

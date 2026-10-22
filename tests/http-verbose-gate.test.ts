@@ -1,24 +1,24 @@
 /**
- * http-verbose-gate.test.ts — the per-request HTTP access line is gated (b.3k6).
+ * http-verbose-gate.test.ts — the per-request HTTP access line is gated.
  *
- * b.brv silenced the loudest routine "success" chatter (the AD
- * `SubprocessClient: <verb> ok` dumps) behind CSCB_AD_VERBOSE. b.3k6 continues
+ * silenced the loudest routine "success" chatter (the AD
+ * `SubprocessClient: <verb> ok` dumps) behind CSCB_AD_VERBOSE. continues
  * that pass for the next-loudest steady-state offender: the `/mcp` fetch
  * handler's per-request access line
  *
  *   [slack] HTTP <method> <path> session=<sid>
  *
  * which fires on every MCP round-trip (poll, notification, tool response, each
- * SSE open). b.3k6 gates it behind a new `isHttpVerbose()` helper reading
+ * SSE open). gates it behind a new `isHttpVerbose()` helper reading
  * CSCB_HTTP_VERBOSE, OFF by default, truthy `1/true/yes/on` (case-insensitive) —
- * mirroring b.brv's CSCB_AD_VERBOSE contract in agent-director-logger.ts.
+ * mirroring CSCB_AD_VERBOSE contract in agent-director-logger.ts.
  *
  * `isHttpVerbose()` is now exported from src/server.ts as an env-parameterized
- * seam (mirroring b.brv's isVerbose in agent-director-logger.ts), so the truthy
+ * seam (mirroring isVerbose in agent-director-logger.ts), so the truthy
  * contract is exercised by importing the helper and injecting `env` objects
  * directly — no source-text audit needed. Importing src/server.ts is safe: it
  * reads no Slack token, builds no Slack client and creates no directory at
- * import (b.av2 SR-3.1) — all of that happens in `main()`, which runs only
+ * import — all of that happens in `main()`, which runs only
  * behind `if (import.meta.main)`.
  *
  * The one remaining static assertion is the guard-adjacency regression pin: it
@@ -44,7 +44,7 @@ function envWith(val: string | undefined): NodeJS.ProcessEnv {
   return val === undefined ? {} : { [HTTP_VERBOSE_ENV]: val }
 }
 
-describe('b.3k6 — isHttpVerbose honors the b.brv truthy contract', () => {
+describe('isHttpVerbose honors the truthy contract', () => {
   test.each([
     ['1'],
     ['true'],
@@ -82,14 +82,14 @@ describe('b.3k6 — isHttpVerbose honors the b.brv truthy contract', () => {
   })
 })
 
-describe('b.3k6 — per-request HTTP access line is gated behind CSCB_HTTP_VERBOSE', () => {
+describe('per-request HTTP access line is gated behind CSCB_HTTP_VERBOSE', () => {
   test('the access line is present exactly once', () => {
     const matches = SERVER_SRC.match(new RegExp(ACCESS_LINE_RE, 'g')) ?? []
     expect(matches).toHaveLength(1)
   })
 
   test('the access line is wrapped in an isHttpVerbose() guard, not unconditional', () => {
-    // FAILS pre-fix: on the pre-b.3k6 source the emit sits at column 6 with no
+    // FAILS pre-fix: on the pre-source the emit sits at column 6 with no
     // guard, so the line preceding it does not open an `if (isHttpVerbose())`.
     const idx = SERVER_SRC.search(ACCESS_LINE_RE)
     expect(idx).toBeGreaterThan(-1)

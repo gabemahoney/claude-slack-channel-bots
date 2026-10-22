@@ -1,36 +1,36 @@
 /**
  * channel-delivery.test.ts — The stored-choice store, src/channel-delivery.ts
- * (b.deo SRI-1303 beside b.av2 SR-14; SRI-401 beside b.av2 SR-8.1; SRI-402;
- * SRI-403 and SRI-407 beside b.av2 SR-8.7; SRI-404; SRI-405; the store part
- * of SRI-502; SRI-904 and SRI-905 beside b.av2 SR-10.3; SRI-907; AC 20, AC 21,
- * AC 23).
+ * (beside beside;
+ * and beside; the store part
+ * of the contract and beside,
+ *).
  *
  * - Fixed values: the file name, format version 1, the closed class list
  *   (`channel-delivery-unreadable`), the `[slack] channel-delivery:` prefix
- *   and SRI-905's three drop reasons, typed only in their one pin case.
- * - Location (SRI-401): the path under a given state directory; the default
+ * and three drop reasons, typed only in their one pin case.
+ * - Location: the path under a given state directory; the default
  *   follows `SLACK_STATE_DIR` at call time; no `src/` module but the store's
  *   spells the file name or names its serialiser or parser.
- * - Format (SRI-402): a round trip; the same record always gives the same
+ * - Format: a round trip; the same record always gives the same
  *   bytes; a key with no channels is left out; every refused form, made by
  *   altering the serialiser's output (its bytes, for the UTF-8 rule), reads
  *   as unreadable through the store's load.
  * - The stored-choice helper's contract (tests/test-helpers/channel-delivery.ts).
- * - The read at start (SRI-403, SRI-904): a missing file; a file that cannot
+ * - The read at start: a missing file; a file that cannot
  *   be read, parsed or validated, and the unreadable state it gives for the
  *   run; a directory and a real FIFO (in a child process); no size cap; the
  *   bytes parsed only; the `channel-delivery-unreadable` line.
- * - Writes (SRI-404, SRI-905, SRI-907): whole-record, durable writes; each
+ * - Writes: whole-record, durable writes; each
  *   failure through the `DurableWriteFs` seam (before the rename, an unsynced
  *   rename, a write-back that fails too); the failed-write line; the
  *   credentials file's path, never its content, in the file.
- * - Drops (SRI-405, SRI-905): at once in memory; one write per batch; a key
+ * - Drops: at once in memory; one write per batch; a key
  *   named twice dropped once; an unknown reason refused before any change;
  *   unwritten drops and the next successful write that carries them; the
  *   drop line.
- * - Start rules (SRI-407): each rule's drop and its kept control, the
+ * - Start rules: each rule's drop and its kept control, the
  *   precedence, both channel modes, a failed start-rule write.
- * - Retiring keys (SRI-502's store part): memory only, never written or
+ * - Retiring keys (store part): memory only, never written or
  *   logged, none at a fresh start.
  *
  * Isolation: every file sits under a per-case `mkdtempSync` root removed in
@@ -416,7 +416,7 @@ function thrownBy(act: () => unknown): NodeJS.ErrnoException {
   throw new Error('expected a throw; none came')
 }
 
-/** Every entry the store holds is one `seeds` held, as it was: the rules only remove (b.deo SRI-407). */
+/** Every entry the store holds is one `seeds` held, as it was: the rules only remove. */
 function expectOnlyRemoved(store: ChannelDeliveryStore, seeds: Readonly<Record<string, ChannelDeliveryPersonaSeed>>): void {
   const seeded = channelDeliveryRecordOf(seeds)
   for (const [key, entry] of store.record()) expect(entry).toEqual(seeded.get(key)!)
@@ -429,7 +429,7 @@ function namesAChoice(line: string, path: string): boolean {
 }
 
 /**
- * What breaks "the bytes are parsed only" (b.deo SRI-403) in comment-stripped
+ * What breaks "the bytes are parsed only" in comment-stripped
  * `code`: each imported specifier naming a crypto module, and each hashing,
  * digest or byte-comparison name in its code outside literals. Empty when the
  * module only parses.
@@ -445,8 +445,8 @@ function parsedOnlyFindings(code: string): string[] {
 // S1: fixed values, location, format, refused forms, the helper's contract
 // ---------------------------------------------------------------------------
 
-describe('the store\'s fixed values (b.deo SRI-401, SRI-402, SRI-901, SRI-905)', () => {
-  test('pin: the file name, format version 1, the class list holding only channel-delivery-unreadable, the line prefix and SRI-905\'s three drop reasons', () => {
+describe('the store\'s fixed values', () => {
+  test('pin: the file name, format version 1, the class list holding only channel-delivery-unreadable, the line prefix and three drop reasons', () => {
     const values = {
       file: CHANNEL_DELIVERY_FILE_NAME,
       version: CHANNEL_DELIVERY_FORMAT_VERSION,
@@ -468,7 +468,7 @@ describe('the store\'s fixed values (b.deo SRI-401, SRI-402, SRI-901, SRI-905)',
   })
 })
 
-describe('where the file lives (b.deo SRI-401 beside b.av2 SR-8.1)', () => {
+describe('where the file lives (beside)', () => {
   test('a store over a state directory has <dir>/<file name> as its path, and its first accepted write creates exactly that file, with no temporary file', () => {
     const rig = openRig()
     expect(rig.store.path).toBe(join(stateDir, CHANNEL_DELIVERY_FILE_NAME))
@@ -508,7 +508,7 @@ describe('where the file lives (b.deo SRI-401 beside b.av2 SR-8.1)', () => {
   })
 })
 
-describe('the file\'s format (b.deo SRI-402)', () => {
+describe('the file\'s format', () => {
   test('a full record round-trips through the serialiser and the parser, and loads whole through the store', () => {
     const seeds = {
       ...baseSeeds(),
@@ -556,7 +556,7 @@ describe('the file\'s format (b.deo SRI-402)', () => {
     doc.personas.alpha.channels[C1].set_at = respell(doc.personas.alpha.channels[C1].set_at)
   }
 
-  // Every form SRI-402 refuses, each the base seeds' serialised record altered.
+  // Every form refuses, each the base seeds' serialised record altered.
   const REFUSED: Array<[string, (doc: Record<string, any>) => unknown]> = [
     ['a record with no `version`', (doc) => { delete doc.version }],
     ['a record with no `personas`', (doc) => { delete doc.personas }],
@@ -589,7 +589,7 @@ describe('the file\'s format (b.deo SRI-402)', () => {
     ['an entry with no channel in `channels`', (doc) => { doc.personas.beta.channels = {} }],
   ]
 
-  // SRI-402's UTF-8 rule, as raw bytes: each would read as the base seeds if
+  // UTF-8 rule, as raw bytes: each would read as the base seeds if
   // the decoder dropped a byte order mark or replaced a bad byte. The bad
   // byte sits inside a declaration path, where a replacement character would
   // still validate.
@@ -617,7 +617,7 @@ describe('the file\'s format (b.deo SRI-402)', () => {
     expectNoLeak(rig)
   })
 
-  // SRI-402's `set_at` is an RFC 3339 UTC timestamp ending in `Z`; the
+  // `set_at` is an RFC 3339 UTC timestamp ending in `Z`; the
   // fraction of a second is optional and of any width.
   test.each<[string, (setAt: string) => string, string]>([
     ['one fraction digit', (setAt) => setAt.replace(/\.\d+Z$/, '.5Z'), '2026-06-01T09:30:00.5Z'],
@@ -638,7 +638,7 @@ describe('the file\'s format (b.deo SRI-402)', () => {
   })
 })
 
-describe('the stored-choice helper\'s contract (tests/test-helpers/channel-delivery.ts; b.deo SRI-1204)', () => {
+describe('the stored-choice helper\'s contract (tests/test-helpers/channel-delivery.ts)', () => {
   test('writeChannelDeliveryRecord writes exactly the serialiser\'s bytes at the module\'s path, a given set_at kept and an unset one SAMPLE_SET_AT', () => {
     const alpha = personaNamed('alpha')
     const expected: ChannelDeliveryRecord = new Map([
@@ -718,10 +718,10 @@ describe('the stored-choice helper\'s contract (tests/test-helpers/channel-deliv
 })
 
 // ---------------------------------------------------------------------------
-// S2: the read at start and the unreadable state (SRI-403, SRI-904)
+// S2: the read at start and the unreadable state
 // ---------------------------------------------------------------------------
 
-describe('the read at start (b.deo SRI-403 beside b.av2 SR-8.7; SRI-905)', () => {
+describe('the read at start (beside)', () => {
   test('a missing file reads as an empty, readable record: nothing written or created, no line', () => {
     const alpha = personaNamed('alpha')
     const rig = openRig({ start: startOf([alpha]) })
@@ -863,8 +863,8 @@ describe('the read at start (b.deo SRI-403 beside b.av2 SR-8.7; SRI-905)', () =>
     expectNoLeak(undefined)
   })
 
-  // SRI-904 gives no exact text: this case pins the logged line to its
-  // builder for each kind and checks each part SRI-904 requires.
+  // gives no exact text: this case pins the logged line to its
+  // builder for each kind and checks each part requires.
   test('pin: the channel-delivery-unreadable line for each kind (read, parse, validate) is its builder\'s, and names the file, the kind with its errno code or position, the fungible-mode effect and the fix', () => {
     const kinds: Array<[string, () => { readFs?: Partial<PersonaConfigFs>; cause: ChannelDeliveryUnreadableCause }]> = [UNREADABLE[0]!, UNREADABLE[2]!, UNREADABLE[3]!]
     const lines: string[] = []
@@ -917,10 +917,10 @@ describe('the read at start (b.deo SRI-403 beside b.av2 SR-8.7; SRI-905)', () =>
 })
 
 // ---------------------------------------------------------------------------
-// S3: whole-record durable writes and their failures (SRI-404, SRI-905, SRI-907)
+// S3: whole-record durable writes and their failures
 // ---------------------------------------------------------------------------
 
-describe('an accepted set writes the whole record, durably (b.deo SRI-404)', () => {
+describe('an accepted set writes the whole record, durably', () => {
   test('with the production writer: the given declaration and the clock\'s set_at stored, the file parsing back to the record in memory, the earlier choice answered', () => {
     writeChannelDeliveryRecord(stateDir, baseSeeds())
     const clock = createFakeClock({ start: START_MS })
@@ -1015,7 +1015,7 @@ describe('an accepted set writes the whole record, durably (b.deo SRI-404)', () 
   })
 })
 
-describe('a failed set leaves memory and the file as they were (b.deo SRI-404, SRI-905)', () => {
+describe('a failed set leaves memory and the file as they were', () => {
   /** The failed-write line of a set of `alpha` in C1. */
   const setLine = (detail: string): string => channelDeliveryWriteFailedLine(filePath(), channelDeliverySetAction('alpha', C1), detail, false)
 
@@ -1140,7 +1140,7 @@ describe('a failed set leaves memory and the file as they were (b.deo SRI-404, S
     expectNoLeak(rig, { result, fresh: fresh.logs })
   })
 
-  // SRI-905 gives no exact text: the one pin of the failed-write line, each
+  // gives no exact text: the one pin of the failed-write line, each
   // variant's detail typed here, every other case building it with the builder.
   test('pin: the failed-write line of a set, of a set whose write-back failed too, and of a drop; each names the file, the action and the codes, and none names a choice', () => {
     writeChannelDeliveryRecord(stateDir, baseSeeds())
@@ -1181,7 +1181,7 @@ describe('a failed set leaves memory and the file as they were (b.deo SRI-404, S
   })
 })
 
-describe('the stored-choice file holds the credentials file\'s path, never its content (b.deo SRI-907)', () => {
+describe('the stored-choice file holds the credentials file\'s path, never its content', () => {
   test('a persona whose credentials file holds fake tokens has a choice stored: the file holds the path and none of the content', () => {
     const credentials = writeCredentialsFile(join(root, 'secrets'), 'persona.json')
     const [persona] = personasOf([{ name: 'alpha', credentials_file: credentials }])
@@ -1197,10 +1197,10 @@ describe('the stored-choice file holds the credentials file\'s path, never its c
 })
 
 // ---------------------------------------------------------------------------
-// S4: drops and unwritten drops (SRI-405, SRI-905)
+// S4: drops and unwritten drops
 // ---------------------------------------------------------------------------
 
-describe('drops and unwritten drops (b.deo SRI-405, SRI-905)', () => {
+describe('drops and unwritten drops', () => {
   /** The failed-write line of a drop of `keys`. */
   const dropLine = (keys: readonly string[]) => (detail: string): string =>
     channelDeliveryWriteFailedLine(filePath(), channelDeliveryDropAction(keys), detail, true)
@@ -1323,7 +1323,7 @@ describe('drops and unwritten drops (b.deo SRI-405, SRI-905)', () => {
   test.each<[string, (rig: Rig) => unknown]>([
     ['an accepted set of another key', (rig) => rig.store.set('beta', C1, 'mentions', declarationOf(personaNamed('beta')))],
     ['writeUnwrittenDrops', (rig) => rig.store.writeUnwrittenDrops()],
-  ])('after a failed drop write, the next successful write (%s) leaves no entry of the key on disk and clears its unwritten drop (AC 23)', (_label, act) => {
+  ])('after a failed drop write, the next successful write (%s) leaves no entry of the key on disk and clears its unwritten drop', (_label, act) => {
     writeChannelDeliveryRecord(stateDir, baseSeeds())
     const rig = openRig({ failures: [{ step: 'renameSync' }] })
     rig.store.drop([{ key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED }])
@@ -1378,7 +1378,7 @@ describe('drops and unwritten drops (b.deo SRI-405, SRI-905)', () => {
     expectNoLeak(rig)
   })
 
-  // SRI-905 gives no exact text: the one pin of the drop line.
+  // gives no exact text: the one pin of the drop line.
   test('pin: the drop line is its builder\'s, and names the key, the number of channels and the reason, and never a choice', () => {
     writeChannelDeliveryRecord(stateDir, baseSeeds())
     const rig = openRig()
@@ -1403,10 +1403,10 @@ describe('drops and unwritten drops (b.deo SRI-405, SRI-905)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// S5: the start rules (SRI-407)
+// S5: the start rules
 // ---------------------------------------------------------------------------
 
-describe('the start rules (b.deo SRI-407 beside b.av2 SR-8.7; AC 20)', () => {
+describe('the start rules (beside)', () => {
   /** A start's personas: `keep` (always applied, unchanged) and the subject `alpha`, both on disk. */
   function startPersonas(): { keep: Persona; alpha: Persona } {
     const [keep, alpha] = personasOf([{ name: 'keep' }, { name: 'alpha' }])
@@ -1617,10 +1617,10 @@ describe('the start rules (b.deo SRI-407 beside b.av2 SR-8.7; AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// S6: the in-memory retiring-key set (SRI-502's store part)
+// S6: the in-memory retiring-key set (store part)
 // ---------------------------------------------------------------------------
 
-describe('the store\'s retiring keys are held in memory only (b.deo SRI-502)', () => {
+describe('the store\'s retiring keys are held in memory only', () => {
   test.each<[string, boolean]>([
     ['a readable store', true],
     ['an unreadable store', false],

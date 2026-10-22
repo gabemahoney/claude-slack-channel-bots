@@ -3,7 +3,7 @@
  *
  * On each tick, checks every applied persona and schedules a restart if its
  * session reads `dead` and is not already pending/failed. The liveness probe
- * answers one of four readings (b.jg5 SRJ-314): only `dead` schedules the
+ * answers one of four readings: only `dead` schedules the
  * kill-and-launch path at once; `live` and `pending` take the alive branches,
  * but only `live` is ever counted healthy: a `pending` row connected with its
  * stream takes the not-deliverable path (its session has not started, and the
@@ -11,23 +11,23 @@
  * probe that threw) skips the persona for the tick, with nothing scheduled or
  * posted, and arms no retry timer. With auto-restart disabled,
  * an alive persona it would reconnect is reported through the not-connected
- * notice instead of being left down silently (b.f2b). The work list, the
+ * notice instead of being left down silently. The work list, the
  * disconnected streaks, every guard call and the `cwd-unreachable` flag are
- * keyed by persona key (b.av2 SR-6.3); log lines name it as `persona=<key>`.
+ * keyed by persona key; log lines name it as `persona=<key>`.
  * The healthy branch (`live`, connected, stream present) is the tick's only
- * clear of the persona's `tmux-unavailable` outage (b.jg5 SRJ-312), with the
+ * clear of the persona's `tmux-unavailable` outage, with the
  * `live` reading passed on to the cleared-flag observer; the liveness read
  * itself never clears it. It also resets the persona's slow-recovery count
- * (b.jg5 SRJ-610).
+ *
  * A persona with a restart pending or active, or at the cap, is skipped
  * before any read. The cap is asked again right after the liveness read
- * (b.4q8): that read can settle the persona's resumed launch as ended before
+ * that read can settle the persona's resumed launch as ended before
  * reporting in, a counted failure that may reach the cap, and a persona it
  * took to the cap is skipped the same way, with nothing scheduled.
  * A persona with a no-attempt reason (`noAttemptReason`:
- * it is latched, b.jg5 SRJ-502; it is held on `ErrInvalidFlags`, b.jg5
- * SRJ-207; work in flight for it; or its `tmux-unavailable` outage raised;
- * b.jg5 SRJ-315, SRJ-311) is still read: the working-directory check runs, and its
+ * it is latched; it is held on `ErrInvalidFlags`
+ * work in flight for it; or its `tmux-unavailable` outage raised
+ * ) is still read: the working-directory check runs, and its
  * liveness, connection and stream are read, so a healthy one takes the
  * healthy branch. Any other reading clears its streak, with no
  * `scheduleRestart` and no not-connected notice: the tick makes no attempt
@@ -60,7 +60,7 @@ import {
 /** Health-check dependencies. Every `key` is a persona key. */
 export interface HealthCheckDeps {
   /**
-   * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
+   * The persona's liveness reading (`src/liveness-reading.ts`):
    * `live`, `pending`, `dead` or `unknown`. `dead` schedules the restart at
    * once; `live` and `pending` take the alive branches, and only `live` is
    * counted healthy (a `pending` row connected with its stream takes the
@@ -72,7 +72,7 @@ export interface HealthCheckDeps {
   /**
    * Returns true when the persona's MCP session is currently connected
    * (registry entry with `connected === true`). Used to catch the
-   * alive-but-disconnected stranding (b.9a7): a row in an AD live state whose
+   * alive-but-disconnected stranding: a row in an AD live state whose
    * MCP transport is gone reads alive (`live` or `pending`) but
    * `isSessionConnected === false`, and without this the tick would never act.
    * Wraps the `isSessionConnected` adapter that `main()` in src/server.ts
@@ -80,7 +80,7 @@ export interface HealthCheckDeps {
    */
   isSessionConnected(key: string): boolean
 
-  /** b.omv SR-7.6: inspect even connected rows; true defers ordinary health recovery. */
+  /** inspect even connected rows; true defers ordinary health recovery. */
   inspectUpgrade?(key: string): Promise<boolean>
   isReconnectDeferred?(key: string): boolean
   isRestartPendingOrActive(key: string): boolean
@@ -91,7 +91,7 @@ export interface HealthCheckDeps {
    */
   isLaunchInFlight?(key: string): boolean
   /**
-   * b.jg5 SRJ-315, SRJ-502: true while the persona is latched (production:
+   * true while the persona is latched (production:
    * the server's latch's `isLatched`). A no-attempt reason, checked first:
    * the tick still runs the working-directory check and reads the persona's
    * liveness, connection and a healthy one takes the healthy
@@ -102,7 +102,7 @@ export interface HealthCheckDeps {
    */
   isLatched?(key: string): boolean
   /**
-   * b.jg5 SRJ-315, SRJ-207: true while the persona is held on
+   * true while the persona is held on
    * `ErrInvalidFlags` (production: the server's hold's `isHeld`). A
    * no-attempt reason, checked right after `isLatched`: the tick still runs
    * the working-directory check and reads the persona's liveness and connection,
@@ -114,7 +114,7 @@ export interface HealthCheckDeps {
    */
   isHeld?(key: string): boolean
   /**
-   * b.jg5 SRJ-311: true while the persona has a retry timer, waiting or
+   * true while the persona has a retry timer, waiting or
    * running (production: the retry controller's `isArmed`). Read only for a
    * persona whose no-attempt reason is `tmux-unavailable` and that the tick
    * read but did not find healthy: a raised outage does not guarantee a
@@ -125,7 +125,7 @@ export interface HealthCheckDeps {
    */
   isRetryArmed?(key: string): boolean
   /**
-   * b.jg5 SRJ-311: arm the persona's retry timer with the ENVIRONMENT cause
+   * arm the persona's retry timer with the ENVIRONMENT cause
    * (production: the retry controller's `arm` with
    * `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`), called when `isRetryArmed`
    * answers false for a persona the tick holds off on for `tmux-unavailable`
@@ -136,14 +136,14 @@ export interface HealthCheckDeps {
    */
   armRetryTimer?(key: string): void
   /**
-   * b.f2b: true when auto-restart is disabled (`session_restart_delay` 0).
+   * true when auto-restart is disabled (`session_restart_delay` 0).
    * `scheduleRestart` then does nothing, so an alive persona the tick finds
    * not deliverable on two consecutive ticks is also reported through
    * `notifyNotConnected` rather than left down silently. Absent: false.
    */
   isAutoRestartDisabled?(): boolean
   /**
-   * b.f2b: raise the persona's not-connected notice (production:
+   * raise the persona's not-connected notice (production:
    * `notifyDisconnectedWithAutoRestartDisabled`, once per episode), worded
    * for `cause`: its MCP session is not connected (`disconnected`). The episode
    * ends when its MCP session registers again, when the tick finds it
@@ -151,14 +151,14 @@ export interface HealthCheckDeps {
    */
   notifyNotConnected?(key: string, cause: 'disconnected'): void
   /**
-   * b.f2b: end the persona's not-connected episode (production:
+   * end the persona's not-connected episode (production:
    * `forgetNotConnectedEpisode`), called on every tick that finds it alive,
    * connected and with its stream: a later episode is reported again.
    * Absent: nothing is called.
    */
   endNotConnectedEpisode?(key: string): void
   /**
-   * b.jg5 SRJ-610: reset the persona's slow-recovery count (production: the
+   * reset the persona's slow-recovery count (production: the
    * slow-recovery tracker's `noteHealthy`), called on every tick that finds
    * it `live` (never `pending`), connected and with its stream, so a persona
    * that healed on its own starts a later count from 0. An open slow-recovery
@@ -168,7 +168,7 @@ export interface HealthCheckDeps {
    */
   resetSlowRecoveryCount?(key: string): void
   /**
-   * b.jg5 SRJ-310 rule 2 (tick half): end the persona's `tmux-unresponsive`
+   * rule 2 (tick half): end the persona's `tmux-unresponsive`
    * condition (production: the condition's end, reason `tick`, with the
    * tick's `live` reading), called on every tick that finds it `live`
    * (never `pending`), connected. A condition that does
@@ -178,7 +178,7 @@ export interface HealthCheckDeps {
    */
   endTmuxUnresponsive?(key: string): void
   /**
-   * b.jg5 SRJ-308: called once when each tick body ends, after all of the
+   * called once when each tick body ends, after all of the
    * tick's per-persona work, with the tick's start time from `now`
    * (production: the `tmux-unresponsive` condition's `onsetAtTick`, which
    * makes no agent-director call and checks every condition still holding
@@ -194,7 +194,7 @@ export interface HealthCheckDeps {
    */
   onTickEnd?(tickStartedAt: number): void
   /**
-   * b.jg5 SRJ-308: the clock a tick's start time is read from, the one the
+   * the clock a tick's start time is read from, the one the
    * `onTickEnd` callee compares first-refusal times against (production: the
    * notice episodes' clock). Read once per tick body, as the body starts.
    * Absent: the system clock (`Date.now`).
@@ -202,7 +202,7 @@ export interface HealthCheckDeps {
   now?(): number
   /**
    * Returns true when the persona has reached the consecutive-failure cap.
-   * Capped personas are skipped on every tick (SR-25.3/25.4) — the tick
+   * Capped personas are skipped on every tick — the tick
    * must not schedule more restarts once a cap has been signalled.
    * Inbound user messages do NOT re-arm recovery for a capped persona: a
    * capped-dead persona has no registered session, so inbound messages are
@@ -211,7 +211,7 @@ export interface HealthCheckDeps {
    * Recovery for such a persona comes from a server restart, which clears the
    * in-process backoff/cap state on boot.
    * Asked before any read and again right after the tick's liveness read
-   * (b.4q8: that read may count a resumed launch that ended before reporting
+   * (that read may count a resumed launch that ended before reporting
    * in, reaching the cap); either answer of true skips the persona.
    */
   isAtCap(key: string): boolean
@@ -256,10 +256,10 @@ let skippedTicks = 0
 
 /**
  * Per-persona count of *consecutive* ticks that observed the persona as
- * alive-but-disconnected (b.9a7). We require this to reach 2 before scheduling
+ * alive-but-disconnected. We require this to reach 2 before scheduling
  * a reconnect.
  *
- * HAZARD 1 (ticket design decision 2) — freshly-launched false positive: a new
+ * HAZARD 1 — freshly-launched false positive: a new
  * session takes seconds to boot and register its MCP connection, and
  * `activeLaunches` (the isRestartPendingOrActive skip) clears BEFORE the SSE
  * connection lands. A naive single-tick `!connected` check would fire
@@ -272,11 +272,11 @@ let skippedTicks = 0
  *   - the moment a persona is observed connected (streak reset inline below),
  *   - when a reconnect is scheduled for it (consumed on fire, below),
  *   - when a tick skips it: pending/active restart, at cap, a liveness
- *     reading of `unknown` or a probe that threw (b.jg5 SRJ-314), or left out
+ * reading of `unknown` or a probe that threw, or left out
  *     of the tick's work list by the relaunch gate,
  *   - when a tick that has a no-attempt reason for it (`noAttemptReason`:
- *     latched, b.jg5 SRJ-502; held on `ErrInvalidFlags`, b.jg5 SRJ-207; work
- *     in flight, b.f2b; or `tmux-unavailable` raised, b.jg5 SRJ-315) reads
+ * latched; held on `ErrInvalidFlags`; work
+ * in flight; or `tmux-unavailable` raised) reads
  *     it anything but healthy: the tick makes
  *     no attempt for it, and a human, the work in flight or the outage's
  *     retry owns it meanwhile,
@@ -291,15 +291,14 @@ const disconnectedStreak = new Map<string, number>()
 // ---------------------------------------------------------------------------
 
 /**
- * Why the tick makes no attempt of its own for a persona this tick (b.jg5
- * SRJ-315): `latched`, the persona is latched (`isLatched`, b.jg5 SRJ-502:
+ * Why the tick makes no attempt of its own for a persona this tick: `latched`, the persona is latched (`isLatched`,
  * a human decides, so no automated attempt is made, and with no retry timer
  * armed for it none is armed here either), `held`, the persona is held on
- * `ErrInvalidFlags` (`isHeld`, b.jg5 SRJ-207: nothing is launched for it until
+ * `ErrInvalidFlags` (`isHeld`, nothing is launched for it until
  * the binary changes, the server restarts or it is torn down, and its hold
  * stopped its retry timer, so none is armed here), `in-flight`, work in
  * flight for it (`isLaunchInFlight`), or
- * `tmux-unavailable`, its `tmux-unavailable` outage raised (b.jg5 SRJ-311:
+ * `tmux-unavailable`, its `tmux-unavailable` outage raised (
  * its retry timer is then its only attempt, one per backoff interval; a tick
  * that finds it not healthy with no timer armed arms one,
  * `armMissingRetryTimer`). A
@@ -325,19 +324,19 @@ function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | nul
 }
 
 /**
- * The tick's skip line for persona `key` at the restart cap (SR-25.3/25.4):
+ * The tick's skip line for persona `key` at the restart cap:
  * logged when the cap is met before the persona's reads, and when the tick's
- * own liveness read took it to the cap (b.4q8). Pure.
+ * own liveness read took it to the cap. Pure.
  *
- *   [slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)
+ * [slack] health-check: persona=<key> is at cap — skipping tick
  */
 export function healthCheckAtCapSkipLine(key: string): string {
-  return `[slack] health-check: persona=${key} is at cap — skipping tick (SR-25.3/25.4)`
+  return `[slack] health-check: persona=${key} is at cap — skipping tick`
 }
 
 /**
  * The latched no-attempt reason asked again after the tick's liveness read
- * (b.jg5 SRJ-502, SRJ-512, SRJ-513): true when `isLatched` answers exactly `true`,
+ * true when `isLatched` answers exactly `true`,
  * since the read itself may have latched the persona. A throw propagates, as
  * from `noAttemptReason` (the per-persona `catch` logs it and ends the
  * persona's work for the tick).
@@ -347,7 +346,7 @@ function latchedAfterRead(d: HealthCheckDeps, key: string): boolean {
 }
 
 /**
- * b.jg5 SRJ-311: for a persona held off on `tmux-unavailable` that the tick
+ * for a persona held off on `tmux-unavailable` that the tick
  * did not find healthy, arm its retry timer with the ENVIRONMENT cause when
  * it has none (`isRetryArmed` answers exactly false), with one line saying
  * so. A retry that stopped while the flag stayed raised (not up, a declined
@@ -432,7 +431,7 @@ async function runHealthCheckTick(): Promise<void> {
   }
   tickInFlight = true
   skippedTicks = 0
-  // b.jg5 SRJ-308: the tick's start time, read before any of its work; the
+  // the tick's start time, read before any of its work; the
   // tick-end hook gets it once the body ends, however it ends. The deps are
   // captured once so the hook that runs is the one whose clock was read,
   // even if `initHealthCheck` swaps the deps mid-tick.
@@ -453,7 +452,7 @@ async function runHealthCheckTick(): Promise<void> {
       try {
         // A restart pending or active owns the session: skip before any read.
         // (Work in flight is not this skip: it is a no-attempt reason below,
-        // and the persona is still read; b.jg5 SRJ-315.)
+        // and the persona is still read.)
         if (deps.isRestartPendingOrActive(key)) {
           // Clear any pending streak: "consecutive" means consecutive
           // *observed* ticks, not observations separated by an entire restart
@@ -464,7 +463,7 @@ async function runHealthCheckTick(): Promise<void> {
           continue
         }
 
-        // SR-25.3/25.4: skip capped personas — the tick must not re-schedule
+        // skip capped personas — the tick must not re-schedule
         // restarts for personas that have reached the consecutive-failure cap.
         // The cap is not clearable from the inbound message path: a capped-dead
         // persona has no registered session, so inbound messages are dropped
@@ -472,7 +471,7 @@ async function runHealthCheckTick(): Promise<void> {
         // cap itself) and never reach scheduleRestart. The in-process cap/backoff state clears
         // only on a server restart.
         //
-        // b.9a7 design decision 1 (DELIBERATE): this skip covers the new
+        // the current rule (DELIBERATE): this skip covers the new
         // alive-but-disconnected reconnect path too — a capped persona gets NO
         // tick-driven reconnect. The lost-message notice at the persona's
         // destination reports a capped persona as "restart limit reached":
@@ -490,12 +489,12 @@ async function runHealthCheckTick(): Promise<void> {
           continue
         }
 
-        // b.jg5 SRJ-315: decided once, before any read. With a reason (the
-        // persona latched, which a human decides, SRJ-502; held on
-        // ErrInvalidFlags until the binary changes, SRJ-207; work in flight,
+        // decided once, before any read. With a reason (the
+        // persona latched, which a human decides; held on
+        // ErrInvalidFlags until the binary changes; work in flight,
         // which owns the session and whose wait reconnects or reports it,
-        // b.f2b; or `tmux-unavailable` raised, whose retry timer is the
-        // persona's only attempt, SRJ-311), the persona is still
+        // or `tmux-unavailable` raised, whose retry timer is the
+        // persona's only attempt), the persona is still
         // read below, so one that recovered on its own takes the healthy
         // branch (clearing the outage and ending `tmux-unresponsive`), but
         // the tick schedules nothing and posts no not-connected notice.
@@ -507,7 +506,7 @@ async function runHealthCheckTick(): Promise<void> {
           setOutageFlag(key, 'cwd-unreachable', cwd)
         }
 
-        // b.jg5 SRJ-314: the probe answers a reading. `unknown` (a `status`
+        // the probe answers a reading. `unknown` (a `status`
         // error agent-director could not answer, or a probe that threw) is
         // never read as dead: the persona is skipped this tick, with no
         // restart scheduled, nothing posted and no episode ended. Its
@@ -521,13 +520,13 @@ async function runHealthCheckTick(): Promise<void> {
           reading = LIVENESS_UNKNOWN
           failure = ` (isSessionAlive failed: ${describeThrownValue(err)})`
         }
-        // b.jg5 SRJ-502, SRJ-512, SRJ-513: the tick's own liveness read may
+        // the tick's own liveness read may
         // have latched the persona (an UNUSABLE NAME answer, or its own row
         // reading `pending` with no launch start); its latched
         // no-attempt reason is asked again after the read, so the tick
         // schedules nothing for it.
         if (reason !== 'latched' && latchedAfterRead(deps, key)) reason = 'latched'
-        // b.4q8: the read may have settled the persona's resumed launch as
+        // the read may have settled the persona's resumed launch as
         // ended before reporting in, a counted failure that can reach the cap
         // (with its cap notice, its retry timer stopped). The cap is asked
         // again, so a persona the read took to the cap is skipped as one met
@@ -543,20 +542,20 @@ async function runHealthCheckTick(): Promise<void> {
           console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
           continue
         }
-        // b.omv SR-7.6: an old connected bot still needs provenance inspection.
+        // an old connected bot still needs provenance inspection.
         if (!holdOff && reading !== LIVENESS_DEAD && await deps.inspectUpgrade?.(key)) {
           disconnectedStreak.delete(key)
           continue
         }
         // `live` and `pending` take the alive branches below; only `live`
-        // is ever counted healthy (b.jg5 SRJ-314).
+        // is ever counted healthy.
         const alive = reading !== LIVENESS_DEAD
         const pending = reading === LIVENESS_PENDING
 
-        // b.9a7: a persona can be alive (AD live state — pending, waiting,
+        // a persona can be alive (AD live state — pending, waiting,
         // working, ask_user, check_permission) yet have a dead MCP session.
         // `isSessionAlive` alone reads `live` or `pending` for such a row,
-        // so the pre-b.9a7 tick (`if (!alive) scheduleRestart`) did nothing
+        // so the pre-tick (`if (!alive) scheduleRestart`) did nothing
         // for it forever —
         // there was no time-bounded recovery. Route BOTH dead sessions and
         // alive-but-disconnected sessions through scheduleRestart; restart.ts
@@ -564,21 +563,21 @@ async function runHealthCheckTick(): Promise<void> {
         // heal, live+disconnected → reconnectSession, pending → the
         // `pending` deferral, dead → kill+relaunch).
         //
-        // NOTE (b.4vj): a future inbound-delivery retry driver will
+        // NOTE: a future inbound-delivery retry driver will
         // also poke unreachable sessions. If it lands, reconcile the two poke
         // paths so they don't race on the same persona.
-        // (Read once: b.f2b words the delay-0 notice by it.)
+        // (Read once: words the delay-0 notice by it.)
         const connected = alive && deps.isSessionConnected(key)
         const deliverable = connected
         if (holdOff && (!alive || !deliverable || pending)) {
-          // b.jg5 SRJ-315: a no-attempt reason holds and the persona is not
+          // a no-attempt reason holds and the persona is not
           // healthy (`dead`, `pending`, disconnected): no
           // `scheduleRestart`, and no not-connected notice, which only
           // accompanies an attempt. Drop the streak, as every skip does, so
           // a later attempt starts a fresh two-tick count. With
           // `tmux-unavailable` and no retry timer armed, arm one.
           disconnectedStreak.delete(key)
-          // b.jg5 SRJ-311: the outage's retry timer is the persona's only
+          // the outage's retry timer is the persona's only
           // attempt, but a raised flag does not guarantee one is armed.
           if (reason === 'tmux-unavailable') armMissingRetryTimer(deps, key)
         } else if (!alive) {
@@ -587,13 +586,13 @@ async function runHealthCheckTick(): Promise<void> {
           disconnectedStreak.delete(key)
           deps.scheduleRestart(key, cwd)
         } else if (!deliverable || pending) {
-          // b.omv SR-9: disconnected and pending rows share the existing
+          // disconnected and pending rows share the existing
           // two-consecutive-tick debounce. A pending row is never healthy.
           const streak = (disconnectedStreak.get(key) ?? 0) + 1
           if (streak >= 2) {
             disconnectedStreak.delete(key)
             deps.scheduleRestart(key, cwd)
-            // b.f2b: with auto-restart disabled scheduleRestart only logs and
+            // with auto-restart disabled scheduleRestart only logs and
             // returns, so nothing would reconnect this persona: report it
             // (the notice is raised once per episode), worded for why it is
             // disconnected. A connected pending row gets no notice.
@@ -604,11 +603,11 @@ async function runHealthCheckTick(): Promise<void> {
             disconnectedStreak.set(key, streak)
           }
         } else {
-          // `live` and connected — healthy (b.omv SR-9). Reset any pending
+          // `live` and connected — healthy. Reset any pending
           // streak so a transient one-tick blip never accumulates toward the
-          // threshold. b.f2b: its not-connected episode, if any, is over.
-          // b.jg5 SRJ-310: so is its tmux-unresponsive condition, if it holds.
-          // b.jg5 SRJ-311, SRJ-312: a healthy check is the one tick
+          // threshold. its not-connected episode, if any, is over.
+          // so is its tmux-unresponsive condition, if it holds.
+          // a healthy check is the one tick
           // observation that clears `tmux-unavailable` (with its single
           // all-clear when that empties the persona's flags), carrying the
           // tick's `live` reading so the retry timer's stop sees a row live
@@ -617,7 +616,7 @@ async function runHealthCheckTick(): Promise<void> {
           deps.endNotConnectedEpisode?.(key)
           deps.endTmuxUnresponsive?.(key)
           clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
-          // b.jg5 SRJ-610: a persona healthy on its own resets its
+          // a persona healthy on its own resets its
           // slow-recovery count; its episode, if open, stays open.
           deps.resetSlowRecoveryCount?.(key)
         }
@@ -631,7 +630,7 @@ async function runHealthCheckTick(): Promise<void> {
     // the interval callback.
     console.error(`[slack] health-check: the tick failed: ${describeThrownValue(err)}`)
   } finally {
-    // b.jg5 SRJ-308: the onset check runs once the tick's per-persona work
+    // the onset check runs once the tick's per-persona work
     // is done, however the body ended (never throws).
     runTickEndHook(tickDeps, tickStartedAt)
     tickInFlight = false
@@ -663,7 +662,7 @@ function runTickEndHook(d: HealthCheckDeps, tickStartedAt: number | undefined): 
 // ---------------------------------------------------------------------------
 
 /**
- * Forget persona `key`'s disconnected streak (b.av2 SR-6.5, a teardown). A
+ * Forget persona `key`'s disconnected streak (a teardown). A
  * persona gone from the work list loses it at the next tick anyway; this
  * drops it at once. Other personas' streaks are untouched; logs nothing.
  */

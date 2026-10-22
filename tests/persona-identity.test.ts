@@ -1,12 +1,12 @@
 /**
  * persona-identity.test.ts — persona key rule and derived identifiers.
  *
- * Covers b.av2 SR-2.1 (key rule and fit constraints), SR-2.2 (instance ID,
+ * Covers (key rule and fit constraints)(instance ID,
  * tmux name, labels, spawn env, with Claude Code's prompt suggestions off in
- * every persona env, b.svb; a notice's quoted session and the exact attach
- * target, b.jg5 SRJ-1001), the effective config-dir set (SR-6.2, SR-8.6
- * step 5), SR-9.1/SR-9.3 (persona target resolution),
- * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects),
+ * every persona env; a notice's quoted session and the exact attach
+ * target), the effective config-dir set (
+ * step 5)(persona target resolution),
+ * (persona-reference rendering) and (no import side effects),
  * plus the test helper's token matcher (`TOKEN_LIKE` / `isTokenLike`), which
  * `assertNoLeak` applies.
  *
@@ -15,10 +15,9 @@
  * keys become persisted agent-director identifiers, so an algorithm change
  * must fail here.
  *
- * Isolation (b.av2 SR-13.2): every home and config dir is a mkdtempSync path,
+ * Isolation: every home and config dir is a mkdtempSync path,
  * removed in afterEach. Nothing touches the real home directory. The
- * module-import child gets its environment from `hostSafeChildEnv` (b.jg5
- * SRJ-1301, SRJ-1302): its temp HOME, no PATH entries, and only the extras
+ * module-import child gets its environment from `hostSafeChildEnv`: its temp HOME, no PATH entries, and only the extras
  * it needs, so no Slack variable or host PATH reaches it.
  *
  * SPDX-License-Identifier: MIT
@@ -76,7 +75,7 @@ function expectedDirHash(absPath: string): string {
 const FORTY_IN_FORM = 'release_coordinator_for_platform_team_01'
 
 // ---------------------------------------------------------------------------
-// Key rule (b.av2 SR-2.1)
+// Key rule
 // ---------------------------------------------------------------------------
 
 describe('personaKey', () => {
@@ -120,7 +119,7 @@ describe('personaKey', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fit constraints (b.av2 SR-2.1)
+// Fit constraints
 // ---------------------------------------------------------------------------
 
 describe('fit constraints', () => {
@@ -150,7 +149,7 @@ describe('fit constraints', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Derived identifiers (b.av2 SR-2.2)
+// Derived identifiers
 // ---------------------------------------------------------------------------
 
 describe('derived identifiers', () => {
@@ -159,7 +158,7 @@ describe('derived identifiers', () => {
     expect(personaTmuxSessionName('ops_bot_5e2526f3')).toBe('slack_bot_ops_bot_5e2526f3')
   })
 
-  test('a notice\'s <session> is the tmux name in double quotes (b.jg5 SRJ-1001), and an attach target is the exact name, =<name> (b.1ix)', () => {
+  test('a notice\'s <session> is the tmux name in double quotes, and an attach target is the exact name, =<name>', () => {
     expect(quotedPersonaSessionName('dev')).toBe('"slack_bot_dev"')
     expect(quotedPersonaSessionName('dev_2')).toBe('"slack_bot_dev_2"')
     expect(tmuxExactSessionTarget('slack_bot_dev')).toBe('=slack_bot_dev')
@@ -208,7 +207,7 @@ describe('derived identifiers', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Effective config-dir set (b.av2 SR-6.2, SR-8.6 step 5)
+// Effective config-dir set (step 5)
 // ---------------------------------------------------------------------------
 
 describe('effectiveClaudeConfigDirs', () => {
@@ -259,7 +258,7 @@ describe('effectiveClaudeConfigDirs', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Spawn environment (b.av2 SR-2.2)
+// Spawn environment
 // ---------------------------------------------------------------------------
 
 describe('personaSpawnEnv', () => {
@@ -294,7 +293,7 @@ describe('personaSpawnEnv', () => {
     ])
   })
 
-  // b.svb / b.f2b: Claude Code's end-of-turn prompt-suggestion fork runs the
+  // Claude Code's end-of-turn prompt-suggestion fork runs the
   // session's PreToolUse hooks and flips an idle persona to `working`.
   describe('prompt suggestions off (PROMPT_SUGGESTION_OFF_ENV)', () => {
     test('the constant is exactly CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false, and frozen', () => {
@@ -323,7 +322,7 @@ describe('personaSpawnEnv', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Rendering (b.av2 SR-10.3)
+// Rendering
 // ---------------------------------------------------------------------------
 
 describe('renderPersonaRef', () => {
@@ -339,7 +338,7 @@ describe('renderPersonaRef', () => {
 // ---------------------------------------------------------------------------
 // The test helper's token matcher (tests/test-helpers/credentials.ts)
 //
-// Persona names have no format rule (b.av2 SR-1.2), so the source has no
+// Persona names have no format rule, so the source has no
 // token matcher. `TOKEN_LIKE` / `isTokenLike` still define what
 // `assertNoLeak` flags and what the secrecy audit's no-token-literal scan
 // looks for, so their boundary and after-dash rules are pinned here.
@@ -387,7 +386,7 @@ describe('TOKEN_LIKE / isTokenLike (the rule assertNoLeak applies)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Target resolution (b.av2 SR-9.1, SR-9.3)
+// Target resolution
 // ---------------------------------------------------------------------------
 
 describe('resolvePersonaTarget', () => {
@@ -421,7 +420,7 @@ describe('resolvePersonaTarget', () => {
 })
 
 // ---------------------------------------------------------------------------
-// No import side effects (b.av2 SR-13.1)
+// No import side effects
 // ---------------------------------------------------------------------------
 
 describe('module import', () => {
@@ -447,7 +446,7 @@ describe('module import', () => {
   })
 })
 
-// b.omv SR-7.4: frozen literal launch controls, never user-wide settings.
+// frozen literal launch controls, never user-wide settings.
 test('updater and survey controls are fixed and frozen', () => {
   expect(AUTOUPDATER_OFF_ENV).toEqual({ DISABLE_AUTOUPDATER: '1' })
   expect(FEEDBACK_SURVEY_OFF_ENV).toEqual({ CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1' })

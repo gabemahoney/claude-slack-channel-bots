@@ -50,7 +50,7 @@ sr_exit() {
 }
 
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -64,7 +64,7 @@ cd "${REPO_ROOT}"
 # Snapshot the working-tree dirt at script start so SR-7.5 (below) can tell
 # promote-INDUCED package.json/bun.lock dirt (safe to revert) apart from
 # dirt an operator deliberately staged BEFORE promote ran (must NOT be
-# clobbered — that is exactly the load-bearing-dirt scenario b.bpp warns of).
+# clobbered — that is exactly the load-bearing-dirt scenario warns of).
 # `|| true` keeps a git failure here from killing the script under set -e;
 # an empty snapshot just means "treat everything as promote-induced", which
 # is the safe default for a clean start.
@@ -254,7 +254,7 @@ echo "SR-6.1 (registry verification): polling npm for claude-slack-channel-bots@
 VERIFIED=0
 for ATTEMPT in $(seq 1 "${SR61_POLL_ATTEMPTS}"); do
   # `|| true` is load-bearing: when npm registry hasn't yet propagated v${NEXT_VERSION},
-  # `npm view` exits non-zero (E404), and under set -e + pipefail the bare pipeline-
+  # `npm view` exits non-zero , and under set -e + pipefail the bare pipeline-
   # assignment kills the script with no SR-X.Y diagnostic. The empty-result case
   # is the intended retry path, so we tolerate it explicitly here.
   REGISTRY_VERSION="$(npm view "claude-slack-channel-bots@${NEXT_VERSION}" version 2>/dev/null | tr -d '[:space:]' || true)"
@@ -280,12 +280,12 @@ if ! bash "${SCRIPT_DIR}/sanitize-global.sh"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 7 prefix resolution + shadowing-install helpers (b.r6x)
+# Phase 7 prefix resolution + shadowing-install helpers
 # ---------------------------------------------------------------------------
 #
 # BUN_PREFIX is bun's global prefix. `${BUN_INSTALL:-$HOME/.bun}` is the CORRECT
 # expansion (verified with bun 1.4.0: with BUN_INSTALL unset, ~/.bun is bun's
-# default global prefix) — do not "fix" it. What b.r6x is about is that an
+# default global prefix) — do not "fix" it. What is about is that an
 # install can also exist in some OTHER prefix (e.g. a stale ~/.cache/.bun farm
 # left by an install run with BUN_INSTALL pointed there), and that stale copy can
 # win on PATH via a shim in ~/.local/bin. Phase 7 used to be blind to that: it
@@ -358,7 +358,7 @@ cscb_bun_prefix_of() {
 # The `-d <candidate>/install/global` test is load-bearing, not belt-and-braces:
 # a plain PATH shim such as ~/.local/bin/claude-slack-channel-bots matches the
 # <prefix>/bin/<pkg> shape by accident, and calling ~/.local a bun prefix would
-# make the report tell the operator to delete the very shim that AC-4 says must
+# make the report tell the operator to delete the very shim that says must
 # be repointed instead. Only a directory that really holds an install/global
 # tree counts.
 cscb_shadow_prefix() {
@@ -402,7 +402,7 @@ cscb_shadow_report() {
     printf 'A second bun global prefix at %s is shadowing the canonical one. Manual remediation (the LLM driving /publish promote MUST NOT execute these commands itself):\n' "${stale}"
     printf '    rm -rf %s/install/global\n' "${stale}"
     # Never emit an `rm -f` for the PATH shim itself — the ln -sfn below repoints
-    # it, and deleting it can make the command unresolvable (AC-4).
+    # it, and deleting it can make the command unresolvable ().
     if [ "${stale}/bin/claude-slack-channel-bots" != "${on_path}" ]; then
       printf '    rm -f  %s/bin/claude-slack-channel-bots\n' "${stale}"
     fi
@@ -416,7 +416,7 @@ cscb_shadow_report() {
   printf 'Two constraints on that cleanup: (1) NEVER touch any install/cache directory under a bun prefix — that is bun'"'"'s shared package download cache, used by every package on the box, not part of this install; (2) REPOINT the PATH shim with ln -sfn, do not delete it — %s/bin is commonly not on the interactive PATH, so deleting the shim makes the command unresolvable in a normal shell.\n' "${BUN_PREFIX}"
 }
 
-# SR-7.0 — pre-install shadowing check (b.r6x AC-1).
+# SR-7.0 — pre-install shadowing check ().
 # Runs BEFORE the remove/install below, so the state it reports is the state that
 # existed when promote started rather than a post-install mixture. It only warns
 # here: aborting before the install would leave the host with the stale copy AND
@@ -440,7 +440,7 @@ fi
 # SR-7.2 — remove any existing global install (tolerate non-zero exit; nothing may be installed).
 # Then defensively rm the leftover node_modules entry to clean up dangling files or symlinks the
 # remove step may not have cleared (e.g. a prior `install-local.sh` symlink farm).
-# Scope note (b.r6x): this cleanup is deliberately confined to ${GLOBAL_DIR}. A
+# Scope note: this cleanup is deliberately confined to ${GLOBAL_DIR}. A
 # shadowing install in another prefix is REPORTED (SR-7.0 / SR-7.4), never
 # deleted here — see cscb_shadow_report.
 (cd "$HOME" && bun remove -g claude-slack-channel-bots) > /dev/null 2>&1 || true
@@ -466,7 +466,7 @@ fi
 case "${RESOLVED_BIN}" in
   "${GLOBAL_DIR}"/*) ;;
   *)
-    # b.r6x AC-6: this used to blame "the global install layout" and send the
+    # this used to blame "the global install layout" and send the
     # operator to re-run remove/install in THIS prefix — which cannot help when
     # the winner on PATH lives in a different prefix entirely. Name what was
     # actually found, what was expected, and the shim in between.
@@ -494,7 +494,7 @@ if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   sr_exit 72
 fi
 
-# SR-7.4b — postinstall trust gap (b.r6x AC-7).
+# SR-7.4b — postinstall trust gap ().
 #
 # Bun blocks a package's postinstall unless the global manifest lists it in
 # trustedDependencies. A FRESH global prefix has no such entry, so the install
@@ -514,7 +514,7 @@ fi
 # release broke when it did not. Paths honor SLACK_STATE_DIR (the same override
 # src/postinstall.ts reads), so this block is drivable against a temp state dir.
 #
-# The state dir is the server's (b.smv: ${XDG_CONFIG_HOME:-~/.config}/claude-slack-channel-bots,
+# The state dir is the server's (${XDG_CONFIG_HOME:-~/.config}/claude-slack-channel-bots,
 # outside ~/.claude where Claude Code asks before every write), chosen the way
 # src/state-dir-migration.ts's resolveCliStateDir does: until the daemon's first
 # start on the new default has moved the old directories (${XDG_CONFIG_HOME:-~/.config}/cscb,
@@ -592,7 +592,7 @@ fi
 
 if [ "${SR74B_TRUSTED}" != "1" ]; then
   echo "SR-7.4b (postinstall trust): ${SR74B_GLOBAL_PKG} does not list claude-slack-channel-bots in trustedDependencies, so bun blocked its postinstall. Running 'bun pm -g trust claude-slack-channel-bots' to execute it."
-  # $HOME subshell for the same reason every other `bun -g` site has one (b.bpp):
+  # $HOME subshell for the same reason every other `bun -g` site has one:
   # bun must not resolve the repo's package.json during a global operation.
   (cd "$HOME" && bun pm -g trust claude-slack-channel-bots) || \
     echo "SR-7.4b (postinstall trust): 'bun pm -g trust claude-slack-channel-bots' did not succeed. Continuing — the artifact check below reports whether that actually left anything missing." >&2
@@ -632,7 +632,7 @@ fi
 # promote is necessarily promote-induced (owned by the prepare-phase commit,
 # never by promote), whereas dirt already present at start is deliberate
 # operator work and must NOT be clobbered (the load-bearing-dirt scenario
-# b.bpp guards against). Anything the revert leaves behind — a file dirty at
+# guards against). Anything the revert leaves behind — a file dirty at
 # start, a non-pkg/lock file, or a checkout that failed to clean — takes the
 # loud-stderr-warning path instead. Either arm keeps exit 0: the release is
 # already published, tagged, and verified, so this late stage never fails it.
@@ -681,7 +681,7 @@ fi
 
 # SR-8.1 — daemon-bounce handoff.
 # Addressed to the orchestrating LLM, NOT the operator. The skill itself does
-# not execute the bounce (clean_restart is operator-state-mutating; the b.1wi
+# not execute the bounce (clean_restart is operator-state-mutating; the
 # contract forbids the LLM from running such commands without explicit operator
 # confirmation). The orchestrator's job on seeing this message: ask the
 # operator, and run clean_restart only on confirmation.

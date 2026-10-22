@@ -3,7 +3,7 @@
  * (src/cron-log.ts). Covers the pure formatters (five-field layout, all current and legacy
  * outcome classes, detail tokens, newline escaping) and the I/O half
  * (createCronLog: append accumulation, unwritable-path resilience, self-heal,
- * whole-line rapid appends) and the `cron_log_max_bytes` cap (b.p4i, E5): the
+ * whole-line rapid appends) and the `cron_log_max_bytes` cap : the
  * pure cut (`cronLogPruneOffset`) and the prune after each append — oldest
  * whole lines dropped, the newest always kept, no prune with the key absent, a
  * failed rewrite losing no line, a symlinked log path kept a symlink, a log
@@ -153,7 +153,7 @@ function appendFires(log: CronLog, count: number, from = 0): string[] {
 /**
  * What a prune to `cap` must leave of `lines` (each newline-terminated, oldest
  * first): the longest run of the NEWEST whole lines that fits in `cap` bytes,
- * and never less than the newest line (E5). Built independently of the code
+ * and never less than the newest line . Built independently of the code
  * under test, as the oracle the pure and I/O cases compare with.
  */
 function newestWithin(lines: readonly string[], cap: number): string {
@@ -633,7 +633,7 @@ describe('rapid sequential appends', () => {
 })
 
 // ---------------------------------------------------------------------------
-// cron_log_max_bytes — the pure cut (b.p4i, E5)
+// cron_log_max_bytes — the pure cut
 // ---------------------------------------------------------------------------
 
 describe('cronLogPruneOffset — where a prune cuts the log', () => {
@@ -666,7 +666,7 @@ describe('cronLogPruneOffset — where a prune cuts the log', () => {
 })
 
 // ---------------------------------------------------------------------------
-// cron_log_max_bytes — the prune after each append (b.p4i, E5)
+// cron_log_max_bytes — the prune after each append
 // ---------------------------------------------------------------------------
 
 describe('cron_log_max_bytes — whole-line pruning of the log', () => {
@@ -697,7 +697,7 @@ describe('cron_log_max_bytes — whole-line pruning of the log', () => {
     return { log, cap, before }
   }
 
-  test('REGRESSION (b.p4i): with a 1 KB cap, appends past it leave the file within the cap — oldest whole lines gone, newest intact, no partial head', () => {
+  test('REGRESSION: with a 1 KB cap, appends past it leave the file within the cap — oldest whole lines gone, newest intact, no partial head', () => {
     const log = createCronLog(logPath, { maxBytes: CAP })
     const written = appendWithinCap(log, CAP, 60, 0)
     expect(Buffer.byteLength(written.join(''))).toBeGreaterThan(2 * CAP)
@@ -791,7 +791,7 @@ describe('cron_log_max_bytes — whole-line pruning of the log', () => {
     expect(readdirSync(realDir)).toEqual(['cron.log'])
   })
 
-  test('REGRESSION (b.p4i): a log path replaced while the log is open (moved away, an empty file made in its place) — the moved file stops growing, later lines land at the path within the cap, no error line', () => {
+  test('REGRESSION: a log path replaced while the log is open (moved away, an empty file made in its place) — the moved file stops growing, later lines land at the path within the cap, no error line', () => {
     const { log, cap, before } = openLogAtCap()
     const movedPath = join(tempDir, 'cron.log.1')
     renameSync(logPath, movedPath)
@@ -808,7 +808,7 @@ describe('cron_log_max_bytes — whole-line pruning of the log', () => {
     expect(errorCalls).toEqual([])
   })
 
-  test('REGRESSION (b.p4i): a log path removed while the log is open — a later append recreates it, the cap holds, no error line', () => {
+  test('REGRESSION: a log path removed while the log is open — a later append recreates it, the cap holds, no error line', () => {
     const { log, cap, before } = openLogAtCap()
     rmSync(logPath)
 

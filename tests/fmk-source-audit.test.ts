@@ -1,7 +1,7 @@
 /**
- * fmk-source-audit.test.ts — One source audit over every `src/` file (b.jg5
- * SRJ-716, SRJ-106, SRJ-612; SRJ-601's removed identifiers and process-start
- * rule; AC 16's source half, AC 17, AC 18).
+ * fmk-source-audit.test.ts — One source audit over every `src/` file (
+ * removed identifiers and process-start
+ * rule source half).
  *
  * `auditSources` is a pure scanner over (path, text) pairs: the tree case
  * reads every `.ts` file under `src/` (recursively) and every planted case
@@ -18,8 +18,8 @@
  *   the bracket form; a `destroy` call on a `director…` receiver. A bare
  *   `.delete(` on any other receiver (a `Map` or `Set`) is no finding.
  * - `delete-helper`: any of the row-delete names, in code or a string.
- * - `finished-row-option`: `include_finished` or `include-finished` anywhere (SRJ-106).
- * - `ad-label`: `ad_owner` or `ad_pane` anywhere (SRJ-612, HO rev 17).
+ * - `finished-row-option`: `include_finished` or `include-finished` anywhere.
+ * - `ad-label`: `ad_owner` or `ad_pane` anywhere (HO rev 17).
  * - `tmux-process-start`: a process start whose command is `tmux` (a literal
  *   in any quote style, an absolute path ending `/tmux`, or the first word of
  *   a shell `-c` string): `spawn`, `spawnSync`, `exec`, `execSync`,
@@ -33,9 +33,9 @@
  *   method (`client.spawn(`) and a method `exec(` (a regex or a database) are
  *   no process start.
  * - `raw-tmux-subcommand`: `kill-session`, `has-session` or `start-server`
- *   anywhere (SRJ-1101; HO C1, C18, C20).
- * - `removed-identifier`: any of SRJ-601's removed names, E17 T1's approver
- *   seam names and E22 T4's ladder kill clock seam, in code or a string.
+ * anywhere (HO C1, C18, C20).
+ * - `removed-identifier`: any of the contract removed names, approver
+ * seam names and ladder kill clock seam, in code or a string.
  *
  * Log text naming tmux sub-commands (`tmux attach -t`) is no process start.
  *
@@ -43,7 +43,7 @@
  * agent-director stub (`tests/test-helpers/agent-director-stub.ts`) with the
  * TypeScript parser, so text in strings and comments never counts, and finds
  * any recognition of a class the client declares by name rather than by class
- * (b.jg5 SRJ-101, SRJ-104). The class names are read from the installed
+ * The class names are read from the installed
  * client's namespace (every subclass of its `AgentDirectorError`, the three
  * Phase-1-only classes in `PHASE1_ONLY_ERR_NAMES` among them), never listed
  * here. A name is the literal, a constant holding it, or an element of a
@@ -61,7 +61,7 @@
  * A-13 and `UnknownError` rows, and the sanctioned comparisons).
  *
  * A third audit, with the same parser, holds the three Phase-1-only classes
- * to the pinned client's own (b.jg5 SRJ-101, SRJ-103, SRJ-1203):
+ * to the pinned client's own:
  *
  * - `phase1ReExportFindings`: `src/agent-director-errors.ts` re-exports
  *   each of them by its own name in an `export { … } from 'agent-director'`
@@ -89,7 +89,7 @@
  * A fourth, `phase1TypesFindings`, holds `src/ad-phase1-types.ts` to type
  * aliases and type-only agent-director imports, with no interface, object
  * type literal or mapped type, so it declares no field the client declares
- * (b.jg5 SRJ-101, SRJ-1303); it is pinned the same way.
+ * it is pinned the same way.
  *
  * Source audits read only the repository and installed client. Legacy
  * contract regressions run extracted declarations in an inert bash child
@@ -417,7 +417,7 @@ const SRC_FILES: ReadonlyArray<readonly [string, string]> = (readdirSync(SRC_DIR
   .sort()
   .map((name) => [name, readFileSync(join(SRC_DIR, name), 'utf-8')] as const)
 
-describe('b.jg5 SRJ-716, SRJ-106, SRJ-612, SRJ-601: one source audit over every src/ file', () => {
+describe('one source audit over every src/ file', () => {
   test('the real src/ has no finding, every listed non-literal start among them', () => {
     expect(SRC_FILES.map(([name]) => name)).toEqual(expect.arrayContaining(['cli.ts', 'session-manager.ts', 'server.ts', 'reply-reminder.ts']))
     expect(auditSources(SRC_FILES, NON_LITERAL_STARTS)).toEqual([])
@@ -448,12 +448,12 @@ const PLANTED: ReadonlyArray<readonly [string, string, Rule]> = [
     [`${name} in code`, `await deps.${name}(key)`, 'delete-helper'],
     [`${name} in a string`, `log('${name} failed')`, 'delete-helper'],
   ]),
-  // finished-row-option: include_finished or include-finished (SRJ-106).
+  // finished-row-option: include_finished or include-finished.
   ['include_finished in code', 'await c.kill({ instance_id: id, include_finished: true })', 'finished-row-option'],
   ['include_finished in a string', "const key = 'include_finished'", 'finished-row-option'],
   ['include-finished in a string', 'const flag = "--include-finished"', 'finished-row-option'],
   ['include-finished in a template', 'const line = `kill --include-finished ${id}`', 'finished-row-option'],
-  // agent-director's labels (SRJ-612).
+  // agent-director's labels.
   ['ad_owner in code', 'const ad_owner = row.label', 'ad-label'],
   ['ad_owner in a string', "const option = '@ad_owner'", 'ad-label'],
   ['ad_pane in code', 'const { ad_pane } = row', 'ad-label'],
@@ -497,11 +497,11 @@ const PLANTED: ReadonlyArray<readonly [string, string, Rule]> = [
   ['deps.spawnSync(variable)', "deps.spawnSync(bin, ['ls'])", 'unlisted-process-start'],
   ["spawn('sh', ['-c', variable])", "spawn('sh', ['-c', script])", 'unlisted-process-start'],
   ['cp.exec(variable) on a child_process namespace', "import cp from 'child_process'; cp.exec(command)", 'unlisted-process-start'],
-  // A raw tmux sub-command named in a string (SRJ-1101).
+  // A raw tmux sub-command named in a string.
   ['kill-session', "const verb = 'kill-session'", 'raw-tmux-subcommand'],
   ['has-session', 'const verb = "has-session"', 'raw-tmux-subcommand'],
   ['start-server', 'const line = `tmux start-server ${flags}`', 'raw-tmux-subcommand'],
-  // SRJ-601's removed identifiers, E17 T1's and E22 T4's seams.
+  // removed identifiers, and seams.
   ...REMOVED_IDENTIFIERS.flatMap((name): Array<readonly [string, string, Rule]> => [
     [`${name} in code`, `export const x = ${name}`, 'removed-identifier'],
     [`${name} in a string`, `log('${name}')`, 'removed-identifier'],
@@ -599,7 +599,7 @@ describe('the closed list of non-literal process starts is keyed by file, callee
 })
 
 // ---------------------------------------------------------------------------
-// By-name recognition of a class the client declares (b.jg5 SRJ-101, SRJ-104)
+// By-name recognition of a class the client declares
 // ---------------------------------------------------------------------------
 
 type ByNameRule = 'class-name-comparison' | 'class-name-lookup' | 'class-by-name-call' | 'base-error-named'
@@ -629,8 +629,8 @@ const CLASS_NAMES: ReadonlySet<string> = new Set(CLIENT_CLASS_EXPORTS.map(([name
 /**
  * The only by-name uses of a class the client declares that the tree keeps,
  * each a finding of `rule` reading `name` in `file`, and nothing else:
- * `ErrAmbiguousRequest` and `ErrPermissionRequestNotFound`, which SRJ-104's
- * table does not list and E37's ruling keeps as they are (b.jg5 SRJ-101); the
+ * `ErrAmbiguousRequest` and `ErrPermissionRequestNotFound`, which
+ * table does not list and ruling keeps as they are; the
  * version gate's three system-install comparisons; and the checked kill's
  * GONE-name log label. Every other class, at these files included, is decided
  * by `instanceof`. The released client declares the A-13 rows too
@@ -646,7 +646,7 @@ interface SanctionedByName {
 }
 
 const SANCTIONED_BY_NAME: readonly SanctionedByName[] = [
-  { file: 'src/permission-click-handler.ts', name: 'ErrAmbiguousRequest', rule: 'class-name-comparison', reason: "decide's defense-in-depth backstop and its trail class (SR-4.4, SR-V-2.7)" },
+  { file: 'src/permission-click-handler.ts', name: 'ErrAmbiguousRequest', rule: 'class-name-comparison', reason: "decide's defense-in-depth backstop and its trail class" },
   { file: 'src/agent-director-client.ts', name: 'ErrPermissionRequestNotFound', rule: 'class-name-comparison', reason: "the permission poller's sentinel matcher (isErrPermissionRequestNotFound)" },
   { file: 'tests/test-helpers/agent-director-stub.ts', name: 'ErrAmbiguousRequest', rule: 'base-error-named', reason: "the stub's base-error builder, which the click handler's comparison matches" },
   { file: 'tests/test-helpers/agent-director-stub.ts', name: 'ErrPermissionRequestNotFound', rule: 'base-error-named', reason: "the stub's base-error builder, which the sentinel matcher matches" },
@@ -677,7 +677,7 @@ const LOOKUP_METHODS: readonly string[] = ['get', 'has', 'includes', 'indexOf', 
 /** Callees whose arguments are log text (`console.error`, `log`, `deps.warn`). */
 const LOG_CALLEES: readonly string[] = ['log', 'warn', 'error', 'info', 'debug']
 
-/** The module that re-exports the client's error classes (b.jg5 SRJ-103). */
+/** The module that re-exports the client's error classes. */
 const ERRORS_FILE = 'src/agent-director-errors.ts'
 
 /** The agent-director stub, audited beside `src/`. */
@@ -1106,7 +1106,7 @@ const DECLARED_CLASS_NAMES: readonly string[] = [
     .matchAll(/^export declare class (\w+) extends \w+/gm),
 ].map((m) => m[1]!).filter((name) => name !== 'AgentDirectorError')
 
-describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by class in src/ and the stub, never by name', () => {
+describe('every class the client declares is decided by class in src/ and the stub, never by name', () => {
   test('the class names are read from the installed client: each of its declared error classes, by its own name, the three Phase-1-only classes among them', () => {
     expect(CLIENT_CLASS_EXPORTS.map(([name]) => name).sort()).toEqual([...DECLARED_CLASS_NAMES].sort())
     for (const [name, cls] of CLIENT_CLASS_EXPORTS) expect(cls.name).toBe(name)
@@ -1144,7 +1144,7 @@ describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by 
 })
 
 // ---------------------------------------------------------------------------
-// The three Phase-1-only classes are the pinned client's own (b.jg5 SRJ-101, SRJ-103, SRJ-1203)
+// The three Phase-1-only classes are the pinned client's own
 // ---------------------------------------------------------------------------
 
 /** The three Phase-1-only class names, as the audits below take them. */
@@ -1310,7 +1310,7 @@ function auditPhase1(files: ReadonlyArray<readonly [string, string]>, audit: (sf
 /** A plain re-export of every Phase-1-only name but `without`, as one declaration. */
 const reExportsWithout = (without: string): string => `export { AgentDirectorError, ${PHASE1_NAMES.filter((n) => n !== without).join(', ')} } from 'agent-director'`
 
-describe('b.jg5 SRJ-103, SRJ-1203: src/agent-director-errors.ts re-exports the three Phase-1-only classes by name from agent-director', () => {
+describe('src/agent-director-errors.ts re-exports the three Phase-1-only classes by name from agent-director', () => {
   const [kill, unresponsive, conflict] = PHASE1_NAMES as [string, string, string]
 
   test('the real module re-exports each of them plainly', () => {
@@ -1340,7 +1340,7 @@ describe('b.jg5 SRJ-103, SRJ-1203: src/agent-director-errors.ts re-exports the t
   })
 })
 
-describe('b.jg5 SRJ-101, SRJ-1203: no file in src/ or tests/test-helpers/ reads a Phase-1-only class from agent-director but by a named import or re-export', () => {
+describe('no file in src/ or tests/test-helpers/ reads a Phase-1-only class from agent-director but by a named import or re-export', () => {
   const flagged: ReadonlyArray<readonly [string, string]> = [
     ['a namespace property read', `${AD_NS}\nconst killFailed = ad.ErrTmuxKillFailed`],
     ['a guarded read through a typed optional cast', `${AD_NS}\nconst killFailed = (ad as unknown as { readonly ErrTmuxKillFailed?: unknown }).ErrTmuxKillFailed ?? StandIn`],
@@ -1385,7 +1385,7 @@ describe('b.jg5 SRJ-101, SRJ-1203: no file in src/ or tests/test-helpers/ reads 
   })
 })
 
-describe('b.jg5 SRJ-101, SRJ-1203: no file in src/ or tests/test-helpers/ declares a stand-in for a Phase-1-only class', () => {
+describe('no file in src/ or tests/test-helpers/ declares a stand-in for a Phase-1-only class', () => {
   const ERRORS_IMPORT_NAMES = "import { ERR_SPAWN_CAP_REACHED_NAME, ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_UNRESPONSIVE_NAME } from './agent-director-errors.ts'"
   const standInFindings = (source: string): string[] => phase1StandInFindings(parseSource('planted/stand-in.ts', source), TREE_BINDINGS)
 
@@ -1432,7 +1432,7 @@ describe('b.jg5 SRJ-101, SRJ-1203: no file in src/ or tests/test-helpers/ declar
 })
 
 // ---------------------------------------------------------------------------
-// src/ad-phase1-types.ts declares no field (b.jg5 SRJ-101, SRJ-1303)
+// src/ad-phase1-types.ts declares no field
 // ---------------------------------------------------------------------------
 
 /** The module of CSCB's own Phase 1 value types. */
@@ -1460,7 +1460,7 @@ function phase1TypesFindings(sf: ts.SourceFile): string[] {
   return findings
 }
 
-describe('b.jg5 SRJ-101, SRJ-1303: src/ad-phase1-types.ts declares no field; the client declares them all', () => {
+describe('src/ad-phase1-types.ts declares no field; the client declares them all', () => {
   const findings = (source: string): string[] => phase1TypesFindings(parseSource(PHASE1_TYPES_FILE, source))
 
   test('the real module: no finding', () => {
@@ -1508,9 +1508,9 @@ describe('released client unknown-envelope classification audit', () => {
   })
 })
 
-// b.m2o: evaluate only extracted helper declarations with inert shell stubs.
+// evaluate only extracted helper declarations with inert shell stubs.
 // Never source the integration harness or start a real AD/tmux/worker process.
-describe('b.m2o: deliberate pre-0.12 integration contracts', () => {
+describe('deliberate pre-0.12 integration contracts', () => {
   const scenario = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
   const helper = (name: string, source = scenario): string => {
     const match = source.match(new RegExp(`^${name}\\(\\) \\{\n[\\s\\S]*?^\\}`, 'm'))
@@ -1538,7 +1538,7 @@ printf '%s|%s|%s|%s|%s' "$SCENARIO_AD_ROOT" "$SCENARIO_AD_ID_FLAG" "$SCENARIO_AD
       ? `${home}/.agent-director|--claude-instance-id|claude_instance_id|claude_session_id|claude_args`
       : `${home}/.config/agent-director|--instance-id|instance_id|session_id|agent_args`)
   })
-  // b.omv SR-13.6: run the actual pre-upgrade proofs against the old row
+  // run the actual pre-upgrade proofs against the old row
   // shape; current-field fallbacks must not hide missing or injected argv.
   test.each([
     ['old row', { claude_session_id: 'old-session', claude_args: [], labels: {} }, true],
@@ -1569,9 +1569,9 @@ printf 'RESULT=%s' "$?"`, ['jq'])
   })
 
   const worker = readFileSync(join(import.meta.dir, 'integration/fixtures/stub-claude.sh'), 'utf8')
-  // b.omv SR-13.6: inspect only extracted byte-writing declarations, never
+  // inspect only extracted byte-writing declarations, never
   // execute the integration worker, source the harness, or launch AD/tmux.
-  test.each(['at-once', 'transcript-on-first-message'])('b.omv SR-13.6: %s retains literal LF until CR writes one main-user receipt and clears the box', mode => {
+  test.each(['at-once', 'transcript-on-first-message'])('%s retains literal LF until CR writes one main-user receipt and clears the box', mode => {
     const text = '<channel source="slack">\n  first line\nsecond line\n</channel>\n'
     const output = shell(`${['ensure_transcript', 'append_user_receipt', 'handle_line', 'handle_key'].map(name => helper(name, worker)).join('\n')}
 MODE='${mode}'
@@ -1615,7 +1615,7 @@ cat "$TRANSCRIPT"`, ['mkdir', 'jq', 'cat', 'date'])
     assertNoLeak(output)
   })
 
-  test('b.omv SR-13.6: first-message mode ignores blank/slash commands, reconnects, and recognises a sentinel in submitted text', () => {
+  test('first-message mode ignores blank/slash commands, reconnects, and recognises a sentinel in submitted text', () => {
     const output = shell(`${helper('handle_line', worker)}
 MODE=transcript-on-first-message
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
@@ -2269,7 +2269,7 @@ fail() { exit 1; }
 (t19_check_unmessaged_reuse fixture old) 2>/dev/null
 printf '%s' "$?"`, ['jq', 'sed'])
     expect(output).toBe(accepted ? '0' : '1')
-    const step6 = source.slice(source.indexOf('    # 6. The harness'), source.indexOf('# Scenario 12 (b.jg5 SRJ-1414): helpers', source.indexOf('    # 6. The harness')))
+    const step6 = source.slice(source.indexOf('    # 6. The harness'), source.indexOf('# Scenario 12: helpers', source.indexOf('    # 6. The harness')))
     expect(step6).toContain('--arg n "${JSONL_MISSING}"')
     expect(step6).not.toContain('${NEVER_WRITTEN}')
   })
@@ -2518,7 +2518,7 @@ function legacyIntegrationFindings(file: string, source: string): string[] {
   })
   return problems
 }
-describe('b.m2o: old-name audit exempts only deliberate old-release contracts', () => {
+describe('old-name audit exempts only deliberate old-release contracts', () => {
   const base = join(import.meta.dir, 'integration')
   const files = (root: string): string[] => readdirSync(root, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? files(join(root, entry.name)) : [join(root, entry.name)])
   test('the integration tree has no old token outside its documented helper contracts', () => {

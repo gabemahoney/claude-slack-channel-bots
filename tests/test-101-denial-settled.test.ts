@@ -17,7 +17,7 @@ function shapeNotification(e: ReturnType<typeof evidence>, shape: typeof shapes[
   } else v.message.content = content
 }
 
-// b.omv SR-14.2 case 8: a main Stop while an async Agent runs is not readiness.
+// case 8: a main Stop while an async Agent runs is not readiness.
 function evidence() {
   const path = '/scenario/projects/work/session.jsonl'
   const entry = (offset: number, value: any, side = false): TranscriptEntry => ({ path: side ? '/scenario/projects/work/session/subagents/agent-agent1.jsonl' : path,

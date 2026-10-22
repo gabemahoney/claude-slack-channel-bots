@@ -1,5 +1,5 @@
 #!/bin/bash
-# SR-14.7 local-only Codex trials. The login is a single mounted file.
+# local-only Codex trials. The login is a single mounted file.
 set -euo pipefail
 [[ -e /etc/cscb-ci-image && -f /run/codex-login/auth.json ]] || exit 2
 [[ "${CODEX_TEST_MODEL:-}" =~ ^[A-Za-z0-9._:/-]+$ ]] || exit 64

@@ -1,13 +1,13 @@
 /**
  * reload-fingerprint.ts — The pending-change fingerprint and the pending
- * file's layout (b.av2 SR-8.1, SR-8.3, SR-8.5).
+ * file's layout.
  *
  * The fingerprint identifies the contents a pending change was derived from:
  * a SHA-256 over the configuration file's bytes and, for each credentials
  * file the configuration file references (in declaration order), its path
  * and its bytes, or a missing or unreadable marker. In dry run no credentials
  * file is read and the fingerprint covers the configuration file alone: the
- * caller passes no credentials entries (b.av2 SR-8.2). The referenced paths
+ * caller passes no credentials entries. The referenced paths
  * come from `referencedCredentialsPaths` in `config.ts`.
  *
  * Encoding: the hash runs over one stream that can be decoded back into its
@@ -32,7 +32,7 @@
  * recovers the fingerprint from it (the apply compares a confirmation's fingerprint
  * with that of the current contents). The operator never types it.
  *
- * Pure (b.av2 SR-13.1): no function here reads a file, logs or holds state,
+ * Pure: no function here reads a file, logs or holds state,
  * and nothing runs at import. Only the hash of any credentials content
  * appears in an output, never the content.
  *
@@ -42,7 +42,7 @@
 import { createHash } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
-// Fingerprint (b.av2 SR-8.3)
+// Fingerprint
 // ---------------------------------------------------------------------------
 
 /** A file that does not exist. */
@@ -89,7 +89,7 @@ function updateContent(hash: ReturnType<typeof createHash>, content: Fingerprint
 }
 
 /**
- * The SR-8.3 fingerprint, as 64 lower-case hex digits: SHA-256 over the
+ * The fingerprint, as 64 lower-case hex digits: SHA-256 over the
  * configuration file's content and each credentials entry (path and content)
  * in the order given (see the module comment for the encoding). The same
  * inputs always give the same fingerprint; changing the configuration bytes,
@@ -115,7 +115,7 @@ export function reloadFingerprint(
 }
 
 // ---------------------------------------------------------------------------
-// Pending file layout (b.av2 SR-8.1)
+// Pending file layout
 // ---------------------------------------------------------------------------
 
 /** Line 1 of every pending file. */

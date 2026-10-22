@@ -32,7 +32,7 @@ function bodiesOf(parts: string[], expectedBody: string): string[] {
   return bodies
 }
 
-describe('wrapper.py byte parity and SR-2.2 escaping', () => {
+describe('wrapper.py byte parity and escaping', () => {
   test.each(cases)('$name matches the independent Python wrapper exactly', ({ msg, typed }) => {
     expect(Buffer.from(buildWrapper(msg))).toEqual(Buffer.from(typed))
     expect(buildTagParts(msg)).toEqual([typed])
@@ -194,7 +194,7 @@ describe('metadata truncation preserves the minimum body allowance', () => {
 })
 
 // Native input observations extend body escaping only; reference corpus is unchanged.
-describe('b.omv SR-14.2 native input rewrites', () => {
+describe('native input rewrites', () => {
   test.each([
     ['line separator', '\u2028', '&#8232;'],
     ['combining acute', 'e\u0301', 'e&#769;'],

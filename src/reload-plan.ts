@@ -1,36 +1,35 @@
 /**
  * reload-plan.ts — The structured change plan and the pending-change preview
- * (b.av2 SR-8.4, SR-8.6, SR-10.3; b.jg5 SRJ-1510, SRJ-1511).
+ *
  *
  * `buildChangePlan` classifies a candidate configuration against the applied
- * one, persona by persona and setting by setting, in the terms of the SR-8.6
+ * one, persona by persona and setting by setting, in the terms of the
  * table: added, removed, destructively modified, modified in place, changed
  * credentials, next-launch changes (own or inherited) and unchanged, plus the
  * changed server-wide settings. A persona's section settings are classified
  * by the candidate's section in force: a change to the section the
- * candidate's switch does not select is recorded, with no effect (b.deo
- * SRI-802, SRI-804), and a change of the switch has a line of its own
- * (`modeSwitchLine`, b.deo SRI-803). The reload detection tick builds it every
+ * candidate's switch does not select is recorded, with no effect, and a change of the switch has a line of its own
+ * (`modeSwitchLine`). The reload detection tick builds it every
  * pass, and a confirmed apply (`reload-apply.ts`) acts on the plan that pass
  * built from the confirmed bytes, never a second diff, so what is applied is
  * what was previewed.
  *
  * The preview is rendered from the plan, never from a second diff:
- * - `renderPreview` / `renderPreviewLines`: the body of `config.json.pending`
- *   (b.av2 SR-8.4). A header with the counts (`changePlanCounts`,
+ * - `renderPreview` / `renderPreviewLines`: the body of `config.json.pending`.
+ * A header with the counts (`changePlanCounts`,
  *   `renderChangePlanCounts`, reused by the `reload-applied` line), then one
  *   line per affected persona and changed setting; removals and destructive
  *   modifies start with `DESTRUCTIVE:` and say the persona will be retired:
  *   its session stopped and never resumed, and a destructive modify's brought
- *   up fresh (`removedLine`, `destructiveLine`, b.jg5 SRJ-1510). An invalid
+ * up fresh (`removedLine`, `destructiveLine`). An invalid
  *   candidate renders one `INVALID` line, a plan with no effect `no effective
  *   change`;
  * - `renderPreviewLogLines`: the same lines, each classed `reload-preview`
- *   (one class label per line, b.av2 SR-10.3);
+ * (one class label per line);
  * - `renderInvalidLogLine`: the one `reload-invalid` line of an invalid
  *   candidate.
  *
- * Pure (b.av2 SR-13.1): nothing here reads or writes a file, calls Slack or
+ * Pure: nothing here reads or writes a file, calls Slack or
  * agent-director, arms a timer, logs or holds state, and nothing runs at
  * import. Every fact that needs I/O (real paths, credentials digests and
  * local validity, the bring-up state, whether an added persona can come up)
@@ -59,7 +58,7 @@ import { effectiveClaudeConfigDirs, renderPersonaRef } from './persona-identity.
 import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from './reload-preview-clauses.ts'
 
 // ---------------------------------------------------------------------------
-// Diagnostic classes (b.av2 SR-10.3); listed in `RELOAD_DIAGNOSTIC_CLASSES`
+// Diagnostic classes; listed in `RELOAD_DIAGNOSTIC_CLASSES`
 // ---------------------------------------------------------------------------
 
 /**
@@ -82,7 +81,7 @@ export const RELOAD_INVALID = 'reload-invalid'
 
 /** What a confirmed apply would apply: the configuration file as it stands. */
 export type ChangePlanCandidate =
-  /** Valid in default mode (full SR-1.5 real-path checks). */
+  /** Valid in default mode (full real-path checks). */
   | { kind: 'valid'; config: PersonaConfig }
   /**
    * Fails validation; `error` is the loader's full message (a parse error
@@ -104,9 +103,9 @@ export const FACT_UNKNOWN = 'unknown'
 export type FactUnknown = typeof FACT_UNKNOWN
 
 /**
- * Why an added persona cannot come up: one failed local bring-up check (b.av2
- * SR-6.1 steps 1 and 2, and the claude_config_dir check its bring-up runs
- * before step 3, bug b.g57).
+ * Why an added persona cannot come up: one failed local bring-up check (
+ * steps 1 and 2, and the claude_config_dir check its bring-up runs
+ * before step 3).
  */
 export interface AddedPersonaCause {
   step: 'credentials' | 'working-directory' | 'claude-config-dir'
@@ -120,10 +119,10 @@ export interface AddedPersonaCause {
  * number of times.
  */
 export interface ChangePlanFacts {
-  /** External open-item fact; this planner performs no queue I/O (b.omv SR-3.7). */
+  /** External open-item fact; this planner performs no queue I/O. */
   queueOpenCount?(key: string): number
   /**
-   * The comparison form of a configured path (b.av2 SR-1.5; production:
+   * The comparison form of a configured path (production:
    * `resolveRealPath`): the only source of path identity. Consulted only to
    * compare two paths written differently; two equal strings are the same
    * path.
@@ -136,7 +135,7 @@ export interface ChangePlanFacts {
    */
   home?: string
   /**
-   * Dry run (b.av2 SR-3.4, SR-8.2): no credentials file is read, and
+   * Dry run: no credentials file is read, and
    * credentials never count as changed. Default false.
    */
   dryRun?: boolean
@@ -175,7 +174,7 @@ export interface ChangePlanFacts {
   /**
    * Why a candidate persona's effective claude_config_dir cannot be resolved
    * to a real path, as the claude_config_dir check its bring-up and launch
-   * run words it (its `problem`, bug b.g57; production: `checkConfigDir`, the
+   * run words it (its `problem`; production: `checkConfigDir`, the
    * one the added-persona check uses); undefined when it resolves, a
    * directory not created yet under a resolvable ancestor included;
    * `FACT_UNKNOWN` when it could not be checked. Consulted only for a persona
@@ -199,18 +198,18 @@ export interface ChangePlanPersonaRef {
 }
 
 /**
- * The settings whose change retires a persona (b.av2 SR-8.6, b.jg5 SRJ-1511):
+ * The settings whose change retires a persona:
  * its session is stopped and never resumed, its key recorded as retired at
- * apply step 1 (SRJ-803), and it is brought up fresh. In the order they are
+ * apply step 1, and it is brought up fresh. In the order they are
  * reported.
  */
 export const DESTRUCTIVE_SETTINGS = ['name', 'credentials_file', 'working_directory'] as const
 
-/** A setting whose change retires the persona and brings it up fresh (SRJ-1511). */
+/** A setting whose change retires the persona and brings it up fresh. */
 export type DestructiveSetting = (typeof DESTRUCTIVE_SETTINGS)[number]
 
 /**
- * The settings applied in place, immediately (b.av2 SR-8.6, b.deo SRI-802),
+ * The settings applied in place, immediately,
  * in the order they are reported. `channels`, `delivery` and
  * `permission_prompts` are in place when the candidate is in declarative
  * mode, `invited.permission_prompts` when it is in fungible mode; `dm.*` in
@@ -231,19 +230,18 @@ export type InPlaceSetting = (typeof IN_PLACE_SETTINGS)[number]
 
 /**
  * The persona keys whose change is recorded, with no effect, when they
- * belong to the section the candidate's switch does not select (b.deo
- * SRI-804): the declarative section's `channels` and `permission_prompts`,
+ * belong to the section the candidate's switch does not select: the declarative section's `channels` and `permission_prompts`,
  * and the fungible section, `invited`. In the order they are reported.
  */
 export const RECORDED_SECTION_KEYS = ['channels', 'permission_prompts', 'invited'] as const satisfies readonly (keyof PersonaSections)[]
 
-/** A persona key whose change can be recorded (b.deo SRI-804). */
+/** A persona key whose change can be recorded. */
 export type RecordedSectionKey = (typeof RECORDED_SECTION_KEYS)[number]
 
-/** The server-wide setting that picks the channel mode (b.deo SRI-101); it has a preview line of its own (SRI-803). */
+/** The server-wide setting that picks the channel mode; it has a preview line of its own. */
 export const MODE_SWITCH_SETTING = 'allow_invited_channels'
 
-/** The settings that take effect at the persona's next launch (b.av2 SR-8.6), in the order they are reported. */
+/** The settings that take effect at the persona's next launch, in the order they are reported. */
 export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir'] as const
 
 /** A setting that takes effect at the persona's next launch, set on the persona or inherited. */
@@ -269,7 +267,7 @@ export type ConfigDirUnresolvable = string | FactUnknown
 /**
  * A persona whose `name`, `credentials_file` or `working_directory` (by real
  * path) changed: retired (its key recorded at apply step 1, its session
- * stopped and never resumed), then brought up fresh (b.jg5 SRJ-803, SRJ-1511).
+ * stopped and never resumed), then brought up fresh.
  */
 export interface DestructivePersonaChange extends ChangePlanPersonaRef {
   /** The changed settings, in `DESTRUCTIVE_SETTINGS` order. */
@@ -293,7 +291,7 @@ export interface InPlacePersonaChange extends ChangePlanPersonaRef {
 
 /**
  * A persona present in both configurations whose section not in force (by the
- * candidate's switch) changed (b.deo SRI-804): the change is recorded and has
+ * candidate's switch) changed: the change is recorded and has
  * no effect until the switch selects that section.
  */
 export interface RecordedPersonaChange extends ChangePlanPersonaRef {
@@ -311,15 +309,15 @@ export interface CredentialsPersonaChange extends ChangePlanPersonaRef {
   path: string
   /**
    * The persona is currently broken by its credentials: it is brought up at
-   * apply rather than reconnected (b.av2 SR-8.6 step 6). Undefined when its
+   * apply rather than reconnected (step 6). Undefined when its
    * bring-up state could not be queried.
    */
   credentialsBroken: boolean | undefined
   /**
    * The persona is retrying its bring-up (Slack-unreachable,
-   * directory-broken, or held for its claude_config_dir, bug b.g57), or its
+   * directory-broken, or held for its claude_config_dir), or its
    * first Slack attempt is in flight: it has no connection and retries with
-   * the new content (b.av2 SR-8.6), or, when the new content is not locally
+   * the new content, or, when the new content is not locally
    * valid, with its current content. Undefined when its bring-up state could
    * not be queried.
    */
@@ -367,7 +365,7 @@ export interface ServerSettingChange {
    */
   inheritedBy?: InheritingPersonaRef[]
   /**
-   * For the switch (`allow_invited_channels`, b.deo SRI-803) only: the
+   * For the switch (`allow_invited_channels`) only: the
    * channel mode the change turns on. Absent for any other setting.
    */
   mode?: ChannelMode
@@ -401,7 +399,7 @@ export interface ValidChangePlan {
   unchanged: ChangePlanPersonaRef[]
   /**
    * Candidate personas present in both, not destructively modified, whose
-   * section not in force changed (b.deo SRI-804), in candidate order. Such a
+   * section not in force changed, in candidate order. Such a
    * change is recorded only: it counts in no header term, makes no apply
    * step act and leaves `noEffectiveChange` as it is. A persona can be here
    * and in another class.
@@ -411,14 +409,14 @@ export interface ValidChangePlan {
   settings: ServerSettingChange[]
   /**
    * True exactly when every persona is unchanged and no server-wide setting
-   * changed; recorded changes do not count (b.deo SRI-804).
+   * changed; recorded changes do not count.
    */
   noEffectiveChange: boolean
   /**
    * The set of effective config directories differs between the applied and
    * the candidate personas (each persona's own `claude_config_dir`, else the
    * inherited one, else `<home>/.claude`): the apply refreshes the
-   * agent-director template (b.av2 SR-8.6 step 5). Not rendered in the
+   * agent-director template (step 5). Not rendered in the
    * preview. Compared lexically resolved (`effectiveClaudeConfigDirs`), not by
    * real path: the template's memory-read rules are written from the lexical
    * paths, so a move to another path that is a symlink to the same directory
@@ -437,7 +435,7 @@ export interface InvalidChangePlan {
   configDirsChanged: false
 }
 
-/** The structured change plan (b.av2 SR-8.4, SR-8.6). */
+/** The structured change plan. */
 export type ChangePlan = ValidChangePlan | InvalidChangePlan
 
 // ---------------------------------------------------------------------------
@@ -450,7 +448,7 @@ const SERVER_SETTINGS: readonly string[] = PERSONA_TOP_LEVEL_KEYS.filter((key) =
 /** The server-wide settings that hold a path: compared by real path. */
 const SERVER_PATH_SETTING_SET: ReadonlySet<string> = new Set<string>(SERVER_PATH_SETTINGS)
 
-/** The top-level settings a persona inherits when its entry omits them (b.av2 SR-1.2). */
+/** The top-level settings a persona inherits when its entry omits them. */
 const INHERITED_DEFAULTS: ReadonlySet<string> = new Set<string>(NEXT_LAUNCH_SETTINGS)
 
 function refOf(persona: Persona): ChangePlanPersonaRef {
@@ -481,20 +479,20 @@ function samePathWith(facts: ChangePlanFacts): (a: string | undefined, b: string
   return (a, b) => a === b || (a !== undefined && b !== undefined && facts.realPath(a) === facts.realPath(b))
 }
 
-/** Whether one section key's written value differs (b.deo SRI-802): by `JSON.stringify`, never validated or resolved. */
+/** Whether one section key's written value differs: by `JSON.stringify`, never validated or resolved. */
 function sectionKeyChanged(before: Persona, after: Persona, key: RecordedSectionKey): boolean {
   return JSON.stringify(before.sections[key]) !== JSON.stringify(after.sections[key])
 }
 
 /**
  * The in-place settings and the recorded keys that differ between two
- * declarations of one persona (b.av2 SR-8.6, b.deo SRI-802, SRI-804),
+ * declarations of one persona,
  * classified by the candidate's section in force (`mode`, the candidate's
  * channel mode):
  * - when both configurations are in that mode, its section is compared by
  *   resolved values: the declarative section by the set of channel IDs, a
- *   kept channel's `delivery` and `permission_prompts`, as b.av2 SR-8.6
- *   (as amended by b.deo SRI-802) compares them; the fungible section by `fungible_destination`, so an
+ * kept channel's `delivery` and `permission_prompts`, as
+ * compares them; the fungible section by `fungible_destination`, so an
  *   absent `invited.permission_prompts` equals `dm`;
  * - otherwise (the switch changed), its keys are compared as written
  *   (`sections`), and a changed `channels`, `permission_prompts` or `invited`
@@ -504,7 +502,7 @@ function sectionKeyChanged(before: Persona, after: Persona, key: RecordedSection
  *   changed one is recorded, never applied;
  * - `dm.enabled` and `dm.contact` are compared by resolved value in both
  *   modes.
- * So a change of the switch alone modifies no persona (b.deo SRI-203).
+ * So a change of the switch alone modifies no persona.
  */
 function personaSectionChanges(
   before: Persona,
@@ -596,16 +594,15 @@ function credentialsChanged(key: string, path: string, facts: ChangePlanFacts): 
 }
 
 /**
- * Whether a persona's current bring-up state is credentials-broken (b.av2
- * SR-6.4); the bring-up controller's rule, which the apply's step bodies and
+ * Whether a persona's current bring-up state is credentials-broken; the bring-up controller's rule, which the apply's step bodies and
  * operations use too. Such a persona is brought up at apply rather than
- * reconnected (SR-8.6 step 6).
+ * reconnected (step 6).
  */
 export { isCredentialsBroken }
 
 /**
  * Whether the set of effective config directories of `candidate`'s personas
- * differs from `applied`'s (b.av2 SR-8.6 step 5). Both sets come from
+ * differs from `applied`'s (step 5). Both sets come from
  * `effectiveClaudeConfigDirs`, the one rule the agent-director template's
  * memory-read rules are written from: lexically resolved, never by real path,
  * because the template text follows the written path. A persona without one
@@ -619,8 +616,7 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
 }
 
 /**
- * Classify `candidate` against the `applied` configuration (b.av2 SR-8.4,
- * SR-8.6; b.deo SRI-802 to SRI-804). Pure: reads no file, calls no Slack or
+ * Classify `candidate` against the `applied` configuration. Pure: reads no file, calls no Slack or
  * agent-director API, arms no timer and logs nothing; every I/O-derived fact
  * comes from `facts`.
  *
@@ -629,7 +625,7 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  * present in both:
  * - destructively modified: its `name` (same key), `credentials_file` or
  *   `working_directory` (by real path) changed, so the confirmation retires
- *   it and brings it up fresh (b.jg5 SRJ-1511). It is not also listed as
+ * it and brings it up fresh. It is not also listed as
  *   modified in place, credentials-changed or next-launch: the new half reads
  *   everything fresh;
  * - modified in place: a setting of the candidate's section in force changed
@@ -637,7 +633,7 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  *   `delivery` or `permission_prompts`; fungible mode:
  *   `invited.permission_prompts`), or `dm.enabled` or `dm.contact` changed,
  *   compared as `personaSectionChanges` gives it;
- * - recorded (b.deo SRI-804): a key of the section the candidate's switch
+ * - recorded: a key of the section the candidate's switch
  *   does not select changed. Recorded only: a persona with no other change
  *   is unchanged. May come with any class but destructive;
  * - credentials changed: same `credentials_file` by real path, and the
@@ -651,19 +647,19 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  * own or inherited, or alongside a destructive modify) carries
  * `configDirUnresolvable` when `facts.configDirProblem` says the new directory
  * cannot be resolved, or could not be checked: the preview warns about it
- * as it does for an added persona that cannot come up (bug b.g57). The change
+ * as it does for an added persona that cannot come up. The change
  * is still applied as previewed.
  *
  * Server-wide settings are compared by resolved value, paths by real path. A
  * changed `claude_config_dir` lists the personas
  * that inherit the change. A changed `allow_invited_channels` (absent and
  * `false` are the same value) carries the mode it turns on and every persona
- * present in both configurations (b.deo SRI-803). `noEffectiveChange` holds
+ * present in both configurations. `noEffectiveChange` holds
  * when nothing but unchanged personas remains: a whitespace or key-order
  * edit, a key added with its default value, or recorded changes only.
  *
  * `configDirsChanged` tells the apply whether to refresh the agent-director
- * template (SR-8.6 step 5); it is not part of the preview.
+ * template (step 5); it is not part of the preview.
  *
  * A fact the caller could not gather (`FACT_UNKNOWN`) is carried as unknown:
  * an added persona's `cannotComeUp`, or a credentials change's
@@ -678,7 +674,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
   const samePath = samePathWith(facts)
   const appliedByKey = new Map(applied.personas.map((p) => [p.key, p]))
   const nextKeys = new Set(next.personas.map((p) => p.key))
-  // b.deo SRI-802: each persona is classified by the candidate's section in
+  // each persona is classified by the candidate's section in
   // force, read from the candidate's own switch.
   const mode = channelModeOf(next)
   const sameMode = channelModeOf(applied) === mode
@@ -758,7 +754,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
   for (const name of SERVER_SETTINGS) {
     if (sameSetting(name, settingOf(applied, name), settingOf(next, name), samePath)) continue
     if (name === MODE_SWITCH_SETTING) {
-      // b.deo SRI-803: the mode turned on applies in place to every persona
+      // the mode turned on applies in place to every persona
       // present in both configurations.
       const personas = next.personas.filter((p) => appliedByKey.has(p.key)).map(refOf)
       plan.settings.push({ name, mode, personas })
@@ -805,7 +801,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
 // Counts (the preview header's terms, reused by the `reload-applied` line)
 // ---------------------------------------------------------------------------
 
-/** The preview header's counts (b.av2 SR-8.4). */
+/** The preview header's counts. */
 export interface ChangePlanCounts {
   added: number
   removed: number
@@ -853,7 +849,7 @@ export function renderChangePlanCounts(counts: ChangePlanCounts): string {
 }
 
 // ---------------------------------------------------------------------------
-// Preview (b.av2 SR-8.4)
+// Preview
 // ---------------------------------------------------------------------------
 
 /** Start of the header of a valid candidate's preview. */
@@ -863,7 +859,7 @@ export const PENDING_PREVIEW_TITLE = 'A configuration change is pending; nothing
 export const NO_EFFECTIVE_CHANGE = 'no effective change'
 
 /**
- * The retiring lines' prefix and clauses (b.jg5 SRJ-1510) live in the
+ * The retiring lines' prefix and clauses live in the
  * import-free `reload-preview-clauses.ts`, so the /ci-live checks can build
  * their expected lines from them; re-exported here unchanged.
  */
@@ -880,7 +876,7 @@ function personaRef(p: Pick<ChangePlanPersonaRef, 'name' | 'key'>): string {
 }
 
 /**
- * A removal's preview line (b.jg5 SRJ-1510): `DESTRUCTIVE: persona "<name>"
+ * A removal's preview line: `DESTRUCTIVE: persona "<name>"
  * (key=<key>) is removed: the persona will be retired: its session stopped
  * and never resumed.` Pure; unescaped (`renderPreviewLines` escapes).
  */
@@ -902,7 +898,7 @@ function configDirWarning(unresolvable: ConfigDirUnresolvable | undefined, when:
 }
 
 /**
- * A destructive modify's preview line (b.jg5 SRJ-1510): `DESTRUCTIVE: persona
+ * A destructive modify's preview line: `DESTRUCTIVE: persona
  * "<name>" (key=<key>) <what changed>: the persona will be retired and
  * brought up fresh: its session stopped and never resumed<warning>.`, where
  * `<what changed>` is each changed setting in `DESTRUCTIVE_SETTINGS` order
@@ -929,7 +925,7 @@ function addedLine(p: AddedPersonaChange): string {
 /**
  * A next-launch effect. A changed `claude_config_dir` (compared by real path,
  * and the session label is a hash of that real path) makes the next launch
- * fresh, so the conversation is not resumed (b.av2 SR-6.2, SR-8.6).
+ * fresh, so the conversation is not resumed.
  */
 function nextLaunchEffect(settings: readonly string[], whose: 'its' | "each one's"): string {
   return settings.includes('claude_config_dir')
@@ -938,7 +934,7 @@ function nextLaunchEffect(settings: readonly string[], whose: 'its' | "each one'
 }
 
 /**
- * A credentials change's effect (b.av2 SR-8.6, credentials row), by the
+ * A credentials change's effect (credentials row), by the
  * persona's bring-up state and whether the new content is locally valid.
  */
 function credentialsEffect(c: CredentialsPersonaChange): string {
@@ -985,7 +981,7 @@ function modifiedLine(
 
 /**
  * The server-wide settings only the CLI uses (`stop` and `clean_restart`),
- * which it takes from the last-applied record (b.av2 SR-8.7): they take
+ * which it takes from the last-applied record: they take
  * effect for the CLI as soon as an apply rewrites the record, not at the next
  * server start. The running server does not use them.
  */
@@ -993,7 +989,7 @@ const CLI_RECORD_SETTINGS: ReadonlySet<string> = new Set<string>(['stop_timeout'
 
 /**
  * The server-wide settings both the CLI and the running server use
- * (b.jg5 SRJ-213): the CLI takes a change from the last-applied record as
+ * the CLI takes a change from the last-applied record as
  * soon as an apply rewrites it, as it takes `exit_timeout`, and the running
  * server uses it from its next start.
  */
@@ -1002,7 +998,7 @@ const CLI_RECORD_AND_SERVER_START_SETTINGS: ReadonlySet<string> = new Set<string
 ])
 
 /**
- * The switch's preview line (b.deo SRI-803): a change of
+ * The switch's preview line: a change of
  * `allow_invited_channels` turns `mode` on for every persona, in place at
  * once:
  *
@@ -1031,7 +1027,7 @@ export function modeSwitchLine(
 }
 
 /**
- * A recorded change's preview line (b.deo SRI-804): the persona, its changed
+ * A recorded change's preview line: the persona, its changed
  * keys of the section not in force, and that the change is recorded with no
  * effect until the switch selects that section:
  *
@@ -1101,7 +1097,7 @@ function inheritedConfigDirWarnings(inheritedBy: readonly InheritingPersonaRef[]
 }
 
 /**
- * The preview's lines (b.av2 SR-8.4, b.deo SRI-803, SRI-804), each on one
+ * The preview's lines, each on one
  * line (control characters escaped). An invalid plan: one `INVALID:` line
  * with the full error and `Nothing will be applied.`, with no counts and no
  * persona lines. A plan with no effect: the title and `no effective change`,
@@ -1150,7 +1146,7 @@ export function renderPreview(plan: ChangePlan): string {
 }
 
 // ---------------------------------------------------------------------------
-// Log form (b.av2 SR-10.3: one class label per line)
+// Log form (one class label per line)
 // ---------------------------------------------------------------------------
 
 /** ` (preview in "<path>")`, or nothing when there is no pending file to point at. */

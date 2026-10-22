@@ -1,8 +1,8 @@
 /**
  * host-safety.test.ts — Keeps unit tests' child processes away from the real
  * home and any agent-director binary, and checks the `bun test` preload guard
- * (b.jg5 SRJ-1304, SRJ-1301), and audits where production code builds the
- * client or resolves the host binary (SRJ-121).
+ * and audits where production code builds the
+ * client or resolves the host binary.
  *
  * Sections:
  * - `hostSafeChildEnv`: the environment it builds for a child and each of its
@@ -11,7 +11,7 @@
  *   reuses, and a `bun` child that loads the helper again reusing its
  *   parent's directory.
  * - `runInFakeHome`: refuses the real home before any child starts.
- * - Static audits (b.jg5 SRJ-1301), read with the TypeScript parser
+ * - Static audits, read with the TypeScript parser
  *   so strings, regex literals and comments never count: no value import of
  *   `Client` / `resolveSystemBinary` from `agent-director`; every child
  *   process call's `env` is a direct `hostSafeChildEnv` call; no file imports
@@ -31,7 +31,7 @@
  *   `tests/test-helpers/ad-value-reads.ts`, which
  *   `tests/fmk-source-audit.test.ts` shares. Each matcher is pinned with
  *   synthetic flagged and allowed sources, then run over the tree.
- * - SRJ-121's call-site audit over every `*.ts` in `src/` and `scripts/`
+ * - call-site audit over every `*.ts` in `src/` and `scripts/`
  *   (`CALL_SITE_AUDITS`, the same parser): `Client.create` is reached only in
  *   the startup gate's module, `runStartupGate` is referenced only there and
  *   in the CLI, `runAgentDirectorStartupGate` only in the server, and
@@ -39,7 +39,7 @@
  *   server, the install check and `/publish`'s check. Each pinned file must
  *   still hold its site. (That `src/ad-version-gate.ts` never imports
  *   `./install-check.ts` is pinned in tests/ad-version-gate.test.ts.)
- * - The `/ci` image refusals (b.jg5 SRJ-1306), read and never run:
+ * - The `/ci` image refusals, read and never run:
  *   `tests/runner.sh`, `tests/integration/lib/scenario.sh` and each
  *   `tests/integration/test-*.sh` that does not source it (found from the
  *   directory) check `/etc/cscb-ci-image` before their first other step; each
@@ -63,7 +63,7 @@
  *   there: `write_ad_settings` before its `rm` and its `mkdir`,
  *   `_scenario_stand_in_settings` before its `write_file`.
  * - scenario.sh's Slack stub, stub MCP session and queue readers (harness additions,
- *   b.jg5 SRJ-1306, b.deo SRI-1404), read and never run: `slack_stub_push`,
+ *), read and never run: `slack_stub_push`,
  *   `stub_session_deliveries`, `stub_session_call` and `queue_accepted`
  *   (`IMAGE_GUARDED_STUB_HELPERS`) each run `require_ci_image`, called
  *   directly, as their first command after their declarations and outside any
@@ -73,11 +73,11 @@
  *   so this pin is the only proof of their refusal. Read with the shell reader
  *   above, pinned with synthetic violations, then run over the tree, and over
  *   the tree with one helper's guard removed or moved into an `if`.
- * - The Slack stub `slack-stub-server.ts` (b.jg5 SRJ-1306, b.deo SRI-1402)
+ * - The Slack stub `slack-stub-server.ts`
  *   statically imports only `node:` built-ins, type-only imports included,
  *   through the image-guarded fixtures' matcher (`nodeOnlyImportFindings`).
  *   It has no marker check, so it is not one of `IMAGE_GUARDED_TS_PATHS`.
- * - The harness's one agent-director delete (b.jg5 SRJ-1306), over every
+ * - The harness's one agent-director delete, over every
  *   file under `tests/integration` (shell or TypeScript, shellcheck's and
  *   bun's config aside): in shell, any command whose first argument after
  *   agent-director's global flags is `delete`, whatever its name but
@@ -832,7 +832,7 @@ function preloadRefusalFindings(sf: ts.SourceFile): string[] {
     findings.push(finding(sf, node, what))
   }
 
-  // Imported name → local name, for the value imports from ./host-safe-env.ts.
+  // Imported name → local name, for the value imports ./host-safe-env.ts.
   const local = new Map<string, string>()
   for (const statement of sf.statements) {
     if (!ts.isImportDeclaration(statement) || statement.importClause?.isTypeOnly === true) continue
@@ -841,7 +841,7 @@ function preloadRefusalFindings(sf: ts.SourceFile): string[] {
     if (bindings === undefined || !ts.isNamedImports(bindings)) continue
     for (const el of bindings.elements) if (!el.isTypeOnly) local.set((el.propertyName ?? el.name).text, el.name.text)
   }
-  for (const name of REFUSAL_LOOP_IMPORTS) if (!local.has(name)) flag(sf, `${name} is not imported from ./host-safe-env.ts`)
+  for (const name of REFUSAL_LOOP_IMPORTS) if (!local.has(name)) flag(sf, `${name} is not imported ./host-safe-env.ts`)
   const isName = (node: ts.Node | undefined, name: string | undefined): boolean => node !== undefined && name !== undefined && ts.isIdentifier(node) && node.text === name
   const isImported = (node: ts.Node | undefined, name: string): boolean => isName(node, local.get(name))
   const isBareCall = (node: ts.Node | undefined, name: string): boolean => node !== undefined && ts.isCallExpression(node) && node.arguments.length === 0 && isImported(node.expression, name)
@@ -969,7 +969,7 @@ function realHomeFindings(sf: ts.SourceFile): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Static audit: where Client.create, the startup gate and resolveSystemBinary run (SRJ-121)
+// Static audit: where Client.create, the startup gate and resolveSystemBinary run
 // ---------------------------------------------------------------------------
 
 const SCRIPTS_DIR = join(REPO_ROOT, 'scripts')
@@ -1065,7 +1065,7 @@ function clientCreateFindings(sf: ts.SourceFile): string[] {
   return findings
 }
 
-/** Where `sf` holds agent-director's `resolveSystemBinary` as a value (E1's matcher, that name only), plus every read it cannot name. */
+/** Where `sf` holds agent-director's `resolveSystemBinary` as a value (matcher, that name only), plus every read it cannot name. */
 function resolveSystemBinaryFindings(sf: ts.SourceFile): string[] {
   return agentDirectorValueReads(sf, ['resolveSystemBinary']).map((read) => finding(sf, read.node, read.what))
 }
@@ -1098,13 +1098,13 @@ function nameReferenceFindings(sf: ts.SourceFile, name: string): string[] {
   return findings
 }
 
-/** Every `*.ts` file under `src/` and `scripts/`: the production side SRJ-121's call sites are audited over. */
+/** Every `*.ts` file under `src/` and `scripts/`: the production side call sites are audited over. */
 function productionFiles(): string[] {
   return [...filesUnder(SRC_DIR, (path) => path.endsWith('.ts')), ...filesUnder(SCRIPTS_DIR, (path) => path.endsWith('.ts'))].sort()
 }
 
 /**
- * The SRJ-121 call-site audits: each matcher, and the only files (by
+ * The call-site audits: each matcher, and the only files (by
  * repository path) it may find anything in.
  *
  * - `Client.create`: the startup gate's module (its production `createClient`).
@@ -1476,7 +1476,7 @@ describe('static audit: the preload refuses before anything else', () => {
 describe('static audit: the guard loads nothing that runs before the refusal', () => {
   const flagged: [label: string, rule: RegExp, source: string][] = [
     ['in the preload, a side-effect import of a src/ module', PRELOAD_LOADS, "import '../../src/config.ts'"],
-    ['in the preload, a named import from ../../src/config.ts', PRELOAD_LOADS, "import { resolveServerStateDir } from '../../src/config.ts'"],
+    ['in the preload, a named import ../../src/config.ts', PRELOAD_LOADS, "import { resolveServerStateDir } from '../../src/config.ts'"],
     ['in the preload, a third-party package import', PRELOAD_LOADS, "import { parse } from 'smol-toml'"],
     ['in the preload, another test helper (it may load src/)', PRELOAD_LOADS, "import { fakeToken } from './credentials.ts'"],
     ['in the preload, a type-only import from a src/ module', PRELOAD_LOADS, "import type { ServerPathSetting } from '../../src/config.ts'"],
@@ -1486,7 +1486,7 @@ describe('static audit: the guard loads nothing that runs before the refusal', (
     ['in the preload, a require of a src/ module', PRELOAD_LOADS, "require('../../src/config.ts')"],
     ['in the preload, a dynamic import of a computed specifier', PRELOAD_LOADS, 'await import(modulePath)'],
     ['in host-safe-env.ts, a side-effect import of a src/ module', HELPER_LOADS, "import '../../src/config.ts'"],
-    ['in host-safe-env.ts, a named import from ../../src/config.ts', HELPER_LOADS, "import { resolveServerStateDir } from '../../src/config.ts'"],
+    ['in host-safe-env.ts, a named import ../../src/config.ts', HELPER_LOADS, "import { resolveServerStateDir } from '../../src/config.ts'"],
     ['in host-safe-env.ts, a third-party package import', HELPER_LOADS, "import { parse } from 'smol-toml'"],
     ['in host-safe-env.ts, another test helper', HELPER_LOADS, "import { treeSnapshot } from './tree-snapshot.ts'"],
   ]
@@ -1554,7 +1554,7 @@ describe('static audit: only the guard’s own files name the real home (realHom
   })
 })
 
-describe('static audit: where Client.create, the startup gate and resolveSystemBinary run (SRJ-121)', () => {
+describe('static audit: where Client.create, the startup gate and resolveSystemBinary run', () => {
   const CLIENT_IMPORT = "import { Client } from 'agent-director'"
   const STARTUP_MODULE = './agent-director-startup.ts'
   const STARTUP_NS = `import * as startup from '${STARTUP_MODULE}'`
@@ -1674,7 +1674,7 @@ describe('static audit: where Client.create, the startup gate and resolveSystemB
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the /ci image marker and SCENARIO_ROOT checks come first (b.jg5 SRJ-1306)
+// Static audit: the /ci image marker and SCENARIO_ROOT checks come first
 // ---------------------------------------------------------------------------
 
 const INTEGRATION_DIR = join(TESTS_DIR, 'integration')
@@ -1721,9 +1721,9 @@ const IMAGE_GUARD_RULE = {
   realpathCheckFirst: 'realpath-check-before-write',
   /** The image-guarded TypeScript fixtures statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
-  /** scenario.sh's Slack stub, stub MCP session and queue readers run `require_ci_image` as their first step after their declarations (b.deo SRI-1404). */
+  /** scenario.sh's Slack stub, stub MCP session and queue readers run `require_ci_image` as their first step after their declarations. */
   helperImageCheckFirst: 'image-check-first-in-helper',
-  /** The Slack stub, which has no marker check, statically imports only `node:` built-ins (b.deo SRI-1402). */
+  /** The Slack stub, which has no marker check, statically imports only `node:` built-ins. */
   stubStaticImport: 'stub-static-import',
 } as const
 
@@ -2441,7 +2441,7 @@ function expectNamedFindings(findings: readonly string[], file: string, rule: st
   expect(findings).toContainEqual(expect.stringMatching(new RegExp(`^${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\d+: ${rule}: `)))
 }
 
-describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first (b.jg5 SRJ-1306)', () => {
+describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first', () => {
   // What is not a step. Shell: the shebang, comments, blank lines, `set`
   // options and literal assignments. The TypeScript fixtures: static imports
   // of `node:` built-ins; a static import of any other module is a step, since
@@ -2816,7 +2816,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the symlink re-point helper (b.jg5 SRJ-1306, SRJ-1401;
+// Static audit: the symlink re-point helper (
 // test-14's harness addition). The value printer, fmk-texts.ts, is one of
 // IMAGE_GUARDED_TS_PATHS above.
 // ---------------------------------------------------------------------------
@@ -2956,7 +2956,7 @@ function codexProcessFindings(source: string): string[] {
     'await new Promise(() => {})', 'return result'], 'text barrier')
   order(body('ai'), ["} else if (ac === 15)", 'multipartSend = oracle.codexMultipartSender',
     'answers.push(await completedItem(item.accepted.seq, part,', 'const seq = await accept(oracle.codexSlackInput(message))',
-    'await delivered(seq)', 'oracle.assertCodexMultipart(parts, body, answers)', 'finally { multipartSend = undefined }'], 'AC15 completed-part pacing')
+    'await delivered(seq)', 'oracle.assertCodexMultipart(parts, body, answers)', 'finally { multipartSend = undefined }'], 'completed-part pacing')
   if (!top.includes("else if (command === 'crash-worker') await crashWorker()")) failures.push('codex-delivery.ts: crash-worker dispatch missing')
   return failures
 }
@@ -2978,8 +2978,8 @@ function codexCrashProtocolFindings(source: string): string[] {
   return required.filter(fragment => !source.includes(fragment)).map(() => 'codex-crash-barrier.ts: unreviewed checkpoint/boundary contract')
 }
 
-describe('E7 Codex executable inventory and import safety', () => {
-  test('AC76 dual-use admission fixture has only its reviewed receipt edge and erased queue types', () => {
+describe('Codex executable inventory and import safety', () => {
+  test('dual-use admission fixture has only its reviewed receipt edge and erased queue types', () => {
     const file = 'tests/integration/fixtures/ac76-admission.ts'
     const source = readFileSync(join(REPO_ROOT, file), 'utf8')
     const edges = ['../../../src/delivery-queue.ts', './transcript-receipts.ts']
@@ -3133,7 +3133,7 @@ describe('E7 Codex executable inventory and import safety', () => {
 /** scenario.sh's re-point of a symlinked directory under SCENARIO_ROOT: a move. */
 const HOME_GUARDED_REPOINT_HELPERS: readonly string[] = ['repoint_symlink']
 
-describe('static audit: repoint_symlink checks HOME first (b.jg5 SRJ-1306)', () => {
+describe('static audit: repoint_symlink checks HOME first', () => {
   test('the current tree: repoint_symlink runs require_scenario_home before its first move', () => {
     expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_REPOINT_HELPERS)).toEqual([])
   })
@@ -3148,8 +3148,8 @@ describe('static audit: repoint_symlink checks HOME first (b.jg5 SRJ-1306)', () 
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the list-refusing agent-director stand-in (b.jg5 SRJ-1306,
-// SRJ-1411; test-21's harness addition)
+// Static audit: the list-refusing agent-director stand-in (
+// test-21's harness addition)
 // ---------------------------------------------------------------------------
 
 /** The stand-in that refuses `list` and runs the release for every other verb, swapped in behind the shim. */
@@ -3160,7 +3160,7 @@ function literalAssignment(source: string, name: string): string | undefined {
   return new RegExp(`^${name}=(/[^\\s"'$;]+)$`, 'm').exec(source)?.[1]
 }
 
-describe('static audit: the list-refusing stand-in checks the image marker first (b.jg5 SRJ-1306)', () => {
+describe('static audit: the list-refusing stand-in checks the image marker first', () => {
   test('the current tree: its first step is the /etc/cscb-ci-image check that exits non-zero', () => {
     expect(existsSync(LIST_REFUSING_STAND_IN_PATH)).toBe(true)
     expect(shellEntryFindings(relative(REPO_ROOT, LIST_REFUSING_STAND_IN_PATH), readFileSync(LIST_REFUSING_STAND_IN_PATH, 'utf-8'))).toEqual([])
@@ -3186,7 +3186,7 @@ describe('static audit: the list-refusing stand-in checks the image marker first
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the harness's one agent-director delete (b.jg5 SRJ-1306)
+// Static audit: the harness's one agent-director delete
 // ---------------------------------------------------------------------------
 
 /** agent-director's global flags, which it takes from anywhere in its argv, each with a value. */
@@ -3271,7 +3271,7 @@ function tsDeleteCalls(file: string, source: string): string[] {
   return out
 }
 
-describe('static audit: the harness’s one agent-director delete is scenario 25’s step (b.jg5 SRJ-1306)', () => {
+describe('static audit: the harness’s one agent-director delete is scenario 25’s step', () => {
   describe('shell', () => {
     const flagged: [label: string, source: string][] = [
       ['ad delete', 'ad delete --instance-id t0-x'],
@@ -3626,7 +3626,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
       const a = dirUnder('a')
       return { inherited: { PATH: a, SLACK_STATE_DIR: dirUnder('stray-state') }, expectedPath: a }
     }],
-    ['an inherited XDG_CONFIG_HOME is replaced by .config under the new HOME', () => {
+    ['an inherited XDG_CONFIG_HOME is replaced .config under the new HOME', () => {
       const a = dirUnder('a')
       return { inherited: { PATH: a, XDG_CONFIG_HOME: dirUnder('operator-config') }, expectedPath: a }
     }],
@@ -3780,7 +3780,7 @@ describe('un-injected gate checks (after the preload check)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: end_stub_mcp_session's guards come before its signal (harness addition, b.jg5 SRJ-1306)
+// Static audit: end_stub_mcp_session's guards come before its signal (harness addition)
 // ---------------------------------------------------------------------------
 
 /** scenario.sh's helper that ends a stub worker's MCP session client with a signal. */
@@ -3844,7 +3844,7 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
 
 // ---------------------------------------------------------------------------
 // Static audit: the Slack stub, stub MCP session and queue readers refuse outside the
-// /ci image (harness additions, b.jg5 SRJ-1306, b.deo SRI-1404)
+// /ci image (harness additions)
 // ---------------------------------------------------------------------------
 
 /**
@@ -3909,7 +3909,7 @@ function homeGuardCallFindings(source: string, helpers: readonly string[]): stri
   return findings
 }
 
-describe('static audit: the Slack stub and stub MCP session helpers run require_ci_image first (b.jg5 SRJ-1306, b.deo SRI-1404)', () => {
+describe('static audit: the Slack stub and stub MCP session helpers run require_ci_image first', () => {
   const RULE = IMAGE_GUARD_RULE.helperImageCheckFirst
   const fn = (name: string, ...body: string[]): string => lines(`${name}() {`, ...body, '}')
   const DECLARATIONS = lines('    local dir="${1:-}" step', '    step="stub_session_deliveries ${dir}"')
@@ -3995,7 +3995,7 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
 
 // ---------------------------------------------------------------------------
 // Static audit: the Slack stub loads only node: built-ins statically
-// (b.jg5 SRJ-1306, b.deo SRI-1402)
+//
 // ---------------------------------------------------------------------------
 
 /**
@@ -4010,7 +4010,7 @@ function stubImportFindings(file: string, source: string): string[] {
   return nodeOnlyImportFindings(file, parse(source, file), IMAGE_GUARD_RULE.stubStaticImport, 'is not a node: built-in; the stub stays self-contained')
 }
 
-describe('static audit: slack-stub-server.ts statically imports only node: built-ins (b.jg5 SRJ-1306, b.deo SRI-1402)', () => {
+describe('static audit: slack-stub-server.ts statically imports only node: built-ins', () => {
   const source = readFileSync(SLACK_STUB_SERVER_PATH, 'utf-8')
   /** The stub's source with `line` added after its first `node:` import. */
   const withImport = (line: string): string => source.replace(/(\nimport [^\n]* from 'node:[^']+'\n)/, `$1${line}\n`)

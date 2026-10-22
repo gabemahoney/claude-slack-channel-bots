@@ -2,7 +2,7 @@
  * launch-home-guard.test.ts — The `bun test` preload guard refuses to start
  * when the home the run was launched with could reach the operator's real
  * Claude, Slack or agent-director state, and `/publish`'s preflight starts the
- * suite with a scratch HOME (bug b.59h).
+ * suite with a scratch HOME.
  *
  * Bun fixes `os.homedir()` at start-up from the launch-time HOME, so code that
  * calls it during a run resolves against that home whatever the preload sets
@@ -738,7 +738,7 @@ describe('this run: launch-time homes and the homedir()-derived defaults', () =>
       return roots[0]!
     }],
     ["expandTilde('~')", () => expandTilde('~')],
-    ['resolveDefaultCronTablePath() with SLACK_STATE_DIR and XDG_CONFIG_HOME unset (the crontable default, bug b.avm)', () => resolveDefaultCronTablePath(resolveServerStateDir(undefined, {}), undefined, {})],
+    ['resolveDefaultCronTablePath() with SLACK_STATE_DIR and XDG_CONFIG_HOME unset (the crontable default)', () => resolveDefaultCronTablePath(resolveServerStateDir(undefined, {}), undefined, {})],
     ['DEFAULT_STATE_DB_PATH (the start gate’s state.db path)', () => DEFAULT_STATE_DB_PATH],
     ['DEFAULT_STORE_PATH expanded', () => expandTilde(DEFAULT_STORE_PATH)],
   ]

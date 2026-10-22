@@ -3,35 +3,33 @@
  * Channel Router.
  *
  * The loader (`loadPersonaConfig` / `resolvePersonaConfig`) reads the persona
- * shape of b.av2 SR-1: a `personas` array plus the server-wide settings
- * (b.av2 SR-1.6). It rejects the pre-persona shape before any other check
- * with the conversion message (b.av2 SR-1.7) and never writes or converts
+ * shape of a `personas` array plus the server-wide settings
+ * It rejects the pre-persona shape before any other check
+ * with the conversion message and never writes or converts
  * the file. Errors name the setting and the rule and never echo a rejected
  * value, and name an unknown key only when it is a plain setting name
  * (`describeUnknownKeys`), so a pasted token never reaches an error
- * (b.av2 SR-10.3).
+ *
  *
  * The server-wide switch `allow_invited_channels` picks the channel mode of
- * every persona (b.deo SRI-101, `channelModeOf`): declarative mode (absent or
+ * every persona (`channelModeOf`): declarative mode (absent or
  * `false`) reads each persona's `channels` and top-level
  * `permission_prompts`; fungible mode (`true`) reads its `invited` section
  * instead. A configuration's entries are validated by the mode its own
- * switch picks, and the section not in force is never parsed (b.deo SRI-103
- * to SRI-105).
+ * switch picks, and the section not in force is never parsed.
  *
  * The configuration file is `config.json` in the state directory, at the path
- * `resolveServerConfigPath` returns (b.av2 SR-8.7). Which configuration a
+ * `resolveServerConfigPath` returns. Which configuration a
  * start runs (the last-applied record or this file) is decided by the reload
  * controller (`src/reload.ts`), which validates the bytes it read through
  * `parsePersonaConfigBytes`; a record is validated in record mode, where a
- * real-path collision is left to the bring-up (b.av2 SR-1.5).
+ * real-path collision is left to the bring-up.
  *
  * Pure functions (expandTilde, resolvePersonaConfig, parsePersonaConfigBytes,
  * resolveRealPath, resolveRealPathStrict) are side-effect-free and importable
- * by tests without performing any I/O (b.av2 SR-13.1); importing this module
+ * by tests without performing any I/O; importing this module
  * touches no file and reads no environment variable. resolvePersonaConfig,
- * resolveRealPath and resolveRealPathStrict resolve real paths (b.av2 SR-1.5,
- * bug b.g57) but never open, read, create or write a file. The I/O wrapper (loadPersonaConfig) reads the JSON file once and
+ * resolveRealPath and resolveRealPathStrict resolve real paths but never open, read, create or write a file. The I/O wrapper (loadPersonaConfig) reads the JSON file once and
  * delegates to them.
  *
  * SPDX-License-Identifier: MIT
@@ -56,19 +54,18 @@ import {
 /** The environment variable that overrides the server's state directory. */
 export const STATE_DIR_ENV = 'SLACK_STATE_DIR'
 
-/** The configuration file's name inside the state directory (b.av2 SR-1.1). */
+/** The configuration file's name inside the state directory. */
 export const CONFIG_FILE_NAME = 'config.json'
 
 /**
  * The XDG Base Directory variable naming the user's configuration directory
  * (`~/.config` when unset). The default state directory, and with it the
- * default crontable, sits under it (bugs b.fc4, b.avm).
+ * default crontable, sits under it.
  */
 export const XDG_CONFIG_HOME_ENV = 'XDG_CONFIG_HOME'
 
 /**
- * CSCB's own directory under the XDG configuration directory: the default state directory (bugs b.fc4, b.avm,
- * b.smv). Named after the package; releases 0.14.0 and 0.15.0 used `cscb`, an acronym that could clash with another
+ * CSCB's own directory under the XDG configuration directory: the default state directory. Named after the package; releases 0.14.0 and 0.15.0 used `cscb`, an acronym that could clash with another
  * app (`LEGACY_XDG_DIR_NAME` in `state-dir-migration.ts`).
  */
 export const CSCB_XDG_DIR_NAME = 'claude-slack-channel-bots'
@@ -83,36 +80,36 @@ export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
 export const ALLOWED_SYSTEM_PROMPT_MODES = ['append', 'none']
 
-/** Default agent-director poll interval (SR-4.1), milliseconds. */
+/** Default agent-director poll interval, milliseconds. */
 export const DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS = 1000
 
-/** Inclusive lower bound on agent_director_poll_interval_ms (SR-4.1). */
+/** Inclusive lower bound on agent_director_poll_interval_ms. */
 export const MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS = 200
 
-/** Inclusive upper bound on agent_director_poll_interval_ms (SR-4.1). */
+/** Inclusive upper bound on agent_director_poll_interval_ms. */
 export const MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS = 3_600_000
 
 /**
- * Default agent-director call timeout (b.jg5 SRJ-213), milliseconds: the
+ * Default agent-director call timeout, milliseconds: the
  * `callTimeoutMs` of every agent-director client CSCB builds for persona calls.
  */
 export const DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 60_000
 
-/** Inclusive lower bound on agent_director_call_timeout_ms (b.jg5 SRJ-213). */
+/** Inclusive lower bound on agent_director_call_timeout_ms. */
 export const MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 1000
 
-/** Inclusive upper bound on agent_director_call_timeout_ms (b.jg5 SRJ-213). */
+/** Inclusive upper bound on agent_director_call_timeout_ms. */
 export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
 
 /**
- * The top-level key of the test-only timer override block (b.2nr). It is not
+ * The top-level key of the test-only timer override block. It is not
  * one of `PERSONA_TOP_LEVEL_KEYS` (it is an undocumented test hook, off by
  * default), but the loader accepts it. See `src/test-timer-overrides.ts`.
  */
 export const TEST_TIMER_OVERRIDES_KEY = 'test_timer_overrides'
 export const TEST_MCP_DROP_ENDPOINT_KEY = 'test_mcp_drop_endpoint'
 
-/** The keys of the test-only timer override block (b.2nr), each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
+/** The keys of the test-only timer override block, each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
 export const TEST_TIMER_OVERRIDE_KEYS = [
   'latch_recheck_interval_ms',
   'ad_version_recheck_interval_ms',
@@ -136,13 +133,13 @@ export const MAX_TEST_TIMER_OVERRIDE_S = 3600
 
 /**
  * The top-level keys of the pre-persona shape that the loader rejects with
- * the conversion message before any other check (b.av2 SR-1.7), in the order
+ * the conversion message before any other check, in the order
  * they are looked for.
  */
 export const PRE_PERSONA_KEYS = ['routes', 'default_route', 'default_dm_session'] as const
 
 /**
- * Server-wide top-level keys (b.av2 SR-1.6, b.deo SRI-101): the settings the
+ * Server-wide top-level keys: the settings the
  * persona shape kept from the pre-persona shape, and `allow_invited_channels`,
  * the switch that picks the channel mode for every persona.
  */
@@ -173,7 +170,7 @@ const SHARED_TOP_LEVEL_KEYS = [
 /**
  * The server-wide settings that hold a path, in the order of the top-level
  * keys: the ones `resolveServerPaths` expands, and the ones a reload compares
- * by real path (b.av2 SR-1.5, SR-8.4).
+ * by real path.
  */
 export const SERVER_PATH_SETTINGS = [
   'mcp_config_path',
@@ -189,31 +186,31 @@ export type ServerPathSetting = (typeof SERVER_PATH_SETTINGS)[number]
 
 /**
  * The pre-rename name of `agent_director_poll_interval_ms`: rejected with a
- * message naming the new name (SR-4.1), never accepted as an alias.
+ * message naming the new name, never accepted as an alias.
  */
 const RENAMED_POLL_INTERVAL_KEY = 'claude_director_poll_interval_ms'
 
 // ---------------------------------------------------------------------------
-// Persona schema constants (b.av2 SR-1.1 to SR-1.3, SR-1.6)
+// Persona schema constants
 // ---------------------------------------------------------------------------
 
-/** Default `reply_chunk_limit` (b.av2 SR-1.6): today's reply-tool default. */
+/** Default `reply_chunk_limit`: today's reply-tool default. */
 export const DEFAULT_REPLY_CHUNK_LIMIT = 4000
 
 export const DEFAULT_QUEUED_ACK_REACTION = 'beehive'
 export const DEFAULT_ACK_REACTION = 'spinthinking'
 
-/** Allowed `reply_chunk_mode` values (b.av2 SR-1.6). */
+/** Allowed `reply_chunk_mode` values. */
 export const REPLY_CHUNK_MODES = ['length', 'newline'] as const
 
-/** Default `reply_chunk_mode` (b.av2 SR-1.6): today's reply-tool default. */
+/** Default `reply_chunk_mode`: today's reply-tool default. */
 export const DEFAULT_REPLY_CHUNK_MODE: ReplyChunkMode = 'newline'
 
-/** Top-level keys that only the persona shape accepts (b.av2 SR-1.6). */
+/** Top-level keys that only the persona shape accepts. */
 const PERSONA_ONLY_SERVER_KEYS = ['queued_ack_reaction', 'ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'] as const
 
 /**
- * Every top-level key the persona shape accepts (b.av2 SR-1.1, SR-1.6):
+ * Every top-level key the persona shape accepts:
  * `personas`, the shared server-wide keys and the persona-only ones.
  */
 export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
@@ -223,7 +220,7 @@ export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
 ]
 
 /**
- * Keys allowed in a persona entry (b.av2 SR-1.2, b.deo SRI-102). `invited` is
+ * Keys allowed in a persona entry. `invited` is
  * a known key in both channel modes, as `channels` and `permission_prompts`
  * are; which of them is read depends on the mode (`channelModeOf`).
  */
@@ -239,17 +236,17 @@ export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'stop_hook_bootstrap',
 ]
 
-/** Keys allowed in a persona's `dm` object (b.av2 SR-1.2). */
+/** Keys allowed in a persona's `dm` object. */
 export const PERSONA_DM_KEYS: readonly (keyof PersonaDmInput)[] = ['enabled', 'contact']
 
 /**
  * Keys allowed in a persona's `invited` object, the fungible section
- * (b.deo SRI-102). Read only in fungible mode.
+ * Read only in fungible mode.
  */
 export const PERSONA_INVITED_KEYS: readonly (keyof PersonaInvitedInput)[] = ['permission_prompts']
 
 /**
- * The two channel modes (b.deo SRI-101), picked for every persona by the
+ * The two channel modes, picked for every persona by the
  * `allow_invited_channels` switch: `declarative` when it is absent or
  * `false` (each persona serves its listed `channels`, with its top-level
  * `permission_prompts` as its destination), `fungible` when it is `true`
@@ -257,29 +254,29 @@ export const PERSONA_INVITED_KEYS: readonly (keyof PersonaInvitedInput)[] = ['pe
  */
 export const CHANNEL_MODES = ['declarative', 'fungible'] as const
 
-/** A channel mode (b.deo SRI-101). Read through `channelModeOf`. */
+/** A channel mode. Read through `channelModeOf`. */
 export type ChannelMode = (typeof CHANNEL_MODES)[number]
 
-/** Keys allowed in a channel entry (b.av2 SR-1.3); both are required. */
+/** Keys allowed in a channel entry; both are required. */
 export const CHANNEL_ENTRY_KEYS: readonly (keyof ChannelEntryInput)[] = ['id', 'delivery']
 
-/** Allowed channel `delivery` values (b.av2 SR-1.3). */
+/** Allowed channel `delivery` values. */
 export const DELIVERY_MODES = ['all', 'mentions'] as const
 
 /** The `permission_prompts` value that sends prompts and notices by DM to `dm.contact`. */
 export const DM_DESTINATION = 'dm'
 
-/** Channel IDs in channel entries and `permission_prompts` (b.av2 SR-1.3, SR-1.5). */
+/** Channel IDs in channel entries and `permission_prompts`. */
 export const CHANNEL_ID_RE = /^[CG][A-Z0-9]+$/
 
-/** `dm.contact` Slack user IDs (b.av2 SR-1.2, SR-1.5). */
+/** `dm.contact` Slack user IDs. */
 export const DM_CONTACT_RE = /^[UW][A-Z0-9]+$/
 
 /** Prefix of every error the persona loader's validation raises. */
 const PERSONA_ERROR_PREFIX = 'Persona config validation error: '
 
 /**
- * The b.av2 SR-1.7 conversion message for a pre-persona key found in a
+ * The conversion message for a pre-persona key found in a
  * configuration: names the key and says the configuration must be rewritten
  * as personas, and that nothing is converted automatically.
  */
@@ -296,7 +293,7 @@ export function prePersonaConversionMessage(key: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Server-wide settings as parsed from disk (b.av2 SR-1.6). All fields may be
+ * Server-wide settings as parsed from disk. All fields may be
  * absent.
  */
 export interface ServerSettingsInput {
@@ -313,7 +310,7 @@ export interface ServerSettingsInput {
   /**
    * Whether bots launch with `--system-prompt-snapshot off`, so a resumed or
    * restarted bot reloads the current system prompt file and `CLAUDE.md`
-   * (b.b1j SR-1). Absent means `true`; must be a boolean. Server-wide only: a
+   * Absent means `true`; must be a boolean. Server-wide only: a
    * persona entry cannot set it. A change takes effect at the next start.
    */
   fresh_system_prompt?: boolean
@@ -339,23 +336,23 @@ export interface ServerSettingsInput {
    */
   stop_hook_bootstrap?: boolean
   /**
-   * Poll interval (ms) for the SR-2.1 permission-relay tick. Must be a
+   * Poll interval (ms) for the permission-relay tick. Must be a
    * positive integer in the closed range [200, 3_600_000]; defaults to 1000.
    * Replaces the old `claude_director_poll_interval_ms` field — the old name
-   * is rejected explicitly at startup per SR-4.1.
+   * is rejected explicitly at startup.
    */
   agent_director_poll_interval_ms?: number
   /**
    * Timeout (ms) of each agent-director call CSCB makes for a persona
-   * (b.jg5 SRJ-213): the `callTimeoutMs` of the server's and the CLI's
+   * the `callTimeoutMs` of the server's and the CLI's
    * persona clients. Must be a positive integer in the closed range
    * [1000, 3_600_000]; defaults to 60000. Server-wide only: a persona entry
    * cannot set it.
    */
   agent_director_call_timeout_ms?: number
   /**
-   * Path to the cscb_cron crontable file (b.he5 PD-5). Optional: when omitted,
-   * defaults to `resolveDefaultCronTablePath` (bug b.avm): with
+   * Path to the cscb_cron crontable file (PD-5). Optional: when omitted,
+   * defaults to `resolveDefaultCronTablePath`: with
    * `SLACK_STATE_DIR` unset, `$XDG_CONFIG_HOME/claude-slack-channel-bots/crontab`
    * (`~/.config/claude-slack-channel-bots/crontab`), outside `~/.claude`; with it set,
    * `<config dir>/crontab`, where `<config dir>` is the directory of the
@@ -364,19 +361,19 @@ export interface ServerSettingsInput {
    */
   cron_table_path?: string
   /**
-   * Path to the cscb_cron log file (b.he5 PD-5). Optional: when omitted,
+   * Path to the cscb_cron log file (PD-5). Optional: when omitted,
    * defaults to `<config dir>/cron.log`. `~` is expanded and the path resolved
    * to absolute.
    */
   cron_log_path?: string
   /**
-   * Maximum size in bytes of the cron log before pruning (b.he5 PD-5). Optional
+   * Maximum size in bytes of the cron log before pruning (PD-5). Optional
    * with NO default: absent means pruning is disabled. When set, must be a
    * positive integer (finite, integer, >= 1) — no upper bound.
    */
   cron_log_max_bytes?: number
   /**
-   * The channel-mode switch (b.deo SRI-101): `true` turns fungible mode on for
+   * The channel-mode switch: `true` turns fungible mode on for
    * every persona; absent or `false` is declarative mode. Must be a boolean.
    */
   allow_invited_channels?: boolean
@@ -384,7 +381,7 @@ export interface ServerSettingsInput {
 
 /**
  * Validated, fully-resolved server-wide settings with all defaults applied
- * (b.av2 SR-1.6).
+ *
  */
 export interface ServerSettings {
   bind: string
@@ -398,7 +395,7 @@ export interface ServerSettings {
   cozempic_prescription: string
   system_prompt_mode: string
   /**
-   * Whether bots launch with `--system-prompt-snapshot off` (b.b1j SR-1).
+   * Whether bots launch with `--system-prompt-snapshot off`.
    * Defaults to true when absent; read by the template builder.
    */
   fresh_system_prompt: boolean
@@ -413,58 +410,58 @@ export interface ServerSettings {
    * `Persona.stop_hook_bootstrap`: its own value, else this one.
    */
   stop_hook_bootstrap: boolean
-  /** Poll interval (ms) for the SR-2.1 permission-relay tick. */
+  /** Poll interval (ms) for the permission-relay tick. */
   agent_director_poll_interval_ms: number
-  /** Timeout (ms) of each agent-director persona call (b.jg5 SRJ-213). */
+  /** Timeout (ms) of each agent-director persona call. */
   agent_director_call_timeout_ms: number
   /**
-   * Absolute path to the cscb_cron crontable file (b.he5 PD-5). Always present:
-   * defaults to `resolveDefaultCronTablePath` when omitted from input (bug b.avm).
+   * Absolute path to the cscb_cron crontable file (PD-5). Always present:
+   * defaults to `resolveDefaultCronTablePath` when omitted from input.
    */
   cron_table_path: string
   /**
-   * Absolute path to the cscb_cron log file (b.he5 PD-5). Always present:
+   * Absolute path to the cscb_cron log file (PD-5). Always present:
    * defaults to `<config dir>/cron.log` when omitted from input.
    */
   cron_log_path: string
   /**
-   * Maximum size in bytes of the cron log before pruning (b.he5 PD-5). Optional
+   * Maximum size in bytes of the cron log before pruning (PD-5). Optional
    * with no default: undefined means pruning is disabled.
    */
   cron_log_max_bytes?: number
   /**
-   * The channel-mode switch (b.deo SRI-101). Defaults to false (declarative
+   * The channel-mode switch. Defaults to false (declarative
    * mode); absent and `false` resolve alike. Read through `channelModeOf`.
    */
   allow_invited_channels: boolean
   /**
-   * Test-only timer overrides (b.2nr): present only when the file has the
+   * Test-only timer overrides: present only when the file has the
    * block. Read once at server start (`installTestTimerOverrides`); a
    * reload never applies a change of it live.
    */
   test_timer_overrides?: TestTimerOverrides
-  /** b.omv SR-14.1: test-only, captured at startup and never applied by reload. */
+  /** test-only, captured at startup and never applied by reload. */
   test_mcp_drop_endpoint?: boolean
 }
 
 // ---------------------------------------------------------------------------
-// Persona configuration types (b.av2 SR-1.1 to SR-1.3, SR-1.6)
+// Persona configuration types
 // ---------------------------------------------------------------------------
 
 /** Channel `delivery`: `all` delivers every message, `mentions` only those that mention the persona. */
 export type DeliveryMode = (typeof DELIVERY_MODES)[number]
 
-/** How a long reply is split into chunks (b.av2 SR-1.6). */
+/** How a long reply is split into chunks. */
 export type ReplyChunkMode = (typeof REPLY_CHUNK_MODES)[number]
 
-/** A channel entry as written in the file (b.av2 SR-1.3). Both keys are required. */
+/** A channel entry as written in the file. Both keys are required. */
 export interface ChannelEntryInput {
   /** Slack channel ID matching `CHANNEL_ID_RE`. */
   id: string
   delivery: DeliveryMode
 }
 
-/** A persona's `dm` object as written in the file (b.av2 SR-1.2). */
+/** A persona's `dm` object as written in the file. */
 export interface PersonaDmInput {
   /** The DMs switch. Defaults to false. */
   enabled?: boolean
@@ -472,7 +469,7 @@ export interface PersonaDmInput {
   contact?: string
 }
 
-/** A persona's `invited` object as written in the file: the fungible section (b.deo SRI-102). */
+/** A persona's `invited` object as written in the file: the fungible section. */
 export interface PersonaInvitedInput {
   /**
    * The persona's destination in fungible mode: `dm` or a Slack channel ID
@@ -481,7 +478,7 @@ export interface PersonaInvitedInput {
   permission_prompts?: string
 }
 
-/** A persona entry as written in the file (b.av2 SR-1.2, b.deo SRI-102). */
+/** A persona entry as written in the file. */
 export interface PersonaInput {
   /** Persona identity: a non-empty string with no format rule. */
   name: string
@@ -506,7 +503,7 @@ export interface PersonaInput {
   stop_hook_bootstrap?: boolean
 }
 
-/** The persona configuration file as parsed from disk (b.av2 SR-1.1, SR-1.6). */
+/** The persona configuration file as parsed from disk. */
 export interface PersonaConfigInput extends ServerSettingsInput {
   /** Required; may be empty. */
   personas: PersonaInput[]
@@ -520,13 +517,13 @@ export interface PersonaConfigInput extends ServerSettingsInput {
   reply_chunk_mode?: ReplyChunkMode
 }
 
-/** A resolved channel entry (b.av2 SR-1.3). */
+/** A resolved channel entry. */
 export interface ChannelEntry {
   id: string
   delivery: DeliveryMode
 }
 
-/** A resolved `dm` object (b.av2 SR-1.2). */
+/** A resolved `dm` object. */
 export interface PersonaDm {
   enabled: boolean
   contact?: string
@@ -534,9 +531,9 @@ export interface PersonaDm {
 
 /**
  * The JSON values of a persona entry's `channels`, `permission_prompts` and
- * `invited` as written, each undefined when absent (b.deo SRI-102). Never
+ * `invited` as written, each undefined when absent. Never
  * validated or resolved: only the reload plan reads them, to tell whether a
- * section changed (b.deo SRI-802, SRI-804).
+ * section changed.
  */
 export interface PersonaSections {
   channels: unknown
@@ -544,12 +541,12 @@ export interface PersonaSections {
   invited: unknown
 }
 
-/** A resolved persona with defaults applied and settings inherited (b.av2 SR-1.2, SR-10.2; b.deo SRI-102). */
+/** A resolved persona with defaults applied and settings inherited. */
 export interface Persona {
   /** Position of the entry in the file's `personas` array, for `personas[i]` in diagnostics. */
   index: number
   name: string
-  /** Persona key derived from `name` (b.av2 SR-2.1). */
+  /** Persona key derived from `name`. */
   key: string
   /** Absolute, tilde-expanded path. Not checked for existence at load time. */
   credentials_file: string
@@ -561,16 +558,16 @@ export interface Persona {
   /**
    * Declarative mode: `dm` or one of `channels`' IDs. Fungible mode:
    * undefined, never parsed. Read for a destination only through the one
-   * destination rule (`personaDestinationOf`, b.deo SRI-701).
+   * destination rule (`personaDestinationOf`).
    */
   permission_prompts: string | undefined
   /**
    * Fungible mode: the resolved `invited.permission_prompts`, `dm` when it is
-   * absent. Declarative mode: undefined (b.deo SRI-102). Read for a
+   * absent. Declarative mode: undefined. Read for a
    * destination only through the one destination rule.
    */
   fungible_destination: string | undefined
-  /** The three section keys as written, in both modes (b.deo SRI-102); read only by the reload plan. */
+  /** The three section keys as written, in both modes; read only by the reload plan. */
   sections: PersonaSections
   /**
    * Effective Claude config dir: the per-persona value, else the top-level
@@ -581,7 +578,7 @@ export interface Persona {
   stop_hook_bootstrap: boolean
 }
 
-/** Validated, fully-resolved persona configuration (b.av2 SR-1.1, SR-1.6). */
+/** Validated, fully-resolved persona configuration. */
 export interface PersonaConfig extends ServerSettings {
   /** In file order. */
   personas: Persona[]
@@ -598,7 +595,7 @@ export interface PersonaConfig extends ServerSettings {
 export type ReplySettings = Pick<PersonaConfig, 'queued_ack_reaction' | 'ack_reaction' | 'reply_chunk_limit' | 'reply_chunk_mode'>
 
 /**
- * The server-wide reply settings of `config` (b.av2 SR-1.6). With no
+ * The server-wide reply settings of `config`. With no
  * configuration (before the server's start resolves): no reaction and the
  * default chunking. Pure; does not mutate the input.
  */
@@ -612,7 +609,7 @@ export function replySettingsOf(config: PersonaConfig | null | undefined): Reply
 }
 
 /**
- * The agent-director call timeout of `config` (b.jg5 SRJ-213), in
+ * The agent-director call timeout of `config`, in
  * milliseconds. With no configuration (one that could not be read, or before
  * the server's start resolves): the default. Pure; does not mutate the input.
  */
@@ -621,7 +618,7 @@ export function agentDirectorCallTimeoutMsOf(config: ServerSettings | null | und
 }
 
 /**
- * The channel mode of `config` (b.deo SRI-101, SRI-201): `fungible` when its
+ * The channel mode of `config`: `fungible` when its
  * `allow_invited_channels` is `true`, else `declarative`. With no
  * configuration (before the server's start resolves): `declarative`. Every
  * consumer of the mode reads it through this, from the configuration in
@@ -636,13 +633,13 @@ export function channelModeOf(config: Pick<ServerSettings, 'allow_invited_channe
 // Pure functions
 // ---------------------------------------------------------------------------
 
-/** The raw test-only timer override block of a parsed input (b.2nr), unvalidated; typed as validated because `validateTestTimerOverrides` runs before any use. */
+/** The raw test-only timer override block of a parsed input, unvalidated; typed as validated because `validateTestTimerOverrides` runs before any use. */
 function testTimerOverridesOf(input: ServerSettingsInput): TestTimerOverrides | undefined {
   return (input as { test_timer_overrides?: TestTimerOverrides }).test_timer_overrides
 }
 
 /**
- * Fill in the defaults of the server-wide settings (b.av2 SR-1.6). Paths are returned as given (defaults unexpanded, except
+ * Fill in the defaults of the server-wide settings. Paths are returned as given (defaults unexpanded, except
  * the cron paths, which are absolute: the crontable's is `cronTableDefault`,
  * and the cron log's is under `configDir`); `resolveServerPaths` expands
  * them. Does not mutate the input.
@@ -659,7 +656,7 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     append_system_prompt_file: input.append_system_prompt_file,
     cozempic_prescription: input.cozempic_prescription ?? 'standard',
     system_prompt_mode: input.system_prompt_mode ?? 'append',
-    // b.b1j SR-1: only an absent key takes the default: any other value,
+    // only an absent key takes the default: any other value,
     // `null` included, is kept so the key's boolean rule rejects it.
     fresh_system_prompt: input.fresh_system_prompt === undefined ? true : input.fresh_system_prompt,
     message_archive_db: input.message_archive_db,
@@ -676,7 +673,7 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     // Only an absent switch takes the default: any other value, `null`
     // included, is kept so the switch's boolean rule rejects it.
     allow_invited_channels: input.allow_invited_channels === undefined ? false : input.allow_invited_channels,
-    // b.2nr: present only when the file has the block (any value, `null`
+    // present only when the file has the block (any value, `null`
     // included, is kept so its rule rejects it). Not a documented key, so it
     // is not in `ServerSettingsInput`.
     ...(testTimerOverridesOf(input) === undefined ? {} : { test_timer_overrides: testTimerOverridesOf(input) }),
@@ -697,11 +694,11 @@ export function expandTilde(path: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Real-path comparison (b.av2 SR-1.5), shared with later bring-up checks
+// Real-path comparison, shared with later bring-up checks
 // ---------------------------------------------------------------------------
 
 /**
- * The comparison form of a configured path (b.av2 SR-1.5): its real path
+ * The comparison form of a configured path: its real path
  * when `realpath` succeeds, otherwise its lexical `path.resolve`. Any realpath
  * failure (missing path or ancestor, permission error, symlink loop) falls
  * back to the lexical form, so this never throws for a string path. Two paths
@@ -723,7 +720,7 @@ export function resolveRealPath(path: string, realpath: (path: string) => string
  * The real path of `path`, or undefined when realpath fails (a missing path
  * or ancestor, a permission error, a symlink loop): `resolveRealPath` without
  * its lexical fallback, for a check that must know the path could not be
- * resolved (b.av2 SR-6.4: a directory-broken persona's rows are not compared
+ * resolved (a directory-broken persona's rows are not compared
  * by `cwd`). Never throws for a string path; the input must already be
  * tilde-expanded.
  *
@@ -783,7 +780,7 @@ function unresolvableFrom(err: unknown): StrictRealPathResult {
 }
 
 /**
- * The real path of `path` with no lexical fallback (bug b.g57), for a
+ * The real path of `path` with no lexical fallback, for a
  * directory that exists or is still to be created, such as a persona's
  * effective claude_config_dir:
  *
@@ -841,12 +838,11 @@ export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathF
 }
 
 // ---------------------------------------------------------------------------
-// Credentials files protected by the file guard (b.av2 SR-5.2)
+// Credentials files protected by the file guard
 // ---------------------------------------------------------------------------
 
 /**
- * The persona credentials files that `assertSendable` must refuse (b.av2
- * SR-5.2): every applied persona's `credentials_file`, plus every string
+ * The persona credentials files that `assertSendable` must refuse: every applied persona's `credentials_file`, plus every string
  * `personas[i].credentials_file` named by the configuration file currently at
  * `configPath`, tilde-expanded under `home` and made absolute.
  *
@@ -855,7 +851,7 @@ export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathF
  * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
  * device) is never read. It reads without the 64 KiB cap (`uncapped`, as the
  * retired-key record's start read and the stored-choice file's start read do,
- * b.deo SRI-403): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
+ *): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
  * still protects the paths it names, so the cap never shrinks what the guard
  * refuses. An unreadable or non-regular file, unparseable JSON, or a file
  * without a `personas` array contributes nothing; this never throws. The
@@ -897,9 +893,9 @@ export function credentialsFilesToProtect(
  * unparseable JSON, a value that is not an object, or a missing or non-array
  * `personas` yields none; a parse error is discarded, never reported. Pure:
  * reads no file. Only the paths leave it, never other content. The one
- * extraction of referenced credentials paths: the SR-5.2 file guard
+ * extraction of referenced credentials paths: the file guard
  * (`credentialsFilesToProtect`) and the reload detection tick's fingerprint
- * (b.av2 SR-8.3) both use it.
+ * both use it.
  *
  * @param bytes  The configuration's bytes, or its text.
  * @param home   Home directory for every `~`; defaults to the OS home, read at
@@ -927,14 +923,14 @@ export function referencedCredentialsPaths(bytes: Uint8Array | string, home?: st
 }
 
 // ---------------------------------------------------------------------------
-// Server-wide rules (b.av2 SR-1.6)
+// Server-wide rules
 // ---------------------------------------------------------------------------
 
 /**
  * How a validation rule words its error: the prefix it starts with. No rule
  * echoes a rejected value, and an unknown key's name is echoed only when it
  * is a plain setting name (`describeUnknownKeys`), so a token pasted into
- * any setting or as a key name cannot reach an error (b.av2 SR-10.3).
+ * any setting or as a key name cannot reach an error.
  */
 interface RuleStyle {
   prefix: string
@@ -1007,7 +1003,7 @@ function checkPositiveIntegerInRange(value: unknown, key: string, min: number, m
 }
 
 /**
- * The test-only timer override block (b.2nr): absent, or an object whose
+ * The test-only timer override block: absent, or an object whose
  * keys are among `TEST_TIMER_OVERRIDE_KEYS`, each a positive integer (at most
  * an hour: `MAX_TEST_TIMER_OVERRIDE_MS`, `MAX_TEST_TIMER_OVERRIDE_S`). The two
  * retry values are given together, the ceiling not below the base. Messages
@@ -1037,9 +1033,9 @@ function validateTestTimerOverrides(value: unknown, style: RuleStyle): void {
 }
 
 /**
- * The server-wide rules that come last: the SR-4.1 poll interval range
- * [200, 3_600_000], the b.jg5 SRJ-213 call timeout range [1000, 3_600_000]
- * and the b.he5 PD-5 cron settings (absent `cron_log_max_bytes` disables
+ * The server-wide rules that come last: the poll interval range
+ * [200, 3_600_000], the call timeout range [1000, 3_600_000]
+ * and the PD-5 cron settings (absent `cron_log_max_bytes` disables
  * pruning).
  */
 function validateServerPollAndCron(config: ServerSettings, style: RuleStyle): void {
@@ -1095,10 +1091,10 @@ function resolveServerPaths(settings: ServerSettings, home?: string): Pick<Serve
 }
 
 /**
- * Reject top-level keys outside `known` (SR-4.2), naming only the keys that
+ * Reject top-level keys outside `known`, naming only the keys that
  * are safe to echo (`describeUnknownKeys`) and never a value. The
  * pre-rename `claude_director_poll_interval_ms` gets a targeted message naming
- * its new name (SR-4.1).
+ * its new name.
  *
  * Operates on the raw parsed object so we can see fields that would otherwise
  * be dropped by structural casting.
@@ -1114,7 +1110,7 @@ function rejectUnknownTopLevelKeys(
     if (key === RENAMED_POLL_INTERVAL_KEY) {
       throw ruleError(
         style,
-        `${RENAMED_POLL_INTERVAL_KEY} has been renamed to agent_director_poll_interval_ms (SR-4.1). Rename the field in config.json — the old name is not accepted as an alias.`,
+        `${RENAMED_POLL_INTERVAL_KEY} has been renamed to agent_director_poll_interval_ms. Rename the field in config.json — the old name is not accepted as an alias.`,
       )
     }
     unknown.push(key)
@@ -1129,7 +1125,7 @@ function rejectUnknownTopLevelKeys(
  * only, at most 48 characters, as every setting name is. Anything else (a
  * digit, a dash, a dot, a space, a longer name) is not echoed: a token or
  * other secret pasted as a key name would otherwise reach the start's log,
- * `config.json.pending` and the reload log lines (b.av2 SR-10.3). Letters
+ * `config.json.pending` and the reload log lines. Letters
  * only, so a hex or base64 secret, a Slack token (`xoxb-…`) and a
  * `ghp_…`-style token all fail it, while a typo such as `chanels` passes.
  */
@@ -1155,7 +1151,7 @@ export function describeUnknownKeys(keys: readonly string[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Persona loader: server-wide settings (b.av2 SR-1.6, SR-10.2)
+// Persona loader: server-wide settings
 // ---------------------------------------------------------------------------
 
 /** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
@@ -1178,10 +1174,10 @@ type PersonaServerSettings = Omit<PersonaConfig, 'personas'>
 
 /**
  * Default, resolve and validate the server-wide settings of a persona-shape
- * object with today's rules (b.av2 SR-1.6): top-level paths keep today's
+ * object with today's rules: top-level paths keep today's
  * resolution (not the persona path rule), with `~` expanded under `home`;
  * the crontable's default is `resolveDefaultCronTablePath` over `configDir`,
- * `home` and `env` (bug b.avm), and the cron log's sits under `configDir`.
+ * `home` and `env`, and the cron log's sits under `configDir`.
  * Adds the persona-only `queued_ack_reaction`, `ack_reaction`, `reply_chunk_limit` and
  * `reply_chunk_mode`. Errors name the key and the rule, never the rejected
  * value.
@@ -1214,7 +1210,7 @@ function resolvePersonaServerSettings(
 
 /**
  * The server-wide rules in their fixed order, then the persona-only keys,
- * then the channel-mode switch (b.deo SRI-101): a boolean, `null` included
+ * then the channel-mode switch: a boolean, `null` included
  * among the rejected values; its error names the setting and never the
  * value. All of them run before any persona entry is parsed, in either
  * mode, since the switch decides how the entries are read.
@@ -1224,7 +1220,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   validateServerTimingsAndModes(settings, style)
   checkOptionalNonEmptyString(settings.claude_config_dir, 'claude_config_dir', style)
   checkBoolean(settings.stop_hook_bootstrap, 'stop_hook_bootstrap', style)
-  checkBoolean(settings.fresh_system_prompt, 'fresh_system_prompt', style) // b.b1j SR-1
+  checkBoolean(settings.fresh_system_prompt, 'fresh_system_prompt', style) //
   validateServerPollAndCron(settings, style)
   checkOptionalNonEmptyString(settings.queued_ack_reaction, 'queued_ack_reaction', style)
   checkOptionalNonEmptyString(settings.ack_reaction, 'ack_reaction', style)
@@ -1236,11 +1232,10 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
 }
 
 // ---------------------------------------------------------------------------
-// Persona loader: persona and channel entries (b.av2 SR-1.2, SR-1.3, SR-1.5;
-// b.deo SRI-102 to SRI-104)
+// Persona loader: persona and channel entries
 // ---------------------------------------------------------------------------
 
-/** Top-level values a persona inherits when its entry omits them (b.av2 SR-1.2, SR-10.2). */
+/** Top-level values a persona inherits when its entry omits them. */
 interface InheritedPersonaSettings {
   claude_config_dir?: string
   stop_hook_bootstrap: boolean
@@ -1259,9 +1254,9 @@ function jsonTypeName(value: unknown): string {
 
 /**
  * Error style for one persona entry. Every message starts with `personas[i]`
- * and, when the name is a non-empty string, the persona reference of b.av2
- * SR-2.2 (JSON-quoted name with its key), and never echoes a rejected value.
- * Any non-empty name is rendered as written (b.av2 SR-1.2: no format rule).
+ * and, when the name is a non-empty string, the persona reference of the contract
+ * (JSON-quoted name with its key), and never echoes a rejected value.
+ * Any non-empty name is rendered as written (no format rule).
  */
 function personaEntryStyle(name: unknown, index: number): RuleStyle {
   const ref = isNonEmptyString(name) ? ` ${renderPersonaRef(name)}` : ''
@@ -1280,10 +1275,9 @@ function rejectUnknownEntryKeys(
 
 /**
  * Stage 1 of an entry: unknown keys of the entry and the shape of the `dm`
- * object, then the section in force (b.deo SRI-103, SRI-104). Declarative
- * mode: the shape of the `channels` array and its entries, as b.av2 SR-1.2
- * (as amended by b.deo SRI-102, SRI-202) and SR-1.3 (as amended by b.deo
- * SRI-103, SRI-104) give it; `invited` is not looked at. Fungible mode: the shape of
+ * object, then the section in force. Declarative
+ * mode: the shape of the `channels` array and its entries, as
+ * and give it; `invited` is not looked at. Fungible mode: the shape of
  * the `invited` object; `channels` is not looked at. Unknown keys are
  * rejected at every level checked (key names only, and only those safe to
  * echo: `describeUnknownKeys`).
@@ -1316,7 +1310,7 @@ function checkPersonaEntryShape(entry: Record<string, unknown>, mode: ChannelMod
 }
 
 /**
- * The persona path rule (b.av2 SR-1.2): a string that is absolute, exactly
+ * The persona path rule: a string that is absolute, exactly
  * `~`, or starts with `~/`. Returns it tilde-expanded under `home` and made
  * absolute. No file-system access.
  */
@@ -1332,7 +1326,7 @@ function requirePersonaPath(entry: Record<string, unknown>, setting: string, hom
   return parsePersonaPath(entry[setting], setting, home, style)
 }
 
-/** Channel entries (b.av2 SR-1.3): shapes already checked in stage 1. */
+/** Channel entries: shapes already checked in stage 1. */
 function parseChannels(channels: Record<string, unknown>[], style: RuleStyle): ChannelEntry[] {
   const firstIndexById = new Map<string, number>()
   return channels.map((channel, j) => {
@@ -1352,7 +1346,7 @@ function parseChannels(channels: Record<string, unknown>[], style: RuleStyle): C
   })
 }
 
-/** The `dm` object (b.av2 SR-1.2): shape already checked in stage 1. */
+/** The `dm` object: shape already checked in stage 1. */
 function parseDm(dm: Record<string, unknown> | undefined, style: RuleStyle): PersonaDm {
   const enabled = dm?.['enabled']
   const contact = dm?.['contact']
@@ -1372,11 +1366,11 @@ function parsePermissionPrompts(value: unknown, style: RuleStyle): string {
   throw ruleError(style, `permission_prompts must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`)
 }
 
-/** The setting that names a persona's destination in fungible mode (b.deo SRI-102). */
+/** The setting that names a persona's destination in fungible mode. */
 const INVITED_PERMISSION_PROMPTS = 'invited.permission_prompts'
 
 /**
- * The fungible destination (b.deo SRI-102): `invited.permission_prompts`,
+ * The fungible destination: `invited.permission_prompts`,
  * `dm` or a Slack channel ID, or `dm` when `invited` or its key is absent.
  * The shape of `invited` is already checked in stage 1.
  */
@@ -1392,7 +1386,7 @@ function parseFungibleDestination(invited: Record<string, unknown> | undefined, 
 
 /**
  * Stage 3 of an entry in fungible mode: the fungible destination rule
- * (b.deo SRI-104). A `dm` destination, written or by default, needs
+ * A `dm` destination, written or by default, needs
  * `dm.contact` set and `dm.enabled` true; the error names
  * `invited.permission_prompts`, says whether `dm` is its default, and names
  * each missing setting (both when both are missing). A channel destination
@@ -1411,10 +1405,10 @@ function checkFungibleDestination(destination: string, written: boolean, dm: Per
 }
 
 /**
- * Stage 3 of an entry in declarative mode: the cross-setting rules of b.av2
- * SR-1.5 (b.deo SRI-103). Zero channels
+ * Stage 3 of an entry in declarative mode: the cross-setting rules of the contract
+ * Zero channels
  * with DMs off comes first: every destination would otherwise fail one of the
- * later rules, so AC 42 could never be reported. Then a channel destination
+ * later rules, so could never be reported. Then a channel destination
  * not among `channels`, then a `dm` destination without `dm.contact` or with
  * `dm.enabled` not true (both named when both are wrong). Values named here
  * (channel IDs) have already passed their format rule.
@@ -1444,7 +1438,7 @@ function checkPersonaCrossSettings(
 
 /**
  * The section in force of one persona entry, parsed and checked by the
- * channel mode (b.deo SRI-103, SRI-104): the resolved `channels`,
+ * channel mode: the resolved `channels`,
  * `permission_prompts` and `fungible_destination`. The section not in force
  * is never looked at.
  */
@@ -1452,11 +1446,11 @@ type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungib
 
 /**
  * Parse, default and validate one persona entry by the channel mode `mode`
- * (b.av2 SR-1.2, SR-1.3 and the per-entry rules of SR-1.5, as b.deo SRI-103
- * and SRI-104 give them per mode), throwing on the first violation.
+ * (and the per-entry rules of the contract, as
+ * and give them per mode), throwing on the first violation.
  *
  * Check order, so "first violation" is reproducible. Declarative mode
- * (b.deo SRI-103):
+ *
  *   0. the entry is a JSON object;
  *   1. shape and unknown keys: persona entry, `dm`, `channels` and each
  *      channel entry (stage 1);
@@ -1471,7 +1465,7 @@ type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungib
  *      `dm.enabled` not true.
  * `invited` is neither checked nor read, whatever its type or content.
  *
- * Fungible mode (b.deo SRI-104):
+ * Fungible mode:
  *   0. the entry is a JSON object;
  *   1. shape and unknown keys: persona entry, `dm` and `invited` (stage 1);
  *   2. types and formats, in this order: `name`, `credentials_file`,
@@ -1551,7 +1545,7 @@ function parsePersonaEntry(
 }
 
 // ---------------------------------------------------------------------------
-// Persona loader: cross-persona rules (b.av2 SR-1.5)
+// Persona loader: cross-persona rules
 // ---------------------------------------------------------------------------
 
 /** `personas[i]` plus the persona reference, naming the other persona in a cross-persona error. */
@@ -1585,7 +1579,7 @@ function describeNameKeyCollision(earlier: Persona, later: Persona): string | un
 }
 
 /**
- * b.av2 SR-1.5, first row: no persona's name or key (SR-2.1) may equal
+ * first row: no persona's name or key may equal
  * another persona's name or key. A persona whose own name is its own key
  * does not collide with itself.
  *
@@ -1654,7 +1648,7 @@ const PREFIX_RELATED_KEYS_HINT =
   "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other."
 
 /**
- * The prefix-related key rule's reason sentence (b.jg5 SRJ-1102): tmux
+ * The prefix-related key rule's reason sentence: tmux
  * matches a session target by prefix unless it is written with `=`, so a
  * human's tmux command without `=` for one persona could reach another
  * persona's session. The one source of that sentence: the validation text
@@ -1710,8 +1704,8 @@ function describePrefixRelatedKeys(earlier: Persona, later: Persona, personas: r
 }
 
 /**
- * No persona's key may be a prefix of another persona's key (b.1ix
- * follow-up; reason per b.jg5 SRJ-1102, {@link prefixRelatedKeysReason}).
+ * No persona's key may be a prefix of another persona's key (
+ * follow-up; reason, {@link prefixRelatedKeysReason}).
  * tmux matches a session target by prefix unless it is written with `=`, so
  * with keys `dev` and `dev_2` a human's `tmux attach -t slack_bot_dev`
  * could reach `slack_bot_dev_2`. The instance IDs (`cscb_<key>`) stand in
@@ -1734,7 +1728,7 @@ function checkPrefixRelatedKeys(personas: readonly Persona[]): void {
   })
 }
 
-/** The per-persona paths that no two personas may share (b.av2 SR-1.5), in the order they are checked. */
+/** The per-persona paths that no two personas may share, in the order they are checked. */
 const UNIQUE_PERSONA_PATH_SETTINGS = ['working_directory', 'credentials_file'] as const
 
 type UniquePersonaPathSetting = (typeof UNIQUE_PERSONA_PATH_SETTINGS)[number]
@@ -1770,7 +1764,7 @@ function rejectSharedRealPath(personas: readonly Persona[], setting: UniquePerso
 }
 
 /**
- * The real-path collision step (b.av2 SR-1.5): no two personas may share a
+ * The real-path collision step: no two personas may share a
  * `working_directory`, then no two may share a `credentials_file`, each
  * compared by real path with a lexical fallback (`resolveRealPath`), so a
  * symlink to another persona's path, or `~/x` against its absolute form, is a
@@ -1790,7 +1784,7 @@ function checkRealPathCollisions(personas: readonly Persona[]): void {
 /** How `resolvePersonaConfig` validates. */
 export interface ResolvePersonaConfigOptions {
   /**
-   * Record mode (b.av2 SR-1.5, record-start part): validate a start's
+   * Record mode (record-start part): validate a start's
    * `config.json.last-applied`. Skips only the real-path collision step
    * (step 9): at a start from the record, two personas sharing a
    * `working_directory` or a `credentials_file` are a bring-up failure of each
@@ -1800,14 +1794,14 @@ export interface ResolvePersonaConfigOptions {
   record?: boolean
   /**
    * The environment the crontable's default reads `SLACK_STATE_DIR` and
-   * `XDG_CONFIG_HOME` from (`resolveDefaultCronTablePath`, bug b.avm).
+   * `XDG_CONFIG_HOME` from (`resolveDefaultCronTablePath`).
    * Defaults to `process.env`, read at call time only.
    */
   env?: NodeJS.ProcessEnv
 }
 
 // ---------------------------------------------------------------------------
-// Persona loader: entry point (b.av2 SR-1.1, SR-1.7)
+// Persona loader: entry point
 // ---------------------------------------------------------------------------
 
 /**
@@ -1819,37 +1813,36 @@ export interface ResolvePersonaConfigOptions {
  *
  * Check order:
  *   1. the value is a JSON object;
- *   2. b.av2 SR-1.7: `routes` (any value), `default_route` or
+ * 2. `routes` (any value), `default_route` or
  *      `default_dm_session` present → the conversion message, before any
  *      other check;
  *   3. unknown top-level keys (key names only, and only plain setting names:
- *      `describeUnknownKeys`; the SR-4.1 rename message);
+ * `describeUnknownKeys`; the rename message);
  *   4. `personas` present and an array (it may be empty);
- *   5. server-wide settings defaulted and validated (b.av2 SR-1.6, b.deo
- *      SRI-101), the `allow_invited_channels` switch among them;
+ * 5. server-wide settings defaulted and validated, the `allow_invited_channels` switch among them;
  *   6. each persona entry in array order, by the rules of the channel mode
  *      this configuration's own switch picks (see `parsePersonaEntry`;
- *      b.deo SRI-103 to SRI-105), inheriting the resolved top-level
+ * to), inheriting the resolved top-level
  *      `claude_config_dir` and `stop_hook_bootstrap`;
- *   7. the cross-persona name/key rule (b.av2 SR-1.5, see
+ * 7. the cross-persona name/key rule (see
  *      `checkUniqueNamesAndKeys`): no name or key equal to another persona's
  *      name or key;
- *   8. the prefix-related key rule (b.1ix follow-up, see
+ * 8. the prefix-related key rule (follow-up, see
  *      `checkPrefixRelatedKeys`): no key that starts with another persona's
  *      key;
- *   9. the real-path collision step (b.av2 SR-1.5, see
+ * 9. the real-path collision step (see
  *      `checkRealPathCollisions`): no shared `working_directory`, then no
  *      shared `credentials_file`, compared by `resolveRealPath`. Skipped in
  *      record mode (`options.record`).
  *
  * Steps 7 to 9 run only after every entry has parsed, so a per-entry
  * violation anywhere is reported before any cross-persona one. They apply
- * unchanged in both channel modes (b.deo SRI-104). Cross-persona errors echo
+ * unchanged in both channel modes. Cross-persona errors echo
  * each name involved as written.
  *
  * Every candidate (a start's configuration or record, a reload tick's
  * pending configuration) is validated here by the mode its own switch picks,
- * never by the mode of the configuration in effect (b.deo SRI-105).
+ * never by the mode of the configuration in effect.
  *
  * @param raw        The parsed JSON value of the configuration file.
  * @param configDir  Directory of the configuration file; the cron log's default sits under it, and
@@ -1890,7 +1883,7 @@ export function resolvePersonaConfig(
   const mode = channelModeOf(settings)
   const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, mode, home))
 
-  // Cross-persona rules (b.av2 SR-1.5), only once every entry has parsed so
+  // Cross-persona rules, only once every entry has parsed so
   // per-entry violations are reported first.
   checkUniqueNamesAndKeys(personas)
   checkPrefixRelatedKeys(personas)
@@ -1900,12 +1893,11 @@ export function resolvePersonaConfig(
 }
 
 // ---------------------------------------------------------------------------
-// Server paths (b.av2 SR-1.1, SR-8.7)
+// Server paths
 // ---------------------------------------------------------------------------
 
 /**
- * The server's state directory, the one definition of the default (bug
- * b.fc4): `SLACK_STATE_DIR` (made absolute) when it is set and non-empty,
+ * The server's state directory, the one definition of the default: `SLACK_STATE_DIR` (made absolute) when it is set and non-empty,
  * otherwise `<XDG config dir>/claude-slack-channel-bots` (`resolveXdgConfigHome`), so
  * `~/.config/claude-slack-channel-bots` unless `XDG_CONFIG_HOME` names another directory.
  * `config.json`, its `.pending`, `.apply` and `.last-applied` files,
@@ -1953,8 +1945,7 @@ export function resolveXdgConfigHome(home?: string, env: NodeJS.ProcessEnv = pro
 }
 
 /**
- * The crontable's default path, used when `cron_table_path` is absent (bugs
- * b.avm, b.fc4). The one definition of the default, used by the loader.
+ * The crontable's default path, used when `cron_table_path` is absent. The one definition of the default, used by the loader.
  *
  * - `SLACK_STATE_DIR` unset (a default install): `<XDG config dir>/claude-slack-channel-bots/crontab`
  *   (`resolveXdgConfigHome`), so `~/.config/claude-slack-channel-bots/crontab` unless
@@ -1984,7 +1975,7 @@ export function resolveDefaultCronTablePath(
 }
 
 /**
- * The configuration file the server loads (b.av2 SR-1.1): `config.json` in
+ * The configuration file the server loads: `config.json` in
  * the state directory (`resolveServerStateDir`). With `SLACK_STATE_DIR` unset
  * this is `~/.config/claude-slack-channel-bots/config.json`. The one definition of the
  * location: the server and the CLI both use it. Computed at call time.
@@ -2018,13 +2009,13 @@ export const CONFIG_NOT_REGULAR_FILE_CODE = 'not a regular file'
  * and hashing work a file grown by mistake could cost. Applied in the readers
  * rather than by one caller, so the start, the bring-up and the reload tick
  * see the same outcome (and the same credentials digest marker) for one file.
- * Three reads are exempt (`readPersonaConfigBytes` with `uncapped`): the SR-5.2
+ * Three reads are exempt (`readPersonaConfigBytes` with `uncapped`): the
  * file guard's read of the configuration file (`credentialsFilesToProtect`);
  * the start's read of the retired-key record (`loadRetiredKeyStore` in
  * `retired-keys.ts`), a file only the server writes that can legitimately
  * grow past the cap, read once at start and never hashed or compared; and
  * the start's read of the stored-choice file (`loadChannelDeliveryStore` in
- * `src/channel-delivery.ts`, b.deo SRI-403), likewise written only by the
+ * `src/channel-delivery.ts`), likewise written only by the
  * server, read once at start, and parsed only, never hashed or compared.
  */
 export const MAX_RELOAD_FILE_BYTES = 64 * 1024
@@ -2120,11 +2111,11 @@ export interface PersonaConfigFs {
 /** How `readPersonaConfigBytes` reads. */
 export interface ReadPersonaConfigBytesOptions {
   /**
-   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Queue journals (b.omv SR-3.6) also read in full. Only three configuration reads
-   * set it: the SR-5.2 file guard's read (`credentialsFilesToProtect`), the
+   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Queue journals also read in full. Only three configuration reads
+   * set it: the file guard's read (`credentialsFilesToProtect`), the
    * start's read of the retired-key record (`loadRetiredKeyStore`), and the
    * start's read of the stored-choice file (`loadChannelDeliveryStore` in
-   * `src/channel-delivery.ts`, b.deo SRI-403); every other caller is capped.
+   * `src/channel-delivery.ts`); every other caller is capped.
    * Stat-first applies all the same: a directory or a non-regular file is
    * refused and never read.
    */
@@ -2147,7 +2138,7 @@ export interface ParsePersonaConfigBytesOptions extends ResolvePersonaConfigOpti
 
 /**
  * The malformed-JSON error for `text`: names `source` and where the text
- * first stops being JSON, and echoes none of it (b.av2 SR-10.3).
+ * first stops being JSON, and echoes none of it.
  */
 function malformedJsonMessage(text: string, source: string): string {
   const offset = jsonSyntaxErrorOffset(text)
@@ -2161,7 +2152,7 @@ function malformedJsonMessage(text: string, source: string): string {
 /**
  * Parse and validate a persona configuration from the exact bytes (or text)
  * that were read, so the bytes that get recorded or applied are the bytes
- * that were checked (b.av2 SR-8.7). The one JSON-parse path of the persona
+ * that were checked. The one JSON-parse path of the persona
  * loader: `loadPersonaConfig` reads a file and delegates here, and the
  * start's record and configuration file are validated here from bytes read
  * once.
@@ -2170,7 +2161,7 @@ function malformedJsonMessage(text: string, source: string): string {
  * - malformed JSON: `loadPersonaConfig: malformed JSON in "<source>" at line
  *   <L>, column <C>.`, a 1-based position of the first invalid character and
  *   none of the parser's text, which can quote file content such as a pasted
- *   token (b.av2 SR-10.3);
+ * token;
  * - any validation failure: `loadPersonaConfig: invalid persona config in
  *   "<source>": <cause>` (see `resolvePersonaConfig`).
  *
@@ -2229,7 +2220,7 @@ export function parsePersonaConfigBytes(
  * refused and never read in full.
  *
  * The exception is `options.uncapped`, which reads the whole file with no size
- * limit (stat-first applies). Three reads set it: the SR-5.2 file guard
+ * limit (stat-first applies). Three reads set it: the file guard
  * (`credentialsFilesToProtect`), which must never protect fewer credentials
  * files because the configuration file grew past the cap; the start's read
  * of the retired-key record (`loadRetiredKeyStore` in `retired-keys.ts`), a
@@ -2237,7 +2228,7 @@ export function parsePersonaConfigBytes(
  * clear or a restore removes it, is read once at start and is never hashed or
  * compared, so a record past the cap is still one the server wrote and must
  * not stop the start; and the start's read of the stored-choice file
- * (`loadChannelDeliveryStore` in `src/channel-delivery.ts`, b.deo SRI-403),
+ * (`loadChannelDeliveryStore` in `src/channel-delivery.ts`),
  * which only the server writes, which is read once at start, and whose bytes
  * are parsed only, never hashed or compared. Every other caller (the start's
  * configuration file, the last-applied record, the pending and apply files,
@@ -2245,7 +2236,7 @@ export function parsePersonaConfigBytes(
  *
  * @param configPath  Absolute path of the file.
  * @param fs          File-system overrides; unset operations use `DEFAULT_PERSONA_CONFIG_FS`.
- * @param options     `uncapped` for the file guard's, the retired-key record's and the stored-choice file's reads only (b.deo SRI-403).
+ * @param options `uncapped` for the file guard's, the retired-key record's and the stored-choice file's reads only.
  */
 export function readPersonaConfigBytes(
   configPath: string,
@@ -2298,10 +2289,10 @@ export function readPersonaConfigBytes(
  * bytes read). Read, parse and validation failures are rethrown naming the
  * path; a read failure is a `PersonaConfigReadError`.
  *
- * Read-only (b.av2 SR-1.7, AC 45): the file is opened for reading only and
+ * Read-only: the file is opened for reading only and
  * nothing is ever written, renamed, created or converted. A malformed-JSON
  * error gives the line and column and omits the parser's detail, which can
- * quote file content such as a pasted token (b.av2 SR-10.3).
+ * quote file content such as a pasted token.
  *
  * @param path  Path to the configuration file; `~` is expanded under `home`.
  * @param home  Home directory for every `~`; defaults to the OS home, read at call time only.
@@ -2334,7 +2325,7 @@ export function configReadFailurePredicate(code: string | undefined): string {
 }
 
 /**
- * The start's message for a configuration file it cannot read (b.av2 SR-8.7):
+ * The start's message for a configuration file it cannot read:
  * names the path, says whether it does not exist, is larger than the 64 KiB
  * limit or cannot be read (with the errno code), and that the server requires
  * the configuration file to start.

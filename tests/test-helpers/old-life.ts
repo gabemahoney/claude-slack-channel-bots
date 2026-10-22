@@ -1,9 +1,9 @@
 /**
  * test-helpers/old-life.ts — The fixtures and line helpers the old-life hold
- * and wait cases share (b.jg5 SRJ-809, SRJ-810, SRJ-811), over the recovery
+ * and wait cases share, over the recovery
  * harness (`makeRecoveryHarness`), so each lives once.
  *
- * - The pre-persona row a hold is begun on (b.1ix: only the `service` and
+ * - The pre-persona row a hold is begun on (only the `service` and
  *   `channel` labels): `PRE_PERSONA_ID`, its labels `PRE_PERSONA_LABELS` and
  *   its session `PRE_PERSONA_SESSION`.
  * - Start-sweep rows and the sweep: `listed` (a persona's own row as the
@@ -16,16 +16,16 @@
  *   a destructive modify that moved it out of there) and `holdOldAt` (an id held
  *   at a persona's directory, as a start-sweep kill that did not succeed
  *   begins it).
- * - The old-life gate (SRJ-810, SRJ-1502): `gateLine` / `oldLifeGateLine`
+ * - The old-life gate: `gateLine` / `oldLifeGateLine`
  *   (its launch line, built by `oldLifeHoldLaunchLine`), `gateLinesIn` (the
  *   gate lines among the harness's errors, matched on the builder's own
  *   fixed words) and `heldBack` (`spawnForPersona`'s answer for a persona it
  *   holds back).
- * - The wait's end line (SRJ-811): `waitEndLine` (one round's line, built by
+ * - The wait's end line: `waitEndLine` (one round's line, built by
  *   `oldLifeWaitEndLine` from the decision's end kind and whether the hold
  *   goes on and is marked) and `waitEndLinePrefix` (the head every end line
  *   of one old row shares, cut from two builder outputs).
- * - The end-retry observer's settled line (SRJ-810):
+ * - The end-retry observer's settled line:
  *   `settledRetryLinePrefix` (the head of a persona's settled line, retried
  *   or not, cut from the builder's two forms).
  *
@@ -68,7 +68,7 @@ import { personaOf, recordCallOrder, type RecoveryHarness } from './recovery-har
 /** The `channel` label of the pre-persona row the cases hold. */
 const PRE_PERSONA_CHANNEL = 'C0OLD'
 
-/** A pre-persona row's instance id (b.1ix): no persona label; its old key is the id itself (SRJ-809). */
+/** A pre-persona row's instance id: no persona label; its old key is the id itself. */
 export const PRE_PERSONA_ID = `cscb_old_${PRE_PERSONA_CHANNEL}`
 
 /** The pre-persona row's labels: `service` and `channel` only. */
@@ -105,7 +105,7 @@ export interface SweepRun {
 /**
  * Run the start sweep over `rows` with `config` (the harness's own by
  * default), as `main()` runs it, its kill retries on the harness clock, with
- * `isShuttingDown` as its shutdown query when given (b.jg5 SRJ-714).
+ * `isShuttingDown` as its shutdown query when given.
  */
 export async function sweepOver(
   h: RecoveryHarness,

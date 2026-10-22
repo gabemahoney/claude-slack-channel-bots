@@ -1,15 +1,15 @@
 /**
  * persona-identity.ts — Persona key rule and the identifiers derived from it.
  *
- * A persona is addressed everywhere by its key (b.av2 SR-2.1). This module
+ * A persona is addressed everywhere by its key. This module
  * owns the key rule, the persona-reference rendering used by logs, previews
- * and errors (b.av2 SR-2.2, SR-10.3), the name-or-key target resolver used
- * by `/interject` and the crontable (b.av2 SR-9.1, SR-9.3), and the pure derivations of every
- * agent-director and tmux identifier a persona gets (b.av2 SR-2.2): instance
+ * and errors, the name-or-key target resolver used
+ * by `/interject` and the crontable, and the pure derivations of every
+ * agent-director and tmux identifier a persona gets: instance
  * ID, tmux session name, labels (including the `config_dir` label) and the
  * spawn-environment values.
  *
- * Pure module (b.av2 SR-13.1): no module-scope side effects, no file-system
+ * Pure module: no module-scope side effects, no file-system
  * or environment access, and nothing reads the home directory at import.
  * Only tilde expansion (`expandTilde`, the one tilde rule, which `config.ts`
  * delegates to) and the `config_dir` derivations consult a home directory,
@@ -26,7 +26,7 @@ import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 
 // ---------------------------------------------------------------------------
-// Persona key constants (b.av2 SR-2.1)
+// Persona key constants
 // ---------------------------------------------------------------------------
 
 /** Longest name that is its own key, and the length a normalised stem is truncated to. */
@@ -49,7 +49,7 @@ export const PERSONA_KEY_IN_FORM_RE: RegExp = new RegExp(`^[a-z0-9_]{1,${PERSONA
 export const PERSONA_KEY_RE: RegExp = new RegExp(`^[a-z0-9_]{1,${PERSONA_KEY_MAX_LENGTH}}$`)
 
 // ---------------------------------------------------------------------------
-// Derived-identifier constants (b.av2 SR-2.2)
+// Derived-identifier constants
 // ---------------------------------------------------------------------------
 
 /** Prefix of every persona's agent-director `instance_id`; the `cscb_` anchor of `PERMISSION_ACTION_ID_RE`. */
@@ -108,7 +108,7 @@ export function expandTilde(path: string, home?: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Derive a persona's key from its name (b.av2 SR-2.1).
+ * Derive a persona's key from its name.
  *
  * A name of 1–40 characters drawn only from `a-z`, `0-9` and `_` is returned
  * unchanged. Any other name is lower-cased, each run of characters outside
@@ -133,8 +133,7 @@ export function personaKey(name: string): string {
 }
 
 /**
- * Render a persona reference for logs, previews and errors (b.av2 SR-2.2,
- * SR-10.3): the name JSON-quoted, with the key beside it.
+ * Render a persona reference for logs, previews and errors: the name JSON-quoted, with the key beside it.
  *
  * Format: `<JSON.stringify(name)> (key=<key>)`, e.g. `"Ops Bot" (key=ops_bot_1a2b3c4d)`.
  * JSON quoting makes quotes, backslashes, newlines and control characters safe.
@@ -146,14 +145,13 @@ export function renderPersonaRef(name: string, key: string = personaKey(name)): 
 
 /**
  * Resolve a persona target — a persona name or key, as written in an
- * `/interject` body or a crontable target list (b.av2 SR-9.1, SR-9.3) — to
+ * `/interject` body or a crontable target list — to
  * the persona whose name or key equals it exactly (case-sensitive, no
  * trimming). Returns undefined for a null or absent config and for a target
  * that matches no persona.
  *
  * The match is unambiguous for a loaded config: the loader rejects any
- * persona whose name or key equals another persona's name or key (b.av2
- * SR-1.5). Generic over the persona shape so this module needs no import of
+ * persona whose name or key equals another persona's name or key. Generic over the persona shape so this module needs no import of
  * the config loader.
  */
 export function resolvePersonaTarget<P extends { name: string; key: string }>(
@@ -178,7 +176,7 @@ export function personaTmuxSessionName(key: string): string {
 }
 
 /**
- * `<session>` in a notice about persona `key` (b.jg5 SRJ-1001): its tmux
+ * `<session>` in a notice about persona `key`: its tmux
  * session name in double quotes, `"slack_bot_<key>"`. The one rendering the
  * `tmux-unresponsive` notices and the stuck-launch post share.
  */
@@ -192,7 +190,7 @@ export function quotedPersonaSessionName(key: string): string {
  * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
  * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
  * an operator's `attach` would reach the neighbour's bot. A `=` prefix accepts only
- * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
+ * the exact name. Verified against tmux 3.2a, the version in the
  * `/ci` image.
  *
  * Every `attach` command a notice gives an operator (the not-connected
@@ -211,7 +209,7 @@ export function tmuxExactSessionTarget(sessionName: string): string {
  * tilde-expanded against `home` and made absolute with `path.resolve` (a
  * relative value resolves against the process working directory).
  * No file-system access: symlinks are not followed and existence is not
- * checked. A caller that needs real-path semantics (b.av2 SR-1.5) passes an
+ * checked. A caller that needs real-path semantics passes an
  * already real-pathed directory.
  *
  * @param home  Home directory for `~` and the default; defaults to the OS
@@ -244,7 +242,7 @@ export function effectiveClaudeConfigDirs(
 
 /**
  * Value of the `config_dir` label: the first 12 lowercase hex digits of the
- * SHA-256 of the resolved effective claude_config_dir (b.av2 SR-2.2).
+ * SHA-256 of the resolved effective claude_config_dir.
  *
  * Hashes exactly the path returned by `resolveClaudeConfigDir(configDir, home)`
  * (lexical tilde expansion plus `path.resolve`); it never reads the file
@@ -270,13 +268,13 @@ export function personaLabels(key: string, configDir?: string, home: string = ho
 
 /**
  * Claude Code's prompt suggestions, switched off in every persona session
- * (b.svb, b.f2b). The one place the variable and its value are written.
+ * The one place the variable and its value are written.
  *
  * Why: at the end of each turn Claude Code starts a background fork that
  * writes a suggested next prompt. The fork inherits the session, runs the
  * parent's PreToolUse hooks and is then denied, so agent-director records a
  * PreToolUse from an idle persona and flips its row from `waiting` to
- * `working` (b.svb). The stale-`working` recovery (b.f2b) still handles such
+ * `working`. The stale-`working` recovery still handles such
  * rows; this removes their most likely source, so it is needed less often.
  * An operator attached to the persona's tmux session sees no suggested
  * prompt.
@@ -293,7 +291,7 @@ export const PROMPT_SUGGESTION_OFF_ENV: Readonly<{ CLAUDE_CODE_ENABLE_PROMPT_SUG
   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
 })
 
-/** Fixed launch controls, restored from the row on resume (b.omv SR-7.4). */
+/** Fixed launch controls, restored from the row on resume. */
 export const AUTOUPDATER_OFF_ENV = Object.freeze({ DISABLE_AUTOUPDATER: '1' as const })
 export const FEEDBACK_SURVEY_OFF_ENV = Object.freeze({ CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1' as const })
 
@@ -312,11 +310,11 @@ export interface PersonaSpawnEnvInput {
 }
 
 /**
- * Spawn-environment values for a persona (b.av2 SR-2.2): `CSCB_PERSONA` and
+ * Spawn-environment values for a persona: `CSCB_PERSONA` and
  * `CLAUDE_MANAGED_CHANNEL` set to the key, `CSCB_CRONTABLE_PATH` always,
  * `CLAUDE_CONFIG_DIR` only when a directory is configured, and
  * the frozen prompt-suggestion, auto-updater and feedback-survey controls
- * always, last (b.omv SR-7.4). No variable name uses
+ * always, last. No variable name uses
  * agent-director's reserved `AGENT_DIRECTOR_` prefix.
  *
  * Every launch of a persona's Claude takes its environment from here: each

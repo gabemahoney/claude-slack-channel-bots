@@ -1,30 +1,30 @@
 /**
  * tests/ci-run-schedule.test.ts — The sharded `/ci` runner's scheduling
- * (`scripts/ci-run.ts` section 8; b.uqm SR-21.6's schedule file, E4).
+ * (`scripts/ci-run.ts` section 8schedule file, ).
  *
- * - The duration table (b.uqm SR-4.1): every line rule (final LF, CR, empty,
+ * - The duration table: every line rule (final LF, CR, empty,
  *   malformed, repeat, out of order, missing entry, unknown entry), each
  *   unreadable cause giving every script the default, entries keyed by number
  *   form, and the committed `tests/ci-durations.tsv` pinned by its form and a
  *   clean parse, never by its seconds (an ordinary refresh commit stays green).
- * - The assignment (b.uqm SR-4.2): unit durations, longest first, both tie
- *   rules, determinism, every script placed, the small cases and SR-4.1's
+ * - The assignment: unit durations, longest first, both tie
+ * rules, determinism, every script placed, the small cases and
  *   6-shard example on a constructed worktree of its 29 scripts.
- * - Shard limits (b.uqm SR-4.3): the formula and floor, `--shard-timeout`, T,
+ * - Shard limits: the formula and floor, `--shard-timeout`, T,
  *   the half-up rounding of the limit cause's minutes, and the limit timer on
  *   the fake clock, end marker just before the limit included.
- * - Timing (b.uqm SR-4.4): the timing values and lines, the `slow:` lines,
+ * - Timing: the timing values and lines, the `slow:` lines,
  *   the duration-table block with its introducing line, and its round trip.
  * - One pin case per section 8 wording and for `DURATION_TABLE_HEADER`: the
  *   only place their text is typed.
  *
  * Everything runs in process through the runner's exports: no child process,
  * no docker, no top-level `mock.module`. Worktrees and run directories come
- * from E1's builders (`tests/test-helpers/ci-run.ts`, used read-only) under a
+ * from builders (`tests/test-helpers/ci-run.ts`, used read-only) under a
  * `mkdtempSync` root removed in `afterEach`; every wait is on `createFakeClock`.
  * Real script names are looked up by number in the repository's listing.
  * Runner constants are imported, never typed; the only figures typed are test
- * data and the SRD's example figures in the cases that pin them (SR-4.1's
+ * data and the contract's example figures in the cases that pin them (
  * initial table in the 6-shard case, 93.4 and 84.5 min, `--shard-timeout 5`).
  *
  * SPDX-License-Identifier: MIT
@@ -128,7 +128,7 @@ const RUN_ID = '20261008t120000z-e4sched1'
 // The real-name lookup and shared factories
 // ---------------------------------------------------------------------------
 
-/** The repository's real file name for script number `n`, looked up in its `tests/integration` listing (b.uqm SR-21.2). */
+/** The repository's real file name for script number `n`, looked up in its `tests/integration` listing. */
 function scriptFile(n: number): string {
   return realScriptFileName(n)
 }
@@ -157,7 +157,7 @@ function rowsOf(pairs: readonly (readonly [number, number | string])[]): Duratio
   return pairs.map(([script, seconds]) => ({ script, seconds }))
 }
 
-/** A table's text from E1's builder: the header, then the rows in the order given (or canonical). */
+/** A table's text from shared runner helpers's builder: the header, then the rows in the order given (or canonical). */
 function tableText(pairs: readonly (readonly [number, number | string])[], options: { order?: 'as-given' | 'canonical' | 'reversed'; finalNewline?: boolean } = {}): string {
   return durationTableText({ kind: 'rows', header: DURATION_TABLE_HEADER, rows: rowsOf(pairs), ...options })
 }
@@ -179,12 +179,12 @@ function invocationOf(args: readonly string[] = []): Invocation {
   return parsed.invocation
 }
 
-/** Fake credentials for a valid run (b.uqm SR-21.2): what `validateRun`'s step 2 checks. */
+/** Fake credentials for a valid run: what `validateRun`'s step 2 checks. */
 function validEnv(): ChildEnvironmentSource {
   return { ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: fakeToken('', 'gh') }
 }
 
-/** E2's validated run over a built worktree, failing the case when it is refused. */
+/** validation's validated run over a built worktree, failing the case when it is refused. */
 function validated(worktreeRoot: string, args: readonly string[] = []): ValidatedRun {
   const validation = validateRun(args, worktreeRoot, validEnv())
   assertNoLeak(validation)
@@ -197,7 +197,7 @@ function entriesOf<K, V>(map: ReadonlyMap<K, V>): [K, V][] {
   return [...map]
 }
 
-/** The estimates SR-4.1 gives `pinned`, in canonical order: each script's seconds from `given` (by number form), else the default. */
+/** The estimates gives `pinned`, in canonical order: each script's seconds from `given` (by number form), else the default. */
 function expectedEstimates(pinned: readonly string[], given: Readonly<Record<string, number>>): [string, number][] {
   return sortCanonical(pinned).map((fileName) => [fileName, given[fileNameNumberForm(fileName) ?? ''] ?? DEFAULT_ESTIMATE_SECONDS])
 }
@@ -261,17 +261,17 @@ function recordOfShards(...shardEvents: readonly (readonly ResultEvent[])[]): Ti
   return recordWith(shardEvents.map((events, i) => shardRecord(i + 1, START_MS + 130_000, START_MS + 190_000, eventsRead([...events, { kind: 'done' }]))))
 }
 
-describe('the duration table header (b.uqm SR-4.1)', () => {
+describe('the duration table header', () => {
   test('DURATION_TABLE_HEADER is script, a tab, seconds', () => {
     expect(DURATION_TABLE_HEADER).toBe('script\tseconds')
   })
 })
 
 // ---------------------------------------------------------------------------
-// T3.S1: the duration table (b.uqm SR-4.1; AC 77's table half, AC 78's 2400 s half)
+// .S1: the duration table (table half2400 s half)
 // ---------------------------------------------------------------------------
 
-describe('the duration table (b.uqm SR-4.1)', () => {
+describe('the duration table', () => {
   let root: string
 
   beforeEach(() => {
@@ -470,17 +470,17 @@ describe('the duration table (b.uqm SR-4.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// T3.S2: assignment (b.uqm SR-4.2; AC 78's ties and determinism)
+// .S2: assignment (ties and determinism)
 // ---------------------------------------------------------------------------
 
-/** SR-4.1's initial table: 29 number-form/seconds pairs in canonical order, typed only here and used only by the 6-shard case. */
-const SR_4_1_INITIAL_TABLE: readonly (readonly [number, number])[] = [
+/** initial table: 29 number-form/seconds pairs in canonical order, typed only here and used only by the 6-shard case. */
+const INITIAL_DURATION_TABLE: readonly (readonly [number, number])[] = [
   [1, 23], [2, 1], [3, 21], [4, 5], [0, 156], [5, 1], [6, 15], [7, 3], [8, 35], [9, 21],
   [10, 111], [12, 32], [13, 244], [14, 258], [15, 67], [16, 541], [17, 448], [18, 495], [19, 506], [20, 1060],
   [21, 386], [22, 523], [23, 2047], [24, 1210], [25, 12], [26, 2330], [27, 371], [28, 1380], [29, 86],
 ]
 
-describe('the assignment (b.uqm SR-4.2)', () => {
+describe('the assignment', () => {
   let root: string
 
   beforeEach(() => {
@@ -590,7 +590,7 @@ describe('the assignment (b.uqm SR-4.2)', () => {
     ['a table missing most entries, test-1 included', () => ({ kind: 'rows', header: DURATION_TABLE_HEADER, rows: rowsOf([[5, 100], [6, 7]]) })],
   ]
 
-  test.each(PLACEMENT_TABLES)('with %s every run script but test-1 is in exactly one shard and test-1 heads every shard (AC 78)', (_label, spec) => {
+  test.each(PLACEMENT_TABLES)('with %s every run script but test-1 is in exactly one shard and test-1 heads every shard', (_label, spec) => {
     const built = buildWorktree(root, { prerequisites: { 3: [{ names: [2] }] }, durationTable: spec() })
     const run = validated(built.root)
 
@@ -630,11 +630,11 @@ describe('the assignment (b.uqm SR-4.2)', () => {
     expect(() => scheduleOf({ rows: [[5, 10]], units: [[5]], shards: 1, pinned: files(5) })).toThrow()
   })
 
-  test("SR-4.1's 6-shard example: SR-4.1's 29 scripts and initial table, test-3 requiring test-2, N = 6", () => {
+  test("6-shard example: 29 scripts and initial table, test-3 requiring test-2, N = 6", () => {
     const built = buildWorktree(root, {
-      scripts: files(...SR_4_1_INITIAL_TABLE.map(([n]) => n)),
+      scripts: files(...INITIAL_DURATION_TABLE.map(([n]) => n)),
       prerequisites: { 3: [{ names: [2] }] },
-      durationTable: { kind: 'rows', header: DURATION_TABLE_HEADER, rows: rowsOf(SR_4_1_INITIAL_TABLE) },
+      durationTable: { kind: 'rows', header: DURATION_TABLE_HEADER, rows: rowsOf(INITIAL_DURATION_TABLE) },
     })
     const run = validated(built.root)
     expect(run.units.length).toBe(27)
@@ -658,11 +658,11 @@ describe('the assignment (b.uqm SR-4.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// T3.S3: shard limits, rounding, --shard-timeout and the limit timer
-// (b.uqm SR-4.3; AC 37's rounding half, AC 78's --shard-timeout 5)
+// .S3: shard limits, rounding, --shard-timeout and the limit timer
+// (rounding half--shard-timeout 5)
 // ---------------------------------------------------------------------------
 
-/** The expected total whose limit by SR-4.3's formula is `limitMinutes`, from the imported factor and addend. */
+/** The expected total whose limit by the contract formula is `limitMinutes`, from the imported factor and addend. */
 function expectedSecondsForLimit(limitMinutes: number): number {
   const limitMs = Math.round(limitMinutes * MS_PER_MINUTE)
   const seconds = (limitMs - LIMIT_ADDEND_MINUTES * MS_PER_MINUTE) / (LIMIT_FACTOR * MS_PER_SECOND)
@@ -670,7 +670,7 @@ function expectedSecondsForLimit(limitMinutes: number): number {
   return seconds
 }
 
-/** SR-4.3's example limits (AC 37), typed only here: 93.4 min prints as 93, 84.5 min as 85. */
+/** example limits, typed only here: 93.4 min prints as 93, 84.5 min as 85. */
 const LIMIT_93_4 = 93.4
 const LIMIT_84_5 = 84.5
 
@@ -680,8 +680,8 @@ function roundingSchedule(): Schedule {
   return scheduleOf({ rows: [[1, test1], [5, expectedSecondsForLimit(LIMIT_93_4) - test1], [6, expectedSecondsForLimit(LIMIT_84_5) - test1]], units: [[5], [6]], shards: 2 })
 }
 
-describe('shard limits (b.uqm SR-4.3)', () => {
-  /** SR-4.3's formula over the imported constants: LIMIT_FACTOR × the total + the addend, at least the floor. */
+describe('shard limits', () => {
+  /** formula over the imported constants: LIMIT_FACTOR × the total + the addend, at least the floor. */
   function formulaMinutes(expectedSeconds: number): number {
     return Math.max(LIMIT_FLOOR_MINUTES, (LIMIT_FACTOR * expectedSeconds) / SECONDS_PER_MINUTE + LIMIT_ADDEND_MINUTES)
   }
@@ -707,7 +707,7 @@ describe('shard limits (b.uqm SR-4.3)', () => {
     expect(shardLimitMs(total, null)).toBe(formulaMinutes(total) * MS_PER_MINUTE)
   })
 
-  test("--shard-timeout 5 sets every shard's limit to 5 min, below the floor and whatever its total (AC 78)", () => {
+  test("--shard-timeout 5 sets every shard's limit to 5 min, below the floor and whatever its total", () => {
     const timeout = 5
     expect(timeout).toBeLessThan(LIMIT_FLOOR_MINUTES)
 
@@ -719,7 +719,7 @@ describe('shard limits (b.uqm SR-4.3)', () => {
     expect(schedule.largestLimitMs).toBe(timeout * MS_PER_MINUTE)
   })
 
-  test('limits of 93.4 and 84.5 min are exact, and the limit cause names 93 and 85 min, rounded halves up (AC 37)', () => {
+  test('limits of 93.4 and 84.5 min are exact, and the limit cause names 93 and 85 min, rounded halves up', () => {
     const schedule = roundingSchedule()
 
     expect(schedule.assignment.map((entry) => entry.limitMinutes)).toEqual([LIMIT_93_4, LIMIT_84_5])
@@ -746,7 +746,7 @@ describe('shard limits (b.uqm SR-4.3)', () => {
   })
 })
 
-describe('the limit timer (b.uqm SR-4.3)', () => {
+describe('the limit timer', () => {
   /** The runtime's largest timer delay, 2^31 − 1 ms: a runtime fact, not a runner constant. */
   const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
   /** Test data: the shard containers' starts, after the build. */
@@ -947,11 +947,11 @@ describe('the limit timer (b.uqm SR-4.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// T3.S4: timing, slow: lines and the duration-table block
-// (b.uqm SR-4.4; AC 77's block half)
+// .S4: timing, slow: lines and the duration-table block
+// (block half)
 // ---------------------------------------------------------------------------
 
-describe('timing (b.uqm SR-4.4)', () => {
+describe('timing', () => {
   /** Two shards, test-1 in each; shard 2's `end` lines include a repeat, of which the first counts. */
   function twoShardRecord(): TimingRecord {
     return recordWith([
@@ -1017,7 +1017,7 @@ describe('timing (b.uqm SR-4.4)', () => {
   })
 })
 
-describe('the slow: lines (b.uqm SR-4.4)', () => {
+describe('the slow: lines', () => {
   test('one line per script over SLOW_FACTOR × its estimate, in canonical order, seconds rounded up, test-1 once on its highest time, from the middle shard', () => {
     // Shards: 1 holds test-7 (the default estimate), 2 holds test-5, 3 holds test-6; test-1's highest time, 17.5 s, is in shard 2.
     const schedule = scheduleOf({ rows: [[1, 10], [5, 20], [6, 20]], units: [[5], [6], [7]], shards: 3 })
@@ -1042,7 +1042,7 @@ describe('the slow: lines (b.uqm SR-4.4)', () => {
   })
 })
 
-describe('the duration-table block (b.uqm SR-4.4)', () => {
+describe('the duration-table block', () => {
   let root: string
 
   beforeEach(() => {
@@ -1164,7 +1164,7 @@ describe('the duration-table block (b.uqm SR-4.4)', () => {
 // Section 8's wordings: the only place their text is typed
 // ---------------------------------------------------------------------------
 
-describe("section 8's wordings (b.uqm SR-4.1, SR-4.4)", () => {
+describe("section 8's wordings", () => {
   const TABLE = `duration table ${DURATION_TABLE_PATH}`
   const DEFAULTS = `every script gets the default estimate, ${DEFAULT_ESTIMATE_SECONDS} s`
 
@@ -1206,8 +1206,8 @@ describe("section 8's wordings (b.uqm SR-4.1, SR-4.4)", () => {
   })
 })
 
-// b.omv SR-14.7: scheduling must never share the file with an ordinary test.
-describe('E7: dedicated Codex shards', () => {
+// scheduling must never share the file with an ordinary test.
+describe('the memory guard: dedicated Codex shards', () => {
   let root: string
   const codex = 'test-999-fmk-real-codex.sh', second = 'test-998-fmk-real-codex-other.sh'
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'ci-codex-schedule-')) })

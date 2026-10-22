@@ -1,12 +1,11 @@
 /**
- * persona-start.ts — The per-persona start procedure (b.av2 SR-6.1) and the
- * seams the server reads each persona's connection through (SR-3.1, SR-3.4,
- * SR-7.2).
+ * persona-start.ts — The per-persona start procedure and the
+ * seams the server reads each persona's connection through.
  *
  * The start procedure brings one persona up, in order:
  *
  *   1. the local credentials check (`checkPersonaCredentials`), skipped in dry
- *      run, where no credentials file is read (SR-3.4);
+ * run, where no credentials file is read;
  *   2. the working-directory check (`checkPersonaWorkingDirectory`), in dry run
  *      and in a real start alike. Steps 1 and 2 are both evaluated before
  *      either stops the bring-up, so both causes are reported;
@@ -47,7 +46,7 @@
  *   serving; the placeholder identity (`U000DRY_<key>`) in dry run.
  * - `createPersonaUpFlushListener`: the manager's status listener; each time
  *   a persona reports `up` (after bring-up or a reopen) the notifier flushes
- *   that persona's held notices, and no other persona's (SR-7.2).
+ * that persona's held notices, and no other persona's.
  * - `composePersonaStatusListeners`: several status listeners as the
  *   manager's one (the up-flush listener and the bring-up controller's).
  * - `createPersonaUpPredicate`: whether a persona is up (serving, and its
@@ -59,7 +58,7 @@
  *   check work list, restart, restart launch): only while it is serving and,
  *   given the bring-up controller, up.
  *
- * Side-effect free (b.av2 SR-13.1): importing this module creates no client,
+ * Side-effect free: importing this module creates no client,
  * reads no file, environment variable or token and starts no timer. Every
  * dependency is injected.
  *
@@ -92,7 +91,7 @@ import type { SlackBotIdentity } from './persona-slack-validation.ts'
 
 /**
  * The bring-up step that failed. `claude-config-dir` is the check of the
- * persona's claude_config_dir (bug b.g57), right before step 3 and before
+ * persona's claude_config_dir, right before step 3 and before
  * every launch, which holds the persona `retrying`, with no Slack
  * connection, until the directory resolves.
  */
@@ -111,7 +110,7 @@ export interface PersonaBringUpFailure {
 export interface PersonaConnectDeps {
   /** Every applied persona, for the credentials and working-directory collision rules (the persona's own entry is skipped). */
   applied: readonly Persona[]
-  /** Dry run (b.av2 SR-3.4): step 1 is skipped and step 3 is handed no tokens. */
+  /** Dry run: step 1 is skipped and step 3 is handed no tokens. */
   dryRun: boolean
   /** Receives step 1–2 failure lines (and a line if step 3 throws). */
   log: PersonaDiagnosticLogger
@@ -129,7 +128,7 @@ export interface PersonaConnectDeps {
 export type AppliedPersonaKeysGetter = () => { personas: readonly Pick<Persona, 'key'>[] } | null | undefined
 
 // ---------------------------------------------------------------------------
-// Bring-up procedure (b.av2 SR-6.1)
+// Bring-up procedure
 // ---------------------------------------------------------------------------
 
 /** Steps 1 and 2 of one bring-up, as `checkPersonaLocalSteps` reports them. */
@@ -142,7 +141,7 @@ export interface PersonaLocalStepsResult {
   tokens: PersonaSlackTokens | undefined
   /**
    * The digest or marker of the credentials bytes step 1 read, whatever its
-   * outcome (b.av2 SR-8.3), a real-path collision included (the file is then
+   * outcome, a real-path collision included (the file is then
    * only hashed, never parsed); undefined in dry run (nothing is read) and
    * when an injected `checkLocal` returns none. Held in memory only, never
    * logged.
@@ -218,7 +217,7 @@ export function personaSlackStatusFailure(status: Exclude<PersonaConnectionStatu
 }
 
 // ---------------------------------------------------------------------------
-// Connection seams (b.av2 SR-3.1, SR-3.4, SR-7.2)
+// Connection seams
 // ---------------------------------------------------------------------------
 
 /**
@@ -227,7 +226,7 @@ export function personaSlackStatusFailure(status: Exclude<PersonaConnectionStatu
  * Not while connecting, retrying its bring-up, broken (at bring-up, on a
  * reopen, or by a Web API call refused for its bot token), stopped,
  * or unmanaged. Whether a persona may be relaunched also needs its bring-up
- * outcome to be `up` (b.av2 SR-6.4; `createPersonaRelaunchGate`).
+ * outcome to be `up` (`createPersonaRelaunchGate`).
  */
 export function isPersonaClientServing(status: PersonaConnectionStatus | undefined): boolean {
   if (status === undefined) return false
@@ -284,7 +283,7 @@ export function createPersonaIdentityLookup(
 /**
  * Build the connection manager's status listener: on every transition of a
  * persona to `up` (its bring-up or a reopen) flush exactly that persona's held
- * notices (b.av2 SR-7.2); a no-op when none are held. Other statuses do
+ * notices; a no-op when none are held. Other statuses do
  * nothing. Returns the flush promise, which never rejects.
  */
 export function createPersonaUpFlushListener(notifier: Pick<PersonaNotifier, 'flush'>): PersonaStatusListener {
@@ -320,7 +319,7 @@ export function composePersonaStatusListeners(...listeners: PersonaStatusListene
 export interface PersonaUpQuery {
   isUp(key: string): boolean
   /**
-   * Whether the key is in the applied persona set now (b.av2 SR-8.6: from a
+   * Whether the key is in the applied persona set now (from a
    * confirmed apply's step 1 on, a key outside it is never launched or
    * restarted). Read live, never a snapshot. Production binds the bring-up
    * controller's `isApplied`; a query without it counts every key as applied.
@@ -329,10 +328,10 @@ export interface PersonaUpQuery {
 }
 
 /**
- * Build the "is this persona up" predicate (b.av2 SR-6.4): true while the
+ * Build the "is this persona up" predicate: true while the
  * persona's connection is serving (`isPersonaClientServing`: `up`, `lost`, or
  * `retrying` a reopen; every brought-up persona is `up` in dry run), its
- * bring-up outcome is `up` and its key is applied (b.av2 SR-8.6); false
+ * bring-up outcome is `up` and its key is applied; false
  * otherwise, including for a persona the manager or the controller does not
  * know. The single source for every
  * refusal of a persona that is not up: the relaunch gate, MCP session
@@ -375,8 +374,8 @@ function isPersonaApplied(key: string, outcomes: PersonaUpQuery | undefined): bo
  * Build the relaunch gate: `canRelaunch(key)` is true while the persona's
  * connection is serving (`isPersonaClientServing`: `up`, `lost`, or
  * `retrying` a reopen; every brought-up persona is `up` in dry run) and, when
- * `outcomes` is given, its bring-up outcome is `up` (b.av2 SR-6.1, SR-6.4)
- * and its key is in the applied set (b.av2 SR-8.6: from a confirmed apply's
+ * `outcomes` is given, its bring-up outcome is `up`
+ * and its key is in the applied set (from a confirmed apply's
  * step 1 on, a removed persona is never launched or restarted, even while its
  * connection still serves until its teardown); false otherwise, including for
  * a persona the manager does not know (one that failed its credentials or

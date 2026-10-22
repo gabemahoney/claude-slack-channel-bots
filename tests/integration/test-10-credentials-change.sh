@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 10 (t3.ob2.5e.u7.bp; E13, E14 director decisions 1, 13 and 14): a
+# Test 10 ( director decisions 1, 13 and 14): a
 # credentials-file change is previewed and applied on confirmation, against
 # the loopback Slack stub, outside dry run.
 #
@@ -35,7 +35,7 @@
 #    exactly one new auth.test and apps.connections.open with the new pair,
 #    the old socket closed, bravo untouched, no persona brought up afresh,
 #    and config.json.last-applied rewritten.
-# 3. Handshake failure (decision 13): the stub's control maps a third alpha
+# 3. Handshake failure: the stub's control maps a third alpha
 #    pair to `closed-port` (a wss:// URL whose ticket holds a marker built
 #    here, to a loopback port nothing listens on). Rotating to it and
 #    confirming gives a real Bun WebSocket handshake failure: one
@@ -54,12 +54,12 @@
 # stub redacts `text` before recording it).
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
-# (E14 decision 14; lib/scenario.sh "Matchers"), each quoted from src/ (see
+# ( the current rule; lib/scenario.sh "Matchers"), each quoted from src/ (see
 # the "Expected text" block). Waits are bounded: the reload tick runs 5 s
 # after the previous pass (src/reload-timer.ts), a reconnect retries after
 # 5 s (doubling). An exit hook (on pass and on failure) kills the personas'
 # tmux sessions and removes stub-claude's transcripts; agent-director rows
-# are left to the ephemeral container (decision 14). The helper's EXIT trap
+# are left to the ephemeral container. The helper's EXIT trap
 # stops the server (with --stop-bots) and the stub and removes the scratch
 # root. Expected runtime: about 2 minutes (the two launches and their dialog
 # approvals dominate; every bound together allows ~17).
@@ -434,9 +434,9 @@ stub_transcripts_only() {
 # Exit hook (on pass and on failure, after the trap's stop --stop-bots): kill
 # each persona's tmux session by name (src/persona-identity.ts
 # personaTmuxSessionName: slack_bot_<key>; agent-director's kill does not
-# always reap it, b.vub), and remove the stub-claude transcript dirs. A dir
+# always reap it), and remove the stub-claude transcript dirs. A dir
 # holding anything but stub-claude's transcripts is left in place and fails
-# the hook. No agent-director row is deleted (decision 14).
+# the hook. No agent-director row is deleted.
 cleanup_launches() {
     local key dir rc=0
     for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
@@ -530,7 +530,7 @@ for class in "${BAD_START_CLASSES[@]}"; do
     expect_count "[slack] ${class}:" 0 "start: ${class} lines"
 done
 
-# Each persona validated and connected with its own pair (E3/E4 identity).
+# Each persona validated and connected with its own pair ( identity).
 for who in alpha bravo; do
     wait_for_record 1 "start: no ok auth.test with ${who}'s bot token" \
         event=api method=auth.test label="${who}-v1" answer=ok token_kind=bot \
@@ -613,7 +613,7 @@ cmp -s "${CONFIG}" "${LAST}" || fail "alpha rotation: config.json.last-applied d
 [[ ! -e "${PENDING}" ]] || fail "alpha rotation: config.json.pending is still there after the apply"
 check_no_leak "alpha rotation applied"
 
-# --- 3. Handshake failure (decision 13) ------------------------------------
+# --- 3. Handshake failure ------------------------------------
 write_control \
     "alphav1|alpha-v1|ok|ok|" \
     "bravov1|bravo-v1|ok|ok|" \

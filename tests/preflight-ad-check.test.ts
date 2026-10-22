@@ -1,6 +1,6 @@
 /**
  * preflight-ad-check.test.ts — `/publish`'s agent-director host check, gate
- * SR-2.5 (b.jg5 SRJ-211, AC 81): `scripts/ad-version-check.ts`, the SR-2.5
+ * SR-2.5: `scripts/ad-version-check.ts`, the SR-2.5
  * block of `scripts/preflight.sh` and the publish skills' SR-2.5 text.
  *
  * - The check runs in process through its exported `runAdVersionCheck`, with
@@ -19,10 +19,10 @@
  * `UPGRADE_FORMS`, as written (its re-install row included), plus
  * `package.json` (see `SR25_FORMS`). No line the check writes carries an
  * `INSTALL_OR_REMOVAL_FORMS` row either (an instruction to install
- * agent-director, or a file removal; E36 T2). The not-found and
+ * agent-director, or a file removal; ). The not-found and
  * below-client-minimum failures name the publishing-host block by its
  * heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
- * `src/ad-version-gate.ts`; b.jg5 SRJ-211, E35 hatch note). Each
+ * `src/ad-version-gate.ts`. Each
  * audit is also run on an in-memory copy with the old SR-2.5 put back, which
  * it must flag.
  *

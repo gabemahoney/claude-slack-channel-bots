@@ -23,7 +23,7 @@
 #
 # Then it idles until the container is stopped. The package itself is
 # installed by the runner's "install" check (docker exec), after the
-# pre-flight, as testplans/b.yko Part 1.4 orders it.
+# pre-flight, as testplans/live-acceptance.md Part 1.4 orders it.
 set -uo pipefail
 
 TESTUSER_HOME=/home/testuser

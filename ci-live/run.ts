@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * run.ts — /ci-live: the live Slack acceptance run of CSCB (testplans/b.yko)
+ * run.ts — /ci-live: the live Slack acceptance run of CSCB (testplans/live-acceptance.md)
  * in a throwaway docker container, against the test workspace.
  *
  *   bun ci-live/run.ts [--dry-run] [--provision-only] [--stage apps|install|tokens|channels]

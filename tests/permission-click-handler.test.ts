@@ -1,41 +1,39 @@
 import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
- * permission-click-handler.test.ts — SR-2.2 / SR-4 click → decide path under
- * the request_token / plural-projection wire (Epic 2 rewrite), resolved by
- * persona (b.av2 SR-7.1).
+ * permission-click-handler.test.ts — click → decide path under
+ * the request_token / plural-projection wire (component 2 rewrite), resolved by
+ * persona.
  *
  * Contract pins:
  *   - decide() is the ONLY AD call. No pre-decide get(); no `tokenStillOpen`
- *     branch. Every click code path calls decide(request_token) exactly once
- *     (SR-4.1, SR-4.3).
+ *     branch. Every click code path calls decide(request_token) exactly once.
  *   - Composite-key routing: live entry lookup is keyed on
- *     (instance_id, request_token) (SR-4.2).
+ * (instance_id, request_token).
  *   - Stale click (no live entry): decide still fires; NO chat.update from
- *     the click handler. The next poller tick reconciles the rendering
- *     (SR-4.2).
+ *     the click handler. The next poller tick reconciles the rendering.
  *   - Happy path: decide → chat.update verdict text → markHandled
- *     ONLY after the chat.update lands (SR-5.4).
+ * ONLY after the chat.update lands.
  *   - Happy path with chat.update failing (scripted on the stub) →
  *     markHandled NOT called; one token-safe log line; nothing leaks.
  *   - ErrAlreadyDecided → silent swallow. No chat.update, no markHandled
- *     mutation (SR-4.4).
+ * mutation.
  *   - ErrRelayFallenBack → log + buttonless "answer at the tmux pane"
- *     repaint + no markHandled + no retry (b.qi1).
+ * repaint + no markHandled + no retry.
  *   - ErrInvalidFlags / ErrAmbiguousRequest → log + no retry + no
- *     chat.update (SR-4.4).
+ * chat.update.
  *   - ErrInvalidFlags additionally makes exactly one immediate agent-director
- *     version re-check (b.jg5 SRJ-204, SRJ-104), after its log line; its log
- *     line, trail result_class, no-retry and no-render are unchanged
- *     (SRJ-122). The handler starts the re-check and does not wait on it
+ * version re-check, after its log line; its log
+ *     line, trail result_class, no-retry and no-render are unchanged.
+ * The handler starts the re-check and does not wait on it
  *     (a re-check that never settles does not hold the click's return, so
  *     the Slack ack is not delayed). No other decide error makes a re-check.
- *   - Unknown decide error → log + no chat.update (SR-4.4).
+ * - Unknown decide error → log + no chat.update.
  *   - Sibling independence: clicking one of two siblings on the same spawn
- *     leaves the sibling's entry / messageTs untouched (SR-4.5).
+ * leaves the sibling's entry / messageTs untouched.
  *   - Malformed action_id returns false (caller keeps looking), before the
  *     receiving persona is resolved.
  *
- * Persona pins (b.av2 SR-7.1, AC 28):
+ * Persona pins:
  *   - Two personas, A and B, each with its own `makeStubSlack` Web stub and
  *     a destination channel that differs from its key. Prompts are seeded
  *     through a poller tick, so they post on A's stub to A's destination.
@@ -50,7 +48,7 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  *     client gets decide but no update and no markHandled.
  *   - Trail `channel` fields keep holding Slack channel IDs.
  *
- * DM prompt pins (b.av2 SR-7.1 DM part, SR-5.1 exception; AC 29, AC 36):
+ * DM prompt pins (DM part exception):
  *   - A third persona, D, has DMs on, a `dm.contact` and
  *     `permission_prompts: 'dm'`. Its prompt is seeded through a poller tick,
  *     which opens the DM on D's stub and records the opened `D…` ID as the
@@ -62,7 +60,7 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  *     nothing else: no post, no `conversations.open` (an update is not a post).
  *   - A's channel prompt and D's DM prompt, clicked in one run, each update
  *     through their own client.
- *   - In-place changes (E12): with B's channel dropped from `channels` and
+ * - In-place changes : with B's channel dropped from `channels` and
  *     its destination moved, or D's `dm.contact` changed, a click on the
  *     prompt posted before the change still makes its one update where it
  *     was posted, through the persona's client, with no post and no open;
@@ -159,7 +157,7 @@ afterAll(() => {
 })
 
 // ---------------------------------------------------------------------------
-// Shared fixtures — no inline magic strings (SR-8.1)
+// Shared fixtures — no inline magic strings
 // ---------------------------------------------------------------------------
 
 /** Persona A's name; its key (hashed form) differs from its destination channel. */
@@ -344,7 +342,7 @@ async function seedLiveEntry(opts: {
 
 /**
  * Seed TWO live entries on persona A's spawn under different request_tokens.
- * Used to assert SR-4.5 sibling independence on click. Pins both tokens to
+ * Used to assert sibling independence on click. Pins both tokens to
  * known constants so the test can target a specific sibling.
  */
 async function seedTwoSiblings(opts: {
@@ -391,7 +389,7 @@ function makeDecideStub(opts: { throwOn?: Error; delivery?: 'delivered' | 'not_c
 }
 
 // ---------------------------------------------------------------------------
-// Malformed action_id — parse first (SR-11)
+// Malformed action_id — parse first
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — non-matching action ids', () => {
@@ -457,7 +455,7 @@ describe('handlePermissionClick — non-matching action ids', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Happy path — decide → chat.update → markHandled (AC 28)
+// Happy path — decide → chat.update → markHandled
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — happy path', () => {
@@ -546,7 +544,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(decide.calls[0]).toEqual({
       instance_id: h.instanceA,
       decision: 'allow',
-      // SR-4.1 / SR-7.2: request_token is unconditionally on the wire.
+      // request_token is unconditionally on the wire.
       request_token: TOKEN_A,
     } as DecideParams & { request_token: string })
 
@@ -635,13 +633,13 @@ describe('handlePermissionClick — happy path', () => {
     const entry = getLivePermission(h.instanceA, TOKEN_A)
     expect(entry).toBeDefined()
     expect(entry?.handled).toBe(false)
-    // b.emk: failures land in BOTH server.log (via logDeps) and the trail JSONL.
+    // failures land in BOTH server.log (via logDeps) and the trail JSONL.
     const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
     expect(closure).toBeDefined()
     expect(closure!['ok']).toBe(false)
     expect(closure!['error']).toBe(errorClass)
     expect(closure!['triggered_by']).toBe('click_handler')
-    // One line, token-safe (b.av2 SR-10.3): the platform reason, never the raw error.
+    // One line, token-safe: the platform reason, never the raw error.
     expect(logs).toHaveLength(1)
     expect(logs[0]).toHaveLength(1)
     const line = String(logs[0]![0])
@@ -658,7 +656,7 @@ describe('handlePermissionClick — happy path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A prompt in a persona's DM — AC 29, AC 36 (b.av2 SR-7.1 DM part, SR-5.1 exception)
+// A prompt in a persona's DM — (DM part exception)
 // ---------------------------------------------------------------------------
 
 /**
@@ -690,10 +688,10 @@ const withDmsOff = (persona: Persona): Persona => ({
   permission_prompts: CHANNEL_D,
 })
 
-describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)', () => {
+describe('handlePermissionClick — a prompt in a persona\'s DM', () => {
   test.each<{ label: string; change?: (p: Persona) => Persona }>([
-    { label: 'AC 29: DMs on' },
-    { label: 'AC 36: DMs turned off after the prompt was posted', change: withDmsOff },
+    { label: 'DMs on' },
+    { label: 'DMs turned off after the prompt was posted', change: withDmsOff },
     {
       label: '`dm.contact` changed in place after the prompt was posted',
       change: (p) => ({ ...p, dm: { enabled: true, contact: CONTACT_D_MOVED } }),
@@ -774,7 +772,7 @@ describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)',
 })
 
 // ---------------------------------------------------------------------------
-// Prompts posted before an in-place change (E12; b.av2 SR-7.1, SR-5.1)
+// Prompts posted before an in-place change
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — a prompt posted before an in-place change', () => {
@@ -817,10 +815,10 @@ describe('handlePermissionClick — a prompt posted before an in-place change', 
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.1 / SR-7.2 — decide-wire invariant
+// decide-wire invariant
 // ---------------------------------------------------------------------------
 
-describe('handlePermissionClick — decide-wire invariant (SR-4.1 / SR-7.2)', () => {
+describe('handlePermissionClick — decide-wire invariant', () => {
   test('every decide call carries a non-empty request_token matching the action_id', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub()
@@ -838,10 +836,10 @@ describe('handlePermissionClick — decide-wire invariant (SR-4.1 / SR-7.2)', ()
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.2 — stale click semantics (no live entry but decide STILL fires)
+// stale click semantics (no live entry but decide STILL fires)
 // ---------------------------------------------------------------------------
 
-describe('handlePermissionClick — stale click (SR-4.2)', () => {
+describe('handlePermissionClick — stale click', () => {
   test('no live entry for (instance, token) → decide STILL fires with decoded token; NO chat.update', async () => {
     // Do NOT seed an entry. The poller-state is empty; the click is stale.
     // The receiving persona resolves, so decide still fires.
@@ -854,7 +852,7 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
     )
 
     expect(result).toBe(true)
-    // SR-4.2: decide STILL fires on stale clicks — AD is the source of truth.
+    // decide STILL fires on stale clicks — AD is the source of truth.
     expect(decide.calls).toHaveLength(1)
     expect(decide.calls[0]).toEqual({
       instance_id: h.instanceA,
@@ -890,10 +888,10 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.4 — decide-error handling
+// decide-error handling
 // ---------------------------------------------------------------------------
 
-describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
+describe('handlePermissionClick — decide-error handling', () => {
   test('ErrAlreadyDecided → silent swallow: no chat.update, no markHandled, returns true', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub({ throwOn: errAlreadyDecided() })
@@ -907,7 +905,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 
     expect(result).toBe(true)
     expect(decide.calls).toHaveLength(1)
-    // SR-4.4: no chat.update from the click handler on ErrAlreadyDecided.
+    // no chat.update from the click handler on ErrAlreadyDecided.
     expect(h.stubA.calls.update).toHaveLength(0)
     expect(h.stubB.calls.update).toHaveLength(0)
     // markHandled was NOT called: the entry remains pristine.
@@ -980,9 +978,9 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
   })
 
-  // AC 20 (b.av2 SR-10.3): the catch-all line logs the error's description
+  // the catch-all line logs the error's description
   // (type, safe code, the message logged redacted, frames), never the error
-  // itself (E14 Task 0, operator decision B1).
+  // itself ( section 0, operator decision B1).
   /** A ticket URL shaped like Slack's Socket Mode WebSocket URL, holding the leak sentinel. */
   /** A non-agent-director decide error whose message and properties carry fake tokens. */
   const sentinelDecideError = (): Error =>
@@ -1020,7 +1018,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
       makeErr: () => errGeneric('decide', fakeToken(BOT_TOKEN_PREFIX, 'errname'), 'transient'),
       desc: 'AgentDirectorError message="<redacted-token> transient" at ',
     },
-  ])('AC 20: $label → one "decide failed" line naming its type, safe code and redacted message; no log line or Slack call leaks', async ({ makeErr, desc }) => {
+  ])('$label → one "decide failed" line naming its type, safe code and redacted message; no log line or Slack call leaks', async ({ makeErr, desc }) => {
     const { result, logs } = await clickWithFailingDecide(makeErr())
 
     expect(result).toBe(true)
@@ -1031,7 +1029,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     assertNoLeak({ logs, slack: h.stubA.web.callLog })
   })
 
-  test('AC 20: an AgentDirectorError with a safe errName → one "decide failed" line that is the errName and its redacted description, no frames; nothing leaks', async () => {
+  test('an AgentDirectorError with a safe errName → one "decide failed" line that is the errName and its redacted description, no frames; nothing leaks', async () => {
     const err = errGeneric('decide', 'ErrDaemonBusy', `retry later ${sentinelInMessage('desc')}`)
     const { result, logs } = await clickWithFailingDecide(err)
 
@@ -1044,8 +1042,8 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     assertNoLeak({ logs, slack: h.stubA.web.callLog })
   })
 
-  // AC 20 / E13 Director decision 16: the trail's raw_error_message
-  // (SR-V-2.7) is recorded with URL-like and token-like text replaced, on
+  // / the trail's raw_error_message
+  // is recorded with URL-like and token-like text replaced, on
   // both the `other` branch and the ad/tmux carve-out.
   const redactableText = (): string => `via https://files.example.test/upload?id=7 ${fakeToken(APP_TOKEN_PREFIX, 'msg')}`
   test.each([
@@ -1060,7 +1058,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
       resultClass: 'ErrTmuxNotAvailable',
       makeErr: () => new ErrTmuxNotAvailable('decide', 'ErrTmuxNotAvailable', `tmux not found ${redactableText()}`),
     },
-  ])('AC 20: $label whose message holds a URL and a fake token → its cscb.ad_decide.attempted event records the message redacted', async ({ resultClass, makeErr }) => {
+  ])('$label whose message holds a URL and a fake token → its cscb.ad_decide.attempted event records the message redacted', async ({ resultClass, makeErr }) => {
     const { logs, trail } = await clickWithFailingDecide(makeErr())
 
     const events = trail.events.filter((e) => e.event === 'cscb.ad_decide.attempted')
@@ -1072,10 +1070,10 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.qi1 — ErrRelayFallenBack (AD 0.10.0) surfaced, session untouched
+// ErrRelayFallenBack (AD 0.10.0) surfaced, session untouched
 // ---------------------------------------------------------------------------
 
-describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
+describe('handlePermissionClick — ErrRelayFallenBack', () => {
   test('repaints the prompt buttonless through A\'s client, emits the relay-fallen-back trail pair, and leaves the entry unhandled', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     const messageTs = getLivePermission(h.instanceA, TOKEN_A)!.messageTs
@@ -1161,10 +1159,10 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.5 — sibling independence on click
+// sibling independence on click
 // ---------------------------------------------------------------------------
 
-describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
+describe('handlePermissionClick — sibling independence', () => {
   test('two sibling rows seeded; clicking one updates only the clicked entry', async () => {
     await seedTwoSiblings({ tokenA: TOKEN_A, tokenB: TOKEN_B })
 
@@ -1232,7 +1230,7 @@ describe('handlePermissionClick — helper sanity', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-V Epic 3 — cscb.chat_update.attempted (click-handler-triggered)
+// Permission trail — cscb.chat_update.attempted (click-handler-triggered)
 // ---------------------------------------------------------------------------
 
 describe('trail events — cscb.chat_update.attempted (click-handler-triggered)', () => {
@@ -1292,7 +1290,7 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
 })
 
 // ---------------------------------------------------------------------------
-// SR-V Epic 4 — cscb.click_handler.invoked
+// Permission trail — cscb.click_handler.invoked
 // ---------------------------------------------------------------------------
 
 describe('trail events — cscb.click_handler.invoked', () => {
@@ -1376,7 +1374,7 @@ describe('trail events — cscb.click_handler.invoked', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-V Epic 5 — cscb.ad_decide.attempted
+// Permission trail — cscb.ad_decide.attempted
 // ---------------------------------------------------------------------------
 
 describe('trail events — cscb.ad_decide.attempted', () => {
@@ -1476,7 +1474,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     expect(event!['raw_error_message']).toBe('network timeout')
   })
 
-  test('request_token correlates with click_handler.invoked from Epic 4', async () => {
+  test('request_token correlates with click_handler.invoked from ', async () => {
     await seedLiveEntry({ requestToken: TOKEN_B })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
@@ -1498,11 +1496,11 @@ describe('trail events — cscb.ad_decide.attempted', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-204, SRJ-104, SRJ-122 — decide ErrInvalidFlags makes one
+// decide ErrInvalidFlags makes one
 // immediate agent-director version re-check; everything else is unchanged
 // ---------------------------------------------------------------------------
 
-describe('handlePermissionClick — decide ErrInvalidFlags version re-check (b.jg5 SRJ-204, SRJ-104, SRJ-122)', () => {
+describe('handlePermissionClick — decide ErrInvalidFlags version re-check', () => {
   const USER = 'U_OPERATOR'
 
   /**
@@ -1612,7 +1610,7 @@ describe('handlePermissionClick — decide ErrInvalidFlags version re-check (b.j
    */
   const NEVER_SETTLES_TEST_LIMIT_MS = 1000
 
-  test('ErrInvalidFlags with a re-check whose call never settles (default path) → the handler still returns true at once (SRJ-122: the ack is not held)', async () => {
+  test('ErrInvalidFlags with a re-check whose call never settles (default path) → the handler still returns true at once (the ack is not held)', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     // The production default: no ClickDeps.recheckAdVersion, so the step
     // triggers the installed re-check, whose one resolve call never settles.
@@ -1679,7 +1677,7 @@ describe('handlePermissionClick — decide ErrInvalidFlags version re-check (b.j
 })
 
 // ---------------------------------------------------------------------------
-// Epic 5 — wrapper outage short-circuit, keyed by persona (b.av2 SR-7.1)
+// component 5 — wrapper outage short-circuit, keyed by persona
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — wrapper outage short-circuit', () => {

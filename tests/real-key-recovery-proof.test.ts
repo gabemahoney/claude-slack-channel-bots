@@ -23,7 +23,7 @@ function proveEnter(journal: any[], calls: Parameters<typeof assertSwallowedEnte
   return assertSwallowedEnterRecovery([fixed, ...journal], [key(1000, 'text'), key(2000, 'enter'), ...calls], faults, 1, instance)
 }
 
-describe('same-conversation reply permission proof (b.pb8)', () => {
+describe('same-conversation reply permission proof', () => {
   let home: string
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'reply-permission-proof-')) })
   afterEach(() => { rmSync(home, { recursive: true, force: true }) })

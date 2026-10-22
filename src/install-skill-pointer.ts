@@ -1,14 +1,14 @@
 /**
  * install-skill-pointer.ts — Render the manual-fetch instructions block
  * appended to the gate's three system-install typed-error failure messages
- * (SR-4.5, SR-9.3).
+ *
  *
  * The block tells the operator where to fetch `skills/install-cscb/SKILL.md`
  * from CSCB's GitHub repo, where to place it under `~/.claude/skills/`, and
  * how to invoke the skill once installed. The skill itself walks the operator
  * through the diagnosis; for a missing or too-old agent-director it names the
  * switch-over runbook in docs/migration.md and runs no agent-director install or upgrade
- * itself (b.jg5 SRJ-208; the E2-gate hatch note).
+ * itself (the -gate design note).
  *
  * The append-on-three-branches rule lives in `agent-director-startup.ts` —
  * this module only renders. The block is appended verbatim regardless of

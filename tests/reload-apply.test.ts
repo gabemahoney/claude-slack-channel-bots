@@ -214,7 +214,7 @@ interface RunningOptions extends ReloadRunOptions {
   top?: TopLevel
 }
 
-/** The real composition, with an MCP session registered for every persona (the AC 58 routing cases). */
+/** The real composition, with an MCP session registered for every persona (the routing cases). */
 const REAL_WITH_SESSIONS: RunningOptions = { realLifecycle: true, sessions: true }
 
 /**
@@ -276,7 +276,7 @@ async function previewConfig(run: ReloadRun, personas: PersonaInput[], top: TopL
   return h.pendingLines()!
 }
 
-/** Every closing check: nothing posted to Slack (b.av2 SR-7.2) and no token in anything captured. */
+/** Every closing check: nothing posted to Slack and no token in anything captured. */
 function expectNoPostNoLeak(run: ReloadRun, extra?: Record<string, unknown>): void {
   expect(run.slackPosts()).toEqual([])
   assertNoLeak(run.captured(extra))
@@ -330,11 +330,11 @@ function indexOf(timeline: readonly LifecycleTimelineEntry[], match: Partial<Lif
 }
 
 // ---------------------------------------------------------------------------
-// Additions (AC 19, AC 22; b.av2 SR-6.1 at apply)
+// Additions (at apply)
 // ---------------------------------------------------------------------------
 
-describe('a confirmed addition brings the persona up (b.av2 SR-6.1 at apply, SR-8.6 step 6)', () => {
-  test('AC 19 / AC 22: a persona whose working directory and credentials file are created while the server runs comes up from its file, never the token environment, and nothing happens to the running persona', async () => {
+describe('a confirmed addition brings the persona up (at apply step 6)', () => {
+  test('a persona whose working directory and credentials file are created while the server runs comes up from its file, never the token environment, and nothing happens to the running persona', async () => {
     const { run, personas } = await running(['alpha'], { realLifecycle: true })
     const [alpha] = personas
     const alphaKey = h.key('alpha')
@@ -388,14 +388,14 @@ describe('a confirmed addition brings the persona up (b.av2 SR-6.1 at apply, SR-
     expectNoPostNoLeak(run)
   })
 
-  // AC 64: a new persona that cannot be used is logged per the startup rules and touches no running persona.
+  // a new persona that cannot be used is logged per the startup rules and touches no running persona.
   test.each<{ label: string; credentials: PreparedPersonaState['credentials']; oversized?: boolean; slack?: boolean; cls: string }>([
     { label: 'its credentials file missing', credentials: 'missing', cls: PERSONA_CREDENTIALS_MISSING },
     { label: 'its credentials file unreadable (a directory)', credentials: 'unreadable', cls: PERSONA_CREDENTIALS_UNREADABLE },
     { label: 'its credentials file unreadable (over the 64 KiB cap)', credentials: 'missing', oversized: true, cls: PERSONA_CREDENTIALS_UNREADABLE },
     { label: 'its credentials file locally invalid', credentials: 'invalid', cls: PERSONA_CREDENTIALS_INVALID },
     { label: "its tokens refused by Slack's auth.test", credentials: 'valid', slack: true, cls: PERSONA_CREDENTIALS_REFUSED },
-  ])('AC 64: an added persona with $label ends broken with its startup class, launches nothing, and leaves the running personas untouched (real composition)', async ({ credentials, oversized, slack, cls }) => {
+  ])('an added persona with $label ends broken with its startup class, launches nothing, and leaves the running personas untouched (real composition)', async ({ credentials, oversized, slack, cls }) => {
     const { run, personas } = await running(['alpha', 'bravo'], {
       realLifecycle: true,
       ...(slack ? { slack: { delta: SLACK_AUTH_REJECTED } } : {}),
@@ -457,7 +457,7 @@ describe('a confirmed addition brings the persona up (b.av2 SR-6.1 at apply, SR-
 })
 
 // ---------------------------------------------------------------------------
-// The Epic's dry-run sprint demo, first leg (a confirmed addition)
+// The component's dry-run sprint demo, first leg (a confirmed addition)
 // ---------------------------------------------------------------------------
 
 describe('the dry-run sprint demo: a confirmed addition (real composition, dry run)', () => {
@@ -533,11 +533,11 @@ describe('the dry-run sprint demo: a confirmed addition (real composition, dry r
 })
 
 // ---------------------------------------------------------------------------
-// Removals (AC 57; b.av2 SR-6.5)
+// Removals
 // ---------------------------------------------------------------------------
 
-describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 2)', () => {
-  test('AC 57: removing bravo from alpha, bravo and charlie tears down bravo only through the real composition: it kills cscb_<bravo> only and deletes nothing, closes only its connection, forgets its bring-up, leaves the applied set, and posts nothing', async () => {
+describe('a confirmed removal tears the persona down (step 2)', () => {
+  test('removing bravo from alpha, bravo and charlie tears down bravo only through the real composition: it kills cscb_<bravo> only and deletes nothing, closes only its connection, forgets its bring-up, leaves the applied set, and posts nothing', async () => {
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'], { realLifecycle: true })
     const [alpha, , charlie] = personas
     const bravoKey = h.key('bravo')
@@ -551,12 +551,12 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     expect(run.since(cp).lifecycle).toEqual([{ op: 'teardown', key: bravoKey, via: 'apply' }])
     const composition = run.composition!
 
-    // SRJ-706, SRJ-715): both recorded at its submission and again as its turn's first two steps, before every other
+    //): both recorded at its submission and again as its turn's first two steps, before every other
     // teardown step for bravo, the wait for its launch in flight included. Its turn starts by forgetting bravo's
-    // outage state, once, right before its notice window opens and nowhere after the kill (b.jg5 SRJ-1002, SRJ-1003),
-    // and the notices its destination hold kept are dropped as the window opens (b.jg5 SRJ-1003).
+    // outage state, once, right before its notice window opens and nowhere after the kill,
+    // and the notices its destination hold kept are dropped as the window opens.
     // Once that launch settled, the sequence is stopped once more and the retry timer with it (a launch in flight can
-    // start a sequence at a replacement site, b.jg5 SRJ-707), before the kill.
+    // start a sequence at a replacement site), before the kill.
     const bravoTeardownCalls = composition.calls.slice(callsAtCp).filter(([, key]) => key === bravoKey)
     const turnHead: Array<[string, string]> = [
 
@@ -572,7 +572,7 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     expect(laterMembers.filter((member) => member === 'stopApprover' || member === 'stopLiveRowSequence')).toEqual(['stopLiveRowSequence'])
     const settledAt = laterMembers.indexOf('whenLaunchSettled')
     expect(laterMembers.slice(settledAt, settledAt + 3)).toEqual(['whenLaunchSettled', 'stopLiveRowSequence', 'stopRetryTimer'])
-    // One kill, which succeeds at its first try, and no delete: the row is kept (b.jg5 SRJ-715).
+    // One kill, which succeeds at its first try, and no delete: the row is kept.
     expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`])
     expect(stubCallCount(composition.agentDirector)).toBe(1)
     // Every dependency call is for bravo alone.
@@ -644,10 +644,10 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
 })
 
 // ---------------------------------------------------------------------------
-// A name change (b.av2 SR-8.6: removal plus addition)
+// A name change (removal plus addition)
 // ---------------------------------------------------------------------------
 
-describe('a name change is a removal of the old key and an addition of the new one (b.av2 SR-8.6)', () => {
+describe('a name change is a removal of the old key and an addition of the new one', () => {
   test('renaming bravo tears down its old key, then brings up the new key, and does nothing for alpha (real composition)', async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [alpha, bravo] = personas
@@ -680,7 +680,7 @@ describe('a name change is a removal of the old key and an addition of the new o
 })
 
 // ---------------------------------------------------------------------------
-// Apply step 1: the retired keys (b.jg5 SRJ-803, SRJ-804, SRJ-1511; AC 52, AC 70)
+// Apply step 1: the retired keys
 // ---------------------------------------------------------------------------
 
 /** The time the run's store gives a key it records now (the store reads `run.clock`). */
@@ -700,7 +700,7 @@ function recordWriteFailedLines(run: ReloadRun): string[] {
 
 /**
  * Hold `key` as retired only in memory, as a start sweep whose write failed
- * leaves it (b.jg5 SRJ-714): one batch through the run's store with the
+ * leaves it: one batch through the run's store with the
  * `absent-at-start` cause, every write failing. The failed write is in
  * `run.writes`; take a checkpoint after it.
  */
@@ -716,7 +716,7 @@ function holdInMemory(run: ReloadRun, key: string): void {
 type Step1Change = (personas: PersonaInput[]) => { personas: PersonaInput[]; top?: TopLevel }
 
 /**
- * Each destructive setting's change of bravo (b.av2 SR-8.6), typed over
+ * Each destructive setting's change of bravo, typed over
  * `DESTRUCTIVE_SETTINGS`, so a new destructive setting fails the typecheck
  * until it has a row. `name` keeps the key: the new name is the old key
  * itself (`personaKey` of a name in key form is the name), so the persona
@@ -728,7 +728,7 @@ const DESTRUCTIVE_CHANGES: Record<DestructiveSetting, { name: string; change: St
   working_directory: { name: 'bravo', change: ([alpha, bravo]) => ({ personas: [alpha!, movedDirectory(bravo!)] }) },
 }
 
-describe('apply step 1 records the retired keys before the last-applied record is rewritten (b.jg5 SRJ-803, SRJ-1511; AC 52)', () => {
+describe('apply step 1 records the retired keys before the last-applied record is rewritten', () => {
   test.each<{ label: string; second: string; change: Step1Change; recorded: (run: ReloadRun) => RetiredKeyRecord }>([
     {
       label: 'a removal records its key as removed',
@@ -790,7 +790,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
         return { personas: [...personas, charlie] }
       },
     },
-  ])('$label records nothing and makes no retired-key write: the apply writes the last-applied record only (b.jg5 SRJ-803)', async ({ change }) => {
+  ])('$label records nothing and makes no retired-key write: the apply writes the last-applied record only', async ({ change }) => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const next = change(personas)
     h.writeConfig(configWith(next.top ?? {}, next.personas))
@@ -855,7 +855,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
   test.each<{ label: string; mark: boolean; written: boolean }>([
     { label: "with its mark set has the mark cleared, its cause and time replaced, in the retired-key write", mark: true, written: true },
     { label: 'with no mark is left as it is, and no retired-key write is made', mark: false, written: false },
-  ])('re-recording: a removed key already recorded $label (b.jg5 SRJ-803)', async ({ mark, written }) => {
+  ])('re-recording: a removed key already recorded $label', async ({ mark, written }) => {
     writeRetiredKeysRecord(h.stateDir, { [h.key('bravo')]: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark } })
     const seeded = readRetiredKeysRecord(h.stateDir)
     const { run, personas } = await running(['alpha', 'bravo'])
@@ -872,7 +872,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     expectNoPostNoLeak(run)
   })
 
-  test('stopped between step 1 and the teardown: after the restart, the removed key is recorded and the record holds the change (AC 52, part)', async () => {
+  test('stopped between step 1 and the teardown: after the restart, the removed key is recorded and the record holds the change (part)', async () => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const bravoKey = h.key('bravo')
     const gate = run.lifecycle.hold('teardown', bravoKey)
@@ -896,9 +896,9 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
   test.each<{ label: string; held: boolean; cause: RetiredKeyCause }>([
     { label: 'a removed key', held: false, cause: RETIRED_KEY_CAUSE_REMOVED },
-    // Recording a key held only in memory writes the record, with the cause it holds (hatch A3).
+    // Recording a key held only in memory writes the record, with the cause it holds (design A3).
     { label: 'a removed key held only in memory after a failed start-sweep write', held: true, cause: RETIRED_KEY_CAUSE_ABSENT_AT_START },
-  ])('stopped between the two writes: $label is written by step 1 and stays retired after the restart, which starts from the old last-applied record (AC 52, part; b.jg5 SRJ-803)', async ({ held, cause }) => {
+  ])('stopped between the two writes: $label is written by step 1 and stays retired after the restart, which starts from the old last-applied record (part)', async ({ held, cause }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { stopBeforeWrite: h.paths.lastApplied })
     const bravoKey = h.key('bravo')
     const recordBytes = h.readRecord()
@@ -923,12 +923,12 @@ describe('apply step 1 records the retired keys before the last-applied record i
     expectNoPostNoLeak(restarted)
   })
 
-  // Real launch (b.jg5 SRJ-805): charlie's old row is `ended` with the current
+  // Real launch: charlie's old row is `ended` with the current
   // `config_dir` label, which a key not recorded would resume. The apply's
   // launch is a reuse whose call is refused UNAVAILABLE, so no mark is set and
   // the row stays ended; after the restart the key is still recorded and the
   // start pass's launch of charlie is a reuse spawn of its id, never a resume.
-  test('an add-only apply re-adding a persona whose key is held only in memory writes the retired-key record before the last-applied record, and after a restart the key is still recorded: the start pass launches the re-added persona by a reuse spawn, never a resume (b.jg5 SRJ-803, SRJ-805; hatch A3; real launch)', async () => {
+  test('an add-only apply re-adding a persona whose key is held only in memory writes the retired-key record before the last-applied record, and after a restart the key is still recorded: the start pass launches the re-added persona by a reuse spawn, never a resume (hatch A3; real launch)', async () => {
     await useConfigDirs()
     const spawnQueue: SpawnQueue = []
     const { run, personas } = await running(['alpha'], { ...REAL_LAUNCH, agentDirector: { spawnQueue } })
@@ -965,7 +965,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     expectNoPostNoLeak(restarted)
   })
 
-  test('a removal of a persona with a token-shaped name records its key as written, and nothing captured or written holds a token but the name (b.av2 SR-1.2)', async () => {
+  test('a removal of a persona with a token-shaped name records its key as written, and nothing captured or written holds a token but the name', async () => {
     const name = `Ops bot ${fakeToken(BOT_TOKEN_PREFIX, 'NAME')}`
     const { run, personas } = await running(['alpha', name])
     const key = h.key(name)
@@ -980,7 +980,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
   })
 })
 
-describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)', () => {
+describe('a failed apply undoes its recording', () => {
   /** zulu recorded before the apply, bravo recorded with its mark set: the record a failed rewrite must put back. */
   const SEEDED = { zulu: { cause: RETIRED_KEY_CAUSE_REMOVED }, bravo: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark: true } } as const
 
@@ -1026,7 +1026,7 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     expect(run.retiredKeys.keys()).toEqual(seeded ? [h.key('bravo'), 'zulu'].sort() : [])
     expect(run.retiredKeys.isMarked(h.key('bravo'))).toBe(seeded)
 
-    // restore stops or restarts none (b.jg5 SRJ-808).
+    // restore stops or restarts none.
     // Nothing applied, the change pending, one line naming the last-applied record and the retired-key record.
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
@@ -1056,10 +1056,10 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
   // The restore clauses' one literal pin; every other case builds them.
   test('the failed rewrite line\'s restore clauses: put back, and its restore failed (pin)', () => {
     expect(reloadRetiredKeysPutBackClause('/state/retired-keys.json')).toBe(
-      '; the retired-key record "/state/retired-keys.json" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)',
+      '; the retired-key record "/state/retired-keys.json" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay',
     )
     expect(reloadRetiredKeysPutBackFailedClause('/state/retired-keys.json')).toBe(
-      '; putting the retired-key record "/state/retired-keys.json" back to what it held before this apply failed, so the keys this apply recorded stay retired (b.jg5 SRJ-804)',
+      '; putting the retired-key record "/state/retired-keys.json" back to what it held before this apply failed, so the keys this apply recorded stay retired',
     )
   })
 
@@ -1099,7 +1099,7 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     { label: 'a removal, with no record before the apply', held: false, failure: { step: 'openSync', call: 1 }, restoreFails: false },
     { label: 'an add-only apply re-adding a key held only in memory, its restore writing the record held before', held: true, failure: { step: 'openSync', call: 1 }, restoreFails: false },
     { label: 'an add-only apply re-adding a key held only in memory, every write failing', held: true, failure: undefined, restoreFails: true },
-  ])("step 1's own retired-key write failing ($label) applies nothing, leaves the last-applied record untouched and the change pending, and logs one reload-record-write-failed line naming the retired-key file (b.jg5 SRJ-803, SRJ-804; hatch A3)", async ({ held, failure, restoreFails }) => {
+  ])("step 1's own retired-key write failing ($label) applies nothing, leaves the last-applied record untouched and the change pending, and logs one reload-record-write-failed line naming the retired-key file (hatch A3)", async ({ held, failure, restoreFails }) => {
     const { run, personas } = await running(held ? ['alpha'] : ['alpha', 'bravo'])
     const charlieKey = h.key('charlie')
     if (held) holdInMemory(run, charlieKey)
@@ -1149,7 +1149,7 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
   })
 })
 
-describe('AC 70: after a failed rewrite, the persona it would have retired resumes its conversation (b.jg5 SRJ-804; real launch)', () => {
+describe('after a failed rewrite, the persona it would have retired resumes its conversation (real launch)', () => {
   beforeEach(useConfigDirs)
 
   test('a removal whose rewrite fails leaves bravo applied and unrecorded, and its next launch from an ended row resumes it: no reuse spawn, no delete', async () => {
@@ -1168,7 +1168,7 @@ describe('AC 70: after a failed rewrite, the persona it would have retired resum
 
     h.seedRow(personas[1]!, { state: 'ended' })
     const from = run.composition!.instanceCallsOf('bravo').length
-    // b.4q8: a resume is counted once its row reports in.
+    // a resume is counted once its row reports in.
     expect(await run.relaunch('bravo')).toBe(LAUNCH_RESUMED_UNREPORTED)
 
     expect(instanceCallsSince(run, 'bravo', from)).toEqual(['spawn ErrInstanceIdCollision', 'resume ok'])
@@ -1178,19 +1178,19 @@ describe('AC 70: after a failed rewrite, the persona it would have retired resum
 })
 
 // ---------------------------------------------------------------------------
-// A retired key's launch (b.jg5 SRJ-805, SRJ-806; AC 49, AC 50, AC 51, AC 52)
+// A retired key's launch
 //
 // Every case runs the real launch path over the row table, with the run's
 // retired-key store installed for the session manager. The persona teardown
-// keeps the old life's row (b.jg5 SRJ-715): `ended`, with the persona's
+// keeps the old life's row: `ended`, with the persona's
 // `cwd` and `config_dir` label, so a key that is not retired would be
 // resumed from it. The new life's first row read that finds it live clears
-// the key's entry (b.jg5 SRJ-807), so the mark is read from the store's and
+// the key's entry, so the mark is read from the store's and
 // the session manager's lines, or from the record as it stood just before
 // that clear's write.
 // ---------------------------------------------------------------------------
 
-/** The store's lines saying `key`'s mark was written (b.jg5 SRJ-806). */
+/** The store's lines saying `key`'s mark was written. */
 function markWrittenLines(run: ReloadRun, key: string): string[] {
   return run.logs.filter((line) => line.startsWith(`${RETIRED_KEYS_LOG_PREFIX} persona=${key} marked: `))
 }
@@ -1234,7 +1234,7 @@ function markedRecordKeeper(key: string): { beforeWrite: (path: string) => void;
   }
 }
 
-describe('a retired key is launched by a reuse spawn at every launch path, never resumed, and its success sets the new-life mark (b.jg5 SRJ-805, SRJ-806; real launch)', () => {
+describe('a retired key is launched by a reuse spawn at every launch path, never resumed, and its success sets the new-life mark (real launch)', () => {
   beforeEach(useConfigDirs)
 
   /**
@@ -1288,7 +1288,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(retiredKeyReadingOf(bravoKey).recorded).toBe(false)
   })
 
-  test('AC 49: a removed persona re-added with the same key after a restart gets a reuse spawn of its id, never a plain spawn or a resume, answering fresh-retired with the mark written; its new life read live clears the entry, and after one more restart the start pass reconnects that live row: no sequence, no reuse, no resume', async () => {
+  test('a removed persona re-added with the same key after a restart gets a reuse spawn of its id, never a plain spawn or a resume, answering fresh-retired with the mark written; its new life read live clears the entry, and after one more restart the start pass reconnects that live row: no sequence, no reuse, no resume', async () => {
     const { run, alpha, bravo } = await removedThenRestarted()
     const bravoKey = h.key('bravo')
 
@@ -1298,7 +1298,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(instanceCallsSince(run, 'bravo', 0)).toEqual(['reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: personaInstanceId(bravoKey), reuse: true, cwd: bravo.working_directory })
     expect(h.rowOf('bravo')?.state).toBe('waiting')
-    // The mark, written through the store, then the entry cleared by the new life's first live read (b.jg5 SRJ-807).
+    // The mark, written through the store, then the entry cleared by the new life's first live read.
     expect(markWrittenLines(run, bravoKey)).toHaveLength(1)
     expect(freshRetiredLines(run, 'bravo')).toHaveLength(1)
     await readPersonaOwnRow(bravoKey, { site: 'reload-apply.test', what: 'observe returned row' })
@@ -1318,7 +1318,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expectNoPostNoLeak(again)
   })
 
-  test("AC 49, SRJ-806: the mark survives a restart: with the server stopped after the mark's write and before its new life was read, the next start pass's one reuse collides with the live row, which is the new life: reconnected, never killed, sequenced or resumed, and that read clears the entry", async () => {
+  test("the mark survives a restart: with the server stopped after the mark's write and before its new life was read, the next start pass's one reuse collides with the live row, which is the new life: reconnected, never killed, sequenced or resumed, and that read clears the entry", async () => {
     const bravoKey = h.key('bravo')
     const keeper = markedRecordKeeper(bravoKey)
     const { run, alpha, bravo } = await removedThenRestarted({ beforeWrite: keeper.beforeWrite })
@@ -1340,17 +1340,17 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(again.composition!.agentDirectorCalls.filter((c) => c.verb === 'kill' || c.verb === 'delete' || c.verb === 'findMissing')).toEqual([])
     expect(again.sequenceRunning('bravo')).toBe(false)
     expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo.working_directory })
-    // The collision get read the new life live with the mark set: the entry is cleared (b.jg5 SRJ-807).
+    // The collision get read the new life live with the mark set: the entry is cleared.
     expect(again.retiredKeys.isRecorded(bravoKey)).toBe(false)
     expectNoPostNoLeak(again)
   })
 
-  // b.jg5 SRJ-810, SRJ-711 bullet 2: the old key's hold is on the directory
+  // bullet 2: the old key's hold is on the directory
   // the new key names, and a successful teardown kill ends no hold by itself,
   // so the new key's bring-up is held back and starts the hold's wait; the
   // wait's first read of the old row (ended) ends the hold, whose end retries
   // the new key at once: its plain first spawn comes only after that read.
-  test("AC 50: a renamed persona's new key gets a plain first spawn, only after the old-life wait's first read of the old row ends the hold, and its old key is recorded; renamed back, the old key comes up the same way by a reuse spawn of its id, never a resume, and the other key is now recorded", async () => {
+  test("a renamed persona's new key gets a plain first spawn, only after the old-life wait's first read of the old row ends the hold, and its old key is recorded; renamed back, the old key comes up the same way by a reuse spawn of its id, never a resume, and the other key is now recorded", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
     const [bravoKey, renamedKey] = keysOf('bravo', 'bravo2')
@@ -1381,7 +1381,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(run.retiredKeys.isRecorded(bravoKey)).toBe(true)
     expect(run.retiredKeys.isRecorded(renamedKey)).toBe(false)
     expect(markWrittenLines(run, renamedKey)).toEqual([])
-    // The old key's row, killed and kept by its teardown (b.jg5 SRJ-715).
+    // The old key's row, killed and kept by its teardown.
     expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     const bravoFrom = run.composition!.instanceCallsOf('bravo').length
     const bravoLaunches = launchesOf(run, 'bravo').length
@@ -1403,7 +1403,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expectNoPostNoLeak(run)
   })
 
-  test("AC 51, restart path: a re-add whose reuse is refused UNAVAILABLE leaves the row and the key's record as they were, and the restart path's retry is a reuse spawn of the id, never a resume, whose success sets the mark", async () => {
+  test(", restart path: a re-add whose reuse is refused UNAVAILABLE leaves the row and the key's record as they were, and the restart path's retry is a reuse spawn of the id, never a resume, whose success sets the mark", async () => {
     const spawnQueue: SpawnQueue = []
     const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { spawnQueue } })
     const [alpha, bravo] = personas
@@ -1439,7 +1439,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
   test.each<{ setting: string; move: (bravo: PersonaInput) => PersonaInput }>([
     { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
     { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo) },
-  ])('AC 52, part (b.jg5 SRJ-803), $setting moved: a server stopped between step 1 and the teardown of a destructive modify restarts with the key recorded, and the new declaration\'s bring-up is a reuse: the colliding reuse sends the old life, still live, through the live-row sequence, which ends in a reuse spawn, never a resume', async ({ move }) => {
+  ])(', part, $setting moved: a server stopped between step 1 and the teardown of a destructive modify restarts with the key recorded, and the new declaration\'s bring-up is a reuse: the colliding reuse sends the old life, still live, through the live-row sequence, which ends in a reuse spawn, never a resume', async ({ move }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -1468,11 +1468,11 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     await applying
   })
 
-  // b.jg5 SRJ-806: the restart's sequence for bravo's old life ends in a
+  // the restart's sequence for bravo's old life ends in a
   // reuse spawn, held mid-call here; a destructive modify applied meanwhile
   // records bravo's key again (unmarked, so its step 1 writes nothing). The
   // reuse was decided before that recording, so its success sets no mark.
-  test('SRJ-806: a destructive modify of bravo, recorded with no mark, applied while its sequence\'s reuse spawn is in flight: the reuse succeeds with no mark set and answers spawned, with the in-flight line; the modify\'s bring-up then begins the new life and sets the mark', async () => {
+  test('a destructive modify of bravo, recorded with no mark, applied while its sequence\'s reuse spawn is in flight: the reuse succeeds with no mark set and answers spawned, with the in-flight line; the modify\'s bring-up then begins the new life and sets the mark', async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -1483,7 +1483,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     await gate.entered
     await run.stop()
 
-    // b.omv SR-7.6: install the hold before start, because extra provenance
+    // install the hold before start, because extra provenance
     // reads can let the sequence reach reuse before startDetecting returns.
     const restarted = h.build(REAL_LAUNCH)
     let first = true
@@ -1551,10 +1551,10 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
 })
 
 // ---------------------------------------------------------------------------
-// Step order (b.av2 SR-8.6, SR-6.6)
+// Step order
 // ---------------------------------------------------------------------------
 
-describe('step order: every teardown settles before any bring-up starts (b.av2 SR-8.6, SR-6.6)', () => {
+describe('step order: every teardown settles before any bring-up starts', () => {
   /** alpha, bravo and delta running; the change removes bravo and delta, rotates alpha's token and adds echo and foxtrot. */
   async function removeTwoAddTwo() {
     const { run, personas } = await running(['alpha', 'bravo', 'delta'])
@@ -1615,7 +1615,7 @@ describe('step order: every teardown settles before any bring-up starts (b.av2 S
 })
 
 // ---------------------------------------------------------------------------
-// In-place updates (AC 58; b.av2 SR-8.6 step 3)
+// In-place updates (step 3)
 // ---------------------------------------------------------------------------
 
 /** Channel IDs no persona has at the start (`h.persona` assigns `C0RLD001`, `C0RLD002`, …). */
@@ -1625,7 +1625,7 @@ const OTHER_CHANNEL = 'C0RLDEXTRA2'
 const CONTACT = 'U0RLDCONTACT1'
 const NEW_CONTACT = 'U0RLDCONTACT2'
 
-/** The in-place settings whose change forgets the persona's cached DM conversation (Director decision 11). */
+/** The in-place settings whose change forgets the persona's cached DM conversation. */
 const DM_DESTINATION_SETTINGS: readonly InPlaceSetting[] = ['permission_prompts', 'dm.enabled', 'dm.contact']
 
 /** The channel `h.persona(name)` gives the persona (its own `all` channel and destination). */
@@ -1670,13 +1670,13 @@ function inPlaceLineStart(name: string, settings: readonly InPlaceSetting[]): st
   return `[slack] persona ${renderPersonaRef(name, h.key(name))}: updated in place (${settings.join(', ')})`
 }
 
-/** An MCP tool's posting-scope refusal naming the persona and `target` (b.av2 SR-5.1); its reason sentences are `tests/registry.test.ts`'s. */
+/** An MCP tool's posting-scope refusal naming the persona and `target`; its reason sentences are `tests/registry.test.ts`'s. */
 function expectRefused(result: { isError: boolean; text: string }, name: string, target: string): void {
   expect(result.isError).toBe(true)
   expect(result.text).toStartWith(`Persona ${renderPersonaRef(name, h.key(name))} may not target ${JSON.stringify(target)}`)
 }
 
-/** One b.av2 SR-8.6 in-place row: bravo's settings before and after, as overrides over `h.persona('bravo')` given its own channel. */
+/** One in-place row: bravo's settings before and after, as overrides over `h.persona('bravo')` given its own channel. */
 interface InPlaceRow {
   label: string
   before: (own: string) => Partial<PersonaInput>
@@ -1748,8 +1748,8 @@ const IN_PLACE_ROWS: InPlaceRow[] = [
   },
 ]
 
-describe('AC 58: an in-place change keeps the instance (b.av2 SR-8.6 step 3, the in-place row)', () => {
-  test.each(IN_PLACE_ROWS)('AC 58: $label on bravo beside alpha records exactly one in-place update, for bravo, and nothing else: no teardown, bring-up, launch, agent-director call, socket close or re-validation, the same MCP session, and alpha untouched (real composition)', async ({ before, after, settings }) => {
+describe('an in-place change keeps the instance (step 3, the in-place row)', () => {
+  test.each(IN_PLACE_ROWS)('$label on bravo beside alpha records exactly one in-place update, for bravo, and nothing else: no teardown, bring-up, launch, agent-director call, socket close or re-validation, the same MCP session, and alpha untouched (real composition)', async ({ before, after, settings }) => {
     const own = ownChannel('bravo')
     const { run, personas } = await running(['alpha', ['bravo', before(own)]], REAL_WITH_SESSIONS)
     const [alpha] = personas
@@ -1793,8 +1793,8 @@ describe('AC 58: an in-place change keeps the instance (b.av2 SR-8.6 step 3, the
   })
 })
 
-describe('AC 58: routing, posting scope and destinations follow the new values from the next event or post (real composition)', () => {
-  test("AC 58 channels: bravo gets events in its added channel and not in its removed one (unclaimed-channel logged), and the reply tool refuses the removed channel naming bravo and it while posting to the added one", async () => {
+describe('routing, posting scope and destinations follow the new values from the next event or post (real composition)', () => {
+  test("channels: bravo gets events in its added channel and not in its removed one (unclaimed-channel logged), and the reply tool refuses the removed channel naming bravo and it while posting to the added one", async () => {
     const own = ownChannel('bravo')
     const { run, personas } = await running(
       ['alpha', ['bravo', { channels: [{ id: own, delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }]],
@@ -1839,7 +1839,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
   test.each<{ from: 'all' | 'mentions'; to: 'all' | 'mentions' }>([
     { from: 'all', to: 'mentions' },
     { from: 'mentions', to: 'all' },
-  ])('AC 58 delivery: after bravo\'s channel goes from $from to $to, the next plain message is delivered or dropped by the new mode, and a mention is delivered', async ({ from, to }) => {
+  ])('delivery: after bravo\'s channel goes from $from to $to, the next plain message is delivered or dropped by the new mode, and a mention is delivered', async ({ from, to }) => {
     const own = ownChannel('bravo')
     const { run, personas } = await running(['alpha', ['bravo', { channels: [{ id: own, delivery: from }] }]], REAL_WITH_SESSIONS)
     const plainExpected = (mode: 'all' | 'mentions') => (mode === 'all' ? [{ chat_id: own, via: 'receive_all' }] : [])
@@ -1854,7 +1854,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
     expectNoPostNoLeak(run)
   })
 
-  test("AC 58 delivery: after bravo's copy of a channel it shares with alpha goes from all to mentions, alpha's next plain message there arrives as receive_all, not receive_all_shared, though alpha itself was not updated", async () => {
+  test("delivery: after bravo's copy of a channel it shares with alpha goes from all to mentions, alpha's next plain message there arrives as receive_all, not receive_all_shared, though alpha itself was not updated", async () => {
     const shared = ownChannel('alpha')
     const bravoWith = (delivery: 'all' | 'mentions'): Partial<PersonaInput> => ({
       channels: [{ id: ownChannel('bravo'), delivery: 'all' }, { id: shared, delivery }],
@@ -1901,7 +1901,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
       old: () => [`conversations.open ${CONTACT}`, `chat.postMessage ${stubOpenedDmId(CONTACT)}`],
       next: (own) => [`chat.postMessage ${own}`],
     },
-  ])('AC 58 permission_prompts: after bravo\'s destination moves to $label, the next notice posts to the new destination through bravo\'s client and nothing goes to the old one', async ({ before, after, old, next }) => {
+  ])('permission_prompts: after bravo\'s destination moves to $label, the next notice posts to the new destination through bravo\'s client and nothing goes to the old one', async ({ before, after, old, next }) => {
     const own = ownChannel('bravo')
     const { run, personas } = await running(['alpha', ['bravo', before(own)]], REAL_WITH_SESSIONS)
     expect(await noticeCalls(run, 'bravo')).toEqual(old(own))
@@ -1913,7 +1913,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
     assertNoLeak(run.captured())
   })
 
-  test("AC 58 dm.contact: the apply opens no conversation; the next notice opens the DM with the new contact on bravo's client and posts there, never to the conversation cached for the old contact", async () => {
+  test("dm.contact: the apply opens no conversation; the next notice opens the DM with the new contact on bravo's client and posts there, never to the conversation cached for the old contact", async () => {
     const dmTo = (contact: string): Partial<PersonaInput> => ({ dm: { enabled: true, contact }, permission_prompts: 'dm' })
     const { run, personas } = await running(['alpha', ['bravo', dmTo(CONTACT)]], REAL_WITH_SESSIONS)
     const oldDm = stubOpenedDmId(CONTACT)
@@ -1935,7 +1935,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
     assertNoLeak(run.captured())
   })
 
-  test("AC 58 permission_prompts: after bravo's destination moves from dm to a channel and back to dm, the next notice opens the DM again: an apply forgets the conversation cached before it (Director decision 11)", async () => {
+  test("permission_prompts: after bravo's destination moves from dm to a channel and back to dm, the next notice opens the DM again: an apply forgets the conversation cached before it", async () => {
     const own = ownChannel('bravo')
     const dmOn = { enabled: true, contact: CONTACT }
     const dm = stubOpenedDmId(CONTACT)
@@ -1955,7 +1955,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
     assertNoLeak(run.captured())
   })
 
-  test('AC 58 dm.enabled off: a DM on bravo\'s connection is dropped with one persona-dm-dropped line naming bravo, and the reply tool refuses a DM conversation and a user ID with no conversations.open', async () => {
+  test('dm.enabled off: a DM on bravo\'s connection is dropped with one persona-dm-dropped line naming bravo, and the reply tool refuses a DM conversation and a user ID with no conversations.open', async () => {
     const { run, personas } = await running(['alpha', ['bravo', { dm: { enabled: true, contact: CONTACT } }]], REAL_WITH_SESSIONS)
     const dm = makeDm().channel as string
     expect(await deliverTo(run, 'bravo', makeDm())).toEqual([{ chat_id: dm, via: 'dm' }])
@@ -1981,7 +1981,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
     assertNoLeak(run.captured({ allowedBefore, toDm, toUser }))
   })
 
-  test('AC 58 dm.enabled on: a DM on bravo\'s connection, dropped before the apply, is delivered after it with via "dm"', async () => {
+  test('dm.enabled on: a DM on bravo\'s connection, dropped before the apply, is delivered after it with via "dm"', async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const dm = makeDm().channel as string
     expect(await deliverTo(run, 'bravo', makeDm())).toEqual([])
@@ -1996,7 +1996,7 @@ describe('AC 58: routing, posting scope and destinations follow the new values f
   })
 })
 
-describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.6 steps 2, 3 and 6)', () => {
+describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 and 6)', () => {
   /** alpha, bravo and charlie running; the change removes charlie, adds a channel to bravo and adds delta. */
   async function removeModifyAdd() {
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
@@ -2012,7 +2012,7 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
     for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done))
   }
 
-  test("AC 58: with charlie's teardown held, bravo's in-place update does not start; with bravo's update held, delta's bring-up does not start; releasing each runs the next step, and reload-applied comes last", async () => {
+  test("with charlie's teardown held, bravo's in-place update does not start; with bravo's update held, delta's bring-up does not start; releasing each runs the next step, and reload-applied comes last", async () => {
     const { run, next } = await removeModifyAdd()
     const [bravoKey, charlieKey, deltaKey] = keysOf('bravo', 'charlie', 'delta')
     const teardown = run.lifecycle.hold('teardown', charlieKey)
@@ -2054,7 +2054,7 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
     expectNoPostNoLeak(run)
   })
 
-  test("AC 68: a removal, an in-place change, a credentials rotation and an addition in one apply run as teardown, then in-place update, then reconnect, then bring-up; with alpha's reconnect held, delta's bring-up does not start", async () => {
+  test("a removal, an in-place change, a credentials rotation and an addition in one apply run as teardown, then in-place update, then reconnect, then bring-up; with alpha's reconnect held, delta's bring-up does not start", async () => {
     const { run, next } = await removeModifyAdd()
     const [alphaKey, bravoKey, charlieKey, deltaKey] = keysOf('alpha', 'bravo', 'charlie', 'delta')
     h.rotateCredentials(next[0]!)
@@ -2122,8 +2122,8 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
   // other persona still settles, every later step still runs, and the apply finishes.
   test.each<{ label: string; op: LifecycleTimelineEntry['op']; failing: string; step: string }>([
     { label: 'step 2', op: 'teardown', failing: 'delta', step: '2 (teardowns)' },
-    { label: 'AC 58: step 3', op: 'update-in-place', failing: 'charlie', step: '3 (in-place-updates)' },
-    { label: 'AC 68: step 4', op: 'reconnect', failing: 'hotel', step: '4 (credentials-reconnects)' },
+    { label: 'step 3', op: 'update-in-place', failing: 'charlie', step: '3 (in-place-updates)' },
+    { label: 'step 4', op: 'reconnect', failing: 'hotel', step: '4 (credentials-reconnects)' },
     { label: 'step 6', op: 'bring-up', failing: 'foxtrot', step: '6 (bring-ups)' },
   ])("$label: when one $op rejects, it is logged once by the controller with its message redacted, the step's other persona still settles, the later steps still run, and the apply finishes", async ({ op, failing, step }) => {
     const { run, next } = await twoOfEach()
@@ -2179,11 +2179,11 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
   })
 })
 
-describe('AC 58: a persona that is not up is still updated in place, and nothing brings it up (b.av2 SR-8.6)', () => {
+describe('a persona that is not up is still updated in place, and nothing brings it up', () => {
   test.each<{ label: string; breakBravo: (bravo: PersonaInput) => void; outcome: PersonaBringUpOutcome }>([
     { label: 'retrying on a missing working directory', breakBravo: (bravo) => h.deleteWorkingDirectory(bravo), outcome: 'retrying' },
     { label: 'broken by a missing credentials file', breakBravo: (bravo) => h.deleteCredentials(bravo), outcome: 'broken' },
-  ])('AC 58: bravo $label, given a new channel, records one in-place update and no bring-up, teardown or retry reset; once up it routes by the new values (real composition)', async ({ breakBravo, outcome }) => {
+  ])('bravo $label, given a new channel, records one in-place update and no bring-up, teardown or retry reset; once up it routes by the new values (real composition)', async ({ breakBravo, outcome }) => {
     const own = ownChannel('bravo')
     const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS, ([, bravo]) => breakBravo(bravo!))
     const bravoKey = h.key('bravo')
@@ -2220,7 +2220,7 @@ describe('AC 58: a persona that is not up is still updated in place, and nothing
     expectNoPostNoLeak(run)
   })
 
-  test("AC 58 permission_prompts: a notice raised while bravo retries on a missing working directory is held; after the apply moves its destination and the directory appears, the retry brings it up and the notice posts once, to the new destination, never the old (real composition)", async () => {
+  test("permission_prompts: a notice raised while bravo retries on a missing working directory is held; after the apply moves its destination and the directory appears, the retry brings it up and the notice posts once, to the new destination, never the old (real composition)", async () => {
     const own = ownChannel('bravo')
     const channels = [{ id: own, delivery: 'all' as const }, { id: EXTRA_CHANNEL, delivery: 'all' as const }]
     const { run, personas } = await running(['alpha', ['bravo', { channels }]], { realLifecycle: true }, ([, bravo]) =>
@@ -2253,8 +2253,8 @@ describe('AC 58: a persona that is not up is still updated in place, and nothing
 })
 
 // ---------------------------------------------------------------------------
-// Credentials changes (AC 68; b.av2 SR-8.6 step 4, step 6's extra case and the
-// credentials row, SR-3.3 reconnect part, SR-6.4 recovery, SR-1.4 apply part)
+// Credentials changes (step 4, step 6's extra case and the
+// credentials row reconnect partrecoveryapply part)
 // ---------------------------------------------------------------------------
 
 /** A persona's bot identity as the manager and a stub name it. */
@@ -2289,8 +2289,8 @@ function socketActivitySince(run: ReloadRun, name: string, from: number): string
   return run.socketActivity(name).slice(from)
 }
 
-describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 SR-8.6 step 4, the credentials row)', () => {
-  test("AC 68: bravo's token rotated in the same file and confirmed records exactly one reconnect for bravo: the new connection opens before the old closes, its identity comes from the new auth.test (another bot and app), its instance and MCP session are kept, and alpha gets no lifecycle call and no auth.test (real composition)", async () => {
+describe('a confirmed token rotation reconnects only that persona (step 4, the credentials row)', () => {
+  test("bravo's token rotated in the same file and confirmed records exactly one reconnect for bravo: the new connection opens before the old closes, its identity comes from the new auth.test (another bot and app), its instance and MCP session are kept, and alpha gets no lifecycle call and no auth.test (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const [, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -2395,7 +2395,7 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
     assertNoLeak(run.captured())
   })
 
-  test("AC 68: a reconnect whose start() never settles holds the apply at step 4 until 10 s on the fake clock, while alpha keeps delivering its events; then it is abandoned, the old connection stays open and in use, the reconnect retries (complete for step order), step 5 refreshes the template once (the added persona brings a new config directory), step 6 then brings up the persona added in the same apply, alpha gets no lifecycle call and its Slack side is untouched, and a later tick detects and previews a further edit", async () => {
+  test("a reconnect whose start() never settles holds the apply at step 4 until 10 s on the fake clock, while alpha keeps delivering its events; then it is abandoned, the old connection stays open and in use, the reconnect retries (complete for step order), step 5 refreshes the template once (the added persona brings a new config directory), step 6 then brings up the persona added in the same apply, alpha gets no lifecycle call and its Slack side is untouched, and a later tick detects and previews a further edit", async () => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const [alpha, bravo] = personas
     const [bravoKey, deltaKey] = keysOf('bravo', 'delta')
@@ -2465,7 +2465,7 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
     expect(run.connections.manager.identity(bravoKey)).toEqual(oldIdentity)
     expect(run.currentStub('bravo')).toBe(run.stub('bravo'))
     expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${ownChannel('bravo')}`])
-    // Its next attempt is due on the SR-3.2 backoff's first step.
+    // Its next attempt is due on the backoff's first step.
     expect(run.clock.pending().map((t) => t.dueAt)).toContain(t0 + 15_000)
     alphaStillUntouched()
 
@@ -2522,7 +2522,7 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
   test.each<{ label: string; later: WebApiOutcome; swaps: boolean }>([
     { label: 'answers', later: { kind: 'ok' }, swaps: true },
     { label: 'refuses the new token', later: { kind: 'platform', error: 'invalid_auth' }, swaps: false },
-  ])("Slack unreachable for bravo's new file: the old connection stays while the new one retries on the SR-3.2 backoff and nothing is pending; when a later attempt $label, the swap completes or the change fails and is pending again, and alpha gets no lifecycle call and its Slack side is untouched", async ({ later, swaps }) => {
+  ])("Slack unreachable for bravo's new file: the old connection stays while the new one retries on the backoff and nothing is pending; when a later attempt $label, the swap completes or the change fails and is pending again, and alpha gets no lifecycle call and its Slack side is untouched", async ({ later, swaps }) => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const [, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -2699,7 +2699,7 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
   })
 })
 
-describe('step 6 brings up a credentials-broken persona whose credentials changed (b.av2 SR-8.6 step 6, SR-6.4 recovery)', () => {
+describe('step 6 brings up a credentials-broken persona whose credentials changed (step 6recovery)', () => {
   interface RecoveryRow {
     label: string
     opts: RunningOptions
@@ -2782,7 +2782,7 @@ describe('step 6 brings up a credentials-broken persona whose credentials change
     expectNoPostNoLeak(run)
   })
 
-  test("Director decision 4: bravo, up when the apply's plan was built (a reconnect), is revoked while step 2 runs; step 4 re-checks it at step time and leaves it, and step 6 brings it up as a recovery with the new tokens (real composition)", async () => {
+  test("bravo, up when the apply's plan was built (a reconnect), is revoked while step 2 runs; step 4 re-checks it at step time and leaves it, and step 6 brings it up as a recovery with the new tokens (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'], REAL_WITH_SESSIONS)
     const [alpha, bravo] = personas
     const [bravoKey, charlieKey] = keysOf('bravo', 'charlie')
@@ -2814,7 +2814,7 @@ describe('step 6 brings up a credentials-broken persona whose credentials change
     expectNoPostNoLeak(run)
   })
 
-  test("Director decision 4, at the reconnect itself: bravo, up when step 4 chose it for a reconnect, is revoked by a Web API call while that reconnect waits to start; the reconnect finds it credentials-broken and leaves it, and step 6 brings it up as a recovery with the new tokens (real composition)", async () => {
+  test("The current rule, at the reconnect itself: bravo, up when step 4 chose it for a reconnect, is revoked by a Web API call while that reconnect waits to start; the reconnect finds it credentials-broken and leaves it, and step 6 brings it up as a recovery with the new tokens (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
     const { tokens, label } = h.rotateCredentials(personas[1]!)
@@ -2900,7 +2900,7 @@ describe('step 6 brings up a credentials-broken persona whose credentials change
   })
 })
 
-describe('b.av2 SR-1.4 at apply: a credentials file whose real path is another applied persona\'s', () => {
+describe('at apply: a credentials file whose real path is another applied persona\'s', () => {
   test('recovery after a record-start collision: alpha and bravo share a credentials file, so both are broken; a confirmed removal of alpha leaves bravo broken and untouched, and a byte change to the file, confirmed, brings bravo up at step 6 (real composition)', async () => {
     const [alpha, charlie] = [h.persona('alpha'), h.persona('charlie')]
     h.materialize(alpha, charlie)
@@ -3145,7 +3145,7 @@ describe('b.av2 SR-1.4 at apply: a credentials file whose real path is another a
 
 // ---------------------------------------------------------------------------
 // Destructive modifies, next-launch and server-wide settings, and step 5
-// (AC 59, 60, 61; b.av2 SR-8.6 table rows and step 5)
+// (60, 61table rows and step 5)
 // ---------------------------------------------------------------------------
 
 /**
@@ -3240,13 +3240,13 @@ function movedCredentials(bravo: PersonaInput, write = true): PersonaInput {
   return moved
 }
 
-describe('AC 60: a destructive modify tears the persona down at step 2 and brings it up fresh at step 6 (b.av2 SR-8.6, the credentials_file path and working_directory rows)', () => {
+describe('a destructive modify tears the persona down at step 2 and brings it up fresh at step 6 (the credentials_file path and working_directory rows)', () => {
   beforeEach(useConfigDirs)
 
   test.each<{ setting: 'working_directory' | 'credentials_file'; move: (bravo: PersonaInput) => PersonaInput }>([
     { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
     { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo) },
-  ])("AC 60: bravo's $setting moved, beside alpha, is previewed DESTRUCTIVE:, then exactly one teardown and one bring-up for bravo: its old row killed and kept, nothing deleted, then replaced by a reuse spawn of its id (never a resume) from the new declaration, its old connection closed before the new one opened, and no call of any kind for alpha (real launch)", async ({ setting, move }) => {
+  ])("bravo's $setting moved, beside alpha, is previewed DESTRUCTIVE:, then exactly one teardown and one bring-up for bravo: its old row killed and kept, nothing deleted, then replaced by a reuse spawn of its id (never a resume) from the new declaration, its old connection closed before the new one opened, and no call of any kind for alpha (real launch)", async ({ setting, move }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -3274,7 +3274,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
 
     // One teardown at step 2, then one bring-up at step 6, launched fresh; nothing else. Its key is retired by step 1,
     // so the launch is a reuse spawn of the same id over the row the teardown kept `ended`, which resets it to a new
-    // life (b.jg5 SRJ-715, SRJ-805, SRJ-806).
+    // life.
     expect(run.since(cp).lifecycle).toEqual([
       { op: 'teardown', key: bravoKey, via: 'apply' },
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
@@ -3318,7 +3318,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
   test.each<{ label: string; move: (bravo: PersonaInput) => PersonaInput; outcome: PersonaBringUpOutcome; cls: string; timers: number }>([
     { label: 'a new working directory that is missing', move: (bravo) => movedDirectory(bravo, false), outcome: 'retrying', cls: PERSONA_DIRECTORY_MISSING, timers: 1 },
     { label: 'a new credentials path that is missing', move: (bravo) => movedCredentials(bravo, false), outcome: 'broken', cls: PERSONA_CREDENTIALS_MISSING, timers: 0 },
-  ])('AC 60: bravo moved to $label is still torn down (its instance killed, nothing deleted), and its fresh bring-up ends $outcome under the startup rules, launching nothing, while alpha is untouched and nothing is pending (real composition)', async ({ move, outcome, cls, timers }) => {
+  ])('bravo moved to $label is still torn down (its instance killed, nothing deleted), and its fresh bring-up ends $outcome under the startup rules, launching nothing, while alpha is untouched and nothing is pending (real composition)', async ({ move, outcome, cls, timers }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [alpha, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -3342,7 +3342,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     expectNoPostNoLeak(run)
   })
 
-  test("AC 60: bravo's working directory moved and its token rotated in the same credentials file, confirmed together, records only a teardown and a bring-up (no reconnect), and the bring-up connects with the new tokens (real composition)", async () => {
+  test("bravo's working directory moved and its token rotated in the same credentials file, confirmed together, records only a teardown and a bring-up (no reconnect), and the bring-up connects with the new tokens (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -3385,7 +3385,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       timers: 1,
       fix: () => undefined,
     },
-  ])("AC 60: bravo $label, whose working directory is moved, is still torn down (its kept row killed, nothing deleted, any retry timer cancelled) and brought up fresh in the new directory; its old declaration never comes back (real launch)", async ({ breakBravo, outcome, timers, fix }) => {
+  ])("bravo $label, whose working directory is moved, is still torn down (its kept row killed, nothing deleted, any retry timer cancelled) and brought up fresh in the new directory; its old declaration never comes back (real launch)", async ({ breakBravo, outcome, timers, fix }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH, ([, bravo]) => {
       breakBravo(bravo!)
       h.seedRow(bravo!, { state: 'ended' })
@@ -3408,7 +3408,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
       { op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
     ])
-    // Its key retired by step 1: a reuse spawn of the same id over the row the teardown kept, never a resume (b.jg5 SRJ-805).
+    // Its key retired by step 1: a reuse spawn of the same id over the row the teardown kept, never a resume.
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ cwd: moved.working_directory })
     expect(run.clock.pendingCount()).toBe(0)
@@ -3425,7 +3425,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     expectNoPostNoLeak(run)
   })
 
-  test("AC 60: bravo's credentials reconnect from an earlier apply, still retrying, is cancelled by a later working-directory change's teardown: after its fresh bring-up, no further auth.test or start() for it on the fake clock", async () => {
+  test("bravo's credentials reconnect from an earlier apply, still retrying, is cancelled by a later working-directory change's teardown: after its fresh bring-up, no further auth.test or start() for it on the fake clock", async () => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -3479,7 +3479,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
         await run.clock.advance(3_600_000)
       },
     },
-  ])("AC 60: between the halves (bravo's step-2 teardown settled, its step-6 bring-up held), $label launches, reconnects and registers nothing; once released, exactly one spawn for its instance (real launch)", async ({ prepare, outcome, trigger }) => {
+  ])("between the halves (bravo's step-2 teardown settled, its step-6 bring-up held), $label launches, reconnects and registers nothing; once released, exactly one spawn for its instance (real launch)", async ({ prepare, outcome, trigger }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH, prepare)
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -3506,14 +3506,14 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     expect(run.connections.manager.status(bravoKey)).toBeUndefined()
     expect(run.isUp('bravo')).toBe(false)
     expect(run.admitSession('bravo').kind).toBe('not-up')
-    // The teardown killed its row and kept it (if it had one), `ended` and otherwise as it was: nothing deleted (b.jg5 SRJ-715).
+    // The teardown killed its row and kept it (if it had one), `ended` and otherwise as it was: nothing deleted.
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok'])
     expect(h.rowOf('bravo')).toEqual(rowBefore === undefined ? undefined : { ...rowBefore, state: 'ended' })
 
     gate.release()
     await applying
 
-    // The new half's one launch: its key retired by step 1, a reuse spawn of the same id over the kept row (b.jg5 SRJ-805).
+    // The new half's one launch: its key retired by step 1, a reuse spawn of the same id over the kept row.
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ cwd: moved.working_directory })
     expect(run.isUp('bravo')).toBe(true)
@@ -3525,7 +3525,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
     // Dry run reads no credentials file, so the new path need not exist.
     { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo, false) },
-  ])("AC 60 in dry run: bravo's $setting moved in the configuration file is still a destructive modify: previewed DESTRUCTIVE:, then one teardown that skips the agent-director kill (no delete exists) and one bring-up under the dry-run rules (no credentials read, no Slack client, a launch recorded), and alpha is untouched (real composition, dry run)", async ({ setting, move }) => {
+  ])("in dry run: bravo's $setting moved in the configuration file is still a destructive modify: previewed DESTRUCTIVE:, then one teardown that skips the agent-director kill (no delete exists) and one bring-up under the dry-run rules (no credentials read, no Slack client, a launch recorded), and alpha is untouched (real composition, dry run)", async ({ setting, move }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true, dryRun: true })
     const [alpha, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -3566,7 +3566,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
   })
 
   test.each<{ setting: 'working_directory' | 'credentials_file' }>([{ setting: 'working_directory' }, { setting: 'credentials_file' }])(
-    "AC 60 control:bravo's $setting written as a symlink to the same real path is no change: previewed with no effective change, and confirmed it records no teardown and no bring-up and logs reload-noop",
+    "control:bravo's $setting written as a symlink to the same real path is no change: previewed with no effective change, and confirmed it records no teardown and no bring-up and logs reload-noop",
     async ({ setting }) => {
       const { run, personas } = await running(['alpha', 'bravo'])
       const [alpha, bravo] = personas
@@ -3592,7 +3592,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-706 (AC 61): an apply is never held up by a live-row sequence,
+// an apply is never held up by a live-row sequence,
 // and a teardown stops the persona's sequence before its first
 // agent-director call
 //
@@ -3605,7 +3605,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
 // after the run is released.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a teardown stops the persona\'s sequence first (real launch)', () => {
+describe('an apply returns while a live-row sequence runs, and a teardown stops the persona\'s sequence first (real launch)', () => {
   /** bravo's sequence, started and held at its first run. */
   async function heldSequence(run: ReloadRun): Promise<{ hold: FindMissingHold; outcome: Promise<LiveRowSequenceOutcome> }> {
     const hold = run.composition!.holdFindMissing()
@@ -3637,7 +3637,7 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
     expect(h.rowOf('charlie')?.state).toBe('waiting')
 
     // Released, the run marks bravo's row missing: the sequence's step 6 is a reuse spawn of the same id over the
-    // finished row (b.jg5 SRJ-705, SRJ-707), which starts its new life.
+    // finished row, which starts its new life.
     const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
     hold.release(bravoMarkedMissing())
     expect(await outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: h.key('bravo'), action: 'spawned' } })
@@ -3649,7 +3649,7 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
 
   test.each<[string, (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[], string[]]>([
     ['a confirmed removal of bravo', (alpha) => [alpha], ['kill ok']],
-    // The new half's launch is a reuse spawn over the kept row: step 1 retired its key (b.jg5 SRJ-715, SRJ-805).
+    // The new half's launch is a reuse spawn over the kept row: step 1 retired its key.
     ['a destructive modify of bravo (its working directory moved)', (alpha, bravo) => [alpha, movedDirectory(bravo)], ['kill ok', 'reuse-spawn ok']],
   ])('%s while bravo\'s run is held: the teardown stops the sequence (at its submission and as its turn\'s step) before its first agent-director call, waits for the held run, and once it is released the sequence makes no further call; the apply then resolves', async (_label, next, instanceCalls) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
@@ -3688,7 +3688,7 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
 
 // ---------------------------------------------------------------------------
 
-// (b.jg5 SRJ-715, SRJ-808, SRJ-805; AC 35, AC 77)
+//
 //
 
 // many writes, apply-time timeline entries and agent-director calls the run
@@ -3699,7 +3699,7 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
 // waits on `run.clock`, moved to each wait as it is set.
 // ---------------------------------------------------------------------------
 
-/** The class of the log-only entry a persona teardown's ordinary kill-failure alert writes (b.jg5 SRJ-704). */
+/** The class of the log-only entry a persona teardown's ordinary kill-failure alert writes. */
 const TEARDOWN_ALERT_CLASS = selectKillFailureAlertRoute({
   version: KILL_FAILURE_VERSION_ORDINARY,
   context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
@@ -3728,7 +3728,7 @@ function callsOnSince(run: ReloadRun, id: string, from: number): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Apply step 1's old-life holds (b.jg5 SRJ-809, SRJ-812, SRJ-715; hatch A3)
+// Apply step 1's old-life holds (design A3)
 //
 // The run's one hold set is the controller's and, with the real launch path,
 // the session manager's (`run.oldLifeHolds`). How a hold ends and what it
@@ -3765,7 +3765,7 @@ function holdPersonaOf(persona: PersonaInput): { key: string; working_directory:
 /** The stub's kill answers, in order (each try takes the next). */
 type KillQueue = NonNullable<StubClientOptions['killQueue']>
 
-describe('b.jg5 SRJ-809: apply step 1 begins an old-life hold on each key it records, once the last-applied rewrite has succeeded', () => {
+describe('apply step 1 begins an old-life hold on each key it records, once the last-applied rewrite has succeeded', () => {
   test.each<{ label: string; seeded: boolean; change: (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[] }>([
     { label: 'a removal', seeded: false, change: (alpha) => [alpha] },
     { label: 'a removal of a key already recorded with no mark (step 1 writes nothing)', seeded: true, change: (alpha) => [alpha] },
@@ -3903,9 +3903,9 @@ describe('b.jg5 SRJ-809: apply step 1 begins an old-life hold on each key it rec
     expectNoPostNoLeak(run)
   })
 
-  // b.jg5 SRJ-810: the hold now refuses the launch. The wait the gate starts
+  // the hold now refuses the launch. The wait the gate starts
   // meets a CONFLICT at its kill here, so its round ends with the hold kept;
-  // how the wait goes on and ends is the SRJ-810/SRJ-811 block's.
+  // how the wait goes on and ends is the block's.
   test("a rename whose teardown kill fails leaves the old key's hold, marked kill-failed, on the working directory the new key names: the new key is recorded as waiting on it and held, its bring-up's launch answering sequence-waiting with no agent-director call on its id and its retry timer armed (real launch)", async () => {
     const killQueue: KillQueue = []
     const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
@@ -3974,8 +3974,8 @@ describe('b.jg5 SRJ-809: apply step 1 begins an old-life hold on each key it rec
 })
 
 // ---------------------------------------------------------------------------
-// What a hold refuses, end to end (b.jg5 SRJ-810, SRJ-811, SRJ-711 bullet 2,
-// SRJ-715, SRJ-1515; AC 54)
+// What a hold refuses, end to end (bullet 2,
+//)
 //
 // Real launch with the old-life wait installed (the harness's default): a launch the
 // old-life gate holds back starts the hold's wait (the live-row sequence's
@@ -4039,7 +4039,7 @@ function failedKills(n = KILL_RETRY_TRIES): KillQueue {
   return Array.from({ length: n }, () => cannedErr(errTmuxKillFailed()))
 }
 
-describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a directory an old life holds; once the old row reads ended or is listed missing, it comes up at once by a plain first spawn (real launch, AC 54)', () => {
+describe('no persona is brought up into a directory an old life holds; once the old row reads ended or is listed missing, it comes up at once by a plain first spawn (real launch)', () => {
   test.each<{ label: string; end: 'ended' | 'ids' }>([
     { label: "the old row set ended, read by the wait's next round", end: 'ended' },
     { label: "the old row, still live after the wait's next kill, listed in a find-missing run's ids", end: 'ids' },
@@ -4095,7 +4095,7 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
     // The old row ends: set ended, or listed in the next find-missing run's ids with the row still live.
     if (end === 'ended') h.seedRow(bravo!, { state: 'ended' })
     else {
-      // That round's kill answers kill_sent false (nothing was signalled), which ends nothing (SRJ-811):
+      // That round's kill answers kill_sent false (nothing was signalled), which ends nothing:
       // only the run's ids end the hold.
       rowSurvivesKill = true
       killQueue.push(cannedOk(cannedKillResult(false)))
@@ -4213,8 +4213,8 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
     expectNoPostNoLeak(next)
   })
 
-  // SRJ-810's exception: the hold step 1 begins on cscb_bravo is on the directory the new half names, and is on the
-  // new half's own row, so the old-life gate leaves the new half to the retired-key rule (SRJ-805).
+  // exception: the hold step 1 begins on cscb_bravo is on the directory the new half names, and is on the
+  // new half's own row, so the old-life gate leaves the new half to the retired-key rule.
   test("a destructive modify of credentials_file whose teardown kill fails: the new half, whose own row is the old life, goes through the live-row sequence with the retired-key flag; its own launch starts no old-life wait on cscb_<key> and records no waiter (real launch, the wait installed)", async () => {
     const killQueue: KillQueue = []
     const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
@@ -4256,13 +4256,13 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
 })
 
 // ---------------------------------------------------------------------------
-// A destructive modify of a latched persona (b.jg5 SRJ-504, AC 45)
+// A destructive modify of a latched persona
 // ---------------------------------------------------------------------------
 
 /**
  * The leftover refusal of a reuse spawn over a finished row (recorded `ended`; the row left as it was): what a
  * destructive modify's new half can meet, its key retired by step 1, so its launch is a reuse spawn of the id over
- * the row its old half's teardown killed and kept (b.jg5 SRJ-715, SRJ-805).
+ * the row its old half's teardown killed and kept.
  */
 const REUSE_LEFTOVER = REUSE_SPAWN_CONFLICT_CASE_ROWS.find(
   (row) => row.stubCase === 'leftover' && row.rowState.kind === 'read' && row.rowState.state === 'ended',
@@ -4277,7 +4277,7 @@ function postOf(call: StubWebCall): { channel: string; text: string } {
   return { channel, text }
 }
 
-describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its new half, which latches, with one post to its own destination, only if it meets the same CONFLICT itself (AC 45; real launch)', () => {
+describe('a destructive modify does not carry a latch over to its new half, which latches, with one post to its own destination, only if it meets the same CONFLICT itself (real launch)', () => {
   beforeEach(useConfigDirs)
 
   test.each<{ label: string; again: boolean }>([
@@ -4303,7 +4303,7 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
       refusedOperation: REUSE_LEFTOVER.refusedOperation,
       rowState: REUSE_LEFTOVER.rowState,
     })
-    // The old life's row, killed and kept by the teardown (b.jg5 SRJ-715); the refused reuse left it as it was.
+    // The old life's row, killed and kept by the teardown; the refused reuse left it as it was.
     expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     expect(run.episodeNotices).toEqual([{ key: bravoKey, text: REUSE_LEFTOVER.notice.text }])
     const posted = formatPersonaNotice({ name: 'bravo', key: bravoKey }, REUSE_LEFTOVER.notice.text)
@@ -4377,10 +4377,10 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
 })
 
 // ---------------------------------------------------------------------------
-// A destructive modify of a persona held on ErrInvalidFlags (b.jg5 SRJ-207, SRJ-715)
+// A destructive modify of a persona held on ErrInvalidFlags
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-207, SRJ-715: a destructive modify ends a held persona\'s ErrInvalidFlags hold at its old half\'s teardown, so its new half launches unheld, with no alert (real launch)', () => {
+describe('a destructive modify ends a held persona\'s ErrInvalidFlags hold at its old half\'s teardown, so its new half launches unheld, with no alert (real launch)', () => {
   beforeEach(useConfigDirs)
 
   test("bravo, held because its relaunch's reuse spawn answered ErrInvalidFlags, is destructively modified (working directory moved): the old half's teardown forgets the hold and posts nothing, the new half's bring-up launches bravo (not refused as held), and alpha gets no call", async () => {
@@ -4436,10 +4436,10 @@ describe('b.jg5 SRJ-207, SRJ-715: a destructive modify ends a held persona\'s Er
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
       { op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
     ])
-    // Its key retired by step 1: the new half's launch is a reuse spawn of the same id over the kept row (b.jg5 SRJ-715, SRJ-805).
+    // Its key retired by step 1: the new half's launch is a reuse spawn of the same id over the kept row.
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory })
-    // The hold forgotten in the teardown's first group and again once its launch in flight settled (b.jg5 SRJ-715).
+    // The hold forgotten in the teardown's first group and again once its launch in flight settled.
     expect(run.composition!.calls.slice(callsFrom).filter(([member]) => member === 'forgetInvalidFlagsHold')).toEqual([
       ['forgetInvalidFlagsHold', bravoKey],
       ['forgetInvalidFlagsHold', bravoKey],
@@ -4501,7 +4501,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
   })
 })
 
-describe('AC 59: a claude_config_dir change keeps the session until the next launch', () => {
+describe('a claude_config_dir change keeps the session until the next launch', () => {
   beforeEach(useConfigDirs)
 
   test.each<{
@@ -4510,7 +4510,7 @@ describe('AC 59: a claude_config_dir change keeps the session until the next lau
     change: () => Partial<PersonaInput>
     refresh: boolean
     nextLaunch: string[]
-    /** What the next launch answers: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in, b.4q8). */
+    /** What the next launch answers: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in). */
     answer: LaunchSessionResult
     /** The `config_dir` label the next launch must carry; default the strict label of the new directory. */
     label?: () => string
@@ -4537,7 +4537,7 @@ describe('AC 59: a claude_config_dir change keeps the session until the next lau
       label: () => configDirLabelValue(join(h.configDir('bravo-parent'), 'fresh', 'nested'), h.home),
       uncreated: true,
     },
-  ])("AC 59: bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session and row; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, answer, label: expectedLabel, uncreated }) => {
+  ])("bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session and row; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, answer, label: expectedLabel, uncreated }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -4595,7 +4595,7 @@ describe('AC 59: a claude_config_dir change keeps the session until the next lau
     expectNoPostNoLeak(run)
   })
 
-  test("b.g57: bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), has its Slack connection closed and its row kept; a confirmed change moving it to a directory that resolves does nothing at the apply; its 5 s re-check reads the applied declaration, not the one it was held with, reconnects it with its held credentials and replaces its row by a reuse of the same id in the new directory, deleting nothing; alpha is untouched (real launch)", async () => {
+  test("bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), has its Slack connection closed and its row kept; a confirmed change moving it to a directory that resolves does nothing at the apply; its 5 s re-check reads the applied declaration, not the one it was held with, reconnects it with its held credentials and replaces its row by a reuse of the same id in the new directory, deleting nothing; alpha is untouched (real launch)", async () => {
     const target = h.configDir('bravo-target')
     const link = configDirLink('bravo-link', target)
     const { run, personas } = await running(['alpha', ['bravo', { claude_config_dir: link }]], REAL_LAUNCH)
@@ -4662,7 +4662,7 @@ describe('AC 59: a claude_config_dir change keeps the session until the next lau
     expectNoPostNoLeak(run)
   })
 
-  test("b.g57: a confirmed change moving bravo's claude_config_dir to a directory that does not resolve (a dangling symlink) keeps its connection at the apply; its next launch holds it, closing its Slack connection and dropping its MCP session while its row is kept; a confirmed rotation while held opens no connection and is not pending again; once the directory appears it connects with the rotated credentials and is launched there (real launch)", async () => {
+  test("a confirmed change moving bravo's claude_config_dir to a directory that does not resolve (a dangling symlink) keeps its connection at the apply; its next launch holds it, closing its Slack connection and dropping its MCP session while its row is kept; a confirmed rotation while held opens no connection and is not pending again; once the directory appears it connects with the rotated credentials and is launched there (real launch)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -4743,7 +4743,7 @@ describe('AC 59: a claude_config_dir change keeps the session until the next lau
   })
 })
 
-describe('AC 61: a changed inherited default leaves every instance undisturbed and reaches each inheriting persona at its next launch (b.av2 SR-8.6)', () => {
+describe('a changed inherited default leaves every instance undisturbed and reaches each inheriting persona at its next launch', () => {
   beforeEach(useConfigDirs)
 
   test.each<{
@@ -4758,7 +4758,7 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
     /** Each inheriting persona's next launch, and charlie's. */
     inheritorLaunch: string[]
     ownLaunch: string[]
-    /** What those launches answer: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in, b.4q8). */
+    /** What those launches answer: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in). */
     inheritorAnswer: LaunchSessionResult
     ownAnswer: LaunchSessionResult
     /** What each persona's next launch used: its spawn's config directory. */
@@ -4777,7 +4777,7 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
       ownAnswer: LAUNCH_RESUMED_UNREPORTED,
       launched: (name) => ({ claudeConfigDir: name === 'charlie' ? ownConfigDir('charlie') : h.configDir('default-new') }),
     },
-  ])('AC 61: the top-level $setting changed, inherited by alpha and bravo and overridden by charlie, is previewed as one line listing exactly alpha and bravo, records no teardown, bring-up or reconnect, and each inheritor\'s next launch uses the new default while charlie\'s keeps its own (real launch)', async ({ setting, before, after, inherit, own, refresh, inheritorLaunch, ownLaunch, inheritorAnswer, ownAnswer, launched }) => {
+  ])('the top-level $setting changed, inherited by alpha and bravo and overridden by charlie, is previewed as one line listing exactly alpha and bravo, records no teardown, bring-up or reconnect, and each inheritor\'s next launch uses the new default while charlie\'s keeps its own (real launch)', async ({ setting, before, after, inherit, own, refresh, inheritorLaunch, ownLaunch, inheritorAnswer, ownAnswer, launched }) => {
     const names = ['alpha', 'bravo', 'charlie']
     const { run, personas } = await running([['alpha', inherit], ['bravo', inherit], ['charlie', own]], { ...REAL_LAUNCH, top: before() })
     const snapshot = () =>
@@ -4818,11 +4818,11 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
   })
 })
 
-describe('AC 61: a changed server-wide setting is recorded and takes effect at the next server start (b.av2 SR-8.6, the server-wide row)', () => {
+describe('a changed server-wide setting is recorded and takes effect at the next server start (the server-wide row)', () => {
   test.each<{ setting: 'port' | 'reply_chunk_limit'; before: number; after: number }>([
     { setting: 'port', before: 3101, after: 3102 },
     { setting: 'reply_chunk_limit', before: 3000, after: 1200 },
-  ])('AC 61: $setting changed is listed in the preview; confirmed, it makes no lifecycle call, is recorded, counts as an effective change, and the running server keeps its start-time value until a fresh start over the same directories runs the new one', async ({ setting, before, after }) => {
+  ])('$setting changed is listed in the preview; confirmed, it makes no lifecycle call, is recorded, counts as an effective change, and the running server keeps its start-time value until a fresh start over the same directories runs the new one', async ({ setting, before, after }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { top: { [setting]: before } as TopLevel })
     expect(run.serverConfig()![setting]).toBe(before)
     const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
@@ -4858,7 +4858,7 @@ describe('AC 61: a changed server-wide setting is recorded and takes effect at t
   })
 })
 
-describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-11)', () => {
+describe('step 5: the agent-director template refresh (step 5)', () => {
   beforeEach(useConfigDirs)
 
   /** The top-level default charlie inherits. */
@@ -4975,7 +4975,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     writeFileSync(prompt, 'be brief\n')
     const startTop: TopLevel = { mcp_config_path: join(h.root, 'mcp-start.json'), system_prompt_mode: 'append', append_system_prompt_file: prompt }
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true, top: startTop })
-    // b.omv SR-7.2: the template always appends the generated prompt; an
+    // the template always appends the generated prompt; an
     // operator file's later absence cannot change the installed arguments.
     rmSync(prompt)
     const installed = run.composition!.installedTemplate!
@@ -4995,10 +4995,10 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     expectNoPostNoLeak(run)
   })
 
-  // b.b1j SR-1.3, SR-2.3, SR-3: fresh_system_prompt is a start-time server-wide
+  // fresh_system_prompt is a start-time server-wide
   // setting. A confirmed change of only it is recorded; the running server keeps
   // `true` and the template it installed (the pair); the next start runs `false`.
-  test("a confirmed change of only fresh_system_prompt to false is recorded and makes no template call or lifecycle operation: the running server keeps true and the installed pair, and the next start installs the template without it (b.b1j SR-1.3, SR-2.3, SR-3; real composition)", async () => {
+  test("a confirmed change of only fresh_system_prompt to false is recorded and makes no template call or lifecycle operation: the running server keeps true and the installed pair, and the next start installs the template without it (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const installed = run.composition!.installedTemplate!
     expect(installed.agent_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
@@ -5073,7 +5073,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     expectNoPostNoLeak(run)
   })
 
-  test("step 5 settles before step 6: with the refresh held, delta, added with a new directory, is not brought up; released, the makeTemplate call comes before delta's spawn, so it launches with the refreshed template (real launch; E12 Task 2's interim gap closed)", async () => {
+  test("step 5 settles before step 6: with the refresh held, delta, added with a new directory, is not brought up; released, the makeTemplate call comes before delta's spawn, so it launches with the refreshed template (real launch; section 2's interim gap closed)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const deltaKey = h.key('delta')
     const candidate = withDelta(personas)
@@ -5177,7 +5177,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
 })
 
 // ---------------------------------------------------------------------------
-// AC 20 at apply: no credential value anywhere (b.av2 SR-10.3, SR-13.4)
+// at apply: no credential value anywhere
 // ---------------------------------------------------------------------------
 
 /**
@@ -5200,7 +5200,7 @@ function plainSentinelError(): Error {
   })
 }
 
-describe('AC 20 at apply: no credential value in any log line, error, notice, tool result or server-written file (b.av2 SR-10.3)', () => {
+describe('at apply: no credential value in any log line, error, notice, tool result or server-written file', () => {
   /** Rejections that escaped during the case (a test-scoped listener, removed in `afterEach`). */
   let rejections: unknown[]
   const onRejection = (reason: unknown) => void rejections.push(reason)
@@ -5260,7 +5260,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     expect(applied[0]).not.toContain('app_token')
   }
 
-  test('AC 20 control: the sweep fails when a file the server could have written under the temp directory holds the sentinel, and passes once it is gone', async () => {
+  test('control: the sweep fails when a file the server could have written under the temp directory holds the sentinel, and passes once it is gone', async () => {
     const { run, personas } = await running(['alpha'])
     const stray = join(h.stateDir, 'stray.log')
     writeFileSync(stray, `left behind ${fakeToken(BOT_TOKEN_PREFIX, 'stray')}\n`)
@@ -5291,7 +5291,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     after?: (run: ReloadRun, t0: number) => Promise<unknown>
     /** The class of the one failure line. */
     cls: string
-    /** The change is pending again afterwards (a failed credentials change, b.av2 SR-8.3). */
+    /** The change is pending again afterwards (a failed credentials change). */
     pendingAgain: boolean
     /** A Slack-unreachable episode opened (and ended with a cleared line) before the refusal. */
     unreachable?: boolean
@@ -5393,7 +5393,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     },
   ]
 
-  test.each(CONTACT_ROWS)('AC 20: $label: one failure line names the persona, its personas[i] entry, the path and the Slack error code, and no captured line, error, record, pending file or other server-written file holds the sentinel or a token-like value; alpha is untouched (real composition)', async ({ opts, change, after, cls, pendingAgain, unreachable }) => {
+  test.each(CONTACT_ROWS)('$label: one failure line names the persona, its personas[i] entry, the path and the Slack error code, and no captured line, error, record, pending file or other server-written file holds the sentinel or a token-like value; alpha is untouched (real composition)', async ({ opts, change, after, cls, pendingAgain, unreachable }) => {
     const { run, personas } = await running(['alpha', 'bravo'], opts)
     const alphaUntouched = watchUntouched(run, 'alpha')
     const { named, index, files } = change(personas)
@@ -5438,7 +5438,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
       content: () => ({ [fakeToken(BOT_TOKEN_PREFIX, 'key')]: fakeToken(APP_TOKEN_PREFIX, 'value') }),
       cause: '1 unexpected key (only bot_token and app_token are allowed)',
     },
-  ])("AC 20: bravo's confirmed credentials file, locally invalid with the sentinel in the offending content ($label): the change-failed line describes the key and rule only, and the pending file rewritten on the next tick carries bravo's credentials line with no value (real composition)", async ({ content, cause }) => {
+  ])("bravo's confirmed credentials file, locally invalid with the sentinel in the offending content ($label): the change-failed line describes the key and rule only, and the pending file rewritten on the next tick carries bravo's credentials line with no value (real composition)", async ({ content, cause }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [, bravo] = personas
     const alphaUntouched = watchUntouched(run, 'alpha')
@@ -5466,7 +5466,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     sweep(run, credentialsFilesOf(...personas))
   })
 
-  test("AC 20: the unhandled-rejection leg at apply: bravo's reconnect start() never settles, is abandoned at 10 s and then rejects with a sentinel-bearing error, and at the later swap the old socket's disconnect() rejects the same way; no rejection escapes, later ticks run, and nothing logged leaks", async () => {
+  test("the unhandled-rejection leg at apply: bravo's reconnect start() never settles, is abandoned at 10 s and then rejects with a sentinel-bearing error, and at the later swap the old socket's disconnect() rejects the same way; no rejection escapes, later ticks run, and nothing logged leaks", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -5528,7 +5528,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     sweep(run, credentialsFilesOf(...personas))
   })
 
-  test("AC 20: a Web API call rejected during an apply (b.ujn): bravo's bot token revoked while its confirmed reconnect waits; the persona-credentials-refused line gives the Web API cause (method and Slack error code), a later call through the client a consumer holds is refused locally (WebApiCallRefusedLocallyError), and the recovery that follows logs its lifecycle lines, none holding a value (real composition)", async () => {
+  test("a Web API call rejected during an apply: bravo's bot token revoked while its confirmed reconnect waits; the persona-credentials-refused line gives the Web API cause (method and Slack error code), a later call through the client a consumer holds is refused locally (WebApiCallRefusedLocallyError), and the recovery that follows logs its lifecycle lines, none holding a value (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const [, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -5603,7 +5603,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
       },
       lines: 4,
     },
-  ])("AC 20: bravo's confirmed rotation $label: its $lines lifecycle line(s) and the manager's unreachable lines are logged, none holding a value (real composition)", async ({ slack, drive, lines }) => {
+  ])("bravo's confirmed rotation $label: its $lines lifecycle line(s) and the manager's unreachable lines are logged, none holding a value (real composition)", async ({ slack, drive, lines }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const [, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -5632,7 +5632,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     { label: 'rewrites the template', line: '[slack] template refresh: rewrote ' },
     // Its message holds a fake token: only a token-free rendering of it may be logged.
     { label: 'fails with a sentinel-bearing error', fail: () => sentinelError('makeTemplate'), line: '[slack] template refresh: refreshing ' },
-  ])('AC 20: step 5 $label: its one template refresh line, the makeTemplate params and every file hold no value (real composition)', async ({ fail, line }) => {
+  ])('step 5 $label: its one template refresh line, the makeTemplate params and every file hold no value (real composition)', async ({ fail, line }) => {
     await useConfigDirs()
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const delta = h.persona('delta')
@@ -5653,7 +5653,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     sweep(run, credentialsFilesOf(...personas, delta))
   })
 
-  test("AC 20: a teardown step before its turn fails with a sentinel-bearing error (bravo's destructive modify): the \"before its turn failed\" line renders its message redacted, and the teardown and fresh bring-up still complete (real composition)", async () => {
+  test("a teardown step before its turn fails with a sentinel-bearing error (bravo's destructive modify): the \"before its turn failed\" line renders its message redacted, and the teardown and fresh bring-up still complete (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -5698,7 +5698,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     sweep(run, credentialsFilesOf(...personas))
   })
 
-  test("AC 20: delta, added with a claude_config_dir that does not resolve (a dangling symlink), is held at its apply bring-up (persona-config-dir-unresolvable) and never connects; its confirmed rotation opens no connection, is taken (not pending again) and is what it connects with once the directory resolves, then the cleared line and its launch follow; nothing holds a value (real launch)", async () => {
+  test("delta, added with a claude_config_dir that does not resolve (a dangling symlink), is held at its apply bring-up (persona-config-dir-unresolvable) and never connects; its confirmed rotation opens no connection, is taken (not pending again) and is what it connects with once the directory resolves, then the cleared line and its launch follow; nothing holds a value (real launch)", async () => {
     await useConfigDirs()
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const deltaKey = h.key('delta')
@@ -5759,8 +5759,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
 })
 
 // ---------------------------------------------------------------------------
-// The channel modes at apply (b.deo SRI-201, SRI-203, SRI-403, SRI-406 to
-// SRI-410, SRI-502, SRI-703, SRI-802, SRI-804, SRI-805)
+// The channel modes at apply
 //
 // The mode rig: alpha and bravo, each with both sections (its own listed
 // `all` channel, which is also its declarative destination, and a fungible
@@ -5781,7 +5780,7 @@ function fungibleDestinationOf(name: string): string {
   return `C0FUNG${h.key(name).toUpperCase().replace(/[^A-Z0-9]/g, '')}`
 }
 
-/** The switch in file form for `mode`, written either way, so each direction changes its resolved value (b.deo SRI-101). */
+/** The switch in file form for `mode`, written either way, so each direction changes its resolved value. */
 function switchTop(mode: ChannelMode): TopLevel {
   return { [MODE_SWITCH_SETTING]: mode === 'fungible' }
 }
@@ -5894,13 +5893,13 @@ function acceptedText(channel: string, delivery: DeliveryMode): { isError: boole
   return { isError: false, text: channelDeliverySetResultText(channel, delivery, { delivery, heldByLoopGuard: false }) }
 }
 
-/** The persona's `persona-invited-channel` lines (one per life and channel heard, b.deo SRI-307). */
+/** The persona's `persona-invited-channel` lines (one per life and channel heard). */
 function invitedLines(run: ReloadRun, name: string): string[] {
   return run.logsOf(PERSONA_INVITED_CHANNEL).filter((line) => line.includes(renderPersonaRef(name, h.key(name))))
 }
 
 /**
- * The rig's leak check (b.deo SRI-907): `assertNoLeak` over
+ * The rig's leak check: `assertNoLeak` over
  * every run the case built (its logs, writer calls and the files they wrote,
  * Slack calls, lifecycle records), `extra`, and the stored-choice file's
  * bytes when it exists.
@@ -5938,8 +5937,8 @@ function watchKept(run: ReloadRun, names: readonly string[] = MODE_RIG): () => v
 
 const OTHER_MODE: Readonly<Record<ChannelMode, ChannelMode>> = { declarative: 'fungible', fungible: 'declarative' }
 
-describe('b.deo SRI-201, SRI-203, SRI-805: a confirmed switch change applies in place, at once, and keeps every session (b.av2 SR-8.6, the server-wide row)', () => {
-  test('b.deo SRI-201: after one confirmed change of the switch and port, the configuration in effect holds the confirmed switch and the start-time port, while the record and the applied configuration hold both new values', async () => {
+describe('a confirmed switch change applies in place, at once, and keeps every session (the server-wide row)', () => {
+  test('after one confirmed change of the switch and port, the configuration in effect holds the confirmed switch and the start-time port, while the record and the applied configuration hold both new values', async () => {
     const { run, personas } = await runningIn('declarative', { top: { port: 3101 } })
 
     await applyIn(run, 'fungible', personas, { port: 3102 })
@@ -5952,7 +5951,7 @@ describe('b.deo SRI-201, SRI-203, SRI-805: a confirmed switch change applies in 
   })
 
   test.each<{ from: ChannelMode }>([{ from: 'declarative' }, { from: 'fungible' }])(
-    'b.deo SRI-203: a switch-only confirmation from $from mode runs no teardown, bring-up, launch, reconnect or in-place update, keeps every session and connection by identity, and keeps the dedupe store: an event delivered before the change is not delivered again after it',
+    'a switch-only confirmation from $from mode runs no teardown, bring-up, launch, reconnect or in-place update, keeps every session and connection by identity, and keeps the dedupe store: an event delivered before the change is not delivered again after it',
     async ({ from }) => {
       const to = OTHER_MODE[from]
       const { run, personas } = await runningIn(from)
@@ -5978,7 +5977,7 @@ describe('b.deo SRI-201, SRI-203, SRI-805: a confirmed switch change applies in 
     },
   )
 
-  test('b.deo SRI-203, SRI-307: the heard set is kept: a channel bravo heard in fungible mode, with the switch then turned off and on again, is accepted by set_channel_delivery without being heard again, and logs no second persona-invited-channel line', async () => {
+  test('the heard set is kept: a channel bravo heard in fungible mode, with the switch then turned off and on again, is accepted by set_channel_delivery without being heard again, and logs no second persona-invited-channel line', async () => {
     const { run, personas } = await runningIn('fungible')
     expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
     expect(invitedLines(run, 'bravo')).toHaveLength(1)
@@ -5997,7 +5996,7 @@ describe('b.deo SRI-201, SRI-203, SRI-805: a confirmed switch change applies in 
     expectModeNoLeak()
   })
 
-  test("b.deo SRI-203, SRI-805: turned on, the next events follow fungible mode with no stored-choice file: an unlisted public or private channel's mention is delivered, bravo's listed delivery: all channel is served at mentions (listed values are not carried over), and set_channel_delivery accepts a channel bravo has heard", async () => {
+  test("turned on, the next events follow fungible mode with no stored-choice file: an unlisted public or private channel's mention is delivered, bravo's listed delivery: all channel is served at mentions (listed values are not carried over), and set_channel_delivery accepts a channel bravo has heard", async () => {
     const { run, personas } = await runningIn('declarative')
     const own = ownChannel('bravo')
     // Declarative: only the listed channel is served, at its listed delivery.
@@ -6020,7 +6019,7 @@ describe('b.deo SRI-201, SRI-203, SRI-805: a confirmed switch change applies in 
     expectModeNoLeak()
   })
 
-  test('b.deo SRI-203, SRI-805: turned off, a channel served only by the fungible path is no longer delivered (one unclaimed-channel line), the declarative section applies again, and set_channel_delivery is refused with the declarative refusal, writing nothing', async () => {
+  test('turned off, a channel served only by the fungible path is no longer delivered (one unclaimed-channel line), the declarative section applies again, and set_channel_delivery is refused with the declarative refusal, writing nothing', async () => {
     const { run, personas } = await runningIn('fungible')
     const own = ownChannel('bravo')
     expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'mention' }])
@@ -6052,7 +6051,7 @@ function withExtraListed(bravo: PersonaInput): PersonaInput {
   return { ...bravo, channels: [{ id: ownChannel('bravo'), delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }
 }
 
-describe('b.deo SRI-802, SRI-804, SRI-805: in-place and recorded section changes at confirmation (b.av2 SR-8.6, the in-place row)', () => {
+describe('in-place and recorded section changes at confirmation (the in-place row)', () => {
   test.each<{ label: string; from: ChannelMode }>([
     { label: 'the switch turned on with it', from: 'declarative' },
     { label: 'in fungible mode, the switch unchanged (the in-place row)', from: 'fungible' },
@@ -6068,7 +6067,7 @@ describe('b.deo SRI-802, SRI-804, SRI-805: in-place and recorded section changes
     await applyIn(run, 'fungible', [alpha!, { ...bravo!, invited: { permission_prompts: NEW_FUNGIBLE_DESTINATION } }])
 
     expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: [FUNGIBLE_DESTINATION_SETTING] }])
-    // A change of the fungible destination forgets the cached DM conversation (b.deo SRI-703).
+    // A change of the fungible destination forgets the cached DM conversation.
     expect(run.composition!.calls.slice(calls)).toEqual([['destinations.forget', bravoKey]])
     expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
     expect(run.session('bravo')).toBe(session)
@@ -6104,7 +6103,7 @@ describe('b.deo SRI-802, SRI-804, SRI-805: in-place and recorded section changes
   test.each<{ label: string; mode: ChannelMode; edit: (bravo: PersonaInput) => PersonaInput }>([
     { label: 'a channels edit in fungible mode', mode: 'fungible', edit: withExtraListed },
     { label: 'an invited edit in declarative mode', mode: 'declarative', edit: (bravo) => ({ ...bravo, invited: { permission_prompts: NEW_FUNGIBLE_DESTINATION } }) },
-  ])('b.deo SRI-804: a confirmation whose only change is $label rewrites the last-applied record to the candidate and logs reload-noop, with no lifecycle operation and the delivery probe unchanged', async ({ mode, edit }) => {
+  ])('a confirmation whose only change is $label rewrites the last-applied record to the candidate and logs reload-noop, with no lifecycle operation and the delivery probe unchanged', async ({ mode, edit }) => {
     const { run, personas } = await runningIn(mode)
     const [alpha, bravo] = personas
     const own = ownChannel('bravo')
@@ -6129,7 +6128,7 @@ describe('b.deo SRI-802, SRI-804, SRI-805: in-place and recorded section changes
     expectModeNoLeak()
   })
 
-  test("b.deo SRI-804: after a recorded channels edit in fungible mode, turning the switch off delivers by the recorded entries", async () => {
+  test("after a recorded channels edit in fungible mode, turning the switch off delivers by the recorded entries", async () => {
     const { run, personas } = await runningIn('fungible')
     const [alpha, bravo] = personas
     const edited = [alpha!, withExtraListed(bravo!)]
@@ -6247,7 +6246,7 @@ function destinationLine(run: ReloadRun, mode: ChannelMode, failure: Destination
   })
 }
 
-describe('b.deo SRI-703: prompts and notices after a confirmed switch change go to the destination of the mode in force (b.av2 SR-7.1)', () => {
+describe('prompts and notices after a confirmed switch change go to the destination of the mode in force', () => {
   afterEach(() => {
     stopPermissionPoller()
     _resetPollerState()
@@ -6369,8 +6368,8 @@ async function restartOf(run: ReloadRun, opts: ReloadRunOptions = { realLifecycl
   return restarted
 }
 
-describe('b.deo SRI-410, SRI-403: the stored choice across restarts, relaunches and switch changes, and an unreadable file at apply', () => {
-  test('b.deo SRI-410: a choice stored through set_channel_delivery survives a restart: the first event from that channel afterwards is decided by it, the tool accepts a stored channel before it is heard again, and the choice still applies after a persona relaunch (real launch)', async () => {
+describe('the stored choice across restarts, relaunches and switch changes, and an unreadable file at apply', () => {
+  test('a choice stored through set_channel_delivery survives a restart: the first event from that channel afterwards is decided by it, the tool accepts a stored channel before it is heard again, and the choice still applies after a persona relaunch (real launch)', async () => {
     await useConfigDirs()
     const { run, personas } = await runningIn('fungible', REAL_LAUNCH_WITH_SESSIONS)
     for (const channel of [EXTRA_CHANNEL, OTHER_CHANNEL]) {
@@ -6390,7 +6389,7 @@ describe('b.deo SRI-410, SRI-403: the stored choice across restarts, relaunches 
     expect(await probe(restarted, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([])
     // A relaunch of bravo keeps the stored choice.
     h.seedRow(personas[1]!, { state: 'ended' })
-    // b.4q8: a resume is counted once its row reports in.
+    // a resume is counted once its row reports in.
     expect(await restarted.relaunch('bravo')).toBe(LAUNCH_RESUMED_UNREPORTED)
     expect(await probe(restarted, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
     expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all', [OTHER_CHANNEL]: 'mentions' })
@@ -6398,7 +6397,7 @@ describe('b.deo SRI-410, SRI-403: the stored choice across restarts, relaunches 
     expectModeNoLeak()
   })
 
-  test("b.deo SRI-410: with stored choices, the switch turned off and on through pending and confirm: while off, a channel listed at mentions and stored as all delivers by its listed entry and an unlisted channel with a stored choice is not delivered; once on, the stored choices apply again; no switch change writes the file", async () => {
+  test("with stored choices, the switch turned off and on through pending and confirm: while off, a channel listed at mentions and stored as all delivers by its listed entry and an unlisted channel with a stored choice is not delivered; once on, the stored choices apply again; no switch change writes the file", async () => {
     const own = ownChannel('bravo')
     const listedAtMentions: Partial<PersonaInput> = { channels: [{ id: own, delivery: 'mentions' }] }
     seedChoices([modePersona('bravo', listedAtMentions), { [own]: 'all', [EXTRA_CHANNEL]: 'all' }])
@@ -6428,7 +6427,7 @@ describe('b.deo SRI-410, SRI-403: the stored choice across restarts, relaunches 
     expectModeNoLeak()
   })
 
-  test('b.deo SRI-403: a declarative start over an unreadable stored-choice file whose bytes hold a stored all, then the switch turned on by a confirmed change: every channel is served at mentions, set_channel_delivery is refused with the unreadable refusal, and the file is never written', async () => {
+  test('a declarative start over an unreadable stored-choice file whose bytes hold a stored all, then the switch turned on by a confirmed change: every channel is served at mentions, set_channel_delivery is refused with the unreadable refusal, and the file is never written', async () => {
     const own = ownChannel('bravo')
     seedChoices([modePersona('bravo'), { [own]: 'all', [EXTRA_CHANNEL]: 'all' }])
     // The serialiser's record with an unknown version: every choice still in the bytes, the file refused.
@@ -6462,7 +6461,7 @@ async function expectAtMentions(run: ReloadRun, name: string, channel: string): 
 }
 
 /**
- * One way a confirmed apply retires a key (b.deo SRI-406): `second` is the
+ * One way a confirmed apply retires a key: `second` is the
  * persona running beside alpha with the stored choice, `change` the
  * personas confirmed, `fresh` the name of the persona the apply brings up in
  * its place, and `readd` whether a later apply adds `second` back instead (a
@@ -6501,9 +6500,9 @@ const RETIREMENTS: Retirement[] = [
   },
 ]
 
-describe('b.deo SRI-406, SRI-408, SRI-805 step 1: a confirmed apply drops the stored choices of the keys it retires, and writes an unwritten drop before it brings a key up', () => {
+describe('step 1: a confirmed apply drops the stored choices of the keys it retires, and writes an unwritten drop before it brings a key up', () => {
   test.each(RETIREMENTS)(
-    "b.deo SRI-406: $label drops the key's stored choices once the last-applied rewrite has succeeded, and the persona brought up fresh serves the channel at mentions",
+    "$label drops the key's stored choices once the last-applied rewrite has succeeded, and the persona brought up fresh serves the channel at mentions",
     async ({ second, change, fresh, readd }) => {
       seedChoices([modePersona(second), { [EXTRA_CHANNEL]: 'all' }])
       const { run, personas } = await runningIn('fungible', {}, {}, ['alpha', second])
@@ -6532,7 +6531,7 @@ describe('b.deo SRI-406, SRI-408, SRI-805 step 1: a confirmed apply drops the st
   test.each<{ label: string; change: (personas: PersonaInput[]) => PersonaInput[] }>([
     { label: 'a removal', change: ([alpha]) => [alpha!] },
     { label: 'a working_directory change', change: ([alpha, bravo]) => [alpha!, withMovedDirectory(bravo!)] },
-  ])("b.deo SRI-406, SRI-805: $label whose last-applied rewrite fails drops nothing: bravo's entries stay in memory and on disk, with no stored-choice write", async ({ change }) => {
+  ])("$label whose last-applied rewrite fails drops nothing: bravo's entries stay in memory and on disk, with no stored-choice write", async ({ change }) => {
     seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
     const { run, personas } = await runningIn('fungible')
     const bravoKey = h.key('bravo')
@@ -6579,7 +6578,7 @@ describe('b.deo SRI-406, SRI-408, SRI-805 step 1: a confirmed apply drops the st
     return { run }
   }
 
-  test('b.deo SRI-408: after a removal whose drop write failed, re-adding bravo writes the stored-choice record first, before the retired-key record and the last-applied rewrite; bravo is then served at mentions, and after a restart too', async () => {
+  test('after a removal whose drop write failed, re-adding bravo writes the stored-choice record first, before the retired-key record and the last-applied rewrite; bravo is then served at mentions, and after a restart too', async () => {
     const { run } = await removedWithFailedDrop()
     h.confirm()
     const applying = run.checkpoint()
@@ -6601,7 +6600,7 @@ describe('b.deo SRI-406, SRI-408, SRI-805 step 1: a confirmed apply drops the st
   test.each<{ label: string; failure: Partial<WriteFailure> }>([
     { label: 'a write failure', failure: { step: 'openSync' } },
     { label: 'an unsynced rename', failure: { step: 'fsyncSync', call: 2 } },
-  ])('b.deo SRI-408: that first write failing ($label) applies nothing: one reload-record-write-failed line names the stored-choice file, the retired-key record is not written, the change stays pending; after a restart and the change confirmed, bravo is served at mentions', async ({ failure }) => {
+  ])('that first write failing ($label) applies nothing: one reload-record-write-failed line names the stored-choice file, the retired-key record is not written, the change stays pending; after a restart and the change confirmed, bravo is served at mentions', async ({ failure }) => {
     const { run } = await removedWithFailedDrop()
     const fingerprint = h.pendingFingerprint()
     const retired = readRetiredKeysRecord(h.stateDir)
@@ -6635,7 +6634,7 @@ describe('b.deo SRI-406, SRI-408, SRI-805 step 1: a confirmed apply drops the st
     expectModeNoLeak()
   })
 
-  test("b.deo SRI-408: the stored-choice reload-record-write-failed line carries its class and names the stored-choice file and the last-applied record", () => {
+  test("the stored-choice reload-record-write-failed line carries its class and names the stored-choice file and the last-applied record", () => {
     const line = reloadChannelDeliveryWriteFailedLine(h.channelDeliveryFile, h.paths.lastApplied)
     expect(line).toStartWith(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: `)
     expect(line).toContain(JSON.stringify(h.channelDeliveryFile))
@@ -6643,9 +6642,9 @@ describe('b.deo SRI-406, SRI-408, SRI-805 step 1: a confirmed apply drops the st
   })
 })
 
-// The path "removed, then added back first" (SRI-408 before the bring-up) is
-// the SRI-408 cases above; the held-teardown window is the next block.
-describe("b.deo SRI-409: a retired key's stored choices never apply again, on each restart path, with the drop's write failing and a restart before any successful write", () => {
+// The path "removed, then added back first" (before the bring-up) is
+// the cases above; the held-teardown window is the next block.
+describe("a retired key's stored choices never apply again, on each restart path, with the drop's write failing and a restart before any successful write", () => {
   test("a destructive modify, the key still applied: the restart drops its choices by the changed declaration, and the new life serves the channel at mentions, before and after the restart (real launch)", async () => {
     await useConfigDirs()
     seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
@@ -6665,7 +6664,7 @@ describe("b.deo SRI-409: a retired key's stored choices never apply again, on ea
     const restarted = await restartOf(run, { realLaunch: true })
 
     // The retired-key record no longer holds the key (its entry is removed once the new life is seen running,
-    // b.jg5 SRJ-807), so only the declaration rule can drop it.
+    //), so only the declaration rule can drop it.
     expect([restarted.retiredKeys.isRecorded(bravoKey), restarted.retiredKeys.isMarked(bravoKey)]).toEqual([false, false])
     expect(restarted.logs).toContain(channelDeliveryDropLine(bravoKey, 1, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED))
     await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
@@ -6698,7 +6697,7 @@ describe("b.deo SRI-409: a retired key's stored choices never apply again, on ea
     expectModeNoLeak()
   })
 
-  test('modified, then modified back before any successful write: SRI-408\'s write runs before the bring-up and, failing, applies nothing; after a restart the channel is at mentions, and stays so once the change back is confirmed and the server restarted again', async () => {
+  test('modified, then modified back before any successful write: write runs before the bring-up and, failing, applies nothing; after a restart the channel is at mentions, and stays so once the change back is confirmed and the server restarted again', async () => {
     seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
     const { run, personas } = await runningIn('fungible')
     const [alpha, bravo] = personas
@@ -6749,7 +6748,7 @@ function storeAs(store: 'readable' | 'unreadable'): void {
   if (store === 'unreadable') h.writeChannelDeliveryBytes('{')
 }
 
-describe('b.deo SRI-409, SRI-502: the destructive-modify window with the teardown held', () => {
+describe('the destructive-modify window with the teardown held', () => {
   test("the key is retiring while its teardown is held, and the old session's call for a heard channel is refused and writes nothing; once step 2 has settled and the new half's session is registered, a call through the old session's kept entry is refused, the new half's call for a channel it heard is accepted, and the new half serves the old life's channel at mentions, before and after a restart (real launch)", async () => {
     await useConfigDirs()
     const { run, personas } = await runningIn('fungible', REAL_LAUNCH_WITH_SESSIONS)
@@ -6857,7 +6856,7 @@ describe('b.deo SRI-409, SRI-502: the destructive-modify window with the teardow
   })
 })
 
-describe('durable queues across confirmed persona changes (SR-3.7)', () => {
+describe('durable queues across confirmed persona changes', () => {
   test('three open items stay under a removed key; re-add restores their order and rename does not transfer them', async () => {
     const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const key = h.key('bravo')

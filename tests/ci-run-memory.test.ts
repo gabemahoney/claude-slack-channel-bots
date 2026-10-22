@@ -1,29 +1,29 @@
 /**
  * tests/ci-run-memory.test.ts — The sharded `/ci` runner's memory guard
- * (`scripts/ci-run.ts` section 11; b.uqm SR-21.6's memory file, E7).
+ * (`scripts/ci-run.ts` section 11memory file, ).
  *
  * One describe block per behaviour group:
- * - samples (b.uqm SR-7.3): timing on the fake clock, what a sample reads,
+ * - samples: timing on the fake clock, what a sample reads,
  *   the failed-reading counts, W before, at its peak and after cleanup, and
  *   each shard's result-file state;
- * - the stop line (b.uqm SR-7.4): its exact line with both ceiling sources and
+ * - the stop line: its exact line with both ceiling sources and
  *   the three per-shard detail forms, the byte boundary, `/ci-live` appearing
  *   mid-run, the PID named, rounding, and the stop decided once;
- * - anon peaks and peak PIDs (b.uqm SR-8.2);
- * - the cap rule (b.uqm SR-8.1, SR-8.3);
- * - the cap line and its `results.json` record (b.uqm SR-8.4, SR-16.1);
- * - out-of-memory detection and lines (b.uqm SR-12.2).
+ * - anon peaks and peak PIDs;
+ * - the cap rule;
+ * - the cap line and its `results.json` record;
+ * - out-of-memory detection and lines.
  *
  * The watchdog runs in process through its injected dependencies, over a
- * sample sequence (`buildSampleSequence`, E7's part of the readings builder)
- * on E6's cgroup tree and `/ci-live` builder and E1's fake container interface
+ * sample sequence (`buildSampleSequence`, part of the readings builder)
+ * on cgroup tree and `/ci-live` builder and fake container interface
  * and run-directory builder, all under a `mkdtempSync` root removed in
  * `afterEach`. Every wait is on `createFakeClock`; no case reads the host's
  * cgroups, another process's `/proc`, a real `/ci-live` lock or a real home,
  * or runs docker. The one child process is `mkfifo`, through
  * `tests/test-helpers/fifo.ts`. The runner's environment holds a credential
  * built with `fakeToken`, and everything a case produces passes `assertNoLeak`.
- * Runner constants are imported, never typed. The PRD's example figures and
+ * Runner constants are imported, never typed. The contract's example figures and
  * lines are typed only in the cases that pin them; no case assumes the cap's
  * current value. Real script names are looked up by number in the
  * repository's listing.
@@ -127,7 +127,7 @@ import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 
 /** Test data: every clock's start. */
 const START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
-/** Test data: L for every case that does not pin the PRD's 64 GiB, in GiB. */
+/** Test data: L for every case that does not pin the contract's 64 GiB, in GiB. */
 const LIMIT_GIB = 48
 /** Test data: a W well below any stop line here, in GiB. */
 const QUIET_W_GIB = 10
@@ -168,7 +168,7 @@ function gib(figure: number): number {
   return gibToBytes(figure)
 }
 
-/** The repository's real file name for script number `n`, looked up in its `tests/integration` listing (b.uqm SR-21.2). */
+/** The repository's real file name for script number `n`, looked up in its `tests/integration` listing. */
 function scriptFile(n: number): string {
   return realScriptFileName(n)
 }
@@ -291,7 +291,7 @@ function quiet(shards: readonly SampleShard[] = [], extra: Partial<SampleStep> =
   return { pod: { workingSet: QUIET_W_GIB , anon: QUIET_W_GIB }, shards, ...extra }
 }
 
-// Result-file events (b.uqm SR-11.3), built as data and written by the run-directory builder.
+// Result-file events, built as data and written by the run-directory builder.
 const started = (fileName: string): ResultEvent => ({ kind: 'start', fileName })
 const passed = (fileName: string): ResultEvent => ({ kind: 'end', fileName, result: 'pass', seconds: 12.5 })
 const notRun = (fileName: string): ResultEvent => ({ kind: 'notrun', fileName })
@@ -302,10 +302,10 @@ function allPassed(files: readonly string[]): ResultEvent[] {
 }
 
 // ---------------------------------------------------------------------------
-// Samples (b.uqm SR-7.3)
+// Samples
 // ---------------------------------------------------------------------------
 
-describe('samples (b.uqm SR-7.3)', () => {
+describe('samples', () => {
   test('nothing is read before start; then one sample every SAMPLE_INTERVAL_MS, each taken at its interval', async () => {
     const run = memoryRun({ shards: [1], steps: [quiet([{ shard: 1 }]), quiet([{ shard: 1 }]), quiet([{ shard: 1 }])] })
     await clock.advance(SAMPLE_INTERVAL_MS * 2)
@@ -679,7 +679,7 @@ describe('samples (b.uqm SR-7.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The stop line (b.uqm SR-7.4)
+// The stop line
 // ---------------------------------------------------------------------------
 
 /** The stop line's expected text from constructed values. */
@@ -702,7 +702,7 @@ function podStopLineBytes(limitBytes: number): number {
   return memoryCeiling(limitBytes, []).bytes - STOP_LINE_OFFSET_BYTES
 }
 
-describe('b.rmn: the watchdog gates non-reclaimable memory', () => {
+describe('the watchdog gates non-reclaimable memory', () => {
   test('high page cache stays below the gate, then high anon stops at the next sample', async () => {
     const run = memoryRun({ limit: 64, steps: [
       { pod: { workingSet: 60, anon: 4.7, activeFile: 44 } },
@@ -737,8 +737,8 @@ describe('b.rmn: the watchdog gates non-reclaimable memory', () => {
   })
 })
 
-describe('the stop line (b.uqm SR-7.4)', () => {
-  test('PRD line: W at the stop line of a 64 GiB pod limit stops the run with its exact line, the shards in shard order', async () => {
+describe('the stop line', () => {
+  test('contract line: W at the stop line of a 64 GiB pod limit stops the run with its exact line, the shards in shard order', async () => {
     const limit = gib(64)
     const run = memoryRun({
       limit: { bytes: limit },
@@ -895,10 +895,10 @@ describe('the stop line (b.uqm SR-7.4)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Anon peaks and peak PIDs (b.uqm SR-8.2)
+// Anon peaks and peak PIDs
 // ---------------------------------------------------------------------------
 
-describe('anon peaks and peak PIDs (b.uqm SR-8.2)', () => {
+describe('anon peaks and peak PIDs', () => {
   /** Shard 1's samples, one per anon figure (`unreadable`: its `memory.stat` is gone), each with its page cache. */
   function anonSteps(anons: readonly (number | 'unreadable')[], files: readonly number[]): SampleStep[] {
     if (anons.length === 0) return [quiet(), quiet()]
@@ -965,7 +965,7 @@ describe('anon peaks and peak PIDs (b.uqm SR-8.2)', () => {
     expect(peaks.anonPeak).toEqual(peak)
   })
 
-  // E1's FinalReading has no PID field, so peak PIDs come from samples only.
+  // FinalReading has no PID field, so peak PIDs come from samples only.
   test.each<{ name: string; pids: (number | 'unreadable')[]; peakPids: number | null }>([
     { name: 'the highest sample', pids: [3, 9, 5], peakPids: 9 },
     { name: 'the highest readable sample', pids: [4, UNREADABLE_READING, 2], peakPids: 4 },
@@ -999,7 +999,7 @@ describe('anon peaks and peak PIDs (b.uqm SR-8.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The cap rule (b.uqm SR-8.1, SR-8.3)
+// The cap rule
 // ---------------------------------------------------------------------------
 
 /** A shard as the cap rule takes it. */
@@ -1019,13 +1019,13 @@ function partial(bytes: number, pageCacheBytes: number | null = 0): ResultsAnonP
 
 const UNKNOWN: ResultsAnonPeak = { bytes: null, pageCacheBytes: null, mark: 'unknown' }
 
-describe('the cap rule (b.uqm SR-8.1, SR-8.3)', () => {
+describe('the cap rule', () => {
   test.each([
     [0.4, 2.0],
     [0.83, 2.0],
     [1.5, 2.5],
     [1.51, 3.0],
-  ])('PRD: a highest anon peak of %p GiB gives %p GiB', (peakGib, capGib) => {
+  ])('contract: a highest anon peak of %p GiB gives %p GiB', (peakGib, capGib) => {
     const result = capRule(SHARD_MEMORY_CAP_BYTES, [capShard(1, complete(gib(peakGib)))])
     expect(result.derivedBytes).toBe(gib(capGib))
     expect(result.source).toMatchObject({ shard: 1, peakBytes: gib(peakGib), fromKill: false })
@@ -1041,7 +1041,7 @@ describe('the cap rule (b.uqm SR-8.1, SR-8.3)', () => {
   })
 
   test.each([
-    { name: 'PRD: a kill at a 2.0 GiB cap with a 1.2 GiB recorded peak', capUsedGib: 2.0, peak: complete(gib(1.2)), countedGib: 2.0, capGib: 3.0 },
+    { name: 'contract: a kill at a 2.0 GiB cap with a 1.2 GiB recorded peak', capUsedGib: 2.0, peak: complete(gib(1.2)), countedGib: 2.0, capGib: 3.0 },
     { name: 'a kill whose recorded peak is above the cap used counts at that peak', capUsedGib: 2.5, peak: complete(gib(2.7)), countedGib: 2.7, capGib: 4.0 },
     { name: 'a kill with an unknown peak counts at the cap used', capUsedGib: 2.5, peak: UNKNOWN, countedGib: 2.5, capGib: 3.5 },
   ])('$name', ({ capUsedGib, peak, countedGib, capGib }) => {
@@ -1111,7 +1111,7 @@ describe('the cap rule (b.uqm SR-8.1, SR-8.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The cap line and its record (b.uqm SR-8.4, SR-16.1)
+// The cap line and its record
 // ---------------------------------------------------------------------------
 
 /** The cap report of a run, with the rule applied to its shards. */
@@ -1126,7 +1126,7 @@ function expectedCapLine(peak: string, shard: number, middle: string, cap: strin
   return `${CAP_LINE_PREFIX}${peak} GiB in ${SHARD_DIR_PREFIX}${shard} ${middle} + ${CAP_MARGIN_BYTES / GIB_BYTES} GiB margin → ${cap} GiB; current cap ${current} GiB${suffix}`
 }
 
-/** Asserts a record survives `results.json`'s strict shape: written and read back unchanged (b.uqm SR-16.1). */
+/** Asserts a record survives `results.json`'s strict shape: written and read back unchanged. */
 function expectRecordRoundTrips(record: ResultsCap): void {
   const parsed = parseResults(serializeResults(makeResults({ runId: RESULTS_RUN_ID, pid: RESULTS_PID, cap: record })))
   expect(parsed.ok).toBe(true)
@@ -1138,7 +1138,7 @@ function withShards(reason: string, shards: readonly number[]): string {
   return `${reason} (${shards.map((shard) => `${SHARD_DIR_PREFIX}${shard}`).join(CAP_LIST_SEPARATOR)})`
 }
 
-describe('the cap line and its record (b.uqm SR-8.4, SR-16.1)', () => {
+describe('the cap line and its record', () => {
   test('full form: peak and page cache rounded up to two decimals, both caps to one, the current cap the cap used', () => {
     const capUsed = gib(3)
     const peakBytes = gib(1.25) + 3
@@ -1159,7 +1159,7 @@ describe('the cap line and its record (b.uqm SR-8.4, SR-16.1)', () => {
     expect(report.line).toBe(expectedCapLine('1.25', 1, `(page cache ${text} GiB)`, '2.5', '2.5', ''))
   })
 
-  test('PRD kill form: a kill at a 2.0 GiB cap with a 1.2 GiB recorded peak prints the counted value and 3.0 GiB', () => {
+  test('contract kill form: a kill at a 2.0 GiB cap with a 1.2 GiB recorded peak prints the counted value and 3.0 GiB', () => {
     const report = capReportOf([], false, gib(2), [capShard(1, complete(gib(1.2), gib(0.4)), true)])
     expect(report.line).toBe(
       'cap from measured anon peak: 2.00 GiB in shard-1 (killed for out of memory at the cap) + 1 GiB margin → 3.0 GiB; current cap 2.0 GiB; source after out-of-memory kill in shard-1',
@@ -1226,7 +1226,7 @@ describe('the cap line and its record (b.uqm SR-8.4, SR-16.1)', () => {
     },
     { name: 'an unknown peak', args: () => [], passed: true, shards: [capShard(1, complete(gib(0.5))), capShard(4, UNKNOWN)], suffix: () => invalid(withShards(CAP_REASON_UNKNOWN, [4])) },
     {
-      name: "the PRD's example",
+      name: "the contract's example",
       args: () => ['--shards', '6'],
       passed: true,
       shards: [capShard(5, partial(gib(0.5))), capShard(2, partial(gib(0.4))), capShard(1, complete(gib(0.3)))],
@@ -1239,9 +1239,9 @@ describe('the cap line and its record (b.uqm SR-8.4, SR-16.1)', () => {
       shards: [capShard(4, UNKNOWN), capShard(2, partial(gib(0.4))), capShard(1, complete(gib(0.3)))],
       suffix: () => invalid(CAP_REASON_NOT_DEFAULT, CAP_REASON_NOT_PASSED, withShards(CAP_REASON_PARTIAL, [2]), withShards(CAP_REASON_UNKNOWN, [4])),
     },
-    { name: 'AC 52: a --shards 1 run with a kill', args: () => ['--shards', '1'], passed: false, shards: [capShard(1, complete(gib(0.5)), true)], suffix: () => '; not a valid cap source: not a default run, run did not pass' },
+    { name: 'a --shards 1 run with a kill', args: () => ['--shards', '1'], passed: false, shards: [capShard(1, complete(gib(0.5)), true)], suffix: () => '; not a valid cap source: not a default run, run did not pass' },
     {
-      name: 'AC 52: an --inject full run with a kill',
+      name: 'an --inject full run with a kill',
       args: () => ['--inject', `fail:${scriptFile(5)}`],
       passed: false,
       shards: [capShard(1, complete(gib(0.5))), capShard(2, complete(gib(0.6)), true)],
@@ -1264,10 +1264,10 @@ describe('the cap line and its record (b.uqm SR-8.4, SR-16.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Out-of-memory detection and lines (b.uqm SR-12.2)
+// Out-of-memory detection and lines
 // ---------------------------------------------------------------------------
 
-describe('out-of-memory detection and lines (b.uqm SR-12.2)', () => {
+describe('out-of-memory detection and lines', () => {
   const T1 = scriptFile(1)
   const T23 = scriptFile(23)
   const T7 = scriptFile(7)
@@ -1299,13 +1299,13 @@ describe('out-of-memory detection and lines (b.uqm SR-12.2)', () => {
     expect(line).toBe(killedShardLine(2))
   })
 
-  test('PRD line: a kill in a shard whose scripts all passed and that ended normally fails the shard', async () => {
+  test('contract line: a kill in a shard whose scripts all passed and that ended normally fails the shard', async () => {
     const ended = allPassed(ASSIGNED[3]!)
     const { line } = await oomOf({ steps: [quiet([{ shard: 3, resultFile: [started(T1)] }]), quiet([{ shard: 3, oomKilled: true, resultFile: ended }])], finals: { 3: {} } }, 3)
     expect(line).toBe('FAIL: shard-3: killed for out of memory')
   })
 
-  test('PRD line: a kill with test-23 in progress names the script and its shard', async () => {
+  test('contract line: a kill with test-23 in progress names the script and its shard', async () => {
     const { line } = await oomOf({ steps: [quiet([{ shard: 2, oomKillCount: 1, resultFile: [started(T1), passed(T1), started(T23)] }])], finals: { 2: {} } }, 2)
     expect(line).toBe(`FAIL: ${T23}: killed for out of memory in shard-2`)
   })
@@ -1344,7 +1344,7 @@ describe('out-of-memory detection and lines (b.uqm SR-12.2)', () => {
     expect(line).toBeNull()
   })
 
-  test('PRD line: neither final source readable and no earlier kill fails the shard as unreadable, even with every script passed', async () => {
+  test('contract line: neither final source readable and no earlier kill fails the shard as unreadable, even with every script passed', async () => {
     const { status, line } = await oomOf(
       { steps: [quiet([{ shard: 3, resultFile: allPassed(ASSIGNED[3]!) }])], finals: { 3: { oomKilled: UNREADABLE_READING, memoryEvents: 'unreadable' } } },
       3,

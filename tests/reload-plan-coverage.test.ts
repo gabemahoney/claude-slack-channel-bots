@@ -1,6 +1,6 @@
 /**
  * reload-plan-coverage.test.ts — Every key the loader accepts has a place in
- * the change plan (b.av2 SR-8.4, SR-8.6; b.deo SRI-101, SRI-802, SRI-803).
+ * the change plan.
  *
  * `src/reload-plan.ts` hand-lists the persona settings it compares in three
  * classes (`DESTRUCTIVE_SETTINGS`, `IN_PLACE_SETTINGS`,
@@ -15,10 +15,10 @@
  * until the plan classifies it.
  *
  * The plan classifies a persona change by the candidate's section in force
- * (b.deo SRI-802): the rows below give each class a change lands in when
+ * the rows below give each class a change lands in when
  * both configurations are in one mode, show that a change of the switch
  * alone, in each direction, modifies no persona, and that `false` written for
- * an absent switch is no change (SRI-101).
+ * an absent switch is no change.
  *
  * The wording of each class's preview line is pinned in
  * tests/reload-preview.test.ts; this file asserts only which class and which
@@ -138,8 +138,7 @@ function personaLeafSettings(): string[] {
 describe('every persona field the loader accepts is classified', () => {
   // When this fails after a key was added to PERSONA_ENTRY_KEYS,
   // PERSONA_DM_KEYS, PERSONA_INVITED_KEYS or CHANNEL_ENTRY_KEYS: decide what
-  // an edit of the new field does to a running persona (b.av2 SR-8.6, b.deo
-  // SRI-802) and add it to exactly one of
+  // an edit of the new field does to a running persona and add it to exactly one of
   // DESTRUCTIVE_SETTINGS (instance torn down and brought up),
   // IN_PLACE_SETTINGS (applied in place, with its comparison in
   // personaSectionChanges) or NEXT_LAUNCH_SETTINGS (takes effect at the next
@@ -222,7 +221,7 @@ describe('every top-level key the loader accepts is compared', () => {
   /**
    * The setting entry a change of only `key` gives: an inherited default
    * names the persona that inherits it; the switch names the mode it turns
-   * on and every persona present in both configurations (b.deo SRI-803).
+   * on and every persona present in both configurations.
    */
   function expectedSetting(key: string): ServerSettingChange {
     if ((NEXT_LAUNCH_SETTINGS as readonly string[]).includes(key) || key === 'stop_hook_bootstrap') return { name: key, inheritedBy: [ALPHA_REF] }
@@ -313,7 +312,7 @@ const PLAN_CLASSES = {
 } as const satisfies Record<string, readonly string[]>
 type PlanClass = keyof typeof PLAN_CLASSES
 
-describe('a persona change is classified by the section in force when both configurations are in one mode (b.deo SRI-802)', () => {
+describe('a persona change is classified by the section in force when both configurations are in one mode', () => {
   // Rows: the mode both configurations are in, alpha's entry before and
   // after, and the class and setting the change lands in. The declarative
   // rows of the 0.11.1 classes are in tests/reload-preview.test.ts; here only
@@ -373,7 +372,7 @@ describe('a persona change is classified by the section in force when both confi
   })
 })
 
-describe('a change of the switch alone modifies no persona, in each direction (b.deo SRI-802, SRI-203)', () => {
+describe('a change of the switch alone modifies no persona, in each direction', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
     ['absent to true', {}, { [MODE_SWITCH_SETTING]: true }],
     ['false to true', { [MODE_SWITCH_SETTING]: false }, { [MODE_SWITCH_SETTING]: true }],
@@ -395,7 +394,7 @@ describe('a change of the switch alone modifies no persona, in each direction (b
   })
 })
 
-describe('writing a key\'s default where it was absent (or removing it) is no effective change (b.deo SRI-101; b.b1j SR-1.1, SR-3)', () => {
+describe('writing a key\'s default where it was absent (or removing it) is no effective change', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
     ['the switch, absent to false', {}, { [MODE_SWITCH_SETTING]: false }],
     ['the switch, false to absent', { [MODE_SWITCH_SETTING]: false }, {}],

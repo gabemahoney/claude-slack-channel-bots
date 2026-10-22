@@ -6,7 +6,7 @@
  * - `atomicWriteFileSync`: the `.tmp` + rename write, for records such as
  *   server.port that are rewritten on startup.
  * - `durableWriteFileSync`: the atomic and durable write of the reload files
- *   beside the configuration file (b.av2 SR-8.1): a uniquely named temporary
+ * beside the configuration file: a uniquely named temporary
  *   file, fsync, rename, then fsync of the directory, so the new bytes
  *   survive a crash or power loss once it returns.
  * - `durableUnlinkSync`: the durable delete of a reload file (unlink, then
@@ -53,7 +53,7 @@ export function atomicWriteFileSync(path: string, contents: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Durable write (b.av2 SR-8.1)
+// Durable write
 // ---------------------------------------------------------------------------
 
 /**
@@ -160,7 +160,7 @@ function errnoCodeOf(err: unknown): string | undefined {
 }
 
 /**
- * Write `bytes` to `path` atomically and durably (b.av2 SR-8.1):
+ * Write `bytes` to `path` atomically and durably:
  *
  *   1. create a temporary file beside `path`, uniquely named per write
  *      (`<name>.<pid>.<random>.tmp`), and write every byte to it;
@@ -217,7 +217,7 @@ export function durableWriteFileSync(path: string, bytes: Uint8Array, fs: Durabl
 }
 
 // ---------------------------------------------------------------------------
-// Durable delete (b.av2 SR-8.1, SR-8.3)
+// Durable delete
 // ---------------------------------------------------------------------------
 
 /** errno codes meaning the target is already absent (ENOTDIR: an ancestor is not a directory). */
@@ -249,7 +249,7 @@ export class DurableUnlinkUnsyncedError extends Error {
 }
 
 /**
- * Delete `path` durably (b.av2 SR-8.1): unlink it, then fsync its directory,
+ * Delete `path` durably: unlink it, then fsync its directory,
  * so the removal survives a crash or power loss once this returns. For the
  * reload files, e.g. `config.json.pending` when nothing is pending.
  *

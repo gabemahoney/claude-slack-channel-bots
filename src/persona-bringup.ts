@@ -1,16 +1,16 @@
 /**
  * persona-bringup.ts — Working-directory check and the local bring-up checks
- * (b.av2 SR-6.1 steps 1 and 2).
+ * (steps 1 and 2).
  *
  * Step 1 is the local credentials check (`checkPersonaCredentials` in
  * `persona-credentials.ts`); step 2 is the working-directory check here: the
  * directory exists, is a directory, is readable and searchable, and its real
  * path is no other applied persona's working directory. Outcomes map to the
- * b.av2 SR-10.3 classes `persona-directory-missing` / `-unusable`.
+ * classes `persona-directory-missing` / `-unusable`.
  *
  * `checkPersonaLocalBringUp` always runs both steps, so when both fail both
  * causes are reported. `checkPersonaWorkingDirectory` also runs on its own
- * and reads no credentials file, for a dry-run bring-up (b.av2 SR-3.4).
+ * and reads no credentials file, for a dry-run bring-up.
  *
  * These are pure checks: no Slack call, no agent-director call, no
  * environment access, no writes, no lock, queue, timer or module-scope state.
@@ -19,7 +19,7 @@
  * outcomes and the directory-retry timers are the bring-up controller's
  * (`persona-bringup-controller.ts`).
  *
- * `checkPersonaConfigDir` (bug b.g57) checks a persona's effective
+ * `checkPersonaConfigDir` checks a persona's effective
  * claude_config_dir: its real path with no lexical fallback
  * (`resolveRealPathStrict`), or `persona-config-dir-unresolvable`. The
  * session manager runs it before every launch; the bring-up controller runs
@@ -41,7 +41,7 @@
  * seam stats through a descriptor (`fstatFile`), so a `stat` override reaches
  * only this check.
  *
- * Pure module (b.av2 SR-13.1): nothing runs at import.
+ * Pure module: nothing runs at import.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -151,7 +151,7 @@ export interface LocalBringUpResult {
   failures: PersonaCheckFailure[]
   /**
    * The digest or marker of the persona's own credentials file as step 1
-   * read it (`credentialsDigest`), for the bring-up to hold (b.av2 SR-8.3),
+   * read it (`credentialsDigest`), for the bring-up to hold,
    * whatever step 1's outcome, a real-path collision included (the file is
    * then only hashed, never parsed). Always set by
    * `checkPersonaLocalBringUp`; optional so an injected check may omit it.
@@ -165,7 +165,7 @@ export interface LocalBringUpResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Check a persona's working directory (b.av2 SR-6.1 step 2). Checks, in order:
+ * Check a persona's working directory (step 2). Checks, in order:
  *
  *   1. its real path (`resolveRealPath`, lexical fallback) is no other
  *      applied persona's working directory → else `persona-directory-unusable`,
@@ -240,8 +240,7 @@ const CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE = 'its Slack connection is closed and 
 
 /**
  * Check that a persona's effective claude_config_dir can be resolved to a
- * real path before it connects to Slack and before it is launched (bug
- * b.g57), with `resolveRealPathStrict`:
+ * real path before it connects to Slack and before it is launched, with `resolveRealPathStrict`:
  * no lexical fallback. A directory not created yet under a resolvable
  * ancestor passes, with the real path it will have. A symlink on its path
  * that points to nothing, or any other resolution failure, is
@@ -275,7 +274,7 @@ export function checkPersonaConfigDir(
 }
 
 /**
- * Run the local bring-up checks (b.av2 SR-6.1 steps 1 and 2): the credentials
+ * Run the local bring-up checks (steps 1 and 2): the credentials
  * check and the working-directory check, always both, so a failure in one
  * never hides the other. Makes no Slack or agent-director call and reads no
  * environment variable. With a `log`, each failure line is emitted exactly

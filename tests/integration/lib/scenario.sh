@@ -100,7 +100,7 @@
 # one line format is stated in the shim's header, and nowhere else).
 #
 # CSCB processes and the tmux shim (fmk mode). A CSCB process is the bot
-# server, or a CLI command or driver the scenario runs (b.jg5 SRJ-1401):
+# server, or a CLI command or driver the scenario runs:
 # every `start` run (`run_start`, `start_server`), every `stop` run
 # (`stop_server` and the trap's), every bot server they leave, and every
 # command run through `cscb_run`. Each starts with the tmux shim's bin
@@ -145,7 +145,7 @@
 # find-missing loop calls `require_ci_image` and then `require_scenario_home`
 # as its first two steps, before any copy, move, install, sqlite3 or tmux step.
 #
-# Matchers (E14 decision 14). Scenario scripts assert a line's class prefix,
+# Matchers. Scenario scripts assert a line's class prefix,
 # persona ref and distinguishing fragments, never a whole sentence the unit
 # tests own. A matcher is one or more fixed-string fragments; a line matches
 # when it holds every fragment, in the given order (anything may sit between
@@ -197,7 +197,7 @@
 #   wait_for_log <matcher> <timeout-s> [<step>]
 #   wait_for_count <matcher> <min> <timeout-s> [<step>]
 #   overrides_stem <line>              print the text of <line> (the printer's TEST TIMER OVERRIDES
-#                                      ACTIVE line, b.2nr) up to its colon, the match for that line
+# ACTIVE line) up to its colon, the match for that line
 #                                      of any override set; exit 1 (after failing) unless it starts
 #                                      with `[slack] `. Call it as `X="$(overrides_stem ...)" || exit 1`
 #   expect_one_overrides_line <step> <count-before> <wait-s>
@@ -336,7 +336,7 @@
 #                                      character; then the copy's `PRAGMA integrity_check` must read
 #                                      `ok`, or it fails
 #   ad_store_pending_no_launch <instance-id>
-#                                      b.jg5 SRJ-1306's `pending` row with no launch start, made from
+# `pending` row with no launch start, made from
 #                                      the row (the persona's live row) with one `ad_store_edit`
 #                                      UPDATE: state `pending`; launch_started_at, launch_token, pid,
 #                                      proc_starttime, pane_id, pane_pid and pane_starttime NULL;
@@ -447,7 +447,7 @@
 #                                      server name slack-channel-router, as the package's install
 #                                      writes it (default <port>: SCENARIO_PORT; setup writes it so)
 #
-#   Labels and seeding (fmk mode; b.jg5 SRJ-1306's seeding steps, under the "Seeding rules"
+# Labels and seeding (fmk mode seeding steps, under the "Seeding rules"
 #   below; each runs both guards first)
 #   ad_new_token [<instance-id> [<token>...]]
 #                                      print a fresh launch token (16 lowercase hex characters, from
@@ -490,7 +490,7 @@
 #                                      SEEDED_STORE_ID (empty when none), which a call inside
 #                                      `$( … )` does not keep
 #
-#   The human's tmux steps (fmk mode; b.jg5 SRJ-1306, SRJ-1401). Each runs both guards first,
+# The human's tmux steps (fmk mode). Each runs both guards first,
 #   then the real tmux on the scenario's own tmux server, from the scenario's own shell, never
 #   a CSCB process (it refuses when TMUX_TMPDIR is not the scenario's or TMUX is set); it reads
 #   back the session, pane, option or server it changed and fails when the change is absent; none
@@ -545,7 +545,7 @@
 #   end_session <session-id>           a human ending a leftover or a hand-made session by its
 #                                      session id ($N): kill-session; fails unless it is gone
 #
-#   Store statements and the human's agent-director actions (fmk mode; b.jg5 SRJ-1306; both
+# Store statements and the human's agent-director actions (fmk mode; both
 #   guards first). Each statement is one `ad_store_edit` UPDATE that names the row by
 #   <instance-id> (letters, digits and `._:@-` only) and its row_version as read just before,
 #   so an agent-director write in between leaves the row unwritten and the step failing; the
@@ -553,7 +553,7 @@
 #   named columns hold their new values and every other column its old one. The pending row
 #   with no launch start is `ad_store_pending_no_launch` (above).
 #   ad_store_mark_finished <instance-id> <missing|ended>
-#                                      b.jg5 SRJ-1412 (scenario 10 part B): state <missing|ended>;
+# (scenario 10 part B): state <missing|ended>;
 #                                      ended_at = now minus the stopping window, in whole seconds, in
 #                                      the store's `YYYY-MM-DD HH:MM:SS` UTC layout; launch_started_at
 #                                      NULL; row_version + 1. The window is [tmux]
@@ -564,7 +564,7 @@
 #                                      SCENARIO_ROOT, by its recorded pane), so while the session is
 #                                      younger than the window; prints the ended_at written
 #   ad_store_seed_pending <instance-id> [<leftover-token>]
-#                                      b.jg5 SRJ-1420 (scenario 19): the persona's row made a `pending`
+# (scenario 19): the persona's row made a `pending`
 #                                      row beside a leftover, as a spawn whose process stopped before
 #                                      its create leaves it: state `pending`; launch_started_at now (in
 #                                      milliseconds); launch_token a fresh token other than the row's
@@ -575,7 +575,7 @@
 #                                      + 1. A harness `status` read must then read `pending` with a
 #                                      launch start; prints the token
 #   ad_store_unusable_name <instance-id> <name>
-#                                      b.jg5 SRJ-1427 (scenario 25): a finished row's (`ended` or
+# (scenario 25): a finished row's (`ended` or
 #                                      `missing`) tmux_session_name set to <name>, which holds a `.`
 #                                      and only letters, digits and `._-`; nothing else changes
 #                                      (row_version included)
@@ -600,13 +600,13 @@
 #                                      lowers that bound in its [tmux] table or waits the 300 s
 #   ad_delete_unusable_row <instance-id>
 #                                      scenario 25's step, the only agent-director `delete` the
-#                                      harness makes (b.jg5 SRJ-1306), through agent-director-admin
+# harness makes, through agent-director-admin
 #                                      (`ad_admin_capture`): a human removing the row with the
 #                                      unusable name; refuses unless the row's recorded session name
 #                                      holds the `.` `ad_store_unusable_name` wrote; fails unless
 #                                      `delete` exits 0 reporting the id `ok` and the row is gone
 #
-#   The find-missing loop (fmk mode; b.jg5 SRJ-1401: only for a latched persona's row, which CSCB
+# The find-missing loop (fmk mode; only for a latched persona's row, which CSCB
 #   makes no extra call for, as the host's find-missing loop marks it; an unlatched persona's
 #   row is CSCB's own pending-row runs' to mark; both guards first)
 #   run_find_missing_loop [<interval-s>]
@@ -635,7 +635,7 @@
 #                                      loop is not running, stops, or is not that far within
 #                                      <timeout-s> (default <n> intervals plus 60 s)
 #
-#   0.10.0 start and seeders (fmk mode; b.jg5 SRJ-1306, SRJ-1402, SRJ-1424). The 0.10.0 start is
+# 0.10.0 start and seeders (fmk mode). The 0.10.0 start is
 #   setup's: a script that sets SCENARIO_AD_START=0.10.0 before sourcing gets 0.10.0's binary
 #   behind the shim (`install_ad_010`) and no store, which 0.10.0's first `spawn` creates.
 #   `install_ad_release` later runs the release's install.sh over it (the migration), then
@@ -769,7 +769,7 @@
 #                                      Fails naming <step> when the count is not above it within
 #                                      <timeout-s>
 #
-#   Scenario 10's harness additions (fmk mode; b.jg5 SRJ-1412, SRJ-1306, SRJ-1401). Each is a
+# Scenario 10's harness additions (fmk mode). Each is a
 #   harness addition; each runs `require_ci_image` first, and
 #   `start_second_tmux_server` and the window copies of `cscb_ad_calls_between` and
 #   `cscb_ad_count_between` also `require_scenario_home`, before any step. Scenario 10 writes
@@ -811,13 +811,13 @@
 #                                      (default 0), in record order, one JSON string per line
 #                                      (`jq -r` gives a post's text back)
 #
-#   Scenario 26's harness additions (fmk mode; b.jg5 SRJ-1428, SRJ-1306, SRJ-1401). Each is a
+# Scenario 26's harness additions (fmk mode). Each is a
 #   harness addition.
 #   SCENARIO_AD_OWNER_OPTION SCENARIO_AD_PANE_OPTION
 #                                      (harness addition) the two
 #                                      tmux option names agent-director labels a session and its
 #                                      worker pane with, `@ad_owner` and `@ad_pane`, as the seeding
-#                                      helpers above set them; src/ names neither (SRJ-716)
+# helpers above set them; src/ names neither
 #   restore_tmux_socket <moved-socket> (harness addition) undo
 #                                      `rebind_tmux_socket`: both guards first, then, from the
 #                                      scenario's own shell with the real tmux (it refuses when
@@ -873,7 +873,7 @@
 #                                      agent-director's row is not touched. Prints `<pane id> <stub
 #                                      pid> <ended client pid>`
 #
-#   Readers for the latch scenarios (fmk mode; harness additions, b.jg5 SRJ-1306). The
+# Readers for the latch scenarios (fmk mode; harness additions). The
 #   agent-director readers are built on `cscb_ad_calls`'s filter: only `call` lines whose
 #   parent is a CSCB process, so the harness's calls, the stub's own `status` reads and its
 #   stop line never count. A mark is a log position, the number of lines the log held when
@@ -941,7 +941,7 @@
 #                                      skipped). Read-only: it never writes
 #
 #   The Slack stub's pushes and the stub MCP session's records (both modes; harness additions,
-#   b.jg5 SRJ-1306, b.deo SRI-1404). Each helper here is a harness addition that works in both
+#). Each helper here is a harness addition that works in both
 #   modes: it runs `require_ci_image` as its first step and never `require_scenario_home` (a
 #   shared-mode script has no scenario HOME), and reads and writes only under SCENARIO_ROOT. A
 #   setting it needs that is unset or bad fails the step at once, with its reason; it never waits
@@ -1062,7 +1062,7 @@
 # this shell, or a process whose environment holds this scenario's
 # SCENARIO_ROOT. A PID the system reused for another process is left alone.
 #
-# Closing assertions (fmk mode; b.jg5 SRJ-1401, SRJ-1418). Every fmk script
+# Closing assertions (fmk mode). Every fmk script
 # ends with `assert_no_server_tmux`, `assert_no_cscb_include_finished` and
 # `assert_no_cscb_delete`, in its own shell, whatever the tmux shim's mode.
 # The trap enforces it, after it has set the shim back to `log` and stopped
@@ -1076,7 +1076,7 @@
 # Shared-mode scripts (test-5 to test-12, test-29 and test-30) have no closing
 # assertions, no tmux shim and no record.
 #
-# Seeding rules (fmk mode; b.jg5 SRJ-1306, agent-director's handoff rev 15 and
+# Seeding rules (fmk mode, agent-director's handoff rev 15 and
 # rev 17). The harness seeds and relabels sessions from the scenario's own
 # shell, never through a CSCB process, and:
 # - every @ad_owner label it seeds or relabels ends with the scenario store's
@@ -2307,7 +2307,7 @@ port_closed() {
 # Personas and tokens
 # ---------------------------------------------------------------------------
 
-# The key rule of src/persona-identity.ts personaKey (b.av2 SR-2.1), written
+# The key rule of src/persona-identity.ts personaKey, written
 # out independently so the scenarios check the server against the rule, not
 # against its own code. ASCII names only.
 persona_key() {
@@ -3228,7 +3228,7 @@ ad_pane_label() {
 }
 
 # ---------------------------------------------------------------------------
-# Seeding (fmk mode; b.jg5 SRJ-1306's seeding steps and rules)
+# Seeding (fmk mode seeding steps and rules)
 # ---------------------------------------------------------------------------
 
 # _scenario_seed <step> <kind> [-c <dir>] <name> [<instance-id>] <worker> [<arg>...]:
@@ -3326,7 +3326,7 @@ seed_other_store() {
 }
 
 # ---------------------------------------------------------------------------
-# The human's tmux steps (fmk mode; b.jg5 SRJ-1306, SRJ-1401)
+# The human's tmux steps (fmk mode)
 # ---------------------------------------------------------------------------
 
 relabel_session() {
@@ -3925,7 +3925,7 @@ ad_delete_unusable_row() {
 }
 
 # ---------------------------------------------------------------------------
-# The find-missing loop (fmk mode; b.jg5 SRJ-1401)
+# The find-missing loop (fmk mode)
 # ---------------------------------------------------------------------------
 
 # _scenario_find_missing_loop <dir> <interval-s>: the loop's body, run in a
@@ -4031,7 +4031,7 @@ wait_find_missing_runs() {
 }
 
 # ---------------------------------------------------------------------------
-# The 0.10.0 seeders (fmk mode; b.jg5 SRJ-1306, SRJ-1402, SRJ-1424)
+# The 0.10.0 seeders (fmk mode)
 # ---------------------------------------------------------------------------
 
 # _scenario_require_010 <step>: refuse unless the binary behind the shim,
@@ -5313,7 +5313,7 @@ ad_trail_events() {
 
 # ---------------------------------------------------------------------------
 # The Slack stub's pushes and the stub MCP session's records (both modes;
-# harness additions, b.jg5 SRJ-1306, b.deo SRI-1404)
+# harness additions)
 # ---------------------------------------------------------------------------
 
 # The stub MCP session's records of a working directory, in the client's
@@ -5558,7 +5558,7 @@ _scenario_fmk_setup() {
     SCENARIO_HOME="${SCENARIO_ROOT}/home"
     SCENARIO_BIN="${SCENARIO_ROOT}/bin"
     # The directory of the stub's MCP session records, which stub_session_deliveries
-    # and stub_session_call read and write (b.deo SRI-1404).
+    # and stub_session_call read and write.
     SCENARIO_STUB_DIR="${SCENARIO_BIN}"
     mkdir -p "${SCENARIO_HOME}" "${SCENARIO_BIN}" "${SCENARIO_ROOT}/tmux" \
         || fail "could not create the scenario's HOME, bin and tmux directories"

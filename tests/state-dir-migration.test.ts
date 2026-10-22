@@ -2,7 +2,7 @@
  * state-dir-migration.test.ts — The move of the server's state directory from
  * its old defaults, `~/.claude/channels/slack` (up to 0.13) and
  * `<XDG config home>/cscb` (0.14.0, 0.15.0), to the new one,
- * `<XDG config home>/claude-slack-channel-bots` (bugs b.fc4, b.smv):
+ * `<XDG config home>/claude-slack-channel-bots`:
  * `prepareStateDir`, `migrateStateDirAtStart`, `resolveCliStateDir` and
  * `resolveCliConfigPath` (src/state-dir-migration.ts).
  *
@@ -16,17 +16,17 @@
  * - Nothing to move: `L` absent or a dangling link (`no-legacy`); `L` a link
  *   to `N`, or `N` a link to `L` (`already-migrated`); neither logs.
  * - `N` absent: `L` is renamed whole and becomes a symbolic link to `N`.
- * - `N` present (a 0.14.0 host, with b.avm's crontab and prompts links back
+ * - `N` present (a 0.14.0 host, with crontab and prompts links back
  *   into it): entries absent from `N` move (a file as a hard link, a
  *   directory renamed, a link re-made with an absolute target), entries that
- *   are the same in `N` (b.avm links, one inode, equal bytes, an empty
+ * are the same in `N` (links, one inode, equal bytes, an empty
  *   directory) are dropped, `L` becomes a symbolic link to `N`.
  * - A conflict (different contents, or different kinds): `N`'s wins, `L`'s
  *   is untouched, one WARN, `pending`, and a later start finishes the move
  *   once the operator settled it.
  * - `L` that cannot be a source: a link to another directory, a file.
  * - Symbolic links in `L`: dangling ones move as they are (or settle against
- *   the same dangling target at `N`), b.avm's `L/crontab` -> `N/crontab`
+ * the same dangling target at `N`)`L/crontab` -> `N/crontab`
  *   left after `N/crontab` was deleted is dropped (never made a self-loop),
  *   two links naming each other conflict, a relative link whose target moved
  *   first settles.
@@ -44,17 +44,17 @@
  *   removes only the temporary copy), a copy of a file that changed discarded.
  * - Never overwriting: a file that appears at `N` mid-move, the renames that
  *   place the old-name link failing, a write through the old name before the
- *   final cleanup; b.avm's links from `N` back into `L` (moved over the link).
+ * final cleanup links from `N` back into `L` (moved over the link).
  * - Re-runs: a second start changes nothing and logs nothing; a pending move
  *   repeats its WARN and changes nothing.
  * - The commands other than the start (`resolveCliStateDir`,
  *   `resolveCliConfigPath`): `L` while an old server runs on it (whatever `N`
  *   holds), or while it is a directory (real, or a link elsewhere) holding a
  *   configuration (or a PID file) and `N` holds no configuration; reads only.
- * - Bug b.smv (the last sections of the file): the start from every
+ * - (the last sections of the file): the start from every
  *   release's layout, each seeded the way that release left a host (up to
- *   0.13: only `L1`; 0.14.0: `L1` plus a partial `L2` with b.avm's links, in
- *   the variants b.avm left; 0.15.0: a full `L2` and `L1` a link to it), under
+ * 0.13: only `L1`; 0.14.0: `L1` plus a partial `L2` with links, in
+ * the variants left; 0.15.0: a full `L2` and `L1` a link to it), under
  *   both XDG locations, with a rerun and `startupErrorDir` (where a stop is
  *   recorded; for a stop with `N` absent it is the stopping step's directory,
  *   so `N` is never made by the log); L1 repointed straight at `N` after a
@@ -398,7 +398,7 @@ describe('prepareStateDir: N absent, the whole directory is renamed', () => {
 // ---------------------------------------------------------------------------
 
 describe('prepareStateDir: N present, the entries are merged', () => {
-  test('a 0.14.0 host: b.avm links into N are dropped, the rest moves, L becomes a link', () => {
+  test('a 0.14.0 host: links into N are dropped, the rest moves, L becomes a link', () => {
     // 0.14.0: the crontab and prompts/ are real in N; L holds links to them and the configuration.
     put(newDir, 'crontab', '0 9 * * * prompts/a.md planner\n')
     put(join(newDir, 'prompts'), 'a.md', 'do the thing')
@@ -1581,7 +1581,7 @@ describe('prepareStateDir: a write through the old name during the move is never
   })
 })
 
-describe("prepareStateDir: b.avm's cross-file-system links back into L (N/<name> is a link to L/<name>)", () => {
+describe("prepareStateDir: cross-file-system links back into L (N/<name> is a link to L/<name>)", () => {
   const CRONTAB = '0 9 * * * prompts/a.md planner\n'
 
   /** The file to read inside each entry, and what it holds. */
@@ -1715,7 +1715,7 @@ describe('prepareStateDir: symbolic links in L (dangling, pointing at their own 
     expectLegacyLinksToNew()
   })
 
-  test("b.avm's leftovers (L/crontab -> N/crontab and L/prompts -> N/prompts, both deleted at N): dropped, nothing made at N, no self-loop, L becomes the link", () => {
+  test("leftovers (L/crontab -> N/crontab and L/prompts -> N/prompts, both deleted at N): dropped, nothing made at N, no self-loop, L becomes the link", () => {
     mkdirSync(newDir, { recursive: true })
     mkdirSync(legacyDir, { recursive: true })
     symlinkSync(join(newDir, 'crontab'), join(legacyDir, 'crontab'))
@@ -1736,7 +1736,7 @@ describe('prepareStateDir: symbolic links in L (dangling, pointing at their own 
     expectNoTemporaries(dirname(legacyDir))
   })
 
-  test("b.avm's leftovers with N the only thing in the move: moved with no entries, N stays empty", () => {
+  test("leftovers with N the only thing in the move: moved with no entries, N stays empty", () => {
     mkdirSync(newDir, { recursive: true })
     mkdirSync(legacyDir, { recursive: true })
     symlinkSync(join(newDir, 'crontab'), join(legacyDir, 'crontab'))
@@ -2177,7 +2177,7 @@ describe('resolveCliStateDir and resolveCliConfigPath: the directory a command a
 })
 
 // ---------------------------------------------------------------------------
-// Bug b.smv: the names, and the start from every release's layout
+// the names, and the start from every release's layout
 // ---------------------------------------------------------------------------
 
 /** The three directories of a host: `L1` (up to 0.13), `L2` (0.14.0, 0.15.0) and `N`, with the environment that names them. */
@@ -2221,7 +2221,7 @@ function seedUpTo013(l: Layout): void {
 }
 
 /**
- * What b.avm (0.14.0) left, besides `L1` holding the server's files:
+ * What (0.14.0) left, besides `L1` holding the server's files:
  * - `plain`: the crontab and `prompts/` are real in `L2`, and `L1/crontab` and `L1/prompts` are symbolic links into them;
  * - `crontab-deleted`: the operator deleted `L2/crontab` since, so the link at `L1/crontab` dangles;
  * - `no-crontab-links`: `L2/crontab` was made by the cron bootstrap, with no link at `L1/crontab` (`L1/prompts` still links);
@@ -2258,7 +2258,7 @@ function seed0140(l: Layout, variant: Seed0140Variant = 'plain'): void {
   if (variant === 'crontab-deleted') unlinkSync(join(l.l2, 'crontab'))
 }
 
-/** 0.15.0 (b.fc4): the whole state directory is `L2`, and `L1` is a symbolic link to it. */
+/** 0.15.0: the whole state directory is `L2`, and `L1` is a symbolic link to it. */
 function seed0150(l: Layout): void {
   putServerFiles(l.l2)
   put(l.l2, 'crontab', CRONTAB_TEXT)
@@ -2311,7 +2311,7 @@ function expectHomeConfigUntouched(l: Layout): void {
 /** The names `L1` holds that move into `N` in the 0.14.0 merge: the server's files (the links are redundant). */
 const MERGED_FROM_L1 = Object.keys(SERVER_FILES).sort()
 
-describe('b.smv: the names (legacyXdgStateDir, stateDirMigrationSteps, the default state directory)', () => {
+describe('the names (legacyXdgStateDir, stateDirMigrationSteps, the default state directory)', () => {
   test("the directory 0.14.0 and 0.15.0 used is still 'cscb', for the migration to find", () => {
     expect(LEGACY_XDG_DIR_NAME).toBe('cscb')
     expect(legacyXdgStateDir(home, {})).toBe(join(home, '.config', 'cscb'))
@@ -2429,7 +2429,7 @@ describe('b.smv: the names (legacyXdgStateDir, stateDirMigrationSteps, the defau
 describe.each([
   ['~/.config (XDG_CONFIG_HOME unset)', (): Layout => layoutFor()],
   ['an absolute XDG_CONFIG_HOME', (): Layout => layoutFor(join(root, 'xdg'))],
-])('b.smv: the start, with %s, from the layout each release left', (_where, makeLayout) => {
+])('the start, with %s, from the layout each release left', (_where, makeLayout) => {
   let l: Layout
   beforeEach(() => {
     l = makeLayout()
@@ -2783,7 +2783,7 @@ describe.each([
   })
 })
 
-describe('b.smv: the start, with ~/.config, in the other situations', () => {
+describe('the start, with ~/.config, in the other situations', () => {
   let l: Layout
   beforeEach(() => {
     l = layoutFor()
@@ -3122,7 +3122,7 @@ describe('b.smv: the start, with ~/.config, in the other situations', () => {
   })
 })
 
-describe('b.smv: resolveCliStateDir before the start moved anything (L2 before L1, N once moved)', () => {
+describe('resolveCliStateDir before the start moved anything (L2 before L1, N once moved)', () => {
   /** Every layout the table seeds, with the directory a command acts on before and after the start. */
   const layouts: [string, (l: Layout) => void, (l: Layout) => string][] = [
     ['up to 0.13', (l) => seedUpTo013(l), (l) => l.l1],

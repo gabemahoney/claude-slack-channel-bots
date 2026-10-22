@@ -1,33 +1,33 @@
 /**
- * channel-delivery.ts — The stored-choice store (b.deo SRI-401 to SRI-407):
+ * channel-delivery.ts — The stored-choice store:
  * each persona's per-channel choice of channel delivery (`mentions` or
  * `all`), stored by its agent with `set_channel_delivery`, kept in
  * `channel-delivery.json` in the server's state directory so that it lasts
  * across restarts without ever touching `config.json`.
  *
  * What this module owns:
- *   - b.deo SRI-401: the file's name and its one path function
+ * - the file's name and its one path function
  *     ({@link channelDeliveryPath}).
- *   - b.deo SRI-402: the format, with one serialiser
+ * - the format, with one serialiser
  *     ({@link serializeChannelDelivery}) and one strict parser
  *     ({@link parseChannelDelivery}), the only way its bytes are made or read.
- *   - b.deo SRI-403 and SRI-904: the read once per start
+ * - the read once per start
  *     ({@link loadChannelDeliveryStore}), the unreadable state and its line.
- *   - b.deo SRI-404: whole-record writes, atomic and durable, and their
+ * - whole-record writes, atomic and durable, and their
  *     failure rules.
- *   - b.deo SRI-405: drops and unwritten drops.
- *   - b.deo SRI-407: the start rules ({@link loadChannelDeliveryAtStart}).
- *   - b.deo SRI-502: the retiring keys, held in memory only.
- *   - b.deo SRI-901: the store's closed class list
+ * - drops and unwritten drops.
+ * - the start rules ({@link loadChannelDeliveryAtStart}).
+ * - the retiring keys, held in memory only.
+ * - the store's closed class list
  *     ({@link CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES}).
- *   - b.deo SRI-905: the `[slack] channel-delivery:` lines.
+ * - the `[slack] channel-delivery:` lines.
  *
- * Ownership (b.deo SRI-401; b.av2 SR-8.1). Only the server reads or writes
+ * Ownership. Only the server reads or writes
  * `channel-delivery.json`, always through this module: `main()` loads one
  * store at start and hands it to the routing, the session tools and the
  * reload controller. The CLI never reads, writes, creates or removes the file.
  *
- * The read (b.deo SRI-403; b.av2 SR-8.7). Once per start, whole, through the
+ * The read. Once per start, whole, through the
  * configuration reader's open-then-fstat rule (`readPersonaConfigBytes`) with
  * no size cap: only the server writes the file, it is read once at start, and
  * its bytes are parsed only, never hashed or compared. It is the third
@@ -38,7 +38,7 @@
  * run: no stored choice, no write, no drop. No startup-errors entry is written
  * and nothing is posted to Slack.
  *
- * Writes (b.deo SRI-404, SRI-405). Every operation is synchronous, so no two
+ * Writes. Every operation is synchronous, so no two
  * writes interleave. Every write writes the whole record held in memory,
  * through `durableWriteFileSync` (or the injected writer). A stored choice
  * changes memory only once its write has succeeded; a drop changes memory at
@@ -81,28 +81,28 @@ import type { DestructiveSetting } from './reload-plan.ts'
 import type { RetiredKeyStore } from './retired-keys.ts'
 
 // ---------------------------------------------------------------------------
-// Constants (b.deo SRI-401, SRI-402, SRI-901, SRI-904, SRI-905)
+// Constants
 // ---------------------------------------------------------------------------
 
-/** The file's name, in the server's state directory (b.deo SRI-401). */
+/** The file's name, in the server's state directory. */
 export const CHANNEL_DELIVERY_FILE_NAME = 'channel-delivery.json'
 
-/** The format version this server reads and writes (b.deo SRI-402). */
+/** The format version this server reads and writes. */
 export const CHANNEL_DELIVERY_FORMAT_VERSION = 1
 
 /**
- * The name of the MCP tool that stores a choice (b.deo SRI-501). Spelled once,
+ * The name of the MCP tool that stores a choice. Spelled once,
  * here: the registry imports it as the tool's name, and this module's lines
  * name the tool through it.
  */
 export const SET_CHANNEL_DELIVERY_TOOL = 'set_channel_delivery'
 
-/** The store's own class: the file could not be read, parsed or validated at start (b.deo SRI-403, SRI-904). */
+/** The store's own class: the file could not be read, parsed or validated at start. */
 export const CHANNEL_DELIVERY_UNREADABLE = 'channel-delivery-unreadable'
 
 /**
  * Every class label the store logs, a closed list kept apart from the persona
- * and reload classes (b.deo SRI-901), as `RELOAD_DIAGNOSTIC_CLASSES` is in
+ * and reload classes, as `RELOAD_DIAGNOSTIC_CLASSES` is in
  * `src/reload.ts`. Its lines go to `server.log` in the `[slack]` stream only.
  */
 export const CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES = [CHANNEL_DELIVERY_UNREADABLE] as const
@@ -110,25 +110,25 @@ export const CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES = [CHANNEL_DELIVERY_UNREADABLE]
 /** A store class label (closed set). */
 export type ChannelDeliveryDiagnosticClass = (typeof CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES)[number]
 
-/** The start of every drop and failed-write line the store logs (b.deo SRI-905). */
+/** The start of every drop and failed-write line the store logs. */
 export const CHANNEL_DELIVERY_LOG_PREFIX = '[slack] channel-delivery:'
 
 /**
  * The file's path: {@link CHANNEL_DELIVERY_FILE_NAME} in `stateDir`, the
  * server's state directory (`resolveServerStateDir()` when omitted, read at
  * call time, so `SLACK_STATE_DIR` is honoured). The one path function of the
- * file (b.deo SRI-401).
+ * file.
  */
 export function channelDeliveryPath(stateDir: string = resolveServerStateDir()): string {
   return join(stateDir, CHANNEL_DELIVERY_FILE_NAME)
 }
 
 // ---------------------------------------------------------------------------
-// The record (b.deo SRI-402)
+// The record
 // ---------------------------------------------------------------------------
 
 /**
- * A persona's declaration (b.deo SRI-402, SRI-407): its `name`,
+ * A persona's declaration: its `name`,
  * `credentials_file` and `working_directory` as the configuration in effect
  * resolved them, exactly the settings of `DESTRUCTIVE_SETTINGS`
  * (`src/reload-plan.ts`).
@@ -160,7 +160,7 @@ type DeclarationInStep = Holds<
   >
 >
 
-/** One channel's stored choice (b.deo SRI-402). */
+/** One channel's stored choice. */
 export interface ChannelDeliveryChannelEntry {
   /** The stored choice: one of `DELIVERY_MODES` (`src/config.ts`). */
   readonly delivery: DeliveryMode
@@ -168,7 +168,7 @@ export interface ChannelDeliveryChannelEntry {
   readonly set_at: string
 }
 
-/** One persona key's entry (b.deo SRI-402). */
+/** One persona key's entry. */
 export interface ChannelDeliveryPersonaEntry {
   /** The persona's declaration when its entry was last written. */
   readonly declaration: ChannelDeliveryDeclaration
@@ -182,7 +182,7 @@ export interface ChannelDeliveryPersonaEntry {
  */
 export type ChannelDeliveryRecord = ReadonlyMap<string, ChannelDeliveryPersonaEntry>
 
-/** The declaration of a resolved persona (b.deo SRI-402, SRI-504): its three declared settings. Pure. */
+/** The declaration of a resolved persona: its three declared settings. Pure. */
 export function channelDeliveryDeclarationOf(
   persona: Pick<Persona, 'name' | 'credentials_file' | 'working_directory'>,
 ): ChannelDeliveryDeclaration {
@@ -194,11 +194,11 @@ export function channelDeliveryDeclarationOf(
 }
 
 // ---------------------------------------------------------------------------
-// Serialiser and parser (b.deo SRI-402)
+// Serialiser and parser
 // ---------------------------------------------------------------------------
 
 /**
- * The record's bytes (b.deo SRI-402): UTF-8 JSON, two-space indented with a
+ * The record's bytes: UTF-8 JSON, two-space indented with a
  * final newline, `version` then `personas`; the persona keys sorted, each
  * entry `declaration` (`name`, `credentials_file`, `working_directory`) then
  * `channels`; the channel IDs sorted, each entry `delivery` then `set_at`. A
@@ -289,7 +289,7 @@ function hasOnlyFields(value: Record<string, unknown>, expected: readonly string
 }
 
 /**
- * Parse and validate the file's bytes (b.deo SRI-402), strictly: valid UTF-8
+ * Parse and validate the file's bytes, strictly: valid UTF-8
  * (a byte order mark is refused); a JSON object with exactly `version` (the
  * integer 1) and `personas` (an object); each persona key matching
  * `PERSONA_KEY_RE`, its entry an object with exactly `declaration` (an object
@@ -371,7 +371,7 @@ function personaEntryOf(key: string, value: unknown): ChannelDeliveryPersonaEntr
     const fields = choice as Record<string, unknown>
     choices.set(id, { delivery: fields['delivery'] as DeliveryMode, set_at: fields['set_at'] as string })
   }
-  // The writer omits a key with no channels (b.deo SRI-402).
+  // The writer omits a key with no channels.
   if (choices.size === 0) return 'has no channel in `channels`'
   return {
     declaration: {
@@ -397,14 +397,14 @@ function channelEntryProblem(id: string, value: unknown): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Lines (b.deo SRI-904, SRI-905)
+// Lines
 // ---------------------------------------------------------------------------
 
 /** The file could not be read. */
 export const CHANNEL_DELIVERY_UNREADABLE_READ = 'read'
 
 /**
- * Why the file is unreadable (b.deo SRI-904): the read failed (with its
+ * Why the file is unreadable: the read failed (with its
  * errno code, when it carried one), or the parser refused the bytes (its
  * stage and its problem, which carries no file content).
  */
@@ -413,13 +413,13 @@ export type ChannelDeliveryUnreadableCause =
   | { readonly stage: ChannelDeliveryProblemStage; readonly problem: string }
 
 /**
- * The `channel-delivery-unreadable` line (b.deo SRI-403, SRI-904): names the
+ * The `channel-delivery-unreadable` line: names the
  * file; says whether it could not be read (with the errno code), parsed or
  * validated (with the parser's problem: a position, never file content); says
  * that in fungible mode every channel is served at `mentions` and
  * `set_channel_delivery` is refused; and gives the fix. Pure.
  *
- *   [slack] channel-delivery-unreadable: the stored-choice file "<path>" could not be read (<code>). It is left in place, and this run neither writes it nor drops anything from it: in fungible mode every channel is served at mentions, and set_channel_delivery is refused. To fix: move the file aside, then restart the server (b.deo SRI-403, SRI-904)
+ * [slack] channel-delivery-unreadable: the stored-choice file "<path>" could not be read (<code>). It is left in place, and this run neither writes it nor drops anything from it: in fungible mode every channel is served at mentions, and set_channel_delivery is refused. To fix: move the file aside, then restart the server
  */
 export function channelDeliveryUnreadableLine(path: string, cause: ChannelDeliveryUnreadableCause): string {
   let what: string
@@ -432,18 +432,18 @@ export function channelDeliveryUnreadableLine(path: string, cause: ChannelDelive
     `[slack] ${CHANNEL_DELIVERY_UNREADABLE}: the stored-choice file ${JSON.stringify(path)} ${what}. ` +
     'It is left in place, and this run neither writes it nor drops anything from it: in fungible mode every channel ' +
     `is served at mentions, and ${SET_CHANNEL_DELIVERY_TOOL} is refused. To fix: move the file aside, then restart ` +
-    'the server (b.deo SRI-403, SRI-904)'
+    'the server'
   )
 }
 
-/** A drop's reason: the key was retired by a confirmed apply (b.deo SRI-406), or held in the retired-key record without its mark at start (b.deo SRI-407). */
+/** A drop's reason: the key was retired by a confirmed apply, or held in the retired-key record without its mark at start. */
 export const CHANNEL_DELIVERY_DROP_RETIRED = 'retired by a confirmed change'
-/** A drop's reason: the key is not an applied persona's at start (b.deo SRI-407). */
+/** A drop's reason: the key is not an applied persona's at start. */
 export const CHANNEL_DELIVERY_DROP_NOT_APPLIED = 'not an applied persona at start'
-/** A drop's reason: the applied persona's declaration differs from the recorded one at start (b.deo SRI-407). */
+/** A drop's reason: the applied persona's declaration differs from the recorded one at start. */
 export const CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED = 'its declaration changed'
 
-/** Every drop reason (b.deo SRI-905), a closed set. */
+/** Every drop reason, a closed set. */
 export const CHANNEL_DELIVERY_DROP_REASONS = [
   CHANNEL_DELIVERY_DROP_RETIRED,
   CHANNEL_DELIVERY_DROP_NOT_APPLIED,
@@ -459,19 +459,19 @@ function keyRef(key: string): string {
 }
 
 /**
- * The line of one key's drop (b.deo SRI-405, SRI-905): names the key, the
+ * The line of one key's drop: names the key, the
  * number of channels whose stored choices were dropped, and why. Never names
  * a choice. Pure.
  *
- *   [slack] channel-delivery: dropped the stored choices of persona=<key> in <n> channel(s): <reason> (b.deo SRI-405, SRI-905)
+ * [slack] channel-delivery: dropped the stored choices of persona=<key> in <n> channel(s): <reason>
  */
 export function channelDeliveryDropLine(key: string, channelCount: number, reason: ChannelDeliveryDropReason): string {
   const channels = `${channelCount} channel${channelCount === 1 ? '' : 's'}`
-  return `${CHANNEL_DELIVERY_LOG_PREFIX} dropped the stored choices of ${keyRef(key)} in ${channels}: ${reason} (b.deo SRI-405, SRI-905)`
+  return `${CHANNEL_DELIVERY_LOG_PREFIX} dropped the stored choices of ${keyRef(key)} in ${channels}: ${reason}`
 }
 
 /**
- * The line of a failed write (b.deo SRI-404, SRI-405, SRI-506, SRI-905):
+ * The line of a failed write:
  * names the action and the file, then `detail`, what the write did (its errno
  * code, and the write-back's when that failed too), then what holds now. With
  * `carriesDrop` (a drop's write, or the write of unwritten drops) it says that
@@ -479,13 +479,13 @@ export function channelDeliveryDropLine(key: string, channelCount: number, reaso
  * the drop; otherwise that the stored choices in memory are unchanged. Never
  * names a choice, a token or file content. Pure.
  *
- *   [slack] channel-delivery: cannot <action> in "<path>"<detail>; the stored choices in memory are unchanged (b.deo SRI-404, SRI-506)
- *   [slack] channel-delivery: cannot <action> in "<path>"<detail>; the dropped choices do not apply, and the next successful write of the file carries the drop (b.deo SRI-405)
+ * [slack] channel-delivery: cannot <action> in "<path>"<detail>; the stored choices in memory are unchanged
+ * [slack] channel-delivery: cannot <action> in "<path>"<detail>; the dropped choices do not apply, and the next successful write of the file carries the drop
  */
 export function channelDeliveryWriteFailedLine(path: string, action: string, detail: string, carriesDrop: boolean): string {
   const after = carriesDrop
-    ? 'the dropped choices do not apply, and the next successful write of the file carries the drop (b.deo SRI-405)'
-    : 'the stored choices in memory are unchanged (b.deo SRI-404, SRI-506)'
+    ? 'the dropped choices do not apply, and the next successful write of the file carries the drop'
+    : 'the stored choices in memory are unchanged'
   return `${CHANNEL_DELIVERY_LOG_PREFIX} cannot ${action} in ${JSON.stringify(path)}${detail}; ${after}`
 }
 
@@ -500,7 +500,7 @@ export function channelDeliveryDropAction(keys: readonly string[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// The store (b.deo SRI-403 to SRI-405, SRI-407, SRI-502)
+// The store
 // ---------------------------------------------------------------------------
 
 /**
@@ -578,21 +578,21 @@ export interface ChannelDeliveryDrop {
   readonly reason: ChannelDeliveryDropReason
 }
 
-/** An applied persona as the start rules see it: its key and its declaration (b.deo SRI-407). */
+/** An applied persona as the start rules see it: its key and its declaration. */
 export interface ChannelDeliveryAppliedPersona {
   readonly key: string
   readonly declaration: ChannelDeliveryDeclaration
 }
 
 /**
- * The start rules' view of the retired-key record (b.deo SRI-407): whether a
+ * The start rules' view of the retired-key record: whether a
  * key is recorded, and whether it carries the "new life has begun" mark
- * (b.jg5 SRJ-806 as amended by b.deo SRI-407). A type-only view of the store `main()` loaded, so this
+ * A type-only view of the store `main()` loaded, so this
  * module never reads `retired-keys.json` itself.
  */
 export type ChannelDeliveryRetiredKeyView = Pick<RetiredKeyStore, 'isRecorded' | 'isMarked'>
 
-/** What the start rules run over (b.deo SRI-407). */
+/** What the start rules run over. */
 export interface ChannelDeliveryStart {
   /** The applied personas of the configuration the start runs. */
   readonly applied: readonly ChannelDeliveryAppliedPersona[]
@@ -601,13 +601,13 @@ export interface ChannelDeliveryStart {
 }
 
 /**
- * One server's stored choices (b.deo SRI-401 to SRI-407, SRI-502). Every
+ * One server's stored choices. Every
  * member is synchronous and never throws, but `drop` on an unknown reason.
  */
 export interface ChannelDeliveryStore {
   /** The file's path. */
   readonly path: string
-  /** Whether the file was readable at start (b.deo SRI-403). Decided once, for the run. */
+  /** Whether the file was readable at start. Decided once, for the run. */
   readonly readable: boolean
   /** The stored choice of `key` for `channel`, or undefined when none is stored or the store is unreadable. */
   storedChoice(key: string, channel: string): DeliveryMode | undefined
@@ -616,7 +616,7 @@ export interface ChannelDeliveryStore {
   /** The record held in memory (empty when the store is unreadable). */
   record(): ChannelDeliveryRecord
   /**
-   * Store `delivery` for `key` and `channel` (b.deo SRI-404, SRI-504): write
+   * Store `delivery` for `key` and `channel`: write
    * the whole record held in memory with the change, `set_at` now and
    * `declaration` as the key's declaration, in one write; memory changes only
    * once that write succeeded, and the write carries every unwritten drop. A
@@ -629,7 +629,7 @@ export interface ChannelDeliveryStore {
    */
   set(key: string, channel: string, delivery: DeliveryMode, declaration: ChannelDeliveryDeclaration): ChannelDeliverySetResult
   /**
-   * Drop the stored choices of each key of `batch` (b.deo SRI-405): memory
+   * Drop the stored choices of each key of `batch`: memory
    * loses them at once, whatever the write does; one drop line per key that
    * lost entries; then one write of the whole record for the batch. A key
    * named twice keeps its first reason. Writes and logs nothing when no key
@@ -640,16 +640,15 @@ export interface ChannelDeliveryStore {
    * change.
    */
   drop(batch: readonly ChannelDeliveryDrop[]): ChannelDeliveryWriteOutcome
-  /** Whether `key` has a drop no successful write has carried yet (b.deo SRI-405, SRI-408). */
+  /** Whether `key` has a drop no successful write has carried yet. */
   hasUnwrittenDrop(key: string): boolean
   /**
-   * Write the record held in memory when any unwritten drop exists (b.deo
-   * SRI-405, SRI-408). An unsynced rename is a failure and keeps the
+   * Write the record held in memory when any unwritten drop exists. An unsynced rename is a failure and keeps the
    * unwritten drops; a failure logs one failed-write line.
    */
   writeUnwrittenDrops(): ChannelDeliveryWriteOutcome
   /**
-   * The start rules (b.deo SRI-407), run once right after the read: drop, in
+   * The start rules, run once right after the read: drop, in
    * one write, the entries of every key that is not an applied persona's, of
    * every applied key whose recorded declaration differs from the applied one
    * (`name` exactly; each path equal as written or by `resolveRealPath`), and
@@ -659,11 +658,11 @@ export interface ChannelDeliveryStore {
    * is dropped.
    */
   applyStartRules(start: ChannelDeliveryStart): ChannelDeliveryWriteOutcome
-  /** Mark `keys` as retiring (b.deo SRI-502). Memory only: never written, never logged. */
+  /** Mark `keys` as retiring. Memory only: never written, never logged. */
   beginRetiring(keys: Iterable<string>): void
-  /** Clear `keys` from the retiring set (b.deo SRI-502). Memory only. */
+  /** Clear `keys` from the retiring set. Memory only. */
   endRetiring(keys: Iterable<string>): void
-  /** Whether `key` is retiring (b.deo SRI-502). Every store begins with none. */
+  /** Whether `key` is retiring. Every store begins with none. */
   isRetiring(key: string): boolean
 }
 
@@ -686,7 +685,7 @@ function isDropReason(reason: unknown): reason is ChannelDeliveryDropReason {
 
 /**
  * Load the stored-choice file at `stateDir` and build the store over it
- * (b.deo SRI-401, SRI-403): read once, whole, through the configuration
+ * read once, whole, through the configuration
  * reader's open-then-fstat rule with no size cap, and parsed only. A missing
  * file is an empty, readable record, and nothing is written or logged. A file
  * that cannot be read (a directory, a FIFO or other non-regular file, an
@@ -718,7 +717,7 @@ export function loadChannelDeliveryStore(stateDir: string, deps: ChannelDelivery
 }
 
 /**
- * The start's load (b.deo SRI-403, SRI-407): {@link loadChannelDeliveryStore},
+ * The start's load: {@link loadChannelDeliveryStore},
  * followed at once by the start rules over `start`. The one entry `main()`
  * and the reload harness use, so the rules always run right after the read.
  */
@@ -751,9 +750,9 @@ function createChannelDeliveryStore(
   let entries: ChannelDeliveryRecord = initial
   /** What the file is believed to hold (null: no file), for a write-back after an unsynced rename. */
   let fileBytes: Uint8Array | null = initialBytes
-  /** Keys whose drop no successful write has carried yet (b.deo SRI-405). */
+  /** Keys whose drop no successful write has carried yet. */
   const unwrittenDrops = new Set<string>()
-  /** Keys retiring in a confirmed apply (b.deo SRI-502). Memory only; every store begins with none. */
+  /** Keys retiring in a confirmed apply. Memory only; every store begins with none. */
   const retiring = new Set<string>()
 
   /** Now as `set_at`, or undefined when the clock gives no RFC 3339 UTC timestamp. */
@@ -874,10 +873,10 @@ function createChannelDeliveryStore(
     }
     if (dropped.length === 0) return CHANNEL_DELIVERY_NOTHING_TO_WRITE
 
-    // A drop applies in memory at once, whatever its write does (b.deo SRI-405).
+    // A drop applies in memory at once, whatever its write does.
     entries = next
     for (const { key, count, reason } of dropped) safeLog(deps.log, channelDeliveryDropLine(key, count, reason))
-    // No drop creates a missing file (b.deo SRI-404): with no file, nothing on disk holds the dropped choices.
+    // No drop creates a missing file: with no file, nothing on disk holds the dropped choices.
     if (fileBytes === null) return CHANNEL_DELIVERY_NOTHING_TO_WRITE
 
     const keys = dropped.map(({ key }) => key)
@@ -916,7 +915,7 @@ function createChannelDeliveryStore(
       : resolveRealPath(a, deps.realpath) === resolveRealPath(b, deps.realpath)
   }
 
-  /** Whether the recorded declaration matches the applied one (b.deo SRI-407). */
+  /** Whether the recorded declaration matches the applied one. */
   function sameDeclaration(recorded: ChannelDeliveryDeclaration, applied: ChannelDeliveryDeclaration): boolean {
     return (
       recorded.name === applied.name &&
@@ -936,9 +935,9 @@ function createChannelDeliveryStore(
       else if (!sameDeclaration(entries.get(key)!.declaration, declared)) {
         batch.push({ key, reason: CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED })
       } else if (start.retiredKeys.isRecorded(key) && !start.retiredKeys.isMarked(key)) {
-        // SRI-905's closed reasons have no reason of their own for a key the
+        // closed reasons have no reason of their own for a key the
         // retired-key record holds without its "new life has begun" mark
-        // (b.jg5 SRJ-806 as amended by b.deo SRI-407); such a key was retired
+        // such a key was retired
         // by a confirmed change (or by the start sweep) whose new life has not
         // begun, so its drop uses "retired by a confirmed change".
         batch.push({ key, reason: CHANNEL_DELIVERY_DROP_RETIRED })

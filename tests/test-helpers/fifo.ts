@@ -1,6 +1,6 @@
 /**
  * test-helpers/fifo.ts — Real FIFOs for tests, made by the `mkfifo` command
- * through a host-safe child environment (b.jg5 SRJ-1302).
+ * through a host-safe child environment.
  *
  * Node and Bun have no mkfifo API, so a test that needs a real FIFO (a
  * credentials, config or record path that is not a regular file) starts the

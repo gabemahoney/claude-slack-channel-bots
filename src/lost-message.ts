@@ -1,16 +1,16 @@
-/** Existing pure message-triggered recovery decisions (b.omv SR-4.2). */
+/** Existing pure message-triggered recovery decisions. */
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /**
- * Every recovery state a lost message reports, once, in SRJ-1011's order (the
+ * Every recovery state a lost message reports, once, in the contract order (the
  * order `decideLostMessageState` asks them, but for the sequence/wait input,
  * which answers `restarting` before `session-starting`). Read-only; tests and
  * the routing harness import it and keep no copy.
  *
- * - `not-up`: P is not up (b.av2 SR-6.4: its bring-up is retrying or broken,
+ * - `not-up`: P is not up (its bring-up is retrying or broken,
  *   or unknown to the bring-up controller), so no restart is started and its
  *   instance is launched once it recovers. A retrying or broken persona
  *   forwards no Slack event, so this is reached only by a message P's
@@ -26,8 +26,7 @@
  *   old-life hold whose old key's kill failed.
  * - `not-answering`: P's `tmux-unresponsive` condition holds, or its
  *   `tmux-unavailable` or `ad-config-malformed` outage is raised, P is below
- *   the restart cap and P's retry timer is armed (b.jg5 SRJ-1011 as amended:
- *   "state 5 applies only while P's retry timer is armed"; the caller's
+ * the restart cap and P's retry timer is armed ( * "state 5 applies only while P's retry timer is armed"; the caller's
  *   `isNotAnswering` asks it). A P at the restart cap is never in this state.
  * - `session-starting`: P's row reads `pending` (a launch or dialog approver
  *   for P is running, or the caller's one `status` read returned `pending`).
@@ -54,7 +53,7 @@ export const LOST_MESSAGE_STATES = Object.freeze([
 /** A recovery state a lost message reports (see `LOST_MESSAGE_STATES`). */
 export type LostMessageState = (typeof LOST_MESSAGE_STATES)[number]
 
-/** States 1 to 5 of SRJ-1011: the states asked before anything that can be in flight for P. */
+/** States 1 to 5 of the states asked before anything that can be in flight for P. */
 export type EarlyLostMessageState = Extract<
   LostMessageState,
   'not-up' | 'held-for-human' | 'cannot-launch' | 'kill-failed' | 'not-answering'
@@ -117,7 +116,7 @@ export interface LostMessageRecoveryQueries extends EarlyLostMessageQueries {
 // ---------------------------------------------------------------------------
 
 /**
- * The first of states 1 to 5 (b.jg5 SRJ-1011) that applies: `not-up`,
+ * The first of states 1 to 5 that applies: `not-up`,
  * `held-for-human`, `cannot-launch`, `kill-failed`, `not-answering`; else
  * undefined. Stops at the first query that answers true; an absent query
  * answers false. Changes nothing. `decideLostMessageState` asks it first, so
@@ -133,10 +132,10 @@ export function decideEarlyLostMessageState(queries: EarlyLostMessageQueries): E
 }
 
 /**
- * The recovery state for a lost message (b.jg5 SRJ-1011): states 1 to 5
+ * The recovery state for a lost message: states 1 to 5
  * (`decideEarlyLostMessageState`); then a live-row sequence or old-life wait
  * step running (`restarting`); then the row reading `pending`
- * (`session-starting`); then, in the human-trigger order (b.kvq / b.9cj),
+ * (`session-starting`); then, in the human-trigger order,
  * restart pending (`restarting`), auto-restart disabled, at the cap;
  * otherwise `starting-now`, and the caller fires the human-triggered restart.
  * Stops at the first query that answers true; an absent optional query
@@ -156,7 +155,7 @@ export function decideLostMessageState(queries: LostMessageRecoveryQueries): Los
 
 /**
  * Whether a lost message in `state` fires the human-triggered restart: only
- * `starting-now` does (b.jg5 SRJ-1011, SRJ-1501).
+ * `starting-now` does.
  */
 export function firesHumanTriggeredRestart(state: LostMessageState): boolean {
   return state === 'starting-now'

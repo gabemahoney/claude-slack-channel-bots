@@ -31,7 +31,7 @@
  * hooks and describe callbacks is indented by at least 2 spaces, so a
  * zero-indentation match reliably identifies leaked top-level calls.
  *
- * Bug reference: b.5wd — "add CI gate against top-level mock.module() in tests/"
+ * Bug reference: "add CI gate against top-level mock.module in tests/"
  */
 
 import { readdirSync, readFileSync, existsSync } from 'fs'

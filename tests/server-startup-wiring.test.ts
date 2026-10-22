@@ -101,7 +101,7 @@ const SERVER_PATH = join(SRC_DIR, 'server.ts')
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(SERVER_PATH, 'utf-8'))
 
-/** The production kill-retry clock (b.jg5 SRJ-702); renaming it fails the typecheck. */
+/** The production kill-retry clock; renaming it fails the typecheck. */
 const KILL_RETRY_PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
 
 /** Awaits main itself executes, including branches, excluding stored callbacks. */
@@ -147,7 +147,7 @@ function onlyCallProps(name: string): Map<string, string> {
 
 /**
  * The object literal a spread `...<name>` in server.ts takes its members
- * from: the one `const <name>(: <Type>)? = { … }` declaration, from its `{`.
+ * from: the one `const <name>(<Type>)? = { … }` declaration, from its `{`.
  * Fails unless there is exactly one.
  */
 function spreadConstObject(name: string): string {
@@ -156,7 +156,7 @@ function spreadConstObject(name: string): string {
   return SERVER_CODE.slice(SERVER_CODE.indexOf('{', decls[0]!))
 }
 
-/** The retry run's gate type (b.jg5 SRJ-303, SRJ-305, SRJ-404), as imported in server.ts. */
+/** The retry run's gate type, as imported in server.ts. */
 const RETRY_RUN_GATE_TYPE = 'RetryRunGateDeps'
 
 function retryRunGate(): { name: string; at: number; start: number; end: number; props: Map<string, string> } {
@@ -192,9 +192,9 @@ function isolated(call: string): string {
   return `try \\{ ${call};? \\} catch(?: \\(\\w+\\))? \\{ \\}`
 }
 
-/** The latch's holds binder (b.jg5 SRJ-502); renaming it fails the typecheck. */
+/** The latch's holds binder; renaming it fails the typecheck. */
 const BIND_LATCH_HOLDS: keyof typeof ConflictLatchModule = 'bindConflictLatchHolds'
-/** The latch's five holds (b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-610, SRJ-1016); renaming one fails the typecheck. */
+/** The latch's five holds; renaming one fails the typecheck. */
 const HOLD_STOP_RETRY: keyof ConflictLatchHolds = 'stopRetryTimer'
 const HOLD_END_TMUX: keyof ConflictLatchHolds = 'endTmuxUnresponsive'
 const HOLD_END_UNCLASSIFIED: keyof ConflictLatchHolds = 'endUnclassifiedError'
@@ -207,7 +207,7 @@ function oneKeyArrow(call: string): RegExp {
 }
 
 /**
- * b.jg5 SRJ-502: the holds object main() binds to the latch, as its
+ * the holds object main binds to the latch, as its
  * properties (name → value text). Fails unless the binder is called exactly
  * once, with three arguments (the latch, the holds, the log), and its second
  * is an object literal.
@@ -219,19 +219,19 @@ function latchHoldProps(): Map<string, string> {
   return objectProperties(args[1]!)
 }
 
-/** The latch's factory (b.jg5 SRJ-501); renaming it fails the typecheck. */
+/** The latch's factory; renaming it fails the typecheck. */
 const LATCH_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
 
-/** The latch re-check's one builder, the session manager's (b.jg5 SRJ-505); renaming it fails the typecheck. */
+/** The latch re-check's one builder, the session manager's; renaming it fails the typecheck. */
 const RECHECK_BUILDER: keyof typeof SessionManagerModule = 'buildLatchRecheck'
-/** The latch re-check's binder (b.jg5 SRJ-505); renaming it fails the typecheck. */
+/** The latch re-check's binder; renaming it fails the typecheck. */
 const RECHECK_BIND: keyof typeof ConflictLatchModule = 'bindLatchRecheck'
-/** The clear by hand's binding over the re-check, the `/clear-latch` route's clear (b.jg5 SRJ-510); renaming it fails the typecheck. */
+/** The clear by hand's binding over the re-check, the `/clear-latch` route's clear; renaming it fails the typecheck. */
 const CLEAR_BY_HAND_OF: keyof typeof SessionManagerModule = 'clearByHandOf'
-/** The builder's latch input (b.jg5 SRJ-505); renaming it fails the typecheck. */
+/** The builder's latch input; renaming it fails the typecheck. */
 const RECHECK_LATCH: keyof LatchRecheckInput = 'latch'
 
-/** Every path that can launch, and so latch or meet a latched persona (b.jg5 SRJ-501, SRJ-502): the retry controller's retries, the restart module, the start bring-up and the health check. */
+/** Every path that can launch, and so latch or meet a latched persona: the retry controller's retries, the restart module, the start bring-up and the health check. */
 function latchStartPass(): number[] {
   return [
     onlyCallOf('createUnavailableRetryController'),
@@ -241,7 +241,7 @@ function latchStartPass(): number[] {
   ]
 }
 
-/** The reconnect adapter's builder (b.f2b, b.jg5 SRJ-502); renaming it fails the typecheck. */
+/** The reconnect adapter's builder; renaming it fails the typecheck. */
 const RECONNECT_ADAPTER: keyof typeof ServerModule = '_buildReconnectSessionAdapter'
 
 /** The restart module's reconnect build; the other build drives deferred reconnects without duplicate prompt notices. */
@@ -260,9 +260,9 @@ function reconnectAdapterArgs(): string[] {
   return splitTopLevel(callArguments(SERVER_CODE, onlyReconnectAdapterBuild()))
 }
 
-/** The retry action's in-flight member (b.jg5 SRJ-301); renaming it fails the typecheck. */
+/** The retry action's in-flight member; renaming it fails the typecheck. */
 const RETRY_IN_FLIGHT_MEMBER: keyof FullModeRetryDeps = 'isInFlight'
-/** The health check's in-flight member (b.f2b, b.jg5 SRJ-315); renaming it fails the typecheck. */
+/** The health check's in-flight member; renaming it fails the typecheck. */
 const TICK_IN_FLIGHT_MEMBER: keyof HealthCheckDeps = 'isLaunchInFlight'
 
 /** `text` with every string and template literal blanked (offsets kept), so brackets inside a log line never count. */
@@ -289,17 +289,17 @@ function moduleFunction(name: string): { at: number; params: string[]; start: nu
   return { at, params, start, end, body: SERVER_CODE.slice(start, end) }
 }
 
-/** The one production session-disconnect handler (b.jg5 SRJ-311): private to server.ts, so named by string. */
+/** The one production session-disconnect handler: private to server.ts, so named by string. */
 const DISCONNECT_HANDLER = 'restartDisconnectedPersona'
 
-/** The `tmux-unavailable` retry check's deps type (b.jg5 SRJ-311), as imported above. */
+/** The `tmux-unavailable` retry check's deps type, as imported above. */
 const CHECK_DEPS_TYPE = 'TmuxUnavailableRetryDeps'
-/** The check's latched and in-flight members (b.jg5 SRJ-311, SRJ-502, SRJ-315); renaming one fails the typecheck. */
+/** The check's latched and in-flight members; renaming one fails the typecheck. */
 const CHECK_LATCHED: keyof TmuxUnavailableRetryDeps = 'isLatched'
 const CHECK_IN_FLIGHT: keyof TmuxUnavailableRetryDeps = 'isWorkInFlight'
 
 /**
- * b.jg5 SRJ-311: the production deps of the `tmux-unavailable` retry check,
+ * the production deps of the `tmux-unavailable` retry check,
  * the one module-scope `const <name>: TmuxUnavailableRetryDeps = { … }`
  * outside main(), declared once (no second set). Returns its name, its
  * object literal's [start, end) (braces excluded) and its properties.
@@ -322,7 +322,7 @@ function exportedFunctionBody(name: string): [number, number] {
   return balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
 }
 
-/** server.ts's one ENVIRONMENT arm path (b.jg5 SRJ-311): private to server.ts, so named by string. */
+/** server.ts's one ENVIRONMENT arm path: private to server.ts, so named by string. */
 const ENVIRONMENT_ARM = 'armEnvironmentRetryTimer'
 
 /** The retry controller's one module-scope handle (assigned only the one controller, once, in main(); pinned in the controller's describe). */
@@ -336,14 +336,14 @@ function withinCall(offsets: number[], at: number): number {
   return offsets.filter((offset) => offset > open && offset < close).length
 }
 
-/** The session manager's launch-in-flight query (b.f2b, b.jg5 SRJ-303); renaming it fails the typecheck. */
+/** The session manager's launch-in-flight query; renaming it fails the typecheck. */
 const LAUNCH_IN_FLIGHT: keyof typeof SessionManagerModule = 'isLaunchInFlight'
 
-/** The session manager's live-row sequence running query (b.jg5 SRJ-706); renaming it fails the typecheck. */
+/** The session manager's live-row sequence running query; renaming it fails the typecheck. */
 const SEQUENCE_RUNNING: keyof typeof SessionManagerModule = 'isLiveRowSequenceRunning'
-/** The session manager's "which work blocks a retry" query (b.jg5 SRJ-303, SRJ-706, SRJ-811); renaming it fails the typecheck. */
+/** The session manager's "which work blocks a retry" query; renaming it fails the typecheck. */
 const RETRY_BLOCK_CAUSE: keyof typeof SessionManagerModule = 'personaRetryBlockCause'
-/** The retry action's cause member (b.jg5 SRJ-303: the again-reason and skip line name the cause); renaming it fails the typecheck. */
+/** The retry action's cause member (the again-reason and skip line name the cause); renaming it fails the typecheck. */
 const RETRY_BLOCK_CAUSE_MEMBER: keyof FullModeRetryDeps = 'retryBlockCause'
 
 function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
@@ -364,7 +364,7 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   // cause query with its own key, so none can block a retry on a launch alone
   // while a sequence or an old-life wait step runs. (The persona routing's
 
-  // SRJ-1011.)
+  //.)
   const narrowCall = `(?:${LAUNCH_IN_FLIGHT}|${RETRY_BLOCK_CAUSE})\\(\\s*\\1\\s*\\)`
   const wrappers = [
     ...indicesOf(new RegExp(`\\bfunction\\s+\\w+\\s*\\(\\s*(\\w+)(?:\\s*:\\s*string)?\\s*\\)(?:\\s*:\\s*boolean)?\\s*\\{\\s*return\\s+${narrowCall}`, 'g'), SERVER_CODE),
@@ -374,7 +374,7 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   // The cause query: its import, the narrow one's body, the retry action's
   // cause member (bare), so the again-reason names what blocked the retry,
   // and the hold's version-changed listener's retry (its 4th argument, so a
-  // skip line there names the cause too, b.jg5 SRJ-207).
+  // skip line there names the cause too).
   const causeNamed = indicesOf(new RegExp(`\\b${RETRY_BLOCK_CAUSE}\\b`, 'g'), SERVER_CODE)
   expect(causeNamed).toHaveLength(4)
   expect(causeNamed.filter((offset) => offset > narrow.start && offset < narrow.end)).toHaveLength(1)
@@ -393,7 +393,7 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   expect(broad.body.replace(/\s+/g, ' ').trim()).toBe(`return ${retryBlocked}(${key})`)
 
   // The narrow one: its declaration, the retry action, the broad one's body
-  // and the hold's version-changed listener (b.jg5 SRJ-207).
+  // and the hold's version-changed listener.
   const narrowNamed = indicesOf(new RegExp(`\\b${retryBlocked}\\b`, 'g'), SERVER_CODE)
   expect(narrowNamed).toHaveLength(4)
   expect(narrowNamed[0]).toBe(SERVER_CODE.indexOf(retryBlocked!, narrow.at))
@@ -426,18 +426,18 @@ function insideMain(offset: number): boolean {
   return insideMainOf(SERVER_CODE, offset)
 }
 
-/** The persona routing's read-gate in-flight member (b.jg5 SRJ-1011); renaming it fails the typecheck. */
+/** The persona routing's read-gate in-flight member; renaming it fails the typecheck. */
 const ROUTING_WORK_IN_FLIGHT: keyof PersonaRoutingDeps = 'isWorkInFlight'
-/** The persona routing's lost-message row read (b.jg5 SRJ-1011, SRJ-115); renaming it fails the typecheck. */
+/** The persona routing's lost-message row read; renaming it fails the typecheck. */
 const ROUTING_ROW_READ: keyof PersonaRoutingDeps = 'readRowLiveness'
 
-/** The persona routing's latched member (b.jg5 SRJ-1011, SRJ-502); renaming it fails the typecheck. */
+/** The persona routing's latched member; renaming it fails the typecheck. */
 const ROUTING_LATCHED: keyof PersonaRoutingDeps = 'isLatched'
-/** The persona routing's `tmux-unresponsive` member (b.jg5 SRJ-1011, SRJ-307); renaming it fails the typecheck. */
+/** The persona routing's `tmux-unresponsive` member; renaming it fails the typecheck. */
 const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
 
 /**
- * b.jg5 SRJ-1011: the module-scope holder through which the persona routing's
+ * the module-scope holder through which the persona routing's
  * `member` reads `query` on one instance main() builds, at call time. The
  * routing is built at module scope, before main() builds the instance, so the
  * member must read the holder at each call:
@@ -452,12 +452,12 @@ const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
  * check's production deps (see retryCheckDeps), each the same call-time
  * query for its own parameter, `(key) => <holder>?.<query>(key) === true`
  * (the latch's: the check's `isLatched`, which the session-disconnect handler
- * and the routing's arm ask, b.jg5 SRJ-311, SRJ-502), and once inside each
+ * and the routing's arm ask), and once inside each
  * range of `alsoIn` ([start, end) offsets; the `ErrInvalidFlags` hold's:
- * shutdown's body, whose forget-all reads it, b.jg5 SRJ-207). With `orCall`
+ * shutdown's body, whose forget-all reads it). With `orCall`
  * (a call name), the member is that read `|| <orCall>(key)` instead, both
  * halves for the member's own parameter (the kill-failed member's old-life
- * half, b.jg5 SRJ-812). Returns the holder's name and the [start, end) of its
+ * half). Returns the holder's name and the [start, end) of its
  * assignment.
  */
 function routingHolder(
@@ -523,7 +523,7 @@ function srcFiles(dir = SRC_DIR): Array<[string, string]> {
 // Static audit: no module-scope Slack client or token read
 // ---------------------------------------------------------------------------
 
-describe('server.ts builds no Slack client and reads no token itself (SR-3.1, SR-10.2, SR-8.7)', () => {
+describe('server.ts builds no Slack client and reads no token itself', () => {
   test.each(['loadTokens', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'MCP_HOST', 'MCP_PORT', 'routingConfig'])(
     'server.ts code never names %s',
     (name) => {
@@ -564,10 +564,10 @@ describe('server.ts builds no Slack client and reads no token itself (SR-3.1, SR
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the start resolution (SR-1.7, SR-8.7)
+// Static audit: the start resolution
 // ---------------------------------------------------------------------------
 
-describe('main() resolves the start through the reload controller and exits on a refused start (SR-1.7, SR-8.7)', () => {
+describe('main() resolves the start through the reload controller and exits on a refused start', () => {
   test('imports createReloadController and reloadFilePaths from the reload module, and neither the start loader nor a route loader from the config module', () => {
     expect(SERVER_CODE).toMatch(
       /import\s*\{[^}]*\bcreateReloadController\b[^}]*\}\s*from\s*['"]\.\/reload\.ts['"]/,
@@ -613,7 +613,7 @@ describe('main() resolves the start through the reload controller and exits on a
     // The start path, from the resolution to the start bring-up request (where
     // every start pass reads the applied config), assigns it from the outcome
     // once. A later assignment outside that window (a confirmed apply,
-    // E12/E13) is not the start's.
+    // ) is not the start's.
     const assigns = assignmentsTo(loaded)
     expect(assigns.filter(({ at }) => at > resolveAt && at < bringUpAt).map(({ at }) => at)).toEqual([assignAt])
     // No assignment anywhere reads the config file (the import test above
@@ -643,10 +643,10 @@ describe('main() resolves the start through the reload controller and exits on a
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the unhandledRejection handler (SR-3.3)
+// Static audit: the unhandledRejection handler
 // ---------------------------------------------------------------------------
 
-describe('main() installs the unhandledRejection handler before any persona connects (SR-3.3)', () => {
+describe('main() installs the unhandledRejection handler before any persona connects', () => {
   const INSTALL = /\bprocess\.on\s*\(\s*['"]unhandledRejection['"]\s*,\s*createUnhandledRejectionHandler\s*\(/g
 
   test('installs createUnhandledRejectionHandler from the connection-errors module, once, inside main() and never at module scope', () => {
@@ -671,10 +671,10 @@ describe('main() installs the unhandledRejection handler before any persona conn
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the agent-director startup gate runs first (b.jg5 SRJ-203)
+// Static audit: the agent-director startup gate runs first
 // ---------------------------------------------------------------------------
 
-describe('main() runs the agent-director startup gate before any other work, always with the Phase 1 floor (b.jg5 SRJ-203, AC 20)', () => {
+describe('main() runs the agent-director startup gate before any other work, always with the Phase 1 floor', () => {
   /** The gate's floor-exempt option; typed against the gate's options, so a rename fails the typecheck. */
   const FLOOR_EXEMPT_OPTION: keyof StartupGateOptions = 'skipPhase1Floor'
 
@@ -710,7 +710,7 @@ describe('main() runs the agent-director startup gate before any other work, alw
   test('inside main(), only the state-directory migration and its stop, the state and inbox directory creations and the unhandledRejection handler install come before it', () => {
     const [mainStart] = mainBody(SERVER_CODE)
     // The gate statement starts at its `await`, or at a single
-    // `const <name> = ` that binds the gate's result (E3 reads its `adVersion`
+    // `const <name> = ` that binds the gate's result ( reads its `adVersion`
     // for the runtime re-check). Only that binding is admitted: any other code
     // before the gate is still left in `before` and fails the check below.
     const gateStatement = SERVER_CODE.slice(0, gateCall()).search(/(?:\bconst\s+[A-Za-z_$][\w$]*\s*=\s*)?\bawait\s+$/)
@@ -719,9 +719,9 @@ describe('main() runs the agent-director startup gate before any other work, alw
     // guarded install `if (!unhandledRejectionHandlerInstalled) { … }`.
     const cuts: Array<[number, number]> = []
     const dirs: string[] = []
-    // b.fc4: the state-directory migration statement and the `if` that stops
+    // the state-directory migration statement and the `if` that stops
     // the start when it could not make the move safe (pinned in full by the
-    // b.fc4 describe below).
+    // describe below).
     const migrations = indicesOf(/\bconst\s+stateDirMigration\s*=\s*migrateStateDirAtStart\s*\(/g, before)
     expect(migrations).toHaveLength(1)
     const [migrationArgsStart, migrationArgsEnd] = balancedAfter(before, migrations[0]!, '(', ')')
@@ -736,7 +736,7 @@ describe('main() runs the agent-director startup gate before any other work, alw
       dirs.push(splitTopLevel(before.slice(argsStart, argsEnd))[0]!)
       cuts.push([at, argsEnd + 1])
     }
-    // b.fc4: the migration's outcome kind and the one-line `if` that repoints
+    // the migration's outcome kind and the one-line `if` that repoints
     // the console redirect at the new directory's server.log (pinned below).
     for (const statement of [/\bconst\s+migrationKind\s*=/g, /\bif\s*\(\s*migrationKind\b/g]) {
       const found = indicesOf(statement, before)
@@ -760,7 +760,7 @@ describe('main() runs the agent-director startup gate before any other work, alw
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the state-directory migration runs first (b.fc4)
+// Static audit: the state-directory migration runs first
 //
 // What the migration does with each state of the old and new directories is
 // driven through its real module in tests/state-dir-migration.test.ts. What
@@ -769,7 +769,7 @@ describe('main() runs the agent-director startup gate before any other work, alw
 // migration says it could not make the move safe.
 // ---------------------------------------------------------------------------
 
-describe('main() migrates the state directory before anything reads or writes it (b.fc4)', () => {
+describe('main() migrates the state directory before anything reads or writes it', () => {
   /** Offset of the only `migrateStateDirAtStart(` call; fails unless there is exactly one. */
   const migrationCall = (): number => onlyCallOf('migrateStateDirAtStart')
 
@@ -842,8 +842,7 @@ describe('main() migrates the state directory before anything reads or writes it
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the runtime agent-director version re-check (b.jg5 SRJ-204,
-// SRJ-205)
+// Static audit: the runtime agent-director version re-check
 //
 // What the re-check does (its 120 s timer, each outcome, the stop calling
 // `stop(AD_VERSION_RECHECK_STOP_EXIT_CODE)` once, dispose) is driven through
@@ -851,7 +850,7 @@ describe('main() migrates the state directory before anything reads or writes it
 // is where main() installs it, what it is given, and what shutdown does.
 // ---------------------------------------------------------------------------
 
-describe('main() installs the runtime agent-director version re-check right after the startup gate, and shutdown disposes it and makes no agent-director call (b.jg5 SRJ-204, SRJ-205)', () => {
+describe('main() installs the runtime agent-director version re-check right after the startup gate, and shutdown disposes it and makes no agent-director call', () => {
   /** The gate result's version field; typed against the gate, so a rename fails the typecheck. */
   const GATE_VERSION_FIELD: keyof Awaited<ReturnType<typeof runAgentDirectorStartupGate>> = 'adVersion'
 
@@ -981,7 +980,7 @@ describe('main() installs the runtime agent-director version re-check right afte
   // What the deadline does is driven in tests/shutdown-deadline.test.ts; this
   // case pins that only this stop arms it, first, with the stop's code, the
   // real exit and the module's own clock and deadline.
-  test('its stop arms the shutdown deadline first (SRJ-205, AC 21): the one armShutdownDeadline call, from shutdown-deadline.ts, with the stop\'s exit code, process.exit, the server log and no clock or deadline override; the signals and shutdown arm none', () => {
+  test('its stop arms the shutdown deadline first: the one armShutdownDeadline call, from shutdown-deadline.ts, with the stop\'s exit code, process.exit, the server log and no clock or deadline override; the signals and shutdown arm none', () => {
     expect(importSource(SERVER_CODE, 'armShutdownDeadline')).toBe('./shutdown-deadline.ts')
     expect(indicesOf(/\b(?:let|const|var|function)\s+armShutdownDeadline\b/g, SERVER_CODE)).toEqual([])
     // The import and the one call are its only mentions: no alias, no second arm.
@@ -1054,8 +1053,7 @@ describe('main() installs the runtime agent-director version re-check right afte
   // main() must not start the HTTP server, the start bring-up, the health
   // check or the detection tick once a shutdown has begun; nor the start
   // sweep or a bootstrap pass after it (trust, JSONL safeguard, legacy cleanup),
-  // so a version re-check's stop changes no agent-director row (b.jg5
-  // SRJ-205, SRJ-714). main() can only observe that after it resumes from an
+  // so a version re-check's stop changes no agent-director row. main can only observe that after it resumes from an
   // await, so each of those calls needs an `if (shuttingDown) return` between
   // the last await in main's execution and the call. Awaits inside a stored
   // callback do not run during startup; awaits in conditional blocks do count.
@@ -1145,7 +1143,7 @@ describe('main() installs the runtime agent-director version re-check right afte
 
 // ---------------------------------------------------------------------------
 // Static audit: agent-director's timing settings are read at start, and again
-// only on the version re-check's tick (b.jg5 SRJ-209)
+// only on the version re-check's tick
 //
 // What the install does (the startup read, the re-read after each 120 s
 // re-check tick whatever health_check_interval is, none after the re-check's
@@ -1155,7 +1153,7 @@ describe('main() installs the runtime agent-director version re-check right afte
 // file.
 // ---------------------------------------------------------------------------
 
-describe('main() installs agent-director\'s settings read once, after the startup gate and the start\'s configuration resolution and before the start bring-up, under the process\'s own HOME (b.jg5 SRJ-209)', () => {
+describe('main() installs agent-director\'s settings read once, after the startup gate and the start\'s configuration resolution and before the start bring-up, under the process\'s own HOME', () => {
   /** The install; typed against its module, so a rename fails the typecheck. */
   const INSTALL: keyof typeof AdSettingsModule = 'installAdSettings'
 
@@ -1224,7 +1222,7 @@ describe('main() installs agent-director\'s settings read once, after the startu
 
 // ---------------------------------------------------------------------------
 // Static audit: the call-timeout start step runs once per start, right after
-// the settings read and before the start pass (b.jg5 SRJ-213)
+// the settings read and before the start pass
 //
 // What the step does (one startup check, then the persona client built with
 // the setting's value, a warning never stopping the start) is driven through
@@ -1233,7 +1231,7 @@ describe('main() installs agent-director\'s settings read once, after the startu
 // the step, with what, and that nothing calls it again.
 // ---------------------------------------------------------------------------
 
-describe('main() runs the call-timeout start step once, after the startup gate, the start\'s configuration resolution and the settings read, and before the template install and the start bring-up, over the start-time config (b.jg5 SRJ-213)', () => {
+describe('main() runs the call-timeout start step once, after the startup gate, the start\'s configuration resolution and the settings read, and before the template install and the start bring-up, over the start-time config', () => {
   /** The step, the check it runs and the persona-client builder; typed against their modules, so a rename fails the typecheck. */
   const STEP: keyof typeof ServerModule = '_runCallTimeoutStartStep'
   const CHECK: keyof typeof AdSettingsModule = 'checkAdCallTimeoutAtStartup'
@@ -1348,7 +1346,7 @@ describe('main() runs the call-timeout start step once, after the startup gate, 
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the retired-key record's start read (b.jg5 SRJ-801, SRJ-802)
+// Static audit: the retired-key record's start read
 //
 // What the read does (a missing file, each unreadable form and its one
 // startup-errors entry, the store) is driven through the module in
@@ -1357,7 +1355,7 @@ describe('main() runs the call-timeout start step once, after the startup gate, 
 // holds the one store.
 // ---------------------------------------------------------------------------
 
-describe('main() reads the retired-key record once, behind no branch, after the PID check and before the start resolution, the start sweep and the start bring-up, exits on a refusal and holds the one store (b.jg5 SRJ-801, SRJ-802)', () => {
+describe('main() reads the retired-key record once, behind no branch, after the PID check and before the start resolution, the start sweep and the start bring-up, exits on a refusal and holds the one store', () => {
   /** The start read; typed against its module, so a rename fails the typecheck. */
   const START_READ: keyof typeof RetiredKeysModule = 'readRetiredKeysAtStart'
   /** What else could build a store, or name or write the file; typed against the module. */
@@ -1446,18 +1444,18 @@ describe('main() reads the retired-key record once, behind no branch, after the 
 
 // ---------------------------------------------------------------------------
 // Static audit: the bring-up gets the loaded config and the bring-up
-// controller; shutdown cancels the controller's retries (SR-6.1, SR-6.4)
+// controller; shutdown cancels the controller's retries
 // ---------------------------------------------------------------------------
 
-describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona config through the bring-up controller, which shutdown cancels (SR-6.1, SR-6.4)', () => {
-  test('is the reload controller\'s start bring-up: it launches over configInEffect(<start-time config>, <the applied config the controller supplies>), as its bring-up the bring-up controller, and as its shutdown query a live read of `shuttingDown` (b.jg5 SRJ-205)', () => {
+describe('startupSessionManager runs the bring-up over the loaded persona config through the bring-up controller, which shutdown cancels', () => {
+  test('is the reload controller\'s start bring-up: it launches over configInEffect(<start-time config>, <the applied config the controller supplies>), as its bring-up the bring-up controller, and as its shutdown query a live read of `shuttingDown`', () => {
     // The only startupSessionManager call is returned by the controller's
     // lifecycle `startBringUp`, right after a guard that throws while the
     // start-time config is unset. Its first argument is configInEffect of the
     // start-time config and that closure's parameter: the controller's applied
     // persona set (the record's at a start from the record) over the
     // start-time server-wide values, as every later launch reads them. Bug
-    // b.avm: a start that fell back to the old crontable sets that path in the
+    // a start that fell back to the old crontable sets that path in the
     // start-time config only, so the controller's config as a whole is never
     // the one a launch reads. Never the module-level config or a config read again from the file. main()
     // requests the pass with no argument, so the controller supplies the config.
@@ -1488,7 +1486,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     const options = objectProperties(args[1]!)
     expect([...options.keys()]).toEqual(['bringUp', 'isShuttingDown'])
     expect(options.get('bringUp')).toBe(constOf('createPersonaBringUpController'))
-    // b.jg5 SRJ-205 (the E4 gate): the launch pool asks the query before each
+    // (the gate): the launch pool asks the query before each
     // launch, so it is an arrow reading the flag at call time, never a value
     // captured when the pass began. The flag is server.ts's one module-level
     // `let shuttingDown` (tests/start-sweep-wiring.test.ts pins that).
@@ -1502,7 +1500,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
   test('the health check starts only after the start bring-up returns: one startHealthCheck, inside main(), after the awaited runStartBringUp(), at the applied config\'s interval', () => {
     // The previous test pins `await <controller>.runStartBringUp()`, so a call
     // after it in main() runs once the pass has returned. The reload detection
-    // tick (b.av2 SR-8.2) follows the same rule.
+    // tick follows the same rule.
     const { bringUpAt, loaded } = startResolution(SERVER_CODE)
     const at = onlyCallOf('startHealthCheck')
     expect(insideMain(at)).toBe(true)
@@ -1518,11 +1516,11 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
 
     const props = onlyCallProps('createPersonaBringUpController')
-    // The whole manager, so a claude_config_dir hold (bug b.g57) can close
+    // The whole manager, so a claude_config_dir hold can close
     // the persona's connection with its `stop`.
     expect(props.get('connections')).toBe(constOf('createPersonaConnectionManager'))
     expect(props.get('dryRun')).toBe('isDryRun()')
-    // b.av2 SR-8.6: the launch reads the applied config at call time (a
+    // the launch reads the applied config at call time (a
     // confirmed apply's step 1 swaps it), falling back to the start-time one.
     const loaded = loadedConfigName(SERVER_CODE)
     const launch = props.get('launch')
@@ -1533,10 +1531,10 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     expect(onlyCallProps('initRestart').get('getRestartDelay')).toBe(`() => ${appliedName}.session_restart_delay`)
   })
 
-  // b.av2 SR-8.6: optional in the controller's type, so only this audit makes
+  // optional in the controller's type, so only this audit makes
   // sure production binds it. Without it every known persona counts as
   // applied: a removed persona's retry would still launch it, and a re-check
-  // would use the set it was brought up with (the E11 stale-set carry).
+  // would use the set it was brought up with (the stale-set carry).
   test('the bring-up controller reads the live applied persona set: appliedPersonas is () => <applied config>?.personas ?? []', () => {
     const props = onlyCallProps('createPersonaBringUpController')
     const loaded = loadedConfigName(SERVER_CODE)
@@ -1574,7 +1572,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     expect(SERVER_CODE.slice(callEnd + 1, at).trim()).toBe('')
   })
 
-  // Bug b.g57: an unresolvable claude_config_dir is a retrying state the
+  // an unresolvable claude_config_dir is a retrying state the
   // bring-up controller holds, with no Slack connection. Both bindings are
   // optional (the controller's `checkConfigDir` defaults to a check against
   // the OS home and file system, and with no hook a launch only logs and
@@ -1583,26 +1581,26 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
   // up would keep its connection and never be launched once the directory
   // resolves; with another check, the check before its Slack step or the
   // re-check could pass a directory the launch then refuses.
-  test('bug b.g57: the bring-up controller checks and re-checks a persona\'s claude_config_dir with the launch\'s own check, checkLaunchConfigDir from the session manager', () => {
+  test('the bring-up controller checks and re-checks a persona\'s claude_config_dir with the launch\'s own check, checkLaunchConfigDir from the session manager', () => {
     expect(onlyCallProps('createPersonaBringUpController').get('checkConfigDir')).toBe('checkLaunchConfigDir')
     expect(importSource(SERVER_CODE, 'checkLaunchConfigDir')).toBe('./session-manager.ts')
     expect(indicesOf(/\b(?:let|const|var|function)\s+checkLaunchConfigDir\b/g, SERVER_CODE)).toEqual([])
   })
 
-  // Bug b.g57: the reload preview lists an added persona whose
+  // the reload preview lists an added persona whose
   // claude_config_dir cannot be resolved. Its `checkConfigDir` is optional
   // (default: a check against the OS home and file system), so only this
   // audit makes sure the preview resolves the directory with the same check
   // the persona's bring-up and launch will use; with another check the
   // preview could promise a persona that is then held, or warn about one
   // that comes up.
-  test('bug b.g57: the reload preview checks an added persona\'s claude_config_dir with the launch\'s own check, checkLaunchConfigDir from the session manager', () => {
+  test('the reload preview checks an added persona\'s claude_config_dir with the launch\'s own check, checkLaunchConfigDir from the session manager', () => {
     expect(onlyCallProps('createReloadController').get('checkConfigDir')).toBe('checkLaunchConfigDir')
     expect(importSource(SERVER_CODE, 'checkLaunchConfigDir')).toBe('./session-manager.ts')
     expect(indicesOf(/\b(?:let|const|var|function)\s+checkLaunchConfigDir\b/g, SERVER_CODE)).toEqual([])
   })
 
-  test('bug b.g57: a launch hands an unresolvable claude_config_dir to the bring-up controller: setConfigDirUnresolvableHook(<controller>.holdForConfigDir) once, on every start, after `bringUps = <controller>` and before any launch path is wired', () => {
+  test('a launch hands an unresolvable claude_config_dir to the bring-up controller: setConfigDirUnresolvableHook(<controller>.holdForConfigDir) once, on every start, after `bringUps = <controller>` and before any launch path is wired', () => {
     const controller = constOf('createPersonaBringUpController')
     const at = onlyCallOf('setConfigDirUnresolvableHook')
     expect(onlyCallArgs('setConfigDirUnresolvableHook')).toEqual([`${controller}.holdForConfigDir`])
@@ -1635,7 +1633,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the persona connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2)
+// Static audit: the persona connection seams
 //
 // The seams themselves (clientFor, the identity getter, the up→flush listener,
 // the event router, the archive source) are driven through the real connection
@@ -1643,13 +1641,13 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
 // module scope hold is which seam gets which argument.
 // ---------------------------------------------------------------------------
 
-describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2)', () => {
+describe('server.ts wires the persona connection seams', () => {
   test('the connection manager takes dry run from isDryRun() and, on each status, flushes on up the notifier every persona notice goes through, tells the bring-up controller and reconciles queued feedback on up', () => {
     const notifier = constOf('createPersonaNotifier')
     // The notices' notifier: the session manager's sink and the outage state's
     // notify. The outage notify passes its options through, so the notifier
     // routes the all-clear of an outage whose onset a persona teardown's
-    // window routed as that onset was (b.jg5 SRJ-1002, SRJ-1003); the
+    // window routed as that onset was; the
     // parameters' names are free.
     expect(onlyCallArgs('setSessionNotifier')).toEqual([`${notifier}.notify`])
     expect(onlyCallProps('initOutageState').get('notify')).toMatch(
@@ -1671,7 +1669,7 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(listeners[2]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
   })
 
-  test('the Slack API base URL override (E14 Task 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
+  test('the Slack API base URL override (section 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
     expect(importSource(SERVER_CODE, 'resolveSlackApiUrlOverride')).toBe('./persona-slack-clients.ts')
     const resolveAt = onlyCallOf('resolveSlackApiUrlOverride')
     expect(insideMain(resolveAt)).toBe(true)
@@ -1690,14 +1688,14 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(offenders).toEqual([])
   })
 
-  test('the notifier and the permission poller share one destination resolver: createPersonaDestinations built once, at module scope, and passed as `destinations` to both (b.av2 SR-7.1)', () => {
+  test('the notifier and the permission poller share one destination resolver: createPersonaDestinations built once, at module scope, and passed as `destinations` to both', () => {
     const resolver = constOf('createPersonaDestinations')
     expect(insideMain(onlyCallOf('createPersonaDestinations'))).toBe(false)
     expect(onlyCallProps('createPersonaNotifier').get('destinations')).toBe(resolver)
     expect(onlyCallProps('startPermissionPoller').get('destinations')).toBe(resolver)
   })
 
-  // b.jg5 SRJ-1003: a stuck-prompt warning raised in a persona's teardown
+  // a stuck-prompt warning raised in a persona's teardown
   // window goes to the notifier, whose window writes it; the poller is handed
   // the one notifier main() builds.
   test('the permission poller\'s teardownNotices is the one persona notifier (createPersonaNotifier\'s constant), beside its destination hold', () => {
@@ -1770,7 +1768,7 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
 // Static audit: only a serving persona is relaunched; the restart delay
 // ---------------------------------------------------------------------------
 
-describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) and reads the restart delay from the applied config', () => {
+describe('server.ts gates every relaunch on the persona\'s connection and reads the restart delay from the applied config', () => {
   test('the relaunch gate is built once, inside main(), over the connection manager and the bring-up controller\'s outcomes', () => {
     constOf('createPersonaRelaunchGate')
     const at = onlyCallOf('createPersonaRelaunchGate')
@@ -1782,11 +1780,11 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(args[2]).toBe(constOf('createPersonaBringUpController'))
   })
 
-  test('the restart module asks the gate before it touches a persona: canRestart is the gate (b.av2 SR-6.4)', () => {
+  test('the restart module asks the gate before it touches a persona: canRestart is the gate', () => {
     expect(onlyCallProps('initRestart').get('canRestart')).toBe(constOf('createPersonaRelaunchGate'))
   })
 
-  test('the restart module\'s launch passes the live applied config (read at call time, SR-8.6), the gate to launchSession as canLaunch, and the escalate-dead verdict it is handed as deadEvidence (b.jg5 SRJ-611)', () => {
+  test('the restart module\'s launch passes the live applied config (read at call time), the gate to launchSession as canLaunch, and the escalate-dead verdict it is handed as deadEvidence', () => {
     const gate = constOf('createPersonaRelaunchGate')
     const binding = onlyCallProps('initRestart').get('launchSession')!
     expect(binding).toContain('launchSession(')
@@ -1806,8 +1804,8 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect([...options.keys()].sort()).toEqual(['canLaunch', 'deadEvidence'])
   })
 
-  // b.jpf: restart recovery is never authorized by installation discovery.
-  test('b.jpf: restart production wiring has no kill dependency', () => {
+  // restart recovery is never authorized by installation discovery.
+  test('restart production wiring has no kill dependency', () => {
     expect(onlyCallProps('initRestart').has('killSession')).toBe(false)
     // The compatibility factory is declared but never built for production.
     expect(indicesOf(/(?<![\w.$]|function\s+)_buildKillSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(0)
@@ -1815,19 +1813,19 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(indicesOf(/\bfunction\s+getAppliedPersona\s*\(/g, SERVER_CODE)).toHaveLength(1)
   })
 
-  // b.jg5 SRJ-702: the clock the adapter's kill retry waits on is the
+  // the clock the adapter's kill retry waits on is the
   // production one, imported from src/kill-retry.ts: no copy or test clock
   // declared in server.ts.
-  test('b.jg5 SRJ-702: the production kill-retry clock is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
+  test('the production kill-retry clock is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
     expect(importSource(SERVER_CODE, KILL_RETRY_PRODUCTION_CLOCK)).toBe('./kill-retry.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${KILL_RETRY_PRODUCTION_CLOCK}\\b`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  // b.jg5 SRJ-702, SRJ-305: main() installs the persona kill retry's
+  // main installs the persona kill retry's
   // keep-going query once, over the server's up predicate and its
   // shutting-down flag, before anything can kill (the start sweep, the
   // restart module, the start bring-up).
-  test('b.jg5 SRJ-702: the kill retry\'s keep-going query is installed once in main(), over isPersonaUp and the shutting-down flag, before the start sweep and the restart module', () => {
+  test('the kill retry\'s keep-going query is installed once in main(), over isPersonaUp and the shutting-down flag, before the start sweep and the restart module', () => {
     const at = onlyCallOf('setPersonaKillKeepGoingQuery')
     expect(insideMain(at)).toBe(true)
     const props = onlyCallProps('setPersonaKillKeepGoingQuery')
@@ -1865,7 +1863,7 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the UNAVAILABLE retry timers (b.jg5 SRJ-301, SRJ-305)
+// Static audit: the UNAVAILABLE retry timers
 //
 // A trigger reaches a persona's retry timer only through the controller
 // main() installs as the outage state's trigger sink, so the install must
@@ -1878,7 +1876,7 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
 // reads, and what the restart module's arm hook arms.
 // ---------------------------------------------------------------------------
 
-describe('main() installs one UNAVAILABLE retry controller as the trigger sink before the start bring-up, and shutdown stops every retry timer (b.jg5 SRJ-301, SRJ-305)', () => {
+describe('main() installs one UNAVAILABLE retry controller as the trigger sink before the start bring-up, and shutdown stops every retry timer', () => {
   test('the controller is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), on the production clock, and handed to the module-scope handle shutdown reads', () => {
     const at = onlyCallOf('createUnavailableRetryController')
     const controller = constOf('createUnavailableRetryController')
@@ -1957,12 +1955,12 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // would still launch over an in-flight launch or past the cap. Only these
   // members are pinned, not the full key set.
 
-  // b.jg5 SRJ-314: the restart module's arm hook is optional (absent, nothing
+  // the restart module's arm hook is optional (absent, nothing
   // is armed), so a production wiring that dropped it, or bound it to a stub
   // or another controller, would type-check and pass every behaviour suite
   // while an `unknown` liveness reading armed no retry. What the hook's call
   // does is tested in tests/restart.test.ts; pinned here: its binding.
-  test('the restart module\'s arm hook (armRetryTimer) arms this controller for the persona it is given, with the read-error cause (b.jg5 SRJ-314, SRJ-301)', () => {
+  test('the restart module\'s arm hook (armRetryTimer) arms this controller for the persona it is given, with the read-error cause', () => {
     const controller = constOf('createUnavailableRetryController')
     const hook = onlyCallProps('initRestart').get('armRetryTimer')
     expect(hook).toBeDefined()
@@ -1975,7 +1973,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     expect(onlyCallOf('createUnavailableRetryController')).toBeLessThan(onlyCallOf('initRestart'))
   })
 
-  // b.jg5 SRJ-311: the health check's retry-timer read and arm are optional
+  // the health check's retry-timer read and arm are optional
   // (absent, the tick arms nothing), so a production wiring that dropped
   // either, bound the read to a constant or another controller, or armed with
   // a no-op or another cause would type-check and pass every behaviour suite
@@ -1983,8 +1981,8 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // raised was never attempted again. What the tick does with them is tested
   // in tests/health-check.test.ts; pinned here: their bindings. The arm is
   // server.ts's one ENVIRONMENT arm path (armEnvironmentRetryTimer), which the
-  // tmux-unavailable retry check's production deps also bind (b.jg5 SRJ-311).
-  test('the health check\'s retry-timer read (isRetryArmed) is this controller\'s isArmed, and its arm (armRetryTimer) is server.ts\'s one ENVIRONMENT arm path, armEnvironmentRetryTimer, which arms this controller, through its one module-scope handle, for the persona it is given, with the environment cause (b.jg5 SRJ-311, SRJ-301)', () => {
+  // tmux-unavailable retry check's production deps also bind.
+  test('the health check\'s retry-timer read (isRetryArmed) is this controller\'s isArmed, and its arm (armRetryTimer) is server.ts\'s one ENVIRONMENT arm path, armEnvironmentRetryTimer, which arms this controller, through its one module-scope handle, for the persona it is given, with the environment cause', () => {
     // Tied to src by type: renaming any of these fails the typecheck.
     const TICK_READ: keyof HealthCheckDeps = 'isRetryArmed'
     const TICK_ARM: keyof HealthCheckDeps = 'armRetryTimer'
@@ -2023,7 +2021,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     // this function; server.ts's only other arm is the restart module's
     // read-error hook (pinned above); and the function is named only at its
     // declaration, the tick's binding and the tmux-unavailable retry check's
-    // production deps' `armRetryTimer` (b.jg5 SRJ-311, which the
+    // production deps' `armRetryTimer` (which the
     // session-disconnect handler and the routing's arm decide through).
     expect(indicesOf(new RegExp(`\\b${CAUSE}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
     const arms = indicesOf(new RegExp(`\\.\\s*${ARM}\\s*\\(`, 'g'), SERVER_CODE)
@@ -2054,7 +2052,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-706, SRJ-303 — the one live-row sequence registry
+// Static audit: the one live-row sequence registry
 //
 // The session manager answers "not installed" and false with no registry
 // installed, and the restart work's running query is optional (absent, no
@@ -2072,7 +2070,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
 // restart query and the shutdown close.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one live-row sequence registry and installs it before the start pass, the restart work asks its running query, and shutdown closes it once before the client is released (b.jg5 SRJ-706, SRJ-303)', () => {
+describe('main() builds the one live-row sequence registry and installs it before the start pass, the restart work asks its running query, and shutdown closes it once before the client is released', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof LiveRowSequenceModule = 'createLiveRowSequenceRegistry'
   const BUILDER: keyof typeof SessionManagerModule = 'buildLiveRowSequenceDeps'
@@ -2093,7 +2091,7 @@ describe('main() builds the one live-row sequence registry and installs it befor
     return match![1]!
   }
 
-  test('the registry is built exactly once, in main()\'s own statement list, from the sequence module, over the session manager\'s one dependency builder (the retry controller\'s arm, the system clock, the server log and the applied configuration read at call time), production\'s detached attempt runner and its outside-every-attempt runner (b.jg5 SRJ-811, SRJ-1512)', () => {
+  test('the registry is built exactly once, in main()\'s own statement list, from the sequence module, over the session manager\'s one dependency builder (the retry controller\'s arm, the system clock, the server log and the applied configuration read at call time), production\'s detached attempt runner and its outside-every-attempt runner', () => {
     expect(importSource(SERVER_CODE, FACTORY)).toBe('./live-row-sequence.ts')
     expect(importSource(SERVER_CODE, BUILDER)).toBe('./session-manager.ts')
     expect(importSource(SERVER_CODE, ATTEMPT)).toBe('./unavailable-retry.ts')
@@ -2141,7 +2139,7 @@ describe('main() builds the one live-row sequence registry and installs it befor
     expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
   })
 
-  // b.jg5 SRJ-811: the bare running query would refuse a restart over an
+  // the bare running query would refuse a restart over an
   // old-life wait on the persona's own row without arming its retry timer,
   // so nothing would retry it once the wait is over.
   test('the restart work uses liveRowSequenceGate to arm old-life retries; the bare running query only guards reconnect deferral and delivery holds', () => {
@@ -2194,7 +2192,7 @@ describe('main() builds the one live-row sequence registry and installs it befor
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-811 / SRJ-812 / SRJ-1512 — the old-life wait's
+// Static audit: the old-life wait's
 // bindings
 //
 // The bindings' alert sinks are optional (absent, the session manager falls
@@ -2209,7 +2207,7 @@ describe('main() builds the one live-row sequence registry and installs it befor
 // pinned here: the install and its members.
 // ---------------------------------------------------------------------------
 
-describe('main() installs the old-life wait\'s bindings once, beside the live-row sequence registry and before the start pass, over the one retry controller, the system clock, the server log, the applied configuration, the one kill-failure alerts instance and recordStartupError (b.jg5 SRJ-811, SRJ-812, SRJ-1512)', () => {
+describe('main() installs the old-life wait\'s bindings once, beside the live-row sequence registry and before the start pass, over the one retry controller, the system clock, the server log, the applied configuration, the one kill-failure alerts instance and recordStartupError', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const INSTALL: keyof typeof SessionManagerModule = 'setOldLifeWaitBindings'
   const REGISTRY_INSTALL: keyof typeof SessionManagerModule = 'setLiveRowSequenceRegistry'
@@ -2239,7 +2237,7 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
   test('its members are exactly the one retry controller, the system clock, the server log, the applied configuration read at call time, the one kill-failure alerts instance, one recordStartupError call with the class and entry it is given, and the wait\'s one unclassified-error episodes instance', () => {
     const props = onlyCallProps(INSTALL)
     expect([...props.keys()].sort()).toEqual([RETRY_ARM, CLOCK, LOG, APPLIED, ALERTS, RECORD, EPISODES].sort())
-    // b.jg5 SRJ-313: the wait's own episodes instance, built before the install, never a persona's.
+    // the wait's own episodes instance, built before the install, never a persona's.
     expect(props.get(EPISODES)).toBe(constOf(EPISODES_FACTORY))
     expect(onlyCallOf(INSTALL)).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
     // Each waiting persona's timer is armed on the one controller shutdown closes.
@@ -2255,7 +2253,7 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
     expect(props.get(RECORD)).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
   })
 
-  test('the wait\'s unclassified-error episodes are built exactly once, in main()\'s own statement list, from the session manager, on the system clock, with the server log, E6\'s alert threshold in effect and one recordStartupError call (b.jg5 SRJ-313, SRJ-811)', () => {
+  test('the wait\'s unclassified-error episodes are built exactly once, in main()\'s own statement list, from the session manager, on the system clock, with the server log, \'s alert threshold in effect and one recordStartupError call', () => {
     expect(importSource(SERVER_CODE, EPISODES_FACTORY)).toBe('./session-manager.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${EPISODES_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
     expect(atMainTopLevel(SERVER_CODE, onlyCallOf(EPISODES_FACTORY))).toBe(true)
@@ -2267,7 +2265,7 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
     expect(props.get('recordStartupError')).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
   })
 
-  test('shutdown() closes the wait\'s unclassified-error episodes exactly once, through the module-scope holder main() assigns them to once, after the shutting-down flag (b.jg5 SRJ-313, SRJ-811)', () => {
+  test('shutdown() closes the wait\'s unclassified-error episodes exactly once, through the module-scope holder main() assigns them to once, after the shutting-down flag', () => {
     const handles = [...SERVER_CODE.matchAll(/^let\s+(\w+)\s*:\s*OldLifeWaitUnclassifiedErrors\s*\|\s*undefined\s*$/gm)]
     expect(handles).toHaveLength(1)
     const handle = handles[0]![1]!
@@ -2286,7 +2284,7 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-314 / SRJ-115 — the restart module's `pending`
+// Static audit: the restart module's `pending`
 // deferral is server.ts's one `deferPendingRow`
 //
 // `RestartDeps.deferPendingRow` is optional (absent, a `pending` liveness
@@ -2297,7 +2295,7 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
 // tests/server.test.ts; pinned here: its binding.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, its answer returned to the restart work, with the reading\'s launch start (b.jg5 SRJ-314, SRJ-115, SRJ-409, SRJ-411, SRJ-410)', () => {
+describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, its answer returned to the restart work, with the reading\'s launch start', () => {
   // Tied to src by type: renaming the member or the reading's field fails the typecheck.
   const DEP: keyof RestartDeps = 'deferPendingRow'
   const LAUNCH_FIELD: keyof PendingLivenessReading = 'launchStartedAt'
@@ -2307,7 +2305,7 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
     expect(hook).toBeDefined()
     // `async (key, reading) => deferPendingRow(key, reading.launchStartedAt)`,
     // or the call returned from a block body; the parameters' names are free.
-    // b.jg5 SRJ-410: the restart work reads the deferral's answer (a row read
+    // the restart work reads the deferral's answer (a row read
     // gone at a retry goes on to the relaunch in the same run), so a body that
     // only awaits the call, or drops it, would lose the gone answer.
     const call = `${DEP}\\(\\1, \\2\\.${LAUNCH_FIELD}\\)`
@@ -2320,7 +2318,7 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-409, SRJ-411 — the pending-only retry's pending-row
+// Static audit: the pending-only retry's pending-row
 // step is the session manager's `retryPendingRowStep` over the applied config
 //
 // `FullModeRetryDeps.stepPendingRow` is optional (absent, a pending-only
@@ -2332,7 +2330,7 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
 // and tests/pending-row.test.ts; pinned here: its binding.
 // ---------------------------------------------------------------------------
 
-describe('main() passes the full-mode retry action the pending-row step, retryPendingRowStep over getAppliedPersona (b.jg5 SRJ-409, SRJ-411)', () => {
+describe('main() passes the full-mode retry action the pending-row step, retryPendingRowStep over getAppliedPersona', () => {
   // Tied to src by type: renaming the member or the step fails the typecheck.
   const DEP: keyof FullModeRetryDeps = 'stepPendingRow'
   const STEP: keyof typeof SessionManagerModule = 'retryPendingRowStep'
@@ -2350,7 +2348,7 @@ describe('main() passes the full-mode retry action the pending-row step, retryPe
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-303, SRJ-305, SRJ-404 — one retry run gate for the
+// Static audit: one retry run gate for the
 
 //
 
@@ -2365,7 +2363,7 @@ describe('main() passes the full-mode retry action the pending-row step, retryPe
 // here: one object, shared.
 // ---------------------------------------------------------------------------
 
-describe('main() builds one retry run gate, spreads it into the full-mode retry action and installs it as the pending-row rule\'s gate (b.jg5 SRJ-303, SRJ-305, SRJ-404)', () => {
+describe('main() builds one retry run gate, spreads it into the full-mode retry action and installs it as the pending-row rule\'s gate', () => {
   // Every member of the gate's type; a member added to it fails the typecheck here.
   const GATE_MEMBERS: Record<keyof RetryRunGateDeps, true> = {
     isShuttingDown: true,
@@ -2415,7 +2413,7 @@ describe('main() builds one retry run gate, spreads it into the full-mode retry 
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-410, SRJ-404 — main()'s one pending-row rule
+// Static audit: main's one pending-row rule
 //
 // The session manager's install is optional (with none installed, a retry or
 
@@ -2432,7 +2430,7 @@ describe('main() builds one retry run gate, spreads it into the full-mode retry 
 // install.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one pending-row rule through its factory over the session manager\'s dependency builder, and installs it with the persona lifecycle serializer after the live-row sequence registry and before the start pass (b.jg5 SRJ-410, SRJ-404)', () => {
+describe('main() builds the one pending-row rule through its factory over the session manager\'s dependency builder, and installs it with the persona lifecycle serializer after the live-row sequence registry and before the start pass', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PendingRowModule = 'createPendingRowRule'
   const BUILDER: keyof typeof SessionManagerModule = 'buildPendingRowRuleDeps'
@@ -2480,7 +2478,7 @@ describe('main() builds the one pending-row rule through its factory over the se
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-1016 — the one set of per-persona notice episodes
+// Static audit: the one set of per-persona notice episodes
 //
 // The episodes' clock is optional (absent, the system clock) and any sink
 // type-checks, so a production wiring on a fake clock, with a sink that
@@ -2489,13 +2487,13 @@ describe('main() builds the one pending-row rule through its factory over the se
 // latch to reach) would pass every behaviour suite. What the episodes do is
 // tested in tests/persona-episodes.test.ts and the teardown's forget in
 // tests/persona-lifecycle.test.ts and tests/reload-wiring.test.ts; pinned
-// here: the build, its dependencies (the sink and the teardown query, b.jg5
-// SRJ-1003) and shutdown's close. A forget-all in its
+// here: the build, its dependencies (the sink and the teardown query
+//) and shutdown's close. A forget-all in its
 // place would end every episode but leave a later begin open: a launch still
 // in flight at shutdown could open an episode and arm an alert check after it.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one set of per-persona notice episodes before the start pass, on the production clock, with the persona notifier as its sink, and shutdown closes them (b.jg5 SRJ-1016, SRJ-309)', () => {
+describe('main() builds the one set of per-persona notice episodes before the start pass, on the production clock, with the persona notifier as its sink, and shutdown closes them', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
   const SINK: keyof PersonaEpisodesDeps = 'sink'
@@ -2560,11 +2558,11 @@ describe('main() builds the one set of per-persona notice episodes before the st
     // Exactly `(key, text, options) => { void <notifier>.notify(key, text, options) }`,
     // the parameters' names free: every argument passed through in order, so
     // the kill-failure survivor version's class reaches the notifier's
-    // teardown window (b.jg5 SRJ-1003, SRJ-1013).
+    // teardown window.
     expect(props.get(SINK)).toMatch(new RegExp(`^\\((\\w+), (\\w+), (\\w+)\\) => \\{ void ${notifier}\\.${NOTIFY}\\(\\1, \\2, \\3\\);? \\}$`))
   })
 
-  // b.jg5 SRJ-1003: the teardown query is optional (absent, every key reads
+  // the teardown query is optional (absent, every key reads
   // `none`), so a production wiring with no query, a stand-in, or another
   // notifier's query would type-check while an old half's posts reached the
   // new half's destination between a teardown's submit and its turn, and the
@@ -2611,7 +2609,7 @@ describe('main() builds the one set of per-persona notice episodes before the st
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-307 / SRJ-310 / SRJ-306 — the tmux-unresponsive
+// Static audit: the tmux-unresponsive
 // condition's production bindings
 //
 // Every hook that starts or ends the condition is optional with a no-op
@@ -2633,7 +2631,7 @@ const FLAG_CLEARED: keyof OutageStateDeps = 'onFlagCleared'
 /** The class the retry's healthy-row hook clears and the observer reports. */
 const TMUX_UNAVAILABLE_CLASS: OutageClass = 'tmux-unavailable'
 
-describe('main() builds the one tmux-unresponsive condition over the notice episodes, installs it as the condition sink before the start pass, and binds the tick\'s and the retry\'s ends to it and its end to the retry controller (b.jg5 SRJ-307, SRJ-310, SRJ-306)', () => {
+describe('main() builds the one tmux-unresponsive condition over the notice episodes, installs it as the condition sink before the start pass, and binds the tick\'s and the retry\'s ends to it and its end to the retry controller', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createTmuxUnresponsiveCondition'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -2713,7 +2711,7 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     // the end is a statement of its own in the block body, never skipped
     // behind a branch (no braces, branch keyword, `?`, `&&` or `||` before
     // it); the parameters' names are free. What else the body does (the
-    // healthy-row `tmux-unavailable` clear, b.jg5 SRJ-311, SRJ-312) is pinned
+    // healthy-row `tmux-unavailable` clear) is pinned
     // in the describe below.
     const call = `${condition}\\.${END}\\(\\1, ${END_RETRY}, \\2\\)`
     const unbranched = `(?:(?!\\b(?:if|else|for|while|do|switch|return|try|catch)\\b)[^{}?&|])*`
@@ -2727,7 +2725,7 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     expect(importSource(SERVER_CODE, 'getSessionByPersona')).toBe('./registry.ts')
   })
 
-  test('the tick\'s and the retry\'s hooks and the latch\'s silent-end hold (b.jg5 SRJ-310, SRJ-502) are the only ends server.ts calls on the condition, one each', () => {
+  test('the tick\'s and the retry\'s hooks and the latch\'s silent-end hold are the only ends server.ts calls on the condition, one each', () => {
     const condition = constOf(FACTORY)
     const ends = indicesOf(new RegExp(`\\b${condition}\\s*[?!]?\\.\\s*${END}\\s*\\(`, 'g'), SERVER_CODE)
     expect(ends).toHaveLength(3)
@@ -2750,7 +2748,7 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ (?:return )?${call};? \\}|${call})$`))
     expect(importSource(SERVER_CODE, RETRY_CONDITION)).toBe('./unavailable-retry.ts')
     // No other report of a condition's end anywhere in server.ts: this hook's
-    // and the outage state's cleared-flag observer's (b.jg5 SRJ-305, SRJ-306;
+    // and the outage state's cleared-flag observer's (
     // pinned in the describe below) are the only two.
     const endEntry = new RegExp(`\\.\\s*${CONTROLLER_END}\\s*\\(`, 'g')
     expect(indicesOf(endEntry, SERVER_CODE)).toHaveLength(2)
@@ -2760,7 +2758,7 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-311 / SRJ-312 / SRJ-305 / SRJ-306 — the
+// Static audit: the
 // `tmux-unavailable` clear's production bindings
 //
 // The outage state's cleared-flag observer (`OutageStateDeps.onFlagCleared`)
@@ -2777,7 +2775,7 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
 // here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the outage state\'s cleared-flag observer to the retry controller\'s condition-end entry for a tmux-unavailable clear, and the retry\'s healthy-row hook clears tmux-unavailable, both before the start pass (b.jg5 SRJ-311, SRJ-312, SRJ-305, SRJ-306)', () => {
+describe('main() binds the outage state\'s cleared-flag observer to the retry controller\'s condition-end entry for a tmux-unavailable clear, and the retry\'s healthy-row hook clears tmux-unavailable, both before the start pass', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const CLEAR: keyof typeof OutageStateModule = 'clearOutageFlag'
   const INIT: keyof typeof OutageStateModule = 'initOutageState'
@@ -2853,7 +2851,7 @@ describe('main() binds the outage state\'s cleared-flag observer to the retry co
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-308 / SRJ-309 / SRJ-210 — the tmux-unresponsive
+// Static audit: the tmux-unresponsive
 // condition's onset hooks, mode, alert threshold and alert stops
 //
 // The health check's tick-end hook and clock (`HealthCheckDeps.onTickEnd`,
@@ -2869,10 +2867,10 @@ describe('main() binds the outage state\'s cleared-flag observer to the retry co
 // entry does is tested in tests/tmux-unresponsive.test.ts,
 // tests/health-check.test.ts and tests/unavailable-retry.test.ts; the
 // teardown's alert cancel in tests/reload-wiring.test.ts; shutdown's close in
-// the SRJ-1016 describe above. Pinned here: the bindings.
+// the describe above. Pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s end and to each retry fire, reads its mode and alert threshold at each check, and cancels its alert only at a retry-timer stop, at a teardown\'s timer stop and at shutdown (b.jg5 SRJ-308, SRJ-309, SRJ-210)', () => {
+describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s end and to each retry fire, reads its mode and alert threshold at each check, and cancels its alert only at a retry-timer stop, at a teardown\'s timer stop and at shutdown', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createTmuxUnresponsiveCondition'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -2951,14 +2949,14 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
     expect(onlyCallArgs('startHealthCheck')).toEqual([`${loaded}.${INTERVAL}`])
   })
 
-  test('the alert threshold is E6\'s accessor of the threshold in effect itself, imported from ad-settings, never called (a value taken once) or shadowed in server.ts', () => {
+  test('the alert threshold is \'s accessor of the threshold in effect itself, imported from ad-settings, never called (a value taken once) or shadowed in server.ts', () => {
     expect(onlyCallProps(FACTORY).get(THRESHOLD)).toBe(THRESHOLD_IN_EFFECT)
     expect(importSource(SERVER_CODE, THRESHOLD_IN_EFFECT)).toBe('./ad-settings.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${THRESHOLD_IN_EFFECT}\\b`, 'g'), SERVER_CODE)).toEqual([])
     expect(indicesOf(new RegExp(`\\b${THRESHOLD_IN_EFFECT}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the retry controller\'s stop observer calls the condition\'s alert cancel and the unclassified-error episodes\' stop entry, each given the persona and the stop reason and each in its own try/catch (b.jg5 SRJ-309, SRJ-313)', () => {
+  test('the retry controller\'s stop observer calls the condition\'s alert cancel and the unclassified-error episodes\' stop entry, each given the persona and the stop reason and each in its own try/catch', () => {
     const condition = constOf(FACTORY)
     declaredOnce(condition)
     const unclassified = constOf(UNCLASSIFIED_FACTORY)
@@ -2993,7 +2991,7 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-313 / SRJ-1009 — the unclassified-error episodes'
+// Static audit: the unclassified-error episodes'
 // production bindings
 //
 // The outage state's unclassified sink (`OutageStateDeps.unclassifiedSink`),
@@ -3013,7 +3011,7 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
 // the describe above. Pinned here: the build and the other bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one unclassified-error episodes instance over the notice episodes before the start pass, installs it as the outage state\'s unclassified sink, routes its log-only alert through recordStartupError, and ends its episode at the restart cap (b.jg5 SRJ-313, SRJ-1009)', () => {
+describe('main() builds the one unclassified-error episodes instance over the notice episodes before the start pass, installs it as the outage state\'s unclassified sink, routes its log-only alert through recordStartupError, and ends its episode at the restart cap', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createUnclassifiedErrorEpisodes'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -3059,7 +3057,7 @@ describe('main() builds the one unclassified-error episodes instance over the no
     }
   })
 
-  test('its log is the server log and its alert threshold is E6\'s accessor of the threshold in effect itself, never a value taken once', () => {
+  test('its log is the server log and its alert threshold is \'s accessor of the threshold in effect itself, never a value taken once', () => {
     const props = onlyCallProps(FACTORY)
     expect(props.get(LOG)).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
     expect(props.get(THRESHOLD)).toBe(THRESHOLD_IN_EFFECT)
@@ -3100,7 +3098,7 @@ describe('main() builds the one unclassified-error episodes instance over the no
     expect(named[0]! > open && named[0]! < close).toBe(true)
   })
 
-  test('the restart module\'s onCapReached raises the cap notice, ends the persona\'s episode with the capped reason and stops its retry timer with the capped reason (b.jg5 SRJ-305), for the key it is given, each in its own try/catch', () => {
+  test('the restart module\'s onCapReached raises the cap notice, ends the persona\'s episode with the capped reason and stops its retry timer with the capped reason, for the key it is given, each in its own try/catch', () => {
     // Tied to src by type: renaming either fails the typecheck.
     const STOP: keyof UnavailableRetryController = 'stop'
     const STOP_CAPPED: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_STOP_CAPPED'
@@ -3124,7 +3122,7 @@ describe('main() builds the one unclassified-error episodes instance over the no
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+(?:notifyRestartCapReached|${END_CAPPED}|${STOP_CAPPED})\\b`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the instance is named only at its build, as the sink, in the stop observer, in onCapReached and in the latch\'s unclassified hold (b.jg5 SRJ-502): its end and stop entries are called from those bindings alone, and server.ts reports to it directly nowhere', () => {
+  test('the instance is named only at its build, as the sink, in the stop observer, in onCapReached and in the latch\'s unclassified hold: its end and stop entries are called from those bindings alone, and server.ts reports to it directly nowhere', () => {
     const unclassified = constOf(FACTORY)
     const named = indicesOf(new RegExp(`\\b${unclassified}\\b`, 'g'), SERVER_CODE)
     expect(named).toHaveLength(5)
@@ -3149,7 +3147,7 @@ describe('main() builds the one unclassified-error episodes instance over the no
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016 — the kill-failure
+// Static audit: the kill-failure
 // alerts' production bindings
 //
 // `KillFailureAlertsDeps.isConfigured` and `logOnly` are optional (absent,
@@ -3169,7 +3167,7 @@ describe('main() builds the one unclassified-error episodes instance over the no
 // the instance (its form is pinned in tests/reload-wiring.test.ts).
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one kill-failure alerts instance over the notice episodes, with the live applied-persona lookup and recordStartupError as its log-only route, and installs it in the session manager before the restart module, the start sweep and the start pass (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
+describe('main() builds the one kill-failure alerts instance over the notice episodes, with the live applied-persona lookup and recordStartupError as its log-only route, and installs it in the session manager before the restart module, the start sweep and the start pass', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createKillFailureAlerts'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -3238,7 +3236,7 @@ describe('main() builds the one kill-failure alerts instance over the notice epi
     const WAIT_ALERTS: keyof OldLifeWaitBindings = 'killFailureAlerts'
     const named = indicesOf(new RegExp(`\\b${alerts}\\b`, 'g'), SERVER_CODE)
     expect(named).toHaveLength(5)
-    // The fifth is the old-life wait's alert sink (b.jg5 SRJ-811): that one
+    // The fifth is the old-life wait's alert sink: that one
     // member of its bindings and nothing else there (its install is pinned in
     // the old-life wait's describe).
     const waitProps = onlyCallProps('setOldLifeWaitBindings')
@@ -3247,7 +3245,7 @@ describe('main() builds the one kill-failure alerts instance over the notice epi
     // The install's one argument starts right at its opening parenthesis.
     expect(named).toContain(balancedAfter(SERVER_CODE, onlyCallOf(INSTALL), '(', ')')[0])
     // The third is the routing holder's assignment (pinned in the routing's describe below).
-    // The fourth is the persona teardown's raiser (b.jg5 SRJ-704, SRJ-715): one
+    // The fourth is the persona teardown's raiser: one
     // raise on the instance inside createPersonaLifecycle's call, as the value
     // of its alert raiser and nothing else (its whole form is pinned in
     // tests/reload-wiring.test.ts).
@@ -3277,7 +3275,7 @@ describe('main() builds the one kill-failure alerts instance over the notice epi
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-501 / SRJ-508 — the one per-persona latch and its
+// Static audit: the one per-persona latch and its
 // CONFLICT notice binding
 //
 // Nothing makes main() build the latch or bind its notice, and any episodes
@@ -3287,13 +3285,13 @@ describe('main() builds the one kill-failure alerts instance over the notice epi
 // after the start pass (a first launch's CONFLICT with no latch, or no
 // notice, to reach), bound the notice twice (two posts in one episode) or to
 // episodes other than the one instance (which a teardown never forgets and
-// shutdown never closes), or seeded the latch from a file (SRJ-501: it is
+// shutdown never closes), or seeded the latch from a file (it is
 // held in server memory only) would pass every behaviour suite. What the
 // latch and its notice do is tested in tests/conflict-latch.test.ts; pinned
 // here: the build and the binding.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one per-persona latch, in server memory only, before the start pass, and binds its CONFLICT notice once to the one set of notice episodes (b.jg5 SRJ-501, SRJ-508)', () => {
+describe('main() builds the one per-persona latch, in server memory only, before the start pass, and binds its CONFLICT notice once to the one set of notice episodes', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BIND: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictNoticeObserver'
@@ -3353,17 +3351,17 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(sets).toEqual([])
 
     // Named only at its build, then once inside each of: the holds' binding
-    // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the latch
-    // re-check's build (its `latch` input) and its binding (b.jg5 SRJ-505;
+    // and the notice's binding, the latch
+    // re-check's build (its `latch` input) and its binding (
     // both pinned in the re-check's describe below), the session
     // manager's install, the retry run's gate's latched query (the retry
 
-    // check's latched query, and the persona teardown's latch forget (b.jg5 SRJ-504; its
+    // check's latched query, and the persona teardown's latch forget (its
     // form is pinned in tests/reload-wiring.test.ts); twice inside the restart
     // module's call: its own latched query and the reconnect adapter's, asked
-    // right before /mcp reconnect is typed (b.jg5 SRJ-502); and once as the
+    // right before /mcp reconnect is typed; and once as the
     // value of the persona routing's module-scope holder, which the routing's
-    // lost-message latched query reads at call time (b.jg5 SRJ-1011). The
+    // lost-message latched query reads at call time. The
     // queries' forms are pinned in the describe below; the holder's in the
     // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
@@ -3403,7 +3401,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-502 / SRJ-305 / SRJ-310 / SRJ-313 / SRJ-315 — what
+// Static audit: what
 // the latch holds back: its hold observer, its install in the session
 // manager and its latched query
 //
@@ -3417,14 +3415,14 @@ describe('main() builds the one per-persona latch, in server memory only, before
 // so holds bound after the notice would post the CONFLICT notice with the
 // timer still armed. A production wiring that dropped one, bound it twice,
 // bound it to a no-op, the wrong reason or the condition-end entry (whose
-// SRJ-306 exceptions must not apply to a latch), or installed the latch after
+// exceptions must not apply to a latch), or installed the latch after
 // the start pass would type-check and pass every behaviour suite. What each
 // does is tested in tests/conflict-latch.test.ts, tests/session-manager.test.ts,
 // tests/restart.test.ts, tests/unavailable-retry.test.ts and
 // tests/health-check.test.ts; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the latch\'s holds before its CONFLICT notice, installs the latch in the session manager before the start pass, and binds its latched query into the retry action, the restart work and the health tick (b.jg5 SRJ-502, SRJ-305, SRJ-310, SRJ-313, SRJ-315)', () => {
+describe('main() binds the latch\'s holds before its CONFLICT notice, installs the latch in the session manager before the start pass, and binds its latched query into the retry action, the restart work and the health tick', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const HOLD_OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatchHoldObserver'
@@ -3462,11 +3460,11 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(callsOf(HOLD_OBSERVER_FACTORY)).toEqual([])
   })
 
-  test('the holds are exactly five: the retry timer stop, the silent end of tmux-unresponsive, the end of the unclassified-error episode, the slow-recovery end and the stuck-launch end (b.jg5 SRJ-610, SRJ-1016; the last two bindings are pinned in their describes below)', () => {
+  test('the holds are exactly five: the retry timer stop, the silent end of tmux-unresponsive, the end of the unclassified-error episode, the slow-recovery end and the stuck-launch end (the last two bindings are pinned in their describes below)', () => {
     expect([...latchHoldProps().keys()].sort()).toEqual([HOLD_STOP_RETRY, HOLD_END_TMUX, HOLD_END_UNCLASSIFIED, HOLD_END_SLOW_RECOVERY, HOLD_END_STUCK_LAUNCH].sort())
   })
 
-  test('the retry-timer hold stops the persona\'s timer on the one retry controller through its stop entry, with the latch\'s own stop reason, never through the condition-end entry (b.jg5 SRJ-305)', () => {
+  test('the retry-timer hold stops the persona\'s timer on the one retry controller through its stop entry, with the latch\'s own stop reason, never through the condition-end entry', () => {
     const controller = constOf('createUnavailableRetryController')
     declaredOnce(controller)
     const hold = latchHoldProps().get(HOLD_STOP_RETRY)
@@ -3477,7 +3475,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(new RegExp(`\\b${STOP_LATCHED}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
   })
 
-  test('the tmux-unresponsive hold ends the one condition silently (no recovery notice), for the persona it is given, with the latch\'s end reason and no reading (b.jg5 SRJ-310)', () => {
+  test('the tmux-unresponsive hold ends the one condition silently (no recovery notice), for the persona it is given, with the latch\'s end reason and no reading', () => {
     const condition = constOf('createTmuxUnresponsiveCondition')
     declaredOnce(condition)
     const hold = latchHoldProps().get(HOLD_END_TMUX)
@@ -3488,7 +3486,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(/\bsilent\s*:/g, SERVER_CODE)).toHaveLength(1)
   })
 
-  test('the unclassified hold ends the persona\'s episode on the one unclassified-error episodes instance, with the latch\'s end reason (b.jg5 SRJ-313)', () => {
+  test('the unclassified hold ends the persona\'s episode on the one unclassified-error episodes instance, with the latch\'s end reason', () => {
     const unclassified = constOf('createUnclassifiedErrorEpisodes')
     declaredOnce(unclassified)
     const hold = latchHoldProps().get(HOLD_END_UNCLASSIFIED)
@@ -3520,19 +3518,19 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, last))).toEqual([])
   })
 
-  test('five latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch (b.jg5 SRJ-1011), which the tmux-unavailable retry check\'s production deps also ask once (b.jg5 SRJ-311)', () => {
+  test('five latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch, which the tmux-unavailable retry check\'s production deps also ask once', () => {
     const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
     const query = oneKeyArrow(`${latch}\\.${IS_LATCHED}\\(\\1\\)`)
     expect(onlyCallProps('createFullModeRetryAction').get(RETRY_LATCHED)).toMatch(query)
     expect(onlyCallProps('initRestart').get(RESTART_LATCHED)).toMatch(query)
     expect(onlyCallProps('initHealthCheck').get(TICK_LATCHED)).toMatch(query)
-    // b.jg5 SRJ-502: the reconnect adapter asks it right before typing /mcp reconnect.
+    // the reconnect adapter asks it right before typing /mcp reconnect.
     const [lookup, adapterQuery, ...extra] = reconnectAdapterArgs()
     expect([lookup, extra]).toEqual(['getAppliedPersona', []])
     expect(adapterQuery).toMatch(query)
 
-    // b.jg5 SRJ-1011: the persona routing, built at module scope before the
+    // the persona routing, built at module scope before the
     // latch exists, reads it through its holder, whose one assignment is this
     // same latch (no second latch, no copy; see routingHolder). The
     // tmux-unavailable retry check's production deps read the same holder
@@ -3545,12 +3543,12 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     // query inside each of the three calls, the reconnect adapter's build
     // (the one inside the restart module's call), the routing's call and the
     // retry check's deps, which the check itself asks once (its `deps`
-    // parameter's, b.jg5 SRJ-311). Outside main(), `isLatched:` is otherwise only a
+    // parameter's). Outside main, `isLatched:` is otherwise only a
     // parameter's type annotation (the reconnect adapter's latched gate), no
     // binding.
     const within = withinCall
     // The retry action's member and query sit in the retry run's gate, which
-    // the action spreads (b.jg5 SRJ-404; see the gate's describe).
+    // the action spreads (see the gate's describe).
     const allMembers = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
     const members = allMembers.filter(insideMain)
     expect(members).toHaveLength(4)
@@ -3578,7 +3576,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-505 — the latch re-check
+// Static audit: the latch re-check
 //
 // Nothing in the type system makes main() build the re-check, build it once,
 // over the one latch and the one persona serializer, bind it (its set
@@ -3595,7 +3593,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
 // build, its input, the binding, the holder and the shutdown stop.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the latch re-check once, through the session manager\'s builder over the one latch, the system clock and the one persona serializer, binds it after the latch\'s holds and CONFLICT notice and before the start pass, and shutdown stops every re-check timer before the client is released (b.jg5 SRJ-505)', () => {
+describe('main() builds the latch re-check once, through the session manager\'s builder over the one latch, the system clock and the one persona serializer, binds it after the latch\'s holds and CONFLICT notice and before the start pass, and shutdown stops every re-check timer before the client is released', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -3629,7 +3627,7 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     return decls[0]![1]!
   }
 
-  test('the re-check is built exactly once, by the session manager\'s builder, bound to a const in main()\'s own statement list (not at module scope, behind no branch), after the latch, the notice episodes and both the holds\' and the notice\'s bindings, and before the start pass; server.ts declares neither name and builds no re-check controller, round, clear entry, after-clear sequence, in-turn run or in-turn retry, nor holds a persona active, of its own (b.jg5 SRJ-506: the clear is the builder\'s)', () => {
+  test('the re-check is built exactly once, by the session manager\'s builder, bound to a const in main()\'s own statement list (not at module scope, behind no branch), after the latch, the notice episodes and both the holds\' and the notice\'s bindings, and before the start pass; server.ts declares neither name and builds no re-check controller, round, clear entry, after-clear sequence, in-turn run or in-turn retry, nor holds a persona active, of its own (the clear is the builder\'s)', () => {
     expect(importSource(SERVER_CODE, RECHECK_BUILDER)).toBe('./session-manager.ts')
     for (const name of [RECHECK_BUILDER, RECHECK_BIND]) {
       expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
@@ -3653,9 +3651,9 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     for (const later of latchStartPass()) expect(at).toBeLessThan(later)
   })
 
-  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance, the relaunch gate the restart path asks, read at call time (b.av2 SR-6.4), the restart cap over the one failure counter (b.av2 SR-6.3; bug b.xkd: the cap wins over the re-check) and that counter\'s own reset, for the clear by hand (b.jg5 SRJ-509; bug b.ebi)', () => {
+  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance, the relaunch gate the restart path asks, read at call time, the restart cap over the one failure counter (the cap wins over the re-check) and that counter\'s own reset, for the clear by hand', () => {
     const props = onlyCallProps(RECHECK_BUILDER)
-    // b.2nr: `intervalMs` is the test-only override's latch interval (see the override block's wiring audit below).
+    // `intervalMs` is the test-only override's latch interval (see the override block's wiring audit below).
     expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, 'intervalMs', IS_AT_CAP, RECHECK_LATCH, LOG, RESET_RESTART_FAILURES, SERIALIZE].sort())
     expect(props.get(RECHECK_LATCH)).toBe(constOf(LATCH_FACTORY))
     expect(props.get(CLOCK)).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
@@ -3706,7 +3704,7 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     const named = indicesOf(new RegExp(`\\b${recheck}\\b`, 'g'), SERVER_CODE)
     expect(named).toHaveLength(4)
     expect(withinCall(named, onlyCallOf(RECHECK_BIND))).toBe(1)
-    // b.jg5 SRJ-510: the fourth is the sole argument of the one clear-by-hand
+    // the fourth is the sole argument of the one clear-by-hand
     // binding, not a second build (withinCall skips a first argument, so the
     // argument's start is checked).
     expect(onlyCallArgs(CLEAR_BY_HAND_OF)).toEqual([recheck])
@@ -3747,7 +3745,7 @@ describe('main() builds the latch re-check once, through the session manager\'s 
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-610 / SRJ-1010 / SRJ-1016 / SRJ-502 — the one
+// Static audit: the one
 // slow-recovery tracker
 //
 // `RestartDeps.slowRecovery`, `HealthCheckDeps.resetSlowRecoveryCount` and
@@ -3766,7 +3764,7 @@ describe('main() builds the latch re-check once, through the session manager\'s 
 // tests/conflict-latch.test.ts; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one slow-recovery tracker over the notice episodes before the start pass, hands it to the restart work as its slow-recovery observer, binds its healthy reset into the health check and its latch end into the latch\'s holds (b.jg5 SRJ-610, SRJ-1010, SRJ-1016, SRJ-502)', () => {
+describe('main() builds the one slow-recovery tracker over the notice episodes before the start pass, hands it to the restart work as its slow-recovery observer, binds its healthy reset into the health check and its latch end into the latch\'s holds', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof SlowRecoveryModule = 'createSlowRecoveryTracker'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -3843,7 +3841,7 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-1016 / SRJ-1017 / SRJ-502 — the stuck-launch
+// Static audit: the stuck-launch
 // episode's production bindings
 //
 // The session manager's install is optional (absent, no own-row read ever
@@ -3859,7 +3857,7 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
 // tests/conflict-latch.test.ts (the latch); pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() installs the one notice episodes instance in the session manager for the stuck-launch episode before the start sweep and the start pass, and binds the latch\'s stuck-launch hold to end that episode over the same instance (b.jg5 SRJ-1016, SRJ-1017, SRJ-502)', () => {
+describe('main() installs the one notice episodes instance in the session manager for the stuck-launch episode before the start sweep and the start pass, and binds the latch\'s stuck-launch hold to end that episode over the same instance', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
   const INSTALL: keyof typeof SessionManagerModule = 'setStuckLaunchEpisodes'
@@ -3894,8 +3892,8 @@ describe('main() installs the one notice episodes instance in the session manage
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-207 / SRJ-1008 / SRJ-305 / SRJ-303 / SRJ-315 /
-// SRJ-204 — the ErrInvalidFlags hold's production bindings
+// Static audit: /
+// the ErrInvalidFlags hold's production bindings
 //
 // The session manager's hold install, the held queries of the retry action,
 // the restart work and the health tick, and the routing's cannot-launch
@@ -3904,7 +3902,7 @@ describe('main() installs the one notice episodes instance in the session manage
 // so the next tick, retry or restart calls agent-director again), and a
 // hold's set reaction and version-change reaction take any body. A
 // production wiring that dropped one, bound it twice, to a second hold, to
-// the condition-end entry (whose SRJ-306 exceptions must not apply to a
+// the condition-end entry (whose exceptions must not apply to a
 // hold), registered no version-changed listener (a hold that never ends) or
 // two (two retries), installed the hold after the start pass, or seeded it
 // from anywhere (a hold that survives a restart) would type-check and pass
@@ -3916,7 +3914,7 @@ describe('main() installs the one notice episodes instance in the session manage
 // describe below; the teardown's forget in tests/reload-wiring.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one ErrInvalidFlags hold before the start pass, installs it in the session manager, binds its set reaction to the retry controller\'s stop entry and the notice episodes, ends it on the one version-changed listener, binds its held query into the retry action, the restart work and the health tick, and shutdown forgets every hold (b.jg5 SRJ-207, SRJ-1008, SRJ-305, SRJ-303, SRJ-315, SRJ-204)', () => {
+describe('main() builds the one ErrInvalidFlags hold before the start pass, installs it in the session manager, binds its set reaction to the retry controller\'s stop entry and the notice episodes, ends it on the one version-changed listener, binds its held query into the retry action, the restart work and the health tick, and shutdown forgets every hold', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof InvalidFlagsHoldModule = 'createInvalidFlagsHold'
   const BIND_SET: keyof typeof InvalidFlagsHoldModule = 'bindInvalidFlagsHoldSetReaction'
@@ -3981,7 +3979,7 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(callsOf(RESET)).toEqual([])
   })
 
-  test('its set reaction is bound exactly once, in main()\'s own statement list after the build and before the start pass, to the one hold: it stops the persona\'s timer on the one retry controller through its stop entry with the hold\'s own reason, never through the condition-end entry, and posts through the one notice episodes instance, with the server log; server.ts builds no reaction by hand and adds no hold observer (b.jg5 SRJ-305, SRJ-1008, SRJ-1016)', () => {
+  test('its set reaction is bound exactly once, in main()\'s own statement list after the build and before the start pass, to the one hold: it stops the persona\'s timer on the one retry controller through its stop entry with the hold\'s own reason, never through the condition-end entry, and posts through the one notice episodes instance, with the server log; server.ts builds no reaction by hand and adds no hold observer', () => {
     const at = onlyCallOf(BIND_SET)
     expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
     importedOnly(BIND_SET, './invalid-flags-hold.ts')
@@ -4020,7 +4018,7 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, built))).toEqual([])
   })
 
-  test('exactly one version-changed listener is registered (onAdVersionChanged), in main()\'s own statement list after the hold is built and before the start bring-up: it ends the one hold\'s holds on the new version through the version-change reaction, ending each episode on the one notice episodes instance, asking the live applied-persona lookup, and retrying each ended persona at once through the restart module\'s retry entry with "blocks a retry" (b.jg5 SRJ-204, SRJ-207)', () => {
+  test('exactly one version-changed listener is registered (onAdVersionChanged), in main()\'s own statement list after the hold is built and before the start bring-up: it ends the one hold\'s holds on the new version through the version-change reaction, ending each episode on the one notice episodes instance, asking the live applied-persona lookup, and retrying each ended persona at once through the restart module\'s retry entry with "blocks a retry"', () => {
     const hold = constOf(FACTORY)
     const at = onlyCallOf(ON_CHANGED)
     expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
@@ -4065,7 +4063,7 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(indicesOf(new RegExp(`\\.\\s*${VERSION_CHANGED}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the held query is bound exactly once into each of the full-mode retry action, the restart work and the health tick, as a call-time read of the one hold\'s isHeld for the key it is given; with the routing\'s member (through its holder) these are server.ts\'s only held members and queries (b.jg5 SRJ-303, SRJ-315)', () => {
+  test('the held query is bound exactly once into each of the full-mode retry action, the restart work and the health tick, as a call-time read of the one hold\'s isHeld for the key it is given; with the routing\'s member (through its holder) these are server.ts\'s only held members and queries', () => {
     const hold = constOf(FACTORY)
     const query = oneKeyArrow(`${hold}\\.${IS_HELD}\\(\\1\\)`)
     expect(onlyCallProps('createFullModeRetryAction').get(RETRY_HELD)).toMatch(query)
@@ -4073,7 +4071,7 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(onlyCallProps('initHealthCheck').get(TICK_HELD)).toMatch(query)
 
     // The retry action's member and query sit in the retry run's gate, which
-    // the action spreads (b.jg5 SRJ-404; see the gate's describe).
+    // the action spreads (see the gate's describe).
     const members = indicesOf(new RegExp(`\\b${IS_HELD}\\s*:`, 'g'), SERVER_CODE)
     expect(members).toHaveLength(4)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([0, 1, 1])
@@ -4128,7 +4126,7 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-1011 — the persona routing's lost-message state
+// Static audit: the persona routing's lost-message state
 // inputs
 //
 // Every lost-message input of `PersonaRoutingDeps` is optional and answers
@@ -4146,8 +4144,8 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
 // here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition, the one kill-failure alerts\' episode or the old-life hold\'s kill-failed mark, and the session manager\'s launch-in-flight, approver-running and sequence-or-wait queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401, SRJ-704, SRJ-812)', () => {
-  /** The session manager's old-life kill-failed query (b.jg5 SRJ-812); renaming it fails the typecheck. */
+describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition, the one kill-failure alerts\' episode or the old-life hold\'s kill-failed mark, and the session manager\'s launch-in-flight, approver-running and sequence-or-wait queries, each read at call time', () => {
+  /** The session manager's old-life kill-failed query; renaming it fails the typecheck. */
   const KILL_FAILED_HOLD: keyof typeof SessionManagerModule = 'waitsOnKillFailedHold'
   // Tied to src by type: renaming any of these fails the typecheck.
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
@@ -4155,9 +4153,9 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   const LAUNCH_RUNNING: keyof PersonaRoutingDeps = 'isLaunchRunning'
   const KILL_FAILED: keyof PersonaRoutingDeps = 'isKillFailed'
   const IS_OPEN: keyof KillFailureAlerts = 'isOpen'
-  /** The sequence/wait input (b.jg5 SRJ-706, SRJ-1011): a running live-row sequence (or an old-life wait step) reports `restarting`. */
+  /** The sequence/wait input: a running live-row sequence (or an old-life wait step) reports `restarting`. */
   const SEQUENCE_WAIT: keyof PersonaRoutingDeps = 'isSequenceOrWaitRunning'
-  /** The cannot-launch input (b.jg5 SRJ-207, SRJ-1011 state 3): P is held on ErrInvalidFlags. */
+  /** The cannot-launch input (state 3): P is held on ErrInvalidFlags. */
   const HELD_ON_INVALID_FLAGS: keyof PersonaRoutingDeps = 'isHeldOnInvalidFlags'
   const IS_HELD: keyof InvalidFlagsHold = 'isHeld'
 
@@ -4184,16 +4182,16 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(holdsQueries[0]! > open && holdsQueries[0]! < close).toBe(true)
   })
 
-  // b.jg5 SRJ-1011 ruling ("two separate inputs"): state 6's input is a
+  // ruling ("two separate inputs"): state 6's input is a
 
-  // registry (SRJ-401), each asked of the session manager for the key at call
+  // registry, each asked of the session manager for the key at call
   // time; it is neither named in-flight binding main() builds (see
-  // inFlightBindings), which later Epics widen with work that must report
+  // inFlightBindings), which later components widen with work that must report
   // `restarting` instead. "In flight for P" is named in the routing's call
   // only as its read gate's in-flight member (see the read-gate describe
   // below), and "blocks a retry" not at all.
 
-  // b.jg5 SRJ-1011 state 4, SRJ-704 (E20), SRJ-812 (E27): P's kill-failure
+  // state 4: P's kill-failure
   // episode is open, or P waits on an old-life hold whose old key's kill
   // failed. The alerts are built in main() over the notice episodes (pinned
   // in the kill-failure alerts' describe below); the routing reads their
@@ -4215,13 +4213,13 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(withinCall(named, onlyCallOf('createDeliveryEngines'))).toBe(1)
   })
 
-  // b.jg5 SRJ-706, SRJ-811, SRJ-1011: the sequence/wait input is the session
+  // the sequence/wait input is the session
   // manager's sequence-or-wait query for the key it is given, read at call
   // time (the registry, the hold set and the wait's bindings are installed in
   // main(), after the routing is built), never the bare sequence query (which
   // misses a wait step for a hold P waits on) nor the state-6
 
-  // b.jg5 SRJ-1011 state 3, SRJ-207: P is held on ErrInvalidFlags. The
+  // state 3, P is held on ErrInvalidFlags. The
   // hold is built in main() (pinned in the hold's describe above); the
   // routing reads it through a holder assigned that one instance, never a
   // second one or a copy. Shutdown's forget-all of every hold reads the same
@@ -4239,7 +4237,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ, SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS]) expect(props.has(member)).toBe(true)
   })
 
-  // b.jg5 SRJ-1011 as amended ("state 5 applies only while P's retry timer is
+  // ("state 5 applies only while P's retry timer is
   // armed"): `isRetryArmed` is optional, and absent the routing decides state
   // 5 without the armed-timer gate, so a wiring that dropped it, bound it to a
   // constant, to a copy of the controller taken at import (before main()
@@ -4267,7 +4265,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // A new routing input (one reading the unclassified-error episode, say)
   // fails here until it is pinned like the others. `getChannelDelivery` gives
   // the stored choices and their readability the routing reads at each
-  // fungible-mode event (b.deo SRI-305, SRI-403).
+  // fungible-mode event.
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
@@ -4279,7 +4277,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-1011, SRJ-115, SRJ-315 — the persona routing's
+// Static audit: the persona routing's
 // lost-message read gate and its one row read
 //
 // Both members are optional: absent, nothing counts as in flight and no read
@@ -4288,17 +4286,17 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
 // behaviour suite while a message lost on a `pending` row reported a later
 // state and fired a restart over the row; one that bound the gate to a second
 // in-flight predicate would read the row while work the retry timer and the
-// health tick count as in flight runs, and miss what later Epics add to the
-// shared one (E17, E21, E27); and one that built a second adapter, or called
+// health tick count as in flight runs, and miss what later components add to the
+// shared one ; and one that built a second adapter, or called
 // the client itself, would read the row outside the one adapter's raise and
-// clear rules (E9, E11, E12) and what later Epics add there (E16, E24). The
+// clear rules and what later components add there . The
 // routing is built at module scope and the adapter in main(), so the read
 // goes through a module-scope holder at call time. What the routing does with
 // the read is tested in tests/persona-routing.test.ts and through the
 // recovery harness's lost-message driver; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('server.ts binds the persona routing\'s read gate to "in flight for P" and its one row read to the one liveness adapter main() builds, read at call time through a module-scope holder (b.jg5 SRJ-1011, SRJ-115, SRJ-315)', () => {
+describe('server.ts binds the persona routing\'s read gate to "in flight for P" and its one row read to the one liveness adapter main() builds, read at call time through a module-scope holder', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const ADAPTER: keyof typeof ServerModule = '_buildIsSessionAliveAdapter'
   const RESTART_ALIVE: keyof RestartDeps = 'isSessionAlive'
@@ -4319,7 +4317,7 @@ describe('server.ts binds the persona routing\'s read gate to "in flight for P" 
     return form![2]!
   }
 
-  // b.jg5 SRJ-1011, SRJ-401: the gate reads no row while a launch call or a
+  // the gate reads no row while a launch call or a
 
   // attempt then; the retry action gets the narrow "blocks a retry", since a
 
@@ -4374,11 +4372,11 @@ describe('server.ts binds the persona routing\'s read gate to "in flight for P" 
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-311 — the session-disconnect handler's and the
+// Static audit: the session-disconnect handler's and the
 // lost-message routing's `tmux-unavailable` retry check: production bindings
 //
 // While a persona's `tmux-unavailable` outage is raised, the only attempts
-// made for it are its retry timer's (SRJ-311), and a raised flag with no
+// made for it are its retry timer's, and a raised flag with no
 // timer (a retry that stopped as not up, on a declined launch or on a failed
 // run) must still get one. The session-disconnect handler and the routing's
 // `armRetryTimerIfMissing` both decide through `armMissingTmuxUnavailableRetry`
@@ -4393,7 +4391,7 @@ describe('server.ts binds the persona routing\'s read gate to "in flight for P" 
 // routing's arm binding.
 // ---------------------------------------------------------------------------
 
-describe('the session-disconnect handler and the routing\'s retry-timer arm decide through one tmux-unavailable retry check over one set of production deps: the outage flag, the one controller, the one latch, "in flight for P" and the one ENVIRONMENT arm path (b.jg5 SRJ-311)', () => {
+describe('the session-disconnect handler and the routing\'s retry-timer arm decide through one tmux-unavailable retry check over one set of production deps: the outage flag, the one controller, the one latch, "in flight for P" and the one ENVIRONMENT arm path', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BUILD: keyof typeof ServerModule = '_buildRestartDisconnectedPersona'
   const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
@@ -4465,7 +4463,7 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-114 / SRJ-501 — the configured-persona query
+// Static audit: the configured-persona query
 //
 // The note rule latches a persona only when the session manager's
 // configured-persona query counts its key as configured. The install is
@@ -4478,7 +4476,7 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
 // tests/conflict-latch.test.ts; pinned here: the install.
 // ---------------------------------------------------------------------------
 
-describe('main() installs the configured-persona query over the live applied configuration, beside the latch, before the start sweep and the start pass (b.jg5 SRJ-114, SRJ-501)', () => {
+describe('main() installs the configured-persona query over the live applied configuration, beside the latch, before the start sweep and the start pass', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const QUERY_INSTALL: keyof typeof SessionManagerModule = 'setConfiguredPersonaQuery'
   const QUERY_RESET: keyof typeof SessionManagerModule = '_resetConfiguredPersonaQuery'
@@ -4518,7 +4516,7 @@ describe('main() installs the configured-persona query over the live applied con
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-807 / SRJ-802 — the retired-key store for the
+// Static audit: the retired-key store for the
 // session manager's own-row reads
 //
 // The session manager's install is optional: with no store installed no read
@@ -4531,7 +4529,7 @@ describe('main() installs the configured-persona query over the live applied con
 // tests/server.test.ts; pinned here: the install.
 // ---------------------------------------------------------------------------
 
-describe('main() installs the one retired-key store for the session manager once, behind no branch, before the start sweep and every launch path (b.jg5 SRJ-807, SRJ-802)', () => {
+describe('main() installs the one retired-key store for the session manager once, behind no branch, before the start sweep and every launch path', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const INSTALL: keyof typeof SessionManagerModule = 'setRetiredKeyStore'
   const RESET: keyof typeof SessionManagerModule = '_resetRetiredKeyStore'
@@ -4554,7 +4552,7 @@ describe('main() installs the one retired-key store for the session manager once
     expect(importSource(SERVER_CODE, INSTALL)).toBe('./session-manager.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
     expect(indicesOf(new RegExp(`\\b${RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    // b.jg5 SRJ-801: only the server writes the record, so the CLI and every
+    // only the server writes the record, so the CLI and every
     // other module install no store; the session manager only declares it.
     const installers = srcFiles()
       .filter(([path]) => path !== 'src/server.ts' && path !== 'src/session-manager.ts')
@@ -4589,7 +4587,7 @@ describe('main() installs the one retired-key store for the session manager once
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-809 — the one old-life hold set
+// Static audit: the one old-life hold set
 //
 // Holds live in server memory: the reload controller's apply step 1 begins
 // them, and the session manager's reads end them, its start sweep begins its
@@ -4603,7 +4601,7 @@ describe('main() installs the one retired-key store for the session manager once
 // the controller's binding.
 // ---------------------------------------------------------------------------
 
-describe('main() builds one old-life hold set, installs it for the session manager before the start sweep and gives the same set to the reload controller (b.jg5 SRJ-809)', () => {
+describe('main() builds one old-life hold set, installs it for the session manager before the start sweep and gives the same set to the reload controller', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BUILD: keyof typeof RetiredKeysModule = 'createOldLifeHoldSet'
   const INSTALL: keyof typeof SessionManagerModule = 'setOldLifeHolds'
@@ -4670,7 +4668,7 @@ describe('main() builds one old-life hold set, installs it for the session manag
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-810, SRJ-1505, SRJ-812 — what a hold refuses
+// Static audit: what a hold refuses
 //
 // The held-directory query, the restart path's old-life hook and the
 // end-retry observer are all optional where main() binds them (absent: no
@@ -4684,7 +4682,7 @@ describe('main() builds one old-life hold set, installs it for the session manag
 // and tests/old-life-wait.test.ts; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() binds what a hold refuses: the held-directory query into the MCP admission, the old-life hook into the restart work, and the end-retry observer over the retry controller\'s run-now entry on the one hold set (b.jg5 SRJ-810, SRJ-1505, SRJ-812)', () => {
+describe('main() binds what a hold refuses: the held-directory query into the MCP admission, the old-life hook into the restart work, and the end-retry observer over the retry controller\'s run-now entry on the one hold set', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const HELD_QUERY: keyof typeof SessionManagerModule = 'oldLifeHeldDirectory'
   const ADMISSION_HELD: keyof SessionAdmissionOptions = 'heldDirectory'
@@ -4773,9 +4771,9 @@ describe('main() binds what a hold refuses: the held-directory query into the MC
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.f2b — a stale `working` row must not strand a persona
+// Static audit: a stale `working` row must not strand a persona
 //
-// The health check's b.f2b dependencies are optional (a test deps object
+// The health check's dependencies are optional (a test deps object
 // without them keeps the old behaviour), and so is nothing else that ends a
 // not-connected episode, so only these audits make sure production binds
 // them: the launch-in-flight skip, the delay-0 not-connected notice read from
@@ -4787,7 +4785,7 @@ describe('main() binds what a hold refuses: the held-directory query into the MC
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Static audit: a persona that is not up is refused service (SR-6.3, SR-6.4)
+// Static audit: a persona that is not up is refused service
 //
 // The admission decision, the drop and the up predicate are driven through
 // their real imports in tests/registry.test.ts; what only server.ts holds is
@@ -4795,7 +4793,7 @@ describe('main() binds what a hold refuses: the held-directory query into the MC
 // does with a refused session.
 // ---------------------------------------------------------------------------
 
-describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, SR-6.4)', () => {
+describe('server.ts refuses service to a persona that is not up', () => {
   /** [start, end) of the body of `async function <name>(…)`. */
   function asyncFunctionBody(name: string): [number, number] {
     const decl = SERVER_CODE.search(new RegExp(`\\basync\\s+function\\s+${name}\\s*\\(`))
@@ -4804,7 +4802,7 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     return balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
   }
 
-  // b.av2 SR-8.6: `isApplied` is optional in PersonaUpQuery (a query without it
+  // `isApplied` is optional in PersonaUpQuery (a query without it
   // counts every key as applied), so this audit is what makes sure production
   // binds it: a removed persona must stop being up for MCP admission, the
   // permission poller and /interject from a confirmed apply's step 1 on.
@@ -5011,7 +5009,7 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: start-up side effects (SR-13.2) and dry run (SR-3.4)
+// Static audit: start-up side effects and dry run
 // ---------------------------------------------------------------------------
 
 describe('main() owns the start-up side effects', () => {
@@ -5038,10 +5036,10 @@ describe('main() owns the start-up side effects', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the file guard refuses every persona credentials file (SR-5.2)
+// Static audit: the file guard refuses every persona credentials file
 // ---------------------------------------------------------------------------
 
-describe('server.ts\'s file guard refuses every persona credentials file (b.av2 SR-5.2; E3 Task 5 carry)', () => {
+describe('server.ts\'s file guard refuses every persona credentials file (section 5 carry)', () => {
   test('assertSendable builds its protected list per call from the reload controller (the applied personas and the config file), with the config file\'s paths before main() builds it, and the session tools get it with clientFor', () => {
     expect(SERVER_CODE).toMatch(/import\s*\{[^}]*\bassertSendable\s+as\s+libAssertSendable\b[^}]*\}\s*from\s*['"]\.\/lib\.ts['"]/)
     const fn = SERVER_CODE.search(/\bfunction\s+assertSendable\s*\(/)
@@ -5077,7 +5075,7 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
   // names (behaviour in tests/config.test.ts); the start's read of the
   // retired-key record, which only the server writes, so a record grown past
   // the cap never stops a start (behaviour in tests/retired-keys.test.ts);
-  // and the start's read of the stored-choice file (b.deo SRI-403), which
+  // and the start's read of the stored-choice file, which
   // only the server writes, so a file of any size loads (behaviour in
   // tests/channel-delivery.test.ts). Every other reader
   // (the start's config, the last-applied record, the pending and apply
@@ -5116,14 +5114,14 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
 
 // ---------------------------------------------------------------------------
 // Static audit: the session tools read the channel mode at call time
-// (b.deo SRI-201, SRI-601)
+//
 // ---------------------------------------------------------------------------
 
-/** The session tools' channel-mode reader (b.deo SRI-601); renaming it fails the typecheck. */
+/** The session tools' channel-mode reader; renaming it fails the typecheck. */
 const SESSION_TOOLS_CHANNEL_MODE: keyof SessionToolDeps = 'getChannelMode'
 
-describe('the session tools read the channel mode of the configuration in effect at each call (b.deo SRI-201, SRI-601)', () => {
-  // b.deo SRI-601, SRI-201: a tool call's target check reads the mode from the
+describe('the session tools read the channel mode of the configuration in effect at each call', () => {
+  // a tool call's target check reads the mode from the
   // configuration in effect at that call. The member is optional in
   // SessionToolDeps, so only this audit makes sure production binds it, binds
   // it to the applied config holder, and hands it to the session server: a
@@ -5156,7 +5154,7 @@ describe('the session tools read the channel mode of the configuration in effect
 
 // ---------------------------------------------------------------------------
 // Static audit: the stored-choice store's start load and its one holder
-// (b.deo SRI-403 beside b.av2 SR-8.7)
+// (beside)
 //
 // What the load does (the read, the unreadable state, the start rules) is
 // driven through the module in tests/channel-delivery.test.ts. What only
@@ -5165,16 +5163,16 @@ describe('the session tools read the channel mode of the configuration in effect
 // holder at call time.
 // ---------------------------------------------------------------------------
 
-/** The store's start load and its factory (b.deo SRI-403, SRI-407); typed against the module, so a rename fails the typecheck. */
+/** The store's start load and its factory; typed against the module, so a rename fails the typecheck. */
 const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryAtStart'
 const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryStore'
-/** The declaration a stored choice is kept under (b.deo SRI-407); typed against the module. */
+/** The declaration a stored choice is kept under; typed against the module. */
 const CHANNEL_DELIVERY_DECLARATION_OF: keyof typeof ChannelDeliveryModule = 'channelDeliveryDeclarationOf'
 /** server.ts's one stored-choice holder: private to server.ts, so named by string. */
 const CHANNEL_DELIVERY_HOLDER = 'channelDeliveryStore'
-/** The reload controller's store accessor (b.deo SRI-406, SRI-408); renaming it fails the typecheck. */
+/** The reload controller's store accessor; renaming it fails the typecheck. */
 const CONTROLLER_CHANNEL_DELIVERY: keyof ReloadControllerDeps = 'channelDelivery'
-/** The routing's and the session tools' store reader (b.deo SRI-305, SRI-502); renaming either fails the typecheck. */
+/** The routing's and the session tools' store reader; renaming either fails the typecheck. */
 const ROUTING_CHANNEL_DELIVERY: keyof PersonaRoutingDeps = 'getChannelDelivery'
 const SESSION_TOOLS_CHANNEL_DELIVERY: keyof SessionToolDeps = 'getChannelDelivery'
 
@@ -5203,7 +5201,7 @@ function startTimeConfig(): { name: string; at: number } {
   return { name, at }
 }
 
-describe('main() loads the stored-choice store once, behind no branch, after the start resolves and before the first await after it and the start bring-up pass, into the one holder the reload controller reads (b.deo SRI-403 beside b.av2 SR-8.7)', () => {
+describe('main() loads the stored-choice store once, behind no branch, after the start resolves and before the first await after it and the start bring-up pass, into the one holder the reload controller reads (beside)', () => {
   test('imports the start load from the store module, declares it nowhere in server.ts, and its import and one call are its only mentions', () => {
     expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_START_LOAD)).toBe('./channel-delivery.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toEqual([])
@@ -5323,14 +5321,14 @@ describe('main() loads the stored-choice store once, behind no branch, after the
   })
 })
 
-/** set_channel_delivery's call-time inputs (b.deo SRI-502, SRI-505); renaming one fails the typecheck. */
+/** set_channel_delivery's call-time inputs; renaming one fails the typecheck. */
 const SESSION_TOOLS_HEARD: keyof SessionToolDeps = 'heardChannels'
 const SESSION_TOOLS_APPLIED: keyof SessionToolDeps = 'getAppliedPersonas'
 const SESSION_TOOLS_LOG: keyof SessionToolDeps = 'log'
-/** The routing's heard-set read (b.deo SRI-307); renaming it fails the typecheck. */
+/** The routing's heard-set read; renaming it fails the typecheck. */
 const ROUTING_HEARD: keyof PersonaRouting = 'heardChannels'
 
-describe('the routing and the session tools read the one stored-choice store through its holder at each call, and set_channel_delivery\'s other inputs at each call (b.deo SRI-305, SRI-403, SRI-502, SRI-505)', () => {
+describe('the routing and the session tools read the one stored-choice store through its holder at each call, and set_channel_delivery\'s other inputs at each call', () => {
   // Every member here is optional in PersonaRoutingDeps or SessionToolDeps,
   // so a dropped member, or one bound to a copy taken at import (before
   // main() loads the store), would type-check and pass every behaviour suite
@@ -5365,7 +5363,7 @@ describe('the routing and the session tools read the one stored-choice store thr
 })
 
 // ---------------------------------------------------------------------------
-// Import-time behaviour, in a child process with a temp HOME (SR-13.2)
+// Import-time behaviour, in a child process with a temp HOME
 // ---------------------------------------------------------------------------
 
 /**
@@ -5386,7 +5384,7 @@ function createdUnder(home: string, dir = home): string[] {
   return out
 }
 
-describe('importing src/server.ts has no side effect (SR-3.1, SR-10.2, SR-13.2)', () => {
+describe('importing src/server.ts has no side effect', () => {
   let home: string | undefined
 
   afterEach(() => {
@@ -5425,10 +5423,10 @@ describe('importing src/server.ts has no side effect (SR-3.1, SR-10.2, SR-13.2)'
 })
 
 // ---------------------------------------------------------------------------
-// The test-only timer override block (b.2nr)
+// The test-only timer override block
 // ---------------------------------------------------------------------------
 
-describe('main() reads the test-only timer override block once, right after the start resolves, and feeds the latch re-check and the retry timers from it (b.2nr)', () => {
+describe('main() reads the test-only timer override block once, right after the start resolves, and feeds the latch re-check and the retry timers from it', () => {
   const INSTALL = 'installTestTimerOverrides'
   const installAt = (): number => onlyCallOf(INSTALL)
 
@@ -5468,7 +5466,7 @@ describe('main() reads the test-only timer override block once, right after the 
   })
 })
 
-// b.omv SR-5.1 / SR-5.5 / D8: runtime unit suites use injected clients and
+// / D8: runtime unit suites use injected clients and
 // clocks; these bindings prove the server shares that ownership in main.
 describe('delivery ownership wiring', () => {
   test('main installs the same lifecycle in the session manager and engines before the start bring-up', () => {
@@ -5520,7 +5518,7 @@ describe('delivery ownership wiring', () => {
   })
 })
 
-describe('reply reminders use authoritative rows and the durable delivery path (b.js7)', () => {
+describe('reply reminders use authoritative rows and the durable delivery path', () => {
   test('independent polling starts unconditionally before the start bring-up, including when health checks are disabled', () => {
     const starts = indicesOf(/\breplyReminders\.start\s*\(/g, SERVER_CODE)
     expect(starts).toHaveLength(1)
@@ -5556,7 +5554,7 @@ describe('reply reminders use authoritative rows and the durable delivery path (
   })
 })
 
-// b.omv SR-8: main cannot run in units; behavior belongs to the reporting suites.
+// main cannot run in units; behavior belongs to the reporting suites.
 describe('typed delivery reporting production wiring', () => {
   test('one reporting consumer uses the live applied lookup, notifier, episodes and timer', () => {
     expect(callsOf('createDeliveryReporting')).toHaveLength(1)
@@ -5593,7 +5591,7 @@ describe('typed delivery reporting production wiring', () => {
   test.each([
     ['queued', 'createQueuedAckCallback', 'queued_ack_reaction'],
     ['delivered', 'createDeliveryAckCallback', 'ack_reaction'],
-  ])('b.p3h: %s reporting uses its configured reaction and the persona client', (stage, factory, setting) => {
+  ])('%s reporting uses its configured reaction and the persona client', (stage, factory, setting) => {
     const effect = onlyCallProps('createDeliveryReporting').get(stage)!
     expect(effect).toBe(`${factory}({ getReaction: () => getReplySettings().${setting}, clientFor, queue: deliveryQueue! })`)
     expect(callsOf(factory)).toHaveLength(1)
@@ -5606,7 +5604,7 @@ describe('typed delivery reporting production wiring', () => {
   })
 })
 
-describe('b.p3h production bring-up reaction recovery', () => {
+describe('production bring-up reaction recovery', () => {
   /** Run only the actual dependency expression, never server main or a copy of
    * its listeners. Bind all effects to the in-process fixtures below. */
   function expression<T>(code: string, bindings: Record<string, unknown>): T {

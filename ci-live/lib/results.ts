@@ -3,7 +3,7 @@
  * - `verdict.txt`: first line `PASS` or `FAIL: <check>: <reason>`;
  * - `results.json`: every check with status, reason, evidence and notes;
  * - `results.md`: a per-check table with evidence, then one row in the
- *   testplan's Results-table format (testplans/b.yko "Results"), ready to
+ * testplan's Results-table format (testplans/live-acceptance.md "Results"), ready to
  *   paste: pass, fail or "not run" per column, never a token or a log excerpt;
  *   then what the prompt guard denied (`promptGuard` in results.json: the
  *   count, and each denial's check, persona and command), when the run had
@@ -86,7 +86,7 @@ export function renderResultsMarkdown(summary: RunSummary): string {
     )
   }
   lines.push('')
-  lines.push('## Row for the testplan Results table (testplans/b.yko)')
+  lines.push('## Row for the testplan Results table (testplans/live-acceptance.md)')
   lines.push('')
   lines.push(
     `| Date | Build (version, commit) | Host / user | ${RESULTS_COLUMNS.join(' | ')} | Notes |`,

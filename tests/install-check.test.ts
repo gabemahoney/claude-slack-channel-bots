@@ -1,6 +1,6 @@
 /**
  * install-check.test.ts — `runInstallCheck` (src/install-check.ts) over an
- * injected resolver (b.jg5 SRJ-212, SRJ-121; AC 81).
+ * injected resolver.
  *
  * Cases, each through `runInstallCheck`:
  *   - the released client minimum passes with no note, echoing the path and version;
@@ -29,7 +29,7 @@
  *   - a client minimum that is not a version fails floor unreadable;
  *   - a malformed floor file or a missing field (seeded failures) is returned
  *     unchanged, without calling the resolver;
- *   - the remedies (b.jg5 SRJ-208, SRJ-212; the E2-gate, E5 and E35 hatch
+ * - the remedies (the -gate, and design
  *     notes): the shared pointer texts name the runbook section's title, the
  *     publishing-host block's heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
  *     `src/ad-version-gate.ts`) and the client-package check; each of
@@ -267,7 +267,7 @@ afterEach(() => {
 // Passing binaries
 // ---------------------------------------------------------------------------
 
-describe('runInstallCheck: a binary at the Phase 1 floor passes with no note (SRJ-212)', () => {
+describe('runInstallCheck: a binary at the Phase 1 floor passes with no note', () => {
   test('CLIENT_MIN_VERSION: success, path and version echoed, floor is the client minimum, no note', async () => {
     const path = binaryPath('released-floor')
     const { result, calls } = await check({ version: CLIENT_MIN_VERSION, path })
@@ -277,7 +277,7 @@ describe('runInstallCheck: a binary at the Phase 1 floor passes with no note (SR
   })
 })
 
-describe('runInstallCheck: a binary below the Phase 1 floor passes with the note (SRJ-212, AC 81)', () => {
+describe('runInstallCheck: a binary below the Phase 1 floor passes with the note', () => {
   test.each([
     ['DEV_PLACEHOLDER_VERSION', DEV_PLACEHOLDER_VERSION],
   ])('%s (%s): success carrying the builder\'s note, naming the runbook section and the version', async (label, version) => {
@@ -300,7 +300,7 @@ describe('runInstallCheck: a binary below the Phase 1 floor passes with the note
 // Failing binaries
 // ---------------------------------------------------------------------------
 
-describe('runInstallCheck: below the client minimum fails too old, naming the runbook (SRJ-212)', () => {
+describe('runInstallCheck: below the client minimum fails too old, naming the runbook', () => {
   test.each([PHASE1_RC_VERSION, OLD_AD_VERSION])('a formerly admitted %s is refused by the released client floor', async (version) => {
     const path = binaryPath('formerly-admitted')
     const { result, calls } = await check({ version, path })
@@ -333,7 +333,7 @@ describe('runInstallCheck: below the client minimum fails too old, naming the ru
   })
 })
 
-describe('runInstallCheck: ErrSystemInstallNotFound fails not found (SRJ-212)', () => {
+describe('runInstallCheck: ErrSystemInstallNotFound fails not found', () => {
   test('not-found label; detail carries the checked locations; the whole result is the canned not-found failure', async () => {
     const checkedLocations = [{ kind: 'path-lookup' as const, detail: null }]
     const failure = failureOf((await check({ throws: errSystemInstallNotFound(checkedLocations) })).result)
@@ -341,7 +341,7 @@ describe('runInstallCheck: ErrSystemInstallNotFound fails not found (SRJ-212)', 
   })
 })
 
-describe('runInstallCheck: ErrSystemInstallUnreachable, all eight reasons, fails unreachable (SRJ-212)', () => {
+describe('runInstallCheck: ErrSystemInstallUnreachable, all eight reasons, fails unreachable', () => {
   test.each([...UNREACHABLE_REASONS])('reason %s: the whole result is the canned unreachable failure, naming the reason and path', async (reason) => {
     const path = binaryPath(`unreachable-${reason}`)
     const failure = failureOf((await check({ throws: errSystemInstallUnreachable(reason, null, path) })).result)
@@ -427,7 +427,7 @@ describe('runInstallCheck: text copied from a thrown error is one token-free lin
   })
 })
 
-describe('runInstallCheck: a resolved version that does not parse fails, never passes (SRJ-212)', () => {
+describe('runInstallCheck: a resolved version that does not parse fails, never passes', () => {
   test.each(UNPARSEABLE_VERSIONS)('%s (%s): unreachable label, reason unparseable-version', async (label, version) => {
     const path = binaryPath(`unparseable-${label.replaceAll(' ', '-')}`)
     const failure = failureOf((await check({ version, path })).result)
@@ -440,7 +440,7 @@ describe('runInstallCheck: a resolved version that does not parse fails, never p
   })
 })
 
-describe('runInstallCheck: any other throw fails unreachable with none of its text (SRJ-212)', () => {
+describe('runInstallCheck: any other throw fails unreachable with none of its text', () => {
   /** Resolvers that fail in a way the decision classes as other. */
   const OTHER_RESOLVERS: ReadonlyArray<[label: string, resolve: InstallCheckResolveSystemBinary]> = [
     ['a plain Error rejection', makeStubResolveSystemBinary({ throws: new Error(RAW_THROWN_TEXT) })],
@@ -470,7 +470,7 @@ describe('runInstallCheck: any other throw fails unreachable with none of its te
   })
 })
 
-describe('runInstallCheck: errors are recognised by errName, not class (SRJ-212)', () => {
+describe('runInstallCheck: errors are recognised by errName, not class', () => {
   test.each([
     ['ErrSystemInstallNotFound', errSystemInstallNotFound([{ kind: 'standard-install-path', detail: null }])],
     ['ErrSystemInstallTooOld', errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, binaryPath('by-name-too-old'))],
@@ -492,7 +492,7 @@ describe('runInstallCheck: errors are recognised by errName, not class (SRJ-212)
 // The client minimum
 // ---------------------------------------------------------------------------
 
-describe('runInstallCheck: a client minimum that cannot be used fails floor unreadable (SRJ-212)', () => {
+describe('runInstallCheck: a client minimum that cannot be used fails floor unreadable', () => {
   test.each([
     ['a non-SemVer minimum', DEV_UNPARSEABLE_VERSION],
     ['a leading-v minimum', `v${CLIENT_MIN_VERSION}`],
@@ -516,7 +516,7 @@ describe('runInstallCheck: a client minimum that cannot be used fails floor unre
   })
 })
 
-describe('readClientMinVersion: each failed floor read, over the injected resolver and reader (SRJ-212)', () => {
+describe('readClientMinVersion: each failed floor read, over the injected resolver and reader', () => {
   /** The canned read failure's message: the text every other failure mode must differ from. */
   const READ_FAILURE_MESSAGE = cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE).message
 
@@ -677,13 +677,13 @@ describe('readClientMinVersion: a call with an injected dep bypasses the floor c
 
 // ---------------------------------------------------------------------------
 // The remedies: the runbook section, no install, re-install or removal
-// (b.jg5 SRJ-208, SRJ-212; E2-gate, E5 and E35 hatch notes)
+// (-gate, and design notes)
 // ---------------------------------------------------------------------------
 
-/** SRJ-208's client-package check, in the SRD's words. */
+/** client-package check, in the contract's words. */
 const CLIENT_PACKAGE_CHECK = 'Check the agent-director npm package installed with CSCB'
 
-describe('runInstallCheck: each failure points to the switch-over runbook and names no install (SRJ-208, SRJ-212)', () => {
+describe('runInstallCheck: each failure points to the switch-over runbook and names no install', () => {
   test('the shared texts: the section by its title, its publishing-host block by its heading, the client-package check with the section', () => {
     expect(RUNBOOK_SECTION_POINTER).toContain(`"${PHASE1_RUNBOOK_SECTION_TITLE}"`)
     expect(PUBLISHING_HOST_BLOCK_POINTER).toContain(`"${PUBLISHING_HOST_BLOCK_HEADING}"`)
@@ -736,7 +736,7 @@ describe('runInstallCheck: each failure points to the switch-over runbook and na
 })
 
 // ---------------------------------------------------------------------------
-// No upgrade, re-install, install or removal instruction anywhere (AC 81)
+// No upgrade, re-install, install or removal instruction anywhere
 // ---------------------------------------------------------------------------
 
 describe('the forbidden forms the sweep adds: self-checks', () => {
@@ -764,7 +764,7 @@ describe('the forbidden forms the sweep adds: self-checks', () => {
   })
 })
 
-describe('runInstallCheck: no message and no note advises upgrading, re-installing or installing agent-director, or removing a file (SRJ-208, SRJ-212, AC 81)', () => {
+describe('runInstallCheck: no message and no note advises upgrading, re-installing or installing agent-director, or removing a file', () => {
   /** Every case above, as a (floor seed, resolver) pair. */
   const SWEEP: ReadonlyArray<[label: string, floor: string | InstallCheckFailure, resolve: InstallCheckResolveSystemBinary]> = [
     ...[PHASE1_RC_VERSION, OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION, CLIENT_MIN_VERSION, BELOW_CLIENT_MIN_VERSION].map(

@@ -1,24 +1,24 @@
 /**
  * registry.test.ts — Persona-keyed MCP session registry, not-up session
- * admission and drop, and persona-scoped Slack tools (b.av2 SR-6.3, SR-6.4,
- * SR-5.1, SR-5.2 wiring, SR-12 instructions part).
+ * admission and drop, and persona-scoped Slack tools (
+ * wiring instructions part).
  *
  * Tools are driven through the real MCP server (`createSessionServer`) with an
  * in-memory MCP client. Each persona has its own `makeStubSlack` client, so a
  * case can show which persona's client a call landed on. Every path is under
  * the test's own `mkdtempSync` directory; no token literal appears here.
- * The not-up block (b.av2 SR-6.3, SR-6.4) brings personas up through the real
+ * The not-up block brings personas up through the real
  * bring-up controller on the real connection manager (stub Slack, fake clock)
  * and drives the real admission decision, up predicate and session drop.
- * Its held-directory block (b.jg5 SRJ-810, SRJ-1505) installs a real
+ * Its held-directory block installs a real
  * old-life hold set in the session manager and gives the admission its
  * production held-directory query (`oldLifeHeldDirectory`): a session from a
  * held directory is refused as held, whichever persona names it, with one
  * line naming the directory and every held id, before any persona is
  * matched; a throwing query refuses as held.
- * The tool-list block also holds b.jg5 SRJ-511 (AC 47): no tool definition
+ * The tool-list block also holds no tool definition
  * and not the instructions a session receives name `clear-latch`.
- * Per channel mode (b.deo SRI-601, SRI-602, SRI-604, SRI-202): the harness's
+ * Per channel mode: the harness's
  * mode seam (`h.mode`, read by `h.modeDeps.getChannelMode` at each call) and
  * a fungible-mode persona (`applyFungibleAlpha`) drive the posting scope per
  * mode, directly and through the MCP server, dry run included; the mode read
@@ -223,7 +223,7 @@ interface Harness {
   deps: SessionToolDeps
   /** The channel mode `modeDeps.getChannelMode` returns at each call; set it between calls. */
   mode: ChannelMode
-  /** `deps` with a channel-mode reader bound to `mode` (b.deo SRI-201, SRI-601). */
+  /** `deps` with a channel-mode reader bound to `mode`. */
   modeDeps: SessionToolDeps
   /** console.error lines captured during the test. */
   lines: string[]
@@ -251,7 +251,7 @@ let consoleSpy: ReturnType<typeof spyOn> | undefined
 
 /**
  * The server-wide reply settings the harness's `getReplySettings` returns
- * (b.av2 SR-1.6): an ack reaction set, and the config's chunking defaults.
+ * an ack reaction set, and the config's chunking defaults.
  */
 const REPLY_SETTINGS: ReplySettings = {
   ack_reaction: 'eyes',
@@ -358,7 +358,7 @@ function totalSlackCalls(): number {
   return [...h.clients.values()].reduce((n, s) => n + slackCallCount(s), 0)
 }
 
-/** Why `checkPersonaTarget` refuses a target (b.av2 SR-5.1). */
+/** Why `checkPersonaTarget` refuses a target. */
 const WHY = {
   channel: "it is not one of the persona's configured channels.",
   dmsOff: 'DMs are off for this persona (dm.enabled is false).',
@@ -390,12 +390,12 @@ function applyPersona(p: Persona, on: boolean, overrides: Partial<Persona> = {})
 }
 
 /**
- * Alpha Bot as the loader resolves it in fungible mode (b.deo SRI-102), with
+ * Alpha Bot as the loader resolves it in fungible mode, with
  * its DMs switch set to `on`: no `channels` and no top-level
  * `permission_prompts` in force, and its destination from `invited`. `spec`
  * sets further fields; its `channels` or `permission_prompts` stand for a
  * declarative section beside the fungible one, which fungible mode never
- * reads (b.deo SRI-202). Applied as the persona `getPersona` returns at the
+ * reads. Applied as the persona `getPersona` returns at the
  * next call, under Alpha's key, so its tools land on Alpha's stub.
  */
 function applyFungibleAlpha(on: boolean, spec: PersonaSpec = {}): Persona {
@@ -507,7 +507,7 @@ describe('registerSession / unregisterSession / getSessionByPersona', () => {
   })
 })
 
-describe('b.xnf regression — persona-keyed isolation', () => {
+describe('regression — persona-keyed isolation', () => {
   test('two personas sharing a cwd keep distinct live sessions', () => {
     const a = registerSession('/tmp/shared', 'persona_a', makeTransport(), makeServer())
     const b = registerSession('/tmp/shared', 'persona_b', makeTransport(), makeServer())
@@ -722,7 +722,7 @@ describe('matchPersonaByRootsPath', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Not-up personas: admission and session drop (b.av2 SR-6.3, SR-6.4)
+// Not-up personas: admission and session drop
 //
 // The admission decision and the drop run through their real imports. The
 // refusal of a registration is checked here with a stubbed up query and cause;
@@ -733,13 +733,13 @@ describe('matchPersonaByRootsPath', () => {
 // the refusal line, and `createNotUpSessionDropper` over `dropPersonaSession` as
 // the controller's `onLeftUp`. Each not-up cause through the real start pass, and
 // a running persona's reopen (refused, in flight, retrying or succeeding), are in
-// tests/persona-connections.test.ts (`bring-up outcomes (E5)`). What
+// tests/persona-connections.test.ts (`bring-up outcomes `). What
 // handleInitialized does with a refusal is `closePendingSession` (tested in
 // `pending sessions` above); server.ts's call of it is pinned in
 // tests/server-startup-wiring.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)', () => {
+describe('not-up personas: MCP session admission and drop', () => {
   interface Started {
     c: ConnectionHarness
     alpha: Persona
@@ -992,7 +992,7 @@ describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)
   })
 
   // -------------------------------------------------------------------------
-  // A directory held for an old life (b.jg5 SRJ-810 bullet 1, SRJ-1505; AC 53)
+  // A directory held for an old life (bullet 1)
   //
   // As main() wires it: one real hold set (`createOldLifeHoldSet`) installed
   // in the session manager (`setOldLifeHolds`), whose held-directory query
@@ -1002,7 +1002,7 @@ describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)
   // tests/old-life-wait.test.ts's.
   // -------------------------------------------------------------------------
 
-  describe('b.jg5 SRJ-810, SRJ-1505: a session opened from a directory held for an old life is registered as no persona\'s, whichever persona names it', () => {
+  describe('a session opened from a directory held for an old life is registered as no persona\'s, whichever persona names it', () => {
     let holds: OldLifeHoldSet
 
     beforeEach(() => {
@@ -1338,10 +1338,10 @@ describe('tool posting scope (through the MCP server)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// DM targets, gated by the persona's DMs switch (b.av2 SR-5.1)
+// DM targets, gated by the persona's DMs switch
 // ---------------------------------------------------------------------------
 
-describe('reply reminder tool facts (b.js7)', () => {
+describe('reply reminder tool facts', () => {
   test.each(['success', 'Slack failure', 'target refusal', 'dry run'] as const)('%s: reply records its own persona before scope validation or Slack outcome', async outcome => {
     const keys: string[] = []
     const deps = { ...h.deps, onReplyCall: async (key: string) => {
@@ -1404,7 +1404,7 @@ describe('DM targets (through the MCP server)', () => {
   // With DMs off every D…/U…/W… target on every tool gets the DMs-off reason,
   // the operator's own contact ID included.
   test.each(TOOLS.flatMap((tool) => [D, OPERATOR, W].map((target) => [tool, target, WHY.dmsOff] as const)))(
-    'AC 36: DMs off, %s to %s is refused with a tool error naming persona and target, and no Slack call on any client',
+    'DMs off, %s to %s is refused with a tool error naming persona and target, and no Slack call on any client',
     async (tool, target, why) => {
       const persona = applyPersona(h.alpha, false, { dm: { enabled: false, contact: OPERATOR } })
       expect(persona.dm).toEqual({ enabled: false, contact: OPERATOR })
@@ -1418,7 +1418,7 @@ describe('DM targets (through the MCP server)', () => {
     },
   )
 
-  test("AC 37: DMs on, a reply in the delivered DM posts there through the persona's own client and removes its ack there", async () => {
+  test("DMs on, a reply in the delivered DM posts there through the persona's own client and removes its ack there", async () => {
     applyPersona(h.alpha, true)
     trackAck(h.alpha.key, D, MSG_TS)
     const session = await openPersonaSession(h.alpha)
@@ -1445,7 +1445,7 @@ describe('DM targets (through the MCP server)', () => {
       [{ method: 'reactions.remove', args: { channel: OPENED, timestamp: MSG_TS, name: 'eyes' } }],
     ],
   ])(
-    "AC 38: DMs on, a reply to user %s (%s) opens the DM on the persona's own client, then posts to the returned conversation",
+    "DMs on, a reply to user %s (%s) opens the DM on the persona's own client, then posts to the returned conversation",
     async (user, _label, extraArgs, afterPost) => {
       applyPersona(h.alpha, true)
       stubOf(h.alpha).script.open.push(openedDm(OPENED))
@@ -1469,7 +1469,7 @@ describe('DM targets (through the MCP server)', () => {
     },
   )
 
-  test('AC 38: a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk and the file there', async () => {
+  test('a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk and the file there', async () => {
     applyPersona(h.alpha, true)
     stubOf(h.alpha).script.open.push(openedDm(OPENED))
     const file = join(h.inboxDir, 'out.txt')
@@ -1599,7 +1599,7 @@ describe('DM targets (through the MCP server)', () => {
     assertNoLeak({ result, lines: h.lines })
   })
 
-  test('AC 40 / AC 41 (registry leg): a zero-channel persona with DMs on answers its DM in place and is refused on any channel', async () => {
+  test('(registry leg): a zero-channel persona with DMs on answers its DM in place and is refused on any channel', async () => {
     const persona = applyPersona(h.alpha, true, { channels: [], permission_prompts: 'dm', dm: { enabled: true, contact: OPERATOR } })
     expect(persona.dm).toEqual({ enabled: true, contact: OPERATOR })
     const session = await openPersonaSession(h.alpha)
@@ -1684,7 +1684,7 @@ describe('dry run (SLACK_DRY_RUN=1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Posting scope per channel mode (b.av2 SR-5.1; b.deo SRI-601, SRI-202)
+// Posting scope per channel mode
 //
 // The mode comes through the harness's mode seam: `h.modeDeps` reads `h.mode`
 // at each call. The target-refusal describes above open their sessions on `h.deps`,
@@ -1712,10 +1712,10 @@ interface ScopeRow {
   dmTarget?: boolean
 }
 
-/** A `D…` conversation's outcome, the same in both modes (b.av2 SR-5.1 as amended by b.deo SRI-601). */
+/** A `D…` conversation's outcome, the same in both modes. */
 const dmConversationOutcome = (dms: boolean): ScopeExpected => (dms ? 'dm' : { why: WHY.dmsOff })
 
-/** A user ID's outcome, the same in both modes (b.av2 SR-5.1 as amended by b.deo SRI-601). */
+/** A user ID's outcome, the same in both modes. */
 const userIdOutcome = (dms: boolean, action: PersonaTargetAction): ScopeExpected =>
   !dms ? { why: WHY.dmsOff } : action === 'post' ? 'user' : { why: WHY.userId }
 
@@ -1723,7 +1723,7 @@ const notListed = (): ScopeExpected => ({ why: WHY.channel })
 const neitherChannelNorDm = (): ScopeExpected => ({ why: FUNGIBLE_TARGET_REFUSAL })
 const anyChannel = (): ScopeExpected => 'channel'
 
-/** SRI-601's six targets, decided by Alpha Bot's listed channels in declarative mode. */
+/** six targets, decided by Alpha Bot's listed channels in declarative mode. */
 const DECLARATIVE_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a listed channel', target: A_ALL, expected: anyChannel },
   { label: 'an unlisted C… channel', target: UNCONFIGURED, expected: notListed },
@@ -1733,7 +1733,7 @@ const DECLARATIVE_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a U… user ID', target: USER_U, expected: userIdOutcome, dmTarget: true },
 ]
 
-/** Targets fungible mode refuses as neither a channel ID nor an allowed DM target (b.deo SRI-601). */
+/** Targets fungible mode refuses as neither a channel ID nor an allowed DM target. */
 const FUNGIBLE_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: string]> = [
   ['a malformed ID', MALFORMED_ID],
   ['an empty value', ''],
@@ -1742,7 +1742,7 @@ const FUNGIBLE_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: str
   ['a D… ID with trailing text', `${DM_CONV},${UNCONFIGURED}`],
 ]
 
-/** SRI-601's six targets plus a `W…` user ID and the other refused shapes, in fungible mode. */
+/** six targets plus a `W…` user ID and the other refused shapes, in fungible mode. */
 const FUNGIBLE_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a listed channel', target: A_ALL, expected: anyChannel },
   { label: 'an unlisted C… channel', target: UNCONFIGURED, expected: anyChannel },
@@ -1769,11 +1769,11 @@ function scopeCheck(persona: Persona, target: string, expected: ScopeExpected): 
     : { allowed: false, message: refusal(persona, target, expected.why) }
 }
 
-// b.av2 SR-5.1; b.deo SRI-601: the table over mode × target × dm.enabled ×
+// the table over mode × target × dm.enabled ×
 // action. Alpha Bot lists A_ALL and A_MENTIONS in both modes, so a fungible
 // row's outcome shows the persona's list is not what decides there. Every
 // refusal is checked by its full message.
-describe('checkPersonaTarget per channel mode (b.av2 SR-5.1; b.deo SRI-601)', () => {
+describe('checkPersonaTarget per channel mode', () => {
   test.each([...scopeCases('declarative', DECLARATIVE_SCOPE_ROWS), ...scopeCases('fungible', FUNGIBLE_SCOPE_ROWS)])(
     '$mode: $label, DMs $dmsLabel, $action',
     ({ mode, target, dms, action, expected, dmTarget }) => {
@@ -1786,7 +1786,7 @@ describe('checkPersonaTarget per channel mode (b.av2 SR-5.1; b.deo SRI-601)', ()
     },
   )
 
-  // b.deo SRI-601 gives the fungible refusal's content, not its text: it says
+  // gives the fungible refusal's content, not its text: it says
   // the target is neither a channel ID nor an allowed DM target. `refusal`
   // pins the persona and the target around it.
   test('the fungible refusal says the target is neither a channel ID nor an allowed DM target', () => {
@@ -1795,9 +1795,9 @@ describe('checkPersonaTarget per channel mode (b.av2 SR-5.1; b.deo SRI-601)', ()
   })
 })
 
-// b.av2 SR-5.1; b.deo SRI-601: the five Slack tools of a fungible-mode
+// the five Slack tools of a fungible-mode
 // persona, through the MCP server.
-describe('tool posting scope in fungible mode (through the MCP server; b.av2 SR-5.1, b.deo SRI-601)', () => {
+describe('tool posting scope in fungible mode (through the MCP server)', () => {
   const ACT_TOOLS = TOOLS.filter((t) => t !== 'reply')
 
   beforeEach(() => {
@@ -1856,9 +1856,9 @@ describe('tool posting scope in fungible mode (through the MCP server; b.av2 SR-
   })
 })
 
-// b.av2 SR-5.1; b.deo SRI-201, SRI-601: the mode is read at each call, with
+// the mode is read at each call, with
 // the persona, and an absent reader is declarative mode.
-describe('the channel mode at each call (b.av2 SR-5.1; b.deo SRI-201, SRI-601)', () => {
+describe('the channel mode at each call', () => {
   test('flipping the mode between calls to the same unlisted channel flips the outcome', async () => {
     const session = await openModeSession(h.alpha)
     const outcomes: Array<[boolean | undefined, string]> = []
@@ -1894,9 +1894,9 @@ describe('the channel mode at each call (b.av2 SR-5.1; b.deo SRI-201, SRI-601)',
   })
 })
 
-// b.av2 SR-5.1; b.deo SRI-601: the scope check runs before the dry-run
+// the scope check runs before the dry-run
 // branch in fungible mode too.
-describe('dry run in fungible mode (SLACK_DRY_RUN=1; b.av2 SR-5.1, b.deo SRI-601)', () => {
+describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
   beforeEach(() => {
     process.env['SLACK_DRY_RUN'] = '1'
     h.mode = 'fungible'
@@ -1928,11 +1928,11 @@ describe('dry run in fungible mode (SLACK_DRY_RUN=1; b.av2 SR-5.1, b.deo SRI-601
   )
 })
 
-// b.av2 SR-1.2, SR-5.1; b.deo SRI-202, SRI-601: in fungible mode the outbound
+// in fungible mode the outbound
 // outcome never depends on the declarative section (`channels`, the top-level
 // `permission_prompts`), even one holding a D… conversation or a malformed
 // value, which declarative mode would allow as listed channels.
-describe('fungible mode never reads the declarative section on the outbound path (b.av2 SR-1.2, SR-5.1; b.deo SRI-202, SRI-601)', () => {
+describe('fungible mode never reads the declarative section on the outbound path', () => {
   /** A declarative section beside the fungible one: a listed channel, a D… conversation and a malformed value. */
   const DECLARATIVE_SECTION: ChannelEntry[] = [
     { id: A_ALL, delivery: 'all' },
@@ -2106,14 +2106,14 @@ describe('Slack call failures', () => {
   })
 })
 
-// b.av2 SR-5.1; b.deo SRI-602: in fungible mode Slack enforces membership, so
+// in fungible mode Slack enforces membership, so
 // its refusal of a call on a channel target reaches the persona as a tool
 // error naming the tool, the persona, the channel and Slack's code, built by
 // `slackRefusalToolErrorText`. DM targets in either mode, and declarative
 // mode, keep the declarative text (pinned by "Slack call failures" and "DM targets"
 // above, whose sessions bind no mode reader). Every scripted failure carries
 // the leak marker (Alpha's stub is built with it).
-describe("Slack's refusals as tool errors in fungible mode (b.av2 SR-5.1; b.deo SRI-602)", () => {
+describe("Slack's refusals as tool errors in fungible mode", () => {
   /** The stub's script queue each tool's one Slack call takes. */
   const TOOL_QUEUE: Record<ToolName, keyof StubSlackScript> = {
     reply: 'post',
@@ -2607,7 +2607,7 @@ function openWithSettings(p: Persona, overrides: Partial<ReplySettings> = {}) {
   return openSession(registerSession(p.working_directory, p.key, makeTransport(), makeServer()), depsWithReplySettings(overrides))
 }
 
-/** Beta Bot also lists A_ALL, so both personas may reply in one shared channel (E4). */
+/** Beta Bot also lists A_ALL, so both personas may reply in one shared channel (). */
 function shareAlphaChannelWithBeta(): void {
   applyPersona(h.beta, h.beta.dm.enabled, { channels: [...h.beta.channels, { id: A_ALL, delivery: 'all' }] })
 }
@@ -2616,8 +2616,8 @@ function shareAlphaChannelWithBeta(): void {
 const REMOVE_EYES = { channel: A_ALL, timestamp: MSG_TS, name: 'eyes' }
 
 // The reaction name comes from the server-wide `ack_reaction` setting through
-// the injected `getReplySettings` (b.av2 SR-1.6). The tracker is keyed by
-// (persona, conversation, ts) (b.av2 SR-4.5): a reply consumes only its own
+// the injected `getReplySettings`. The tracker is keyed by
+// (persona, conversation, ts): a reply consumes only its own
 // persona's entry and removes the reaction through its own client.
 describe('reply — ack reaction removal', () => {
   test.each<[string, Partial<ReplySettings>, string]>([
@@ -2740,7 +2740,7 @@ const LINE_C = 'c'.repeat(1999)
 const PHONETIC = 'alpha\nbravo\ncharlie\ndelta'
 
 // `reply_chunk_limit` and `reply_chunk_mode` come from the server-wide settings
-// (b.av2 SR-1.6, SR-5.2); `{}` keeps the harness's, which are the config's
+// `{}` keeps the harness's, which are the config's
 // defaults (4000, `newline`). `chunkText`'s own edge cases are in server.test.ts.
 describe('reply — chunking by the server-wide settings', () => {
   test.each<[string, Partial<ReplySettings>, string, string[]]>([
@@ -2778,9 +2778,9 @@ describe('reply — chunking by the server-wide settings', () => {
 // ---------------------------------------------------------------------------
 
 describe('tool list and instructions', () => {
-  // b.deo SRI-501: six tools, the five Slack tools with their inputs and
+  // six tools, the five Slack tools with their inputs and
   // `set_channel_delivery` with `channel` and `delivery`, both required.
-  test('lists exactly the six tools with their inputs and required inputs unchanged; no tool name, description or input schema text carries reload wording (AC 74)', async () => {
+  test('lists exactly the six tools with their inputs and required inputs unchanged; no tool name, description or input schema text carries reload wording', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
     const { tools } = await client.listTools()
@@ -2797,19 +2797,19 @@ describe('tool list and instructions', () => {
       download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
       [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery'], required: ['channel', 'delivery'] },
     })
-    // b.av2 SR-8.8: the whole tool definition (name, description, every schema
+    // the whole tool definition (name, description, every schema
     // property name and description), so a reload tool or hint can't slip in.
     expect(Object.fromEntries(tools.map((t) => [t.name, reloadTermsIn(JSON.stringify(t))]))).toEqual(
       Object.fromEntries(tools.map((t) => [t.name, []])),
     )
   })
 
-  // b.jg5 SRJ-511 (AC 47): the clear-latch command is the operator's alone. The
+  // the clear-latch command is the operator's alone. The
   // whole serialized definition of every tool (name, description, every schema
   // property name and description) and the instructions the session receives
   // carry no spelling of it (tests/test-helpers/clear-latch-terms.ts); a
   // failure names the tool, or the instructions, and the terms found.
-  test('SRJ-511 (AC 47): no tool definition and not the instructions the session receives name clear-latch in any spelling', async () => {
+  test('no tool definition and not the instructions the session receives name clear-latch in any spelling', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
     const { tools } = await client.listTools()
@@ -2827,7 +2827,7 @@ describe('tool list and instructions', () => {
   })
 
   test.each(['reload', 'apply_config'])(
-    'AC 74: calling a `%s` tool is refused as unknown, with no Slack call and nothing leaked',
+    'calling a `%s` tool is refused as unknown, with no Slack call and nothing leaked',
     async (name) => {
       const { client } = await openPersonaSession(h.alpha)
 
@@ -2850,7 +2850,7 @@ describe('tool list and instructions', () => {
     },
   )
 
-  // The content audit (reload wording, AC 74; forbidden terms, AC 46) reads
+  // The content audit (reload wording; forbidden terms) reads
   // MCP_INSTRUCTIONS in shipped-docs.test.ts; this pins that a session sends
   // exactly that string, so the audit reads what instances receive.
   test('a session sends exactly MCP_INSTRUCTIONS as its instructions', async () => {
@@ -2859,7 +2859,7 @@ describe('tool list and instructions', () => {
     expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS)
   })
 
-  // b.omv SR-7.1/3: negotiated tools only; the system prompt owns full tag semantics.
+  // negotiated tools only; the system prompt owns full tag semantics.
   test('the compact contract retains all nine points in order and every tool/via value under its cap', async () => {
     const { client } = await openPersonaSession(h.alpha)
     expect(client.getServerCapabilities()).toEqual({ tools: {} })
@@ -2887,12 +2887,12 @@ describe('tool list and instructions', () => {
   })
 })
 
-// b.av2 SR-12; b.deo SRI-604: one instructions text for every session, in
+// one instructions text for every session, in
 // both channel modes, so its elements are checked once, on that text. Key
 // phrases only, each within one line, and the tool named through
 // SET_CHANNEL_DELIVERY_TOOL. The DM text is the DM cases' above; the tool
 // list, the clear-latch check and the content audits are elsewhere.
-describe('session instructions in both channel modes (b.av2 SR-12; b.deo SRI-604)', () => {
+describe('session instructions in both channel modes', () => {
   /** `text` matched literally inside a pattern. */
   const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -2924,7 +2924,7 @@ describe('session instructions in both channel modes (b.av2 SR-12; b.deo SRI-604
   })
 })
 
-// b.omv SR-8.7: registry records only successful replies, using the resolved target.
+// registry records only successful replies, using the resolved target.
 describe('reply before delivery', () => {
   test.each([A_ALL, USER_U])('successful reply to %s suppresses only the calling persona in the resolved conversation', async target => {
     applyPersona(h.alpha, true)

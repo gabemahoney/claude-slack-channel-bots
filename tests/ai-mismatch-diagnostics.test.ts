@@ -7,7 +7,7 @@ import { fixtureDifference, readbackMismatch } from './real-agent/ai-mismatch-di
 import { AI_FAILURE_PREFIX, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
 import { assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 
-const expected = { case: 'AC15', messages: 1, body: 'amber birch cedar' }
+const expected = { case: "AC15", messages: 1, body: 'amber birch cedar' }
 const digest = (s: string) => createHash('sha256').update(s).digest('hex')
 
 test.each([

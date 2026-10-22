@@ -1,23 +1,23 @@
 /**
  * persona-retry-schedule.ts — The per-persona retry backoff schedule
- * (b.av2 SR-3.2).
+ *
  *
  * A Slack-unreachable persona is retried with backoff starting at 5 s and
  * doubling to a 300 s ceiling, with no cap, until Slack answers. A wait after
  * rate limiting is never shorter than the error's `retryAfter`. The same
  * policy is reused for Socket Mode reopen attempts after the first immediate
- * one (SR-3.3), directory-broken re-checks (SR-6.4) and destination-failure
- * retries (SR-7.1).
+ * one, directory-broken re-checks and destination-failure
+ * retries.
  *
  * Each caller creates its own schedule (one per persona and retry purpose)
  * with `createPersonaRetrySchedule`; a schedule holds only its own failure
  * count. There is no module-scope state, so nothing spans two personas
- * (SR-3.3), and `backoff.ts`'s per-persona counters and cap are not used —
+ * and `backoff.ts`'s per-persona counters and cap are not used —
  * only its stateless `doublingBackoffDelay` arithmetic.
  *
  * The schedule returns waits; it creates no timers and reads no clock.
  * Scheduling the wait is the caller's job, through its injected timers
- * (b.av2 SR-13.1).
+ *
  *
  * SPDX-License-Identifier: MIT
  */
@@ -25,13 +25,13 @@
 import { doublingBackoffDelay } from './backoff.ts'
 
 // ---------------------------------------------------------------------------
-// SR-3.2 constants
+// constants
 // ---------------------------------------------------------------------------
 
-/** First retry wait, in seconds (b.av2 SR-3.2). */
+/** First retry wait, in seconds. */
 export const PERSONA_RETRY_BASE_S = 5
 
-/** Retry wait ceiling, in seconds (b.av2 SR-3.2). There is no attempt cap. */
+/** Retry wait ceiling, in seconds. There is no attempt cap. */
 export const PERSONA_RETRY_CEILING_S = 300
 
 /**
@@ -63,7 +63,7 @@ export interface PersonaRetrySchedule {
   readonly failures: number
 }
 
-/** Create an independent retry schedule following the b.av2 SR-3.2 policy. */
+/** Create an independent retry schedule following the policy. */
 export function createPersonaRetrySchedule(): PersonaRetrySchedule {
   let failures = 0
   return {

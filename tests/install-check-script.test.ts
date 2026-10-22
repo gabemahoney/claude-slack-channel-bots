@@ -1,6 +1,6 @@
 /**
  * install-check-script.test.ts — `scripts/install-check.ts`'s rendering
- * (SR-6, b.jg5 SRJ-212, AC 81).
+ *
  *
  * The script's exported `renderSuccess` and `renderFailure` run over the
  * canned results of `tests/test-helpers/install-check-fixtures.ts`, which
@@ -72,7 +72,7 @@ import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 /** The install-skill block the script appends to a failure. */
 const SKILL_BLOCK = renderInstallSkillInstructions()
 
-/** What `main()` writes to stderr for a failure (its append rule, SR-6.3). */
+/** What `main()` writes to stderr for a failure (its append rule). */
 function scriptFailureBody(result: InstallCheckFailure): string {
   const body = renderFailure(result)
   return result.classLabel === AD_VERSION_FLOOR_UNREADABLE ? body : body + SKILL_BLOCK
@@ -108,7 +108,7 @@ const MEETS_FLOOR: ReadonlyArray<[string, string]> = [
   ['PHASE1_FLOOR_VERSION', PHASE1_FLOOR_VERSION],
 ]
 
-describe('SR-6 / SRJ-212: install-check script — success with the Phase 1 note', () => {
+describe('install-check script — success with the Phase 1 note', () => {
   test.each(BELOW_FLOOR_PASSING)('%s: the note follows the OK block, once', (_name, version) => {
     const result = cannedSuccessResult({ binaryVersion: version })
     const note = buildInstallCheckPhase1Note(version)
@@ -131,7 +131,7 @@ describe('SR-6 / SRJ-212: install-check script — success with the Phase 1 note
     expect(tail).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
 
     // The note line begins, after its indent, with the exported label, then
-    // the note's text (SRJ-212, SRJ-1110); no line of the OK block does.
+    // the note's text; no line of the OK block does.
     const noteLine = tail.trimStart()
     expect(noteLine.startsWith(INSTALL_CHECK_NOTE_LABEL)).toBe(true)
     const afterLabel = noteLine.slice(INSTALL_CHECK_NOTE_LABEL.length)
@@ -141,7 +141,7 @@ describe('SR-6 / SRJ-212: install-check script — success with the Phase 1 note
   })
 })
 
-describe('SR-6: install-check script — success without a note', () => {
+describe('install-check script — success without a note', () => {
   test.each(MEETS_FLOOR)('%s: the OK block alone, no note text', (_name, version) => {
     const result = cannedSuccessResult({ binaryVersion: version })
     expect(result.note).toBeUndefined()
@@ -164,7 +164,7 @@ describe('SR-6: install-check script — success without a note', () => {
   })
 })
 
-describe('SR-6: install-check script — failures that end with the install-skill block', () => {
+describe('install-check script — failures that end with the install-skill block', () => {
   test(`${AD_SYSTEM_INSTALL_NOT_FOUND}: class label, message, then the skill block`, () => {
     const result = cannedFailureResult(AD_SYSTEM_INSTALL_NOT_FOUND)
     const body = scriptFailureBody(result)
@@ -201,7 +201,7 @@ describe('SR-6: install-check script — failures that end with the install-skil
   })
 })
 
-describe('SR-6.3: ad-version-floor-unreadable does NOT get the install-skill block', () => {
+describe('ad-version-floor-unreadable does NOT get the install-skill block', () => {
   test('class label and message present, no skill block', () => {
     const result = cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE)
     const body = scriptFailureBody(result)
@@ -212,7 +212,7 @@ describe('SR-6.3: ad-version-floor-unreadable does NOT get the install-skill blo
   })
 })
 
-describe('AC 81: no rendered line advises upgrading agent-director', () => {
+describe('no rendered line advises upgrading agent-director', () => {
   const successes: Array<[string, InstallCheckSuccess]> = [
     ...BELOW_FLOOR_PASSING.map(([name, v]): [string, InstallCheckSuccess] => [`success ${name} (note)`, cannedSuccessResult({ binaryVersion: v })]),
     ...MEETS_FLOOR.map(([name, v]): [string, InstallCheckSuccess] => [`success ${name} (no note)`, cannedSuccessResult({ binaryVersion: v })]),

@@ -1,6 +1,6 @@
 /**
  * test-helpers/fake-clock.ts — A manual clock and timer driver for code that
- * takes its clock and timers as injected dependencies (b.av2 SR-13.1).
+ * takes its clock and timers as injected dependencies.
  *
  * The connection manager takes its clock and timers by injection, so suites
  * that need virtual time (the 10 s bound on a `start()` that never settles,

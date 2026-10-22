@@ -15,13 +15,12 @@
  * (Bun's recursive `readdirSync` follows directory symlinks and fails with
  * `ELOOP` on a loop, so this walks with `withFileTypes` instead.)
  *
- * The opt-in option (b.uqm SR-21.3). `treeSnapshot(dir, { extended: true })`
+ * The opt-in option. `treeSnapshot(dir, { extended: true })`
  * appends to every line, `.` included, the entry's permission bits as four
  * octal digits and its change time (`ctimeMs`), and, for a regular file only,
  * the SHA-256 of its content as 64 lowercase hex digits (`unreadable(<code>)`
- * when the file cannot be read):
- *
- *   .:<mtime>:<mode>:<ctime>
+ * when the file cannot be read):.
+ *   :<mtime>:<mode>:<ctime>
  *   <relative path>:<kind>:<detail>:<mtime>:<mode>:<ctime>[:<sha256>]
  *
  * So a mode change (`chmod`), a change-time change (a rename, a link count, an
@@ -43,7 +42,7 @@ import { join } from 'node:path'
 
 /** `treeSnapshot`'s options. */
 export interface TreeSnapshotOptions {
-  /** Add each entry's permission bits and change time, and a regular file's content digest (b.uqm SR-21.3). Off by default. */
+  /** Add each entry's permission bits and change time, and a regular file's content digest. Off by default. */
   readonly extended?: boolean
 }
 

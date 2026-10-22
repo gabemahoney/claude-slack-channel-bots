@@ -1,6 +1,6 @@
 /**
  * shutdown-deadline.ts — The bounded fallback exit for a shutdown that nothing
- * else ends (b.jg5 SRJ-205: a stop by the runtime version re-check runs the
+ * else ends (a stop by the runtime version re-check runs the
  * shutdown sequence and exits non-zero).
  *
  * The shutdown sequence awaits the MCP transport closes and the persona Slack

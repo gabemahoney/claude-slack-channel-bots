@@ -160,7 +160,7 @@ export function cannedMakeTemplate(path: string): MakeTemplateResult {
 
 /**
  * Build a canned `FindMissingResult` in the agent-director 0.8.0 shape
- * (b.4dk / plan b.93m: `{ count, ids, unverified, unverified_ids }`). All
+ * (/ plan `{ count, ids, unverified, unverified_ids }`). All
  * four fields are read by the CSCB findMissing-before-resume log line. The
  * default is the empty/zero result (count 0, empty id arrays); tests that need
  * missing rows pass overrides.
@@ -204,8 +204,8 @@ export interface FindMissingPlacement {
 /**
  * A result as agent-director may answer it: the client's own type `T`, with
  * the fields `K` that the client declares required left optional, because a
- * binary older than Phase 1 omits them (b.jg5 SRJ-110: a `kill` result with
- * no `kill_sent`; SRJ-413: a spawn or `resume` result with no `pre_trust`).
+ * binary older than Phase 1 omits them (a `kill` result with
+ * no `kill_sent`; a spawn or `resume` result with no `pre_trust`).
  * Every field keeps the client's own type.
  */
 export type MayLackPhase1Fields<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>
@@ -229,14 +229,14 @@ export function cannedKillResult(killSent?: boolean): StubKillResult {
 }
 
 /**
- * Sample launch starts (`launch_started_at`, ADSRD SR-22.2: RFC 3339 UTC with
+ * Sample launch starts (`launch_started_at`, agent-director contract RFC 3339 UTC with
  * millisecond precision, the fraction shown only when it is not zero): one
  * with fractional seconds and one without.
  *
  * The canned row builders (`cannedStatusResult`, `cannedGetResult`,
  * `cannedListRow`) give a `pending` row `SAMPLE_LAUNCH_START_DEFAULT` when the
  * overrides have no `launch_started_at` key, since a configured persona's own
- * `pending` row with no launch start latches the persona (b.jg5 SRJ-513).
+ * `pending` row with no launch start latches the persona.
  * "No launch start" is an explicit request: pass
  * `launch_started_at: SAMPLE_LAUNCH_START_NONE` (`undefined`: the key is left
  * out of the row) or `launch_started_at: null` (the key shown as `null`). A
@@ -281,7 +281,7 @@ type ClientLivenessNote = NonNullable<GetResult['liveness_note']>
 
 /**
  * The `liveness_note` that latches a persona with the CONFLICT case
- * "conflicting labels" (b.jg5 SRJ-114, SRJ-501, SRJ-507), and the only note
+ * "conflicting labels", and the only note
  * that latches. Set it on a `get` or `list` row with
  * `cannedGetResult({ ..., liveness_note: provenanceNote })` or
  * `cannedListRow(...)`. It is the stub's own spelling of agent-director's
@@ -292,7 +292,7 @@ export const provenanceNote: LivenessNote = 'provenance_conflict'
 
 /**
  * Every `liveness_note` agent-director names besides `provenanceNote`, as
- * HO rev 22 spells them; none ever latches a persona (b.jg5 SRJ-114:
+ * HO rev 22 spells them; none ever latches a persona (
  * `tmux_server_changed`, `process_not_seen_*`, `probe_eacces`,
  * `tmux_session_name_*`). This is the list a `test.each` iterates for "no
  * other note latches". Neither `provenanceNote` nor `unknownNote` is in it.
@@ -309,7 +309,7 @@ export const nonLatchingNotes: readonly ClientLivenessNote[] = [
 
 /**
  * A `liveness_note` agent-director might send that CSCB does not know, for
- * the "an unknown note latches no one" cases (b.jg5 SRJ-114). It starts with
+ * the "an unknown note latches no one" cases. It starts with
  * `provenanceNote`'s spelling, so a prefix match of the latching note (in
  * place of exact equality) latches on it and fails the case.
  */
@@ -374,7 +374,7 @@ const PRE_TRUST_MEMBERS: { readonly [V in PreTrust]: V } = {
 
 /**
  * The three `pre_trust` values a Phase 1 spawn or `resume` result carries
- * (b.jg5 SRJ-413), for `test.each` with `cannedSpawnResult` and
+ * for `test.each` with `cannedSpawnResult` and
  * `cannedResumeResult`; an absent field is their `preTrust` left out. Tests
  * take `pre_trust` values from here and never type them.
  */
@@ -467,7 +467,7 @@ export function errSpawnNotInteractiveNoLaunchStart(verb: string = 'send-keys'):
  * Build the client's ErrSendKeysWhileRelayed for `send-keys`: agent-director
  * refuses keystrokes to a row that sits on a relayed permission prompt, and
  * nothing was sent. CSCB gives the name no handling, so it classes
- * UNCLASSIFIED (b.jg5 SRJ-104, SRJ-118).
+ * UNCLASSIFIED.
  */
 export function errSendKeysWhileRelayed(): ErrSendKeysWhileRelayed {
   return new ErrSendKeysWhileRelayed(
@@ -477,7 +477,7 @@ export function errSendKeysWhileRelayed(): ErrSendKeysWhileRelayed {
   )
 }
 
-/** E3 per-key refusals, before any text was typed (b.omv SR-5.6). */
+/** per-key refusals, before any text was typed. */
 export function errDialogMaybeOpen(): ErrDialogMaybeOpen {
   return new ErrDialogMaybeOpen('send-keys', 'ErrDialogMaybeOpen', 'a dialog may still be open')
 }
@@ -485,7 +485,7 @@ export function errPaneChanged(): ErrPaneChanged {
   return new ErrPaneChanged('send-keys', 'ErrPaneChanged', 'the pane changed before typing')
 }
 
-/** Build an ErrInstanceIdCollision (spawn / SR-1.4 collision path). */
+/** Build an ErrInstanceIdCollision (spawn / collision path). */
 export function errInstanceIdCollision(): ErrInstanceIdCollision {
   return new ErrInstanceIdCollision('spawn', 'ErrInstanceIdCollision', 'instance_id already in use')
 }
@@ -494,7 +494,7 @@ export function errInstanceIdCollision(): ErrInstanceIdCollision {
  * Build agent-director's session-create failure (`ErrTmuxSessionCreate`, the
  * LAUNCH FAILURE class) for a `resume` (the default `verb`) or, with
  * 'spawn', a spawn. CSCB counts it once as a launch failure and never
- * follows it with a kill or a spawn in its place (b.jg5 SRJ-602).
+ * follows it with a kill or a spawn in its place.
  */
 export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCreate {
   return new ErrTmuxSessionCreate(verb, 'ErrTmuxSessionCreate', 'tmux: new-session failed: tmux session already exists')
@@ -505,7 +505,7 @@ export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCre
  * a `resume` of a row agent-director could not restore: its description ends
  * with HO rev 28's restore sentence "the row could not be restored and stays
  * pending", so the row then reads `pending`. CSCB matches no restore
- * sentence: the retry's read of the row decides (b.jg5 SRJ-112, SRJ-409).
+ * sentence: the retry's read of the row decides.
  */
 export function errTmuxSessionCreateStaysPending(verb: string = 'spawn'): ErrTmuxSessionCreate {
   return withRestoreSentence(errTmuxSessionCreate(verb), RESTORE_SENTENCE_STAYS_PENDING)
@@ -515,12 +515,12 @@ export function errTmuxSessionCreateStaysPending(verb: string = 'spawn'): ErrTmu
 export const RESTORE_SENTENCE_STAYS_PENDING = 'the row could not be restored and stays pending'
 
 /**
- * HO rev 28's four restore sentences (ADSRD SR-1.4, SR-8.5): one ends the
+ * HO rev 28's four restore sentences (agent-director contract): one ends the
  * description of a `resume` or reuse whose launch failed after its move or
  * reset (a launch timeout carries none): the row was restored to its prior
  * state; it changed after the move and was left as it is; it was removed, so
  * nothing was restored; or it could not be restored and stays `pending`.
- * CSCB keys no behaviour on them (b.jg5 SRJ-113), and `src/` holds none, so
+ * CSCB keys no behaviour on them, and `src/` holds none, so
  * a case's row stays as the case scripts it (`statusFn`, `getFn`), never
  * derived from the sentence.
  */
@@ -554,7 +554,7 @@ export function errCwdNotADirectory(verb: string = 'spawn', cwd: string = '/x'):
 }
 
 /**
- * Build an ErrTmuxSendKeys (sendKeys / b.rmy post-reboot reconnect failure).
+ * Build an ErrTmuxSendKeys (sendKeys / post-reboot reconnect failure).
  * The message mirrors the observed field failure: no tmux server exists at
  * all after a container restart wipes /tmp.
  */
@@ -562,16 +562,16 @@ export function errTmuxSendKeys(): ErrTmuxSendKeys {
   return new ErrTmuxSendKeys('send-keys', 'ErrTmuxSendKeys', 'tmux: send-keys failed: no server running on /tmp/tmux-1000/default: exit status 1')
 }
 
-/** Build an ErrNoSessionId (resume / SR-1.3 fall-through). */
+/** Build an ErrNoSessionId (resume / fall-through). */
 export function errNoSessionId(): ErrNoSessionId {
   return new ErrNoSessionId('resume', 'ErrNoSessionId', 'no session id available')
 }
 
 /**
- * Build an ErrJsonlMissing (resume / SR-1.3 fall-through).
+ * Build an ErrJsonlMissing (resume / fall-through).
  *
  * The optional `description` maps to `errDescription`, the human-readable
- * detail string AD attaches to the error envelope. b.wrb's diagnostic parses
+ * detail string AD attaches to the error envelope. diagnostic parses
  * this for the rich `<source> <path> (<stat error>)` enumeration; pass a plain
  * string (the installed 0.8.0 shape) to exercise the locally-computed
  * degradation path.
@@ -583,7 +583,7 @@ export function errJsonlMissing(description: string = 'jsonl missing'): ErrJsonl
 /**
  * Build an ErrJsonlNeverWritten (resume / AD 0.10.0). Distinct from
  * ErrJsonlMissing: the session never wrote a transcript at all, so there is
- * provably no history to lose and the recovery is lossless (b.jgf).
+ * provably no history to lose and the recovery is lossless.
  */
 export function errJsonlNeverWritten(): ErrJsonlNeverWritten {
   return new ErrJsonlNeverWritten(
@@ -593,7 +593,7 @@ export function errJsonlNeverWritten(): ErrJsonlNeverWritten {
   )
 }
 
-/** Build an ErrSpawnNotResumable (resume / SR-1.4 collision-recovery). */
+/** Build an ErrSpawnNotResumable (resume / collision-recovery). */
 export function errSpawnNotResumable(): ErrSpawnNotResumable {
   return new ErrSpawnNotResumable('resume', 'ErrSpawnNotResumable', 'row is non-terminal')
 }
@@ -642,7 +642,7 @@ export function errNoOpenPermissionRequest(): ErrNoOpenPermissionRequest {
   return new ErrNoOpenPermissionRequest('decide', 'ErrNoOpenPermissionRequest', 'no open permission request')
 }
 
-/** Build an ErrRelayModeOff (spawn / SR-1.2 abort). */
+/** Build an ErrRelayModeOff (spawn / abort). */
 export function errRelayModeOff(): ErrRelayModeOff {
   return new ErrRelayModeOff('spawn', 'ErrRelayModeOff', 'relay_mode is off')
 }
@@ -651,7 +651,7 @@ export function errRelayModeOff(): ErrRelayModeOff {
  * Build an ErrRelayFallenBack (decide / AD 0.10.0). Distinct from
  * ErrRelayModeOff: relay was on, but this request's relay window elapsed, so
  * Claude already fell back to asking at its own tmux pane and AD refuses to
- * record a verdict nothing would read. The spawn stays alive (b.qi1).
+ * record a verdict nothing would read. The spawn stays alive.
  */
 export function errRelayFallenBack(): ErrRelayFallenBack {
   return new ErrRelayFallenBack(
@@ -667,7 +667,7 @@ export function errPauseTimeout(): ErrPauseTimeout {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 error builders (b.jg5 SRJ-1303)
+// Phase 1 error builders
 // ---------------------------------------------------------------------------
 
 /** The tmux session name the Phase 1 error builders name by default: the default persona fixture's. */
@@ -765,7 +765,7 @@ export function errTmuxUnresponsiveStillStarting(
 
 /**
  * The retry a plain spawn's re-lookup error names once it has ended its new
- * row (HO rev 26; b.jg5 SRJ-111): a spawn with `reuse_finished` once the
+ * row (HO rev 26): a spawn with `reuse_finished` once the
  * session name is free. agent-director's own words; CSCB keys nothing on
  * them, so `src/` holds none.
  */
@@ -774,8 +774,8 @@ export const NEW_ROW_ENDED_RETRY = 'retry with reuse_finished once the session n
 /**
  * Build an `ErrTmuxUnresponsive` (the client's class) from a plain spawn whose
  * `tmux new-session` answered "duplicate session" and whose re-lookup of the
- * session holding the name could not answer (HO rev 26; b.jg5 SRJ-111,
- * SRJ-1303): agent-director ended the new row, so the description carries
+ * session holding the name could not answer (HO rev 26,
+ *): agent-director ended the new row, so the description carries
  * "the new row was ended" and names a retry with `reuse_finished`, and none
  * of the launch-timeout, still-stopping or still-starting words (default verb
  * `spawn`).
@@ -921,7 +921,7 @@ export function errTmuxKillFailed(
 }
 
 /**
- * The `ErrTmuxSessionConflict` cases the stub builds (ADSRD SR-1.4), each
+ * The `ErrTmuxSessionConflict` cases the stub builds (agent-director contract), each
  * named for its case words; `unrecognised` carries none of them.
  */
 export type ConflictCase =
@@ -983,8 +983,8 @@ export const STUB_TMUX_SESSION_ID = '$7'
 /**
  * Build an `ErrTmuxSessionConflict` (the client's class, as
  * `src/agent-director-errors.ts` re-exports it) for `conflictCase`. Each
- * description carries the quoted session name and the case words of ADSRD
- * SR-1.4 (from `src/ad-description-phrases.ts`), with that table's extras,
+ * description carries the quoted session name and the case words of agent-director contract
+ * (from `src/ad-description-phrases.ts`), with that table's extras,
  * and ends with the `list --tmux-session-name` line naming the session:
  * agent-director puts that line in every CONFLICT message.
  *   - `different-id` and `another-store`: that the session is another row's
@@ -1088,7 +1088,7 @@ export function errTmuxNotAvailableDifferentServer(
 /**
  * Build an ErrTmuxNotAvailable (the client's class) from a plain spawn whose
  * `tmux new-session` answered "duplicate session" and whose re-lookup of the
- * session holding the name could not run tmux (HO rev 26; b.jg5 SRJ-111):
+ * session holding the name could not run tmux (HO rev 26):
  * agent-director ended the new row, so the description carries "the new row
  * was ended" and names a retry with `reuse_finished` (default verb `spawn`).
  */
@@ -1165,7 +1165,7 @@ export function errInternal(description: string = 'the store could not be read')
 }
 
 /**
- * One UNAVAILABLE form (b.jg5 SRJ-104): its label, its builder for the verb
+ * One UNAVAILABLE form: its label, its builder for the verb
  * whose call meets it, and the retry cause kind it arms. A tuple, so a
  * `test.each` over it names its cases by the label.
  */
@@ -1205,7 +1205,7 @@ export function unavailableForms(...picks: ReadonlyArray<string | readonly [labe
 }
 
 /**
- * The three recorded-name faults of ADSRD SR-1.4 (an empty name, a control
+ * The three recorded-name faults of agent-director contract (an empty name, a control
  * character, a character tmux stores differently).
  */
 export type UnusableNameFault = 'empty' | 'control-character' | 'stored-differently'
@@ -1260,12 +1260,12 @@ export function errConfigMalformed(
 export type CannedRowPersona = Pick<Persona, 'key' | 'working_directory' | 'claude_config_dir'>
 
 /**
- * The fields a spawn of `persona` writes (b.av2 SR-2.2): `cwd` = the working
+ * The fields a spawn of `persona` writes: `cwd` = the working
  * directory, instance ID `cscb_<key>`, tmux session `slack_bot_<key>`, and the
  * labels `service=cscb`, `persona=<key>` and `config_dir=<value>` (no
  * `channel` label). The `config_dir` value comes from the production helper
- * `personaConfigDirLabelValue` (the strict real path, no lexical fallback;
- * bug b.g57) against the caller's `home`, never the OS home. A
+ * `personaConfigDirLabelValue` (the strict real path, no lexical fallback
+ * ) against the caller's `home`, never the OS home. A
  * claude_config_dir that cannot be resolved (a symlink on its path pointing
  * to nothing, a dropped mount) makes that helper throw
  * `ConfigDirUnresolvableError`, so the persona forms of `cannedListRow` and
@@ -1309,7 +1309,7 @@ function defaultRowPersonaKey(instanceId: string): string {
 }
 
 /**
- * Defaults for a row built without a persona argument (b.av2 SR-13.4): labels
+ * Defaults for a row built without a persona argument: labels
  * exactly `service=cscb` and `persona=<key>` (no `config_dir`, no `channel`),
  * tmux session `slack_bot_<key>`, and `cwd` `defaultCannedRowCwd()`.
  */
@@ -1383,7 +1383,7 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
 /**
  * Build a canned `PermissionRequestRow` for the plural-projection wire. The
  * default `request_token` is a fresh UUIDv4 (via `crypto.randomUUID()`) so
- * the encoded action_id round-trips through the SR-2.2 anchored regex. CSCB
+ * the encoded action_id round-trips through the anchored regex. CSCB
  * test infrastructure mints opaque tokens; production CSCB code never does.
  */
 export function cannedPermissionRequest(
@@ -1511,7 +1511,7 @@ export function cannedGetResultPlural(
 
 /**
  * Build a canned plural projection with TWO open `permission_requests`
- * rows on the same spawn — the Epic-1 acceptance fixture for
+ * rows on the same spawn — the component-1 acceptance fixture for
  * "two concurrent prompts on one spawn each get their own Slack message
  * keyed on the composite (instance_id, request_token)".
  *
@@ -1536,10 +1536,10 @@ export function cannedTwoRowPluralProjection(
 /**
  * Build a canned `GetPermissionResult` — the single-row response shape from
  * the paired AD release's `get-permission --request-token <uuid>` verb
- * (SR-7.1). Defaults to the operator-allow shape (`decision='allow'`,
+ * Defaults to the operator-allow shape (`decision='allow'`,
  * `decision_reason=null`); tests override `decision` + `decision_reason` to
- * exercise the four verdict-rendering branches (SR-5.1) plus the unknown-enum
- * fail-closed path (SR-5.2).
+ * exercise the four verdict-rendering branches plus the unknown-enum
+ * fail-closed path.
  */
 export function cannedGetPermissionResponse(
   overrides: Partial<GetPermissionResult> = {},
@@ -1598,9 +1598,9 @@ export type StubCallAnswer<T> = T | Error | undefined | Promise<T | Error | unde
  * Per-call function knobs compute a response per call and take precedence
  * over every other knob of their verb: `statusFn` and `getFn`; `spawnFn`
  * and `resumeFn` for the two launch verbs; `findMissingFn`, `readPaneFn`,
- * `sendKeysFn` and `killFn` (b.jg5 SRJ-410, SRJ-412). All but `statusFn`
+ * `sendKeysFn` and `killFn`. All but `statusFn`
  * and `getFn` may be async, so a test can run code while the call is in
- * progress (move a fake clock, then answer or reject it: b.jg5 SRJ-407's
+ * progress (move a fake clock, then answer or reject it:
  * launch-call window). Each may answer `undefined` to leave that call to the
  * verb's other knobs, the queue first, as if it were not set.
  *
@@ -1612,7 +1612,7 @@ export interface StubClientOptions {
   binaryPath?: string
   /**
    * The binary version the stub reports (default: `PHASE1_RC_VERSION`, which
-   * passes CSCB's Phase 1 floor; b.jg5 SRJ-1303).
+   * passes CSCB's Phase 1 floor).
    */
   binaryVersion?: string
 
@@ -1628,7 +1628,7 @@ export interface StubClientOptions {
 
   // spawn() — a result may carry the Phase 1 `pre_trust` (`cannedSpawnResult`).
   // A recorded call may be a reuse spawn: its parameters carry the client's
-  // `reuse_finished` (`SpawnParams`, b.jg5 SRJ-112, SRJ-708), readable
+  // `reuse_finished` (`SpawnParams`), readable
   // with no cast. The stub answers a reuse like any spawn, from the same
   // queue and knobs.
   spawnResult?: StubSpawnResult
@@ -1636,7 +1636,7 @@ export interface StubClientOptions {
   spawnQueue?: CannedResponse<StubSpawnResult>[]
   spawnCalls?: SpawnParams[]
   /**
-   * Per-call `spawn` answer (b.jg5 SRJ-407), like `getFn`: when supplied, it
+   * Per-call `spawn` answer, like `getFn`: when supplied, it
    * is called with each call's parameters, after the call is recorded in
    * `spawnCalls`, and takes precedence over `spawnQueue`/`spawnError`/
    * `spawnResult`. It may be async and run test code while the call is in
@@ -1656,7 +1656,7 @@ export interface StubClientOptions {
   statusQueue?: CannedResponse<StatusResult>[]
   statusCalls?: StatusParams[]
   /**
-   * Dynamic status seam (b.m4r). When supplied, takes precedence over
+   * Dynamic status seam. When supplied, takes precedence over
    * `statusResult`/`statusQueue`/`statusError` and computes the result from the
    * current call params — lets a test model an AD row whose state depends on
    * whether an earlier verb (e.g. the up-front `findMissing` reconcile sweep)
@@ -1690,7 +1690,7 @@ export interface StubClientOptions {
   sendKeysQueue?: CannedResponse<SendKeysResult>[]
   sendKeysCalls?: SendKeysParams[]
   /**
-   * Per-call `send-keys` answer (b.jg5 SRJ-410, SRJ-118), as `spawnFn` is for
+   * Per-call `send-keys` answer, as `spawnFn` is for
    * `spawn`: called with each call's parameters after the call is recorded
    * in `sendKeysCalls`, it takes precedence over `sendKeysQueue`/
    * `sendKeysError`/`sendKeysResult`, may be async, rejects with an `Error`
@@ -1715,7 +1715,7 @@ export interface StubClientOptions {
    */
   readPaneQueue?: CannedResponse<ReadPaneResult>[]
   /**
-   * Per-call `read-pane` answer (b.jg5 SRJ-410, SRJ-117), as `spawnFn` is for
+   * Per-call `read-pane` answer, as `spawnFn` is for
    * `spawn`: called with each call's parameters (`n_lines`, `allow_pending`
    * included) after the call is recorded in `readPaneCalls`, it takes
    * precedence over `readPaneQueue`/`readPaneError`/`readPaneResults`, may
@@ -1731,7 +1731,7 @@ export interface StubClientOptions {
   killQueue?: CannedResponse<StubKillResult>[]
   killCalls?: KillParams[]
   /**
-   * Per-call `kill` answer (b.jg5 SRJ-412, SRJ-702), as `spawnFn` is for
+   * Per-call `kill` answer, as `spawnFn` is for
    * `spawn`: called with each call's parameters after the call is recorded
    * in `killCalls`, it takes precedence over `killQueue`/`killError`/
    * `killResult`, may be async, rejects with an `Error` (e.g.
@@ -1753,7 +1753,7 @@ export interface StubClientOptions {
   resumeQueue?: CannedResponse<StubResumeResult>[]
   resumeCalls?: ResumeParams[]
   /**
-   * Per-call `resume` answer (b.jg5 SRJ-407), as `spawnFn` is for `spawn`:
+   * Per-call `resume` answer, as `spawnFn` is for `spawn`:
    * called after the call is recorded in `callLog` and `resumeCalls`, it
    * takes precedence over `resumeQueue`/`resumeError`/`resumeResult`, may be
    * async, rejects with an `Error`, resolves with a result, and leaves the
@@ -1761,7 +1761,7 @@ export interface StubClientOptions {
    */
   resumeFn?: (params: ResumeParams) => StubCallAnswer<StubResumeResult>
 
-  // findMissing() — b.4dk: dead-session recovery runs one findMissing before
+  // findMissing — dead-session recovery runs one findMissing before
   // resume so AD transitions the dead live-state row to `missing`. Defaults to
   // the 0.8.0 zero-transition shape.
   findMissingResult?: FindMissingResult
@@ -1769,7 +1769,7 @@ export interface StubClientOptions {
   findMissingQueue?: CannedResponse<FindMissingResult>[]
   findMissingCalls?: FindMissingParams[]
   /**
-   * Per-call `find-missing` answer (b.jg5 SRJ-410, SRJ-120), as `spawnFn` is
+   * Per-call `find-missing` answer, as `spawnFn` is
    * for `spawn`: called with each call's parameters after the call is
    * recorded in `callLog` and `findMissingCalls`, it takes precedence over
    * `findMissingQueue`/`findMissingError`/`findMissingResult`, may be async,
@@ -1800,7 +1800,7 @@ export interface StubClientOptions {
   pauseCalls?: PauseParams[]
 
   // getPermission() — paired-AD-release verb wrapping `get-permission
-  // --request-token <uuid>` (SR-7.1). The published `agent-director` Client
+  // --request-token <uuid>`. The published `agent-director` Client
   // doesn't ship this yet, so it lives on the stub via the optional
   // structural-method surface PollerDeps#getClient already exposes.
   getPermissionResult?: GetPermissionResult
@@ -1811,8 +1811,8 @@ export interface StubClientOptions {
   /**
    * Ordered verb-name log. When supplied, the instrumented verbs — `findMissing`,
    * `status`, and `resume` — push their name before returning, letting a test
-   * assert their relative ordering (b.4dk: findMissing must precede resume;
-   * b.m4r: the up-front findMissing sweep must precede the first status poll).
+   * assert their relative ordering (findMissing must precede resume;
+   * the up-front findMissing sweep must precede the first status poll).
    * Other verbs are not instrumented.
    */
   callLog?: string[]
@@ -1847,7 +1847,7 @@ export type StubClient = {
   list(params: ListParams): Promise<ListResult>
   pause(params: PauseParams): Promise<PauseResult>
   /**
-   * Paired-AD-release `get-permission` verb (SR-7.1). Optional on the
+   * Paired-AD-release `get-permission` verb. Optional on the
    * structural type so existing tests that don't configure it still satisfy
    * the `PollerDeps#getClient` shape (where `getPermission` is also optional).
    */
@@ -2066,7 +2066,7 @@ export interface FindMissingHold {
 /**
  * Replace `stub.findMissing` so every call stays open until the test
  * releases or fails it, oldest first. Lets a test keep a `find-missing` run
- * (a live-row sequence's, b.jg5 SRJ-706) outstanding while it drives other
+ * (a live-row sequence's) outstanding while it drives other
  * work, then settle it with a placement. Held calls are recorded in the
  * handle's `calls`, not in the stub's own call log.
  */
@@ -2233,8 +2233,7 @@ export interface StubCreateClientOptions {
   /**
    * Capture the options each client is built with, one entry per call, in
    * call order (the error path included), typed as the client's
-   * `ClientOptions` so a test reads e.g. `calls[0].callTimeoutMs` (b.jg5
-   * SRJ-213); a field the caller did not pass is absent.
+   * `ClientOptions` so a test reads e.g. `calls[0].callTimeoutMs`; a field the caller did not pass is absent.
    */
   calls?: ClientOptions[]
 }
@@ -2243,7 +2242,7 @@ export interface StubCreateClientOptions {
  * Build a stub `Client.create`-shaped factory function. Returns a function
  * of shape `(opts: object) => Promise<StubClient>` that records `opts` in
  * `calls`, then either resolves with the supplied stub or rejects with the
- * supplied error. Drives the startup gate's catch ladder (Task 5 / a9) for
+ * supplied error. Drives the startup gate's catch ladder (section 5 / a9) for
  * the three new typed errors.
  */
 export function makeStubCreateClient(opts: StubCreateClientOptions = {}): (clientOpts: object) => Promise<StubClient> {

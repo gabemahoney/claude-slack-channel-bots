@@ -1,5 +1,5 @@
 /**
- * block-action-received.test.ts — SR-V-2.9 unit tests for
+ * block-action-received.test.tsunit tests for
  * `emitBlockActionReceived` in src/permission-click-handler.ts. The helper
  * is the diagnostically critical surface for "I clicked Allow and nothing
  * happened" — every inbound `block_actions` action_id produces one event
@@ -21,7 +21,7 @@ import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/** Persona whose key differs from the inbound channel ID (b.av2 SR-2.2). */
+/** Persona whose key differs from the inbound channel ID. */
 const PERSONA_NAME = 'Demo Relay Bot'
 const PERSONA_KEY = personaKey(PERSONA_NAME)
 const INSTANCE_C = personaInstanceId(PERSONA_KEY)

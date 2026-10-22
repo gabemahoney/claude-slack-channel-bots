@@ -1,6 +1,6 @@
 /**
  * ci-live-docker.test.ts — Tests for how the /ci-live runner reaches docker
- * and child processes (bug b.1cx): the `docker run` argv and its guard
+ * and child processes: the `docker run` argv and its guard
  * (`ci-live/lib/docker.ts`), the one `docker exec` path (`lib/container.ts`),
  * the minimal child environment (`lib/proc.ts`) and the run lock
  * (`lib/run-lock.ts`).
@@ -84,7 +84,7 @@
  *   repo context (never `package.json`), and only `install.sh` from its one named build context
  *   (no release-candidate context, no SHA256SUMS); pins a plain release that
  *   is CSCB's Phase 1 floor (`PHASE1_FLOOR_VERSION`) and `package.json`'s
- *   pin, with its commit and SHA-256s (b.jg5 SRJ-201); checks `install.sh`
+ * pin, with its commit and SHA-256s; checks `install.sh`
  *   against its SHA-256 before installing it off PATH; installs the release's
  *   binaries with that `install.sh --from-release` of the pinned tag and both
  *   pinned SHA-256s (no hooks, no symlink, a throwaway HOME); puts the binary
@@ -107,7 +107,7 @@
  *   execute bit (never runs it) and stages it in both runs. No image file
  *   (`docker/`, its docs aside), `ci-live/lib/` module or skill names a
  *   release-candidate version, context, directory variable, SHA256SUMS, swap
- *   helper or pin, or a commit other than the release's; the SRD's
+ * helper or pin, or a commit other than the release's; the contract's
  *   release-candidate-counts wording (`<P1>-rc.N` counts as `<P1>`) passes;
  * - the client under test (`ci-live/lib/ad-client-check.ts`): the check
  *   changes nothing (it writes only in its scratch directory and runs no
@@ -135,7 +135,7 @@
  *   built. No Claude Code version is written in this file.
  * - the runner loads from outside `ci-live/` only `src/`'s two import-free
  *   text modules (`src/reload-preview-clauses.ts` and
- *   `src/startup-summary-ending.ts`, b.jg5 SRJ-1111), each imported by a
+ * `src/startup-summary-ending.ts`), each imported by a
  *   runner file, and packages only node builtins and playwright-core; every
  *   form of load counts (type-only, re-export, dynamic, `require`, a
  *   `/// <reference path>` or `types` directive), and one
@@ -1369,7 +1369,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     ])
   })
 
-  test("no host command starts, stops or kills CSCB, tmux or agent-director: those appear only in the checks, which reach the container only; the HOST check's two read-only probes are the only host-side agent-director and tmux argv (b.jg5 SRJ-1301's one exception)", () => {
+  test("no host command starts, stops or kills CSCB, tmux or agent-director: those appear only in the checks, which reach the container only; the HOST check's two read-only probes are the only host-side agent-director and tmux argv (one exception)", () => {
     const failures: string[] = []
     const argvLiterals: string[] = []
     const shellCommands: string[] = []
@@ -1424,7 +1424,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     // the checks above, in the container only); no runner file outside the checks calls sh (failures above).
     expect(unresolvedScripts).toEqual([`${join('lib', 'container.ts')}: helperScript(script)`])
     // The checks do kill tmux sessions (Checks 7, 12, 24), in the container; on the host only the HOST check's two read-only probes run.
-    // b.jg5 SRJ-1301: these two argv are the one exception to "no host-side agent-director or tmux"; exact equality, so a third fails.
+    // these two argv are the one exception to "no host-side agent-director or tmux"; exact equality, so a third fails.
     expect(checkFiles).toBeGreaterThan(0)
     expect(argvLiterals).toEqual([
       `${join('lib', 'host-state.ts')}: ['agent-director', '--store-path', hostStorePath(home), 'list', '--label', 'service=cscb']`,
@@ -1973,7 +1973,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// What the runner loads from outside ci-live/ (source audit, b.jg5 SRJ-1111)
+// What the runner loads from outside ci-live/ (source audit)
 // ---------------------------------------------------------------------------
 
 const SRC = join(import.meta.dir, '..', 'src')
@@ -2163,7 +2163,7 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
 const REPO = join(import.meta.dir, '..')
 const BASE_DOCKERFILE = join('docker', 'Dockerfile.test.base')
 const CI_SKILL = join('.claude', 'skills', 'ci', 'SKILL.md')
-/** The /ci base-build step: the skill's base-build commands, moved (b.uqm SR-9.2, SR-19.5). */
+/** The /ci base-build step: the skill's base-build commands, moved. */
 const CI_BASE_BUILD_STEP = join('scripts', 'ci-base-build.sh')
 const CI_LIVE_SKILL = join('.claude', 'skills', 'ci-live', 'SKILL.md')
 
@@ -2552,7 +2552,7 @@ const rcLayoutProblems = (text: string): string[] => leftoversIn(text, RC_LAYOUT
 
 /**
  * What in `text` pins a release candidate: one of {@link RC_LEFTOVERS}, or a
- * commit other than `releaseCommit` (the release's, `AD_COMMIT`). The SRD's
+ * commit other than `releaseCommit` (the release's, `AD_COMMIT`). The contract's
  * release-candidate-counts wording (`<P1>-rc.N` counts as `<P1>`) names no
  * release candidate's version and passes.
  */
@@ -2621,7 +2621,7 @@ describe('the /ci images (source audit)', () => {
     expect(step).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
   })
 
-  test("the base's layout: the release (CSCB's Phase 1 floor and package.json's pin, a plain release) installed by its own install.sh --from-release with pinned SHA-256s, its binary alone first on PATH and checked, agent-director-admin off PATH, the global client from npm at the pin checked by the client check, and nothing else from the repo or a context (b.jg5 SRJ-201, SRJ-1306)", () => {
+  test("the base's layout: the release (CSCB's Phase 1 floor and package.json's pin, a plain release) installed by its own install.sh --from-release with pinned SHA-256s, its binary alone first on PATH and checked, agent-director-admin off PATH, the global client from npm at the pin checked by the client check, and nothing else from the repo or a context", () => {
     const { args } = baseImage()
     expect(args.AD_VERSION).toBe(PHASE1_FLOOR_VERSION)
     expect(packageAdPin()).toBe(PHASE1_FLOOR_VERSION)
@@ -2674,7 +2674,7 @@ describe('the /ci images (source audit)', () => {
     ])
   })
 
-  test("the /ci-live skill downloads the release's linux-amd64 asset into a scratch directory, checks it against the base's AD_SHA256, never runs it, and stages it in both runs; a planted run of it or a release-candidate binary is refused (b.jg5 SRJ-1301)", () => {
+  test("the /ci-live skill downloads the release's linux-amd64 asset into a scratch directory, checks it against the base's AD_SHA256, never runs it, and stages it in both runs; a planted run of it or a release-candidate binary is refused", () => {
     const skill = repoFile(CI_LIVE_SKILL)
     expect(ciLiveSkillProblems(skill)).toEqual([])
     expect(ciLiveSkillProblems(planted(skill, '       chmod 0755 "${AD_BIN}"', '       chmod 0755 "${AD_BIN}"\n       "${AD_BIN}" version'))).toEqual([
@@ -2701,7 +2701,7 @@ describe('the /ci images (source audit)', () => {
     ['a SHA256SUMS check', () => 'sha256sum -c SHA256SUMS', () => ['a SHA256SUMS file: SHA256SUMS']],
     ['the swap helper', () => 'COPY docker/rc-client-check.sh /opt/check.sh', () => ['the swap helper: rc-client']],
     ['a release-candidate pin', () => 'ARG AD_RC_COMMIT=x', () => ['a release-candidate pin: AD_RC_COMMIT']],
-    ["the SRD's release-candidate-counts wording (excepted)", () => `# any ${PHASE1_FLOOR_VERSION}-rc.N counts as ${PHASE1_FLOOR_VERSION} (release candidates included)`, () => []],
+    ["the contract's release-candidate-counts wording (excepted)", () => `# any ${PHASE1_FLOOR_VERSION}-rc.N counts as ${PHASE1_FLOOR_VERSION} (release candidates included)`, () => []],
   ])('a planted %s in an image file is reported', (_name, line, expected) => {
     const commit = baseImage().args.AD_COMMIT!
     expect(rcPinProblems(`${repoFile(BASE_DOCKERFILE)}\n${line(commit)}\n`, commit)).toEqual(expected(commit))
@@ -3111,8 +3111,8 @@ describe("Dockerfile.live's Claude Code pin", () => {
   /** Dockerfile.live's text with its declaration's value replaced by `value`. */
   const withPin = (value: string): string => live().replace(`ARG ${CLAUDE_CODE_ARG}=${pinnedValue()}`, `ARG ${CLAUDE_CODE_ARG}=${value}`)
 
-  // b.omv SR-13.6: live coverage advances independently of the supported floor.
-  test('the live Slack image uses the E9 target; the former minimum-version pin is refused', () => {
+  // live coverage advances independently of the supported floor.
+  test('the live Slack image uses the shard management target; the former minimum-version pin is refused', () => {
     const usesLiveTarget = (text: string) => pinnedValue(text) === LIVE_CLAUDE_CODE_VERSION
     expect(pinnedValue()).toBe(LIVE_CLAUDE_CODE_VERSION)
     expect(usesLiveTarget(live())).toBe(true)

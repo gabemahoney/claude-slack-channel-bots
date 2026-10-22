@@ -1,10 +1,9 @@
 /**
- * ack-tracker.test.ts — Tests for the ack-tracker module (Task t3.xrm.9d.ap.2h;
- * persona-keyed entries, Task t3.ob2.gg.fa.k8)
+ * ack-tracker.test.ts — Tests for the ack-tracker module (section;
+ * persona-keyed entries, section)
  *
- * Entries are keyed by (persona key, conversation ID, message ts) (b.av2
- * SR-4.5); only an exact match consumes one. The per-key forget drops one
- * persona's entries at its teardown (b.av2 SR-6.5).
+ * Entries are keyed by (persona key, conversation ID, message ts); only an exact match consumes one. The per-key forget drops one
+ * persona's entries at its teardown.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -46,7 +45,7 @@ describe('trackAck + consumeAck', () => {
   })
 })
 
-describe('only an exact (persona, conversation, ts) match consumes (b.av2 SR-4.5)', () => {
+describe('only an exact (persona, conversation, ts) match consumes', () => {
   const tracked: Triple = ['A', 'C_ALPHA', '1234567890.000400']
 
   test.each<[string, Triple]>([
@@ -91,7 +90,7 @@ describe('only an exact (persona, conversation, ts) match consumes (b.av2 SR-4.5
   })
 })
 
-describe('forgetPersonaAcks — per-persona forget at teardown (b.av2 SR-6.5)', () => {
+describe('forgetPersonaAcks — per-persona forget at teardown', () => {
   test("drops only that persona's entries, silently", () => {
     trackAck('A', 'C_ALPHA', '1234567890.000600')
     trackAck('A', 'C_BETA', '1234567890.000610')
@@ -160,7 +159,7 @@ describe('_resetAckTracker', () => {
   })
 })
 
-// b.omv SR-8.7: successful replies have a separate, memory-only 24h lifetime.
+// successful replies have a separate, memory-only 24h lifetime.
 describe('early successful replies', () => {
   test.each([['other persona', 'B', 'C_ALPHA', 'early'], ['other channel', 'A', 'C_OTHER', 'early'], ['other message', 'A', 'C_ALPHA', 'other']])('%s does not suppress another delivery', async (_label, persona, channel, ts) => {
     consumeAck('A', 'C_ALPHA', 'early')

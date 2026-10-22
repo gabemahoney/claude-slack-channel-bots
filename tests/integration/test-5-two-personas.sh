@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 5 (E3/E4, E9): two personas start from one config, each with its own
+# Test 5 : two personas start from one config, each with its own
 # identity and its own working directory, and the start lines name both.
 #
 # One config, in the scenario's own state dir and port, with:
@@ -8,7 +8,7 @@
 #   personas[1] "<TAG> Bravo Bot" not in key form (a space and capitals, so
 #                                 its key is derived), DM-only (no channels,
 #                                 DMs on, prompts by DM);
-# and E9's reply settings (`ack_reaction`, `reply_chunk_limit`,
+# and reply settings (`ack_reaction`, `reply_chunk_limit`,
 # `reply_chunk_mode`, each set to a non-default value) at the top level, as a
 # load smoke: the start is not refused. Each persona has its own working
 # directory, made by the script. Dry run: no credentials file is read
@@ -20,7 +20,7 @@
 # is never logged in dry run; test-10 (Slack stub) covers per-persona tokens.
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
-# (E14 decision 14; lib/scenario.sh "Matchers"), never as whole sentences:
+# ( the current rule; lib/scenario.sh "Matchers"), never as whole sentences:
 #   [slack] Loaded persona config: 2 persona(s)                    src/server.ts
 #   [slack] No last-applied record: … "<cfg>" … "<cfg>.last-applied"
 #                                                                  src/reload.ts resolveStart
@@ -86,7 +86,7 @@ print(json.dumps({
     ],
     "bind": "127.0.0.1",
     "port": int(port),
-    # E9's reply settings (src/config.ts: a non-empty string, a positive
+    # reply settings (src/config.ts: a non-empty string, a positive
     # integer, "length" or "newline"), each off its default.
     "ack_reaction": "eyes",
     "reply_chunk_limit": 2000,
@@ -108,7 +108,7 @@ start_server
 wait_for_log "$(completion_match 2)" "${BRINGUP_WAIT_S}" \
     "start: server.log never showed the startupSessionManager completion line for 2 personas"
 
-# --- Config load (E9's settings included) and the last-applied record -------
+# --- Config load ( settings included) and the last-applied record -------
 expect_count '[slack] Running in dry-run mode' 1 "dry run"
 expect_count '[slack] Loaded persona config: 2 persona(s)' 1 "config load"
 expect_count '[slack] Fatal: ' 0 "config load: the start with E9's reply settings was refused"

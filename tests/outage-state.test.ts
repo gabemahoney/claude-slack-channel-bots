@@ -1,30 +1,30 @@
 /**
- * outage-state.test.ts — SRD §Test plan cases 1-24, plus the
+ * outage-state.test.ts — contract §Test plan cases 1-24, plus the
  * tests/getclient-allowlist.txt static audit (case 22) and the
  * resetAllToHealthy call-site audit (case 23 Part A), the wrappers'
- * report to the UNAVAILABLE retry timer's trigger sink (b.jg5 SRJ-301), and
+ * report to the UNAVAILABLE retry timer's trigger sink, and
  * the declared verb's start and end of the persona's `tmux-unresponsive`
- * condition (b.jg5 SRJ-307, SRJ-310), and the `tmux-unavailable` onset a
- * re-bound socket gets (b.jg5 SRJ-1021: one pin case holds its text; every
+ * condition, and the `tmux-unavailable` onset a
+ * re-bound socket gets (one pin case holds its text; every
  * other case compares with the exported builder), and the
  * `ad-config-malformed` outage a CONFIG answer raises: its raise, clear,
- * report and onset (b.jg5 SRJ-316, SRJ-312, SRJ-1018: one pin case holds
+ * report and onset (one pin case holds
  * the onset's text; every other case compares with the exported template
- * over the classifier's rendered message; the raise and clear lines, b.jg5
- * SRJ-1014, compare with their exported builders), and, with a notify that
+ * over the classifier's rendered message; the raise and clear lines
+ * compare with their exported builders), and, with a notify that
  * throws or rejects, the wrappers' `ad-unreachable`, `tmux-unavailable` and
  * `cwd-unreachable` onsets: the call's own error rethrown and one failure
  * line, and the report of an UNCLASSIFIED
  * outcome met in P's attempt to the unclassified sink, through the wrappers,
- * the reporting point and the site entry (b.jg5 SRJ-313, SRJ-301), and the
+ * the reporting point and the site entry, and the
  * phase and classes each notice carries to the notifier, the all-clear's
  * `allClearOf` rendering any subset of its classes over the same bad
- * stretch (b.jg5 SRJ-1002, SRJ-1003; the notifier's split of it is
+ * stretch (the notifier's split of it is
  * tests/persona-notifier.test.ts's), and the latch re-check's no-information
- * scope at the wrappers and the site entries (b.jg5 SRJ-505, SRJ-506: AC 71;
+ * scope at the wrappers and the site entries (
  * the scope's own queries and the retry timer's side are
  * tests/unavailable-retry.test.ts's), and the onset texts' scope and remedy
- * (b.jg5 SRJ-1001): the `ad-unreachable` onset affects every persona and
+ * the `ad-unreachable` onset affects every persona and
  * points to the README's switch-over runbook section by its title
  * (`PHASE1_RUNBOOK_SECTION_TITLE`), with no install, reinstall or upgrade
  * (`UPGRADE_FORMS`); the generic `tmux-unavailable` onset speaks for this
@@ -177,7 +177,7 @@ import {
 type Emission = { key: string; text: string }
 
 /**
- * Persona keys. Outage state is keyed by persona key (b.av2 SR-6.3); it never
+ * Persona keys. Outage state is keyed by persona key; it never
  * resolves a key, so plain in-form keys stand in for applied personas.
  */
 const P1 = 'persona_one'
@@ -341,7 +341,7 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
     const msg = newEmissions[0].text
     expect(msg).toMatch(/All clear/)
     expect(msg).toContain('ad-unreachable')
-    // SRD case 10 — no timestamp text
+    // contract case 10 — no timestamp text
     expect(msg).not.toMatch(/\dT\d/)
   })
 
@@ -360,7 +360,7 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
     expect(emissions[before].text).toMatch(/agent-director unreachable/)
   })
 
-  test('11b. resetAllToHealthy([key]) at a teardown (b.av2 SR-6.5): clears only that persona, silently; the neighbour keeps its flags and history', () => {
+  test('11b. resetAllToHealthy([key]) at a teardown: clears only that persona, silently; the neighbour keeps its flags and history', () => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P2, 'ad-unreachable', '/bin/ad')
@@ -443,10 +443,10 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
 })
 
 // ---------------------------------------------------------------------------
-// The options each notice carries (b.jg5 SRJ-1002, SRJ-1003)
+// The options each notice carries
 // ---------------------------------------------------------------------------
 
-describe('the options each notice carries to the notifier (b.jg5 SRJ-1002, SRJ-1003)', () => {
+describe('the options each notice carries to the notifier', () => {
   /** A harness whose notify also records each call's options. */
   function makeOptionsHarness(): Array<{ key: string; text: string; options: OutageNoticeOptions | undefined }> {
     const calls: Array<{ key: string; text: string; options: OutageNoticeOptions | undefined }> = []
@@ -666,8 +666,8 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Persona keying — notice wording, per-persona isolation, and the AC 25
-// destination leg through the real per-persona notifier (b.av2 SR-6.3, SR-7.2)
+// Persona keying — notice wording, per-persona isolation, and the
+// destination leg through the real per-persona notifier
 // ---------------------------------------------------------------------------
 
 describe('persona-keyed notices', () => {
@@ -687,7 +687,7 @@ describe('persona-keyed notices', () => {
       expect(text).not.toMatch(/\dT\d/)
     }
     // ad-unreachable is fleet-wide (the binary is host-wide) and says so; the
-    // generic tmux-unavailable onset speaks for this persona only (b.jg5 SRJ-1001, E11).
+    // generic tmux-unavailable onset speaks for this persona only .
     expect(ONSET_TEMPLATES['ad-unreachable']('/bin/ad')).toContain('affects every persona')
     const tmux = ONSET_TEMPLATES['tmux-unavailable']()
     expect(tmux).not.toMatch(/every persona|all personas/i)
@@ -704,7 +704,7 @@ describe('persona-keyed notices', () => {
   test.each([
     ['a binary path', '/bin/ad'],
     ['no binary path', undefined],
-  ])('ad-unreachable onset, %s: affects every persona; its remedy points to the README\'s switch-over runbook section by its title, with no install, reinstall or upgrade and no command (b.jg5 SRJ-1001)', (_label, binaryPath) => {
+  ])('ad-unreachable onset, %s: affects every persona; its remedy points to the README\'s switch-over runbook section by its title, with no install, reinstall or upgrade and no command', (_label, binaryPath) => {
     const text = ONSET_TEMPLATES['ad-unreachable'](binaryPath)
     expect(text).toContain('affects every persona')
     const remedy = text.split('\n').at(-1)!
@@ -756,7 +756,7 @@ describe('persona-keyed notices', () => {
     expect(forKey(P2)).toHaveLength(2)
   })
 
-  describe('AC 25 (outage-state leg): notices reach only the persona destination through the real notifier', () => {
+  describe('(outage-state leg): notices reach only the persona destination through the real notifier', () => {
     let dir: string
 
     beforeEach(() => {
@@ -905,10 +905,10 @@ describe('persona-keyed notices', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-301 — the wrappers report to the retry timer's trigger sink
+// the wrappers report to the retry timer's trigger sink
 // ---------------------------------------------------------------------------
 
-describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorError', () => {
+describe('trigger sink: the wrappers and reportAgentDirectorError', () => {
   /** One `arm` call the recording sink received. */
   type Arm = { key: string; cause: UnavailableRetryCause }
 
@@ -1005,7 +1005,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     ['ENVIRONMENT from resume', 'resume', () => errTmuxNotAvailable(undefined, 'resume'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ENVIRONMENT from kill', 'kill', () => errTmuxNotAvailable(undefined, 'kill'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ENVIRONMENT from status (the ENVIRONMENT cause, not read-error)', 'status', () => errTmuxNotAvailable(undefined, 'status'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
-    ['a CONFIG answer from status (the CONFIG cause, not read-error; b.jg5 SRJ-316)', 'status', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from status (the CONFIG cause, not read-error)', 'status', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
     ['a CONFIG answer from get (the CONFIG cause, not read-error)', 'get', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
     ['a CONFIG answer from kill (not a read verb)', 'kill', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
     ['a CONFIG answer from resume (withSpawnDetection; not a read verb)', 'resume', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
@@ -1028,7 +1028,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     ['ErrSpawnNotFound from status', 'status', () => errSpawnNotFound()],
     ['an UNUSABLE NAME answer from get', 'get', () => errUnusableName()],
     ['a STATE error from kill (not a read verb)', 'kill', () => errInstanceIdCollision()],
-    ['a STATE error from resume (not a read verb; ENVIRONMENT now arms, b.jg5 SRJ-311)', 'resume', () => errSpawnNotResumable()],
+    ['a STATE error from resume (not a read verb; ENVIRONMENT now arms)', 'resume', () => errSpawnNotResumable()],
   ] as const)('inside P\'s attempt, a non-arming error (%s) calls no sink; the attempt records it unarmed', async (_label, verb, build) => {
     const err = build()
     const { arms } = makeSinkHarness({ client: failing(verb, err) })
@@ -1292,11 +1292,11 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-307, SRJ-310 — the declared verb and the tmux-unresponsive
+// the declared verb and the tmux-unresponsive
 // condition sink
 // ---------------------------------------------------------------------------
 
-describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-307, SRJ-310)', () => {
+describe('the declared verb and the tmux-unresponsive condition sink', () => {
   /** One `start` the recording condition sink received. */
   type Start = { key: string; verb: AdVerb; error: unknown }
   /** One `end` the recording condition sink received. */
@@ -1376,12 +1376,12 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
   }
 
   /**
-   * The UNAVAILABLE forms other than `ErrTmuxKillFailed` (b.jg5 SRJ-104), each
+   * The UNAVAILABLE forms other than `ErrTmuxKillFailed`, each
    * built for the declared verb.
    */
   const TMUX_STARTING_FORMS = unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', 'ErrUnknownErrorName', 'a wrapped UnknownError', 'a plain Error')
 
-  /** The GONE answers (b.jg5 SRJ-104). */
+  /** The GONE answers. */
   const GONE_FORMS: ReadonlyArray<readonly [string, () => unknown]> = [
     ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
     ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed()],
@@ -1405,7 +1405,7 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     })
   }
 
-  test('pin: the exported tmux-touching verbs are the SRD glossary\'s six', () => {
+  test('pin: the exported tmux-touching verbs are the contract glossary\'s six', () => {
     expect([...TMUX_TOUCHING_VERBS].sort()).toEqual(['kill', 'pause', 'read-pane', 'resume', 'send-keys', 'spawn'])
   })
 
@@ -1609,7 +1609,7 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-311, SRJ-312, SRJ-301, SRJ-305 — what clears `tmux-unavailable`,
+// what clears `tmux-unavailable`,
 // ENVIRONMENT's report to the trigger sink, and the cleared-flag observer
 // ---------------------------------------------------------------------------
 
@@ -1732,7 +1732,7 @@ async function rejectionFrom(wrap: AnyWrap, key: string, call: AdCall, err: unkn
   throw new Error(`${declaredName(call)} did not reject`)
 }
 
-/** The GONE answers (b.jg5 SRJ-104). */
+/** The GONE answers. */
 const GONE_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> = [
   ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
   ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed()],
@@ -1757,7 +1757,7 @@ async function runIn<T>(context: Context, body: () => Promise<T> | T): Promise<{
 }
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-702, SRJ-301, SRJ-307: one try of a bounded kill retry is wrapped
+// one try of a bounded kill retry is wrapped
 // with `deferUnavailableReport`, so its UNAVAILABLE answer reports nothing
 // (no retry-timer arm, no `tmux-unresponsive` start, no attempt record, no
 // flag); the caller reports the outcome that stands once, through
@@ -1765,7 +1765,7 @@ async function runIn<T>(context: Context, body: () => Promise<T> | T): Promise<{
 // value is handled as the plain wrapper handles it.
 // ---------------------------------------------------------------------------
 
-describe('a kill try\'s deferred UNAVAILABLE report and the one standing report (b.jg5 SRJ-702, SRJ-301, SRJ-307)', () => {
+describe('a kill try\'s deferred UNAVAILABLE report and the one standing report', () => {
   /** A fresh outage state over the default stub client, with recording trigger and condition sinks. */
   function makeKillReportHarness(): { emissions: Emission[]; arms: Array<{ key: string; kind: string }>; starts: Array<{ key: string; verb: string }>; ends: string[] } {
     const emissions: Emission[] = []
@@ -1905,8 +1905,8 @@ describe('a kill try\'s deferred UNAVAILABLE report and the one standing report 
   })
 })
 
-describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
-  test('pin: the calls the not-tmux-touching rows below run over include every one the SRD names (status, get, list, find-missing, delete, kill of a row not read live)', () => {
+describe('what clears tmux-unavailable ()', () => {
+  test('pin: the calls the not-tmux-touching rows below run over include every one the contract names (status, get, list, find-missing, delete, kill of a row not read live)', () => {
     expect(NON_CLEARING_CALLS).toEqual(expect.arrayContaining(
       ['status', 'get', 'list', 'find-missing', 'delete', AD_CALL_KILL_ROW_NOT_READ_LIVE] satisfies AdCall[],
     ))
@@ -2009,10 +2009,10 @@ describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
   })
 })
 
-describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P, in any context', () => {
+describe('ENVIRONMENT is reported: from any verb for P, in any context', () => {
   /**
    * The ENVIRONMENT answers, each built for the declared verb, with the onset
-   * it raises: SRJ-1021's for the different-server form, today's for the others.
+   * it raises: for the different-server form, today's for the others.
    */
   const ENVIRONMENT_FORMS: ReadonlyArray<readonly [string, (verb: string) => unknown, () => string]> = [
     ['plain', (verb) => errTmuxNotAvailable(undefined, verb), () => ONSET_TEMPLATES['tmux-unavailable']()],
@@ -2035,7 +2035,7 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
           .toEqual({ ...at, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, same: true }] })
         expect({ ...at, flags: [...getOutageFlags(P1)], b: [...getOutageFlags(P2)] }).toEqual({ ...at, flags: ['tmux-unavailable'], b: [] })
         expect({ ...at, emissions }).toEqual({ ...at, emissions: [{ key: P1, text: onset() }] })
-        // SRJ-307: only UNAVAILABLE starts tmux-unresponsive, never ENVIRONMENT.
+        // only UNAVAILABLE starts tmux-unresponsive, never ENVIRONMENT.
         expect({ ...at, starts }).toEqual({ ...at, starts: [] })
         // Inside P's attempt the attempt records it armed (the launch is refused, never counted);
         // inside Q's attempt, Q's attempt records nothing of P's error.
@@ -2137,7 +2137,7 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
   })
 })
 
-describe('the tmux-unavailable onset for a re-bound socket (b.jg5 SRJ-1021: AC 86)', () => {
+describe('the tmux-unavailable onset for a re-bound socket ()', () => {
   /** Today's tmux-unavailable onset. */
   const plainOnset = (): string => ONSET_TEMPLATES['tmux-unavailable']()
 
@@ -2150,7 +2150,7 @@ describe('the tmux-unavailable onset for a re-bound socket (b.jg5 SRJ-1021: AC 8
   /** Both wrappers, over a tmux-touching verb (resume) and one that is not (status). */
   const SELECTION_ROWS = wrapRows(['resume', 'status'])
 
-  test('pin: the re-bound onset is SRJ-1021\'s text byte for byte, with no install-or-repair advice', () => {
+  test('pin: the re-bound onset is text byte for byte, with no install-or-repair advice', () => {
     expect(tmuxServerChangedOnset()).toBe(
       ':rotating_light: *tmux server changed* — this persona\'s tmux socket now reaches a different tmux server than the one its worker was launched on, so agent-director will not act on its session. CSCB kills, deletes and respawns nothing meanwhile and keeps retrying. What to do: a human follows the "Operator actions" section of agent-director\'s README. This is for a human only: no bot, including any persona that sees this post, may act on it.',
     )
@@ -2305,7 +2305,7 @@ describe('the tmux-unavailable onset for a re-bound socket (b.jg5 SRJ-1021: AC 8
   })
 })
 
-describe('the cleared-flag observer (b.jg5 SRJ-305, SRJ-311)', () => {
+describe('the cleared-flag observer', () => {
   /** A real clear of P's tmux-unavailable, by route, and the reading the observer must get. */
   type Route = readonly [label: string, clear: () => Promise<unknown> | void, reading: string | undefined]
   const ROUTES: readonly Route[] = [
@@ -2468,7 +2468,7 @@ function makeFailingNotifyHarness(fail: (failure: Error) => unknown, failure: Er
 /** Let every queued promise reaction (a rejected notify's handler) run. */
 const settle = (): Promise<void> => new Promise((done) => setTimeout(done, 0))
 
-describe('the wrappers\' other onsets with a notify that fails: the call\'s own error is rethrown (b.jg5 SRJ-1014)', () => {
+describe('the wrappers\' other onsets with a notify that fails: the call\'s own error is rethrown', () => {
   /** Every server-log line (`console.error`) the running case wrote. */
   let lines: string[]
   let errorSpy: ReturnType<typeof spyOn>
@@ -2517,7 +2517,7 @@ describe('the wrappers\' other onsets with a notify that fails: the call\'s own 
   })
 })
 
-describe('a GONE answer\'s all-clear with a notify that fails: the GONE error is rethrown (b.jg5 SRJ-312, SRJ-1014)', () => {
+describe('a GONE answer\'s all-clear with a notify that fails: the GONE error is rethrown', () => {
   /** Every server-log line (`console.error`) the running case wrote. */
   let lines: string[]
   let errorSpy: ReturnType<typeof spyOn>
@@ -2558,12 +2558,12 @@ describe('a GONE answer\'s all-clear with a notify that fails: the GONE error is
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-316, SRJ-312, SRJ-1018, SRJ-301 — the ad-config-malformed outage
+// the ad-config-malformed outage
 // a CONFIG answer (`ErrConfigMalformed`) raises: its onset, raise, clear,
-// report, the stable class order, and the version re-check (AC 84)
+// report, the stable class order, and the version re-check
 // ---------------------------------------------------------------------------
 
-describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 84)', () => {
+describe('the ad-config-malformed outage ()', () => {
   /** The CONFIG answer's agent-director error name, from the stub's builder. */
   const CONFIG_NAME = errConfigMalformed().errName
 
@@ -2610,7 +2610,7 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     assertNoLeak([raised, adConfigMalformedClearedLine(P1)])
   })
 
-  test('pin: the onset is SRJ-1018\'s text byte for byte, quoting the description; with no description the quoting sentence is dropped', () => {
+  test('pin: the onset is text byte for byte, quoting the description; with no description the quoting sentence is dropped', () => {
     const err = configAnswer('config ~/.config/agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s')
     expect(adConfigMalformedOnset(err)).toBe(
       ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.config/agent-director/config.toml. agent-director said: "config ~/.config/agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s". CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
@@ -2857,7 +2857,7 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     }
   })
 
-  test('AC 84: with it raised, a version re-check that passes leaves it raised and posts nothing; no wrapped call is version or help', async () => {
+  test('with it raised, a version re-check that passes leaves it raised and posts nothing; no wrapped call is version or help', async () => {
     const { emissions, cleared } = makeRecordingHarness()
     await rejectionFrom(withOutageDetection, P1, 'status', errConfigMalformed())
     const clock = createFakeClock()
@@ -2900,7 +2900,7 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
         .toEqual({ ...at, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, same: true }] })
       expect({ ...at, flags: [...getOutageFlags(P1)], b: [...getOutageFlags(P2)] }).toEqual({ ...at, flags: ['ad-config-malformed'], b: [] })
       expect({ ...at, emissions }).toEqual({ ...at, emissions: [{ key: P1, text: onsetFor(err) }] })
-      // SRJ-307: only UNAVAILABLE starts tmux-unresponsive, never CONFIG.
+      // only UNAVAILABLE starts tmux-unresponsive, never CONFIG.
       expect({ ...at, starts }).toEqual({ ...at, starts: [] })
       // Inside P's attempt the attempt records it armed (the launch is refused, never counted).
       const expected = context === 'inside P\'s attempt' ? { verb, causeKind: UNAVAILABLE_RETRY_CAUSE_CONFIG, armed: true } : undefined
@@ -3003,7 +3003,7 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
   })
 })
 
-describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only (b.jg5 SRJ-313, SRJ-301)', () => {
+describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only', () => {
   /** One `report` the recording unclassified sink received. */
   type Report = { key: string; error: unknown; classification: AdErrorClassification | undefined }
 
@@ -3067,7 +3067,7 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
   }
 
   /**
-   * The UNCLASSIFIED answers (b.jg5 SRJ-104), each built for the declared
+   * The UNCLASSIFIED answers, each built for the declared
    * verb, with the flags each raises by itself: `ErrSystemInstallDisappeared`
    * still raises `ad-unreachable`; the others raise none.
    */
@@ -3078,7 +3078,7 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
     ['ErrSystemInstallDisappeared', (verb) => errSystemInstallDisappeared(verb, AD_PATH), ['ad-unreachable']],
   ]
 
-  /** The read calls, which keep E8's read-error cause; every other declared call arms the UNCLASSIFIED cause. */
+  /** The read calls, which keep read-error cause; every other declared call arms the UNCLASSIFIED cause. */
   const READ_CALLS: readonly AdCall[] = ['status', 'get', 'list']
 
   test.each(EVERY_WRAPPED_ROW)('%s, %s: each form inside P\'s attempt is reported once for P with the same value and arms once; inside Q\'s attempt or outside any, nothing; no flag raised (but ad-unreachable) or cleared; no condition start or end; rethrown unchanged', async (_w, _c, wrap, call) => {
@@ -3105,7 +3105,7 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
           .toEqual({ ...at, flags: (['cwd-unreachable', 'tmux-unavailable', ...raises] satisfies OutageClass[]).sort(), b: [] })
         expect({ ...at, cleared }).toEqual({ ...at, cleared: [] })
         expect({ ...at, posted: emissions.slice(before) }).toEqual({ ...at, posted: raises.map(() => ({ key: P1, text: ONSET_TEMPLATES['ad-unreachable'](AD_PATH) })) })
-        // SRJ-307: only UNAVAILABLE starts tmux-unresponsive; an UNCLASSIFIED answer is not tmux answering either.
+        // only UNAVAILABLE starts tmux-unresponsive; an UNCLASSIFIED answer is not tmux answering either.
         expect({ ...at, starts, ends }).toEqual({ ...at, starts: [], ends: [] })
       }
     }
@@ -3121,7 +3121,7 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
     expect(armsOf(arms, err)).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, same: true }])
   })
 
-  test('an ErrInternal carrying the unusable-name phrase (UNUSABLE NAME, the E16 boundary) inside P\'s attempt is not reported', async () => {
+  test('an ErrInternal carrying the unusable-name phrase (UNUSABLE NAME, the boundary) inside P\'s attempt is not reported', async () => {
     const err = errUnusableName()
     const { reports } = makeUnclassifiedHarness()
 
@@ -3247,21 +3247,21 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-505 (AC 71), SRJ-506, SRJ-307, SRJ-313, SRJ-316: inside a latch
+// inside a latch
 // re-check of a persona that is still latched (`runInLatchRecheck`), an
 // answer through the wrappers or a site entry gives no information: nothing
 // is armed (pending-only included), no `tmux-unresponsive` condition starts,
-// `tmux-unavailable` is not raised (a `find-missing` call's excepted, SRJ-506)
+// `tmux-unavailable` is not raised (a `find-missing` call's excepted)
 // and nothing reaches the unclassified sink. CONFIG still raises
 // `ad-config-malformed`, `ErrSystemInstallDisappeared` `ad-unreachable` and
 // DIRECTORY `cwd-unreachable`, and every clear is as ever. Once the latch has
 // cleared, and outside every re-check, all is as today. The scope's latch
-// query is a stand-in the case clears; the re-check round end to end (AC 71
+// query is a stand-in the case clears; the re-check round end to end (
 // through the round) is tests/conflict-latch.test.ts's and
 // tests/tmux-unresponsive.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('the latch re-check\'s no-information scope at the wrappers and the site entries (b.jg5 SRJ-505, SRJ-506, SRJ-307, SRJ-313, SRJ-316: AC 71)', () => {
+describe('the latch re-check\'s no-information scope at the wrappers and the site entries ()', () => {
   /** The binary path the `ErrSystemInstallDisappeared` answers here carry. */
   const AD_PATH = '/bin/ad'
 
@@ -3376,8 +3376,7 @@ describe('the latch re-check\'s no-information scope at the wrappers and the sit
   ]
 
   /**
-   * The answers to a probe or retry that give no information (b.jg5
-   * SRJ-505), each built for the verb, with its class.
+   * The answers to a probe or retry that give no information, each built for the verb, with its class.
    */
   const NO_INFORMATION_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => unknown, string]> = [
     ...unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', ['ErrUnknownErrorName', 'an UNAVAILABLE-classed ErrUnknownErrorName'], 'a wrapped UnknownError')
@@ -3528,7 +3527,7 @@ describe('the latch re-check\'s no-information scope at the wrappers and the sit
     expect(gone).toMatchObject({ flags: ['ad-config-malformed', 'ad-unreachable'], ends: [P1] })
   })
 
-  test.each([...PLACES])('a find-missing run for a latched P at %s (the bypassing run, SRJ-506) raises as for any caller: ENVIRONMENT raises P\'s tmux-unavailable with its onset, CONFIG its ad-config-malformed; neither arms, starts a tmux-unresponsive condition or reaches the unclassified sink', async (place) => {
+  test.each([...PLACES])('a find-missing run for a latched P at %s (the bypassing run) raises as for any caller: ENVIRONMENT raises P\'s tmux-unavailable with its onset, CONFIG its ad-config-malformed; neither arms, starts a tmux-unresponsive condition or reaches the unclassified sink', async (place) => {
     const answers: ReadonlyArray<readonly [string, unknown, OutageClass, string]> = [
       ['ErrTmuxNotAvailable', errTmuxNotAvailable(undefined, 'find-missing'), 'tmux-unavailable', ONSET_TEMPLATES['tmux-unavailable']()],
       ['the different-server form', errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, 'find-missing'), 'tmux-unavailable', tmuxServerChangedOnset()],
@@ -3638,7 +3637,7 @@ describe('the latch re-check\'s no-information scope at the wrappers and the sit
   })
 })
 
-describe('the stable class order (b.jg5 SRJ-1018)', () => {
+describe('the stable class order', () => {
   test('every OutageClass appears exactly once in OUTAGE_CLASS_ORDER, which is read-only', () => {
     // ONSET_TEMPLATES is a Record over OutageClass, so its keys are every member.
     expect<string[]>([...OUTAGE_CLASS_ORDER].sort()).toEqual(Object.keys(ONSET_TEMPLATES).sort())
@@ -3670,8 +3669,8 @@ describe('the stable class order (b.jg5 SRJ-1018)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SRD § Test plan case 22 — getClient() allowlist static audit
-// SRD § Test plan case 23 Part A — resetAllToHealthy call-site audit (boot + teardown)
+// contract § Test plan case 22 — getClient allowlist static audit
+// contract § Test plan case 23 Part A — resetAllToHealthy call-site audit (boot + teardown)
 // ---------------------------------------------------------------------------
 
 // Repo root, so the audits below read src/ and the allow-list from any
@@ -3685,7 +3684,7 @@ describe('static audits', () => {
 
     // Enumerate src/**/*.ts and build a path → content Map for the pure core.
     // Anchoring is by (path, enclosing-scope, normalized-content), so this
-    // audit survives comment/JSDoc insertion above a site (b.qbn); it fails
+    // audit survives comment/JSDoc insertion above a site; it fails
     // only when a NEW site appears or a site MOVES to a different function.
     function walk(dir: string): string[] {
       const out: string[] = []
@@ -3747,7 +3746,7 @@ describe('static audits', () => {
     const countIn = (re: RegExp) =>
       Object.fromEntries([...code].map(([f, c]) => [f, [...c.matchAll(re)].length] as const).filter(([, n]) => n > 0))
 
-    // The one boot reset in server.ts. A teardown (b.av2 SR-6.5) reaches it
+    // The one boot reset in server.ts. A teardown reaches it
     // through createPersonaLifecycle's injected resetOutageState, never by
     // name; tests/reload-wiring.test.ts pins that binding.
     expect(countIn(/(?<![\w.$])resetAllToHealthy\s*\(/g)).toEqual({ 'src/server.ts': 1 })
@@ -3805,7 +3804,7 @@ describe('static audits', () => {
     const allClear = emissions[2]
     expect(allClear.key).toBe(P1)
     expect(allClear.text).toMatch(/All clear/)
-    // SRD stable rendering order: ad-unreachable BEFORE cwd-unreachable.
+    // contract stable rendering order: ad-unreachable BEFORE cwd-unreachable.
     const adIdx = allClear.text.indexOf('ad-unreachable')
     const cwdIdx = allClear.text.indexOf('cwd-unreachable')
     expect(adIdx).toBeGreaterThan(-1)
@@ -3818,16 +3817,16 @@ describe('static audits', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.qbn — getClient() allowlist content-anchoring meta-tests
+// getClient allowlist content-anchoring meta-tests
 //
 // These exercise the PURE audit core (tests/getclient-allowlist-audit.ts) with
 // SYNTHETIC sources, proving both directions of the guard independent of the
-// real src/ tree: comment insertion is inert (AC-1), a new site fails (AC-2),
-// a relocated site fails (AC-3), plus counts, the four non-call kinds, and
+// real src/ tree: comment insertion is inert, a new site fails,
+// a relocated site fails, plus counts, the four non-call kinds, and
 // stale-entry detection.
 // ---------------------------------------------------------------------------
 
-describe('getClient() allowlist content-anchoring (b.qbn)', () => {
+describe('getClient() allowlist content-anchoring', () => {
   // A tiny synthetic module with one sanctioned site inside `reconcileOrphans`,
   // and the allowlist entry that anchors it. Reused across cases.
   const baseSource = [
@@ -3842,7 +3841,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
     `# header comment\n` +
     `src/fake.ts | reconcileOrphans | const client = getClient()  # sanctioned`
 
-  test('AC-1: inserting comment/JSDoc lines above an allowed site → no violations, no stale entries', () => {
+  test('inserting comment/JSDoc lines above an allowed site → no violations, no stale entries', () => {
     const withComments = [
       `export async function reconcileOrphans(`,
       `  personaConfig: PersonaConfig,`,
@@ -3863,7 +3862,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
     expect(res.staleEntries).toEqual([])
   })
 
-  test('AC-2: a brand-new getClient() call not covered by an entry → violation names path + scope + content', () => {
+  test('a brand-new getClient() call not covered by an entry → violation names path + scope + content', () => {
     const withNewSite = baseSource.replace(
       `  return client.list()`,
       `  return client.list()\n}\n\nexport async function brandNewFn(): Promise<void> {\n  const c2 = getClient()\n  return c2.list()`,
@@ -3879,7 +3878,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
     expect(res.staleEntries).toEqual([])
   })
 
-  test('AC-3: relocating an allowed call into a DIFFERENT function → violation AND stale entry', () => {
+  test('relocating an allowed call into a DIFFERENT function → violation AND stale entry', () => {
     const relocated = [
       `export async function reconcileOrphans(`,
       `  personaConfig: PersonaConfig,`,
@@ -3945,7 +3944,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
       `    )`,
       `  }`,
       `  return singleton`,
-      `}`,
+      `  }`,
       ``,
       `export interface OutageStateDeps {`,
       `  /** Return the singleton AD Client. Same semantics as getClient() here. */`,
@@ -3976,7 +3975,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
   })
 })
 
-// b.omv SR-5.1 / D8: isolated delivery clients retain the same outage
+// / D8: isolated delivery clients retain the same outage
 // classification and per-persona all-clear behavior as recovery calls.
 test('explicit persona clients preserve outage wrapping and never read the singleton', async () => {
   const emissions: Emission[] = []

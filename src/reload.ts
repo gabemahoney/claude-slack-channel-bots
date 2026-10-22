@@ -1,7 +1,7 @@
 /**
  * reload.ts — The reload controller: the last-applied record and the start
- * rules (b.av2 SR-8.1, SR-8.7, SR-13.1), and apply step 1's retired keys
- * (b.jg5 SRJ-803, SRJ-804, SRJ-1511).
+ * rules, and apply step 1's retired keys
+ *
  *
  * Saving `config.json` does not change what runs. The server keeps a byte
  * copy of the last applied configuration, `config.json.last-applied` (the
@@ -9,13 +9,13 @@
  *
  * - record present: its bytes are read once and validated in record mode
  *   (`parsePersonaConfigBytes`), where a real-path collision is left to the
- *   bring-up (b.av2 SR-1.5). The configuration file is not read to decide
+ * bring-up. The configuration file is not read to decide
  *   what runs. A record that cannot be read or validated stops the start; the
  *   line names the record and says that deleting it makes the next start
  *   apply the configuration file;
  * - no record: the configuration file's bytes are read once and validated in
  *   default mode. A missing, unreadable or invalid file (a pre-persona file
- *   gets the SR-1.7 conversion error) stops the start. A valid file's bytes
+ * gets the conversion error) stops the start. A valid file's bytes
  *   are written to the record with the durable writer before anything is
  *   applied; a failed write stops the start (`reload-record-write-failed`),
  *   including one whose record reached the disk but whose directory could
@@ -25,41 +25,40 @@
  * stand, so a credentials change made while the server was down takes effect
  * at the start. An empty `personas` array is a valid applied set.
  *
- * Detection (b.av2 SR-8.2, SR-8.3, SR-8.7): once the start bring-up pass has
+ * Detection: once the start bring-up pass has
  * returned, `startDetection` hands the detection tick to the injected tick
  * driver (every 5 s in production). Each pass compares the configuration
  * file's bytes with the applied bytes and, unless in dry run, each
  * referenced credentials file's digest with the one the persona's bring-up
- * holds, and keeps `config.json.pending` (the SR-8.4 preview, rendered from
+ * holds, and keeps `config.json.pending` (the preview, rendered from
  * the change plan of `reload-plan.ts`, behind a fingerprint,
  * `reload-fingerprint.ts`) in step: written while a change is pending,
  * deleted when nothing is. Its first pass after a start from the record is
- * the SR-8.7 comparison, so an unconfirmed edit stays pending.
+ * the comparison, so an unconfirmed edit stays pending.
  *
- * Confirmation and apply (b.av2 SR-8.5, SR-8.6; b.deo SRI-406, SRI-408,
- * SRI-502, SRI-805): each pass first processes
+ * Confirmation and apply: each pass first processes
  * `config.json.apply` (the operator's rename of the pending file), deleting it
  * before anything is applied. A confirmation whose fingerprint matches the
  * pass's applies the bytes and the change plan that pass derived: an invalid
  * candidate logs `reload-invalid` and changes nothing; a valid one runs step
- * 1 (b.jg5 SRJ-1511: when a persona it brings up, an added one or a
+ * 1 (when a persona it brings up, an added one or a
  * destructive modify's new half, has an unwritten drop in the stored-choice
  * store, first write that store's record, a failure of that write failing
- * the apply with nothing applied, b.deo SRI-408 beside SRJ-804; then record
+ * the apply with nothing applied beside; then record
  * the retired keys of removed personas, a renamed
  * persona's old key included, and of the old halves of destructive modifies,
  * and the key of each persona it brings up that is held as retired only in
  * memory, durably through the injected retired-key store, a failure of that
- * write failing the apply with nothing applied, SRJ-803, SRJ-804; then
- * stop the dialog approver of each key recorded, SRJ-808; then rewrite the
+ * write failing the apply with nothing applied; then
+ * stop the dialog approver of each key recorded; then rewrite the
  * record; if the rewrite fails, nothing is applied,
  * `reload-record-write-failed` is logged, and the keys this apply recorded
  * are removed again, a key held as retired before the apply staying retired,
- * SRJ-804; once the rewrite succeeded, begin an old-life hold on each
+ * once the rewrite succeeded, begin an old-life hold on each
  * removed or destructively modified key's `cscb_<key>` at its old working
- * directory, SRJ-809, drop the stored choices of each of those keys, b.deo
- * SRI-406, and mark each destructive modify's key as retiring, b.deo
- * SRI-502; then swap the applied state and tell `onApplied`), then steps 2–6
+ * directory, drop the stored choices of each of those keys
+ * and mark each destructive modify's key as retiring
+ * then swap the applied state and tell `onApplied`), then steps 2–6
  * of `reload-apply.ts` in order (by default through the
  * lifecycle operations: step 2 tears down each removed persona and the old
  * half of each destructive modify, steps 3 and 4 update in place and
@@ -73,13 +72,13 @@
  * what is applied.
  *
  * The controller (`createReloadController`) is built with every dependency
- * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
+ * injected, as `createCronScheduler` is: the paths, the durable
  * writer and delete, the server's retired-key store (`retired-keys.ts`,
  * whose writes go through the same writer), an accessor over the server's
- * stored-choice store (`channel-delivery.ts`, b.deo SRI-406, SRI-408,
- * SRI-502), which only a confirmed apply calls, the dialog approver stop that
- * step 1 calls for each key it records (b.jg5 SRJ-808), the server's
- * old-life hold set step 1 begins holds in (b.jg5 SRJ-809), the log sink, the
+ * stored-choice store (`channel-delivery.ts`,
+ *), which only a confirmed apply calls, the dialog approver stop that
+ * step 1 calls for each key it records, the server's
+ * old-life hold set step 1 begins holds in, the log sink, the
  * lifecycle operations (the start bring-up pass, and the apply's per-step
  * operations), the tick driver, the dry-run flag, the held credentials
  * digests and bring-up states, and the Slack client factory that later work binds
@@ -88,10 +87,10 @@
  * `readAppliedPersonaConfig` is the CLI's read-only resolver over the same
  * rules.
  *
- * Importable without side effects (b.av2 SR-13.1): importing it creates no
+ * Importable without side effects: importing it creates no
  * timer or Slack client, reads no file or environment variable and logs
  * nothing. No line it logs carries a token or file content. Its output goes
- * to the server log only, never to Slack (b.av2 SR-7.2).
+ * to the server log only, never to Slack.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -205,7 +204,7 @@ export { RELOAD_INVALID, RELOAD_PREVIEW } from './reload-plan.ts'
 export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload-apply.ts'
 
 // ---------------------------------------------------------------------------
-// Diagnostic classes (b.av2 SR-10.3)
+// Diagnostic classes
 // ---------------------------------------------------------------------------
 
 /**
@@ -214,14 +213,14 @@ export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload
  * nothing is applied and the change stays pending. At a confirmed apply the
  * same class names a failed write of the retired-key record at step 1, and
  * a failed rewrite's line says how the retired-key record's restore went
- * (b.jg5 SRJ-804), and a failed write of the stored-choice file before a
- * bring-up (b.deo SRI-408).
+ * and a failed write of the stored-choice file before a
+ * bring-up.
  */
 export const RELOAD_RECORD_WRITE_FAILED = 'reload-record-write-failed'
 
 /**
  * How the restore went, in the `reload-record-write-failed` line of a failed
- * write of the retired-key record at step 1 (b.jg5 SRJ-804): the restore
+ * write of the retired-key record at step 1: the restore
  * succeeded. True whether the restore wrote the record held before the apply
  * back or wrote a key held only in memory to the file for the first time.
  */
@@ -238,34 +237,34 @@ export const RELOAD_RETIRED_KEYS_RESTORE_FAILED =
 
 /**
  * What a failed rewrite's `reload-record-write-failed` line adds once step 1
- * wrote the retired-key record and putting it back succeeded (b.jg5 SRJ-804),
+ * wrote the retired-key record and putting it back succeeded,
  * for the record at `path` (quoted as JSON in the line):
  *
- *   ; the retired-key record "<path>" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)
+ * ; the retired-key record "<path>" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay
  */
 export function reloadRetiredKeysPutBackClause(path: string): string {
   return (
     `; the retired-key record ${JSON.stringify(path)} is put back to what it held before this apply: the keys this apply ` +
-    'recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)'
+    'recorded are removed again, and keys recorded before it stay'
   )
 }
 
 /**
  * What the same line adds when putting the record at `path` back failed
- * (b.jg5 SRJ-804):
  *
- *   ; putting the retired-key record "<path>" back to what it held before this apply failed, so the keys this apply recorded stay retired (b.jg5 SRJ-804)
+ *
+ * ; putting the retired-key record "<path>" back to what it held before this apply failed, so the keys this apply recorded stay retired
  */
 export function reloadRetiredKeysPutBackFailedClause(path: string): string {
   return (
     `; putting the retired-key record ${JSON.stringify(path)} back to what it held before this apply failed, so the keys this ` +
-    'apply recorded stay retired (b.jg5 SRJ-804)'
+    'apply recorded stay retired'
   )
 }
 
 /**
  * The one `reload-record-write-failed` line of a failed write of the
- * stored-choice file at step 1 (b.deo SRI-408 beside b.jg5 SRJ-804): a key
+ * stored-choice file at step 1 (beside): a key
  * the confirmed change brings up has an unwritten drop, and writing it before
  * the bring-up failed, so nothing is applied. Names the stored-choice file at
  * `channelDeliveryPath` and the last-applied record at `lastAppliedPath`
@@ -273,14 +272,14 @@ export function reloadRetiredKeysPutBackFailedClause(path: string): string {
  * no file content and no error code (the store's own `[slack]
  * channel-delivery:` line carries the code). Pure.
  *
- *   [slack] reload-record-write-failed: cannot write the stored-choice file "<path>" before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the last-applied record "<path>" is not rewritten, and the confirmed change is not applied and stays pending (b.deo SRI-408; b.jg5 SRJ-804)
+ * [slack] reload-record-write-failed: cannot write the stored-choice file "<path>" before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the last-applied record "<path>" is not rewritten, and the confirmed change is not applied and stays pending
  */
 export function reloadChannelDeliveryWriteFailedLine(channelDeliveryPath: string, lastAppliedPath: string): string {
   return (
     `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the stored-choice file ${JSON.stringify(channelDeliveryPath)} ` +
     'before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the ' +
     `last-applied record ${JSON.stringify(lastAppliedPath)} is not rewritten, and the confirmed change is not ` +
-    'applied and stays pending (b.deo SRI-408; b.jg5 SRJ-804)'
+    'applied and stays pending'
   )
 }
 
@@ -315,7 +314,7 @@ export const RELOAD_DIAGNOSTIC_CLASSES = [
 export type ReloadDiagnosticClass = (typeof RELOAD_DIAGNOSTIC_CLASSES)[number]
 
 // ---------------------------------------------------------------------------
-// Reload files (b.av2 SR-8.1)
+// Reload files
 // ---------------------------------------------------------------------------
 
 /** Appended to the configuration file's name: the pending-change preview. */
@@ -327,7 +326,7 @@ export const APPLY_FILE_SUFFIX = '.apply'
 /** Appended to the configuration file's name: the last-applied record. */
 export const LAST_APPLIED_FILE_SUFFIX = '.last-applied'
 
-/** The configuration file and the three reload files beside it (b.av2 SR-8.1). */
+/** The configuration file and the three reload files beside it. */
 export interface ReloadFilePaths {
   /** The configuration file, e.g. `<dir>/config.json`. */
   config: string
@@ -401,7 +400,7 @@ export interface ReloadLifecycleOps {
    * configuration step 1 made current. Resolves once it has an outcome and,
    * when up, its launch settled. With `options.recovery` the persona is not
    * new: it is broken by its credentials and its credentials file changed
-   * (b.av2 SR-8.6 step 6, SR-6.4), and it is brought up afresh the same way;
+   * (step 6), and it is brought up afresh the same way;
    * one that is not broken by its credentials any more when the operation
    * runs gets its changed credentials applied as `reconnectCredentials`
    * would, so step 4 and step 6 never both skip a confirmed change.
@@ -414,7 +413,7 @@ export interface ReloadLifecycleOps {
    */
   teardown(persona: Persona): Promise<unknown>
   /**
-   * Apply one persona's changed credentials file (b.av2 SR-8.6 step 4,
+   * Apply one persona's changed credentials file (step 4,
    * credentials row), `applied` being the configuration step 1 made current:
    * reconnect it (up) or hand its retries the new content (retrying).
    * Resolves once its first attempt settled; resolves with
@@ -430,7 +429,7 @@ export interface ReloadLifecycleOps {
   updateInPlace(change: InPlaceApplyInput): Promise<unknown>
   /**
    * Refresh the agent-director template's memory-read rules for the persona
-   * set of `applied`, the configuration step 1 made current (b.av2 SR-8.6
+   * set of `applied`, the configuration step 1 made current (
    * step 5), keeping the template's start-time server-wide arguments. Asked
    * only when the change plan's `configDirsChanged`. Resolves once the
    * refresh settled, whether it succeeded or failed: a failure is logged,
@@ -469,9 +468,9 @@ export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 
 /** Dependencies of `createReloadController`. */
 export interface ReloadControllerDeps {
-  /** b.omv SR-3.7: facts gathered outside the pure change planner. */
+  /** facts gathered outside the pure change planner. */
   queueOpenCount?(key: string): number
-  /** Confirmation-time E5 seam; no E2 log or notice wording. */
+  /** Confirmation-time seam; no log or notice wording. */
   onQueueRetained?(key: string, count: number): void
   /** The configuration file and its reload files (`reloadFilePaths`). */
   paths: ReloadFilePaths
@@ -484,37 +483,37 @@ export interface ReloadControllerDeps {
   /** The durable delete (of `config.json.pending` and `config.json.apply`); `durableUnlinkSync` by default. */
   remove?: ReloadFileRemover
   /**
-   * The server's retired-key store (`src/retired-keys.ts`, b.jg5 SRJ-802):
+   * The server's retired-key store (`src/retired-keys.ts`):
    * production passes the one store `main()` loaded at start. A confirmed
    * apply's step 1 records through it, and restores it after a failed
-   * rewrite of the last-applied record (SRJ-803, SRJ-804, SRJ-1511). Its
+   * rewrite of the last-applied record. Its
    * writes must reach the disk through the same writer as `write`: production
    * builds it with the default `durableWriteFileSync`, the default of `write`
    * too, and a test builds it over the writer (and delete) it gives here.
    */
   retiredKeys: RetiredKeyStore
   /**
-   * The server's stored-choice store (`src/channel-delivery.ts`, b.deo
-   * SRI-401): production passes an accessor over the one store `main()`
+   * The server's stored-choice store (`src/channel-delivery.ts`
+   *): production passes an accessor over the one store `main()`
    * loaded after the start resolution, which is why it is an accessor and
    * not a value. The controller calls it once per confirmed apply, on the
    * valid-plan path, before step 1's first write, and uses that store for
    * the whole apply; nothing else calls it (not building the controller,
    * `resolveStart`, `runStartBringUp`, a detection pass or the preview).
    * Through it step 1 writes the unwritten drops of a key it brings up before
-   * any other write, and fails closed when that write fails (b.deo SRI-408
-   * beside b.jg5 SRJ-804); drops the stored choices of every key it retires
-   * once the last-applied rewrite has succeeded (b.deo SRI-406); and marks
+   * any other write, and fails closed when that write fails (
+   * beside); drops the stored choices of every key it retires
+   * once the last-applied rewrite has succeeded; and marks
    * each destructive modify's key as retiring, clearing it once step 2 has
-   * settled (b.deo SRI-502), all beside b.av2 SR-8.6 as amended by b.jg5
-   * SRJ-1511. In production its writes reach the disk through
+   * settled, all beside
+   * In production its writes reach the disk through
    * `durableWriteFileSync`; a test builds it over the writer seam the
    * reload harness gives.
    */
   channelDelivery: () => ChannelDeliveryStore
   /**
    * Stop delivery running for a key apply step 1 recorded as
-   * retired (b.jg5 SRJ-808, SRJ-404: production `stopDialogApprover` with
+   * retired (production `stopDialogApprover` with
    * the retired-key reason, which logs the stop and its reason and also
    * cancels the approver a launch in flight would start; no pending-row rule
    * run follows). Called synchronously in step 1, for each key of the batch,
@@ -527,7 +526,7 @@ export interface ReloadControllerDeps {
   stopDelivery: (key: string) => unknown
   /**
    * The server's old-life hold set (`createOldLifeHoldSet`,
-   * `src/retired-keys.ts`; b.jg5 SRJ-809): production passes the one set
+   * `src/retired-keys.ts`): production passes the one set
    * `main()` builds, the set the session manager has installed. Once a
    * confirmed apply's last-applied rewrite has succeeded, step 1 begins one
    * hold in it for each removed persona's key (a renamed persona's old key
@@ -540,14 +539,13 @@ export interface ReloadControllerDeps {
   /** The detection tick's driver; without one, `startDetection` arms nothing. */
   tickDriver?: ReloadTickDriver
   /**
-   * Dry run (b.av2 SR-3.4, SR-8.2): the detection tick reads no credentials
+   * Dry run: the detection tick reads no credentials
    * file, credentials never count as changed and the fingerprint covers the
    * configuration file alone. Default false.
    */
   dryRun?: boolean
   /**
-   * The held credentials digests the detection tick compares against (b.av2
-   * SR-8.3); production binds the bring-up controller's `credentialsDigest`.
+   * The held credentials digests the detection tick compares against; production binds the bring-up controller's `credentialsDigest`.
    * Without it nothing is held, so credentials never count as changed.
    */
   heldCredentialsDigest?: HeldCredentialsDigestQuery
@@ -555,8 +553,7 @@ export interface ReloadControllerDeps {
    * An applied persona's current bring-up state (production: the bring-up
    * controller's `state`), for the preview of a credentials change and again
    * when apply steps 4 and 6 run: a persona broken
-   * by its credentials is brought up at apply rather than reconnected (b.av2
-   * SR-8.6). Without it no persona counts as broken by its credentials in the
+   * by its credentials is brought up at apply rather than reconnected. Without it no persona counts as broken by its credentials in the
    * preview, and the steps follow the plan's split.
    */
   bringUpState?: BringUpStateQuery
@@ -574,7 +571,7 @@ export interface ReloadControllerDeps {
   workingDirectoryFs?: Partial<WorkingDirectoryFs>
   /**
    * The detection tick's claude_config_dir check of an added persona and of
-   * a persona whose effective claude_config_dir changed (bug b.g57):
+   * a persona whose effective claude_config_dir changed:
    * production passes the session manager's pre-launch check
    * (`checkLaunchConfigDir`), the one the bring-up controller checks with, so
    * the preview and the bring-up resolve the directory the same way. Default
@@ -586,7 +583,7 @@ export interface ReloadControllerDeps {
   /**
    * Told the configuration a confirmed apply's step 1 made the applied one,
    * right after the record was rewritten and in the same synchronous step as
-   * the controller's own swap (b.av2 SR-8.6, b.deo SRI-201). Production
+   * the controller's own swap. Production
    * reassigns the server's `personaConfig` to `configInEffect`: the new
    * persona set and its `allow_invited_channels` switch, with every other
    * server-wide value kept from start time; the bring-up controller's applied
@@ -622,7 +619,7 @@ export interface ReloadControllerDeps {
 
 /**
  * The configuration the server runs once a confirmed apply's step 1 made
- * `applied` current (b.av2 SR-8.6, the server-wide row; b.deo SRI-201):
+ * `applied` current (the server-wide row):
  * `applied`'s persona set and its `allow_invited_channels` switch over every
  * other server-wide setting of `startTime`, the configuration the server
  * started with. A changed server-wide setting (the listener's `bind` and
@@ -646,12 +643,12 @@ export function configInEffect(startTime: PersonaConfig, applied: PersonaConfig)
 }
 
 // ---------------------------------------------------------------------------
-// Apply step 1's retired keys (b.jg5 SRJ-803, SRJ-1511)
+// Apply step 1's retired keys
 // ---------------------------------------------------------------------------
 
 /**
  * The keys a confirmed apply's step 1 records as retired, one batch for one
- * write (SRJ-803): the key of each removed persona as `removed` (a
+ * write: the key of each removed persona as `removed` (a
  * key-changing rename is a removal of its old key and an addition of its new
  * one, so its old key is among them), the key of each destructive modify as
  * `destructive-modify` (a change of `name` that keeps the key,
@@ -676,7 +673,7 @@ export function retiredKeysToRecord(
 
 /**
  * The old-life holds a confirmed apply's step 1 begins once its last-applied
- * rewrite has succeeded (b.jg5 SRJ-809's first start): one per key the step
+ * rewrite has succeeded (first start): one per key the step
  * records whose old declaration `applied` (the configuration in effect
  * before the apply) holds, in the plan's order: each removed persona's key
  * (a key-changing rename's old key included) and each destructive modify's
@@ -685,7 +682,7 @@ export function retiredKeysToRecord(
  * `cwd` replaces it later), and the apply-step-1 cause. A key recorded again
  * (already recorded with no mark, so nothing was written) and a destructive
  * modify whose working directory is unchanged still get theirs: only a
- * launch gate tells a same-key new half apart (SRJ-805). A key the plan adds
+ * launch gate tells a same-key new half apart. A key the plan adds
  * that the store held only in memory gets none here: it has no old
  * declaration, and the start sweep held its live row already. Pure.
  */
@@ -726,7 +723,7 @@ export type ReloadStartOutcome =
       kind: 'refused'
       /** Which file stopped the start. */
       source: AppliedConfigSource
-      /** The SR-10.3 class, when the refusal has one. */
+      /** The class, when the refusal has one. */
       class: ReloadDiagnosticClass | undefined
       /** The line that was logged. */
       line: string
@@ -809,7 +806,7 @@ function selectConfiguration(
 }
 
 // ---------------------------------------------------------------------------
-// Detection: the pending state (b.av2 SR-8.2, SR-8.3)
+// Detection: the pending state
 // ---------------------------------------------------------------------------
 
 /** One read of the configuration file by the detection tick. */
@@ -834,7 +831,7 @@ interface PendingState {
    * credentials change is decided (never in dry run).
    */
   plan: ChangePlan
-  /** The SR-8.3 fingerprint of the bytes this pass read. */
+  /** The fingerprint of the bytes this pass read. */
   fingerprint: string
   /** A change is pending: the configuration changed or any credentials changed. */
   pending: boolean
@@ -877,7 +874,7 @@ interface PendingDetectionHost {
   /** The applied configuration now; read at the start of every derivation, so a swap is seen at once. */
   applied(): AppliedConfiguration
   /**
-   * Apply the pass's state after a matching confirmation (b.av2 SR-8.6).
+   * Apply the pass's state after a matching confirmation.
    * Resolves true when the applied state changed (step 1 succeeded), false
    * when nothing was applied. Rejects only on a programming error, before
    * anything is written.
@@ -898,7 +895,7 @@ type ConfirmationRead =
 const UNREADABLE_CONFIRMATION_IDENTITY = 'unreadable'
 
 /**
- * Build the detection tick (b.av2 SR-8.2, SR-8.3, SR-8.5) over the applied
+ * Build the detection tick over the applied
  * configuration, which it reads from `host` at the start of every derivation
  * (so a confirmed apply's swap is seen at once, with the logged state kept).
  * One pass reads the configuration file once and, unless in
@@ -906,7 +903,7 @@ const UNREADABLE_CONFIRMATION_IDENTITY = 'unreadable'
  * or a device reads as unreadable and never blocks), derives the pending
  * state through the change plan (`buildChangePlan` in `reload-plan.ts`),
  * then keeps `config.json.pending` in step: written durably, with the
- * SR-8.4 preview rendered from the plan, when a change is pending and the
+ * preview rendered from the plan, when a change is pending and the
  * file is missing or differs from what the pass would write; deleted durably
  * when nothing is pending. The credentials bytes are dropped at the end of
  * the pass; only their digests are compared, with the held ones.
@@ -920,7 +917,7 @@ const UNREADABLE_CONFIRMATION_IDENTITY = 'unreadable'
  * persona is not probed. The bring-up state is asked only for a persona
  * whose credentials changed.
  *
- * Confirmation (b.av2 SR-8.5): each pass first derives the state, then
+ * Confirmation: each pass first derives the state, then
  * processes `config.json.apply` before refreshing the pending state. The
  * confirmation is read once (stat-first) and deleted durably before anything
  * is decided; its fingerprint (`parsePendingFingerprint`) is compared with
@@ -993,7 +990,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   let factFailed = false
 
   /**
-   * A persona named by key, as the logs name it (b.av2 SR-2.2): its
+   * A persona named by key, as the logs name it: its
    * JSON-quoted name from the candidate (else the applied set), key beside it.
    */
   function personaRefOf(key: string, candidate: ChangePlanCandidate): string {
@@ -1028,7 +1025,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
   /**
    * Whether each added persona can come up, as its bring-up would check it
-   * (b.av2 SR-6.1 steps 1 and 2, then its claude_config_dir, bug b.g57): the
+   * (steps 1 and 2, then its claude_config_dir): the
    * credentials content from the bytes this pass already read (no second
    * read; none in dry run, where no credentials file is read), the
    * working-directory check and the claude_config_dir check
@@ -1062,7 +1059,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
   /**
    * Why a persona whose effective claude_config_dir changed cannot come up
-   * with the new one (bug b.g57): the same check as an added persona's
+   * with the new one: the same check as an added persona's
    * (`checkConfigDir`, so the preview, the bring-up and the launch resolve
    * the directory the same way), its `problem` when the directory cannot be
    * resolved, undefined when it resolves. A check that throws is a fact that
@@ -1180,7 +1177,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   }
 
   /**
-   * Write the pending file (the SR-8.4 preview behind the fingerprint) when it
+   * Write the pending file (the preview behind the fingerprint) when it
    * is missing or differs from what this pass would write; log the preview
    * when the pending state changed: every `reload-preview` line of a valid
    * candidate, or the one `reload-invalid` line of an invalid one. The log
@@ -1303,7 +1300,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   }
 
   /**
-   * Process `config.json.apply` (b.av2 SR-8.5) against this pass's `state`:
+   * Process `config.json.apply` against this pass's `state`:
    * read it, delete it, then apply on a fingerprint match or log one
    * `reload-stale-confirmation` line. Resolves whether the applied state
    * changed.
@@ -1390,14 +1387,14 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
 /**
  * Apply step 2, the teardowns: a confirmed apply runs it on its own, then
- * clears the retiring keys before steps 3–6 (b.deo SRI-502).
+ * clears the retiring keys before steps 3–6.
  */
 const TEARDOWNS_STEP: ApplyStepName = 'teardowns'
 
 /** The reload controller handle. */
 export interface ReloadController {
   /**
-   * Resolve the start (b.av2 SR-8.7): choose the record or the configuration
+   * Resolve the start: choose the record or the configuration
    * file, write the record when there was none, and keep the applied bytes
    * and configuration. A refusal is logged here, as one line, and nothing is
    * applied. Reads no credentials file. Call once, before anything consumes
@@ -1418,7 +1415,7 @@ export interface ReloadController {
    */
   applied(): AppliedConfiguration | undefined
   /**
-   * Start the detection tick (b.av2 SR-8.2): hand it to the injected tick
+   * Start the detection tick: hand it to the injected tick
    * driver. Arms it only once, and only after the start resolved `applied`
    * and the start bring-up pass returned (`runStartBringUp` settled, even by
    * a throw); called before that, after a refused start, a second time,
@@ -1433,7 +1430,7 @@ export interface ReloadController {
    */
   stopDetection(): void
   /**
-   * The credentials files the file guard must refuse (b.av2 SR-5.2): the
+   * The credentials files the file guard must refuse: the
    * applied set's `credentials_file` paths, plus every `credentials_file`
    * string in the `personas` entries of the configuration file as it stands
    * now (`credentialsFilesToProtect`). Reads the configuration file on every
@@ -1546,8 +1543,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
-   * Step 1's rewrite of the last-applied record (b.av2 SR-8.6, b.jg5
-   * SRJ-1511): the candidate bytes, byte for byte, through the durable
+   * Step 1's rewrite of the last-applied record: the candidate bytes, byte for byte, through the durable
    * writer. Answers undefined when it succeeded. On a failure before the
    * rename the old record is intact; on a directory-sync failure after it the
    * previous bytes are written back (best effort). Either way it answers the
@@ -1584,7 +1580,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
 
   /**
    * The one `reload-record-write-failed` line of a failed write of the
-   * retired-key record at step 1 (b.jg5 SRJ-804): names the file, says the
+   * retired-key record at step 1: names the file, says the
    * last-applied record was not rewritten and nothing is applied, and how the
    * restore of the record held before the apply went. The store's own line
    * carries the write's error. No file content, no token.
@@ -1594,13 +1590,13 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     return (
       `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the retired-key record ${JSON.stringify(store.path)}; ` +
       `the last-applied record ${JSON.stringify(paths.lastApplied)} is not rewritten, and the confirmed change is ` +
-      `not applied and stays pending; ${restored} (b.jg5 SRJ-803, SRJ-804)`
+      `not applied and stays pending; ${restored}`
     )
   }
 
   /**
    * What a failed rewrite's `reload-record-write-failed` line adds once step 1
-   * wrote the retired-key record (b.jg5 SRJ-804): the record put back to what
+   * wrote the retired-key record: the record put back to what
    * it held before the apply (`reloadRetiredKeysPutBackClause`), or, when that
    * restore failed, that the keys this apply recorded stay retired
    * (`reloadRetiredKeysPutBackFailedClause`).
@@ -1613,7 +1609,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
 
   /**
    * Stop delivery of `key`, which step 1 recorded as retired
-   * (b.jg5 SRJ-808): `deps.stopDelivery`, not awaited; a throw or a
+   * `deps.stopDelivery`, not awaited; a throw or a
    * rejection is logged, never raised:
    *
    *   [slack] reload: stopping delivery of key=<key>, recorded as retired, failed: <thrown value>
@@ -1629,8 +1625,8 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
-   * Begin apply step 1's old-life holds (`oldLifeHoldsToBegin`, b.jg5
-   * SRJ-809) in the injected hold set, after the last-applied rewrite
+   * Begin apply step 1's old-life holds (`oldLifeHoldsToBegin`
+   *) in the injected hold set, after the last-applied rewrite
    * succeeded; each begin logs its own line. A throw is logged, never
    * raised: the apply goes on.
    */
@@ -1640,13 +1636,13 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       try {
         holds.begin(begin)
       } catch (err) {
-        deps.log(`[slack] reload: beginning the old-life hold of ${begin.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+        deps.log(`[slack] reload: beginning the old-life hold of ${begin.instanceId} failed: ${describeThrownValue(err)}`)
       }
     }
   }
 
   /**
-   * Step 1's first write (b.deo SRI-408 beside b.jg5 SRJ-804): when a key the
+   * Step 1's first write (beside): when a key the
    * plan brings up (`plan.added`, a key-changing rename's new key included,
    * and `plan.destructive`'s new halves) has an unwritten drop in
    * `channelDelivery`, write the record the store holds in memory, once.
@@ -1664,7 +1660,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
-   * Drop the stored choices of every key the apply retires (b.deo SRI-406),
+   * Drop the stored choices of every key the apply retires,
    * once the last-applied rewrite has succeeded: each removed persona's key
    * (a key-changing rename's old key included) and each destructive modify's
    * key, the keys `retiredKeysToRecord` records as `removed` and
@@ -1680,12 +1676,12 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     try {
       channelDelivery.drop(batch)
     } catch (err) {
-      deps.log(`[slack] reload: dropping the stored choices of the retired keys failed: ${describeThrownValue(err)} (b.deo SRI-406)`)
+      deps.log(`[slack] reload: dropping the stored choices of the retired keys failed: ${describeThrownValue(err)}`)
     }
   }
 
   /**
-   * Open or close the retiring window of `keys` (b.deo SRI-502): `begin`
+   * Open or close the retiring window of `keys`: `begin`
    * marks them as retiring in `channelDelivery`, the end clears them. Memory
    * only. A throw is logged, never raised: the apply goes on.
    */
@@ -1696,7 +1692,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       else channelDelivery.endRetiring(keys)
     } catch (err) {
       const what = begin ? 'marking' : 'clearing'
-      deps.log(`[slack] reload: ${what} the retiring keys failed: ${describeThrownValue(err)} (b.deo SRI-502)`)
+      deps.log(`[slack] reload: ${what} the retiring keys failed: ${describeThrownValue(err)}`)
     }
   }
 
@@ -1710,23 +1706,23 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
-   * Apply a confirmed candidate (b.av2 SR-8.6): the exact bytes and the plan
+   * Apply a confirmed candidate: the exact bytes and the plan
    * the tick derived from them, never a second read or diff. An invalid
    * candidate logs one `reload-invalid` line and changes nothing. A valid one
-   * runs step 1 (b.jg5 SRJ-1511; b.deo SRI-805) in one synchronous stretch,
+   * runs step 1 in one synchronous stretch,
    * with no await between its writes, over the one stored-choice store
    * `channelDelivery` answers, asked once here, before the first write.
    * First, when a key the apply brings up (an added persona, a key-changing
    * rename's new key included, or a destructive modify's new half) has an
-   * unwritten drop, the stored-choice store's record is written (b.deo
-   * SRI-408 beside SRJ-804). When that write fails (an unsynced rename
+   * unwritten drop, the stored-choice store's record is written (
+   * beside). When that write fails (an unsynced rename
    * included), one `reload-record-write-failed` line names the stored-choice
    * file (`reloadChannelDeliveryWriteFailedLine`) and nothing is applied: no
    * retired-key record is written, no approver stopped, nothing rewritten,
    * held, dropped or marked, and the change stays pending. Nothing is written
    * when no such key has an unwritten drop, or when the store is unreadable.
    * Then:
-   *   1. record the retired keys (`retiredKeysToRecord`, SRJ-803) with one
+   * 1. record the retired keys (`retiredKeysToRecord`) with one
    *      write of the retired-key store, when there are any: each removed
    *      persona's key (a renamed persona's old key included) as `removed`,
    *      each destructive modify's key as `destructive-modify`, and the key
@@ -1735,24 +1731,24 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    *      before the apply, as far as it can be, one
    *      `reload-record-write-failed` line naming the retired-key file is
    *      logged, and nothing is applied: the last-applied record is not
-   *      rewritten and the change stays pending (SRJ-804). Once the record
+   * rewritten and the change stays pending. Once the record
    *      did not fail (written, or nothing to write for keys already
    *      recorded with no mark), the dialog approver of each key of the
-   *      batch is stopped (`stopDelivery`, SRJ-808), before the rewrite and
+   * batch is stopped (`stopDelivery`), before the rewrite and
    *      before any teardown's kill;
    *   2. rewrite the last-applied record. When that fails, the retired-key
    *      record, if step 1 wrote it, is restored to what it held before the
    *      apply (the keys this apply recorded removed again, keys and marks
    *      held before it kept), one `reload-record-write-failed` line says how
-   *      the restore went, and nothing is applied (SRJ-804); no approver
+   * the restore went, and nothing is applied; no approver
    *      stopped in step 1 is started again, and no old-life hold begins.
    *      Once it succeeded, each removed persona's key (a rename's old key
    *      included) and each destructive modify's key holds its old life's
-   *      working directory (`oldLifeHoldsToBegin`, SRJ-809), before any
+   * working directory (`oldLifeHoldsToBegin`), before any
    *      teardown's kill; a failed retired-key write above began none
    *      either. Then the stored choices of those same keys are dropped in
-   *      one batch with the retired reason (b.deo SRI-406), and each
-   *      destructive modify's key is marked as retiring (b.deo SRI-502), in
+   * one batch with the retired reason, and each
+   * destructive modify's key is marked as retiring, in
    *      both modes and whether or not the store is readable. A failed drop
    *      write is the store's own line and never fails the apply; a failed
    *      stored-choice write, retired-key write or rewrite above drops
@@ -1762,16 +1758,16 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    * template refresh for a no-op, and that only when the config directories
    * changed): step 2 on its own first, and once it has settled (fulfilled,
    * rejected, unbound or not run) the retiring keys are cleared, before step
-   * 3 starts (b.deo SRI-502), on every path out of the apply; then steps 3–6.
+   * 3 starts, on every path out of the apply; then steps 3–6.
    * Then `reload-applied` or `reload-noop` is logged. A candidate
    * whose only changes are recorded ones (the section the switch does not
    * select) has no effective change: it rewrites the record, swaps the
    * applied state and logs `reload-noop`, with no lifecycle operation
-   * (b.av2 SR-8.6, b.deo SRI-804, SRI-805). A change of the switch is a
+   * A change of the switch is a
    * server-wide setting the swap applies in place (`configInEffect`); it puts
    * no persona in any step, so on its own it runs no teardown, bring-up,
    * launch, reconnect or in-place operation and every session is kept
-   * (b.deo SRI-203). Resolves
+   * Resolves
    * whether the applied state changed. Rejects only on a programming error (a
    * plan naming a key its configuration lacks, or a `channelDelivery`
    * accessor with no store to answer), before anything is written; the tick
@@ -1789,14 +1785,14 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     if (candidate.kind !== 'valid' || bytes === undefined) return false
     const inputs = applyStepInputs(plan, current.config, candidate.config)
     const steps = applyStepsFor(plan)
-    // b.deo SRI-406, SRI-408, SRI-502: the one stored-choice store, asked
+    // the one stored-choice store, asked
     // once per apply, before step 1's first write, and used for the whole
     // apply.
     const channelDelivery = deps.channelDelivery()
 
-    // Step 1 (SRJ-1511; b.deo SRI-805): write, record, rewrite and restore in
+    // Step 1: write, record, rewrite and restore in
     // one synchronous stretch, so no mark, clear or other write of either
-    // store comes between. b.deo SRI-408 beside SRJ-804: a key brought up
+    // store comes between. beside a key brought up
     // with an unwritten drop has it written first, or nothing is applied.
     if (!writeDropsBeforeBringUp(channelDelivery, plan)) {
       deps.log(reloadChannelDeliveryWriteFailedLine(channelDelivery.path, paths.lastApplied))
@@ -1809,7 +1805,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       deps.log(retiredKeysWriteFailedLine(store, store.restore(recorded.snapshot)))
       return false
     }
-    // b.jg5 SRJ-808: each recorded key's approver stops now, before the
+    // each recorded key's approver stops now, before the
     // rewrite and the teardown's kill; nothing awaited, so step 1 stays one
     // synchronous stretch.
     for (const { key } of batch) stopDeliveryOf(key)
@@ -1822,17 +1818,17 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       deps.log(rewriteFailed + restored)
       return false
     }
-    // b.jg5 SRJ-809: the rewrite succeeded, so each key this step recorded
+    // the rewrite succeeded, so each key this step recorded
     // holds its old life's working directory from now, before any teardown's
     // kill; a failed write or rewrite above began none.
     beginStepOneHolds(plan, current.config)
     for (const persona of plan.removed) {
       try { deps.onQueueRetained?.(persona.key, deps.queueOpenCount?.(persona.key) ?? 0) } catch { /* observer cannot interrupt apply */ }
     }
-    // b.deo SRI-406: the retired keys' stored choices stop applying now, in
+    // the retired keys' stored choices stop applying now, in
     // the same synchronous stretch; a failed write never fails the apply.
     dropRetiredChoices(channelDelivery, plan)
-    // b.deo SRI-502: each destructive modify's key is retiring from here
+    // each destructive modify's key is retiring from here
     // until step 2 has settled, so no call stores a choice for it meanwhile.
     const retiring = plan.destructive.map(({ key }) => key)
     setRetiring(channelDelivery, retiring, true)
@@ -1887,8 +1883,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
 // ---------------------------------------------------------------------------
 
 /**
- * The configuration the CLI takes its settings and persona set from (b.av2
- * SR-8.7): the last-applied record beside `configPath` when it exists
+ * The configuration the CLI takes its settings and persona set from: the last-applied record beside `configPath` when it exists
  * (validated in record mode, so a record with a real-path collision still
  * resolves), otherwise the configuration file. Read-only: never writes,
  * rewrites or deletes the record or any other reload file. A record that

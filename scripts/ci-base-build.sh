@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/ci-base-build.sh: the /ci base-image build step (b.uqm SR-9.2, SR-19.5).
+# scripts/ci-base-build.sh: the /ci base-image build step.
 #
 # The /ci skill's base-build commands at 946be79, moved here unchanged: the
 # BASE_TAG assignment, then every line inside the skill's guard that built the

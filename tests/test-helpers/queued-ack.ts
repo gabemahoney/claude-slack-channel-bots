@@ -1,4 +1,4 @@
-/** b.p3h: real intake/queue/engine/reporting/reply, in-process Slack and AD. */
+/** real intake/queue/engine/reporting/reply, in-process Slack and AD. */
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { _resetAckTracker, createQueuedAckCallback, createDeliveryAckCallback, consumeAck } from '../../src/ack-tracker.ts'
@@ -95,7 +95,7 @@ export async function makeQueuedAckHarness() {
   const handler = createPersonaEventRouter({ routing, clientFor: key => asWebClient(clientFor(key)),
     getPersona: key => n.config.personas.find(p => p.key === key), log: line => n.logs.push(line),
   })
-  const event = { ...makeChannelMessage({ text: 'b.p3h queued body' }), channel: 'C0ALPHA01', ts: '1700000000.000001' }
+  const event = { ...makeChannelMessage({ text: 'queued body' }), channel: 'C0ALPHA01', ts: '1700000000.000001' }
   const h = {
     e, n, settings, routing, event, order, snapshots, failures, clientOverrides, unavailableClients, applyReaction,
     get reporting() { return reporting! },

@@ -1,17 +1,12 @@
 /**
  * ci-run-admission.test.ts — Tests for the sharded `/ci` runner's admission
- * (`scripts/ci-run.ts`; b.uqm SR-6, SR-21.6).
+ * (`scripts/ci-run.ts`).
  *
- * One region per Epic that adds to this file, in this fixed order; each lane
- * writes only inside its own region (Plan b.t6s, "One runner file"):
+ * Covers owners and liveness, labels and run-private tags, reservation
+ * formats, admission locks and sweeps, readings, /ci-live detection, fits
+ * and refusal messages.
  *
- *   E1 (t1.t6s.te): owners and liveness, labels and run-private tags, the
- *       reservation format and its names, and the lock probe E5 and E6 use;
- *   E5 (t1.t6s.ec): the admission lock, reservations and the sweep;
- *   E6 (t1.t6s.6s): the readings, `/ci-live` detection, the fits and the
- *       refusal messages.
- *
- * Isolation (b.uqm SR-21.7): every file a case touches sits under its own
+ * Isolation: every file a case touches sits under its own
  * `mkdtempSync` root, removed in `afterEach`. No case takes the real admission
  * lock, reads `.config/cscb-ci` in a real home, reads another process's
  * `/proc` entries or the host's cgroup files, or runs docker: processes come
@@ -21,8 +16,8 @@
  * started with a direct `hostSafeChildEnv` under the case's root, killed at a
  * time limit and in `afterEach`. No case hand-writes a reservation (each is
  * the runner's serializer's text, or that text with one named change) or types
- * a runner constant's value, but for the one pin case of b.uqm SR-6.1's lock
- * path, which types the two names SR-6.1 states.
+ * a runner constant's value, but for the one pin case of the contract lock
+ * path, which types the two names states.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -78,7 +73,7 @@ import {
   type JsonFileChange,
 } from './test-helpers/ci-run.ts'
 import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
-// E5's names, kept apart from E1's above.
+// names, kept apart from above.
 import {
   accountHomeFrom,
   accountHomeRefusal,
@@ -143,11 +138,11 @@ import { hostSafeChildEnv, passwdHomeFrom } from './test-helpers/host-safe-env.t
 import { callsOf, stripComments } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
-// E1 (t1.t6s.te): owners, labels and run-private tags, the reservation format
+// owners, labels and run-private tags, the reservation format
 // and its names, and the lock probe
 // ---------------------------------------------------------------------------
 
-describe('E1: owners, the reservation format and the lock probe', () => {
+describe('shared runner helpers: owners, the reservation format and the lock probe', () => {
   /** Test data: a RUN_ID (its suffix holds no hyphen; the RUN_ID itself does) and another run's. */
   const RUN_ID = '20261008t120000z-abcd1234'
   const OTHER_RUN_ID = '20261008t120001z-wxyz5678'
@@ -184,7 +179,7 @@ describe('E1: owners, the reservation format and the lock probe', () => {
     return join(root, RUNNER_PATH_SUFFIX)
   }
 
-  // --- Owners (b.uqm Terms, SR-6.3) ---
+  // --- Owners (Terms) ---
 
   describe('owners, <RUN_ID>-<PID>', () => {
     test('an owner formats as <RUN_ID>-<PID> and parses back from the right, despite the RUN_ID\'s own hyphen', () => {
@@ -222,7 +217,7 @@ describe('E1: owners, the reservation format and the lock probe', () => {
   })
 
   describe('liveness: an owner is alive only when its PID is live and runs the /ci runner with its RUN_ID next', () => {
-    /** Each row builds its owner from the case's process table; true when SR-6.3 calls the owner alive. */
+    /** Each row builds its owner from the case's process table; true when calls the owner alive. */
     const rows: [string, () => Owner, boolean][] = [
       ['a live /ci runner with the owner\'s RUN_ID', () => liveOwner(), true],
       [
@@ -365,7 +360,7 @@ describe('E1: owners, the reservation format and the lock probe', () => {
     })
   })
 
-  // --- The reservation (b.uqm SR-6.2) ---
+  // --- The reservation ---
 
   /** A reservation of `shards` shards for `owner`, its figures from the runner's constants: N × the cap, 2 × N. */
   function reservationFor(owner: Owner, shards: number, kind: RunKind): Reservation {
@@ -415,7 +410,7 @@ describe('E1: owners, the reservation format and the lock probe', () => {
     const owner: Owner = { runId: RUN_ID, pid: 4242 }
     const validText = (): string => serializeReservation(reservationFor(owner, MAX_SHARDS, 'full'))
 
-    test.each([['full' as RunKind], ['selective' as RunKind]])('a %s run\'s reservation serializes to exactly SR-6.2\'s keys, in order, and parses back', (kind) => {
+    test.each([['full' as RunKind], ['selective' as RunKind]])('a %s run\'s reservation serializes to exactly keys, in order, and parses back', (kind) => {
       const reservation = reservationFor(owner, OPTION_RANGE_MIN, kind)
       const text = serializeReservation(reservation)
       expect(Object.keys(JSON.parse(text) as object)).toEqual(['version', 'runId', 'pid', 'shards', 'memoryBytes', 'cpus', 'kind'])
@@ -512,12 +507,12 @@ describe('E1: owners, the reservation format and the lock probe', () => {
 })
 
 // ---------------------------------------------------------------------------
-// E5 (t1.t6s.ec): the admission lock, reservations and the sweep
+// the admission lock, reservations and the sweep
 // ---------------------------------------------------------------------------
 
-// --- E5 lane A (T5.S1–S3): the account's home, the lock and reservations ---
+// --- lane A (.S1–S3): the account's home, the lock and reservations ---
 
-describe('E5: the account\'s home, the admission lock and reservations', () => {
+describe('reservation management: the account\'s home, the admission lock and reservations', () => {
   /** Test data: the runner's user ID in the constructed password files. */
   const UID = 4242
   /** Test data: an absolute home used only to name the password-file cases at registration; nothing is read or written there. */
@@ -730,7 +725,7 @@ console.log(JSON.stringify({ listed: names.length, onLock, held }))
     assertNoLeak(refusal)
   }
 
-  // --- T5.S1: the account's home from the password file, the lock path, and the pin case (b.uqm SR-6.1, SR-21.5) ---
+  // --- .S1: the account's home from the password file, the lock path, and the pin case ---
 
   describe('the account\'s home from the password file', () => {
     const caseRows = Object.values(passwordFileCases(UID, CASE_NAMING_HOME))
@@ -787,7 +782,7 @@ console.log(JSON.stringify({ listed: names.length, onLock, held }))
       expect(readdirSync(envHome)).toEqual([])
     })
 
-    test('pin (b.uqm SR-6.1): the lock path under the account\'s home is .config/cscb-ci/admission.lock, the one path every worktree\'s runner takes', () => {
+    test('pin: the lock path under the account\'s home is .config/cscb-ci/admission.lock, the one path every worktree\'s runner takes', () => {
       expect([LOCK_DIR_SUBPATH, LOCK_FILE_NAME]).toEqual(['.config/cscb-ci', 'admission.lock'])
     })
 
@@ -799,7 +794,7 @@ console.log(JSON.stringify({ listed: names.length, onLock, held }))
       expect(code).not.toMatch(/\b(?:homedir|userInfo)\b/)
     })
 
-    test('pin (b.uqm SR-21.5): the runner\'s password-file rule gives what passwdHomeFrom gives, row for row, a home or none', () => {
+    test('pin: the runner\'s password-file rule gives what passwdHomeFrom gives, row for row, a home or none', () => {
       const rows = [0, 1, UID].flatMap((uid) => Object.values(passwordFileCases(uid, join(root, `home-${uid}`))).map((row) => ({ uid, text: row.text, label: `${uid}: ${row.label}`, home: row.home })))
       // A user ID that is no user ID gives no home by either rule.
       rows.push({ uid: -1, text: passwordFileCases(UID, join(root, 'home'))['first-match'].text, label: '-1: no user ID', home: undefined })
@@ -809,7 +804,7 @@ console.log(JSON.stringify({ listed: names.length, onLock, held }))
     })
   })
 
-  // --- T5.S2: the admission lock (b.uqm SR-6.1, SR-6.8's busy lock) ---
+  // --- .S2: the admission lock (busy lock) ---
 
   describe('the admission lock', () => {
     test('a missing lock directory and lock file are created 0700 and 0600', async () => {
@@ -1004,7 +999,7 @@ console.log(JSON.stringify({ listed: names.length, onLock, held }))
     })
   })
 
-  // --- T5.S3: reservations, written, removed and read (b.uqm SR-6.2) ---
+  // --- .S3: reservations, written, removed and read ---
 
   describe('reservations', () => {
     const OWNER: Owner = { runId: TAKER_RUN_ID, pid: 4242 }
@@ -1224,9 +1219,9 @@ console.log(JSON.stringify({ listed: names.length, onLock, held }))
   })
 })
 
-// --- E5 lane B (T5.S4–S5): the sweep ---
+// --- lane B (.S4–S5): the sweep ---
 
-describe('E5: the sweep of dead runs\' leftovers', () => {
+describe('reservation management: the sweep of dead runs\' leftovers', () => {
   /** Test data: the RUN_ID every owner of a case names, and the RUN_ID another run's runner holds. */
   const RUN_ID = '20261008t130000z-sweep001'
   const OTHER_RUN_ID = '20261008t130001z-other002'
@@ -1268,7 +1263,7 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
 
   // --- Owners and their leftovers ---
 
-  /** b.uqm SR-6.3's owner states: three dead ones, and the one live one (a `/ci` runner with the owner's own RUN_ID). */
+  /** owner states: three dead ones, and the one live one (a `/ci` runner with the owner's own RUN_ID). */
   type OwnerState = 'gone' | 'not-a-runner' | 'other-run-id' | 'live'
 
   /** An owner in `state`; its process, if it has one, is in the process table the spawn recorder shares. */
@@ -1390,7 +1385,7 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
     return failures
   }
 
-  // --- T5.S4: scope, owners, order and failed steps (b.uqm SR-6.4, SR-6.3; AC 24, AC 25) ---
+  // --- .S4: scope, owners, order and failed steps ---
 
   describe('scope and owners', () => {
     const OWNER_ROWS: [string, OwnerState, boolean][] = [
@@ -1614,7 +1609,7 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
     })
   })
 
-  // --- T5.S5: the removal path and the prune retry (b.uqm SR-9.3, SR-6.4) ---
+  // --- .S5: the removal path and the prune retry ---
 
   describe('the removal path: tag names only, owner-filtered prunes after a listing, the retry', () => {
     /** Test data: a prune's confirmation-skip flag and its filter option, the only options a prune may carry (no `--all`). */
@@ -1779,11 +1774,11 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
       expect(fake.images()).toHaveLength(1)
     })
 
-    test('known gap against b.uqm SR-6.3/SR-6.4: an untagged image with an empty owner label is selected but never pruned, and each sweep logs one cleanup failure', async () => {
-      // SR-6.3/SR-6.4 call this image a dead run's leftover to remove, but E1's
+    test('known gap against an untagged image with an empty owner label is selected but never pruned, and each sweep logs one cleanup failure', async () => {
+      // call this image a dead run's leftover to remove, but
       // image-list filter builder refuses an empty label value, so the owner's
       // listing fails before any prune. This case pins today's behaviour;
-      // closing the gap needs E1's filter builders changed (the orchestrator's
+      // closing the gap needs filter builders changed (the orchestrator's
       // decision), and then this case changes with them.
       const lock = buildLockDir(root)
       addUntaggedImage('')
@@ -1825,12 +1820,12 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
 })
 
 // ---------------------------------------------------------------------------
-// E6 (t1.t6s.6s): the readings, /ci-live detection, the fits and the refusal
+// the readings, /ci-live detection, the fits and the refusal
 // messages
 // ---------------------------------------------------------------------------
 //
-// Admission (b.uqm SR-6.5 to SR-6.8, SR-7.1, SR-7.2) and the runner's copies of
-// `/ci-live`'s rules (SR-21.5), tested in process through the runner's injected
+// Admission and the runner's copies of
+// `/ci-live`'s rules, tested in process through the runner's injected
 // dependencies. Every reading is constructed under the case's own
 // `mkdtempSync` root (tests/test-helpers/ci-run.ts, section 9): the cgroup
 // tree stands for `/sys/fs/cgroup`, a temp home holds `/ci-live`'s config
@@ -1838,7 +1833,7 @@ describe('E5: the sweep of dead runs\' leftovers', () => {
 // root through `TMPDIR`, so no case reads the host's cgroups, a real home's
 // `.config`, `/ci-live`'s real locks or the real `/tmp`. The one child process
 // (the `os.tmpdir()` pin) gets a direct `hostSafeChildEnv` call and a time
-// limit. E6's imports sit here, in its own region; names E1's and E5's imports
+// limit. imports sit here, in its own region; names and imports
 // above already bring in are used from there.
 
 import { spawnSync } from 'node:child_process'
@@ -1967,8 +1962,8 @@ import {
 } from './test-helpers/ci-run.ts'
 import { fakeToken } from './test-helpers/credentials.ts'
 
-describe('E6: admission readings, /ci-live, commitments, fits and refusals', () => {
-  /** Test data: this run's RUN_ID, the runner's user ID, and the host's pod limit L in GiB (the PRD's 64 GiB container cgroup). */
+describe('admission: admission readings, /ci-live, commitments, fits and refusals', () => {
+  /** Test data: this run's RUN_ID, the runner's user ID, and the host's pod limit L in GiB (the contract's 64 GiB container cgroup). */
   const RUN_ID = '20261008t130000z-e6run001'
   const RUNNER_UID = 4321
   const POD_LIMIT_GIB = 64
@@ -2040,7 +2035,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
 
   /**
    * Builds the runner's admission dependencies from constructed readings, in
-   * a new directory under the case's root: at E1's starting cap, an L of
+   * a new directory under the case's root: at starting cap, an L of
    * 64 GiB and W of 0, nothing else counted (no reservations, no `/ci-live`
    * activity, no `cscb-ci*` containers) and an idle volume, with a runner
    * environment holding fake credentials. Any of them can be overridden.
@@ -2122,7 +2117,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
     return { pid, path: lock.lockPath }
   }
 
-  /** A run's invocation and its admission request at the starting cap; `units` is u, and the effective N is the smaller of r and u, at least 1 (E2's rule, b.uqm SR-3.4). */
+  /** A run's invocation and its admission request at the starting cap; `units` is u, and the effective N is the smaller of r and u, at least 1 (validation's rule). */
   function requestFor(args: readonly string[], units: number): { readonly invocation: Invocation; readonly request: AdmissionRequest } {
     const parsed = parseCiArguments(args)
     if (!parsed.ok) throw new Error(`requestFor: ${JSON.stringify(args)} does not parse`)
@@ -2157,10 +2152,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   const okReading = <T,>(value: T): ReadingResult<T> => ({ ok: true, value })
 
   // -------------------------------------------------------------------------
-  // T7.S1: pod memory, the ceiling and container figures (b.uqm SR-7.1, SR-7.2; AC 26)
+  // .S1: pod memory, the ceiling and container figures
   // -------------------------------------------------------------------------
 
-  describe('pod memory, the ceiling and container figures (b.uqm SR-7.1, SR-7.2)', () => {
+  describe('pod memory, the ceiling and container figures', () => {
     test('L and W come from the namespace root, not from a cgroup on the runner\'s own path with a smaller limit', () => {
       const rig = makeAdmission({
         pod: { limitGib: POD_LIMIT_GIB, workingSetGib: 30, anonGib: 12, activeFileGib: 15, inactiveFileGib: 4 },
@@ -2273,10 +2268,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 
   // -------------------------------------------------------------------------
-  // T7.S2: the admission readings and failed readings (b.uqm SR-6.5; AC 26, AC 33's admission half)
+  // .S2: the admission readings and failed readings (admission half)
   // -------------------------------------------------------------------------
 
-  describe('the admission readings and failed readings (b.uqm SR-6.5)', () => {
+  describe('the admission readings and failed readings', () => {
     /** W of 35.5 GiB: anon, active page cache and the rest, with inactive page cache outside it. */
     const BUSY_POD: PodFigures = { limitGib: POD_LIMIT_GIB, workingSetGib: 35.5, anonGib: 14, activeFileGib: 18.5, inactiveFileGib: 3 }
 
@@ -2429,14 +2424,14 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 
   // -------------------------------------------------------------------------
-  // T7.S3: the runner's /ci-live copies and E6's constants, pinned (b.uqm SR-6.6, SR-21.5)
+  // .S3: the runner's /ci-live copies and constants, pinned
   // -------------------------------------------------------------------------
   //
   // Paths here are only compared as strings: no case reads, stats or locks a
   // path a rule produces. With every temp variable unset the rule names
   // `/ci-live`'s real dry-run lock under `/tmp`, which is never touched.
 
-  describe('the runner\'s /ci-live copies, pinned against /ci-live and Bun (b.uqm SR-6.6, SR-21.5)', () => {
+  describe('the runner\'s /ci-live copies, pinned against /ci-live and Bun', () => {
     /** Test data: a home and a directory that are only ever strings, and a user ID whose digits appear nowhere else in the lock's name. */
     const PIN_HOME = '/pin-home/account'
     const PIN_DIR = '/pin-dir/config'
@@ -2448,14 +2443,14 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
      * One pin per exported constant of the runner's section 10: its name, its
      * value, and what it must equal. The runner's copies of `/ci-live`'s rules
      * and figures are checked against `/ci-live`'s own exports; every other
-     * constant against the PRD's or SRD's value, typed only here.
+     * constant against the contract's or contract's value, typed only here.
      */
-    const E6_CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
-      // The runner's copies of /ci-live's three figures (b.uqm SR-6.6, SR-7.1), in bytes.
+    const ADMISSION_CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
+      // The runner's copies of /ci-live's three figures, in bytes.
       ['CI_LIVE_CONTAINER_MEMORY_BYTES', CI_LIVE_CONTAINER_MEMORY_BYTES, parseMemorySize(CONTAINER_MEMORY)],
       ['CI_LIVE_CHROME_LIMIT_BYTES', CI_LIVE_CHROME_LIMIT_BYTES, CHROME_PSS_LIMIT_BYTES],
       ['CI_LIVE_WORKING_SET_LIMIT_BYTES', CI_LIVE_WORKING_SET_LIMIT_BYTES, HOST_WORKING_SET_LIMIT_BYTES],
-      // Their sum with the runner allowance: the PRD's 13 GiB per active /ci-live run.
+      // Their sum with the runner allowance: the contract's 13 GiB per active /ci-live run.
       ['CI_LIVE_RUN_COMMITMENT_BYTES', CI_LIVE_RUN_COMMITMENT_BYTES, 13 * GIB_BYTES],
       // The runner's copies of /ci-live's lock paths and names.
       ['CI_LIVE_CONFIG_DIR_SUBPATH', CI_LIVE_CONFIG_DIR_SUBPATH, relative(PIN_HOME, defaultConfigDir(PIN_HOME))],
@@ -2473,10 +2468,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       ['CI_LIVE_ENTRY_FILE_NAME', CI_LIVE_ENTRY_FILE_NAME, 'run.ts'],
       // The runner's own bound on a lock read: a PID of at most ten digits fits well inside it.
       ['CI_LIVE_LOCK_READ_MAX_BYTES', CI_LIVE_LOCK_READ_MAX_BYTES, 64],
-      // Readings and the shard-count line (b.uqm SR-6.5, SR-6.7).
+      // Readings and the shard-count line.
       ['CI_CONTAINER_NAME_PREFIX', CI_CONTAINER_NAME_PREFIX, 'cscb-ci'],
       ['ENDED_BEFORE_ADMISSION_REASON', ENDED_BEFORE_ADMISSION_REASON, 'ended before admission'],
-      // Refusal messages (b.uqm SR-6.8).
+      // Refusal messages.
       [
         'MEMORY_REFUSAL_ADVICE',
         MEMORY_REFUSAL_ADVICE,
@@ -2505,9 +2500,9 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       ['UNKNOWN_TEMP_DIR_TEXT', UNKNOWN_TEMP_DIR_TEXT, '(unknown)'],
     ]
 
-    /** The runner's section 10 banner and the next one: E6's constants are exported between them. */
-    const SECTION_10_BANNER = /^\/\/ 10\. Admission readings and fit \(E6\)$/m
-    const SECTION_11_BANNER = /^\/\/ 11\. Memory guard \(E7\)$/m
+    /** The runner's section 10 banner and the next one: admission's constants are exported between them. */
+    const SECTION_10_BANNER = /^\/\/ 10\. Admission readings and fit$/m
+    const SECTION_11_BANNER = /^\/\/ 11\. Memory guard$/m
 
     /** The names of the `export const` declarations in the runner's section 10. */
     function exportedSection10Constants(): string[] {
@@ -2529,12 +2524,12 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       return names
     }
 
-    test.each(E6_CONSTANT_PINS)('pins %s', (_name, actual, expected) => {
+    test.each(ADMISSION_CONSTANT_PINS)('pins %s', (_name, actual, expected) => {
       expect(actual).toEqual(expected)
     })
 
     test('every exported constant of the runner\'s section 10 has exactly one pin case', () => {
-      const pinned = E6_CONSTANT_PINS.map(([name]) => name)
+      const pinned = ADMISSION_CONSTANT_PINS.map(([name]) => name)
       expect(new Set(pinned).size).toBe(pinned.length)
       expect([...exportedSection10Constants()].sort()).toEqual([...pinned].sort())
     })
@@ -2686,10 +2681,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 
   // -------------------------------------------------------------------------
-  // T7.S4: /ci-live detection and its untouched lock files (b.uqm SR-6.6; AC 18)
+  // .S4: /ci-live detection and its untouched lock files
   // -------------------------------------------------------------------------
 
-  describe('/ci-live detection and its untouched lock files (b.uqm SR-6.6)', () => {
+  describe('/ci-live detection and its untouched lock files', () => {
     const activeRows: [string, (rig: AdmissionRig) => CiLiveRunSeen[]][] = [
       [
         'a held real-run lock',
@@ -2768,7 +2763,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       expect((await rig.figures()).readings.ciLive.runs).toEqual([{ via: 'real-run-lock', what: rig.ciLive.realRunLock, pid }])
     })
 
-    test('$HOME never names the home (b.uqm SR-6.1): a held run.lock in the home $HOME names is not seen, the one in the home admission is given is', async () => {
+    test('$HOME never names the home: a held run.lock in the home $HOME names is not seen, the one in the home admission is given is', async () => {
       const rig = makeAdmission()
       const pid = addCiLiveLockHolder(rig.processes, 'runner-by-path')
       const decoy = makeCiLiveHome(join(rig.dir, 'decoy'), ciLiveLockText(pid))
@@ -2819,10 +2814,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 
   // -------------------------------------------------------------------------
-  // T7.S5: the memory commitments and the CPU in use (b.uqm SR-6.6; AC 18's counting)
+  // .S5: the memory commitments and the CPU in use (counting)
   // -------------------------------------------------------------------------
 
-  describe('what admission counts (b.uqm SR-6.6)', () => {
+  describe('what admission counts', () => {
     /** One active `/ci-live` run: the sum of the runner's three copied figures. */
     const PER_CI_LIVE_RUN_BYTES = CI_LIVE_CONTAINER_MEMORY_BYTES + CI_LIVE_CHROME_LIMIT_BYTES + CI_LIVE_RUNNER_ALLOWANCE_BYTES
     /** A shard container of LIVE_OWNER that has stopped: never counted against its reservation. */
@@ -2986,10 +2981,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 
   // -------------------------------------------------------------------------
-  // T7.S6: the fits, choosing N and the shard-count line (b.uqm SR-6.7; AC 16, AC 18's W cases, AC 20, AC 35's decision)
+  // .S6: the fits, choosing N and the shard-count line (W cases decision)
   // -------------------------------------------------------------------------
 
-  describe('b.rmn: reclaimable cache does not consume admission headroom', () => {
+  describe('reclaimable cache does not consume admission headroom', () => {
     test.each([
       ['shared memory makes anon plus shmem larger than the LRU total', 48, 4, 20, 26, 2, 52, 'refused'],
       ['locked pages make the LRU plus unevictable total larger than anon plus shmem', 48, 1, 20, 26, 6, 52, 'refused'],
@@ -3050,7 +3045,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
     })
   })
 
-  describe('the fits, choosing N and the shard-count line (b.uqm SR-6.7)', () => {
+  describe('the fits, choosing N and the shard-count line', () => {
     /** An unlabelled, capped `cscb-ci*` container: one counted commitment. */
     const CAPPED_SCRATCH = `${CI_CONTAINER_NAME_PREFIX}-capped-scratch`
     /** A pod at the factory's L whose W is exactly `bytes`. */
@@ -3083,7 +3078,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       expect(memoryFits(figures, shards, SHARD_MEMORY_CAP_BYTES)).toBe(fits)
     })
 
-    test('E7: Codex extra memory is included at the one-byte admission boundary and in reservations', async () => {
+    test('the memory guard: Codex extra memory is included at the one-byte admission boundary and in reservations', async () => {
       const rig = makeAdmission(), figures = await rig.figures()
       const extra = gibToBytes(2), shards = 2
       const ceiling = shards * SHARD_MEMORY_CAP_BYTES + extra + ADMISSION_MARGIN_BYTES
@@ -3096,7 +3091,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       assertNoLeak(reservation)
     })
 
-    test('E7: admission never reduces shards below the dedicated Codex isolation floor', async () => {
+    test('the memory guard: admission never reduces shards below the dedicated Codex isolation floor', async () => {
       const rig = makeAdmission(), figures = await rig.figures()
       const request = { ...defaultFullRun(), minimumShards: 2, extraMemoryBytes: gibToBytes(2) }
       const ceiling = SHARD_MEMORY_CAP_BYTES + gibToBytes(2) + ADMISSION_MARGIN_BYTES
@@ -3164,7 +3159,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       const decision = admittedOf(decideAdmission(figures, request, rig.listResultsDirs))
 
       expect(canChooseShards(invocation)).toBe(true)
-      // SR-6.7's gate eligibility holds by construction; E13 proves it.
+      // gate eligibility holds by construction; proves it.
       expect(memoryFits(figures, decision.shards, SHARD_MEMORY_CAP_BYTES)).toBe(true)
       expect(memoryFits(figures, decision.shards + 1, SHARD_MEMORY_CAP_BYTES)).toBe(false)
       expect(decision.shards).toBeLessThan(request.effectiveShards)
@@ -3206,7 +3201,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       expect(() => decideAdmission(figures, { ...defaultFullRun(), ...fields }, rig.listResultsDirs)).toThrow()
     })
 
-    // --- The worked examples, pinned: at the 2 GiB cap with nothing else counted (b.uqm SR-6.7; AC 16, AC 18) ---
+    // --- The worked examples, pinned: at the 2 GiB cap with nothing else counted ---
 
     test('pin: W = 42.3 GiB gives a default full run 5 shards, shards: 5 of 6 with its memory reason', async () => {
       const rig = makeAdmission({ pod: podAt(42.3) })
@@ -3266,7 +3261,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       assertNoLeak({ refusal })
     })
 
-    // --- AC 20: /ci test-23 beside an active full run ---
+    // --- /ci test-23 beside an active full run ---
 
     test.each([
       ['beside a live 5-shard full run it is admitted with 1 shard when memory fits', 5, true],
@@ -3386,10 +3381,10 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 
   // -------------------------------------------------------------------------
-  // T7.S7: refusal messages (b.uqm SR-6.8; AC 34, AC 35's message)
+  // .S7: refusal messages (message)
   // -------------------------------------------------------------------------
 
-  describe('refusal messages (b.uqm SR-6.8)', () => {
+  describe('refusal messages', () => {
     /** Test data: the volume's mount point, a label only. */
     const MOUNT = '/data-volume'
     /** A volume of 100 GiB with `usedGib` used. */
@@ -3399,7 +3394,7 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
     /** Whether this process is root, which reads a directory whatever its mode. */
     const isRoot = process.getuid?.() === 0
 
-    /** Every `<x> GiB` figure of a message has one decimal place; the disk summary's `this run's 1 GiB` is SR-6.8's own wording. */
+    /** Every `<x> GiB` figure of a message has one decimal place; the disk summary's `this run's 1 GiB` is own wording. */
     function expectGibToOneDecimal(lines: readonly string[]): void {
       const allowance = `this run's ${DISK_CHECK_ALLOWANCE_BYTES / GIB_BYTES} GiB`
       for (const line of lines) {
@@ -3761,13 +3756,13 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
   })
 })
 
-// b.omv SR-14.7: the shared admission contract used by /ci and the heavy leg.
+// the shared admission contract used by /ci and the heavy leg.
 import { acquireCodexLogin, readCodexLogin, CODEX_LOGIN_LOCK_WAIT_MS } from '../scripts/codex-login.ts'
 import { makeFakeCodexHome, makeFakeCodexLogin } from './test-helpers/ci-run.ts'
 import { decodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
 import { symlinkSync, unlinkSync } from 'node:fs'
 
-describe('E7: Codex login admission', () => {
+describe('the memory guard: Codex login admission', () => {
   let root: string
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'ci-codex-admission-')) })
   afterEach(() => { rmSync(root, { recursive: true, force: true }) })

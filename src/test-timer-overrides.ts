@@ -1,5 +1,5 @@
 /**
- * The test-only timer override block (b.2nr). Undocumented for users; OFF by
+ * The test-only timer override block. Undocumented for users; OFF by
  * default. It lets a `/ci` scenario shorten production timers so it does
  * not wait them out, without changing any of them for a real configuration.
  *

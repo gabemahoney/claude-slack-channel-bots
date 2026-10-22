@@ -1,6 +1,6 @@
 /**
  * atomic-write.test.ts — Tests for durableWriteFileSync in src/atomic-write.ts,
- * the atomic and durable write of the reload files (b.av2 SR-8.1): a uniquely
+ * the atomic and durable write of the reload files: a uniquely
  * named temporary file, fsync, rename over the target, then fsync of the
  * directory.
  *
@@ -13,14 +13,13 @@
  * the rename is thrown as raised; a directory open or fsync failure after it
  * is a `DurableWriteUnsyncedError`; a directory close failure is ignored.
  *
- * `durableUnlinkSync`, the durable delete of `config.json.pending` (b.av2
- * SR-8.1, SR-8.3), runs on the same seam: unlink, then fsync of the
+ * `durableUnlinkSync`, the durable delete of `config.json.pending`, runs on the same seam: unlink, then fsync of the
  * directory; an absent target (ENOENT, ENOTDIR) returns false and syncs
  * nothing; every other unlink failure reaches the caller as raised, and a
  * directory open or fsync failure after the unlink is a
  * `DurableUnlinkUnsyncedError`.
  *
- * `atomicWriteFileSync` (E10) is covered by the stop-hook and reply-guard
+ * `atomicWriteFileSync` is covered by the stop-hook and reply-guard
  * suites and is not tested here.
  *
  * SPDX-License-Identifier: MIT
@@ -464,7 +463,7 @@ describe('durableWriteFileSync failure at each step', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Durable delete (b.av2 SR-8.1, SR-8.3)
+// Durable delete
 // ---------------------------------------------------------------------------
 
 describe('durableUnlinkSync', () => {

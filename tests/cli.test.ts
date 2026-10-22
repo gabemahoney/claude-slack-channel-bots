@@ -2,7 +2,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
  * `clean_restart`, `credentials`) at the createCli factory level, with all
- * I/O injected; for `clear-latch` (b.jg5 SRJ-509), only its usage entry, the
+ * I/O injected; for `clear-latch`, only its usage entry, the
  * entry point, the production dial's wiring and the retired-key check, its
  * rows being tests/clear-latch.test.ts's. No other command dials
  * `clear-latch`'s route: the fixture's default dial records any call and
@@ -12,18 +12,18 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * the script itself, and the one real run of the CLI through it, are
  * tests/credentials-command.test.ts's.
  *
- * Persona model (b.av2 SR-8.7, SR-10.2): the CLI reads no Slack token (AC 47,
+ * Persona model: the CLI reads no Slack token (
  * cli leg), takes its settings and persona set from the configuration the
  * server runs (`config.json.last-applied` beside `config.json` in the state
  * directory when it exists, otherwise `config.json`), and tears down exactly
  * that configuration's personas, addressing each instance as `cscb_<key>`.
  *
- * The retired-key record (b.jg5 SRJ-801): only the server writes it. Every
+ * The retired-key record: only the server writes it. Every
  * command that acts leaves a record seeded by `writeRetiredKeysRecord`
  * byte-identical, a marked key whose row the stub client reports live
  * included, and creates none where there was none.
  *
- * The stored-choice file (b.deo SRI-401): only the server reads or writes
+ * The stored-choice file: only the server reads or writes
  * `channel-delivery.json`. Every command that acts, over the same command
  * table and bundle as the retired-key cases, leaves a file seeded by
  * `writeChannelDeliveryRecord` byte-identical (a key the server's start would
@@ -33,7 +33,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * `src/channel-delivery.ts` and names none of its entries that load, write,
  * parse or locate the file.
  *
- * Isolation (b.av2 SR-13.2): every real path sits under a per-test
+ * Isolation: every real path sits under a per-test
  * `mkdtempSync` directory removed in `afterEach`. The token variables are
  * removed for the whole file (restored afterwards), so no case or failure
  * message can see an ambient token. `start`'s daemon is always the injected
@@ -50,13 +50,13 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * `clean_restart`'s answer check run on the per-test fake clock; none waits in real time, and no case leaves a timer
  * pending.
  *
- * The precheck (b.jg5 SRJ-901): before `stop --stop-bots` or `clean_restart`
+ * The precheck: before `stop --stop-bots` or `clean_restart`
  * stops anything, one `get` and, for a live row, one one-line `read-pane` of
  * each persona's `cscb_<key>` (the fixture's `directorGet` and
  * `directorReadPane`, by default a live `waiting` row and a pane). The
  * verdict over each answer is tests/cli-teardown.test.ts's.
  *
- * The teardown (b.jg5 SRJ-903, SRJ-119, SRJ-904, SRJ-908): after a passed
+ * The teardown: after a passed
  * precheck and the server stop, each persona's `status` read, its `pause`
  * decided by class (GONE and every other answer escalate to the kill,
  * UNAVAILABLE is tried three times 2 s apart, CONFLICT, ENVIRONMENT, UNUSABLE
@@ -69,7 +69,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * call order. The verdicts and the kill's mapping per answer are
  * tests/cli-teardown.test.ts's.
  *
- * The teardown's report (b.jg5 SRJ-907, SRJ-909, SRJ-1013): once every
+ * The teardown's report: once every
  * persona has settled, each failed persona's failure line, followed by the
  * kill-failure alert's ordinary version where the kill's decision says so,
  * and a stopped persona's survivor version, in configuration order, then the
@@ -83,7 +83,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * expected line comes from the builders of `src/cli-teardown.ts` and
  * `src/kill-failure-alert.ts`.
  *
- * After the teardown (b.jg5 SRJ-905, SRJ-906, SRJ-1013): `stop --stop-bots`
+ * After the teardown: `stop --stop-bots`
  * never starts the server. `clean_restart` after a failed teardown checks
  * that agent-director answers through the fixture's `directorList` (each
  * call recorded with its fake-clock time and in `events`; by default a
@@ -92,7 +92,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * not-restarted alert (`cleanRestartNotRestartedAlert`). The tries on the
  * injected clock (`callWithCliTries`) are also tested on their own.
  *
- * The client's initialization (b.jg5 SRJ-203, SRJ-902): the fixture's
+ * The client's initialization: the fixture's
  * `initClient` records the call timeout and the gate each command asks for
  * (`clean_restart` the whole gate, `stop --stop-bots` the gate without CSCB's
  * Phase 1 floor). Every gate refusal a case throws is the real gate's
@@ -377,7 +377,7 @@ const CLI_SOURCE = resolve(import.meta.dir, '..', 'src', 'cli.ts')
 const TOKEN_VARS = ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'] as const
 
 // ---------------------------------------------------------------------------
-// File-level isolation: no ambient token for any case (b.av2 SR-13.2)
+// File-level isolation: no ambient token for any case
 // ---------------------------------------------------------------------------
 
 const savedTokenEnv: Record<string, string | undefined> = {}
@@ -429,7 +429,7 @@ let currentClock: FakeClock | null
 /**
  * Every call of a `makeDeps` bundle's default `dialClearLatch` in the case,
  * as `[port, persona]`; checked empty after each case, so a command other
- * than `clear-latch` that dials fails it (b.jg5 SRJ-509).
+ * than `clear-latch` that dials fails it.
  */
 let unexpectedDials: Array<[port: number, persona: string]>
 
@@ -461,7 +461,7 @@ afterEach(() => {
   delete process.env['_CLI_DAEMON_CHILD']
   for (const name of TOKEN_VARS) delete process.env[name]
   rmSync(root, { recursive: true, force: true })
-  // Every wait ran on the fake clock and none is left behind (b.jg5 SRJ-908).
+  // Every wait ran on the fake clock and none is left behind.
   expect(currentClock?.pending() ?? []).toEqual([])
   // Only clear-latch dials, and no case here runs it over the default dial.
   expect(unexpectedDials).toEqual([])
@@ -495,7 +495,7 @@ const OPS_PERSONA: CliTeardownPersona = Object.freeze({ name: OPS_NAME, key: per
 /** The last-applied record beside the per-test config.json. */
 const recordPath = (): string => `${configPath}.last-applied`
 
-/** The production `loadConfig` (b.av2 SR-8.7) over the per-test tree, with the temp root as home. */
+/** The production `loadConfig` over the per-test tree, with the temp root as home. */
 const appliedLoader = (path: string): PersonaConfig => readAppliedPersonaConfig(path, root)
 
 function opsConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
@@ -574,14 +574,14 @@ interface Overrides {
   /** The teardown's kill; default the Phase 1 success with a kill sent (`cannedKillResult(true)`). */
   directorKill?: (id: string) => Promise<unknown>
   /**
-   * `clean_restart`'s answer check's `list` (b.jg5 SRJ-906); default a
+   * `clean_restart`'s answer check's `list`; default a
    * successful empty list, so agent-director answers at the first try.
    */
   directorList?: CliDeps['directorList']
   /**
    * How long each director call (`get`, `read-pane`, `status`, `pause`,
    * `kill`, `list`) takes on the fake clock before it answers, as a call that uses
-   * its whole call timeout does (b.jg5 SRJ-908); default 0, an answer at once.
+   * its whole call timeout does; default 0, an answer at once.
    */
   callMs?: number
   /** `credentials`' loader of the configuration file; default the real `loadPersonaConfig` with the temp root as home. */
@@ -595,17 +595,17 @@ interface Overrides {
   sleep?: (ms: number) => Promise<void>
   /**
    * The teardown's `server.log` appender; default the real `appendLogLine`
-   * on `<stateDir>/server.log` in the temp tree (b.jg5 SRJ-909).
+   * on `<stateDir>/server.log` in the temp tree.
    */
   appendServerLogLine?: CliDeps['appendServerLogLine']
   /**
    * The teardown's startup-errors recorder; default the real
    * `recordStartupError` into `<stateDir>/startup-errors.log` in the temp
-   * tree, with no copy on fd 2 (b.jg5 SRJ-909, SRJ-1013).
+   * tree, with no copy on fd 2.
    */
   recordStartupErrorEntry?: CliDeps['recordStartupErrorEntry']
   /**
-   * `clear-latch`'s dial (b.jg5 SRJ-510). Default: none of this file's
+   * `clear-latch`'s dial. Default: none of this file's
    * commands may dial; the default records the call in `unexpectedDials`,
    * which fails the case, and rejects.
    */
@@ -639,10 +639,10 @@ interface Bundle {
   killCalls: string[]
   serverSignals: string[]
   events: string[]
-  /** The call timeout each `initClient` call received, in call order (b.jg5 SRJ-213). */
+  /** The call timeout each `initClient` call received, in call order. */
   initClientCalls: number[]
   /**
-   * The gate each `initClient` call asked for, in call order (b.jg5 SRJ-203):
+   * The gate each `initClient` call asked for, in call order:
    * `undefined` for the whole gate, {@link FLOOR_EXEMPT_GATE} for the gate
    * without CSCB's Phase 1 floor.
    */
@@ -833,7 +833,7 @@ function makeDeps(o: Overrides = {}): Bundle {
 /** How the fixture records each `directorList` call in `events` and `directorCallTimes`; it takes no instance id. */
 const LIST_CALL = 'list'
 
-/** The gate `stop --stop-bots` asks for: CSCB's Phase 1 floor left out (b.jg5 SRJ-203, SRJ-902). */
+/** The gate `stop --stop-bots` asks for: CSCB's Phase 1 floor left out. */
 const FLOOR_EXEMPT_GATE: InitClientGateOptions = Object.freeze({ skipPhase1Floor: true })
 
 /** The options each stub client was built with, as `makeStubCreateClient` records them. */
@@ -868,7 +868,7 @@ const tooOldBuild = (calls?: RecordedClientOptions): StubCreateClientOptions => 
 const tooOldRefusal = (): Promise<StartupGateFailedError> => gateRefusalOf(tooOldBuild(), FLOOR_EXEMPT_GATE)
 
 /**
- * One build per refusal kind the whole gate gives (b.jg5 SRJ-203): the
+ * One build per refusal kind the whole gate gives: the
  * client's own too-old refusal, CSCB's floor refusing `DEV_PLACEHOLDER_VERSION`, and
  * another construction failure.
  */
@@ -891,15 +891,14 @@ const stopBotsInitFailed = (description: string): string => agentDirectorInitFai
 
 const startedServer = (b: Bundle): boolean => b.spawnCalls.some((c) => c.args.includes('start'))
 
-/** The fake-clock time of each `directorList` call (`clean_restart`'s answer check, b.jg5 SRJ-906), in call order. */
+/** The fake-clock time of each `directorList` call (`clean_restart`'s answer check), in call order. */
 const listTimesOf = (b: Bundle): number[] => b.directorCallTimes.filter(([call]) => call === LIST_CALL).map(([, at]) => at)
 
 /** The teardown's director verbs, whose calls all come before the answer check's `list`. */
 const TEARDOWN_VERBS = ['status', 'pause', 'kill'] as const
 
 /**
- * `clean_restart` after a failed teardown, agent-director answering (b.jg5
- * SRJ-906): it spawned `stop`, then made `lists` `list` calls (one by
+ * `clean_restart` after a failed teardown, agent-director answering: it spawned `stop()`, then made `lists` `list` calls (one by
  * default), the first after the last teardown call, then spawned `start`, so
  * the server runs again.
  */
@@ -912,7 +911,7 @@ function expectRestarted(b: Bundle, lists = 1): void {
   expect(b.events.lastIndexOf(LIST_CALL)).toBeLessThan(b.events.indexOf('spawnSync:start'))
 }
 
-/** The precheck made exactly one `get` and one one-line `read-pane` of each of `ids`, and of no other instance (b.jg5 SRJ-901). */
+/** The precheck made exactly one `get` and one one-line `read-pane` of each of `ids`, and of no other instance. */
 function expectOnePrecheckEach(b: Bundle, ids: readonly string[]): void {
   const sorted = [...ids].sort()
   expect([...b.getCalls].sort()).toEqual(sorted)
@@ -935,8 +934,7 @@ function makeLiveStopDeps(o: Overrides = {}): Bundle {
 }
 
 // ---------------------------------------------------------------------------
-// The teardown's report and its three destinations (b.jg5 SRJ-907, SRJ-909,
-// SRJ-1013)
+// The teardown's report and its three destinations
 // ---------------------------------------------------------------------------
 
 /** `<stateDir>/startup-errors.log`, where the fixture's recorder writes. */
@@ -987,7 +985,7 @@ const personaOf = (name: string): CliTeardownPersona => ({ name, key: personaKey
 const ALPHA_PERSONA = personaOf(ALPHA.name)
 const BETA_PERSONA = personaOf(BETA.name)
 
-/** What one persona's teardown reports (b.jg5 SRJ-907, SRJ-909): its lines in order and its startup-errors entry. */
+/** What one persona's teardown reports: its lines in order and its startup-errors entry. */
 interface ExpectedReport {
   /** Printed (for `clean_restart` through its fatal path) and appended to `server.log`, one line each. */
   readonly lines: readonly string[]
@@ -1000,7 +998,7 @@ interface ExpectedReport {
 /**
  * A failed persona's report: `teardownFailureLine` over the classifier's
  * class (`errorClass`, checked) and `describeReportedAdFailure`'s redacted
- * description of `error` (SRJ-104; a CONFIG one led by the config file's
+ * description of `error` (a CONFIG one led by the config file's
  * name), naming the persona's session. With `quotes` it is followed by the
  * ordinary version quoting them, ending with the ordinary CLI closing
  * sentence, both recorded as one `persona-kill-failed` entry; without, the
@@ -1060,7 +1058,7 @@ interface ReportDestinations {
 
 /**
  * The teardown's report under `command` is exactly `reports`, in
- * configuration order (b.jg5 SRJ-907, SRJ-909): its lines on the terminal
+ * configuration order: its lines on the terminal
  * once each, in order, and when any persona failed the last line, counting
  * only the failed ones, as the last line of all; one `server.log` line per
  * report line, stamped with the fake clock's time, and one
@@ -1104,7 +1102,7 @@ const callTimesOf = (b: Bundle, verb: string, id: string = opsId()): number[] =>
   b.directorCallTimes.filter(([call]) => call === `${verb}:${id}`).map(([, at]) => at)
 
 // ---------------------------------------------------------------------------
-// start — pre-flight (AC 47, b.av2 SR-8.7, SR-10.2)
+// start — pre-flight
 // ---------------------------------------------------------------------------
 
 describe('start — pre-flight', () => {
@@ -1122,7 +1120,7 @@ describe('start — pre-flight', () => {
   test.each([
     ['unset', undefined],
     ['set to placeholders', 'placeholder-not-a-credential'],
-  ])('AC 47: start passes pre-flight with the token variables %s (they are never read)', async (_label, value) => {
+  ])('start passes pre-flight with the token variables %s (they are never read)', async (_label, value) => {
     for (const name of TOKEN_VARS) {
       if (value === undefined) delete process.env[name]
       else process.env[name] = value
@@ -1137,7 +1135,7 @@ describe('start — pre-flight', () => {
     expect(stderr.join('\n')).not.toContain('missing prerequisite')
   })
 
-  test('AC 47: the code of src/cli.ts names neither SLACK_BOT_TOKEN nor SLACK_APP_TOKEN (static)', () => {
+  test('the code of src/cli.ts names neither SLACK_BOT_TOKEN nor SLACK_APP_TOKEN (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     expect(code).not.toContain('SLACK_BOT_TOKEN')
     expect(code).not.toContain('SLACK_APP_TOKEN')
@@ -1174,7 +1172,7 @@ describe('start — pre-flight', () => {
     expect(b.daemonSpawns).toEqual([])
   })
 
-  test('does NOT probe tmux on PATH (Epic 2: SR-5.1 owns runtime checks)', async () => {
+  test('does NOT probe tmux on PATH (: owns runtime checks)', async () => {
     const b = makeDeps()
     await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
     expect(b.spawnCalls.filter((c) => c.cmd === 'tmux')).toHaveLength(0)
@@ -1182,20 +1180,20 @@ describe('start — pre-flight', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The CLI reads the configuration file the server loads (b.av2 SR-8.7)
+// The CLI reads the configuration file the server loads
 // ---------------------------------------------------------------------------
 
-describe('shared config path (SR-8.7)', () => {
-  /** A pre-persona key E1's loader rejects with its conversion message (b.av2 SR-1.7). */
+describe('shared config path', () => {
+  /** A pre-persona key loader rejects with its conversion message. */
   const PRE_PERSONA_KEY = 'default_route'
   const writePrePersonaFile = (): void => {
     writeConfigFile(stateDir, { [PRE_PERSONA_KEY]: { cwd: join(root, 'work') } })
   }
 
-  test('production deps resolve the state dir and config path with the CLI resolvers (b.fc4) and the loader with the server function (static)', () => {
+  test('production deps resolve the state dir and config path with the CLI resolvers and the loader with the server function (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
-    // b.fc4: the CLI resolves through the fallback that keeps a command on the old directory until the server has moved it.
+    // the CLI resolves through the fallback that keeps a command on the old directory until the server has moved it.
     expect(props.get('resolveStateDir')).toBe('() => resolveCliStateDir()')
     expect(props.get('resolveConfigPath')).toBe('() => resolveCliConfigPath()')
     expect(props.get('loadConfig')).toBe('(path) => readAppliedPersonaConfig(path)')
@@ -1274,7 +1272,7 @@ describe('shared config path (SR-8.7)', () => {
 
     expect(b.serverSignals).toEqual(['SIGTERM'])
     expect(b.exitCodes).toEqual([0])
-    // b.jg5 SRJ-901: no per-persona step (no get or read-pane), and the teardown skipped.
+    // no per-persona step (no get or read-pane), and the teardown skipped.
     expect(b.directorCallTimes).toEqual([])
     expect(stderr.join('\n')).toContain('could not load config — skipping bot teardown')
   })
@@ -1354,7 +1352,7 @@ describe('stop — waits on the injected clock', () => {
 })
 
 // ---------------------------------------------------------------------------
-// stop — server.port goes with the PID file (b.jg5 SRJ-510): removed when the
+// stop — server.port goes with the PID file: removed when the
 // PID is stale and after the server stops or is killed, and on no other path.
 // ---------------------------------------------------------------------------
 
@@ -1413,13 +1411,13 @@ describe('stop — server.port is removed with the PID file', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The last-applied record (b.av2 SR-8.7): settings and persona set come from
+// The last-applied record: settings and persona set come from
 // config.json.last-applied when it exists, from config.json when it does not.
 // Every case goes through the production resolver over real files in the
 // per-test tree.
 // ---------------------------------------------------------------------------
 
-describe('last-applied record (SR-8.7)', () => {
+describe('last-applied record', () => {
   /** Only in the edited config.json: a record-sourced teardown never addresses it. */
   const GAMMA = { name: 'Gamma Bot', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }], permission_prompts: 'C0GAMMA01' }
   const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
@@ -1427,7 +1425,7 @@ describe('last-applied record (SR-8.7)', () => {
   const gammaId = (): string => personaInstanceId(personaKey(GAMMA.name))
 
   /**
-   * The call timeouts of APPLIED and EDITED (b.jg5 SRJ-213): the setting's
+   * The call timeouts of APPLIED and EDITED: the setting's
    * two bounds, so each differs from the other and from the default.
    */
   const APPLIED_CALL_TIMEOUT_MS = MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS
@@ -1511,7 +1509,7 @@ describe('last-applied record (SR-8.7)', () => {
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop (${source})`)
   })
 
-  // b.jg5 SRJ-213: the CLI's client carries the call timeout of the
+  // the CLI's client carries the call timeout of the
   // configuration the server runs, read before the client is built; with a
   // record present, the record's, never the edited config.json's.
   test.each([
@@ -1532,7 +1530,7 @@ describe('last-applied record (SR-8.7)', () => {
     await run(b)
 
     const ids = [alphaId(), betaId()].sort()
-    // b.jg5 SRJ-901: one get and one one-line read-pane of each persona of the configuration the server runs.
+    // one get and one one-line read-pane of each persona of the configuration the server runs.
     expectOnePrecheckEach(b, ids)
     // exit_timeout 0: no status poll after the pause, straight to kill.
     expect([...b.statusCalls].sort()).toEqual(ids)
@@ -1547,7 +1545,7 @@ describe('last-applied record (SR-8.7)', () => {
       expect(startedServer(b)).toBe(true)
     }
     expect(b.initClientCalls).toEqual([APPLIED_CALL_TIMEOUT_MS])
-    // b.jg5 SRJ-203: only stop --stop-bots leaves the floor out.
+    // only stop --stop-bots leaves the floor out.
     expect(b.initClientGates).toEqual([name === 'stop --stop-bots' ? FLOOR_EXEMPT_GATE : undefined])
     // The configuration read that sizes the client comes before it is built,
     // and the client is built before the precheck's first call.
@@ -1568,7 +1566,7 @@ describe('last-applied record (SR-8.7)', () => {
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
   })
 
-  // b.jg5 SRJ-119, SRJ-213: pause waits up to the host's [pause] timeout, so
+  // pause waits up to the host's [pause] timeout, so
   // the client carries CSCB's configured call timeout, sized above that wait;
   // with the key omitted, the default (config.test.ts pins its value).
   /** A configured call timeout strictly between the setting's bounds, and not the default. */
@@ -1734,7 +1732,7 @@ describe('last-applied record (SR-8.7)', () => {
     expect(stderr).toHaveLength(1)
     expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
     expect(stderr[0]).toContain(deletionHint())
-    expect(b.initClientCalls).toEqual([]) // b.jg5 SRJ-213: fatal before any client is built
+    expect(b.initClientCalls).toEqual([]) // fatal before any client is built
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.spawnCalls).toEqual([])
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'clean_restart (malformed record)')
@@ -1761,7 +1759,7 @@ describe('last-applied record (SR-8.7)', () => {
     const stopLine = stderr.filter((l) => l.startsWith(STOP_LOAD_FAILURE_PREFIX))
     expect(stopLine).toHaveLength(1)
     expect(stopLine[0]).toContain(deletionHint())
-    // b.jg5 SRJ-213: the default, never the edited config.json's value.
+    // the default, never the edited config.json's value.
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'stop --stop-bots (malformed record)')
@@ -1916,7 +1914,7 @@ describe('last-applied record (SR-8.7)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// start — waiting for the daemon's startup outcome (b.av2 SR-1.7, SR-8.7)
+// start — waiting for the daemon's startup outcome
 // ---------------------------------------------------------------------------
 
 describe('start — daemon startup wait', () => {
@@ -2010,7 +2008,7 @@ describe('start — daemon startup wait', () => {
     expect(b.exitTimes[0]).toBeLessThan(200 + 2 * DAEMON_STARTUP_POLL_MS)
   })
 
-  // b.fc4: the CLI chose its state directory (`stateDir`, the old one between an
+  // the CLI chose its state directory (`stateDir`, the old one between an
   // upgrade and the first start) before the daemon moved it; the daemon then
   // writes its PID where the server's state directory is, and the parent
   // polls that file too.
@@ -2081,7 +2079,7 @@ describe('start — server.log descriptor', () => {
     expect(b.exitCodes).toEqual([])
   })
 
-  test('production deps open the log for append, close it with closeSync and redirect with initLogging from ./logging.ts (static)', () => {
+  test('production deps open the log for append, close it with closeSync and redirect with initLogging ./logging.ts (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
     expect(props.get('openLogAppend')).toBe("(path) => openSync(path, 'a')")
@@ -2092,7 +2090,7 @@ describe('start — server.log descriptor', () => {
 })
 
 // ---------------------------------------------------------------------------
-// start — session-leader daemonize guard (b.acn)
+// start — session-leader daemonize guard
 //
 // The bug: a leaked _CLI_DAEMON_CHILD marker in the launcher's environment made
 // `start` trust the marker and run the server in-place (child path), inheriting
@@ -2122,14 +2120,14 @@ function readOwnSessionId(): number | null {
   }
 }
 
-describe('start — daemonize session-leader guard (b.acn)', () => {
+describe('start — daemonize session-leader guard', () => {
   beforeEach(() => {
     // PRECONDITION: the leaked-marker tests assume the runner is NOT a session
     // leader. Fail loudly with a self-diagnosing message if it is (e.g. PID 1).
     const sid = readOwnSessionId()
     if (sid !== null && sid === process.pid) {
       throw new Error(
-        `b.acn precondition violated: the test runner IS a session leader ` +
+        `precondition violated: the test runner IS a session leader ` +
         `(session id ${sid} === pid ${process.pid}). The leaked-marker guard ` +
         `tests require a non-session-leader runner. Run the suite as a child ` +
         `process (not PID 1 / not a session leader).`,
@@ -2152,7 +2150,7 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
     expect(child.unrefCalls).toBe(1)
   }
 
-  // REGRESSION (b.acn): fails with pre-fix code, passes with the fix.
+  // REGRESSION: fails with pre-fix code, passes with the fix.
   test('leaked _CLI_DAEMON_CHILD marker (not a session leader) re-detaches instead of running in-place', async () => {
     const b = makeDeps()
     process.env['_CLI_DAEMON_CHILD'] = '1'
@@ -2175,9 +2173,9 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
     expect(b.startServerCalled).toBe(false)
   })
 
-  // b.av2 SR-10.2: `--reconcile-instance-ids` is retired, so `start` no longer
+  // `--reconcile-instance-ids` is retired, so `start` no longer
   // turns it into CSCB_RECONCILE_INSTANCE_IDS for the daemon child.
-  test('--reconcile-instance-ids on argv is not forwarded to the daemon child as CSCB_RECONCILE_INSTANCE_IDS (SR-10.2)', async () => {
+  test('--reconcile-instance-ids on argv is not forwarded to the daemon child as CSCB_RECONCILE_INSTANCE_IDS', async () => {
     const savedEnv = process.env['CSCB_RECONCILE_INSTANCE_IDS']
     // The child env copies process.env, so the runner's own value must not mask a forward.
     delete process.env['CSCB_RECONCILE_INSTANCE_IDS']
@@ -2196,7 +2194,7 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Persona-set teardown (b.av2 SR-8.7): exactly the config's personas, by cscb_<key>
+// Persona-set teardown: exactly the config's personas, by cscb_<key>
 // ---------------------------------------------------------------------------
 
 describe('persona-set teardown', () => {
@@ -2210,7 +2208,7 @@ describe('persona-set teardown', () => {
     const b = makeStopDeps({
       config: twoPersonas(),
       directorStatus: async () => ({ state: 'waiting' }),
-      directorPause: async () => { throw errTmuxSendKeys() }, // GONE: escalate → one kill each (b.jg5 SRJ-903)
+      directorPause: async () => { throw errTmuxSendKeys() }, // GONE: escalate → one kill each
     })
 
     await run(b)
@@ -2264,7 +2262,7 @@ describe('persona-set teardown', () => {
         if (id === alphaId()) throw alphaError
         return { state: 'waiting' }
       },
-      directorPause: async () => { throw errTmuxSendKeys() }, // GONE: one pause, then the kill (b.jg5 SRJ-903)
+      directorPause: async () => { throw errTmuxSendKeys() }, // GONE: one pause, then the kill
     })
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
     expect(b.killCalls).toEqual([betaId()])
@@ -2273,24 +2271,24 @@ describe('persona-set teardown', () => {
     expectRestarted(b)
   })
 
-  // AC 20 (b.av2 SR-10.3): the pause-escalation, timeout-path "kill failed"
+  // the pause-escalation, timeout-path "kill failed"
   // and per-persona teardown failure lines log each error's description
-  // (b.jg5 SRJ-104: the reported name and redacted description of an
+  // (the reported name and redacted description of an
   // agent-director error, else its type, safe code, message through
   // `redactSlackLogText` and frames), never the error itself; the failure
-  // line also names the persona, its session and the class (b.jg5 SRJ-907).
+  // line also names the persona, its session and the class.
   // The errors carry fake tokens (in a message, with a URL); the raw
   // console.error arguments, server.log and startup-errors.log are checked.
   // With a successful pause and `exit_timeout: 0` the poll loop never runs,
   // so the timeout path's kill is reached at once.
-  /** The command's report lines that name a class (SRJ-907's failure lines). */
+  /** The command's report lines that name a class (failure lines). */
   const failureLines = (): string[] => stderr.filter((l) => l.startsWith(`${CLI_COMMAND_CLEAN_RESTART}: `))
 
-  test('AC 20: a pause answering UNAVAILABLE on every try and then its escalation kill failing, with errors carrying fake tokens — the pause and teardown lines name each error with its message redacted; clean_restart exits 1 and, agent-director answering, starts the server again; nothing logged leaks', async () => {
+  test('a pause answering UNAVAILABLE on every try and then its escalation kill failing, with errors carrying fake tokens — the pause and teardown lines name each error with its message redacted; clean_restart exits 1 and, agent-director answering, starts the server again; nothing logged leaks', async () => {
     const killError = new AgentDirectorError('kill', 'ErrKillBroken', `kill refused (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`)
     const b = makeDeps({
       directorStatus: async () => ({ state: 'waiting' }),
-      // A plain Error is UNAVAILABLE: the pause is tried PRECHECK_TRIES times, then escalates (b.jg5 SRJ-903).
+      // A plain Error is UNAVAILABLE: the pause is tried PRECHECK_TRIES times, then escalates.
       directorPause: async () => {
         throw Object.assign(new Error(`pause refused (${sentinelInMessage('pause')})`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
       },
@@ -2313,7 +2311,7 @@ describe('persona-set teardown', () => {
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 
-  test('AC 20: a timeout-path kill failing with an UNAVAILABLE error carrying fake tokens on every try — KILL_RETRY_TRIES kills with a status read before each further one, then the "kill failed" and teardown lines name the error with its message redacted; clean_restart exits 1 and, agent-director answering, starts the server again; nothing logged leaks', async () => {
+  test('a timeout-path kill failing with an UNAVAILABLE error carrying fake tokens on every try — KILL_RETRY_TRIES kills with a status read before each further one, then the "kill failed" and teardown lines name the error with its message redacted; clean_restart exits 1 and, agent-director answering, starts the server again; nothing logged leaks', async () => {
     const killError = Object.assign(new Error(`kill refused (${sentinelInMessage('kill')})`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
     const b = makeDeps({
       config: opsConfig({ exit_timeout: 0 }),
@@ -2327,13 +2325,13 @@ describe('persona-set teardown', () => {
     const ref = renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))
     const line = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment))
     expect(b.pauseCalls).toEqual([opsId()])
-    // A plain Error is UNAVAILABLE: tried KILL_RETRY_TRIES times, one status read before each further try (b.jg5 SRJ-904).
+    // A plain Error is UNAVAILABLE: tried KILL_RETRY_TRIES times, one status read before each further try.
     expect(b.killCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES }, opsId))
     expect(b.statusCalls).toEqual(Array.from({ length: 1 + (KILL_RETRY_TRIES - 1) }, opsId)) // the state read, then one read between each pair of tries
     expect(line('kill failed').map((l) => l.split(' at ')[0])).toEqual([
       `[slack] teardownBots: kill failed for persona ${ref}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
-    // A plain Error is no ErrTmuxKillFailed: no alert follows its line (b.jg5 SRJ-907).
+    // A plain Error is no ErrTmuxKillFailed: no alert follows its line.
     expectReported(b, CLI_COMMAND_CLEAN_RESTART, [failedReport(CLI_COMMAND_CLEAN_RESTART, OPS_PERSONA, killError, AD_ERROR_CLASS_UNAVAILABLE)])
     expect(failureLines()[0]).toContain(`: ${AD_ERROR_CLASS_UNAVAILABLE}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`)
     expect(b.exitCodes).toEqual([1])
@@ -2343,7 +2341,7 @@ describe('persona-set teardown', () => {
 })
 
 // ---------------------------------------------------------------------------
-// clean_restart — SR-11 Event 12: a row with nothing to stop is skipped. The
+// clean_restart — Event 12: a row with nothing to stop is skipped. The
 // pause, the poll and the kill by class are covered for both commands below.
 // ---------------------------------------------------------------------------
 
@@ -2354,7 +2352,7 @@ describe('clean_restart', () => {
     expect(b.statusCalls).toEqual([opsId()])
     expect(b.pauseCalls).toEqual([])
     expect(b.killCalls).toEqual([])
-    // Absent-row (null) → skip + proceed; AD error (throw) → loud abort (b.qwo below).
+    // Absent-row (null) → skip + proceed; AD error (throw) → loud abort (below).
     expect(b.exitCodes).not.toContain(1)
     expect(startedServer(b)).toBe(true)
   })
@@ -2379,7 +2377,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
   /** Each case's fatal lines, in order: each terminal line starts with its entry. */
   const FATAL: Array<[string, Overrides, () => string[]]> = [
     ['config load fails', { loadConfig: () => { throw new Error('config boom') } }, () => ['[slack] clean_restart: failed to load config: config boom']],
-    // b.jg5 SRJ-901: an initialization failure is a precheck failure; it stops nothing and says so.
+    // an initialization failure is a precheck failure; it stops nothing and says so.
     [
       'agent-director initialization fails',
       { initClient: async () => { throw initError } },
@@ -2388,7 +2386,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
         precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART),
       ],
     ],
-    // b.jg5 SRJ-906, SRJ-907: agent-director answers, so the server is started (its lines are log only); the
+    // agent-director answers, so the server is started (its lines are log only); the
     // persona's failure line, then the last line, printed last.
     [
       'teardown fails',
@@ -2398,7 +2396,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
         teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, 1),
       ],
     ],
-    // b.jg5 SRJ-906: the start after the failed teardown fails: its start-failed line before the last line.
+    // the start after the failed teardown fails: its start-failed line before the last line.
     [
       'teardown fails, then the start fails',
       { directorStatus: async () => { throw teardownError }, spawnSyncStatus: 3 },
@@ -2408,7 +2406,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
         teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, 1),
       ],
     ],
-    // b.jg5 SRJ-906, SRJ-1013: agent-director does not answer: the not-restarted alert before the last line; each
+    // agent-director does not answer: the not-restarted alert before the last line; each
     // failed list try's line is log only.
     [
       'teardown fails and agent-director does not answer',
@@ -2464,7 +2462,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
 })
 
 // ---------------------------------------------------------------------------
-// createDirectorOps — the production director deps (b.qwo, b.dnt)
+// createDirectorOps — the production director deps
 // ---------------------------------------------------------------------------
 
 describe('createDirectorOps', () => {
@@ -2511,10 +2509,10 @@ describe('createDirectorOps', () => {
    * AgentDirectorError merely named ErrSpawnNotFound is not that class and
    * rejects like any other error. Every other op, and every other error, rejects
    * with the same value: the precheck classifies its get and read-pane errors
-   * itself (b.jg5 SRJ-117, SRJ-901; ErrSpawnNotFound takes read-pane's GONE
+   * itself (ErrSpawnNotFound takes read-pane's GONE
    * column), the teardown's checked kill reads ErrSpawnNotFound as a success
-   * (SRJ-110, SRJ-904), and the answer check counts every list error, CONFIG
-   * included, as a failed try (SRJ-906).
+   * and the answer check counts every list error, CONFIG
+   * included, as a failed try.
    */
   const OP_ERRORS: ReadonlyArray<readonly [string, () => unknown, missingRow: boolean]> = [
     ['ErrSpawnNotFound', () => errSpawnNotFound(), true],
@@ -2544,7 +2542,7 @@ describe('createDirectorOps', () => {
     },
   )
 
-  test('directorList makes one list whose request is exactly the service label filter, and answers the Client\'s rows unchanged (b.jg5 SRJ-906)', async () => {
+  test('directorList makes one list whose request is exactly the service label filter, and answers the Client\'s rows unchanged', async () => {
     const { client, calls } = fakeClient()
     expect(await createDirectorOps(() => client).directorList()).toEqual([LIST_ROW])
     expect(calls).toEqual([['list', { label: [SERVICE_LABEL] }]])
@@ -2552,8 +2550,8 @@ describe('createDirectorOps', () => {
     assertNoLeak({ calls })
   })
 
-  // b.jg5 SRJ-110, SRJ-904: the kill result goes to the teardown's checked kill as the Client answered it, and the
-  // request is the instance ID alone (never include_finished, SRJ-106).
+  // the kill result goes to the teardown's checked kill as the Client answered it, and the
+  // request is the instance ID alone (never include_finished).
   test.each([
     ['kill_sent true', cannedKillResult(true)],
     ['kill_sent false', cannedKillResult(false)],
@@ -2613,14 +2611,14 @@ describe('createDirectorOps', () => {
 })
 
 // ---------------------------------------------------------------------------
-// stop — b.4dk `--stop-bots` graceful bot teardown
+// stop — `--stop-bots` graceful bot teardown
 //
 // `stop({ stopBots: true })` reuses clean_restart's per-persona pause/poll/kill
 // teardown (teardownBots) AFTER stopping the server. Plain `stop()` never
 // touches the director verbs — bots survive server restarts.
 // ---------------------------------------------------------------------------
 
-describe('stop --stop-bots (b.4dk)', () => {
+describe('stop --stop-bots', () => {
   test('stopBots: a config load error does NOT block server stop and runs no director verb', async () => {
     const b = makeStopDeps({ loadConfig: () => { throw new Error('config boom') } })
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
@@ -2628,8 +2626,8 @@ describe('stop --stop-bots (b.4dk)', () => {
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
   })
 
-  // b.4dk ordering: the server is stopped BEFORE any bot teardown begins, so the
-  // live daemon cannot respawn a persona mid-teardown. b.jg5 SRJ-901: the
+  // ordering: the server is stopped BEFORE any bot teardown begins, so the
+  // live daemon cannot respawn a persona mid-teardown. the
   // precheck's get and read-pane come before the server stop, so a failed
   // precheck stops nothing.
   test('stopBots: every precheck call precedes the server SIGTERM, which precedes the teardown\'s first status, pause and kill (teardown-first regression guard)', async () => {
@@ -2662,20 +2660,20 @@ describe('stop --stop-bots (b.4dk)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.qwo — AD-unreachable teardown must fail LOUDLY, never a silent no-op
+// AD-unreachable teardown must fail LOUDLY, never a silent no-op
 //
-// Root cause (b.qps / incident-2026-09-18): getClient() threw in the short-lived
+// Root cause (/ incident-2026-09-18): getClient threw in the short-lived
 // CLI process (no server startup gate) and the error was collapsed into a
 // per-bot "no spawn row — skipping". Every bot was skipped and clean_restart
 // proceeded to `start`. Now directorStatus errors propagate (null only for
 // ErrSpawnNotFound) and fail that persona, which gets its failure line;
 // clean_restart and `stop --stop-bots` then exit(1). `stop --stop-bots` never
 // starts; clean_restart starts only once agent-director answers its `list`
-// (b.jg5 SRJ-906).
+//.
 // ---------------------------------------------------------------------------
 
-describe('b.qwo — teardown fails loudly when agent-director is unreachable', () => {
-  // b.jg5 SRJ-906: agent-director unreachable at the teardown and at the answer check's list: no start.
+describe('teardown fails loudly when agent-director is unreachable', () => {
+  // agent-director unreachable at the teardown and at the answer check's list: no start.
   test.each([
     ['a connection error', () => new Error('AD connection refused')],
     ['ErrCallTimeout', () => new ErrCallTimeout('status', 35000, 30000)],
@@ -2698,7 +2696,7 @@ describe('b.qwo — teardown fails loudly when agent-director is unreachable', (
   })
 })
 
-describe('b.qwo — initClient startup gate', () => {
+describe('initClient startup gate', () => {
   test('clean_restart calls initClient once, with the configuration\'s call timeout, before any director verb; then the precheck, then the stop spawn, then the teardown', async () => {
     let n = 0
     const b = makeDeps({
@@ -2707,7 +2705,7 @@ describe('b.qwo — initClient startup gate', () => {
     })
     await createCli(b.deps).clean_restart()
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
-    // b.jg5 SRJ-901: init, get, read-pane, the stop spawn, then the teardown's status and pause, then start.
+    // init, get, read-pane, the stop spawn, then the teardown's status and pause, then start.
     expect(b.events.filter((e) => e !== 'loadConfig' && e !== 'initLogging' && e !== 'sleep')).toEqual([
       'initClient',
       `${PRECHECK_CALL_GET}:${opsId()}`,
@@ -2721,7 +2719,7 @@ describe('b.qwo — initClient startup gate', () => {
     assertNoLeak({ stderr, events: b.events })
   })
 
-  // b.jg5 SRJ-213: an unreadable configuration still builds the client, with
+  // an unreadable configuration still builds the client, with
   // the default call timeout, after the failed read; teardown is skipped and
   // the stop's exit code is unchanged.
   test('stop --stop-bots whose configuration cannot be read: the read comes first, then initClient once with the default call timeout; teardown skipped, exit 0', async () => {
@@ -2743,7 +2741,7 @@ describe('b.qwo — initClient startup gate', () => {
   test.each<[string, (b: Bundle) => Promise<void>]>([
     ['plain stop', (b) => createCli(b.deps).stop()],
     ['credentials <persona>', (b) => createCli(b.deps).credentials([OPS_NAME])],
-  ])('%s builds no agent-director client, even with initClient wired (b.jg5 SRJ-203)', async (_label, run) => {
+  ])('%s builds no agent-director client, even with initClient wired', async (_label, run) => {
     const b = makeLiveStopDeps({ initClient: async () => { /* gate ok */ } })
     await expect(run(b)).rejects.toBeInstanceOf(ExitError)
     expect(b.exitCodes).toEqual([0])
@@ -2754,7 +2752,7 @@ describe('b.qwo — initClient startup gate', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The precheck (b.jg5 SRJ-901; SRJ-117's CLI-precheck column; AC 74)
+// The precheck (CLI-precheck column)
 //
 // Before either command stops anything, it reads each persona of the
 // configuration the server runs: one `get` of `cscb_<key>` and, for a live
@@ -2785,7 +2783,7 @@ function forEachCommand<S>(rows: ReadonlyArray<readonly [string, S]>): Array<rea
   return COMMANDS.flatMap((cmd) => rows.map(([label, spec]) => [cmd[0], label, spec, cmd] as const))
 }
 
-describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
+describe('precheck before anything is stopped', () => {
   const idOf = (p: CliTeardownPersona): string => personaInstanceId(p.key)
 
   /** The failure the precheck reports for `error` thrown by `call` (the verdict is tests/cli-teardown.test.ts's). */
@@ -2861,7 +2859,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`a finished row (${state})`, async () => ({ state })] as const),
     ['no row (null)', async () => null],
     ['no row (ErrSpawnNotFound thrown at the get)', async () => { throw errSpawnNotFound() }],
-  ]))('%s: %s is skipped: one get, no read-pane, and the command goes on (AC 74: skips finished rows)', async (command, _label, answer, [, make, run]) => {
+  ]))('%s: %s is skipped: one get, no read-pane, and the command goes on (skips finished rows)', async (command, _label, answer, [, make, run]) => {
     const b = make({ directorGet: answer })
     await run(b)
     expect(b.getCalls).toEqual([idOf(OPS_PERSONA)])
@@ -2870,11 +2868,11 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  // SRJ-901 step 5 and SRJ-114: a note alone fails nothing; the read-pane decides. SRJ-513 latches only in the server.
+  // step 5 and a note alone fails nothing; the read-pane decides. latches only in the server.
   test.each(forEachCommand<PrecheckRow>([
     [`a live row carrying the ${provenanceNote} note`, { state: 'waiting', liveness_note: provenanceNote }],
     ['a pending row with no launch start', { state: AGENT_DIRECTOR_PENDING_STATE }],
-  ]))('%s: %s gets its one-line read-pane and passes on a pane (AC 74)', async (command, _label, row, [, make, run]) => {
+  ]))('%s: %s gets its one-line read-pane and passes on a pane', async (command, _label, row, [, make, run]) => {
     const b = make({ directorGet: async () => row })
     await run(b)
     expect(b.readPaneCalls).toEqual(opsPaneReads(1))
@@ -2883,7 +2881,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // SRJ-117's CLI-precheck column, one case per cell, at read-pane and at get
+  // CLI-precheck column, one case per cell, at read-pane and at get
   // -------------------------------------------------------------------------
 
   const PASSES = 'passes'
@@ -2919,7 +2917,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   })
 
   // A get's UNAVAILABLE is retried and its CONFIG fails at once; every other class fails with no retry and no
-  // read-pane, a class SRJ-117 gives a get no meaning for reported as UNCLASSIFIED.
+  // read-pane, a class gives a get no meaning for reported as UNCLASSIFIED.
   const GET_CELLS: ReadonlyArray<readonly [string, Cell]> = [
     ...UNAVAILABLE_FORMS.map(([label, make]) => [`UNAVAILABLE (${label})`, cell(() => make(PRECHECK_CALL_GET), RETRIED, AD_ERROR_CLASS_UNAVAILABLE)] as const),
     ['CONFIG (ErrConfigMalformed)', cell(() => errConfigMalformed(), FAILS_AT_ONCE, AD_ERROR_CLASS_CONFIG)],
@@ -2950,7 +2948,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   test.each(forEachCommand<PrecheckCall>([
     ['get', PRECHECK_CALL_GET],
     ['read-pane', PRECHECK_CALL_READ_PANE],
-  ]))('%s: a %s answering UNAVAILABLE every time is called at t, t + gap and t + 2 gaps on the fake clock, never a fourth time; the persona is named and nothing is stopped (AC 74)', async (command, _label, call, [, make, run]) => {
+  ]))('%s: a %s answering UNAVAILABLE every time is called at t, t + gap and t + 2 gaps on the fake clock, never a fourth time; the persona is named and nothing is stopped', async (command, _label, call, [, make, run]) => {
     const error = errTmuxUnresponsive(call)
     const throwIt = async (): Promise<never> => { throw error }
     const b = make(call === PRECHECK_CALL_GET ? { directorGet: throwIt } : { directorReadPane: throwIt })
@@ -3075,7 +3073,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  // SRJ-114, SRJ-115, SRJ-801: the precheck latches nothing, writes no record and never clears a retired-key entry.
+  // the precheck latches nothing, writes no record and never clears a retired-key entry.
   test.each(forEachCommand<Overrides>([
     [`a live row carrying the ${provenanceNote} note (passes)`, { directorGet: async () => ({ state: 'waiting', liveness_note: provenanceNote }) }],
     ['a pending row with no launch start (passes)', { directorGet: async () => ({ state: AGENT_DIRECTOR_PENDING_STATE }) }],
@@ -3092,14 +3090,14 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   })
 
   // The CLI's clock is pinned under the kill's describe (Date.now and setTimeout only in realDeps) and its tries
-  // under callWithCliTries. The stored-choice module is the server's alone too (b.deo SRI-401).
+  // under callWithCliTries. The stored-choice module is the server's alone too.
   test('src/cli.ts imports nothing from the session manager, the conflict latch, the retired-key record module or the stored-choice module (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     const banned = ['./session-manager.ts', './conflict-latch.ts', './retired-keys.ts', './channel-delivery.ts']
     expect(importedSpecifiers(code).filter((s) => banned.includes(s))).toEqual([])
   })
 
-  // SRJ-613 (E19 note): a pane passes the precheck but proves nothing; the teardown's own calls are the backstop.
+  // ( note): a pane passes the precheck but proves nothing; the teardown's own calls are the backstop.
   test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, the server is stopped and the teardown still makes its own status, pause and kill; a kill answering CONFLICT "not this launch\'s session" fails the teardown (exit 1) with its line naming the session, and latches nothing', async (command, make, run) => {
     const conflict = errTmuxSessionConflict('kill', 'not-this-launch', personaTmuxSessionName(OPS_PERSONA.key))
     const b = make({
@@ -3111,7 +3109,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     await run(b)
     expect(b.readPaneCalls).toEqual(opsPaneReads(1))
     expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[idOf(OPS_PERSONA)], [idOf(OPS_PERSONA)], [idOf(OPS_PERSONA)]])
-    // stop --stop-bots stays stopped; clean_restart, agent-director answering, starts the server again (b.jg5 SRJ-905, SRJ-906).
+    // stop --stop-bots stays stopped; clean_restart, agent-director answering, starts the server again.
     expectTeardownFailed(b, command, [failedReport(command, OPS_PERSONA, conflict, AD_ERROR_CLASS_CONFLICT)])
     expect(snapshotTreeExceptTeardownLogs()).toEqual(before)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
@@ -3119,8 +3117,8 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The teardown's pause by class (b.jg5 SRJ-903, SRJ-119; AC 73's and AC 4's
-// unit halves; hatch note E12)
+// The teardown's pause by class (and
+// unit halves; design note )
 //
 // After a passed precheck and the server stop, each persona's teardown reads
 // its row, then pauses a live row and decides the pause's answer by class:
@@ -3131,7 +3129,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
 // The verdict per answer is tests/cli-teardown.test.ts's; here each class's
 // calls, times, exit and report: a failed pause gives its failure line alone
 // (no kill-failure alert), recorded under `cli-teardown-failed`, then the
-// last line (b.jg5 SRJ-907, SRJ-909).
+// last line.
 // ---------------------------------------------------------------------------
 
 /** A `status` row: the fixture's `directorStatus` answer. */
@@ -3145,8 +3143,7 @@ const ENDED_ROW: StatusRow = Object.freeze({ state: 'ended' })
  * failure path: no answer-check `list` and no `clean-restart-not-restarted`
  * entry. The report is `reports` alone: none by default, so no line is
  * printed and neither log file is written; a persona stopped with the
- * survivor version has its survivor report and counts as stopped (b.jg5
- * SRJ-904, SRJ-905, SRJ-906; AC 64).
+ * survivor version has its survivor report and counts as stopped.
  */
 function expectTeardownStopped(b: Bundle, command: CliTeardownCommand, reports: readonly ExpectedReport[] = [], to: ReportDestinations = {}): void {
   expect(listTimesOf(b)).toEqual([])
@@ -3164,8 +3161,7 @@ function expectTeardownStopped(b: Bundle, command: CliTeardownCommand, reports: 
 
 /**
  * At least one persona failed: exit 1 after the server stop, and the report
- * is exactly `reports`, in configuration order, then the last line (b.jg5
- * SRJ-905, SRJ-906, SRJ-907, SRJ-909). `stop --stop-bots` spawns no start and
+ * is exactly `reports`, in configuration order, then the last line. `stop --stop-bots` spawns no start and
  * makes no `list`, so the server stays stopped; `clean_restart`, whose
  * fixture `list` answers by default, restarts the server
  * ({@link expectRestarted}) and records no `clean-restart-not-restarted`
@@ -3189,7 +3185,7 @@ type PauseClassCase = readonly [make: () => unknown, outcome: typeof PAUSE_VERDI
 
 const PAUSE_VERB = 'pause'
 
-/** SRJ-903's table at the pause, one row per class or form. */
+/** table at the pause, one row per class or form. */
 const PAUSE_CLASS_ROWS: ReadonlyArray<readonly [string, PauseClassCase]> = [
   ['GONE (ErrTmuxSendKeys)', [() => errTmuxSendKeys(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_GONE]],
   ...UNAVAILABLE_FORMS.map(([label, make]) => [`UNAVAILABLE (${label})`, [() => make(PAUSE_VERB), PAUSE_VERDICT_RETRY, AD_ERROR_CLASS_UNAVAILABLE]] as const),
@@ -3212,7 +3208,7 @@ const PAUSE_CLASS_ROWS: ReadonlyArray<readonly [string, PauseClassCase]> = [
   ['DIRECTORY (ErrCwdNotFound)', [() => errCwdNotFound(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_DIRECTORY]],
 ]
 
-describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)', () => {
+describe('the teardown\'s pause by class', () => {
   const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
   const betaId = (): string => personaInstanceId(personaKey(BETA.name))
 
@@ -3228,7 +3224,7 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
     expect(b.statusCalls).toEqual([opsId()])
     if (outcome === PAUSE_VERDICT_FAIL) {
       expect([pauses.length, kills]).toEqual([1, []])
-      // A failed pause carries no kill-failure alert: its line alone, under cli-teardown-failed (b.jg5 SRJ-907, SRJ-909).
+      // A failed pause carries no kill-failure alert: its line alone, under cli-teardown-failed.
       expectTeardownFailed(b, command, [failedReport(command, OPS_PERSONA, error, errorClass)])
     } else {
       // UNAVAILABLE: exactly PRECHECK_TRIES pauses at t, t + gap, t + 2 gaps; then, like every escalation, one kill at once.
@@ -3264,8 +3260,8 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  // AC 4's unit half: a launch in progress cannot be paused, and the kill ends it.
-  test.each(COMMANDS)('%s: AC 4: a persona pending at its dialog: the state read finds pending, the pause answers ErrSpawnNotPausable and the kill succeeds: one pause, one kill, every persona stopped (clean_restart goes on to its start)', async (command, make, run) => {
+  // unit half: a launch in progress cannot be paused, and the kill ends it.
+  test.each(COMMANDS)('%s: a persona pending at its dialog: the state read finds pending, the pause answers ErrSpawnNotPausable and the kill succeeds: one pause, one kill, every persona stopped (clean_restart goes on to its start)', async (command, make, run) => {
     const pending = { state: AGENT_DIRECTOR_PENDING_STATE }
     const b = make({
       directorGet: async () => pending,
@@ -3298,7 +3294,7 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  // E32's SRJ-613 backstop, pause leg: a pane passes the precheck but proves nothing; the pause answers CONFLICT.
+  // backstop, pause leg: a pane passes the precheck but proves nothing; the pause answers CONFLICT.
   test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, a pause answering CONFLICT "not this launch\'s session" fails that persona with no kill; exit 1, nothing is latched, and nothing is written but its server.log line and startup-errors entry', async (command, make, run) => {
     const conflict = errTmuxSessionConflict(PAUSE_VERB, 'not-this-launch', personaTmuxSessionName(personaKey(OPS_NAME)))
     const b = make({ directorStatus: async () => WAITING_ROW, directorPause: async () => { throw conflict } })
@@ -3315,7 +3311,7 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
 })
 
 // ---------------------------------------------------------------------------
-// The teardown's state read and poll (b.jg5 SRJ-903, SRJ-908; hatch note E24)
+// The teardown's state read and poll (design note )
 //
 // After a successful pause the teardown reads the row on the injected clock,
 // the first wait TEARDOWN_POLL_FIRST_WAIT_MS, each later one doubled up to
@@ -3323,10 +3319,10 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
 // row is ended, missing or absent; at exit_timeout it kills, and never later.
 // The state read before the pause and every poll read fail the persona at
 // once on any error but ErrSpawnNotFound, with no retry. The poll reads and
-// writes no record and never clears a retired-key entry (SRJ-801).
+// writes no record and never clears a retired-key entry.
 // ---------------------------------------------------------------------------
 
-describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-903, SRJ-908; hatch note E24)', () => {
+describe('the teardown\'s state read and poll on the injected clock (hatch note )', () => {
   /** The poll's read times after a pause at `pausedAt` with `exitTimeoutS`: the doubling waits, the last cut short at the deadline. */
   function pollReadTimes(pausedAt: number, exitTimeoutS: number): number[] {
     const deadline = pausedAt + exitTimeoutMsOf(exitTimeoutS)
@@ -3372,7 +3368,7 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
     ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`a ${state} row`, { state }] as const),
     ['no row (null)', null],
     ['no row (ErrSpawnNotFound thrown)', thrown(errSpawnNotFound())],
-  ]))('%s: a poll read finding %s ends the teardown as stopped, with no kill (b.4dk: both commands share one teardown)', async (command, _label, answer, [, make, run]) => {
+  ]))('%s: a poll read finding %s ends the teardown as stopped, with no kill (both commands share one teardown)', async (command, _label, answer, [, make, run]) => {
     const b = make({ directorStatus: scripted<{ state: string } | null>(WAITING_ROW, answer) })
 
     await run(b)
@@ -3417,7 +3413,7 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  // Hatch note E24: the poll is an SRJ-115 site; the CLI never writes retired-keys.json (SRJ-801).
+  // design note : the poll is an site; the CLI never writes retired-keys.json.
   test.each(forEachCommand([
     ['a seeded retired-key record whose marked key is the persona\'s', true],
     ['no retired-key record', false],
@@ -3437,8 +3433,8 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
 })
 
 // ---------------------------------------------------------------------------
-// The teardown's kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64, AC 73,
-// AC 77; hatch notes E12, E16, E20, E24, E32)
+// The teardown's kill by class (
+// design notes )
 //
 // After an escalated pause, or at exit_timeout after a successful pause, the
 // teardown makes the bounded retry of checked kills on the injected clock: a
@@ -3454,12 +3450,12 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
 // so a GONE answer is a non-success the retry logs as such and never tries
 // again; after a survivor-naming try its end line carries alert=ordinary. The
 // mapping of each retry result is tests/cli-teardown.test.ts's. Each case
-// checks the persona's report (b.jg5 SRJ-907, SRJ-909): a failure line, then
+// checks the persona's report: a failure line, then
 // the kill-failure alert's ordinary version exactly after an ErrTmuxKillFailed
 // that stands or any failure after a survivor-naming try (GONE included),
 // quoting the descriptions the retry's decision carries; or, for a persona
 // stopped after a survivor-naming try, the survivor version alone, the
-// persona counting as stopped (AC 64).
+// persona counting as stopped.
 // ---------------------------------------------------------------------------
 
 const KILL_VERB = 'kill'
@@ -3553,7 +3549,7 @@ function forEachKillPath<T>(rows: ReadonlyArray<readonly [string, () => T]>, lea
     rows.map(([label, make]) => [`${path}, ${lead}${label}`, { overrides, make }] as const)))
 }
 
-/** The ErrTmuxKillFailed whose description names a surviving pid (b.jg5 SRJ-702). */
+/** The ErrTmuxKillFailed whose description names a surviving pid. */
 const survivorKillFailed = (): unknown => errTmuxKillFailed(opsSession(), 'pane-process-survived')
 
 /** The head of every line the Ops persona's kill retry logs. */
@@ -3562,7 +3558,7 @@ const opsKillLogPrefix = (): string => `[slack] teardownBots: persona ${renderPe
 /** The lines the Ops persona's kill retry logged (each try, read, stop and end), in order. */
 const opsKillRetryLines = (): string[] => stderr.filter((l) => l.startsWith(`${opsKillLogPrefix()}: `))
 
-/** A kill answer each try that is no success and is never tried again, with its class (b.jg5 SRJ-904 bullets 3 and 4). */
+/** A kill answer each try that is no success and is never tried again, with its class (bullets 3 and 4). */
 const FAIL_AT_ONCE_ANSWERS: ReadonlyArray<readonly [string, () => unknown, AdErrorClass, names: readonly string[]]> = [
   ...CONFLICT_CASES.map((c) => [`CONFLICT (${c})`, () => errTmuxSessionConflict(KILL_VERB, c, opsSession()), AD_ERROR_CLASS_CONFLICT, [opsSession()]] as const),
   ['ENVIRONMENT (ErrTmuxNotAvailable, tmux not runnable)', () => errTmuxNotAvailable(undefined, KILL_VERB), AD_ERROR_CLASS_ENVIRONMENT, []],
@@ -3579,7 +3575,7 @@ const FAIL_AT_ONCE_ANSWERS: ReadonlyArray<readonly [string, () => unknown, AdErr
   ['CONFIG (ErrConfigMalformed) at a try', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, []],
 ]
 
-/** Kill answers SRJ-904 lists under no class of its own: each fails at once with the classifier's class, never UNCLASSIFIED (hatch A3). */
+/** Kill answers lists under no class of its own: each fails at once with the classifier's class, never UNCLASSIFIED (hatch A3). */
 const UNLISTED_ANSWERS: ReadonlyArray<readonly [string, () => unknown, AdErrorClass]> = [
   ['GONE (ErrTmuxSendKeys)', () => errTmuxSendKeys(), AD_ERROR_CLASS_GONE],
   ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(opsSession(), KILL_VERB), AD_ERROR_CLASS_GONE],
@@ -3595,25 +3591,25 @@ const GONE_KILL_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> = UNLIS
 
 /**
  * Every UNAVAILABLE kill answer but ErrTmuxKillFailed: each failure after its
- * tries, with no kill-failure alert (b.jg5 SRJ-907).
+ * tries, with no kill-failure alert.
  */
 const UNAVAILABLE_KILL_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> =
   UNAVAILABLE_FORMS.filter(([label]) => label !== 'ErrTmuxKillFailed').map(([label, make]) => [label, () => make(KILL_VERB)] as const)
 
-/** SRJ-904's kill answers, one row each, with the reads between tries that each one meets. */
+/** kill answers, one row each, with the reads between tries that each one meets. */
 const KILL_CLASS_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   // Success forms: one kill, no read.
   ['kill_sent true (a success)', () => stops([cannedKillResult(true)], [1, 0])],
   ['kill_sent false (a success)', () => stops([cannedKillResult(false)], [1, 0])],
   ['no kill_sent from a binary older than Phase 1 (a plain success)', () => stops([cannedKillResult()], [1, 0])],
-  ['ErrSpawnNotFound (a success: b.dnt\'s already-gone race)', () => stops([thrown(errSpawnNotFound())], [1, 0])],
-  // UNAVAILABLE: KILL_RETRY_TRIES kills, a read before each further one, then the persona fails (b.dnt: agent-director
+  ['ErrSpawnNotFound (a success: already-gone race)', () => stops([thrown(errSpawnNotFound())], [1, 0])],
+  // UNAVAILABLE: KILL_RETRY_TRIES kills, a read before each further one, then the persona fails (agent-director
   // dying mid-teardown fails it loudly).
   ...UNAVAILABLE_KILL_ANSWERS.map(([label, make]) => [`UNAVAILABLE (${label}) on every try`, (): KillCase => {
     const error = make()
     return { kills: [thrown(error)], calls: [KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1], fails: [error, AD_ERROR_CLASS_UNAVAILABLE] }
   }] as const),
-  // ErrTmuxKillFailed standing after the tries, one row per description: the ordinary version quotes it (b.jg5 SRJ-907, SRJ-1007).
+  // ErrTmuxKillFailed standing after the tries, one row per description: the ordinary version quotes it.
   ...KILL_FAILED_DESCRIPTIONS.map((d) => [`UNAVAILABLE (ErrTmuxKillFailed, ${d}) on every try`, (): KillCase => {
     const error = errTmuxKillFailed(opsSession(), d)
     return {
@@ -3655,9 +3651,9 @@ const KILL_READ_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
 /**
  * A survivor-naming ErrTmuxKillFailed at the first try, then each end of the
  * tries: an end as a success stops the persona with the survivor version
- * (AC 64); any failure, whatever its class, fails it with the ordinary
+ * any failure, whatever its class, fails it with the ordinary
  * version quoting the survivor-naming description, never the survivor one
- * (b.jg5 SRJ-904 bullet 7, SRJ-907).
+ * (bullet 7).
  */
 const KILL_SURVIVOR_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   ['a read of ended (stopped)', () => stopsWithSurvivor([thrown(survivorKillFailed())], [1, 1], [ENDED_ROW])],
@@ -3701,7 +3697,7 @@ const KILL_SURVIVOR_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
  * or, when stopped, the survivor version when `kc.survivor` is set, else
  * nothing), the exit, a state directory unchanged but for the report's two
  * log files, and no leak. The CLI builds no Slack client and makes no Slack
- * call while the teardown runs (b.jg5 SRJ-1002, SRJ-909; AC 64): a Web API
+ * call while the teardown runs: a Web API
  * call or a Socket Mode start throws, and neither is made.
  */
 async function runKillCase(command: CliTeardownCommand, [, mk, run]: Command, overrides: () => Overrides, kc: KillCase): Promise<Bundle> {
@@ -3734,7 +3730,7 @@ async function runKillCase(command: CliTeardownCommand, [, mk, run]: Command, ov
   return b
 }
 
-describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64, AC 73, AC 77)', () => {
+describe('the teardown\'s kill by class', () => {
   test.each(forEachKillPath(KILL_CLASS_ROWS, 'a kill answering '))('%s: %s', async (command, _label, { overrides, make }, cmd) => {
     await runKillCase(command, cmd, overrides, make())
   })
@@ -3772,7 +3768,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
     expect(stderr.filter((l) => l.includes(KILL_OUTCOME_SESSION_GONE))).toEqual([])
   })
 
-  test('the rows reach every class SRJ-904 names at the kill and every unlisted one, a success, a retry, and both reads that end the tries', () => {
+  test('the rows reach every class names at the kill and every unlisted one, a success, a retry, and both reads that end the tries', () => {
     const failed = [...KILL_CLASS_ROWS, ...KILL_SURVIVOR_ROWS].flatMap(([, make]) => {
       const { fails } = make()
       return fails === null ? [] : [fails[1]]
@@ -3828,7 +3824,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
     expect(lines.filter((l) => l.includes('stop before try'))).toEqual([])
   })
 
-  // b.jg5 SRJ-1014 (SRJ-702's lines; hatch note E33): the teardown's kill
+  // (lines; design note ): the teardown's kill
   // writes each try line, each between-try status read line and its end line
   // through the kill retry's own builders, with the teardown's prefix; a fake
   // token in a try's or a read's description comes out redacted. The text of
@@ -3878,7 +3874,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
     assertNoLeak({ lines })
   })
 
-  // Hatch note E24: the reads between tries are SRJ-115 sites; the CLI never writes retired-keys.json (SRJ-801).
+  // design note : the reads between tries are sites; the CLI never writes retired-keys.json.
   test.each(COMMANDS)('%s: the reads between kill tries of a key the seeded retired-key record marks leave the record byte-identical', async (command, make, run) => {
     writeRetiredKeysRecord(stateDir, { [personaKey(OPS_NAME)]: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark: true } })
     const record = new Uint8Array(readFileSync(retiredKeysPath(stateDir)))
@@ -3887,7 +3883,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
     expect(new Uint8Array(readFileSync(retiredKeysPath(stateDir))) as Uint8Array).toEqual(record)
   })
 
-  test('static (comments stripped): Date.now and setTimeout appear in src/cli.ts only as realDeps\' now and sleep, and no agent-director error is told apart with instanceof on an Err* class (b.jg5 SRJ-908; hatch notes E12, E20)', () => {
+  test('static (comments stripped): Date.now and setTimeout appear in src/cli.ts only as realDeps\' now and sleep, and no agent-director error is told apart with instanceof on an Err* class (hatch notes , )', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     const main = indicesOf(/\bif\s*\(\s*import\.meta\.main\s*\)/g, code)
     expect(main).toHaveLength(1)
@@ -3904,8 +3900,8 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
 })
 
 // ---------------------------------------------------------------------------
-// A human-initiated teardown's kill of a row the server would hold (b.jg5
-// SRJ-503, SRJ-513 bullet 2; AC 4, AC 46; hatch notes E16, E32 bullet 2)
+// A human-initiated teardown's kill of a row the server would hold (
+// bullet 2; design notes bullet 2)
 //
 // The CLI has no latch: a pending row with no launch start gets its pause
 // (ErrSpawnNotPausable) and then the ordinary checked kill, and a finished
@@ -3913,7 +3909,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
 // director ops, every kill request is the instance id alone.
 // ---------------------------------------------------------------------------
 
-describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; AC 4, AC 46)', () => {
+describe('a human-initiated teardown\'s ordinary kill', () => {
   /** A pending row with no launch start, as `status` and `get` show it. */
   const pendingNoLaunchStart = (): StatusRow & PrecheckRow =>
     cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
@@ -3936,7 +3932,7 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  // E32 bullet 2's pending-row leg: the precheck's pane proves nothing; the kill answers CONFLICT.
+  // bullet 2's pending-row leg: the precheck's pane proves nothing; the kill answers CONFLICT.
   test.each(COMMANDS)('%s: the same pending row whose kill answers CONFLICT "not this launch\'s session": that persona fails at once after one kill and no read; exit 1, nothing latched and the seeded retired-key record byte-identical', async (command, make, run) => {
     writeRetiredKeysRecord(stateDir, { [personaKey(OPS_NAME)]: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark: true } })
     const conflict = errTmuxSessionConflict(KILL_VERB, 'not-this-launch', opsSession())
@@ -3965,7 +3961,7 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
     const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
     const betaId = (): string => personaInstanceId(personaKey(BETA.name))
 
-    test('stop --stop-bots, Alpha\'s row finished (get and status read ended) and Beta\'s pending with no launch start: Alpha gets its get and its status read and nothing more; Beta its read-pane, pause and one kill whose request is exactly its instance ID, with no include_finished; exit 0 (AC 46)', async () => {
+    test('stop --stop-bots, Alpha\'s row finished (get and status read ended) and Beta\'s pending with no launch start: Alpha gets its get and its status read and nothing more; Beta its read-pane, pause and one kill whose request is exactly its instance ID, with no include_finished; exit 0', async () => {
       const log = makeStubCallLog()
       const stateOf = (id: string): string => (id === alphaId() ? ENDED_ROW.state : AGENT_DIRECTOR_PENDING_STATE)
       const client = makeStubClient({
@@ -3993,8 +3989,8 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
 })
 
 // ---------------------------------------------------------------------------
-// The teardown's report and where each line goes (b.jg5 SRJ-907, SRJ-909,
-// SRJ-1013, SRJ-1002; AC 64, AC 73, AC 77; hatch notes E19–E20 bullet 1, E21)
+// The teardown's report and where each line goes (
+// design notes bullet 1, )
 //
 // Personas are torn down in parallel; once every one has settled (a teardown
 // that rejects included, as a failure), each persona's report is written in
@@ -4005,7 +4001,7 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
 // printed last and only printed. Both writes are best effort: a failed one
 // prints one line, leaves the print and the other destination as they are and
 // changes no exit status. Both CLI closing sentences of the kill-failure
-// alert are reached here, through the CLI (hatch note E21).
+// alert are reached here, through the CLI (design note ).
 // ---------------------------------------------------------------------------
 
 /** A write failure carrying fake tokens: its description, never itself, reaches the one line that reports it. */
@@ -4019,7 +4015,7 @@ const WRITE_FAILURES: ReadonlyArray<readonly [string, WriteFailure]> = [
   ['the startup-errors recorder throws', (error) => ({ overrides: { recordStartupErrorEntry: () => { throw error } }, to: { startupErrors: false } })],
 ]
 
-describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-909, SRJ-1013; AC 64, AC 73, AC 77)', () => {
+describe('the teardown\'s report and where each line goes', () => {
   const GAMMA = { name: 'Gamma', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }] }
   const [alphaP, betaP, gammaP] = [ALPHA.name, BETA.name, GAMMA.name].map(personaOf) as [CliTeardownPersona, CliTeardownPersona, CliTeardownPersona]
   const idOf = (p: CliTeardownPersona): string => personaInstanceId(p.key)
@@ -4120,11 +4116,11 @@ describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-90
     expect(serverLogTexts(b.clock.now())).not.toContain(last)
     expect(startupErrorEntries().map((e) => e.classLabel)).toEqual([PERSONA_KILL_FAILED_LABEL, CLI_TEARDOWN_FAILED_LABEL, PERSONA_KILL_SURVIVOR_LABEL])
     expect(startupErrorEntries().filter((e) => e.message.includes(last))).toEqual([])
-    // The alert entries' context names the command (hatch note E19–E20 bullet 1).
+    // The alert entries' context names the command (design note bullet 1).
     const context = killFailureAlertEntryText('', killFailureCliTeardownEntryContext(command), '')
     expect(context).toContain(command)
     for (const i of [0, 2]) expect(startupErrorEntries()[i]!.message).toContain(context)
-    // Both CLI closing sentences reach the terminal (hatch note E21).
+    // Both CLI closing sentences reach the terminal (design note ).
     expect(stderr.filter((l) => l.endsWith(KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING))).toEqual([reports[0]!.lines[1]])
     expect(stderr.filter((l) => l.endsWith(KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING))).toEqual([reports[2]!.lines[0]])
     // Per persona in turn: its server.log lines, then its entry.
@@ -4132,7 +4128,7 @@ describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-90
     expect(writes).toEqual(['log', 'log', 'entry', 'log', 'entry', 'log', 'entry'])
   })
 
-  test.each(COMMANDS)('%s: AC 64: every persona stopped, Alpha after a survivor-naming kill failure and a read of ended: only the survivor version is printed, logged and recorded under persona-kill-survivor; Alpha counts as stopped, so there is no failure line and no last line; stop --stop-bots exits 0 and clean_restart starts the server', async (command, make, run) => {
+  test.each(COMMANDS)('%s: every persona stopped, Alpha after a survivor-naming kill failure and a read of ended: only the survivor version is printed, logged and recorded under persona-kill-survivor; Alpha counts as stopped, so there is no failure line and no last line; stop --stop-bots exits 0 and clean_restart starts the server', async (command, make, run) => {
     const alphaSurvivor = errTmuxKillFailed(sessionOf(alphaP), 'pane-process-survived')
     let alphaKills = 0
     const b = make({
@@ -4212,7 +4208,7 @@ describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-90
     expectTeardownFailed(b, command, [failedReport(command, alphaP, sleepError, AD_ERROR_CLASS_UNAVAILABLE)])
   })
 
-  test('production deps append the teardown\'s lines to server.log in the server\'s state directory through appendLogLine, at the time given, and record its entries with recordStartupError there with no copy on fd 2 (static; b.jg5 SRJ-909)', () => {
+  test('production deps append the teardown\'s lines to server.log in the server\'s state directory through appendLogLine, at the time given, and record its entries with recordStartupError there with no copy on fd 2 (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     const main = indicesOf(/\bif\s*\(\s*import\.meta\.main\s*\)/g, code)
     expect(main).toHaveLength(1)
@@ -4229,8 +4225,8 @@ describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-90
 })
 
 // ---------------------------------------------------------------------------
-// The precheck's and the teardown's bounded cost on the injected clock (b.jg5
-// SRJ-908; hatch note E32 bullet 4)
+// The precheck's and the teardown's bounded cost on the injected clock (
+// design note bullet 4)
 //
 // The longest failing paths, each run with calls answering at once and with
 // each call taking the call timeout: the precheck's get and read-pane each
@@ -4248,7 +4244,7 @@ describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-90
 // (c) with calls answering at once takes exactly teardownBoundMs.
 // ---------------------------------------------------------------------------
 
-describe('the precheck\'s and the teardown\'s bounded cost on the injected clock (b.jg5 SRJ-908)', () => {
+describe('the precheck\'s and the teardown\'s bounded cost on the injected clock', () => {
   const CALL_TIMEOUT_MS = DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
   const EXIT_TIMEOUT_S = 5
 
@@ -4294,7 +4290,7 @@ describe('the precheck\'s and the teardown\'s bounded cost on the injected clock
   /**
    * The teardown's span on the fake clock: from its first status read to the
    * persona's failure, which is the exit for `stop --stop-bots` and, for
-   * `clean_restart`, the answer check's first `list` (b.jg5 SRJ-906), whose
+   * `clean_restart`, the answer check's first `list`, whose
    * cost is bounded on its own below.
    */
   const teardownSpanOf = (b: Bundle): number => (listTimesOf(b)[0] ?? b.exitTimes[0]!) - callTimesOf(b, STATUS_VERB)[0]!
@@ -4345,8 +4341,7 @@ describe('the precheck\'s and the teardown\'s bounded cost on the injected clock
 })
 
 // ---------------------------------------------------------------------------
-// After a failed teardown (b.jg5 SRJ-905, SRJ-906, SRJ-1013; AC 64, AC 73,
-// AC 75)
+// After a failed teardown
 //
 // `stop --stop-bots` never starts the server: a failed persona exits 1 with
 // the server stopped, no `start` and no `list`. `clean_restart` checks that
@@ -4364,7 +4359,7 @@ describe('the precheck\'s and the teardown\'s bounded cost on the injected clock
 // (expectNothingStopped).
 // ---------------------------------------------------------------------------
 
-describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart restarts or alerts (b.jg5 SRJ-905, SRJ-906, SRJ-1013; AC 64, AC 73, AC 75)', () => {
+describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart restarts or alerts', () => {
   const [alphaP, betaP] = [ALPHA.name, BETA.name].map(personaOf) as [CliTeardownPersona, CliTeardownPersona]
   const idOf = (p: CliTeardownPersona): string => personaInstanceId(p.key)
   const sessionOf = (p: CliTeardownPersona): string => personaTmuxSessionName(p.key)
@@ -4376,7 +4371,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     readonly errorClass: AdErrorClass
   }
 
-  /** SRJ-906's injected failures (AC 73, AC 75): a pause CONFLICT, a pause ENVIRONMENT and a kill UNAVAILABLE on every try. */
+  /** injected failures: a pause CONFLICT, a pause ENVIRONMENT and a kill UNAVAILABLE on every try. */
   const INJECTED: ReadonlyArray<readonly [string, (p: CliTeardownPersona) => InjectedFailure]> = [
     ['a pause answering CONFLICT', (p) => ({ at: PAUSE_VERB, error: errTmuxSessionConflict(PAUSE_VERB, 'not-this-launch', sessionOf(p)), errorClass: AD_ERROR_CLASS_CONFLICT })],
     ['a pause answering ENVIRONMENT', () => ({ at: PAUSE_VERB, error: errTmuxNotAvailable(undefined, PAUSE_VERB), errorClass: AD_ERROR_CLASS_ENVIRONMENT })],
@@ -4441,7 +4436,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     })
   }
 
-  /** The answer check's lines for `n` failed `list` tries of `error`, one per try in order (b.jg5 SRJ-906). */
+  /** The answer check's lines for `n` failed `list` tries of `error`, one per try in order. */
   const listTryLines = (n: number, error: unknown): string[] => {
     const { errorClass, description } = teardownErrorReportOf(error)
     return Array.from({ length: n }, (_, i) => answerCheckFailedTryLine(i + 1, { errorClass, description }))
@@ -4455,7 +4450,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
 
   /**
    * `clean_restart` started nothing after `failures`, agent-director never
-   * answering (b.jg5 SRJ-906, SRJ-1013): only the `stop` spawn, exit 1; on the
+   * answering: only the `stop()` spawn, exit 1; on the
    * terminal exactly the failed personas' report lines, then the one
    * not-restarted alert, then the last line, each also once in
    * clean_restart.log; `server.log` holds the report lines at the teardown's
@@ -4479,7 +4474,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     return alert
   }
 
-  test.each(forEachCommand(INJECTED))('%s: %s fails the persona: exit 1 naming it, its session and the class, after the server stop; stop --stop-bots spawns no start and makes no list, so the server stays stopped (AC 75); clean_restart makes one list after the teardown, starts the server (AC 73) and prints the last line after the start', async (command, _label, inject, [, make, run]) => {
+  test.each(forEachCommand(INJECTED))('%s: %s fails the persona: exit 1 naming it, its session and the class, after the server stop; stop --stop-bots spawns no start and makes no list, so the server stays stopped; clean_restart makes one list after the teardown, starts the server and prints the last line after the start', async (command, _label, inject, [, make, run]) => {
     const failure = inject(alphaP)
     const b = make(teardownOverrides([[alphaP, failure]]))
     const atStart = printedAtStart(b)
@@ -4558,7 +4553,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout(LIST_CALL)],
     ['UNAVAILABLE (a plain Error: agent-director unreachable)', () => new Error('AD connection refused')],
     ['CONFIG (ErrConfigMalformed), a failed try like any other', () => errConfigMalformed()],
-  ])('clean_restart: the list answering %s at every try: exactly PRECHECK_TRIES list calls PRECHECK_TRY_SPACING_MS apart, no start, exit 1; the persona\'s report as ever, then the not-restarted alert printed once, in clean_restart.log once, in server.log once and recorded once, then the last line (AC 73)', async (_label, makeListError) => {
+  ])('clean_restart: the list answering %s at every try: exactly PRECHECK_TRIES list calls PRECHECK_TRY_SPACING_MS apart, no start, exit 1; the persona\'s report as ever, then the not-restarted alert printed once, in clean_restart.log once, in server.log once and recorded once, then the last line', async (_label, makeListError) => {
     const log: string[] = []
     const listError = makeListError()
     const failures = [[alphaP, sentinelConflictAtPause()]] as const
@@ -4578,7 +4573,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     expect(alert).not.toContain(REDACTED_SENTINEL_TAIL)
   })
 
-  // SRJ-909's best-effort writes cover the not-restarted alert too: a failed write is one line in clean_restart.log.
+  // best-effort writes cover the not-restarted alert too: a failed write is one line in clean_restart.log.
   test.each(WRITE_FAILURES)('clean_restart, agent-director never answering, %s: the persona\'s report and the not-restarted alert are still printed once each and the last line is still last; each failed write, the alert\'s included, is reported in one line in clean_restart.log naming its error by description only; the other destination still holds the alert; exit 1', async (_label, fail) => {
     const log: string[] = []
     const error = writeError()
@@ -4610,7 +4605,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     assertNoLeak({ stderr, log, consoleErrorArgs: errorSpy.mock.calls, files: writtenTeardownLogs() })
   })
 
-  test('clean_restart: two failed personas (Alpha CONFLICT at its pause, Beta UNAVAILABLE at every kill try), agent-director never answering: one not-restarted alert naming both, each with its session and class, the same text printed, logged and recorded (SRJ-906)', async () => {
+  test('clean_restart: two failed personas (Alpha CONFLICT at its pause, Beta UNAVAILABLE at every kill try), agent-director never answering: one not-restarted alert naming both, each with its session and class, the same text printed, logged and recorded', async () => {
     const log: string[] = []
     const failures = [[alphaP, conflictAtPause(alphaP)], [betaP, unavailableAtKill(betaP)]] as const
     const b = makeDeps({ ...teardownOverrides(failures), directorList: async () => { throw errCallTimeout(LIST_CALL) }, initLogging: redirectTo(log) })
@@ -4624,7 +4619,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     }
   })
 
-  test('clean_restart: with each call taking the call timeout, the answer check that never hears agent-director ends PRECHECK_TRIES call timeouts and PRECHECK_TRIES - 1 gaps after its first list (b.jg5 SRJ-908)', async () => {
+  test('clean_restart: with each call taking the call timeout, the answer check that never hears agent-director ends PRECHECK_TRIES call timeouts and PRECHECK_TRIES - 1 gaps after its first list', async () => {
     const callMs = DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
     const b = makeDeps({ ...teardownOverrides([[alphaP, conflictAtPause(alphaP)]]), callMs, directorList: async () => { throw errCallTimeout(LIST_CALL) } })
 
@@ -4639,10 +4634,10 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
 
 // ---------------------------------------------------------------------------
 // callWithCliTries: the CLI's one source of "PRECHECK_TRIES calls,
-// PRECHECK_TRY_SPACING_MS apart" (b.jg5 SRJ-901, SRJ-903, SRJ-906, SRJ-908)
+// PRECHECK_TRY_SPACING_MS apart"
 // ---------------------------------------------------------------------------
 
-describe('callWithCliTries (b.jg5 SRJ-901, SRJ-903, SRJ-906, SRJ-908)', () => {
+describe('callWithCliTries', () => {
   const AGAIN = 'again'
 
   /** Run the tries over `answers` (the last repeating) on a fake clock: the answer, each call's time and each wait. */
@@ -4730,15 +4725,15 @@ describe('callWithCliTries (b.jg5 SRJ-901, SRJ-903, SRJ-906, SRJ-908)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// stop --stop-bots failure lines (b.av2 SR-10.3, AC 20): a failure CSCB
+// stop --stop-bots failure lines: a failure CSCB
 // authored prints its message; any other thrown value only its description
 // ---------------------------------------------------------------------------
 
-describe('stop --stop-bots failure lines (AC 20)', () => {
+describe('stop --stop-bots failure lines', () => {
   /** The stderr lines holding `fragment`, each cut before its first stack frame. */
   const linesWith = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment)).map((l) => l.split(' at ')[0]!)
 
-  // b.jg5 SRJ-203: the error keeps the gate outcome's refusal kind, read from
+  // the error keeps the gate outcome's refusal kind, read from
   // the error itself (never from its label or message text).
   test.each<[StartupGateRefusalKind, string]>([
     [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD],
@@ -4750,7 +4745,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     expect(gateError.classLabel).toBe(label)
   })
 
-  // b.jg5 SRJ-901, SRJ-902: every gate refusal but the client's too-old one is
+  // every gate refusal but the client's too-old one is
   // a precheck failure that stops nothing. The line is the gate's own label and
   // message (CSCB authored them, so they are printed whole).
   test.each(GATE_REFUSAL_BUILDS.filter(([kind]) => kind !== REFUSAL_KIND_CLIENT_TOO_OLD).map(([kind]) => [kind]))(
@@ -4770,7 +4765,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     },
   )
 
-  test('the floor-exempt gate option appears once in src/cli.ts, at stop --stop-bots\' initClient call, and clean_restart\'s initClient call passes only the call timeout; production initClient is initProductionClient, which hands the caller\'s gate options with its call timeout to the one runStartupGate call and throws StartupGateFailedError with the outcome\'s label, message and refusal kind; realDeps.initClient hands on the call timeout and the gate options, no gate seams (static; b.jg5 SRJ-203, SRJ-213, SRJ-902)', () => {
+  test('the floor-exempt gate option appears once in src/cli.ts, at stop --stop-bots\' initClient call, and clean_restart\'s initClient call passes only the call timeout; production initClient is initProductionClient, which hands the caller\'s gate options with its call timeout to the one runStartupGate call and throws StartupGateFailedError with the outcome\'s label, message and refusal kind; realDeps.initClient hands on the call timeout and the gate options, no gate seams (static)', () => {
     const FLOOR_EXEMPT_OPTION: keyof StartupGateOptions = 'skipPhase1Floor'
     const CALL_TIMEOUT_OPTION: keyof StartupGateOptions = 'callTimeoutMs'
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
@@ -4853,7 +4848,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr, files: writtenTeardownLogs() })
   })
 
-  test('no aggregate teardown failure: TeardownIncompleteError appears nowhere in src/ (static; b.jg5 SRJ-907)', () => {
+  test('no aggregate teardown failure: TeardownIncompleteError appears nowhere in src/ (static)', () => {
     const srcDir = resolve(import.meta.dir, '..', 'src')
     const files = (readdirSync(srcDir, { recursive: true }) as string[]).filter((rel) => rel.endsWith('.ts'))
     expect(files).toContain('cli.ts') // the walk is not vacuous
@@ -4896,7 +4891,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-902, AC 75's
+// stop --stop-bots on the development sentinel below Phase 1 (
 // part). Its init leaves CSCB's Phase 1 floor out, so on a binary the client
 // accepts (DEV_PLACEHOLDER_VERSION) the precheck and teardown run through that client.
 // Only the client's own too-old refusal, read from the gate's refusal kind and
@@ -4909,7 +4904,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 // runs.
 // ---------------------------------------------------------------------------
 
-describe('stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-902, AC 75)', () => {
+describe('stop --stop-bots on the development sentinel below Phase 1', () => {
   beforeEach(() => resetClientForTests())
   afterEach(() => resetClientForTests())
 
@@ -4978,7 +4973,7 @@ describe('stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-
   // Through the stub client, as production wires it
   // -------------------------------------------------------------------------
 
-  test('on DEV_PLACEHOLDER_VERSION, which the client accepts: the floor-exempt production init installs the stub with the configured call timeout, and per persona the stub gets get, a one-line readPane, status, pause and kill, in that order; the kill result with no kill_sent is a plain success, every persona is stopped and the server too; exit 0 (AC 75)', async () => {
+  test('on DEV_PLACEHOLDER_VERSION, which the client accepts: the floor-exempt production init installs the stub with the configured call timeout, and per persona the stub gets get, a one-line readPane, status, pause and kill, in that order; the kill result with no kill_sent is a plain success, every persona is stopped and the server too; exit 0', async () => {
     const log = makeStubCallLog()
     const created: RecordedClientOptions = []
     const client = makeStubClient({
@@ -5038,7 +5033,7 @@ describe('stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
-  test('a stub client factory throwing the client\'s too-old refusal: the server is stopped, no client is installed and no verb is asked of agent-director, the initialization-failed line names the version found and the version required, then only the server was stopped; exit 1 (AC 75)', async () => {
+  test('a stub client factory throwing the client\'s too-old refusal: the server is stopped, no client is installed and no verb is asked of agent-director, the initialization-failed line names the version found and the version required, then only the server was stopped; exit 1', async () => {
     const created: RecordedClientOptions = []
     const b = productionWired(makeLiveStopDeps, tooOldBuild(created))
 
@@ -5110,7 +5105,7 @@ describe('stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-
   })
 
   // -------------------------------------------------------------------------
-  // Keyed on the refusal kind, never the label or the message (SRJ-203)
+  // Keyed on the refusal kind, never the label or the message
   // -------------------------------------------------------------------------
 
   test.each<[string, StartupGateRefusalKind]>([
@@ -5169,7 +5164,7 @@ describe('stop --stop-bots on the development sentinel below Phase 1 (b.jg5 SRJ-
 
 // ---------------------------------------------------------------------------
 // initProductionClient — the production init over the start gate's stubbed
-// seams (b.jg5 SRJ-213); never a real agent-director client
+// seams; never a real agent-director client
 // ---------------------------------------------------------------------------
 
 describe('initProductionClient', () => {
@@ -5207,7 +5202,7 @@ describe('initProductionClient', () => {
     assertNoLeak({ stderr, message: gateError.message })
   })
 
-  // b.jg5 SRJ-203, SRJ-902: the gate stop --stop-bots asks for leaves only CSCB's floor out.
+  // the gate stop --stop-bots asks for leaves only CSCB's floor out.
   test('with the floor-exempt gate, a client reporting DEV_PLACEHOLDER_VERSION (below CSCB\'s floor, ranked above every minimum by the client) passes: built with the call timeout and installed as the singleton', async () => {
     const calls: RecordedClientOptions = []
     const client = makeStubClient({ binaryVersion: DEV_PLACEHOLDER_VERSION })
@@ -5237,8 +5232,8 @@ describe('initProductionClient', () => {
 })
 
 // ---------------------------------------------------------------------------
-// credentials <persona> — the setup wizard's credentials command (b.av2 SR-12,
-// SR-1.4 part). The script it runs is tests/credentials-command.test.ts's.
+// credentials <persona> — the setup wizard's credentials command (
+// part). The script it runs is tests/credentials-command.test.ts's.
 // ---------------------------------------------------------------------------
 
 describe('credentials <persona>', () => {
@@ -5400,8 +5395,7 @@ describe('credentials <persona>', () => {
 })
 
 // ---------------------------------------------------------------------------
-// clear-latch <persona>: the entry point and the production dial (b.jg5
-// SRJ-509, SRJ-510; AC 47). Each of its rows over injected deps is
+// clear-latch <persona>: the entry point and the production dial. Each of its rows over injected deps is
 // tests/clear-latch.test.ts's; its usage entry is the unknown-subcommand
 // block's.
 // ---------------------------------------------------------------------------
@@ -5442,7 +5436,7 @@ describe('clear-latch <persona>: entry point and production wiring', () => {
 
 // ---------------------------------------------------------------------------
 // The server's own state files: no CLI command touches the retired-key record
-// (b.jg5 SRJ-801) or the stored-choice file (b.deo SRI-401)
+// or the stored-choice file
 //
 // The CLI shares modules with the server (src/reload.ts, src/config.ts, and
 // through src/reload.ts both files' modules), so the check is behavioural:
@@ -5470,7 +5464,7 @@ function actingDeps(o: Overrides): ActingRun {
   const statusCalls: NonNullable<StubClientOptions['statusCalls']> = []
   const getCalls: NonNullable<StubClientOptions['getCalls']> = []
   const readPaneCalls: NonNullable<StubClientOptions['readPaneCalls']> = []
-  // The precheck's get reads the marked key's row live (b.jg5 SRJ-114: the CLI applies no clear).
+  // The precheck's get reads the marked key's row live (the CLI applies no clear).
   const client = makeStubClient({
     statusResult: cannedStatusResult({ state: 'waiting' }),
     statusCalls,
@@ -5491,7 +5485,7 @@ const upOnce = (): Overrides => {
 
 /**
  * A running server with its `server.port` record, whose route answers that
- * the Ops persona's latch was cleared (b.jg5 SRJ-509, SRJ-510); the dial is
+ * the Ops persona's latch was cleared; the dial is
  * a stub, so no request is made.
  */
 const clearsOnRunningServer = (): Overrides => {
@@ -5534,7 +5528,7 @@ function expectActed({ b, statusCalls, getCalls, readPaneCalls }: ActingRun, rea
 const runActing = (run: (b: Bundle) => Promise<void>, b: Bundle): Promise<void> =>
   run(b).catch((err) => { if (!(err instanceof ExitError)) throw err })
 
-describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
+describe('no CLI command writes the retired-key record', () => {
   /** What could build a store or write the record; typed against the module, so a rename fails the typecheck. */
   const WRITING_NAMES: ReadonlyArray<keyof typeof RetiredKeysModule> = [
     'loadRetiredKeyStore',
@@ -5544,7 +5538,7 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
 
   /**
    * The record: the Ops persona's key with its mark set (its row, which the
-   * stub reports live, would clear the entry on a server read; SRJ-807), and
+   * stub reports live, would clear the entry on a server read), and
    * a key with no mark. Answers the file's bytes.
    */
   function seedRecord(): Uint8Array {
@@ -5576,7 +5570,7 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
   })
 })
 
-describe('no CLI command reads, writes, creates or removes the stored-choice file (b.deo SRI-401)', () => {
+describe('no CLI command reads, writes, creates or removes the stored-choice file', () => {
   /**
    * What could load, write, parse or locate the file: the store factory, the
    * start load, the serialiser, the parser, the path function and the file
@@ -5600,10 +5594,9 @@ describe('no CLI command reads, writes, creates or removes the stored-choice fil
   /**
    * The file: the Ops persona's two channels under its declaration as the
    * applied configuration resolves it, and a key that configuration lacks,
-   * which the server's start would drop (b.deo SRI-407). `refused` appends a
+   * which the server's start would drop. `refused` appends a
    * byte to what the serialiser wrote, so the module's parser refuses the
-   * file and a load through the module would log its unreadable line (b.deo
-   * SRI-403). Answers the file's bytes.
+   * file and a load through the module would log its unreadable line. Answers the file's bytes.
    */
   function seedStoredChoices(refused: boolean): Uint8Array {
     const ops = appliedLoader(recordPath()).personas[0]!
@@ -5657,8 +5650,8 @@ describe('no CLI command reads, writes, creates or removes the stored-choice fil
 })
 
 // ---------------------------------------------------------------------------
-// unknown subcommand — regression for b.8tm (trail subcommand removed), and
-// the unadvertised reload gesture (b.av2 SR-8.8, AC 74 cli leg)
+// unknown subcommand — regression for (trail subcommand removed), and
+// the unadvertised reload gesture (cli leg)
 // ---------------------------------------------------------------------------
 
 /**
@@ -5697,7 +5690,7 @@ function usageEntries(output: string): {
 }
 
 /**
- * Run the real CLI script in a child process (b.av2 SR-13.2, b.jg5 SRJ-1302):
+ * Run the real CLI script in a child process:
  * its env is a direct `hostSafeChildEnv` call, so the child gets the temp HOME
  * (the per-test root by default), a PATH naming no directory (Bun is started
  * by absolute path and the CLI runs nothing by name on these paths), its own
@@ -5722,7 +5715,7 @@ function runCli(args: string[], home = root) {
 }
 
 describe('unknown subcommand', () => {
-  test('`trail` hits the usage error (non-zero exit; no "trail", retired reconcile flag, token variable or reload wording in usage; AC 74)', () => {
+  test('`trail` hits the usage error (non-zero exit; no "trail", retired reconcile flag, token variable or reload wording in usage)', () => {
     const result = runCli(['trail'])
     expect(result.status).not.toBe(0)
     const output = result.output
@@ -5735,7 +5728,7 @@ describe('unknown subcommand', () => {
     expect(reloadTermsIn(output)).toEqual([])
   })
 
-  test('AC 74, AC 47: no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials and clear-latch (with SRJ-509\'s line), and only --stop-bots, under stop, with no reload wording', () => {
+  test('no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials and clear-latch (with line), and only --stop-bots, under stop, with no reload wording', () => {
     const result = runCli([])
 
     expect(result.status).not.toBe(0)
@@ -5749,12 +5742,12 @@ describe('unknown subcommand', () => {
     expect(usage.unexpected).toEqual([])
     expect(usage.allFlags).toEqual(['--stop-bots'])
     expect(reloadTermsIn(result.output)).toEqual([])
-    // b.jg5 SRJ-509: clear-latch's one entry is the exported one (its wording is
-    // pinned against SRJ-509's line in tests/clear-latch.test.ts's pin table).
+    // clear-latch's one entry is the exported one (its wording is
+    // pinned against line in tests/clear-latch.test.ts's pin table).
     expect(result.stderr.split('\n').filter((line) => /^\s+clear-latch\b/.test(line))).toEqual([CLEAR_LATCH_USAGE_ENTRY])
   })
 
-  describe('AC 74: hidden subcommands', () => {
+  describe('hidden subcommands', () => {
     /** The no-argument usage (stderr), captured once in its own temp home. */
     let noArgUsage: string
     beforeAll(() => {
@@ -5768,7 +5761,7 @@ describe('unknown subcommand', () => {
     })
 
     test.each(['reload', 'apply', 'confirm', 'reload-config', 'Reload', 'apply_config'])(
-      'AC 74: hidden subcommand `%s` takes the unknown-subcommand path: non-zero exit, the same usage, nothing else done (a pending file stays put)',
+      'hidden subcommand `%s` takes the unknown-subcommand path: non-zero exit, the same usage, nothing else done (a pending file stays put)',
       (spelling) => {
         // A pending change is waiting, so a hidden confirm (pending renamed to
         // apply) or any other touch of it shows in the snapshot.

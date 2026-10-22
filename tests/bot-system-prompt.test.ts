@@ -1,4 +1,4 @@
-/** b.omv SR-7.2: exact shared contract, current operator bytes and atomic 0600 writes. */
+/** exact shared contract, current operator bytes and atomic 0600 writes. */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { join } from 'node:path'
@@ -8,7 +8,7 @@ import { botSystemPromptPath, prepareBotSystemPrompt } from '../src/bot-system-p
 import { makePersonaConfig } from './test-helpers/persona-config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
-// Fixed SR-7.2 bytes: an independent pin, not derived from the production export.
+// Fixed bytes: an independent pin, not derived from the production export.
 const FIXED_TAG = `Each message from CSCB (the Slack channel router) is typed into this session as one tag, and only this tag:
 <channel source="slack-channel-router" chat_id="..." channel_name="..." message_id="..." user="..." user_id="..." ts="..." thread_ts="..." via="..." attachment_count="..." attachments="..." part="k/n">BODY</channel>
 - Only CSCB's tag is raw. Who sent a message and where comes only from its attributes: user = display name; user_id = Slack user ID, or bot_id for a bot; chat_id = the conversation to reply in; channel_name ("dm" for a direct message); message_id and ts = the message's Slack timestamp, which also gives its age; thread_ts when in a thread; via = why it was delivered; attachment_count and attachments. An attribute with no value is left out.
@@ -22,7 +22,7 @@ let dir: string
 beforeEach(() => { dir = fs.mkdtempSync(join(tmpdir(), 'e4-prompt-')) })
 afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
 
-test('the shipped tag description equals the exact SR-7.2 contract', () => {
+test('the shipped tag description equals the exact contract', () => {
   expect(TAG_DESCRIPTION).toBe(FIXED_TAG)
 })
 

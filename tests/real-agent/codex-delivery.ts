@@ -451,7 +451,7 @@ async function ai(ac: number) {
   }
   if ([11, 12, 20].includes(ac)) {
     const cases = oracle.codexAICases(ac)
-    if (ac === 11 && cases.length !== 15) throw new Error('AC11 corpus incomplete')
+    if (ac === 11 && cases.length !== 15) throw new Error('corpus incomplete')
     for (const [i, test] of cases.entries()) {
       stage = `AI-AC${ac}-${test.label}`
       if (test.msg.user_id) userNames.set(test.msg.user_id, test.msg.user)
@@ -468,31 +468,31 @@ async function ai(ac: number) {
       await retire(`ai_${ac}_${i}`)
     }
   } else if (ac === 15) {
-    const after = await begin('ai_15', 'Give a visible JSON response on every turn. For received multipart input, acknowledge a nonfinal part with {"status":"received"} and finish the turn. Once complete return {"case":"AC15","messages":the number of messages received,"body":the joined BODY}. Use only input received in this conversation. Do not retrieve other data. Use no tools. Return JSON without Markdown.')
+    const after = await begin('ai_15', 'Give a visible JSON response on every turn. For received multipart input, acknowledge a nonfinal part with {"status":"received"} and finish the turn. Once complete return {"case":"","messages":the number of messages received,"body":the joined BODY}. Use only input received in this conversation. Do not retrieve other data. Use no tools. Return JSON without Markdown.')
     const message = oracle.codexAC15Message(), body = message.text
     userNames.set(message.user_id, message.user)
     const answers: any[] = []
     multipartSend = oracle.codexMultipartSender((params: any) => client.sendKeys(params), async text => {
       const item = queue.items(key).find((item: any) => item.accepted.seq > after && item.fixed?.parts.includes(text))
-      if (!item) throw new Error('AC15 submission has no exact durable part')
+      if (!item) throw new Error('submission has no exact durable part')
       const part = item.fixed.parts.indexOf(text) + 1
-      if (part !== answers.length + 1) throw new Error('AC15 submission order differs')
-      stage = `AI-AC15-part-${part}-completion`
+      if (part !== answers.length + 1) throw new Error('submission order differs')
+      stage = `AI--part-${part}-completion`
       answers.push(await completedItem(item.accepted.seq, part,
-        part < 3 ? { status: 'received' } : { case: 'AC15', messages: 1, body }, true))
+        part < 3 ? { status: 'received' } : { case: "AC15", messages: 1, body }, true))
     })
     try {
       const seq = await accept(oracle.codexSlackInput(message))
       await delivered(seq)
       const parts = queue.item(key, seq).fixed.parts
-      if (parts.length !== 3) throw new Error('AC15 production wrapper did not make three parts')
+      if (parts.length !== 3) throw new Error('production wrapper did not make three parts')
       oracle.assertCodexMultipart(parts, body, answers)
       await waiting()
-      await completedItem(seq, 3, { case: 'AC15', messages: 1, body }, true)
+      await completedItem(seq, 3, { case: "AC15", messages: 1, body }, true)
       await audit(after)
     } finally { multipartSend = undefined }
   } else {
-    const after = await begin('ai_106', 'Answer ordinary test requests with JSON without Markdown. Acknowledge a message with {"status":"received"}. When asked for a count, return {"case":"AC106","messages":the number of distinct prior DMs received before the query}. Use no tools.')
+    const after = await begin('ai_106', 'Answer ordinary test requests with JSON without Markdown. Acknowledge a message with {"status":"received"}. When asked for a count, return {"case":"","messages":the number of distinct prior DMs received before the query}. Use no tools.')
     const seq = await accept(dm('Please acknowledge this DM.', 110))
     await delivered(seq); await completedItem(seq, 1, { status: 'received' }, true); await waiting()
     const item = queue.item(key, seq), sent = item.records.find((r: any) => r.kind === 'sent' && r.part === 1)
@@ -507,9 +507,9 @@ async function ai(ac: number) {
     if (!actual) throw new Error('second DM has no actual submitted shim call')
     await waiting()
     oracle.assertCodexDuplicateTakeins((await rollout()).data, first, second)
-    const query = await accept(dm('How many distinct DMs have you received before this query? Return a JSON object with case "AC106" and messages set to the count you observed.', 111))
-    await delivered(query); await completedItem(query, 1, { case: 'AC106', messages: 1 }, true); await waiting()
-    await completedItem(query, 1, { case: 'AC106', messages: 1 }, true)
+    const query = await accept(dm('How many distinct DMs have you received before this query? Return a JSON object with case "" and messages set to the count you observed.', 111))
+    await delivered(query); await completedItem(query, 1, { case: "AC106", messages: 1 }, true); await waiting()
+    await completedItem(query, 1, { case: "AC106", messages: 1 }, true)
     await audit(after)
   }
   if (queue.openCount(key) !== 0) throw new Error('AI scenario retained open items')

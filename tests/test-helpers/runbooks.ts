@@ -1,7 +1,7 @@
 /**
  * runbooks.ts — the titles and block headings of the README's two runbooks,
  * the form of their step headings, and the one reader of a runbook's steps
- * (b.jg5 SRJ-1108, SRJ-1109; the E2-gate and E5 hatch notes; ruling Q13).
+ * (the -gate and design notes; ruling Q13).
  * Tests take every one of them from here.
  *
  * Ruling (values in tests): the rollback section's title and the switch-over
@@ -13,8 +13,8 @@
  *     which every refusal and note reads;
  *   - the publishing-host block heading, `PUBLISHING_HOST_BLOCK_HEADING`,
  *     which the install check's and the startup gate's not-found messages and
- *     SR-2.5's not-found and below-client-minimum diagnostics name (b.jg5
- *     SRJ-211, SRJ-212; E36 T2 ruling).
+ * not-found and below-client-minimum diagnostics name (
+ * ; ruling).
  *
  * Load path: this file imports only `tests/test-helpers/markdown.ts`, which
  * imports nothing, so it loads where `tests/` is copied without `src/` or the
@@ -36,10 +36,10 @@
 
 import { headings } from './markdown.ts'
 
-/** The rollback runbook's section title (b.jg5 SRJ-1109). */
+/** The rollback runbook's section title. */
 export const ROLLBACK_RUNBOOK_SECTION_TITLE = 'Rolling back the switch-over'
 
-/** The switch-over runbook's first block: the entry from a startup refusal (E2-gate hatch note; SRJ-1108). */
+/** The switch-over runbook's first block: the entry from a startup refusal (-gate hatch note). */
 export const REFUSAL_BLOCK_HEADING = 'Arrived here from a startup refusal?'
 
 /** The start of step `n`'s heading title: `Step <n>: `. */
@@ -82,7 +82,7 @@ export interface RunbookStepsOptions {
  * excluded, as `findSection` and `requiredSection` return it), in order.
  * Steps are the headings at the step level whose title starts with
  * `stepHeadingPrefix(n)`, found by `stepNumberOf`; a step is found by its
- * number, never its title, because the SRD's contract is "steps 1 to n in
+ * number, never its title, because the contract's contract is "steps 1 to n in
  * order". Headings outside fenced code only (`headings`).
  *
  * Throws, naming the step, when a step is missing, appears more than once or

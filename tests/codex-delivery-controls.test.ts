@@ -514,7 +514,7 @@ describe('D1 scratch preparation and disposable observation cleanup', () => {
 
 })
 
-describe('decision 22 native scratch config lifecycle', () => {
+describe(' native scratch config lifecycle', () => {
   test('first prepare requires absence; only a returned guarded spawn establishes durable provenance', () => withScratchLifecycle(f => {
     const guard = f.guard()
     expect(guard.check()).toMatchObject({ scratchConfigPresent: false, keyNames: [], unknownKeyCount: 0, nativeSpawnRecorded: false })

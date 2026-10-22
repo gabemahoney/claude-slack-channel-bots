@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# b.yko pre-flight, adapted to the /ci-live container (testplans/b.yko
+# pre-flight, adapted to the /ci-live container (testplans/live-acceptance.md
 # "Pre-flight"). The entrypoint installs it as ~/cscb-live-preflight.sh with
 # TEST_HOST set to the container's hostname.
 # Usage: bash ~/cscb-live-preflight.sh setup|check1

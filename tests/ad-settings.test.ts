@@ -1,32 +1,32 @@
 /**
  * ad-settings.test.ts — agent-director's timing settings, read the way
- * agent-director reads them (b.jg5 SRJ-209, AC 80): the read with
+ * agent-director reads them: the read with
  * agent-director's rule (the 64-bit bound, strict UTF-8 and a home getter
  * that throws included), the values in effect, `[pause] timeout_seconds`, the
  * one line per run of refused reads, the install and its re-read at the
- * version re-check's 120 s ticks (b.jg5 SRJ-204), and source audits of the
+ * version re-check's 120 s ticks, and source audits of the
  * settings module. Then the waits derived from the values in effect
- * (b.jg5 SRJ-210, AC 80): G, the alert threshold and B, their accessors at
+ * G, the alert threshold and B, their accessors at
  * check time, the never-early wait helper beyond the timer maximum and with
  * a getter it reads again at every fire, and whole-minute rendering. Then
  * agent-director's verb ceilings, the call timeout's need and the startup
  * check that warns when `agent_director_call_timeout_ms` does not exceed it
- * (b.jg5 SRJ-213, AC 80): each ceiling against its formula written out here,
+ * each ceiling against its formula written out here,
  * the need, and the check's one line through a capturing log sink. The
- * settings helper's own self-test (b.jg5 SRJ-1304) is here too: where
+ * settings helper's own self-test is here too: where
  * `writeAgentDirectorConfig` writes, the HOME it refuses, a `BigInt` read
  * back as an integer and a plain number, its zero fraction kept, as a float,
  * the zero-fraction row of `REFUSED_AD_CONFIG_FORMS`, and the re-exports.
  *
  * Every config file is written by `writeAgentDirectorConfig`
- * (`tests/test-helpers/ad-settings.ts`, b.jg5 SRJ-1304) under a
+ * (`tests/test-helpers/ad-settings.ts`) under a
  * `mkdtempSync` HOME removed in `afterEach`, and read by a reader whose home
  * getter answers that HOME. Every default, minimum, key name, path and
- * interval is imported from `src/` or the helper; the SRD's numbers are
+ * interval is imported from `src/` or the helper; the contract's numbers are
  * stated once, in the pin table at the end, so a change to a default or a
  * minimum leaves every other case valid.
  *
- * The tick cases install E3's re-check on `createFakeClock` with a passing
+ * The tick cases install re-check on `createFakeClock` with a passing
  * `makeStubResolveSystemBinary` and no health check: the re-check's timer is
  * the only one armed. No process, no real HOME, no real timer, no top-level
  * mock.module(), no value import of `Client` or `resolveSystemBinary`.
@@ -240,7 +240,7 @@ function changedWithout(key: AdTmuxKey): { file: Partial<Record<AdTmuxKey, bigin
   return { file, expected: { ...DEFAULT_TMUX, ...file } }
 }
 
-/** The values line the reader under `rig`'s HOME writes for `tmux` (b.jg5 SRJ-1014). */
+/** The values line the reader under `rig`'s HOME writes for `tmux`. */
 function valuesLine(rig: Pick<ReaderRig, 'path'>, tmux: AdTmuxValues): string {
   return buildAdSettingsValuesLine(rig.path, tmux)
 }
@@ -252,7 +252,7 @@ function refusedReason(outcome: AdSettingsReadOutcome): string {
 }
 
 // ---------------------------------------------------------------------------
-// Accepted reads (SRJ-209: a missing file, a missing key or 0 gives the default)
+// Accepted reads (a missing file, a missing key or 0 gives the default)
 // ---------------------------------------------------------------------------
 
 describe('ad settings: accepted reads', () => {
@@ -338,7 +338,7 @@ describe('ad settings: accepted reads', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Refused reads (SRJ-209: refused forms keep the last accepted values, one line per run)
+// Refused reads (refused forms keep the last accepted values, one line per run)
 // ---------------------------------------------------------------------------
 
 const REFUSED_FORM_ROWS = REFUSED_AD_CONFIG_FORMS.map((form) => [form.name, form] as const)
@@ -402,7 +402,7 @@ describe('ad settings: refused reads', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Read failures, through the file-system seam (SRJ-209: only a missing file gives the defaults)
+// Read failures, through the file-system seam (only a missing file gives the defaults)
 // ---------------------------------------------------------------------------
 
 /** A descriptor number the seam hands out; never a real one. */
@@ -496,7 +496,7 @@ describe('ad settings: read failures', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runs of refused reads, and when a change takes effect (SRJ-209)
+// Runs of refused reads, and when a change takes effect
 // ---------------------------------------------------------------------------
 
 describe('ad settings: runs of refused reads', () => {
@@ -551,12 +551,12 @@ describe('ad settings: runs of refused reads', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The values line (SRJ-1014: each read that changes the values in effect, with the nine values)
+// The values line (each read that changes the values in effect, with the nine values)
 // ---------------------------------------------------------------------------
 
 const TMUX_KEY_ROWS = AD_TMUX_KEYS.map((key) => [key])
 
-describe('ad settings: the values line (b.jg5 SRJ-1014, SRJ-209)', () => {
+describe('ad settings: the values line', () => {
   test.each(['', `ji${CHANGED_PAUSE_SECONDS}e7-`])('the line names the path and each of the nine keys with its value and unit, and nothing of [pause] (temp prefix %s)', suffix => {
     const rig = makeReaderRig(undefined, makeHome(suffix))
     rig.write(CHANGED_FILE)
@@ -659,7 +659,7 @@ describe('ad settings: the values line (b.jg5 SRJ-1014, SRJ-209)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The 64-bit bound (SRJ-209: agent-director holds each setting in a 64-bit integer)
+// The 64-bit bound (agent-director holds each setting in a 64-bit integer)
 // ---------------------------------------------------------------------------
 
 /** `key` at `value`, with the grace period raised to the minimum the timers then give, when they raise it. */
@@ -700,7 +700,7 @@ describe('ad settings: the 64-bit bound', () => {
 })
 
 // ---------------------------------------------------------------------------
-// [pause] timeout_seconds (SRJ-209: for SRJ-213's check only; never refuses the read)
+// [pause] timeout_seconds (for check only; never refuses the read)
 // ---------------------------------------------------------------------------
 
 describe('ad settings: [pause] timeout_seconds', () => {
@@ -755,10 +755,10 @@ describe('ad settings: [pause] timeout_seconds', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The install and the re-read at the version re-check's ticks (SRJ-209, SRJ-204)
+// The install and the re-read at the version re-check's ticks
 // ---------------------------------------------------------------------------
 
-/** E3's re-check installed on a fake clock, and the settings installed over a temp HOME after it (as `main()` does). */
+/** re-check installed on a fake clock, and the settings installed over a temp HOME after it (as `main()` does). */
 interface TickRig {
   readonly clock: FakeClock
   readonly home: string
@@ -900,7 +900,7 @@ describe('ad settings: install and the re-read at each 120 s re-check tick', () 
 })
 
 // ---------------------------------------------------------------------------
-// Leak safety (b.av2 SR-10.3): no file text, string value or parser text in a line or a reason
+// Leak safety: no file text, string value or parser text in a line or a reason
 // ---------------------------------------------------------------------------
 
 describe('ad settings: no file text reaches a line or an outcome', () => {
@@ -923,7 +923,7 @@ describe('ad settings: no file text reaches a line or an outcome', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The settings helper's self-test (b.jg5 SRJ-1304): where it writes, the HOME it refuses, how it writes numbers, its zero-fraction row, its re-exports
+// The settings helper's self-test: where it writes, the HOME it refuses, how it writes numbers, its zero-fraction row, its re-exports
 // ---------------------------------------------------------------------------
 
 /** Added to an integral number, a float with a fraction. */
@@ -940,7 +940,7 @@ const ZERO_FRACTION_FORM_ROWS = REFUSED_AD_CONFIG_FORMS.filter((form) => {
   return typeof value === 'number' && Number.isInteger(value)
 }).map((form) => [form.name, form] as const)
 
-describe('ad settings: the writeAgentDirectorConfig helper (b.jg5 SRJ-1304)', () => {
+describe('ad settings: the writeAgentDirectorConfig helper', () => {
   test('it writes AD_SETTINGS_RELATIVE_PATH under the HOME it is given, creating the directory, and answers that path', () => {
     const home = makeHome()
     const path = writeAgentDirectorConfig(home, CHANGED_FILE)
@@ -1004,7 +1004,7 @@ describe('ad settings: the writeAgentDirectorConfig helper (b.jg5 SRJ-1304)', ()
 })
 
 // ---------------------------------------------------------------------------
-// Source audits (SRJ-209: one parser, one settings module, no outage path)
+// Source audits (one parser, one settings module, no outage path)
 // ---------------------------------------------------------------------------
 
 const SETTINGS_MODULE = 'ad-settings.ts'
@@ -1069,7 +1069,7 @@ describe('ad settings: source audits', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The derived waits (SRJ-210): G, the alert threshold and B
+// The derived waits: G, the alert threshold and B
 // ---------------------------------------------------------------------------
 
 /** Milliseconds per second and per minute: unit conversions only. */
@@ -1098,7 +1098,7 @@ function exactOrNeverEnds(ms: bigint): number {
   return ms <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(ms) : AD_WAIT_NEVER_ENDS
 }
 
-/** SRJ-210's waits for `tmux`, computed here from the addends and `DIALOG_READY_TIMEOUT_MS`. */
+/** waits for `tmux`, computed here from the addends and `DIALOG_READY_TIMEOUT_MS`. */
 function expectedWaits(tmux: AdTmuxValues): DerivedWaits {
   const { pending_grace_seconds: grace, stopping_window_seconds: stopping, starting_session_seconds: starting } = tmux
   const longer = stopping > starting ? stopping : starting
@@ -1158,7 +1158,7 @@ describe('ad settings: the derived waits G, the alert threshold and B', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Check time (SRJ-210: a threshold or bound is checked against the values in effect when CSCB checks it)
+// Check time (a threshold or bound is checked against the values in effect when CSCB checks it)
 // ---------------------------------------------------------------------------
 
 describe('ad settings: the derived waits at check time', () => {
@@ -1193,7 +1193,7 @@ describe('ad settings: the derived waits at check time', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Beyond the timer maximum (SRJ-210: a setting too large for the timers never ends a wait early)
+// Beyond the timer maximum (a setting too large for the timers never ends a wait early)
 // ---------------------------------------------------------------------------
 
 /** A fake clock the `afterEach` checks for pending timers. */
@@ -1413,7 +1413,7 @@ describe('ad settings: armNeverEarlyWait arming', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A getter wait (SRJ-210: the wait in effect is read again at every timer fire)
+// A getter wait (the wait in effect is read again at every timer fire)
 // ---------------------------------------------------------------------------
 
 /** A wait getter the test steers: from the next call it answers `set`'s value, or throws after `set('throws')`. */
@@ -1605,7 +1605,7 @@ describe('ad settings: armNeverEarlyWait with a getter, read at every fire', () 
 })
 
 // ---------------------------------------------------------------------------
-// Whole minutes (SRJ-210: a notice gives a derived value in whole minutes, rounded down)
+// Whole minutes (a notice gives a derived value in whole minutes, rounded down)
 // ---------------------------------------------------------------------------
 
 describe('ad settings: whole minutes, rounded down', () => {
@@ -1625,7 +1625,7 @@ describe('ad settings: whole minutes, rounded down', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The verb ceilings (SRJ-213; ADSRD SR-13.2)
+// The verb ceilings (agent-director contract)
 // ---------------------------------------------------------------------------
 
 /** One fresh read of `input` under a new temp HOME: the values in effect after it, which must be accepted. */
@@ -1642,7 +1642,7 @@ function maxOf(values: readonly bigint[]): bigint {
 }
 
 /**
- * A verb's ceiling paths (ADSRD SR-13.2), written out here from the record's
+ * A verb's ceiling paths (agent-director contract), written out here from the record's
  * Q, A, C, W, E and B; the ceiling is the largest path. `pause` counts its
  * wait only when `[pause] timeout_seconds` is used.
  */
@@ -1696,7 +1696,7 @@ function formulaNeed(values: AdSettingsInEffect): bigint {
 const RAISED_QUERY_TIMEOUT_MS = DEFAULT_TMUX.kill_exit_wait_ms + 2n * DEFAULT_TMUX.action_timeout_ms + DEFAULT_TMUX.pipe_close_wait_ms
 const RAISED_QUERY_IN_EFFECT = inEffect(tmuxWith({ query_timeout_ms: RAISED_QUERY_TIMEOUT_MS }))
 
-/** SRJ-213's worked inputs: `create_timeout_ms` 40000 with the grace period at the minimum it gives (61), and a pause wait of 60. */
+/** worked inputs: `create_timeout_ms` 40000 with the grace period at the minimum it gives (61), and a pause wait of 60. */
 const WORKED_CREATE_TIMEOUT_MS = 40000n
 const WORKED_TMUX = {
   create_timeout_ms: WORKED_CREATE_TIMEOUT_MS,
@@ -1706,7 +1706,7 @@ const WORKED_PAUSE_SECONDS = 60n
 
 const TWO_PATH_VERBS: readonly AdCeilingVerb[] = ['kill', 'resume', 'spawn-with-reuse', 'plain-spawn']
 
-describe('ad settings: the verb ceilings (b.jg5 SRJ-213)', () => {
+describe('ad settings: the verb ceilings', () => {
   test.each(CEILING_VERBS.map((verb) => [verb]))('%s: its ceiling equals its formula at the defaults, with Q raised and with every value changed', (verb) => {
     const valueSets = [DEFAULT_AD_SETTINGS_IN_EFFECT, RAISED_QUERY_IN_EFFECT, CHANGED_IN_EFFECT]
     expect(valueSets.map((values) => adVerbCeilingsMs(values)[verb])).toEqual(valueSets.map((values) => formulaCeiling(verb, values)))
@@ -1747,13 +1747,13 @@ describe('ad settings: the verb ceilings (b.jg5 SRJ-213)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The need (SRJ-213: the largest ceiling among the verbs CSCB calls, plus the margin)
+// The need (the largest ceiling among the verbs CSCB calls, plus the margin)
 // ---------------------------------------------------------------------------
 
 /** A sweep budget whose ceiling is above every other ceiling at the defaults: derived, never typed. */
 const SWEEP_LARGEST_SECONDS = maxOf(CSCB_CEILING_VERBS.map((verb) => formulaCeiling(verb, DEFAULT_AD_SETTINGS_IN_EFFECT))) / MS_PER_SECOND + 1n
 
-/** The four unused forms of `[pause] timeout_seconds` SRJ-213's check names (0 is the SRD's worked input). */
+/** The four unused forms of `[pause] timeout_seconds` check names (0 is the contract's worked input). */
 const UNUSED_PAUSE_FORMS: readonly (readonly [string, AdConfigValue])[] = [
   ['0', 0n],
   ['a negative value', -CHANGED_PAUSE_SECONDS],
@@ -1767,7 +1767,7 @@ function unusedPauseFound(values: AdSettingsInEffect): string {
   return values.pauseTimeout.kind === 'not-used' ? values.pauseTimeout.found : ''
 }
 
-describe('ad settings: the call timeout need (b.jg5 SRJ-213)', () => {
+describe('ad settings: the call timeout need', () => {
   test.each<[string, () => AdSettingsInEffect, AdCeilingVerb]>([
     ['at the defaults (an empty file): pause', () => acceptedValuesOfFile({}), 'pause'],
     [
@@ -1791,7 +1791,7 @@ describe('ad settings: the call timeout need (b.jg5 SRJ-213)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The startup call-timeout check (SRJ-213: one warning line, never a refusal)
+// The startup call-timeout check (one warning line, never a refusal)
 // ---------------------------------------------------------------------------
 
 /** The setting the check sizes, typed against the configuration. */
@@ -1854,7 +1854,7 @@ function withExitAndTimersSpied(body: () => void): { exit: number; setTimeout: n
   }
 }
 
-describe('ad settings: the startup call-timeout check (b.jg5 SRJ-213)', () => {
+describe('ad settings: the startup call-timeout check', () => {
   test('at the defaults the imported default gives no line', () => {
     expect(runCheck(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, DEFAULT_AD_SETTINGS_IN_EFFECT)).toEqual({ lines: [], returned: undefined })
   })
@@ -1937,7 +1937,7 @@ describe('ad settings: the startup call-timeout check (b.jg5 SRJ-213)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SRD pins: SRJ-209's, SRJ-210's and SRJ-213's numbers against the exports
+// contract pins: and numbers against the exports
 // ---------------------------------------------------------------------------
 
 /** One fresh read of a file with `tmux`, under a new temp HOME: its outcome's kind. */
@@ -1950,7 +1950,7 @@ function readKindOf(tmux: Readonly<Partial<Record<AdTmuxKey, AdConfigValue>>>): 
 /** The ceilings at the defaults. */
 const defaultCeilings = (): ReturnType<typeof adVerbCeilingsMs> => adVerbCeilingsMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
 
-describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210, SRJ-213)', () => {
+describe('ad settings: contract pins', () => {
   test.each<[string, () => unknown, unknown]>([
     ['the settings file path', () => AD_SETTINGS_RELATIVE_PATH, join('.config/agent-director', 'config.toml')],
     [
@@ -2045,9 +2045,9 @@ describe('0.12 settings require an absolute HOME', () => {
   })
 })
 
-// b.2nr: B's floor is DIALOG_READY_TIMEOUT_MS unless the test-only timer override block set another at server start.
+// B's floor is DIALOG_READY_TIMEOUT_MS unless the test-only timer override block set another at server start.
 // Regression: before the fix B was never below 300 s, so a floor of 120 s changed nothing.
-describe('B\'s floor (b.2nr: the test-only dialog_ready_timeout_ms override)', () => {
+describe('B\'s floor (the test-only dialog_ready_timeout_ms override)', () => {
   const FLOOR_MS = 120_000
   const G30 = inEffect(tmuxWith({ pending_grace_seconds: 30n }))
 

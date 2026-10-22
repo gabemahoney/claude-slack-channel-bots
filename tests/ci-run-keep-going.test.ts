@@ -1,4 +1,4 @@
-/** b.pb8 public runner contracts. No ambient credentials or external processes. */
+/** public runner contracts. No ambient credentials or external processes. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -12,7 +12,7 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
-describe('b.pb8: keep-going is explicit and does not weaken gate eligibility', () => {
+describe('keep-going is explicit and does not weaken gate eligibility', () => {
   test.each([
     ['default', [], false, true],
     ['full keep-going', ['--keep-going'], true, true],
@@ -46,7 +46,7 @@ describe('b.pb8: keep-going is explicit and does not weaken gate eligibility', (
   })
 })
 
-describe('b.pb8: CI-prefixed credentials are direct runner inputs', () => {
+describe('CI-prefixed credentials are direct runner inputs', () => {
   test.each(['raw', 'gateway'] as const)('%s input validates without host ANTHROPIC assignments', kind => {
     const env = {
       CI_ANTHROPIC_API_KEY: fakeToken(kind === 'raw' ? runner.RAW_KEY_PREFIX : '', `pb8-${kind}`),
@@ -125,7 +125,7 @@ describe('b.pb8: CI-prefixed credentials are direct runner inputs', () => {
   })
 })
 
-describe('b.pb8: durable notrun reasons', () => {
+describe('durable notrun reasons', () => {
   test.each(['fail-fast', 'unsafe-cleanup', `dependency:${realScriptFileName(2)}`])('%s survives the production result-file codec', reason => {
     const line = `${runner.RESULT_WORD_NOTRUN} ${realScriptFileName(3)} ${reason}`
     const event = runner.parseResultLine(line)
@@ -146,7 +146,7 @@ describe('b.pb8: durable notrun reasons', () => {
   })
 })
 
-describe('b.pb8: performance guard uses one shared/exclusive flock inode', () => {
+describe('performance guard uses one shared/exclusive flock inode', () => {
   test('shared work overlaps, exclusive measurement waits for every reader, and release permits the next run', () => {
     const root = mkdtempSync(join(tmpdir(), 'ci-pb8-lock-'))
     roots.push(root)

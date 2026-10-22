@@ -423,7 +423,7 @@ releases shared ownership, and takes exclusive ownership for that script.
 After verified cleanup it returns to shared ownership for later work.
 
 The guard coordinates these managed builds and scripts, not unrelated host
-work or the heavy coordinator. It preserves native AC76's 20 samples and
+work or the heavy coordinator. It preserves native latency's 20 samples and
 p95 limits (typing start 2 s, delivery 10 s). Lock controls do not establish
 native latency acceptance; use actual native results. Existing shard/run
 deadlines bound guard waits, so contention can still fail a run.
@@ -459,7 +459,7 @@ admission errors at this stage fail the run; ordinary shards can already
 have started. The reader relays the actual failure rather than turning it
 into an early `NOT RUN`.
 
-**Native-written scratch config (amended decision 22).** The harness creates no Codex `config.toml` and copies no host settings. It must be absent before first spawn. Later preparation/recovery needs a durable successful-native-spawn receipt tied to the exact private home's device/inode; config presence alone grants nothing. The names-only checker allows only fixed native-written `tui.screen_reader_detection_done` and genuine parent tables containing exclusively allowed descendants. That leaf and its parent may overlap host key names without reading or copying their host values. All other host keys and every model, reasoning, profile/profiles, provider/auth or unknown key reject the script. Scalar/array namespace impostors and unknown descendants also reject it. Record only key names and unknown-key counts. New allowlist entries require native-source or observed-run evidence. Native CLI `tui.show_tooltips=false` avoids the optional startup counter without broadening this allowlist.
+**Native-written scratch config (the scratch-config policy).** The harness creates no Codex `config.toml` and copies no host settings. It must be absent before first spawn. Later preparation/recovery needs a durable successful-native-spawn receipt tied to the exact private home's device/inode; config presence alone grants nothing. The names-only checker allows only fixed native-written `tui.screen_reader_detection_done` and genuine parent tables containing exclusively allowed descendants. That leaf and its parent may overlap host key names without reading or copying their host values. All other host keys and every model, reasoning, profile/profiles, provider/auth or unknown key reject the script. Scalar/array namespace impostors and unknown descendants also reject it. Record only key names and unknown-key counts. New allowlist entries require native-source or observed-run evidence. Native CLI `tui.show_tooltips=false` avoids the optional startup counter without broadening this allowlist.
 
 **Resources and heavy execution.** Login-bearing containers set `--ulimit core=0`. Each Codex shard adds 2 GiB to the ordinary cap and reservation, currently 4 GiB memory and memory-swap, retaining 2 CPUs and 2,048 PIDs. Admission, concurrent-run commitments, cap reports and OOM accounting include the extra memory. The local heavy job uses the same 4 GiB/2 CPU/2,048 PID bounds, a 3-hour job timeout, exact login mount and verified final stopped/exit/cap reading. Its five AI criteria run three independent trials each; see [Codex gate and heavy AI](../tests/README.md#codex-gate-and-heavy-ai). Nothing carrying the login goes to a scheduler. `/ci-live` runs in its own container against the test workspace, with its existing credentials and isolation.
 
@@ -474,8 +474,8 @@ Codex model. Its `REAL-AGENT-CLAUDE-VERDICT` certifies only those Claude trials.
 Use `--keep-going` to retain failures and execute the remaining trials; any
 failure still fails the selection.
 
-Add `--ai-only` to `--claude-versions` to run just AC11, AC12, AC15,
-AC20, AC23, AC91 and AC106, three trials each (21 per version).
+Add `--ai-only` to `--claude-versions` to run just field-readback, command-prefix, multipart,
+sender-identity, compact/resume, DM/thread and duplicate-DM, three trials each (21 per version).
 This selection records `claude-ai-only` and uses
 `REAL-AGENT-CLAUDE-AI-VERDICT`; it certifies only those AI trials.
 For a narrower rerun, add `--ai-criteria 15` (or a comma-separated set of known
@@ -484,12 +484,6 @@ keeps three trials per selected criterion, and records `claude-ai-selected`
 with `REAL-AGENT-CLAUDE-AI-SELECTED-VERDICT`. It cannot certify omitted criteria.
 
 Supply the same `CI_ANTHROPIC_*` environment directly to `/ci` and every `ci-verdict.ts` wait/stop/report/recovery call. The heavy coordinator also reads those names directly. Never put credential values in arguments or diagnostic output.
-
-Historical E7 acceptance, before the current track/cleanup changes: default full `/ci` `20261018t042311z-fik3tlbb` (no selection arguments, reader exit 0) passed all 46 executions in 2,521.526 s, including the 17-item native Codex fault/recovery/fidelity gate. Focused local heavy `real-1792299930887-3167396` ended `REAL-AGENT-CODEX-VERDICT PASS`: 15 unique completed native trials, AC11/12/15/20/106 each 3 of 3, in 1,726.57 s, on Codex 0.159.2 / `gpt-6-astra`.
-
-All 441 heavy auth/config checks and 15 final symlink checks passed, along with full CI's 48 checks. The login stayed the single existing read-write file bind, never copied, printed, hashed or scheduled; host config stayed unchanged.
-
-Both runners retired, no active/login containers remained, and unit scratch/build context were removed. The 886 recorded source/test identities stayed unchanged through validation. See [final evidence, unit/typecheck results and historical failures](../docs/testing-guide.md#e7-final-acceptance-evidence). Base `cscb-ci-base:v8` remains pinned; no image tag edit is needed.
 
 ### Admission: memory, disk and CPU
 
@@ -1225,7 +1219,7 @@ once no base build is running.
 
 ## /ci-live: the live Slack acceptance run
 
-`/ci-live` (`bun ci-live/run.ts`) runs the `testplans/b.yko` live acceptance
+`/ci-live` (`bun ci-live/run.ts`) runs the `testplans/live-acceptance.md` live acceptance
 checks against real Slack, in the test workspace `cscb-ci-test` only, never a
 production workspace. It is the pre-deploy check for a release. `/ci` never
 connects to Slack; `/ci-live` installs the packed package in a throwaway
@@ -2150,4 +2144,4 @@ not answer (see [The test mailbox](#the-test-mailbox)).
 ## Out of scope (future work)
 
 Publishing `cscb-ci-base` to a registry (GHCR or similar) so fresh hosts pull
-instead of build — tracked under DR-3 of b.nfg.
+instead of build — tracked under DR-3 of the contract.

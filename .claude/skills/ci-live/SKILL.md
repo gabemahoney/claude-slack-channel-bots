@@ -8,8 +8,7 @@ allowed-tools: [Bash]
 # /ci-live
 
 The live, pre-deploy acceptance run of CSCB: the automated checks from the
-checked-in scenario `testplans/b.yko/b.yko.md` (test fixture data, not an Apiary
-workflow store), against the **test workspace** only (never a production workspace),
+checked-in scenario `testplans/live-acceptance.md` (a local scenario document), against the **test workspace** only (never a production workspace),
 in a fresh container built from the `/ci` base (`cscb-ci-base:v8`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,

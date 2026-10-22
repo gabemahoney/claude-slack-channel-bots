@@ -1,29 +1,29 @@
 #!/usr/bin/env bun
 /**
- * scripts/ci-verdict.ts — the `/ci` verdict reader (b.uqm SR-17). It is the
+ * scripts/ci-verdict.ts — the `/ci` verdict reader. It is the
  * only code that reads `verdict.txt`, and the only mapping from a run's files
  * to `/ci`'s report and exit code. The `/ci` skill relays what it prints and
- * the code it exits with, and holds no verdict logic of its own (SR-18.2).
+ * the code it exits with, and holds no verdict logic of its own.
  *
- * Usage (b.uqm SR-17.1):
+ * Usage:
  *
  *   bun scripts/ci-verdict.ts report <RUN_ID> <PID> <grace> [the /ci arguments]...
- *     Prints the run's outcome and exits with its code (SR-17.3):
+ * Prints the run's outcome and exits with its code:
  *       0  full PASS: `✓ Integration tests passed.`, then the timing summary
  *       1  full or selective FAIL, or the runner died or wrote no valid verdict
  *       2  not runnable: the refusal's `NOT RUN:` line and its detail lines
  *       3  selective PASS (not a gate result)
  *       4  injected run (not a gate result)
  *     It removes the run directory only after printing a full or selective
- *     PASS with its timing summary, or a refusal (SR-16.3).
+ * PASS with its timing summary, or a refusal.
  *
  *   bun scripts/ci-verdict.ts wait <RUN_ID> <PID>
- *     Waits at most 90 s for the run to move on (SR-17.5). It checks the run
+ * Waits at most 90 s for the run to move on. It checks the run
  *     at its start, then every 1 s on its injected clock, and returns at the
  *     first check at which one of these holds, in this order:
  *       10 verdict  `verdict.txt` exists (it is never read here)
  *       11 refused  the status file records a refusal
- *       12 gone     the runner is gone (SR-6.3)
+ * 12 gone the runner is gone
  *       13 grace    the grace has ended and the runner is alive
  *        0 running  the phase differs from the first check's, or the bound
  *                   is reached
@@ -33,8 +33,8 @@
  *     removes, signals and spawns nothing.
  *
  *   bun scripts/ci-verdict.ts stop <RUN_ID> <PID>
- *     Stops a runner still alive at grace expiry (SR-17.6). It signals only a
- *     runner alive by SR-6.3, and only its PID, never a process group:
+ * Stops a runner still alive at grace expiry. It signals only a
+ * runner alive by the contract, and only its PID, never a process group:
  *     SIGTERM, then, checking every 1 s on its injected clock, SIGKILL when
  *     the runner is still alive 30 s after the SIGTERM. A signal that is not
  *     delivered (no such process, or not permitted) counts as not sent.
@@ -46,9 +46,9 @@
  *   `<PID>` is the runner PID the skill printed, or `-`. `<grace>` is `none`,
  *   `term:<m>` or `kill:<m>`, m a whole number of at least 1. Malformed
  *   arguments exit 64 with one `usage: ` line on standard error, having read,
- *   written, removed, spawned and signalled nothing (SR-17.1).
+ * written, removed, spawned and signalled nothing.
  *
- * Import safety (b.uqm SR-1.3). Importing this file runs nothing: no process,
+ * Import safety. Importing this file runs nothing: no process,
  * no file read or write, no signal handler. Its top level holds only imports,
  * declarations and exports; there is no top-level call, `new` or `await`
  * outside the one entry block at the very end of the file, which acts only
@@ -57,7 +57,7 @@
  * runner's `RunnerDeps` plus the reader's own run-directory reads, removal and
  * standard output. Its real bindings are built only by `createRealReaderDeps`,
  * which only that entry block calls. Component tests drive every verb in
- * process through fakes (SR-21.1); there is no test-only option or
+ * process through fakes; there is no test-only option or
  * environment variable. At run time the file loads only `node:` built-ins and
  * the runner, `scripts/ci-run.ts`, from which it takes every rule the two
  * share: argument parsing and the run kind, script-name forms, fault
@@ -66,15 +66,15 @@
  *
  * Section map:
  *
- *   1. dependencies (E3 T1)
- *   2. constants (E3 T1)
- *   3. arguments (E3 T1)
- *   4. run files, the runner's PID and liveness (E3 T1)
- *   5. first-line validity (E3 T1)
- *   6. the report verb (E3 T1)
- *   7. the wait verb (E3 T2)
- *   8. the stop verb (E3 T2)
- *   9. the verb runner and the entry block (E3 T1)
+ * 1. dependencies
+ * 2. constants
+ * 3. arguments
+ * 4. run files, the runner's PID and liveness
+ * 5. first-line validity
+ * 6. the report verb
+ * 7. the wait verb
+ * 8. the stop verb
+ * 9. the verb runner and the entry block
  *
  * Not in `package.json` `files`: never shipped.
  *
@@ -120,10 +120,10 @@ import {
 import type { FileTextRead, Invocation, OwnerLivenessProbe, Refusal, RunnerDeps, RunStatus, SentSignal, StatusPhase, WriteResult } from './ci-run.ts'
 
 // ---------------------------------------------------------------------------
-// 1. Dependencies (E3 T1)
+// 1. Dependencies
 // ---------------------------------------------------------------------------
 //
-// The reader's injected dependencies (b.uqm SR-1.3): the runner's own
+// The reader's injected dependencies: the runner's own
 // interface, `RunnerDeps`, narrowed to the members the reader uses, plus the
 // reader's run-directory reads, its one removal and standard output. The run
 // directory and the system temp directory are derived from the injected
@@ -133,14 +133,14 @@ import type { FileTextRead, Invocation, OwnerLivenessProbe, Refusal, RunnerDeps,
 export type RunPathKind = 'missing' | 'directory' | 'other'
 
 /**
- * Every input and side effect of the reader (b.uqm SR-1.3), one member per
+ * Every input and side effect of the reader, one member per
  * line. Only `createRealReaderDeps` binds the real ones.
  *
- * From `RunnerDeps`: `spawn` (the `gh` lookups, SR-17.4), `env` (the reader's
+ * From `RunnerDeps`: `spawn` (the `gh` lookups), `env` (the reader's
  * own environment), `worktreeRoot` (the tree holding this file; the `gh`
  * lookups run there), `clock` (the wait and stop verbs' clock and timers),
  * `sendSignal` (the stop verb), `isPidAlive` and `readProcCmdline` (the
- * liveness rule, SR-6.3) and `writeStderr`.
+ * liveness rule) and `writeStderr`.
  */
 export interface ReaderDeps extends Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock' | 'sendSignal' | 'isPidAlive' | 'readProcCmdline' | 'writeStderr'> {
   /** Writes text to standard output; each report line goes here. */
@@ -149,7 +149,7 @@ export interface ReaderDeps extends Pick<RunnerDeps, 'spawn' | 'env' | 'worktree
   readonly readRunFile: (path: string) => FileTextRead
   /** What lies at a path, never following a final symbolic link. */
   readonly runPathKind: (path: string) => RunPathKind
-  /** Removes a run directory and everything under it, never following a symbolic link (b.uqm SR-16.3). */
+  /** Removes a run directory and everything under it, never following a symbolic link. */
   readonly removeRunDir: (path: string) => WriteResult
 }
 
@@ -242,33 +242,33 @@ export function createRealReaderDeps(): ReaderDeps {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Constants (E3 T1)
+// 2. Constants
 // ---------------------------------------------------------------------------
 //
-// Every numeric bound, exit code and fixed text of the reader (b.uqm SR-21.5),
-// each under one name. Tests and the skill audit (E13) import them. The usage
+// Every numeric bound, exit code and fixed text of the reader,
+// each under one name. Tests and the skill audit import them. The usage
 // exit status 64 is the runner's `USAGE_EXIT_STATUS`.
 
 // --- Bounds ---
 
-/** The runner-log lines a runner-died report prints, at most: the log's last 40 (b.uqm SR-17.1, SR-17.3). */
+/** The runner-log lines a runner-died report prints, at most: the log's last 40. */
 export const RUNNER_LOG_TAIL_LINES = 40
-/** The wait verb's bound: it returns at most 90 s after its start (b.uqm SR-17.5). */
+/** The wait verb's bound: it returns at most 90 s after its start. */
 export const WAIT_BOUND_MS = 90_000
-/** The wait verb checks the run at its start, then every 1 s (b.uqm SR-17.5). */
+/** The wait verb checks the run at its start, then every 1 s. */
 export const WAIT_CHECK_INTERVAL_MS = 1_000
-/** The grace after the deadline: 10 min (b.uqm SR-17.5, SR-18.2). */
+/** The grace after the deadline: 10 min. */
 export const GRACE_MINUTES = 10
-/** The deadline while no status file can be read: the RUN_ID's time plus 90 min (b.uqm SR-17.5, SR-18.2). */
+/** The deadline while no status file can be read: the RUN_ID's time plus 90 min. */
 export const NO_STATUS_DEADLINE_MINUTES = 90
-/** The stop verb sends SIGKILL when the runner is still alive 30 s after its SIGTERM (b.uqm SR-17.6). */
+/** The stop verb sends SIGKILL when the runner is still alive 30 s after its SIGTERM. */
 export const STOP_KILL_AFTER_MS = 30_000
-/** The stop verb checks the PID every 1 s after its SIGTERM (b.uqm SR-17.6). */
+/** The stop verb checks the PID every 1 s after its SIGTERM. */
 export const STOP_CHECK_INTERVAL_MS = 1_000
 
 // --- Exit codes ---
 
-/** Wait: the phase moved on, or the bound was reached (b.uqm SR-17.5). */
+/** Wait: the phase moved on, or the bound was reached. */
 export const WAIT_EXIT_RUNNING = 0
 /** Wait: `verdict.txt` exists. */
 export const WAIT_EXIT_VERDICT = 10
@@ -278,13 +278,13 @@ export const WAIT_EXIT_REFUSED = 11
 export const WAIT_EXIT_GONE = 12
 /** Wait: the grace has ended and the runner is alive. */
 export const WAIT_EXIT_GRACE = 13
-/** Stop: the runner was not alive; no signal sent; grace `none` (b.uqm SR-17.6). */
+/** Stop: the runner was not alive; no signal sent; grace `none`. */
 export const STOP_EXIT_NOT_ALIVE = 0
 /** Stop: SIGTERM sent; grace `term:<m>`. */
 export const STOP_EXIT_SENT_SIGTERM = 20
 /** Stop: SIGTERM, then SIGKILL after 30 s; grace `kill:<m>`. */
 export const STOP_EXIT_SENT_SIGKILL = 21
-/** Report: a full, uninjected PASS (b.uqm SR-17.3). */
+/** Report: a full, uninjected PASS. */
 export const REPORT_EXIT_FULL_PASS = 0
 /** Report: a full or selective FAIL, or the runner died or wrote no valid verdict. */
 export const REPORT_EXIT_FAIL = 1
@@ -295,24 +295,24 @@ export const REPORT_EXIT_SELECTIVE_PASS = 3
 /** Report: an injected run, not a gate result. */
 export const REPORT_EXIT_INJECTED = 4
 
-// --- The skill's limits and its two failure lines (b.uqm SR-18.2) ---
+// --- The skill's limits and its two failure lines ---
 
 /** After this many unknown wait exits in a row the skill stops polling. */
 export const UNKNOWN_WAIT_EXIT_LIMIT = 3
 /** The skill makes at most this many stop calls in all. */
 export const STOP_CALL_LIMIT = 3
-/** The skill's line after `UNKNOWN_WAIT_EXIT_LIMIT` unknown wait exits in a row; `<code>` and `<PID>` are its placeholders (b.uqm SR-18.2). */
+/** The skill's line after `UNKNOWN_WAIT_EXIT_LIMIT` unknown wait exits in a row; `<code>` and `<PID>` are its placeholders. */
 export const WAIT_READER_FAILED_TEXT = `verdict reader failed: wait exited <code> ${UNKNOWN_WAIT_EXIT_LIMIT} times in a row; runner <PID> may still be running; finish the run as "Finishing a run by hand" says`
-/** The skill's line after `STOP_CALL_LIMIT` unknown stop exits; `<code>` and `<PID>` are its placeholders (b.uqm SR-18.2). */
+/** The skill's line after `STOP_CALL_LIMIT` unknown stop exits; `<code>` and `<PID>` are its placeholders. */
 export const STOP_READER_FAILED_TEXT = `verdict reader failed: stop exited <code> ${STOP_CALL_LIMIT} times in a row; runner <PID> may still be running; finish the run as "Finishing a run by hand" says`
 
 // --- Command line ---
 
-/** The reader's verbs, in the order its usage text gives them (b.uqm SR-17.1). */
+/** The reader's verbs, in the order its usage text gives them. */
 export const READER_VERBS = ['report', 'wait', 'stop'] as const
 /** How the reader is run, as its usage text names it. */
 export const READER_COMMAND = 'bun scripts/ci-verdict.ts'
-/** The reader's usage text: its three command lines (b.uqm SR-17.1). */
+/** The reader's usage text: its three command lines. */
 export const READER_USAGE_TEXT = `${READER_COMMAND} report <RUN_ID> <PID> <grace> [/ci arguments] | ${READER_COMMAND} wait <RUN_ID> <PID> | ${READER_COMMAND} stop <RUN_ID> <PID>`
 /** `<PID>` when the skill obtained none. */
 export const PID_ARGUMENT_NONE = '-'
@@ -323,7 +323,7 @@ export const GRACE_TERM_PREFIX = 'term:'
 /** `<grace>`'s prefix when the skill sent SIGTERM, then SIGKILL: `kill:<m>`. */
 export const GRACE_KILL_PREFIX = 'kill:'
 
-// --- Verdict shapes (b.uqm SR-12.5, SR-17.2) ---
+// --- Verdict shapes ---
 
 /** A selective verdict's opening, before its script list: `SELECTIVE (`. */
 export const SELECTIVE_VERDICT_OPEN = 'SELECTIVE ('
@@ -332,7 +332,7 @@ export const VERDICT_WRAPPER_CLOSE = '): '
 /** What separates a selective verdict's number forms: one space. */
 export const SCRIPT_LIST_SEPARATOR = ' '
 
-// --- Report texts (b.uqm SR-17.3) ---
+// --- Report texts ---
 
 /** The runner-died report's first line. */
 export const RUNNER_DIED_TEXT = `test runner did not write a valid ${VERDICT_FILE_NAME}`
@@ -347,24 +347,24 @@ export const RESULTS_LINE_PREFIX = 'results: '
 
 /** Milliseconds in a second, for the texts that give a bound in seconds. */
 const MS_PER_SECOND = 1_000
-/** The least `<PID>` and the least m of `<grace>` (b.uqm SR-17.1). */
+/** The least `<PID>` and the least m of `<grace>`. */
 export const LEAST_PID_AND_GRACE_MINUTES = 1
-/** test-1's number: every shard runs it, so every selective verdict's list holds it (b.uqm SR-12.5, SR-17.2). */
+/** test-1's number: every shard runs it, so every selective verdict's list holds it. */
 const EVERY_SHARD_SCRIPT_NUMBER = 1
 
 // ---------------------------------------------------------------------------
-// 3. Arguments (E3 T1)
+// 3. Arguments
 // ---------------------------------------------------------------------------
 //
-// The three verbs' command lines (b.uqm SR-17.1). Malformed arguments exit 64
+// The three verbs' command lines. Malformed arguments exit 64
 // with one `usage: ` line naming the argument, before anything is read. The
-// `/ci` arguments after `report`'s `<grace>` are kept as given: SR-17.2
+// `/ci` arguments after `report`'s `<grace>` are kept as given:
 // judges them, never this parser.
 
 /** One of the reader's verbs. */
 export type ReaderVerb = (typeof READER_VERBS)[number]
 
-/** `<grace>`: what the skill did at grace expiry (b.uqm SR-17.1). */
+/** `<grace>`: what the skill did at grace expiry. */
 export type Grace =
   | {
       readonly kind: 'none'
@@ -412,7 +412,7 @@ export interface StopInvocation {
 /** A well-formed reader command line. */
 export type ReaderInvocation = ReportInvocation | WaitInvocation | StopInvocation
 
-/** The argument a malformed command line lacks or gets wrong (b.uqm SR-17.1). */
+/** The argument a malformed command line lacks or gets wrong. */
 export type UsageProblem =
   | {
       /** A required argument is missing. */
@@ -500,7 +500,7 @@ export function graceText(grace: Grace): string {
 /** The verbs as the usage reasons list them: `report, wait or stop`. */
 const VERB_CHOICES_TEXT = `${READER_VERBS[0]}, ${READER_VERBS[1]} or ${READER_VERBS[2]}`
 
-/** Why a command line is malformed, naming the argument (b.uqm SR-17.1). */
+/** Why a command line is malformed, naming the argument. */
 export function usageProblemText(problem: UsageProblem): string {
   switch (problem.kind) {
     case 'missing':
@@ -518,7 +518,7 @@ export function usageProblemText(problem: UsageProblem): string {
   }
 }
 
-/** The one standard-error line of a malformed command line: `usage: <the three command lines>: <why>` (b.uqm SR-17.1). */
+/** The one standard-error line of a malformed command line: `usage: <the three command lines>: <why>`. */
 export function readerUsageLine(problem: UsageProblem): string {
   return `${USAGE_PREFIX}${READER_USAGE_TEXT}: ${usageProblemText(problem)}`
 }
@@ -528,7 +528,7 @@ function isReaderVerb(text: string): text is ReaderVerb {
 }
 
 /**
- * Parses the reader's command line (b.uqm SR-17.1). Pure: it reads nothing.
+ * Parses the reader's command line. Pure: it reads nothing.
  * Malformed when the verb is missing or unknown, an argument is missing, the
  * RUN_ID is not one (the runner's rule), `<PID>` is neither `-` nor a whole
  * number of at least 1, `<grace>` is not of its three forms, or `wait` or
@@ -555,13 +555,13 @@ export function parseReaderArguments(argv: readonly string[]): ReaderArgumentPar
 }
 
 // ---------------------------------------------------------------------------
-// 4. Run files, the runner's PID and liveness (E3 T1)
+// 4. Run files, the runner's PID and liveness
 // ---------------------------------------------------------------------------
 //
 // Every read goes through the injected `readRunFile` and `runPathKind`. The
 // status file is parsed by the runner's strict parser, so one it rejects
-// counts exactly as a missing one (b.uqm SR-5.2). `results.json` is read
-// narrowly: only `version` and `timingSummary` (b.uqm SR-16.1).
+// counts exactly as a missing one. `results.json` is read
+// narrowly: only `version` and `timingSummary`.
 
 /** `verdict.txt` as `report` reads it: absent, present but unreadable, or its first line. */
 export type VerdictFirstLine =
@@ -578,7 +578,7 @@ export type VerdictFirstLine =
       readonly line: string
     }
 
-/** What `report` reads from a run directory (b.uqm SR-17.1). */
+/** What `report` reads from a run directory. */
 export interface ReportFiles {
   /** The run directory, as the runner derives it. */
   readonly runDir: string
@@ -598,7 +598,7 @@ export function hasRunDirectory(reads: Pick<ReaderDeps, 'runPathKind'>, runDir: 
   return reads.runPathKind(runDir) === 'directory'
 }
 
-/** Whether `verdict.txt` exists in the run directory: anything at its path counts, even what cannot be read. The wait verb's only look at it (b.uqm SR-17.1). */
+/** Whether `verdict.txt` exists in the run directory: anything at its path counts, even what cannot be read. The wait verb's only look at it. */
 export function verdictFileExists(reads: Pick<ReaderDeps, 'runPathKind'>, runDir: string): boolean {
   return reads.runPathKind(join(runDir, VERDICT_FILE_NAME)) !== 'missing'
 }
@@ -618,7 +618,7 @@ export function readVerdictFirstLine(reads: Pick<ReaderDeps, 'readRunFile'>, run
   }
 }
 
-/** The status file through the runner's parser (b.uqm SR-5.2); null for no status file. */
+/** The status file through the runner's parser; null for no status file. */
 export function readRunStatus(reads: Pick<ReaderDeps, 'readRunFile'>, runDir: string): RunStatus | null {
   const read = reads.readRunFile(join(runDir, STATUS_FILE_NAME))
   if (read.kind !== 'text') return null
@@ -632,7 +632,7 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * The timing summary from `results.json`'s text (b.uqm SR-16.1, SR-17.3):
+ * The timing summary from `results.json`'s text:
  * null when the text is not JSON, not an object, holds another `version`, or
  * its `timingSummary` is not an array of strings. No other key is checked.
  */
@@ -668,7 +668,7 @@ export function readRunnerLogTail(reads: Pick<ReaderDeps, 'readRunFile'>, runDir
   return read.kind === 'text' ? lastLines(read.text, RUNNER_LOG_TAIL_LINES) : null
 }
 
-/** Everything `report` reads (b.uqm SR-17.1). When no directory lies at the run directory's path, nothing in it is read: no verdict, no status, no timing summary, no log. */
+/** Everything `report` reads. When no directory lies at the run directory's path, nothing in it is read: no verdict, no status, no timing summary, no log. */
 export function readReportFiles(reads: RunFileReads, runDir: string): ReportFiles {
   if (!hasRunDirectory(reads, runDir)) {
     return { runDir, runDirExists: false, verdict: { kind: 'absent' }, status: null, timingSummary: null, logTail: null }
@@ -689,7 +689,7 @@ export function statusRefusal(status: RunStatus | null): Refusal | null {
 }
 
 /**
- * The runner's PID (b.uqm SR-17.1): the status file's `pid` when the status
+ * The runner's PID: the status file's `pid` when the status
  * file can be read, else the `<PID>` argument when it is a number, else none
  * (null). A `<PID>` too large to be a process ID is none.
  */
@@ -701,7 +701,7 @@ export function resolveRunnerPid(status: RunStatus | null, pidArgument: string):
 }
 
 /**
- * Whether the run's runner is alive (b.uqm SR-6.3, SR-17.1), by the runner's
+ * Whether the run's runner is alive, by the runner's
  * own rule only: a PID that is none is gone; any other is alive only when it is
  * a live process whose command line runs `scripts/ci-run.ts` with this
  * RUN_ID, so a gone PID, one reused by another program and one reused by a
@@ -712,15 +712,15 @@ export function isRunnerAlive(runId: string, pid: number | null, probe: OwnerLiv
 }
 
 // ---------------------------------------------------------------------------
-// 5. First-line validity (E3 T1)
+// 5. First-line validity
 // ---------------------------------------------------------------------------
 //
-// Which first lines are valid for an invocation (b.uqm SR-17.2), the second
+// Which first lines are valid for an invocation, the second
 // half of the double guard: only a full, uninjected invocation can have a
 // first line of exactly `PASS`. The invocation is parsed by the runner's own
 // rules; when it does not parse, no line is valid.
 
-/** A first line judged against the invocation (b.uqm SR-17.2). */
+/** A first line judged against the invocation. */
 export type FirstLineJudgement =
   | {
       readonly valid: false
@@ -775,7 +775,7 @@ function passOrFail(text: string): { readonly pass: boolean; readonly failLine: 
 }
 
 /**
- * Judges a verdict's first line against the `/ci` arguments (b.uqm SR-17.2).
+ * Judges a verdict's first line against the `/ci` arguments.
  * Pure. Valid lines:
  * - no selection, no injection: exactly `PASS`, or a line beginning `FAIL: `;
  * - a selection, no injection: `SELECTIVE (<list>): PASS` or
@@ -828,15 +828,14 @@ export function judgeVerdict(ciArgs: readonly string[], verdict: VerdictFirstLin
 }
 
 // ---------------------------------------------------------------------------
-// 6. The report verb (E3 T1)
+// 6. The report verb
 // ---------------------------------------------------------------------------
 //
-// The mapping from a run's files to the report's lines and exit code (b.uqm
-// SR-17.3), the masking of every run-file text it prints (SR-17.4) and the
-// removal of a PASS's or a refusal's run directory after printing (SR-16.3).
+// The mapping from a run's files to the report's lines and exit code, the masking of every run-file text it prints and the
+// removal of a PASS's or a refusal's run directory after printing.
 // The decision reads no liveness: the grace argument carries any signal sent.
 
-/** The report's seven outcomes, in precedence (b.uqm SR-17.3). */
+/** The report's seven outcomes, in precedence. */
 export type ReportOutcome = 'not-run' | 'runner-died' | 'injected' | 'selective-pass' | 'selective-fail' | 'full-pass' | 'full-fail'
 
 /** What the report decision needs. */
@@ -870,12 +869,12 @@ export function resultsLine(runDir: string): string {
   return `${RESULTS_LINE_PREFIX}${runDir}`
 }
 
-/** `timing summary could not be read from <run dir>/results.json` (b.uqm SR-17.3). */
+/** `timing summary could not be read from <run dir>/results.json`. */
 export function timingSummaryUnreadableLine(runDir: string): string {
   return `timing summary could not be read from ${runDir}/${RESULTS_FILE_NAME}`
 }
 
-/** `runner <PID> still alive after the <m> min deadline plus grace: sent SIGTERM`, ending `, then SIGKILL after 30 s` for `kill:<m>` (b.uqm SR-17.3). */
+/** `runner <PID> still alive after the <m> min deadline plus grace: sent SIGTERM`, ending `, then SIGKILL after 30 s` for `kill:<m>`. */
 export function graceSignalLine(pid: string, grace: Exclude<Grace, { readonly kind: 'none' }>): string {
   const term = `runner ${pid} still alive after the ${grace.minutes} min deadline plus grace: sent SIGTERM`
   return grace.kind === 'kill' ? `${term}, then SIGKILL after ${STOP_KILL_AFTER_MS / MS_PER_SECOND} s` : term
@@ -896,12 +895,12 @@ export function selectiveFailLine(failLine: string): string {
   return `${SELECTIVE_REPORT_PREFIX}${failLine}`
 }
 
-/** A refusal's report: `NOT RUN: <reason>` (the runner's `refusalLine`), then each detail line in order (b.uqm SR-5.8, SR-17.3). */
+/** A refusal's report: `NOT RUN: <reason>` (the runner's `refusalLine`), then each detail line in order. */
 export function notRunLines(refusal: Refusal): string[] {
   return [refusalLine(refusal), ...refusal.details]
 }
 
-/** The one standard-error line of a removal that failed, naming the run directory and holding no error text (b.uqm SR-16.3). */
+/** The one standard-error line of a removal that failed, naming the run directory and holding no error text. */
 export function removalFailedLine(runDir: string): string {
   return `ci-verdict: the run directory ${runDir} could not be removed; remove it by hand`
 }
@@ -914,7 +913,7 @@ function passReport(outcome: 'selective-pass' | 'full-pass', passLine: string, f
   return { outcome, lines: [passLine, ...files.timingSummary.map(mask)], exitCode, removeRunDir: true }
 }
 
-/** The runner-died report (b.uqm SR-17.3): its line, the directory when it exists, the log tail when there is one, and the grace line when the skill signalled. */
+/** The runner-died report: its line, the directory when it exists, the log tail when there is one, and the grace line when the skill signalled. */
 function runnerDiedReport(input: ReportInput, mask: RunFileMask): ReportDecision {
   const { files, grace } = input
   const lines = [RUNNER_DIED_TEXT]
@@ -925,7 +924,7 @@ function runnerDiedReport(input: ReportInput, mask: RunFileMask): ReportDecision
 }
 
 /**
- * The report (b.uqm SR-17.3), in precedence:
+ * The report, in precedence:
  * 1. not runnable, exit 2: a refusal, no verdict, grace `none`;
  * 2. runner died or invalid, exit 1: no valid verdict and no refusal, a
  *    verdict and a refusal both, an invalid first line, or any signalled grace;
@@ -969,8 +968,7 @@ function escapedPattern(value: string): string {
 }
 
 /**
- * A mask that replaces every one of `values` with `<redacted>` (b.uqm
- * SR-17.4), longest first so one pass replaces each whole value. Empty values
+ * A mask that replaces every one of `values` with `<redacted>`, longest first so one pass replaces each whole value. Empty values
  * are ignored; every other value is masked whatever its length.
  */
 export function secretMask(values: Iterable<string>): RunFileMask {
@@ -981,12 +979,12 @@ export function secretMask(values: Iterable<string>): RunFileMask {
 }
 
 /**
- * The secret values the report masks (b.uqm SR-15.1, SR-17.4): the reader's
+ * The secret values the report masks: the reader's
  * environment's secret credentials, by the runner's set, plus the base-build
  * token found by the runner's lookup, run through the injected spawn in the
  * reader's worktree root. Its first `gh auth token` gets the reader's
  * environment plus `GH_CONFIG_DIR=<$HOME>/.config/gh-personal`, the plain one
- * after it the environment unchanged (SR-15.4). A failed or empty lookup adds
+ * after it the environment unchanged. A failed or empty lookup adds
  * nothing. No value is printed, logged or passed on.
  */
 export async function gatherSecretValues(deps: Pick<ReaderDeps, 'spawn' | 'env' | 'worktreeRoot'>): Promise<ReadonlySet<string>> {
@@ -1016,7 +1014,7 @@ function stderrLine(deps: Pick<ReaderDeps, 'writeStderr'>, line: string): void {
 }
 
 /**
- * The report verb (b.uqm SR-17.1, SR-17.3, SR-17.4, SR-16.3): reads the run
+ * The report verb: reads the run
  * directory derived from the RUN_ID, judges the verdict, gathers the secret
  * values, prints the report, and only then, when the decision allows it and
  * every line was written, removes that directory. A failed removal adds one
@@ -1042,17 +1040,17 @@ export async function runReport(invocation: ReportInvocation, deps: ReaderDeps):
 }
 
 // ---------------------------------------------------------------------------
-// 7. The wait verb (E3 T2)
+// 7. The wait verb
 // ---------------------------------------------------------------------------
 //
-// `wait` (b.uqm SR-17.5) checks the run at its start, then every 1 s on the
+// `wait` checks the run at its start, then every 1 s on the
 // injected clock, for at most 90 s, and returns the first state that holds.
 // It counts the deadline and the grace from the run's files and the RUN_ID
 // alone, so the skill keeps no count across calls. It only reads: it never
 // writes, renames, removes, signals or spawns, and it only tests whether
 // `verdict.txt` exists, never reading it.
 
-/** The wait verb's states, in the order its checks take them (b.uqm SR-17.5). */
+/** The wait verb's states, in the order its checks take them. */
 export const WAIT_STATES = ['verdict', 'refused', 'gone', 'grace', 'running'] as const
 
 /** One of the wait verb's states. */
@@ -1067,7 +1065,7 @@ export type WaitPhase = StatusPhase | typeof PHASE_NONE
 /** Milliseconds in a minute, for the deadline and the grace. */
 const MS_PER_MINUTE = 60_000
 
-/** The run's deadline and grace as the wait and stop verbs count them (b.uqm SR-17.5). */
+/** The run's deadline and grace as the wait and stop verbs count them. */
 export interface RunDeadline {
   /** The deadline, epoch milliseconds. */
   readonly deadlineMs: number
@@ -1078,7 +1076,7 @@ export interface RunDeadline {
 }
 
 /**
- * The run's deadline (b.uqm SR-17.5): the status file's `deadline.epochSeconds`
+ * The run's deadline: the status file's `deadline.epochSeconds`
  * and `deadline.minutes` when it can be read, else the RUN_ID's time plus
  * `NO_STATUS_DEADLINE_MINUTES` and that many minutes. The grace ends
  * `GRACE_MINUTES` after the deadline. Throws for a `runId` that is no RUN_ID,
@@ -1099,7 +1097,7 @@ export function runDeadline(status: RunStatus | null, runId: string): RunDeadlin
   return { deadlineMs, minutes, graceEndsMs: deadlineMs + GRACE_MINUTES * MS_PER_MINUTE }
 }
 
-/** What one check of the wait verb reads (b.uqm SR-17.5). */
+/** What one check of the wait verb reads. */
 export interface WaitReading extends RunDeadline {
   /** Whether anything lies at `verdict.txt`'s path. */
   readonly verdictExists: boolean
@@ -1109,7 +1107,7 @@ export interface WaitReading extends RunDeadline {
   readonly refused: boolean
   /** The runner's PID (`resolveRunnerPid`); null for none. */
   readonly pid: number | null
-  /** Whether the runner is alive by b.uqm SR-6.3 (`isRunnerAlive`). */
+  /** Whether the runner is alive by the contract (`isRunnerAlive`). */
   readonly alive: boolean
   /** The clock at the check, epoch milliseconds. */
   readonly nowMs: number
@@ -1118,7 +1116,7 @@ export interface WaitReading extends RunDeadline {
 /** The members one wait check uses: reads, the liveness probe and the clock. Nothing that writes, removes, signals or spawns. */
 export type WaitCheckDeps = Pick<ReaderDeps, 'env' | 'readRunFile' | 'runPathKind' | 'isPidAlive' | 'readProcCmdline' | 'clock'>
 
-/** One check of the run (b.uqm SR-17.5): whether `verdict.txt` exists, the status file's phase, refusal and deadline, the runner's PID and liveness, and the clock. */
+/** One check of the run: whether `verdict.txt` exists, the status file's phase, refusal and deadline, the runner's PID and liveness, and the clock. */
 export function readWaitCheck(runId: string, pidArgument: string, deps: WaitCheckDeps): WaitReading {
   const runDir = runDirPath(deps.env, runId)
   const verdictExists = verdictFileExists(deps, runDir)
@@ -1136,7 +1134,7 @@ export function readWaitCheck(runId: string, pidArgument: string, deps: WaitChec
 }
 
 /**
- * The state one check finds (b.uqm SR-17.5), the first that holds in this
+ * The state one check finds, the first that holds in this
  * order: `verdict`, `refused`, `gone`, `grace` (the clock at or after the
  * grace's end, the runner alive), `running` (the phase differs from
  * `firstPhase`, the one the first check read). Null when none holds; the
@@ -1151,7 +1149,7 @@ export function waitStateOf(reading: WaitReading, firstPhase: WaitPhase): WaitSt
   return null
 }
 
-/** The wait verb's exit code for a state (b.uqm SR-17.5). */
+/** The wait verb's exit code for a state. */
 export function waitExitCode(state: WaitState): number {
   switch (state) {
     case 'verdict':
@@ -1173,7 +1171,7 @@ function pidText(pid: number | null): string {
 }
 
 /**
- * The wait verb's one line (b.uqm SR-17.5):
+ * The wait verb's one line:
  * `wait: <state> phase=<phase|none> pid=<pid|-> runner=<alive|gone> deadline=<UTC time> minutes=<m> grace-ends=<UTC time>`,
  * the UTC times in the runner's format (`formatUtcTime`).
  */
@@ -1196,7 +1194,7 @@ export interface WaitResult {
 }
 
 /**
- * Waits for the run to move on (b.uqm SR-17.5), on the injected clock only.
+ * Waits for the run to move on, on the injected clock only.
  * It checks at its start, then `WAIT_CHECK_INTERVAL_MS` after each check
  * (one `clock.setTimeout` per pause), and returns at the first check at which
  * a state holds (`waitStateOf`). When a check finds none and the bound
@@ -1222,7 +1220,7 @@ export async function waitForRun(runId: string, pidArgument: string, deps: WaitC
   }
 }
 
-/** The wait verb (b.uqm SR-17.5): waits, prints its one line on standard output and answers the state's exit code. */
+/** The wait verb: waits, prints its one line on standard output and answers the state's exit code. */
 export async function runWait(invocation: WaitInvocation, deps: ReaderDeps): Promise<number> {
   const { state, reading } = await waitForRun(invocation.runId, invocation.pid, deps)
   printLines(deps, [waitLine(state, reading)])
@@ -1230,19 +1228,19 @@ export async function runWait(invocation: WaitInvocation, deps: ReaderDeps): Pro
 }
 
 // ---------------------------------------------------------------------------
-// 8. The stop verb (E3 T2)
+// 8. The stop verb
 // ---------------------------------------------------------------------------
 //
-// `stop` (b.uqm SR-17.6) signals only a runner alive by SR-6.3, and only its
+// `stop` signals only a runner alive by the contract, and only its
 // PID, never a process group: SIGTERM, then SIGKILL when it is still alive
 // 30 s later. A signal that is not delivered (no such process, or not
 // permitted) counts as not sent. It writes, renames, removes and spawns
 // nothing.
 
-/** What the stop verb did (b.uqm SR-17.6). */
+/** What the stop verb did. */
 export type StopOutcome =
   | {
-      /** No signal sent: the PID is none, not alive by SR-6.3, or its SIGTERM was not delivered. */
+      /** No signal sent: the PID is none, not alive by the contract, or its SIGTERM was not delivered. */
       readonly kind: 'not-alive'
       readonly pid: number | null
     }
@@ -1267,7 +1265,7 @@ export function stopGrace(outcome: StopOutcome): Grace {
 }
 
 /**
- * The stop verb's one line (b.uqm SR-17.6), `stop: <what it did>; grace <grace>`:
+ * The stop verb's one line, `stop: <what it did>; grace <grace>`:
  * - `stop: runner <pid|-> not alive, no signal sent; grace none`
  * - `stop: sent SIGTERM to runner <pid>; grace term:<m>`
  * - `stop: sent SIGTERM to runner <pid>, then SIGKILL after 30 s; grace kill:<m>`
@@ -1284,7 +1282,7 @@ export function stopLine(outcome: StopOutcome): string {
   }
 }
 
-/** The stop verb's exit code for an outcome: 0, 20 or 21 (b.uqm SR-17.6). */
+/** The stop verb's exit code for an outcome: 0, 20 or 21. */
 export function stopExitCode(outcome: StopOutcome): number {
   switch (outcome.kind) {
     case 'not-alive':
@@ -1305,9 +1303,9 @@ function signalPid(deps: Pick<ReaderDeps, 'sendSignal'>, pid: number, signal: Se
 }
 
 /**
- * Stops the run's runner (b.uqm SR-17.6). Reads the status file once for the
+ * Stops the run's runner. Reads the status file once for the
  * PID (`resolveRunnerPid`) and m (`runDeadline`). Sends nothing unless that
- * PID is alive by SR-6.3. Then it sends SIGTERM to the PID; one not delivered
+ * PID is alive by the contract. Then it sends SIGTERM to the PID; one not delivered
  * gives `not-alive`. After it, it checks liveness every
  * `STOP_CHECK_INTERVAL_MS` on the injected clock (the last pause shortened to
  * end exactly `STOP_KILL_AFTER_MS` after the SIGTERM): a runner found gone,
@@ -1332,7 +1330,7 @@ export async function stopRunner(runId: string, pidArgument: string, deps: StopD
   }
 }
 
-/** The stop verb (b.uqm SR-17.6): stops the runner, prints its one line on standard output and answers its exit code. */
+/** The stop verb: stops the runner, prints its one line on standard output and answers its exit code. */
 export async function runStop(invocation: StopInvocation, deps: ReaderDeps): Promise<number> {
   const outcome = await stopRunner(invocation.runId, invocation.pid, deps)
   printLines(deps, [stopLine(outcome)])
@@ -1340,11 +1338,11 @@ export async function runStop(invocation: StopInvocation, deps: ReaderDeps): Pro
 }
 
 // ---------------------------------------------------------------------------
-// 9. The verb runner and the entry block (E3 T1)
+// 9. The verb runner and the entry block
 // ---------------------------------------------------------------------------
 
 /**
- * The reader, driven in process through its dependencies (b.uqm SR-21.1):
+ * The reader, driven in process through its dependencies:
  * parses the command line, then runs its verb. Answers the exit code and
  * never exits the process; only the entry block does.
  * - Malformed arguments: one `usage: ` line on standard error, nothing on
@@ -1380,7 +1378,7 @@ export async function runVerdictReader(argv: readonly string[], deps: ReaderDeps
 // a declaration, import or export, and the last thing in the file. It binds
 // the real dependencies, runs the verb runner with the process arguments and
 // exits with its code; an uncaught error writes one line to standard error and
-// exits 1. Nothing here runs on import (b.uqm SR-1.3).
+// exits 1. Nothing here runs on import.
 if (import.meta.main) {
   const fail: (err: unknown, origin: string) => never = (err, origin) => {
     writeSync(2, `ci-verdict: ${origin}: ${oneLineError(err)}\n`)

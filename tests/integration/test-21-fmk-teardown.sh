@@ -516,7 +516,7 @@ t21_check_last_line() {
 }
 
 # ---------------------------------------------------------------------------
-# S3: the precheck legs (SRJ-901; E32's hatch note)
+# S3: the precheck legs ( design note)
 # ---------------------------------------------------------------------------
 
 t21_precheck_legs() {
@@ -601,8 +601,8 @@ t21_precheck_legs() {
 }
 
 # ---------------------------------------------------------------------------
-# S4: the teardown-failure legs (SRJ-905, SRJ-906, SRJ-907, SRJ-909; E33's
-# hatch note)
+# S4: the teardown-failure legs (
+# design note)
 # ---------------------------------------------------------------------------
 
 t21_teardown_failure_legs() {
@@ -654,7 +654,7 @@ t21_teardown_failure_legs() {
 }
 
 # ---------------------------------------------------------------------------
-# S5: the not-restarted leg (SRJ-906; SRD over Epic: one alert per run,
+# S5: the not-restarted leg (contract over component: one alert per run,
 # printed, logged and recorded)
 # ---------------------------------------------------------------------------
 
@@ -748,8 +748,8 @@ t21_not_restarted_leg() {
 }
 
 # ---------------------------------------------------------------------------
-# S6: the pending-persona leg (SRJ-1411's second sentence, SRJ-903, SRJ-410;
-# AC 4)
+# S6: the pending-persona leg (second sentence;
+#)
 # ---------------------------------------------------------------------------
 
 # t21_trail_after <time> <event> <id>: the trail's <event> records for <id>
@@ -848,7 +848,7 @@ t21_not_restarted_leg
 t21_pending_leg
 stop_server
 
-# The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
+# The closing assertions.
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

@@ -1,9 +1,9 @@
 /**
  * phase1-client-classes.test.ts — the agent-director error classes
  * `src/agent-director-errors.ts` exports for the classifier are the pinned
- * client's own (b.jg5 SRJ-101, SRJ-103; PRD AC 14).
+ * client's own.
  *
- * One identity check per class: SRJ-103's seven re-exports
+ * One identity check per class: seven re-exports
  * (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`, `ErrTmuxSessionConflict`,
  * `ErrTmuxSendKeys`, `ErrTmuxCaptureFailed`, `ErrTmuxSessionCreate`,
  * `ErrUnknownErrorName`) and `ErrSendKeysWhileRelayed` are each the class
@@ -38,7 +38,7 @@ import {
   ErrUnknownErrorName,
 } from '../src/agent-director-errors.ts'
 
-describe('b.jg5 SRJ-103: each class src/agent-director-errors.ts re-exports is the pinned client\'s own', () => {
+describe('each class src/agent-director-errors.ts re-exports is the pinned client\'s own', () => {
   test.each([
     ['ErrTmuxKillFailed', ErrTmuxKillFailed, agentDirector.ErrTmuxKillFailed],
     ['ErrTmuxUnresponsive', ErrTmuxUnresponsive, agentDirector.ErrTmuxUnresponsive],

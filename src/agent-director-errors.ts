@@ -4,17 +4,16 @@
  *
  * An agent-director error's class (GONE, UNAVAILABLE, CONFLICT, UNUSABLE NAME,
  * CONFIG, ENVIRONMENT, LAUNCH FAILURE, STATE, DIRECTORY, UNCLASSIFIED) is
- * decided by the classifier in `src/ad-error-class.ts` (b.jg5 SRJ-104), which
+ * decided by the classifier in `src/ad-error-class.ts`, which
  * recognises every error the client declares as a class by `instanceof` that
  * class. No `instanceof` ladder outside the classifier decides a class. This
  * module exports the client's error classes so the classifier, the rest of
  * CSCB and the tests import them from one place, and keeps the subset list in
- * sync with SRD edits. Per SR-0.2 CSCB never parses free-form error message
+ * sync with contract edits. Per CSCB never parses free-form error message
  * text or exit codes, apart from matching agent-director's fixed description
  * words, which are kept in `src/ad-description-phrases.ts`.
  *
- * The seven classes of the tmux-side and unknown-name errors (b.jg5 SRJ-103,
- * SRJ-104), each a named re-export of the client's own class:
+ * The seven classes of the tmux-side and unknown-name errors, each a named re-export of the client's own class:
  *   - ErrTmuxSendKeys           GONE
  *   - ErrTmuxCaptureFailed      GONE
  *   - ErrTmuxSessionCreate      LAUNCH FAILURE
@@ -35,17 +34,17 @@
  * a client class by its name. The names of the
  * last three are also exported below as plain strings, for the startup gate's
  * dist-text check (`REQUIRED_ERR_NAMES`, `src/agent-director-startup.ts`,
- * b.jg5 SRJ-102) and for log labels only. So are the three store-open
+ *) and for log labels only. So are the three store-open
  * `unknownName`s (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`,
  * `ErrStoreOpen`) and `ErrInternal`, whose native classes the classifier recognises; explicit legacy envelopes
  * also retain handling through `unknownName`.
  *
- * Catalog (SR-0.2):
+ * Catalog:
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
  *   - ErrSystemInstallNotFound  (Client.create / resolveSystemBinary — no `agent-director` on PATH or at ~/.config/agent-director)
  *   - ErrSystemInstallTooOld    (Client.create / resolveSystemBinary — system binary older than required minimum)
  *   - ErrSystemInstallUnreachable (Client.create / resolveSystemBinary — system binary present but not executable or fails --version)
- *   - ErrSystemInstallDisappeared (any verb / binary gone after valid construction — b.xht)
+ * - ErrSystemInstallDisappeared (any verb / binary gone after valid construction —)
  *   - ErrTmuxNotAvailable       (spawn / tmux binary not found or not executable)
  *   - ErrTmuxSessionCreate      (spawn / tmux could not create the session)
  *   - ErrTmuxSendKeys           (send-keys / the tmux session is gone)
@@ -60,33 +59,33 @@
  *                               client has no class for)
  *   - ErrCwdNotFound            (spawn / persona working directory does not exist on disk)
  *   - ErrCwdNotADirectory       (spawn / persona working directory exists but is not a directory)
- *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
+ * - ErrInstanceIdCollision (spawn / idempotency)
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
  *   - ErrSpawnNotInteractive    (send-keys / the row is `ended` or `missing`, or
  *                               `pending` whose session may be another launch's
  *                               or with no launch start: the reconnect's
- *                               `dead-session` (`row-not-interactive`, b.dup),
+ * `dead-session` (`row-not-interactive`),
  *                               a route into the restart path's decision only;
- *                               it does not prove the worker gone, b.jg5 SRJ-609)
+ * it does not prove the worker gone)
  *   - ErrSendKeysWhileRelayed   (send-keys / the row sits on a relayed permission
- *                               prompt; UNCLASSIFIED under SRJ-104: CSCB gives it
+ * prompt; UNCLASSIFIED under CSCB gives it
  *                               no handling)
- *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
- *   - ErrJsonlMissing           (resume / SR-1.3 fallthrough)
+ * - ErrNoSessionId (resume / fallthrough)
+ * - ErrJsonlMissing (resume / fallthrough)
  *   - ErrJsonlNeverWritten      (resume / AD 0.10.0 — session never wrote a transcript, so nothing can be lost)
- *   - ErrSpawnNotResumable      (resume / SR-1.3 collision-recovery)
- *   - ErrAlreadyDecided         (decide / SR-2.2 treated-as-success)
+ * - ErrSpawnNotResumable (resume / collision-recovery)
+ * - ErrAlreadyDecided (decide / treated-as-success)
  *   - ErrNoOpenPermissionRequest (decide / poller race)
- *   - ErrRelayModeOff           (spawn / SR-1.2 abort)
+ * - ErrRelayModeOff (spawn / abort)
  *   - ErrRelayFallenBack       (decide / AD 0.10.0 — the request's relay window
  *                               elapsed, so Claude already fell back to asking at
  *                               the tmux pane; AD refuses to record a verdict that
  *                               nothing would read. The spawn stays alive.)
- *   - ErrRelayModeInvalid       (spawn / SR-1.2 abort)
- *   - ErrTemplateMalformed      (makeTemplate / SR-3.2 fatal)
+ * - ErrRelayModeInvalid (spawn / abort)
+ * - ErrTemplateMalformed (makeTemplate / fatal)
  *   - ErrTemplateExists         (makeTemplate; only relevant pre-overwrite)
  *   - ErrTemplateNotFound       (defensive — not raised by makeTemplate)
- *   - ErrTemplateNameUnsafe     (makeTemplate / SR-3.2 fatal)
+ * - ErrTemplateNameUnsafe (makeTemplate / fatal)
  *   - ErrClientClosed           (post-close verb call; TS-only)
  *   - ErrCallTimeout            (any verb / per-call timeout exceeded)
  *
@@ -96,12 +95,12 @@
  * ErrPauseTimeout (pause / the row did not end within the host's
  * `[pause] timeout_seconds`) is not re-exported: the CLI teardown's pause
  * (`teardownPersona`, `src/cli.ts`, through `src/cli-teardown.ts`) meets it and escalates to the
- * kill (b.jg5 SRJ-119, SRJ-903) on the classifier's answer, UNCLASSIFIED, as
- * for every other agent-director error SRJ-104 gives no handling.
+ * kill on the classifier's answer, UNCLASSIFIED, as
+ * for every other agent-director error gives no handling.
  *
  * CSCB-synthetic subclasses (NOT emitted by the agent-director library — minted
  * inside CSCB and recognised by their class, like agent-director's own
- * errors, so SR-0.2 holds for them too):
+ * errors, so holds for them too):
  *   - ErrSpawnCapReached        (restart backoff / consecutive-failure cap latch)
  *
  * SPDX-License-Identifier: MIT
@@ -112,7 +111,7 @@ import { AgentDirectorError } from 'agent-director'
 /**
  * `errName` of CSCB's own `ErrSpawnCapReached`. The spawn-failure notice's
  * remediation line tells it apart by its class (`ErrSpawnCapReached`, below;
- * SR-0.2 — no message matching).
+ * no message matching).
  */
 export const ERR_SPAWN_CAP_REACHED_NAME = 'SpawnCapReached'
 
@@ -130,8 +129,7 @@ export class ErrSpawnCapReached extends AgentDirectorError {
 }
 
 /**
- * Names of the three errors only the Phase 1 client declares (b.jg5 SRJ-102,
- * SRJ-103), as plain strings. They serve the startup gate's dist-text check
+ * Names of the three errors only the Phase 1 client declares, as plain strings. They serve the startup gate's dist-text check
  * (`REQUIRED_ERR_NAMES`, `src/agent-director-startup.ts`) and log labels
  * only; no code decides an error by them. The errors themselves are
  * recognised by class: the re-exported `ErrTmuxKillFailed`,

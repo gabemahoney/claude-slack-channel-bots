@@ -248,7 +248,7 @@ import {
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 
-/** The kill's success the fixture's `killInstance` answers: `kill_sent: true` (b.jg5 SRJ-701). */
+/** The kill's success the fixture's `killInstance` answers: `kill_sent: true`. */
 const KILL_SUCCEEDED: KillOutcome = { kind: KILL_OUTCOME_KILLED, killSent: true }
 
 /** The teardown kill's result the fixture's `killInstance` answers: one try, `KILL_SUCCEEDED`, no alert. */
@@ -517,31 +517,31 @@ function teardownPrefix(p: Persona): string {
 
 /**
  * The teardown's line naming its kill's outcome for `p` after `tries`
- * kill(s), the row kept (b.jg5 SRJ-715, SRJ-701, SRJ-1014), logged when the
+ * kill(s), the row kept, logged when the
  * kill succeeded: `outcome` is the fixture's `KILL_SUCCEEDED` unless given
  * (the real kill over the stub's default result answers `kill_sent` absent).
  */
 function killOutcomeLine(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED, tries = 1): string {
-  return `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)}: ${describeKillOutcome(outcome)} after ${tries} kill(s); the row is kept (b.jg5 SRJ-715)`
+  return `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)}: ${describeKillOutcome(outcome)} after ${tries} kill(s); the row is kept`
 }
 
 /**
  * The teardown's kill-step failure line for `p` whose kill's standing
  * outcome is `outcome` after `tries` kill(s): the row is kept, nothing
- * latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110).
+ * latches and no retry timer is armed.
  */
 function killFailedLine(p: Persona, outcome: KillOutcome, tries: number): string {
   return (
     `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)} failed: ${describeKillOutcome(outcome)} after ${tries} kill(s) — ` +
-    'the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)'
+    'the row is kept; nothing latches and no retry timer is armed'
   )
 }
 
-/** The teardown's one line for `p` when its kill answered a malformed kill-failure alert decision: nothing is raised (b.jg5 SRJ-704). */
+/** The teardown's one line for `p` when its kill answered a malformed kill-failure alert decision: nothing is raised. */
 function malformedAlertLine(p: Persona): string {
   return (
     `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)}: it answered a malformed kill-failure alert decision — ` +
-    'no kill-failure alert is raised (b.jg5 SRJ-704)'
+    'no kill-failure alert is raised'
   )
 }
 
@@ -551,8 +551,7 @@ function cleanTeardownLines(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED, t
 }
 
 /**
- * The start of the teardown's turn for `p`, before its first step (b.jg5
- * SRJ-1002, SRJ-1003): its outage state forgotten silently, then its notice
+ * The start of the teardown's turn for `p`, before its first step: its outage state forgotten silently, then its notice
  * window opened, then the notices its destination hold kept dropped
  * (`DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP`), nothing awaited in between.
  */
@@ -562,7 +561,7 @@ function turnStart(p: Persona): string[] {
 
 /**
  * The end of the teardown's turn for `p`, after its last step, whatever a
- * step threw (b.jg5 SRJ-1003): its notice window closed, then its submit
+ * step threw: its notice window closed, then its submit
  * ended.
  */
 function turnEnd(p: Persona): string[] {
@@ -687,11 +686,11 @@ function makeControllerStack(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Persona teardown (SR-6.5): order, failures, dry run
+// Persona teardown: order, failures, dry run
 // ---------------------------------------------------------------------------
 
-describe('persona teardown (SR-6.5): every step for the removed key only, in order', () => {
-  test('AC 57: tearing B down runs every step for B alone, in the documented order, starting and complete lines only', async () => {
+describe('persona teardown: every step for the removed key only, in order', () => {
+  test('tearing B down runs every step for B alone, in the documented order, starting and complete lines only', async () => {
     const f = makeFixture()
 
     await f.lifecycle.teardown(f.b)
@@ -702,11 +701,11 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.submitted).toEqual([f.b.key])
   })
 
-  // b.jg5 SRJ-811: the optional old-life member (production: the session
+  // the optional old-life member (production: the session
   // manager's forgetOldLifeWaits) runs right after each stop of B's retry
   // timer before the kill; the fixture's other teardowns, built without it,
   // keep the trail above.
-  test('b.jg5 SRJ-811: with the optional old-life member, B\'s old-life waits are forgotten right after each retry-timer stop before the kill (in the first group, and again once its launch in flight settled), for B only; none after the kill', async () => {
+  test('with the optional old-life member, B\'s old-life waits are forgotten right after each retry-timer stop before the kill (in the first group, and again once its launch in flight settled), for B only; none after the kill', async () => {
     const f = makeFixture({
       overrides: {
         forgetOldLifeWaits: (key: string) => {
@@ -730,7 +729,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
-  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('b.jg5 SRJ-811: the old-life member failing (it %s) is one token-safe line per step naming B, and every later step still runs', async (how) => {
+  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('the old-life member failing (it %s) is one token-safe line per step naming B, and every later step still runs', async (how) => {
     const f = makeFixture({
       overrides: {
         forgetOldLifeWaits: (key: string) => {
@@ -754,7 +753,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  test('b.f2b: a launch in flight that settles only once its wait for a working row is cancelled (up to 10 minutes otherwise) does not hold the teardown: the wait is cancelled at submit, before the teardown waits for the launch', async () => {
+  test('a launch in flight that settles only once its wait for a working row is cancelled (up to 10 minutes otherwise) does not hold the teardown: the wait is cancelled at submit, before the teardown waits for the launch', async () => {
     const waitCancelled = Promise.withResolvers<void>()
     const f = makeFixture({
       launchInFlight: () => waitCancelled.promise,
@@ -778,17 +777,17 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
   // Rows: how the turn's stop fails (the submit-time stop succeeds).
 
-  // b.jg5 SRJ-706, SRJ-715: the live-row sequence is stopped right after the
+  // the live-row sequence is stopped right after the
 
   // that stop (the sequence's call in flight) before any other step and
   // before it waits for the launch in flight.
 
-  // b.jg5 SRJ-715, SRJ-706, SRJ-707: B's launch in flight can start B's
+  // B's launch in flight can start B's
   // sequence at a collision ladder replacement site after the turn's first
   // sequence stop. Once that launch settled, the turn stops the sequence
   // again and awaits that stop (the sequence's call in flight) before its
   // second retry-timer stop and every later step, the kill included.
-  test('b.jg5 SRJ-715, SRJ-706: once B\'s launch in flight settled, B\'s live-row sequence is stopped again and the turn awaits that stop, then stops B\'s retry timer again and forgets its latch, hold and notice episodes again, before its Slack connection stops and before its kill', async () => {
+  test('once B\'s launch in flight settled, B\'s live-row sequence is stopped again and the turn awaits that stop, then stops B\'s retry timer again and forgets its latch, hold and notice episodes again, before its Slack connection stops and before its kill', async () => {
     const againStop = Promise.withResolvers<boolean>()
     let stops = 0
     const f = makeFixture({
@@ -826,7 +825,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     [2, LIVE_ROW_SEQUENCE_STOP_STEP, 'rejects'],
     [3, LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP, 'throws'],
     [3, LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP, 'rejects'],
-  ])('b.jg5 SRJ-706: the live-row sequence\'s stop number %i failing in the turn (%s; it %s): one token-safe line naming B by its step, every later step still runs and the teardown completes with one failed step', async (failing, phrase, how) => {
+  ])('the live-row sequence\'s stop number %i failing in the turn (%s; it %s): one token-safe line naming B by its step, every later step still runs and the teardown completes with one failed step', async (failing, phrase, how) => {
     let stops = 0
     const f = makeFixture({
       overrides: {
@@ -860,14 +859,14 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
-  // b.jg5 SRJ-706, SRJ-715 (E21 T1's reconcile note): a kill try already in
+  // ( reconcile note): a kill try already in
   // flight when the sequence is stopped can still arm P's retry timer from
   // inside the try (a CONFIG answer through the outage state's detection).
   // The teardown's sequence stop waits for that call, so its later stops of
   // P's retry timer clear the arm. Composed over the recovery harness: its
   // registry, retry controller and sequence dependencies, with the
   // teardown's sequence stop and retry-timer stop bound as main() binds them.
-  test('b.jg5 SRJ-706, SRJ-715: a teardown of P during its sequence\'s held step-1 kill, which then answers CONFIG: the turn waits for the kill, the CONFIG answer arms P\'s retry timer, and the teardown\'s later timer stops leave none armed', async () => {
+  test('a teardown of P during its sequence\'s held step-1 kill, which then answers CONFIG: the turn waits for the kill, the CONFIG answer arms P\'s retry timer, and the teardown\'s later timer stops leave none armed', async () => {
     const h = makeRecoveryHarness()
     cleanups.push(() => {
       try {
@@ -918,14 +917,14 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     h.controller.stop(q, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
   })
 
-  // b.jg5 SRJ-715, SRJ-706, SRJ-707 (E21 T2's reconcile note): a launch of P
+  // ( reconcile note): a launch of P
   // in flight at the teardown's first sequence stop can start P's sequence at
   // a collision ladder replacement site after that stop. Once the launch has
   // settled, the turn's second, awaited stop stops it: its step-1 kill, in
   // flight, is waited for, and no get, run or launch follows. Composed over
   // the recovery harness as above, the turn waiting for the real launch in
   // flight (`whenLaunchSettled`).
-  test('b.jg5 SRJ-715, SRJ-706: P\'s launch in flight at the teardown starts P\'s sequence after the turn\'s first stop; the stop once the launch settled stops that sequence before the teardown goes on: its kill in flight is waited for, and no get, run or reuse spawn follows', async () => {
+  test('P\'s launch in flight at the teardown starts P\'s sequence after the turn\'s first stop; the stop once the launch settled stops that sequence before the teardown goes on: its kill in flight is waited for, and no get, run or reuse spawn follows', async () => {
     const h = makeRecoveryHarness()
     cleanups.push(() => {
       try {
@@ -996,7 +995,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(h.controller.isArmed(p)).toBe(false)
   })
 
-  // b.jg5 SRJ-715, SRJ-305, SRJ-301: P's launch in flight
+  // P's launch in flight
   // (the start pass's, outside the serializer) can arm P's retry timer after
   // the teardown's first-group stop. Composed over the recovery harness: the
   // real retry controller on its fake clock and the real launch, its spawn
@@ -1004,9 +1003,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // retry-timer stop and its wait for the launch bound as main() binds them.
   test.each<[string, (spawns: ReturnType<typeof holdSpawns>, id: string) => void, string]>([
     ['meets UNAVAILABLE', (spawns, id) => spawns.fail(id, errTmuxUnresponsive('spawn')), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-    // b.jg5 SRJ-301, SRJ-409: a launch that returned success arms P's pending-only watch.
+    // a launch that returned success arms P's pending-only watch.
     ['succeeds (its pending-only watch)', (spawns, id) => spawns.release(id), UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-  ])('b.jg5 SRJ-715: P\'s launch in flight %s after the teardown\'s first retry-timer stop and arms P\'s timer; the stop once that launch settled clears it, so no timer is armed for P when the teardown completes; Q\'s timer stays armed', async (_label, settle, cause) => {
+  ])('P\'s launch in flight %s after the teardown\'s first retry-timer stop and arms P\'s timer; the stop once that launch settled clears it, so no timer is armed for P when the teardown completes; Q\'s timer stays armed', async (_label, settle, cause) => {
     const h = makeRecoveryHarness()
     cleanups.push(() => {
       try {
@@ -1066,9 +1065,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // in the turn, so each of their steps fails: stopRetryTimer (in the first group, again once the launch in flight
   // settled and once more after the kill), the latch forget (in the first group, again once the launch settled and
   // once more after the kill), and the hold and episodes forgets (in the first group and again once the launch
-  // settled) (b.jg5 SRJ-715), and the destination hold's cancel (right after the window opens, and again in step 6,
-  // b.jg5 SRJ-1003). The outage state is forgotten once, at the turn's start, and the held notices dropped once; the
-  // notice window's open and close are steps of their own (b.jg5 SRJ-1002, SRJ-1003).
+  // settled), and the destination hold's cancel (right after the window opens, and again in step 6,
+  //). The outage state is forgotten once, at the turn's start, and the held notices dropped once; the
+  // notice window's open and close are steps of their own.
   test.each<[DepName, string[]]>([
     ['notifier.openTeardownWindow', ['opening its notice window']],
     ['notifier.closeTeardownWindow', ['closing its notice window']],
@@ -1109,10 +1108,10 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-715, SRJ-110: a kill step that throws shows no outcome: the
+  // a kill step that throws shows no outcome: the
   // step fails, nothing is raised and the row is kept (there is no delete);
   // every other step still runs.
-  test('b.jg5 SRJ-715: killInstance failing (it throws): its step is logged token-safely, no alert is raised, every other step still runs, and the completion line counts one failed step', async () => {
+  test('killInstance failing (it throws): its step is logged token-safely, no alert is raised, every other step still runs, and the completion line counts one failed step', async () => {
     const f = makeFixture({ fail: ['killInstance'] })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
@@ -1126,7 +1125,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  test('b.jg5 SRJ-715: a kill answering no kill outcome fails the kill step with its own line; nothing is raised and every other step still runs', async () => {
+  test('a kill answering no kill outcome fails the kill step with its own line; nothing is raised and every other step still runs', async () => {
     const f = makeFixture({ killResult: { refusals: [] } as unknown as PersonaTeardownKillResult })
 
     await f.lifecycle.teardown(f.b)
@@ -1134,12 +1133,12 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
-      `${teardownPrefix(f.b)}: agent-director kill of ${personaInstanceId(f.b.key)} failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)`,
+      `${teardownPrefix(f.b)}: agent-director kill of ${personaInstanceId(f.b.key)} failed: it answered no kill outcome — the row is kept`,
       `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
     ])
   })
 
-  // b.jg5 SRJ-704, SRJ-715: the kill's retry decision is raised right after
+  // the kill's retry decision is raised right after
   // the kill step, for B, with the decision as the kill answered it, before
   // the outage state is forgotten again; a `none` decision raises nothing
   // (every other case here). A failing raise is one failed step.
@@ -1168,7 +1167,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       },
       true,
     ],
-  ])('b.jg5 SRJ-704: the kill\'s %s is raised once for B, right after the kill step; a raise that throws is logged as its own failed step and every other step still runs', async (_label, killResult, succeeded) => {
+  ])('the kill\'s %s is raised once for B, right after the kill step; a raise that throws is logged as its own failed step and every other step still runs', async (_label, killResult, succeeded) => {
     for (const raiseFails of [false, true]) {
       const f = makeFixture({ killResult, ...(raiseFails ? { fail: ['raiseKillFailureAlert' as const] } : {}) })
       const k = f.b.key
@@ -1189,7 +1188,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     }
   })
 
-  // b.jg5 SRJ-704: only an ordinary decision, or a survivor one carrying a
+  // only an ordinary decision, or a survivor one carrying a
   // string description, is raised. A malformed decision (or one whose read
   // throws) raises nothing and is said once, inside the kill step: the kill
   // succeeded, so no step fails.
@@ -1200,7 +1199,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['survivor with a non-string description', { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: 42 }],
     ['a decision without a kind', {}],
     ['a decision that is not an object', KILL_RETRY_ALERT_ORDINARY],
-  ])('b.jg5 SRJ-704: a malformed kill-failure alert decision (%s) raises nothing, logs its one line, counts no failed step, and the teardown resolves', async (_label, alert) => {
+  ])('a malformed kill-failure alert decision (%s) raises nothing, logs its one line, counts no failed step, and the teardown resolves', async (_label, alert) => {
     const killResult = { ...KILL_RESULT_SUCCEEDED, alert } as unknown as PersonaTeardownKillResult
     const f = makeFixture({ killResult })
 
@@ -1216,7 +1215,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ])
   })
 
-  test('b.jg5 SRJ-704: a kill-failure alert decision whose read throws raises nothing, logs the malformed-decision line, counts no failed step, and the teardown resolves', async () => {
+  test('a kill-failure alert decision whose read throws raises nothing, logs the malformed-decision line, counts no failed step, and the teardown resolves', async () => {
     const killResult = { ...KILL_RESULT_SUCCEEDED } as Record<string, unknown>
     Object.defineProperty(killResult, 'alert', { get: () => { throw failure() }, enumerable: true })
     const f = makeFixture({ killResult: killResult as unknown as PersonaTeardownKillResult })
@@ -1233,9 +1232,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-110: with no alert raised, the standing ErrTmuxKillFailed is
+  // with no alert raised, the standing ErrTmuxKillFailed is
   // recorded by the not-succeeded notice, right after the kill step.
-  test('b.jg5 SRJ-704, SRJ-110: a malformed decision after a failing kill raises no alert and logs its line; the standing outcome is one not-succeeded notice right after the kill step; only the kill step counts as failed', async () => {
+  test('a malformed decision after a failing kill raises no alert and logs its line; the standing outcome is one not-succeeded notice right after the kill step; only the kill step counts as failed', async () => {
     const outcome = killOutcomeOf({ thrown: errTmuxKillFailed() })
     const killResult = {
       outcome,
@@ -1285,7 +1284,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   /** The notifier's `notify` calls in `f`'s trail. */
   const notifyCalls = (f: Fixture): string[] => f.trail.filter((c) => c.startsWith('notifier.notify:'))
 
-  // b.jg5 SRJ-110, SRJ-1003: a standing non-success that no other notice
+  // a standing non-success that no other notice
   // records is raised as one notice through the notifier, right after the
   // kill step. An ENVIRONMENT or CONFIG outcome (and ErrSystemInstallDisappeared)
   // is recorded by its outage's onset when that outage is raised:
@@ -1314,7 +1313,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['ErrSystemInstallDisappeared, B removed, the reader seeing no class raised', () => new ErrSystemInstallDisappeared('kill', '/opt/ad/bin'), 1, false, () => new Set<string>(), true],
     ['ErrSystemInstallDisappeared, B removed, the reader seeing ad-unreachable raised', () => new ErrSystemInstallDisappeared('kill', '/opt/ad/bin'), 1, false, () => new Set(['ad-unreachable']), false],
     ['ENVIRONMENT, B still applied, a reader that throws (counts as none raised)', () => errTmuxNotAvailable(undefined, 'kill'), 1, true, throwingReader, true],
-  ])('b.jg5 SRJ-110, SRJ-1003: the kill\'s outcome %s: the not-succeeded notice is raised for B right after the kill step only when no onset records it (%p); only the kill step counts as failed', async (_label, make, tries, stillApplied, outageFlags, raised) => {
+  ])('the kill\'s outcome %s: the not-succeeded notice is raised for B right after the kill step only when no onset records it (%p); only the kill step counts as failed', async (_label, make, tries, stillApplied, outageFlags, raised) => {
     const killResult = failedKillResult(make(), tries)
     const f = makeFixture({ killResult, overrides: outageFlags === undefined ? {} : { outageFlags } })
     if (stillApplied) f.applied.push(f.b)
@@ -1333,7 +1332,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-1003, SRJ-110: a CONFLICT or UNUSABLE NAME met at a try is the
+  // a CONFLICT or UNUSABLE NAME met at a try is the
   // outcome's own record (its refusal notice); one met at a status read
   // between the tries is not, so the outcome standing after them gets the
   // not-succeeded notice too, after the refusal's.
@@ -1348,7 +1347,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       () => failedKillResult(errTmuxUnresponsive('kill'), KILL_RETRY_TRIES, [{ at: KILL_REFUSAL_AT_READ, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, error: errUnusableName() }]),
       (f, r) => [teardownKillRefusalNoticeText(personaInstanceId(f.b.key), r.refusals[0]!), notSucceededText(f, r)],
     ],
-  ])('b.jg5 SRJ-1003, SRJ-110: %s', async (_label, build, texts) => {
+  ])('%s', async (_label, build, texts) => {
     const killResult = build()
     const f = makeFixture({ killResult })
     const k = f.b.key
@@ -1362,10 +1361,10 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 1 failed step(s)`)
   })
 
-  // b.jg5 SRJ-110: the notice's own failure is one failed step; a notifier
+  // the notice's own failure is one failed step; a notifier
   // with no `notify` (a hand-built fixture) logs the notice's text in one line
   // instead, counting no failed step.
-  test.each<[string, 'fails' | 'absent']>([['the notifier\'s notify rejecting', 'fails'], ['no notify installed', 'absent']])('b.jg5 SRJ-110: the not-succeeded notice with %s: one token-safe line, every later step still runs', async (_label, how) => {
+  test.each<[string, 'fails' | 'absent']>([['the notifier\'s notify rejecting', 'fails'], ['no notify installed', 'absent']])('the not-succeeded notice with %s: one token-safe line, every later step still runs', async (_label, how) => {
     const killResult = failedKillResult(errTmuxUnresponsive('kill'), KILL_RETRY_TRIES)
     const f = how === 'fails'
       ? makeFixture({ killResult, fail: ['notifier.notify'] })
@@ -1395,7 +1394,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   test.each<[string, Partial<PersonaTeardownKillResult>]>([
     ['a none decision', { alert: { kind: KILL_RETRY_ALERT_NONE } }],
     ['no decision', { alert: undefined }],
-  ])('b.jg5 SRJ-704: %s raises nothing and logs no malformed-decision line', async (_label, alertPart) => {
+  ])('%s raises nothing and logs no malformed-decision line', async (_label, alertPart) => {
     const f = makeFixture({ killResult: { ...KILL_RESULT_SUCCEEDED, ...alertPart } as PersonaTeardownKillResult })
 
     await f.lifecycle.teardown(f.b)
@@ -1427,8 +1426,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-1003: the window opens at the turn's start and closes after its last step, whatever a step throws.
-  test('b.jg5 SRJ-1003: the notice window opens right after the outage reset, before the turn\'s first step, and closes after its last step, then the submit ends; a throwing step and failing reminder cancellation still leave it closed', async () => {
+  // the window opens at the turn's start and closes after its last step, whatever a step throws.
+  test('the notice window opens right after the outage reset, before the turn\'s first step, and closes after its last step, then the submit ends; a throwing step and failing reminder cancellation still leave it closed', async () => {
     const f = makeFixture({ fail: ['connections.stop', 'killInstance', 'forgetReplyReminders'] })
     const k = f.b.key
 
@@ -1451,7 +1450,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   test.each<['notifier.submitTeardown' | 'notifier.settleTeardown', string]>([
     ['notifier.submitTeardown', 'registering its submit'],
     ['notifier.settleTeardown', 'ending its submit'],
-  ])('b.jg5 SRJ-1003: %s throwing: one token-safe line naming B (%s failed), every step still runs, the window still opens and closes; only the submit\'s end is counted, and the complete line is last', async (dep, phrase) => {
+  ])('%s throwing: one token-safe line naming B (%s failed), every step still runs, the window still opens and closes; only the submit\'s end is counted, and the complete line is last', async (dep, phrase) => {
     const f = makeFixture({ fail: [dep] })
     const k = f.b.key
 
@@ -1470,14 +1469,14 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-1003: the steps run without awaiting (the outage reset, the window's open and close) count a returned
+  // the steps run without awaiting (the outage reset, the window's open and close) count a returned
   // promise that rejects too: it is settled before the complete line, its line logged and counted, the complete line
   // last. Rows: the step, its phrase, and whether its rejection settles after the kill (the window's close runs last).
   test.each<['resetOutageState' | 'notifier.openTeardownWindow' | 'notifier.closeTeardownWindow', string, boolean]>([
     ['resetOutageState', 'forgetting its outage state', false],
     ['notifier.openTeardownWindow', 'opening its notice window', false],
     ['notifier.closeTeardownWindow', 'closing its notice window', true],
-  ])('b.jg5 SRJ-1003: %s returning a rejected promise: one token-safe line (%s failed) before the complete line, which counts it; every step still runs', async (dep, phrase, afterKill) => {
+  ])('%s returning a rejected promise: one token-safe line (%s failed) before the complete line, which counts it; every step still runs', async (dep, phrase, afterKill) => {
     const f = makeFixture({ fail: [dep], rejectFailures: true })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
@@ -1493,8 +1492,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-1003: a teardown whose turn never runs (its serializer turn rejected before it) still ends its submit.
-  test('b.jg5 SRJ-1003: a teardown whose serializer rejects without running its turn still ends its submit once, and opens no window', async () => {
+  // a teardown whose turn never runs (its serializer turn rejected before it) still ends its submit.
+  test('a teardown whose serializer rejects without running its turn still ends its submit once, and opens no window', async () => {
     const f = makeFixture({ overrides: { serialize: () => Promise.reject(failure()) } })
     const k = f.b.key
 
@@ -1545,10 +1544,10 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(consumeAck(a, 'C0ALPHA001', '1700000000.000300')).toBe(true)
   })
 
-  // Rows: the forget that fails (b.jg5 SRJ-1016's notice episodes, SRJ-504's latch, SRJ-207's
+  // Rows: the forget that fails (notice episodes latch
   // ErrInvalidFlags hold), its step phrase, and how (no production form returns a promise, but a
   // rejection is awaited too). Each runs in the first group and again once the launch in flight
-  // settled; the latch once more after the kill (b.jg5 SRJ-715).
+  // settled; the latch once more after the kill.
   test.each<['forgetNoticeEpisodes' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold', string, 'throws' | 'rejects']>([
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'throws'],
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'rejects'],
@@ -1556,7 +1555,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetConflictLatch', 'forgetting its latch', 'rejects'],
     ['forgetInvalidFlagsHold', 'forgetting its ErrInvalidFlags hold', 'throws'],
     ['forgetInvalidFlagsHold', 'forgetting its ErrInvalidFlags hold', 'rejects'],
-  ])('b.jg5: %s failing (%s; it %s): each of its steps is logged token-safely by its own phrase, every other step still runs, and the teardown completes counting each', async (dep, phrase, how) => {
+  ])('%s failing (%s; it %s): each of its steps is logged token-safely by its own phrase, every other step still runs, and the teardown completes counting each', async (dep, phrase, how) => {
     const f = makeFixture({
       overrides: {
         [dep]: (key: string) => {
@@ -1582,7 +1581,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  test('b.jg5 SRJ-1016: over the real notice episodes, tearing B down ends every kind\'s episode of B silently (nothing posted or logged), so B added again begins afresh, and leaves A\'s episodes and posted marks untouched', async () => {
+  test('over the real notice episodes, tearing B down ends every kind\'s episode of B silently (nothing posted or logged), so B added again begins afresh, and leaves A\'s episodes and posted marks untouched', async () => {
     const clock = createFakeClock()
     const posts: Array<{ key: string; text: string }> = []
     const episodeLogs: string[] = []
@@ -1622,7 +1621,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(clock.pendingCount()).toBe(0)
   })
 
-  test('b.deo SRI-307 (b.deo AC 13): over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
+  test('over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
     const clock = createFakeClock()
     const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'fungible', dedupeClock: () => clock.now() })
     cleanups.push(resetRoutingState)
@@ -1652,8 +1651,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 })
 
 // ---------------------------------------------------------------------------
-// Persona teardown end to end over the recovery harness (b.jg5 SRJ-715,
-// SRJ-404, SRJ-706, SRJ-305, SRJ-504, SRJ-207, SRJ-1016): the lifecycle's
+// Persona teardown end to end over the recovery harness: the lifecycle's
 // teardown dependencies that act on what the harness owns are its
 
 // sequence stops, retry controller, latch, hold, notice episodes, outage
@@ -1662,7 +1660,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 // the applied set (`h.remove`), as for a removed persona.
 // ---------------------------------------------------------------------------
 
-describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715): nothing the server runs for the key is left, the row is kept, and the other persona keeps its own', () => {
+describe('persona teardown end to end over the recovery harness: nothing the server runs for the key is left, the row is kept, and the other persona keeps its own', () => {
 
   /** What is left for `key`, each read through its own module's query. */
 
@@ -1671,12 +1669,12 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
   // at P's spawn, an ErrInvalidFlags at P's reuse), and what that leaves
   // standing for P just before the teardown.
 
-  // b.jg5 SRJ-404, SRJ-715: the stop made when the teardown is submitted,
+  // the stop made when the teardown is submitted,
 
   // would start. The turn is held behind work already queued for P, so only
   // the submit-time stop has run when the held spawn succeeds.
 
-  // b.jg5 SRJ-811 (hatch A3): the teardown's old-life step (the session
+  // (design A3): the teardown's old-life step (the session
   // manager's forgetOldLifeWaits, through `teardownDeps()`) forgets P as
   // waiting and stops the hold's wait only when no persona left in the
   // applied configuration waits on it. P waits on a pre-persona row held in
@@ -1743,10 +1741,10 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
 
 // ---------------------------------------------------------------------------
 // Persona teardown of a key still applied: the old half of a destructive
-// modify (b.av2 SR-8.6, a credentials_file path or working_directory change).
+// modify (a credentials_file path or working_directory change).
 // ---------------------------------------------------------------------------
 
-describe('persona teardown of a key still applied (the old half of a destructive modify, SR-8.6)', () => {
+describe('persona teardown of a key still applied (the old half of a destructive modify)', () => {
   // Rows: whether B is still applied when its teardown is submitted, what ran
   // at submit while B's turn was held, and the whole trail once it ran.
   test.each<[string, boolean, (f: Fixture) => string[], (f: Fixture) => string[]]>([
@@ -1790,7 +1788,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 'rejects'],
     ['cancelLaunchWait', 'cancelling its launch\'s wait for a working row', 'throws'],
 
-    // b.jg5 SRJ-706, SRJ-715: the live-row sequence's stop, right after it.
+    // the live-row sequence's stop, right after it.
     ['stopLiveRowSequence', LIVE_ROW_SEQUENCE_STOP_STEP, 'throws'],
     ['stopLiveRowSequence', LIVE_ROW_SEQUENCE_STOP_STEP, 'rejects'],
   ])('%s failing at submit (%s; it %s): one token-safe "before its turn failed" line, the other early cancels still run, and the whole teardown still runs', async (dep, phrase, how) => {
@@ -1823,7 +1821,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     expect(beforeTurn[0]).toMatch(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} before its turn failed: Error`)}( |$)`))
     expect(f.lines).toContain(`${teardownPrefix(f.b)}: starting`)
     // A throwing stopRetryTimer fails the turn's three stops (with the early timers, once its launch in flight settled,
-    // and after the agent-director calls; b.jg5 SRJ-311, SRJ-715); a throwing sequence stop fails both of the turn's
+    // and after the agent-director calls); a throwing sequence stop fails both of the turn's
     // sequence stops (its second step, and again once its launch in flight settled).
     const turnFailures = how === 'rejects' ? 0 : dep === 'stopRetryTimer' ? 3 : dep === 'stopLiveRowSequence' ? 2 : 1
     expect(f.lines.at(-1)).toBe(turnFailures === 0 ? `${teardownPrefix(f.b)}: complete` : `${teardownPrefix(f.b)}: complete, with ${turnFailures} failed step(s)`)
@@ -1843,12 +1841,12 @@ describe('persona teardown of a key still applied (the old half of a destructive
       `${teardownPrefix(f.b)}: starting`,
     ])
     // In the turn: the bring-up cancel, the restart-timer cancel and the three retry-timer stops (with the early
-    // timers, once its launch in flight settled, and after the agent-director calls; b.jg5 SRJ-311, SRJ-715).
+    // timers, once its launch in flight settled, and after the agent-director calls).
     expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 5 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
-  test('B still applied and dropping its notices failing: its one drop is logged token-safely, there is no second drop after the kill (b.jg5 SRJ-1003), and every other step still runs', async () => {
+  test('B still applied and dropping its notices failing: its one drop is logged token-safely, there is no second drop after the kill, and every other step still runs', async () => {
     const f = makeFixture({ fail: ['notifier.forget'] })
     f.applied.push(f.b)
 
@@ -1882,7 +1880,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
 const NEW_HALF_CHANNEL = 'C0BETANEW1'
 
 /**
- * Step 1 of a destructive modify of `old` (SR-8.6): its key stays applied, its
+ * Step 1 of a destructive modify of `old`: its key stays applied, its
  * new half's declaration sending notices to `NEW_HALF_CHANNEL` (its own
  * channel and prompt target), put in `old`'s place in the notifier harness's
  * persona list and added to `applied`. Answers the new half.
@@ -1896,11 +1894,11 @@ function applyNewHalfOf(h: NotifierHarness, applied: Persona[], old: Persona): P
 }
 
 // ---------------------------------------------------------------------------
-// Persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the latch
+// Persona teardown over the real latch: the latch
 // ends silently with its persona, a latch its launch in flight set included.
 // ---------------------------------------------------------------------------
 
-describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the key\'s latch and CONFLICT episode end silently, for that key only', () => {
+describe('persona teardown over the real latch: the key\'s latch and CONFLICT episode end silently, for that key only', () => {
   interface LatchFixture {
     f: Fixture
     latch: ConflictLatch
@@ -1909,7 +1907,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     posts: Array<{ key: string; text: string }>
     /** The latch's and the episodes' log lines. */
     latchLines: string[]
-    /** With `notifier`: the real notifier the episodes' sink and the lifecycle's notifier are (b.jg5 SRJ-1003). */
+    /** With `notifier`: the real notifier the episodes' sink and the lifecycle's notifier are. */
     h?: NotifierHarness
   }
 
@@ -1918,7 +1916,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
    * clock, recording sink), as `main()` binds them; the lifecycle's latch and
    * episodes forgets are theirs, each recorded in the trail first so the
    * order is asserted with the other steps. `launchInFlight` is B's launch in
-   * flight, given the latch. With `notifier` (b.jg5 SRJ-1003), as `main()`
+   * flight, given the latch. With `notifier`, as `main()`
    * binds them: the sink hands each notice to the real notifier (recorded
    * first), the episodes read its teardown window, and the lifecycle's
    * notifier is that notifier, so its window routes what the teardown raises.
@@ -2008,13 +2006,13 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     expect(r.posts.slice(postsBefore.length)).toEqual([bNotice])
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003 (hatch A3): the latch B's launch in
+  // (design A3): the latch B's launch in
   // flight sets during the teardown raises its CONFLICT notice at the set,
   // inside the window: the window writes it (one log line and one
   // persona-teardown-notice entry naming B), it reaches no destination and is
   // never dropped; the latch is then forgotten, so the teardown latches
   // nothing. Over the real notifier, as main() binds it.
-  test('SRJ-1002, SRJ-1003: a latch B\'s launch in flight sets as it settles during the teardown is forgotten too (the forget waits for the launch); its CONFLICT notice is written by the window (one log line, one persona-teardown-notice entry), never posted or dropped, and its episode is not left open: B added again and latched posts to its destination', async () => {
+  test('a latch B\'s launch in flight sets as it settles during the teardown is forgotten too (the forget waits for the launch); its CONFLICT notice is written by the window (one log line, one persona-teardown-notice entry), never posted or dropped, and its episode is not left open: B added again and latched posts to its destination', async () => {
     const release = Promise.withResolvers<void>()
     let bRecordAtSettle: ConflictLatchRecord | undefined
     const r = makeLatched({
@@ -2071,7 +2069,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     expect(h.startupEntries()).toHaveLength(1)
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003 (hatch A3): as above for an UNUSABLE NAME
+  // (design A3): as above for an UNUSABLE NAME
   // latch B's launch in flight sets, and for a destructive modify's old half
   // (its new half sending notices to another channel): the in-flight latch's
   // notice is written by the window, reaches neither half's destination, and
@@ -2081,7 +2079,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     ['an UNUSABLE NAME latch, B removed', 'unusable-name', false],
     ['an UNUSABLE NAME latch, a destructive modify\'s old half', 'unusable-name', true],
     ['a CONFLICT latch, a destructive modify\'s old half', LATCH_CASE_LEFTOVER, true],
-  ])('SRJ-1002, SRJ-1003: %s, set by B\'s launch in flight as it settles during the teardown: one log line and one persona-teardown-notice entry, no Slack call for either half, and once the teardown completes no latch and no episode are left', async (_label, latchKind, destructive) => {
+  ])('%s, set by B\'s launch in flight as it settles during the teardown: one log line and one persona-teardown-notice entry, no Slack call for either half, and once the teardown completes no latch and no episode are left', async (_label, latchKind, destructive) => {
     const release = Promise.withResolvers<void>()
     let notice: string | undefined
     const r = makeLatched({
@@ -2123,7 +2121,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(r.f.b)}: complete`)
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003 (E34 final review): the session manager's
+  // ( final review): the session manager's
   // CONFLICT and UNUSABLE NAME latch entries ask the not-configured guard
   // (`latchEntryConfigured`), which reads the key's teardown window through
   // the installed notice episodes. Apply step 1 removes B before its teardown
@@ -2173,7 +2171,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
   const notConfiguredLines = (row: GuardRow): string[] =>
     consoleLines().filter((line) => line.includes(notConfiguredLatchOutcome(row.latchCase, row.refusedOperation)))
 
-  test.each(GUARD_ANSWERS)('SRJ-1002, SRJ-1003: B removed, its launch in flight meeting %s through the not-configured guard as it settles inside B\'s open teardown window: latched as for a configured persona, no not-configured line; its notice written by the window as one persona-teardown-notice entry with no Slack call; once the teardown completes no latch and no episode are left', async (_label, row, episodeKind) => {
+  test.each(GUARD_ANSWERS)('B removed, its launch in flight meeting %s through the not-configured guard as it settles inside B\'s open teardown window: latched as for a configured persona, no not-configured line; its notice written by the window as one persona-teardown-notice entry with no Slack call; once the teardown completes no latch and no episode are left', async (_label, row, episodeKind) => {
     const release = Promise.withResolvers<void>()
     let atSettle: { latched: boolean; answer: boolean; notice: string } | undefined
     const r = makeLatched({
@@ -2211,7 +2209,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     assertNoLeak({ lines: consoleLines() })
   })
 
-  test.each(GUARD_ANSWERS.flatMap(([label, row]) => (['none', 'submitted'] as const).map((window) => [label, window, row] as const)))('SRJ-1002, SRJ-1003: B removed, its launch meeting %s with its teardown window %s: routed log-only by the not-configured guard: nothing latched, posted or written, and one line carrying the not-configured outcome', async (_label, window, row) => {
+  test.each(GUARD_ANSWERS.flatMap(([label, row]) => (['none', 'submitted'] as const).map((window) => [label, window, row] as const)))('B removed, its launch meeting %s with its teardown window %s: routed log-only by the not-configured guard: nothing latched, posted or written, and one line carrying the not-configured outcome', async (_label, window, row) => {
     const r = makeLatched({ notifier: true })
     installGuard(r)
     const h = r.h!
@@ -2271,12 +2269,11 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
 })
 
 // ---------------------------------------------------------------------------
-// Persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207,
-// SRJ-715): the hold ends silently with its persona, a hold its launch in
+// Persona teardown over the real ErrInvalidFlags hold: the hold ends silently with its persona, a hold its launch in
 // flight set included.
 // ---------------------------------------------------------------------------
 
-describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SRJ-715): the key\'s hold and hold episode end silently, for that key only', () => {
+describe('persona teardown over the real ErrInvalidFlags hold: the key\'s hold and hold episode end silently, for that key only', () => {
   interface HoldFixture {
     f: Fixture
     hold: InvalidFlagsHold
@@ -2287,7 +2284,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
     holdLines: string[]
     /** Every retry-timer stop the set reaction asked for, by key. */
     timerStops: string[]
-    /** With `notifier`: the real notifier the episodes' sink and the lifecycle's notifier are (b.jg5 SRJ-1003). */
+    /** With `notifier`: the real notifier the episodes' sink and the lifecycle's notifier are. */
     h?: NotifierHarness
   }
 
@@ -2296,7 +2293,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
    * clock, recording sink), as `main()` binds it; the lifecycle's hold and
    * episodes forgets are theirs, each recorded in the trail first so the
    * order is asserted with the other steps. `launchInFlight` is B's launch in
-   * flight, given the hold. With `notifier` (b.jg5 SRJ-1003), as `main()`
+   * flight, given the hold. With `notifier`, as `main()`
    * binds them: the sink hands each alert to the real notifier (recorded
    * first), the episodes read its teardown window, and the lifecycle's
    * notifier is that notifier.
@@ -2420,7 +2417,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
     expect(r.posts).toEqual([alertFor(b), alertFor(b)])
   })
 
-  // b.jg5 SRJ-1003, SRJ-207 (hatch A3): a reuse spawn still running
+  // (design A3): a reuse spawn still running
   // while a destructive modify tears B down meets ErrInvalidFlags and sets
   // the hold; its set reaction's Cannot launch alert, raised in the window,
   // is written (one log line, one persona-teardown-notice entry naming B),
@@ -2473,12 +2470,11 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
 
 // ---------------------------------------------------------------------------
 // Persona teardown with the real agent-director kill, outage state, notifier,
-// destination hold and kill-failure alerts (b.jg5 SRJ-715, SRJ-110, SRJ-702,
-// SRJ-704): no wind-down, no delete (the row is kept, HO C16), no flag, no
+// destination hold and kill-failure alerts: no wind-down, no delete (the row is kept, HO C16), no flag, no
 // latch, no retry timer and no Slack post left.
 // ---------------------------------------------------------------------------
 
-describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry kill, outage state, notifier, destination hold and kill-failure alerts: no delete, the row kept', () => {
+describe('persona teardown over the real bounded-retry kill, outage state, notifier, destination hold and kill-failure alerts: no delete, the row kept', () => {
   interface RealFixture {
     f: Fixture
     h: NotifierHarness
@@ -2509,8 +2505,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 
   /**
    * B already left the applied set (apply step 1): the notifier harness's
-   * persona list no longer has it (`removeB`). As `main()` binds them (b.jg5
-   * SRJ-1003): the lifecycle's notifier is the real notifier (its teardown
+   * persona list no longer has it (`removeB`). As `main()` binds them: the lifecycle's notifier is the real notifier (its teardown
    * window included), whose startup-errors recorder and the kill-failure
    * alerts' log-only route both write `startup-errors.log` in the test's temp
    * directory; outage notices go to the notifier with their phase and
@@ -2519,7 +2514,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
    * `killPersonaInstanceForTeardown` (here on `killClock`, a fake clock), and
    * its alert raiser the real kill-failure alerts over those episodes with
    * the context 'persona teardown', and its outage reader the real
-   * `getOutageFlags` (b.jg5 SRJ-110: a standing outcome whose onset was not
+   * `getOutageFlags` (a standing outcome whose onset was not
    * written gets the not-succeeded notice). `kill*` and `status*` script the stub;
    * the outage state's trigger, unclassified and condition sinks record;
    * `overrides` replace further lifecycle dependencies.
@@ -2661,7 +2656,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.killClock.pendingCount()).toBe(0)
   }
 
-  /** The kills the teardown's bounded retry makes for `err` answered at every try: `KILL_RETRY_TRIES` for UNAVAILABLE, else one (b.jg5 SRJ-702). */
+  /** The kills the teardown's bounded retry makes for `err` answered at every try: `KILL_RETRY_TRIES` for UNAVAILABLE, else one. */
   function triesFor(err: Error): number {
     const outcome = killOutcomeOf({ thrown: err })
     return outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE ? KILL_RETRY_TRIES : 1
@@ -2683,7 +2678,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 
   /**
    * The server's latch installed for the case, with `configured` as the
-   * configured-persona query (b.jg5 SRJ-114), both put back in `cleanups`.
+   * configured-persona query, both put back in `cleanups`.
    * Returns the latch, so a case can show the teardown's kill latched nothing.
    */
   function installLatch(configured: (key: string) => boolean): ConflictLatch {
@@ -2697,7 +2692,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     return latch
   }
 
-  /** The class of the persona-teardown route's ordinary entry, from the kill-failure alert's route selection (b.jg5 SRJ-704, SRJ-1013). */
+  /** The class of the persona-teardown route's ordinary entry, from the kill-failure alert's route selection. */
   function teardownNoticeClass(): string {
     return selectKillFailureAlertRoute({
       version: KILL_FAILURE_VERSION_ORDINARY,
@@ -2718,7 +2713,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     for (const p of r.h.personas) expect(r.h.stub(p.key).callLog).toEqual([])
   }
 
-  test('AC 57: B\'s row is killed, cscb_B only, and no other agent-director verb is called (no graceful wind-down, no delete: the row is kept); A\'s outage flag is untouched', async () => {
+  test('B\'s row is killed, cscb_B only, and no other agent-director verb is called (no graceful wind-down, no delete: the row is kept); A\'s outage flag is untouched', async () => {
     const r = makeReal()
     setOutageFlag(r.f.a.key, 'ad-unreachable', '/bin/ad')
     removeB(r)
@@ -2754,10 +2749,10 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.h.posts(r.f.b.key)).toHaveLength(postsBefore)
   })
 
-  // b.jg5 SRJ-1003, SRJ-1002 (AC 65): the onset the kill's call raises for
+  // the onset the kill's call raises for
   // a removed key, inside the window, is written, not dropped by the rule for
   // a key no longer applied; its flag outlives the teardown.
-  test('b.jg5 SRJ-715, SRJ-1003: agent-director unreachable, B removed: the kill fails (one try: not UNAVAILABLE) and is logged, no delete is made, the other steps run; the onset raised for B is written to the log and a persona-teardown-notice entry, never posted, held or dropped, and its flag is kept', async () => {
+  test('agent-director unreachable, B removed: the kill fails (one try: not UNAVAILABLE) and is logged, no delete is made, the other steps run; the onset raised for B is written to the log and a persona-teardown-notice entry, never posted, held or dropped, and its flag is kept', async () => {
     const unreachable = new ErrSystemInstallDisappeared('kill', `/opt/ad/${fakeToken(BOT_TOKEN_PREFIX, 'bin')}`)
     const r = makeReal({ killError: unreachable })
     removeB(r)
@@ -2773,7 +2768,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
       `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
     ])
     expect(r.f.lines[1]).toContain(`class=${AD_ERROR_CLASS_UNCLASSIFIED}`)
-    // The wrapper raises ad-unreachable for B (b.jg5 SRJ-110); the window writes its onset, and the flag stays.
+    // The wrapper raises ad-unreachable for B; the window writes its onset, and the flag stays.
     expect(r.emissions.map((e) => e.key)).toEqual([r.f.b.key])
     const [onsetNotice] = r.emissions
     expect(r.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, onsetNotice!.text)])
@@ -2787,17 +2782,17 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ entries: r.startupEntries().map((entry) => entry.text.replaceAll(unreachable.binaryPath, '<binary path>')) })
   })
 
-  // b.jg5 SRJ-715, SRJ-701, SRJ-703, SRJ-104: a success (`kill_sent` true,
+  // a success (`kill_sent` true,
   // false or absent), `ErrSpawnNotFound` and GONE end the kill step at the
   // first try with its outcome line; no delete follows, nothing is raised.
   test.each<[string, { killResult?: StubKillResult; killError?: Error }, KillOutcome]>([
     ['kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
     ['kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
     ['ErrSpawnNotFound (the row already gone)', { killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE }],
-    // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
+    // for `kill`, gone is success.
     ['GONE (ErrTmuxCaptureFailed), the session-gone success', { killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName }],
     ['GONE (ErrTmuxSendKeys), the session-gone success', { killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName }],
-  ])('b.jg5 SRJ-715, SRJ-701, SRJ-104: the kill succeeds with %s: one try, the kill step passes with its outcome line, no delete is made, nothing is raised or posted', async (_label, kill, outcome) => {
+  ])('the kill succeeds with %s: one try, the kill step passes with its outcome line, no delete is made, nothing is raised or posted', async (_label, kill, outcome) => {
     const r = makeReal(kill)
     removeB(r)
 
@@ -2811,7 +2806,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expectNothingArmedOrDeleted(r)
   })
 
-  // b.jg5 SRJ-715 (HO C16 Verify, AC 77), SRJ-110, SRJ-702, SRJ-1002: each
+  // (HO C16 Verify), each
   // of HO C2's non-success classes at every try of the teardown's kill, over
   // the real kill on the fake clock: UNAVAILABLE gets KILL_RETRY_TRIES tries
   // KILL_RETRY_SPACING_MS apart with one `status` read of the row before
@@ -2824,13 +2819,12 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   // steps still run. The standing outcome is recorded by exactly one
   // persona-teardown-notice entry, and nothing reaches Slack: ErrTmuxKillFailed
   // by its alert (the ordinary version, on the persona-teardown route,
-  // below), a CONFLICT or an UNUSABLE NAME by its refusal notice (b.jg5
-  // SRJ-1003, below), an ENVIRONMENT answer by its outage's onset (B counts
+  // below), a CONFLICT or an UNUSABLE NAME by its refusal notice (
+  // below), an ENVIRONMENT answer by its outage's onset (B counts
   // as configured here, through the installed query, so it raises
   // tmux-unavailable, and the outage reader sees it raised), and every other
   // non-success (an UNAVAILABLE value other than ErrTmuxKillFailed after its
-  // tries, an UNCLASSIFIED value) by the not-succeeded notice (b.jg5
-  // SRJ-110), which no other notice duplicates.
+  // tries, an UNCLASSIFIED value) by the not-succeeded notice, which no other notice duplicates.
   /** What records the standing outcome: the entry's text, from the case's fixture, the thrown value and the tries made. */
   type RecordedBy = (r: RealFixture, err: Error, tries: number) => string
   const BY_ALERT: RecordedBy = (r, err) => teardownAlertText(ordinaryAlertContent(r.f.b.key, { last: err }), false)
@@ -2854,7 +2848,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     ['an UNUSABLE NAME ErrInternal', () => errUnusableName(), BY_REFUSAL],
     ['an unreachable error (a plain Error)', () => new Error(`agent-director went away (${sentinelInMessage('teardown-kill')})`), BY_NOT_SUCCEEDED],
     ['another error (ErrKillBroken)', () => errGeneric('kill', 'ErrKillBroken'), BY_NOT_SUCCEEDED],
-  ])('b.jg5 SRJ-715, SRJ-110: the kill answers %s at every try: its tries are made on the fake clock, the kill step fails with its line, no delete is made (the row is kept), nothing latches, arms, starts or posts, and every other step still runs; the standing outcome is recorded by exactly one persona-teardown-notice entry', async (_label, make, recordedBy) => {
+  ])('the kill answers %s at every try: its tries are made on the fake clock, the kill step fails with its line, no delete is made (the row is kept), nothing latches, arms, starts or posts, and every other step still runs; the standing outcome is recorded by exactly one persona-teardown-notice entry', async (_label, make, recordedBy) => {
     const err = make()
     const latch = installLatch(() => true)
     const r = makeReal({ killError: err })
@@ -2882,11 +2876,11 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, alertLines: r.alertLines, entries: r.startupEntries(), killLines: consoleLines() })
   })
 
-  // b.jg5 SRJ-513 bullet 2, SRJ-715, SRJ-1002: a destructive
+  // bullet 2, a destructive
   // modify's old half whose row reads `pending` with no launch start still
-  // gets the ordinary checked kill (SRJ-316's no-kill-of-a-pending-row rule
+  // gets the ordinary checked kill (no-kill-of-a-pending-row rule
   // does not hold it back), and the reads between its tries latch nothing.
-  test('b.jg5 SRJ-513, SRJ-715: B still applied, its row read pending with no launch start: the kill is made, an UNAVAILABLE first try is tried again after a read of that row, the second try\'s success ends the step; nothing latches, nothing is armed and no delete is made', async () => {
+  test('B still applied, its row read pending with no launch start: the kill is made, an UNAVAILABLE first try is tried again after a read of that row, the second try\'s success ends the step; nothing latches, nothing is armed and no delete is made', async () => {
     const latch = installLatch(() => true)
     const r = makeReal({
       killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))],
@@ -2907,13 +2901,13 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expectNothingArmedOrDeleted(r)
   })
 
-  /** The kill-failure alert's text as the teardown window writes it: the persona-teardown route's closing, no Slack escaping (b.jg5 SRJ-704, SRJ-1007). */
+  /** The kill-failure alert's text as the teardown window writes it: the persona-teardown route's closing, no Slack escaping. */
   function teardownAlertText(content: KillFailureAlertContent, configured: boolean): string {
     const route = selectKillFailureAlertRoute({ version: content.version, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, configured, latched: false })
     return killFailureAlertText(content, route.closing, false)
   }
 
-  // b.jg5 SRJ-704, SRJ-702, SRJ-1007, SRJ-1013, SRJ-1003: the kill's alert,
+  // the kill's alert,
   // raised in the teardown's window, for a removed B and for the old half of
   // a destructive modify (B still applied, its new half sending notices to
   // another channel, which would otherwise take B's destination route): the
@@ -2922,7 +2916,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   // builder), its text the persona-teardown route's alert text; the alerts'
   // own log-only route is not used, and nothing reaches Slack.
   test.each<[string, boolean]>([['removed', false], ['still applied (a destructive modify\'s old half)', true]])(
-    'b.jg5 SRJ-704, SRJ-1003: ErrTmuxKillFailed at every try, B %s: one ordinary alert, one log line and one persona-teardown-notice entry naming B and "raised during its teardown", its text the ordinary version quoting the last description; nothing posted to Slack',
+    'ErrTmuxKillFailed at every try, B %s: one ordinary alert, one log line and one persona-teardown-notice entry naming B and "raised during its teardown", its text the ordinary version quoting the last description; nothing posted to Slack',
     async (_label, stillApplied) => {
       const err = errTmuxKillFailed()
       const r = makeReal({ killError: err })
@@ -2953,7 +2947,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   )
 
   test.each<[string, boolean]>([['removed', false], ['still applied (a destructive modify\'s old half)', true]])(
-    'b.jg5 SRJ-704, SRJ-1013, SRJ-1003 (AC 65): a survivor-naming ErrTmuxKillFailed, then a success, B %s: one survivor alert, one log line and one persona-kill-survivor entry naming B, and no persona-teardown-notice entry; nothing posted to Slack; the kill step passes',
+    'a survivor-naming ErrTmuxKillFailed, then a success, B %s: one survivor alert, one log line and one persona-kill-survivor entry naming B, and no persona-teardown-notice entry; nothing posted to Slack; the kill step passes',
     async (_label, stillApplied) => {
       const survivor = errTmuxKillFailed(undefined, 'pane-process-survived')
       const r = makeReal({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] })
@@ -2977,13 +2971,13 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     },
   )
 
-  // b.jg5 SRJ-1003, SRJ-1002 (AC 65; hatch A3): the onset the old half's
+  // (design A3): the onset the old half's
   // kill raises in the window is written, never held for the new half (the
   // old case held it and dropped it after the kill); its flag is kept, and
   // its all-clear, coming after the teardown completed and the new half is
   // up, is written the same way, never posted to the new half's destination.
   // The new half's own notices then reach its destination as usual.
-  test('b.jg5 SRJ-715, SRJ-1003: the old half of a destructive modify (its connection stopped, its new half sending notices elsewhere) with agent-director unreachable: the onset its failing kill raises is written, never held or dropped; once the new half is up nothing is flushed to it, the outage\'s later all-clear is written too, and the new half\'s own notice posts to its destination', async () => {
+  test('the old half of a destructive modify (its connection stopped, its new half sending notices elsewhere) with agent-director unreachable: the onset its failing kill raises is written, never held or dropped; once the new half is up nothing is flushed to it, the outage\'s later all-clear is written too, and the new half\'s own notice posts to its destination', async () => {
     const unreachable = new ErrSystemInstallDisappeared('kill', '/opt/ad/bin')
     const r = makeReal({ killError: unreachable })
     const b = r.f.b
@@ -3052,7 +3046,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, 'ad-config-malformed', false],
   ]
 
-  // b.jg5 SRJ-110, SRJ-301, SRJ-1002, SRJ-1003 (hatch A3): the teardown's
+  // (design A3): the teardown's
   // kill is no launch or recovery attempt, so an ENVIRONMENT or CONFIG answer
   // there arms no retry timer and makes no delete; it raises its outage only
   // while B is in the applied configuration (the configured-persona query).
@@ -3061,8 +3055,8 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   // outage's all-clear, when it clears after the teardown completed, is
   // written the same way: neither reaches the new half's destination. With
   // no onset written (B not configured), the outage reader sees no flag, so
-  // the standing outcome is the not-succeeded notice instead (b.jg5 SRJ-110).
-  test.each(OUTAGE_ANSWERS)('b.jg5 SRJ-110, SRJ-1002, SRJ-1003 (hatch A3): the old half of a destructive modify whose kill answers %s (class %s, outage %s; B configured: %p): no retry timer is armed for B and no delete is made; the onset and its later all-clear (a configured B), or the not-succeeded notice (B not configured), are each a log line and a persona-teardown-notice entry, never posted to the new half\'s destination; A\'s timer stays armed', async (_label, make, errorClass, outage, configured) => {
+  // the standing outcome is the not-succeeded notice instead.
+  test.each(OUTAGE_ANSWERS)('(hatch A3): the old half of a destructive modify whose kill answers %s (class %s, outage %s; B configured: %p): no retry timer is armed for B and no delete is made; the onset and its later all-clear (a configured B), or the not-succeeded notice (B not configured), are each a log line and a persona-teardown-notice entry, never posted to the new half\'s destination; A\'s timer stays armed', async (_label, make, errorClass, outage, configured) => {
     const { controller, clock, lines: retryLines } = makeRetryController()
     const err = make()
     const r = makeReal({
@@ -3124,13 +3118,13 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries() })
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003 (AC 65; hatch A3): an ENVIRONMENT or CONFIG
+  // (design A3): an ENVIRONMENT or CONFIG
   // answer met by the launch in flight the teardown waits for (its spawn,
   // through the outage wrapper) raises its outage in the window: the onset is
   // written, the timer the launch armed is stopped once it settled, and the
   // outage's all-clear after the teardown is written too. The kill meets the
   // same answer, so the flag stands past the teardown (raised once).
-  test.each(OUTAGE_ANSWERS.filter(([, , , , configured]) => configured))('b.jg5 SRJ-1002, SRJ-1003 (hatch A3): a destructive modify whose launch in flight meets %s (class %s, outage %s) while the teardown waits for it: the onset is a log line and a persona-teardown-notice entry, the timer that launch armed is stopped, and the all-clear after the teardown is written the same way; nothing reaches the new half\'s destination', async (_label, make, _errorClass, outage) => {
+  test.each(OUTAGE_ANSWERS.filter(([, , , , configured]) => configured))('(hatch A3): a destructive modify whose launch in flight meets %s (class %s, outage %s) while the teardown waits for it: the onset is a log line and a persona-teardown-notice entry, the timer that launch armed is stopped, and the all-clear after the teardown is written the same way; nothing reaches the new half\'s destination', async (_label, make, _errorClass, outage) => {
     const { controller } = makeRetryController()
     const r = makeReal({
       killError: make(),
@@ -3179,7 +3173,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries() })
   })
 
-  // b.jg5 SRJ-1003, SRJ-1002, SRJ-715 (AC 65): a CONFLICT or an UNUSABLE
+  // a CONFLICT or an UNUSABLE
   // NAME answer the teardown's kill meets, at a try or at the `status` read
   // between its tries, latches nothing (the server's latch installed, B
   // configured) and is one notice, written by the window: one server-log line
@@ -3197,7 +3191,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     ['a CONFLICT at the status read between its tries, a destructive modify\'s old half', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('status', 'not-this-launch'), true],
     ['an UNUSABLE NAME at the status read between its tries, B removed', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), false],
     ['an UNUSABLE NAME at the status read between its tries, a destructive modify\'s old half', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), true],
-  ])('AC 65: %s: one log line and one persona-teardown-notice entry with the kill outcome\'s one-line rendering, nothing latched, nothing posted to either half\'s destination', async (_label, at, errorClass, make, destructive) => {
+  ])('%s: one log line and one persona-teardown-notice entry with the kill outcome\'s one-line rendering, nothing latched, nothing posted to either half\'s destination', async (_label, at, errorClass, make, destructive) => {
     const refused = make()
     expect(classifyAdError(refused).errorClass).toBe(errorClass)
     const latch = installLatch(() => true)
@@ -3230,7 +3224,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries(), killLines: consoleLines() })
   })
 
-  // b.jg5 SRJ-715, SRJ-1003: in dry run the teardown makes no kill, so its
+  // in dry run the teardown makes no kill, so its
   // kill-refusal path never runs: a kill that would answer CONFLICT is never
   // made, and no refusal notice is written, posted or latched.
   test('dry run: no kill is made, so the CONFLICT the kill would meet raises no refusal notice: no agent-director call, no entry, no notifier line, nothing posted or latched; the dry-run line names the kept row', async () => {
@@ -3257,14 +3251,14 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expectNothingArmedOrDeleted(r)
   })
 
-  // b.jg5 SRJ-702, SRJ-1003 (hatch A3): a CONFIG answer at the status read
+  // (design A3): a CONFIG answer at the status read
   // between the kill's tries raises ad-config-malformed for a configured B,
   // written by the window, never posted; the tries go on, and the next read's
   // success clears it, its all-clear raised in the window and written too.
   // The ErrTmuxUnresponsive that stands after the tries calls for no alert
   // and raises no outage, so it is the not-succeeded notice, written last
-  // (b.jg5 SRJ-110).
-  test('b.jg5 SRJ-702, SRJ-1003, SRJ-110: a CONFIG answer at the status read between the kill\'s tries, B a destructive modify\'s old half: ad-config-malformed\'s onset, the all-clear the next read raises and the not-succeeded notice of the UNAVAILABLE outcome standing after the tries are each a log line and a persona-teardown-notice entry, posted to neither half\'s destination; nothing latches or arms', async () => {
+  //.
+  test('a CONFIG answer at the status read between the kill\'s tries, B a destructive modify\'s old half: ad-config-malformed\'s onset, the all-clear the next read raises and the not-succeeded notice of the UNAVAILABLE outcome standing after the tries are each a log line and a persona-teardown-notice entry, posted to neither half\'s destination; nothing latches or arms', async () => {
     const latch = installLatch((key) => key === r.f.b.key)
     const unavailable = errTmuxUnresponsive('kill')
     const r = makeReal({
@@ -3293,12 +3287,12 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries(), killLines: consoleLines() })
   })
 
-  // b.jg5 SRJ-110, SRJ-1003: a removed B (apply step 1 took it out of the
+  // a removed B (apply step 1 took it out of the
   // applied configuration, so the configured-persona query answers false):
   // an ENVIRONMENT or CONFIG answer at its kill raises no outage, so no onset
   // records it; the standing outcome is the not-succeeded notice, one log
   // line and one persona-teardown-notice entry, never posted, and no flag.
-  test.each(OUTAGE_ANSWERS.filter(([, , , , configured]) => !configured))('b.jg5 SRJ-110, SRJ-1003: B removed, its kill answers %s (class %s, outage %s): no onset and no flag; the standing outcome is one not-succeeded notice, a log line and a persona-teardown-notice entry naming the kill count; nothing posted, armed or deleted', async (_label, make, errorClass) => {
+  test.each(OUTAGE_ANSWERS.filter(([, , , , configured]) => !configured))('B removed, its kill answers %s (class %s, outage %s): no onset and no flag; the standing outcome is one not-succeeded notice, a log line and a persona-teardown-notice entry naming the kill count; nothing posted, armed or deleted', async (_label, make, errorClass) => {
     const err = make()
     installLatch(() => false)
     const r = makeReal({ killError: err })
@@ -3322,12 +3316,12 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries() })
   })
 
-  // b.jg5 SRJ-1003, SRJ-110: a CONFLICT met at the status read between the
+  // a CONFLICT met at the status read between the
   // tries is no answer of a try, so its refusal notice does not record the
   // outcome that stands after them: an UNAVAILABLE value other than
   // ErrTmuxKillFailed (no alert, no outage) also gets the not-succeeded
   // notice. Two entries, the refusal's first.
-  test('b.jg5 SRJ-1003, SRJ-110: a CONFLICT at the status read between the tries, then ErrTmuxUnresponsive standing after the last try, B removed: two persona-teardown-notice entries, the read-time refusal notice and then the not-succeeded notice; nothing latched or posted', async () => {
+  test('a CONFLICT at the status read between the tries, then ErrTmuxUnresponsive standing after the last try, B removed: two persona-teardown-notice entries, the read-time refusal notice and then the not-succeeded notice; nothing latched or posted', async () => {
     const latch = installLatch(() => true)
     const unavailable = errTmuxUnresponsive('kill')
     const refused = errTmuxSessionConflict('status', 'not-this-launch')
@@ -3353,12 +3347,12 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries(), killLines: consoleLines() })
   })
 
-  // b.jg5 SRJ-313, SRJ-1003 (hatch A3): an UNCLASSIFIED outcome met past
+  // (design A3): an UNCLASSIFIED outcome met past
   // the alert threshold by the launch in flight the teardown waits for raises
   // the unclassified-error alert in the window: one persona-teardown-notice
   // entry with the unescaped alert text, never the persona-unclassified-error
   // entry a key no longer applied would get outside the window, and no post.
-  test('b.jg5 SRJ-313, SRJ-1003: B removed, its launch in flight meets UNCLASSIFIED outcomes past the alert threshold while the teardown waits for it: the alert is a log line and a persona-teardown-notice entry, no persona-unclassified-error entry, nothing posted', async () => {
+  test('B removed, its launch in flight meets UNCLASSIFIED outcomes past the alert threshold while the teardown waits for it: the alert is a log line and a persona-teardown-notice entry, no persona-unclassified-error entry, nothing posted', async () => {
     const unclassifiedErr = errInstanceIdCollision()
     const r = makeReal({
       overrides: (f) => ({
@@ -3384,7 +3378,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, alertLines: r.alertLines, entries: r.startupEntries() })
   })
 
-  // b.jg5 SRJ-110 (hatch A3): the teardown's kill is no launch or recovery
+  // (design A3): the teardown's kill is no launch or recovery
   // attempt, so a class the kill has no row for (UNCLASSIFIED) arms nothing
   // and feeds no unclassified-error episode, even when the teardown runs
   // inside a recovery attempt for B (an attempt-context kill would arm); the
@@ -3393,7 +3387,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     ['a STATE name (ErrInstanceIdCollision)', () => errInstanceIdCollision()],
     ['a STATE name (ErrSpawnNotResumable)', () => errSpawnNotResumable()],
     ['a LAUNCH FAILURE name (ErrTmuxSessionCreate)', () => errTmuxSessionCreate('kill')],
-  ])('b.jg5 SRJ-110: the kill answers %s (a class it has no row for, UNCLASSIFIED), the teardown run inside a recovery attempt for B: nothing armed or reported; the kill step fails with its line, no delete is made, nothing latches', async (_label, make) => {
+  ])('the kill answers %s (a class it has no row for, UNCLASSIFIED), the teardown run inside a recovery attempt for B: nothing armed or reported; the kill step fails with its line, no delete is made, nothing latches', async (_label, make) => {
     const err = make()
     const latch = installLatch(() => true)
     const r = makeReal({ killError: err })
@@ -3413,7 +3407,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
   })
 
-  // b.jg5 SRJ-104, SRJ-204, SRJ-205: an ErrInvalidFlags at the teardown's
+  // an ErrInvalidFlags at the teardown's
   // kill gets exactly one immediate version re-check; either way the kill
   // step fails after its one try and no delete is made, and nothing is armed
   // or reported.
@@ -3489,7 +3483,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.h.posts(r.f.a.key)).toEqual([])
   })
 
-  // b.jg5 SRJ-1003: the notice the destination hold kept for B before its
+  // the notice the destination hold kept for B before its
   // teardown is dropped as the window opens (DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP),
   // nothing awaited in between, so while the teardown waits for B's launch in
   // flight its retry, come due with B's destination working again, posts
@@ -3498,7 +3492,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   test.each([
     ['B removed', false],
     ["B still applied (a destructive modify's old half): nothing reaches the new half's destination", true],
-  ] as const)('b.jg5 SRJ-1003: a notice held for B\'s failing destination before its teardown is never posted while the window is open, nor after (%s)', async (_label, stillApplied) => {
+  ] as const)('a notice held for B\'s failing destination before its teardown is never posted while the window is open, nor after (%s)', async (_label, stillApplied) => {
     const launchInFlight = Promise.withResolvers<void>()
     const order: string[] = []
     const r: RealFixture = makeReal({
@@ -3551,10 +3545,10 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 })
 
 // ---------------------------------------------------------------------------
-// Apply bring-up (SR-6.1, SR-6.2)
+// Apply bring-up
 // ---------------------------------------------------------------------------
 
-describe('apply bring-up (SR-6.1, SR-6.2): storage check, bring-up, then a launch only when up', () => {
+describe('apply bring-up: storage check, bring-up, then a launch only when up', () => {
   /** An applied config holding A and the added persona B. */
   function appliedOf(f: Fixture): PersonaConfig {
     return { ...f.config, personas: [f.a, f.b] }
@@ -3685,7 +3679,7 @@ describe('apply bring-up (SR-6.1, SR-6.2): storage check, bring-up, then a launc
 })
 
 // ---------------------------------------------------------------------------
-// Recovery bring-up (SR-6.4, SR-8.6 step 6): a persona broken by its
+// Recovery bring-up (step 6): a persona broken by its
 // credentials whose credentials file changed. Decided when it runs.
 // ---------------------------------------------------------------------------
 
@@ -3705,13 +3699,13 @@ const STATES = {
   brokenOther: { outcome: 'broken', causes: { slack: causeOf('slack', 'error') } },
   retryingSlack: { outcome: 'retrying', causes: { slack: causeOf('slack', PERSONA_SLACK_UNREACHABLE) } },
   retryingDirectory: { outcome: 'retrying', causes: { directory: causeOf('working-directory', PERSONA_DIRECTORY_MISSING) } },
-  /** Held for an unresolvable claude_config_dir (bug b.g57): no Slack connection, its launch waits. */
+  /** Held for an unresolvable claude_config_dir: no Slack connection, its launch waits. */
   heldConfigDir: { outcome: 'retrying', causes: { configDir: causeOf('claude-config-dir', PERSONA_CONFIG_DIR_UNRESOLVABLE) } },
   firstAttempt: { outcome: undefined, causes: {} },
   up: { outcome: 'up', causes: {} },
 } satisfies Record<string, PersonaBringUpState>
 
-describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken persona is cleared, then brought up afresh', () => {
+describe('recovery bring-up (step 6): a credentials-broken persona is cleared, then brought up afresh', () => {
   const recovery = { recovery: true } as const
 
   /** B's recovery-specific steps, then the apply bring-up's, for an `up` result. */
@@ -3761,7 +3755,7 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
     ['retrying: Slack unreachable', STATES.retryingSlack, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
     ['retrying: working directory missing', STATES.retryingDirectory, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
     ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
-    ['held for its claude_config_dir (bug b.g57)', STATES.heldConfigDir, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    ['held for its claude_config_dir', STATES.heldConfigDir, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
     ['broken by another Slack error', STATES.brokenOther, { kind: 'skipped' }, undefined],
     ['unknown to the controller', undefined, { kind: 'skipped' }, undefined],
   ])('B %s when the recovery runs: not cleared or brought up; its changed credentials are applied as a credentials change in the same serializer turn, and it resolves with its outcome then and no failures', async (_label, state, changeResult, changeLine) => {
@@ -3902,11 +3896,11 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
 })
 
 // ---------------------------------------------------------------------------
-// Credentials change (SR-8.6 step 4, credentials row): the controller's
+// Credentials change (step 4, credentials row): the controller's
 // changeCredentials over the lifecycle's connections, under the serializer.
 // ---------------------------------------------------------------------------
 
-describe('credentials change (SR-8.6 step 4): the controller\'s change over the connection manager, one line per outcome', () => {
+describe('credentials change (step 4): the controller\'s change over the connection manager, one line per outcome', () => {
   const lineOf = (f: Fixture, rest: string) => `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: ${rest}`
 
   // Rows: the controller's result, and the lifecycle's line after the persona prefix (none for failed and skipped).
@@ -4056,7 +4050,7 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
 
 // ---------------------------------------------------------------------------
 // Confirmed credentials changes over the real bring-up controller and
-// connection manager (b.av2 SR-8.3, SR-8.6 step 4): the content held after
+// connection manager (step 4): the content held after
 // superseded and late reconnects, the failed line's "kept" wording, and the
 // results worded from B's state after the attempt. B is up on its original
 // file (O); each rotation writes B's file with a new token pair registered
@@ -4064,7 +4058,7 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
 // ---------------------------------------------------------------------------
 
 const HOUR_MS = 3_600_000
-/** A reconnect left retrying tries again after 5 s (the SR-3.2 schedule's first step). */
+/** A reconnect left retrying tries again after 5 s (the schedule's first step). */
 const FIRST_RETRY_MS = 5_000
 
 interface CredentialsStack extends ControllerStack {
@@ -4129,7 +4123,7 @@ async function makeCredentialsStack(stubOptions?: ConnectionHarnessOptions['stub
   }
 }
 
-describe('the controller\'s credentials change (SR-8.3, SR-8.6 step 4): any refusal holds the content B\'s own connection uses', () => {
+describe('the controller\'s credentials change (step 4): any refusal holds the content B\'s own connection uses', () => {
   const KEPT_CONNECTION = '; the current connection stays in use, and the change stays pending'
   const KEPT_BROKEN = '; it stays broken by its credentials, and the change stays pending'
 
@@ -4383,11 +4377,11 @@ describe('credentials change over the real controller and manager: the DM forget
 })
 
 // ---------------------------------------------------------------------------
-// In-place update (SR-8.6, AC 58, apply step 3): the DM-cache forget and one
+// In-place update (apply step 3): the DM-cache forget and one
 // line, under the serializer; nothing else about the persona is touched.
 // ---------------------------------------------------------------------------
 
-describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destination settings changed, one line, nothing else', () => {
+describe('in-place update: forget the cached DM when its destination settings changed, one line, nothing else', () => {
   /** The step-3 input for `p` with `settings` changed (`previous` is not read by the operation). */
   function change(p: Persona, settings: InPlaceSetting[]): InPlaceApplyInput {
     return { persona: p, previous: p, settings }
@@ -4410,7 +4404,7 @@ describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destina
     return f
   }
 
-  // Rows: the changed settings, and whether B's cached DM is forgotten (Director decision 11).
+  // Rows: the changed settings, and whether B's cached DM is forgotten.
   test.each<[InPlaceSetting[], boolean]>([
     [['channels'], false],
     [['delivery'], false],
@@ -4421,7 +4415,7 @@ describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destina
     [['dm.contact'], true],
     [['delivery', 'dm.contact'], true],
     [['channels', 'delivery', 'permission_prompts', 'dm.enabled', 'dm.contact'], true],
-  ])('AC 58: %j changed: forgets B\'s cached DM only when a DM destination setting changed, logs one line, and touches no other state of B (no bring-up, retry, restart, connection, session, prompts, held notice or reply reminder), live and in dry run alike', async (settings, forgets) => {
+  ])('%j changed: forgets B\'s cached DM only when a DM destination setting changed, logs one line, and touches no other state of B (no bring-up, retry, restart, connection, session, prompts, held notice or reply reminder), live and in dry run alike', async (settings, forgets) => {
     for (const dryRun of [false, true]) {
       const f = makeInPlaceFixture({ dryRun })
 
@@ -4538,13 +4532,13 @@ describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destina
 })
 
 // ---------------------------------------------------------------------------
-// Template refresh (SR-8.6 step 5) through the lifecycle: its dependencies
+// Template refresh (step 5) through the lifecycle: its dependencies
 // passed through, not serialized. The refresh itself (the `allow`
 // replacement, the exact lines, token safety, a rejection) is pinned in
 // agent-director-template.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('template refresh (SR-8.6 step 5) through the lifecycle: the start-time template and client passed through; not serialized', () => {
+describe('template refresh (step 5) through the lifecycle: the start-time template and client passed through; not serialized', () => {
   /** The applied config: B alone, whose own config dir gives the only rule (no default dir, so no home is read). */
   const appliedOf = (f: Fixture): PersonaConfig => ({ ...f.config, personas: [f.b] })
 
@@ -4575,11 +4569,11 @@ describe('template refresh (SR-8.6 step 5) through the lifecycle: the start-time
 })
 
 // ---------------------------------------------------------------------------
-// Serialization (SR-6.6): a teardown waits behind the key's restart, retry
+// Serialization: a teardown waits behind the key's restart, retry
 // launch and in-flight start-pass launch; never behind another key's work.
 // ---------------------------------------------------------------------------
 
-describe('persona teardown serialization (SR-6.6)', () => {
+describe('persona teardown serialization', () => {
   test('a teardown for B waits at its launch-in-flight step (the start pass\'s launch) and holds B\'s turn meanwhile; A\'s teardown and bring-up complete in the meantime', async () => {
     const launchInFlight = Promise.withResolvers<void>()
     let bKey = ''
@@ -4708,7 +4702,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       const done = f.lifecycle.teardown(f.b)
       expect(await settled(done)).toBe(false)
       expect(f.lines).toEqual([])
-      // Only the submit's registration, the submit-time stops and the cancel of a launch's wait for a working row (b.f2b), so the restart's launch is not held by one.
+      // Only the submit's registration, the submit-time stops and the cancel of a launch's wait for a working row, so the restart's launch is not held by one.
       expect(teardownOnly(f)).toEqual(submitCancels(f.b))
 
       launchGate.resolve(true)
@@ -4724,7 +4718,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       expectOnlyBRetryStopped(f, retry)
     })
 
-    // SRJ-305 / SRJ-715: the submit-time stop cannot see an arm that the
+    // the submit-time stop cannot see an arm that the
     // in-flight retry's own launch makes afterwards; the turn's stop, which
     // runs only after that work settled, must catch it.
     test('a still-applied teardown for B submitted while B\'s runRestartRetry is running (its launch in progress) starts only once that work settled; the launch arms B during the run, and B ends with no retry timer while A stays armed', async () => {
@@ -4794,7 +4788,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
 
       const k = f.b.key
       expect(restartOnly(f)).toEqual([`restart.canRestart:${k}`, `restart.submitted:${k}`, `restart.canRestart:${k}`])
-      // The submit's registration, its stops and cancel of a launch's wait (b.f2b), then the refused restart work, then B's turn.
+      // The submit's registration, its stops and cancel of a launch's wait, then the refused restart work, then B's turn.
       const head = [
         `restart.canRestart:${k}`, `restart.submitted:${k}`, ...submitCancels(f.b), `restart.canRestart:${k}`,
         ...turnStart(f.b),  `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,

@@ -1,17 +1,3 @@
----
-id: b.set
-type: bee
-title: 'Test 3: Cozempic availability and clean server restart'
-up_dependencies:
-- b.3hy
-parent: null
-egg: null
-created_at: '2026-04-04T21:36:24.881785'
-status: pupa
-schema_version: '0.1'
-guid: setkutjznmwpgemdxschnjtrhqz23kun
----
-
 ## Test 3: Cozempic availability and clean server restart
 
 Runs only inside the docker CI container (`/ci`), never on a host with a real

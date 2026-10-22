@@ -14,8 +14,8 @@
  *   indentation walk (see enclosingScope). `(module)` if none.
  *
  * The pure functions here take SYNTHETIC inputs (no fs / execSync), so the
- * behavioural directions (AC-1 comment insertion is inert, AC-2 new site fails,
- * AC-3 relocation fails) can be exercised in-process. The real test enumerates
+ * behavioural directions (comment insertion is inert new site fails,
+ * relocation fails) can be exercised in-process. The real test enumerates
  * src/**\/*.ts via fs, builds the Map, and calls auditGetClientAllowlist.
  *
  * SPDX-License-Identifier: MIT
@@ -110,7 +110,7 @@ export function declarationName(trimmed: string): string | null {
   if (m) return m[1]
 
   // Method / interface-method shorthand:  name(...) {   or   name(...): T {
-  //   e.g.  installSlackChannelBotTemplate(  ,  getClient(): Client
+  // e.g. installSlackChannelBotTemplate(getClient: Client
   //   Guard against control keywords (if/for/while/switch/catch/return...).
   m = trimmed.match(/^(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+|async\s+|get\s+|set\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(/)
   if (m && !CONTROL_KEYWORDS.has(m[1])) return m[1]

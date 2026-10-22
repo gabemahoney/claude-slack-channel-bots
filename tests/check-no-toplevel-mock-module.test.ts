@@ -11,7 +11,7 @@
  * environment from hostSafeChildEnv: a temp HOME this file owns and removes,
  * and `bun` as its only named tool.
  *
- * Bug reference: b.5wd — "add CI gate against top-level mock.module() in tests/"
+ * Bug reference: "add CI gate against top-level mock.module in tests/"
  */
 
 import { describe, test, expect, afterEach } from 'bun:test'

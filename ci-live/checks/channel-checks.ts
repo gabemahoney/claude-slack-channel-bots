@@ -1,5 +1,5 @@
 /**
- * channel-checks.ts — testplans/b.yko Parts 3–5: the first start and the
+ * channel-checks.ts — testplans/live-acceptance.md Parts 3–5: the first start and the
  * channel checks (1–7), bot-to-bot, broadcasts and the persona-post event
  * shape (8–12), and A receive-all in both channels (13).
  *
@@ -93,7 +93,7 @@ export const COMPLETE_FIRST_START =
 
 export const check1: CheckDef<CheckContext> = {
   id: '1',
-  title: 'Check 1: the first start applies config.json as it stands, with no token variables (AC 71, AC 47)',
+  title: 'Check 1: the first start applies config.json as it stands, with no token variables',
   needs: LIVE,
   row: '1',
   blocking: true,
@@ -150,7 +150,7 @@ export const check2: CheckDef<CheckContext> = {
 
 export const check3: CheckDef<CheckContext> = {
   id: '3',
-  title: 'Check 3: a mention reaches only the persona mentioned (AC 1)',
+  title: 'Check 3: a mention reaches only the persona mentioned',
   needs: LIVE,
   row: '3',
   async run(ctx) {
@@ -167,7 +167,7 @@ export const check3: CheckDef<CheckContext> = {
 
 export const check4: CheckDef<CheckContext> = {
   id: '4',
-  title: 'Check 4: one instance hears both of A\'s channels and replies in each (AC 2)',
+  title: 'Check 4: one instance hears both of A\'s channels and replies in each',
   needs: LIVE,
   row: '4',
   async run(ctx) {
@@ -195,7 +195,7 @@ export const CHECK5_PROMPT_2 = /permission-check-2\.txt/
 
 export const check5: CheckDef<CheckContext> = {
   id: '5',
-  title: "Check 5: permission prompts go to A's destination (AC 28, AC 31)",
+  title: "Check 5: permission prompts go to A's destination",
   needs: LIVE,
   row: '5',
   async run(ctx) {
@@ -234,7 +234,7 @@ export const check5: CheckDef<CheckContext> = {
 
 export const check6: CheckDef<CheckContext> = {
   id: '6',
-  title: 'Check 6: one agent-director row per persona (AC 4)',
+  title: 'Check 6: one agent-director row per persona',
   needs: LIVE,
   row: '6',
   async run(ctx) {
@@ -251,7 +251,7 @@ export const check6: CheckDef<CheckContext> = {
 
 export const check7: CheckDef<CheckContext> = {
   id: '7',
-  title: 'Check 7: crash and recover (AC 4)',
+  title: 'Check 7: crash and recover',
   needs: LIVE,
   row: '7',
   async run(ctx) {
@@ -308,7 +308,7 @@ export function rawShape(line: string): Record<string, string> {
 
 export const check8: CheckDef<CheckContext> = {
   id: '8',
-  title: 'Check 8: persona-post event shape (SR-4.2, the event-shape capture)',
+  title: 'Check 8: persona-post event shape (the event-shape capture)',
   needs: LIVE,
   row: '8',
   async run(ctx) {
@@ -343,7 +343,7 @@ export const check8: CheckDef<CheckContext> = {
 
 export const check9: CheckDef<CheckContext> = {
   id: '9',
-  title: 'Check 9: one mention is delivered once (SR-4.1)',
+  title: 'Check 9: one mention is delivered once',
   needs: LIVE,
   row: '9',
   async run(ctx) {
@@ -367,7 +367,7 @@ export const check9: CheckDef<CheckContext> = {
       f.expect(byText.msg === 1 && byText.app === 1, `RAW lines for the message: message=${byText.msg} app_mention=${byText.app}, not one each`)
     }
     expectOneTag(f, await tags(ctx, 'a', x.ts), 'tags a TS', { via: 'mention', user_id: ctx.ids.humanUserId })
-    // Acceptance and final receipt are correlated to this Slack event (b.omv SR-13.6).
+    // Acceptance and final receipt are correlated to this Slack event.
     for (const kind of ['message-received', 'message-delivered'] as const) {
       const found = await waitDeliveryLines(ctx, m, kind, 'a', ctx.ids.coordination, x.ts)
       f.expect(found.length === 1, `${found.length} correlated ${kind} lines for the message, not 1`)
@@ -381,7 +381,7 @@ export const check9: CheckDef<CheckContext> = {
 
 export const check10: CheckDef<CheckContext> = {
   id: '10',
-  title: 'Check 10: @here and @channel wake the mention-only personas (AC 7)',
+  title: 'Check 10: @here and @channel wake the mention-only personas',
   needs: LIVE,
   row: '10',
   async run(ctx) {
@@ -405,7 +405,7 @@ export const check10: CheckDef<CheckContext> = {
 
 export const check11: CheckDef<CheckContext> = {
   id: '11',
-  title: "Check 11: a persona's own @here does not wake it (AC 8)",
+  title: "Check 11: a persona's own @here does not wake it",
   needs: LIVE,
   row: '11',
   async run(ctx) {
@@ -422,7 +422,7 @@ export const check11: CheckDef<CheckContext> = {
   },
 }
 
-/** RAW and first-typing dispatch excerpts carry message text; metadata diagnostics do not (b.omv SR-13.6). */
+/** RAW and first-typing dispatch excerpts carry message text; metadata diagnostics do not. */
 const MESSAGE_TEXT_LINE_RE = /\[slack\] RAW [a-z_]+ event persona=|\[slack\] dispatch: persona=/
 
 /**
@@ -508,7 +508,7 @@ export async function liftCheck12Stop(ctx: CheckContext, f: Findings, inPanes: b
 
 export const check12: CheckDef<CheckContext> = {
   id: '12',
-  title: 'Check 12: two personas converse with no limit (AC 11, AC 18, SR-4.2)',
+  title: 'Check 12: two personas converse with no limit',
   needs: LIVE,
   row: '12',
   async run(ctx) {
@@ -598,7 +598,7 @@ export const check12: CheckDef<CheckContext> = {
 
 export const check13: CheckDef<CheckContext> = {
   id: '13',
-  title: 'Check 13: a persona receive-all in two channels hears both in one instance (AC 12)',
+  title: 'Check 13: a persona receive-all in two channels hears both in one instance',
   needs: LIVE,
   row: '13',
   async run(ctx) {

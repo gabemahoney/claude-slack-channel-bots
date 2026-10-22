@@ -1,4 +1,4 @@
-/** Decision 18's reviewed AI inputs. No model calls or production imports.
+/** The current rule's reviewed AI inputs. No model calls or production imports.
  * The AI copy is explicit; this audit never rewrites a delivered input.
  */
 import { createHash } from 'node:crypto'

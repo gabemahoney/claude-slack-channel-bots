@@ -1,19 +1,3 @@
----
-id: b.3hy
-type: bee
-title: 'Test 2: Dry-run startup spawn-skip verification'
-up_dependencies:
-- b.j9i
-down_dependencies:
-- b.set
-parent: null
-egg: null
-created_at: '2026-04-04T21:36:15.184642'
-status: pupa
-schema_version: '0.1'
-guid: 3hywfx89ra34w1vgokq1z8orjccznbti
----
-
 ## Test 2: Dry-run startup spawn-skip verification
 
 Runs only inside the docker CI container (`/ci`), never on a host with a real

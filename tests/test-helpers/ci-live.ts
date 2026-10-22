@@ -1,6 +1,6 @@
 /**
  * test-helpers/ci-live.ts — Shared fakes for the /ci-live runner suites
- * (`tests/ci-live-*.test.ts`, bug b.1cx).
+ * (`tests/ci-live-*.test.ts`).
  *
  * - `memSecureFs()` is an in-memory `SecureFs` (the runner's secret-store
  *   seam): files and directories with their modes, plus a log of every call,

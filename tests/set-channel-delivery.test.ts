@@ -1,26 +1,24 @@
 /**
- * set-channel-delivery.test.ts — The `set_channel_delivery` tool (b.deo
- * SRI-1304): SRI-501 to SRI-507, SRI-404's tool side, and SRI-902's
- * `persona-channel-delivery-set` pin (AC 14 to AC 16, AC 19, AC 22, AC 24,
- * AC 25).
+ * set-channel-delivery.test.ts — The `set_channel_delivery` tool: to tool side, and
+ * `persona-channel-delivery-set` pin.
  *
- * - Listing (SRI-501): every persona's session lists the tool, with the
+ * - Listing: every persona's session lists the tool, with the
  *   exported name and descriptions and its two required inputs, the same
  *   definition in both modes.
- * - Resolution (SRI-502): an unmatched session (a persona that is not up
+ * - Resolution: an unmatched session (a persona that is not up
  *   among them), an unapplied key, a retiring key and a session the registry
- *   dropped or replaced get the other tools' refusals, before SRI-503's
+ * dropped or replaced get the other tools' refusals, before
  *   order; the handler's stretch from resolution to the store's write has no
  *   await (a source audit of `src/registry.ts`).
- * - Refusals (SRI-503): each rule, its echo rule stated per row, the
+ * - Refusals: each rule, its echo rule stated per row, the
  *   known-channel branches, and the order with several causes at once.
- * - Secrecy (SRI-1304, SRI-907): `LEAK_SENTINEL` and a fake token as
+ * - Secrecy: `LEAK_SENTINEL` and a fake token as
  *   `delivery` and as `channel` appear in no tool error.
- * - Accepted calls (SRI-504, SRI-505): the stored record, the result, the
+ * - Accepted calls: the stored record, the result, the
  *   next event decided by it, the same value again, the loop guard, and the
  *   one `persona-channel-delivery-set` line per accepted call (one pin case).
- * - Failed writes (SRI-506, SRI-404's tool side), a store that refuses the
- *   input it would write, and dry run (SRI-507).
+ * - Failed writes (tool side), a store that refuses the
+ * input it would write, and dry run.
  *
  * How the tool is driven: through the reload harness's `run.callTool`
  * (`createSessionServer` over an in-memory MCP client, with each persona's
@@ -37,7 +35,7 @@
  * stub's log (every persona's, and the direct client's) during a tool call.
  * Deliveries a case makes to set itself up make their own calls (a delivered
  * message's `users.info`) and are not the tool's; a case that delivers
- * nothing keeps every log empty throughout (b.deo SRI-605).
+ * nothing keeps every log empty throughout.
  *
  * Isolation: every file sits under the harness's `mkdtempSync` root, removed
  * by `h.cleanup()`; time comes only from the run's fake clock; the tools'
@@ -212,7 +210,7 @@ afterEach(async () => {
     }
     assertNoLeak(extra, 'set-channel-delivery afterEach')
     h.runs.forEach((run, i) => assertNoLeak(run.captured(extra), `set-channel-delivery afterEach run ${i}`))
-    // The tool posts nothing, and no case's setup posts either (b.deo SRI-505).
+    // The tool posts nothing, and no case's setup posts either.
     for (const run of h.runs) expect(run.slackPosts()).toEqual([])
   } finally {
     // Each step runs whatever the one before did: a client that fails to
@@ -331,7 +329,7 @@ function storedChoiceBytes(): Buffer | null {
   return existsSync(h.channelDeliveryFile) ? readFileSync(h.channelDeliveryFile) : null
 }
 
-/** The SR-8.1 (as amended by b.deo SRI-401) reload files' bytes (`config.json` among them), each undefined when absent. */
+/** The reload files' bytes (`config.json` among them), each undefined when absent. */
 function reloadFiles(): Record<string, Buffer | undefined> {
   return { config: h.readConfig(), lastApplied: h.readRecord(), pending: h.readPending(), apply: h.readApply() }
 }
@@ -562,7 +560,7 @@ function expectWriteFailedLine(line: string, key: string, channel: string, codes
 }
 
 // ---------------------------------------------------------------------------
-// S1: listing (SRI-501)
+// S1: listing
 // ---------------------------------------------------------------------------
 
 /**
@@ -583,7 +581,7 @@ const EXPECTED_DEFINITION = {
   },
 }
 
-describe('every session lists set_channel_delivery, the same in both modes (b.deo SRI-501)', () => {
+describe('every session lists set_channel_delivery, the same in both modes', () => {
   test.each<[ChannelMode, () => Promise<ReloadRun>, readonly string[]]>([
     ['fungible', async () => (await startFungible()).run, NAMES],
     ['declarative', async () => (await startDeclarative()).run, [P]],
@@ -604,11 +602,11 @@ describe('every session lists set_channel_delivery, the same in both modes (b.de
 })
 
 // ---------------------------------------------------------------------------
-// S2: resolution before the refusal order (SRI-502)
+// S2: resolution before the refusal order
 // ---------------------------------------------------------------------------
 
 /**
- * What breaks SRI-502's synchronous stretch in `src/registry.ts`'s
+ * What breaks synchronous stretch in `src/registry.ts`'s
  * comment-stripped code: `setChannelDelivery` declared `async`, an `await`
  * in it before its `store.set(` write, or an `await` in the CallTool handler
  * before it hands the call to `setChannelDelivery`. Empty when the stretch
@@ -642,7 +640,7 @@ function insertedAfterBrace(code: string, anchor: string, text: string): string 
   return `${code.slice(0, brace)}${text}${code.slice(brace)}`
 }
 
-describe('resolution comes before the refusal order (b.deo SRI-502)', () => {
+describe('resolution comes before the refusal order', () => {
   test('a session matched to no persona gets the unmatched refusal, the one reply gets for its own name; nothing written, logged or called', async () => {
     const { run } = await startFungible()
     await hear(run, P, plainMessage(PUBLIC))
@@ -727,7 +725,7 @@ describe('resolution comes before the refusal order (b.deo SRI-502)', () => {
     ['an unmatched session with an unreadable store', 'unmatched', async () => (await startFungible({ unreadable: true })).run],
     ['an unapplied key in declarative mode', 'unapplied', async () => (await startDeclarative()).run],
     ['an unapplied key with an unreadable store', 'unapplied', async () => (await startFungible({ unreadable: true })).run],
-  ])('%s gets the resolution refusal, not an SRI-503 refusal', async (_label, form, start) => {
+  ])('%s gets the resolution refusal, not an refusal', async (_label, form, start) => {
     const run = await start()
     const args = { channel: NEVER_HEARD, delivery: BAD_DELIVERY }
 
@@ -758,10 +756,10 @@ describe('resolution comes before the refusal order (b.deo SRI-502)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// S3: rules 1 and 2, and the order (SRI-503, SRI-404 tool side)
+// S3: rules 1 and 2, and the order (tool side)
 // ---------------------------------------------------------------------------
 
-/** SRI-503's rules, by number: the refusal each gives P, built for persona `persona` and the call's values. */
+/** rules, by number: the refusal each gives P, built for persona `persona` and the call's values. */
 function ruleRefusal(rule: 1 | 2 | 3 | 4, persona: Persona, args: { channel: unknown; delivery: unknown }): string {
   switch (rule) {
     case 1:
@@ -775,7 +773,7 @@ function ruleRefusal(rule: 1 | 2 | 3 | 4, persona: Persona, args: { channel: unk
   }
 }
 
-describe('rule 1, declarative mode, and rule 2, the store unreadable (b.deo SRI-503, SRI-404 tool side)', () => {
+describe('rule 1, declarative mode, and rule 2, the store unreadable (tool side)', () => {
   test.each<[string, (listed: string) => string]>([
     ['the listed channel, which is in its posting scope', (listed) => listed],
     ['an unlisted channel', () => NEVER_HEARD],
@@ -812,7 +810,7 @@ describe('rule 1, declarative mode, and rule 2, the store unreadable (b.deo SRI-
     )
   })
 
-  test('the texts carry what the SRD names: the persona in rules 1 to 4; the operator\'s config.json in rule 1; the file and the move-aside-and-restart fix in rule 2; the value not shown, and absent, in rules 3 and 4\'s not-shown forms; the result\'s channel, choice and delivery, with the loop guard and the fungible destination only when held', () => {
+  test('the texts carry what the contract names: the persona in rules 1 to 4; the operator\'s config.json in rule 1; the file and the move-aside-and-restart fix in rule 2; the value not shown, and absent, in rules 3 and 4\'s not-shown forms; the result\'s channel, choice and delivery, with the loop guard and the fungible destination only when held', () => {
     const name = 'Delta Bot'
     const key = personaKey(name)
     const ref = renderPersonaRef(name, key)
@@ -844,7 +842,7 @@ describe('rule 1, declarative mode, and rule 2, the store unreadable (b.deo SRI-
       expect(notShown.toLowerCase()).not.toContain(hidden.toLowerCase())
     }
 
-    // The result (SRI-504): the channel, the stored choice and the delivery as
+    // The result: the channel, the stored choice and the delivery as
     // whole words; the held form also names the loop guard and the fungible
     // destination, the not-held form neither.
     const word = (text: string, w: string): boolean => new RegExp(`\\b${w}\\b`).test(text)
@@ -858,7 +856,7 @@ describe('rule 1, declarative mode, and rule 2, the store unreadable (b.deo SRI-
   // Each row breaks the rules it names and no other; the first one gives the
   // error. A rule-1 row starts fungible, hears its channel, then a confirmed
   // change turns the switch off (the routing keeps its heard sets across a
-  // switch change, b.deo SRI-307, so the channel stays known); a rule-2 row
+  // switch change, so the channel stays known); a rule-2 row
   // starts over unreadable bytes.
   test.each<[string, { declarative: boolean; unreadable: boolean; badDelivery: boolean; unknownChannel: boolean; first: 1 | 2 | 3 }]>([
     ['1+2', { declarative: true, unreadable: true, badDelivery: false, unknownChannel: false, first: 1 }],
@@ -879,7 +877,7 @@ describe('rule 1, declarative mode, and rule 2, the store unreadable (b.deo SRI-
 })
 
 // ---------------------------------------------------------------------------
-// S4: rules 3 and 4, their echo rules, and the known channels (SRI-503)
+// S4: rules 3 and 4, their echo rules, and the known channels
 // ---------------------------------------------------------------------------
 
 /** No `delivery` given. */
@@ -893,8 +891,8 @@ function argsOf(channel: unknown, delivery: unknown): Record<string, unknown> {
   }
 }
 
-describe('rule 3, delivery, and rule 4, the channel, with their echo rules (b.deo SRI-503)', () => {
-  // Echoed: the SRD's rule, a string matching ECHOABLE_KEY_NAME_RE, stated per row.
+describe('rule 3, delivery, and rule 4, the channel, with their echo rules', () => {
+  // Echoed: the contract's rule, a string matching ECHOABLE_KEY_NAME_RE, stated per row.
   test.each<[string, unknown, boolean]>([
     ['missing', MISSING, false],
     ['a number', 3, false],
@@ -919,7 +917,7 @@ describe('rule 3, delivery, and rule 4, the channel, with their echo rules (b.de
     }
   })
 
-  // Echoed: the SRD's rule, a string of 1 to 24 characters from A-Z0-9, stated per row.
+  // Echoed: the contract's rule, a string of 1 to 24 characters from A-Z0-9, stated per row.
   test.each<[string, unknown, (run: ReloadRun) => Promise<void>, boolean]>([
     ['a C… ID never heard', NEVER_HEARD, async () => {}, true],
     ['a channel only Q has heard', Q_ONLY, async (run) => hear(run, Q, plainMessage(Q_ONLY)), true],
@@ -968,15 +966,15 @@ describe('rule 3, delivery, and rule 4, the channel, with their echo rules (b.de
 })
 
 // ---------------------------------------------------------------------------
-// S5: secrecy (SRI-1304, SRI-907)
+// S5: secrecy
 // ---------------------------------------------------------------------------
 
-describe('LEAK_SENTINEL and a fake token, as delivery and as channel, appear in no tool error (b.deo SRI-1304, SRI-907)', () => {
+describe('LEAK_SENTINEL and a fake token, as delivery and as channel, appear in no tool error', () => {
   test.each<[string, Record<string, unknown>, 3 | 4]>([
     ['LEAK_SENTINEL as delivery', { channel: PUBLIC, delivery: LEAK_SENTINEL }, 3],
     ['a fake bot token as delivery', { channel: PUBLIC, delivery: fakeToken(BOT_TOKEN_PREFIX, 'delivery') }, 3],
     // LEAK_SENTINEL is 1 to 24 characters of A-Z0-9, so rule 4 echoes it bare
-    // by design (SRI-503); as `channel` it is passed with a hyphen added, the
+    // by design; as `channel` it is passed with a hyphen added, the
     // form a pasted secret would not be echoed in. assertNoLeak matches it in
     // any letter case.
     ['LEAK_SENTINEL in a non-echoable form as channel', { channel: `${LEAK_SENTINEL}-channel`, delivery: 'all' }, 4],
@@ -999,10 +997,10 @@ describe('LEAK_SENTINEL and a fake token, as delivery and as channel, appear in 
 })
 
 // ---------------------------------------------------------------------------
-// S6: accepted calls (SRI-504, SRI-501, SRI-404 tool side)
+// S6: accepted calls (tool side)
 // ---------------------------------------------------------------------------
 
-describe('an accepted call (b.deo SRI-504, SRI-404 tool side)', () => {
+describe('an accepted call (tool side)', () => {
   test('the first accepted call creates the file in one write: P\'s key, the channel, all, set_at from the clock and the applied declaration; the result names the delivery', async () => {
     const { run } = await startFungible()
     await hear(run, P, plainMessage(PUBLIC))
@@ -1066,12 +1064,12 @@ describe('an accepted call (b.deo SRI-504, SRI-404 tool side)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// S7: the persona-channel-delivery-set line (SRI-505, SRI-902)
+// S7: the persona-channel-delivery-set line
 // ---------------------------------------------------------------------------
 
-describe('one persona-channel-delivery-set line per accepted call (b.deo SRI-505, SRI-902)', () => {
-  // SRI-902 gives no exact text: the one pin of the line, its class label and
-  // `none` typed here as the SRD names them; every other case builds the
+describe('one persona-channel-delivery-set line per accepted call', () => {
+  // gives no exact text: the one pin of the line, its class label and
+  // `none` typed here as the contract names them; every other case builds the
   // line through the builders (expectAccepted). The built lines of a second
   // call (before `all`, after `mentions`), of the same value again (before
   // and after `all`) and of the loop guard (delivery `mentions`) are asserted
@@ -1130,10 +1128,10 @@ describe('one persona-channel-delivery-set line per accepted call (b.deo SRI-505
 })
 
 // ---------------------------------------------------------------------------
-// S8: a failed write (SRI-506, SRI-404 tool side)
+// S8: a failed write (tool side)
 // ---------------------------------------------------------------------------
 
-describe('a failed write (b.deo SRI-506, SRI-404 tool side)', () => {
+describe('a failed write (tool side)', () => {
   /** The tool error a failed write gives P, checked for the persona and the file. */
   function expectWriteFailedError(o: Observation, persona: Persona): void {
     const text = channelDeliveryWriteFailedText(persona.name, persona.key, h.channelDeliveryFile)
@@ -1248,10 +1246,10 @@ describe('a failed write (b.deo SRI-506, SRI-404 tool side)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// S9: dry run (SRI-507)
+// S9: dry run
 // ---------------------------------------------------------------------------
 
-describe('dry run: the same rules, the choice stored, no Slack call (b.deo SRI-507)', () => {
+describe('dry run: the same rules, the choice stored, no Slack call', () => {
   test.each<[string, () => Promise<{ run: ReloadRun; args: Record<string, unknown>; rule: 1 | 4 }>]>([
     ['a declarative-mode call', async () => ({ run: (await startDeclarative()).run, args: { channel: PUBLIC, delivery: 'all' }, rule: 1 })],
     ['a call for an unknown channel', async () => ({ run: (await startFungible()).run, args: { channel: NEVER_HEARD, delivery: 'all' }, rule: 4 })],

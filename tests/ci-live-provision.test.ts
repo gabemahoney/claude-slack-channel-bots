@@ -1,6 +1,6 @@
 /**
  * ci-live-provision.test.ts — Tests for the /ci-live runner's host-side
- * provisioning (bug b.1cx): the Slack Web API caller
+ * provisioning: the Slack Web API caller
  * (`ci-live/lib/slack-api.ts`), the configuration token with its rotation
  * (`provision/config-token.ts`), the bot and app-level token checks
  * (`provision/bot-api.ts`), the persona manifests and their drift check

@@ -243,7 +243,7 @@ function openStore(opts: { write?: RetiredKeysWriter; clock?: FakeClock } = {}):
   return rig
 }
 
-/** The record a fresh store over `dir` reads (SRJ-801: a new server instance). */
+/** The record a fresh store over `dir` reads (a new server instance). */
 function freshRecord(): RetiredKeyRecord {
   return openStore().store.snapshot().entries
 }
@@ -255,10 +255,10 @@ const SEED: Readonly<Record<string, RetiredKeySeed>> = {
 }
 
 // ---------------------------------------------------------------------------
-// The SRD's values (the one place they are typed)
+// The contract's values (the one place they are typed)
 // ---------------------------------------------------------------------------
 
-describe('the record\'s fixed values (b.jg5 SRJ-801, SRJ-802, SRJ-1013)', () => {
+describe('the record\'s fixed values', () => {
   test('pin: the file name, the format version, the three causes in the format\'s order and the startup-errors class', () => {
     expect([RETIRED_KEYS_FILE_NAME, RETIRED_KEYS_FORMAT_VERSION, [...RETIRED_KEY_CAUSES], RETIRED_KEYS_UNREADABLE_LABEL]).toEqual([
       'retired-keys.json',
@@ -270,10 +270,10 @@ describe('the record\'s fixed values (b.jg5 SRJ-801, SRJ-802, SRJ-1013)', () => 
 })
 
 // ---------------------------------------------------------------------------
-// Location (SRJ-801)
+// Location
 // ---------------------------------------------------------------------------
 
-describe('where the record lives (b.jg5 SRJ-801)', () => {
+describe('where the record lives', () => {
   test('a store over a state directory writes exactly <dir>/<file name> and leaves no temporary file', () => {
     const rig = openStore()
     expect(rig.store.path).toBe(join(dir, RETIRED_KEYS_FILE_NAME))
@@ -308,10 +308,10 @@ describe('where the record lives (b.jg5 SRJ-801)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Format and round trip (SRJ-802, SRJ-1304)
+// Format and round trip
 // ---------------------------------------------------------------------------
 
-describe('the record\'s format and round trip (b.jg5 SRJ-802, SRJ-1304)', () => {
+describe('the record\'s format and round trip', () => {
   test('the parser reads back exactly what the serialiser writes: every cause, a mark and none, and keys that are no persona key', () => {
     const record = retiredKeysRecordOf({
       ...Object.fromEntries(RETIRED_KEY_CAUSES.map((cause) => [`key-${cause}`, { cause }])),
@@ -415,7 +415,7 @@ describe('the record\'s format and round trip (b.jg5 SRJ-802, SRJ-1304)', () => 
 // The primitives
 // ---------------------------------------------------------------------------
 
-describe('record, mark and clear (b.jg5 SRJ-803, SRJ-806, SRJ-807)', () => {
+describe('record, mark and clear', () => {
   test('a batch is one write; a new key gets the clock\'s time, its cause and no mark', () => {
     const rig = openStore()
     const result = rig.store.record([
@@ -520,7 +520,7 @@ describe('record, mark and clear (b.jg5 SRJ-803, SRJ-806, SRJ-807)', () => {
     if (loaded.kind === 'loaded') expect(loaded.store.clear('gamma')).toBe(RETIRED_KEYS_WRITTEN)
   })
 
-  // SRJ-1014: each retired-key record change, through its builder. The
+  // each retired-key record change, through its builder. The
   // recording's `described` is what it says of each key written
   // (`retiredKeyWrittenText`).
   test('a record, a mark and a clear (with and without the read that cleared it) each log the line their builder gives', () => {
@@ -545,7 +545,7 @@ describe('record, mark and clear (b.jg5 SRJ-803, SRJ-806, SRJ-807)', () => {
   })
 })
 
-describe('restore puts back the record held before a batch (b.jg5 SRJ-804)', () => {
+describe('restore puts back the record held before a batch', () => {
   test('after a written batch: the keys it recorded removed, the mark it cleared restored, earlier keys kept, the previous bytes exactly', async () => {
     writeRetiredKeysRecord(dir, SEED)
     const before = fileBytes()
@@ -590,7 +590,7 @@ describe('restore puts back the record held before a batch (b.jg5 SRJ-804)', () 
     expect(rig.store.keys()).toEqual([])
   })
 
-  // SRJ-1014: a restore, written or failed, is a record change; it logs one
+  // a restore, written or failed, is a record change; it logs one
   // line, after the batch's own, its builder's for the form the restore took.
   // Rows: the form, what the record held before the batch (null: no file),
   // the failures, and the line's check.
@@ -668,7 +668,7 @@ describe('restore puts back the record held before a batch (b.jg5 SRJ-804)', () 
 })
 
 // ---------------------------------------------------------------------------
-// The start read (SRJ-802, SRJ-1013)
+// The start read
 // ---------------------------------------------------------------------------
 
 /** The startup-errors entries the real `recordStartupError` wrote to the temp `logDir`, each as its class and text. */
@@ -703,7 +703,7 @@ function altered(alter: (doc: Record<string, any>) => unknown): Uint8Array {
 /** `bytes` with `prefix` in front. */
 const prefixed = (prefix: number[], bytes: Uint8Array): Uint8Array => new Uint8Array([...prefix, ...bytes])
 
-describe('the start read (b.jg5 SRJ-802, SRJ-1013)', () => {
+describe('the start read', () => {
   test('a missing file: an empty record, nothing written, no startup-errors entry', () => {
     const logs: string[] = []
     const outcome = startRead(undefined, logs)
@@ -869,7 +869,7 @@ describe('the start read (b.jg5 SRJ-802, SRJ-1013)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Interrupted writes (SRJ-802; the tests/atomic-write.test.ts pattern)
+// Interrupted writes (the tests/atomic-write.test.ts pattern)
 // ---------------------------------------------------------------------------
 
 /** A step of `durableWriteFileSync`, as tests/atomic-write.test.ts names them. */
@@ -908,7 +908,7 @@ function failingAt(step: Step): DurableWriteFs {
   }
 }
 
-describe('an interrupted write leaves the previous record (b.jg5 SRJ-802)', () => {
+describe('an interrupted write leaves the previous record', () => {
   const PRIMITIVES: Array<[string, (store: RetiredKeyStore) => string]> = [
     ['a batch record', (store) => store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }]).outcome],
     ['a clear', (store) => store.clear('alpha')],
@@ -956,7 +956,7 @@ describe('an interrupted write leaves the previous record (b.jg5 SRJ-802)', () =
   })
 })
 
-describe('the record-change lines of a mark cleared, a key held in memory and a failed write, through their builders (b.jg5 SRJ-803, SRJ-806, SRJ-807, SRJ-714, SRJ-1014)', () => {
+describe('the record-change lines of a mark cleared, a key held in memory and a failed write, through their builders', () => {
   test('a marked key recorded again: its mark cleared; a key held only in memory written by the next record, and carried by the next write of another key', () => {
     writeRetiredKeysRecord(dir, SEED)
     const rig = openStore()
@@ -1013,10 +1013,10 @@ describe('the record-change lines of a mark cleared, a key held in memory and a 
 })
 
 // ---------------------------------------------------------------------------
-// Changes held in memory (SRJ-714, SRJ-803, SRJ-806, SRJ-807; hatch A3)
+// Changes held in memory (design A3)
 // ---------------------------------------------------------------------------
 
-describe('changes held in memory after a failed write (b.jg5 SRJ-714, SRJ-803, SRJ-806, SRJ-807)', () => {
+describe('changes held in memory after a failed write', () => {
   /** A store over the seed whose `absent-at-start` batch of `held` has just failed to write. */
   function afterFailedSweepWrite(): { rig: Rig; before: Uint8Array | null; heldAt: string } {
     writeRetiredKeysRecord(dir, SEED)
@@ -1134,12 +1134,12 @@ describe('changes held in memory after a failed write (b.jg5 SRJ-714, SRJ-803, S
 })
 
 // ---------------------------------------------------------------------------
-// The record generation (SRJ-806): an in-memory count of the batches that
+// The record generation: an in-memory count of the batches that
 // named a key, so a reader holding a reading across a wait sees a re-record
 // that wrote nothing
 // ---------------------------------------------------------------------------
 
-describe('the record generation (b.jg5 SRJ-806)', () => {
+describe('the record generation', () => {
   test('a key no batch named reads 0, a key loaded from the file included', () => {
     writeRetiredKeysRecord(dir, SEED)
     const rig = openStore()
@@ -1233,8 +1233,8 @@ describe('the record generation (b.jg5 SRJ-806)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// When an entry is cleared (SRJ-807; the clear rule of SRJ-114, SRJ-115 and
-// SRJ-116; SRJ-513's latch beside it)
+// When an entry is cleared (the clear rule of the contract and
+// latch beside it)
 // ---------------------------------------------------------------------------
 
 /** The fields a read's row is built from; a `status` result carries no note. */
@@ -1314,7 +1314,7 @@ const OTHER_KEY_READS: ReadonlyArray<readonly [string, string, string]> = [
   ['a row whose id only starts with the marked key\'s own, read for it', 'alpha', `${personaInstanceId('alpha')}_x`],
 ]
 
-describe('the entry-clear decision over one read of a key\'s row (b.jg5 SRJ-807, SRJ-114, SRJ-115, SRJ-116)', () => {
+describe('the entry-clear decision over one read of a key\'s row', () => {
   test('pin: the clearing states are waiting, working, ask_user and check_permission: the live states other than pending', () => {
     expect(CLEARING_STATES).toEqual(['waiting', 'working', 'ask_user', 'check_permission'])
     expect(CLEARING_STATES).toEqual([...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE))
@@ -1352,7 +1352,7 @@ describe('the entry-clear decision over one read of a key\'s row (b.jg5 SRJ-807,
   test.each(
     LAUNCH_START_READ_SHAPES.flatMap((shape) => NO_LAUNCH_START_FORM_NAMES.flatMap((form) => [true, false].map((mark) => [shape, form, mark] as const))),
   )(
-    'a configured persona\'s own %s row reading pending with no launch start (%s), recorded as a destructive modify\'s old half (mark: %p), decides the launch-start latch only, never a clear (SRJ-513)',
+    'a configured persona\'s own %s row reading pending with no launch start (%s), recorded as a destructive modify\'s old half (mark: %p), decides the launch-start latch only, never a clear',
     (shape, form, mark) => {
       const store = storeOver({ alpha: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark } })
       const row = ownRow(shape, 'alpha', { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: NO_LAUNCH_START_FORMS[form] })
@@ -1362,7 +1362,7 @@ describe('the entry-clear decision over one read of a key\'s row (b.jg5 SRJ-807,
 
   test.each(
     (['get', 'list'] as const).flatMap((shape) => [...CLEARING_STATES, AGENT_DIRECTOR_PENDING_STATE].map((state) => [shape, state] as const)),
-  )('the marked key\'s own %s row read %s with the latching note: configured, the note latch and the clear (only off pending) on the one read; not configured, the clear alone (SRJ-114)', (shape, state) => {
+  )('the marked key\'s own %s row read %s with the latching note: configured, the note latch and the clear (only off pending) on the one read; not configured, the clear alone', (shape, state) => {
     const store = storeOver(SEED)
     const row = ownRow(shape, 'alpha', { state, liveness_note: provenanceNote })
     const clears = state !== AGENT_DIRECTOR_PENDING_STATE
@@ -1376,7 +1376,7 @@ describe('the entry-clear decision over one read of a key\'s row (b.jg5 SRJ-807,
   })
 })
 
-describe('the clear end to end over the store: only a qualifying read removes an entry, durably (b.jg5 SRJ-807; hatch A3)', () => {
+describe('the clear end to end over the store: only a qualifying read removes an entry, durably (hatch A3)', () => {
   /** The seed with a second marked key, so a clear that removes more than its own entry shows. */
   const MARKED_SEED: Readonly<Record<string, RetiredKeySeed>> = { ...SEED, delta: { cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, mark: true } }
 
@@ -1469,8 +1469,7 @@ describe('the clear end to end over the store: only a qualifying read removes an
 })
 
 // ---------------------------------------------------------------------------
-// End to end over the session manager and the stub (b.jg5 SRJ-806, SRJ-807,
-// SRJ-805), on `makeRecoveryHarness`, whose one store is installed as
+// End to end over the session manager and the stub, on `makeRecoveryHarness`, whose one store is installed as
 // `main()` installs it. A recorded key whose row `expire` already removed is
 // launched by its reuse, an ordinary fresh spawn; the reuse that succeeds sets
 // the mark, which a store loaded anew over the same directory reads (a server
@@ -1478,7 +1477,7 @@ describe('the clear end to end over the store: only a qualifying read removes an
 // entry, durably, through the shared own-row read's clear.
 // ---------------------------------------------------------------------------
 
-describe('a recorded key\'s reuse sets its mark, which survives a restart, and its new life\'s first live read clears the entry, end to end (b.jg5 SRJ-806, SRJ-807, SRJ-805)', () => {
+describe('a recorded key\'s reuse sets its mark, which survives a restart, and its new life\'s first live read clears the entry, end to end', () => {
   let harness: RecoveryHarness | undefined
 
   afterEach(() => {
@@ -1530,8 +1529,7 @@ describe('a recorded key\'s reuse sets its mark, which survives a restart, and i
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-806's second trigger end to end (b.jg5 SRJ-407, SRJ-806, SRJ-807; AC 52,
-// AC 35), on `makeRecoveryHarness` built with `harnessNow`, so the session
+// second trigger end to end, on `makeRecoveryHarness` built with `harnessNow`, so the session
 // manager reads each launch call's window on the harness clock, and
 // `scriptTimedLaunch` times P's reuse spawn and places its row's launch start
 // against that window. A reuse of a recorded key that ended in a launch
@@ -1541,11 +1539,11 @@ describe('a recorded key\'s reuse sets its mark, which survives a restart, and i
 // (a new harness over the record the first one wrote), until the new life's
 // row reads live other than `pending`; that row is never replaced. A row whose
 
-// the live-row sequence (AC 35). What the launch answers in every other
+// the live-row sequence. What the launch answers in every other
 // respect, and the window itself, are tests/session-manager.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('a recorded key\'s reuse that timed out but launched sets its mark, kept across a restart until its new life reads live other than pending, its row never replaced (b.jg5 SRJ-806\'s second trigger, SRJ-407; AC 52, AC 35)', () => {
+describe('a recorded key\'s reuse that timed out but launched sets its mark, kept across a restart until its new life reads live other than pending, its row never replaced (second trigger)', () => {
   let harness: RecoveryHarness | undefined
 
   afterEach(() => {
@@ -1645,7 +1643,7 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
   )
 
   test.each([...FORMS])(
-    'AC 52 (%s): across a restart the record a timed-out reuse marked is still in place while the new life reads pending, a pending-only retry over it replaces nothing, and its first read live other than pending removes the entry, in the file and for the next start',
+    '(%s): across a restart the record a timed-out reuse marked is still in place while the new life reads pending, a pending-only retry over it replaces nothing, and its first read live other than pending removes the entry, in the file and for the next start',
     async (form) => {
       const first = await recordedP()
       const { p, q } = first
@@ -1689,7 +1687,7 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
     },
   )
 
-  // SRJ-806's Test clause for the second trigger: a mark whose write failed
+  // Test clause for the second trigger: a mark whose write failed
   // after a timed-out reuse is written again at the key's next launch decision
   // (the ladder's start, `retiredLaunchReadingOf`), with writes working again.
   // P is read as marked, so that launch is a reuse that collides with its new

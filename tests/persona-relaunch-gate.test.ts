@@ -1,5 +1,5 @@
 /**
- * persona-relaunch-gate.test.ts — The relaunch gate (b.av2 SR-6.1: a persona
+ * persona-relaunch-gate.test.ts — The relaunch gate (a persona
  * whose Slack connection is not serving is never launched by the restart
  * path) and its place in the health-check tick.
  *
@@ -8,7 +8,7 @@
  *     manager does not know (its credentials or directory check failed), and
  *     with the bring-up outcomes (`isUp`) the server passes: a serving
  *     connection whose outcome is not up is refused;
- *   - the applied-set guard (b.av2 SR-8.6, `isApplied`): a key outside the
+ * - the applied-set guard (`isApplied`): a key outside the
  *     applied set is refused whatever its connection status or outcome, with
  *     `it is no longer in the applied configuration`; a query without
  *     `isApplied` counts every key as applied;
@@ -40,7 +40,7 @@
  * tests/session-manager.test.ts and restart.ts's handling of `'skipped'` in
  * tests/restart.test.ts; the work-list filter alone in tests/health-check.test.ts.
  *
- * Isolation (b.av2 SR-13.2): every path is under a `mkdtempSync` directory
+ * Isolation: every path is under a `mkdtempSync` directory
  * removed in afterEach; tokens are sentinel-bearing fakes and the token
  * environment variables hold fakes for the whole file. The health check arms
  * no interval: each tick body runs through its tick seam
@@ -104,7 +104,7 @@ const gateLine = (key: string, state: string) =>
 const bringUpLine = (key: string) =>
   `[slack] persona=${key}: not relaunched — its bring-up has not succeeded; eligible again once it is up`
 
-/** The gate's line for a persona outside the applied set (b.av2 SR-8.6). */
+/** The gate's line for a persona outside the applied set. */
 const notAppliedLine = (key: string) =>
   `[slack] persona=${key}: not relaunched — it is no longer in the applied configuration`
 

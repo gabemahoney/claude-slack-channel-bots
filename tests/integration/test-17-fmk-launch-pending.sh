@@ -92,7 +92,7 @@ FC_POLL_S=1               # the harness's read of the row while it waits
 # agent-director's error name for a launch whose session-creating call failed.
 SESSION_CREATE_ERR=ErrTmuxSessionCreate
 
-# The words SRJ-1413 says no post holds.
+# The words says no post holds.
 DISPATCHER_BUG='dispatcher bug'
 
 # Scenario 13's persona S (working directory `paused`, selected for the
@@ -1616,7 +1616,7 @@ leg_still_stopping() {
         || fail "${step}: the refusal line is not between the two resumes"
     echo "${TEST_NAME}: ${step}: the refusal (recorded): $(cut -f3 <<< "${lines[0]}" | cut -c1-400)"
     echo "${TEST_NAME}: ${step}: every server.log line naming S that carries the still-stopping phrase (recorded): $(log_hits 0 "${STILL_STOPPING}" | cut -f3 | naming_persona "${S_KEY}" "${S_REF}" | cut -c1-200 | tr '\n' '|')"
-    # One get after the UNAVAILABLE outcome (SRJ-407): its line, and exactly
+    # One get after the UNAVAILABLE outcome: its line, and exactly
     # one bot-server get of S from the refused resume to that line.
     mapfile -t lines < <(log_hits 0 "${GET_HEAD}${RESUME_WHAT}${GET_OF[${S_KEY}]}${FORM_UNAVAILABLE_HEAD}")
     (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} post-refusal get line(s) for S's resume, not one"

@@ -5,7 +5,7 @@
  * - the host's `slack_bot_*` / `cscb_*` tmux sessions;
  * - the PID listening on host port 3100 (read from /proc, nothing connects);
  * - the sha256 of the host's `~/.config/claude-slack-channel-bots/config.json` (bug
- *   b.smv; a host whose server has not yet moved its state directory still has
+ * ; a host whose server has not yet moved its state directory still has
  *   it in an old default, `hostConfigPaths`).
  *
  * Only reads: `agent-director list`, `tmux ls`, /proc and a file hash. Never
@@ -120,7 +120,7 @@ export const TMUX_NO_SERVER_RE = /no server running|error connecting to .*\(No s
 
 /**
  * The host's config.json, in the order read: the state directory's default
- * (`~/.config/claude-slack-channel-bots`, bug b.smv), then the one 0.14.0 and
+ * (`~/.config/claude-slack-channel-bots`), then the one 0.14.0 and
  * 0.15.0 used (`~/.config/cscb`), then the oldest (the `slack` directory in
  * `.claude/channels` under the home), which a host keeps until its server's
  * first start on the new default has moved it (each old one is then a link to

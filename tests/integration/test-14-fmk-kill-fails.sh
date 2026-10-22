@@ -58,7 +58,7 @@ read -r _ UB_ID UB_SESSION _ _ <<< "$(grep "^${UB_CHANNEL} " <<< "${U_ROWS}")"
 # P, which the configuration names: its own row (`cscb_<key>`, its `persona`
 # label) in a working directory other than P's configured one, with a worker
 # that reports in before upgrade. After migration, rebuild it silent and inject
-# `pending` with no launch start (b.jg5 SRJ-513, SRJ-1020).
+# `pending` with no launch start.
 P_NAME="${SCENARIO_TAG}latched"
 P_KEY="$(persona_key "${P_NAME}")"
 t14_value P_ID personaInstanceId "${P_KEY}"
@@ -141,7 +141,7 @@ for fixture in A B P Q; do
     (( AD_RC == 0 )) || fail "setup: could not rebuild live fixture ${id} after upgrade"
 done
 # P's intentionally injected pre-launch row still tests the no-launch-start
-# latch (SRJ-513); this state is established after installer quiescence.
+# latch; this state is established after installer quiescence.
 ad_store_pending_no_launch "${P_ID}"
 read -r UA_SID UA_PANE < <("${SCENARIO_REAL_TMUX}" display-message -p -t "=${UA_SESSION}:" '#{session_id} #{pane_id}')
 
@@ -171,7 +171,7 @@ NO_SECOND_ALERT_MARGIN_S=5
 STUB_WAIT_S=30
 # A stub process in no tmux pane ending (a short-lived run outside tmux).
 WORKER_GONE_S=10
-# Before the first pending-only retry (30 s after the launch, SRJ-302) the
+# Before the first pending-only retry (30 s after the launch) the
 # `cwd` symlink must be re-pointed: at most this many seconds after the launch
 # start.
 REPOINT_BEFORE_S=25
@@ -584,7 +584,7 @@ t14_recount_before_stop() {
 }
 
 # t14_note_posts <line> <channel> <step>: log every post at <channel> after
-# <line> (an outcome the SRD leaves open beside the checked alert).
+# <line> (an outcome the contract leaves open beside the checked alert).
 t14_note_posts() {
     local text
     while IFS= read -r text; do
@@ -594,7 +594,7 @@ t14_note_posts() {
 
 # t14_note_calls_before <time-from> <time-to> <id> <step>: log how many CSCB
 # calls of each verb named <id> between the two times (the calls a site made
-# before its first kill; the SRD leaves their shape open).
+# before its first kill; the contract leaves their shape open).
 t14_note_calls_before() {
     local out summary
     out="$(t14_cscb_calls_since "$1" "" "$3")" || exit 1
@@ -626,7 +626,7 @@ t14_start_and_wait() {
 # mark holds its started line up to the refusing verb (the line the condition
 # logs at its first refusal), and no post after the mark holds its onset
 # (ErrTmuxKillFailed starts no such condition and makes no such post,
-# SRJ-307). The started line is what makes this check able to fail within a
+#). The started line is what makes this check able to fail within a
 # leg: no leg lasts the alert threshold past a first refusal, so a post alone
 # could never be seen.
 t14_no_unresponsive() {
@@ -680,7 +680,7 @@ t14_count_entries() {
 
 # t14_retired_cause <key>: print the cause the retired-key record holds for
 # <key> (nothing when the record or the key's entry is missing). The record's
-# `keys` and `cause` fields are its format's (b.jg5 SRJ-802;
+# `keys` and `cause` fields are its format's (
 # src/retired-keys.ts serializeRetiredKeys, which exports no field name).
 t14_retired_cause() {
     local path
@@ -848,7 +848,7 @@ t14_later() {
     awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 > b + 0) }'
 }
 
-# t14_check_sweep_budget <step>: the start sweep's pass budget (SRJ-702, AC
+# t14_check_sweep_budget <step>: the start sweep's pass budget (AC
 # 56) over the live strays A, B and Q, taken in the order of CSCB's first
 # kill of each after the leg's mark (agent-director's `list` order is not
 # assumed). Before the first row whose kill failed (its `orphan-cleanup`
@@ -959,7 +959,7 @@ t14_check_other_stray() {
 # True once a harness `find-missing` run leaves A's, B's, Q's and P's rows
 # finished (`missing` or `ended`). P's is among them: a live row of P that a
 # later start swept (P is absent from leg 1 on) would spend that pass's
-# retry budget (SRJ-702), leaving leg 1's X one try.
+# retry budget, leaving leg 1's X one try.
 t14_old_rows_finished() {
     local id state
     ad_capture find-missing
@@ -1175,7 +1175,7 @@ leg_start_sweep() {
     [[ "${n}" == 0 ]] || fail "${step}: ${n} Slack stub record(s) about ${X_NAME} after the mark"
     # No tmux-unresponsive condition starts, for X or any persona: X is
     # absent, so its kill is the start sweep's, and neither a start-sweep
-    # kill nor ErrTmuxKillFailed starts one (SRJ-307); no persona is
+    # kill nor ErrTmuxKillFailed starts one; no persona is
     # configured, so no launch or recovery attempt could start one either.
     t14_no_unresponsive_any "${X_KEY}" "${step}"
 
@@ -1414,7 +1414,7 @@ leg_config_dir
 leg_cwd
 leg_persona_removal
 
-# The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
+# The closing assertions.
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

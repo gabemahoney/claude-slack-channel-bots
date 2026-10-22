@@ -149,7 +149,7 @@ describe('CRONTABLE_TEMPLATE_HEADER — parser integration', () => {
     expect(CRONTABLE_TEMPLATE_HEADER).toContain('All-bots fan-out is not delivered yet')
   })
 
-  test('no example presents a line with no persona list as delivered: each such example is labelled NOT delivered yet (b.n4n)', () => {
+  test('no example presents a line with no persona list as delivered: each such example is labelled NOT delivered yet', () => {
     const undelivered = headerExamples().filter(
       (e) => parseCrontable(e.line).schedules[0]?.targets.kind === 'all-bots',
     )
@@ -205,7 +205,7 @@ describe('scheduled-prompts doc / CRONTABLE_TEMPLATE_HEADER drift guard', () => 
     expect(schedStart).toBeGreaterThanOrEqual(0)
   })
 
-  test('the doc section the no-persona-list warning names is a heading in the scheduled-prompts doc (b.n4n)', () => {
+  test('the doc section the no-persona-list warning names is a heading in the scheduled-prompts doc', () => {
     // The warning points there because an old crontable's own header may be
     // out of date; a renamed heading would leave it pointing at nothing.
     const pointer = /section "([^"]+)" in (\S+) is the reference/.exec(noPersonaListWarning(1, '/p/a.md'))

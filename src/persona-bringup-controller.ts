@@ -1,8 +1,8 @@
 /**
  * persona-bringup-controller.ts — Per-persona bring-up outcomes and retries
- * (b.av2 SR-6.1 outcomes, SR-6.4, SR-7.2 part, SR-10.3 part, SR-13.1).
+ * (outcomespartpart).
  *
- * `createPersonaBringUpController(deps)` runs the SR-6.1 procedure of
+ * `createPersonaBringUpController(deps)` runs the procedure of
  * `persona-start.ts` (steps 1–2 `checkPersonaLocalSteps`, step 3
  * `connectPersonaSlack`) for each applied persona and keeps, per persona, a
  * definite outcome:
@@ -13,10 +13,10 @@
  *   launches the persona itself through the injected `launch`, which joins a
  *   launch already in flight for the persona (`spawnForPersona`). A launch
  *   failure is not a new outcome: it takes today's spawn-failure path.
- *   Step 4 is SR-6.1's as amended by b.jg5 SRJ-1502: "(4) launch, which
+ * Step 4 is "(4) launch, which
  *   waits while an old life that may still be running holds the persona's
- *   working directory (b.jg5 SRJ-809, SRJ-810); the persona is retried on
- *   its UNAVAILABLE retry timer (b.jg5 SRJ-301) until that wait ends." Every
+ * working directory; the persona is retried on
+ * its UNAVAILABLE retry timer until that wait ends." Every
  *   launch of a persona, the start pass's, an apply's and this controller's
  *   after a retry, goes through `spawnForPersona`, whose old-life gate makes
  *   that wait: no agent-director call, the hold's wait started, the
@@ -26,11 +26,11 @@
  * - `broken` (credentials-broken): the credentials file is missing,
  *   unreadable or locally invalid, or Slack refused a token (at bring-up, on
  *   a reopen of a running persona, or in a Web API call of a running persona,
- *   bug b.ujn; its instance is left running). Not retried: it recovers only
- *   through a confirmed change to its credentials file (b.av2 SR-6.4), which
+ * ; its instance is left running). Not retried: it recovers only
+ * through a confirmed change to its credentials file, which
  *   the apply brings up afresh (`persona-lifecycle.ts`, step 6).
  * - `retrying`: Slack-unreachable (retried by the connection manager on its
- *   own per-persona timer, the SR-3.2 schedule), directory-broken, or held
+ * own per-persona timer, the schedule), directory-broken, or held
  *   for an unresolvable claude_config_dir (below).
  *
  * Causes are kept apart (credentials, directory, Slack, claude_config_dir).
@@ -39,15 +39,15 @@
  * still re-checked on its own timer and logs its start and cleared lines, but
  * nothing moves on to Slack or the launch while the credentials cause holds.
  *
- * Directory-broken (SR-6.4): no Slack connection is opened. The directory is
- * re-checked on the persona's own timer on the SR-3.2 schedule
+ * Directory-broken: no Slack connection is opened. The directory is
+ * re-checked on the persona's own timer on the schedule
  * (`createPersonaRetrySchedule`: 5 s doubling to 300 s, no cap), outside the
  * restart failure counter and cap. Once it is usable the bring-up continues
  * with no confirmation: the claude_config_dir check (below), Slack
  * validation with the held credentials, then the launch. If Slack is then
  * unreachable the persona is Slack-unreachable retrying.
  *
- * Held credentials (SR-6.1): the tokens read at the persona's first bring-up
+ * Held credentials: the tokens read at the persona's first bring-up
  * (or at its last confirmed credentials change) are kept in the persona's
  * entry and handed to the manager when a directory or claude_config_dir
  * retry reaches Slack; the
@@ -56,13 +56,13 @@
  * tokens for its own retries and reopens. The tokens are never logged,
  * returned or written, and no query exposes them. Beside them the entry holds
  * the digest of the bytes that read produced, or a missing/unreadable marker
- * (b.av2 SR-8.3); the read-only `credentialsDigest(key)` query exposes only
+ * the read-only `credentialsDigest(key)` query exposes only
  * that, for the reload detection tick. A persona broken by a shared
  * credentials file holds the digest of its own file too (read only to be
  * hashed, never parsed), so once the collision is gone a re-save of that
  * file makes a change pending.
  *
- * Confirmed credentials change (b.av2 SR-8.6 credentials row, SR-8.3;
+ * Confirmed credentials change (credentials row;
  * `changeCredentials`, apply step 4): for a persona that is up or retrying,
  * the file is read once through the local check, against the applied set
  * now. A locally bad file changes nothing and logs one
@@ -102,7 +102,7 @@
  * again (a confirmed credentials reconnect left retrying succeeded) is
  * launched the same way, through its launch path's collision ladder.
  *
- * claude_config_dir hold (bug b.g57): a persona whose effective
+ * claude_config_dir hold: a persona whose effective
  * claude_config_dir cannot be resolved to a real path (a symlink on its path
  * pointing to nothing, an unmounted drive, a dropped mount) is held: it is
  * `retrying` with a `configDir` cause and has no Slack connection, like a
@@ -117,7 +117,7 @@
  * instance and agent-director row are kept. While held it receives no Slack
  * message, and its notices are held by the notifier until its client is
  * validated again. The directory is re-checked on the persona's own timer on
- * the SR-3.2 schedule, outside the restart counter and cap, each attempt
+ * the schedule, outside the restart counter and cap, each attempt
  * through the serializer. The class line (`persona-config-dir-unresolvable`)
  * is logged when the hold starts and a cleared line when the directory
  * resolves. The bring-up then continues with no confirmation: Slack
@@ -134,7 +134,7 @@
  * its refusal is kept as its cause, and a reconnect of an earlier change
  * still retrying then is cancelled, so that change is pending again.)
  *
- * Leaving up (SR-6.3, SR-6.4): each time a persona's outcome changes from
+ * Leaving up: each time a persona's outcome changes from
  * `up` to `broken` or `retrying` (a refused reopen of a running persona, a
  * Web API call refused for its bot token, or a claude_config_dir hold), the
  * injected `onLeftUp` is told once. A lost connection being
@@ -144,7 +144,7 @@
  * `describePersonaNotUp` renders a state's outcome and cause for the not-up
  * refusal and drop lines.
  *
- * Logging (SR-10.3): one `persona-start` line per persona when its bring-up
+ * Logging: one `persona-start` line per persona when its bring-up
  * starts, before its outcome lines:
  *
  *   [slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting
@@ -166,11 +166,11 @@
  * Lines go through the injected logger only (the `[slack]` server log), never
  * `startup-errors.log`, and nothing here posts to Slack.
  *
- * Dry run (SR-3.4): no credentials file is read and no Slack call is made
+ * Dry run: no credentials file is read and no Slack call is made
  * (the manager reports every persona up); the directory and
  * claude_config_dir checks and their retries run as in a real start.
  *
- * Applied set (b.av2 SR-8.6): the injected `appliedPersonas` getter is the
+ * Applied set: the injected `appliedPersonas` getter is the
  * live applied persona set, read at each use, never a snapshot. A directory
  * or claude_config_dir re-check or a launch after a retry for a key outside
  * it does nothing (no Slack step, no launch): from a confirmed apply's step
@@ -180,7 +180,7 @@
  * declaration, and a launch after a retry launches the current declaration. `isApplied(key)` answers
  * from the same getter, for the up predicate and the relaunch gate.
  *
- * Isolation (SR-3.3, SR-6.6): each persona's state, timer and in-flight flag
+ * Isolation: each persona's state, timer and in-flight flag
  * live in its own entry; nothing spans two personas, and a directory retry is
  * scheduled only once the previous one has finished, so attempts never
  * overlap. Each retry attempt, through to the launch it triggers, runs
@@ -189,7 +189,7 @@
  * and its checks (cancelled, applied, already launched) see the state when
  * it starts.
  *
- * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
+ * Pure module: nothing is created, read or scheduled at
  * import or at `createPersonaBringUpController`. The clock, logger, checks,
  * file-system seam, connection manager, launch and leaving-up listener are
  * injected.
@@ -232,7 +232,7 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
-/** A bring-up outcome (b.av2 SR-6.1). */
+/** A bring-up outcome. */
 export type PersonaBringUpOutcome = 'up' | 'broken' | 'retrying'
 
 /** A persona's current causes, one per kind; absent when that kind has none. */
@@ -241,7 +241,7 @@ export interface PersonaBringUpCauses {
   directory?: PersonaBringUpFailure
   slack?: PersonaBringUpFailure
   /**
-   * Held until its claude_config_dir resolves (bug b.g57): no Slack
+   * Held until its claude_config_dir resolves: no Slack
    * connection, no launch.
    */
   configDir?: PersonaBringUpFailure
@@ -331,7 +331,7 @@ export type PersonaCredentialsChangeResult =
   | { kind: 'skipped' }
 
 /**
- * Whether a bring-up state is credentials-broken (b.av2 SR-6.4): its outcome
+ * Whether a bring-up state is credentials-broken: its outcome
  * is `broken` and either its local credentials check failed (missing,
  * unreadable or locally invalid, or another applied persona's file) or Slack
  * refused a token (`persona-credentials-refused`: at bring-up, on a reopen,
@@ -339,7 +339,7 @@ export type PersonaCredentialsChangeResult =
  * Slack is unreachable or its directory is unusable, or broken for another
  * reason, is not. Such a persona recovers only through a confirmed change to
  * its credentials file, which the apply brings up rather than reconnects
- * (SR-8.6 step 6). Pure.
+ * (step 6). Pure.
  */
 export function isCredentialsBroken(state: Pick<PersonaBringUpState, 'outcome' | 'causes'> | undefined): boolean {
   if (state?.outcome !== 'broken') return false
@@ -360,13 +360,13 @@ export interface PersonaBringUpControllerDeps
    * path, which joins a launch already in flight for it. Its result is not
    * inspected; a throw or rejection is logged. Production passes
    * `spawnForPersona`, whose old-life gate holds the launch back while an old
-   * life holds the persona's working directory (b.av2 SR-6.1 step 4 as
-   * amended by b.jg5 SRJ-1502; SRJ-810), with its retry timer armed.
+   * life holds the persona's working directory (step 4 as
+   * amended by), with its retry timer armed.
    */
   launch: (persona: Persona) => Promise<unknown>
   /**
    * Told once each time a persona's outcome changes from `up` to `broken` or
-   * `retrying` (b.av2 SR-6.3, SR-6.4), with the persona and its new state.
+   * `retrying`, with the persona and its new state.
    * A persona that was never up is never reported; a lost connection being
    * reopened stays `up` and is not reported. A throw or rejection is logged.
    * Production drops the persona's registered MCP session
@@ -376,14 +376,14 @@ export interface PersonaBringUpControllerDeps
   /** Clock and timers for the directory re-checks; default the real clock. */
   clock?: PersonaConnectionClock
   /**
-   * The applied persona set now (b.av2 SR-8.6), read at each use: production
+   * The applied persona set now, read at each use: production
    * reads the server's `personaConfig`, which a confirmed apply's step 1
    * swaps. Without it every known persona counts as applied and a re-check
    * uses the set the persona was brought up with.
    */
   appliedPersonas?: () => readonly Persona[]
   /**
-   * Check a persona's claude_config_dir (bug b.g57): right before step 3 (at
+   * Check a persona's claude_config_dir: right before step 3 (at
    * bring-up, and when a directory retry reaches Slack) and on each re-check
    * of a held persona (`holdForConfigDir`), with the persona's current
    * applied declaration. Production passes the session manager's pre-launch
@@ -393,7 +393,7 @@ export interface PersonaBringUpControllerDeps
    */
   checkConfigDir?: (persona: Persona) => { ok: true } | PersonaCheckFailure
   /**
-   * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
+   * The per-persona lifecycle serializer's `run` (
    * `persona-serializer.ts`). Each retry attempt runs through it, through to
    * the launch it triggers: a directory re-check (with its Slack step and
    * launch), a claude_config_dir re-check (with its Slack step and launch)
@@ -431,7 +431,7 @@ export interface PersonaBringUpController {
   state(key: string): PersonaBringUpState | undefined
   /**
    * The digest or marker of the credentials bytes the persona's bring-up read
-   * (b.av2 SR-8.3): what it connected with, is retrying with or broke with.
+   * what it connected with, is retrying with or broke with.
    * `sha256:<hex>`, or `CREDENTIALS_MISSING_MARKER` /
    * `CREDENTIALS_UNREADABLE_MARKER`. A persona broken by a credentials file
    * another applied persona shares holds the digest of its own file (hashed,
@@ -442,8 +442,8 @@ export interface PersonaBringUpController {
    */
   credentialsDigest(key: string): CredentialsDigest | undefined
   /**
-   * Apply a confirmed change of the persona's credentials file (b.av2 SR-8.6
-   * credentials row, SR-8.3), for a persona that is up or retrying, as it is
+   * Apply a confirmed change of the persona's credentials file (
+   * credentials row), for a persona that is up or retrying, as it is
    * declared in the applied set now; see the module comment. Re-checks the
    * persona's state when it runs: a persona credentials-broken now is left
    * alone (`credentials-broken`). Reads the file once, through the local
@@ -468,13 +468,13 @@ export interface PersonaBringUpController {
   ): Promise<PersonaCredentialsChangeResult>
   /**
    * Hold back a persona whose launch found its claude_config_dir unresolvable
-   * (bug b.g57; the session manager's hook, `setConfigDirUnresolvableHook`).
+   * (the session manager's hook, `setConfigDirUnresolvableHook`).
    * The persona becomes `retrying` with a `configDir` cause and its Slack
    * connection is closed (`connections.stop`, not awaited): `onLeftUp` fires
    * once if it was up, and nothing is delivered to it. A persona Slack had
    * refused keeps that refusal as its cause and stays broken. The failure's
    * line is logged when the episode starts, not again while it lasts. The
-   * directory is re-checked on the persona's own timer (SR-3.2 schedule: 5 s
+   * directory is re-checked on the persona's own timer (schedule: 5 s
    * doubling to 300 s, no cap), each attempt through the serializer; once it
    * resolves, one cleared line, then Slack validation and connection with
    * the held credentials, then the launch. The instance and its row are left
@@ -550,7 +550,7 @@ interface BringUpEntry {
   readonly directorySchedule: PersonaRetrySchedule
   directoryTimer: TimerBox | undefined
   /**
-   * Held until its claude_config_dir resolves (bug b.g57): no Slack
+   * Held until its claude_config_dir resolves: no Slack
    * connection, no launch. Undefined when not held.
    */
   configDir: DirectoryEpisode | undefined
@@ -594,7 +594,7 @@ const DIRECTORY_CLEARED_CONTINUING = 'cleared: working directory is usable again
 const DIRECTORY_CLEARED_STILL_BROKEN =
   'cleared: working directory is usable again; the persona stays broken until its credentials file is fixed and the change confirmed'
 
-/** Cause of a claude_config_dir cleared line (bug b.g57), by whether the persona stays broken. */
+/** Cause of a claude_config_dir cleared line, by whether the persona stays broken. */
 const CONFIG_DIR_CLEARED_CONTINUING = 'cleared: claude_config_dir resolves to a real path again; continuing the bring-up'
 const CONFIG_DIR_CLEARED_STILL_BROKEN =
   'cleared: claude_config_dir resolves to a real path again; the persona stays broken until its credentials file is fixed and the change confirmed'
@@ -666,7 +666,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     if (entry.credentials) return 'broken'
     if (entry.directory) return 'retrying'
     if (entry.slackError) return 'broken'
-    // Held for its claude_config_dir (b.g57): no connection, retried on its timer.
+    // Held for its claude_config_dir: no connection, retried on its timer.
     if (entry.configDir) return 'retrying'
     if (!entry.slackStarted) return undefined
     return slackOutcome(connections.status(entry.persona.key))
@@ -723,7 +723,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   }
 
   // -------------------------------------------------------------------------
-  // Leaving up (b.av2 SR-6.3, SR-6.4)
+  // Leaving up
   // -------------------------------------------------------------------------
 
   /**
@@ -776,7 +776,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
 
   /**
    * Launch after a pending credentials reconnect brought back a persona whose
-   * connection Slack had refused (b.av2 SR-6.4): its instance was kept, so
+   * connection Slack had refused: its instance was kept, so
    * the launch path's collision ladder reaches it. Runs inside the persona's
    * serialized turn, like `launchAfterRetry`.
    */
@@ -807,7 +807,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   }
 
   // -------------------------------------------------------------------------
-  // Directory retry (SR-6.4)
+  // Directory retry
   // -------------------------------------------------------------------------
 
   function scheduleDirectoryRecheck(entry: BringUpEntry): void {
@@ -875,7 +875,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   }
 
   // -------------------------------------------------------------------------
-  // claude_config_dir hold (bug b.g57)
+  // claude_config_dir hold
   // -------------------------------------------------------------------------
 
   /**
@@ -1097,7 +1097,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   }
 
   // -------------------------------------------------------------------------
-  // Confirmed credentials change (b.av2 SR-8.6 credentials row, SR-8.3)
+  // Confirmed credentials change (credentials row)
   // -------------------------------------------------------------------------
 
   function logChangeFailed(persona: Persona, cause: string, kept: CredentialsChangeKept): void {
@@ -1143,7 +1143,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     if (current === undefined) return { kind: 'skipped' }
     // Decided now, not at the preview: a Web API call may have broken it since.
     if (isCredentialsBroken({ outcome: outcomeOf(entry), causes: causesOf(entry) })) return { kind: 'credentials-broken' }
-    // A persona held for its claude_config_dir (b.g57) has no connection: it
+    // A persona held for its claude_config_dir has no connection: it
     // is retrying, and takes the new content for its return.
     const outcome = outcomeOf(entry)
     const up = outcome === 'up'
@@ -1152,7 +1152,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     if (!up && !retrying) return { kind: 'skipped' }
 
     const local = checkPersonaLocalSteps(current, {
-      // SR-1.4 at apply: another applied persona's file, after step 1's swap.
+      // at apply: another applied persona's file, after step 1's swap.
       applied: deps.appliedPersonas?.() ?? applied,
       dryRun: false,
       checkLocal: deps.checkLocal,
@@ -1304,7 +1304,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
 }
 
 // ---------------------------------------------------------------------------
-// Not-up descriptions and the session drop (b.av2 SR-6.3, SR-6.4)
+// Not-up descriptions and the session drop
 // ---------------------------------------------------------------------------
 
 /**
@@ -1331,7 +1331,7 @@ export interface NotUpSessionDropperDeps {
 
 /**
  * Build the controller's `onLeftUp` listener: drop the MCP session registered
- * for the persona that stopped being up (b.av2 SR-6.3: a session is
+ * for the persona that stopped being up (a session is
  * registered only while its persona is up) and log one line when a session
  * was dropped:
  *

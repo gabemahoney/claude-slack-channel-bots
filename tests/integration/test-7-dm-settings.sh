@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Test 7 (t3.ob2.5e.u7.wa): the DMs switch and a `dm` permission-prompt
+# Test 7: the DMs switch and a `dm` permission-prompt
 # destination load and validate from a clean install, and invalid DM settings
-# refuse the start (b.av2 SR-1.2, SR-1.5; E6/E7).
+# refuse the start .
 #
 # Valid leg: one config in the scenario's own state dir, shaped like the
 # docs/configuration.md's complete example (a shared channel, a DM-only persona, `dm`
@@ -24,7 +24,7 @@
 # personas[0], never echoes the rejected value, and leaves no server process,
 # no PID file, no listener and no config.json.last-applied.
 #
-# Dry run throughout: no credentials file exists or is read (SR-3.4), no
+# Dry run throughout: no credentials file exists or is read, no
 # token is used, no Slack call is made. Nothing here reads or writes HOME's
 # state dir; claude_config_dir is left unset so no Claude settings file is
 # patched.

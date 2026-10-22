@@ -73,7 +73,7 @@ export interface PendingRowModelHost {
 
 
 /**
- * The launch start agent-director shows for the instant `ms` (ADSRD SR-22.2:
+ * The launch start agent-director shows for the instant `ms` (agent-director contract
  * RFC 3339 UTC, the milliseconds shown only when they are not zero): a whole
  * second gives the form without fractional seconds, any other instant the
  * fractional form.
@@ -133,7 +133,7 @@ export function judgeMissingFromG(): PendingRowJudgment {
 
 /** A `find-missing` run removes nothing of the row (the default). */
 export const PENDING_ROW_FIND_MISSING_REMOVES_NOTHING = 'nothing'
-/** A `find-missing` run removes the row's `provenance_conflict` note (b.jg5 SRJ-120: a stale note cleared). */
+/** A `find-missing` run removes the row's `provenance_conflict` note (a stale note cleared). */
 export const PENDING_ROW_FIND_MISSING_REMOVES_NOTE = 'note'
 /** A `find-missing` run removes the row: `status` and `get` answer `errSpawnNotFound()` from then on. */
 export const PENDING_ROW_FIND_MISSING_REMOVES_ROW = 'row'
@@ -174,14 +174,14 @@ export interface PendingRowRefusal {
 export type PendingRowLaunchAnswer = Error | PendingRowRefusal | undefined
 
 /**
- * A plain spawn refused by the pre-spawn scan (HO rev 15; b.jg5 SRJ-713):
+ * A plain spawn refused by the pre-spawn scan (HO rev 15):
  * nothing was written and no row created, so no row after it.
  */
 export function scanRefusal(error: Error): PendingRowRefusal {
   return Object.freeze({ error, rowAfter: PENDING_ROW_MODEL_NO_ROW })
 }
 
-/** A plain spawn refused after "duplicate session" (b.jg5 SRJ-111, SRJ-713): agent-director ended the new row. */
+/** A plain spawn refused after "duplicate session": agent-director ended the new row. */
 export function duplicateSessionRefusal(error: Error): PendingRowRefusal {
   return Object.freeze({ error, rowAfter: LIVENESS_DEAD_ROW_ENDED })
 }
@@ -256,7 +256,7 @@ export function staysPendingLaunchFailure(verb: string = 'spawn'): PendingRowRef
 }
 
 /**
- * The row a latch re-check's step-1 reading reads (E30; b.jg5 SRJ-505), as
+ * The row a latch re-check's step-1 reading reads , as
  * the model holds it: its state (`PENDING_ROW_MODEL_NO_ROW` for no row) and
  * whether the note is on it. Undefined for a failed read, which a case
  * scripts as a `status` or `get` error instead (`scriptStatus`,

@@ -1,7 +1,7 @@
 /**
  * test-helpers/persona-connection-harness.ts — Personas on the real
  * connection manager, with the server's connection seams built from the
- * factories `src/persona-start.ts` exports (b.av2 SR-3.1, SR-3.4, SR-7.2).
+ * factories `src/persona-start.ts` exports.
  *
  * `makeConnectionHarness(specs, baseDir, opts?)` builds:
  * - a resolved persona config over `specs` (`makeMultiPersonaConfig`), read by
@@ -31,7 +31,7 @@
  * Call `h.manager.stopAll()` after each test (the harness schedules nothing on
  * a real timer, but a live stub socket keeps its listeners).
  *
- * Isolation (b.av2 SR-13.2): every persona path is under the caller's
+ * Isolation: every persona path is under the caller's
  * `baseDir`, and nothing is created on disk unless `files` is set (then only
  * under those paths); no network, no environment access, no real timer, no
  * token literal.
@@ -62,7 +62,7 @@ import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, fakeToken, writeCredentialsFile } from './credentials.ts'
 
 export interface ConnectionHarnessOptions {
-  /** Dry run (SR-3.4): no stub is registered and no token is handed to the manager. */
+  /** Dry run: no stub is registered and no token is handed to the manager. */
   dryRun?: boolean
   /** Per-persona-name stub options, merged over the leak marker. */
   stubOptions?: Readonly<Record<string, StubSlackOptions>>
@@ -78,7 +78,7 @@ export interface ConnectionHarnessOptions {
   tokens?: Readonly<Record<string, PersonaSlackTokens>>
   /**
    * The per-persona serializer's `run` handed to the manager as its
-   * `serialize` (bug b.ujn: the network close of a socket detached by a
+   * `serialize` (the network close of a socket detached by a
    * refused Web API call waits for the persona's turn), so the manager is
    * wired as `server.ts` wires it (`serialize: personaLifecycle.run`). Omitted:
    * the manager gets none and that close runs at once.

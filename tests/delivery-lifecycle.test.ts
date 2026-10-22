@@ -1,4 +1,4 @@
-/** Shared typing ownership and the no-engine reconnect driver (b.omv SR-5.5/6.6). */
+/** Shared typing ownership and the no-engine reconnect driver. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
 import { createDeliveryLifecycle, NOT_NOW_RETRY_MS, type DeliveryLifecycle, type TypingOwner } from '../src/delivery-lifecycle.ts'

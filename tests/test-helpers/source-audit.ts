@@ -1,7 +1,7 @@
 /**
  * test-helpers/source-audit.ts — Helpers for static audits of source text
  * (tests that cannot import a module, e.g. src/server.ts, whose module-scope
- * startup code must never run in a unit test; b.av2 SR-13.2).
+ * startup code must never run in a unit test).
  *
  * Pass every helper comment-stripped code (`stripComments`). The bracket
  * scanners skip string and template literals (templates nested inside
@@ -415,8 +415,7 @@ export interface StartResolution {
 }
 
 /**
- * How `main()` resolves the start through the reload controller (b.av2
- * SR-8.7), as read from `code`:
+ * How `main()` resolves the start through the reload controller, as read from `code`:
  *
  *     const <controller> = createReloadController({ … })
  *     const <outcome> = <controller>.resolveStart()
@@ -428,7 +427,7 @@ export interface StartResolution {
  * (one `createReloadController(` declaration, one `resolveStart(` call on that
  * controller bound to a `const`, one assignment from `<outcome>.config` after
  * it, one `runStartBringUp(` call on that controller). What else assigns
- * `<loaded>` (a later confirmed apply, E12/E13) is not its concern; the one
+ * `<loaded>` (a later confirmed apply, ) is not its concern; the one
  * test that owns the start's assignment rule is in
  * tests/server-startup-wiring.test.ts.
  */
@@ -565,10 +564,10 @@ export function forbiddenServerLoads(entry: string): { loads: RuntimeLoads; forb
 // The word rules of the one source audit (tests/fmk-source-audit.test.ts)
 // ---------------------------------------------------------------------------
 
-/** The row-delete helpers (b.jg5 SRJ-716) and the `src/cli.ts` audit's delete verbs (`directorDelete`, `deleteSpawn`). */
+/** The row-delete helpers and the `src/cli.ts` audit's delete verbs (`directorDelete`, `deleteSpawn`). */
 export const DELETE_HELPERS: readonly string[] = ['deleteInstance', 'deleteInstanceRow', 'deletePersonaInstance', 'tryDelete', 'killAndDeleteSweptRow', 'directorDelete', 'deleteSpawn']
 
-/** b.jg5 SRJ-601's removed identifiers, E17 T1's focused approver-seam names and E22 T4's ladder kill clock seam. */
+/** removed identifiers, 's focused approver-seam names and 's ladder kill clock seam. */
 export const REMOVED_IDENTIFIERS: readonly string[] = [
   // The raw runner.
   'defaultRunTmux', '_runTmux', '_setTmuxCommandRunner', '_resetTmuxCommandRunner', 'TmuxCommandRunner', 'TmuxRunResult',
@@ -578,12 +577,12 @@ export const REMOVED_IDENTIFIERS: readonly string[] = [
   'defaultHasTmuxSession', '_hasTmuxSession', '_setTmuxSessionProber', '_resetTmuxSessionProber', 'hasPersonaTmuxSession', 'tmuxFallbackVerdict',
   // The approver's raw path.
   'defaultTmuxCapturePane', 'defaultTmuxSendEnter', '_setTmuxCapturePane', '_setTmuxSendEnter', '_resetTmuxDialogHelpers', 'tmuxExactPaneTarget',
-  // E17 T1: the pane reader and Enter sender types, the dead-state streak and its seams, the poll-interval seams and the state sets.
+  // the pane reader and Enter sender types, the dead-state streak and its seams, the poll-interval seams and the state sets.
   'TmuxPaneReader', 'TmuxEnterSender', 'DIALOG_DEAD_GRACE_POLLS', '_setDialogDeadGracePolls', '_resetDialogDeadGracePolls',
   '_setDialogPollIntervalMs', '_resetDialogPollIntervalMs', 'DIALOG_READY_STATES', 'DIALOG_DEAD_STATES',
-  // The b.vub self-heal.
+  // The self-heal.
   'defaultKillTmuxSession', '_setTmuxSessionKiller', '_resetTmuxSessionKiller', 'selfHealTmuxCollisionAndRespawn',
-  // E22 T4: the ladder's kill clock seam.
+  // the ladder's kill clock seam.
   '_ladderKillClock', '_setLadderKillClock', '_resetLadderKillClock',
 ]
 
@@ -597,11 +596,11 @@ export type SourceWordRule = 'delete-helper' | 'finished-row-option' | 'ad-label
 
 /**
  * The source audit's word rules, each a global RegExp: the row-delete helpers,
- * agent-director's finished-row option in both spellings (b.jg5 SRJ-106), its
- * labels (SRJ-612), the raw tmux kill, probe and server start (SRJ-1101) and
- * the removed identifiers (SRJ-601). tests/fmk-source-audit.test.ts runs them
+ * agent-director's finished-row option in both spellings, its
+ * labels, the raw tmux kill, probe and server start and
+ * the removed identifiers. tests/fmk-source-audit.test.ts runs them
  * over every `src/` file; tests/shipped-docs.test.ts reads some of them over
- * the architecture doc and the engineering guide (SRJ-1105, SRJ-1106).
+ * the architecture doc and the engineering guide.
  */
 export const SOURCE_WORD_RULES: ReadonlyArray<readonly [SourceWordRule, RegExp]> = [
   ['delete-helper', wholeWord(DELETE_HELPERS)],

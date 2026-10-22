@@ -1,5 +1,5 @@
 /** Real durable queue + production executor, manual clock, shared AD stub and
- * concrete UI/transcript adapters (b.omv SR-13.2–13.4). No agent is launched. */
+ * concrete UI/transcript adapters. No agent is launched. */
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

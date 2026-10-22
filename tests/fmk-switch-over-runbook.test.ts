@@ -1,9 +1,9 @@
 /**
  * fmk-switch-over-runbook.test.ts — test-13 follows the switch-over runbook
- * in docs/migration.md, with exactly SRJ-1402's host-only substitutions (b.jg5 SRJ-1402;
- * SRJ-1108's /ci Test line; the E35 hatch note; ruling Q13).
+ * in docs/migration.md, with exactly host-only substitutions (
+ * /ci Test line; the design note; ruling Q13).
  *
- * Reads two texts and runs neither, spawning nothing (SRJ-1301):
+ * Reads two texts and runs neither, spawning nothing:
  * - the switch-over section of docs/migration.md, found by its title imported from `src/`
  *   and read through the shared step reader (`runbookSteps`,
  *   tests/test-helpers/runbooks.ts); N, its step count, comes from it;
@@ -45,7 +45,7 @@ function readRepoFile(relPath: string): string {
   return readFileSync(resolve(REPO_ROOT, relPath), 'utf-8')
 }
 
-/** One substitution test-13 may declare: its step, its kind, and the SRJ-1402 clause it rests on. */
+/** One substitution test-13 may declare: its step, its kind, and the clause it rests on. */
 interface Substitution {
   step: number
   kind: string
@@ -53,11 +53,11 @@ interface Substitution {
 }
 
 /**
- * The substitutions test-13 declares, by step: SRJ-1402's host-only steps
- * (b.jg5 SRD, bees `t1.jg5.kt`, SRJ-1402 "Host-only steps"), each `basis`
+ * The substitutions test-13 declares, by step: host-only steps
+ * (host-only steps), each `basis`
  * quoting the clause the kind rests on. Steps 3 to 6 have none.
  *
- * SRJ-1402 ties two clauses to no step: "Slack apps and token variables are
+ * ties two clauses to no step: "Slack apps and token variables are
  * the container's fixtures" and "the §6 prompt wording [is] skipped". The
  * §6 orchestrator prompt changes at steps 1 ("ship now"), 10 (worker
  * cleanup) and 11 ("hold until after"). By ruling, the build under test that
@@ -150,11 +150,11 @@ function runbookFindings(section: string, script: string): string[] {
   for (const d of substitutions) {
     const inside = steps.filter((s) => s.line < d.line).at(-1)?.step
     if (inside !== d.step) findings.push(`step ${d.step}: ${d.kind} declared at line ${d.line}, ${inside === undefined ? 'before any step' : `inside step ${inside}'s section`}`)
-    if (!SUBSTITUTIONS.some((e) => e.step === d.step && e.kind === d.kind)) findings.push(`step ${d.step}: ${d.kind} is not one of SRJ-1402's substitutions for step ${d.step}`)
+    if (!SUBSTITUTIONS.some((e) => e.step === d.step && e.kind === d.kind)) findings.push(`step ${d.step}: ${d.kind} is not one of the documented substitutions for step ${d.step}`)
   }
   for (const e of SUBSTITUTIONS) {
     const times = substitutions.filter((d) => d.step === e.step && d.kind === e.kind).length
-    if (times === 0) findings.push(`step ${e.step}: ${e.kind} is not declared (SRJ-1402: ${e.basis})`)
+    if (times === 0) findings.push(`step ${e.step}: ${e.kind} is not declared (${e.basis})`)
     if (times > 1) findings.push(`step ${e.step}: ${e.kind} is declared ${times} times`)
   }
   return findings
@@ -181,12 +181,12 @@ function moveDeclaration(script: string, prefix: string, to: number, as?: number
   return edit(edit(script, line, ''), `\nrunbook_step ${to}\n`, `\nrunbook_step ${to}\n${moved}`)
 }
 
-describe(`test-13 follows docs/migration.md's "${PHASE1_RUNBOOK_SECTION_TITLE}" runbook with exactly SRJ-1402's substitutions (b.jg5 SRJ-1402, SRJ-1108)`, () => {
+describe(`test-13 follows docs/migration.md's "${PHASE1_RUNBOOK_SECTION_TITLE}" runbook with exactly substitutions`, () => {
   const section = requiredSection(readRepoFile(PHASE1_RUNBOOK_DOC), SECTION_HEADING, PHASE1_RUNBOOK_DOC)
   const script = readRepoFile(SCRIPT_FILE)
   const count = runbookSteps(section, { name: SECTION_NAME }).length
 
-  test(`${SCRIPT_FILE} enters steps 1 to N of the runbook once each, in order, and declares exactly SRJ-1402's substitutions, each inside its step's section`, () => {
+  test(`${SCRIPT_FILE} enters steps 1 to N of the runbook once each, in order, and declares exactly substitutions, each inside its step's section`, () => {
     expect(runbookFindings(section, script)).toEqual([])
   })
 
@@ -220,18 +220,18 @@ describe(`test-13 follows docs/migration.md's "${PHASE1_RUNBOOK_SECTION_TITLE}" 
     [
       'an extra substitution',
       () => [section, edit(script, '\nrunbook_step 4\n', '\nrunbook_step 4\nrunbook_substitute 4 wait-skipped "the five-minute wait is skipped"\n')],
-      [/^step 4: wait-skipped is not one of SRJ-1402's substitutions for step 4$/],
+      [/^step 4: wait-skipped is not one of the documented substitutions for step 4$/],
     ],
     [
       'a substitution declared twice',
       () => [section, edit(script, '\nrunbook_step 9\n', '\nrunbook_step 9\nrunbook_substitute 9 no-agents-restarted "again"\n')],
       [/^step 9: no-agents-restarted is declared 2 times$/],
     ],
-    ['a missing substitution', () => [section, edit(script, lineStarting(script, 'runbook_substitute 11 expire-skipped '), '')], [/^step 11: expire-skipped is not declared \(SRJ-1402: step 11's expire schedule is skipped\)$/]],
+    ['a missing substitution', () => [section, edit(script, lineStarting(script, 'runbook_substitute 11 expire-skipped '), '')], [/^step 11: expire-skipped is not declared \(step 11's expire schedule is skipped\)$/]],
     [
       'a substitution moved to the wrong step',
       () => [section, moveDeclaration(script, 'runbook_substitute 2 autostart-skipped ', 3, 3)],
-      [/^step 3: autostart-skipped is not one of SRJ-1402's substitutions for step 3$/, /^step 2: autostart-skipped is not declared \(SRJ-1402: /],
+      [/^step 3: autostart-skipped is not one of the documented substitutions for step 3$/, /^step 2: autostart-skipped is not declared \(/],
     ],
     [
       "a substitution declared inside another step's section",
@@ -254,7 +254,7 @@ describe(`test-13 follows docs/migration.md's "${PHASE1_RUNBOOK_SECTION_TITLE}" 
   })
 })
 
-// b.omv SR-13.6: provenance must precede replacement; later marked rows resume.
+// provenance must precede replacement; later marked rows resume.
 test('test-13 explicitly proves earlier-release provenance before the fresh upgrade and later ordinary resume', () => {
   const script = readRepoFile(SCRIPT_FILE)
   const seed = script.indexOf('# E4_EARLIER_RELEASE_PROVENANCE')

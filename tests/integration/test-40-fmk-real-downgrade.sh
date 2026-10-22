@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# b.omv SR-14.8 / R55, authoritative decision 15: exact safe downgrade order.
+# / R55, exact safe downgrade order.
 set -euo pipefail
 TEST_NAME="test-40-fmk-real-downgrade"
 source "$(dirname "$0")/lib/scenario.sh"

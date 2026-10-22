@@ -1,15 +1,15 @@
 /**
- * conflict-latch.ts — The per-persona latch (b.jg5 SRJ-501), its record and
- * the CONFLICT case recognition (b.jg5 SRJ-507).
+ * conflict-latch.ts — The per-persona latch, its record and
+ * the CONFLICT case recognition.
  *
  * What latches. An `ErrTmuxSessionConflict` from any verb for persona P
- * latches P (SRJ-501); so do a `provenance_conflict` note on P's own row
- * (case "conflicting labels"), an unusable recorded name (SRJ-512) and a
- * `pending` row with no launch start (SRJ-513). While P is latched CSCB's
- * automated paths attempt nothing for it beyond the re-check (SRJ-502). One
+ * latches P; so do a `provenance_conflict` note on P's own row
+ * (case "conflicting labels"), an unusable recorded name and a
+ * `pending` row with no launch start. While P is latched CSCB's
+ * automated paths attempt nothing for it beyond the re-check. One
  * latch per persona, held in server memory only: a restart drops every latch
  * with the process, and a persona's teardown forgets its latch silently
- * (SRJ-504).
+ *
  *
  * What the record holds ({@link ConflictLatchRecord}):
  *   - the quoted session: the first non-empty double-quoted name on one line
@@ -19,7 +19,7 @@
  *   - whether the CONFLICT notice's list line must not name that session
  *     (`listLineUnsafe`), decided from the name as given before it is
  *     redacted; the unredacted name is never kept;
- *   - the case ({@link LatchCase}): one of SRJ-507's nine CONFLICT cases,
+ * - the case ({@link LatchCase}): one of the contract nine CONFLICT cases,
  *     unrecognised text, or one of the two hold cases, "unusable recorded
  *     name" and "launch start not recorded";
  *   - the refused operation ({@link RefusedOperation}): a plain spawn, a
@@ -33,7 +33,7 @@
  *     classifier renders a message (`renderLogMessageText`: redacted, on one
  *     line, capped), never raw.
  *
- * Case recognition (SRJ-507). CSCB tells the CONFLICT cases apart only by
+ * Case recognition. CSCB tells the CONFLICT cases apart only by
  * agent-director's case words, checked in {@link CONFLICT_CASE_ORDER}, the
  * first match deciding; none gives unrecognised text
  * ({@link recogniseConflictCase}). The words come from
@@ -46,7 +46,7 @@
  * The latch ({@link createConflictLatch}): one instance per server, built in
  * `main()`. `set` latches a persona, relatches it with a different case
  * (replacing the record), or, with the same case, keeps it with the record
- * unchanged (SRJ-506), and answers which ({@link ConflictLatchSetOutcome});
+ * unchanged, and answers which ({@link ConflictLatchSetOutcome});
  * `setFromConflict` builds the record from a thrown CONFLICT value,
  * `setFromUnusableName` from a thrown UNUSABLE NAME value, and
  * `setLaunchStartNotRecorded` for a `pending` row with no launch start. Every set
@@ -59,7 +59,7 @@
  * launch in flight settled and right before it forgets the persona's notice
  * episodes, which ends the CONFLICT episode with it. There is no forget-all.
  *
- * The unusable recorded name (SRJ-512): {@link isUnusableNameError} tells
+ * The unusable recorded name: {@link isUnusableNameError} tells
  * an UNUSABLE NAME value by the classifier, and {@link unusableNameSetInput}
  * builds its `set` input: the case "unusable recorded name", the refused
  * operation "none", the row state the caller gives, the classification's
@@ -73,7 +73,7 @@
  * the first two apply the session manager's own-row `status` step, the third
  * `latchOnRestartKillOutcome`.
  *
- * The launch start not recorded (SRJ-513): {@link launchStartNotRecordedSetInput}
+ * The launch start not recorded: {@link launchStartNotRecordedSetInput}
  * builds its `set` input: the case "launch start not recorded", the refused
  * operation "none", the row state the caller gives (`pending`), the session
  * `slack_bot_<key>` and no description. Its trigger is the row-read rule's
@@ -84,13 +84,13 @@
  * this input. The re-check's step-1 read latches through the same shared
  * reads, so through the same input.
  *
- * The notices (SRJ-1004, SRJ-1019, SRJ-1020, SRJ-508, SRJ-1016): {@link conflictNoticeText}
+ * The notices: {@link conflictNoticeText}
  * builds the CONFLICT notice's body from a CONFLICT latch's record, from the
  * exported fixed lines (`CONFLICT_NOTICE_*`) and the case sentences
  * ({@link CONFLICT_CASE_SENTENCES}); {@link unusableNameNoticeText} builds
- * SRJ-1019's from the persona's key and the record's description, from the
+ * from the persona's key and the record's description, from the
  * exported fixed parts (`UNUSABLE_NAME_NOTICE_*`); and
- * {@link launchStartNotRecordedNoticeText} builds SRJ-1020's from the
+ * {@link launchStartNotRecordedNoticeText} builds from the
  * persona's key, from the exported fixed parts (`LAUNCH_START_NOTICE_*`).
  * One set observer
  * ({@link createConflictNoticeObserver}, bound by {@link bindConflictNotice}
@@ -106,12 +106,12 @@
  * (`escapeSlackControlCharacters`); so is the session name. Log lines stay
  * unescaped.
  *
- * The holds (SRJ-305, SRJ-310, SRJ-313, SRJ-502): a second set observer
+ * The holds: a second set observer
  * ({@link createConflictLatchHoldObserver}, bound by
  * {@link bindConflictLatchHolds} in `main()` before the notice) stops the
  * persona's retry timer, ends its `tmux-unresponsive` condition silently,
  * ends its unclassified-error episode, ends its slow-recovery episode
- * with its count (SRJ-610) and ends its stuck-launch episode (SRJ-1016) on
+ * with its count and ends its stuck-launch episode on
  * every set, through the injected
  * {@link ConflictLatchHolds}. What else a latch holds back is asked of the
  * latch where it happens: the collision ladder (`src/session-manager.ts`,
@@ -119,12 +119,12 @@
  * launches no latched persona), the restart work, the retry action and the health tick, each
  * through `isLatched`.
  *
- * The recovery notice (SRJ-1005): {@link conflictRecoveryText},
+ * The recovery notice: {@link conflictRecoveryText},
  * {@link holdRecoveryText} and {@link latchRecoveryText} build it for either
  * latch kind ({@link LatchKind}) and one of five reasons
  * ({@link LatchRecoveryReason}); the clear entry posts it.
  *
- * The clear (SRJ-506): {@link createLatchClear} builds the one clear entry,
+ * The clear: {@link createLatchClear} builds the one clear entry,
  * which takes a persona and a reason: it removes the record, stops the
  * persona's re-check timer, posts the recovery notice once in the episode of
  * the latch's kind, ends that episode (and any other latch kind's) and logs
@@ -138,7 +138,7 @@
  * id" probe dropped (`probeDropped`); a new case's record starts without the
  * mark.
  *
- * The re-check (SRJ-505): {@link LATCH_RECHECK_INTERVAL_MS}, step 1's reading
+ * The re-check: {@link LATCH_RECHECK_INTERVAL_MS}, step 1's reading
  * ({@link LatchRecheckReading}), the step, action and call identifiers
  * (`RECHECK_STEP_*`, `RECHECK_ACTION_*`, `RECHECK_CALL_*`), the pure decision
  * ({@link decideLatchRecheck}) and the finished-row retry's launch
@@ -173,7 +173,7 @@
  * No agent-director call, no persistence and no module-scope state; the
  * only timer is the re-check controller's, on its injected clock, and
  * nothing runs at import or at creation. No label option name is spelled
- * here (b.jg5 SRJ-716).
+ * here.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -227,7 +227,7 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 
 // ---------------------------------------------------------------------------
-// Cases (b.jg5 SRJ-501, SRJ-507, SRJ-512, SRJ-513)
+// Cases
 // ---------------------------------------------------------------------------
 
 /** CONFLICT case "conflicting labels" (also a latch from a `provenance_conflict` note). */
@@ -251,20 +251,20 @@ export const LATCH_CASE_ANOTHER_STORE = 'another-store'
 /** A CONFLICT whose description carries none of the case words. */
 export const LATCH_CASE_UNRECOGNISED = 'unrecognised'
 /**
- * Hold case "unusable recorded name" (SRJ-512): production sets it through
+ * Hold case "unusable recorded name": production sets it through
  * `set` with {@link unusableNameSetInput}'s input; `setFromUnusableName` is
  * the same set from a thrown value.
  */
 export const LATCH_CASE_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
 /**
- * Hold case "launch start not recorded" (SRJ-513): production sets it through
+ * Hold case "launch start not recorded": production sets it through
  * `set` with {@link launchStartNotRecordedSetInput}'s input;
  * `setLaunchStartNotRecorded` is the same set.
  */
 export const LATCH_CASE_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**
- * The CONFLICT case words in SRJ-507's order: the first whose phrase a
+ * The CONFLICT case words in the contract order: the first whose phrase a
  * description contains decides its case. "no pane 0.0" is withdrawn (HO rev
  * 17), and the plain spawn's label wordings are never case phrases (HO rev
  * 15).
@@ -299,7 +299,7 @@ export type HoldLatchCase = (typeof HOLD_LATCH_CASES)[number]
 /** Any case a latch records. */
 export type LatchCase = ConflictLatchCase | HoldLatchCase
 
-/** Every case a latch records: the nine CONFLICT cases in SRJ-507's order, unrecognised text, then the two hold cases. */
+/** Every case a latch records: the nine CONFLICT cases in the contract order, unrecognised text, then the two hold cases. */
 export const LATCH_CASES: readonly LatchCase[] = Object.freeze([
   ...CONFLICT_CASE_ORDER.map((entry) => entry.latchCase),
   LATCH_CASE_UNRECOGNISED,
@@ -311,19 +311,19 @@ export function isHoldLatchCase(latchCase: LatchCase): latchCase is HoldLatchCas
   return (HOLD_LATCH_CASES as readonly LatchCase[]).includes(latchCase)
 }
 
-/** The cases posted with the unrecognised-text wording (SRJ-1004) and re-checked as unrecognised text (SRJ-505). */
+/** The cases posted with the unrecognised-text wording and re-checked as unrecognised text. */
 export const UNRECOGNISED_HANDLING_CASES: ReadonlySet<LatchCase> = new Set<LatchCase>([
   LATCH_CASE_UNRECOGNISED,
   LATCH_CASE_NEVER_REPORTED_IN,
 ])
 
-/** True for unrecognised text and "never reported in" (SRJ-507): both take the unrecognised-text wording and re-check. */
+/** True for unrecognised text and "never reported in": both take the unrecognised-text wording and re-check. */
 export function takesUnrecognisedHandling(latchCase: LatchCase): boolean {
   return UNRECOGNISED_HANDLING_CASES.has(latchCase)
 }
 
 /**
- * The CONFLICT case of agent-director's `description` (SRJ-507): the first
+ * The CONFLICT case of agent-director's `description`: the first
  * case in {@link CONFLICT_CASE_ORDER} whose phrase it contains, else
  * unrecognised text (also for a value that is not a string). Pure.
  */
@@ -342,7 +342,7 @@ const QUOTED_SPAN_RE = /"([^"]*)"/g
 const LINE_BREAK_RE = /[\r\n\u2028\u2029]/
 
 /**
- * The latch's quoted session for persona `key` (SRJ-501): the first
+ * The latch's quoted session for persona `key`: the first
  * double-quoted name in `description` that is non-empty and on one line,
  * without its quotes and through `redactSlackLogText`, else the persona's own
  * session name `slack_bot_<key>` (`personaTmuxSessionName`), also when
@@ -373,7 +373,7 @@ function rawQuotedSessionName(description: unknown): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Refused operation (b.jg5 SRJ-501)
+// Refused operation
 // ---------------------------------------------------------------------------
 
 /** A plain first spawn was refused. */
@@ -382,14 +382,14 @@ export const REFUSED_OPERATION_PLAIN_SPAWN = 'plain-spawn'
 export const REFUSED_OPERATION_REUSE_SPAWN = 'reuse-spawn'
 /** A `resume` was refused. */
 export const REFUSED_OPERATION_RESUME = 'resume'
-/** P's bring-up by the restart path's decision: a latch from a `provenance_conflict` note (b.jg5 SRJ-114). */
+/** P's bring-up by the restart path's decision: a latch from a `provenance_conflict` note. */
 export const REFUSED_OPERATION_BRING_UP = 'bring-up'
 /** P's next check or recovery, decided afresh from its row by the restart path's decision: a pane verb's or a kill's CONFLICT. */
 export const REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY = 'next-check-or-recovery'
 /** None: the two hold cases, whose re-check reads only `status`. */
 export const REFUSED_OPERATION_NONE = 'none'
 
-/** Every refused operation SRJ-501 names. */
+/** Every refused operation names. */
 export const REFUSED_OPERATIONS = Object.freeze([
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_REUSE_SPAWN,
@@ -403,7 +403,7 @@ export const REFUSED_OPERATIONS = Object.freeze([
 export type RefusedOperation = (typeof REFUSED_OPERATIONS)[number]
 
 // ---------------------------------------------------------------------------
-// Recorded row state (b.jg5 SRJ-501, SRJ-505)
+// Recorded row state
 // ---------------------------------------------------------------------------
 
 /** The row read in a state. */
@@ -437,7 +437,7 @@ export function latchRowStateRead(state: unknown): LatchRowState {
 }
 
 /**
- * Whether a recorded state counts as live (SRJ-501, SRJ-505): every state the
+ * Whether a recorded state counts as live: every state the
  * row had reported in by (`waiting`, `working`, `ask_user`,
  * `check_permission`, or any state CSCB does not know) and an unreadable
  * state count; `pending`, `ended`, `missing` and no row do not. A latch whose
@@ -463,7 +463,7 @@ export function describeLatchRowState(rowState: LatchRowState): string {
 // The record and the set outcomes
 // ---------------------------------------------------------------------------
 
-/** One persona's latch record (SRJ-501). Frozen. */
+/** One persona's latch record. Frozen. */
 export interface ConflictLatchRecord {
   /** The quoted session's name, without quotes and redacted; `slack_bot_<key>` when the description gave none. */
   readonly sessionName: string
@@ -477,7 +477,7 @@ export interface ConflictLatchRecord {
   readonly description?: string
   /**
    * Set (true) once this episode's "this row's own id" probe is dropped
-   * (b.jg5 SRJ-505's first table row: the single retry after a cleared probe
+   * (first table row: the single retry after a cleared probe
    * was refused again with that case), through the latch's
    * `setProbeDropped`; absent otherwise. A same-case set keeps it; a new
    * case begins a new episode and a new record without it.
@@ -518,7 +518,7 @@ export interface ConflictLatchConflictFields {
 export const CONFLICT_LATCH_SET_LATCHED = 'latched'
 /** A latched persona was relatched with a different case: the record was replaced (a new episode). */
 export const CONFLICT_LATCH_SET_RELATCHED = 'relatched'
-/** A latched persona met its own case again: still latched, the record unchanged (SRJ-506). */
+/** A latched persona met its own case again: still latched, the record unchanged. */
 export const CONFLICT_LATCH_SET_SAME_CASE = 'same-case'
 
 /** What one set did. */
@@ -592,7 +592,7 @@ export interface ConflictLatch {
    */
   forget(key: string): boolean
   /**
-   * Mark `key`'s latch episode as having its probe dropped (b.jg5 SRJ-505):
+   * Mark `key`'s latch episode as having its probe dropped:
    * the record is replaced by the same record with `probeDropped` set, with
    * no observer call and no line. Answers false, doing nothing, when `key`
    * is not latched. The mark lasts until a set with a new case replaces the
@@ -760,7 +760,7 @@ function normaliseRowState(rowState: LatchRowState): LatchRowState {
 }
 
 /**
- * The latch-set line (b.jg5 SRJ-501, SRJ-1014): a new latch, or, with
+ * The latch-set line: a new latch, or, with
  * `previousCase`, a relatch with a different case. The record's session and
  * description are redacted before they are stored, so the line carries no
  * token. Pure.
@@ -794,16 +794,16 @@ function safeLog(log: (line: string) => void, line: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// The unusable recorded name (b.jg5 SRJ-512)
+// The unusable recorded name
 // ---------------------------------------------------------------------------
 
 /**
- * True when `value` classifies as UNUSABLE NAME (b.jg5 SRJ-104: an
+ * True when `value` classifies as UNUSABLE NAME (an
  * `ErrInternal` whose description carries "the recorded tmux session name"),
  * decided by the classifier (`classifyAdError`, by the `ErrUnknownErrorName`
  * class and its `unknownName`). For a site that
  * must branch before it knows the row state to record. Every other
- * `ErrInternal` is UNCLASSIFIED and answers false (SRJ-313). Pure; never
+ * `ErrInternal` is UNCLASSIFIED and answers false. Pure; never
  * throws.
  */
 export function isUnusableNameError(value: unknown): boolean {
@@ -811,8 +811,7 @@ export function isUnusableNameError(value: unknown): boolean {
 }
 
 /**
- * What `set` takes for persona `key` meeting the thrown `value` (b.jg5
- * SRJ-501, SRJ-512), when `value` classifies as UNUSABLE NAME: the case
+ * What `set` takes for persona `key` meeting the thrown `value`, when `value` classifies as UNUSABLE NAME: the case
  * "unusable recorded name", the refused operation "none" (its re-check reads
  * only `status`), `rowState`, the classification's message as the
  * description (already redacted, on one line and capped by the classifier)
@@ -839,31 +838,30 @@ export function unusableNameSetInput(
 }
 
 // ---------------------------------------------------------------------------
-// A persona no longer in the applied configuration (b.jg5 SRJ-1002)
+// A persona no longer in the applied configuration
 // ---------------------------------------------------------------------------
 
 /**
  * The outcome a CONFLICT or UNUSABLE NAME latch entry gives, in its site's
- * one line, for a persona no longer in the applied configuration (b.jg5
- * SRJ-1002): the case (`unusable-recorded-name` for an UNUSABLE NAME) and the
+ * one line, for a persona no longer in the applied configuration: the case (`unusable-recorded-name` for an UNUSABLE NAME) and the
  * refused operation, and that nothing is latched or posted. The site's line
  * already names the persona reference, the call and the redacted
- * description; no startup-errors entry is written, since SRJ-1013 has no
+ * description; no startup-errors entry is written, since has no
  * class for it. Pure.
  *
- *   the persona is not in the applied configuration (case=<case> refused=<operation>), so nothing is latched or posted (b.jg5 SRJ-1002)
+ * the persona is not in the applied configuration (case=<case> refused=<operation>), so nothing is latched or posted
  */
 export function notConfiguredLatchOutcome(latchCase: LatchCase, operation: RefusedOperation): string {
-  return `the persona is not in the applied configuration (case=${latchCase} refused=${operation}), so nothing is latched or posted (b.jg5 SRJ-1002)`
+  return `the persona is not in the applied configuration (case=${latchCase} refused=${operation}), so nothing is latched or posted`
 }
 
 // ---------------------------------------------------------------------------
-// A `pending` row with no launch start (b.jg5 SRJ-513)
+// A `pending` row with no launch start
 // ---------------------------------------------------------------------------
 
 /**
  * What `set` takes for persona `key` whose own row reads `pending` with no
- * launch start (b.jg5 SRJ-501, SRJ-513): the case "launch start not
+ * launch start: the case "launch start not
  * recorded", the refused operation "none" (its re-check reads only
  * `status`), `rowState` (the state the read gave, `pending`), the session
  * `slack_bot_<key>` and no description, since a row read carries none. The
@@ -880,7 +878,7 @@ export function launchStartNotRecordedSetInput(key: string, rowState: LatchRowSt
 }
 
 // ---------------------------------------------------------------------------
-// The CONFLICT notice (b.jg5 SRJ-1004)
+// The CONFLICT notice
 // ---------------------------------------------------------------------------
 
 /** The first line up to `<session>`. */
@@ -935,18 +933,18 @@ export const CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME = 'The session name could not
  */
 const UNSAFE_LIST_NAME_RE = /[\p{Cc}\p{Zl}\p{Zp}`]/u
 
-/** The human-only line (SRJ-1001). */
+/** The human-only line. */
 export const CONFLICT_NOTICE_HUMAN_ONLY_LINE =
   'This is for a human only: no bot, including any persona that sees this post, may act on it.'
 
 /** What separates the notice's lines. */
 export const CONFLICT_NOTICE_LINE_SEPARATOR = '\n'
 
-/** A recognised case that has a case sentence: every one but "never reported in", which takes the unrecognised-text wording (SRJ-507). */
+/** A recognised case that has a case sentence: every one but "never reported in", which takes the unrecognised-text wording. */
 export type ConflictCaseWithSentence = Exclude<RecognisedConflictCase, typeof LATCH_CASE_NEVER_REPORTED_IN>
 
 /**
- * SRJ-1004's case sentence for each recognised case. Unrecognised text and
+ * case sentence for each recognised case. Unrecognised text and
  * "never reported in" have none ({@link conflictCaseSentence}). Both
  * leftover descriptions, the pre-spawn scan's and the "duplicate session"
  * one, are the one case {@link LATCH_CASE_LEFTOVER}, so both get its sentence.
@@ -1039,7 +1037,7 @@ function listLineName(sessionName: string, listLineUnsafe: boolean): string | nu
 }
 
 /**
- * The CONFLICT notice's body for a CONFLICT latch's record (b.jg5 SRJ-1004);
+ * The CONFLICT notice's body for a CONFLICT latch's record;
  * the persona notifier adds the persona prefix. Its lines, joined by
  * {@link CONFLICT_NOTICE_LINE_SEPARATOR}:
  *
@@ -1049,7 +1047,7 @@ function listLineName(sessionName: string, listLineUnsafe: boolean): string | nu
  *      capped (`renderLogMessageText`, the record's form, so a no-op on a
  *      record's description) and then escaped once for Slack
  *      (`escapeSlackControlCharacters`); left out when there is none (the
- *      `provenance_conflict` note latch's form, SRJ-1004 hatch A2);
+ * `provenance_conflict` note latch's form hatch A2);
  *   3. the pointer line, or for "a different instance id" its
  *      must-not-be-ended line in place of it, or for "another agent-director
  *      store" its must-not-be-ended line and then the pointer line;
@@ -1064,7 +1062,7 @@ function listLineName(sessionName: string, listLineUnsafe: boolean): string | nu
  * The session name is text CSCB did not write, so it is escaped for Slack
  * too, in the first line and the list line (after the shell quoting). No
  * line of CSCB's own names a session-ending command, a label option or
- * anything SRJ-1001 forbids. Pure.
+ * anything forbids. Pure.
  */
 export function conflictNoticeText(source: ConflictNoticeSource): string {
   const session = slackQuotedSession(source.sessionName)
@@ -1100,7 +1098,7 @@ export function conflictNoticeText(source: ConflictNoticeSource): string {
 }
 
 // ---------------------------------------------------------------------------
-// The unusable-recorded-name notice (b.jg5 SRJ-1019)
+// The unusable-recorded-name notice
 // ---------------------------------------------------------------------------
 
 /** The notice up to `<instance id>`. */
@@ -1126,8 +1124,7 @@ export const UNUSABLE_NAME_NOTICE_HOLD =
 export const UNUSABLE_NAME_NOTICE_SEPARATOR = ' '
 
 /**
- * The unusable-recorded-name notice's body for persona `key` (b.jg5
- * SRJ-1019); the persona notifier adds the persona prefix. One line:
+ * The unusable-recorded-name notice's body for persona `key`; the persona notifier adds the persona prefix. One line:
  * {@link UNUSABLE_NAME_NOTICE_HEAD}, the instance id `cscb_<key>`,
  * {@link UNUSABLE_NAME_NOTICE_REASON}, `agent-director said: "<description>".`
  * (the latch record's description, rendered by `renderLogMessageText`, a
@@ -1151,7 +1148,7 @@ export function unusableNameNoticeText(key: string, description: string | undefi
 }
 
 // ---------------------------------------------------------------------------
-// The launch-start-not-recorded notice (b.jg5 SRJ-1020)
+// The launch-start-not-recorded notice
 // ---------------------------------------------------------------------------
 
 /** The notice up to `<session>`. */
@@ -1173,8 +1170,7 @@ export const LAUNCH_START_NOTICE_HOLD =
 export const LAUNCH_START_NOTICE_SEPARATOR = ' '
 
 /**
- * The launch-start-not-recorded notice's body for persona `key` (b.jg5
- * SRJ-1020); the persona notifier adds the persona prefix. One line:
+ * The launch-start-not-recorded notice's body for persona `key`; the persona notifier adds the persona prefix. One line:
  * {@link LAUNCH_START_NOTICE_HEAD}, the persona's session `"slack_bot_<key>"`
  * (the session such a latch records, rendered as the CONFLICT notice renders
  * a record's quoted session: redacted, escaped for Slack, between double
@@ -1192,7 +1188,7 @@ export function launchStartNotRecordedNoticeText(key: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// The recovery notice (b.jg5 SRJ-1005)
+// The recovery notice
 //
 // Built here and posted by the clear entry (`createLatchClear`), once per
 // clear: the re-check's clears with every reason but "cleared by hand", and a
@@ -1229,7 +1225,7 @@ export const LATCH_RECOVERY_REASON_KIND_RELAUNCH_NOT_REFUSED = 'relaunch-not-ref
 /** Reason `cleared by hand` (`clear-latch`). */
 export const LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND = 'cleared-by-hand'
 
-/** Why a latch cleared: one of SRJ-1005's five reasons, the state-bearing one with its state. */
+/** Why a latch cleared: one of the contract five reasons, the state-bearing one with its state. */
 export type LatchRecoveryReason =
   | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_ROW_READS; readonly state: string }
   | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_ROW_GONE }
@@ -1294,7 +1290,7 @@ export const LATCH_RECOVERY_TAIL = '). CSCB is recovering this persona again.'
 /**
  * The recovery notice's body for a CONFLICT latch on the quoted session
  * `sessionName` (the record's, without quotes) cleared for `reason`
- * (b.jg5 SRJ-1005); the persona notifier adds the persona prefix. Pure.
+ * the persona notifier adds the persona prefix. Pure.
  */
 export function conflictRecoveryText(sessionName: string, reason: LatchRecoveryReason): string {
   return (
@@ -1306,7 +1302,7 @@ export function conflictRecoveryText(sessionName: string, reason: LatchRecoveryR
   )
 }
 
-/** The recovery notice's body for an "unusable recorded name" or "launch start not recorded" latch cleared for `reason` (b.jg5 SRJ-1005). Pure. */
+/** The recovery notice's body for an "unusable recorded name" or "launch start not recorded" latch cleared for `reason`. Pure. */
 export function holdRecoveryText(reason: LatchRecoveryReason): string {
   return HOLD_RECOVERY_HEAD + latchRecoveryReasonText(reason) + LATCH_RECOVERY_TAIL
 }
@@ -1321,7 +1317,7 @@ export function latchRecoveryText(kind: LatchKind, reason: LatchRecoveryReason, 
 }
 
 // ---------------------------------------------------------------------------
-// The latch notices' episodes (b.jg5 SRJ-508, SRJ-1016)
+// The latch notices' episodes
 // ---------------------------------------------------------------------------
 
 /**
@@ -1338,10 +1334,10 @@ export interface HoldNotice {
 }
 
 /**
- * Each hold case's notice (b.jg5 SRJ-508, SRJ-1016): its own episode kind
- * and its text. "unusable recorded name" posts SRJ-1019
+ * Each hold case's notice: its own episode kind
+ * and its text. "unusable recorded name" posts
  * ({@link unusableNameNoticeText}); "launch start not recorded" posts
- * SRJ-1020 ({@link launchStartNotRecordedNoticeText}).
+ * ({@link launchStartNotRecordedNoticeText}).
  */
 export const HOLD_NOTICES: Readonly<Record<HoldLatchCase, HoldNotice>> = Object.freeze({
   [LATCH_CASE_UNUSABLE_RECORDED_NAME]: Object.freeze({
@@ -1369,25 +1365,24 @@ export function latchNoticeEpisodeKindOf(latchCase: LatchCase): PersonaEpisodeKi
 }
 
 /**
- * The latch notices' set observer over `episodes` (b.jg5 SRJ-508,
- * SRJ-1016), dispatching by the record's latch kind:
+ * The latch notices' set observer over `episodes`, dispatching by the record's latch kind:
  *
  *   - a latch (`latched`) or a relatch with a new case (`relatched`) first
  *     ends P's open episodes of the other latch kinds silently (`end`: no
  *     recovery post), so a later relatch back to one of them posts once more
- *     (SRJ-512, SRJ-513); then
+ * ; then
  *       - for a CONFLICT case or unrecognised text, it begins P's CONFLICT
  *         episode with the record's case, or keeps the open one when its
  *         case is the same, and posts {@link conflictNoticeText} in it at
  *         most once: a new case's episode is new, so it posts once more;
  *       - for a hold case, it begins (or keeps) P's episode of that case's
  *         kind ({@link HOLD_NOTICES}) and posts that case's text in it at
- *         most once (SRJ-1019 or SRJ-1020). SRJ-1004 is never posted for a
+ * most once (or). is never posted for a
  *         hold case;
  *   - a same-case set (`same-case`) keeps the episode and posts nothing.
  *
  * Every post goes through the episodes' sink (the persona notifier), never
- * straight to Slack, and reads no other notice's latch, b.f2b's
+ * straight to Slack, and reads no other notice's latch
  * `unproven-idle` and `blocked-on-prompt` included, so none holds it back.
  * After the episodes' `close` (shutdown) it opens and posts nothing. A
  * teardown's `forget` ends them silently; the clear entry
@@ -1429,14 +1424,14 @@ export function bindConflictNotice(latch: Pick<ConflictLatch, 'addSetObserver'>,
 }
 
 // ---------------------------------------------------------------------------
-// The clear (b.jg5 SRJ-506, SRJ-1005, SRJ-1016)
+// The clear
 // ---------------------------------------------------------------------------
 
 /** The mark the recovery notice is posted under in the episode of the latch's kind. */
 export const LATCH_RECOVERY_MARK = 'recovery'
 
 /**
- * Clear persona `key`'s latch for `reason` (one of SRJ-1005's five), with
+ * Clear persona `key`'s latch for `reason` (one of the contract five), with
  * its one recovery notice. Answers whether `key` was latched; an unlatched
  * persona gets nothing (no post, no line). Never throws.
  */
@@ -1465,7 +1460,7 @@ function latchRecoveryReasonLogText(reason: LatchRecoveryReason): string {
 }
 
 /**
- * The clear's one line (b.jg5 SRJ-506, SRJ-1014): the persona, the cleared
+ * The clear's one line: the persona, the cleared
  * record's case and session, the reason, and whether the recovery notice was
  * posted (it is not once the notice episodes are closed, at shutdown):
  *
@@ -1482,7 +1477,7 @@ export function latchClearedLine(key: string, record: ConflictLatchRecord, reaso
 }
 
 /**
- * The one clear entry (b.jg5 SRJ-506, SRJ-1005, SRJ-1016). For a latched
+ * The one clear entry. For a latched
  * persona, in this order:
  *
  *   1. the record is removed (`forget`; its forget observers, the re-check
@@ -1544,7 +1539,7 @@ export function createLatchClear(deps: LatchClearDeps): LatchClear {
 }
 
 // ---------------------------------------------------------------------------
-// The holds (b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-502)
+// The holds
 // ---------------------------------------------------------------------------
 
 /**
@@ -1554,21 +1549,21 @@ export function createLatchClear(deps: LatchClearDeps): LatchClear {
  * slow-recovery tracker and its notice episodes' stuck-launch kind.
  */
 export interface ConflictLatchHolds {
-  /** Stop the persona's retry timer with the latch's stop reason, through the controller's `stop` (SRJ-305: "P latches, whatever the case"). */
+  /** Stop the persona's retry timer with the latch's stop reason, through the controller's `stop` ("P latches, whatever the case"). */
   stopRetryTimer(key: string): void
-  /** End the persona's `tmux-unresponsive` condition silently: no recovery notice (SRJ-310). */
+  /** End the persona's `tmux-unresponsive` condition silently: no recovery notice. */
   endTmuxUnresponsive(key: string): void
-  /** End the persona's unclassified-error episode with the latch's end reason (SRJ-313). */
+  /** End the persona's unclassified-error episode with the latch's end reason. */
   endUnclassifiedError(key: string): void
   /**
    * Reset the persona's slow-recovery count and end its slow-recovery
-   * episode silently (SRJ-610, SRJ-1016; `main()` binds the tracker's
+   * episode silently (`main()` binds the tracker's
    * `endForLatch`). Absent: no slow-recovery state is kept for the latch to
    * end.
    */
   endSlowRecovery?(key: string): void
   /**
-   * End the persona's stuck-launch episode silently (SRJ-1016; `main()`
+   * End the persona's stuck-launch episode silently (`main()`
    * binds `endStuckLaunchEpisodeForLatch`, `src/pending-row.ts`, over its
    * notice episodes). Absent: no stuck-launch episode is kept for the latch
    * to end.
@@ -1577,12 +1572,12 @@ export interface ConflictLatchHolds {
 }
 
 /**
- * The holds' set observer (b.jg5 SRJ-502): on every set, a latch, a relatch
+ * The holds' set observer: on every set, a latch, a relatch
  * and a same-case set alike and whatever the case, it stops the persona's
  * retry timer, then ends its `tmux-unresponsive` condition silently, then
  * ends its unclassified-error episode, then resets its slow-recovery count
- * and ends that episode silently (SRJ-610, SRJ-1016), then ends its
- * stuck-launch episode silently (SRJ-1016), in that order. A same-case set runs
+ * and ends that episode silently, then ends its
+ * stuck-launch episode silently, in that order. A same-case set runs
  * them too: a refusal met while P was already latched (the latch-time
  * `status` read's error included) may have armed the timer again. Each hold
  * is isolated: one that throws is logged to `log` and the next still runs.
@@ -1627,11 +1622,11 @@ export function bindConflictLatchHolds(
 }
 
 // ---------------------------------------------------------------------------
-// The re-check (b.jg5 SRJ-505): its interval, step 1's reading, the decision
+// The re-check: its interval, step 1's reading, the decision
 // ---------------------------------------------------------------------------
 
 /**
- * The re-check's interval (b.jg5 SRJ-505): at most one re-check per latched
+ * The re-check's interval: at most one re-check per latched
  * persona per 120 s, on its own timer, whatever `health_check_interval` is
  * (0 included). The first comes one interval after the persona latches,
  * each next one interval after the previous one has settled.
@@ -1646,7 +1641,7 @@ export const RECHECK_READING_NO_ROW = 'no-row'
 export const RECHECK_READING_FAILED = 'failed'
 
 /**
- * What step 1's read of the row gave (b.jg5 SRJ-505): a state, with
+ * What step 1's read of the row gave: a state, with
  * `notePresent` true when its `get` showed the latching `provenance_conflict`
  * note (a "conflicting labels" latch's read; a `status` shows no note); no
  * row; or a failed read.
@@ -1745,7 +1740,7 @@ export interface LatchRecheckDecisionInput {
   /**
    * Whether the persona's key is recorded in `retired-keys.json` now (the
    * caller reads `retiredKeyReadingOf`). While it is, a retry that would be a
-   * `resume` or a plain spawn is the reuse (b.jg5 SRJ-805).
+   * `resume` or a plain spawn is the reuse.
    */
   readonly retiredKeyRecorded: boolean
 }
@@ -1758,14 +1753,14 @@ export interface LatchRecheckDecision {
   /**
    * Present when step 1's reading clears the latch (gone, reported in, or a
    * "launch start not recorded" row read `ended` or `missing`): the
-   * recovery notice's reason (SRJ-1005).
+   * recovery notice's reason.
    */
   readonly clear?: { readonly reason: LatchRecoveryReason }
   /** True for a latch whose refused operation and case match no table row: step 1 only, with one line naming the pair. */
   readonly unmatched?: true
 }
 
-/** The states a row has reported in by (SRJ-505 step 1's second bullet): the live states other than `pending`. */
+/** The states a row has reported in by (step 1's second bullet): the live states other than `pending`. */
 const REPORTED_IN_STATES: ReadonlySet<string> = new Set(
   [...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE),
 )
@@ -1783,13 +1778,13 @@ function decided(step: LatchRecheckStep, action: LatchRecheckAction, call: Latch
   return Object.freeze({ step, action, call })
 }
 
-/** `call` as made for a key recorded in `retired-keys.json`: a `resume` or a plain spawn is the reuse (b.jg5 SRJ-805). */
+/** `call` as made for a key recorded in `retired-keys.json`: a `resume` or a plain spawn is the reuse. */
 function retiredAware(call: LatchRecheckCall, retiredKeyRecorded: boolean): LatchRecheckCall {
   return retiredKeyRecorded && (call === RECHECK_CALL_RESUME || call === RECHECK_CALL_PLAIN_SPAWN) ? RECHECK_CALL_REUSE_SPAWN : call
 }
 
 /**
- * The re-check's decision for one latched persona (b.jg5 SRJ-505), from its
+ * The re-check's decision for one latched persona, from its
  * latch record, step 1's reading and whether its key is retired. Pure; makes
  * no call.
  *
@@ -1935,14 +1930,14 @@ function tableDecision(
 
 /**
  * The launch of a "not this launch's session" latch's finished-row retry
- * (b.jg5 SRJ-505; hatch A3), from the one `get` it makes (`reading`) and
+ * (design A3), from the one `get` it makes (`reading`) and
  * whether that row has a session id: a row read `ended` or `missing` with a
  * session id gets a `resume`, one with none a reuse spawn; no row left gets
  * the plain first spawn; a row read live, `pending` included, gets no
  * launch (HO rev 28), and so does a failed read (no information). Never a
  * kill and never a plain spawn over a row. A key recorded in
  * `retired-keys.json` gets the reuse in place of a `resume` or a plain spawn
- * (b.jg5 SRJ-805). Pure.
+ * Pure.
  */
 export function decideFinishedRowLaunch(
   reading: LatchRecheckReading,
@@ -1961,7 +1956,7 @@ export function decideFinishedRowLaunch(
 }
 
 // ---------------------------------------------------------------------------
-// The re-check's verdict on a `read-pane` answer (b.jg5 SRJ-505, SRJ-117)
+// The re-check's verdict on a `read-pane` answer
 // ---------------------------------------------------------------------------
 
 /** The answer keeps the persona latched with its case (no post, record unchanged). */
@@ -2005,7 +2000,7 @@ function commonPaneVerdict(answer: LatchRecheckPaneAnswer): LatchRecheckVerdict 
     case PANE_READ_UNAVAILABLE:
     case PANE_READ_ENVIRONMENT:
     case PANE_READ_UNCLASSIFIED:
-    // b.jg5 SRJ-117: `ErrSpawnNotFound` from `read-pane`: the next re-check's read decides.
+    // `ErrSpawnNotFound` from `read-pane`: the next re-check's read decides.
     case PANE_READ_ABSENT:
       return RECHECK_VERDICT_NO_INFORMATION
     case PANE_READ_CONFIG:
@@ -2018,7 +2013,7 @@ function commonPaneVerdict(answer: LatchRecheckPaneAnswer): LatchRecheckVerdict 
 }
 
 /**
- * The probe's verdict (b.jg5 SRJ-505, SRJ-117's "Latch re-check probe" row)
+ * The probe's verdict ("Latch re-check probe" row)
  * for a latch of `latchCase` on one one-line `read-pane` answer: a pane
  * keeps "this row's own id" latched and clears "the agent's pane was not
  * found"; GONE clears both; a CONFLICT with the latch's own case keeps it
@@ -2045,8 +2040,8 @@ export function decideLatchRecheckProbe(latchCase: LatchCase, answer: LatchReche
 
 /**
  * The verdict on a "conflicting labels" latch's `read-pane` of a `pending`
- * row (b.jg5 SRJ-505, SRJ-117), which is that latch's retry, not a probe:
- * a pane or GONE clears it as a retry's answer (SRJ-506); a CONFLICT with
+ * row, which is that latch's retry, not a probe:
+ * a pane or GONE clears it as a retry's answer; a CONFLICT with
  * the latch's own case keeps it (no post), and one with another case
  * relatches (`relatch`); UNAVAILABLE, ENVIRONMENT, UNCLASSIFIED and an
  * absent row give no information; CONFIG keeps it; UNUSABLE NAME relatches.
@@ -2065,12 +2060,12 @@ export function decideLatchRecheckPendingReadPane(latchCase: LatchCase, answer: 
 }
 
 // ---------------------------------------------------------------------------
-// The re-check's clear hand-off (b.jg5 SRJ-505, SRJ-506)
+// The re-check's clear hand-off
 // ---------------------------------------------------------------------------
 
 /** Cleared by step 1's read: the row is gone, or it reported in. */
 export const RECHECK_CLEARED_BY_STEP_1 = 'step-1'
-/** Cleared by a "launch start not recorded" latch's row read `ended` or `missing` (its clear is followed by one bring-up retry, SRJ-506). */
+/** Cleared by a "launch start not recorded" latch's row read `ended` or `missing` (its clear is followed by one bring-up retry). */
 export const RECHECK_CLEARED_BY_LAUNCH_START_FINISHED = 'launch-start-finished'
 /** Cleared by a retry at the cadence (or step 1's spawn retry) that was not refused. */
 export const RECHECK_CLEARED_BY_RETRY = 'retry'
@@ -2091,7 +2086,7 @@ export type LatchRecheckClearedBy =
   | typeof RECHECK_CLEARED_BY_RESTART_DECISION
 
 /**
- * The clears that launched nothing (b.jg5 SRJ-506): step 1's, a "launch
+ * The clears that launched nothing: step 1's, a "launch
  * start not recorded" row read finished, and a "conflicting labels" latch's
  * `pending` `read-pane`. The bring-up the latch held back is still owed, so
  * the persona is retried at once after them; a retry, a finished-row retry
@@ -2106,9 +2101,9 @@ export const RECHECK_CLEARS_THAT_LAUNCHED_NOTHING: ReadonlySet<LatchRecheckClear
 /**
  * What the re-check hands off for persona P: a cleared outcome. `record` is
  * P's latch record when the round decided (the retry's latched operation).
- * `reason` is SRJ-1005's for the recovery notice. `by` says what cleared
+ * `reason` is for the recovery notice. `by` says what cleared
  * (see {@link RECHECK_CLEARS_THAT_LAUNCHED_NOTHING}). A probe that finds the
- * condition cleared is no clear: the round itself runs SRJ-506's
+ * condition cleared is no clear: the round itself runs
  * `find-missing` and single retry, whose answer may clear.
  */
 export interface LatchRecheckCleared {
@@ -2118,7 +2113,7 @@ export interface LatchRecheckCleared {
 }
 
 /**
- * The one clear hand-off (b.jg5 SRJ-505, SRJ-506): called synchronously, once
+ * The one clear hand-off: called synchronously, once
  * per cleared outcome, before any step of the clearing path that stops for a
  * latched persona (the dialog approver, a live-row sequence) and before a
  * definite failure's class handling. Must not throw (a throw is logged and
@@ -2134,8 +2129,8 @@ export interface LatchRecheckCleared {
 export type LatchRecheckClearHandOff = (key: string, cleared: LatchRecheckCleared) => void
 
 /**
- * The single retry after a probe that found the condition cleared (b.jg5
- * SRJ-506; hatch A3), for the latch `record` whose step-1 reading in the same
+ * The single retry after a probe that found the condition cleared (
+ * design A3), for the latch `record` whose step-1 reading in the same
  * re-check was `reading`: the latched operation itself. A `resume` or reuse
  * is retried as itself, only on a row read `ended` or `missing` (HO rev 28;
  * the probe is gated the same way); a plain spawn as the plain-spawn row
@@ -2144,7 +2139,7 @@ export type LatchRecheckClearHandOff = (key: string, cleared: LatchRecheckCleare
  * latch from a pane verb, a kill or a note (P's next check or recovery, P's
  * bring-up) gets one run of the restart path's decision. A key recorded in
  * `retired-keys.json` gets the reuse in place of a `resume` or a plain spawn
- * (b.jg5 SRJ-805). The hold cases are never probed: none. Pure.
+ * The hold cases are never probed: none. Pure.
  */
 export function decideClearedProbeRetry(
   record: Pick<ConflictLatchRecord, 'refusedOperation'>,
@@ -2169,7 +2164,7 @@ export function decideClearedProbeRetry(
 }
 
 // ---------------------------------------------------------------------------
-// The re-check timer (b.jg5 SRJ-505)
+// The re-check timer
 // ---------------------------------------------------------------------------
 
 /** The timers the re-check controller uses (the system clock in production, a fake clock in tests). */
@@ -2218,7 +2213,7 @@ interface LatchRecheckEntry {
 }
 
 /**
- * Build one server's re-check timers (b.jg5 SRJ-505) over an injected clock,
+ * Build one server's re-check timers over an injected clock,
  * the latch's query, the persona serializer and the round; it imports
  * nothing from the session manager. A persona's timer is armed when it goes
  * from unlatched to latched (its `observer`, bound after the holds and the
@@ -2357,7 +2352,7 @@ export const RECHECK_LINE_STEP_NOT_DECIDED = 'not-decided'
 export type LatchRecheckLineStep = LatchRecheckStep | typeof RECHECK_LINE_STEP_NOT_DECIDED
 
 /**
- * The re-check round's one line (b.jg5 SRJ-505, SRJ-1014): the persona
+ * The re-check round's one line: the persona
  * reference, the latch's case, step 1's outcome (`RECHECK_STEP_*`, or
  * {@link RECHECK_LINE_STEP_NOT_DECIDED}), the call made (`none` when it made
  * none after its read) and the answer's class, each a CSCB-written label:

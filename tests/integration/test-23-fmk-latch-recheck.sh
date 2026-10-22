@@ -18,7 +18,7 @@ SETTLE_S=30
 AGE_MARGIN_S=5
 HOLD_S=10
 
-# The test-only settings (b.2nr), scenario inputs; every value read back goes
+# The test-only settings, scenario inputs; every value read back goes
 # through the printer in "Values from the installed package", none is retyped:
 # the latch re-check interval, in config.json's `test_timer_overrides` block
 # (ms; it must stay above SETTLE_S, which the setup checks), and the
@@ -28,7 +28,7 @@ OVR_LATCH_RECHECK_MS=45000
 OVR_STARTING_SESSION_S=60
 
 # The still-latched rounds every latched persona shows before its clearing
-# round (SRJ-1422: at least two).
+# round (at least two).
 MIN_LATCHED_ROUNDS=2
 
 FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
@@ -317,7 +317,7 @@ round_call_is() {
 
 # latch_rounds <step> <key> <from-mark> <to-mark>: the round checker's
 # reader. Persona <key>'s CSCB-parented calls after <from-mark> (up to
-# <to-mark>), from E42 T1's reader (`ad_cscb_calls`), must be, in log
+# <to-mark>), from reader (`ad_cscb_calls`), must be, in log
 # order, one read of the row (READ_OF: `get` for a "conflicting labels"
 # latch, else `status`) then one call of the persona's table call (CALL_OF,
 # as round_call_is reads it) per round, or, for RECHECK_CALL_NONE, one read
@@ -750,7 +750,7 @@ p1_only() {
 # skip_early_reads <step> <key>: the persona's CSCB calls after its latch mark
 # that come before one interval from the round timer's starting point
 # (LATCH_US), where no round can be: at most one `get` (the startup
-# JSONL-persistence safeguard's, b.jg5 SRJ-122, recorded), and no other call.
+# JSONL-persistence safeguard's, recorded), and no other call.
 # Sets ROUNDS_FROM to the mark the rounds are read from.
 skip_early_reads() {
     local step="$1" key="$2" id="${PERSONA_ID[$2]}" rows pos time verb n=0
@@ -762,7 +762,7 @@ skip_early_reads() {
         [[ "${verb}" == get ]] || { calls_of "${key}" "${LATCH_MARK[${key}]}"; fail "${step}: CSCB ${verb} of ${id} at shim line ${pos}, within one interval of its latch"; }
         n=$(( n + 1 ))
         ROUNDS_FROM[${key}]="${pos}"
-        echo "${TEST_NAME}: ${step}: [recorded] a get of ${id} at shim line ${pos}, within one interval of its latch (the startup JSONL-persistence safeguard's, SRJ-122)"
+        echo "${TEST_NAME}: ${step}: [recorded] a get of ${id} at shim line ${pos}, within one interval of its latch (the startup JSONL-persistence safeguard's)"
     done <<< "${rows}"
     (( n <= 1 )) || fail "${step}: ${n} get(s) of ${id} within one interval of its latch, more than the safeguard's one"
 }
@@ -859,7 +859,7 @@ p1_note() {
 }
 
 # ---------------------------------------------------------------------------
-# Part 1, the latch life: the note latch, and AC 43's latch
+# Part 1, the latch life: the note latch, and latch
 # ---------------------------------------------------------------------------
 
 # p1_check_note_notice <step> <key>: exactly one post on the persona's channel
@@ -883,7 +883,7 @@ p1_check_note_notice() {
 }
 
 # p1_check_note_latch: the note persona latched by the start sweep's `list`
-# (SRJ-714), before any call of its id, with one post.
+#, before any call of its id, with one post.
 p1_check_note_latch() {
     local key="${CN_KEY}" step="part 1: latch life: ${CN_KEY} latches" id="${PERSONA_ID[${CN_KEY}]}" set_line rows n
     set_line="$(fmk_text conflictLatchSetLine "${key}" "${CASE_OF[${key}]}" "${SESSION_OF[${key}]}" "${OP_OF[${key}]}" "${LATCH_ROW_OF[${key}]}")" \
@@ -938,7 +938,7 @@ p1_latch_life() {
 }
 
 # ---------------------------------------------------------------------------
-# Part 1: AC 43's two harness steps, the clears, and the loop
+# Part 1: two harness steps, the clears, and the loop
 # ---------------------------------------------------------------------------
 
 # p1_ac43 [harness]: right after the held-dialog persona's round k (k =
@@ -954,7 +954,7 @@ p1_note_release() {
     P1_ENTER_MARK="$(ad_shim_mark)"
 }
 
-# p1_note_clear [harness]: after AC 43's clear, the store-wide find-missing
+# p1_note_clear [harness]: after clear, the store-wide find-missing
 # of its after-clear run (CSCB's; awaited, not asserted here); which run
 # removes the note is logged (ruling S8). The harness then starts its
 # find-missing loop; once a harness get shows no note, the note persona's
@@ -964,7 +964,7 @@ p1_note_clear() {
     _scenario_poll_until "${SETTLE_S}" cscb_find_missing_after "${P1_ENTER_MARK}" || true
     read_note "${step}" "${id}"
     if [[ -z "${ROW_NOTE}" ]]; then
-        who="the store-wide find-missing after AC 43's clear"
+        who="the store-wide find-missing after clear"
     else
         who="the harness's find-missing loop"
     fi
@@ -1244,7 +1244,7 @@ p2_no_row() {
     [[ "${rows}" == 0 ]] || fail "part 2: set-up: the store holds ${rows} row(s) with id ${PERSONA_ID[$1]}, not none"
 }
 
-# The own-id persona [harness]: E39's scenario 10 part B statement on its
+# The own-id persona [harness]: scenario 10 part B statement on its
 # live row, its worker running and its session past the bound.
 p2_setup_own_id() {
     local step="part 2: set-up: ${OI_KEY}'s row marked finished" id="${PERSONA_ID[${OI_KEY}]}" session="${PERSONA_NAMED[${OI_KEY}]}" ended
@@ -1269,7 +1269,7 @@ p2_setup_pane_gone() {
     echo "${TEST_NAME}: ${step}: pane and new pid ${out}; ${session} (${SEED_SID[${PN_KEY}]}) kept; ${id} still reads waiting ${HOLD_S} s later (no SessionEnd on the respawn)"
 }
 
-# The unusable-name persona [harness]: E39's scenario 25 statement on its
+# The unusable-name persona [harness]: scenario 25 statement on its
 # finished row.
 p2_setup_unusable() {
     local step="part 2: set-up: ${UN_KEY}'s recorded name made unusable" id="${PERSONA_ID[${UN_KEY}]}"
@@ -1302,7 +1302,7 @@ p2_setup_relabel() {
     echo "${TEST_NAME}: ${step}: ${session} (${SEEDED_SESSION_ID}, window ${SEED_WID[${key}]}, worker pane ${SEEDED_PANE_ID}) labelled with token ${SEEDED_TOKEN}; the row records ${current} and reads waiting"
 }
 
-# The "launch start not recorded" persona [harness]: E39's statement
+# The "launch start not recorded" persona [harness]: statement
 # (ad_store_pending_no_launch) on its live row, its worker running; the
 # harness never ends this session (PM decision Q1).
 p2_setup_no_launch() {
@@ -1370,7 +1370,7 @@ wait_latch_set() {
 
 # check_conflict_notice <step> <key> [<case> <from-index>]: exactly one post
 # on the persona's channel since the latch life began (or from <from-index>
-# on), the CONFLICT notice, its lines in SRJ-1004's order for its case (the
+# on), the CONFLICT notice, its lines in the contract order for its case (the
 # latch's, or <case> for a relatch); every line but the description line
 # equals the printed line; the description holds the case phrase.
 check_conflict_notice() {
@@ -1402,7 +1402,7 @@ check_conflict_notice() {
         for i in "${!expected[@]}"; do
             printf '  | expected line %d: %q\n' "$(( i + 1 ))" "${expected[i]}" >&2
         done
-        fail "${step}: the CONFLICT notice's lines are not, in order, the ones SRJ-1004 gives case ${lcase}"
+        fail "${step}: the CONFLICT notice's lines are not, in order, the ones gives case ${lcase}"
     fi
     desc="${PARTS[1]}"
     [[ "${desc}" == "${DESC_HEAD}"*"${DESC_TAIL}" ]] || fail "${step}: the notice's second line is not a description line: ${desc}"
@@ -1415,7 +1415,7 @@ check_conflict_notice() {
 
 # check_launch_start_notice <step> <key>: exactly one post on the persona's
 # channel since the latch life began holds the launch-start notice head, and
-# it is SRJ-1020's notice as printed (`launchStartNotRecordedNoticeText` for
+# it is notice as printed (`launchStartNotRecordedNoticeText` for
 # the key, with the persona prefix), so it names no command.
 check_launch_start_notice() {
     local step="$1" key="$2" notice
@@ -1433,7 +1433,7 @@ check_launch_start_notice() {
 
 # check_unusable_notice <step> <key>: exactly one post on the persona's
 # channel since the latch life began holds the unusable-name notice head,
-# and it is SRJ-1019's notice: the persona prefix, then
+# and it is notice: the persona prefix, then
 # `unusableNameNoticeText`'s text for the key around the quoted description
 # (its fixed parts: the head, `cscb_<key>`, the pointer to "Operator
 # actions"), the description holding the unusable-name phrase and the

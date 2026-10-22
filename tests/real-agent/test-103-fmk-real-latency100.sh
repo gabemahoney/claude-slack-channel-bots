@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# b.omv SR-14.4: heavy scenario, outside /ci gate discovery.
+# heavy scenario, outside /ci gate discovery.
 set -euo pipefail
 TEST_NAME="test-103-fmk-real-latency100"
 source "$(dirname "$0")/../integration/lib/scenario.sh"

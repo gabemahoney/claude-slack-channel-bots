@@ -17,15 +17,15 @@
  * request's relay window elapsed, Claude fell back to its own tmux pane, and
  * AD refuses the verdict. The session is healthy, so the handler neither
  * retries nor touches the session — it repaints the prompt message to say the
- * answer must now be given at the pane (b.qi1).
+ * answer must now be given at the pane.
  *
  * `ErrInvalidFlags` from `decide` is logged once and not retried, and it
  * starts one immediate agent-director version re-check through the
- * `ErrInvalidFlags` step in `src/ad-error-class.ts` (b.jg5 SRJ-204, SRJ-104).
+ * `ErrInvalidFlags` step in `src/ad-error-class.ts`.
  * The re-check is started, not awaited: the Slack interactive ack waits on
- * this handler's return, so awaiting it would delay the ack (SRJ-122).
+ * this handler's return, so awaiting it would delay the ack.
  *
- * Clicks resolve through the receiving persona (b.av2 SR-7.1): the persona
+ * Clicks resolve through the receiving persona: the persona
  * whose connection received the click. Its key keys the outage state around
  * `decide`, and the verdict update and the relay-fallen-back repaint go
  * through its client, to the channel and `ts` recorded on the live entry. A
@@ -37,7 +37,7 @@
  * is its `D…` ID, and the persona comes from the receiving connection, never
  * from a channel lookup. Nothing here reads the persona's current destination
  * or DMs switch, so a DM prompt stays answerable after DMs were turned off
- * (b.av2 SR-5.1: an update is not a post). The click path never posts and
+ * (an update is not a post). The click path never posts and
  * never calls `conversations.open`.
  *
  * SPDX-License-Identifier: MIT
@@ -91,7 +91,7 @@ export interface ClickDeps {
   getPersona: (key: string) => Persona | undefined
   log?: (...args: unknown[]) => void
   /**
-   * Trail emitter hook (SR-V). Defaults to `emitTrail` from
+   * Trail emitter hook. Defaults to `emitTrail` from
    * `permission-trail.ts`. Tests override with a capture stub.
    */
   emitTrail?: (
@@ -99,7 +99,7 @@ export interface ClickDeps {
   ) => void
   /**
    * The immediate agent-director version re-check a `decide` answering
-   * `ErrInvalidFlags` runs (b.jg5 SRJ-204, SRJ-104). Defaults to
+   * `ErrInvalidFlags` runs. Defaults to
    * `triggerAdVersionRecheck` (`src/ad-version-gate.ts`). Tests inject a
    * counting stub.
    */
@@ -112,7 +112,7 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
 }
 
 /**
- * SR-V-2.7 call-side classification of an agent-director `decide` error.
+ * call-side classification of an agent-director `decide` error.
  * Mirrors the existing branches in `handlePermissionClick`'s catch so the
  * trail's `result_class` is identical to the operational discriminator.
  */
@@ -124,7 +124,7 @@ function classifyAdDecideError(err: unknown): AdDecideResponseClass {
   return 'other'
 }
 
-// Match the poller's SR-2.4 terminal verdict text exactly so the click-handler
+// Match the poller's terminal verdict text exactly so the click-handler
 // render and the next-tick reconciliation render are byte-identical — no
 // visible flicker.
 function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
@@ -140,7 +140,7 @@ function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
 }
 
 /**
- * b.qi1 — message body for a click AD refused with `ErrRelayFallenBack`. The
+ * message body for a click AD refused with `ErrRelayFallenBack`. The
  * request's relay window elapsed before the click landed, so Claude already
  * fell back to asking at its own tmux pane and AD will not record a verdict
  * nothing would read. The session is alive and unharmed; only THIS prompt is
@@ -161,7 +161,7 @@ function buildRelayFallenBackBlocks(): unknown[] {
 
 /**
  * Render a terminal state over a live prompt's Slack message through the
- * receiving persona's client and emit the SR-V-2.5
+ * receiving persona's client and emit the
  * `cscb.chat_update.attempted` event. Returns true when Slack accepted the
  * update. When the persona's client is unavailable, logs one line and makes
  * no update (decide has already happened; the next poller tick reconciles
@@ -207,7 +207,7 @@ async function renderPromptUpdate(
     emit({ ...envelope, ok: true })
     return true
   } catch (err) {
-    // b.emk: failures land in BOTH server.log and the trail JSONL.
+    // failures land in BOTH server.log and the trail JSONL.
     logDeps(
       deps,
       `[slack] permission-click: decision chat.update failed for ${entry.instanceId}${describeSlackCallFailure(err)}`,
@@ -219,10 +219,10 @@ async function renderPromptUpdate(
 
 /**
  * Inbound context captured from the Socket Mode interactive payload. Used by
- * the SR-V-2.6 `cscb.click_handler.invoked` event so investigations can
+ * the `cscb.click_handler.invoked` event so investigations can
  * pivot by clicking user or by the Slack message being clicked against.
  * Optional so unit-test call sites can omit it; the trail event records the
- * fields as undefined/missing when not supplied (open envelope per SR-V-1).
+ * fields as undefined/missing when not supplied (open envelope ).
  */
 export interface ClickInteractionContext {
   /** Inbound Slack channel id from the interactive payload. */
@@ -250,7 +250,7 @@ export async function handlePermissionClick(
 
   const { decision, instanceId, requestToken } = parsed
   const emit = deps.emitTrail ?? defaultEmitTrail
-  // SR-V-2.6: live_pending captures the click-time state. Read the entry
+  // live_pending captures the click-time state. Read the entry
   // here so the trail event records the value at handler entry, before any
   // markHandled / drop later in this function (or in the next tick) mutates
   // the map.
@@ -296,10 +296,10 @@ export async function handlePermissionClick(
     return true
   }
 
-  // SR-4.1, SR-4.2, SR-7.2: AD is the source of truth. Always call decide
+  // AD is the source of truth. Always call decide
   // with the decoded request_token — including for stale clicks whose
   // composite key is no longer in the pending map. This is the click's ONLY
-  // AD interaction (SR-4.3 retires the pre-decide get).
+  // AD interaction (retires the pre-decide get).
   const decideEnvelope = {
     event: 'cscb.ad_decide.attempted',
     instance_id: instanceId,
@@ -314,7 +314,7 @@ export async function handlePermissionClick(
         request_token: requestToken,
       }),
     )
-    // SR-V-2.7 call-side success emission.
+    // call-side success emission.
     emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass, delivery: result.delivery, confirm_by: result.confirm_by })
     if (result.delivery !== 'delivered') {
       const pending = getLivePermission(instanceId, requestToken)
@@ -328,7 +328,7 @@ export async function handlePermissionClick(
       err instanceof AgentDirectorError &&
       (isAdErrorInstance(err, ErrSystemInstallDisappeared) || classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT)
     ) {
-      // SR-V-2.7 ad/tmux carve-out: the wrapper already raised the outage
+      // ad/tmux carve-out: the wrapper already raised the outage
       // flag (one Slack onset alert via the state machine). Forensic
       // requirement: the trail JSONL must still carry the typed error name
       // and message so post-incident debugging can correlate the click
@@ -341,7 +341,7 @@ export async function handlePermissionClick(
       emit({ ...decideEnvelope, result_class, raw_error_message })
       return true
     }
-    // SR-V-2.7 call-side failure emission. Classify against the same AD
+    // call-side failure emission. Classify against the same AD
     // error names the existing branches discriminate on so the trail's
     // result_class stays consistent with src/agent-director-errors.ts. The
     // existing logDeps operational logging is preserved alongside the
@@ -353,17 +353,17 @@ export async function handlePermissionClick(
       result_class,
     }
     if (result_class === 'other') {
-      // Kept for forensics (SR-V-2.7), but redacted first: the trail is a
+      // Kept for forensics, but redacted first: the trail is a
       // server-written file, and a thrown message can hold a URL or a token.
       const raw = err instanceof Error ? err.message : String(err)
       emission['raw_error_message'] = redactSlackLogText(raw)
     }
     emit(emission)
 
-    // SR-4.4: ErrAlreadyDecided is silently swallowed — the next poller tick
-    // reconciles the operator-visible Slack rendering via SR-2.4 / SR-5.
+    // ErrAlreadyDecided is silently swallowed — the next poller tick
+    // reconciles the operator-visible Slack rendering via.
     if (err instanceof ErrAlreadyDecided) return true
-    // b.qi1: the relay window for this request elapsed before the click landed.
+    // the relay window for this request elapsed before the click landed.
     // AD refuses the verdict because Claude has already fallen back to asking
     // at its own tmux pane. Nothing is broken and nothing is retryable here —
     // re-deciding would fail identically, and killing or respawning the session
@@ -396,19 +396,19 @@ export async function handlePermissionClick(
     }
     if (isInvalidFlagsError(err)) {
       logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${instanceId} (request_token=${requestToken})`)
-      // b.jg5 SRJ-204, SRJ-104: the ErrInvalidFlags step — one immediate
+      // the ErrInvalidFlags step — one immediate
       // version re-check (a stop it decides ends the process), class
       // UNCLASSIFIED. The line above, the trail event, the no-retry and the
-      // return value stay as they are (SRJ-122).
+      // return value stay as they are.
       //
       // Started, not awaited: the router acks the Slack interactive payload
       // only after this handler returns, and a slow re-check (up to its time
-      // limit) would hold that ack past Slack's window (SRJ-122). The step
+      // limit) would hold that ack past Slack's window. The step
       // never rejects; the `.catch` only guards against an unhandled rejection.
       void classifyWithInvalidFlagsRecheck(err, deps.recheckAdVersion).catch(() => {})
       return true
     }
-    // ErrAmbiguousRequest is a defense-in-depth backstop per SR-4.4; under
+    // ErrAmbiguousRequest is a defense-in-depth backstop; under
     // contract it should be unreachable.
     if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') {
       logDeps(deps, `[slack] permission-click: ErrAmbiguousRequest from decide for ${instanceId} (request_token=${requestToken})`)
@@ -418,13 +418,13 @@ export async function handlePermissionClick(
     return true
   }
 
-  // SR-4.2 stale-click semantics: decide already fired; no live entry means
+  // stale-click semantics: decide already fired; no live entry means
   // nothing to render against here. (The poller's reconciliation tick will
   // surface the closure on whichever Slack message currently tracks it.)
   const entry = getLivePermission(instanceId, requestToken)
   if (!entry) return true
 
-  // SR-4.5 sibling independence: target only this row's messageTs.
+  // sibling independence: target only this row's messageTs.
   const text = decision === 'allow'
     ? '*Permission* — Allowed'
     : '*Permission* — Denied by operator'
@@ -438,11 +438,11 @@ export async function handlePermissionClick(
 }
 
 // ---------------------------------------------------------------------------
-// SR-V-2.9 inbound block_actions emission
+// inbound block_actions emission
 // ---------------------------------------------------------------------------
 
 /**
- * Classify a `block_actions` action_id for the SR-V-2.9 trail event without
+ * Classify a `block_actions` action_id for the trail event without
  * mutating state. Exported so `src/server.ts`'s `socket.on('interactive')`
  * handler stays a thin wiring layer and so this branch can be unit-tested
  * in isolation (server.ts has module-load side effects and is not directly
@@ -468,7 +468,7 @@ export interface BlockActionTrailContext {
 /**
  * Emit one `cscb.block_action.received` event for an inbound `block_actions`
  * action_id. Called once per action in the payload's `actions` array,
- * regardless of whether the action_id decodes (SR-V-2.9 — the
+ * regardless of whether the action_id decodes (— the
  * decode-failure case is the diagnostically critical surface for
  * "I clicked Allow and nothing happened").
  */

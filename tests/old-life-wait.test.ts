@@ -3,11 +3,10 @@ import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 useImmediateTypingLifecycle()
 /**
- * old-life-wait.test.ts — The old-life hold: start and end (b.jg5 SRJ-809;
- * SRJ-703's old-life clause, SRJ-714's sweep holds, SRJ-715's teardown hold,
- * SRJ-812's kill-failed mark), and the old-life wait's steps (SRJ-811,
- * SRJ-812, SRJ-1512). E27 T1 builds the holds; T2 the wait's steps; T3
- * (what a hold refuses, SRJ-810, SRJ-809's admission clause, AC 53, and the
+ * old-life-wait.test.ts — The old-life hold: start and end (
+ * old-life clause sweep holds teardown hold,
+ * kill-failed mark), and the old-life wait's steps. builds the holds; the wait's steps;
+ * (what a hold refuses admission clause, and the
  * gates that start a wait in production) extends this file.
  *
  * - The hold set (`createOldLifeHoldSet`, src/retired-keys.ts) over its own
@@ -39,15 +38,15 @@ useImmediateTypingLifecycle()
  *   kept or spared for a latch, `pending` included; none for a marked key, a
  *   finished row or a key not recorded; none once the sweep's shutdown
  *   query answers true.
- * - Ends that are not kill outcomes (AC 54, AC 63): a teardown kill and a
+ * - Ends that are not kill outcomes: a teardown kill and a
  *   sweep kill, whatever they answer (a success with `kill_sent` true or
  *   false, gone, a CONFLICT, an UNUSABLE NAME, UNAVAILABLE, a failure), end
  *   no hold; only the tries that decided the ordinary kill-failure alert
- *   mark it kill-failed (SRJ-812), a failure after a survivor-naming one
+ * mark it kill-failed, a failure after a survivor-naming one
  *   (UNAVAILABLE, a CONFLICT) included, never the survivor version.
  * - The new life: a reuse that begins the key's new life ends its hold,
  *   also when the mark's write failed; another key's reuse ends none. A
- *   reuse that timed out but launched (SRJ-407, SRJ-806; on a harness built
+ * reuse that timed out but launched (on a harness built
  *   with `harnessNow`, the reuse timed by `scriptTimedLaunch`), its one `get`
  *   reading this launch's row inside the call's window, ends the hold with
  *   the new-life reason and its own read name, and the persona waiting on it
@@ -58,7 +57,7 @@ useImmediateTypingLifecycle()
  *   whose teardown kill failed) keeps P's own live row, whose `cwd` matches
  *   P, and begins its hold; a row that reads `ended` rebuilds none.
  *
- * - The wait (E27 T2), started through the session manager's ensure entry
+ * - The wait , started through the session manager's ensure entry
  *   (`h.startOldLifeWait`, `h.runOldLifeWait`) on an old row held at P's
  *   working directory, so P waits on it, for each id form (a renamed-away
  *   key's own `cscb_<old>`, a pre-persona row's id, an id that is not its
@@ -67,14 +66,13 @@ useImmediateTypingLifecycle()
  *   the old id, with no launch and no timer for the old key; a configured
  *   persona's own row in a run's `unverified_ids` gets its one `get`; a
  *   wait and a live-row sequence never run at once on one id (held
- *   `find-missing`). Its results by class (SRJ-811, SRJ-702, SRJ-717,
- *   SRJ-1002, SRJ-1013), for every id form, UNAVAILABLE and ENVIRONMENT at
+ * `find-missing`). Its results by class, for every id form, UNAVAILABLE and ENVIRONMENT at
  *   the kill and at the `get`, CONFIG, UNCLASSIFIED and a STATE answer at
  *   the `get`, and UNAVAILABLE at a run included: what the calls are, the
  *   round's one end line (a failed `get` or run's naming the failing
  *   answer's class, a class with no end of its own a failed call), whether
  *   the hold goes on and is
- *   marked kill-failed (SRJ-812), the waiting persona armed uncounted, the
+ * marked kill-failed, the waiting persona armed uncounted, the
  *   outages raised for it, the kill-failure alert's own line (its version on
  *   the not-configured, log-only route), the exact startup-errors entries
  *   (`persona-kill-failed`, `persona-kill-survivor`,
@@ -83,15 +81,14 @@ useImmediateTypingLifecycle()
  *   `ad-config-malformed` for the waiting persona, a later round's
  *   successful call clearing `ad-config-malformed` but never
  *   `tmux-unavailable`; UNCLASSIFIED reported once per round that keeps the
- *   hold to the wait's own unclassified-error episode on the held id (E12:
- *   nothing at the first round, the one log-only `persona-unclassified-error`
+ * hold to the wait's own unclassified-error episode on the held id ( * nothing at the first round, the one log-only `persona-unclassified-error`
  *   entry at the first round past the alert threshold, none later; the
  *   hold's end ends it; a round a shutdown stopped reports nothing; its
  *   lines name `instanceId=<id>` and say the row is an old life the server
  *   is ending, a configured persona's own row included); the
  *   session a stand-in id's alert names (the start sweep's listing, else
  *   "unknown"); an UNUSABLE NAME at a `get`, a run or a `status` read
- *   routed; SRJ-408's old `pending` row with no launch start killed and run
+ * routed old `pending` row with no launch start killed and run
  *   at once; a configured persona's own row stopping at that persona's
  *   latch (a read latch keeps the ordinary alert and marks the hold; a
  *   latched persona's row gets no kill and no `get`; the persona latched
@@ -102,28 +99,28 @@ useImmediateTypingLifecycle()
  *   latch never stopping a wait on another id, and two waiters' own
  *   launching sequences starting beside a wait on another id. The wait's
  *   ends (its hold's end, the registry's close), its kill keeping its tries
- *   while no persona is up and stopped by a shutdown (AC 64), and a hold
- *   that ends while its kill runs (SRJ-811's Test line, option A): between
+ * while no persona is up and stopped by a shutdown, and a hold
+ * that ends while its kill runs (Test line, option A): between
  *   tries (also when a new hold is begun on the id before the next try), at
  *   the `status` read, during the third try that answers UNAVAILABLE, in the
  *   very try that names the survivor, and in the same window as a shutdown
  *   stop, each a success. Step 5's exact alert text per id form is
  *   tests/live-row-sequence.test.ts's. A wait round that a configured
  *   persona's own-row latch stopped arms only the waiting personas that are
- *   not latched (SRJ-305), with one latched line for each that is; a
+ * not latched, with one latched line for each that is; a
  *   waiting persona not up or held on `ErrInvalidFlags` is never armed (one
  *   skip line at each arm, the hold step's line naming the skip) and not
- *   retried at its hold's end (SRJ-305), while an arm asked for that fails
+ * retried at its hold's end, while an arm asked for that fails
  *   or throws is named "could not be armed". The
  *   start sweep's listing of a same-key row `pending` seeds its hold's first
  *   wait `pending`, so with `ad-config-malformed` raised that wait makes no
- *   kill (SRJ-316).
+ * kill.
  *
- * - What a hold refuses (E27 T3; SRJ-810, SRJ-1502, SRJ-1505, SRJ-809's
- *   admission clause, SRJ-811's persona-waits half), on the harness that
+ * - What a hold refuses (
+ * admission clause persona-waits half), on the harness that
  *   composes the gate, the restart hook, the reconnect guard, the admission
  *   driver (`h.admitSession`) and the end-retry observer
- *   (`h.holdEndRetries`) as `main()` does: AC 53 for a renamed-away key's old
+ * (`h.holdEndRetries`) as `main()` does: for a renamed-away key's old
  *   life in the directory a different persona names and for a destructive
  *   modify's same-key old life (a session from D refused as held with one
  *   line, the reconnect guard and P's restart run typing nothing into the
@@ -131,14 +128,14 @@ useImmediateTypingLifecycle()
  *   rebuilt hold refusing a session from P's directory; the launch gate end
  *   to end (no call for Q, sequence-waiting, the wait started once, Q armed
  *   uncounted, B beside it up, Q retried at once at the clock time of the
- *   end with a plain first spawn); SRJ-810's same-key exception (the new
+ * end with a plain first spawn)same-key exception (the new
  *   half's reuse collides and its sequence replaces the old life, no gate);
  *   each failed sweep-kill source of Q-9 making P wait on that row's id; a
  *   persona already running when its directory becomes held (no call from its
  *   restart run until the hold ends, then nothing left to recover); and
  *   what stops the wait: the only waiter's teardown (with no further call,
  *   and between its kill's tries with the stopped-retry line and the old
- *   key's `persona-kill-failed` entry with no alert text, AC 64), never a
+ * key's `persona-kill-failed` entry with no alert text), never a
  *   teardown while another persona waits (its kill keeps its tries), and a
  *   shutdown. The multi-waiter setup production reaches (two personas in
  *   one directory are refused by config validation): B's own row swept for
@@ -470,7 +467,7 @@ function harnessAfterEach(): void {
 /** The harness's holds, in begin order, as a case asserts them. */
 const holdsOf = (h: RecoveryHarness): HoldFields[] => h.oldLifeHolds.snapshot().map(fieldsOf)
 
-/** A live pre-persona row (b.1ix): only the `service` and `channel` labels. */
+/** A live pre-persona row: only the `service` and `channel` labels. */
 function prePersonaRow(state = 'waiting'): ListRow {
   const id = `cscb_old_${state}_C0OLD`
   return cannedListRow({ instance_id: id, state, labels: { ...PRE_PERSONA_LABELS }, tmux_session_name: id.replace(/^cscb_/, 'slack_bot_') })
@@ -480,7 +477,7 @@ function prePersonaRow(state = 'waiting'): ListRow {
 // The hold set
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809: the hold set — begin, re-point, end, the real-path queries, who waits and the kill-failed mark', () => {
+describe('the hold set — begin, re-point, end, the real-path queries, who waits and the kill-failed mark', () => {
   let dir: string
   let lines: string[]
   let set: OldLifeHoldSet
@@ -621,7 +618,7 @@ describe('b.jg5 SRJ-809: the hold set — begin, re-point, end, the real-path qu
     expect(view.waiting).toEqual(['neighbour'])
     set.end('cscb_old', OLD_LIFE_HOLD_END_READ_ENDED)
     expect(endedLinesIn(lines)).toEqual([oldLifeHoldEndedLine(view, OLD_LIFE_HOLD_END_READ_ENDED)])
-    expect(endedLinesIn(lines)[0]).toContain('waiting personas: neighbour ')
+    expect(endedLinesIn(lines)[0]).toEndWith('waiting personas: neighbour')
   })
 
   test('the kill-failed mark: set only on a held id, read through each persona waiting on it, and lasting until the hold ends', () => {
@@ -659,7 +656,7 @@ describe('b.jg5 SRJ-809: the hold set — begin, re-point, end, the real-path qu
 // The end rule at the one read entry
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809: the one read entry ends a hold only on a read of ended or missing, no row, or a find-missing run\'s ids', () => {
+describe('the one read entry ends a hold only on a read of ended or missing, no row, or a find-missing run\'s ids', () => {
   let dir: string
   let lines: string[]
   let set: OldLifeHoldSet
@@ -728,7 +725,7 @@ describe('b.jg5 SRJ-809: the one read entry ends a hold only on a read of ended 
 // Start 1: apply step 1 (the pure begin list)
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809 start 1: apply step 1 holds each key it records at the old declaration\'s working directory (oldLifeHoldsToBegin)', () => {
+describe('start 1: apply step 1 holds each key it records at the old declaration\'s working directory (oldLifeHoldsToBegin)', () => {
   let dir: string
 
   afterEach(() => {
@@ -792,7 +789,7 @@ describe('b.jg5 SRJ-809 start 1: apply step 1 holds each key it records at the o
 // Start 1 end to end: a later live read re-points apply step 1's hold
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809 start 1 end to end: a later read of the old row as live with another cwd re-points apply step 1\'s hold to that cwd (real launch)', () => {
+describe('start 1 end to end: a later read of the old row as live with another cwd re-points apply step 1\'s hold to that cwd (real launch)', () => {
   let rh: ReloadHarness | undefined
 
   afterEach(async () => {
@@ -812,7 +809,7 @@ describe('b.jg5 SRJ-809 start 1 end to end: a later read of the old row as live 
 
   // A rename's new half shares bravo's directory, so its bring-up is held back and starts the old-life wait on
   // cscb_bravo (installed, as main() installs it); that round's kill answers a CONFLICT too, so the row stays live,
-  // the hold is kept and bravo2 is armed (SRJ-811). A removal has no persona waiting, so no wait starts.
+  // the hold is kept and bravo2 is armed. A removal has no persona waiting, so no wait starts.
   test.each<[string, (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[], string | undefined]>([
     ['a removal of bravo', (alpha) => [alpha], undefined],
     ['a rename of bravo to bravo2', (alpha, bravo) => [alpha, { ...bravo, name: 'bravo2' }], 'bravo2'],
@@ -861,7 +858,7 @@ describe('b.jg5 SRJ-809 start 1 end to end: a later read of the old row as live 
 // Starts 2 and 3: the start sweep
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd of each live row it failed to kill and of each live row of a key recorded without its mark', () => {
+describe('starts 2 and 3, the start sweep holds the cwd of each live row it failed to kill and of each live row of a key recorded without its mark', () => {
   afterEach(harnessAfterEach)
 
   test('every kill failing (ErrTmuxKillFailed through the tries): an absent persona\'s row, a live pre-persona row, a row swept for its instance id and one swept for its cwd are each held at the row\'s cwd and marked kill-failed; the absent key, just recorded, was held by the listing first; one began line each; nothing ends them', async () => {
@@ -984,7 +981,7 @@ describe('b.jg5 SRJ-809 starts 2 and 3, SRJ-714: the start sweep holds the cwd o
 /** One queued answer to a kill. */
 type KillAnswer = NonNullable<RecoveryStubScript['killQueue']>[number]
 
-/** Each answer a kill's tries can end with, the script giving it, and whether it decides the ordinary kill-failure alert (SRJ-812). */
+/** Each answer a kill's tries can end with, the script giving it, and whether it decides the ordinary kill-failure alert. */
 const KILL_ANSWERS: ReadonlyArray<readonly [string, () => RecoveryStubScript, boolean]> = [
   ['ErrTmuxKillFailed at every try (the ordinary alert)', () => ({ killError: errTmuxKillFailed() }), true],
   ['a survivor-naming ErrTmuxKillFailed, then a success (the survivor version)', () => ({ killQueue: [cannedErr(errTmuxKillFailed(undefined, 'pane-process-survived')), cannedOk(cannedKillResult(true))] }), false],
@@ -994,19 +991,19 @@ const KILL_ANSWERS: ReadonlyArray<readonly [string, () => RecoveryStubScript, bo
     true,
   ],
   [
-    'a survivor-naming ErrTmuxKillFailed, then a CONFLICT (also the ordinary alert, SRJ-702)',
+    'a survivor-naming ErrTmuxKillFailed, then a CONFLICT (also the ordinary alert)',
     () => ({ killQueue: [cannedErr(errTmuxKillFailed(undefined, 'pane-process-survived')), cannedErr(errTmuxSessionConflict('kill', 'different-id'))] }),
     true,
   ],
   ['a success with kill_sent true', () => ({ killResult: cannedKillResult(true) }), false],
-  ['a success with kill_sent false (AC 63)', () => ({ killResult: cannedKillResult(false) }), false],
+  ['a success with kill_sent false', () => ({ killResult: cannedKillResult(false) }), false],
   ['ErrSpawnNotFound at the kill (gone: a success)', () => ({ killError: errSpawnNotFound() }), false],
-  ['a CONFLICT (AC 54)', () => ({ killError: errTmuxSessionConflict('kill', 'different-id') }), false],
+  ['a CONFLICT', () => ({ killError: errTmuxSessionConflict('kill', 'different-id') }), false],
   ['an UNUSABLE NAME', () => ({ killError: errUnusableName() }), false],
   ['UNAVAILABLE at every try (ErrTmuxUnresponsive: no ordinary alert)', () => ({ killError: errTmuxUnresponsive('kill') }), false],
 ]
 
-describe('b.jg5 SRJ-809, SRJ-703, SRJ-812 (AC 54, AC 63): no kill outcome ends a hold; only tries that decided the ordinary kill-failure alert mark it kill-failed', () => {
+describe('no kill outcome ends a hold; only tries that decided the ordinary kill-failure alert mark it kill-failed', () => {
   afterEach(harnessAfterEach)
 
   test.each(KILL_ANSWERS)('the persona teardown\'s kill of P\'s held old life answering %s: the hold stays, with no end line', async (_label, script, marks) => {
@@ -1037,7 +1034,7 @@ describe('b.jg5 SRJ-809, SRJ-703, SRJ-812 (AC 54, AC 63): no kill outcome ends a
 // The new life
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809, SRJ-806: a reuse that begins the key\'s new life ends its hold', () => {
+describe('a reuse that begins the key\'s new life ends its hold', () => {
   afterEach(harnessAfterEach)
 
   test.each<[string, boolean]>([
@@ -1056,7 +1053,7 @@ describe('b.jg5 SRJ-809, SRJ-806: a reuse that begins the key\'s new life ends i
     expect(h.retiredEntry(p).marked).toBe(true)
     expect(holdsOf(h)).toEqual([fieldsOf(bHold)])
     expect(endedLinesIn(h.errors)).toEqual([oldLifeHoldEndedLine(pHold, OLD_LIFE_HOLD_END_NEW_LIFE, OLD_LIFE_NEW_LIFE_READ)])
-    // The reuse that began the new life left P's timer armed pending-only for its row (b.jg5 SRJ-301, SRJ-409); B has none.
+    // The reuse that began the new life left P's timer armed pending-only for its row; B has none.
     expectPendingOnlyWatch(h, p)
     expect(h.controller.armedKeys()).toEqual([p])
     h.controller.stop(p, 'the case is over')
@@ -1067,7 +1064,7 @@ describe('b.jg5 SRJ-809, SRJ-806: a reuse that begins the key\'s new life ends i
 // The restart
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-809, SRJ-714 (hatch A3): after a restart the start sweep rebuilds the holds still needed from its list and the record', () => {
+describe('(hatch A3): after a restart the start sweep rebuilds the holds still needed from its list and the record', () => {
   afterEach(harnessAfterEach)
 
   /** P recorded as a destructive modify's old half (a credentials_file change whose teardown kill failed), with no mark, as the record a restart reads. */
@@ -1095,7 +1092,7 @@ describe('b.jg5 SRJ-809, SRJ-714 (hatch A3): after a restart the start sweep reb
     expect(h.oldLifeHolds.holdsWaitedOnBy(personaOf(h, p)).map((view) => view.instanceId)).toEqual([personaInstanceId(p)])
   })
 
-  test('SRJ-809\'s admission clause (AC 53): after the restart, with the sweep\'s hold on P\'s kept own row, a session from P\'s directory is no persona\'s, P up, with one line naming cscb_<P>; a session from B\'s is B\'s', async () => {
+  test('admission clause: after the restart, with the sweep\'s hold on P\'s kept own row, a session from P\'s directory is no persona\'s, P up, with one line naming cscb_<P>; a session from B\'s is B\'s', async () => {
     const { h, p, b } = build(RECORDED_P)
     await sweepOver(h, [listed(h, p)])
     const real = realpathSync(personaOf(h, p).working_directory)
@@ -1116,17 +1113,17 @@ describe('b.jg5 SRJ-809, SRJ-714 (hatch A3): after a restart the start sweep reb
 })
 
 // ===========================================================================
-// The wait's steps (b.jg5 SRJ-811, SRJ-812, SRJ-1512; E27 T2)
+// The wait's steps
 //
 // Every case holds an old row at P's working directory (so P waits on it)
 // and starts its wait through the session manager's ensure entry
 // (`h.startOldLifeWait`, `h.runOldLifeWait`), on the recovery harness whose
 // wait bindings, registry and holds are composed as `main()` composes them.
 // The gates that start a wait in production, and the persona-waits cases,
-// are E27 T3's section at the end of this file.
+// are section at the end of this file.
 // ===========================================================================
 
-/** An old row a wait runs on (b.jg5 SRJ-809, SRJ-1007): its id, its old key, and the row as a `get` reads it (live `waiting` unless overridden). */
+/** An old row a wait runs on: its id, its old key, and the row as a `get` reads it (live `waiting` unless overridden). */
 interface OldRow {
   readonly instanceId: string
   readonly oldKey: string
@@ -1138,7 +1135,7 @@ function oldRowAt(h: RecoveryHarness, p: string, instanceId: string, oldKey: str
   return { instanceId, oldKey, row: (overrides = {}) => cannedGetResult({ instance_id: instanceId, cwd: personaOf(h, p).working_directory, ...extra, ...overrides }) }
 }
 
-/** The id forms an old row comes in (SRJ-809's old key, SRJ-1007's ids), each on a harness over P and B; P waits on each. */
+/** The id forms an old row comes in (old key ids), each on a harness over P and B; P waits on each. */
 const OLD_ROWS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, b: string) => OldRow]> = [
   ['a renamed-away key\'s own cscb_<old> (B, no longer applied)', (h, p, b) => {
     h.remove(b)
@@ -1165,7 +1162,7 @@ function waitAfterEach(): void {
 
 /**
  * The session the wait's kill-failure alert names before any `get` read the
- * row and with no start-sweep listing naming one (b.jg5 SRJ-1001): the old
+ * row and with no start-sweep listing naming one: the old
  * key's `slack_bot_<key>` for its own `cscb_<key>` row; none for an id
  * standing in (never the id itself), which the alert renders as "unknown".
  */
@@ -1173,7 +1170,7 @@ function sessionBeforeGet(old: OldRow): string {
   return old.oldKey === old.instanceId ? '' : personaTmuxSessionName(old.oldKey)
 }
 
-/** The kill-failure entry text for `decision` under the wait's reference (`oldLifeWaitRef`, SRJ-1007; context `old-life wait`, log-only closing), naming `session`. */
+/** The kill-failure entry text for `decision` under the wait's reference (`oldLifeWaitRef`; context `old-life wait`, log-only closing), naming `session`. */
 function waitAlertEntry(old: OldRow, decision: KillRetryAlert, session: string): string {
   const content = killFailureAlertContentOf(decision, session, old.instanceId)
   if (content === undefined) throw new Error('no alert for a none decision')
@@ -1225,7 +1222,7 @@ function expectNoLatchOrPost(h: RecoveryHarness): void {
  * name the key `instanceId=<id>` (`oldLifeWaitRef` of an id standing for
  * itself) in place of `persona=<id>` (`oldLifeWaitRef`'s persona form), and
  * say the row is an old life the server is ending in place of the
- * not-configured wording (b.jg5 SRJ-1007; the episodes' `ref` and
+ * not-configured wording (the episodes' `ref` and
  * `notConfiguredWording` hooks).
  */
 function waitUnclassifiedLine(instanceId: string, line: string): string {
@@ -1239,7 +1236,7 @@ function oldLifeArms(h: RecoveryHarness): string[] {
   return h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD).map((t) => t.key)
 }
 
-describe('b.jg5 SRJ-811, SRJ-1512: the wait\'s steps run on the old id only, with no launch and no retry timer for the old key', () => {
+describe('the wait\'s steps run on the old id only, with no launch and no retry timer for the old key', () => {
   afterEach(waitAfterEach)
 
   test.each(OLD_ROWS)('%s, read live at every get and judged alive by every run: one kill, the step-2 get, three runs each with its get (each run reaching the stub: the memo is bypassed), the step-4 kill, one more run and get; every call on the old id; no spawn or resume; no timer or trigger for the old key', async (_label, form) => {
@@ -1261,7 +1258,7 @@ describe('b.jg5 SRJ-811, SRJ-1512: the wait\'s steps run on the old id only, wit
     }
   })
 
-  test('a run that lists P\'s own row and Q\'s in unverified_ids, in a wait on P\'s own row: P\'s row gets only the wait\'s one get after each run, Q\'s its one get from the run (E14)', async () => {
+  test('a run that lists P\'s own row and Q\'s in unverified_ids, in a wait on P\'s own row: P\'s row gets only the wait\'s one get after each run, Q\'s its one get from the run ()', async () => {
     const { h, p, b, old } = heldOld(OLD_ROWS[3]![1])
     const q = b
     h.script({
@@ -1277,7 +1274,7 @@ describe('b.jg5 SRJ-811, SRJ-1512: the wait\'s steps run on the old id only, wit
   })
 })
 
-describe('b.jg5 SRJ-811 (AC 54): the wait and a live-row sequence never run at once on one instance id', () => {
+describe('the wait and a live-row sequence never run at once on one instance id', () => {
   afterEach(waitAfterEach)
 
   test('while P\'s live-row sequence runs (its first run held), a hold on cscb_<P> gets no wait: the ensure entry answers already-running and makes no call', async () => {
@@ -1318,7 +1315,7 @@ describe('b.jg5 SRJ-811 (AC 54): the wait and a live-row sequence never run at o
   })
 })
 
-describe('b.jg5 SRJ-811, SRJ-706: a wait on one id never refuses a waiting persona\'s own live-row sequence on its cscb_<key>', () => {
+describe('a wait on one id never refuses a waiting persona\'s own live-row sequence on its cscb_<key>', () => {
   let shared: string | undefined
 
   afterEach(() => {
@@ -1378,7 +1375,7 @@ describe('b.jg5 SRJ-811, SRJ-706: a wait on one id never refuses a waiting perso
 /** What a results row arranges: the stub's answers for the old row, and the errors the expected entries quote. */
 type ResultArrange = (h: RecoveryHarness, old: OldRow) => readonly Error[]
 
-/** One row of the results table (SRJ-811, SRJ-812, SRJ-702, SRJ-717). */
+/** One row of the results table. */
 interface ResultRow {
   /** The calls, in order. */
   readonly order: readonly string[]
@@ -1386,11 +1383,11 @@ interface ResultRow {
   readonly end: OldLifeWaitEndKind
   /** Whether the hold goes on after the round (false: the round ended it, and the wait). */
   readonly kept: boolean
-  /** Whether the hold is marked kill-failed (SRJ-812). */
+  /** Whether the hold is marked kill-failed. */
   readonly marked: boolean
   /** The kill-failure alert version the round raised, on the not-configured log-only route; none when absent. */
   readonly alert?: KillFailureAlertVersion
-  /** The outage classes raised for the waiting persona (SRJ-811: ENVIRONMENT raises `tmux-unavailable`); none when absent. */
+  /** The outage classes raised for the waiting persona (ENVIRONMENT raises `tmux-unavailable`); none when absent. */
   readonly outages?: readonly OutageClass[]
   /** The startup-errors entries, in order: the class and the exact text, or undefined for a text pinned elsewhere. */
   readonly entries: (old: OldRow, errors: readonly Error[]) => Array<readonly [string, string | undefined]>
@@ -1471,7 +1468,7 @@ const RESULTS: ReadonlyArray<readonly [string, ResultArrange, ResultRow]> = [
     h.script({ killResult: cannedKillResult(false), getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE }) })
     return []
   }, { order: ['kill', 'get', 'findMissing'], end: OLD_LIFE_WAIT_END_NOT_JUDGED, kept: true, marked: false, entries: () => [] }],
-  ['a pending row the run does not judge: the round stops with no alert and nothing counted (SRJ-717)', (h, old) => {
+  ['a pending row the run does not judge: the round stops with no alert and nothing counted', (h, old) => {
     h.script({ getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE }) })
     return []
   }, { order: ['kill', 'get', 'findMissing'], end: OLD_LIFE_WAIT_END_NOT_JUDGED, kept: true, marked: false, entries: () => [] }],
@@ -1484,7 +1481,7 @@ const RESULTS: ReadonlyArray<readonly [string, ResultArrange, ResultRow]> = [
     kept: true,
     marked: true,
     alert: KILL_FAILURE_VERSION_ORDINARY,
-    // Step 5's exact text for each id form is tests/live-row-sequence.test.ts's (SRJ-1007's Test line).
+    // Step 5's exact text for each id form is tests/live-row-sequence.test.ts's (Test line).
     entries: () => [[PERSONA_KILL_FAILED_LABEL, undefined]],
   }],
   ['the row listed in a run\'s ids: the hold ends, and the wait with it before its next call', (h, old) => {
@@ -1503,7 +1500,7 @@ const RESULTS: ReadonlyArray<readonly [string, ResultArrange, ResultRow]> = [
 
 const RESULT_CASES = RESULTS.flatMap(([result, arrange, row]) => OLD_ROWS.map(([form, make]) => [result, form, arrange, row, make] as const))
 
-describe('b.jg5 SRJ-811, SRJ-812, SRJ-1002, SRJ-702, SRJ-717 (AC 54, AC 63): the wait\'s results follow their class, for every id form; nothing latches and nothing is posted', () => {
+describe('the wait\'s results follow their class, for every id form; nothing latches and nothing is posted', () => {
   afterEach(waitAfterEach)
 
   test.each(RESULT_CASES)('%s — %s', async (_result, _form, arrange, expected, form) => {
@@ -1547,7 +1544,7 @@ describe('b.jg5 SRJ-811, SRJ-812, SRJ-1002, SRJ-702, SRJ-717 (AC 54, AC 63): the
   })
 })
 
-describe('b.jg5 SRJ-1001, SRJ-811: the session a wait\'s kill-failure alert names for an id standing in, before any get', () => {
+describe('the session a wait\'s kill-failure alert names for an id standing in, before any get', () => {
   afterEach(waitAfterEach)
 
   test('a pre-persona row the start sweep listed and failed to kill (a CONFLICT): the wait\'s persona-kill-failed entry names the listing\'s tmux_session_name', async () => {
@@ -1580,11 +1577,11 @@ describe('b.jg5 SRJ-1001, SRJ-811: the session a wait\'s kill-failure alert name
   })
 })
 
-/** Where else a refusal is met (SRJ-1002, SRJ-1013): the form it is met on, its arrangement, where, how many times, and the calls. */
+/** Where else a refusal is met: the form it is met on, its arrangement, where, how many times, and the calls. */
 const REFUSALS_ELSEWHERE: ReadonlyArray<readonly [string, number, (h: RecoveryHarness, old: OldRow, err: Error) => void, OldLifeWaitRefusalAt, number, readonly string[]]> = [
-  ['an UNUSABLE NAME at the get of P\'s own row (routed, SRJ-1002)', 3, (h, _old, err) => h.script({ getError: err }), OLD_LIFE_WAIT_AT_GET, 1, ['kill', 'get']],
+  ['an UNUSABLE NAME at the get of P\'s own row (routed)', 3, (h, _old, err) => h.script({ getError: err }), OLD_LIFE_WAIT_AT_GET, 1, ['kill', 'get']],
   ['an UNUSABLE NAME at the get of a pre-persona row', 1, (h, _old, err) => h.script({ getError: err }), OLD_LIFE_WAIT_AT_GET, 1, ['kill', 'get']],
-  // A failed run judges nothing and the step goes on (SRJ-120): every run fails, so no run judged the row and step 5 raises no alert.
+  // A failed run judges nothing and the step goes on: every run fails, so no run judged the row and step 5 raises no alert.
   [
     'an UNUSABLE NAME at every run',
     1,
@@ -1603,7 +1600,7 @@ const REFUSALS_ELSEWHERE: ReadonlyArray<readonly [string, number, (h: RecoveryHa
   ],
 ]
 
-describe('b.jg5 SRJ-811, SRJ-1002, SRJ-1013: an UNUSABLE NAME met at a get, a run or a status read between tries is one persona-teardown-notice entry each, "during the wait", and latches no one', () => {
+describe('an UNUSABLE NAME met at a get, a run or a status read between tries is one persona-teardown-notice entry each, "during the wait", and latches no one', () => {
   afterEach(waitAfterEach)
 
   test.each(REFUSALS_ELSEWHERE)('%s', async (_label, form, arrange, at, times, calls) => {
@@ -1623,7 +1620,7 @@ describe('b.jg5 SRJ-811, SRJ-1002, SRJ-1013: an UNUSABLE NAME met at a get, a ru
   })
 })
 
-describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
+describe(', : UNCLASSIFIED and CONFIG in the wait', () => {
   afterEach(waitAfterEach)
 
   test.each(OLD_ROWS)('UNCLASSIFIED at the kill (%s), round after round while the hold goes on: the first round begins the wait\'s episode on the held id and writes nothing; the first round past the alert threshold writes the one log-only persona-unclassified-error entry; a later round writes none; the hold\'s end ends the episode. P is armed uncounted each round; nothing latches or is posted, and the old key\'s own episode never opens', async (_label, form) => {
@@ -1678,7 +1675,7 @@ describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
     expect(h.errors.filter((line) => line === oldLifeWaitUnclassifiedNotReportedLine(oldLifeWaitRef(old.instanceId, old.oldKey)))).toHaveLength(1)
   })
 
-  test('an UNCLASSIFIED answer at a status read between tries, in a round a shutdown then stopped, is reported to no episode (SRJ-706): only the stopped kill\'s persona-kill-failed entry', async () => {
+  test('an UNCLASSIFIED answer at a status read between tries, in a round a shutdown then stopped, is reported to no episode: only the stopped kill\'s persona-kill-failed entry', async () => {
     const { h, old } = heldOld(OLD_ROWS[1]![1])
     h.script({ killError: errTmuxUnresponsive('kill'), statusError: errInternal() })
     // The shutdown lands during the second try, after the status read met UNCLASSIFIED.
@@ -1706,10 +1703,10 @@ describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
     if (old.oldKey !== p) expect(getOutageFlags(old.oldKey).size).toBe(0)
   })
 
-  // b.jg5 SRJ-809, SRJ-811, SRJ-316: the start sweep's listing begins the
+  // the start sweep's listing begins the
   // hold before its read of the row is noted, so the hold's first wait is
   // seeded with the state the list gave.
-  test('the start sweep lists P\'s own row pending, P recorded without its mark: the listing holds it and seeds its first wait pending, so with ad-config-malformed raised for P that wait makes no kill and no call (SRJ-316), keeps the hold and arms P', async () => {
+  test('the start sweep lists P\'s own row pending, P recorded without its mark: the listing holds it and seeds its first wait pending, so with ad-config-malformed raised for P that wait makes no kill and no call, keeps the hold and arms P', async () => {
     const { h, p } = build()
     h.retireKey(p)
     const row = listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE })
@@ -1749,7 +1746,7 @@ describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
   })
 })
 
-describe('b.jg5 SRJ-408 (E16): an old key\'s pending row with no launch start gets the wait\'s kill and its run at once, with no wait for G, and latches nothing', () => {
+describe('(): an old key\'s pending row with no launch start gets the wait\'s kill and its run at once, with no wait for G, and latches nothing', () => {
   afterEach(waitAfterEach)
 
   test.each(OLD_ROWS.slice(0, 3))('%s, read pending with no launch start: the kill, the get and the first run all at the start\'s clock time; no latch', async (_label, form) => {
@@ -1776,14 +1773,14 @@ describe('b.jg5 SRJ-408 (E16): an old key\'s pending row with no launch start ge
   })
 })
 
-describe('b.jg5 SRJ-502, SRJ-513, SRJ-812, SRJ-811, SRJ-305, SRJ-702: a wait on a configured persona\'s own row stops at that persona\'s latch, keeps the hold and arms only the waiting personas that are not latched', () => {
+describe('a wait on a configured persona\'s own row stops at that persona\'s latch, keeps the hold and arms only the waiting personas that are not latched', () => {
   afterEach(waitAfterEach)
 
   // The two-waiter form (B latched by the wait's read of its own row while
   // P waits beside it, only P armed) runs on the setup production reaches:
   // B's own row swept into P's directory, in the Q-9 describe below.
 
-  /** The wait's line for a waiting persona it does not arm because it is latched (SRJ-305). */
+  /** The wait's line for a waiting persona it does not arm because it is latched. */
   const latchedLines = (h: RecoveryHarness, key: string): string[] => h.errors.filter((line) => line === oldLifeWaitLatchedLine(key))
 
   /** Latch P by another call's read of its own row carrying provenance_conflict, outside the wait (its keep-going check then finds P latched). */
@@ -1793,9 +1790,9 @@ describe('b.jg5 SRJ-502, SRJ-513, SRJ-812, SRJ-811, SRJ-305, SRJ-702: a wait on 
     expect(h.latch.isLatched(p)).toBe(true)
   }
 
-  // SRJ-702: a configured persona's stop writes the log line only. P's latch
+  // a configured persona's stop writes the log line only. P's latch
   // is a stop of the wait on P's own row; a shutdown is the wait's stop, so
-  // it writes the old key's persona-kill-failed entry too (SRJ-811).
+  // it writes the old key's persona-kill-failed entry too.
   test.each<[string, (h: RecoveryHarness, p: string) => Promise<void> | void, LiveRowSequenceStopReason, string, boolean]>([
     ['P latched meanwhile (the keep-going check\'s latch): one line naming the latch as the cause and no persona-kill-failed entry; no shutdown wording; the hold goes on, P not armed (one latched line)', latchP, LIVE_ROW_STOP_LATCHED, OLD_LIFE_WAIT_STOP_CAUSE_LATCHED, false],
     ['a shutdown: one line naming the shutdown and the old key\'s persona-kill-failed entry with no alert text', (h) => h.shutdown(), LIVE_ROW_STOP_SHUTDOWN, OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN, true],
@@ -1871,7 +1868,7 @@ describe('b.jg5 SRJ-502, SRJ-513, SRJ-812, SRJ-811, SRJ-305, SRJ-702: a wait on 
   })
 })
 
-describe('b.jg5 SRJ-305, SRJ-811, SRJ-810: a waiting persona not up, or held on ErrInvalidFlags, is never armed by the wait and not retried at its hold\'s end', () => {
+describe('a waiting persona not up, or held on ErrInvalidFlags, is never armed by the wait and not retried at its hold\'s end', () => {
   afterEach(waitAfterEach)
 
   test.each<[string, (h: RecoveryHarness, p: string) => Promise<void> | void, (key: string) => string, string]>([
@@ -1911,7 +1908,7 @@ describe('b.jg5 SRJ-305, SRJ-811, SRJ-810: a waiting persona not up, or held on 
   })
 })
 
-describe('b.jg5 SRJ-810, SRJ-1014: the old-life hold step\'s line tells an arm that was asked for and failed from a skipped one', () => {
+describe('the old-life hold step\'s line tells an arm that was asked for and failed from a skipped one', () => {
   afterEach(waitAfterEach)
 
   test.each<[string, () => boolean]>([
@@ -1944,7 +1941,7 @@ describe('b.jg5 SRJ-810, SRJ-1014: the old-life hold step\'s line tells an arm t
   })
 })
 
-describe('b.jg5 SRJ-812: the kill-failed mark, and the per-persona query', () => {
+describe('the kill-failed mark, and the per-persona query', () => {
   afterEach(waitAfterEach)
 
   test('a failed kill marks the hold P waits on: P\'s query answers true, Q\'s (in its own directory) false; the hold\'s end clears it', async () => {
@@ -1959,7 +1956,7 @@ describe('b.jg5 SRJ-812: the kill-failed mark, and the per-persona query', () =>
   })
 })
 
-describe('b.jg5 SRJ-811: the wait ends at its hold\'s end and at the registry\'s close, with no further call and no timer left', () => {
+describe('the wait ends at its hold\'s end and at the registry\'s close, with no further call and no timer left', () => {
   afterEach(waitAfterEach)
 
   test.each<[string, (h: RecoveryHarness, old: OldRow) => void, string]>([
@@ -1995,7 +1992,7 @@ async function startedUntilKillWait(h: RecoveryHarness, old: OldRow, tries: numb
   return { outcome }
 }
 
-/** The stopped-retry text for the old key's kill stopped for `stopCause` (b.jg5 SRJ-702): its line and its entry, quoting `quoted`. */
+/** The stopped-retry text for the old key's kill stopped for `stopCause`: its line and its entry, quoting `quoted`. */
 function stoppedWait(old: OldRow, quoted: KillRetryAlert, stopCause: string): { readonly line: string; readonly entry: string } {
   return killFailureStoppedRetryText({
     key: old.oldKey,
@@ -2009,7 +2006,7 @@ function stoppedWait(old: OldRow, quoted: KillRetryAlert, stopCause: string): { 
 /** The stopped-retry text for the old key's kill stopped at a shutdown. */
 const stoppedAtShutdown = (old: OldRow, quoted: KillRetryAlert): { readonly line: string; readonly entry: string } => stoppedWait(old, quoted, OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN)
 
-describe('b.jg5 SRJ-702, SRJ-811 (AC 64): the wait\'s kill keeps its tries while no persona is up, and a shutdown is its stop', () => {
+describe('the wait\'s kill keeps its tries while no persona is up, and a shutdown is its stop', () => {
   afterEach(waitAfterEach)
 
   test.each(OLD_ROWS.slice(0, 3))('no persona is up (%s): the kill answering ErrTmuxKillFailed keeps its 3 tries and raises the ordinary version', async (_label, form) => {
@@ -2083,7 +2080,7 @@ function expectHoldEndedSuccess(
   expectNoLatchOrPost(h)
 }
 
-describe('b.jg5 SRJ-811\'s Test line, SRJ-702 (AC 64; option A): a hold that ends while the wait\'s kill runs ends its tries as a success', () => {
+describe('Test line(option A): a hold that ends while the wait\'s kill runs ends its tries as a success', () => {
   afterEach(waitAfterEach)
 
   test.each<[string, () => Error, boolean]>([
@@ -2173,7 +2170,7 @@ describe('b.jg5 SRJ-811\'s Test line, SRJ-702 (AC 64; option A): a hold that end
 })
 
 // ===========================================================================
-// What a hold refuses (b.jg5 SRJ-810, SRJ-1502, SRJ-1505; E27 T3)
+// What a hold refuses
 //
 // On the recovery harness, which composes the session manager's old-life gate
 // (every launch reaches `spawnForPersona`), the restart path's old-life hook,
@@ -2225,7 +2222,7 @@ async function expectRetriedAtOnceAndUp(h: RecoveryHarness, key: string, endedAt
 
 }
 
-describe('b.jg5 SRJ-810 (AC 53), SRJ-1505: a retired key\'s old life that survived a failed kill is no persona\'s MCP session, and nothing types /mcp reconnect into it', () => {
+describe('a retired key\'s old life that survived a failed kill is no persona\'s MCP session, and nothing types /mcp reconnect into it', () => {
   afterEach(waitAfterEach)
 
   test.each<[string, (h: RecoveryHarness, p: string, b: string) => OldRow, RetiredKeyCause]>([
@@ -2242,7 +2239,7 @@ describe('b.jg5 SRJ-810 (AC 53), SRJ-1505: a retired key\'s old life that surviv
     expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(true)
     const dir = personaOf(h, p).working_directory
 
-    // Session admission (SRJ-1505): refused as held, whichever persona names D, P up.
+    // Session admission: refused as held, whichever persona names D, P up.
     expect(h.admitSession(dir)).toEqual({ kind: 'held', directory: realDirOf(h, p), instanceIds: [old.instanceId] })
     expect(h.errors.filter((line) => line === sessionHeldRefusalLine(realDirOf(h, p), [old.instanceId]))).toHaveLength(1)
 
@@ -2271,7 +2268,7 @@ describe('b.jg5 SRJ-810 (AC 53), SRJ-1505: a retired key\'s old life that surviv
   })
 })
 
-describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back a persona whose working directory is held, starts the wait once, and retries it at once when the hold ends', () => {
+describe('bullet 3, the launch gate holds back a persona whose working directory is held, starts the wait once, and retries it at once when the hold ends', () => {
   afterEach(waitAfterEach)
 
   test('Q in D, held for a pre-persona row: Q\'s launch makes no call for Q, answers sequence-waiting, starts the wait and arms Q\'s timer, uncounted; a second launch starts no second wait; B in its own directory comes up; once the hold ends Q is retried at once and comes up with a plain first spawn', async () => {
@@ -2302,7 +2299,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
     expect(getFailureCount(q)).toBe(0)
   })
 
-  test('SRJ-805, SRJ-810\'s exception: P\'s destructive-modify new half, its own cscb_<P> held, is not held by the gate: its reuse collides and its live-row sequence replaces the old life, ending in the reuse; no gate line, no wait, no old-life arm', async () => {
+  test('exception: P\'s destructive-modify new half, its own cscb_<P> held, is not held by the gate: its reuse collides and its live-row sequence replaces the old life, ending in the reuse; no gate line, no wait, no old-life arm', async () => {
     const { h, p } = build()
     h.retireKey(p, { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY })
     beginApplyHold(h, p)
@@ -2318,7 +2315,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
   })
 })
 
-/** A live row the start sweep kills, in P's working directory, by source (SRJ-809's sweep start; Q-9). */
+/** A live row the start sweep kills, in P's working directory, by source (sweep start; Q-9). */
 const SWEPT_IN_P_DIR: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, b: string) => ListRow]> = [
   ['an absent persona\'s row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)],
   ['a live pre-persona row', (h, p) => ({ ...prePersonaRow(), cwd: personaOf(h, p).working_directory })],
@@ -2326,7 +2323,7 @@ const SWEPT_IN_P_DIR: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: st
   ['a row swept for its cwd (B\'s own row in P\'s directory)', (h, p, b) => listed(h, b, { cwd: personaOf(h, p).working_directory })],
 ]
 
-describe('b.jg5 SRJ-811\'s Test line (Q-9), SRJ-810: a persona in the cwd of each row whose start-sweep kill failed waits on its hold, and the wait runs on that row\'s id', () => {
+describe('Test line (Q-9), a persona in the cwd of each row whose start-sweep kill failed waits on its hold, and the wait runs on that row\'s id', () => {
   afterEach(waitAfterEach)
 
   test.each(SWEPT_IN_P_DIR)('%s: P\'s launch is held back and starts the wait on the row\'s id, every wait call on that id; once the hold ends P is retried at once and comes up', async (_label, swept) => {
@@ -2355,7 +2352,7 @@ describe('b.jg5 SRJ-811\'s Test line (Q-9), SRJ-810: a persona in the cwd of eac
   })
 })
 
-describe('b.jg5 SRJ-810 (hatch A3), SRJ-812: a persona already running when its directory becomes held gets no reconnect, kill or launch from the restart path until the hold ends', () => {
+describe('(hatch A3), a persona already running when its directory becomes held gets no reconnect, kill or launch from the restart path until the hold ends', () => {
   afterEach(waitAfterEach)
 
   test('P\'s row live, its session connected: once D is held, P\'s restart run makes no call for P, starts the wait and arms P, and P\'s worker is not killed; once the hold ends P is retried at once, finds its session connected and its timer stops', async () => {
@@ -2383,7 +2380,7 @@ describe('b.jg5 SRJ-810 (hatch A3), SRJ-812: a persona already running when its 
   })
 })
 
-describe('b.jg5 SRJ-811 (hatch A3): what stops the wait — the teardown of the only waiting persona, never one while another waits, and shutdown', () => {
+describe('(hatch A3): what stops the wait — the teardown of the only waiting persona, never one while another waits, and shutdown', () => {
   let shared: string | undefined
 
   afterEach(() => {
@@ -2479,7 +2476,7 @@ describe('b.jg5 SRJ-811 (hatch A3): what stops the wait — the teardown of the 
   test.each<[string, () => Error, (err: Error) => KillRetryAlert]>([
     ['a try that returned a survivor-naming ErrTmuxKillFailed: the line quotes it', survivorFailure, (err) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: descriptionOf(err) })],
     ['a try that returned ErrTmuxUnresponsive: no description', () => errTmuxUnresponsive('kill'), () => ({ kind: KILL_RETRY_ALERT_ORDINARY })],
-  ])('AC 64: the wait\'s kill stopped between tries by the teardown of the only waiting persona, after %s: no further kill or status read, neither version, nothing posted or armed; one line and the old key\'s persona-kill-failed entry with no alert text', async (_label, make, decision) => {
+  ])('the wait\'s kill stopped between tries by the teardown of the only waiting persona, after %s: no further kill or status read, neither version, nothing posted or armed; one line and the old key\'s persona-kill-failed entry with no alert text', async (_label, make, decision) => {
     const { h, p, old } = heldOld(OLD_ROWS[0]![1])
     const err = make()
     h.script({ killError: err })
@@ -2500,7 +2497,7 @@ describe('b.jg5 SRJ-811 (hatch A3): what stops the wait — the teardown of the 
     expectNoLatchOrPost(h)
   })
 
-  test('AC 64: with B still waiting, P\'s teardown between the kill\'s tries stops neither the wait nor its kill: it makes all its tries, writes no stopped-retry line, and the round arms B', async () => {
+  test('with B still waiting, P\'s teardown between the kill\'s tries stops neither the wait nor its kill: it makes all its tries, writes no stopped-retry line, and the round arms B', async () => {
     const { h, p, b, old } = sharedHeld()
     h.script({ killError: errTmuxUnresponsive('kill') })
     await launchedUntilKillWait(h, p)
@@ -2518,7 +2515,7 @@ describe('b.jg5 SRJ-811 (hatch A3): what stops the wait — the teardown of the 
   })
 })
 
-describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, its kill failed — P and B both wait on the one hold; B is retried only once the stopped wait on its own row has settled, and its teardown as the last waiter stops the wait', () => {
+describe('(Q-9): B\'s own row swept into P\'s directory, its kill failed — P and B both wait on the one hold; B is retried only once the stopped wait on its own row has settled, and its teardown as the last waiter stops the wait', () => {
   afterEach(waitAfterEach)
 
   /**
@@ -2585,7 +2582,7 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
     expect(await h.driveSequence(h.oldLifeWaitSettled(id))).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
     expect([h.latch.isLatched(p), h.latch.isLatched(b)]).toEqual([false, true])
     expect(h.oldLifeHolds.holdOf(id)?.waiting).toEqual([p, b])
-    // The round's arms: P only; B, latched, gets one latched line and its timer stays stopped (SRJ-305).
+    // The round's arms: P only; B, latched, gets one latched line and its timer stays stopped.
     expect(oldLifeArms(h).slice(armsBefore)).toEqual([p])
     expect([h.controller.isArmed(p), h.controller.isArmed(b)]).toEqual([true, false])
     expect([p, b].map((key) => h.errors.filter((line) => line === oldLifeWaitLatchedLine(key)).length)).toEqual([0, 1])
@@ -2616,7 +2613,7 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
   })
 
   // The wait's outcome names the stop it met first: the hold's end, or B's
-  // latch, at which a wait on B's own row stops (SRJ-502).
+  // latch, at which a wait on B's own row stops.
   test.each<[string, string, (h: RecoveryHarness, b: string) => Promise<void>, string]>([
     ['removed', OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED, async (h, b) => h.remove(b), LIVE_ROW_STOP_HOLD_ENDED],
     ['latched (a reconnect of its own row, no longer held, answered CONFLICT)', OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED, async (h, b) => {
@@ -2643,7 +2640,7 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
 })
 
 // ===========================================================================
-// A reuse that timed out but launched (b.jg5 SRJ-407, SRJ-806, SRJ-809; E28)
+// A reuse that timed out but launched
 //
 // On the recovery harness built with `harnessNow`, so the session manager
 // reads each launch call's window on the harness clock, P's reuse spawn timed
@@ -2655,13 +2652,13 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
 // that row (a launch while one runs makes no call, so no launch timeout can
 // happen there). When the one `get` after P's timed-out reuse reads this
 // launch's row (its launch start inside the call's window), the key's new
-// life has begun: the hold ends with E27's new-life reason, and B, waiting on
+// life has begun: the hold ends with new-life reason, and B, waiting on
 // it, is retried at once (the end observer's run-now). A launch start outside
 // the window is the old life: the hold stays, and P's row goes to the
 // live-row sequence (its start recorded, not run, here).
 // ===========================================================================
 
-describe('b.jg5 SRJ-809, SRJ-806, SRJ-407: a reuse that timed out but launched ends its key\'s hold for its new life, and the persona waiting on it is retried at once; a launch start outside the window keeps the hold', () => {
+describe('a reuse that timed out but launched ends its key\'s hold for its new life, and the persona waiting on it is retried at once; a launch start outside the window keeps the hold', () => {
   afterEach(waitAfterEach)
 
   /** How long P's timed reuse spawn takes on the harness clock. */
@@ -2710,7 +2707,7 @@ describe('b.jg5 SRJ-809, SRJ-806, SRJ-407: a reuse that timed out but launched e
 
     expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
     expect(h.retiredEntry(p).marked).toBe(true)
-    // The get's pending read of the held row re-pointed the hold to the row's cwd, P's directory, before the end (E27's read entry).
+    // The get's pending read of the held row re-pointed the hold to the row's cwd, P's directory, before the end ( read entry).
     const atEnd: OldLifeHold = { ...held, directory: personaOf(h, p).working_directory, realDirectory: realDirOf(h, p) }
     expect(endedLinesIn(h.errors)).toEqual([oldLifeHoldEndedLine(atEnd, OLD_LIFE_HOLD_END_NEW_LIFE, OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ)])
     expect(h.holdEndRetries).toEqual([{ key: b, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])

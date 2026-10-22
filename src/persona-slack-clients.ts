@@ -1,6 +1,6 @@
 /**
  * persona-slack-clients.ts — The Slack client factory and the exact client
- * options for persona connections (b.av2 SR-3.3, SR-13.1).
+ * options for persona connections.
  *
  * Each persona gets three kinds of Slack client, all built through a
  * `PersonaSlackClientFactory` that the connection manager
@@ -69,7 +69,7 @@
  * only the URL's origin. Unset (the builders get no URL), every option set
  * is exactly as above.
  *
- * Pure module (b.av2 SR-13.1): nothing is constructed, read or scheduled at
+ * Pure module: nothing is constructed, read or scheduled at
  * import; no file access, and the environment is read only through the `env`
  * passed to `resolveSlackApiUrlOverride` when it is called. Nothing logs at
  * import: the library loggers built here write only when a client calls them.
@@ -88,7 +88,7 @@ import { SLACK_START_TIMEOUT_MS } from './persona-slack-validation.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER, redactSlackLogText } from './slack-log-redaction.ts'
 
 // ---------------------------------------------------------------------------
-// Timing constants (b.av2 SR-3.3)
+// Timing constants
 // ---------------------------------------------------------------------------
 
 /** Bound on the WebSocket phase of every Socket Mode `start()`, in milliseconds (10 s). */
@@ -169,7 +169,7 @@ function slackApiUrlOption(slackApiUrl: string | undefined): WebClientOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Option sets (b.av2 SR-3.3)
+// Option sets
 // ---------------------------------------------------------------------------
 
 /**

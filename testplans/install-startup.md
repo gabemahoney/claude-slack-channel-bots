@@ -1,17 +1,3 @@
----
-id: b.j9i
-type: bee
-title: 'Test 1: Package install and server startup in dry-run mode'
-down_dependencies:
-- b.3hy
-parent: null
-egg: null
-created_at: '2026-04-04T21:36:06.958341'
-status: pupa
-schema_version: '0.1'
-guid: j9ieuurbhzsbscd8ag78yx3cb2pbrqfu
----
-
 ## Test 1: Package install and server startup in dry-run mode
 
 Runs only inside the docker CI container (`/ci`), never on a host with a real

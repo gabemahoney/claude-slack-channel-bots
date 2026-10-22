@@ -1,6 +1,6 @@
 /**
  * agent-director-logger.ts — Verbosity filter for the `agent-director`
- * library's diagnostic logger (b.brv).
+ * library's diagnostic logger.
  *
  * The AD Client is handed a `logger` at `Client.create()` time and emits a
  * per-poll success dump for every verb it dispatches, e.g.
@@ -12,7 +12,7 @@
  * CSCB polls agent-director continuously (permission poller, health check),
  * so at `info` level these routine `<verb> ok` blocks dominate server.log —
  * millions of lines, no forensic value (see the 2 GB / 137 MB observations in
- * b.brv). This wrapper drops those routine success dumps at the default
+ *). This wrapper drops those routine success dumps at the default
  * verbosity while leaving failures, warnings, and errors untouched so
  * incident forensics still works.
  *
@@ -64,7 +64,7 @@ function isRoutineSuccessDump(args: unknown[]): boolean {
 }
 
 /**
- * Wrap a base logger (typically `console`) with the b.brv verbosity filter.
+ * Wrap a base logger (typically `console`) with the verbosity filter.
  *
  * - `warn` / `error` always pass through unfiltered.
  * - `log` / `info` pass through UNLESS the record is a routine

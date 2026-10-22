@@ -1,18 +1,18 @@
 /**
  * reload-apply.ts — The step-ordered apply of a confirmed change and its log
- * lines (b.av2 SR-8.5, SR-8.6, SR-10.3).
+ * lines.
  *
  * A confirmed, valid candidate is applied in six steps; each step completes
- * for every persona before the next starts (b.av2 SR-8.6):
+ * for every persona before the next starts:
  *
  *   1. record the retired keys of removed personas (a renamed persona's old
  *      key included) and of the old halves of destructive modifies, and the
  *      key of each persona brought up that is held as retired only in
  *      memory, durably, a failure of that write failing the apply with
- *      nothing applied (b.jg5 SRJ-803, SRJ-804); then rewrite the
+ * nothing applied; then rewrite the
  *      last-applied record, a failed rewrite applying nothing and removing
- *      again the keys this apply recorded (SRJ-804); then swap the applied
- *      set (b.jg5 SRJ-1511; the reload controller in `reload.ts` does this
+ * again the keys this apply recorded; then swap the applied
+ * set (the reload controller in `reload.ts` does this
  *      itself);
  *   2. teardowns of removed personas (and the old half of a destructive
  *      modify);
@@ -57,7 +57,7 @@
  * `reload-applied`, `reload-noop`, `reload-stale-confirmation`, and the
  * `reload-invalid` line of a confirmed candidate.
  *
- * Pure (b.av2 SR-13.1): nothing here reads or writes a file, calls Slack or
+ * Pure: nothing here reads or writes a file, calls Slack or
  * agent-director, arms a timer or logs, and nothing runs at import;
  * `runApplySteps` and the fan-outs only call and await the injected bodies,
  * members and queries. The only state is the default bodies' per-apply set
@@ -81,7 +81,7 @@ import {
 import type { ReloadLifecycleOps } from './reload.ts'
 
 // ---------------------------------------------------------------------------
-// Diagnostic classes (b.av2 SR-10.3); listed in `RELOAD_DIAGNOSTIC_CLASSES`
+// Diagnostic classes; listed in `RELOAD_DIAGNOSTIC_CLASSES`
 // ---------------------------------------------------------------------------
 
 /** A confirmed change was applied without a restart. */
@@ -100,7 +100,7 @@ export const RELOAD_STALE_CONFIRMATION = 'reload-stale-confirmation'
 // Steps 2–6
 // ---------------------------------------------------------------------------
 
-/** The apply steps after step 1, in the order they run (b.av2 SR-8.6 steps 2–6). */
+/** The apply steps after step 1, in the order they run (steps 2–6). */
 export const APPLY_STEPS = [
   'teardowns',
   'in-place-updates',
@@ -186,7 +186,7 @@ export type ApplyLifecycleMembers = Pick<
 export interface ApplyBringUpOptions {
   /**
    * The persona is not new: it is broken by its credentials and its
-   * credentials file changed (b.av2 SR-8.6 step 6, SR-6.4 recovery). Its
+   * credentials file changed (step 6recovery). Its
    * leftover state is cleared before the same bring-up runs; if it is not
    * broken by its credentials any more when the operation runs, its changed
    * credentials are applied as step 4's reconnect would apply them. Absent
@@ -206,7 +206,7 @@ export interface CredentialsBrokenAtReconnect {
 }
 
 /**
- * Whether persona `key` is broken by its credentials now (b.av2 SR-6.4),
+ * Whether persona `key` is broken by its credentials now,
  * asked by steps 4 and 6 when they run, not at the preview; undefined when
  * it cannot be told, and the plan's
  * `credentialsBroken` decides.
@@ -251,7 +251,7 @@ export function applyStepInputs(plan: ValidChangePlan, previous: PersonaConfig, 
 
 /**
  * Run `operation` for every persona at once (different personas are
- * independent, b.av2 SR-6.6) and settle once all of them settled, never
+ * independent) and settle once all of them settled, never
  * fail-fast: each rejection or throw is reported to `onFailure` with its
  * persona, in `personas` order, and the others still complete. Never rejects
  * (unless `onFailure` throws).
@@ -291,7 +291,7 @@ function isCredentialsBrokenAtReconnect(result: unknown): result is CredentialsB
 }
 
 /**
- * The controller's default step bodies (b.av2 SR-8.6): pure fan-outs over the
+ * The controller's default step bodies: pure fan-outs over the
  * lifecycle members. Step 2 tears down every removed persona and the old
  * half of every destructive modify (as the previous configuration declares
  * it), step 3 updates every persona modified in place (`inputs.inPlace`, one
@@ -396,7 +396,7 @@ export function lifecycleApplySlots(
  * The steps after step 1 that run for `plan`, in order: every step for a plan
  * with an effect, the template refresh (step 5) only when the config
  * directories changed, and for a plan with no effective change nothing but
- * that refresh (b.av2 SR-8.6: a no-op still refreshes the template whose rule
+ * that refresh (a no-op still refreshes the template whose rule
  * text changed). Pure.
  */
 export function applyStepsFor(plan: ValidChangePlan): ApplyStepName[] {
@@ -429,13 +429,13 @@ export async function runApplySteps(
   }
 }
 
-/** The SR-8.6 step number of a step after step 1, for log lines. */
+/** The step number of a step after step 1, for log lines. */
 export function applyStepNumber(step: ApplyStepName): number {
   return APPLY_STEPS.indexOf(step) + 2
 }
 
 // ---------------------------------------------------------------------------
-// Log lines (b.av2 SR-10.3: one class label per line)
+// Log lines (one class label per line)
 // ---------------------------------------------------------------------------
 
 /**

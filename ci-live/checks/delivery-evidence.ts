@@ -1,4 +1,4 @@
-/** Live delivery evidence without loading production adapters on the host (b.omv SR-13.6). */
+/** Live delivery evidence without loading production adapters on the host. */
 import { personaName, type PersonaLetter } from '../lib/personas.ts'
 import { waitFor, POLL_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'

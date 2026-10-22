@@ -1,17 +1,17 @@
 /**
  * ad-settings.ts — agent-director's timing settings, read the way
- * agent-director reads them (b.jg5 SRJ-209).
+ * agent-director reads them.
  *
  * Scope: the settings file's path (defined in `src/ad-config-file.ts`),
  * table and key names, the defaults and minimums, the read with
  * agent-director's rule, the values in effect and
- * `[pause] timeout_seconds` (b.jg5 SRJ-209); the waits derived from the
+ * `[pause] timeout_seconds`; the waits derived from the
  * values in effect (G, the alert threshold and B), their whole-minute
  * rendering for notices, and the never-early wait helper that arms a derived
- * wait on an injected clock (b.jg5 SRJ-210); agent-director's verb ceilings
- * (ADSRD SR-13.2), the need CSCB's call timeout must exceed, and the startup
+ * wait on an injected clock; agent-director's verb ceilings
+ * (agent-director contract), the need CSCB's call timeout must exceed, and the startup
  * check that warns when `agent_director_call_timeout_ms` does not exceed it
- * (b.jg5 SRJ-213). The need's 15 s margin is named here and nowhere else in
+ * The need's 15 s margin is named here and nowhere else in
  * `src/`. The nine `[tmux]` defaults,
  * `[pause] timeout_seconds`'s 30 s and the three minimums are named here and
  * nowhere else: no other module in `src/` defines one, and no CSCB wait
@@ -47,14 +47,14 @@
  *
  * An accepted read logs the nine `[tmux]` values in effect at the reader's
  * first accepted read and at each accepted read that changes them
- * ({@link buildAdSettingsValuesLine}; b.jg5 SRJ-1014); a change of
+ * ({@link buildAdSettingsValuesLine}); a change of
  * `[pause] timeout_seconds` alone logs nothing. A refused read changes no
  * value in effect: the reader keeps the values of
  * its last accepted read (the defaults at startup) and writes one log line
  * per run of refused reads, at the first refused read after start or after
  * an accepted read ({@link buildAdSettingsRefusedReadLine}). The read raises
  * no outage, records no startup error and posts nothing: agent-director's
- * own `ErrConfigMalformed` answers decide that (b.jg5 SRJ-316). No log line
+ * own `ErrConfigMalformed` answers decide that. No log line
  * or reason carries the parser's message, file text or a string value: a
  * parse failure is reported by position only, a read failure by its errno
  * code, a wrong-typed value by its kind.
@@ -73,7 +73,7 @@
  * timers this module arms are those of {@link armNeverEarlyWait}, on the
  * clock its caller passes.
  *
- * The derived waits (b.jg5 SRJ-210), in milliseconds:
+ * The derived waits, in milliseconds:
  * - G, the grace period, is `pending_grace_seconds`;
  * - the alert threshold is the longer of `stopping_window_seconds` and
  *   `starting_session_seconds`, plus {@link AD_ALERT_THRESHOLD_ADDEND_SECONDS};
@@ -96,7 +96,7 @@
  * accessor rather than a number, it reads the wait in effect again at every
  * timer fire, so a value raised while the wait is armed never ends it early.
  *
- * The ceilings and the need (b.jg5 SRJ-213) are computed exactly from the
+ * The ceilings and the need are computed exactly from the
  * `bigint` values in effect, in milliseconds ({@link adVerbCeilingsMs},
  * {@link adCallTimeoutNeed}): the need is the largest ceiling among the verbs
  * CSCB calls (every verb but `expire`; `pause` with its configured wait) plus
@@ -175,7 +175,7 @@ export interface AdSettingsDefaults {
   readonly pause: { readonly timeout_seconds: bigint }
 }
 
-/** agent-director's defaults (b.jg5 SRJ-209). */
+/** agent-director's defaults. */
 export const DEFAULT_AD_SETTINGS: AdSettingsDefaults = Object.freeze({
   tmux: Object.freeze({
     pending_grace_seconds: 60n,
@@ -186,7 +186,7 @@ export const DEFAULT_AD_SETTINGS: AdSettingsDefaults = Object.freeze({
     action_timeout_ms: 2000n,
     create_timeout_ms: 5000n,
     pipe_close_wait_ms: 100n,
-    // The 0.11.0 release's default (b.jg5 SRJ-209): its release notes list the
+    // The 0.11.0 release's default: its release notes list the
     // key under the `[tmux]` settings, and its value is `DefaultKillExitWaitMs`
     // in agent-director's `internal/config/tmux.go` at tag `v0.11.0`, measured
     // (the slowest exit after a pane kill, 603 ms).
@@ -203,7 +203,7 @@ export interface AdSettingMinimums {
   readonly pending_grace_seconds: { readonly floor: bigint; readonly addend: bigint }
 }
 
-/** agent-director's minimums (b.jg5 SRJ-209); the six other keys have none. */
+/** agent-director's minimums; the six other keys have none. */
 export const AD_SETTING_MINIMUMS: AdSettingMinimums = Object.freeze({
   starting_session_seconds: 60n,
   stopping_window_seconds: 30n,
@@ -425,17 +425,17 @@ function readAdSettingsFile(path: string, fs: Partial<PersonaConfigFs> | undefin
 /** The prefix of every line this module logs. */
 export const AD_SETTINGS_LOG_PREFIX = '[slack] agent-director settings:'
 
-/** A `[tmux]` key's unit, from its name's suffix: `s` for a `_seconds` key, `ms` for a `_ms` key (b.jg5 SRJ-209). */
+/** A `[tmux]` key's unit, from its name's suffix: `s` for a `_seconds` key, `ms` for a `_ms` key. */
 export function adTmuxKeyUnit(key: AdTmuxKey): 's' | 'ms' {
   return key.endsWith('_seconds') ? 's' : 'ms'
 }
 
 /**
- * The values line (b.jg5 SRJ-209, SRJ-1014): the nine `[tmux]` values in
+ * The values line: the nine `[tmux]` values in
  * effect, written at the reader's first accepted read and at each later
  * accepted read whose nine values differ from those in effect:
  *
- *   [slack] agent-director settings: the [tmux] values in effect from "<path>": pending_grace_seconds 60 s, stopping_window_seconds 90 s, starting_session_seconds 300 s, sweep_budget_seconds 15 s, query_timeout_ms 1500 ms, action_timeout_ms 2000 ms, create_timeout_ms 5000 ms, pipe_close_wait_ms 100 ms, kill_exit_wait_ms 5000 ms (b.jg5 SRJ-209, SRJ-1014)
+ * [slack] agent-director settings: the [tmux] values in effect from "<path>": pending_grace_seconds 60 s, stopping_window_seconds 90 s, starting_session_seconds 300 s, sweep_budget_seconds 15 s, query_timeout_ms 1500 ms, action_timeout_ms 2000 ms, create_timeout_ms 5000 ms, pipe_close_wait_ms 100 ms, kill_exit_wait_ms 5000 ms
  *
  * The keys come in {@link AD_TMUX_KEYS}' order, each with its unit
  * ({@link adTmuxKeyUnit}). The line holds the path and the nine integers
@@ -444,7 +444,7 @@ export function adTmuxKeyUnit(key: AdTmuxKey): 's' | 'ms' {
  */
 export function buildAdSettingsValuesLine(path: string, values: AdTmuxValues): string {
   const listed = AD_TMUX_KEYS.map((key) => `${key} ${values[key]} ${adTmuxKeyUnit(key)}`).join(', ')
-  return `${AD_SETTINGS_LOG_PREFIX} the [${AD_TMUX_TABLE}] values in effect from "${path}": ${listed} (b.jg5 SRJ-209, SRJ-1014)`
+  return `${AD_SETTINGS_LOG_PREFIX} the [${AD_TMUX_TABLE}] values in effect from "${path}": ${listed}`
 }
 
 /** Whether two sets of the nine `[tmux]` values are equal, key by key. */
@@ -453,10 +453,10 @@ function sameTmuxValues(a: AdTmuxValues, b: AdTmuxValues): boolean {
 }
 
 /**
- * The one line of a run of refused reads (b.jg5 SRJ-209), written at the
+ * The one line of a run of refused reads, written at the
  * first refused read after start or after an accepted read:
  *
- *   [slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)
+ * [slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted
  *
  * `<kept>` is `the defaults` when no read has been accepted since start, and
  * `the values of the last accepted read` otherwise. `<reason>` is the
@@ -464,7 +464,7 @@ function sameTmuxValues(a: AdTmuxValues, b: AdTmuxValues): boolean {
  */
 export function buildAdSettingsRefusedReadLine(path: string, reason: string, hadAcceptedRead: boolean): string {
   const kept = hadAcceptedRead ? 'the values of the last accepted read' : 'the defaults'
-  return `${AD_SETTINGS_LOG_PREFIX} the read of "${path}" was refused: ${reason}; ${kept} stay in effect until a read is accepted (b.jg5 SRJ-209)`
+  return `${AD_SETTINGS_LOG_PREFIX} the read of "${path}" was refused: ${reason}; ${kept} stay in effect until a read is accepted`
 }
 
 /** The reader's dependencies. */
@@ -604,7 +604,7 @@ export function resetAdSettingsForTests(): void {
 }
 
 // ---------------------------------------------------------------------------
-// The derived waits: G, the alert threshold and B (b.jg5 SRJ-210)
+// The derived waits: G, the alert threshold and B
 // ---------------------------------------------------------------------------
 
 /**
@@ -662,7 +662,7 @@ export function adAlertThresholdMs(values: AdSettingsInEffect): number {
  * `DIALOG_READY_TIMEOUT_MS` and G plus {@link AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS}
  * (300 000 at the defaults; 360 000 with `pending_grace_seconds` 300), or
  * {@link AD_WAIT_NEVER_ENDS}. `floorMs` is B's floor ({@link DIALOG_READY_TIMEOUT_MS}
- * by default; the test-only override block's `dialog_ready_timeout_ms`, b.2nr,
+ * by default; the test-only override block's `dialog_ready_timeout_ms`,
  * through {@link adLaunchBoundMsInEffect}).
  */
 export function adLaunchBoundMs(values: AdSettingsInEffect, floorMs: number = DIALOG_READY_TIMEOUT_MS): number {
@@ -683,13 +683,13 @@ export function adAlertThresholdMsInEffect(): number {
 
 /**
  * B's floor in effect: {@link DIALOG_READY_TIMEOUT_MS} unless the test-only
- * timer override block (b.2nr, `src/test-timer-overrides.ts`) set another at
+ * timer override block (`src/test-timer-overrides.ts`) set another at
  * server start through {@link installLaunchBoundFloorMs}.
  */
 let launchBoundFloorMs: number = DIALOG_READY_TIMEOUT_MS
 
 /**
- * Set B's floor for the rest of the process (b.2nr, test-only): called once at
+ * Set B's floor for the rest of the process (test-only): called once at
  * server start by `installTestTimerOverrides`, only when the override block
  * sets `dialog_ready_timeout_ms`. The exported {@link DIALOG_READY_TIMEOUT_MS}
  * stays the default and is never changed.
@@ -713,7 +713,7 @@ export function wholeMinutes(ms: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// The never-early wait helper (b.jg5 SRJ-210)
+// The never-early wait helper
 // ---------------------------------------------------------------------------
 
 /** The clock and timers {@link armNeverEarlyWait} takes: the timer subset of the persona clock type. */
@@ -733,8 +733,7 @@ export type NeverEarlyWaitLength = number | (() => number)
  *
  * `waitMs` is a fixed number or a getter. A getter is called once while
  * arming and again at every timer fire, so each check and each re-arm uses
- * the value in effect at that moment, never a copy from the arm (b.jg5
- * SRJ-210):
+ * the value in effect at that moment, never a copy from the arm:
  * - When a timer fires, the callback runs only if `clock.now() - startMs` is
  *   at least the wait in effect. The deadline is checked by that comparison,
  *   never by a sum that could round, so a timer that fires early (or a clock
@@ -835,18 +834,18 @@ export function armNeverEarlyWait(
 }
 
 // ---------------------------------------------------------------------------
-// The verb ceilings, the need and the startup call-timeout check (b.jg5 SRJ-213)
+// The verb ceilings, the need and the startup call-timeout check
 // ---------------------------------------------------------------------------
 
 /**
  * The need's margin over the largest ceiling, in milliseconds: the store's
  * 10 s busy timeout and 5 s for starting the CLI, which the ceilings do not
- * count (b.jg5 SRJ-213).
+ * count.
  */
 export const AD_CALL_TIMEOUT_NEED_MARGIN_MS = 15_000n
 
 /**
- * The verbs of agent-director's ceiling table (ADSRD SR-13.2), in table
+ * The verbs of agent-director's ceiling table (agent-director contract), in table
  * order, each marked with whether CSCB calls it. `spawn-with-reuse` and
  * `plain-spawn` share `resume`'s row (a plain spawn's ceiling includes its
  * pre-spawn scan); `find-missing` and `expire` share the sweep's row. CSCB
@@ -870,7 +869,7 @@ export const AD_CEILING_VERBS = Object.freeze([
 /** One verb of the ceiling table. */
 export type AdCeilingVerb = (typeof AD_CEILING_VERBS)[number]['verb']
 
-/** The verbs that share ADSRD SR-13.2's launch row; the warning line names that row by all three. */
+/** The verbs that share ADSRD launch row; the warning line names that row by all three. */
 export const AD_LAUNCH_CEILING_VERBS: readonly AdCeilingVerb[] = Object.freeze(['resume', 'spawn-with-reuse', 'plain-spawn'])
 
 /**
@@ -890,7 +889,7 @@ function maxBigInt(a: bigint, b: bigint): bigint {
 }
 
 /**
- * Each verb's ceiling in milliseconds (ADSRD SR-13.2), from the values in
+ * Each verb's ceiling in milliseconds (agent-director contract), from the values in
  * effect, with Q, A and C the query, action and create timeouts, W
  * `pipe_close_wait_ms`, E `kill_exit_wait_ms` and B `sweep_budget_seconds`
  * (converted to milliseconds):
@@ -947,7 +946,7 @@ export interface AdCallTimeoutNeed {
 }
 
 /**
- * The call timeout's need (b.jg5 SRJ-213): the largest ceiling among the
+ * The call timeout's need: the largest ceiling among the
  * verbs CSCB calls (every verb of {@link AD_CEILING_VERBS} but `expire`),
  * plus {@link AD_CALL_TIMEOUT_NEED_MARGIN_MS}. A tie names the earlier verb in
  * table order. When `[pause] timeout_seconds` holds a value that is not used,
@@ -986,7 +985,7 @@ function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
 }
 
 /**
- * The startup check's warning line (b.jg5 SRJ-213), or `undefined` when none
+ * The startup check's warning line, or `undefined` when none
  * is due: one line when `callTimeoutMs` is at or below the need, or when
  * `[pause] timeout_seconds` holds a value that is not used (then the line
  * names that value where it would name the verb, whatever the setting).
@@ -994,8 +993,8 @@ function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
  * `resume`, `spawn-with-reuse` and `plain-spawn` share,
  * `resume/spawn-with-reuse/plain-spawn` ({@link AD_LAUNCH_CEILING_VERBS}).
  *
- *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <ceiling> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "<title>" (b.jg5 SRJ-213)
- *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "<title>" (b.jg5 SRJ-213)
+ * [slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <ceiling> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "<title>"
+ * [slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "<title>"
  *
  * The need is in milliseconds, like the setting. `<found>` is the reader's token-free
  * description; the line holds no file text, no string value and no token.
@@ -1003,7 +1002,7 @@ function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
  */
 export function buildAdCallTimeoutWarningLine(callTimeoutMs: number, values: AdSettingsInEffect): string | undefined {
   const { needMs, setBy } = adCallTimeoutNeed(values)
-  const runbook = `see the switch-over runbook in ${PHASE1_RUNBOOK_DOC}, section "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-213)`
+  const runbook = `see the switch-over runbook in ${PHASE1_RUNBOOK_DOC}, section "${PHASE1_RUNBOOK_SECTION_TITLE}"`
   const head = `${AD_SETTINGS_LOG_PREFIX} ${CALL_TIMEOUT_SETTING} is ${callTimeoutMs}`
   if (setBy.kind === 'unused-pause-value') {
     return (
@@ -1028,7 +1027,7 @@ export interface AdCallTimeoutCheckDeps {
 }
 
 /**
- * The startup call-timeout check (b.jg5 SRJ-213): computes the need from the
+ * The startup call-timeout check: computes the need from the
  * values in effect and writes {@link buildAdCallTimeoutWarningLine}'s line,
  * if one is due, to `deps.log`. The server runs it once per start, right
  * after the startup read of agent-director's settings and before the start

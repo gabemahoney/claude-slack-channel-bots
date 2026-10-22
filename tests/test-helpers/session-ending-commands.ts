@@ -1,6 +1,6 @@
 /**
  * test-helpers/session-ending-commands.ts — the session-ending command forms
- * of ADSRD SR-1.4, as b.jg5 SRJ-1001 lists them for every post CSCB writes
+ * of agent-director contract, as lists them for every post CSCB writes
  * (the CONFLICT, unusable-name, launch-start and stuck-launch posts): `kill`
  * named as a command to run, `pause` in any form, `--include-finished`,
  * `tmux kill-session` and `tmux kill-server`.
@@ -42,7 +42,7 @@ function commandFormOf(verb: string): RegExp {
 }
 
 /**
- * The commands that end a session as ADSRD SR-1.4 defines one, as SRJ-1001
+ * The commands that end a session as agent-director contract defines one, as
  * lists them for the CONFLICT, unusable-name, launch-start and stuck-launch
  * posts: `kill` named as a command to run (so agent-director's "no kill was
  * sent" and "retry kill later" are no hit), `pause` in any form,

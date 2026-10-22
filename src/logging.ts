@@ -206,7 +206,7 @@ export function initLogging(logFilePath: string): void {
  * it is not already writing to `logFilePath`; the next file is opened before
  * the current one is closed, so a failure to open it leaves the redirect as it
  * was. Without an active redirect it does nothing. Best-effort: it never
- * throws. The server calls it once the state directory has moved (b.fc4): the
+ * throws. The server calls it once the state directory has moved: the
  * daemon starts logging at the path the CLI chose before the move, which can
  * be a per-file link in the old directory, and a rotation renames that link,
  * not the file behind it.

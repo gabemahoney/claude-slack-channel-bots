@@ -35,7 +35,7 @@ READ_PANE="$(_scenario_printed "${STEP_VALUES}" PANE_READ_PANE)"
 POLL_INTERVAL_MS="$(_scenario_printed "${STEP_VALUES}" MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS)"
 # src/unavailable-retry.ts over src/backoff.ts doublingBackoffDelay: when the
 # retry timer's third and fourth retries fall due after its arm (the first
-# refusal), each later wait doubling the one before up to its ceiling (SRJ-302).
+# refusal), each later wait doubling the one before up to its ceiling.
 RETRY_THIRD_S="$(_scenario_printed "${STEP_VALUES}" unavailableRetryDueS 3)"
 RETRY_FOURTH_S="$(_scenario_printed "${STEP_VALUES}" unavailableRetryDueS 4)"
 # src/ad-description-phrases.ts.
@@ -51,7 +51,7 @@ ESCALATE_HEAD_A="$(_scenario_printed "${STEP_VALUES}" escalateDeadSweepLineHead 
 RECONNECT_GONE_HEAD="$(_scenario_printed "${STEP_VALUES}" reconnectGoneLineHead)"
 
 
-# Legs 5 to 7 (E49 T3).
+# Legs 5 to 7 .
 REF_B="$(persona_ref "${PERSONA_B}")"
 SESSION_B="$(_scenario_printed "${STEP_VALUES}" personaTmuxSessionName "${KEY_B}")"
 # src/pane-read.ts.
@@ -75,7 +75,7 @@ NOTICE_POINTER="$(_scenario_printed "${STEP_VALUES}" CONFLICT_NOTICE_POINTER_LIN
 NOTICE_HUMAN_ONLY="$(_scenario_printed "${STEP_VALUES}" CONFLICT_NOTICE_HUMAN_ONLY_LINE)"
 CONFLICT_RECOVERY_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSONA_A}" \
     conflictRecoveryText "${SESSION_A}" LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)"
-# src/persona-episodes.ts: the tmux-unresponsive onset and alert (SRJ-1006),
+# src/persona-episodes.ts: the tmux-unresponsive onset and alert,
 # which an UNAVAILABLE of leg 6's resume may post before the latch.
 UNRESPONSIVE_ONSET_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSONA_A}" tmuxUnresponsiveOnsetText "${KEY_A}")"
 UNRESPONSIVE_ALERT_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSONA_A}" tmuxUnresponsiveAlertText "${KEY_A}")"
@@ -549,7 +549,7 @@ EOF
 
 # apply_personas_config <step> <health-check-interval> [<session-restart-delay>]:
 # a human's confirmed edit of two server-wide settings while the server runs
-# (b.av2 SR-8.6, SR-8.7): config.json rewritten (write_personas_config), its
+#: config.json rewritten (write_personas_config), its
 # pending file renamed to config.json.apply once the server previewed it, and
 # the apply logged (`applied_match settings=2`). A changed server-wide setting
 # takes effect at the next start, which runs the record.
@@ -826,7 +826,7 @@ done
 expect_nothing_launched "${STEP}" "${MARK_R}" "${ID_A}"
 expect_status "${STEP}" "${ID_A}" waiting
 
-# The health check's pane read of the renamed session (SRJ-1428 bullet 2,
+# The health check's pane read of the renamed session (bullet 2,
 # decision D4): A's stub's MCP session ends from the client's side
 # (`end_stub_mcp_session`); the server schedules a restart for the
 # disconnected persona, and the restart path's reconnect of A's live
@@ -976,7 +976,7 @@ for id in "${ID_A}" "${ID_B}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Leg 4: a re-bound socket; SRJ-1021's onset, nothing killed, deleted or launched
+# Leg 4: a re-bound socket onset, nothing killed, deleted or launched
 # ---------------------------------------------------------------------------
 
 STEP="leg 4 (re-bound socket)"
@@ -1209,7 +1209,7 @@ done
 
 # One latch post, with the CONFLICT notice's CSCB-authored parts and no
 # session-ending command. Before it, only the tmux-unresponsive onset and
-# alert the UNAVAILABLE answers may post (SRJ-308, SRJ-309), each at most once.
+# alert the UNAVAILABLE answers may post, each at most once.
 wait_until "${POST_WAIT_S}" "${STEP}: no latch post for ${PERSONA_A}" \
     post_opening_with "${SUFFIX_A}" "${POSTS_E}" "${NOTICE_HEAD_A}"
 sleep "${SETTLE_S}"

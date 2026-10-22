@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 29 (b.deo SRI-1401 to SRI-1410): declarative and fungible channel
+# Test 29: declarative and fungible channel
 # modes, end to end against the loopback Slack stub, outside dry run.
 #
 # A shared-mode scenario (no `-fmk-` in its name; lib/scenario.sh "Two
@@ -20,10 +20,10 @@
 # is 5 (stub-claude ignores the `/exit` that `stop --stop-bots` sends).
 #
 # Phases:
-# - Start (SRI-1404): both personas up, each launched `claude` the stub, both
+# - Start: both personas up, each launched `claude` the stub, both
 #   MCP sessions registered; a push to an unknown label is refused
 #   (`no-open-socket`) with its `push-refused` record line.
-# - A, a 0.11.x configuration (SRI-1405, the upgrade path): neither key of this
+# - A, a 0.11.x configuration (the upgrade path): neither key of this
 #   work; config.json equals its copy and the last-applied record; no
 #   stored-choice file; no server.log line names the switch's key, fungible
 #   mode or a class this work adds. alpha A1 plain is delivered `receive_all`
@@ -33,25 +33,25 @@
 #   `not-mentioned` drop; A2 and B1 mentions are delivered `mention`; the
 #   tool is refused with the declarative text (the first-tool-result control),
 #   and nothing is written.
-# - Switch on (SRI-1406): the switch and alpha's `invited.permission_prompts`;
+# - Switch on: the switch and alpha's `invited.permission_prompts`;
 #   the pending file carries the switch's line; its confirmation applies it
 #   with both sessions kept (no registration or launch line, read after a
 #   delivery on each persona's connection, in phase B).
-# - B, fungible mode (SRI-1407 steps 1 to 11): the fungible path, both orders
+# - B, fungible mode (steps 1 to 11): the fungible path, both orders
 #   of a mention's two events, a broadcast, a private channel, the externally
 #   shared, missing and non-boolean flags, a group DM, alpha's own fungible
 #   destination, then set_channel_delivery: stored, refused, held by the loop
 #   guard, and shared delivery, exactly once to each persona.
-# - Restart (SRI-1408): a plain stop (the bots keep running) and a live start;
+# - Restart: a plain stop (the bots keep running) and a live start;
 #   the stored-choice file keeps its bytes; the reconnect's new MCP clients
-#   repeat no call (SRI-1403); the stored choice applies again.
-# - Switch off (SRI-1409): declarative mode again, sessions kept (read after
+# repeat no call; the stored choice applies again.
+# - Switch off: declarative mode again, sessions kept (read after
 #   a delivery on each persona's connection), the stored choice inert and the
 #   file unchanged.
-# - Closing (SRI-1410): `stop --stop-bots`; the port closed; the Slack stub
+# - Closing: `stop --stop-bots`; the port closed; the Slack stub
 #   stopped; no token-like text anywhere; the elapsed time on the PASS line.
 #
-# Runtime rules (SRI-1401). Every wait polls and returns once its condition
+# Runtime rules. Every wait polls and returns once its condition
 # holds. Nothing waits on a health tick (off), a restart delay, a dedupe
 # retention window, a grace period or a launch bound; the only timing the
 # server sets on its own is the reload tick (5 s after the previous pass,
@@ -133,7 +133,7 @@ ALPHA_INDEX=0
 BRAVO_INDEX=1
 
 # Channel and user IDs: each a valid Slack ID of 1 to 24 characters from
-# A-Z0-9 (src/registry.ts ECHOABLE_CHANNEL_RE, SRI-503's echo rule), each
+# A-Z0-9 (src/registry.ts ECHOABLE_CHANNEL_REecho rule), each
 # channel matching src/config.ts CHANNEL_ID_RE.
 CH_TAG="${SCENARIO_TAG^^}"
 A1="C0${CH_TAG}A1"          # alpha: listed `all`; alpha's fungible destination in fungible mode
@@ -353,7 +353,7 @@ with open(path) as f:
 print(count)
 EOF
 
-# The stub MCP session's request and results records, for SRI-1403's checks
+# The stub MCP session's request and results records, for checks
 # (fixtures/stub-mcp-session.ts, its line formats), each file a path resolved
 # once below (REQUESTS_FILE, RESULTS_FILE):
 #   ids <requests-file>...               every request ID, one per line
@@ -686,10 +686,10 @@ wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" 
 
 # --- Configurations --------------------------------------------------------
 # write_persona_config <declarative|fungible|switch-off>:
-# - declarative: the 0.11.x shape of SRI-1405 (neither key of this work);
+# - declarative: the 0.11.x shape of the contract (neither key of this work);
 # - fungible: that plus the switch, and alpha's invited.permission_prompts A1
-#   (bravo has no `invited`, so its default "dm" applies) (SRI-1406);
-# - switch-off: fungible without the switch (SRI-1409).
+# (bravo has no `invited`, so its default "dm" applies);
+# - switch-off: fungible without the switch.
 write_persona_config() {
     local switch='' invited=''
     case "$1" in
@@ -737,7 +737,7 @@ write_persona_config() {
 EOF
 }
 
-# --- Start (SRI-1401, SRI-1404) --------------------------------------------
+# --- Start --------------------------------------------
 write_persona_config declarative
 CONFIG_A_COPY="${SCENARIO_ROOT}/config-phase-a.json"
 cp -- "${CONFIG}" "${CONFIG_A_COPY}"
@@ -840,7 +840,7 @@ for dir in "${ALPHA_TRANSCRIPTS}" "${BRAVO_TRANSCRIPTS}"; do
         || fail "start: ${dir} holds no transcript with stub-claude's session marker: the launched claude was not the stub"
 done
 
-# Positive control (SRI-1404): a push to a label no persona's token carries is
+# Positive control: a push to a label no persona's token carries is
 # refused, and the stub records the refusal.
 unknown_event="$(message_event "${A1}" channel "$(plain_text)" "${TS_BASE}.000000")"
 reason="$(slack_stub_push --expect-refused "${UNKNOWN_LABEL}" "${unknown_event}")"
@@ -850,7 +850,7 @@ wait_until "${RECORD_WAIT_S}" "start: the stub's record holds no push-refused li
     rec_at_least 1 event=push-refused label="${UNKNOWN_LABEL}" reason="${NO_OPEN_SOCKET}"
 [[ "$(rec_count event=push label="${UNKNOWN_LABEL}")" == 0 ]] || fail "start: the stub sent a push to ${UNKNOWN_LABEL}"
 
-# --- Phase A: a 0.11.x configuration (SRI-1405) ----------------------------
+# --- Phase A: a 0.11.x configuration ----------------------------
 # check_upgrade_log <step>: no server.log line names the switch's key,
 # fungible mode, or a class or line this work adds.
 check_upgrade_log() {
@@ -869,7 +869,7 @@ cmp -s -- "${CONFIG}" "${LAST}" || fail "phase A: config.json.last-applied does 
 check_upgrade_log "phase A after the start"
 
 # alpha A1 plain: delivered `receive_all`, found in the accepted queue record (the
-# first-delivery control, SRI-1404).
+# first-delivery control).
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 A_A1_TS="${PUSH_TS}"
 wait_queued "phase A: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${A_A1_TS}" "${VIA_RECEIVE_ALL}"
@@ -904,14 +904,14 @@ wait_queued "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${V
 
 # alpha calls the tool for A1 with `all`: refused with the declarative text,
 # found in the results record with isError set (the first-tool-result
-# control, SRI-1404); nothing written.
+# control); nothing written.
 expect_tool "phase A: alpha's set_channel_delivery A1 all" "${ALPHA_DIR}" \
     "$(jq -c -n --arg c "${A1}" '{channel: $c, delivery: "all"}')" true "${ALPHA_DECLARATIVE_REFUSAL}"
 [[ ! -e "${STORE_FILE}" ]] || fail "phase A: the refused call created ${STORE_FILE}"
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json changed after the refused call"
 check_upgrade_log "phase A after its last control"
 
-# --- The mode switch (SRI-1406, SRI-1409) -----------------------------------
+# --- The mode switch -----------------------------------
 # confirm_switch <fungible|switch-off> <switch-line> <step>: note each
 # persona's registration and launch lines (launch_counts), write the
 # configuration of that shape, wait for the pending file to carry the
@@ -946,10 +946,10 @@ expect_sessions_kept() {
         || fail "${step}: a session registration or launch line for ${BRAVO} after the confirmation"
 }
 
-# --- Switch on (SRI-1406) ---------------------------------------------------
+# --- Switch on ---------------------------------------------------
 confirm_switch fungible "${SWITCH_ON_LINE}" "switch on"
 
-# --- Phase B: fungible mode (SRI-1407) --------------------------------------
+# --- Phase B: fungible mode --------------------------------------
 # 1. alpha, public F1 (flag false), plain: no delivery, a not-mentioned line,
 #    one persona-invited-channel line (alpha, F1, public, mentions).
 B1_MARK="$(log_mark)"
@@ -989,12 +989,12 @@ push_message "${BRAVO_LABEL}" "${F2}" group "$(mention_text "${BRAVO_BOT_USER}")
 B4_TS="${PUSH_TS}"
 wait_queued "step 4: bravo F2 mention" "${BRAVO_DIR}" "${F2}" "${B4_TS}" "${VIA_MENTION}"
 expect_since "${B4_MARK}" "${BRAVO_HEARS_F2}" 1 "step 4: bravo's persona-invited-channel lines for F2"
-# The switch kept both sessions (SRI-1406), read after alpha's step 3
+# The switch kept both sessions, read after alpha's step 3
 # broadcast and bravo's step 4 mention, each delivered since the confirmation.
 expect_sessions_kept "switch on" "${F1}" "${B3_HERE_TS}" "${F2}" "${B4_TS}"
 
 # 5. alpha, X1 (flag true), X2 (no flag) and X3 (a flag that is not a
-#    boolean, beyond SRI-1407's two: SRI-1402's non-boolean form), each
+# boolean, beyond two: non-boolean form), each
 #    a mention: no delivery, one unclaimed-channel line with its reason, no
 #    audit line.
 b5_refused() {
@@ -1095,7 +1095,7 @@ wait_queued "step 11: bravo F1 mention, after the shared message" "${BRAVO_DIR}"
 expect_queued "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11_TS}"
 expect_queued "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
 
-# --- Persistence across a restart (SRI-1408, SRI-1403) ----------------------
+# --- Persistence across a restart ----------------------
 # Queue acceptance above can precede typing and its receipt. Settle both
 # personas before checking an immediate idle-session reconnect on restart.
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
@@ -1158,7 +1158,7 @@ done
 expect_tool "restart: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" false "${RESULT_F1_ALL}"
 expect_since "${RESTART_MARK}" "${ALPHA_SET_F1_AGAIN}" 1 "restart: alpha's persona-channel-delivery-set lines (all to all)"
 
-# SRI-1403: the reconnect's new clients read each request file from its
+# the reconnect's new clients read each request file from its
 # start and skip every request ID already answered, each with its own stderr
 # line in stub-mcp-session.log beside the stub (fixtures/stub-mcp-session.ts:
 # `request <id> has a result line; not run`), and no request ID made so far
@@ -1177,7 +1177,7 @@ expect_since "${RESTART_MARK}" "${ALPHA_HEARS_F1_ALL}" 1 "restart: alpha's perso
 expect_since "${RESTART_MARK}" "$(matcher "${ALPHA_INVITED_HEAD}" " ${F1} ")" 1 \
     "restart: alpha's persona-invited-channel lines naming F1 in this run"
 
-# --- Switch off (SRI-1409) --------------------------------------------------
+# --- Switch off --------------------------------------------------
 STORE_BEFORE_OFF="${SCENARIO_ROOT}/store-before-off.json"
 cp -- "${STORE_FILE}" "${STORE_BEFORE_OFF}"
 confirm_switch switch-off "${SWITCH_OFF_LINE}" "switch off"
@@ -1206,10 +1206,10 @@ expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
 cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FILE} changed"
 
-# E5 demo (b.omv SR-8.6): retain one real stub DM's log and transcript
+# demo: retain one real stub DM's log and transcript
 # metadata before the successful scenario's EXIT trap deletes both. The
 # existing queue checks establish acceptance and receipt completion; this
-# export prints the observed evidence; E9's exact log assertion follows below.
+# export prints the observed evidence; exact log assertion follows below.
 push_message "${BRAVO_LABEL}" "${DM}" im "$(plain_text)"
 DM_TS="${PUSH_TS}"
 wait_queued "E5: bravo direct DM" "${BRAVO_DIR}" "${DM}" "${DM_TS}" dm
@@ -1264,12 +1264,12 @@ for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
         || fail "closing: persona ${key} has an unexpected accepted queue set"
 done
 
-# --- Closing (SRI-1410) -----------------------------------------------------
+# --- Closing -----------------------------------------------------
 stop_server --stop-bots
 port_closed "${SCENARIO_PORT}" || fail "closing: something still answers on 127.0.0.1:${SCENARIO_PORT}"
 stop_tracked_pid "${STUB_PID}" 10 "the Slack stub did not exit on SIGTERM"
 
-# b.omv SR-13.6: the complete accepted sets also pin exactly one received
+# the complete accepted sets also pin exactly one received
 # diagnostic per persona/source/conversation/ts/sender. This includes paired
 # event dedupe, both shared recipients and the DM, and excludes every refused
 # input and nonrecipient. DELIVERIES_BEFORE preserves pre-compaction evidence;
@@ -1307,7 +1307,7 @@ print(f"received evidence: {sum(actual.values())} exact acceptances, paired even
 EOF
 
 # The token scan, read once every writer has stopped (the files stay until
-# the EXIT trap removes the scratch root). SRI-1410's files: server.log and
+# the EXIT trap removes the scratch root). files: server.log and
 # its rotations, the stub's record, the delivery and results records and the
 # stored-choice file; and, beside them, the request files, the client's log
 # and the stub's output.

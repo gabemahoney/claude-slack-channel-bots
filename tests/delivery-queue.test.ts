@@ -75,7 +75,7 @@ describe('durable record schemas', () => {
     expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
   })
 })
-test.each([false, true])('b.d6n: sent journal with legacy launch_id=%s replays as an unconfirmed send and survives compaction', async legacy => {
+test.each([false, true])('sent journal with legacy launch_id=%s replays as an unconfirmed send and survives compaction', async legacy => {
   const sent = legacy ? { ...sentRecord(), launch_id: 'old-server:42' } : sentRecord()
   expect(parseQueueRecord(JSON.stringify(sent))).toEqual(sent)
   seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['message'] }, sent])
@@ -88,7 +88,7 @@ test.each([false, true])('b.d6n: sent journal with legacy launch_id=%s replays a
   expect(replay.openCount('alpha')).toBe(1)
   expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([sent])
 })
-describe('b.p3h durable queued reaction metadata', () => {
+describe('durable queued reaction metadata', () => {
   test('legacy adoption keeps the first name and open delivery facts through replay and compaction', async () => {
     seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['first', 'second'] }, sentRecord(), deliveredRecord()])
     let q = await open({ now: createFakeClock({ start: 1000 }).now })
@@ -557,7 +557,7 @@ test('short filesystem writes are completed before acceptance, and file fsync pr
   const q = await open({ fs: seam }); expect((await q.accept('alpha', injectedInput({ text: '🙂'.repeat(40) }))).status).toBe('accepted'); expect(readQueue(dir)[0]).toMatchObject({ text: '🙂'.repeat(40) }); expect(order.lastIndexOf(join(dir, 'queue'))).toBeGreaterThan(order.lastIndexOf(queuePath(dir)))
 })
 
-// b.omv SR-3: acceptance failures must never turn uncertain bytes into replayed work.
+// acceptance failures must never turn uncertain bytes into replayed work.
 test.each(['truncate', 'fsync'] as const)('keeps the original rollback boundary through repeated reconciliation %s failures', async failure => {
   let phase: 'ok' | 'failed-append' | 'reconcile' = 'ok'
   const truncations: number[] = []

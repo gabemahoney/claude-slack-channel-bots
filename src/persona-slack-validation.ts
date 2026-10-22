@@ -1,6 +1,6 @@
 /**
  * persona-slack-validation.ts — Classify the outcome of validating a
- * persona's Slack tokens (b.av2 SR-3.2).
+ * persona's Slack tokens.
  *
  * Bring-up validates the bot token with `auth.test` and the app token by
  * opening Socket Mode (`apps.connections.open`, then the WebSocket up to
@@ -23,13 +23,13 @@
  *   credentials-broken.
  *
  * A running persona's Web API calls are classified too, but only for a
- * revoked bot token (bug b.ujn): `classifyWebApiAuthFailure` maps a platform
+ * revoked bot token: `classifyWebApiAuthFailure` maps a platform
  * error whose Slack error is `invalid_auth`, `token_revoked`,
  * `account_inactive` or `not_authed` to credentials refused (the `web-api`
  * check, `bot_token`, naming the method), and everything else to nothing.
  *
  * A connection counts as up only once `auth.test` has returned both the bot
- * user ID and the bot ID (b.av2 SR-3.1); `botIdentityFromAuthTest` maps a
+ * user ID and the bot ID; `botIdentityFromAuthTest` maps a
  * result lacking either to Slack-unreachable, never up.
  *
  * Library errors (`@slack/web-api`, `@slack/socket-mode`) are recognised
@@ -37,7 +37,7 @@
  * error built by a test stub or by another copy of the library classifies the
  * same way.
  *
- * Secrecy (b.av2 SR-10.3): an outcome never holds the thrown value, its
+ * Secrecy: an outcome never holds the thrown value, its
  * stack, body, headers, request config or `original`. The only values copied
  * from an error are the Slack error code (and only when it matches
  * `SLACK_ERROR_CODE_RE`; otherwise nothing is copied and the outcome is
@@ -49,7 +49,7 @@
  * — the reason kind, the token key, the check, the class label and the cause
  * text — is built by this module; the cause never holds error text.
  *
- * Pure module (b.av2 SR-13.1): no module-scope state, timers, I/O, logging,
+ * Pure module: no module-scope state, timers, I/O, logging,
  * network or environment access. The classifier never throws. The connection
  * manager (`persona-connections.ts`) calls it for every attempt.
  *
@@ -67,7 +67,7 @@ import { PERSONA_CREDENTIALS_REFUSED, PERSONA_SLACK_UNREACHABLE } from './person
  * Which validation a failure came from: `auth.test` checks the bot token,
  * `socket-mode` (opening Socket Mode: `apps.connections.open`, then the
  * WebSocket up to `hello`) checks the app token. `web-api` is a Web API call
- * a running persona's long-lived client made (bug b.ujn): it checks the bot
+ * a running persona's long-lived client made: it checks the bot
  * token too, and only its auth errors are classified
  * (`classifyWebApiAuthFailure`).
  */
@@ -111,7 +111,7 @@ const SOCKET_MODE_CODE_PREFIX = 'slack_socket_mode_'
 
 /**
  * Platform errors that mean Slack is having trouble, not that the token is
- * bad: Slack-unreachable, retried (b.av2 SR-3.2).
+ * bad: Slack-unreachable, retried.
  */
 export const TRANSIENT_SLACK_PLATFORM_ERRORS: ReadonlySet<string> = new Set([
   'internal_error',
@@ -129,7 +129,7 @@ export const UNKNOWN_SLACK_ERROR = 'unknown'
 
 /**
  * The Slack errors of a Web API call that mean the bot token no longer works
- * (bug b.ujn): the persona is marked credentials-broken at the first one. Any
+ * the persona is marked credentials-broken at the first one. Any
  * other Slack error (`missing_scope`, `channel_not_found`, `ratelimited`, …)
  * is the call's own failure and changes nothing.
  */
@@ -148,10 +148,10 @@ export const WEB_API_AUTH_FAILURE_ERRORS: ReadonlySet<string> = new Set([
 export const SLACK_METHOD_NAME_RE = /^[A-Za-z][A-Za-z0-9_.]{0,63}$/
 
 // ---------------------------------------------------------------------------
-// Start timeout marker (b.av2 SR-3.3)
+// Start timeout marker
 // ---------------------------------------------------------------------------
 
-/** Bound on the WebSocket phase of every Socket Mode `start()`, in milliseconds (b.av2 SR-3.3). */
+/** Bound on the WebSocket phase of every Socket Mode `start()`, in milliseconds. */
 export const SLACK_START_TIMEOUT_MS = 10_000
 
 /**
@@ -173,7 +173,7 @@ export const SLACK_TIMEOUT_CODE = 'cscb_slack_start_timeout'
 
 /**
  * Marker for "the WebSocket phase of `start()` was abandoned after
- * `SLACK_START_TIMEOUT_MS`" (b.av2 SR-3.3). The connection manager rejects
+ * `SLACK_START_TIMEOUT_MS`". The connection manager rejects
  * with it (or any value whose `code` is `SLACK_TIMEOUT_CODE`); the
  * classifier recognises it by that code, not by `instanceof`.
  */
@@ -232,7 +232,7 @@ export type SlackUnreachableReason =
   /** Anything else, including a platform error without a well-formed Slack error code. */
   | 'unknown'
 
-/** Slack could not be reached; retry with backoff (b.av2 SR-3.2). */
+/** Slack could not be reached; retry with backoff. */
 export interface SlackUnreachableOutcome {
   kind: 'slack-unreachable'
   class: typeof PERSONA_SLACK_UNREACHABLE
@@ -257,7 +257,7 @@ export interface SlackUnreachableOutcome {
   message?: string
 }
 
-/** Slack refused the token: the persona is credentials-broken (b.av2 SR-3.2, SR-6.4). */
+/** Slack refused the token: the persona is credentials-broken. */
 export interface SlackCredentialsRefusedOutcome {
   kind: 'credentials-refused'
   class: typeof PERSONA_CREDENTIALS_REFUSED
@@ -277,7 +277,7 @@ export interface SlackCredentialsRefusedOutcome {
 /** A failed validation. */
 export type SlackValidationFailure = SlackUnreachableOutcome | SlackCredentialsRefusedOutcome
 
-/** The persona's bot identity from `auth.test` (b.av2 SR-3.1). */
+/** The persona's bot identity from `auth.test`. */
 export interface SlackBotIdentity {
   /** `auth.test` `user_id`: the bot user's ID. */
   botUserId: string
@@ -300,7 +300,7 @@ export type SlackValidationOutcome = SlackUpOutcome | SlackValidationFailure
 
 /**
  * Classify a value thrown (or rejected) by `check` as Slack-unreachable or
- * credentials refused (b.av2 SR-3.2). Accepts any value, never throws, and
+ * credentials refused. Accepts any value, never throws, and
  * copies nothing from it but the Slack error code, the HTTP status,
  * `retryAfter` and, on a Slack-unreachable outcome other than `timeout`, its
  * message rendered redacted as `message` (see the module comment).
@@ -354,8 +354,7 @@ function classifyThrownValue(error: unknown, check: SlackValidationCheck): Slack
 }
 
 /**
- * Classify a value a running persona's Web API call rejected with (bug
- * b.ujn): a refused outcome of the `web-api` check (`bot_token`) when it is a
+ * Classify a value a running persona's Web API call rejected with: a refused outcome of the `web-api` check (`bot_token`) when it is a
  * Web API platform error whose Slack error is exactly one of
  * `WEB_API_AUTH_FAILURE_ERRORS`; undefined for anything else (another Slack
  * error, a network, HTTP or rate-limited error, any other value). Recognised
@@ -373,7 +372,7 @@ export function classifyWebApiAuthFailure(error: unknown, method: string | undef
 
 /**
  * Turn a successful `auth.test` result into the persona's bot identity
- * (b.av2 SR-3.1): `user_id` and `bot_id`, each a non-empty string. A result
+ * `user_id` and `bot_id`, each a non-empty string. A result
  * lacking either is a failed check; not being a platform error, it is
  * Slack-unreachable (`no-identity`), never up. The IDs are copied only on
  * success.

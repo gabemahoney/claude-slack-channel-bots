@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# b.omv SR-14.1/14.2: real native Claude; all state belongs to this container.
+# real native Claude; all state belongs to this container.
 set -euo pipefail
 TEST_NAME="test-34-fmk-real-compact"
 source "$(dirname "$0")/lib/scenario.sh"
 source "$(dirname "$0")/lib/real-scenario.sh"
-# Decision 16: explicit /compact proves AC42 on every gate invocation.
+# Explicit /compact proves post-compaction delivery on every gate invocation.
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 real_prepare

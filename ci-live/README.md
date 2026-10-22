@@ -1,7 +1,7 @@
 # ci-live: operator setup
 
 This directory is the runner for `/ci-live`, the live Slack acceptance run of
-`testplans/b.yko` in a throwaway docker container. What a run does, how it
+`testplans/live-acceptance.md` in a throwaway docker container. What a run does, how it
 keeps the production bots and the secrets safe, and what it checks are in
 `docker/README.md` under "/ci-live". This page takes the operator from the
 state below to a full run, then covers setting up a new VM.

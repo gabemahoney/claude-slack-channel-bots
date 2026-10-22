@@ -1,13 +1,13 @@
 /**
- * delivery-decision-fungible.test.ts — The decision table of b.deo SRI-1301:
+ * delivery-decision-fungible.test.ts — The decision table of
  * `decideDelivery` in both channel modes, called directly with the rows of
- * `tests/test-helpers/fungible-decision.ts`, one `test.each` per SRI-1301
+ * `tests/test-helpers/fungible-decision.ts`, one `test.each`
  * group, plus the completeness case and the purity cases.
  *
- * Test lines carried: b.deo SRI-202's decision rows (with b.av2 SR-1.2),
- * SRI-303 (with b.av2 SR-4.2 and SR-4.3), SRI-305, SRI-306 (with b.av2
- * SR-4.2 and SR-4.4), SRI-308 (with b.av2 SR-4.2 to SR-4.4) and SRI-309
- * (with b.av2 SR-13.1). SRI-605's share: the decision takes no Slack client
+ * Test lines carried: decision rows (with),
+ * (with and)(with
+ * and)(with to) and
+ * (with). share: the decision takes no Slack client
  * and this suite uses no stub, so the purity audit shows it adds no Slack
  * call.
  *
@@ -95,51 +95,51 @@ function allRows(): FungibleDecisionRow[] {
 const G = FUNGIBLE_DECISION_GROUPS
 
 // ---------------------------------------------------------------------------
-// The decision table (b.deo SRI-1301)
+// The decision table
 // ---------------------------------------------------------------------------
 
-describe('b.deo SRI-1301 group 1: declarative mode (switch absent or false) is unchanged by every fungible input (b.deo SRI-308, SRI-202, SRI-309; b.av2 SR-4.2 to SR-4.4)', () => {
+describe('group 1: declarative mode (switch absent or false) is unchanged by every fungible input', () => {
   test.each(cases(G.declarative))('%s', (_title, row) => expectOutcome(row))
 })
 
-describe('b.deo SRI-1301 group 2: fungible mode, no stored choice, flag false (b.deo SRI-306; b.av2 SR-4.2, SR-4.4)', () => {
+describe('group 2: fungible mode, no stored choice, flag false', () => {
   test.each(cases(G.noStoredChoice))('%s', (_title, row) => expectOutcome(row))
 })
 
-describe('b.deo SRI-1301 group 3: fungible mode, P\'s stored all (b.deo SRI-306, SRI-305; b.av2 SR-4.4)', () => {
+describe('group 3: fungible mode, P\'s stored all', () => {
   test.each(cases(G.storedAll))('%s', (_title, row) => expectOutcome(row))
 })
 
-describe('b.deo SRI-1301 group 4: fungible mode ignores every declarative section, listed, malformed or absent (b.deo SRI-305, SRI-202; b.av2 SR-1.2)', () => {
+describe('group 4: fungible mode ignores every declarative section, listed, malformed or absent', () => {
   test.each(cases(G.ignoresChannels))('%s; channelDeliveryFor agrees', (_title, row) => expectOutcomeAndChannelDelivery(row))
 })
 
-describe('b.deo SRI-1301 group 5: the fungible path\'s five conditions, first failure decides, and the same events listed in declarative mode (b.deo SRI-303, SRI-308; b.av2 SR-4.2)', () => {
+describe('group 5: the fungible path\'s five conditions, first failure decides, and the same events listed in declarative mode', () => {
   test.each(cases(G.conditions))('%s', (_title, row) => expectOutcome(row))
 })
 
-describe('b.deo SRI-1301 group 6: group DMs in fungible mode (b.deo SRI-303; b.av2 SR-4.3)', () => {
+describe('group 6: group DMs in fungible mode', () => {
   test.each(cases(G.groupDms))('%s', (_title, row) => expectOutcome(row))
 })
 
-describe('b.deo SRI-1301 group 7: the loop guard under P\'s stored all (b.deo SRI-305)', () => {
+describe('group 7: the loop guard under P\'s stored all', () => {
   test.each(cases(G.loopGuard))('%s; channelDeliveryFor agrees', (_title, row) => expectOutcomeAndChannelDelivery(row))
 })
 
-describe('b.deo SRI-1301 group 8: in fungible mode non-message, no-author and own run before the fungible conditions (b.deo SRI-303; b.av2 SR-4.2)', () => {
+describe('group 8: in fungible mode non-message, no-author and own run before the fungible conditions', () => {
   test.each(cases(G.firstSteps))('%s', (_title, row) => expectOutcome(row))
 })
 
-describe('b.deo SRI-1301 group 9: an unreadable store applies no stored choice (b.deo SRI-305)', () => {
+describe('group 9: an unreadable store applies no stored choice', () => {
   test.each(cases(G.unreadableStore))('%s; channelDeliveryFor agrees', (_title, row) => expectOutcomeAndChannelDelivery(row))
 })
 
-describe('b.deo SRI-1301 group 10: a DM in fungible mode is decided by dm.enabled (b.deo SRI-303; b.av2 SR-4.3)', () => {
+describe('group 10: a DM in fungible mode is decided by dm.enabled', () => {
   test.each(cases(G.dmInFungibleMode))('%s', (_title, row) => expectOutcome(row))
 })
 
 // ---------------------------------------------------------------------------
-// Completeness (b.deo SRI-1301)
+// Completeness
 // ---------------------------------------------------------------------------
 
 /** A row's switch × channel_type × flag combination, classified from its inputs; undefined for a channel_type outside the five. */
@@ -150,7 +150,7 @@ function combinationOf(row: FungibleDecisionRow): string | undefined {
   return `switch ${switchFormOf(row.config)} × ${channelType} × flag ${flagFormOf(row.flag)}`
 }
 
-describe('b.deo SRI-1301 completeness', () => {
+describe('completeness', () => {
   test('every switch form × channel_type × flag form (60 combinations) appears in at least one row', () => {
     const seen = new Set(allRows().map(combinationOf))
     const all = SWITCH_FORMS.flatMap((s) => CHANNEL_TYPE_FORMS.flatMap((c) => FLAG_FORMS.map((f) => `switch ${s} × ${c} × flag ${f}`)))
@@ -158,14 +158,14 @@ describe('b.deo SRI-1301 completeness', () => {
     expect(all.filter((combination) => !seen.has(combination))).toEqual([])
   })
 
-  test('every refusal of FUNGIBLE_REFUSALS is the expected outcome of at least one row (b.deo SRI-303)', () => {
+  test('every refusal of FUNGIBLE_REFUSALS is the expected outcome of at least one row', () => {
     const expected = new Set(allRows().map((row) => ('refusal' in row.expected ? row.expected.refusal : undefined)))
     expect(FUNGIBLE_REFUSALS.filter((refusal) => !expected.has(refusal))).toEqual([])
   })
 })
 
 // ---------------------------------------------------------------------------
-// Purity (b.deo SRI-309, b.av2 SR-13.1; b.deo SRI-605's share)
+// Purity (share)
 // ---------------------------------------------------------------------------
 
 /** Names whose use means I/O, logging, time, randomness, the environment or global state. */
@@ -254,7 +254,7 @@ function decisionCode(): string {
   return stripComments(readFileSync(DECISION_SOURCE, 'utf-8'))
 }
 
-describe('b.deo SRI-309: the decision stays pure (b.av2 SR-13.1)', () => {
+describe('the decision stays pure', () => {
   test('src/delivery-decision.ts imports types only: no value, node: or package import, no dynamic import', () => {
     expect(importFindings(decisionCode())).toEqual([])
   })

@@ -1,6 +1,6 @@
 /**
  * cron-scheduler.test.ts — Unit tests for the once-per-minute dispatch tick
- * (Task 3 on b.he5; decision 8, D-Q3, PD-4 on b.grx / t2.he5.eu.4q).
+ *
  *
  * Drives `createCronScheduler` with an injected clock and a recording
  * dispatcher stub — NO real time passes, NO real timers fire, NO HTTP, and
@@ -8,7 +8,7 @@
  * scheduling semantics; the fake `setTimeout`/`clearTimeout` are used only to
  * assert single minute-aligned arming and stop() cancellation.
  *
- * Hot-reload (E3) and this file: the tick's step (1) is a real reload gated on
+ * Hot-reload and this file: the tick's step (1) is a real reload gated on
  * the crontable's (mtimeMs, size). Every test here writes the crontable ONCE,
  * before start(), and never rewrites it mid-test, so that gate always compares
  * equal and the reload step is a silent no-op — these tests stay about pure
@@ -110,7 +110,7 @@ function makeClock(start: Date): ManualClock {
 // ---------------------------------------------------------------------------
 // Recording dispatcher stub — captures per-schedule fire() calls; no HTTP.
 // The scheduler dispatches one fire() per matched schedule in crontable line
-// order (plain cron, b.qby revert — there is no fireGroup); fireCalls preserves
+// order (plain cron revert — there is no fireGroup); fireCalls preserves
 // that dispatch order for order-sensitive assertions.
 // ---------------------------------------------------------------------------
 
@@ -259,7 +259,7 @@ describe('cron-scheduler — start()', () => {
     expect(logRecords().filter((r) => r.kind === 'warn')).toEqual([])
   })
 
-  test('each line with no persona list → its own warn naming its line number and prompt, and the started marker counts them undeliverable (b.n4n)', () => {
+  test('each line with no persona list → its own warn naming its line number and prompt, and the started marker counts them undeliverable', () => {
     const start = new Date('2026-06-15T10:30:00')
     const standup = line(everyMinute, '/p/standup.md')
     const grooming = line(everyMinute, '/p/grooming.md')
@@ -319,7 +319,7 @@ describe('cron-scheduler — start()', () => {
     expect(clock.pending()).toHaveLength(0)
     expect(dispatcher.fireCalls).toHaveLength(0)
 
-    // The direct tick() seam is deliberately NOT gated on started: post-E3 its
+    // The direct tick seam is deliberately NOT gated on started: post- its
     // reload step loads the table itself (lastLoadStat is null → first stat
     // always loads), so a hand-called tick() on a never-started scheduler does
     // dispatch. Pinned here so the ungated seam is a stated decision rather
@@ -366,7 +366,7 @@ describe('cron-scheduler — start()', () => {
 })
 
 // ===========================================================================
-// Load-line wording (b.n4n) — pinned once here; the start and reload cases
+// Load-line wording — pinned once here; the start and reload cases
 // compare the logged lines with these builders.
 // ===========================================================================
 
@@ -440,7 +440,7 @@ describe('cron-scheduler — tick() matching', () => {
     const start = new Date('2026-06-15T10:30:00')
     // Four schedules ALL matching this minute, deliberately NOT in path-alpha
     // order, so an accidental sort would reorder and fail this assertion loudly.
-    // Plain cron (b.qby): each match is its own fire(), never grouped.
+    // Plain cron: each match is its own fire, never grouped.
     writeCrontable(
       line(everyMinute, '/p/zeta.md', 'C1'),
       line(matchAt(start), '/p/alpha.md', 'C2'),

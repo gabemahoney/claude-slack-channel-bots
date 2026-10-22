@@ -1,8 +1,7 @@
 /**
- * permission-poller.test.ts — SR-2.1 / SR-2.4 / SR-5 / SR-8.4 poller behavior
+ * permission-poller.test.ts — poller behavior
  * under the plural-projection wire, composite-key live map, and verdict-
- * rendering newly-closed reconciliation, keyed by persona (b.av2 SR-7.1,
- * SR-7.2).
+ * rendering newly-closed reconciliation, keyed by persona.
  *
  * Harness: a three-persona config (`makeMultiPersonaConfig`) with one
  * `makeStubSlack` stub per persona (leak marker on), handed to the poller
@@ -13,7 +12,7 @@
  * differ, so no assertion can pass by confusing a key with a channel ID.
  *
  * Coverage:
- *   - AC 28 / AC 31: a row labelled for A posts exactly once, on A's stub, to
+ * - a row labelled for A posts exactly once, on A's stub, to
  *     A's destination (not its first, work channel); no other stub is called;
  *     the live entry records the channel, ts and persona key; the buttons
  *     decode to `cscb_<A key>`.
@@ -26,19 +25,19 @@
  *     closing sweep), its wedge counter and its not-posted record; applied
  *     again, nothing is re-posted.
  *   - Slack failures (prompt post, wedge warning, closure update) are
- *     scripted on the stub, the error class in the trail, nothing leaks
- *     (b.av2 SR-10.3). A closure update failure logs one token-safe line per
+ *     scripted on the stub, the error class in the trail, nothing leaks.
+ * A closure update failure logs one token-safe line per
  *     attempt with the platform reason, and a prompt failing on its own
  *     message (`invalid_blocks`, `msg_too_long`) one line per request; a
  *     destination failure of a prompt or wedge warning logs one
  *     `persona-destination-failed` line per episode instead.
- *   - The prompt's size (b.zmq): Bash's command and Edit's or Write's
+ * - The prompt's size: Bash's command and Edit's or Write's
  *     file_path are cut to Slack's section-text limit, another input's JSON
  *     to the JSON summary's cap, each with a marker giving the shown and
  *     total counts; a long tool name is cut, ending `…`, in the text and the
  *     header; no cut splits a surrogate pair. A 10 000-character Bash
  *     command posts once across ticks, within the limit (AC).
- *   - `dm` destination (b.av2 SR-7.1; AC 29, 34, 44): `conversations.open`
+ * - `dm` destination (34, 44): `conversations.open`
  *     for `dm.contact` then `chat.postMessage` to the returned `D…`, both on
  *     the persona's own client, with no identity override; the live entry and
  *     the trail name the `D…`; one open serves every later prompt; a
@@ -46,7 +45,7 @@
  *     open is trailed (ok:false, no channel) and nothing posts; a refused
  *     destination (DMs off or no contact) is logged once per request with no
  *     Slack call and no trail event.
- *   - Fungible mode (b.deo SRI-702, SRI-906, beside b.av2 SR-7.1), in its own
+ * - Fungible mode (beside), in its own
  *     describe with the switch on and a resolver reading it at each attempt,
  *     as `src/server.ts` wires it: a prompt for a persona whose fungible
  *     destination (`invited.permission_prompts`) is a channel posts once to
@@ -58,7 +57,7 @@
  *     request naming the setting in force (from `destinationSettingOf`),
  *     otherwise the declarative-mode line for the same persona and request,
  *     with no Slack call.
- *   - Destination failures held and retried (b.av2 SR-7.1, SR-3.2; AC 44),
+ * - Destination failures held and retried,
  *     through a destination hold on a fake clock (`makeHold`): `missing_scope`
  *     on a DM-only persona's first open and `not_in_channel` on a channel
  *     post log one episode line (naming `im:write` only for the former); no
@@ -70,7 +69,7 @@
  *     naming it. A held persona never holds another; a request closed
  *     while held is never posted or updated; a stuck-prompt warning joins the
  *     episode and a held tick leaves its throttle alone; a payload error is
- *     not held and its message never posted again (b.zmq): the next tick
+ * not held and its message never posted again: the next tick
  *     posts the short prompt naming the tool and the error, tracked so it
  *     closes; a short prompt rejected too makes two posts in all and nothing
  *     tracked. A due retry whose attempt ends early (the warning finding no
@@ -80,11 +79,10 @@
  *     held: its next prompt or warning posts. A token-shaped Slack error
  *     reaches the trail and the episode line as `unknown_error`.
  *   - Closing updates after DMs are turned off, the destination changes or
- *     `dm.contact` changes in place with the cached DM forgotten (AC 36,
- *     b.av2 SR-5.1): one `chat.update` on the recorded conversation and ts,
+ * `dm.contact` changes in place with the cached DM forgotten: one `chat.update` on the recorded conversation and ts,
  *     no post and no open; later prompts use the new destination; another
  *     persona's tracked prompt is untouched.
- *   - The applied set swapped mid-tick (a confirmed reload's step 1; AC 58):
+ * - The applied set swapped mid-tick (a confirmed reload's step 1):
  *     a destination or DMs change during the `get`, or between two prompts
  *     of one row, sends the next prompt to the new destination; a persona
  *     removed then posts nothing more, logs the unchanged "names no applied
@@ -101,52 +99,52 @@
  *     no map mutation (duplicate-tick no-op).
  *   - Empty `permission_requests` array → zero postMessage activity from
  *     the open-rows path; existing entries from prior ticks are reconciled
- *     via `getPermission` + verdict-distinct `chat.update` + drop (SR-2.4).
+ * via `getPermission` + verdict-distinct `chat.update` + drop.
  *   - `null` / `undefined` open-rows → logs and skips, no state change.
  *   - Row disappearance → `getPermission` called for the disappeared token,
  *     verdict-distinct `chat.update` lands on that row's messageTs only,
- *     entry dropped from livePermissions (SR-2.4, SR-5.3).
- *   - SR-5.1 four verdict renderings: operator_allow, operator_deny,
+ * entry dropped from livePermissions.
+ * - four verdict renderings: operator_allow, operator_deny,
  *     timeout, find_missing — each visually distinct.
- *   - SR-5.2 unknown `decision_reason` → fail-closed generic deny, log,
+ * - unknown `decision_reason` → fail-closed generic deny, log,
  *     no crash, sibling rows on the same tick still proceed.
- *   - SR-2.4 not-found (`ErrPermissionRequestNotFound`) → generic deny, log,
+ * - not-found (`ErrPermissionRequestNotFound`) → generic deny, log,
  *     drop, no retry on subsequent ticks.
  *   - Transient `getPermission` error → entry preserved, retried next tick.
- *   - SR-5.3 sibling independence on closure: chat.update targets only the
+ * - sibling independence on closure: chat.update targets only the
  *     disappeared row's messageTs; the sibling's entry + messageTs are
  *     untouched.
  *   - get() ErrSpawnNotFound → continue silently.
  *   - Skipped-tick observability (5+ consecutive in-flight ticks → warn).
  *   - buildPermissionBlocks emits the UUIDv4-anchored action_id shape.
- *   - Wedge detector (b.fae F4 / SR-7.2): one persona-named warning to the
+ * - Wedge detector (F4 /): one persona-named warning to the
  *     persona's destination through its client, equal to the exported
  *     builder's text for the tripped spawn's own instance id. The text
- *     itself (b.jg5 SRJ-1012): one pin case holds SRJ-1012's text; the other
+ * itself: one pin case holds text; the other
  *     cases check the imported builder: agent-director verbs only (`read-pane`,
  *     then `kill` with "check the result"), no "tmux-kill", no tmux command,
- *     no respawn step, and SRJ-1001's human-only sentence (AC 78). The
+ * no respawn step, and human-only sentence. The
  *     scenario passes a
  *     destination hold whose fake clock moves one poll interval per tick.
- *     While the persona's teardown window is open (b.jg5 SRJ-1003, a
+ * While the persona's teardown window is open (a
  *     recording stand-in for the notifier's `notify` and
  *     `teardownWindowState`), the warning's body is handed to `notify` once,
  *     with one line, never to the hold, and latched; with no window open, or
  *     only another persona's, it posts as before; a throwing window read and
  *     a rejecting `notify` are logged token-safely.
- *   - A persona that is not up (b.av2 SR-6.4), through the production up
+ * - A persona that is not up, through the production up
  *     predicate: its rows get no `get`, post, update, live entry, wedge tick
  *     or trail event while an up persona's row posts in the same tick; a
  *     skipped request posts once after it comes up; its tracked prompt and
  *     wedge count are held (not closed, dropped, re-posted or re-armed) and
  *     reconciled once it is up; the skip is logged once per episode.
- *   - A teardown's drop (`forgetPersonaPrompts`, b.av2 SR-6.5): B's tracked
+ * - A teardown's drop (`forgetPersonaPrompts`): B's tracked
  *     prompts (by key or `cscb_<key>`), not-posted, payload-rejection and
- *     failure records (b.zmq), stuck-prompt count and not-up skip episode are
+ * failure records, stuck-prompt count and not-up skip episode are
  *     dropped with no Slack call, trail event or closing update, A's are
  *     kept; one line only when prompts were dropped; a leftover row labelled
  *     for B after B left the applied set posts and tracks nothing.
- *   - One failure stays with its row, request or closed entry (b.zmq): a
+ * - One failure stays with its row, request or closed entry: a
  *     tick whose first row throws (a request the builder rejects, or a `get`
  *     result that is not a list) still posts rows 2 and 3 and runs the
  *     closed-request check (AC); a throwing request is logged once while
@@ -160,7 +158,7 @@
  *     failure is still logged once, through its own record. A payload
  *     rejection is recorded before its line, so a logger throwing on that
  *     line still leaves the short prompt to post next. Each line is
- *     asserted with its text from its builder (b.jg5 SRJ-1014), whose
+ * asserted with its text from its builder, whose
  *     literal texts one `pin:` case holds.
  *
  * SPDX-License-Identifier: MIT
@@ -290,7 +288,7 @@ afterAll(() => {
 })
 
 // ---------------------------------------------------------------------------
-// Shared fixtures — no inline magic strings (SR-8.1)
+// Shared fixtures — no inline magic strings
 // ---------------------------------------------------------------------------
 
 // Persona A works in A_WORK (its first channel) and sends prompts to A_DEST.
@@ -423,8 +421,8 @@ const chatPosts = (trail: TrailCapture) => trail.events.filter((e) => e.event ==
 const logLines = (logCalls: unknown[][], fragment: string) =>
   logCalls.filter((args) => String(args[0]).includes(fragment))
 
-// The fixed text of b.zmq's failure and payload-rejection lines, taken from
-// their builders (b.jg5 SRJ-1014): each builder's line with an empty
+// The fixed text of the contract failure and payload-rejection lines, taken from
+// their builders: each builder's line with an empty
 // description (or failure tail). A line it writes is that text, then its
 // description, so it starts with it. The literal texts are pinned once, in
 // the `pin:` case below.
@@ -437,7 +435,7 @@ const shortPromptRejectedLead = (instance: string, token: string) =>
 const TICK_FAILED_LEAD = buildTickFailedLine('')
 
 /**
- * A failed Slack call (b.av2 SR-10.3): exactly one log line carries
+ * A failed Slack call: exactly one log line carries
  * `fragment`; it names the platform reason for a platform error (and none for
  * a network error) and ends with the token-safe description; nothing in the
  * log calls or the trail carries the sentinel or a token.
@@ -463,21 +461,21 @@ function expectTokenSafeFailure(
 /** The Slack failures each failed-call site is checked with. */
 type SlackFailureRow = { kind: 'platform'; error: string } | { kind: 'network' }
 
-/** The server-log class of a destination-failure episode (b.av2 SR-10.3). */
+/** The server-log class of a destination-failure episode. */
 const EPISODE_CLASS = 'persona-destination-failed'
 /** The scope a `missing_scope` failure of `conversations.open` names. */
 const DM_OPEN_SCOPE = 'im:write'
 
 /** Every `persona-destination-failed` line: the episode's opening line and its cleared line. */
 const episodeLines = (logCalls: unknown[][]) => logLines(logCalls, `] ${EPISODE_CLASS}: `)
-/** The cleared lines among them (E2's convention: the cause starts `cleared:`). */
+/** The cleared lines among them (convention: the cause starts `cleared:`). */
 const clearedLines = (logCalls: unknown[][]) => episodeLines(logCalls).filter((args) => String(args[0]).includes(': cleared: '))
 /** Per-attempt failure lines the poller itself writes (a prompt or wedge-warning open or post). */
 const pollerFailureLines = (logCalls: unknown[][]) =>
   logCalls.filter((args) => String(args[0]).includes('permission-poller:') && String(args[0]).includes(' failed for '))
 
 /**
- * A destination failure (b.av2 SR-7.1, SR-10.3): exactly one
+ * A destination failure: exactly one
  * `persona-destination-failed` line (the episode opened; nothing cleared),
  * naming the persona by index, name and key, the destination, the failed step
  * and the Slack error code, and `im:write` only when `namesScope`; no
@@ -559,7 +557,7 @@ function getResult(permission_requests?: PermissionRequestRow[] | null, persona:
 // Block Kit builder
 // ---------------------------------------------------------------------------
 
-describe('buildPermissionBlocks (SR-2.2 action_id shape with request_token)', () => {
+describe('buildPermissionBlocks (action_id shape with request_token)', () => {
   test('emits perm_allow_<instance>_<token> and perm_deny_<instance>_<token>', () => {
     const blocks = buildPermissionBlocks('Bash', { command: 'rm -rf' }, INSTANCE_A, TOKEN_A) as Array<Record<string, unknown>>
     const actions = blocks[1] as { elements: Array<{ action_id: string }> }
@@ -569,7 +567,7 @@ describe('buildPermissionBlocks (SR-2.2 action_id shape with request_token)', ()
 })
 
 // ---------------------------------------------------------------------------
-// The prompt's size: Slack's section-text limit (b.zmq)
+// The prompt's size: Slack's section-text limit
 // ---------------------------------------------------------------------------
 
 /** The text of a prompt's section block (its first block). */
@@ -593,7 +591,7 @@ function expectCut(text: string, tool: string, content: string): number {
   return Number(shown)
 }
 
-describe('the prompt\'s section stays within Slack\'s section-text limit, with a marker when cut (b.zmq)', () => {
+describe('the prompt\'s section stays within Slack\'s section-text limit, with a marker when cut', () => {
   test('a short input is shown whole with no marker: Bash\'s command, or the JSON of another tool\'s input', () => {
     expect(sectionText(buildPermissionBlocks('Bash', { command: 'ls /tmp' }, INSTANCE_A, TOKEN_A))).toBe('🤖🛠️ *Bash*\n`ls /tmp`')
     expect(sectionText(buildPermissionBlocks('Read', { file_path: '/tmp/a' }, INSTANCE_A, TOKEN_A))).toBe('🤖🛠️ *Read*\n`{"file_path":"/tmp/a"}`')
@@ -676,7 +674,7 @@ describe('the prompt\'s section stays within Slack\'s section-text limit, with a
 // ---------------------------------------------------------------------------
 
 describe('poller tick — Case 1: new entry', () => {
-  test('AC 28 / AC 31: posts once through the persona\'s own client to its destination (not its first, work channel) and records the live entry with handled=false', async () => {
+  test('posts once through the persona\'s own client to its destination (not its first, work channel) and records the live entry with handled=false', async () => {
     scriptPostTs(stubA, POST_TS)
     const row = cannedPermissionRequest({ request_token: TOKEN_A, request_id: 7 })
     const ivl = startPoller(() => ({
@@ -696,7 +694,7 @@ describe('poller tick — Case 1: new entry', () => {
     expect(live?.requestId).toBe(7)
     expect(live?.handled).toBe(false)
 
-    // AC 31 precondition: the destination is not the first channel A lists.
+    // precondition: the destination is not the first channel A lists.
     expect(A.channels[0]?.id).toBe(A_WORK)
     const postCalls = posts(stubA)
     expect(postCalls).toHaveLength(1)
@@ -748,10 +746,10 @@ describe('poller tick — Case 1: new entry', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Persona routing (b.av2 SR-7.1)
+// Persona routing
 // ---------------------------------------------------------------------------
 
-describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
+describe('poller tick — persona routing', () => {
   test('two personas in one tick post on their own clients to their own destinations; a closure of A updates only through A', async () => {
     scriptPostTs(stubA, POST_TS)
     scriptPostTs(stubB, POST_TS_2)
@@ -839,7 +837,7 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     expect(outageEmissions).toHaveLength(0)
   })
 
-  // b.1ix: the start sweep keeps a pre-persona row, which can sit in
+  // the start sweep keeps a pre-persona row, which can sit in
   // check_permission for good, so its skip line must not repeat every tick.
   test('a row with no persona label is logged once while it stays listed, per instance ID; a failed list forgets nothing; a row no longer listed logs again when it comes back', async () => {
     const logCalls: unknown[][] = []
@@ -1029,10 +1027,10 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// `dm` destination (b.av2 SR-7.1; SR-5.1 exception)
+// `dm` destination (exception)
 // ---------------------------------------------------------------------------
 
-describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
+describe('poller tick — `dm` destination', () => {
   const A_CONTACT = 'U0ACONTACT1'
   const D_NEW_CONTACT = 'U0DNEWCON1'
   const TOKEN_C = '33333333-3333-4333-8333-333333333333'
@@ -1045,11 +1043,11 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
   test.each<[string, string, (() => void) | undefined, string[], () => string]>([
     ['channel destination (A): chat.postMessage only, to its channel', KEY_A, undefined, ['chat.postMessage'], () => A_DEST],
     [
-      'AC 29: DM destination with DMs on (D): conversations.open for its contact, then chat.postMessage to the returned D…',
+      'DM destination with DMs on (D): conversations.open for its contact, then chat.postMessage to the returned D…',
       KEY_D, undefined, ['conversations.open', 'chat.postMessage'], () => D_DM,
     ],
     [
-      'AC 44: DM-only persona with zero channels (D), first prompt with no DM yet: the conversation is opened and the prompt delivered there',
+      'DM-only persona with zero channels (D), first prompt with no DM yet: the conversation is opened and the prompt delivered there',
       KEY_D, () => reconfigure(KEY_D, { channels: [] }), ['conversations.open', 'chat.postMessage'], () => D_DM,
     ],
   ])('%s — on the persona\'s own client, in that exact order, with no identity override; the live entry and trail name that conversation', async (_label, key, setup, expectedMethods, expectedChannel) => {
@@ -1112,7 +1110,7 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
     expect(posts(stubD).map((c) => c.channel)).toEqual([D_DM, D_DM])
   })
 
-  test('AC 34: two personas in one tick route by their own settings: A posts to its channel with no conversations.open, D opens and posts in its DM, each on its own client; B gets nothing', async () => {
+  test('two personas in one tick route by their own settings: A posts to its channel with no conversations.open, D opens and posts in its DM, each on its own client; B gets nothing', async () => {
     scriptPostTs(stubA, POST_TS)
     scriptPostTs(stubD, POST_TS_2)
     const ivl = startPoller(() => ({
@@ -1134,7 +1132,7 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
 
   test.each<[string, string, () => void, () => string, string[], string[], () => string]>([
     [
-      'AC 36: a DM prompt, after DMs are turned off and the destination is a channel',
+      'a DM prompt, after DMs are turned off and the destination is a channel',
       KEY_D, () => reconfigure(KEY_D, { dm: { enabled: false }, permission_prompts: D_WORK }),
       () => D_DM, ['conversations.open', 'chat.postMessage'], ['chat.postMessage'], () => D_WORK,
     ],
@@ -1253,10 +1251,10 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fungible mode: prompts at the fungible destination (b.deo SRI-702, SRI-906)
+// Fungible mode: prompts at the fungible destination
 // ---------------------------------------------------------------------------
 
-describe('poller tick — fungible mode: prompts at the fungible destination (b.deo SRI-702, SRI-906, beside b.av2 SR-7.1)', () => {
+describe('poller tick — fungible mode: prompts at the fungible destination (beside)', () => {
   /** The configuration in effect in declarative mode, as the one destination rule reads it. */
   const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
   /** The configuration in effect in fungible mode, as the one destination rule reads it. */
@@ -1405,10 +1403,10 @@ describe('poller tick — fungible mode: prompts at the fungible destination (b.
 })
 
 // ---------------------------------------------------------------------------
-// The applied set swapped mid-tick (a confirmed reload's step 1; AC 58)
+// The applied set swapped mid-tick (a confirmed reload's step 1)
 // ---------------------------------------------------------------------------
 
-describe('poller tick — the applied set swapped mid-tick by a confirmed reload (AC 58)', () => {
+describe('poller tick — the applied set swapped mid-tick by a confirmed reload', () => {
   const A_CONTACT = 'U0ACONTACT1'
   const TOKEN_C = '33333333-3333-4333-8333-333333333333'
   const request = (request_token: string, request_id: number) => cannedPermissionRequest({ request_token, request_id })
@@ -1421,11 +1419,11 @@ describe('poller tick — the applied set swapped mid-tick by a confirmed reload
 
   test.each<[string, string, () => void, string[], () => string]>([
     [
-      'AC 58: D\'s DMs turned off and its prompts moved to its channel while its get is in flight: one post to the channel, no conversations.open',
+      'D\'s DMs turned off and its prompts moved to its channel while its get is in flight: one post to the channel, no conversations.open',
       KEY_D, () => reconfigure(KEY_D, { dm: { enabled: false }, permission_prompts: D_WORK }), ['chat.postMessage'], () => D_WORK,
     ],
     [
-      'AC 58: A\'s prompts moved from its channel to dm while its get is in flight: the DM with the new contact is opened and posted to',
+      'A\'s prompts moved from its channel to dm while its get is in flight: the DM with the new contact is opened and posted to',
       KEY_A, () => reconfigure(KEY_A, { dm: { enabled: true, contact: A_CONTACT }, permission_prompts: 'dm' }),
       ['conversations.open', 'chat.postMessage'], () => stubOpenedDmId(A_CONTACT),
     ],
@@ -1511,7 +1509,7 @@ describe('poller tick — the applied set swapped mid-tick by a confirmed reload
     await ticking
   }
 
-  test('AC 58: A\'s destination changed between two prompts of one row: the second goes to the new destination', async () => {
+  test('A\'s destination changed between two prompts of one row: the second goes to the new destination', async () => {
     const logCalls: unknown[][] = []
     await tickChangingDuringFirstPost(() => reconfigure(KEY_A, { permission_prompts: A_WORK }), logCalls)
 
@@ -1535,10 +1533,10 @@ describe('poller tick — the applied set swapped mid-tick by a confirmed reload
 })
 
 // ---------------------------------------------------------------------------
-// Destination failures held and retried (b.av2 SR-7.1, SR-3.2, SR-10.3; AC 44)
+// Destination failures held and retried
 // ---------------------------------------------------------------------------
 
-describe('poller tick — a destination failure holds the persona\'s prompts and retries them on backoff (b.av2 SR-7.1, SR-10.3)', () => {
+describe('poller tick — a destination failure holds the persona\'s prompts and retries them on backoff', () => {
   const request = (request_token: string, request_id: number) => cannedPermissionRequest({ request_token, request_id })
   const allowAll = async (params: GetPermissionParams): Promise<GetPermissionResult> =>
     cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
@@ -1567,7 +1565,7 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
 
   const CASES: Array<[string, HeldCase]> = [
     [
-      'AC 44: a DM-only persona with zero channels (D), first prompt, conversations.open fails missing_scope',
+      'a DM-only persona with zero channels (D), first prompt, conversations.open fails missing_scope',
       {
         persona: () => D,
         stub: () => stubD,
@@ -1781,7 +1779,7 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
     assertNoLeak({ logCalls, trail: trail.events }, 'held prompt, destination changed')
   })
 
-  test('AC 44: the missing_scope line names the persona and the im:write scope, and tells the operator to re-install the app with it', async () => {
+  test('the missing_scope line names the persona and the im:write scope, and tells the operator to re-install the app with it', async () => {
     reconfigure(KEY_D, { channels: [] })
     failSticky(stubD, 'open', 'missing_scope')
     const trail = makeTrailCapture()
@@ -1995,13 +1993,13 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
 })
 
 // ---------------------------------------------------------------------------
-// A throw inside a tick while a persona's retry is due (b.av2 SR-7.1, b.zmq)
+// A throw inside a tick while a persona's retry is due
 // ---------------------------------------------------------------------------
 
 /**
  * A throw inside a tick (a row the prompt builder rejects, a throwing trail
  * emitter or logger, a listing that is not a list) is caught in the poller
- * (b.zmq): the interval's fire-and-forget promise never rejects. These cases
+ * the interval's fire-and-forget promise never rejects. These cases
  * prove that where it would show: in a child `bun` process (`runInFakeHome`,
  * temp HOME and state dir, no token variables) that counts unhandled
  * rejections with its own listener, captures `console.error` (where a failure
@@ -2034,7 +2032,7 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
  * (and B's with it, unless already posted), or for the wedge the warning posts
  * at the next throttle window (t=120 s).
  */
-describe('poller tick — a throw while a persona\'s retry is due leaves it retrying, with no unhandled rejection (b.av2 SR-7.1, b.zmq)', () => {
+describe('poller tick — a throw while a persona\'s retry is due leaves it retrying, with no unhandled rejection', () => {
   const POLLER_PATH = join(import.meta.dir, '..', 'src', 'permission-poller.ts')
   const REPO_ROOT = join(import.meta.dir, '..')
 
@@ -2347,7 +2345,7 @@ describe('poller tick — duplicate (instance_id, request_token) is a no-op', ()
 })
 
 // ---------------------------------------------------------------------------
-// Tick behavior — two concurrent rows on a single tick (Epic 1 AC)
+// Tick behavior — two concurrent rows on a single tick (component 1 AC)
 // ---------------------------------------------------------------------------
 
 describe('poller tick — two concurrent open rows on a single tick', () => {
@@ -2412,7 +2410,7 @@ describe('poller tick — two concurrent open rows on a single tick', () => {
 // ---------------------------------------------------------------------------
 
 describe('poller tick — non-positive open-rows responses', () => {
-  test('empty `permission_requests` array → zero postMessage; prior entry reconciled via getPermission + verdict chat.update + drop (SR-2.4)', async () => {
+  test('empty `permission_requests` array → zero postMessage; prior entry reconciled via getPermission + verdict chat.update + drop', async () => {
     scriptPostTs(stubA, POST_TS)
     let permissionsList: ReturnType<typeof cannedPermissionRequest>[] = [
       cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
@@ -2432,7 +2430,7 @@ describe('poller tick — non-positive open-rows responses', () => {
     expect(posts(stubA)).toHaveLength(1)
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeDefined()
 
-    // Tick 2: empty array → SR-2.4 set-diff sees TOK_A missing → getPermission
+    // Tick 2: empty array → set-diff sees TOK_A missing → getPermission
     // fires for TOK_A → verdict chat.update lands → entry dropped.
     permissionsList = []
     await ivl.tick()
@@ -2469,7 +2467,7 @@ describe('poller tick — non-positive open-rows responses', () => {
     expect(nonConfLogs.length).toBeGreaterThan(0)
   })
 
-  test('null `permission_requests` preserves prior entries for that instance (SR-2.1)', async () => {
+  test('null `permission_requests` preserves prior entries for that instance', async () => {
     scriptPostTs(stubA, POST_TS)
     let projectionMode: 'present' | 'null' = 'present'
     const ivl = startPoller(() => ({
@@ -2483,7 +2481,7 @@ describe('poller tick — non-positive open-rows responses', () => {
     await ivl.tick()
     expect(getLivePermission(INSTANCE_A, TOKEN_A)?.handled).toBe(false)
 
-    // Tick 2: get() returns null projection — SR-2.1 says the sweep must skip
+    // Tick 2: get returns null projection — says the sweep must skip
     // entries on the non-conforming instance.
     projectionMode = 'null'
     await ivl.tick()
@@ -2493,7 +2491,7 @@ describe('poller tick — non-positive open-rows responses', () => {
     expect(updates(stubA)).toHaveLength(0)
   })
 
-  test('undefined `permission_requests` preserves prior entries for that instance (SR-2.1)', async () => {
+  test('undefined `permission_requests` preserves prior entries for that instance', async () => {
     scriptPostTs(stubA, POST_TS)
     let projectionMode: 'present' | 'undefined' = 'present'
     const ivl = startPoller(() => ({
@@ -2535,7 +2533,7 @@ describe('poller tick — non-positive open-rows responses', () => {
 // Tick behavior — Case 5: row disappears
 // ---------------------------------------------------------------------------
 
-describe('poller tick — row disappears from plural projection (SR-2.4 closure reconciliation)', () => {
+describe('poller tick — row disappears from plural projection (closure reconciliation)', () => {
   test('handled=false: getPermission called → verdict chat.update fires on disappeared row → entry dropped', async () => {
     scriptPostTs(stubA, POST_TS)
     let listReturn: import('agent-director').ListResult = {
@@ -2557,7 +2555,7 @@ describe('poller tick — row disappears from plural projection (SR-2.4 closure 
     expect(seeded).toBeDefined()
     expect(seeded?.handled).toBe(false)
 
-    // Tick 2: spawn no longer in check_permission → SR-2.4 reconciliation
+    // Tick 2: spawn no longer in check_permission → reconciliation
     listReturn = { spawns: [] }
     await ivl.tick()
 
@@ -2570,8 +2568,8 @@ describe('poller tick — row disappears from plural projection (SR-2.4 closure 
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
   })
 
-  test('handled=true: SR-2.4 reconciliation still fires verdict chat.update + drops entry', async () => {
-    // Epic 3 design note: the poller-side verdict rendering is unconditional —
+  test('handled=true: reconciliation still fires verdict chat.update + drops entry', async () => {
+    // component 3 design note: the poller-side verdict rendering is unconditional —
     // it stands in for the case where the click handler's chat.update didn't
     // land. With handled=true the click's "Allowed by X" rendering is the
     // authoritative happy-path rendering; the poller-side overwrite with the
@@ -2611,7 +2609,7 @@ describe('poller tick — row disappears from plural projection (SR-2.4 closure 
 })
 
 // ---------------------------------------------------------------------------
-// SR-2.4 / SR-5 — verdict-driven newly-closed reconciliation
+// verdict-driven newly-closed reconciliation
 // ---------------------------------------------------------------------------
 
 /**
@@ -2660,7 +2658,7 @@ async function seedAndClose(opts: {
   return { ivl, getPermissionCalls, token }
 }
 
-describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', () => {
+describe('newly-closed reconciliation + verdict rendering', () => {
   test.each([
     ['not_confirmed', 'none', null, 'waiting for agent delivery confirmation'],
     ['fallen_back', 'none', null, 'answer this prompt at the session'],
@@ -2712,7 +2710,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     expect(getLivePermission(INSTANCE_A, token) !== undefined).toBe(final.delivery === 'fallen_back')
   })
 
-  test('SR-5.1 operator_allow rendering — decision=allow, decision_reason=null → "*Permission* — Allowed"', async () => {
+  test('operator_allow rendering — decision=allow, decision_reason=null → "*Permission* — Allowed"', async () => {
     const { getPermissionCalls, token } = await seedAndClose({
       getPermissionResult: cannedGetPermissionResponse({ decision: 'allow', decision_reason: null }),
     })
@@ -2728,7 +2726,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     expect(getLivePermission(INSTANCE_A, token)).toBeUndefined()
   })
 
-  test('SR-5.1 operator_deny rendering — decision=deny, decision_reason="operator" → "*Permission* — Denied by operator"', async () => {
+  test('operator_deny rendering — decision=deny, decision_reason="operator" → "*Permission* — Denied by operator"', async () => {
     const { token } = await seedAndClose({
       getPermissionResult: cannedGetPermissionResponse({ decision: 'deny', decision_reason: 'operator' }),
     })
@@ -2739,7 +2737,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     expect(getLivePermission(INSTANCE_A, token)).toBeUndefined()
   })
 
-  test('SR-5.1 timeout rendering — decision=deny, decision_reason="timeout" → "⏱ *Permission* — Timed out"', async () => {
+  test('timeout rendering — decision=deny, decision_reason="timeout" → "⏱ *Permission* — Timed out"', async () => {
     const { token } = await seedAndClose({
       getPermissionResult: cannedGetPermissionResponse({ decision: 'deny', decision_reason: 'timeout' }),
     })
@@ -2750,7 +2748,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     expect(getLivePermission(INSTANCE_A, token)).toBeUndefined()
   })
 
-  test('SR-5.1 find_missing rendering — decision=deny, decision_reason="find_missing" → distinct "session ended" text', async () => {
+  test('find_missing rendering — decision=deny, decision_reason="find_missing" → distinct "session ended" text', async () => {
     const { token } = await seedAndClose({
       getPermissionResult: cannedGetPermissionResponse({ decision: 'deny', decision_reason: 'find_missing' }),
     })
@@ -2760,14 +2758,14 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     const findMissingText = updateCalls[0].text
     expect(findMissingText).toBe('🪦 *Permission* — Session ended')
 
-    // SR-5.1 distinctness: find_missing must NOT collapse to operator-deny or timeout text.
+    // distinctness: find_missing must NOT collapse to operator-deny or timeout text.
     expect(findMissingText).not.toBe('*Permission* — Denied by operator')
     expect(findMissingText).not.toBe('⏱ *Permission* — Timed out')
     expect(findMissingText).not.toBe('*Permission* — Denied (closed)')
     expect(getLivePermission(INSTANCE_A, token)).toBeUndefined()
   })
 
-  test('SR-5.2 unknown decision_reason → fail-closed generic deny, log fires, poller does not crash; sibling fresh-post still happens', async () => {
+  test('unknown decision_reason → fail-closed generic deny, log fires, poller does not crash; sibling fresh-post still happens', async () => {
     // This test specifically exercises the "bad branch did not crash the
     // tick" assertion. Seed a live entry under TOK_A, then on the next tick
     // present a fresh row under TOK_B AND drop TOK_A from the projection.
@@ -2788,7 +2786,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
         return cannedGetPermissionResponse({
           request_token: params.request_token,
           decision: 'deny',
-          // Intentionally outside the canonical enum to exercise the SR-5.2
+          // Intentionally outside the canonical enum to exercise the
           // fail-closed path. AD 0.6.1+ types decision_reason as a strict
           // union; cast through unknown so the literal lands at runtime.
           decision_reason: 'something-new' as unknown as GetPermissionResult['decision_reason'],
@@ -2817,12 +2815,12 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     const unknownLogs = logLines(logCalls, 'unknown verdict')
     expect(unknownLogs.length).toBe(1)
 
-    // SR-5.2 sanity — sibling fresh-post happened despite the bad branch
+    // sanity — sibling fresh-post happened despite the bad branch
     expect(posts(stubA)).toHaveLength(2) // tick 1 (TOK_A) + tick 2 (TOK_B)
     expect(getLivePermission(INSTANCE_A, TOKEN_B)?.messageTs).toBe(POST_TS_2)
   })
 
-  test('SR-2.4 ErrPermissionRequestNotFound → generic deny, log fires, drop, no retry on the next tick', async () => {
+  test('ErrPermissionRequestNotFound → generic deny, log fires, drop, no retry on the next tick', async () => {
     // Round 1: seed TOK_A, then close with not-found.
     scriptPostTs(stubA, POST_TS)
     const logCalls: unknown[][] = []
@@ -2861,7 +2859,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     expect(updates(stubA)).toHaveLength(1)
   })
 
-  test('SR-2.4 transient getPermission error → entry preserved, retried next tick when call succeeds', async () => {
+  test('transient getPermission error → entry preserved, retried next tick when call succeeds', async () => {
     scriptPostTs(stubA, POST_TS)
     const getPermissionCalls: GetPermissionParams[] = []
 
@@ -2905,7 +2903,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
   })
 
-  test('SR-5.3 sibling independence on closure — only the disappeared row gets chat.update; sibling untouched', async () => {
+  test('sibling independence on closure — only the disappeared row gets chat.update; sibling untouched', async () => {
     scriptPostTs(stubA, POST_TS, POST_TS_2)
     const getPermissionCalls: GetPermissionParams[] = []
 
@@ -2937,11 +2935,11 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
     presentRows = [{ token: TOKEN_B, req_id: 2 }]
     await ivl.tick()
 
-    // SR-5.3: getPermission fired exactly once for TOK_A only
+    // getPermission fired exactly once for TOK_A only
     expect(getPermissionCalls).toHaveLength(1)
     expect(getPermissionCalls[0].request_token).toBe(TOKEN_A)
 
-    // SR-5.3: chat.update only on TOK_A's messageTs; sibling's ts never targeted
+    // chat.update only on TOK_A's messageTs; sibling's ts never targeted
     const updateCalls = updates(stubA)
     expect(updateCalls).toHaveLength(1)
     expect(updateCalls[0].ts).toBe(POST_TS)
@@ -3095,7 +3093,7 @@ describe('poller lifecycle', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-V Epic 2 — cscb.poller.row_decision + cscb.chat_post.attempted
+// Permission trail — cscb.poller.row_decision + cscb.chat_post.attempted
 // ---------------------------------------------------------------------------
 
 describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted', () => {
@@ -3182,7 +3180,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     expect(notFound!.request_token).toBe(TOKEN_A)
   })
 
-  test('action=non_conforming_skipped omits request_token entirely (SR-V-1.1)', async () => {
+  test('action=non_conforming_skipped omits request_token entirely', async () => {
     const trail = makeTrailCapture()
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow()] }),
@@ -3195,7 +3193,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     )
     expect(nc).toBeDefined()
     expect(nc!.instance_id).toBe(INSTANCE_A)
-    // request_token MUST be absent — not an empty string (SR-V-1.1).
+    // request_token MUST be absent — not an empty string.
     expect('request_token' in nc!).toBe(false)
   })
 
@@ -3239,7 +3237,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     expect(Array.isArray(post!['blocks'])).toBe(true)
   })
 
-  test('SR-V-1.4 action_id decode round-trip from persisted blocks', async () => {
+  test('action_id decode round-trip from persisted blocks', async () => {
     scriptPostTs(stubA, POST_TS)
     const trail = makeTrailCapture()
     const ivl = startOneOpenRow(trail)
@@ -3259,7 +3257,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     expect(decDeny).toEqual({ decision: 'deny', instanceId: INSTANCE_A, requestToken: TOKEN_A })
   })
 
-  // The last row's Slack error is a token-shaped string (b.av2 SR-10.3): the
+  // The last row's Slack error is a token-shaped string: the
   // trail and the episode line carry `unknown_error`, never the raw code.
   test.each<[string, SlackFailureRow, string]>([
     ['platform channel_not_found', { kind: 'platform', error: 'channel_not_found' }, 'channel_not_found'],
@@ -3278,8 +3276,8 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     expect(post!['error']).toBe(errorClass)
     expect(post!.channel).toBe(A_DEST)
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
-    // b.emk: the failure is visible in server.log beside the trail event, as
-    // the destination-failure episode line (b.av2 SR-10.3).
+    // the failure is visible in server.log beside the trail event, as
+    // the destination-failure episode line.
     expectOneEpisodeLine(logCalls, trail, A, { step: 'chat.postMessage', destination: A_DEST, code: errorClass, namesScope: false })
   })
 
@@ -3300,7 +3298,7 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
 })
 
 // ---------------------------------------------------------------------------
-// SR-V Epic 3 — cscb.chat_update.attempted (poller-triggered)
+// Permission trail — cscb.chat_update.attempted (poller-triggered)
 // ---------------------------------------------------------------------------
 
 describe('trail events — cscb.chat_update.attempted (poller-triggered)', () => {
@@ -3407,17 +3405,17 @@ describe('trail events — cscb.chat_update.attempted (poller-triggered)', () =>
     // The failed update was attempted through A's client, on the recorded channel.
     expect(updates(stubA).map((u) => u.channel)).toEqual([A_DEST])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
-    // b.emk: failure also lands in server.log alongside the trail event.
+    // failure also lands in server.log alongside the trail event.
     expectTokenSafeFailure(scenario.logCalls, scenario.trail, 'closure chat.update failed', outcome)
     expect(String(logLines(scenario.logCalls, 'closure chat.update failed')[0][0])).toContain(`token=${TOKEN_A} (verdict=operator_allow)`)
   })
 })
 
 // ---------------------------------------------------------------------------
-// b.en2 Epic 6 — withOutageDetection wrapper integration, keyed by persona
+// component 6 — withOutageDetection wrapper integration, keyed by persona
 // ---------------------------------------------------------------------------
 
-describe('b.en2 Epic 6 — withOutageDetection wrapper integration (keyed by persona)', () => {
+describe('— withOutageDetection wrapper integration (keyed by persona)', () => {
   // Case 1: per-row client.get raises ad-unreachable via wrapper.
   test('per-row client.get: ErrSystemInstallDisappeared → ad-unreachable raised under the persona key; no Slack postMessage', async () => {
     const getCalls: unknown[] = []
@@ -3483,17 +3481,17 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration (keyed by per
 })
 
 // ---------------------------------------------------------------------------
-// AC 20 (b.av2 SR-10.3): an agent-director call that fails with an error that
+// an agent-director call that fails with an error that
 // is not an agent-director error is logged as its description (type, safe
 // code, the message logged redacted, frames), never the error itself, on each
 // of the poller's three read sites. The error carries fake tokens and a
 // WebSocket ticket URL in its message, and the leak sentinel in a property. An
 // agent-director error is logged by its errName and its redacted description
 // when that errName passes `isSafeIdentifier`; a token-shaped errName falls
-// back to the description (E14 Task 0, operator decision B1).
+// back to the description ( section 0, operator decision B1).
 // ---------------------------------------------------------------------------
 
-describe('AC 20: an agent-director call failure on list, get or getPermission is logged with its message redacted', () => {
+describe('an agent-director call failure on list, get or getPermission is logged with its message redacted', () => {
   /** A ticket URL shaped like Slack's Socket Mode WebSocket URL, holding the leak sentinel. */
   const sentinelError = (): Error =>
     Object.assign(new Error(`socket closed ${sentinelInMessage('msg')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
@@ -3510,7 +3508,7 @@ describe('AC 20: an agent-director call failure on list, get or getPermission is
     { site: 'getPermission', label: 'an error carrying fake tokens', makeErr: sentinelError, tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: Error code=ECONNRESET ${redactedSocket} at ` },
     { site: 'get', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, tail: `get failed for ${INSTANCE_A}: AgentDirectorError message="<redacted-token> transient" at ` },
     { site: 'getPermission', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: AgentDirectorError message="<redacted-token> transient" at ` },
-  ])('AC 20: $site rejects with $label — one line naming its type, safe code and redacted message; nothing logged, trailed or posted leaks', async ({ site, makeErr, tail }) => {
+  ])('$site rejects with $label — one line naming its type, safe code and redacted message; nothing logged, trailed or posted leaks', async ({ site, makeErr, tail }) => {
     const { lines, logCalls, trail } = await runFailingSite(site, makeErr)
 
     expect(lines).toHaveLength(1)
@@ -3522,7 +3520,7 @@ describe('AC 20: an agent-director call failure on list, get or getPermission is
   test.each<{ site: 'get' | 'getPermission'; head: string }>([
     { site: 'get', head: `get failed for ${INSTANCE_A}` },
     { site: 'getPermission', head: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}` },
-  ])('AC 20: $site rejects with an AgentDirectorError with a safe errName — the line is the errName and its redacted description, no frames; nothing leaks', async ({ site, head }) => {
+  ])('$site rejects with an AgentDirectorError with a safe errName — the line is the errName and its redacted description, no frames; nothing leaks', async ({ site, head }) => {
     const { lines, logCalls, trail } = await runFailingSite(site, safeErrNameError)
 
     expect(lines).toHaveLength(1)
@@ -3568,13 +3566,13 @@ describe('AC 20: an agent-director call failure on list, get or getPermission is
 })
 
 // ---------------------------------------------------------------------------
-// b.fae F4 — silent-wedge detector (empty permission_requests in
+// F4 — silent-wedge detector (empty permission_requests in
 // check_permission for K consecutive ticks → one-shot warning to the
 // persona's destination + cscb.poller.wedge_detected trail event + log;
-// re-arms on recovery). b.av2 SR-7.2: the warning names the persona.
+// re-arms on recovery). the warning names the persona.
 // ---------------------------------------------------------------------------
 
-describe('b.fae F4 — wedge detector', () => {
+describe('F4 — wedge detector', () => {
   const WEDGE_INTERVAL_MS = 1000
   // K at the 1s test interval: max(5, ceil(90000/1000)) = 90.
   const K = wedgeTripTicks(WEDGE_INTERVAL_MS)
@@ -3647,7 +3645,7 @@ describe('b.fae F4 — wedge detector', () => {
     const warnings = wedgeWarnings(stubA)
     expect(warnings).toHaveLength(1)
     expect(warnings[0].channel).toBe(A_DEST)
-    // b.jg5 SRJ-1012: the builder's text (persona prefix + body) for this spawn's instance id.
+    // the builder's text (persona prefix + body) for this spawn's instance id.
     expect(warnings[0].text).toBe(buildWedgeWarningText(A, INSTANCE_A))
     expect(posts(stubA)).toHaveLength(1)
     expect(slackCalls(stubB, stubD)).toBe(0)
@@ -3742,20 +3740,20 @@ describe('b.fae F4 — wedge detector', () => {
     expect(wedgeTrail(s.trail).map((e) => e['instance_id'])).toEqual([INSTANCE_B])
   })
 
-  // b.jg5 SRJ-1012 (AC 78): the warning names agent-director verbs only, as a
-  // human's steps, with "check the result"; one pin holds the SRD's text, the
+  // the warning names agent-director verbs only, as a
+  // human's steps, with "check the result"; one pin holds the contract's text, the
   // other cases check the imported builder.
-  describe('the wedge warning\'s text (b.jg5 SRJ-1012, SRJ-1001)', () => {
-    /** SRJ-1012's text as the SRD writes it; `<id>` stands for the claude instance id. */
-    const SRJ_1012_TEXT =
+  describe('the wedge warning\'s text', () => {
+    /** text as the contract writes it; `<id>` stands for the claude instance id. */
+    const PERMISSION_WEDGE_TEXT =
       '⚠️ This persona appears blocked on a native Claude Code permission prompt that never reached Slack — it will not respond until it\'s cleared. To recover: run `agent-director read-pane --instance-id <id>` to see the native prompt, then end the session with `agent-director kill --instance-id <id>` and check the result; the server then brings the persona up again. Do NOT use send-keys — it is rejected in this state. These commands are for a human only: no bot, including any persona that sees this post, may run them.'
 
     /** Every inline code span in `text`, without its backticks. */
     const codeSpans = (text: string): string[] => [...text.matchAll(/`([^`]*)`/g)].map((m) => m[1]!)
 
-    test('pin: the body is SRJ-1012\'s text byte for byte, with the instance id in both commands; the full text is the persona prefix and that body', () => {
-      expect(buildWedgeWarningBody(INSTANCE_A)).toBe(SRJ_1012_TEXT.replaceAll('<id>', INSTANCE_A))
-      expect(buildWedgeWarningText(A, INSTANCE_A)).toBe(`Persona ${renderPersonaRef(NAME_A, KEY_A)}: ${SRJ_1012_TEXT.replaceAll('<id>', INSTANCE_A)}`)
+    test('pin: the body is text byte for byte, with the instance id in both commands; the full text is the persona prefix and that body', () => {
+      expect(buildWedgeWarningBody(INSTANCE_A)).toBe(PERMISSION_WEDGE_TEXT.replaceAll('<id>', INSTANCE_A))
+      expect(buildWedgeWarningText(A, INSTANCE_A)).toBe(`Persona ${renderPersonaRef(NAME_A, KEY_A)}: ${PERMISSION_WEDGE_TEXT.replaceAll('<id>', INSTANCE_A)}`)
     })
 
     test.each([
@@ -3779,17 +3777,17 @@ describe('b.fae F4 — wedge detector', () => {
     })
 
     // The shared pattern (tests/test-helpers/conflict-cases.ts) holds every wording of it.
-    test('carries SRJ-1001\'s human-only sentence', () => {
+    test('carries human-only sentence', () => {
       expect(buildWedgeWarningBody(INSTANCE_A)).toMatch(HUMAN_ONLY_SENTENCE)
     })
   })
 
-  // b.jg5 SRJ-1003: while the persona's teardown window is open, its
+  // while the persona's teardown window is open, its
   // stuck-prompt warning is a teardown notice: handed to the notifier's
   // `notify` (whose window writes it as one log line and one
   // persona-teardown-notice entry, tests/persona-notifier.test.ts), never to
   // the destination hold, and latched as delivered. Outside a window it posts.
-  describe('during a persona teardown (b.jg5 SRJ-1003)', () => {
+  describe('during a persona teardown', () => {
     /** A recording stand-in for the notifier: each key's window state, and every notice handed to `notify`. */
     function recordingNotices(
       states: Readonly<Record<string, PersonaTeardownWindowState>>,
@@ -3809,7 +3807,7 @@ describe('b.fae F4 — wedge detector', () => {
     }
 
     /** The poller's one line for A's warning handed to the notifier in A's teardown window. */
-    const handedLine = `[slack] permission-poller: stuck-prompt warning for ${renderPersonaRef(NAME_A, KEY_A)} (${INSTANCE_A}) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)`
+    const handedLine = `[slack] permission-poller: stuck-prompt warning for ${renderPersonaRef(NAME_A, KEY_A)} (${INSTANCE_A}) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted`
 
     test('A\'s window open at the trip: the warning\'s body is handed to the notifier once, with one line; nothing reaches A\'s destination or the hold, no attempt is made, and the latch holds across many later ticks', async () => {
       const r = recordingNotices({ [KEY_A]: 'open' })
@@ -3825,7 +3823,7 @@ describe('b.fae F4 — wedge detector', () => {
       expect(key).toBe(KEY_A)
       // The notifier adds the persona reference itself: the body carries none.
       expect(text).not.toStartWith('Persona ')
-      // b.jg5 SRJ-1012: the same body the post carries.
+      // the same body the post carries.
       expect(text).toBe(buildWedgeWarningBody(INSTANCE_A))
       expect(text).toContain(INSTANCE_A)
       expect(text).toContain('read-pane')
@@ -3899,13 +3897,13 @@ describe('b.fae F4 — wedge detector', () => {
     })
   })
 
-  // b.fae F3 — warning-post FAILURE path. The latch (`warningFired`) sets ONLY
+  // F3 — warning-post FAILURE path. The latch (`warningFired`) sets ONLY
   // on a successful chat.postMessage; a failed post keeps it unset and retries
   // on a later tick, throttled to one attempt per WEDGE_WARN_RETRY_WALL_CLOCK_MS.
   // Each ACTUAL failed attempt still emits a `cscb.poller.wedge_detected`
   // ok:false trail event; on eventual success exactly one channel message lands
   // and no further posts occur.
-  test('6. post failure does not latch; retries throttled to the 30s window; success lands exactly one message (b.fae F3)', async () => {
+  test('6. post failure does not latch; retries throttled to the 30s window; success lands exactly one message (F3)', async () => {
     // Two failing posts, then Slack recovers (an empty script means success).
     stubA.script.post.push({ kind: 'network' }, { kind: 'network' })
     const s = makeWedgeScenario()
@@ -3942,7 +3940,7 @@ describe('b.fae F4 — wedge detector', () => {
     expect(posts(stubA)).toHaveLength(3)
     expect(okEvents()).toHaveLength(1)
     expect(slackCalls(stubB, stubD)).toBe(0)
-    // The failures are one destination-failure episode (b.av2 SR-7.1): one
+    // The failures are one destination-failure episode: one
     // opening line and one cleared line, no line per failed attempt; nothing leaks.
     expect(logLines(s.logCalls, 'wedge warning postMessage failed')).toHaveLength(0)
     const episode = episodeLines(s.logCalls).map((args) => String(args[0]))
@@ -3955,7 +3953,7 @@ describe('b.fae F4 — wedge detector', () => {
   test.each<[string, SlackFailureRow, string]>([
     ['platform not_in_channel', { kind: 'platform', error: 'not_in_channel' }, 'not_in_channel'],
     ['network', { kind: 'network' }, 'network_error'],
-    // A token-shaped Slack error (b.av2 SR-10.3): `unknown_error`, never the raw code.
+    // A token-shaped Slack error: `unknown_error`, never the raw code.
     ['platform, a token-shaped error code', { kind: 'platform', error: fakeToken(BOT_TOKEN_PREFIX, 'code') }, 'unknown_error'],
   ])('6b. wedge warning post failure (%s) → one token-safe persona-destination-failed line naming the persona (no per-attempt line), ok:false trail with the token-safe error class', async (_label, outcome, errorClass) => {
     stubA.script.post.push(outcome)
@@ -3971,20 +3969,20 @@ describe('b.fae F4 — wedge detector', () => {
     expect(logLines(s.logCalls, 'wedge warning postMessage failed')).toHaveLength(0)
   })
 
-  // b.fae F4 — K derivation from the poll interval and the 5-tick floor.
+  // F4 — K derivation from the poll interval and the 5-tick floor.
   test.each([
     [1000, 90],
     [200, 450],
     [60000, 5],
-  ])('7. wedgeTripTicks(%i ms) === %i (derivation + 5-tick floor, b.fae F4)', (intervalMs, expected) => {
+  ])('7. wedgeTripTicks(%i ms) === %i (derivation + 5-tick floorF4)', (intervalMs, expected) => {
     expect(wedgeTripTicks(intervalMs)).toBe(expected)
   })
 
-  // b.fae F4 follow-up — a transient `get` error tick does NOT reset the wedge
+  // F4 follow-up — a transient `get` error tick does NOT reset the wedge
   // counter (it is exempt from re-arming), so the counter accumulates across the
   // gap and trips at K TOTAL empty observations. An ErrSpawnNotFound tick, by
   // contrast, is a positive "spawn is gone" observation and DOES reset.
-  test('8. transient get-error does not reset the counter; ErrSpawnNotFound does (b.fae F4 follow-up)', async () => {
+  test('8. transient get-error does not reset the counter; ErrSpawnNotFound does (F4 follow-up)', async () => {
     const trail = makeTrailCapture()
     // get() behavior is switchable per tick: 'empty' | 'transient' | 'notfound'.
     let mode: 'empty' | 'transient' | 'notfound' = 'empty'
@@ -4129,7 +4127,7 @@ describe('b.fae F4 — wedge detector', () => {
     expect(slackCalls(stubB, stubD)).toBe(0)
   })
 
-  // b.av2 SR-7.1: the warning is gated by the persona's destination hold. A
+  // the warning is gated by the persona's destination hold. A
   // held tick makes no attempt and writes no line, and it leaves the 30 s
   // throttle alone, so the attempt comes on the first tick the hold allows.
   test('11. a stuck-prompt warning failing with not_in_channel joins the persona\'s episode (opened by a prompt): one persona-destination-failed line and no per-attempt line; a throttle window that falls inside the backoff attempts nothing and does not move the throttle; once the cause clears exactly one warning posts and the latch holds', async () => {
@@ -4243,7 +4241,7 @@ describe('b.fae F4 — wedge detector', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A persona that is not up (b.av2 SR-6.4, SR-7.2); the scenario is shared
+// A persona that is not up; the scenario is shared
 // with the teardown drop and the per-row isolation cases below
 // ---------------------------------------------------------------------------
 
@@ -4267,7 +4265,7 @@ const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
  * up predicate over a per-persona connection status and bring-up outcome.
  * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
  * brings it up. `trailFault`, when it returns an error for an event, makes
- * the trail emitter throw it instead of capturing the event (b.zmq).
+ * the trail emitter throw it instead of capturing the event.
  */
 function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | undefined = () => undefined) {
   const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
@@ -4330,9 +4328,9 @@ function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | un
 
 const requestA = () => cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })
 const requestB = () => cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })
-/** A request the prompt builder rejects: its `request_token` is empty, so handling it throws (b.zmq). */
+/** A request the prompt builder rejects: its `request_token` is empty, so handling it throws. */
 const rejectedRequest = () => cannedPermissionRequest({ request_token: '', request_id: 9 })
-/** A `get` result's `permission_requests` that is not a list: handling its row throws (b.zmq). */
+/** A `get` result's `permission_requests` that is not a list: handling its row throws. */
 const NOT_A_LIST = {} as unknown as PermissionRequestRow[]
 const allUpdates = () => updates(stubA).length + updates(stubB).length + updates(stubD).length
 const trailFor = (trail: TrailCapture, instanceId: string) =>
@@ -4344,14 +4342,14 @@ const skipStarts = (logCalls: unknown[][], persona: Persona) =>
 const skipEnds = (logCalls: unknown[][], persona: Persona) =>
   logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('up again'))
 
-describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
+describe('poller tick — a persona that is not up', () => {
   test.each(NOT_UP)('%s: its row gets no get, no post, no update, no live entry and no trail event, while an up persona\'s row in the same tick posts through its own client', async (label, status, outcomeUp) => {
     const s = makeNotUpScenario()
     s.down(KEY_A, [label, status, outcomeUp])
     s.open.set(INSTANCE_A, [requestA()])
     s.open.set(INSTANCE_B, [requestB()])
     scriptPostTs(stubB, POST_TS_2)
-    // E3's handling of a row with no persona label, and of one naming no applied persona, is unchanged.
+    // handling of a row with no persona label, and of one naming no applied persona, is unchanged.
     s.extraRows.push(
       cannedListRow({ instance_id: 'cscb_unlabelled', state: 'check_permission', labels: { service: 'cscb' } }),
       cannedListRow({ instance_id: 'cscb_absent', state: 'check_permission', labels: { tag_prompt: '1', service: 'cscb', persona: 'absent' } }),
@@ -4509,7 +4507,7 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'not-up skip lines')
   })
 
-  test('a persona dropped from the applied set mid-episode ends its skip with one line naming its key; its row then gets E3\'s not-applied handling', async () => {
+  test('a persona dropped from the applied set mid-episode ends its skip with one line naming its key; its row then gets \'s not-applied handling', async () => {
     const s = makeNotUpScenario()
     s.down(KEY_A)
     await s.drive(2)
@@ -4518,17 +4516,17 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     const ended = logLines(s.logCalls, `persona=${KEY_A} is no longer applied`)
     expect(ended).toHaveLength(1)
     expect(skipStarts(s.logCalls, A)).toHaveLength(1)
-    // E3's not-applied handling logs the row on each of the three ticks.
+    // not-applied handling logs the row on each of the three ticks.
     expect(logLines(s.logCalls, `${INSTANCE_A} names no applied persona`)).toHaveLength(3)
     expect(s.getCalls.filter((id) => id === INSTANCE_A)).toHaveLength(0)
   })
 })
 
 // ---------------------------------------------------------------------------
-// A teardown drops one persona's poller state (b.av2 SR-6.5)
+// A teardown drops one persona's poller state
 // ---------------------------------------------------------------------------
 
-describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state (b.av2 SR-6.5)', () => {
+describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state', () => {
   const TOKEN_C = '33333333-3333-4333-8333-333333333333'
   /** A spawn of B's that is not `cscb_<B>`: its prompt is B's by its `persona` label only. */
   const B_OTHER_INSTANCE = `${INSTANCE_B}_other`
@@ -4602,7 +4600,7 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
     expect(slackCalls(stubA, stubB, stubD)).toBe(0)
   })
 
-  test('drops B\'s payload-rejection record (b.zmq): B\'s next attempt posts its full prompt again, while A\'s, rejected the same way, posts the short prompt', async () => {
+  test('drops B\'s payload-rejection record: B\'s next attempt posts its full prompt again, while A\'s, rejected the same way, posts the short prompt', async () => {
     const s = makeNotUpScenario()
     s.open.set(INSTANCE_A, [requestA()])
     s.open.set(INSTANCE_B, [requestB()])
@@ -4631,7 +4629,7 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
       () => NOT_A_LIST,
       spawnFailedLead,
     ],
-  ])('drops B\'s %s (b.zmq): the next tick logs B\'s failure line again, while A\'s, failing the same way, stays logged once', async (_label, open, line) => {
+  ])('drops B\'s %s: the next tick logs B\'s failure line again, while A\'s, failing the same way, stays logged once', async (_label, open, line) => {
     const s = makeNotUpScenario()
     s.open.set(INSTANCE_A, open())
     s.open.set(INSTANCE_B, open())
@@ -4724,10 +4722,10 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state 
 })
 
 // ---------------------------------------------------------------------------
-// One failure stays with its row, request or closed entry (b.zmq)
+// One failure stays with its row, request or closed entry
 // ---------------------------------------------------------------------------
 
-describe('pin: the b.zmq failure and payload-rejection lines, as the debugging skill quotes them (b.jg5 SRJ-1014)', () => {
+describe('pin: the failure and payload-rejection lines, as the debugging skill quotes them', () => {
   test.each<[string, string, string]>([
     [
       'a request\'s prompt failed',
@@ -4764,7 +4762,7 @@ describe('pin: the b.zmq failure and payload-rejection lines, as the debugging s
   })
 })
 
-describe('poller tick — a throw on one row, request or closed entry is caught there, logged once, and the tick goes on (b.zmq)', () => {
+describe('poller tick — a throw on one row, request or closed entry is caught there, logged once, and the tick goes on', () => {
   /** A trail write failure carrying fake tokens: its line must hold the redacted message only. */
   const trailWriteError = (label: string) =>
     Object.assign(new Error(`trail write failed ${sentinelInMessage(label)}`), { detail: LEAK_SENTINEL })

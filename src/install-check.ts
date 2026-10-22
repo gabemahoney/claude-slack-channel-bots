@@ -1,5 +1,5 @@
 /**
- * install-check.ts — the agent-director install check (b.jg5 SRJ-212).
+ * install-check.ts — the agent-director install check.
  *
  * Answers "is agent-director installed on this host at a version this CSCB
  * release can be installed beside?" for:
@@ -10,9 +10,9 @@
  * {@link runInstallCheck} reads the installed client's minimum binary version
  * ({@link readClientMinVersion}), makes one call to the injected resolver
  * (default: the client's own `resolveSystemBinary`; tests pass a stub,
- * b.jg5 SRJ-121) and applies the one host-version decision,
+ *) and applies the one host-version decision,
  * `decideHostAdVersion` in `src/ad-version-gate.ts`, which `/publish`'s
- * check `scripts/ad-version-check.ts` shares (b.jg5 SRJ-211). The decision
+ * check `scripts/ad-version-check.ts` shares. The decision
  * classifies agent-director errors by name, never `instanceof`:
  *   - a missing binary, a version that cannot be read (every
  *     `ErrSystemInstallUnreachable` reason, or a resolved version that does
@@ -21,7 +21,7 @@
  *     the too-old message names the switch-over runbook section, the
  *     not-found message its publishing-host block, the client-package texts
  *     {@link CLIENT_PACKAGE_REMEDY}, and no message advises installing,
- *     reinstalling or upgrading agent-director (b.jg5 SRJ-208, SRJ-1101);
+ * reinstalling or upgrading agent-director;
  *   - a binary the client accepts but below CSCB's Phase 1 floor passes with
  *     the Phase 1 `note`: the server refuses to start on it until
  *     agent-director Phase 1 is installed. With the released 0.12.0 client,
@@ -104,16 +104,14 @@ export type { InstallCheckClassLabel } from './install-check-labels.ts'
  * The switch-over runbook section in docs/migration.md, named by its title
  * (`PHASE1_RUNBOOK_SECTION_TITLE`), as the install check's and the startup
  * gate's texts point to it. No text that carries it advises installing,
- * reinstalling, upgrading or removing anything (b.jg5 SRJ-208, SRJ-212,
- * SRJ-1101).
+ * reinstalling, upgrading or removing anything.
  */
 export const RUNBOOK_SECTION_POINTER = `the switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}" in ${PHASE1_RUNBOOK_DOC}`
 
 /**
  * The publishing-host block (`PUBLISHING_HOST_BLOCK_HEADING`) inside the
  * switch-over runbook section: where the install check's not-found text
- * points, since that block covers a host with no agent-director (b.jg5
- * SRJ-1108, SRJ-212). The startup gate's not-found text points at
+ * points, since that block covers a host with no agent-director. The startup gate's not-found text points at
  * `RUNBOOK_SECTION_POINTER` instead (it runs on a bot host).
  */
 export const PUBLISHING_HOST_BLOCK_POINTER = `the block "${PUBLISHING_HOST_BLOCK_HEADING}" in ${RUNBOOK_SECTION_POINTER}`
@@ -121,7 +119,7 @@ export const PUBLISHING_HOST_BLOCK_POINTER = `the block "${PUBLISHING_HOST_BLOCK
 /**
  * The remedy every text about the agent-director client package carries (the
  * `ad-version-floor-unreadable` texts here and the startup gate's three
- * `ad-shim-*` probes; b.jg5 SRJ-208): check the package installed with CSCB,
+ * `ad-shim-*` probes): check the package installed with CSCB,
  * and the runbook section. It names no reinstall, upgrade, `@latest` or
  * package-manager command.
  */
@@ -270,7 +268,7 @@ export type InstallCheckResolveSystemBinary = () => Promise<ResolveSystemBinaryR
 export interface InstallCheckDeps {
   /**
    * Resolves the host's agent-director binary; default: the client's own
-   * `resolveSystemBinary`. Tests pass a stub (b.jg5 SRJ-121, SRJ-1301).
+   * `resolveSystemBinary`. Tests pass a stub.
    */
   resolveSystemBinary?: InstallCheckResolveSystemBinary
 }
@@ -390,7 +388,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
 }
 
 /**
- * Run the full check (b.jg5 SRJ-212); see the module header. Reads the
+ * Run the full check; see the module header. Reads the
  * client minimum (cached), makes one resolver call and applies the shared
  * host-version decision. The result is success (with the Phase 1 `note` when
  * the binary is below CSCB's floor) or one of the four failure class labels.

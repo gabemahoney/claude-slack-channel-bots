@@ -1,24 +1,23 @@
 import { ErrInternal, ErrConfigMalformed, ErrSchemaMismatch } from 'agent-director'
 /**
  * ad-error-class.test.ts — the one classifier of agent-director errors
- * (b.jg5 SRJ-104), which recognises every error the client declares as a
- * class by `instanceof` that class (b.jg5 SRJ-101), never by its `errName` or
+ * which recognises every error the client declares as a
+ * class by `instanceof` that class, never by its `errName` or
  * `name`; the by-class helper `isAdErrorInstance` and the GONE label
  * `goneErrNameOf`; the `ErrInvalidFlags` step beside it; the re-bound-socket
- * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021; class plus
- * phrase); the CONFLICT description accessor `conflictDescriptionOf` (b.jg5
- * SRJ-501, SRJ-507) and the kill-failure description accessor
- * `killFailedDescriptionOf` (b.jg5 SRJ-110, SRJ-702), each answering only
+ * predicate `isDifferentTmuxServerError` (class plus
+ * phrase); the CONFLICT description accessor `conflictDescriptionOf` and the kill-failure description accessor
+ * `killFailedDescriptionOf`, each answering only
  * for an instance of its class (an `ErrUnknownErrorName` carrying the name,
- * UNAVAILABLE by SRJ-104, answers nothing); the launch-timeout predicate
- * `isLaunchTimeoutError` / `launchTimeoutFormOf` (b.jg5 SRJ-407; class plus
+ * UNAVAILABLE by the contract, answers nothing); the launch-timeout predicate
+ * `isLaunchTimeoutError` / `launchTimeoutFormOf` (class plus
  * phrase and the declared call: an `ErrCallTimeout` instance, or an
  * `ErrTmuxUnresponsive` instance whose description carries
  * `LAUNCH_TIMEOUT_PHRASE`, only at a launch call; both forms stay
- * UNAVAILABLE); the one-line description `describeReportedAdFailure` (b.jg5
- * SRJ-104: what agent-director reported, else
+ * UNAVAILABLE); the one-line description `describeReportedAdFailure` (
+ * what agent-director reported, else
  * `describeAgentDirectorFailure`'s description); and the stub's error
- * builders it is fed with (b.jg5 SRJ-1303; their shape checks live here).
+ * builders it is fed with (their shape checks live here).
  *
  * Every value is built with the stub's builders; a value of a class with a
  * description no builder takes has that description set on the builder's
@@ -34,7 +33,7 @@ import { ErrInternal, ErrConfigMalformed, ErrSchemaMismatch } from 'agent-direct
  * `survivorPids` from `src/ad-description-phrases.ts` and the cap from
  * `src/persona-connection-errors.ts`.
  *
- * The step's re-check is either an injected recording trigger or E3's
+ * The step's re-check is either an injected recording trigger or
  * installed re-check over `makeStubResolveSystemBinary` on `createFakeClock`;
  * the installed re-check and the client singleton are reset in `afterEach`.
  * No process, no real timer, no top-level mock.module(), no value import of
@@ -244,7 +243,7 @@ afterEach(() => {
 const ERR_INTERNAL = errInternal().errName
 const ERR_CONFIG_MALFORMED = errConfigMalformed().errName
 
-/** The classes whose classification carries a reported name and message (b.jg5 SRJ-104). */
+/** The classes whose classification carries a reported name and message. */
 const REPORTING_CLASSES: readonly AdErrorClass[] = [
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
@@ -269,7 +268,7 @@ function withErrDescription<T extends AgentDirectorError>(value: T, description:
 }
 
 // ---------------------------------------------------------------------------
-// Every row of SRJ-104's table
+// Every row of the contract table
 // ---------------------------------------------------------------------------
 
 type Row = readonly [label: string, build: () => unknown, expected: AdErrorClass]
@@ -375,7 +374,7 @@ const ROWS: readonly Row[] = [
   ],
 ]
 
-describe('classifyAdError: every row of SRJ-104', () => {
+describe('classifyAdError: every row of the contract', () => {
   test.each(ROWS.map(([label, build, expected]) => [label, expected, build] as const))('%s is %s', (_label, expected, build) => {
     const classification = classifyAdError(build())
     expect(classification.errorClass).toBe(expected)
@@ -499,11 +498,11 @@ describe('classifyAdError: a table class wins over an A-13 or UnknownError errNa
 })
 
 // ---------------------------------------------------------------------------
-// The store-open names (b.jg5 SRJ-104; A-32, Q-15)
+// The store-open names (A-32, Q-15)
 // ---------------------------------------------------------------------------
 
-/** The three store-open names as the SRD spells them, the wire names the Phase 1 CLI returns. */
-const SRD_STORE_OPEN_NAMES = ['ErrSchemaMismatch', 'ErrSchemaMigrationRequired', 'ErrStoreOpen']
+/** The three store-open names as the contract spells them, the wire names the Phase 1 CLI returns. */
+const STORE_OPEN_CLASS_NAMES = ['ErrSchemaMismatch', 'ErrSchemaMigrationRequired', 'ErrStoreOpen']
 
 /** Each store-open name with the stub call that builds it around a description. */
 const STORE_OPEN_BUILDERS: ReadonlyArray<readonly [string, (description: string) => AgentDirectorError]> = [
@@ -513,8 +512,8 @@ const STORE_OPEN_BUILDERS: ReadonlyArray<readonly [string, (description: string)
 ]
 
 describe('classifyAdError: the store-open names', () => {
-  test('the constants are the SRD\'s three names', () => {
-    expect<readonly string[]>(STORE_OPEN_ERR_NAMES).toEqual(SRD_STORE_OPEN_NAMES)
+  test('the constants are the contract\'s three names', () => {
+    expect<readonly string[]>(STORE_OPEN_ERR_NAMES).toEqual(STORE_OPEN_CLASS_NAMES)
   })
 
   test.each(STORE_OPEN_BUILDERS)('%s is UNCLASSIFIED with its reported name and its description redacted', (name, build) => {
@@ -539,13 +538,13 @@ describe('classifyAdError: the store-open names', () => {
 })
 
 // ---------------------------------------------------------------------------
-// By class, never by `errName` or `name` (b.jg5 SRJ-101)
+// By class, never by `errName` or `name`
 // ---------------------------------------------------------------------------
 
 /** A class the classifier decides by `instanceof`, a stub value of it, and that class's answer. */
 type ClassRow = readonly [errorClass: AdErrorConstructor, build: () => AgentDirectorError, expected: AdErrorClass]
 
-/** Every class the classifier decides by `instanceof`: SRJ-104's classes and `ErrUnknownErrorName`. */
+/** Every class the classifier decides by `instanceof`: classes and `ErrUnknownErrorName`. */
 const BY_CLASS_ROWS: readonly ClassRow[] = [
   [ErrInternal, () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
   [ErrConfigMalformed, () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
@@ -604,7 +603,7 @@ describe('classifyAdError: by class', () => {
     expect(classifyAdError(value).errorClass).toBe(expected)
   })
 
-  test('the table holds every class SRJ-104 decides: each classified row that is an agent-director error, CSCB\'s wrapper aside, is an instance of one of its classes', () => {
+  test('the table holds every class decides: each classified row that is an agent-director error, CSCB\'s wrapper aside, is an instance of one of its classes', () => {
     const decided = ROWS
       .filter(([, , expected]) => expected !== AD_ERROR_CLASS_UNCLASSIFIED)
       .map(([label, build]) => [label, build()] as const)
@@ -642,10 +641,10 @@ describe('classifyAdError: by class', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Builder shape (SRJ-1303)
+// Builder shape
 // ---------------------------------------------------------------------------
 
-/** Every CONFLICT case word, and every word ADSRD SR-1.4 sets beside one. */
+/** Every CONFLICT case word, and every word ADSRD sets beside one. */
 const CONFLICT_WORDS: readonly string[] = [
   CONFLICT_CONFLICTING_LABELS_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
@@ -664,7 +663,7 @@ const CONFLICT_WORDS: readonly string[] = [
   NO_KILL_SENT_PHRASE,
 ]
 
-/** The words each case carries from a verb other than `kill` and with no options (ADSRD SR-1.4 with its extras). */
+/** The words each case carries from a verb other than `kill` and with no options (ADSRD with its extras). */
 const CASE_WORDS: Readonly<Record<ConflictCase, readonly string[]>> = {
   'no-valid-id': [CONFLICT_NO_VALID_ID_PHRASE],
   'different-id': [CONFLICT_DIFFERENT_ID_PHRASE],
@@ -680,7 +679,7 @@ const CASE_WORDS: Readonly<Record<ConflictCase, readonly string[]>> = {
   'unrecognised': [],
 }
 
-/** The two cases whose session must not be ended: they point to no "Operator actions" (ADSRD SR-1.4; SRJ-1004). */
+/** The two cases whose session must not be ended: they point to no "Operator actions" (ADSRD). */
 const NO_POINTER_CASES: readonly ConflictCase[] = ['different-id', 'another-store']
 
 /** A session name other than the default, to show the builders carry the one they are given. */
@@ -689,7 +688,7 @@ const OTHER_SESSION_NAME = `${STUB_TMUX_SESSION_NAME}_other`
 /**
  * The `list --tmux-session-name` line naming `sessionName`: agent-director
  * puts it in every CONFLICT message, including the two with no "Operator
- * actions" pointer (handoff; SRJ-1303).
+ * actions" pointer (handoff).
  */
 function listLineFor(sessionName: string): string {
   return `list --tmux-session-name ${JSON.stringify(sessionName)}`
@@ -702,7 +701,7 @@ function wordsIn(description: string): string[] {
 /**
  * The description with the one allowed "no kill was sent" removed: any other
  * mention of a kill in a CONFLICT description names a command that ends a
- * session (SRJ-507).
+ * session.
  */
 function withoutNoKillSent(description: string): string {
   return description.replace(NO_KILL_SENT_PHRASE, '')
@@ -744,7 +743,7 @@ const CONFLICT_VARIANTS: ReadonlyArray<readonly [label: string, verb: string, c:
   ],
 ]
 
-/** Each option key with the cases it applies to (SRJ-1303). */
+/** Each option key with the cases it applies to. */
 const OPTION_CASES: ReadonlyArray<readonly [keyof ConflictOptions, readonly ConflictCase[]]> = [
   ['plainSpawn', ['different-id', 'another-store']],
   ['notAdopted', ['pane-not-found']],
@@ -797,7 +796,7 @@ const KILL_FAILED_BUILDS: ReadonlyArray<
   ],
 ]
 
-describe('stub builders: shape (SRJ-1303)', () => {
+describe('stub builders: shape', () => {
   test.each(PHASE1_BUILDS)(
     '%s builds an instance of its binding, with the name constant as errName, its verb and a description',
     (_label, errorClass, name, verb, build) => {
@@ -1080,7 +1079,7 @@ const AD_KILL_FAILED_DESCRIPTIONS: ReadonlyArray<readonly [label: string, descri
  * the stub's `errTmuxKillFailed`; a clause whose words and pid form disagree
  * is a stub description with the other clause's words swapped in.
  */
-describe('SURVIVOR_PID_PATTERN and survivorPids (b.jg5 SRJ-702)', () => {
+describe('SURVIVOR_PID_PATTERN and survivorPids', () => {
   test.each(AD_KILL_FAILED_DESCRIPTIONS)(
     'agent-director\'s description (%s): SURVIVOR_PID_PATTERN matches only its survivor clause and survivorPids reads exactly the survivor pids, never the worker\'s',
     (_label, description, clause, survivors) => {
@@ -1342,7 +1341,7 @@ describe('goneErrNameOf', () => {
 })
 
 // ---------------------------------------------------------------------------
-// isDifferentTmuxServerError (b.jg5 SRJ-311, SRJ-1021)
+// isDifferentTmuxServerError
 // ---------------------------------------------------------------------------
 
 /** `ErrTmuxNotAvailable`, as the stub's builder names it. */
@@ -1445,14 +1444,14 @@ describe('isDifferentTmuxServerError', () => {
 })
 
 // ---------------------------------------------------------------------------
-// conflictDescriptionOf (b.jg5 SRJ-501, SRJ-507)
+// conflictDescriptionOf
 // ---------------------------------------------------------------------------
 
 /** A thrown value and its label, for the accessor's tables. */
 type Built = readonly [label: string, build: () => unknown]
 
 /**
- * Every CONFLICT value the stub builds: SRJ-104's CONFLICT rows above (every
+ * Every CONFLICT value the stub builds: CONFLICT rows above (every
  * case from `resume`, the two `kill` forms, the options variants), and every
  * case and options variant again on another session name and verb.
  */
@@ -1536,7 +1535,7 @@ describe('conflictDescriptionOf', () => {
     expect(conflictDescriptionOf(value)).toBeUndefined()
   })
 
-  // SRJ-104: an ErrUnknownErrorName whose unknownName is not one of the five
+  // an ErrUnknownErrorName whose unknownName is not one of the five
   // names the table gives their own handling is UNAVAILABLE, the CONFLICT name
   // included, so it has no CONFLICT description.
   test.each([...CONFLICT_CASES])(
@@ -1646,7 +1645,7 @@ describe('conflictDescriptionOf', () => {
 })
 
 // ---------------------------------------------------------------------------
-// killFailedDescriptionOf (b.jg5 SRJ-110, SRJ-702)
+// killFailedDescriptionOf
 // ---------------------------------------------------------------------------
 
 /** The ROWS labels that build an `ErrTmuxKillFailed` instance: one per description. */
@@ -1673,7 +1672,7 @@ describe('killFailedDescriptionOf', () => {
     expect(killFailedDescriptionOf(value)).toBe(expected)
   })
 
-  // b.jg5 SRJ-104: an ErrUnknownErrorName carrying the kill-failure name is
+  // an ErrUnknownErrorName carrying the kill-failure name is
   // UNAVAILABLE and no kill failure, whatever its envelope says.
   test.each([...KILL_FAILED_DESCRIPTIONS])(
     'an ErrUnknownErrorName whose unknownName is ErrTmuxKillFailed, carrying the %s description in its envelope, is UNAVAILABLE and answers nothing',
@@ -1748,7 +1747,7 @@ describe('killFailedDescriptionOf', () => {
 })
 
 // ---------------------------------------------------------------------------
-// isLaunchTimeoutError / launchTimeoutFormOf (b.jg5 SRJ-407): a launch call's
+// isLaunchTimeoutError / launchTimeoutFormOf: a launch call's
 // `ErrCallTimeout`, or its `ErrTmuxUnresponsive` carrying the launch-timeout
 // words; recognised by class, the declared call deciding whether it is a launch
 // ---------------------------------------------------------------------------
@@ -1793,7 +1792,7 @@ const LAUNCH_TIMEOUT_ROW_LABELS: ReadonlySet<string> = new Set([
   'errTmuxUnresponsiveLaunchTimeout (resume)',
 ])
 
-describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
+describe('isLaunchTimeoutError and launchTimeoutFormOf', () => {
   test('the forms are the two names, by value: ErrCallTimeout\'s and ErrTmuxUnresponsive\'s', () => {
     expect([LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]).toEqual([errCallTimeout().errName, ERR_TMUX_UNRESPONSIVE_NAME])
     expect(LAUNCH_CALLS).toEqual(['spawn', 'resume'])
@@ -1829,7 +1828,7 @@ describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
     ['errTmuxUnresponsiveStillStopping', () => errTmuxUnresponsiveStillStopping()],
     ['errTmuxUnresponsiveStillStarting', () => errTmuxUnresponsiveStillStarting()],
     ['errTmuxUnresponsiveAfterDuplicateSession (its holder could not be read)', () => errTmuxUnresponsiveAfterDuplicateSession()],
-    ...ROWS.filter(([label]) => !LAUNCH_TIMEOUT_ROW_LABELS.has(label)).map(([label, build]): Built => [`${label} (SRJ-104's row)`, build]),
+    ...ROWS.filter(([label]) => !LAUNCH_TIMEOUT_ROW_LABELS.has(label)).map(([label, build]): Built => [`${label} (row)`, build]),
   ])('%s, at either launch call, is no launch timeout', (_label, build) => {
     for (const call of LAUNCH_CALLS) {
       const value = build()
@@ -1916,11 +1915,11 @@ describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110): the UNCLASSIFIED
+// unclassifiedClassificationOf: the UNCLASSIFIED
 // classification a kill site reports for a class it has no row for
 // ---------------------------------------------------------------------------
 
-describe('unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110)', () => {
+describe('unclassifiedClassificationOf', () => {
   test.each<[string, () => AgentDirectorError & { errName: string; errDescription: string }, AdErrorClass]>([
     ['errInstanceIdCollision', () => errInstanceIdCollision(), AD_ERROR_CLASS_STATE],
     ['errSpawnNotResumable', () => errSpawnNotResumable(), AD_ERROR_CLASS_STATE],
@@ -1973,11 +1972,11 @@ describe('unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// describeReportedAdFailure (b.jg5 SRJ-104): the one-line description that
+// describeReportedAdFailure: the one-line description that
 // names what agent-director reported
 // ---------------------------------------------------------------------------
 
-describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
+describe('describeReportedAdFailure', () => {
   /** The envelope's `err_description` of an `ErrUnknownErrorName`. */
   const envelopeDescription = (value: ErrUnknownErrorName): string => (value.envelope as { err_description: string }).err_description
 
@@ -2103,11 +2102,11 @@ describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// describeAdFailureForLog (b.jg5 SRJ-104, SRJ-1014): the reported name when
+// describeAdFailureForLog: the reported name when
 // the classifier gives one, else describeAgentDirectorFailure's description
 // ---------------------------------------------------------------------------
 
-describe('describeAdFailureForLog (b.jg5 SRJ-104, SRJ-1014)', () => {
+describe('describeAdFailureForLog', () => {
   test.each<Built>([
     ['a plain ErrInternal', () => errInternal()],
     ['the unusable-name ErrInternal', () => errUnusableName()],
@@ -2196,7 +2195,7 @@ function expectedInvalidFlagsClassification(): AdErrorClassification {
   return { errorClass: AD_ERROR_CLASS_UNCLASSIFIED, reportedName: err.errName, message: err.errDescription }
 }
 
-/** E3's re-check installed on a fake clock over a stub resolve; returns the resolve's call list and the stop codes. */
+/** re-check installed on a fake clock over a stub resolve; returns the resolve's call list and the stop codes. */
 function installStubRecheck(outcomes?: readonly StubResolveSystemBinaryOutcome[]): { resolveCalls: unknown[]; stops: number[] } {
   const resolveCalls: Array<object | undefined> = []
   const stops: number[] = []

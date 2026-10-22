@@ -1,9 +1,8 @@
 /**
- * cron-scheduler.ts — The once-per-minute dispatch tick (Task 3 on b.he5;
- * decision 8, D-Q3, PD-4 on b.grx / t2.he5.eu.4q).
+ * cron-scheduler.ts — The once-per-minute dispatch tick.
  *
  * `createCronScheduler(deps)` returns a handle whose single self-re-arming
- * timer is the ONLY code path that dispatches cron schedules (decision 8). It
+ * timer is the ONLY code path that dispatches cron schedules. It
  * loads the crontable at start() and re-loads it at the top of any tick whose
  * (mtimeMs, size) stat differs from the last successful load, matches the
  * in-memory schedules against the current wall-clock minute in server-local
@@ -18,7 +17,7 @@
  * at the top of the tick body mutates the in-memory table between whole passes,
  * never mid-pass. setInterval cannot guarantee that.
  *
- * Hot-reload (E3): the crontable file — not the in-memory copy — is the runtime
+ * Hot-reload : the crontable file — not the in-memory copy — is the runtime
  * source of truth. Freshness is a per-tick (mtimeMs, size) stat compared for
  * INEQUALITY (not ordering — a backwards touch still reloads) against the last
  * SUCCESSFUL load. There is deliberately NO fs.watch/watcher/dirty flag: a swap
@@ -30,14 +29,14 @@
  * it via the bootstrap. Errors are latched so a persistent condition warns once,
  * not once a minute.
  *
- * Undeliverable lines (b.n4n): a line with no persona list (the all-bots form)
+ * Undeliverable lines: a line with no persona list (the all-bots form)
  * loads and matches, but all-bots fan-out is not built, so it can never be
  * delivered in this version. Every load (start() and each reload) writes one
  * WARN per such line, and both load lines carry the undeliverable count, so the
  * gap shows at load time and not only as the dispatcher's fire-time
  * fanout-deferred record. An unchanged file is not reloaded, so it stays quiet.
  *
- * At-most-once is a LOGGED ASSERTION, not the mechanism (decision 8): the
+ * At-most-once is a LOGGED ASSERTION, not the mechanism: the
  * minute-aligned single-pass loop already makes a double-fire structurally
  * impossible; the Map<schedule instance, epoch minute> exists only to catch a
  * scheduler BUG (the SAME loaded schedule fired twice in one pass) and shout
@@ -109,9 +108,9 @@ const REAL_CLOCK: SchedulerClock = {
 
 /** Constructor dependencies for the scheduler. */
 export interface CronSchedulerDeps {
-  /** The dispatcher (Task 2) — its fire() is the only fire path. */
+  /** The dispatcher (section 2) — its fire() is the only fire path. */
   dispatcher: CronDispatcher
-  /** The cron-log writer handle (Task 1). */
+  /** The cron-log writer handle (section 1). */
   cronLog: CronLog
   /** Path to the crontable file (bootstrapped if absent; re-read on change). */
   cronTablePath: string
@@ -163,7 +162,7 @@ interface CompiledSchedule {
 }
 
 // ---------------------------------------------------------------------------
-// Undeliverable lines and the load log lines (b.n4n)
+// Undeliverable lines and the load log lines
 // ---------------------------------------------------------------------------
 
 /**
@@ -317,7 +316,7 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
    *
    * It is also the ONLY place a line with no persona list is warned about
    * (one WARN per such line per load, as with parse errors), and it returns
-   * the undeliverable count for the callers' load lines (b.n4n).
+   * the undeliverable count for the callers' load lines.
    *
    * It deliberately does NOT log the "crontable reloaded" INFO: that line
    * belongs to the tick-reload caller only, so start() never emits it.
@@ -427,7 +426,7 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
       }
 
       // (3) Exactly ONE started marker (PD-4 outage-window marker), with the
-      // count of loaded lines that can never be delivered (b.n4n).
+      // count of loaded lines that can never be delivered.
       cronLog.info(
         clock.now().toISOString(),
         schedulerStartedLine(compiled.length, countUndeliverable(compiled)),

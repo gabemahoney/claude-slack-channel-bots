@@ -1,6 +1,6 @@
 /**
- * delivery-decision.test.ts — The pure inbound delivery decision (b.av2
- * SR-4.2 steps in order, SR-4.3 direct messages and group DMs, SR-4.4 `via`
+ * delivery-decision.test.ts — The pure inbound delivery decision (
+ * steps in order direct messages and group DMs`via`
  * precedence).
  *
  * Imports the module directly: no server, no `mock.module`, no I/O. Events
@@ -178,7 +178,7 @@ describe('step 2: author and self-exclusion', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 3: conversation kind (DMs and group DMs, SR-4.3)
+// Step 3: conversation kind (DMs and group DMs)
 // ---------------------------------------------------------------------------
 
 describe('step 3: DMs and group DMs', () => {
@@ -360,7 +360,7 @@ describe('steps 5 and 6: delivery setting', () => {
 })
 
 // ---------------------------------------------------------------------------
-// via precedence (SR-4.4)
+// via precedence
 // ---------------------------------------------------------------------------
 
 describe('via precedence', () => {

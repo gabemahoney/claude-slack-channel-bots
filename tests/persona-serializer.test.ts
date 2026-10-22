@@ -1,5 +1,5 @@
 /**
- * persona-serializer.test.ts — per-persona lifecycle serialization (b.av2 SR-6.6).
+ * persona-serializer.test.ts — per-persona lifecycle serialization.
  *
  * Drives `createPersonaSerializer` with controllable operations only (each
  * one a `Promise.withResolvers` gate the test settles); no timer, no real
@@ -54,7 +54,7 @@ async function settled(p: Promise<unknown>): Promise<boolean> {
   return done
 }
 
-describe('createPersonaSerializer: one persona (SR-6.6)', () => {
+describe('createPersonaSerializer: one persona', () => {
   test.each<['resolves' | 'rejects']>([['resolves'], ['rejects']])(
     'the second operation for a persona starts only after the first %s, and each submitter gets its own operation\'s result',
     async (how) => {
@@ -120,7 +120,7 @@ describe('createPersonaSerializer: one persona (SR-6.6)', () => {
   })
 })
 
-describe('createPersonaSerializer: personas are independent (SR-3.3, SR-6.6)', () => {
+describe('createPersonaSerializer: personas are independent', () => {
   test('persona B\'s operation starts and completes while persona A\'s is still pending, and A\'s later operation still waits for A only', async () => {
     const s = createPersonaSerializer()
     const ops = makeOps(s)

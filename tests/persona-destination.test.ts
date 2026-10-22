@@ -1,21 +1,20 @@
 /**
  * persona-destination.test.ts — Where a persona's permission prompts and
- * notices go, and the post there (b.av2 SR-7.1, SR-5.1, SR-10.3; b.deo
- * SRI-701, SRI-702, SRI-906).
+ * notices go, and the post there.
  *
- * One destination rule per mode (b.deo SRI-701, beside b.av2 SR-7.1): a
+ * One destination rule per mode (beside): a
  * persona's destination is its `permission_prompts` in declarative mode and
  * its fungible destination (`invited.permission_prompts`, `dm` when absent)
  * in fungible mode; the section not in force is ignored, and the resolver
  * reads the configuration in effect and the applied persona again at each
  * attempt. In fungible mode the resolver posts to
  * a channel destination, or opens the DM with `dm.contact` on the persona's
- * own client for a `dm` one (b.deo SRI-702). `destinationSettingOf` is
+ * own client for a `dm` one. `destinationSettingOf` is
  * pinned here for each mode, the one pin of the setting names in this work;
  * every other suite builds its expectations through it. The resolver's
  * refusal of a `dm` destination names the setting in force, and in fungible
- * mode differs from the declarative line in that name only (b.deo SRI-906,
- * beside b.av2 SR-10.3).
+ * mode differs from the declarative line in that name only (
+ * beside).
  *
  * The destination module is proven here once, so the poller and notifier
  * suites need not re-prove it: a channel destination is the configured
@@ -112,7 +111,7 @@ const opens = (p: Persona) => stub(p).calls.conversationsOpen
 /** `chat.postMessage` arguments on `p`'s stub, as the module passes them. */
 const posts = (p: Persona) => stub(p).calls.postMessage as { channel: string; text: string; blocks?: unknown[] }[]
 
-/** The persona with another contact (an in-place contact change, as E12's reload makes). */
+/** The persona with another contact (an in-place contact change, as reload makes). */
 const withContact = (p: Persona, contact: string): Persona => ({ ...p, dm: { ...p.dm, contact } })
 
 /** Record a result for the leak check, without its raw thrown value. */
@@ -146,7 +145,7 @@ afterEach(() => {
 // Resolution
 // ---------------------------------------------------------------------------
 
-describe('resolution (SR-7.1)', () => {
+describe('resolution', () => {
   test('a dm destination opens the DM with its contact on its own client and posts to the returned D… ID; a second post reuses the cache', async () => {
     stub(A).script.open.push(openedDm('D0ALPHADM'))
 
@@ -213,7 +212,7 @@ describe('resolution (SR-7.1)', () => {
   })
 
   // An in-place update forgets the persona's cached DM when `dm.contact`,
-  // `dm.enabled` or `permission_prompts` changed (E12 decision 11), so the
+  // `dm.enabled` or `permission_prompts` changed, so the
   // forget can come with or without a new contact.
   test.each([
     ['with a new contact', 'U0NEWCON1'],
@@ -379,8 +378,8 @@ describe('a failed conversations.open', () => {
 // Posting
 // ---------------------------------------------------------------------------
 
-describe('posting (SR-7.1, SR-3.1)', () => {
-  test('AC 29 / AC 44: a DM-only persona\'s first post, with no DM yet, opens the DM on its own client, then posts to the D… ID (never the user ID) with no username or icon override', async () => {
+describe('posting', () => {
+  test('a DM-only persona\'s first post, with no DM yet, opens the DM on its own client, then posts to the D… ID (never the user ID) with no username or icon override', async () => {
     const r = await d.post(A, client(A), { text: 'prompt', blocks: [{ type: 'section' }] })
     record(r)
 
@@ -544,10 +543,10 @@ describe('never rejects', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Defensive refusal (SR-5.1)
+// Defensive refusal
 // ---------------------------------------------------------------------------
 
-describe('a dm destination with DMs off or no contact is refused (SR-5.1)', () => {
+describe('a dm destination with DMs off or no contact is refused', () => {
   test.each([
     ['DMs off', { enabled: false, contact: 'U0ALPHA01' }, 'dm_disabled', 'dm.enabled is not true'],
     ['no contact', { enabled: true }, 'no_dm_contact', 'dm.contact is not set'],
@@ -710,7 +709,7 @@ describe('describeDestinationFailureCause (token-safe)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// One destination rule per mode (b.deo SRI-701, SRI-702, SRI-906)
+// One destination rule per mode
 // ---------------------------------------------------------------------------
 
 /** The configuration in effect in declarative mode, as the one destination rule reads it. */
@@ -751,7 +750,7 @@ function resolverOn(getConfig: () => DestinationConfig, sink: string[] = []): Pe
   return createPersonaDestinations({ log, getPersonaConfig: getConfig })
 }
 
-describe('destinationSettingOf: the setting in force, pinned per mode (b.deo SRI-906)', () => {
+describe('destinationSettingOf: the setting in force, pinned per mode', () => {
   test('declarative mode names permission_prompts; fungible mode names invited.permission_prompts', () => {
     expect(destinationSettingOf(DECLARATIVE_MODE)).toBe('permission_prompts')
     expect(destinationSettingOf(FUNGIBLE_MODE)).toBe('invited.permission_prompts')
@@ -833,7 +832,7 @@ const RULE_ROWS: [string, RuleRow][] = [
   ],
 ]
 
-describe('the one destination rule per mode (b.deo SRI-701, SRI-702)', () => {
+describe('the one destination rule per mode', () => {
   test.each(RULE_ROWS)('%s', (_label, row) => {
     const p = personaIn(row.mode, row.spec)
 
@@ -853,7 +852,7 @@ describe('the one destination rule per mode (b.deo SRI-701, SRI-702)', () => {
   })
 })
 
-describe('the resolver in fungible mode (b.deo SRI-702)', () => {
+describe('the resolver in fungible mode', () => {
   const POST_ROWS: [string, PersonaSpec, 'channel' | 'dm'][] = [
     ['a channel destination', { dm: DMS_ON, invited: { permission_prompts: FUNG_CHANNEL } }, 'channel'],
     ['an explicit "dm" destination', { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, 'dm'],
@@ -878,7 +877,7 @@ describe('the resolver in fungible mode (b.deo SRI-702)', () => {
   })
 })
 
-describe('the destination is resolved again at each attempt (b.deo SRI-701)', () => {
+describe('the destination is resolved again at each attempt', () => {
   test('the switch is read at each attempt, never when the resolver is built: the same persona moves with it, and its DM is opened once', async () => {
     // Both sections set, as only a spec can: the switch alone picks the one read.
     const both = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, fungible_destination: DM_DESTINATION, dm: DMS_ON })
@@ -912,7 +911,7 @@ describe('the destination is resolved again at each attempt (b.deo SRI-701)', ()
   })
 })
 
-describe('the resolver\'s "dm" refusal in fungible mode names invited.permission_prompts (b.deo SRI-906, b.av2 SR-5.1, SR-10.3)', () => {
+describe('the resolver\'s "dm" refusal in fungible mode names invited.permission_prompts', () => {
   const DM_STATES: [string, Persona['dm'], DmDestinationRefusal][] = [
     ['DMs off', { enabled: false, contact: RULE_CONTACT }, 'dm_disabled'],
     ['no contact', { enabled: true }, 'no_dm_contact'],

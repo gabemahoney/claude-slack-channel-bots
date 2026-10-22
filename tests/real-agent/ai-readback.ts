@@ -11,7 +11,7 @@ export function safeSelectedModel(value: string): boolean { return typeof value 
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))])) : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
 
-// SR-6.2 also records human queued commands as attachments. Reuse the packed
+// also records human queued commands as attachments. Reuse the packed
 // production parser so other attachments, tool results and origins stay out.
 function nativeTakeIn(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   if (entry.value?.type !== 'user' && !(entry.value?.type === 'attachment' && entry.value.attachment?.type === 'queued_command')) return false
@@ -21,7 +21,7 @@ function nativeTakeIn(entry: TranscriptEntry, adapters: ReceiptAdapters): boolea
 
 // Native session metadata has no temporal or ancestry identity. Only the five
 // observed three-field shapes are informational; added evidence stays checked.
-// api-request-blob is not a blanket informational exclusion. AC15 separately
+// api-request-blob is not a blanket informational exclusion. separately
 // validates its request-echo structure and all embedded actions below.
 export function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   const value = entry.value, field = new Map([
@@ -66,14 +66,14 @@ function nativeSetup(entry: TranscriptEntry): boolean {
 
 export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, receipt: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   if (!Number.isFinite(entry.at)) return false
-  // Decision 24: setup is prepared before the user record is timestamped.
+  // setup is prepared before the user record is timestamped.
   // Membership is ancestry/file order, with the previous turn as a time floor;
   // no guessed millisecond allowance applies to these native setup types.
   if (nativeSetup(entry)) {
     const preceding = session.filter(e => e.offset < receipt.offset)
     const predecessor = preceding.at(-1)
     const previousReceipt = preceding.map(e => nativeTakeIn(e, adapters)).lastIndexOf(true)
-    // Decision 24's amendment: untimed shutdown/bookkeeping records have no
+    // untimed shutdown/bookkeeping records have no
     // clock. Only the last finite timestamp in the previous turn sets the floor.
     const previousLast = previousReceipt < 0 ? undefined
       : preceding.slice(previousReceipt).filter(e => Number.isFinite(e.at)).at(-1)
@@ -94,7 +94,7 @@ export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, r
 
 function assertAC15Action(block: any) {
   if (block.type === 'tool_use' || block.type === 'server_tool_use') check(block.type === 'tool_use'
-    && ['mcp__slack-channel-router__reply', 'ToolSearch'].includes(block.name), 'AC15 non-reply tool action observed')
+    && ['mcp__slack-channel-router__reply', 'ToolSearch'].includes(block.name), 'non-reply tool action observed')
 }
 
 function assertAC15EmbeddedActions(value: any): void {
@@ -140,13 +140,13 @@ function ac15RequestEcho(entry: TranscriptEntry, adapters: ReceiptAdapters): boo
     && onlyKeys(value.message, ['role', 'content']) && Object.keys(value.message).length === 2
     && ['user', 'assistant', 'system'].includes(value.message.role) && requestEchoContent(value.message.content)
     && Number.isNaN(entry.at) && entry.kind === 'other' && entry.uuid === undefined && entry.text === undefined,
-  'AC15 malformed native request echo')
+  'malformed native request echo')
   const parsed = adapters.parseDeliveryTranscriptRecord('claude', value)
-  check(parsed.kind === 'other' && parsed.uuid === undefined && parsed.text === undefined, 'AC15 request echo carries transcript evidence')
+  check(parsed.kind === 'other' && parsed.uuid === undefined && parsed.text === undefined, 'request echo carries transcript evidence')
   return true
 }
 
-// AC15 may acknowledge a part, but retrieval or any other action cannot
+// may acknowledge a part, but retrieval or any other action cannot
 // supply missing context. Inspect every copy's turn and its late descendants;
 // completion/JSON provenance remains the ordinary final-part oracle below.
 function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, journal: any[], own: TranscriptEntry[], adapters: ReceiptAdapters) {
@@ -162,15 +162,15 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
       && parts.some(text => adapters.receiptTextMatches(e.text!, text)))
     if (!copies.length) continue
     const ids = session.map(e => e.value?.uuid).filter(id => typeof id === 'string')
-    check(new Set(ids).size === ids.length, 'AC15 has ambiguous native UUID')
+    check(new Set(ids).size === ids.length, 'has ambiguous native UUID')
     for (const copy of copies) {
       check(typeof copy.uuid === 'string' && nativeTakeIn(copy, adapters) && copy.value.uuid === copy.uuid
         && copy.value.isMeta !== true && copy.value.sessionId === basename(copy.path, '.jsonl') && Number.isFinite(copy.at) && copy.at >= acceptedAt,
-      'AC15 copy has no exact own native receipt')
+      'copy has no exact own native receipt')
       check(sends.some(r => r.transcript_path === copy.path && r.session_id === copy.value.sessionId
         && adapters.receiptTextMatches(copy.text!, parts[r.part - 1]) && Number.isFinite(r.at) && r.at >= acceptedAt && r.at <= copy.at
         && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= copy.offset),
-      'AC15 copy has no native send window')
+      'copy has no native send window')
       const next = session.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
       // Queued commands start their own exchange even if their timestamp is
       // earlier than the previous acknowledgement; their send checks apply.
@@ -180,12 +180,12 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
         if (nativeInformation(e, adapters)) continue
         if (ac15RequestEcho(e, adapters)) continue
         check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
-          'AC15 exchange has refusal/API failure')
-        check(nativeTime(session, e, copy, adapters), 'AC15 exchange has invalid/stale time')
+          'exchange has refusal/API failure')
+        check(nativeTime(session, e, copy, adapters), 'exchange has invalid/stale time')
         if (e.value.type !== 'assistant') continue
-        check(Array.isArray(e.value.message?.content), 'AC15 has malformed native assistant content')
+        check(Array.isArray(e.value.message?.content), 'has malformed native assistant content')
         for (const block of e.value.message.content) {
-          check(block && typeof block === 'object' && typeof block.type === 'string', 'AC15 has malformed native response block')
+          check(block && typeof block === 'object' && typeof block.type === 'string', 'has malformed native response block')
           // Claude's native ToolSearch discovers deferred tool definitions; it
           // does not execute them. Check every subsequent action independently.
           assertAC15Action(block)
@@ -226,7 +226,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
       && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= take!.offset),
     'AI readback receipt has no native send window')
   }
-  if (expected.case === 'AC15') assertAC15Exchange(fixed.parts, accepted.received_at, seq, journal, own, adapters)
+  if (expected.case === "AC15") assertAC15Exchange(fixed.parts, accepted.received_at, seq, journal, own, adapters)
   // Reassembly answers belong to the final delivered part. Explicit seqs also
   // preserve earlier DM checks after a later thread and across resume sessions.
   const receipt = take!

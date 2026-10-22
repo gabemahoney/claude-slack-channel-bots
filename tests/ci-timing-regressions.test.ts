@@ -1,4 +1,4 @@
-/** b.pb8: run the real scenario assertions over synthetic AD/receipt evidence.
+/** run the real scenario assertions over synthetic AD/receipt evidence.
  * No scenario is sourced, no native process is launched, and clocks are fake. */
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
@@ -148,19 +148,19 @@ describe('retained timing regressions', () => {
   test.each([
     [20, 2000, 10000, true], [19, 2000, 10000, false],
     [20, 2000.001, 10000, false], [20, 2000, 10000.001, false],
-  ] as const)('AC76 retains 20 samples and exact p95 bounds: %s/%s/%s', (samples, typing, delivery, passes) => {
+  ] as const)('retains 20 samples and exact p95 bounds: %s/%s/%s', (samples, typing, delivery, passes) => {
     const text = source('fixtures/transcript-receipts.ts')
     const check = new Function('result', 'count', 'percentile', 'console', block(text, '        const n = Number(count)', '\n      }'))
     const timings = Array.from({ length: samples }, () => ({ typing_ms: typing, delivery_ms: delivery }))
     const run = () => check({ timings }, '20', percentile, { log() {} })
     if (passes) expect(run).not.toThrow()
-    else expect(run).toThrow(samples < 20 ? 'Insufficient latency samples' : 'AC76 latency exceeded')
+    else expect(run).toThrow(samples < 20 ? 'Insufficient latency samples' : 'latency exceeded')
     const script = source('test-32-fmk-real-order.sh')
     expect(script).toContain('for n in {1..20}; do')
     expect(script).toContain('real_assert_latency "${REAL_KEY}" 20')
   })
 
-  test('AC76 rejects the observed 18-fast/two-slow sample shape without dropping either slow trial', () => {
+  test('rejects the observed 18-fast/two-slow sample shape without dropping either slow trial', () => {
     // Numeric-only projection of run 20261021t182831z-lmk9ayre's final 20
     // originals. This tests the oracle, not the cause of either slow sample.
     const timings = [
@@ -181,7 +181,7 @@ describe('retained timing regressions', () => {
     const check = new Function('result', 'count', 'percentile', 'console',
       block(source('fixtures/transcript-receipts.ts'), '        const n = Number(count)', '\n      }'))
     const recorded: string[] = []
-    expect(() => check({ timings }, '20', percentile, { log: (line: string) => recorded.push(line) })).toThrow('AC76 latency exceeded')
+    expect(() => check({ timings }, '20', percentile, { log: (line: string) => recorded.push(line) })).toThrow('latency exceeded')
     expect(recorded).toEqual(['recorded: p95 typing_start_ms=2467.921142578125 delivery_ms=4043 samples=20'])
   })
 })

@@ -1,6 +1,6 @@
 /**
  * persona-connection-errors.ts — Token-safe description of thrown values, and
- * the process-level `unhandledRejection` handler (b.av2 SR-3.3, SR-10.3).
+ * the process-level `unhandledRejection` handler.
  *
  * A Slack library error can hold secrets beyond its code: its `original`
  * (the raw request error, Authorization header included), request headers,
@@ -43,7 +43,7 @@
  * stray rejection cannot take the process down. This module never installs
  * it (no `process.on`); `server.ts` installs it once, in `main()`.
  *
- * Pure module (b.av2 SR-13.1): no module-scope state, no environment access,
+ * Pure module: no module-scope state, no environment access,
  * no file writes, nothing runs at import.
  *
  * SPDX-License-Identifier: MIT

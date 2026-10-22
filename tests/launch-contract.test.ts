@@ -1,4 +1,4 @@
-/** b.omv SR-7.2/4/6: every actual launch prepares current bytes and fails closed. */
+/** every actual launch prepares current bytes and fails closed. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'

@@ -25,11 +25,11 @@
 set -euo pipefail
 
 # This trap deliberately lacks the SR_GUARDED_EXIT guard the other release
-# scripts carry (b.vqy): every deliberate exit here is `exit 0` (sanitize is
+# scripts carry: every deliberate exit here is `exit 0` (sanitize is
 # best-effort by contract), so the rc-ne-0 test alone already excludes them
 # and the trap can only fire on a genuinely unguarded failure.
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 # Runtime sunset check: if bun is past the 1.3.13 defect, the empty-string
 # poison can't reproduce. Skip the sanitize (warn once so operators on old
@@ -47,7 +47,7 @@ if [ -n "${BUN_VERSION}" ]; then
   fi
 fi
 
-# SCOPE (b.r6x, deliberate): this script sanitizes the CANONICAL prefix only —
+# SCOPE (deliberate): this script sanitizes the CANONICAL prefix only —
 # `${BUN_INSTALL:-$HOME/.bun}/install/global` — and does not look for, or touch,
 # an install living in any other bun prefix, even one that is shadowing this one
 # on PATH. Three reasons:
@@ -66,7 +66,7 @@ fi
 #      mutates — it names the shadowing path, the PATH shim, and the exact manual
 #      remediation, and leaves the deletion to a human.
 # The expansion below is correct as written (with BUN_INSTALL unset, ~/.bun is
-# bun's default global prefix): b.r6x's defect was the missing shadow check, not
+# bun's default global prefix): defect was the missing shadow check, not
 # a miscomputed prefix. Do not "fix" it.
 GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
 GLOBAL_PKG="${GLOBAL_DIR}/package.json"

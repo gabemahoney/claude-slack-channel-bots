@@ -1,5 +1,5 @@
 
-/** The production engine and gate's I/O-free choices (b.omv SR-1.2/15.6).
+/** The production engine and gate's I/O-free choices.
  * Observations are values: receipt records and saved key readings are never
  * replaced with a newer environment while an owned operation completes. */
 export const ENGINE_ACTIONS = ['expireTimers', 'commitAppend', 'observeLaunch', 'readReceipt', 'fixText', 'recordSend', 'recordRecoveryEnter', 'typeText', 'pressEnter', 'recordRefusal', 'releaseAttempt', 'requestGate', 'deferReconnect', 'recordNotice', 'stopAbsent', 'compactQueueRename', 'compactQueueFinish', 'ignoreDuplicate'] as const

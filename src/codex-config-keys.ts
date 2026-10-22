@@ -1,4 +1,4 @@
-/** b.omv SR-14.7, decision 22. Import-safe, names-only TOML projection.
+/** Import-safe, names-only TOML projection.
  * Scalar text is lexically skipped; names-only callers send only keys and zero
  * placeholders to the TOML parser for duplicate/table-definition validation.
  * The model reader separately decodes only the authorized top-level model.
@@ -298,7 +298,7 @@ export function checkCodexScratchConfigKeys(text: string | undefined, hostProjec
   const forbidden = (path: CodexConfigKeyPath) => path.some(segment => /^(?:model|model_reasoning_effort|profile|profiles)$|provider|auth/i.test(segment))
   const unknownKeyCount = paths.filter(path => {
     const id = pathId(path)
-    // Decision 22 amendment: only native leaves and their actual parent tables
+    // only native leaves and their actual parent tables
     // may overlap host names. Any extra descendant still rejects the file.
     const native = leaves.has(id) || (permitted.has(id) && tables.has(id))
     return forbidden(path) || (host.has(id) && !native) || !native

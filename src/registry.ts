@@ -2,16 +2,15 @@
  * registry.ts — Persona-keyed MCP session registry and the per-session MCP
  * Server with its persona-scoped Slack tools.
  *
- * Session identity (b.av2 SR-6.3): an MCP session is identified by the working
+ * Session identity: an MCP session is identified by the working
  * directory its client reports through `roots/list`. That directory is
  * compared by real path (`resolveRealPath`) with the applied personas' working
  * directories and maps to exactly one persona (`matchPersonaByRootsPath`),
  * except that a session opened from the working directory of an old life
  * that may still be running is registered as no persona's session until
- * that wait ends (b.av2 SR-6.3 as amended by b.jg5 SRJ-1505; SRJ-809,
- * SRJ-810): `decideSessionAdmission` asks the injected held-directory query
+ * that wait ends: `decideSessionAdmission` asks the injected held-directory query
  * before it matches any persona, and refuses such a session (`held`). A
- * session is admitted only while that persona is up (b.av2 SR-6.4,
+ * session is admitted only while that persona is up (
  * `decideSessionAdmission`, with the up check injected), and a persona that
  * stops being up has its session dropped (`dropPersonaSession`). The
  * registry is keyed by persona key; a newer session for a persona replaces the
@@ -19,7 +18,7 @@
  * its roots are matched, and its entry stub is promoted in place so the tool
  * handlers that closed over it read the persona key it is promoted under.
  *
- * Tool scope (b.av2 SR-5.1, b.deo SRI-501, SRI-601; b.av2 SR-3.1): every
+ * Tool scope: every
  * session lists six tools in both modes. The five Slack tools (`reply`,
  * `react`, `edit_message`, `fetch_messages`, `download_attachment`) keep
  * their names and inputs. Each call resolves the calling session's persona,
@@ -30,22 +29,21 @@
  * declarative mode only the channels in the persona's current applied
  * configuration; in fungible mode any channel ID, with Slack enforcing
  * membership, and Slack's refusal returned as a tool error naming the
- * persona, the channel and Slack's error code (b.deo SRI-602,
+ * persona, the channel and Slack's error code (
  * `slackRefusalToolErrorText`).
  *
- * The sixth tool, `set_channel_delivery` (b.deo SRI-501 to SRI-507), has no
+ * The sixth tool, `set_channel_delivery`, has no
  * Slack target and makes no Slack call, in or out of dry run. It stores the
  * persona's channel delivery (`mentions` or `all`) for one channel it heard
  * in fungible mode, or already holds a choice for, in the one stored-choice
  * store (`src/channel-delivery.ts`), and the choice applies from the next
  * event under the loop guard. It resolves the persona at call time as the
  * other tools do, also refusing a retiring key and a session that is not the
- * one the registry holds for its key (b.deo SRI-502), then checks SRI-503's rules in
+ * one the registry holds for its key, then checks rules in
  * order; in declarative mode every call is refused.
  *
  * Instructions: `MCP_INSTRUCTIONS` is exported as the exact string every
- * session server sends as its MCP `instructions`, in both modes (b.deo
- * SRI-604), so the shipped-docs audit reads what instances receive.
+ * session server sends as its MCP `instructions`, in both modes, so the shipped-docs audit reads what instances receive.
  *
  * Importing this module has no side effects.
  *
@@ -91,7 +89,7 @@ import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIV
 import { isDryRun } from './tokens.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
-// Peer-PID + sessions.json registry have been deleted (SR-7.1). The
+// Peer-PID + sessions.json registry have been deleted. The
 // agent-director library owns session state.
 
 // ---------------------------------------------------------------------------
@@ -161,7 +159,7 @@ const mcpSessionIdToPersonaKey = new Map<string, string>()
 const pendingSessionMap = new Map<string, PendingSessionEntry>()
 
 // ---------------------------------------------------------------------------
-// Roots cwd → persona matching (b.av2 SR-6.3)
+// Roots cwd → persona matching
 // ---------------------------------------------------------------------------
 
 /** Options for `matchPersonaByRootsPath`. */
@@ -173,7 +171,7 @@ export interface MatchPersonaOptions {
 }
 
 /**
- * The persona a session's roots working directory maps to (b.av2 SR-6.3):
+ * The persona a session's roots working directory maps to:
  * the one applied persona whose `working_directory` has the same real path
  * (`resolveRealPath`) as `rootsPath`, or undefined when none does.
  *
@@ -198,12 +196,11 @@ export function matchPersonaByRootsPath(
 }
 
 // ---------------------------------------------------------------------------
-// Session admission (b.av2 SR-6.3 as amended by b.jg5 SRJ-1505, SR-6.4)
+// Session admission
 // ---------------------------------------------------------------------------
 
 /**
- * A directory held for an old life that may still be running (b.jg5
- * SRJ-809, SRJ-810), as the held-directory query answers it: the held
+ * A directory held for an old life that may still be running, as the held-directory query answers it: the held
  * directory and every held old instance id on it (two holds on one
  * directory give two ids).
  */
@@ -217,7 +214,7 @@ export interface SessionHeldDirectory {
 /** Options for `decideSessionAdmission`. */
 export interface SessionAdmissionOptions extends MatchPersonaOptions {
   /**
-   * Whether the persona with this key is up (b.av2 SR-6.4). Production passes
+   * Whether the persona with this key is up. Production passes
    * `createPersonaUpPredicate` over the connection manager and the bring-up
    * controller.
    */
@@ -229,7 +226,7 @@ export interface SessionAdmissionOptions extends MatchPersonaOptions {
    */
   describeNotUp?: (key: string) => string
   /**
-   * The held-directory query (b.jg5 SRJ-810, SRJ-1505): given the session's
+   * The held-directory query: given the session's
    * roots real path, the held directory and every held old instance id on
    * it, or undefined when that path is not held (production: the session
    * manager's `oldLifeHeldDirectory`, which answers undefined before `main()`
@@ -250,19 +247,19 @@ export type SessionAdmission =
   | { kind: 'not-up'; persona: Persona }
   /**
    * The roots working directory is held for an old life that may still be
-   * running (b.jg5 SRJ-810, SRJ-1505): refuse the session, whichever persona
+   * running: refuse the session, whichever persona
    * names the directory; register it as no persona's.
    */
   | { kind: 'held'; directory: string; instanceIds: readonly string[] }
 
 /**
  * The one line `decideSessionAdmission` logs when it refuses a session
- * opened from a held directory (b.jg5 SRJ-810, SRJ-1505): the held directory
+ * opened from a held directory: the held directory
  * and every held old instance id, each JSON-quoted, with, when the query
  * threw, what it threw:
  *
- *   [slack] Session refused: its working directory "<D>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)
- *   [slack] Session refused: its working directory "<D>" is held for an old life that may still be running (the held-directory query failed: <thrown> — taken as held) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)
+ * [slack] Session refused: its working directory "<D>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends
+ * [slack] Session refused: its working directory "<D>" is held for an old life that may still be running (the held-directory query failed: <thrown> — taken as held) — registered as no persona's session until the hold ends
  *
  * Carries no token. Pure.
  */
@@ -276,19 +273,19 @@ export function sessionHeldRefusalLine(directory: string, instanceIds: readonly 
         : instanceIds.map((id) => `instanceId=${quote(id)}`).join(', ')
   return (
     `[slack] Session refused: its working directory ${quote(directory)} is held for an old life that may still be running ` +
-    `(${what}) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)`
+    `(${what}) — registered as no persona's session until the hold ends`
   )
 }
 
 /**
  * Decide whether a session whose roots working directory is `rootsPath` may
- * register (b.av2 SR-6.3 as amended by b.jg5 SRJ-1505, SR-6.4): "MCP sessions
+ * register: "MCP sessions
  * still identify by the roots/list working directory, compared by real path,
  * which maps to exactly one persona, except that a session opened from the
  * working directory of an old life that may still be running (a retired
  * key's, or a live pre-persona row's or any other swept row's whose
  * start-sweep kill did not succeed) is registered as no persona's session
- * until that wait ends (b.jg5 SRJ-809, SRJ-810)."
+ * until that wait ends."
  *
  * First, before any persona is matched, the held-directory query
  * (`options.heldDirectory`) is asked with the roots real path
@@ -331,7 +328,7 @@ export function decideSessionAdmission(
 }
 
 /**
- * The held-directory query's reading of `rootsPath` (b.jg5 SRJ-810): asked
+ * The held-directory query's reading of `rootsPath`: asked
  * with its real path; an answer naming at least one instance id is held
  * (its directory, or the real path when the answer names none); undefined,
  * an answer with no id, or no query is not held. A query that throws counts
@@ -471,7 +468,7 @@ export function removePendingSession(pendingId: string): void {
   pendingSessionMap.delete(pendingId)
 }
 
-/** What `closePendingSession` acts through, injected (b.av2 SR-13.1). */
+/** What `closePendingSession` acts through, injected. */
 export interface ClosePendingSessionDeps<T> {
   /** Remove the pending entry (production: `removePendingSession`). */
   removePending: (pendingId: string) => void
@@ -483,7 +480,7 @@ export interface ClosePendingSessionDeps<T> {
  * Disconnect a pending session that will not be registered: remove its
  * pending entry, stop its SSE keep-alive, then close its transport (a close
  * failure is ignored). The one close path for a pending session in
- * `handleInitialized`: a persona that is not up (b.av2 SR-6.4), a roots
+ * `handleInitialized`: a persona that is not up, a roots
  * working directory that matches no persona, a roots/list failure or empty
  * roots, and an SSE stream that never opened. Registers nothing and never
  * touches a persona's registered session. Resolves once the close settles.
@@ -560,8 +557,8 @@ export function unregisterSession(personaKey: string): void {
 }
 
 /**
- * Drop the session registered for a persona (b.av2 SR-6.3: a session is
- * registered only while its persona is up; the SR-6.5 teardown can reuse it):
+ * Drop the session registered for a persona (a session is
+ * registered only while its persona is up; the teardown can reuse it):
  * remove its registry entry and every MCP session ID mapped to the persona,
  * mark the entry not connected, then close its transport. The mappings go
  * first, so the close's `onsessionclosed` and the SSE abort find no session
@@ -653,7 +650,7 @@ export interface SessionToolDeps {
   /** File exfiltration guard — throws when the file must not be sent */
   assertSendable: (filePath: string) => void
   /**
-   * The server-wide reply settings (b.av2 SR-1.6): reply chunking and the
+   * The server-wide reply settings: reply chunking and the
    * ack reaction name. Their start-time values; a reload does not change them.
    */
   getReplySettings: () => ReplySettings
@@ -673,34 +670,32 @@ export interface SessionToolDeps {
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
   /**
-   * The channel mode of the configuration in effect (b.deo SRI-201,
-   * SRI-601), read on every tool call together with the persona and never
+   * The channel mode of the configuration in effect, read on every tool call together with the persona and never
    * copied at session creation (production: `channelModeOf` over the applied
    * configuration). Absent: declarative mode.
    */
   getChannelMode?: () => ChannelMode
   /**
-   * The one stored-choice store `main()` loads (b.deo SRI-403, SRI-502),
+   * The one stored-choice store `main()` loads,
    * read at each `set_channel_delivery` call (production: the server's
    * module-scope holder). Undefined while no store is bound (before `main()`
    * loads it): the call is refused and nothing is written. Absent: the same.
    */
   getChannelDelivery?(): SessionChannelDeliveryStore | undefined
   /**
-   * A read-only view of persona `key`'s heard set (b.deo SRI-307, SRI-503),
+   * A read-only view of persona `key`'s heard set,
    * read at each `set_channel_delivery` call (production: the one routing's
    * `heardChannels`). Absent: the heard set is empty.
    */
   heardChannels?(key: string): ReadonlySet<string>
   /**
-   * The applied personas of the configuration in effect (b.deo SRI-305,
-   * SRI-504), read at each `set_channel_delivery` call for the loop guard's
+   * The applied personas of the configuration in effect, read at each `set_channel_delivery` call for the loop guard's
    * input. Absent: only the calling persona.
    */
   getAppliedPersonas?(): readonly Persona[]
   /**
    * Receives the `persona-channel-delivery-set` line of each accepted
-   * `set_channel_delivery` call (b.deo SRI-505, SRI-901): the `[slack]`
+   * `set_channel_delivery` call: the `[slack]`
    * stream of `server.log`, as the routing's `log` receives
    * `persona-invited-channel` (production: `console.error`). Absent:
    * `console.error`.
@@ -709,8 +704,7 @@ export interface SessionToolDeps {
 }
 
 /**
- * What `set_channel_delivery` uses of the stored-choice store (b.deo
- * SRI-502 to SRI-506): its path, readability, lookups, the retiring keys and
+ * What `set_channel_delivery` uses of the stored-choice store: its path, readability, lookups, the retiring keys and
  * the one write of a choice. `ChannelDeliveryStore` satisfies it as it is.
  */
 export type SessionChannelDeliveryStore = Pick<
@@ -719,15 +713,14 @@ export type SessionChannelDeliveryStore = Pick<
 >
 
 // ---------------------------------------------------------------------------
-// Posting scope (b.av2 SR-5.1, b.deo SRI-601)
+// Posting scope
 // ---------------------------------------------------------------------------
 
 /** A DM conversation ID. A group DM (`G…`, `mpim`) never matches. */
 const DM_CONVERSATION_ID_RE = /^D[A-Z0-9]+$/
 
 /**
- * What a tool target is, for one persona in one channel mode (b.av2 SR-5.1,
- * b.deo SRI-601):
+ * What a tool target is, for one persona in one channel mode:
  * - `channel`: in declarative mode, the `id` of one of the persona's
  *   configured channels; in fungible mode, any value matching
  *   `CHANNEL_ID_RE` (a `C…` or `G…` ID);
@@ -741,7 +734,7 @@ type PersonaTargetKind = 'channel' | 'dm' | 'user' | 'other'
 /**
  * Classify `target` for `persona` in `mode`. In declarative mode a
  * configured channel wins over the ID shapes; in fungible mode the persona's
- * `channels` is never read (b.deo SRI-202) and the channel-ID shape decides.
+ * `channels` is never read and the channel-ID shape decides.
  * Pure: no Slack call, logging or state.
  */
 function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMode): PersonaTargetKind {
@@ -757,7 +750,7 @@ function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMo
 
 /**
  * The reason a fungible-mode refusal of a target that is neither a channel ID
- * nor a DM target gives (b.deo SRI-601), after `checkPersonaTarget`'s lead
+ * nor a DM target gives, after `checkPersonaTarget`'s lead
  * naming the persona and the target.
  */
 export const FUNGIBLE_TARGET_REFUSAL = 'it is neither a channel ID nor an allowed DM target.'
@@ -779,7 +772,7 @@ export type PersonaTargetCheck =
   | { allowed: false; message: string }
 
 /**
- * The posting scope of a persona (b.av2 SR-5.1, b.deo SRI-601), decided from
+ * The posting scope of a persona, decided from
  * the persona and the channel mode as applied now (callers pass both,
  * resolved at call time). `mode` absent is declarative mode.
  * - Declarative mode: a configured channel is allowed, whatever its delivery
@@ -841,7 +834,7 @@ function toolError(text: string) {
 
 /**
  * The tool error for a failed call on a channel target in fungible mode
- * (b.deo SRI-602; b.av2 SR-5.1), where Slack enforces membership: it names
+ * where Slack enforces membership: it names
  * the tool, the persona (`renderPersonaRef`), the channel and Slack's error
  * code (`slackPlatformReason` of the thrown value, e.g. `not_in_channel` or
  * `channel_not_found`):
@@ -865,12 +858,11 @@ export function slackRefusalToolErrorText(
 }
 
 // ---------------------------------------------------------------------------
-// Resolution refusals (b.av2 SR-5.1, b.deo SRI-502)
+// Resolution refusals
 // ---------------------------------------------------------------------------
 
 /**
- * The tool error for a call from a session matched to no persona (b.av2
- * SR-5.1, b.deo SRI-502), the same for every tool:
+ * The tool error for a call from a session matched to no persona, the same for every tool:
  *
  *   Tool "<tool>" refused: this session is not matched to a persona.
  *
@@ -882,7 +874,7 @@ export function sessionNotMatchedRefusal(tool: string): string {
 
 /**
  * The tool error for a call whose persona key is not an applied persona's
- * (b.av2 SR-5.1, b.deo SRI-502), the same for every tool. `set_channel_delivery`
+ * the same for every tool. `set_channel_delivery`
  * also gives it for a retiring key and for a session that is not the one the
  * registry holds for its key:
  *
@@ -895,11 +887,11 @@ export function personaNotAppliedRefusal(tool: string, key: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// set_channel_delivery (b.deo SRI-501 to SRI-507)
+// set_channel_delivery
 // ---------------------------------------------------------------------------
 
 /**
- * The tool's description (b.deo SRI-501): it sets how closely the persona
+ * The tool's description: it sets how closely the persona
  * listens in one channel its Slack app was invited to, between @mentions and
  * broadcasts only (`mentions`) and every message (`all`); it is called when
  * someone in that channel asks for it; it works only when the operator has
@@ -911,15 +903,15 @@ export const SET_CHANNEL_DELIVERY_DESCRIPTION =
   'It works only when the operator has turned invited channels on; otherwise every call is refused. ' +
   'The choice applies from the next message in that channel and is kept across server restarts.'
 
-/** The description of the tool's `channel` input (b.deo SRI-501). */
+/** The description of the tool's `channel` input. */
 export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
   'The channel ID (C... or G...) of a channel your persona has heard a message from, or already holds a choice for'
 
-/** The description of the tool's `delivery` input (b.deo SRI-501). */
+/** The description of the tool's `delivery` input. */
 export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
   '"mentions" (only @mentions of you and @here or @channel broadcasts) or "all" (every message in the channel)'
 
-/** The values the tool's `delivery` input takes, in the order its schema lists them (b.deo SRI-501). */
+/** The values the tool's `delivery` input takes, in the order its schema lists them. */
 const SET_CHANNEL_DELIVERY_VALUES: readonly DeliveryMode[] = ['mentions', 'all']
 
 /** Whether `value` is a value the tool's `delivery` input takes: `"mentions"` or `"all"`. */
@@ -928,13 +920,13 @@ function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
 }
 
 /**
- * A channel value a `set_channel_delivery` error may echo (b.deo SRI-503):
+ * A channel value a `set_channel_delivery` error may echo:
  * a string of 1 to 24 characters from `A-Z0-9`. Any other value is not shown.
  */
 export const ECHOABLE_CHANNEL_RE = /^[A-Z0-9]{1,24}$/
 
 /**
- * The tool's refusals (b.deo SRI-503), in the order a call is checked; the
+ * The tool's refusals, in the order a call is checked; the
  * first rule a call breaks gives its tool error:
  * - `declarative-mode`: the configuration in effect is in declarative mode
  *   (`channelDeliveryDeclarativeRefusal`);
@@ -944,7 +936,7 @@ export const ECHOABLE_CHANNEL_RE = /^[A-Z0-9]{1,24}$/
  *   value included (`channelDeliveryValueRefusal`);
  * - `channel-unknown`: the channel is neither in the persona's heard set nor
  *   among its stored choices (`channelDeliveryChannelRefusal`).
- * Every one is checked after the resolution refusals (b.deo SRI-502).
+ * Every one is checked after the resolution refusals.
  */
 export const SET_CHANNEL_DELIVERY_REFUSALS = [
   'declarative-mode',
@@ -962,7 +954,7 @@ function channelDeliveryRefusalLead(name: string, key: string): string {
 }
 
 /**
- * Rule 1's tool error (b.deo SRI-503): declarative mode.
+ * Rule 1's tool error: declarative mode.
  *
  *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): invited channels are off, and in declarative mode channel delivery is set by the operator in config.json.
  *
@@ -976,7 +968,7 @@ export function channelDeliveryDeclarativeRefusal(name: string, key: string): st
 }
 
 /**
- * Rule 2's tool error (b.deo SRI-503): the stored-choice file is unreadable,
+ * Rule 2's tool error: the stored-choice file is unreadable,
  * or no store is bound. `path` is the store's path, or
  * `CHANNEL_DELIVERY_FILE_NAME` when no store is bound.
  *
@@ -992,7 +984,7 @@ export function channelDeliveryUnreadableRefusal(name: string, key: string, path
 }
 
 /**
- * Rule 3's tool error (b.deo SRI-503): `delivery` is not `"mentions"` or
+ * Rule 3's tool error: `delivery` is not `"mentions"` or
  * `"all"`. The value is named, JSON-encoded, only when it is a string
  * matching `ECHOABLE_KEY_NAME_RE` (`src/config.ts`); otherwise the error
  * says it is not shown.
@@ -1011,7 +1003,7 @@ export function channelDeliveryValueRefusal(name: string, key: string, value: un
 }
 
 /**
- * Rule 4's tool error (b.deo SRI-503): the channel is not known, neither in
+ * Rule 4's tool error: the channel is not known, neither in
  * the persona's heard set nor among its stored choices. The channel is
  * named, JSON-encoded, only when it matches `ECHOABLE_CHANNEL_RE`; otherwise
  * the error says it is not shown.
@@ -1032,7 +1024,7 @@ export function channelDeliveryChannelRefusal(name: string, key: string, channel
 }
 
 /**
- * The result of an accepted call (b.deo SRI-504): the channel, the stored
+ * The result of an accepted call: the channel, the stored
  * choice, and the persona's channel delivery there from the next event,
  * `result` (`channelDeliveryFor` with the choice just stored). When the loop
  * guard holds the channel at `mentions`, it says so and that the channel is
@@ -1053,7 +1045,7 @@ export function channelDeliverySetResultText(channel: string, stored: DeliveryMo
 }
 
 /**
- * The tool error of a failed write (b.deo SRI-404, SRI-506): names the
+ * The tool error of a failed write: names the
  * persona and the file. Memory is unchanged; the store logs its own
  * `[slack] channel-delivery:` line.
  *
@@ -1169,7 +1161,7 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
-/** b.omv SR-7.3: every session receives the nine retained points in order. */
+/** every session receives the nine retained points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
   'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
@@ -1327,8 +1319,7 @@ export function createSessionServer(
   }))
 
   // -------------------------------------------------------------------------
-  // Tool execution — persona-scoped (b.av2 SR-5.1, b.deo SRI-601; b.av2
-  // SR-3.1)
+  // Tool execution — persona-scoped
   //
   // Every call resolves the session's persona and the channel mode at call
   // time (the persona from the entry this server closes over, the mode
@@ -1338,7 +1329,7 @@ export function createSessionServer(
   // client, with no username or icon override. A refusal is a tool error
   // (`isError: true`), never a protocol error, and makes no Slack call. In
   // fungible mode, a failed call on a channel target returns
-  // `slackRefusalToolErrorText` (b.deo SRI-602).
+  // `slackRefusalToolErrorText`.
   //
   // A user-ID target (`reply` only) is opened with `conversations.open` on the
   // persona's client on every call (no cache), and the reply goes to the
@@ -1682,23 +1673,22 @@ export function createSessionServer(
   }
 
   // -------------------------------------------------------------------------
-  // set_channel_delivery (b.deo SRI-501 to SRI-507; resolution as b.av2
-  // SR-5.1 and SR-6.5 as amended by b.jg5 SRJ-1507, beside b.deo SRI-307 and
-  // SRI-502)
+  // set_channel_delivery (to; resolution as
+  // and , beside and
+  //)
   //
   // One synchronous stretch from reading the entry's persona key to the
   // store's write, with no await, so no confirmed apply's step 1 comes
-  // between the persona resolved and the declaration stored (b.deo SRI-502).
+  // between the persona resolved and the declaration stored.
   // Resolution first: a session matched to no persona, a key that is not an
   // applied persona's, a retiring key (the store's `isRetiring`), and a
   // session entry that is not the one the registry holds for its key (dropped
   // by `dropPersonaSession` or replaced by a newer registration) each get the
-  // other tools' refusal. Then SRI-503's rules, in order. A refused call
+  // other tools' refusal. Then rules, in order. A refused call
   // stores, writes and logs nothing. An accepted call makes one store write
   // and logs one `persona-channel-delivery-set` line after it. The tool never
   // passes `checkPersonaTarget`, never reads a client and never makes a Slack
-  // call; dry run is not consulted, so it stores as outside dry run (b.deo
-  // SRI-507).
+  // call; dry run is not consulted, so it stores as outside dry run.
   // -------------------------------------------------------------------------
 
   function setChannelDelivery(name: string, args: Record<string, unknown>) {
@@ -1710,7 +1700,7 @@ export function createSessionServer(
     if (store?.isRetiring(key) === true) return toolError(personaNotAppliedRefusal(name, key))
     if (getSessionByPersona(key) !== entry) return toolError(personaNotAppliedRefusal(name, key))
 
-    // b.deo SRI-503's rules, in order; the first broken gives the error.
+    // rules, in order; the first broken gives the error.
     const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
     if (mode !== 'fungible') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
     if (store === undefined || !store.readable) {
@@ -1723,13 +1713,13 @@ export function createSessionServer(
       ((deps.heardChannels?.(key).has(channel) ?? false) || store.storedChannels(key).includes(channel))
     if (!known) return toolError(channelDeliveryChannelRefusal(persona.name, key, channel))
 
-    // b.deo SRI-504: one write, with P's declaration from the configuration in effect.
+    // one write, with P's declaration from the configuration in effect.
     const outcome = store.set(key, channel, delivery, channelDeliveryDeclarationOf(persona))
     switch (outcome.kind) {
       case CHANNEL_DELIVERY_SET_STORED:
         break
       case CHANNEL_DELIVERY_SET_WRITE_FAILED:
-        // b.deo SRI-506: the store logged its own failed-write line; memory is unchanged.
+        // the store logged its own failed-write line; memory is unchanged.
         return toolError(channelDeliveryWriteFailedText(persona.name, key, outcome.path))
       case CHANNEL_DELIVERY_SET_UNREADABLE:
         return toolError(channelDeliveryUnreadableRefusal(persona.name, key, outcome.path))
@@ -1737,7 +1727,7 @@ export function createSessionServer(
         return toolError(channelDeliveryNotStoredText(persona.name, key, outcome.field))
     }
 
-    // P's channel delivery there from the next event (b.deo SRI-305, SRI-504):
+    // P's channel delivery there from the next event:
     // the one loop guard over the applied personas' destinations, built as the
     // routing builds them, with the choice just stored. Rule 1 passed, so the
     // mode read above is fungible, and the destination rule is given that
@@ -1747,7 +1737,7 @@ export function createSessionServer(
       fungibleDestinations: fungibleDestinationsOf({ allow_invited_channels: true }, applied),
       storedChoices: store,
     })
-    // b.deo SRI-505, SRI-901, SRI-902: one line per accepted call, after the
+    // one line per accepted call, after the
     // write, to the `[slack]` stream only.
     const log = deps.log ?? ((line: string) => console.error(line))
     log(formatPersonaDiagnostic({
@@ -1765,7 +1755,7 @@ export function createSessionServer(
     const args = (request.params.arguments || {}) as Record<string, any>
 
     // set_channel_delivery has no Slack target, so it never reaches the
-    // target lookup, the scope check or the dry-run branch (b.deo SRI-502).
+    // target lookup, the scope check or the dry-run branch.
     if (name === SET_CHANNEL_DELIVERY_TOOL) return setChannelDelivery(name, args)
 
     const toolTarget = Object.hasOwn(TOOL_TARGET, name) ? TOOL_TARGET[name] : undefined
@@ -1777,10 +1767,10 @@ export function createSessionServer(
     const persona = getPersona(key)
     if (!persona) return toolError(personaNotAppliedRefusal(name, key))
     if (name === 'reply') await deps.onReplyCall?.(key)
-    // The channel mode, read now with the persona (b.deo SRI-201, SRI-601).
+    // The channel mode, read now with the persona.
     const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
 
-    // Posting scope, before the dry-run branch (b.av2 SR-5.1, b.deo SRI-601).
+    // Posting scope, before the dry-run branch.
     const rawTarget = args[toolTarget.arg]
     const target = typeof rawTarget === 'string' ? rawTarget : ''
     const scope = checkPersonaTarget(persona, target, toolTarget.action, mode)
@@ -1796,7 +1786,7 @@ export function createSessionServer(
     try {
       return await runTool(name, args, persona, web, scope.kind, dm)
     } catch (err) {
-      // Fungible mode, channel target (b.deo SRI-602): Slack enforces
+      // Fungible mode, channel target: Slack enforces
       // membership, so its refusal names the persona, the channel and
       // Slack's error code. The log line stays token-safe.
       if (mode === 'fungible' && scope.kind === 'channel') {

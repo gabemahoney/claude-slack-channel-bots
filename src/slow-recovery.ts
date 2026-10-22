@@ -1,13 +1,12 @@
 /**
- * slow-recovery.ts — The slow dead-session recovery post (b.jg5 SRJ-610,
- * SRJ-1010, SRJ-1016).
+ * slow-recovery.ts — The slow dead-session recovery post.
  *
  * After an escalate-dead sweep, agent-director may leave the persona's row
  * live for further ticks (in `unverified_ids`, or not judged), so the restart
  * path re-sweeps on each escalate-dead tick and does nothing more: no kill
  * outside the live-row sequence, no counted failure, no other destructive
  * step. This tracker counts persona P's consecutive escalate-dead verdicts
- * whose re-probe still reads the row live, and the third posts SRJ-1010 once
+ * whose re-probe still reads the row live, and the third posts once
  * per slow-recovery episode, so a human is told once that recovery is slow.
  *
  * The count is the `slow-dead-session-recovery` kind's count in the episodes
@@ -20,12 +19,12 @@
  * to `initRestart` and `initHealthCheck`, and ends P's episode from the
  * latch's hold observer (`endForLatch`).
  *
- * Per persona (SRJ-610, SRJ-1016):
+ * Per persona:
  *
  * - `noteLive(key)`: an escalate-dead verdict whose re-probe reads the row
  *   `live` (a live state other than `pending`). The count goes up by one.
  *   When it reaches `SLOW_RECOVERY_POST_THRESHOLD` and no slow-recovery
- *   episode is open, the episode begins and SRJ-1010's text is posted once
+ * episode is open, the episode begins and text is posted once
  *   through the episodes instance (its sink, the persona notifier). While the
  *   episode is open, further notes post nothing.
  * - `noteDead(key)`: a row read of `ended` or `missing`, or no row
@@ -34,12 +33,12 @@
  *   run of three posts again.
  * - `noteInstallGone(key)`: the `dead` reading from
  *   `ErrSystemInstallDisappeared`, which reads no row. The count is reset;
- *   an open episode stays open (hatch A2).
+ * an open episode stays open (design A2).
  * - `noteOther(key, reason)`: a run whose reconnect ended with a verdict
  *   other than escalate-dead or that found P already connected with its
  *   stream, a run whose first liveness probe read `pending`, or an
  *   escalate-dead verdict whose re-probe read `pending` (whose notice is the
- *   stuck-launch post, SRJ-1017). The count is reset; an open episode stays
+ * stuck-launch post). The count is reset; an open episode stays
  *   open.
  * - `noteHealthy(key)`: a health-check tick found P `live` and connected.
  *   The count is reset; an open episode stays open.
@@ -51,7 +50,7 @@
  * resets. A count reset alone never ends an open episode: only a row read of
  * `ended` or `missing` or no row, a latch or a teardown ends it.
  *
- * Text (SRJ-1010; `<session>` the persona's quoted session name,
+ * Text (`<session>` the persona's quoted session name,
  * `"slack_bot_<key>"`, from `quotedPersonaSessionName`, the rendering the
  * other notices share): `slowRecoveryText`.
  *
@@ -92,11 +91,11 @@ import {
   type SlowRecoveryOtherReason,
 } from './restart.ts'
 
-/** How many consecutive escalate-dead verdicts whose re-probe still reads the row live post SRJ-1010 (b.jg5 SRJ-610). */
+/** How many consecutive escalate-dead verdicts whose re-probe still reads the row live post. */
 export const SLOW_RECOVERY_POST_THRESHOLD = 3
 
 /**
- * The slow-recovery notice's body for persona `key` (b.jg5 SRJ-1010); the
+ * The slow-recovery notice's body for persona `key`; the
  * persona notifier adds the persona prefix.
  */
 export function slowRecoveryText(key: string): string {
@@ -150,14 +149,14 @@ export function slowRecoveryCountLine(key: string, count: number): string {
   return `${slowRecoveryLineHead(key)} count ${count} of ${SLOW_RECOVERY_POST_THRESHOLD} — an escalate-dead verdict's re-probe still reads the row live`
 }
 
-/** The line for the notice posted for persona `key` at `count` (b.jg5 SRJ-1010). */
+/** The line for the notice posted for persona `key` at `count`. */
 export function slowRecoveryNoticePostedLine(key: string, count: number): string {
   return `${slowRecoveryLineHead(key)} notice posted — ${count} consecutive escalate-dead verdicts whose re-probe still reads the row live`
 }
 
 /**
  * The line for the notice of persona `key` at `count` that its submitted
- * persona teardown muted (b.jg5 SRJ-1003): nothing reached Slack, and it
+ * persona teardown muted: nothing reached Slack, and it
  * counts as posted in its episode.
  */
 export function slowRecoveryNoticeMutedLine(key: string, count: number): string {
@@ -271,7 +270,7 @@ export function createSlowRecoveryTracker(deps: SlowRecoveryTrackerDeps): SlowRe
             log(slowRecoveryNoticeNotPostedLine(key))
             return 'closed'
           }
-          // b.jg5 SRJ-1003: read before the post, which a submitted teardown
+          // read before the post, which a submitted teardown
           // mutes (the episode still counts it as posted).
           const muted = episodes.teardownWindowState(key) === 'submitted'
           if (!episodes.post(key, kind, slowRecoveryText(key))) return 'counted'

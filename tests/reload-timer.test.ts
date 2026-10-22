@@ -1,6 +1,6 @@
 /**
  * reload-timer.test.ts — Unit tests for the production reload detection timer
- * (`createReloadTickDriver`, b.av2 SR-8.2): one serialized, self-re-arming 5 s
+ * (`createReloadTickDriver`): one serialized, self-re-arming 5 s
  * setTimeout chain in the `cron-scheduler.ts` pattern.
  *
  * Driven only through the shared fake clock (`createFakeClock`): no real timer

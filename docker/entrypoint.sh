@@ -2,7 +2,7 @@
 # entrypoint.sh — Sets up testuser's Claude config (bot Claudes spawned by the
 # daemon-under-test still consume .claude.json + settings.json), then execs
 # the bash test runner, passing it every argument this entrypoint got,
-# unchanged and in order (the shard's arguments: b.uqm SR-11.1, SR-11.2).
+# unchanged and in order (the shard's arguments:).
 # No tmux, no orchestrator Claude.
 set -euo pipefail
 

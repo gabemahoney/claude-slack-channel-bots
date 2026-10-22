@@ -1,7 +1,7 @@
 /**
  * state-dir-migration.ts — The move of the server's state directory from its
  * old defaults to its current one, `<XDG config home>/claude-slack-channel-bots`
- * (bugs b.fc4, b.smv), and the state directory the commands that run before
+ * and the state directory the commands that run before
  * that move must act on.
  *
  * Three locations have been the default:
@@ -10,12 +10,12 @@
  *   Claude Code asks the user before every write under `~/.claude`, and allow
  *   rules cannot turn that off, so every unattended change of `config.json`,
  *   `config.json.pending` / `.apply`, `channel-delivery.json` and the rest
- *   stalled on a permission prompt (b.fc4).
- * - L2, `legacyXdgStateDir`: `<XDG config home>/cscb`. 0.14.0 (b.avm) put only
+ * stalled on a permission prompt.
+ * - L2, `legacyXdgStateDir`: `<XDG config home>/cscb`. 0.14.0 put only
  *   the crontable and `prompts/` there, leaving links to them in L1; 0.15.0
- *   (b.fc4) made it the whole state directory, with L1 a symbolic link to it.
+ * made it the whole state directory, with L1 a symbolic link to it.
  *   "cscb" is an acronym that could clash with another app, so the folder is
- *   named after the package instead (b.smv).
+ * named after the package instead.
  * - N, `resolveServerStateDir` (`config.ts`): `~/.config/claude-slack-channel-bots`,
  *   or `$XDG_CONFIG_HOME/claude-slack-channel-bots`.
  *
@@ -33,7 +33,7 @@
  *   repointed straight at N (below), as 0.14.0's L1 is.
  * - N only, with or without the links (a rerun): nothing to do.
  *
- * L1 a symbolic link whose absolute target is exactly L2 (b.fc4 made it) is
+ * L1 a symbolic link whose absolute target is exactly L2 (made it) is
  * repointed at N once L2 reaches N, after both steps ended without a stop
  * (`repointLinkViaLegacyXdg`): a temporary link beside L1 is renamed over it,
  * one atomic step. Without it, an operator who removes `~/.config/cscb` (the
@@ -53,7 +53,7 @@
  * `channel-delivery.json`, the logs, the permission trail, the
  * reply-guard records, the crontable). It acts only when `SLACK_STATE_DIR` is
  * unset or empty: a set variable names the state directory outright, so
- * nothing moves (`overridden`, as in b.avm's legacy-is-default case). It never
+ * nothing moves (`overridden`, as in the contract legacy-is-default case). It never
  * throws, and it never overwrites a file at the new location.
  *
  * What it does with the legacy directory `L` and the new one `N`:
@@ -78,7 +78,7 @@
  *   the entry-by-entry move below runs instead.
  * - `L` is a directory and `N` exists (it does on every 0.14.0 host: the
  *   crontable and `prompts/` are there, and `L/crontab` and `L/prompts` may be
- *   symbolic links into it from b.avm; a pre-0.14.0 host has a real crontable
+ * symbolic links into it from the contract; a pre-0.14.0 host has a real crontable
  *   in `L` and no `N`): each entry of `L` is looked at by name.
  *     - Absent at `N`: it moves there. A file is hard-linked to `N` (or copied,
  *       checked, across file systems), never renamed, so an entry that
@@ -86,7 +86,7 @@
  *       directory is renamed (copied across file systems, to a temporary name
  *       beside the destination and renamed into place); a symbolic link is
  *       re-made at `N` with an absolute target (a link whose absolute target
- *       is its own destination, b.avm's `L/crontab` -> `N/crontab` after
+ * is its own destination`L/crontab` -> `N/crontab` after
  *       `N/crontab` was deleted, is dropped instead: re-made it would point
  *       at itself). The old name is first
  *       swapped, in one rename, for a symbolic link to the new one, so a
@@ -94,10 +94,10 @@
  *       upgrade, a script, an operator's habit) never finds a gap.
  *     - Present at `N` and the same thing (one inode, a link into `N`, a
  *       file with identical bytes, an empty directory): `redundant`, covering
- *       what b.avm's links left behind. Links are compared by what they
+ * what links left behind. Links are compared by what they
  *       resolve to, and, when they do not resolve (dangling), by their
  *       absolute target, so a dangling link moved to `N` settles.
- *     - Present at `N` as a symbolic link back to the entry in `L` (b.avm's
+ * - Present at `N` as a symbolic link back to the entry in `L` (
  *       cross-file-system fallback leaves `N/prompts` -> `L/prompts`): the
  *       entry in `L` is the only copy, so it is moved over the link (a file
  *       is linked or copied under a temporary name and renamed over it; a
@@ -238,7 +238,7 @@ const ABSENT_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR'])
 // ---------------------------------------------------------------------------
 
 /**
- * The state directory every release before b.fc4 defaulted to: `slack` in
+ * The state directory every release before defaulted to: `slack` in
  * `channels` in `.claude` under the home directory. Pure.
  *
  * @param home  Home directory; defaults to the OS home, read only when needed.
@@ -247,7 +247,7 @@ export function legacyServerStateDir(home?: string): string {
   return join(home ?? homedir(), '.claude', 'channels', 'slack')
 }
 
-/** The directory name under the XDG configuration directory that 0.14.0 and 0.15.0 used (bug b.smv renamed it). */
+/** The directory name under the XDG configuration directory that 0.14.0 and 0.15.0 used (renamed it). */
 export const LEGACY_XDG_DIR_NAME = 'cscb'
 
 /**
@@ -657,7 +657,7 @@ function sameBytes(fs: StateDirMigrationFs, a: string, b: string, aStat: StateEn
 
 /**
  * How an entry of the legacy directory compares with the same name in the new one.
- * `link-back`: the new one is a symbolic link to the legacy entry itself (b.avm's
+ * `link-back`: the new one is a symbolic link to the legacy entry itself (
  * cross-file-system fallback leaves `N/prompts` -> `L/prompts`), so the legacy
  * entry is the only copy and is moved over the link.
  */
@@ -672,7 +672,7 @@ function absoluteLinkTarget(fs: StateDirMigrationFs, path: string): string {
  * Compare the symbolic link `src` (in the legacy directory) with `dst` (the same
  * name in the new one; `dstStat` is its entry, undefined when absent).
  *
- * - A link whose absolute target is `dst` itself (b.avm's `L/crontab` ->
+ * - A link whose absolute target is `dst` itself (`L/crontab` ->
  *   `N/crontab`, left when `N/crontab` was deleted) is `redundant`, whether or
  *   not `dst` exists: re-made at `dst` it would point at itself.
  * - A link that resolves to what `dst` resolves to is `redundant`.
@@ -1263,7 +1263,7 @@ function stopLogDir(fs: StateDirMigrationFs, startupErrorDir: string, step: Stat
 }
 
 /**
- * After a 0.15.0 upgrade L1 is a link to L2 (b.fc4 made it), and L2 is now a
+ * After a 0.15.0 upgrade L1 is a link to L2 (made it), and L2 is now a
  * link to N. An operator may delete `~/.config/cscb` (the point of the rename
  * is that the name may clash with another app), which would leave L1
  * dangling, so L1 is repointed straight at N, as 0.14.0's is: a temporary

@@ -1,4 +1,4 @@
-/** b.omv SR-7.6: one fresh conversation through the real collision/checked lifecycle paths. */
+/** one fresh conversation through the real collision/checked lifecycle paths. */
 import type { Client, GetResult, SpawnParams } from 'agent-director'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -110,7 +110,7 @@ function withinBudget(engine: EngineHarness) {
 }
 
 describe('earlier-release replacement', () => {
-  test.each(['recorded window', 'immediate ready followups'] as const)('%s: ready-message cadence meets AC76 with production upgrade reads inside the 40-call budget', async cadence => {
+  test.each(['recorded window', 'immediate ready followups'] as const)('%s: ready-message cadence meets with production upgrade reads inside the 40-call budget', async cadence => {
     const f = fleet('waiting', true)
     const engine = await deliveryFleet(f, { get: 8, readPane: 25, sendKeys: 25 })
     // Native280 Test32, decision19 job-01: seq33 -> seq34 idle gap, then
@@ -246,7 +246,7 @@ describe('earlier-release replacement', () => {
     kept(f)
   })
 
-  test('a fresh current delivery reading clears E5 upgrade pending after replacement without another inspector', async () => {
+  test('a fresh current delivery reading clears upgrade pending after replacement without another inspector', async () => {
     const f = fleet('working')
     expect(await inspectPersonaUpgrade(f.p, f.persona)).toBe('deferred')
     expect(isTagUpgradePending(f.p)).toBe(true)

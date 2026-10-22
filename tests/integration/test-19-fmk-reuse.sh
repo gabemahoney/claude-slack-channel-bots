@@ -570,7 +570,7 @@ t19_harness_check() {
 }
 
 # ---------------------------------------------------------------------------
-# The legs (b.jg5 SRJ-1409)
+# The legs
 # ---------------------------------------------------------------------------
 
 # t19_leg <prefix> <step> <resume-enabled> <disabled|missing>
@@ -685,7 +685,7 @@ t19_leg() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 12 (b.jg5 SRJ-1414): helpers
+# Scenario 12: helpers
 # ---------------------------------------------------------------------------
 
 # t19_poll <timeout-s> <command> [<arg>...]: run the command every second
@@ -1014,7 +1014,7 @@ t19_leg_missing_row() {
     [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the mark"
     t19_watch_check "${watch}" "${id}" "${step}"
 
-    # Outcomes the SRD leaves open.
+    # Outcomes the contract leaves open.
     t19_note_calls "${MARK_TIME}" "${id}" "${step}"
     t19_note_posts "${G_CHANNEL}" "${mark_record}" "${step}"
     t19_note_pre_trust "${name}" "${step}"
@@ -1080,7 +1080,7 @@ t19_leg_stale_config_dir() {
     # 5. The checks.
     # Every CSCB spawn of H's id after the mark that carries no
     # `--reuse-finished` is the collision ladder's first spawn, answered
-    # ErrInstanceIdCollision (nothing written; SRJ-111, SRJ-114: the SRD's
+    # ErrInstanceIdCollision (nothing written; the contract's
     # ladder makes it before its collision `get`); no resume.
     all="$(t19_cscb_count_since "${MARK_TIME}" spawn "${id}")"
     n="$(t19_count_lines "$(t19_reuse_spawns_since "${MARK_TIME}" "${id}")")"
@@ -1102,7 +1102,7 @@ t19_leg_stale_config_dir() {
     [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the mark"
     t19_watch_check "${watch}" "${id}" "${step}"
 
-    # Outcomes the SRD leaves open.
+    # Outcomes the contract leaves open.
     t19_note_calls "${MARK_TIME}" "${id}" "${step}"
     t19_note_posts "${H_CHANNEL}" "${mark_record}" "${step}"
     t19_note_pre_trust "${name}" "${step}"
@@ -1113,12 +1113,12 @@ t19_leg_stale_config_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 18 (b.jg5 SRJ-1419): helpers
+# Scenario 18: helpers
 # ---------------------------------------------------------------------------
 
 # t19_retired_cause <key>: print the cause the retired-key record holds for
 # <key> (nothing when the record or the key's entry is missing). The record's
-# `keys` and `cause` fields are its format's (b.jg5 SRJ-802;
+# `keys` and `cause` fields are its format's (
 # src/retired-keys.ts serializeRetiredKeys, which exports no field name).
 t19_retired_cause() {
     local path
@@ -1334,7 +1334,7 @@ t19_leg_credentials_changed() {
     t19_apply_config "${step}: the change" 0 0 1 K
     wait_until "${ROW_WAIT_S}" "${step}: ${id} never read waiting with a new session after the change" t19_row_waiting_new "${id}" "${old_sid}"
     # Working default: by now the new life may have begun and its entry been
-    # cleared (b.jg5 SRJ-806, SRJ-807), so only a cause other than the
+    # cleared, so only a cause other than the
     # destructive modify's fails.
     cause="$(t19_retired_cause "${K_KEY}")"
     if [[ -n "${cause}" ]]; then
@@ -1356,23 +1356,23 @@ t19_leg_credentials_changed() {
 }
 
 t19_harness_check
-# S3: resume_enabled=false (SRJ-707's `resumeOrFreshSpawn` site).
+# S3: resume_enabled=false (`resumeOrFreshSpawn` site).
 t19_leg E "resume_enabled=false" false disabled
-# S4: a missing transcript (SRJ-707, SRJ-712).
+# S4: a missing transcript.
 t19_leg F "missing transcript" true missing
-# E48 T2 S1: a missing row with no session id beside a leftover (SRJ-1414).
+# S1: a missing row with no session id beside a leftover.
 t19_leg_missing_row
-# E48 T2 S2: an ended row with a stale config_dir label beside its remaining
-# session (SRJ-1414, SRJ-707's config_dir site).
+# S2: an ended row with a stale config_dir label beside its remaining
+# session (config_dir site).
 t19_leg_stale_config_dir
-# E48 T3 S1: a persona messaged, removed, applied, restarted and re-added
-# (SRJ-1419, SRJ-805).
+# S1: a persona messaged, removed, applied, restarted and re-added
+#.
 t19_leg_removed_readded
-# E48 T3 S2: a messaged persona whose credentials_file path changes
-# (SRJ-1419, SRJ-803, SRJ-805; AC 49).
+# S2: a messaged persona whose credentials_file path changes
+#.
 t19_leg_credentials_changed
 
-# The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
+# The closing assertions.
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

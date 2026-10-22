@@ -1,5 +1,5 @@
-/** Shared read-only E1 evidence validator; the synthetic verdict suite owns
- * its boundary matrix; E3 composes it for certified runtime replay. */
+/** Shared read-only evidence validator; the synthetic verdict suite owns
+ * its boundary matrix; composes it for certified runtime replay. */
 export const deliveryEvidencePython = String.raw`
 import base64, contextlib, copy, hashlib, importlib.util, io, json, os, re, shutil, socket, subprocess, sys
 from pathlib import Path
@@ -208,7 +208,7 @@ def envelope_for(root, temporal=False):
                 "hashes": {"spec": inputs["Synthetic.tla"], "cfg": inputs["ci/cfg/synthetic.cfg"]}, "raw": raw}
     return run, row, envelope
 
-# SR-15.6 checks the committed serialization. The CLI's full canonical audit
+# checks the committed serialization. The CLI's full canonical audit
 # additionally needs ignored scheduler/SANY files and reconstructs work proofs;
 # those are separate obligations, never prerequisites for this portable gate.
 def portable_fixture(root, record, row, fixture, identifier):

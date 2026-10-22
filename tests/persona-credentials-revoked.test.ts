@@ -1,6 +1,6 @@
 /**
  * persona-credentials-revoked.test.ts — A bot token revoked while a persona
- * runs, end to end, and its recovery (bug b.ujn; b.av2 SR-6.4, SR-8.6 step 6).
+ * runs, end to end, and its recovery (step 6).
  *
  * Personas alpha (A) and bravo (B) run from a byte-equal record and
  * configuration file through `makeReloadHarness` with the real lifecycle
@@ -183,8 +183,8 @@ function expectNoLeak(run: ReloadRun, extra: Record<string, unknown> = {}): void
 // The revocation
 // ---------------------------------------------------------------------------
 
-describe('b.ujn: a Web API call refused with token_revoked marks the persona broken at once', () => {
-  test('b.ujn: A’s tool call refused with token_revoked marks A broken with a credentials cause, logs one line naming A, personas[0] and its credentials path, drops A’s MCP session, keeps its instance (no agent-director call) and leaves B serving', async () => {
+describe('a Web API call refused with token_revoked marks the persona broken at once', () => {
+  test('A’s tool call refused with token_revoked marks A broken with a credentials cause, logs one line naming A, personas[0] and its credentials path, drops A’s MCP session, keeps its instance (no agent-director call) and leaves B serving', async () => {
     const { run, alpha, bravo } = await running()
     const a = applied(run, 'alpha')
     const cp = run.checkpoint()
@@ -224,7 +224,7 @@ describe('b.ujn: a Web API call refused with token_revoked marks the persona bro
     expectNoLeak(run, { refused })
   })
 
-  test('b.ujn: nothing more reaches A: its connection is closed and never reopened, so no inbound event is delivered; a later notice and a later tool call post nothing under any identity; its instance cannot register', async () => {
+  test('nothing more reaches A: its connection is closed and never reopened, so no inbound event is delivered; a later notice and a later tool call post nothing under any identity; its instance cannot register', async () => {
     const { run, alpha, bravo } = await running()
     const a = applied(run, 'alpha')
     const stubA = run.stub('alpha')
@@ -261,7 +261,7 @@ describe('b.ujn: a Web API call refused with token_revoked marks the persona bro
     expectNoLeak(run, { reply })
   })
 
-  test('b.ujn: A does not recover by itself: its held digest still matches its file, so no pending change is written, and over many ticks and a long clock advance it is not re-validated and does not come up', async () => {
+  test('A does not recover by itself: its held digest still matches its file, so no pending change is written, and over many ticks and a long clock advance it is not re-validated and does not come up', async () => {
     const { run, alpha } = await running()
     const a = applied(run, 'alpha')
     await revokeThroughReact(run, alpha)
@@ -285,11 +285,11 @@ describe('b.ujn: a Web API call refused with token_revoked marks the persona bro
 })
 
 // ---------------------------------------------------------------------------
-// Recovery through the confirmed credentials change (b.av2 SR-6.4)
+// Recovery through the confirmed credentials change
 // ---------------------------------------------------------------------------
 
-describe('b.ujn: recovery through the confirmed credentials change', () => {
-  test('b.ujn: a working file at A’s path is previewed, not applied; once confirmed, step 6’s recovery bring-up brings A up with the new tokens and records its launch, with no reconnect, kill or delete, and admits its MCP registration again; the notice held while broken posts through the new identity only; B is untouched', async () => {
+describe('recovery through the confirmed credentials change', () => {
+  test('a working file at A’s path is previewed, not applied; once confirmed, step 6’s recovery bring-up brings A up with the new tokens and records its launch, with no reconnect, kill or delete, and admits its MCP registration again; the notice held while broken posts through the new identity only; B is untouched', async () => {
     const { run, alpha, bravo } = await running()
     const a = applied(run, 'alpha')
     const oldStub = run.stub('alpha')
@@ -362,11 +362,11 @@ describe('b.ujn: recovery through the confirmed credentials change', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A notice that finds the token revoked (E13 Director: the hold keeps it)
+// A notice that finds the token revoked ( Director: the hold keeps it)
 // ---------------------------------------------------------------------------
 
-describe('b.ujn: a notice post refused with token_revoked', () => {
-  test('b.ujn: marks A broken the same way, and the notice is held, never posted while A is broken; after the confirmed recovery it posts once through A’s new client', async () => {
+describe('a notice post refused with token_revoked', () => {
+  test('marks A broken the same way, and the notice is held, never posted while A is broken; after the confirmed recovery it posts once through A’s new client', async () => {
     const { run, alpha, bravo } = await running()
     const a = applied(run, 'alpha')
     const oldStub = run.stub('alpha')
@@ -408,7 +408,7 @@ describe('b.ujn: a notice post refused with token_revoked', () => {
 // The detached socket while A's serializer turn is held (server.ts wiring)
 // ---------------------------------------------------------------------------
 
-describe('b.ujn: the manager wired with the per-persona serializer, as server.ts wires it', () => {
+describe('the manager wired with the per-persona serializer, as server.ts wires it', () => {
   let dir: string
   let c: ConnectionHarness | undefined
 
@@ -427,7 +427,7 @@ describe('b.ujn: the manager wired with the per-persona serializer, as server.ts
     }
   })
 
-  test('b.ujn: A’s next inbound event, arriving on its detached socket before that socket’s close gets A’s turn, is not delivered to A’s session, while B’s event reaches B’s session; the close runs once A’s turn is free', async () => {
+  test('A’s next inbound event, arriving on its detached socket before that socket’s close gets A’s turn, is not delivered to A’s session, while B’s event reaches B’s session; the close runs once A’s turn is free', async () => {
     const serializer = createPersonaSerializer()
     c = makeConnectionHarness([{ name: 'alpha' }, { name: 'bravo' }], dir, { serialize: serializer.run })
     const [A, B] = [c.p('alpha'), c.p('bravo')]

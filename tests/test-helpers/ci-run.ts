@@ -1,6 +1,6 @@
 /**
  * test-helpers/ci-run.ts — Builders and fakes for the sharded `/ci` runner's
- * component tests (`tests/ci-run-*.test.ts`; b.uqm SR-21.4).
+ * component tests (`tests/ci-run-*.test.ts`).
  *
  * Every test of `scripts/ci-run.ts` drives the runner in process through its
  * injected dependencies (`RunnerDeps`), and takes those fakes and the files it
@@ -17,18 +17,18 @@
  *   (`./fake-clock.ts`), which the runner takes as its `RunnerClock`.
  *
  * Layout. One banner per owner, in this fixed order; each lane writes only
- * under its own banner (Plan b.t6s, "One runner file"):
+ * under its own banner (Plan, "One runner file"):
  *
- *    1. spawn recorder (E1 T6)
- *    2. process table, signals and `/proc` (E1 T6)
- *    3. lock probe (E1 T6)
- *    4. fake container interface (E1 T6)
- *    5. worktree builder (E1 T7)
- *    6. run-directory builder (E1 T7)
- *    7. reader additions (E3)
- *    8. lock directory and password file (E5)
- *    9. cgroups, `/ci-live` and readings (E6)
- *   10. sample sequences (E7)
+ * 1. spawn recorder
+ * 2. process table, signals and `/proc`
+ * 3. lock probe
+ * 4. fake container interface
+ * 5. worktree builder
+ * 6. run-directory builder
+ * 7. reader additions
+ * 8. lock directory and password file
+ * 9. cgroups, `/ci-live` and readings
+ * 10. sample sequences
  *
  * The import from the runner below also keeps `scripts/ci-run.ts` in
  * `bun run typecheck`: `tsconfig.json` includes only `src/`,
@@ -206,13 +206,13 @@ import {
 } from 'node:path'
 
 // ---------------------------------------------------------------------------
-// 1. Spawn recorder (E1 T6)
+// 1. Spawn recorder
 // ---------------------------------------------------------------------------
 //
 // `createSpawnRecorder` gives the runner's `spawn` dependency and keeps every
 // spawn in order: its argument list, a copy of its environment, its working
 // directory, whether it was started in a process group of its own and its
-// standard input (b.uqm SR-15.4, SR-21.4). Each child is answered from:
+// standard input. Each child is answered from:
 //
 // 1. scripted answers (`answer` by exact argument list, `answerWhen` by
 //    predicate), the most recently added first, each for a number of spawns
@@ -622,15 +622,15 @@ export function createSpawnRecorder(options: SpawnRecorderOptions): SpawnRecorde
 }
 
 // ---------------------------------------------------------------------------
-// 2. Process table, signals and /proc (E1 T6)
+// 2. Process table, signals and /proc
 // ---------------------------------------------------------------------------
 //
 // One fake process table per test (`createProcessTable`). The liveness
 // dependency and the three `/proc` reads all answer from it (`deps()`), so a
 // process made gone, by a signal or at a time, reads gone to each of them.
 // Each process carries its command line, its working directory and its cgroup
-// membership line (`0::<path>`), for owners (b.uqm SR-6.3), `/ci-live`'s
-// `isLiveRunnerPid` and E6's container figures. A PID can be reused: adding a
+// membership line (`0::<path>`), for owners, `/ci-live`'s
+// `isLiveRunnerPid` and container figures. A PID can be reused: adding a
 // process on a gone PID replaces it, as after a VM reboot.
 //
 // The builders give a `/ci` runner with a given RUN_ID (its command line from
@@ -854,13 +854,13 @@ const RUNNER_INTERPRETER = 'bun'
 const DEFAULT_FAKE_WORKTREE_ROOT = '/home/ci/worktree'
 
 // The `/ci-live` runner's directory and entry file, as `isLiveRunnerPid`
-// (`ci-live/lib/run-lock.ts`) judges them. E6 adds the runner's own copies;
+// (`ci-live/lib/run-lock.ts`) judges them. adds the runner's own copies;
 // until then they live here, once, and each is replaced by its export when it
 // lands.
 const CI_LIVE_DIR_NAME = 'ci-live'
 const CI_LIVE_ENTRY_FILE_NAME = 'run.ts'
 
-/** A `/ci` runner process: `bun <worktree>/scripts/ci-run.ts <RUN_ID> [args]...`, the command line a live owner holds (b.uqm SR-6.3). */
+/** A `/ci` runner process: `bun <worktree>/scripts/ci-run.ts <RUN_ID> [args]...`, the command line a live owner holds. */
 export function ciRunnerProcess(
   runId: string,
   options: FakeProcessOptions & { readonly worktreeRoot?: string; readonly args?: readonly string[] } = {},
@@ -1005,13 +1005,13 @@ export function createSignalSource(options: { readonly clock: RunnerClock }): Si
 }
 
 // ---------------------------------------------------------------------------
-// 3. Lock probe (E1 T6)
+// 3. Lock probe
 // ---------------------------------------------------------------------------
 //
-// Whether a file's `flock` is held, for E5 (a child the runner starts holds
-// no admission lock) and E6 (the runner holds no lock on `/ci-live`'s lock
-// files, PRD AC 18). On this host two descriptors opened by one process
-// contend just as two processes do (b.uqm SR-6.1's note), so both the probe
+// Whether a file's `flock` is held, for (a child the runner starts holds
+// no admission lock) and (the runner holds no lock on `/ci-live`'s lock
+// files, contract). On this host two descriptors opened by one process
+// contend just as two processes do (note), so both the probe
 // and the holder work in process, each on a fresh read-only descriptor of the
 // path given, through libc's `flock` by `bun:ffi`. Neither starts a child,
 // reads or writes the file's content, or changes its mode or times; opening a
@@ -1075,12 +1075,12 @@ export function holdFlock(path: string): FlockHolder {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Fake container interface (E1 T6)
+// 4. Fake container interface
 // ---------------------------------------------------------------------------
 //
 // `createFakeDocker(recorder)` registers a responder on the spawn recorder
-// that claims every `docker` argument list (b.uqm SR-21.4). It answers only
-// the forms of the runner's docker layer (section 6/T4), each recognised by
+// that claims every `docker` argument list. It answers only
+// the forms of the runner's docker layer (section 6/), each recognised by
 // rebuilding the list with the runner's own exported builder and comparing
 // them exactly; any other `docker` argument list throws, so the spawn fails
 // loudly. The one shape answered beyond the builders is `docker image rm` with
@@ -1096,7 +1096,7 @@ export function holdFlock(path: string): FlockHolder {
 // template keys of `CONTAINER_STATE_FORMAT`, `CONTAINER_INSPECTION_FORMAT` and
 // `IMAGE_INSPECT_FORMAT` exactly, so no answer carries an environment field.
 //
-// Docker's image rules, as b.uqm SR-23.6 records them:
+// Docker's image rules, as records them:
 // - a build's image ID is a digest of what it was built from and its labels,
 //   so two identical builds give one ID, and a build with a label of its own
 //   gives another;
@@ -1210,7 +1210,7 @@ export interface FakeInspectionMount {
   readonly rw: boolean
 }
 
-/** The inspection form's fields beyond the container's name and labels (b.uqm SR-10.5). */
+/** The inspection form's fields beyond the container's name and labels. */
 export interface FakeInspection {
   readonly imageId: string
   readonly mounts: readonly FakeInspectionMount[]
@@ -1341,7 +1341,7 @@ export interface FakeBuildSelector {
 }
 
 export interface FakeDockerOptions {
-  /** The daemon's version (default `29.7.2`, the host's, b.uqm SR-23.6). */
+  /** The daemon's version (default `29.7.2`, the host's). */
   readonly serverVersion?: string
   /** Each prune's duration on the fake clock (default 0). */
   readonly pruneDurationMs?: number
@@ -1385,7 +1385,7 @@ export interface FakeDocker {
   removals(): readonly FakeDockerOperation[]
 }
 
-/** The fake daemon's default version: test data, the host's (b.uqm SR-23.6). */
+/** The fake daemon's default version: test data, the host's. */
 const DEFAULT_FAKE_SERVER_VERSION = '29.7.2'
 /** A run-private tag's RUN_ID for the sample lists the form heads are read from. */
 const FORM_SAMPLE_RUN_ID = '20261008t120000z-sample01'
@@ -1620,8 +1620,8 @@ function matchDockerForm(request: SpawnRequest): DockerForm | null {
   const imageRemove = after(heads.imageRemove)
   if (imageRemove?.length === 1) {
     const argument = imageRemove[0]!
-    // A run-private tag is exactly T4's form. Any other one operand (an ID, a digest, a foreign tag) has the same
-    // shape, which T4's builder refuses to build; if one ever arrives, Docker's rules answer it and it is recorded.
+    // A run-private tag is exactly form. Any other one operand (an ID, a digest, a foreign tag) has the same
+    // shape, which builder refuses to build; if one ever arrives, Docker's rules answer it and it is recorded.
     if (exactly(() => imageTagRemovalArgs(argument)) || (argument !== '' && !argument.startsWith('-'))) return { kind: 'image-remove', argument }
   }
   const imageTag = after(heads.imageTag)
@@ -2409,13 +2409,13 @@ export function buildTarArchive(entries: Readonly<Record<string, string | Uint8A
 }
 
 // ---------------------------------------------------------------------------
-// 5. Worktree builder (E1 T7)
+// 5. Worktree builder
 // ---------------------------------------------------------------------------
 //
-// b.uqm SR-21.4's worktree: a temporary tree, made under a caller's
+// worktree: a temporary tree, made under a caller's
 // `mkdtempSync` root, whose `tests/integration` holds one minimal valid script
 // per real script number by default (the real file names, from the
-// repository's own listing, looked up by number; SR-21.2), or a given list.
+// repository's own listing, looked up by number), or a given list.
 // Per script, prerequisite lines in every placement; extra badly named files;
 // `test-*.sh` entries that are not regular files; duplicate numbers; a missing
 // test-1; a duration table given, absent, unreadable, out of order, without a
@@ -2450,7 +2450,7 @@ export function realScriptNumbers(): number[] {
   return realScriptFileNames().map((fileName) => fileNameNumber(fileName) as number)
 }
 
-/** The repository's real file name for script number `n`, looked up in its listing (b.uqm SR-21.2). Throws when it has none. */
+/** The repository's real file name for script number `n`, looked up in its listing. Throws when it has none. */
 export function realScriptFileName(n: number): string {
   const fileName = realScriptFileNames().find((name) => fileNameNumber(name) === n)
   if (fileName === undefined) throw new Error(`realScriptFileName: the repository has no script numbered ${n}`)
@@ -2470,7 +2470,7 @@ function realShebang(): string {
 }
 
 /**
- * Where a prerequisite line goes in a built script (b.uqm SR-3.1):
+ * Where a prerequisite line goes in a built script:
  * - `second-line`: right after the shebang, the header block's first line;
  * - `header`: inside the header block, after its first comment line;
  * - `below-header`: after the first line that is not a comment, so below the header block;
@@ -2532,7 +2532,7 @@ export interface WorktreeScript {
   readonly prerequisites?: readonly PrerequisiteLine[]
 }
 
-/** An entry named like a script that is not a regular file (b.uqm SR-2.3). */
+/** An entry named like a script that is not a regular file. */
 export type NonRegularEntry =
   | {
       /** A symbolic link; its target defaults to the first script written, by relative name (never followed by the runner). */
@@ -2552,7 +2552,7 @@ export interface DurationRow {
   readonly seconds: number | string
 }
 
-/** The worktree's duration table (b.uqm SR-4.1). */
+/** The worktree's duration table. */
 export type DurationTableSpec =
   | {
       /** No file at the table's path. */
@@ -2580,7 +2580,7 @@ export type DurationTableSpec =
       readonly carriageReturns?: boolean | readonly number[]
     }
 
-/** One duration-table line, `<number form>\t<seconds>` (b.uqm SR-4.1), without its line feed. */
+/** One duration-table line, `<number form>\t<seconds>`, without its line feed. */
 export function durationTableLine(row: DurationRow): string {
   return `${typeof row.script === 'number' ? numberFormOf(row.script) : row.script}\t${row.seconds}`
 }
@@ -2600,7 +2600,7 @@ export function durationTableText(spec: Extract<DurationTableSpec, { readonly ki
   return spec.finalNewline === false || text === '' ? text : `${text}\n`
 }
 
-/** The repository's own Dockerfile lines the worktree copies (b.uqm SR-9.2): never typed. */
+/** The repository's own Dockerfile lines the worktree copies: never typed. */
 export interface RepositoryDockerfileLines {
   /** `docker/Dockerfile.test`'s `FROM` lines, in order. */
   readonly testFrom: readonly string[]
@@ -2664,7 +2664,7 @@ export interface BuiltWorktree {
   readonly baseDockerfilePath: string
 }
 
-/** Builds a worktree in a new directory under `root` (a caller's `mkdtempSync` directory), writing only there (b.uqm SR-21.4). */
+/** Builds a worktree in a new directory under `root` (a caller's `mkdtempSync` directory), writing only there. */
 export function buildWorktree(root: string, options: WorktreeOptions = {}): BuiltWorktree {
   if (!lstatSync(root).isDirectory()) throw new Error(`buildWorktree: ${root} is not a directory`)
   const worktree = mkdtempSync(join(root, 'worktree-'))
@@ -2720,10 +2720,10 @@ export function buildWorktree(root: string, options: WorktreeOptions = {}): Buil
 }
 
 // ---------------------------------------------------------------------------
-// 6. Run-directory builder (E1 T7)
+// 6. Run-directory builder
 // ---------------------------------------------------------------------------
 //
-// b.uqm SR-21.4's run directories, in a constructed system temp directory:
+// run directories, in a constructed system temp directory:
 // status files, verdicts, runner logs, results files and shard
 // subdirectories; and new-style and legacy results directories of given
 // sizes. Every valid file comes from the runner's own writers, serializers,
@@ -2753,7 +2753,7 @@ export function runDirIn(tempDir: string, runId: string): string {
   return runDirPath({ TMPDIR: tempDir }, runId)
 }
 
-/** Creates the run directory of `runId` in `tempDir`, mode 0700, as the runner's first act does (b.uqm SR-5.1); fails when anything is already there. */
+/** Creates the run directory of `runId` in `tempDir`, mode 0700, as the runner's first act does; fails when anything is already there. */
 export function makeRunDir(tempDir: string, runId: string): string {
   const runDir = runDirIn(tempDir, runId)
   makeDirWithMode(runDir, RUN_DIR_MODE)
@@ -2834,7 +2834,7 @@ export function changedJsonText(valid: string, change: JsonFileChange): string {
   return text
 }
 
-// The status file (b.uqm SR-5.2).
+// The status file.
 
 /** One status file's content. */
 export interface StatusSpec {
@@ -2853,7 +2853,7 @@ export interface StatusSpec {
   }
 }
 
-/** A status, built by the runner's own `buildStatus` or `buildRefusedStatus` (b.uqm SR-5.2): every phase, and a refusal of every kind. */
+/** A status, built by the runner's own `buildStatus` or `buildRefusedStatus`: every phase, and a refusal of every kind. */
 export function makeStatus(spec: StatusSpec): RunStatus {
   const basis = { runId: spec.runId, pid: spec.pid, startMs: spec.startMs, deadline: statusDeadline(spec.startMs, spec.deadlineMinutes) }
   if (spec.phase !== 'refused') {
@@ -2884,7 +2884,7 @@ export function writeStatus(runDir: string, status: RunStatus, change?: StatusFi
   return join(runDir, STATUS_FILE_NAME)
 }
 
-// The verdict file (b.uqm SR-5.7).
+// The verdict file.
 
 /** A named change to a valid verdict file. */
 export type VerdictFileChange =
@@ -2913,7 +2913,7 @@ export function writeVerdict(runDir: string, line: string, change?: VerdictFileC
   return join(runDir, VERDICT_FILE_NAME)
 }
 
-// The runner log (b.uqm SR-5.4).
+// The runner log.
 
 /** A runner log's content. */
 export interface RunnerLogSpec {
@@ -2937,7 +2937,7 @@ export interface RunnerLogSpec {
   readonly values?: Readonly<Record<number, string>>
 }
 
-/** Writes the run directory's `runner.log` through the runner's own `createRunnerLog` (b.uqm SR-5.4). Answers its path. */
+/** Writes the run directory's `runner.log` through the runner's own `createRunnerLog`. Answers its path. */
 export function writeRunnerLog(runDir: string, spec: RunnerLogSpec): string {
   const path = join(runDir, RUNNER_LOG_FILE_NAME)
   const valid = formatRunnerLogFirstLine(spec.runId, spec.pid, spec.args ?? [])
@@ -2959,7 +2959,7 @@ export function writeRunnerLog(runDir: string, spec: RunnerLogSpec): string {
   return path
 }
 
-// results.json (b.uqm SR-16.1).
+// results.json.
 
 /** `results.json`'s content: the run's RUN_ID and PID, and any keys to set. */
 export type ResultsSpec = Partial<Results> & Pick<Results, 'runId' | 'pid'>
@@ -2975,16 +2975,15 @@ export function runDirModes(runDir: string): Results['modes'] {
 
 /**
  * A `Results` value: `spec`'s keys over defaults that, with one exception,
- * describe one run consistently by b.uqm SR-16.1: a default full run (`/ci`
+ * describe one run consistently by a default full run (`/ci`
  * with no arguments, so not selective) on the real tree, `MAX_SHARDS`
  * requested and effective and, admission never having lowered it, its N
- * (`admitted`), that stopped before it packed the package (b.uqm SR-5.3,
- * SR-5.6): so no tarball, no image, no shard scheduled or started
+ * (`admitted`), that stopped before it packed the package: so no tarball, no image, no shard scheduled or started
  * (`scripts` and `shards` empty, `started` 0), no reading, no shard directory,
  * and the full run's `cap`: a boolean `peakFromKill` (false) and an empty
  * `suffix`, every peak null. The exception: such a run fails, but `verdict`
  * defaults to '' and `failures` to none. They are shape-only filler, since the
- * runner has no writer of its verdict lines yet (E10) and the helper types no
+ * runner has no writer of its verdict lines yet and the helper types no
  * runner message: a test that reads either sets both. A test of another run
  * kind (a selective run's null `peakFromKill` and `suffix`, a run with shards)
  * sets those keys too. `modes` defaults to `runDir`'s modes on disk when a run
@@ -3017,10 +3016,10 @@ export function makeResults(spec: ResultsSpec, runDir?: string): Results {
   return { ...defaults, ...spec }
 }
 
-/** The key of `results.json`'s timing summary, the one key the reader reads besides `version` (b.uqm SR-16.1). */
+/** The key of `results.json`'s timing summary, the one key the reader reads besides `version`. */
 const TIMING_SUMMARY_KEY: keyof Results = 'timingSummary'
 
-/** A named change to a valid results file: a JSON change, or one of the timing-summary changes the reader tells apart (b.uqm SR-17.3). */
+/** A named change to a valid results file: a JSON change, or one of the timing-summary changes the reader tells apart. */
 export type ResultsFileChange =
   | JsonFileChange
   | {
@@ -3043,7 +3042,7 @@ export function writeResults(runDir: string, results: Results, change?: ResultsF
   return join(runDir, RESULTS_FILE_NAME)
 }
 
-// Shard subdirectories (b.uqm SR-11.3).
+// Shard subdirectories.
 
 /** A named change that makes one complete result-file line of no known form. */
 export type ResultLineChange =
@@ -3090,7 +3089,7 @@ export function malformedResultLine(event: ResultEvent, change: ResultLineChange
   return line
 }
 
-/** A result file's text (b.uqm SR-11.3): the runner's own `formatResultFile` of the events, or, with a malformed line, each event's line through `formatResultLine` and that one changed; then the spec's partial line. */
+/** A result file's text: the runner's own `formatResultFile` of the events, or, with a malformed line, each event's line through `formatResultLine` and that one changed; then the spec's partial line. */
 export function resultFileText(spec: ResultFileSpec): string {
   const malformed = spec.malformed
   let complete: string
@@ -3108,7 +3107,7 @@ export function resultFileText(spec: ResultFileSpec): string {
   return `${complete}${whole.slice(0, length)}`
 }
 
-/** A named change that makes a hex record malformed (b.uqm SR-11.3). */
+/** A named change that makes a hex record malformed. */
 export type HexRecordChange =
   /** The value without its line feed. */
   | 'no-final-line-feed'
@@ -3220,7 +3219,7 @@ export interface RunDirectorySpec {
       }
 }
 
-/** Builds a run directory in a constructed system temp directory (b.uqm SR-21.4): the directory (0700), then its status file, runner log, shard subdirectories, results file and verdict, as given. Answers its path. */
+/** Builds a run directory in a constructed system temp directory: the directory (0700), then its status file, runner log, shard subdirectories, results file and verdict, as given. Answers its path. */
 export function buildRunDirectory(tempDir: string, spec: RunDirectorySpec): string {
   const runDir = makeRunDir(tempDir, spec.runId)
   if (spec.status !== undefined) {
@@ -3240,11 +3239,11 @@ export function buildRunDirectory(tempDir: string, spec: RunDirectorySpec): stri
   return runDir
 }
 
-// Results directories in the system temp directory (b.uqm SR-6.8).
+// Results directories in the system temp directory.
 
 /** One `/ci` results directory for the disk refusal's listing. */
 export interface ResultsDirSpec {
-  /** `new`: `cscb-ci-<RUN_ID>` (b.uqm SR-5.1); `legacy`: `cscb-ci-<digits>-<six>`, made by the skill of 946be79. */
+  /** `new`: `cscb-ci-<RUN_ID>`; `legacy`: `cscb-ci-<digits>-<six>`, made by the skill of 946be79. */
   readonly style: 'new' | 'legacy'
   /** New style: its RUN_ID. */
   readonly runId?: string
@@ -3283,10 +3282,10 @@ function fillWithBytes(dir: string, bytes: number): void {
 
 /**
  * Makes one results directory of a given size in a constructed system temp
- * directory, and answers its path (b.uqm SR-6.8). Sparse files keep a large
+ * directory, and answers its path. Sparse files keep a large
  * size cheap: its size, `spec.bytes`, is the sum of its regular files'
  * apparent sizes (about 0 bytes allocated), and excludes the sizes of
- * directories and links themselves, so E6 must size a results directory as
+ * directories and links themselves, so must size a results directory as
  * the sum of its regular files' sizes, never by blocks or `du`.
  */
 export function makeResultsDir(tempDir: string, spec: ResultsDirSpec): string {
@@ -3305,19 +3304,19 @@ export function makeResultsDir(tempDir: string, spec: ResultsDirSpec): string {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Reader additions (E3)
+// 7. Reader additions
 // ---------------------------------------------------------------------------
 //
 // The run-directory cases the verdict reader (`scripts/ci-verdict.ts`) needs
-// beyond section 6's (b.uqm SR-21.4): a symbolic link inside a run directory
-// that points out of it (the removal of b.uqm SR-16.3 must remove the link,
+// beyond section 6's: a symbolic link inside a run directory
+// that points out of it (the removal of the contract must remove the link,
 // never its target), and a results file whose `version` and `timingSummary`
-// are valid while its other keys depart from b.uqm SR-16.1's shape (the
-// reader reads only those two keys, SR-17.3), and something other than a
+// are valid while its other keys depart from the contract shape (the
+// reader reads only those two keys), and something other than a
 // directory at the run-directory path (a regular file, or a symbolic link to
-// a run directory elsewhere: no run directory, never removed, SR-17.3,
-// SR-16.3). Each starts from a valid run directory or file and makes one
-// stated change; section 6's builders are used read-only. Later E3 Subtasks
+// a run directory elsewhere: no run directory, never removed,
+//). Each starts from a valid run directory or file and makes one
+// stated change; section 6's builders are used read-only. Later Subtasks
 // add any further reader case here.
 
 /** Whether `path` lies strictly below `dir`, judged on the resolved paths. */
@@ -3344,15 +3343,15 @@ export function linkOutOfRunDir(runDir: string, target: string, name = 'link-out
   return link
 }
 
-/** The keys `results.json` keeps valid in an off-shape file: the two the reader reads (b.uqm SR-16.1, SR-17.3). */
+/** The keys `results.json` keeps valid in an off-shape file: the two the reader reads. */
 const READER_RESULTS_KEYS: readonly (keyof Results)[] = ['version', 'timingSummary']
 
-/** A key b.uqm SR-16.1 does not have, added by the off-shape change: test data. */
+/** A key does not have, added by the off-shape change: test data. */
 const FOREIGN_RESULTS_KEY = 'unexpectedKey'
 
 /**
  * `results.json`'s valid text (`serializeResults`) with one stated change:
- * every key but `version` and `timingSummary` departs from b.uqm SR-16.1's
+ * every key but `version` and `timingSummary` departs from the contract
  * shape. Of the others, the first is removed, the second given a value of
  * the wrong type (a string), and a foreign key is added; `version` and
  * `timingSummary` keep their valid values. Throws unless the runner's strict
@@ -3411,8 +3410,8 @@ function entryAt(path: string): boolean {
 
 /**
  * Plants what is not a run directory at the run-directory path `runDir`
- * (the reader counts it as no run directory and never removes it, b.uqm
- * SR-17.3, SR-16.3): a regular file (test data), or a symbolic link to a
+ * (the reader counts it as no run directory and never removes it
+ *): a regular file (test data), or a symbolic link to a
  * valid run directory that section 6's `buildRunDirectory` builds from
  * `at.run` in `at.elsewhere`. The stated change: one entry that is not a
  * directory where the run directory would be. Answers the directory holding
@@ -3434,10 +3433,10 @@ export function plantNonDirectoryAtRunDir(runDir: string, at: NonDirectoryAtRunD
 }
 
 // ---------------------------------------------------------------------------
-// 8. Lock directory and password file (E5)
+// 8. Lock directory and password file
 // ---------------------------------------------------------------------------
 //
-// b.uqm SR-21.4's lock directories and password files, for the E5 region of
+// lock directories and password files, for the region of
 // `tests/ci-run-admission.test.ts`. Everything is built under the caller's own
 // `mkdtempSync` root; nothing here reads or writes a real home, the real lock
 // directory or the host's password file, and nothing starts a child process.
@@ -3454,7 +3453,7 @@ export function plantNonDirectoryAtRunDir(runDir: string, at: NonDirectoryAtRunD
 //   a reservation that vanishes between the runner's listing and its read; and
 //   unrelated entries. Owners named by RUN_ID and liveness are added to the
 //   caller's fake process table (section 2) as a live or gone `/ci` runner.
-// - **Password file** (`passwordFileCases`): one text per b.uqm SR-21.4 case
+// - **Password file** (`passwordFileCases`): one text case
 //   for any user ID and home, each row labelled by what it is and naming what
 //   the password-file rule gives for it. `writePasswordFile` and
 //   `writeUnreadablePasswordFile` put a text, or an entry that cannot be read
@@ -3482,7 +3481,7 @@ import {
 } from '../../scripts/ci-run.ts'
 import { rmSync } from 'node:fs'
 
-// The lock directory (b.uqm SR-6.1, SR-6.2).
+// The lock directory.
 
 /** An owner for the lock directory: by RUN_ID and liveness (a `/ci` runner added to the spec's process table, live or gone, on a PID the table picks), or exactly as given (no process added). */
 export type LockDirOwnerSpec =
@@ -3722,8 +3721,7 @@ function writeUnrelatedEntry(lockDir: string, spec: UnrelatedEntrySpec, processe
 }
 
 /**
- * Builds a lock directory under the caller's own temporary root (b.uqm
- * SR-21.4): the directories, then the lock file (its record written, then its
+ * Builds a lock directory under the caller's own temporary root: the directories, then the lock file (its record written, then its
  * flock taken when asked), the reservations, the vanishing reservation and the
  * unrelated entries, in that order, each owner given by RUN_ID and liveness
  * added to `spec.processes` in that order too. A held flock blocks the
@@ -3810,9 +3808,9 @@ export function buildLockDir(root: string, spec: LockDirSpec = {}): BuiltLockDir
   }
 }
 
-// The password file (b.uqm SR-6.1, SR-21.4).
+// The password file.
 
-/** The b.uqm SR-21.4 password-file cases, by what the runner's user ID has in the file. */
+/** The password-file cases, by what the runner's user ID has in the file. */
 export type PasswordFileCase =
   /** A first matching line that gives the home. */
   | 'first-match'
@@ -3862,7 +3860,7 @@ function passwordFields(name: string, uidField: string, gid: number, home: strin
 }
 
 /**
- * Every b.uqm SR-21.4 password-file case for `uid` and `home`, by name. Each
+ * Every password-file case for `uid` and `home`, by name. Each
  * text holds, around the case's lines, a line before for the user ID `<uid>0`
  * (which is not `uid`) and a line after for `uid + 1`, each with its own home.
  * A malformed case is the first-match line with one named change.
@@ -3938,11 +3936,11 @@ export function passwordFileReader(path: string): RunnerDeps['readPasswordFile']
 }
 
 // ---------------------------------------------------------------------------
-// 9. Cgroups, /ci-live and readings (E6)
+// 9. Cgroups, /ci-live and readings
 // ---------------------------------------------------------------------------
 //
-// Constructed host state for admission (b.uqm SR-21.4), never the host's own
-// (b.uqm SR-21.7). Every file is written below a root the caller made with
+// Constructed host state for admission, never the host's own
+//. Every file is written below a root the caller made with
 // `mkdtempSync`; nothing here reads `/sys/fs/cgroup`, a real home or `/tmp`.
 //
 // - The cgroup builder (`createCgroupTree`): a directory standing for the
@@ -3954,7 +3952,7 @@ export function passwordFileReader(path: string): RunnerDeps['readPasswordFile']
 //   any parent. Any file can be removed, emptied, garbled, made unreadable or
 //   stripped of one key. `addCgroupContainer` adds a container to the fake
 //   container interface (section 4) whose main process carries that cgroup as
-//   its membership line, so the runner finds it as b.uqm SR-7.2 asks: through
+// its membership line, so the runner finds it as asks: through
 //   `State.Pid`, then that PID's `/proc/<pid>/cgroup` (section 2).
 // - The `/ci-live` builder: `run.lock` in `/ci-live`'s default config
 //   directory under a constructed home, another config directory that a
@@ -3968,13 +3966,13 @@ export function passwordFileReader(path: string): RunnerDeps['readPasswordFile']
 //   written in whole bytes by one rule (`gibToBytes`), through the cgroup
 //   builder, the fake container interface and a fake volume dependency
 //   (`createFakeVolume`). Every file can be written again, so a later sample
-//   sequence (E7) reuses the same tree. Beside it, reservation-listing
+// sequence reuses the same tree. Beside it, reservation-listing
 //   results for a stub reader, each valid reservation built through the
 //   runner's own serializer and parser.
 //
-// No PRD example figure is preset here: every figure is the caller's.
+// No contract example figure is preset here: every figure is the caller's.
 
-// --- 9/T6.S1: cgroup trees and container main PIDs ---
+// --- 9/.S1: cgroup trees and container main PIDs ---
 
 /**
  * The cgroup v2 file names the builders write: test data, the kernel's own
@@ -4001,7 +3999,7 @@ export const CGROUP_UNLIMITED = 'max'
 
 /** The cgroup v2 line of `/proc/<pid>/cgroup`, `0::<path>`: the kernel's form. */
 const CGROUP_MEMBERSHIP_PREFIX = '0::'
-/** Container cgroups' parent when the caller names none: Docker's cgroupfs layout on this host (b.uqm SR-7.2). Test data. */
+/** Container cgroups' parent when the caller names none: Docker's cgroupfs layout on this host. Test data. */
 const DEFAULT_CONTAINER_CGROUP_PARENT = '/docker'
 /** What a garbled cgroup file holds when the caller gives no text: no number, and no `key value` line. */
 const GARBLED_CGROUP_TEXT = 'garbled: not a cgroup value\n'
@@ -4331,12 +4329,12 @@ export function addCgroupContainer(docker: FakeDocker, tree: CgroupTree, spec: C
   return { id, name: added.name, pid: added.pid, cgroupPath, membershipLine, figures }
 }
 
-/** The labels a `/ci` shard container of `owner` carries: `cscb-ci=1` and its owner label (b.uqm SR-10.1). */
+/** The labels a `/ci` shard container of `owner` carries: `cscb-ci=1` and its owner label. */
 export function ciShardLabels(owner: Owner): Readonly<Record<string, string>> {
   return { [CI_LABEL]: CI_LABEL_VALUE, [OWNER_LABEL]: formatOwner(owner) }
 }
 
-// --- 9/T6.S2: /ci-live lock files, their holders and cscb-live containers ---
+// --- 9/.S2: /ci-live lock files, their holders and cscb-live containers ---
 
 /** The text `/ci-live` writes in a lock file it takes: its runner's PID and a line feed, as `RunLock.acquire` (`ci-live/lib/run-lock.ts`) writes it. */
 export function ciLiveLockText(pid: number): string {
@@ -4422,7 +4420,7 @@ export interface DryRunLock {
  *
  * Throws unless at least one variable names a directory under `root`: with
  * every one unset or empty, the runner falls back to the host's own `/tmp`
- * (b.uqm SR-21.7). That fallback is for path pin cases only, which compute
+ * That fallback is for path pin cases only, which compute
  * the path and need no builder.
  */
 export function makeDryRunLock(root: string, spec: DryRunLockSpec): DryRunLock {
@@ -4536,7 +4534,7 @@ export function addCiLiveContainer(docker: FakeDocker, spec: CiLiveContainerSpec
   return { id, name }
 }
 
-// --- 9/T6.S3: readings in GiB, and reservation-listing results ---
+// --- 9/.S3: readings in GiB, and reservation-listing results ---
 
 /**
  * GiB to whole bytes, the readings builder's one rule: the figure times
@@ -4573,7 +4571,7 @@ export interface PodFigures {
 
 /** Pod figures in whole bytes, as written. */
 export interface PodBytes extends PodCgroupBytes {
-  /** W as b.uqm SR-7.1 reads it from these files: `memory.current` minus `inactive_file`, floored at 0. */
+  /** W as reads it from these files: `memory.current` minus `inactive_file`, floored at 0. */
   readonly workingSetBytes: number
   /** W's rest: W minus anon and active page cache, floored at 0. */
   readonly restBytes: number
@@ -4744,9 +4742,9 @@ export interface ReservationSpec {
   readonly shards: number
   /** Default `full`. */
   readonly kind?: RunKind
-  /** Default N × the cap (`SHARD_MEMORY_CAP_BYTES`), as a run writes it (b.uqm SR-6.2). */
+  /** Default N × the cap (`SHARD_MEMORY_CAP_BYTES`), as a run writes it. */
   readonly memoryBytes?: number
-  /** Default N × `CPUS_PER_SHARD` (b.uqm SR-6.2). */
+  /** Default N × `CPUS_PER_SHARD`. */
   readonly cpus?: number
 }
 
@@ -4833,13 +4831,13 @@ export function stubReservationReader(listing: ReservationListing = reservationL
 }
 
 // ---------------------------------------------------------------------------
-// 10. Sample sequences (E7)
+// 10. Sample sequences
 // ---------------------------------------------------------------------------
 //
-// The readings builder's sample sequences (b.uqm SR-21.4), for the memory
+// The readings builder's sample sequences, for the memory
 // watchdog's tests: a run of n samples, each a stated state of everything a
-// sample reads (b.uqm SR-7.3), and a final-reading entry per shard. Built
-// only from E6's and E1's builders: the cgroup tree (`createCgroupTree`), the
+// sample reads, and a final-reading entry per shard. Built
+// only from and builders: the cgroup tree (`createCgroupTree`), the
 // `/ci-live` builder (`makeCiLiveHome`, `makeDryRunLock`,
 // `addCiLiveLockHolder`), the fake container interface and the run-directory
 // builder (`makeRunDir`, `writeShardDir`, `resultFileText`). Everything is
@@ -4849,7 +4847,7 @@ export function stubReservationReader(listing: ReservationListing = reservationL
 // `step()` writes the next sample's state, then moves the fake clock one
 // `SAMPLE_INTERVAL_MS`, so a watchdog started at the clock's time before the
 // first step takes that state as its sample. Figures are given in GiB and
-// written as whole bytes by E6's one rule (`gibToBytes`), or given as exact
+// written as whole bytes by one rule (`gibToBytes`), or given as exact
 // byte counts (`{ bytes }`), so a case can sit on a line or one byte below.
 //
 // `State.OOMKilled` per sample. The fake container interface answers each
@@ -4949,7 +4947,7 @@ export interface SampleStep {
   readonly containerList?: 'fails'
 }
 
-/** A shard's final reading (b.uqm SR-10.6), constructed: E9 takes the real one. */
+/** A shard's final reading, constructed: shard management takes the real one. */
 export interface SampleFinal {
   /** `anon` (default 0); unread when `memoryStat` is `unreadable`. */
   readonly anon?: SampleFigure
@@ -5219,7 +5217,7 @@ export function buildSampleSequence(root: string, fakes: SampleSequenceFakes, sp
 }
 
 
-// b.omv SR-14.7: only fake login/config bytes, always below a caller's scratch root.
+// only fake login/config bytes, always below a caller's scratch root.
 import { fakeToken } from './credentials.ts'
 import { codexLoginContainerListArgs, type CodexLoginDeps, type LoginRead } from '../../scripts/codex-login.ts'
 export function makeFakeCodexHome(root: string, model = 'test/model:1') {

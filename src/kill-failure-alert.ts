@@ -1,6 +1,6 @@
 /**
  * kill-failure-alert.ts — The kill-failure alert's texts and its route
- * selection (b.jg5 SRJ-704, SRJ-1007, SRJ-1013).
+ * selection.
  *
  * The alert has two versions:
  *   - the ordinary version (`:rotating_light: *Kill failed*`), for a kill
@@ -8,7 +8,7 @@
  *     `ordinary` decision), whose row is kept. It quotes agent-director's
  *     description of the last kill failure; after a survivor-naming
  *     `ErrTmuxKillFailed` earlier in the same retry, the latest
- *     survivor-naming description, and both, in SRJ-1007's two-description
+ * survivor-naming description, and both, in the contract two-description
  *     form, when the last outcome is an `ErrTmuxKillFailed` naming no
  *     survivor. With no description it leaves the "agent-director said"
  *     sentence out;
@@ -25,7 +25,7 @@
  *
  * Every quoted description, the session and the instance id go through the
  * shared redaction on one line, capped as every quoted agent-director
- * description is (`renderLogMessageText`, b.jg5 SRJ-1001). The Slack-bound
+ * description is (`renderLogMessageText`). The Slack-bound
  * text (`forSlack`) also escapes Slack's control characters
  * (`escapeSlackControlCharacters`, `src/slack-text-escape.ts`), as every
  * notice that quotes agent-director's text does; a log line or a
@@ -36,10 +36,10 @@
  * text says that no bot, including any persona that sees the post, may run
  * it; the survivor version names no command. The survivor version's pid list
  * holds the pids of the description's survivor clause only, in the form
- * `SURVIVOR_PID_PATTERN` defines (SRJ-702, checked against agent-director
+ * `SURVIVOR_PID_PATTERN` defines (checked against agent-director
  * 0.11.0), never the worker's own pid.
  *
- * The route selection ({@link selectKillFailureAlertRoute}, SRJ-704, first
+ * The route selection ({@link selectKillFailureAlertRoute}, first
  * match wins, for either version):
  *   1. a start-sweep kill: the server log and an `orphan-cleanup` entry;
  *   2. a CLI teardown: printed, the server log and a `persona-kill-failed`
@@ -52,11 +52,11 @@
  *      ordinary version once per kill-failure episode, the survivor version
  *      once per bounded retry.
  * The survivor version's entry, on every route that writes one, is of its
- * own class, `persona-kill-survivor` (SRJ-1013). The persona teardown's
+ * own class, `persona-kill-survivor`. The persona teardown's
  * class, `persona-teardown-notice` (`PERSONA_TEARDOWN_NOTICE_LABEL`), is the
  * one constant the persona notifier (`src/persona-notifier.ts`), which owns
  * the teardown route for every notice raised during a persona teardown
- * (SRJ-1003), imports and re-exports. While a persona's teardown window is
+ * imports and re-exports. While a persona's teardown window is
  * open, the kill-failure alerts take the persona-teardown route for any
  * alert raised for its key, whatever its context but a start-sweep or CLI
  * teardown kill (`src/persona-episodes.ts`).
@@ -95,33 +95,33 @@ import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 // Versions, contexts and classes
 // ---------------------------------------------------------------------------
 
-/** The ordinary version: a kill that still fails after the bounded retry (SRJ-1007). */
+/** The ordinary version: a kill that still fails after the bounded retry. */
 export const KILL_FAILURE_VERSION_ORDINARY = 'ordinary'
-/** The survivor version: a bounded retry that ended as a success after a survivor-naming failure (SRJ-1007). */
+/** The survivor version: a bounded retry that ended as a success after a survivor-naming failure. */
 export const KILL_FAILURE_VERSION_SURVIVOR = 'survivor'
 
 /** Which version of the alert. */
 export type KillFailureAlertVersion = typeof KILL_FAILURE_VERSION_ORDINARY | typeof KILL_FAILURE_VERSION_SURVIVOR
 
-/** Context: a start-sweep kill (SRJ-714). */
+/** Context: a start-sweep kill. */
 export const KILL_FAILURE_CONTEXT_START_SWEEP = 'start sweep'
-/** Context: a CLI teardown's kill (SRJ-904, SRJ-909). */
+/** Context: a CLI teardown's kill. */
 export const KILL_FAILURE_CONTEXT_CLI_TEARDOWN = 'CLI teardown'
-/** Context: a persona teardown's kill (removal or destructive modify, SRJ-1003). */
+/** Context: a persona teardown's kill (removal or destructive modify). */
 export const KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN = 'persona teardown'
-/** Context: an old-life wait's kill (SRJ-811). */
+/** Context: an old-life wait's kill. */
 export const KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT = 'old-life wait'
-/** Context: the abort of CSCB's own stuck launch (SRJ-412). */
+/** Context: the abort of CSCB's own stuck launch. */
 export const KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT = 'stuck-launch abort'
 /**
  * Context: the server's restart path, its collision ladder, or a live-row
- * sequence one of them started (SRJ-1007). It names the context in the log
+ * sequence one of them started. It names the context in the log
  * line and entry of an alert for a persona no longer in the applied
  * configuration; for a configured persona the alert goes to its destination.
  */
 export const KILL_FAILURE_CONTEXT_RECOVERY = 'recovery'
 
-/** Every context SRJ-1007 lists, in its order. */
+/** Every context lists, in its order. */
 export const KILL_FAILURE_CONTEXTS = [
   KILL_FAILURE_CONTEXT_START_SWEEP,
   KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
@@ -138,16 +138,16 @@ export type KillFailureAlertContext = (typeof KILL_FAILURE_CONTEXTS)[number]
  * The `startup-errors.log` class of the ordinary version with no Slack
  * destination outside a persona teardown and the start sweep: a CLI
  * teardown, a persona no longer in the applied configuration, an old-life
- * wait's kill (SRJ-1013).
+ * wait's kill.
  */
 export const PERSONA_KILL_FAILED_LABEL = 'persona-kill-failed'
 
-/** The `startup-errors.log` class of the survivor version on every route that writes an entry (SRJ-1013). */
+/** The `startup-errors.log` class of the survivor version on every route that writes an entry. */
 export const PERSONA_KILL_SURVIVOR_LABEL = 'persona-kill-survivor'
 
 /**
  * The `startup-errors.log` class of a notice raised during a persona teardown
- * (SRJ-1003, SRJ-1013): the ordinary version's on the persona-teardown route,
+ * the ordinary version's on the persona-teardown route,
  * and every other notice the persona notifier's teardown window writes. The
  * one constant: the persona notifier (`src/persona-notifier.ts`), which owns
  * the teardown route for every notice, imports and re-exports it, since this
@@ -156,14 +156,14 @@ export const PERSONA_KILL_SURVIVOR_LABEL = 'persona-kill-survivor'
 export const PERSONA_TEARDOWN_NOTICE_LABEL = 'persona-teardown-notice'
 
 /**
- * The start sweep's class (SRJ-714, SRJ-1013): the ordinary version rides in
+ * The start sweep's class: the ordinary version rides in
  * its entry. The start sweep's own entries (`reconcileOrphans`,
  * `src/session-manager.ts`) are of this class too.
  */
 export const ORPHAN_CLEANUP_LABEL = 'orphan-cleanup'
 
 // ---------------------------------------------------------------------------
-// Closing sentences (SRJ-1007)
+// Closing sentences
 // ---------------------------------------------------------------------------
 
 /** Ordinary version, a configured persona's destination, the persona not latched. */
@@ -172,7 +172,7 @@ export const KILL_FAILURE_ORDINARY_DESTINATION_CLOSING = 'CSCB keeps retrying on
 /**
  * Ordinary version, a configured persona's destination, when the retry's last
  * outcome latched the persona, or a `status` read between its tries did
- * (hatch A2); its own hold post goes there too.
+ * (design A2); its own hold post goes there too.
  */
 export const KILL_FAILURE_ORDINARY_LATCHED_CLOSING =
   'This persona is held for a human (see its hold post); CSCB posts no second alert about this.'
@@ -213,7 +213,7 @@ export type KillFailureClosing =
   | typeof KILL_FAILURE_CLOSING_LOG_ONLY
 
 /**
- * The closing sentence of `version` for `closing` (SRJ-1007). The survivor
+ * The closing sentence of `version` for `closing`. The survivor
  * version has no latched row: its destination sentence is used for a latched
  * persona too, since it neither holds the persona nor says CSCB retries.
  */
@@ -241,7 +241,7 @@ export function killFailureClosingSentence(version: KillFailureAlertVersion, clo
 }
 
 // ---------------------------------------------------------------------------
-// Route selection (SRJ-704, SRJ-1013)
+// Route selection
 // ---------------------------------------------------------------------------
 
 /** Route: a start-sweep kill (the server log and an entry). */
@@ -255,7 +255,7 @@ export const KILL_FAILURE_ROUTE_NOT_CONFIGURED = 'not-configured'
 /** Route: a configured persona's destination. */
 export const KILL_FAILURE_ROUTE_DESTINATION = 'destination'
 
-/** Which of SRJ-704's routes. */
+/** Which of the contract routes. */
 export type KillFailureAlertRouteKind =
   | typeof KILL_FAILURE_ROUTE_START_SWEEP
   | typeof KILL_FAILURE_ROUTE_CLI_TEARDOWN
@@ -274,7 +274,7 @@ export interface KillFailureAlertRouteInput {
   /**
    * Whether the persona is latched now: by the bounded retry's last outcome
    * (a CONFLICT or an UNUSABLE NAME answer) or by a `status` read between its
-   * tries (SRJ-702; hatch A2). Only the ordinary version at a destination
+   * tries (design A2). Only the ordinary version at a destination
    * reads it.
    */
   readonly latched: boolean
@@ -300,7 +300,7 @@ export interface KillFailureAlertRoute {
 
 /**
  * The route of a CLI teardown's alert: log-only and printed, always with its
- * startup-errors class (SRJ-704, SRJ-1013).
+ * startup-errors class.
  */
 export interface KillFailureCliTeardownRoute extends KillFailureAlertRoute {
   readonly route: typeof KILL_FAILURE_ROUTE_CLI_TEARDOWN
@@ -310,8 +310,8 @@ export interface KillFailureCliTeardownRoute extends KillFailureAlertRoute {
 }
 
 /**
- * SRJ-704's route for an alert, first match wins (see the module comment),
- * with SRJ-1013's class and SRJ-1007's closing sentence. Pure; never throws.
+ * route for an alert, first match wins (see the module comment),
+ * with class and closing sentence. Pure; never throws.
  * The CLI teardown's context always takes its own route
  * ({@link KillFailureCliTeardownRoute}).
  */
@@ -342,7 +342,7 @@ export function selectKillFailureAlertRoute(input: KillFailureAlertRouteInput): 
     return logOnly(KILL_FAILURE_ROUTE_PERSONA_TEARDOWN, PERSONA_TEARDOWN_NOTICE_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
   }
   // An old-life wait's kill is of a retired key's old life: always a persona
-  // no longer in the applied configuration (SRJ-704).
+  // no longer in the applied configuration.
   if (context === KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT || input.configured !== true) {
     return logOnly(KILL_FAILURE_ROUTE_NOT_CONFIGURED, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
   }
@@ -358,7 +358,7 @@ export function selectKillFailureAlertRoute(input: KillFailureAlertRouteInput): 
 }
 
 // ---------------------------------------------------------------------------
-// Bodies (SRJ-1007)
+// Bodies
 // ---------------------------------------------------------------------------
 
 /**
@@ -405,14 +405,14 @@ function renderQuoted(text: unknown, forSlack: boolean, fallback = ''): string {
   return forSlack ? escapeSlackControlCharacters(value) : value
 }
 
-/** `<session>`: the session name in double quotes (SRJ-1001). */
+/** `<session>`: the session name in double quotes. */
 function renderSession(session: string, forSlack: boolean): string {
   return `"${renderQuoted(session, forSlack, 'unknown')}"`
 }
 
 /**
  * The ordinary version's "agent-director said" sentence with its trailing
- * space, or the empty string when there is no description (SRJ-1007): one
+ * space, or the empty string when there is no description: one
  * description quoted; with both, the last kill failure's and then the
  * earlier survivor-naming one, in the stated form.
  */
@@ -426,7 +426,7 @@ function agentDirectorSaid(quotes: KillFailureOrdinaryQuotes | undefined, forSla
   return one === '' ? '' : `agent-director said: "${one}". `
 }
 
-/** The ordinary version's body, with no closing sentence (SRJ-1007). Never throws. */
+/** The ordinary version's body, with no closing sentence. Never throws. */
 export function killFailureOrdinaryBody(input: KillFailureOrdinaryBodyInput): string {
   const { forSlack } = input
   const session = renderSession(input.session, forSlack)
@@ -446,7 +446,7 @@ export function killFailureOrdinaryBody(input: KillFailureOrdinaryBodyInput): st
 }
 
 /**
- * `<pid list>` (SRJ-1007): "pid S" for each pid `description`'s survivor
+ * `<pid list>`: "pid S" for each pid `description`'s survivor
  * clause names (`survivorPids`: one for "(pid S)", each of "(pids S1, S2)";
  * never the worker's), in its order, joined with ", "; the empty string when
  * it names none. Never throws.
@@ -461,7 +461,7 @@ export function killFailureSurvivorPidList(description: string): string {
   }
 }
 
-/** The survivor version's body, with no closing sentence (SRJ-1007). Names no command. Never throws. */
+/** The survivor version's body, with no closing sentence. Names no command. Never throws. */
 export function killFailureSurvivorBody(input: KillFailureSurvivorBodyInput): string {
   const { forSlack } = input
   const session = renderSession(input.session, forSlack)
@@ -552,7 +552,7 @@ export function killFailureAlertText(content: KillFailureAlertContent, closing: 
 /**
  * A CLI teardown's context in the log-line and startup-errors form, naming
  * the command that ran the teardown (`stop --stop-bots` or `clean_restart`,
- * SRJ-909, SRJ-1013). The command is a plain string: this module imports
+ *). The command is a plain string: this module imports
  * neither `src/cli.ts` nor `src/cli-teardown.ts`.
  */
 export interface KillFailureCliTeardownEntryContext {
@@ -581,7 +581,7 @@ export function renderKillFailureAlertEntryContext(context: KillFailureAlertEntr
 }
 
 /**
- * The log-line and startup-errors form (SRJ-1007): the persona reference or
+ * The log-line and startup-errors form: the persona reference or
  * the row's id (`ref`, e.g. `persona=<key>` or `instanceId=<id>`), the
  * context, then the text: `<ref> (<context>): <text>`; a CLI teardown's
  * context names its command, `<ref> (CLI teardown, <command>): <text>`.

@@ -1,10 +1,10 @@
 /**
- * retired-keys.ts — The retired-key record (b.jg5 SRJ-801, SRJ-802): which
+ * retired-keys.ts — The retired-key record: which
  * persona keys are retired, so that no launch resumes a life a removal or a
  * destructive modify retired, and whether each retired key's new life has
  * begun.
  *
- * Where (SRJ-801). The file `retired-keys.json` ({@link RETIRED_KEYS_FILE_NAME})
+ * Where. The file `retired-keys.json` ({@link RETIRED_KEYS_FILE_NAME})
  * in the server's state directory (`resolveServerStateDir()`,
  * `src/config.ts`: `~/.config/claude-slack-channel-bots/` unless `SLACK_STATE_DIR` is
  * set), beside `config.json.last-applied` ({@link retiredKeysPath}). Only the
@@ -14,7 +14,7 @@
  * entry. It survives a server restart: a new store over the same directory
  * reads what an earlier one wrote.
  *
- * Format (SRJ-802). A UTF-8 JSON object, `version` (integer 1) and `keys`,
+ * Format. A UTF-8 JSON object, `version` (integer 1) and `keys`,
  * one entry per retired key: `retired_at` (RFC 3339 UTC, ending in `Z`),
  * `cause` ({@link RETIRED_KEY_CAUSES}) and `new_life_begun_at` (such a
  * timestamp, or `null` while the key's row, if any, is the old life).
@@ -22,7 +22,7 @@
  * strictly: every field is required with its type, only `new_life_begun_at`
  * may be `null`, a field the format does not name is refused at either level,
  * and a key is any non-empty string (the start sweep records the keys of
- * rows' `persona` labels, SRJ-714). A missing file is an empty record. A file
+ * rows' `persona` labels). A missing file is an empty record. A file
  * that exists but cannot be read (a directory, FIFO or other non-regular file
  * included, refused by the config reader's non-blocking open-then-fstat rule,
  * `readPersonaConfigBytes`, which reads the record whole with no size cap),
@@ -40,26 +40,26 @@
  * as it was, and an unsynced rename has the previous bytes written back, best
  * effort. Two changes are held in memory for the server's life instead, each
  * flagged unwritten until a later write that succeeds carries it: the keys of
- * a failed batch recorded with the `absent-at-start` cause (SRJ-714), and a
- * failed mark (SRJ-806). Its users:
+ * a failed batch recorded with the `absent-at-start` cause, and a
+ * failed mark. Its users:
  *   - `record` (a batch, one write) and `restore`: the apply's step 1 and its
- *     undo (SRJ-803, SRJ-804), and the start sweep (`absent-at-start`,
- *     SRJ-714). Recording a key already recorded clears its mark; one with no
+ * undo, and the start sweep (`absent-at-start`,
+ *). Recording a key already recorded clears its mark; one with no
  *     mark is left as it is and writes nothing, unless it is held only in
- *     memory, which makes the batch write (SRJ-803);
+ * memory, which makes the batch write;
  *   - `isHeldInMemory`: the apply's step 1, which writes the record for a
- *     persona it brings up whose key is held only in memory (SRJ-803);
- *   - `mark`: a reuse spawn that began the key's new life (SRJ-806);
+ * persona it brings up whose key is held only in memory;
+ * - `mark`: a reuse spawn that began the key's new life;
  *   - `clear`: the session manager's shared own-row reads
  *     (`readPersonaOwnRow`, `applyOwnRowStatusStep`) and the persona
  *     teardown kill's read between its tries (`readTeardownKillRow`), on the
  *     row-read rule's clear decision for a marked key's row read live other
- *     than `pending` (SRJ-807);
- *   - `isRecorded`, `isMarked` and `entry`: the launch rule (SRJ-805), the
- *     row-read rule and the old-life hold (SRJ-809);
+ * than `pending`;
+ * - `isRecorded`, `isMarked` and `entry`: the launch rule, the
+ * row-read rule and the old-life hold;
  *   - `recordGeneration`: a launch attempt, read when it starts and at its
  *     reuse spawn's success, so that a key recorded while the attempt was in
- *     flight gets no mark (SRJ-806).
+ * flight gets no mark.
  *
  * The record generation. Each key has an in-memory count of the `record`
  * calls that named it in this store's life, every one counted: a batch that
@@ -72,7 +72,7 @@
  * again in between, which the record itself cannot show when a re-record of
  * an unmarked key leaves it as it was.
  *
- * Log lines (SRJ-1014), one per change of the record and one per failed
+ * Log lines, one per change of the record and one per failed
  * write, to the injected log (a throwing log is swallowed). They name the
  * file, the keys and the cause or action, and carry no file content, no
  * parser text and no token:
@@ -83,7 +83,7 @@
  *   [slack] retired-keys: restored the record held before the apply …
  *   [slack] retired-keys: cannot <action> …
  *
- * The old-life holds (b.jg5 SRJ-809; {@link createOldLifeHoldSet}). An old
+ * The old-life holds ({@link createOldLifeHoldSet}). An old
  * life that may still be running holds its working directory until
  * agent-director shows it finished. Holds live in server memory only: one
  * hold set per server, built by `main()` beside the store and shared by the
@@ -92,7 +92,7 @@
  * A hold is keyed by the old row's instance id and carries the old key, the
  * held directory (compared by real path), what began it
  * ({@link OLD_LIFE_HOLD_CAUSES}), whether the old key's kill has failed
- * (SRJ-812) and the personas recorded as waiting on it. It ends only on a
+ * and the personas recorded as waiting on it. It ends only on a
  * read of the old row as `ended` or `missing` (or no row), a listing in a
  * `find-missing` result's `ids`, or the key's new life
  * ({@link OLD_LIFE_HOLD_END_REASONS}); no kill outcome ends it. The hold set
@@ -100,8 +100,8 @@
  * without its mark is asked of the store by the hold's starters. One line
  * when a hold begins and one when it ends:
  *
- *   [slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — the old life may still be running (b.jg5 SRJ-809)
- *   [slack] old-life hold: ended on "<real path>" for oldKey=<key> (instanceId="<id>"): <reason>[ (<read>)]; waiting personas: <keys|none> (b.jg5 SRJ-809)
+ * [slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — the old life may still be running
+ * [slack] old-life hold: ended on "<real path>" for oldKey=<key> (instanceId="<id>"): <reason>[ (<read>)]; waiting personas: <keys|none>
  *
  * Importable with no side effect: nothing reads a file or the environment,
  * arms a timer or logs at import. Loading the store reads the file once and
@@ -135,23 +135,23 @@ import { PERSONA_KEY_RE, personaInstanceId } from './persona-identity.ts'
 import { recordStartupError } from './startup-errors.ts'
 
 // ---------------------------------------------------------------------------
-// Constants (b.jg5 SRJ-801, SRJ-802, SRJ-1013)
+// Constants
 // ---------------------------------------------------------------------------
 
-/** The record's file name, in the server's state directory (SRJ-801). */
+/** The record's file name, in the server's state directory. */
 export const RETIRED_KEYS_FILE_NAME = 'retired-keys.json'
 
-/** The format version this server reads and writes (SRJ-802). */
+/** The format version this server reads and writes. */
 export const RETIRED_KEYS_FORMAT_VERSION = 1
 
-/** A removed persona's key (a renamed persona's old key included), recorded at the apply's step 1 (SRJ-803). */
+/** A removed persona's key (a renamed persona's old key included), recorded at the apply's step 1. */
 export const RETIRED_KEY_CAUSE_REMOVED = 'removed'
-/** A destructive modify's old half, recorded at the apply's step 1 (SRJ-803). */
+/** A destructive modify's old half, recorded at the apply's step 1. */
 export const RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY = 'destructive-modify'
-/** A row's persona absent from the applied configuration, recorded by the start sweep (SRJ-714). */
+/** A row's persona absent from the applied configuration, recorded by the start sweep. */
 export const RETIRED_KEY_CAUSE_ABSENT_AT_START = 'absent-at-start'
 
-/** Every cause the record holds, in the format's order (SRJ-802). */
+/** Every cause the record holds, in the format's order. */
 export const RETIRED_KEY_CAUSES = [
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY,
@@ -161,7 +161,7 @@ export const RETIRED_KEY_CAUSES = [
 /** What recorded a key last. */
 export type RetiredKeyCause = (typeof RETIRED_KEY_CAUSES)[number]
 
-/** The startup-errors class of a record the start cannot read, parse or validate (SRJ-802, SRJ-1013). */
+/** The startup-errors class of a record the start cannot read, parse or validate. */
 export const RETIRED_KEYS_UNREADABLE_LABEL = 'retired-keys-unreadable'
 
 /** The start of every line the store logs. */
@@ -186,7 +186,7 @@ export interface RetiredKeyEntry {
   readonly retiredAt: string
   /** What recorded it last. */
   readonly cause: RetiredKeyCause
-  /** When a reuse for the key began its new life (SRJ-806), or null while its row, if any, is the old life. */
+  /** When a reuse for the key began its new life, or null while its row, if any, is the old life. */
   readonly newLifeBegunAt: string | null
 }
 
@@ -197,7 +197,7 @@ export interface RetiredKeyEntry {
 export type RetiredKeyRecord = ReadonlyMap<string, RetiredKeyEntry>
 
 // ---------------------------------------------------------------------------
-// Serialiser and parser (b.jg5 SRJ-802)
+// Serialiser and parser
 // ---------------------------------------------------------------------------
 
 /**
@@ -266,7 +266,7 @@ function hasOnlyFields(fields: readonly string[], expected: readonly string[]): 
 }
 
 /**
- * Parse and validate the record's bytes (SRJ-802), strictly: valid UTF-8 (a
+ * Parse and validate the record's bytes, strictly: valid UTF-8 (a
  * byte order mark is refused), a JSON object with exactly `version` (the
  * integer 1) and `keys` (an object); each key a non-empty string; each entry
  * an object with exactly `retired_at` (an RFC 3339 UTC timestamp ending in
@@ -341,7 +341,7 @@ function entryProblem(key: string, value: unknown): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// The refusal (b.jg5 SRJ-802, SRJ-1013)
+// The refusal
 // ---------------------------------------------------------------------------
 
 /**
@@ -360,7 +360,7 @@ export function retiredKeysUnreadableMessage(path: string, problem: string): str
 }
 
 // ---------------------------------------------------------------------------
-// The store (b.jg5 SRJ-802, SRJ-803, SRJ-804, SRJ-806, SRJ-807)
+// The store
 // ---------------------------------------------------------------------------
 
 /**
@@ -449,7 +449,7 @@ export interface RetiredKeyStore {
   isMarked(key: string): boolean
   /**
    * Whether `key` is held only in memory: recorded by a failed batch with the
-   * `absent-at-start` cause that no write has carried yet (SRJ-714, SRJ-803).
+   * `absent-at-start` cause that no write has carried yet.
    */
   isHeldInMemory(key: string): boolean
   /** `key`'s entry in memory, or undefined when it is not recorded. */
@@ -463,17 +463,17 @@ export interface RetiredKeyStore {
    * write, its failure included; a key named twice in one batch counts once.
    * Held in memory only: never written, never restored, it only increases.
    * A reader that captures it before a wait and finds it unchanged after
-   * knows no `record` named the key in between (SRJ-806).
+   * knows no `record` named the key in between.
    */
   recordGeneration(key: string): number
   /**
-   * Record a batch with one write (SRJ-803). A new key gets an entry
+   * Record a batch with one write. A new key gets an entry
    * (`retired_at` now, the cause, no mark); a recorded key whose mark is set
    * gets the mark cleared, `retired_at` now and the new cause; a recorded key
    * with no mark is left as it is. A batch that changes nothing writes nothing,
    * unless one of its keys is held only in memory. A failed write leaves the
    * record in memory as it was, except that the keys it recorded with the
-   * `absent-at-start` cause stay recorded, held only in memory (SRJ-714).
+   * `absent-at-start` cause stay recorded, held only in memory.
    * Answers the outcome and the record before the batch. Throws a `RangeError`
    * on an empty key or an unknown cause, before any change. Every key of a
    * batch that does not throw has its record generation increased by one,
@@ -481,14 +481,14 @@ export interface RetiredKeyStore {
    */
   record(batch: readonly RetiredKeyToRecord[]): RetiredKeysRecordResult
   /**
-   * Set `key`'s "new life has begun" mark, now, with one write (SRJ-806).
+   * Set `key`'s "new life has begun" mark, now, with one write.
    * Writes nothing for a key not recorded, or already marked with the mark
    * written. A mark held only in memory is written again, with its time. A
    * failed write keeps the mark set in memory, held for a later write.
    */
   mark(key: string): RetiredKeysChangeOutcome
   /**
-   * Remove `key`'s entry with one write (SRJ-807). Writes nothing for a key
+   * Remove `key`'s entry with one write. Writes nothing for a key
    * not recorded; a failed write keeps the entry. `onRead`, when given, says
    * which read cleared it, and the one line the clear logs carries it.
    */
@@ -496,7 +496,7 @@ export interface RetiredKeyStore {
   /** The record in memory now, unwritten changes included. */
   snapshot(): RetiredKeysSnapshot
   /**
-   * Put `snapshot` back (SRJ-804): write it, keys and marks held only in memory
+   * Put `snapshot` back: write it, keys and marks held only in memory
    * included, or, when it is empty, remove the file durably, writing an empty
    * record when the remove fails. A failure leaves the record in memory as it
    * is now, so the keys it could not remove stay retired.
@@ -523,35 +523,34 @@ function keyRef(key: string): string {
 }
 
 /**
- * The record-change line of a recording (b.jg5 SRJ-803, SRJ-1014):
+ * The record-change line of a recording:
  * `described` names each key written (`persona=<key> (cause=<cause>…)`),
  * `file` the record's path JSON-quoted, `carried` the suffix for changes held
  * only in memory that the write carries (empty when none). Pure.
  *
- *   [slack] retired-keys: recorded <keys> in "<path>"[; it carries …] (b.jg5 SRJ-803)
+ * [slack] retired-keys: recorded <keys> in "<path>"[; it carries …]
  */
 export function retiredKeysRecordedLine(described: string, file: string, carried: string): string {
-  return `${RETIRED_KEYS_LOG_PREFIX} recorded ${described} in ${file}${carried} (b.jg5 SRJ-803)`
+  return `${RETIRED_KEYS_LOG_PREFIX} recorded ${described} in ${file}${carried}`
 }
 
 /**
- * The record-change line of a "new life has begun" mark (b.jg5 SRJ-806,
- * SRJ-1014). Pure.
+ * The record-change line of a "new life has begun" mark. Pure.
  *
- *   [slack] retired-keys: persona=<key> marked: its new life has begun, in "<path>"[; it carries …] (b.jg5 SRJ-806)
+ * [slack] retired-keys: persona=<key> marked: its new life has begun, in "<path>"[; it carries …]
  */
 export function retiredKeysMarkedLine(key: string, file: string, carried: string): string {
-  return `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} marked: its new life has begun, in ${file}${carried} (b.jg5 SRJ-806)`
+  return `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} marked: its new life has begun, in ${file}${carried}`
 }
 
 /**
- * The record-change line of an entry's clear (b.jg5 SRJ-807, SRJ-1014),
+ * The record-change line of an entry's clear,
  * `onRead` the read that cleared it, when given. Pure.
  *
- *   [slack] retired-keys: persona=<key> entry cleared from "<path>"[ on <read>][; it carries …] (b.jg5 SRJ-807)
+ * [slack] retired-keys: persona=<key> entry cleared from "<path>"[ on <read>][; it carries …]
  */
 export function retiredKeysClearedLine(key: string, file: string, onRead: string | undefined, carried: string): string {
-  return `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} entry cleared from ${file}${onReadSuffix(onRead)}${carried} (b.jg5 SRJ-807)`
+  return `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} entry cleared from ${file}${onReadSuffix(onRead)}${carried}`
 }
 
 /** ` on <read>` for a clear's `onRead`, when given and not empty, else nothing. Pure. */
@@ -563,7 +562,7 @@ function onReadSuffix(onRead: string | undefined): string {
 export const RETIRED_KEY_WRITTEN_NEW = 'new'
 /** A recorded key written over a marked entry, whose "new life has begun" mark the write clears. */
 export const RETIRED_KEY_WRITTEN_MARK_CLEARED = 'mark-cleared'
-/** A key held only in memory (a failed `absent-at-start` recording, b.jg5 SRJ-714) that the write now carries. */
+/** A key held only in memory (a failed `absent-at-start` recording) that the write now carries. */
 export const RETIRED_KEY_WRITTEN_HELD = 'held-in-memory'
 
 /** How a recording writes one key ({@link retiredKeyWrittenText}). */
@@ -573,7 +572,7 @@ export type RetiredKeyWrittenAs =
   | typeof RETIRED_KEY_WRITTEN_HELD
 
 /**
- * What a recording's line says of one key it writes (b.jg5 SRJ-803): the
+ * What a recording's line says of one key it writes: the
  * persona reference and its cause, with what the write does to it besides.
  * `retiredKeysRecordedLine`'s `described` is these, distinct, joined with
  * `, ` in the batch's order. Pure.
@@ -594,7 +593,7 @@ export function retiredKeyWrittenText(key: string, cause: string, as: RetiredKey
 
 /**
  * The suffix of a record-change line whose write carries the changes held
- * only in memory for `keys` (b.jg5 SRJ-714, SRJ-806): the keys sorted and
+ * only in memory for `keys`: the keys sorted and
  * distinct; nothing when there are none. Pure.
  *
  *   ; it carries the changes held only in memory for persona=<key>[, persona=<key>…]
@@ -605,116 +604,115 @@ export function retiredKeysCarriedSuffix(keys: Iterable<string>): string {
 }
 
 /**
- * The line of a recording whose write failed (b.jg5 SRJ-803, SRJ-714):
+ * The line of a recording whose write failed:
  * `described` as for {@link retiredKeysRecordedLine}, `detail` what the
  * write did (its errno and what the file holds), `heldInMemory` the
  * `absent-at-start` keys the server now holds as retired in memory (none:
  * the record in memory is unchanged). Pure.
  *
- *   [slack] retired-keys: cannot record <keys> in "<path>"<detail>; this server holds persona=<key>[, …] as retired in memory for its life, and the next write of the record that succeeds carries them (b.jg5 SRJ-803, SRJ-714)
- *   [slack] retired-keys: cannot record <keys> in "<path>"<detail>; the record in memory is unchanged (b.jg5 SRJ-803)
+ * [slack] retired-keys: cannot record <keys> in "<path>"<detail>; this server holds persona=<key>[, …] as retired in memory for its life, and the next write of the record that succeeds carries them
+ * [slack] retired-keys: cannot record <keys> in "<path>"<detail>; the record in memory is unchanged
  */
 export function retiredKeysCannotRecordLine(described: string, file: string, detail: string, heldInMemory: readonly string[]): string {
   const inMemory =
     heldInMemory.length > 0
-      ? `this server holds ${heldInMemory.map(keyRef).join(', ')} as retired in memory for its life, and the next write of the record that succeeds carries them (b.jg5 SRJ-803, SRJ-714)`
-      : 'the record in memory is unchanged (b.jg5 SRJ-803)'
+      ? `this server holds ${heldInMemory.map(keyRef).join(', ')} as retired in memory for its life, and the next write of the record that succeeds carries them`
+      : 'the record in memory is unchanged'
   return `${RETIRED_KEYS_LOG_PREFIX} cannot record ${described} in ${file}${detail}; ${inMemory}`
 }
 
 /**
- * The line of a "new life has begun" mark whose write failed (b.jg5
- * SRJ-806), `detail` what the write did. Pure.
+ * The line of a "new life has begun" mark whose write failed, `detail` what the write did. Pure.
  *
- *   [slack] retired-keys: cannot mark persona=<key> in "<path>"<detail>; this server holds its mark in memory, and its next launch decision writes it again (b.jg5 SRJ-806)
+ * [slack] retired-keys: cannot mark persona=<key> in "<path>"<detail>; this server holds its mark in memory, and its next launch decision writes it again
  */
 export function retiredKeysCannotMarkLine(key: string, file: string, detail: string): string {
   return (
     `${RETIRED_KEYS_LOG_PREFIX} cannot mark ${keyRef(key)} in ${file}${detail}; this server holds its mark in memory, ` +
-    'and its next launch decision writes it again (b.jg5 SRJ-806)'
+    'and its next launch decision writes it again'
   )
 }
 
 /**
- * The line of an entry's clear whose write failed (b.jg5 SRJ-807), `onRead`
+ * The line of an entry's clear whose write failed, `onRead`
  * the read that cleared it, when given, `detail` what the write did. Pure.
  *
- *   [slack] retired-keys: cannot clear persona=<key> from "<path>"[ on <read>]<detail>; the entry stays, and the next qualifying read clears it again (b.jg5 SRJ-807)
+ * [slack] retired-keys: cannot clear persona=<key> from "<path>"[ on <read>]<detail>; the entry stays, and the next qualifying read clears it again
  */
 export function retiredKeysCannotClearLine(key: string, file: string, onRead: string | undefined, detail: string): string {
   return (
     `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${keyRef(key)} from ${file}${onReadSuffix(onRead)}${detail}; the entry stays, and the next ` +
-    'qualifying read clears it again (b.jg5 SRJ-807)'
+    'qualifying read clears it again'
   )
 }
 
 /**
- * The restore line (b.jg5 SRJ-804) when the record held before the apply
+ * The restore line when the record held before the apply
  * was written back to `file`. Pure.
  *
- *   [slack] retired-keys: restored the record held before the apply in "<path>" (b.jg5 SRJ-804)
+ * [slack] retired-keys: restored the record held before the apply in "<path>"
  */
 export function retiredKeysRestoredLine(file: string): string {
-  return `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply in ${file} (b.jg5 SRJ-804)`
+  return `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply in ${file}`
 }
 
 /**
- * The restore line (b.jg5 SRJ-804) when the record held before the apply
+ * The restore line when the record held before the apply
  * was empty and the file was removed; `unsyncedErrno`, when given (the
  * remove's errno suffix, possibly empty), says its directory could not be
  * synced. Pure.
  *
- *   [slack] retired-keys: restored the record held before the apply: it was empty, so "<path>" was removed (b.jg5 SRJ-804)
- *   [slack] retired-keys: restored the record held before the apply: it was empty, so "<path>" was removed, but its directory could not be synced<errno>, so it may reappear after a crash (b.jg5 SRJ-804)
+ * [slack] retired-keys: restored the record held before the apply: it was empty, so "<path>" was removed
+ * [slack] retired-keys: restored the record held before the apply: it was empty, so "<path>" was removed, but its directory could not be synced<errno>, so it may reappear after a crash
  */
 export function retiredKeysRestoredEmptyRemovedLine(file: string, unsyncedErrno?: string): string {
   if (unsyncedErrno === undefined) {
-    return `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed (b.jg5 SRJ-804)`
+    return `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed`
   }
   return (
     `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed, but its ` +
-    `directory could not be synced${unsyncedErrno}, so it may reappear after a crash (b.jg5 SRJ-804)`
+    `directory could not be synced${unsyncedErrno}, so it may reappear after a crash`
   )
 }
 
 /**
- * The restore line (b.jg5 SRJ-804) when the record held before the apply
+ * The restore line when the record held before the apply
  * was empty, removing `file` failed (`removeDetail`, its errno suffix) and an
  * empty record was written in its place. Pure.
  *
- *   [slack] retired-keys: restored the record held before the apply: it was empty, and removing "<path>" failed<errno>, so an empty record was written (b.jg5 SRJ-804)
+ * [slack] retired-keys: restored the record held before the apply: it was empty, and removing "<path>" failed<errno>, so an empty record was written
  */
 export function retiredKeysRestoredEmptyWrittenLine(file: string, removeDetail: string): string {
   return (
     `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, and removing ${file} failed` +
-    `${removeDetail}, so an empty record was written (b.jg5 SRJ-804)`
+    `${removeDetail}, so an empty record was written`
   )
 }
 
 /**
- * The failed restore line (b.jg5 SRJ-804) of an empty record: removing
+ * The failed restore line of an empty record: removing
  * `file` failed (`removeDetail`) and so did writing an empty record
  * (`writeDetail`). Pure.
  *
- *   [slack] retired-keys: cannot restore the record held before the apply: removing "<path>" failed<errno>, and writing an empty record failed<detail>; the keys it holds stay retired (b.jg5 SRJ-804)
+ * [slack] retired-keys: cannot restore the record held before the apply: removing "<path>" failed<errno>, and writing an empty record failed<detail>; the keys it holds stay retired
  */
 export function retiredKeysCannotRestoreEmptyLine(file: string, removeDetail: string, writeDetail: string): string {
   return (
     `${RETIRED_KEYS_LOG_PREFIX} cannot restore the record held before the apply: removing ${file} failed${removeDetail}, and ` +
-    `writing an empty record failed${writeDetail}; the keys it holds stay retired (b.jg5 SRJ-804)`
+    `writing an empty record failed${writeDetail}; the keys it holds stay retired`
   )
 }
 
 /**
- * The failed restore line (b.jg5 SRJ-804) of a record that is not empty,
+ * The failed restore line of a record that is not empty,
  * `detail` what the write did. Pure.
  *
- *   [slack] retired-keys: cannot restore the record held before the apply in "<path>"<detail>; the keys it could not remove stay retired (b.jg5 SRJ-804)
+ * [slack] retired-keys: cannot restore the record held before the apply in "<path>"<detail>; the keys it could not remove stay retired
  */
 export function retiredKeysCannotRestoreLine(file: string, detail: string): string {
   return (
     `${RETIRED_KEYS_LOG_PREFIX} cannot restore the record held before the apply in ${file}${detail}; the keys it ` +
-    'could not remove stay retired (b.jg5 SRJ-804)'
+    'could not remove stay retired'
   )
 }
 
@@ -728,8 +726,7 @@ function safeLog(log: (line: string) => void, line: string): void {
 }
 
 /**
- * Load the record at `stateDir` and build the store over it (SRJ-801,
- * SRJ-802): read once, through the config reader's non-blocking
+ * Load the record at `stateDir` and build the store over it: read once, through the config reader's non-blocking
  * open-then-fstat rule, whole, with no size cap (`uncapped`): only the server
  * writes the record and entries leave it only by a clear or a restore, so a
  * record grown past the readers' 64 KiB cap is still one the server wrote
@@ -844,7 +841,7 @@ function createRetiredKeyStore(
       if (typeof key !== 'string' || key === '') throw new RangeError('retired-keys: a key to record must be a non-empty string')
       if (!isRetiredKeyCause(cause)) throw new RangeError('retired-keys: a key to record needs a known cause')
     }
-    // SRJ-806: every recording of a key counts, a re-record that writes nothing included.
+    // every recording of a key counts, a re-record that writes nothing included.
     for (const key of new Set(batch.map(({ key }) => key))) generations.set(key, (generations.get(key) ?? 0) + 1)
     const before = snapshot()
     const next = new Map(entries)
@@ -855,7 +852,7 @@ function createRetiredKeyStore(
     for (const { key, cause } of batch) {
       const existing = next.get(key)
       if (existing !== undefined && existing.newLifeBegunAt === null) {
-        // SRJ-803: a key held only in memory makes the batch write; any other unmarked key is left as it is.
+        // a key held only in memory makes the batch write; any other unmarked key is left as it is.
         if (heldKeys.has(key) && !changed.some((c) => c.key === key)) {
           writing.push(retiredKeyWrittenText(key, existing.cause, RETIRED_KEY_WRITTEN_HELD))
         }
@@ -876,7 +873,7 @@ function createRetiredKeyStore(
       return { outcome: RETIRED_KEYS_WRITTEN, snapshot: before }
     }
 
-    // SRJ-714: the keys of a failed `absent-at-start` recording stay recorded, held only in memory.
+    // the keys of a failed `absent-at-start` recording stay recorded, held only in memory.
     const held = changed.filter(({ cause }) => cause === RETIRED_KEY_CAUSE_ABSENT_AT_START).map(({ key }) => key)
     if (held.length > 0) {
       const kept = new Map(entries)
@@ -906,7 +903,7 @@ function createRetiredKeyStore(
       safeLog(deps.log, retiredKeysMarkedLine(key, file, carried))
       return RETIRED_KEYS_WRITTEN
     }
-    // SRJ-806: a mark whose write fails stays set in memory for this server's life.
+    // a mark whose write fails stays set in memory for this server's life.
     entries = next
     heldMarks = new Set([...heldMarks, key])
     safeLog(deps.log, retiredKeysCannotMarkLine(key, file, attempt.detail))
@@ -986,7 +983,7 @@ function createRetiredKeyStore(
 }
 
 // ---------------------------------------------------------------------------
-// The start read (b.jg5 SRJ-801, SRJ-802)
+// The start read
 // ---------------------------------------------------------------------------
 
 /** Dependencies of {@link readRetiredKeysAtStart}: the store's, and the startup-errors recorder. */
@@ -1001,7 +998,7 @@ export type RetiredKeysStartOutcome =
   | { readonly kind: 'refused'; readonly path: string }
 
 /**
- * The start's read of the record (SRJ-802): load the store over `stateDir`.
+ * The start's read of the record: load the store over `stateDir`.
  * A record that cannot be read, parsed or validated records exactly one
  * {@link RETIRED_KEYS_UNREADABLE_LABEL} entry with the refusal text and
  * answers `refused`; the caller stops the start. Never exits the process.
@@ -1014,20 +1011,20 @@ export function readRetiredKeysAtStart(stateDir: string, deps: RetiredKeysStartD
 }
 
 // ---------------------------------------------------------------------------
-// The old-life holds (b.jg5 SRJ-809)
+// The old-life holds
 // ---------------------------------------------------------------------------
 
 /** The start of the two lines the hold set logs. */
 export const OLD_LIFE_HOLD_LOG_PREFIX = '[slack] old-life hold:'
 
-/** Apply step 1 recorded the key as retired, and the last-applied rewrite succeeded (SRJ-809's first start). */
+/** Apply step 1 recorded the key as retired, and the last-applied rewrite succeeded (first start). */
 export const OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 = 'apply-step-1'
-/** A start-sweep kill of a live row did not succeed (SRJ-809's second start). */
+/** A start-sweep kill of a live row did not succeed (second start). */
 export const OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL = 'start-sweep-kill-not-succeeded'
-/** The start sweep listed a live row of a key recorded as retired without the "new life has begun" mark (SRJ-809's third start). */
+/** The start sweep listed a live row of a key recorded as retired without the "new life has begun" mark (third start). */
 export const OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING = 'start-sweep-listing'
 
-/** What begins a hold, in SRJ-809's order. */
+/** What begins a hold, in the contract order. */
 export const OLD_LIFE_HOLD_CAUSES = [
   OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
   OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
@@ -1043,10 +1040,10 @@ export const OLD_LIFE_HOLD_END_READ_ENDED = 'read-ended'
 export const OLD_LIFE_HOLD_END_READ_MISSING = 'read-missing'
 /** A completed `find-missing` run listed the old row in its `ids`. */
 export const OLD_LIFE_HOLD_END_FIND_MISSING_IDS = 'find-missing-ids'
-/** A reuse for the key began its new life (SRJ-806), which implies the old row was finished. */
+/** A reuse for the key began its new life, which implies the old row was finished. */
 export const OLD_LIFE_HOLD_END_NEW_LIFE = 'new-life'
 
-/** What ends a hold (SRJ-809): nothing else does, and no kill outcome is among them. */
+/** What ends a hold: nothing else does, and no kill outcome is among them. */
 export const OLD_LIFE_HOLD_END_REASONS = [
   OLD_LIFE_HOLD_END_READ_ENDED,
   OLD_LIFE_HOLD_END_READ_MISSING,
@@ -1077,7 +1074,7 @@ const OLD_LIFE_HOLD_END_WORDS: Readonly<Record<OldLifeHoldEndReason, string>> = 
 })
 
 /**
- * The old key of a row an old-life hold is begun on (SRJ-809): the key in the
+ * The old key of a row an old-life hold is begun on: the key in the
  * row's `persona` label when the row's instance id is that key's own
  * (`cscb_<key>`); otherwise (no label, an empty one, or an instance id that
  * is not the label's `cscb_<key>`) the instance id itself takes the place of
@@ -1102,7 +1099,7 @@ export interface OldLifeHold {
   readonly realDirectory: string
   /** What began it (the latest begin's cause). */
   readonly cause: OldLifeHoldCause
-  /** True once a kill of the old row decided the ordinary kill-failure alert (SRJ-812); until the hold ends. */
+  /** True once a kill of the old row decided the ordinary kill-failure alert; until the hold ends. */
   readonly killFailed: boolean
   /** The persona keys recorded as having waited on it, sorted. */
   readonly waiting: readonly string[]
@@ -1139,7 +1136,7 @@ export interface OldLifeHoldSetDeps {
 }
 
 /**
- * One server's old-life holds (SRJ-809), in memory. Every member is
+ * One server's old-life holds, in memory. Every member is
  * synchronous and never throws. No member ends a hold on a kill outcome:
  * only `end`, which its callers call on a read of the old row as `ended` or
  * `missing` (or no row), a `find-missing` result's `ids`, or the key's new
@@ -1169,7 +1166,7 @@ export interface OldLifeHoldSet {
    * does nothing and logs nothing. Answers the hold as it was, or undefined.
    */
   end(instanceId: string, reason: OldLifeHoldEndReason, read?: string): OldLifeHold | undefined
-  /** Mark `instanceId`'s hold kill-failed (SRJ-812): it stays so until it ends. True when the id is held. */
+  /** Mark `instanceId`'s hold kill-failed: it stays so until it ends. True when the id is held. */
   markKillFailed(instanceId: string): boolean
   /** Record persona `key` as waiting on `instanceId`'s hold. True when the id is held. */
   recordWaiting(instanceId: string, key: string): boolean
@@ -1187,7 +1184,7 @@ export interface OldLifeHoldSet {
    * persona's own `cscb_<key>`.
    */
   holdsWaitedOnBy(persona: OldLifeHoldPersona): OldLifeHold[]
-  /** Whether any hold `persona` waits on is marked kill-failed (SRJ-812's state 4). */
+  /** Whether any hold `persona` waits on is marked kill-failed (state 4). */
   waitsOnKillFailed(persona: OldLifeHoldPersona): boolean
   /** Every hold, in begin order: for tests and diagnostics. */
   snapshot(): OldLifeHold[]
@@ -1214,13 +1211,13 @@ function holdQuoted(text: string): string {
 }
 
 /**
- * The line a hold's begin logs (SRJ-809): the directory as its real path, the
+ * The line a hold's begin logs: the directory as its real path, the
  * old key, the instance id and the cause; `again` when the instance id was
  * already held, so the one hold is kept on its held directory with the new
  * cause:
  *
- *   [slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — the old life may still be running (b.jg5 SRJ-809)
- *   [slack] old-life hold: began again on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — one hold is kept, on its held directory (b.jg5 SRJ-809)
+ * [slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — the old life may still be running
+ * [slack] old-life hold: began again on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — one hold is kept, on its held directory
  *
  * Carries no token and no file content. Pure.
  */
@@ -1228,16 +1225,16 @@ export function oldLifeHoldBeganLine(hold: OldLifeHold, again = false): string {
   const tail = again ? OLD_LIFE_HOLD_BEGAN_AGAIN_TAIL : 'the old life may still be running'
   return (
     `${OLD_LIFE_HOLD_LOG_PREFIX} began ${again ? 'again ' : ''}on ${holdQuoted(hold.realDirectory)} for oldKey=${holdKeyText(hold.oldKey)} ` +
-    `(instanceId=${holdQuoted(hold.instanceId)}): ${OLD_LIFE_HOLD_CAUSE_WORDS[hold.cause] ?? hold.cause} — ${tail} (b.jg5 SRJ-809)`
+    `(instanceId=${holdQuoted(hold.instanceId)}): ${OLD_LIFE_HOLD_CAUSE_WORDS[hold.cause] ?? hold.cause} — ${tail}`
   )
 }
 
 /**
- * The line a hold's end logs (SRJ-809): the directory as its real path, the
+ * The line a hold's end logs: the directory as its real path, the
  * old key, the instance id, what ended it (with the read that did, when
  * given) and the personas recorded as waiting on it:
  *
- *   [slack] old-life hold: ended on "<real path>" for oldKey=<key> (instanceId="<id>"): <reason>[ (<read>)]; waiting personas: <keys|none> (b.jg5 SRJ-809)
+ * [slack] old-life hold: ended on "<real path>" for oldKey=<key> (instanceId="<id>"): <reason>[ (<read>)]; waiting personas: <keys|none>
  *
  * Carries no token and no file content. Pure.
  */
@@ -1246,25 +1243,25 @@ export function oldLifeHoldEndedLine(hold: OldLifeHold, reason: OldLifeHoldEndRe
   const waiting = hold.waiting.length === 0 ? 'none' : hold.waiting.map(holdKeyText).join(', ')
   return (
     `${OLD_LIFE_HOLD_LOG_PREFIX} ended on ${holdQuoted(hold.realDirectory)} for oldKey=${holdKeyText(hold.oldKey)} ` +
-    `(instanceId=${holdQuoted(hold.instanceId)}): ${OLD_LIFE_HOLD_END_WORDS[reason] ?? reason}${by}; waiting personas: ${waiting} (b.jg5 SRJ-809)`
+    `(instanceId=${holdQuoted(hold.instanceId)}): ${OLD_LIFE_HOLD_END_WORDS[reason] ?? reason}${by}; waiting personas: ${waiting}`
   )
 }
 
 /**
- * The line a hold's end logs when one of its end observers threw (SRJ-809);
+ * The line a hold's end logs when one of its end observers threw;
  * the other observers still run. `failure` is what it threw, rendered
  * (`describeThrownValue`):
  *
- *   [slack] old-life hold: an end observer failed for instanceId="<id>": <failure> (b.jg5 SRJ-809)
+ * [slack] old-life hold: an end observer failed for instanceId="<id>": <failure>
  *
  * Pure.
  */
 export function oldLifeHoldEndObserverFailedLine(instanceId: string, failure: string): string {
-  return `${OLD_LIFE_HOLD_LOG_PREFIX} an end observer failed for instanceId=${holdQuoted(instanceId)}: ${failure} (b.jg5 SRJ-809)`
+  return `${OLD_LIFE_HOLD_LOG_PREFIX} an end observer failed for instanceId=${holdQuoted(instanceId)}: ${failure}`
 }
 
 /**
- * Build one server's old-life hold set (SRJ-809): in memory, empty, with no
+ * Build one server's old-life hold set: in memory, empty, with no
  * timer, no file read or write and no agent-director call; nothing is shared
  * between two sets. Directories are compared by `deps.realPath` (default
  * `resolveRealPath`), resolved when compared, so a directory created or

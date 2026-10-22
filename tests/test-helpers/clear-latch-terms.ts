@@ -1,8 +1,8 @@
 /**
  * test-helpers/clear-latch-terms.ts — The `clear-latch` wording nothing
- * offered to a bot may carry (b.jg5 SRJ-511, AC 47): the MCP tool list and
+ * offered to a bot may carry: the MCP tool list and
  * every tool definition (registry.test.ts), `MCP_INSTRUCTIONS` and the Slack
- * Reply Guard's reminder text (shipped-docs.test.ts) and every SRJ-10xx
+ * Reply Guard's reminder text (shipped-docs.test.ts) and every server-notice
  * notice builder's output (notice-texts.test.ts). The README, the skills, the
  * Slack app manifest, the crontable header and the CLI usage text are for the
  * operator and are not checked.
@@ -23,7 +23,7 @@ const CLEAR_LATCH_SNAKE = CLEAR_LATCH_COMMAND.replaceAll('-', '_')
 const CLEAR_LATCH_CAMEL = CLEAR_LATCH_COMMAND.replace(/-([a-z])/g, (_dash, letter: string) => letter.toUpperCase())
 
 /**
- * SRJ-511's spellings (hatch A3): the command, the route, the underscore and
+ * spellings (design A3): the command, the route, the underscore and
  * the camel-case forms. Each is matched case-insensitively anywhere in a text.
  */
 export const CLEAR_LATCH_TERMS: readonly string[] = Object.freeze([

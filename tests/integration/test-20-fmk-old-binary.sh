@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 20 (HO §7 scenarios 8 and 23; b.jg5 SRJ-1410, SRJ-1425; AC 1, 11, 21,
+# Test 20 (HO §7 scenarios 8 and 23, 11, 21,
 # 22, 23): this build never runs against an agent-director older than Phase 1
 # or a development build. It refuses to start on 0.10.0, stops without
 # touching a worker or row when the binary behind the shim becomes 0.10.0
@@ -19,7 +19,7 @@
 # (fixtures/slack-stub-server.ts --record), which records each
 # chat.postMessage text whole. agent-director runs at its default settings:
 # the scenario HOME's agent-director settings file carries no [tmux] table
-# (b.jg5 SRJ-1401; set-up fails if it does). One persona, P (`t20_p`,
+# (set-up fails if it does). One persona, P (`t20_p`,
 # instance `cscb_t20_p`, one channel), whose working directory selects the
 # stub worker's `at-once` mode (it reports in with no dialog). Server-wide:
 # `health_check_interval` 0 (no health tick can relaunch P; ruling S3),
@@ -139,7 +139,7 @@
 #        below-floor stand-in behind the shim. P's next attempt must be a
 #        reuse spawn made before the first timed re-check, with no resume
 #        and no plain spawn that did not collide with P's row before it
-#        (hatch gap: if it is not, the script fails saying so and the build
+# (design gap: if it is not, the script fails saying so and the build
 #        stops and reports); that rejected spawn is directly followed by a bot-server
 #        probe, with no other probe between the swap and it; the server exits
 #        with its re-check shutdown line and exactly one more entry, equal to
@@ -154,7 +154,7 @@
 #        resume) follows, P reports in (`waiting`), and the start wrote no
 #        `ad-below-phase1-floor` entry. The server is stopped and the
 #        release goes back.
-#   23b  AC 11 first: the installed client's package version
+# 23b first: the installed client's package version
 #        (CLIENT_PKG_VERSION, read from the package.json of the client the
 #        installed package resolves, as docker/ad-client-check.sh finds it)
 #        meets the floor (`meetsPhase1Floor` prints `true`). The stand-in
@@ -203,10 +203,10 @@
 #   UNREACHABLE_LABEL    AD_SYSTEM_INSTALL_UNREACHABLE     src/install-check-labels.ts
 #   UNPARSEABLE_REASON   UNREACHABLE_REASON_UNPARSEABLE_VERSION
 #                                                          src/ad-version-gate.ts
-#   the AC 11 check      meetsPhase1Floor <CLIENT_PKG_VERSION>
+# the check meetsPhase1Floor <CLIENT_PKG_VERSION>
 #                                                          src/ad-version-gate.ts
 # GO_BUILD_VERSION (`dev`, a plain `go build`'s version) is not a CSCB
-# constant: it is quoted, citing b.jg5 SRJ-202 and HO §7 scenario 23.
+# constant: it is quoted, citing and HO §7 scenario 23.
 # Lines with no exported builder are matched by a fragment quoted from src/
 # (ruling S7), each with its source beside it below. The binary path in the
 # floor messages is the client's resolved path of the standard path (the
@@ -217,7 +217,7 @@
 # printer's RECHECK_STOP_EXIT is non-zero, so that line stands for a
 # non-zero exit.
 #
-# Hatch decisions (the Epic's "Hatch gap"):
+# design decisions (the component's "design gap"):
 # - scenario 8's server effects come from the server's own reuse spawn of P
 #   (`resume_enabled` false, a finished row): at the start pass under the
 #   passing wrapper (8d); after a `fail-create` start-pass failure under the
@@ -236,7 +236,7 @@
 # - scenario 23's release-candidate leg (23a) runs on the stand-in reporting
 #   PASSING_VERSION in `pass` mode, every call handed to the release, since
 #   the image holds the 0.11.0 release and no release candidate;
-# - AC 11: the installed client's package version is the release's (0.11.0),
+# - the installed client's package version is the release's (0.11.0),
 #   which meets the floor, so the proof is the development-build legs: a
 #   CSCB that judged the client's package version would launch on
 #   `0.0.0-dev` and `dev`, and it refuses both.
@@ -287,7 +287,7 @@ AD_STOPPING_WINDOW_S="$(bun "${TEXTS}" DEFAULT_AD_SETTINGS tmux stopping_window_
 FINISH_AGE_S=$(( (AD_STARTING_BOUND_S > AD_STOPPING_WINDOW_S ? AD_STARTING_BOUND_S : AD_STOPPING_WINDOW_S) + 2 ))
 
 # The allowance on top of RECHECK_S for the probe, the shutdown and this
-# script's polling (hatch decision), and so every re-check wait's bound.
+# script's polling (design decision), and so every re-check wait's bound.
 EXIT_ALLOWANCE_S=10
 RECHECK_WAIT_S=$(( RECHECK_S + EXIT_ALLOWANCE_S ))
 
@@ -299,7 +299,7 @@ PASSING_VERSION="${floor_major}.${floor_minor}.$(( 10#${floor_patch} + 1 ))-rc.1
 
 # Scenario 23's development builds: a `make` build without a version stamp
 # reports the client's development sentinel; a plain `go build` reports
-# `dev`, which CSCB exports no constant for (b.jg5 SRJ-202, which refuses a
+# `dev`, which CSCB exports no constant for (which refuses a
 # version that does not parse; HO §7 scenario 23).
 DEV_SENTINEL="$(bun "${TEXTS}" CLIENT_DEV_SENTINEL_VERSION)" || fail "setup: fmk-texts CLIENT_DEV_SENTINEL_VERSION"
 GO_BUILD_VERSION='dev'
@@ -756,7 +756,7 @@ read_client_package_version() {
 # ---------------------------------------------------------------------------
 
 # agent-director's default settings: no [tmux] table in the scenario HOME's
-# settings file (b.jg5 SRJ-1401), at the package's AD_SETTINGS_RELATIVE_PATH
+# settings file, at the package's AD_SETTINGS_RELATIVE_PATH
 # under HOME, the table named as the package's AD_TMUX_TABLE.
 AD_SETTINGS_REL="$(bun "${TEXTS}" AD_SETTINGS_RELATIVE_PATH)" || fail "setup: fmk-texts AD_SETTINGS_RELATIVE_PATH"
 TMUX_TABLE="$(bun "${TEXTS}" AD_TMUX_TABLE)" || fail "setup: fmk-texts AD_TMUX_TABLE"
@@ -1091,16 +1091,16 @@ swap_ad_binary release "23a: the release back behind the shim"
 # 23b, 23c: development builds launch nothing; CSCB reads binaryVersion
 # ---------------------------------------------------------------------------
 
-# AC 11: the installed client's package version (the field its `version()`
+# the installed client's package version (the field its `version()`
 # reports) meets the floor, so a CSCB that judged it would launch on the
 # development builds below; their refusals show CSCB judges the binary's
 # version (the client's `binaryVersion`).
-read_client_package_version "23 (AC 11)"
+read_client_package_version "23"
 client_meets="$(bun "${TEXTS}" meetsPhase1Floor "${CLIENT_PKG_VERSION}")" \
-    || fail "23 (AC 11): fmk-texts meetsPhase1Floor ${CLIENT_PKG_VERSION}"
+    || fail "23: fmk-texts meetsPhase1Floor ${CLIENT_PKG_VERSION}"
 [[ "${client_meets}" == true ]] \
-    || fail "23 (AC 11): the installed client's package version ${CLIENT_PKG_VERSION} (${CLIENT_PKG_JSON}) does not meet the floor ${FLOOR} (meetsPhase1Floor: ${client_meets}), so the development-build legs cannot show which version CSCB judges"
-echo "${TEST_NAME}: 23 (AC 11): the installed client's package version ${CLIENT_PKG_VERSION} (${CLIENT_PKG_JSON}) meets the floor ${FLOOR}"
+    || fail "23: the installed client's package version ${CLIENT_PKG_VERSION} (${CLIENT_PKG_JSON}) does not meet the floor ${FLOOR} (meetsPhase1Floor: ${client_meets}), so the development-build legs cannot show which version CSCB judges"
+echo "${TEST_NAME}: 23: the installed client's package version ${CLIENT_PKG_VERSION} (${CLIENT_PKG_JSON}) meets the floor ${FLOOR}"
 
 leg 23b
 MSG_DEV="$(bun "${TEXTS}" buildBelowPhase1FloorMessage "${DEV_SENTINEL}" "${AD_BIN_PATH}" startup)" \
@@ -1132,7 +1132,7 @@ entry="$(_scenario_scan lastline "${SLACK_STATE_DIR}/startup-errors.log" "] [${U
 swap_ad_binary release "23c: the release back behind the shim"
 
 # ---------------------------------------------------------------------------
-# Closing assertions (b.jg5 SRJ-1401, SRJ-1418)
+# Closing assertions
 # ---------------------------------------------------------------------------
 
 assert_no_server_tmux

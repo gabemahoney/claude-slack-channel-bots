@@ -25,7 +25,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 - The runner and verdict reader now accept `CI_ANTHROPIC_*` directly on the
   host; native-name translation stays inside the disposable container.
   Timing assertions use correlated AD events, exact receipt progress and
-  fresh connection evidence while retaining native AC76 requirements.
+  fresh connection evidence while retaining native requirements.
 
 ---
 
@@ -33,7 +33,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 - Slack acknowledgements now have two configurable, startup-only stages: `queued_ack_reaction` defaults to `beehive` after durable acceptance; `ack_reaction` now defaults to `spinthinking` after receipt-backed delivery. Queued is removed before delivered is added, and the first successful correlated reply clears the actual stage. Custom emoji must exist in the Slack workspace before configuration; `spinthinking` is custom. See [settings and retention limits](docs/server-settings.md#acknowledgement-reactions).
 
-- **b.d6n:** delegate native workspace trust and transcript references to agent-director; remove archive-derived history-loss verdicts, dormant transcript cleanup, synthetic delivery launch identities and the readiness settle timer. Unconfirmed delivery follows AD state/session transitions while retaining guarded recovery.
+- **** delegate native workspace trust and transcript references to agent-director; remove archive-derived history-loss verdicts, dormant transcript cleanup, synthetic delivery launch identities and the readiness settle timer. Unconfirmed delivery follows AD state/session transitions while retaining guarded recovery.
 
 ### Slack reply reminders use agent-director state
 
@@ -54,8 +54,7 @@ The transcript-reading `stop-hooks/slack-reply-guard.sh` and per-persona `reply-
 
 If agent-director reports `ErrSystemInstallDisappeared`, CSCB keeps the `ad-unreachable` outage and waits for a fresh agent-director observation before recovery. The error no longer triggers an agent-death relaunch or a preceding kill. Restart failure counts and the slow-recovery count and notice episode stay unchanged while the agent state is unknown.
 
-- Live acceptance checks route agent input and restart faults through agent-director, with bounded state polling and confirmed kill results (b.ou8).
-- Release audits and finished-ticket sweeps follow Apiary 4.0.3 acceptance rules (b.vrx).
+- Live acceptance checks route agent input and restart faults through agent-director, with bounded state polling and confirmed kill results.
 
 ---
 
@@ -216,7 +215,7 @@ A persona whose session ends cleanly (an `agent-director pause`, which types `/e
 - **A crash still waits the full delay.** A session agent-director reads `missing` (a crash or a kill), or has no row for, still waits `session_restart_delay`. Failed launches still back off, doubling up to 15 minutes, and stop after 5 in a row.
 - **At most one fast relaunch per `session_restart_delay`.** A restart within that time of the persona's last fast relaunch waits the full delay, so a session that exits right after every launch is not relaunched every few seconds.
 - **`session_restart_delay` set to `0` still turns auto-restart off,** clean exits included.
-- **Three new `server.log` lines,** each ending in `(b.4vm)`: `[slack] Session for persona=<key> ended cleanly`, `[slack] Clean-exit check for persona=<key>` and `[slack] No clean-exit check for persona=<key>`. See "Session not restarting after crash" under [Troubleshooting](docs/troubleshooting.md#troubleshooting) in the README.
+- **Three new `server.log` lines,** including: `[slack] Session for persona=<key> ended cleanly`, `[slack] Clean-exit check for persona=<key>` and `[slack] No clean-exit check for persona=<key>`. See "Session not restarting after crash" under [Troubleshooting](docs/troubleshooting.md#troubleshooting) in the README.
 
 ### A crontable line with no persona list is warned at load
 
@@ -266,7 +265,7 @@ A persona whose transcript holds no conversation Claude Code can load (an empty 
 - **A resume counts only once its session starts.** A resume whose row reads `ended` or `missing`, or is gone, before the session reports in is a failed launch. A restart's resume counts toward the restart limit (5 in a row, then the `SpawnCapReached` notice); one made when the persona is brought up, at a start or for a confirmed change, does not, unless a restart joins it while it is still starting.
 - **A restart stops once such a resume reaches the limit.** The failure is counted when the server reads the resume's row. A restart, a health check and the server's replacement of an old instance ask the limit again after their reads, so once a read takes the persona to it none of them kills, launches or schedules anything more for the persona. A resume that the server's own kill of the instance ends is not counted.
 - **After 2 such resumes in a row, the persona starts fresh.** Its next launch is a reuse spawn of the same instance, without its conversation. Nothing is deleted: the transcript stays on disk, and the old conversation is kept as an earlier life of the instance. The fallback posts nothing to Slack.
-- **New `server.log` lines,** each ending in `(b.4q8)`: one containing `its resumed launch ended before reporting in`, `[slack] Resumed launch failed for persona=<key>`, one containing `not resuming its transcript again`, `[slack] Restart for persona=<key> goes no further` with `the persona reached the restart cap while this restart ran`, `[slack] live-row-sequence: not launching <ref> — the persona reached the restart cap while its sequence ran`, and `[slack] counting the resumed launch of <ref> failed`, which is a bug to report. See "Session not restarting after crash" under [Troubleshooting](docs/troubleshooting.md#troubleshooting) in the README, and the debugging skill's section on a resumed launch that ends before it reports in.
+- **New `server.log` lines,** including: one containing `its resumed launch ended before reporting in`, `[slack] Resumed launch failed for persona=<key>`, one containing `not resuming its transcript again`, `[slack] Restart for persona=<key> goes no further` with `the persona reached the restart cap while this restart ran`, `[slack] live-row-sequence: not launching <ref> — the persona reached the restart cap while its sequence ran`, and `[slack] counting the resumed launch of <ref> failed`, which is a bug to report. See "Session not restarting after crash" under [Troubleshooting](docs/troubleshooting.md#troubleshooting) in the README, and the debugging skill's section on a resumed launch that ends before it reports in.
 
 ---
 

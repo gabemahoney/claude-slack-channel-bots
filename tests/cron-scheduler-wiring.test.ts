@@ -1,9 +1,9 @@
 /**
- * cron-scheduler-wiring.test.ts — Static audit (b.he5 E2 wiring guard;
- * b.av2 SR-11 cron semantics, SR-8.7 applied config).
+ * cron-scheduler-wiring.test.ts — Static audit ( wiring guard;
+ * cron semantics applied config).
  *
  * main() cannot run in a unit test (the agent-director startup gate, a real
- * port, real Slack connections), so the SRD invariant "the cron scheduler
+ * port, real Slack connections), so the contract invariant "the cron scheduler
  * starts only AFTER the HTTP server is listening, from main(), and is stopped
  * on shutdown" cannot be exercised behaviorally. This follows the repo
  * precedent for exactly that situation: tests/jsonl-safeguard-wiring.test.ts —
@@ -85,8 +85,8 @@ describe('server.ts wires the cron scheduler', () => {
   })
 
   test('builds the cron log, dispatcher and scheduler from the applied persona config', () => {
-    // The config the start resolution applied (b.av2 SR-8.7). The dispatcher
-    // resolves each fire's target against it (b.av2 SR-11). The builders run
+    // The config the start resolution applied. The dispatcher
+    // resolves each fire's target against it. The builders run
     // after `<loaded> = <outcome>.config` (the previous test), so reading
     // <loaded> there is reading the applied config, never the edited file.
     const { loaded } = startResolution(SERVER_CODE)
@@ -101,8 +101,8 @@ describe('server.ts wires the cron scheduler', () => {
     )
   })
 
-  test('builds the one cron log with the applied cron_log_max_bytes as its cap and the default rewrite (b.p4i)', () => {
-    // E5: the cap the loader validated reaches the writer (an absent key
+  test('builds the one cron log with the applied cron_log_max_bytes as its cap and the default rewrite', () => {
+    // the cap the loader validated reaches the writer (an absent key
     // passes `undefined`: append-only), and production never swaps the
     // prune's durable rewrite for the test seam.
     const { loaded } = startResolution(SERVER_CODE)

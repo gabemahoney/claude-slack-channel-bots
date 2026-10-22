@@ -1,57 +1,56 @@
 /**
- * old-life-wait.ts — How an old-life wait's round ends (b.jg5 SRJ-811,
- * SRJ-812, SRJ-702, SRJ-704, SRJ-717, SRJ-1002, SRJ-1013).
+ * old-life-wait.ts — How an old-life wait's round ends.
  *
  * An old-life wait runs the live-row sequence's kill and `find-missing` steps
- * (SRJ-705 steps 1 to 5) on an old row's instance id, with no launch, in the
+ * (steps 1 to 5) on an old row's instance id, with no launch, in the
  * background (the no-launch form of `src/live-row-sequence.ts`, started by
  * the session manager's `ensureOldLifeWait`). This module decides, from how
  * one round ended and what its calls met, what follows it
  * ({@link decideOldLifeWaitEnd}), and renders its lines; the session
  * manager's end handler applies the decision.
  *
- * The rounds' results by class (SRJ-811; the calling agent's rulings):
+ * The rounds' results by class (the calling agent's rulings):
  *   - the row finished (step 6 of the no-launch form): nothing more; the read
- *     that found it finished ended the hold (SRJ-809);
+ * that found it finished ended the hold;
  *   - the hold ended while the round ran, its kill's tries included (between
  *     tries, or during a try whose UNAVAILABLE outcome would stand, the last
  *     included): a success, as a finished read is; no mark, nothing armed;
  *     decided before every case below, so it also wins over a stop in the
- *     same window (SRJ-702; option A). A survivor named by those tries has
+ * same window (option A). A survivor named by those tries has
  *     raised the survivor version already, through the round's alert sink;
  *   - stopped by a shutdown or by the teardown of the last persona waiting
  *     on the hold: nothing more here (a kill those stopped wrote its one line
  *     and the old key's `persona-kill-failed` entry, with no alert text,
  *     through the round's alert sink); no mark, nothing armed, no notice;
  *   - stopped because a configured persona's own row is latched (a read of
- *     it latched the persona, or the persona was latched already; SRJ-114,
- *     SRJ-513, SRJ-502): the hold goes on, the waiting personas that are not
+ * it latched the persona, or the persona was latched already,
+ *): the hold goes on, the waiting personas that are not
  *     latched are armed as below (the session manager's arm never arms a
- *     latched persona: SRJ-305, SRJ-301), and the hold is marked
+ * latched persona:), and the hold is marked
  *     kill-failed when the round's kill decided the ordinary alert and no
  *     stop ended its tries (a read-latch end is a failure end, its alert
- *     standing; SRJ-812);
+ * standing);
  *   - every other end keeps the hold and arms each waiting persona's retry
  *     timer with {@link OLD_LIFE_WAIT_ARM_CAUSE}, uncounted: an UNAVAILABLE,
  *     ENVIRONMENT, CONFIG or UNCLASSIFIED answer (the outages were raised for
  *     the waiting personas at the call), a kill failure, a CONFLICT or an
  *     unusable recorded name, a run that did not judge a `pending` old row
- *     (SRJ-717: no alert, no mark), or the row still live after runs that
- *     judged it (SRJ-705 step 5). The hold is marked kill-failed (SRJ-812)
+ * (no alert, no mark), or the row still live after runs that
+ * judged it (step 5). The hold is marked kill-failed
  *     when the round's kill decided the ordinary kill-failure alert and no
  *     stop ended its tries, or at step 5's alert; a survivor version never
  *     marks it.
  * Each CONFLICT and unusable recorded name a round met (at a kill try, a
  * `status` read between tries, a `get` or a run) is one log line and one
  * `persona-teardown-notice` entry worded "during the wait", latching no one
- * (SRJ-1002, SRJ-1013). A round's first UNCLASSIFIED answer is reported to
- * the old row's unclassified-error episode (SRJ-313), keyed by the held
+ * A round's first UNCLASSIFIED answer is reported to
+ * the old row's unclassified-error episode, keyed by the held
  * instance id, whose one alert per episode takes the log-only route once the
  * answers have lasted longer than the alert threshold; it is reported only
  * after a round that keeps the hold, and the hold's end ends the episode.
  * Nothing is written or reported for a round a shutdown or a teardown
- * stopped, whose answers are dropped (SRJ-706). A `kill_sent: false`
- * success, and a CONFLICT, never end the hold (SRJ-809).
+ * stopped, whose answers are dropped. A `kill_sent: false`
+ * success, and a CONFLICT, never end the hold.
  *
  * Pure module: no module-scope state, no environment or file access, no
  * server-only import, and nothing runs at import. Errors are classified by
@@ -104,13 +103,13 @@ export const OLD_LIFE_WAIT_SITE = 'old-life-wait'
 /** The head of every line the wait's end handler logs. */
 export const OLD_LIFE_WAIT_LOG_PREFIX = `[slack] ${OLD_LIFE_WAIT_SITE}:`
 
-/** The context an UNUSABLE NAME answer to a wait's `get` of a configured persona's own row is routed in (SRJ-1002). */
+/** The context an UNUSABLE NAME answer to a wait's `get` of a configured persona's own row is routed in. */
 export const OLD_LIFE_WAIT_ROUTED_CONTEXT = 'the old-life wait'
 
 /**
  * The retry cause each waiting persona's timer is armed with after a round
  * that keeps the hold, and a persona refused because a wait runs on its own
- * row (SRJ-811, SRJ-301). The same string as the retry controller's label
+ * row. The same string as the retry controller's label
  * (`UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD`, `src/unavailable-retry.ts`, not
  * imported here: that module loads server modules). Never counted.
  */
@@ -185,7 +184,7 @@ export const OLD_LIFE_WAIT_END_KILL_FAILED = 'kill-failed'
 export const OLD_LIFE_WAIT_END_ESCALATED = 'escalated'
 /** The kill met a CONFLICT or an unusable recorded name. */
 export const OLD_LIFE_WAIT_END_REFUSED = 'refused'
-/** A run did not judge the `pending` old row, or no run judged it (SRJ-717). */
+/** A run did not judge the `pending` old row, or no run judged it. */
 export const OLD_LIFE_WAIT_END_NOT_JUDGED = 'not-judged'
 /** An UNAVAILABLE answer (a kill's that stands, other than one that decided the alert). */
 export const OLD_LIFE_WAIT_END_UNAVAILABLE = 'unavailable'
@@ -232,7 +231,7 @@ export interface OldLifeWaitEndDecision {
   readonly kind: OldLifeWaitEndKind
   /** The hold goes on (no end of the round ended it). */
   readonly holdGoesOn: boolean
-  /** Mark the hold kill-failed (SRJ-812). */
+  /** Mark the hold kill-failed. */
   readonly markKillFailed: boolean
   /** Arm each waiting persona's retry timer with `OLD_LIFE_WAIT_ARM_CAUSE`, uncounted. */
   readonly armWaiting: boolean
@@ -240,7 +239,7 @@ export interface OldLifeWaitEndDecision {
   readonly notices: readonly OldLifeWaitRefusal[]
   /**
    * Report the round's first UNCLASSIFIED answer to the old row's
-   * unclassified-error episode (SRJ-313; keyed by the instance id, its alert
+   * unclassified-error episode (keyed by the instance id, its alert
    * on the log-only route). Only for a round after which the hold goes on.
    */
   readonly reportUnclassified: boolean
@@ -260,7 +259,7 @@ export function decideOldLifeWaitEnd(input: OldLifeWaitEndInput): OldLifeWaitEnd
   const notices = answers.refusals
   const reportUnclassified = answers.unclassified !== undefined
   // A round after which the hold is over reports nothing to the episode: the
-  // hold's end ended it (SRJ-313, SRJ-811).
+  // hold's end ended it.
   const ends = (kind: OldLifeWaitEndKind, withNotices: boolean): OldLifeWaitEndDecision => ({
     kind,
     holdGoesOn: false,
@@ -269,7 +268,7 @@ export function decideOldLifeWaitEnd(input: OldLifeWaitEndInput): OldLifeWaitEnd
     notices: withNotices ? notices : [],
     reportUnclassified: false,
   })
-  // SRJ-702, SRJ-811 (option A): the hold's end while the kill ran is a
+  // (option A): the hold's end while the kill ran is a
   // success, and wins over a stop that lands in the same window.
   if (lastKill?.end === KILL_RETRY_END_HOLD_ENDED) return ends(OLD_LIFE_WAIT_END_HOLD_ENDED, true)
   if (outcome.kind === LIVE_ROW_OUTCOME_STOPPED && outcome.reason === LIVE_ROW_STOP_HOLD_ENDED) {
@@ -287,23 +286,23 @@ export function decideOldLifeWaitEnd(input: OldLifeWaitEndInput): OldLifeWaitEnd
   })
   if (outcome.kind === LIVE_ROW_OUTCOME_STOPPED) {
     if (outcome.reason === LIVE_ROW_STOP_LATCHED) {
-      // SRJ-114, SRJ-513, SRJ-502: a configured persona's own row is latched.
+      // a configured persona's own row is latched.
       // The hold goes on and the waiting personas are armed, as after every
       // end that keeps the hold other than a stop; the session manager's arm
-      // skips a latched persona (SRJ-305, SRJ-301). A read-latch end of the
+      // skips a latched persona. A read-latch end of the
       // kill's tries is a failure end whose ordinary alert stands, so it
-      // marks the hold (SRJ-812); only tries a stop ended do not.
+      // marks the hold; only tries a stop ended do not.
       const marks = lastKill !== undefined && lastKill.alert.kind === KILL_RETRY_ALERT_ORDINARY && lastKill.end !== KILL_RETRY_END_STOPPED
       return kept(OLD_LIFE_WAIT_END_LATCHED, marks)
     }
-    // SRJ-702, SRJ-706: a shutdown or teardown stop drops what came after it.
+    // a shutdown or teardown stop drops what came after it.
     return ends(OLD_LIFE_WAIT_END_STOPPED, false)
   }
   switch (outcome.kind) {
     case LIVE_ROW_OUTCOME_ESCALATED:
       return kept(OLD_LIFE_WAIT_END_ESCALATED, true)
     case LIVE_ROW_OUTCOME_ABORTED: {
-      // SRJ-812: only a kill whose tries decided the ordinary alert, with no stop, marks the hold.
+      // only a kill whose tries decided the ordinary alert, with no stop, marks the hold.
       if (lastKill !== undefined && lastKill.alert.kind === KILL_RETRY_ALERT_ORDINARY && !killRetryStopped(lastKill)) {
         return kept(OLD_LIFE_WAIT_END_KILL_FAILED, true)
       }
@@ -370,7 +369,7 @@ function render(text: unknown): string {
 }
 
 /**
- * The reference an old-life wait's entries and lines name (SRJ-1007): the
+ * The reference an old-life wait's entries and lines name: the
  * old key, as `persona=<key>`, when the old row is its `cscb_<key>`;
  * otherwise the instance id standing in for it, as `instanceId=<id>`. Pure.
  */
@@ -380,7 +379,7 @@ export function oldLifeWaitRef(instanceId: string, oldKey: string): string {
 
 /**
  * The text of a CONFLICT or UNUSABLE NAME answer met in an old-life wait
- * (SRJ-1002, SRJ-1003, SRJ-811), its `persona-teardown-notice` entry's
+ * its `persona-teardown-notice` entry's
  * notice: at a kill try or a `status` read between tries, the kill outcome's
  * one-line rendering (`teardownKillRefusalNoticeText`, the builder the
  * persona teardown's entry uses); at a `get` or a run, the call, the
@@ -442,9 +441,9 @@ export interface OldLifeWaitEndLineInput {
 }
 
 /**
- * One round's end line (SRJ-811, SRJ-1014):
+ * One round's end line:
  *
- *   [slack] old-life-wait: <ref> (instanceId=<id>): ended — <what ended it>; <the hold goes on|the hold is over|nothing more>[; the hold is marked kill-failed]; waiting personas armed (held-for-old-life): <keys|none> (b.jg5 SRJ-811)
+ * [slack] old-life-wait: <ref> (instanceId=<id>): ended — <what ended it>; <the hold goes on|the hold is over|nothing more>[; the hold is marked kill-failed]; waiting personas armed (held-for-old-life): <keys|none>
  *
  * Pure.
  */
@@ -459,6 +458,6 @@ export function oldLifeWaitEndLine(input: OldLifeWaitEndLineInput): string {
   const armed = input.armed.length === 0 ? 'none' : input.armed.map(render).join(', ')
   return (
     `${OLD_LIFE_WAIT_LOG_PREFIX} ${oldLifeWaitRef(input.instanceId, input.oldKey)} (instanceId=${render(input.instanceId)}): ` +
-    `ended — ${describeEnd(decision.kind)}; ${hold}${mark}; waiting personas armed (${OLD_LIFE_WAIT_ARM_CAUSE}): ${armed} (b.jg5 SRJ-811)`
+    `ended — ${describeEnd(decision.kind)}; ${hold}${mark}; waiting personas armed (${OLD_LIFE_WAIT_ARM_CAUSE}): ${armed}`
   )
 }

@@ -6,7 +6,7 @@
  * substring of a text with a fixed placeholder. `persona-slack-clients.ts`
  * uses it in `redactingSlackLogger` (and re-exports it); the permission click
  * handler uses it on the `raw_error_message` it records in the permission
- * trail (SR-V-2.7), so a thrown message holding a short-lived upload URL or a
+ * trail, so a thrown message holding a short-lived upload URL or a
  * token never reaches that file. It lives here, not in
  * `persona-slack-clients.ts`, so a caller can redact without importing the
  * Slack client libraries.

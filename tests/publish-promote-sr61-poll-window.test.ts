@@ -1,7 +1,7 @@
 /**
- * publish-promote-sr61-poll-window.test.ts — guard + behavioral tests for bug b.dti.
+ * publish-promote-sr61-poll-window.test.ts — guard + behavioral tests for.
  *
- * Bug b.dti: `scripts/publish-promote.sh`'s SR-6.1 registry-visibility poll waited
+ * `scripts/publish-promote.sh`'s SR-6.1 registry-visibility poll waited
  * only 60 seconds (12 attempts at a 5s cadence). Real npm propagation on the 0.10.0
  * release took ~210s, so promote hit `sr_exit 60` between the publish/tag phase and
  * Phase 7 — leaving the release delivered remotely but the dev box on its old install.
@@ -29,7 +29,7 @@ import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const SCRIPT_ABS = join(REPO_ROOT, 'scripts/publish-promote.sh')
 
-/** AC-1's floor: the window must cover ordinary npm propagation lag. */
+/** 's floor: the window must cover ordinary npm propagation lag. */
 const MIN_WINDOW_SECONDS = 300
 
 function readScript(): string {
@@ -59,8 +59,8 @@ function extractBlock(script: string, startMatch: RegExp, endMatch: RegExp): str
 // Static guards
 // ---------------------------------------------------------------------------
 
-describe('b.dti: SR-6.1 poll window is wide enough for npm propagation', () => {
-  test('attempts × interval covers at least 5 minutes (AC-1)', () => {
+describe('SR-6.1 poll window is wide enough for npm propagation', () => {
+  test('attempts × interval covers at least 5 minutes ()', () => {
     const script = readScript()
     const attempts = readIntAssignment(script, 'SR61_POLL_ATTEMPTS')
     const interval = readIntAssignment(script, 'SR61_POLL_INTERVAL')
@@ -76,7 +76,7 @@ describe('b.dti: SR-6.1 poll window is wide enough for npm propagation', () => {
   // proven behaviorally below — `npmCalls === attempts` and every recorded sleep
   // equalling `interval` — so no source-regex test for the loop shape lives here.
 
-  test('a rationale comment for the chosen window sits at the poll site (AC-1)', () => {
+  test('a rationale comment for the chosen window sits at the poll site ()', () => {
     const script = readScript()
     const lines = script.split('\n')
     const knob = lines.findIndex((l) => /^SR61_POLL_ATTEMPTS=/.test(l))
@@ -98,7 +98,7 @@ describe('b.dti: SR-6.1 poll window is wide enough for npm propagation', () => {
     expect(rationale.toLowerCase()).toMatch(/propagat|minute/)
   })
 
-  test('the progress cadence knob is a sane, positive value (AC-2)', () => {
+  test('the progress cadence knob is a sane, positive value ()', () => {
     // That the knob actually gates a periodic progress line is proven
     // behaviorally below (progress-line count === attempts / every); here we
     // only assert the knob exists and yields at least one line per window.
@@ -109,7 +109,7 @@ describe('b.dti: SR-6.1 poll window is wide enough for npm propagation', () => {
     expect(every!).toBeLessThanOrEqual(attempts)
   })
 
-  test('fail-closed behavior is unchanged: sr_exit 60 and the manifest is preserved (AC-3)', () => {
+  test('fail-closed behavior is unchanged: sr_exit 60 and the manifest is preserved ()', () => {
     const timeout = extractBlock(
       readScript(),
       /^if \[ "\$\{VERIFIED\}" != "1" \]/,
@@ -119,7 +119,7 @@ describe('b.dti: SR-6.1 poll window is wide enough for npm propagation', () => {
     expect(timeout).toContain('${MANIFEST} is preserved')
   })
 
-  test('no surface inside the script still advertises the old 60-second window (AC-4)', () => {
+  test('no surface inside the script still advertises the old 60-second window ()', () => {
     const script = readScript()
     const stale = script
       .split('\n')
@@ -315,7 +315,7 @@ function runPollIn(
   }
 }
 
-describe('b.dti: SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
+describe('SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
   test('a registry that never surfaces the version is polled for the full window', () => {
     const attempts = readIntAssignment(readScript(), 'SR61_POLL_ATTEMPTS')!
     const interval = readIntAssignment(readScript(), 'SR61_POLL_INTERVAL')!
@@ -329,7 +329,7 @@ describe('b.dti: SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
     expect(r.sleeps.every((s) => s === interval)).toBe(true)
   })
 
-  test('progress lines are emitted during a long wait, with attempt and elapsed markers (AC-2)', () => {
+  test('progress lines are emitted during a long wait, with attempt and elapsed markers ()', () => {
     const attempts = readIntAssignment(readScript(), 'SR61_POLL_ATTEMPTS')!
     const every = readIntAssignment(readScript(), 'SR61_PROGRESS_EVERY')!
     const r = runPoll(0)
@@ -375,7 +375,7 @@ describe('b.dti: SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
     expect(r.verified).toBe('1')
   })
 
-  test('timeout still exits 60 with a diagnostic and leaves the manifest in place (AC-3)', () => {
+  test('timeout still exits 60 with a diagnostic and leaves the manifest in place ()', () => {
     const r = runPoll(0, { withTimeoutBlock: true })
     expect(r.code).toBe(60)
     expect(r.stderr).toContain('SR-6.1')

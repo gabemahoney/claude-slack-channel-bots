@@ -1,8 +1,7 @@
 /**
  * tokens.test.ts — Tests for isDryRun() dry-run detection (`SLACK_DRY_RUN`).
  *
- * The server reads no Slack token from the environment (b.av2 SR-3.1,
- * SR-10.2); `src/tokens.ts` now only answers whether dry-run mode is on.
+ * The server reads no Slack token from the environment; `src/tokens.ts` now only answers whether dry-run mode is on.
  *
  * SPDX-License-Identifier: MIT
  */

@@ -1,5 +1,5 @@
 /**
- * install-skill-pointer.test.ts — Exercise the SR-9.3 manual-fetch-block helper.
+ * install-skill-pointer.test.ts — Exercise the manual-fetch-block helper.
  *
  * Tests cover URL derivation (git+ prefix + .git suffix stripping), the
  * in-repo skill path literal, the full block format, idempotency, purity

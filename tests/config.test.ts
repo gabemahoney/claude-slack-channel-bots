@@ -125,14 +125,14 @@ describe('expandTilde', () => {
 })
 
 // ===========================================================================
-// Persona configuration loader (b.av2 SR-1.1–1.3, 1.5, 1.6, 1.7) and its
+// Persona configuration loader (1.5, 1.6, 1.7) and its
 // real-path helper
 //
 // Every case writes its file into its own mkdtempSync directory and loads it
-// with an injected mkdtempSync home (b.av2 SR-13.2); both are removed after
+// with an injected mkdtempSync home; both are removed after
 // each case. Directories, placeholder credentials files and symlinks live in
 // that temp directory too. The loader lives in src/config.ts, so no
-// child-process import purity test is added here (b.av2 SR-13.1).
+// child-process import purity test is added here.
 // ===========================================================================
 
 /**
@@ -141,7 +141,7 @@ describe('expandTilde', () => {
  */
 const PLACEHOLDER = 'placeholder_not_a_secret'
 
-describe('resolveRealPath (b.av2 SR-1.5)', () => {
+describe('resolveRealPath', () => {
   let tmp: string
   /** The temp root's own real path: the temp root may itself sit behind a symlink. */
   let real: string
@@ -207,7 +207,7 @@ describe('resolveRealPath (b.av2 SR-1.5)', () => {
   })
 })
 
-describe('loadPersonaConfig (b.av2 SR-1)', () => {
+describe('loadPersonaConfig', () => {
   let dir: string
   let home: string
 
@@ -226,7 +226,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   /**
    * Load `input`, expecting rejection; returns the message after checking it
    * leaks no placeholder and that the whole error passes `assertNoLeak` (the
-   * config leg of AC 20), so every rejection case built on it is leak-checked.
+   * config leg of), so every rejection case built on it is leak-checked.
    * `name` is a token-shaped persona name the error is meant to carry: it and
    * its key are masked first (`withoutName`), and the rest of the error is
    * leak-checked as usual.
@@ -245,7 +245,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     return error.message
   }
 
-  /** The b.av2 SR-2.2 persona reference: JSON-quoted name with its key. */
+  /** The persona reference: JSON-quoted name with its key. */
   function expectNamesPersona(message: string, name: string): void {
     expect(message).toContain(`${JSON.stringify(name)} (key=${personaKey(name)})`)
   }
@@ -253,7 +253,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   const withPersonas = (...personas: PersonaInput[]) => makePersonaConfigInput({ personas })
 
   describe('valid load', () => {
-    test('AC 3 / AC 16: two personas sharing a channel, one also in a second channel, resolve with keys and defaults — the two-channel persona loads as a single persona holding both channels, and both personas hold the shared channel as delivery: all', () => {
+    test('two personas sharing a channel, one also in a second channel, resolve with keys and defaults — the two-channel persona loads as a single persona holding both channels, and both personas hold the shared channel as delivery: all', () => {
       const config = load(withPersonas(
         makePersona({
           name: 'Ops Bot',
@@ -271,7 +271,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         { id: 'G0TEST002', delivery: 'all' },
       ])
       expect(config.personas[1].channels).toEqual([{ id: 'C0TEST001', delivery: 'all' }])
-      // AC 3: the persona in two channels is one persona, not one per channel.
+      // the persona in two channels is one persona, not one per channel.
       expect(config.personas.filter((p) => p.name === 'Ops Bot')).toHaveLength(1)
       for (const persona of config.personas) {
         expect(persona.dm).toEqual({ enabled: false })
@@ -301,11 +301,11 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   })
 
   describe('empty and zero-channel shapes', () => {
-    test('an empty personas array loads (AC 54 config leg)', () => {
+    test('an empty personas array loads (config leg)', () => {
       expect(load({ personas: [] }).personas).toEqual([])
     })
 
-    test('a zero-channel DM-only persona loads, channels defaulting to empty (AC 40/41 config leg)', () => {
+    test('a zero-channel DM-only persona loads, channels defaulting to empty (config leg)', () => {
       const persona = makePersona({
         channels: undefined,
         dm: { enabled: true, contact: 'U0TEST001' },
@@ -327,7 +327,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('claude_config_dir and stop_hook_bootstrap inheritance (SR-1.2, SR-10.2; AC 48 config leg)', () => {
+  describe('claude_config_dir and stop_hook_bootstrap inheritance (config leg)', () => {
     test.each([
       ['neither set: absent and true', {}, {}, undefined, true],
       ['top-level only: inherited', { claude_config_dir: '~/cfg-top', stop_hook_bootstrap: false }, {}, 'cfg-top', false],
@@ -345,7 +345,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('persona path rules (SR-1.2)', () => {
+  describe('persona path rules', () => {
     test.each([
       ['credentials_file', '~/creds/ops.json'],
       ['working_directory', '~'],
@@ -378,7 +378,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('unknown keys (SR-1.1, SR-1.2; AC 20 config leg)', () => {
+  describe('unknown keys (config leg)', () => {
     // Table inputs are built at registration, before `dir` exists, so these
     // personas keep the helper's default base dir; each case is rejected per
     // entry, before any path is resolved.
@@ -406,8 +406,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['persona entry', persona({ nickname: 'ops' }), 'nickname', WHERE.entry, true],
       ['persona entry bot_token', persona({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }), 'bot_token', WHERE.entry, true],
       ['persona entry app_token', persona({ app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }), 'app_token', WHERE.entry, true],
-      ['persona entry route-era cwd (SR-10.2)', persona({ cwd: '/tmp/somewhere' }), 'cwd', WHERE.entry, true],
-      // Server-wide only (b.jg5 SRJ-213): a persona entry cannot set it.
+      ['persona entry route-era cwd', persona({ cwd: '/tmp/somewhere' }), 'cwd', WHERE.entry, true],
+      // Server-wide only: a persona entry cannot set it.
       [
         'persona entry server-wide agent_director_call_timeout_ms',
         persona({ agent_director_call_timeout_ms: DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS }),
@@ -415,7 +415,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         WHERE.entry,
         true,
       ],
-      // Server-wide only (b.b1j SR-1): a persona entry cannot set it, even to a valid boolean.
+      // Server-wide only: a persona entry cannot set it, even to a valid boolean.
       ['persona entry server-wide fresh_system_prompt', persona({ fresh_system_prompt: true }), 'fresh_system_prompt', WHERE.entry, true],
       ['dm object', inDm({ relay: true }), 'relay', WHERE.dm, true],
       ['dm object bot_token', inDm({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'dm') }), 'bot_token', WHERE.dm, true],
@@ -429,7 +429,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       if (inPersona) expectNamesPersona(message, 'Ops Bot')
     })
 
-    // Director decision 5: a key whose name could be a pasted token is counted, never echoed.
+    // a key whose name could be a pasted token is counted, never echoed.
     // loadError's assertNoLeak fails if the name (each embeds the sentinel) reaches the error.
     const ONE_HIDDEN = '1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).'
     const tokenNames: [string, string][] = [
@@ -457,7 +457,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('dm and channel shapes, channel and contact formats (SR-1.2, SR-1.3, SR-1.5)', () => {
+  describe('dm and channel shapes, channel and contact formats', () => {
     test.each([
       ['a non-object dm', { dm: true }, 'dm'],
       ['a non-array channels', { channels: PLACEHOLDER }, 'channels'],
@@ -479,7 +479,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('type and range errors (SR-1.5)', () => {
+  describe('type and range errors', () => {
     test.each([
       ['an empty name', { name: '' }, 'name'],
       ['a whitespace-only name', { name: '   ' }, 'name'],
@@ -503,7 +503,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('SR-14 rejection table and cross-persona rules (SR-1.5; AC 21, 30, 32, 33, 42, 43, 53)', () => {
+  describe('rejection table and cross-persona rules (30, 32, 33, 42, 43, 53)', () => {
     /** A name needing normalisation whose key is longer than 40 characters, so a persona named by that key has another key. */
     const LONG_NAME = 'Operations Review And Deployment Assistant Bot'
     const LONG_KEY = personaKey(LONG_NAME)
@@ -536,7 +536,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
           dir,
         ))
 
-    /** `personas[i]` plus the b.av2 SR-2.2 reference (JSON-quoted name with its key). */
+    /** `personas[i]` plus the reference (JSON-quoted name with its key). */
     const indexedRef = (index: number, name: string) =>
       `personas[${index}] ${JSON.stringify(name)} (key=${personaKey(name)})`
 
@@ -552,7 +552,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     }
 
     const rejectionRows: RejectionRow[] = [
-      // Per-entry rows (Task 2)
+      // Per-entry rows (section 2)
       {
         ac: '33',
         label: 'missing permission_prompts',
@@ -911,21 +911,21 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  // b.1ix follow-up: no persona's key may start with another persona's key.
-  // The reason (b.jg5 SRJ-1102): tmux matches a session target by prefix
+  // follow-up: no persona's key may start with another persona's key.
+  // The reason: tmux matches a session target by prefix
   // unless it is written with `=`, so a human's tmux command without `=` for
   // one persona could reach another persona's session. The rule runs after
   // the name/key uniqueness rule and before the shared-path rule, in record
   // mode too.
-  describe('prefix-related keys (b.1ix follow-up)', () => {
+  describe('prefix-related keys (follow-up)', () => {
     const HINT =
       "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other."
 
-    /** SRJ-1102's reason sentence for a shorter and a longer key, from the loader's own reason builder. */
+    /** reason sentence for a shorter and a longer key, from the loader's own reason builder. */
     const reasonFor = (shorterKey: string, longerKey: string) =>
       prefixRelatedKeysReason(personaTmuxSessionName(shorterKey), personaTmuxSessionName(longerKey))
 
-    /** `personas[i]` plus the b.av2 SR-2.2 reference (JSON-quoted name with its key). */
+    /** `personas[i]` plus the reference (JSON-quoted name with its key). */
     const indexedRef = (index: number, name: string) =>
       `personas[${index}] ${JSON.stringify(name)} (key=${personaKey(name)})`
 
@@ -1062,7 +1062,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       }
     })
 
-    // AC 78: the reason is about a human's tmux command only. No rejection
+    // the reason is about a human's tmux command only. No rejection
     // keeps the old "once <shorter> is gone" clause, names agent-director,
     // CSCB or a version, or says anything but tmux matches by prefix.
     test.each(rows)('rejected: $label, with no old clause and no claim that CSCB or agent-director matches by prefix', ({ names }) => {
@@ -1082,7 +1082,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['dev_a and dev_b', ['dev_a', 'dev_b']],
       ['alpha and beta', ['alpha', 'beta']],
       ['names normalising to the same stem with different hashed keys', ['Ops Bot', 'OPS BOT']],
-      ['team_main and team_admin (the suggested rename of team)', ['team_main', 'team_admin', 'team_apiary']],
+      ['team_main and team_admin (the suggested rename of team)', ['team_main', 'team_admin', 'team_support']],
       ['dev_main and dev_2 (the suggested rename of dev)', ['dev_main', 'dev_2']],
       ['keys sharing a start that neither is (dev_2 and dev_3)', ['dev_2', 'dev_3']],
     ])('accepted: %s', (_label, names) => {
@@ -1164,7 +1164,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  // b.av2 SR-1.2 ("No format rule"), E14 Task 0 operator decision A: any
+  // ("No format rule"), section 0 operator decision A: any
   // non-empty persona name loads, including one shaped like a Slack token, and
   // is printed exactly as written in the persona reference of every error.
   // Only CSCB's own credential values (`bot_token` / `app_token` in an entry)
@@ -1176,13 +1176,13 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   // sentinel. `withoutName` first masks the name and its key (the key keeps
   // the name's characters, lower-cased), and `assertNoLeak` checks the rest,
   // which proves nothing else token-like, such as a credential value, got in.
-  describe('token-shaped persona name (SR-1.2: no format rule; AC 20 config leg)', () => {
+  describe('token-shaped persona name (no format rule config leg)', () => {
     const tokenName = (prefix: string) => fakeToken(prefix, 'name')
 
     /** `captured` with `name` (as written) and its key masked, so `assertNoLeak` checks what is left. */
     const masked = (captured: unknown, name: string) => withoutName(captured, name, personaKey(name))
 
-    /** The b.av2 SR-2.2 reference of entry `i`: `personas[i]`, the JSON-quoted name and its key. */
+    /** The reference of entry `i`: `personas[i]`, the JSON-quoted name and its key. */
     const indexedRef = (index: number, name: string) => `personas[${index}] ${JSON.stringify(name)} (key=${personaKey(name)})`
 
     // Token-shaped rows first, then names near the token shape (a word such
@@ -1280,8 +1280,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('server-wide settings (SR-1.6)', () => {
-    test('b.p3h: loaded defaults are queued beehive and delivered spinthinking', () => {
+  describe('server-wide settings', () => {
+    test('loaded defaults are queued beehive and delivered spinthinking', () => {
       const config = load(makePersonaConfigInput({}, dir))
       expect(config).toMatchObject({ queued_ack_reaction: 'beehive', ack_reaction: 'spinthinking' })
       expect(replySettingsOf(config)).toMatchObject({ queued_ack_reaction: 'beehive', ack_reaction: 'spinthinking' })
@@ -1292,20 +1292,20 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       [{ ack_reaction: 'bee' }, { queued_ack_reaction: 'beehive', ack_reaction: 'bee' }],
       [{ queued_ack_reaction: 'eyes', ack_reaction: 'custom_working' }, { queued_ack_reaction: 'eyes', ack_reaction: 'custom_working' }],
       [{ queued_ack_reaction: 'same', ack_reaction: 'same' }, { queued_ack_reaction: 'same', ack_reaction: 'same' }],
-    ])('b.p3h: acknowledgement stages can be configured independently: %j', (settings, expected) => {
+    ])('acknowledgement stages can be configured independently: %j', (settings, expected) => {
       const config = load({ ...makePersonaConfigInput({}, dir), ...settings })
       expect(config).toMatchObject(expected)
       expect(replySettingsOf(config)).toMatchObject(expected)
     })
 
-    test.each(['', '   ', null, 0, false, [], {}].map(value => ({ value })))('b.p3h: queued_ack_reaction rejects a bad value $value as a string setting', ({ value }) => {
+    test.each(['', '   ', null, 0, false, [], {}].map(value => ({ value })))('queued_ack_reaction rejects a bad value $value as a string setting', ({ value }) => {
       const error = loadError({ ...makePersonaConfigInput({}, dir), queued_ack_reaction: value })
       expect(error).toContain('queued_ack_reaction')
       expect(error).not.toContain('unknown top-level')
       assertNoLeak(error)
     })
 
-    test('b.p3h: both reaction keys are registered server settings; reload records them and keeps startup values in effect', () => {
+    test('both reaction keys are registered server settings; reload records them and keeps startup values in effect', () => {
       expect(PERSONA_TOP_LEVEL_KEYS).toContain('queued_ack_reaction')
       expect(PERSONA_TOP_LEVEL_KEYS).toContain('ack_reaction')
       const start = load({ ...makePersonaConfigInput({}, dir), queued_ack_reaction: 'start_queue', ack_reaction: 'start_delivery' })
@@ -1412,20 +1412,20 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       expect(loadError({ ...makePersonaConfigInput({}, dir), [key]: value })).toContain(named)
     })
 
-    // b.b1j SR-1: fresh_system_prompt is a server-wide boolean; only an absent key takes the default.
-    describe('fresh_system_prompt (b.b1j SR-1)', () => {
+    // fresh_system_prompt is a server-wide boolean; only an absent key takes the default.
+    describe('fresh_system_prompt', () => {
       const withFresh = (value: unknown) => ({ ...makePersonaConfigInput({}, dir), fresh_system_prompt: value })
 
       test.each([
         ['absent', undefined, true],
         ['true', true, true],
         ['false', false, false],
-      ] as const)('%s loads and resolves to %p (SR-1.1)', (_label, value, resolved) => {
+      ] as const)('%s loads and resolves to %p', (_label, value, resolved) => {
         const input = value === undefined ? makePersonaConfigInput({}, dir) : withFresh(value)
         expect(load(input).fresh_system_prompt).toBe(resolved)
       })
 
-      test('absent and true resolve to the same configuration (SR-1.1)', () => {
+      test('absent and true resolve to the same configuration', () => {
         expect(load(makePersonaConfigInput({}, dir))).toStrictEqual(load(withFresh(true)))
       })
 
@@ -1442,8 +1442,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         ['an array holding the leak sentinel', [LEAK_SENTINEL]],
       ]
 
-      // The same full message for every value: it names the setting, no persona, and never echoes the value (SR-1.2).
-      test.each(REJECTED)('%s is rejected with the full message, naming the setting and no persona (SR-1.2)', (_label, value) => {
+      // The same full message for every value: it names the setting, no persona, and never echoes the value.
+      test.each(REJECTED)('%s is rejected with the full message, naming the setting and no persona', (_label, value) => {
         expect(loadError(withFresh(value))).toBe(
           `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
             'fresh_system_prompt must be a boolean.',
@@ -1451,7 +1451,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       })
     })
 
-    // b.jg5 SRJ-213: the error names the setting and both bounds of its range,
+    // the error names the setting and both bounds of its range,
     // and never the rejected value (loadError fails if PLACEHOLDER reaches it).
     test.each([
       ['below the minimum', MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS - 1],
@@ -1477,9 +1477,9 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  // b.2nr: the test-only timer override block. Undocumented, off by default, so it is not one of PERSONA_TOP_LEVEL_KEYS
+  // the test-only timer override block. Undocumented, off by default, so it is not one of PERSONA_TOP_LEVEL_KEYS
   // (the documented-key tests see no change), but the loader accepts it and validates it with the rules below.
-  describe('the test-only timer override block test_timer_overrides (b.2nr)', () => {
+  describe('the test-only timer override block test_timer_overrides', () => {
     const withBlock = (block: unknown) => ({ ...makePersonaConfigInput({}, dir), [TEST_TIMER_OVERRIDES_KEY]: block })
     const MS_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_ms'))
     const S_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_s'))
@@ -1511,7 +1511,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       }
     })
 
-    test('all six keys together load as given (b.omv SR-14.1)', () => {
+    test('all six keys together load as given', () => {
       const block = {
         latch_recheck_interval_ms: 45_000,
         ad_version_recheck_interval_ms: 20_000,
@@ -1599,14 +1599,14 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  // AC 49 (b.av2 SR-1.6, SR-10.1, SR-10.2): access.json's ackReaction,
+  // access.json's ackReaction,
   // textChunkLimit and chunkMode became ack_reaction, reply_chunk_limit and
   // reply_chunk_mode. Their defaults and validation are pinned above; these
   // cases pin the move: the old names are not accepted in config.json, and a
   // leftover access.json beside it neither supplies the settings nor is
   // touched. The access.json sits in the config directory, where the server
   // used to keep it.
-  describe('settings moved from access.json (SR-1.6, SR-10.1, SR-10.2; AC 49)', () => {
+  describe('settings moved from access.json', () => {
     test.each([
       ['ackReaction', 'eyes'],
       ['textChunkLimit', 1234],
@@ -1641,7 +1641,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('pre-persona rejection (SR-1.7 loader part; AC 45)', () => {
+  describe('pre-persona rejection (loader part)', () => {
     /**
      * Load `input`, returning the error message plus proof that the file and
      * directory are untouched and that the error passes `assertNoLeak`.
@@ -1711,7 +1711,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Channel modes (b.deo SRI-101 to SRI-104). The switch picks the mode for
+  // Channel modes. The switch picks the mode for
   // every persona at once: declarative mode (absent or false) reads each
   // persona's `channels` and top-level `permission_prompts`; fungible mode
   // (true) reads its `invited` section. Setting names, key lists and the "dm"
@@ -1755,7 +1755,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   const bothModesEntry = (overrides: Record<string, unknown> = {}) =>
     modeEntry({ [INVITED]: { permission_prompts: CHANNEL }, ...overrides })
 
-  describe('the channel-mode switch allow_invited_channels (b.deo SRI-101; b.av2 SR-1.6)', () => {
+  describe('the channel-mode switch allow_invited_channels', () => {
     test.each([
       ['true', true, 'fungible'],
       ['false', false, 'declarative'],
@@ -1811,7 +1811,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('the invited section and the resolved form (b.deo SRI-102; b.av2 SR-1.2)', () => {
+  describe('the invited section and the resolved form', () => {
     test('invited is a known persona-entry key (PERSONA_ENTRY_KEYS)', () => {
       expect(PERSONA_ENTRY_KEYS).toContain(INVITED)
     })
@@ -1874,7 +1874,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('fungible parity: the real loader against makeMultiPersonaConfig (b.deo SRI-102, SRI-1203)', () => {
+  describe('fungible parity: the real loader against makeMultiPersonaConfig', () => {
     test('makeFungiblePersona entries under the switch load to the sections and destinations makeMultiPersonaConfig builds from the same values', () => {
       const specs = [
         { name: 'alpha' },
@@ -1917,7 +1917,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     ['false', false],
   ] as const
 
-  describe('validation in declarative mode: invited is neither checked nor read (b.deo SRI-103; b.av2 SR-1.5)', () => {
+  describe('validation in declarative mode: invited is neither checked nor read', () => {
     const MALFORMED_INVITED: [string, unknown][] = [
       ['an invited with a malformed permission_prompts', { permission_prompts: PLACEHOLDER }],
       ['an invited with a non-string permission_prompts', { permission_prompts: 42 }],
@@ -1958,7 +1958,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('validation in fungible mode (b.deo SRI-104; b.av2 SR-1.3, SR-1.5)', () => {
+  describe('validation in fungible mode', () => {
     /** `personas[i]` plus the persona reference (`renderPersonaRef`). */
     const indexedRef = (index: number, name: string) => `personas[${index}] ${renderPersonaRef(name)}`
 
@@ -2179,7 +2179,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       offenders: [number, string][]
       /** Builds the personas with the persona builder of one mode. */
       build: (factory: typeof makePersona) => PersonaInput[]
-      /** Record mode (b.av2 SR-1.5; b.deo SRI-104): only the real-path collision step is skipped. */
+      /** Record mode: only the real-path collision step is skipped. */
       record: 'loads' | 'rejects'
     }
 
@@ -2330,7 +2330,7 @@ const NOT_REGULAR_STATS = () => ({ isFile: () => false, isDirectory: () => false
  * in-process it would hang the whole suite instead of failing the test.
  * `body` prints one JSON line; returns the child and that line parsed.
  * The child is Bun by absolute path (`process.execPath`) with its `env` a
- * direct `hostSafeChildEnv` call (b.av2 SR-13.2, b.jg5 SRJ-1302): the test's
+ * direct `hostSafeChildEnv` call: the test's
  * temp `home` as HOME, no tool (so `PATH` names no directory) and a state dir
  * under `home` as `SLACK_STATE_DIR`; nothing else comes from `process.env`.
  */
@@ -2358,11 +2358,11 @@ const CHILD_RECORDING_FS = `
 `
 
 // ---------------------------------------------------------------------------
-// describeUnknownKeys (b.av2 SR-10.3; Director decision 5): only plain setting
+// describeUnknownKeys: only plain setting
 // names are echoed. Pure; the loader's use of it is in `unknown keys` above.
 // ---------------------------------------------------------------------------
 
-describe('describeUnknownKeys (b.av2 SR-10.3)', () => {
+describe('describeUnknownKeys', () => {
   const ONE = '1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret)'
   const many = (n: number) => `${n} fields whose names are not shown (they are not plain setting names, so they could be pasted secrets)`
 
@@ -2402,10 +2402,10 @@ describe('describeUnknownKeys (b.av2 SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// personaKeysPrefixRelated / suggestNonPrefixingName (b.1ix follow-up)
+// personaKeysPrefixRelated / suggestNonPrefixingName (follow-up)
 // ---------------------------------------------------------------------------
 
-describe('personaKeysPrefixRelated (b.1ix follow-up)', () => {
+describe('personaKeysPrefixRelated (follow-up)', () => {
   test.each([
     ['dev', 'dev_2', true],
     ['dev_2', 'dev', true],
@@ -2421,13 +2421,13 @@ describe('personaKeysPrefixRelated (b.1ix follow-up)', () => {
   })
 })
 
-describe('suggestNonPrefixingName (b.1ix follow-up)', () => {
+describe('suggestNonPrefixingName (follow-up)', () => {
   /** Persona name-and-key pairs for in-form names, each its own key. */
   const inForm = (...names: string[]) => names.map((name) => ({ name, key: personaKey(name) }))
 
   test.each([
     ['dev beside dev_2', 'dev', inForm('dev_2'), 'dev_main'],
-    ['team beside the other team_ keys', 'team', inForm('general', 'team_admin', 'team_apiary'), 'team_main'],
+    ['team beside the other team_ keys', 'team', inForm('general', 'team_admin', 'team_support'), 'team_main'],
     ['a key that starts with <key>_main moves to _main_2', 'dev', inForm('dev_2', 'dev_main_x'), 'dev_main_2'],
     ['keys starting with <key>_main and <key>_main_2 move to _main_3', 'dev', inForm('dev_2', 'dev_main_x', 'dev_main_2x'), 'dev_main_3'],
     ['a hashed key beside it', 'dev', [{ name: 'Dev Bot', key: personaKey('Dev Bot') }], 'dev_main'],
@@ -2469,10 +2469,10 @@ describe('suggestNonPrefixingName (b.1ix follow-up)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// credentialsFilesToProtect (b.av2 SR-5.2)
+// credentialsFilesToProtect
 // ---------------------------------------------------------------------------
 
-describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
+describe('credentialsFilesToProtect', () => {
   let dir: string
   let home: string
   let lines: string[]
@@ -2694,14 +2694,14 @@ describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// referencedCredentialsPaths (b.av2 SR-8.3): the extraction both
+// referencedCredentialsPaths: the extraction both
 // credentialsFilesToProtect and the reload fingerprint use. Its ~ expansion,
 // validation tolerance and the failure shapes shared with the file guard are
 // covered through credentialsFilesToProtect above; these cases are its own.
 // Pure: no file is read or written.
 // ---------------------------------------------------------------------------
 
-describe('referencedCredentialsPaths (b.av2 SR-8.3)', () => {
+describe('referencedCredentialsPaths', () => {
   // An injected home that exists nowhere: expansion is string work only.
   const home = '/nonexistent-home-for-test'
 
@@ -2755,7 +2755,7 @@ describe('referencedCredentialsPaths (b.av2 SR-8.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Server config path (b.av2 SR-1.1, SR-8.7)
+// Server config path
 // ---------------------------------------------------------------------------
 
 /** Environment variables this block changes; restored after every test. */
@@ -2772,7 +2772,7 @@ function saveStartEnv(): () => void {
   }
 }
 
-describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () => {
+describe('resolveServerConfigPath / resolveServerStateDir', () => {
   let dir: string
   let home: string
   let restoreEnv: () => void
@@ -2800,7 +2800,7 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
     expect(path).toBe(join(process.cwd(), 'rel', 'state', 'config.json'))
   })
 
-  // Bug b.fc4: the default sits outside ~/.claude, where Claude Code asks before every write.
+  // the default sits outside ~/.claude, where Claude Code asks before every write.
   test.each([
     ['SLACK_STATE_DIR unset', {}],
     ['SLACK_STATE_DIR empty', { SLACK_STATE_DIR: '' }],
@@ -2837,13 +2837,13 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
 
 
 // ---------------------------------------------------------------------------
-// Start-path primitives (b.av2 SR-8.7, SR-1.5 record-start part, SR-10.3):
+// Start-path primitives (record-start part):
 // readPersonaConfigBytes, configFileReadFailureMessage and
 // parsePersonaConfigBytes. Which file a start runs, and what it logs, is
 // covered in tests/reload.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
+describe('start-path primitives', () => {
   let dir: string
   let home: string
 
@@ -2923,7 +2923,7 @@ describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
     })
   })
 
-  // Stat-first (b.av2 SR-8.7 with the E2 FIFO carry): the file is opened once,
+  // Stat-first (with the FIFO carry): the file is opened once,
   // read-only and non-blocking, its descriptor is stat'ed, only a regular file
   // is read through that same descriptor, and the descriptor is always closed.
   describe('readPersonaConfigBytes: opened once, checked, read and closed through its descriptor', () => {
@@ -3249,7 +3249,7 @@ describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
       expect(message).toContain(`invalid persona config in "${recordPath()}"`)
     })
 
-    // SR-10.3 (E1/E2 carry): a malformed file gives the 1-based line and
+    // ( carry): a malformed file gives the 1-based line and
     // column of the first invalid character and none of its content. A row's
     // leak marker sits where Bun's own parse error would quote it.
     const bareToken = `${LEAK_SENTINEL}_pasted`
@@ -3290,15 +3290,15 @@ describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
 })
 
 // ===========================================================================
-// resolveRealPathStrict (bug b.g57): the real path of a persona's
+// resolveRealPathStrict: the real path of a persona's
 // claude_config_dir with no lexical fallback. A directory not created yet
-// resolves through its nearest existing ancestor (E13 Director decision 1);
+// resolves through its nearest existing ancestor;
 // anything else that fails is unresolvable. Real-file-system cases live in a
 // mkdtempSync directory; injected cases pass both realpath and lstat, so they
 // touch no file system at all.
 // ===========================================================================
 
-describe('resolveRealPathStrict (bug b.g57)', () => {
+describe('resolveRealPathStrict', () => {
   let tmp: string
   /** The temp root's own real path: the temp root may itself sit behind a symlink. */
   let real: string

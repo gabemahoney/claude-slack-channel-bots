@@ -6,7 +6,7 @@
  * The header is the script's leading run of comment lines (a `#` after any
  * indent), the shebang included. An exit-code entry is a header line
  * `#   <code>  SR-x.y …` whose code column is a number, or `--` for a step with
- * no exit code of its own (publish-prepare.sh's SR-3.2), with its continuation
+ * no exit code of its own (publish-prepare.sh's), with its continuation
  * lines: each following comment line whose first word is neither a number nor
  * `--`.
  *
@@ -43,9 +43,9 @@ function escapeRegExp(value: string): string {
 }
 
 /**
- * Every entry of `header` for the SR id `sr` (`'SR-3.2'`), in order. The id
- * is matched as a whole word, so `'SR-2.4'` finds neither `SR-2.4a` nor
- * `SR-2.41`.
+ * Every entry of `header` for the SR id `sr` (`''`), in order. The id
+ * is matched as a whole word, so `''` finds neither `` nor
+ * ``.
  */
 export function headerEntries(header: string, sr: string): HeaderEntry[] {
   const entry = new RegExp(`^#\\s+(\\d+|--)\\s+${escapeRegExp(sr)}\\b.*(?:\\n#\\s+(?!\\d|--\\s)\\S.*)*`, 'gm')

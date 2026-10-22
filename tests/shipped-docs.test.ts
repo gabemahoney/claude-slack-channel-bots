@@ -1,9 +1,9 @@
 import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
 /**
- * shipped-docs.test.ts — the shipped-description audit (b.av2 SR-13.5): what
+ * shipped-docs.test.ts — the shipped-description audit: what
  * the package ships to the operator and to bot instances describes personas
- * and nothing else. It backs the SR-14 `shipped-docs` rows for AC 39, AC 46
- * and AC 74.
+ * and nothing else. It backs the `shipped-docs` rows for
+ * and.
  *
  * "The README" below names the user docs (`USER_DOC_FILES`): the README and
  * the `docs/` pages that took its reference sections (configuration, reload,
@@ -13,80 +13,79 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  * text (`userDocsText`), and every link check reads each page on its own.
  *
  * Covers:
- * - the Slack app manifest (AC 39, SR-4.3, SR-12): `im:write` and the pinned
+ * - the Slack app manifest: `im:write` and the pinned
  *   scopes and events, and its comments;
- * - the README's modify-semantics table (SR-12, SR-8.6), held against the
+ * - the README's modify-semantics table, held against the
  *   change plan's exported classes in src/reload-plan.ts, the switch's row
  *   and the recorded row among them, each "Kept", and the server-wide row
- *   naming the switch as its exception (b.deo SRI-805, SRI-1103), the new
+ * naming the switch as its exception, the new
  *   rows self-checked on edited copies;
- * - the README persona reference (SR-12, b.deo SRI-1101): its key tables
+ * - the README persona reference: its key tables
  *   list exactly the loader's keys, and its two complete examples, one per
  *   channel mode, load through the real loader and are complete for their
  *   mode;
  * - the README's pointers to the setup wizard;
- * - the shipped-text audit (AC 46) over `SHIPPED_TEXTS` (the README, every
+ * - the shipped-text audit over `SHIPPED_TEXTS` (the README, every
  *   file under `skills/`, the whole manifest, the setup wizard's packaged
  *   credentials script, the MCP instructions read
  *   through `MCP_INSTRUCTIONS` exported by src/registry.ts, the Slack Reply
  *   Guard's reminder text, the crontable template header, and
  *   `set_channel_delivery`'s texts read through their src/registry.ts
  *   exports, each builder rendered with fixed samples in each of its forms,
- *   with a membership case built from the module's exports (b.deo
- *   SRI-1308); the five 0.11.1 tools' descriptions are built inline and not
+ * with a membership case built from the module's exports; the five 0.11.1 tools' descriptions are built inline and not
  *   read): no
- *   first-@mention claim (SR-12), and no term of `FORBIDDEN_TERMS` (the
+ * first-@mention claim, and no term of `FORBIDDEN_TERMS` (the
  *   pre-persona shape, the token environment variables and command-line
  *   tokens, the access-control file, the retired name-rule wording). The
  *   exemptions (`AUDIT_EXCEPTIONS`) are exactly three: the debugging skill's
- *   SR-1.7 entry, and one entry per README runbook section, each exempting
+ * entry, and one entry per README runbook section, each exempting
  *   `access.json` only, and only inside "Switching over to agent-director
  *   Phase 1" (which saves the previous CSCB's file) or "Rolling back the
- *   switch-over" (which restores it) (b.jg5 SRJ-1108, SRJ-1109, SRJ-1516).
+ * switch-over" (which restores it).
  *   Every other term stays banned inside those sections, the token
  *   variables' names included; a missing heading fails the audit;
- * - the README's receiving section (SR-12, SR-4.4): its table's row for each
+ * - the README's receiving section: its table's row for each
  *   `via` value shows that value, and both injected kinds' rows show none;
- * - the MCP instructions carry no reload wording (AC 74, SR-8.8);
+ * - the MCP instructions carry no reload wording;
  * - the MCP instructions and the Reply Guard's reminder text name no
- *   spelling of `clear-latch` (AC 47, b.jg5 SRJ-511); the README and the
+ * spelling of `clear-latch`; the README and the
  *   skills may, for the operator;
  * - the two agent-director refusal classes, `ad-below-phase1-floor` and
- *   `ad-system-install-too-old` (b.jg5 SRJ-208): the debugging skill has an
+ * `ad-system-install-too-old`: the debugging skill has an
  *   entry per label inside its refusal section and README "Startup errors" a
  *   line per label, each naming the switch-over runbook section by its title;
  *   neither the refusal section nor a README line carries an upgrade form
  *   (tests/test-helpers/upgrade-forms.ts, self-checked here; the runtime-stop
  *   remedy's `agent-director serve` span removed first, ruling C-1,
- *   SRJ-1104); exactly one
+ *); exactly one
  *   README heading, under `## Migration`, carries the title the refusals
- *   name (replacing E2's no-link case), and every link into that section
+ * name (replacing no-link case), and every link into that section
  *   from the README and the two skills resolves;
  * - the switch-over runbook, README "Switching over to agent-director
- *   Phase 1" (b.jg5 SRJ-1108; the E2-gate and E5 hatch notes): its steps
+ * Phase 1" (the -gate and design notes): its steps
  *   1–11 read in order by the shared step reader (`runbookSteps`,
  *   tests/test-helpers/runbooks.ts), one named case per
- *   SRJ-1108 element over each carrier (`SWITCH_OVER_CARRIERS`: the README
+ * element over each carrier (`SWITCH_OVER_CARRIERS`: the README
  *   section and the CHANGELOG release entry's copy), the
  *   negative and order checks, the "Arrived here from a startup refusal?"
  *   block's ordered elements and branches, the publishing-host block, the
  *   sections the runbook replaced or kept, and the reader's self-checks.
  *   Values CSCB defines are imported; agent-director vocabulary CSCB defines
  *   nowhere sits in `AD_VOCABULARY`, each row citing its source;
- * - the rollback runbook, README "Rolling back the switch-over" (b.jg5
- *   SRJ-1109; hatch A3): exactly one `###` heading under `## Migration`,
+ * - the rollback runbook, README "Rolling back the switch-over" (
+ * ; design A3): exactly one `###` heading under `## Migration`,
  *   after the switch-over section; its steps 1–9 read in order by the same
- *   step reader, one named case per SRJ-1109 element over each carrier
+ * step reader, one named case element over each carrier
  *   (`ROLLBACK_CARRIERS`, the same two), the order rows (steps 6, 8 and 9), the cross-step
  *   rows ("Operator actions" named by title; no `tmux kill-session` and no
- *   finished-row option are E36 T4's whole-file checks), step 8's
+ * finished-row option are whole-file checks), step 8's
  *   no-conversion-tool check, and ruling C-2: the
  *   switch-over refusal block's pointers to the rollback runbook and its
  *   step 8 are links that resolve, as are the runbooks' other links and the
  *   registry-install runbook's scope note links to both sections.
- * - `OPERATOR_TEXTS` (b.jg5 SRJ-1101's seven operator texts: the README, the
+ * - `OPERATOR_TEXTS` (seven operator texts: the README, the
  *   debugging, install and setup skills, docs/architecture.md,
- *   docs/engineering-guide.md and CHANGELOG.md), read for SRJ-1107's checks:
+ * docs/engineering-guide.md and CHANGELOG.md), read for checks:
  *   no "Upgrade steps" heading or link and no "checks its tmux session first"
  *   in any of them; the CHANGELOG release entry (the 0.11.0 entry, found by
  *   its version and publish date, never by its place; it alone holds the
@@ -95,29 +94,29 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *   retired access file kept until rollback is no longer wanted and never
  *   deleted; the relaunch through agent-director; the dropped tmux-commands
  *   note; the prefix-key reason without the old agent-director version; the
- *   fresh-once note's runbook pointer), each self-checked against b.ob2's
- *   wording; the names the hatch-note entries introduce, through their `src/`
+ * fresh-once note's runbook pointer), each self-checked against
+ * wording; the names the design-note entries introduce, through their `src/`
  *   exports; the two runbook copies, which join `SWITCH_OVER_CARRIERS` and
  *   `ROLLBACK_CARRIERS`, name the README as the maintained copy and match it
- *   word for word; and every CHANGELOG link resolves (hatch A3).
- * - Bug b.7sd (SRD A-19): no operator text, the CHANGELOG read as its
+ * word for word; and every CHANGELOG link resolves (design A3).
+ * - (contract A-19): no operator text, the CHANGELOG read as its
  *   release entry, nor any other shipped skill file or the registry-install
  *   runbook names an agent-director install-gate record (or any gate
  *   record), go line or post-install check line for the operator to read or
  *   write (only step 1's "agent-director ships no install-gate file or
  *   record" passes); self-checked on 0.11.0's runbook wording and on new
  *   forms, a denial by any other "no" among them.
- * - E36 T1's checks, also read through `OPERATOR_TEXTS`: no operator text
+ * - checks, also read through `OPERATOR_TEXTS`: no operator text
  *   quotes a sentence of the *Kill failed* or *Process outlived kill* alert
- *   but its title and closing sentences (the E20 note; both versions rendered
+ * but its title and closing sentences (the note; both versions rendered
  *   from src/kill-failure-alert.ts with the stub's descriptions, one case per
  *   text and sentence); the README's and the debugging skill's
  *   `auto-restart disabled` lost-message text keeps not saying the persona
- *   will not restart on its own (the E8 note); each self-checked. The E8
- *   note's raw-command advice is checked over every operator text with E36
- *   T4's checks, below.
- * - E36 T2's checks, also read through `OPERATOR_TEXTS`:
- *   - SRJ-1102 (AC 78): the prefix-key reason sentence, built by
+ * will not restart on its own (the note); each self-checked. The
+ * note's raw-command advice is checked over every operator text with
+ * checks, below.
+ * - checks, also read through `OPERATOR_TEXTS`:
+ * - the prefix-key reason sentence, built by
  *     `prefixRelatedKeysReason` in its operator-text form, in each carrier's
  *     section (README "Persona name and key", the debugging skill's "Across
  *     personas", the wizard's name step, the engineering guide's
@@ -126,11 +125,11 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *     skill quotes the validation text the loader renders for `dev` then
  *     `dev_2`; the example `tmux attach -t slack_bot_dev` stands in no
  *     operator text outside those two spans (`PREFIX_KEY_REASON_SPANS`, one
- *     file-local list citing SRJ-1102 and SRJ-1101's exception); and no
+ * file-local list citing and exception); and no
  *     operator text says CSCB or agent-director targets a session by prefix
  *     or passes a bare name (`PREFIX_TARGETING_CLAIMS`);
- *   - the E2-gate, E4 and E5 notes over the README: each install-check and
- *     startup-error entry this Task rewrote names the runbook section (the
+ * - the -gate, and notes over the README: each install-check and
+ * startup-error entry this section rewrote names the runbook section (the
  *     install check's not-found entry its publishing-host block, by a link
  *     that resolves; the startup gate's not-found entry, which runs on a bot
  *     host, switch-over step 1 by a link that resolves, and no
@@ -138,15 +137,15 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *     `ErrUnknownErrorName` clause; the state-DB owner entry runs the server
  *     as the owner and never removes the file; the "Bots come back with no
  *     memory" paragraph and the `resume_enabled` row name no pre-floor
- *     version; "Preflight gates" counts its gates and lists SR-2.5 with
+ * version; "Preflight gates" counts its gates and lists with
  *     `AD_VERSION_CHECK_FAIL_EXIT_CODE` (scripts/ad-version-check.ts) and the
  *     below-floor note; no operator text advises re-installing
  *     agent-director (`UPGRADE_FORMS`' re-install row, whose self-checks sit
- *     with the other rows' under SRJ-208). Each self-checked against the
- *     wording the Task replaced.
- * - E36 T3's checks over docs/architecture.md and docs/engineering-guide.md,
- *   read through `OPERATOR_TEXTS` (b.jg5 SRJ-1105, SRJ-1106, SRJ-612; AC 78;
- *   the passage and presence checks SRJ-1101's term checks cannot express):
+ * with the other rows' under). Each self-checked against the
+ * wording the section replaced.
+ * - checks over docs/architecture.md and docs/engineering-guide.md,
+ * read through `OPERATOR_TEXTS` (
+ * the passage and presence checks term checks cannot express):
  *   - both docs: no tmux call made by the server (a raw session, pane or
  *     server sub-command, `tmux send-keys`, an affirmed raw or direct tmux
  *     call; `SERVER_TMUX_CALLS`, `AFFIRMED_TMUX_CALLS`), no row delete
@@ -155,51 +154,51 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *     incident write-up, and no word of the source audit's
  *     `delete-helper`, `finished-row-option` or `removed-identifier` rules
  *     (`SOURCE_WORD_RULES`, tests/test-helpers/source-audit.ts), the two
- *     delete-helper lists (`DELETE_HELPER_LISTS`, SRJ-716) excepted; none of
+ * delete-helper lists (`DELETE_HELPER_LISTS`) excepted; none of
  *     the old raw-tmux guidance (its heading, a link to it, the known gap);
  *     every link resolves;
- *   - the engineering guide: SRJ-1106's section states the rule, links
+ * - the engineering guide: section states the rule, links
  *     Source Invariants and names the source audit; agent-director's labels
  *     (`AD_VOCABULARY`) only inside it; the Layering section's two rules and
  *     its link to it; the Start Sweep's pre-persona-row rule says the kill is
  *     checked and the row kept;
- *   - the architecture doc: one passage per SRJ-1105 topic
- *     (`SRJ_1105_TOPICS`), each found by the `src/` exports it names
+ * - the architecture doc: one passage topic
+ * (`OPERATOR_TOPICS`), each found by the `src/` exports it names
  *     (imported, `exportName`). Each self-checked against the old wording or
  *     a synthetic text.
- * - E36 T4's checks, read through `OPERATOR_TEXTS` (b.jg5 SRJ-1101, SRJ-1103,
- *   SRJ-1104; SRJ-1105 and SRJ-1106 through the term checks; AC 78, AC 79):
- *   - SRJ-1101 over all seven texts, each hit with file and line: none of
- *     `SRJ_1101_TERMS` (`has-session`, `tmux-kill`, `agent-director delete`,
+ * - checks, read through `OPERATOR_TEXTS` (
+ * and through the term checks):
+ * - over all seven texts, each hit with file and line: none of
+ * `FORBIDDEN_OPERATOR_TERMS` (`has-session`, `tmux-kill`, `agent-director delete`,
  *     `find-missing --timeout`, `include-finished` and `include_finished`,
  *     `kill-pane`, `kill-server`), wrapped or in any case; `tmux kill-session`
  *     only in switch-over steps 5 and 6 of the two runbook carriers (the
  *     steps' lines cross-checked against `runbookSteps`; `-t =` through the
  *     allow-list); no `tmux attach -t` without `=` outside
  *     `PREFIX_KEY_REASON_SPANS`; no `agent-director kill` with a positional id
- *     and no kill-and-respawn advice (`RAW_COMMAND_FORMS`, the E8 note's two
+ * and no kill-and-respawn advice (`RAW_COMMAND_FORMS`, the note's two
  *     forms the other checks do not name); every tmux command on the
  *     layering rule's allow-list (`TMUX_ALLOWED_FORMS`: the exact-target
  *     attach, the runbooks' read-only `tmux ls`, `tmux list-windows -a` or
  *     `-t =`, `tmux display-message -p`, and `tmux kill-session -t =`), found
  *     by tmux's command names (`TMUX_COMMAND_NAMES`, citing tmux(1)); no
  *     pane, `read-pane` answer or GONE taken as proof a worker is gone
- *     (SRJ-613; a negation passes only when it governs the claim's verb);
+ * (a negation passes only when it governs the claim's verb);
  *     every `agent-director kill --instance-id` (the id after a space
  *     or `=`) named with its result checked, and in the README and the
  *     CHANGELOG with "on an error, don't delete or respawn" (also a row per
  *     runbook step), and no fenced block running `agent-director kill`; the
  *     debugging skill's one-line `read-pane` check, both caveats and the
  *     pointer;
- *   - SRJ-1103 over the README, a row per prerequisite and per section
- *     (`README_SRJ_1103_ROWS`), each notice's symptom by its `src/`-rendered
+ * - over the README, a row per prerequisite and per section
+ * (`README_NOTICE_ROWS`), each notice's symptom by its `src/`-rendered
  *     title, read in the debugging-skill section its `### Symptom:` entry
- *     links (`viaSymptom`), each SRJ-1013 class under "Startup errors",
+ * links (`viaSymptom`), each class under "Startup errors",
  *     the cron line (`AD_VOCABULARY`'s `findMissingCron`), the refusal items
  *     and the runtime-stop paragraph, switch-over steps 1 and 7 linking
  *     "Upgrading to personas" in both carriers;
- *   - SRJ-1104 over the debugging skill, a row per section
- *     (`DEBUG_SKILL_SRJ_1104_ROWS`), each SRJ-1013 class in its section, the
+ * - over the debugging skill, a row per section
+ * (`DEBUG_SKILL_NOTICE_ROWS`), each class in its section, the
  *     refusal entries, and the runtime-stop remedy's elements
  *     (`RUNTIME_STOP_REMEDY_ROWS`), with no `command -v agent-director` and no
  *     upgrade form once ruling C-1's one span (`RUNBOOK_COMMAND_SPANS`) is
@@ -208,9 +207,9 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *     tests/ad-version-gate.test.ts) and by the runtime-stop heading check here.
  *   Each self-checked: every row's items cut one by one from the document
  *   itself (`withItemCut`, only where the row's passage reads them) with the
- *   row's real check run on the edited document, and the rows SRJ-1103's and
- *   SRJ-1104's Test lines name reverted to the old wording.
- * - E39 T5's check of tests/README.md (b.jg5 SRJ-1112), with
+ * row's real check run on the edited document, and the rows and
+ * Test lines name reverted to the old wording.
+ * - check of tests/README.md, with
  *   tests/integration/ listed read-only: the README names every `test-*.sh`
  *   there and no `test-<n>-<name>.sh` that is not there; no passage about
  *   the start sweep says it deletes, removes or loses a row
@@ -219,25 +218,25 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *   personas' keys as retired, so the rows stay. Each self-checked on
  *   in-memory copies, the old Test 10 passage among them. tests/README.md is
  *   no shipped description: `SHIPPED_TEXTS` does not hold it.
- * - b.deo SRI-1308's README checks (SRI-1101 to SRI-1105; AC 42), beside
- *   T1's key-table, example and in-place-row cases above:
- *   - the headings T17 added, each exactly once where it was placed
+ * - README checks, beside
+ * key-table, example and in-place-row cases above:
+ * - the headings added, each exactly once where it was placed
  *     (`README_DEO_PLACEMENTS`): `## Channel modes` the last section of
  *     `# Configuration`, right before `# Reload`, with its four subsections in order, the security
  *     subsection inside "How a persona receives messages", and
  *     "Downgrading to an earlier release" a `###` of its own right after
  *     "Upgrading to personas";
  *   - one row per element (`README_DEO_ROWS`, read by `docRowProblems`):
- *     the two modes (SRI-1102); the server-wide exception, the field marks,
+ * the two modes; the server-wide exception, the field marks,
  *     the declarative-scoped sections and "Load-time rules" per mode
- *     (SRI-1101); the receiving rows per mode, the @mention rule and the
- *     security statement (SRI-1102, SRI-1104); the introduction,
+ * ; the receiving rows per mode, the @mention rule and the
+ * security statement; the introduction,
  *     "Personas (config.json)" and "Tools" per mode, the tools' rows, both
- *     known residuals, the prompt note and the archive reason (SRI-1103);
+ * known residuals, the prompt note and the archive reason;
  *     the `channel-delivery.json` row, "Size limit", the preview's lines
  *     and rows, "Confirming a change" and the switch's take-effect exception
- *     (SRI-1103); the troubleshooting entries and the downgrade steps
- *     (SRI-1105). Setting names come from `src/` or typed names, preview
+ * ; the troubleshooting entries and the downgrade steps.
+ * Setting names come from `src/` or typed names, preview
  *     lines from `modeSwitchLine` and `recordedLine` (built when the row
  *     runs), labels from their exports; the switch's line is read in its
  *     second carrier too, the setup wizard's step on how a change takes
@@ -257,14 +256,14 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
- * docs/registry-install-runbook.md, for its links and bug b.7sd's check.
+ * docs/registry-install-runbook.md, for its links and check.
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The two writers are the complete-example load
  * and the fungible-mode preview example's case: each writes configurations
  * into its own `mkdtempSync` directory, removed after the test, and passes
  * that directory's `home` to the loader, which reads no credentials file. No
- * real HOME, no server, no CLI (SR-13.2).
+ * real HOME, no server, no CLI.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
@@ -592,25 +591,25 @@ describe('slack-app-manifest.yml', () => {
   }
   const comments = yamlComments(text)
 
-  test('AC 39: the bot scopes include im:write', () => {
+  test('the bot scopes include im:write', () => {
     expect(manifest.oauth_config.scopes.bot).toContain('im:write')
   })
 
-  test('bug b.jpc: the bot scopes include channels:read and groups:read, so conversations.info resolves a channel name', () => {
+  test('the bot scopes include channels:read and groups:read, so conversations.info resolves a channel name', () => {
     expect(manifest.oauth_config.scopes.bot).toEqual(expect.arrayContaining(['channels:read', 'groups:read']))
   })
 
-  test('bug b.am4: the bot scopes include lists:read and lists:write, so a bot can use the shared Slack List', () => {
+  test('the bot scopes include lists:read and lists:write, so a bot can use the shared Slack List', () => {
     expect(manifest.oauth_config.scopes.bot).toEqual(expect.arrayContaining(['lists:read', 'lists:write']))
   })
 
-  test('bug b.am4: the configuration reference names lists:read and lists:write and the re-install', () => {
+  test('the configuration reference names lists:read and lists:write and the re-install', () => {
     const readme = readRepoFile(CONFIGURATION_DOC)
     expect(readme).toContain('`lists:read` and `lists:write` bot scopes')
     expect(readme).toMatch(/earlier manifest must have both scopes added and be re-installed/)
   })
 
-  test('SR-4.3: message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
+  test('message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
     expect(events).not.toContain('message.mpim')
@@ -652,7 +651,7 @@ describe('slack-app-manifest.yml', () => {
     ['SLACK_APP_TOKEN', /SLACK_APP_TOKEN/],
     ['SLACK_BOT_TOKEN', /SLACK_BOT_TOKEN/],
     ['an environment variable', /environment\s+variable|\benv\s+var/i],
-  ])('SR-12: no comment names %s', (_label, pattern) => {
+  ])('no comment names %s', (_label, pattern) => {
     expect(comments).not.toMatch(pattern)
   })
 
@@ -666,7 +665,7 @@ describe('slack-app-manifest.yml', () => {
     ['groups:read', /\bgroups:read\b/],
     ['re-installing existing apps', /\bre-?install/i],
     ['the Reinstall to Workspace button', /Reinstall\s+to\s+Workspace/],
-  ])('SR-12: the comments name %s', (_label, pattern) => {
+  ])('the comments name %s', (_label, pattern) => {
     expect(comments).toMatch(pattern)
   })
 })
@@ -708,16 +707,16 @@ function codeSpans(cell: string): string[] {
 /** The persona configuration reference heading (in `CONFIGURATION_DOC`) and its complete-example heading, DOC-1's interface. */
 const PERSONAS_HEADING = '## Personas (config.json)'
 const EXAMPLE_HEADING = '### Example'
-/** The heading of the second complete example, in fungible mode (b.deo SRI-1101), a section of `CHANNEL_MODES_DOC`. */
+/** The heading of the second complete example, in fungible mode, a section of `CHANNEL_MODES_DOC`. */
 const FUNGIBLE_EXAMPLE_HEADING = '## Example in fungible mode'
 
 /**
- * The persona-entry key holding the fungible section (b.deo SRI-102): read
+ * The persona-entry key holding the fungible section: read
  * only in fungible mode, so the declarative example need not carry it.
  */
 const FUNGIBLE_SECTION_KEY = 'invited' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
 
-/** The fungible section's key naming the persona's destination, `invited.permission_prompts` (b.deo SRI-102). */
+/** The fungible section's key naming the persona's destination, `invited.permission_prompts`. */
 const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_INVITED_KEYS)[number]
 
 /** Where a section nested in the persona reference comes from, for `requiredSection` failures. */
@@ -748,17 +747,17 @@ function completeExample(configuration: string, heading: string = EXAMPLE_HEADIN
   return blocks[0].body
 }
 
-/** The three server-wide settings moved into config.json by the persona format (b.av2 SR-1.6; not exported). */
+/** The three server-wide settings moved into config.json by the persona format (not exported). */
 const MOVED_SERVER_SETTINGS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode']
 
 /**
  * The reference's key tables: each heading with the keys its table must list,
  * one code span per row in the first column, built from the loader's exported
- * key sets: the b.av2 SR-1.2 persona-entry keys (b.deo SRI-102; the `dm`
+ * key sets: the persona-entry keys (the `dm`
  * sub-keys written `dm.<key>`, the `invited` sub-keys `invited.<key>` alike)
- * and the SR-1.3 channel-entry keys (b.deo SRI-103), each a `###` under
- * `## Personas (config.json)` in `CONFIGURATION_DOC`; and the SR-1.1 / SR-1.6
- * top-level keys but `personas` (b.deo SRI-101: `allow_invited_channels`
+ * and the channel-entry keys, each a `###` under
+ * `## Personas (config.json)` in `CONFIGURATION_DOC`; and the
+ * top-level keys but `personas` (`allow_invited_channels`
  * among them), the `## Server-wide settings` table of `SERVER_SETTINGS_DOC`.
  */
 const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
@@ -794,17 +793,17 @@ describe('README.md', () => {
   const reloadDoc = readRepoFile(RELOAD_DOC)
 
   /**
-   * b.av2 SR-12 / SR-8.6: the README's modify-semantics table, "What a
+   * the README's modify-semantics table, "What a
    * confirmation applies" in the Reload section. Each expected row is found by
    * the setting names in its Change cell (or a keyword where it names none),
    * and pinned by its Live session cell and whether its Once confirmed cell
-   * carries `DESTRUCTIVE:`. Wording is not pinned. SR-8.6 as amended by b.jg5
-   * SRJ-1511: removal and destructive rows read "Retired: never resumed". As
-   * amended by b.deo SRI-805: the switch's row and the recorded row, each
+   * carries `DESTRUCTIVE:`. Wording is not pinned.
+   * removal and destructive rows read "Retired: never resumed". As
+   * amended by the switch's row and the recorded row, each
    * "Kept", and the server-wide row naming the switch as its exception; the
    * new rows are self-checked on edited copies.
    */
-  describe('What a confirmation applies (SR-8.6 rows)', () => {
+  describe('What a confirmation applies (rows)', () => {
     const reload = markdownSection(reloadDoc, '# Reload')
     const table = firstTable(markdownSection(reload, '## What a confirmation applies'))
 
@@ -832,14 +831,14 @@ describe('README.md', () => {
     const naming = (...settings: readonly string[]) => (row: Row) =>
       settings.every((s) => codeSpans(row.change).includes(s))
 
-    /** SR-8.6: each next-launch setting keeps the instance, `claude_config_dir` only until the next launch. */
+    /** each next-launch setting keeps the instance, `claude_config_dir` only until the next launch. */
     const NEXT_LAUNCH_SESSION: Record<NextLaunchSetting, string> = {
       claude_config_dir: 'Kept until the next launch',
     }
 
     /**
      * A removal or a destructive modify retires the persona: its session is
-     * stopped and never resumed (b.jg5 SRJ-1511).
+     * stopped and never resumed.
      */
     const RETIRED_SESSION = 'Retired: never resumed'
 
@@ -851,10 +850,10 @@ describe('README.md', () => {
       destructive: false,
     }
 
-    /** The switch's row, found by the switch named in its Change cell (b.deo SRI-805). */
+    /** The switch's row, found by the switch named in its Change cell. */
     const SWITCH_ROW: Expected = { label: `the switch ${MODE_SWITCH_SETTING}`, find: naming(MODE_SWITCH_SETTING), session: 'Kept', destructive: false }
 
-    /** The recorded row, found by the section keys its Change cell names (b.deo SRI-805, SRI-1103). */
+    /** The recorded row, found by the section keys its Change cell names. */
     const RECORDED_ROW: Expected = {
       label: `a recorded change to the section not in force (${RECORDED_SECTION_KEYS.join(', ')})`,
       find: naming(...RECORDED_SECTION_KEYS),
@@ -867,14 +866,13 @@ describe('README.md', () => {
      * the settings expanded from the plan's exported classes. A new kind in the
      * plan fails the typecheck here until it has a README row; a new setting in
      * a class needs its name in that class's row, so the in-place row names
-     * `invited.permission_prompts` too (b.deo SRI-1103). The plan reports the
+     * `invited.permission_prompts` too. The plan reports the
      * switch (`MODE_SWITCH_SETTING`) among the server-wide settings, so the
      * switch's row is a second `settings` entry, found by the switch named in
      * its Change cell; the server-wide row names the switch only in its Once
      * confirmed cell, as its exception, so each finder matches one row. The
      * recorded row (a change to the section not in force) is found by the
-     * section keys its Change cell names (`RECORDED_SECTION_KEYS`) (b.av2
-     * SR-8.6, b.deo SRI-805, SRI-1103).
+     * section keys its Change cell names (`RECORDED_SECTION_KEYS`).
      */
     const EXPECTED: Record<
       Exclude<keyof ValidChangePlan, 'valid' | 'noEffectiveChange' | 'configDirsChanged' | 'unchanged'>,
@@ -931,7 +929,7 @@ describe('README.md', () => {
     })
 
     test.each(Object.values(EXPECTED).flat().map((e) => [e.label, e] as const))(
-      'SR-8.6 row for %s: exactly one row, with its Live session effect and DESTRUCTIVE: only if destructive',
+      'row for %s: exactly one row, with its Live session effect and DESTRUCTIVE: only if destructive',
       (_label, expected) => {
         expect(rowProblems(rows, expected)).toEqual([])
       },
@@ -945,7 +943,7 @@ describe('README.md', () => {
       for (const setting of named) expect(PERSONA_TOP_LEVEL_KEYS).toContain(setting)
     })
 
-    /** The server-wide row's problems in `all`: its Once confirmed cell keeps the next server start and names the switch as its exception (b.deo SRI-805). */
+    /** The server-wide row's problems in `all`: its Once confirmed cell keeps the next server start and names the switch as its exception. */
     function serverWideExceptionProblems(all: readonly Row[]): string[] {
       const row = all.find(SERVER_WIDE_ROW.find)
       if (row === undefined) return ['no server-wide row']
@@ -957,23 +955,23 @@ describe('README.md', () => {
       ]
     }
 
-    test(`the server-wide row keeps "next server start" and names \`${MODE_SWITCH_SETTING}\` as its exception in its Once confirmed cell (b.deo SRI-805)`, () => {
+    test(`the server-wide row keeps "next server start" and names \`${MODE_SWITCH_SETTING}\` as its exception in its Once confirmed cell`, () => {
       expect(serverWideExceptionProblems(rows)).toEqual([])
     })
 
-    /** The recorded row's problems in `all`: its Once confirmed cell names no `reload-noop` (b.deo SRI-804, SRI-1103). */
+    /** The recorded row's problems in `all`: its Once confirmed cell names no `reload-noop`. */
     function recordedNoopProblems(all: readonly Row[]): string[] {
       const row = all.find(RECORDED_ROW.find)
       if (row === undefined) return ['no recorded row']
       return codeSpans(row.confirmed).includes(RELOAD_NOOP) ? [] : [`Once confirmed names no \`${RELOAD_NOOP}\``]
     }
 
-    test(`the recorded row's Once confirmed cell names \`${RELOAD_NOOP}\` for a confirmation of recorded changes only (b.deo SRI-804, SRI-1103)`, () => {
+    test(`the recorded row's Once confirmed cell names \`${RELOAD_NOOP}\` for a confirmation of recorded changes only`, () => {
       expect(recordedNoopProblems(rows)).toEqual([])
     })
 
     /**
-     * Self-checks on edited copies of the README (b.deo SRI-805): each of the
+     * Self-checks on edited copies of the README: each of the
      * two rows this work adds, the switch's and the recorded one, fails its
      * case when it is removed or duplicated, when its Live session changes,
      * and when its Once confirmed cell gains `DESTRUCTIVE:`; each leg of the
@@ -1035,14 +1033,14 @@ describe('README.md', () => {
   })
 
   /**
-   * b.av2 SR-12 / SR-13.5, b.deo SRI-1101: the README persona reference. Its
+   * the README persona reference. Its
    * key tables list exactly the keys the loader accepts, and each of its two
    * complete examples (declarative mode under `### Example` in the persona
    * reference, fungible mode under `## Example in fungible mode` in
    * `CHANNEL_MODES_DOC`) loads through the server's loader
    * and is complete for its own mode.
    */
-  describe('persona configuration reference (SR-12, SR-13.5)', () => {
+  describe('persona configuration reference', () => {
     /** The section holding the `heading` key table: the server-wide table in `SERVER_SETTINGS_DOC`, the others in the persona reference. */
     const keyTableSection = (heading: string): string =>
       heading === 'Server-wide settings'
@@ -1060,7 +1058,7 @@ describe('README.md', () => {
     /**
      * Each complete example, written byte for byte into a temp dir and loaded
      * through the server's loader (default loader options, temp home). The
-     * loader reads no credentials file (b.av2 SR-1.5; b.deo SRI-103, SRI-104
+     * loader reads no credentials file (
      * in each channel mode), so none is written.
      */
     describe('complete examples through the real loader', () => {
@@ -1131,7 +1129,7 @@ describe('README.md', () => {
       /**
        * The declarative example (`### Example`): declarative mode, every key
        * declarative mode reads, and the declarative shapes below. The
-       * fungible section is not required (b.deo SRI-1101).
+       * fungible section is not required.
        */
       const COMPLETENESS: [label: string, check: (example: Example) => void][] = [
         ['the switch absent or false (declarative mode)', ({ raw }) => {
@@ -1164,7 +1162,7 @@ describe('README.md', () => {
           expect(MOVED_SERVER_SETTINGS.filter((key) => !(key in raw))).toEqual([])
         }],
         // Examples keep each config directory isolated from the temp home's default Claude directory.
-        ['no claude_config_dir is <home>/.claude (SR-9.4)', ({ home, config }) => {
+        ['no claude_config_dir is <home>/.claude', ({ home, config }) => {
           const dirs = [['top level', config.claude_config_dir], ...config.personas.map((p) => [p.name, p.claude_config_dir])]
           expect(dirs.filter(([, configDir]) => configDir === join(home, '.claude'))).toEqual([])
         }],
@@ -1175,8 +1173,8 @@ describe('README.md', () => {
       })
 
       /**
-       * The fungible example (`## Example in fungible mode`, b.deo
-       * SRI-1101): the switch on, a persona with DMs off and a channel
+       * The fungible example (`## Example in fungible mode`
+       *): the switch on, a persona with DMs off and a channel
        * fungible destination, another whose destination is `"dm"` by default
        * (no `invited.permission_prompts` written), and every key of the
        * fungible section.
@@ -1297,10 +1295,9 @@ function crontableHeaderText(): string {
 
 /**
  * The fixed sample arguments `set_channel_delivery`'s text builders are
- * rendered with (b.deo SRI-1308): a persona from `makePersona` (its key from
+ * rendered with: a persona from `makePersona` (its key from
  * `personaKey`), a channel ID, a stored-choice file path, and one value and
- * one channel each builder echoes and one each does not show (b.deo
- * SRI-503). No token, no `LEAK_SENTINEL`, no banned term. Built at its first
+ * one channel each builder echoes and one each does not show. No token, no `LEAK_SENTINEL`, no banned term. Built at its first
  * call, when a case runs, so a `makePersona` change fails only the cases that
  * read it.
  */
@@ -1319,13 +1316,12 @@ const toolTextSample = lazy(() => {
 })
 
 /**
- * `set_channel_delivery`'s shipped texts (b.deo SRI-501, SRI-503 to SRI-506,
- * SRI-1308), each read through its export in src/registry.ts:
+ * `set_channel_delivery`'s shipped texts, each read through its export in src/registry.ts:
  * [export name, form ('' for a text with one form), text]. The listing texts
  * as exported; each builder rendered with `toolTextSample()`, the value and
  * channel refusals in their echoed and their not-shown forms, the result in
  * its plain and its loop-guard-held forms; and the two resolution refusals
- * every tool shares (b.av2 SR-5.1, b.deo SRI-502), named for this tool. Each
+ * every tool shares, named for this tool. Each
  * text is rendered when its case runs.
  */
 const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, text: () => string][] = (() => {
@@ -1369,7 +1365,7 @@ function toolTextEntry([exportName, form, text]: (typeof SET_CHANNEL_DELIVERY_TE
  * 0.11.1 tools' descriptions are not read: src/registry.ts builds them inline
  * in `createSessionServer` and exports no list to read them through.
  * `set_channel_delivery`'s texts are read through their exports
- * (`SET_CHANNEL_DELIVERY_TEXTS`, b.deo SRI-1308).
+ * (`SET_CHANNEL_DELIVERY_TEXTS`).
  */
 const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   ...[...USER_DOC_FILES, CONTRIBUTING_FILE].map((file): [string, () => string] => [file, () => readRepoFile(file)]),
@@ -1387,10 +1383,10 @@ const INSTALL_SKILL_FILE = 'skills/install-cscb/SKILL.md'
 const CHANGELOG_FILE = 'CHANGELOG.md'
 
 /**
- * b.jg5 SRJ-1101's operator texts, [name, text], read from the repository:
+ * operator texts, [name, text], read from the repository:
  * the user docs (the README and its `docs/` pages), CONTRIBUTING.md, the
  * debugging, install and setup skills, the architecture doc, the engineering
- * guide and the CHANGELOG. SRJ-1107's checks (the CHANGELOG release entry, at
+ * guide and the CHANGELOG. checks (the CHANGELOG release entry, at
  * the end of this file) read their texts through this list. It is not
  * `SHIPPED_TEXTS`: the forbidden-term audit reads only that list, which holds
  * the user docs but neither the CHANGELOG nor the internal `docs/` guides.
@@ -1445,7 +1441,7 @@ function docText(file: string): string {
 }
 
 /**
- * b.av2 SR-12: the claim that a first @mention activates (wakes, unlocks)
+ * the claim that a first @mention activates (wakes, unlocks)
  * event delivery in a channel, in the forms the README and the wizard once
  * shipped ("Slack may not deliver messages until the bot is @mentioned for
  * the first time … the first @mention activates event delivery"). Matched
@@ -1475,7 +1471,7 @@ describe(`shipped text audit (README, skills, manifest, MCP instructions, ${SET_
     expect(SHIPPED_TEXTS.map(([name]) => name)).toContain(WIZARD_FILE)
   })
 
-  test.each(SHIPPED_TEXTS)('SR-12: %s does not claim a first @mention activates event delivery', (_name, read) => {
+  test.each(SHIPPED_TEXTS)('%s does not claim a first @mention activates event delivery', (_name, read) => {
     expect(termsIn(read(), FIRST_MENTION_CLAIM)).toEqual([])
   })
 
@@ -1493,30 +1489,29 @@ describe(`shipped text audit (README, skills, manifest, MCP instructions, ${SET_
 })
 
 // ---------------------------------------------------------------------------
-// AC 46: the forbidden-term audit
+// the forbidden-term audit
 // ---------------------------------------------------------------------------
 
 /** One forbidden term: its label in case titles and failures, and its pattern (flag `g`, so every occurrence is found). */
 type Term = readonly [label: string, pattern: RegExp]
 
-/** A group of forbidden terms: what they stand for, the b.av2 SRs (or E14 decisions) that retire them, and the terms. */
+/** A group of forbidden terms: what they stand for, the SRs (or decisions) that retire them, and the terms. */
 interface TermGroup {
   name: string
-  cites: string
   terms: readonly Term[]
 }
 
 /**
- * AC 46's forbidden terms: the one list the audit checks every shipped text
+ * forbidden terms: the one list the audit checks every shipped text
  * against. The first-@mention claim is `FIRST_MENTION_CLAIM` above, checked
  * by its own case; reload wording is `RELOAD_TERMS` (tests/test-helpers/
- * reload-terms.ts), checked in the MCP instructions only (SR-8.8 lets the README and the skills describe the
+ * reload-terms.ts), checked in the MCP instructions only (lets the README and the skills describe the
  * gesture).
  *
  * Matching rules:
  * - Key, file and variable names match as whole words (`\b…\b`), as written,
  *   so `default_route` doesn't match inside a longer key.
- * - The pre-persona shape is banned as nouns, not the verb (E14 decision 13):
+ * - The pre-persona shape is banned as nouns, not the verb:
  *   `routes` only as a config key (`` `routes` ``, `"routes"`, `routes:`),
  *   and route-keyed noun phrases ("per-route", "a/each/the route",
  *   "route's", "routed channel", "route map"). "The server routes each Slack
@@ -1537,7 +1532,7 @@ interface TermGroup {
  *   like a Slack token"); the redaction wording "a value that looks like a
  *   Slack token" is not a hit.
  * - Token environment variables are banned by name and by export form, not
- *   by the phrase "token environment variables": E14 decision 12 prescribes
+ * by the phrase "token environment variables": the current rule prescribes
  *   that phrase for the README upgrade entry ("remove any token environment
  *   variables you exported for the previous version"), so banning it would
  *   need a second exemption; a name or an export is what would tell an
@@ -1546,7 +1541,6 @@ interface TermGroup {
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
     name: 'accepted-message loss during MCP disconnection',
-    cites: 'b.omv AC64, R44, SR-16',
     terms: [
       // Match an affirmed message-loss clause, rather than any sentence that
       // happens to mention both disconnection and loss. In particular, a
@@ -1561,12 +1555,10 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
   },
   {
     name: 'the retired stream notice',
-    cites: 'b.omv SR-8.5, SR-9',
     terms: [['Not receiving messages', /\bnot\s+receiving\s+messages\b/gi]],
   },
   {
     name: 'the pre-persona shape',
-    cites: 'b.av2 SR-1.7, SR-10.2',
     terms: [
       ['routes', /`routes`|"routes"|\broutes:/g],
       ['default_route', /\bdefault_route\b/g],
@@ -1582,7 +1574,6 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
   },
   {
     name: 'the token environment variables',
-    cites: 'b.av2 SR-1.4, SR-10.2; E14 decision 12',
     terms: [
       ['SLACK_BOT_TOKEN', /\bSLACK_BOT_TOKEN\b/g],
       ['SLACK_APP_TOKEN', /\bSLACK_APP_TOKEN\b/g],
@@ -1592,12 +1583,10 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
   },
   {
     name: 'a token on a command line',
-    cites: 'b.av2 SR-1.4',
     terms: [['a bearer token in a curl header flag', /(?:-H|--header)[\s=]+["']?Authorization:\s*Bearer\b/gi]],
   },
   {
     name: 'the access-control file and its model',
-    cites: 'b.av2 SR-10.1, SR-10.2, SR-12',
     terms: [
       ['access.json', /\baccess\.json\b/gi],
       ['SLACK_ACCESS_MODE', /\bSLACK_ACCESS_MODE\b/g],
@@ -1616,7 +1605,6 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
   },
   {
     name: 'the retired persona-name rule',
-    cites: 'b.av2 SR-1.2; E14 Task 0',
     terms: [['a name that "looks like a Slack token"', /\bnames?\b[^.]{0,40}\blooks?\s+like\s+an?\s+(?:Slack\s+)?token\b/gi]],
   },
 ]
@@ -1630,39 +1618,39 @@ interface AuditException {
 }
 
 /**
- * The first exemption (b.av2 SR-12): the debugging skill's SR-1.7 entry may
+ * The first exemption: the debugging skill's entry may
  * name the three pre-persona keys to say they are rejected. Any other term
  * inside that section, and those keys anywhere else, still fail. When the
  * heading is missing the audit throws for that file; it never exempts the
  * whole file.
  */
-const SR_1_7_EXCEPTION: AuditException = {
+const DELIVERY_WORDING_EXCEPTION: AuditException = {
   file: 'skills/debug-slack-channel-bots/SKILL.md',
   heading: '## Pre-persona configuration',
   terms: ['routes', 'default_route', 'default_dm_session'],
-  reason: 'b.av2 SR-1.7 rejection entry: names the keys only to say they are rejected',
+  reason: 'rejection entry: names the keys only to say they are rejected',
 }
 
 /**
- * The switch-over runbook's exemption (b.jg5 SRJ-1108, SRJ-1516): the runbook
+ * The switch-over runbook's exemption: the runbook
  * section, in `RUNBOOK_DOC`, may name `access.json` among the previous CSCB's files it saves and
  * restores. Every other term stays banned there, the token variables' names
  * included, and `access.json` stays banned everywhere else. A missing heading
- * throws, as for the SR-1.7 entry. The rollback section has its own entry,
+ * throws, as for the entry. The rollback section has its own entry,
  * below.
  */
 const SWITCH_OVER_EXCEPTION: AuditException = {
   file: RUNBOOK_DOC,
   heading: `### ${PHASE1_RUNBOOK_SECTION_TITLE}`,
   terms: ['access.json'],
-  reason: "b.jg5 SRJ-1108, SRJ-1516: the switch-over runbook saves and restores the previous CSCB's access.json",
+  reason: "the switch-over runbook saves and restores the previous CSCB's access.json",
 }
 
 /** The rollback section's heading as `RUNBOOK_DOC` writes it: a `###` under `## Migration`, after the switch-over section. */
 const ROLLBACK_HEADING = `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`
 
 /**
- * The rollback runbook's exemption (b.jg5 SRJ-1109, SRJ-1516): the runbook
+ * The rollback runbook's exemption: the runbook
  * section, in `RUNBOOK_DOC`, may name `access.json` among the files its step 8 restores. As for
  * the switch-over entry: every other term stays banned there, the token
  * variables' names included, `access.json` stays banned everywhere else, and
@@ -1672,13 +1660,13 @@ const ROLLBACK_EXCEPTION: AuditException = {
   file: RUNBOOK_DOC,
   heading: ROLLBACK_HEADING,
   terms: ['access.json'],
-  reason: "b.jg5 SRJ-1109, SRJ-1516: the rollback runbook's step 8 restores the previous CSCB's access.json",
+  reason: "the rollback runbook's step 8 restores the previous CSCB's access.json",
 }
 
-/** The two runbook entries (SRJ-1516): one per runbook section in `RUNBOOK_DOC`, each exempting only `access.json`. */
+/** The two runbook entries: one per runbook section in `RUNBOOK_DOC`, each exempting only `access.json`. */
 const RUNBOOK_EXCEPTIONS: readonly AuditException[] = [SWITCH_OVER_EXCEPTION, ROLLBACK_EXCEPTION]
 
-const AUDIT_EXCEPTIONS: readonly AuditException[] = [SR_1_7_EXCEPTION, ...RUNBOOK_EXCEPTIONS]
+const AUDIT_EXCEPTIONS: readonly AuditException[] = [DELIVERY_WORDING_EXCEPTION, ...RUNBOOK_EXCEPTIONS]
 
 /** A forbidden term found in a text: its file, 1-based line, term label, matched text and whole line. */
 interface TermHit {
@@ -1746,13 +1734,13 @@ function termLabels(group: TermGroup): string {
   return group.terms.map(([label]) => label).join(', ')
 }
 
-describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instructions, ${SET_CHANNEL_DELIVERY_TOOL}'s texts)`, () => {
+describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SET_CHANNEL_DELIVERY_TOOL}'s texts)`, () => {
   test('the audit reads skills/EXAMPLE_CLAUDE.md', () => {
     expect(SHIPPED_TEXTS.map(([name]) => name)).toContain('skills/EXAMPLE_CLAUDE.md')
   })
 
   /**
-   * b.deo SRI-1308: the audit reads every `set_channel_delivery` text
+   * the audit reads every `set_channel_delivery` text
    * src/registry.ts exports (its listing texts, `SET_CHANNEL_DELIVERY_*`
    * `DESCRIPTION`; its builders, `channelDelivery…Refusal` and
    * `channelDelivery…Text`), found among the module's exports, so a text
@@ -1761,7 +1749,7 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
    * the module, never from `SET_CHANNEL_DELIVERY_TEXTS`, so dropping an entry
    * fails here.
    */
-  test(`the audit reads each of ${SET_CHANNEL_DELIVERY_TOOL}'s exported texts, each form of each two-form builder (b.deo SRI-1308)`, () => {
+  test(`the audit reads each of ${SET_CHANNEL_DELIVERY_TOOL}'s exported texts, each form of each two-form builder`, () => {
     const TWO_FORMS: Record<string, readonly string[]> = {
       [channelDeliveryValueRefusal.name]: ['echoed', 'not shown'],
       [channelDeliveryChannelRefusal.name]: ['echoed', 'not shown'],
@@ -1790,33 +1778,33 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
   })
 
   const cases = SHIPPED_TEXTS.flatMap(([name, read]) =>
-    FORBIDDEN_TERMS.map((group) => [name, group.name, group.cites, termLabels(group), read, group] as const),
+    FORBIDDEN_TERMS.map((group) => [name, group.name, termLabels(group), read, group] as const),
   )
 
-  test.each(cases)('%s: none of %s (%s): %s', (name, _group, _cites, _labels, read, group) => {
+  test.each(cases)('%s: none of %s: %s', (name, _group, _labels, read, group) => {
     expect(auditText(name, read(), group.terms).hits.map(formatHit)).toEqual([])
   })
 
-  test(`the only allowed hit: ${SR_1_7_EXCEPTION.terms.join(', ')} in ${SR_1_7_EXCEPTION.file} under "${SR_1_7_EXCEPTION.heading}" (SR-1.7); with the exemption off, they appear nowhere else in shipped text`, () => {
-    const keys = ALL_FORBIDDEN_TERMS.filter(([label]) => SR_1_7_EXCEPTION.terms.includes(label))
-    expect(keys.map(([label]) => label)).toEqual([...SR_1_7_EXCEPTION.terms])
+  test(`the only allowed hit: ${DELIVERY_WORDING_EXCEPTION.terms.join(', ')} in ${DELIVERY_WORDING_EXCEPTION.file} under "${DELIVERY_WORDING_EXCEPTION.heading}"; with the exemption off, they appear nowhere else in shipped text`, () => {
+    const keys = ALL_FORBIDDEN_TERMS.filter(([label]) => DELIVERY_WORDING_EXCEPTION.terms.includes(label))
+    expect(keys.map(([label]) => label)).toEqual([...DELIVERY_WORDING_EXCEPTION.terms])
     const hits = SHIPPED_TEXTS.flatMap(([name, read]) => auditText(name, read(), keys, []).hits)
-    const range = sectionRange(readRepoFile(SR_1_7_EXCEPTION.file), SR_1_7_EXCEPTION.heading)
-    if (range === undefined) throw new Error(`${SR_1_7_EXCEPTION.file} has no heading "${SR_1_7_EXCEPTION.heading}"`)
-    const inside = (hit: TermHit) => hit.file === SR_1_7_EXCEPTION.file && hit.line > range.start && hit.line <= range.end
+    const range = sectionRange(readRepoFile(DELIVERY_WORDING_EXCEPTION.file), DELIVERY_WORDING_EXCEPTION.heading)
+    if (range === undefined) throw new Error(`${DELIVERY_WORDING_EXCEPTION.file} has no heading "${DELIVERY_WORDING_EXCEPTION.heading}"`)
+    const inside = (hit: TermHit) => hit.file === DELIVERY_WORDING_EXCEPTION.file && hit.line > range.start && hit.line <= range.end
     expect(hits.filter((hit) => !inside(hit)).map(formatHit)).toEqual([])
-    expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...SR_1_7_EXCEPTION.terms].sort())
+    expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...DELIVERY_WORDING_EXCEPTION.terms].sort())
   })
 
-  test(`the exemptions are exactly the SR-1.7 entry and the two runbook entries, each runbook entry exempting only access.json in ${RUNBOOK_DOC} (SRJ-1516)`, () => {
+  test(`the exemptions are exactly the entry and the two runbook entries, each runbook entry exempting only access.json in ${RUNBOOK_DOC}`, () => {
     expect(AUDIT_EXCEPTIONS.map((e) => [e.file, e.heading, [...e.terms]])).toEqual([
-      [SR_1_7_EXCEPTION.file, SR_1_7_EXCEPTION.heading, [...SR_1_7_EXCEPTION.terms]],
+      [DELIVERY_WORDING_EXCEPTION.file, DELIVERY_WORDING_EXCEPTION.heading, [...DELIVERY_WORDING_EXCEPTION.terms]],
       [RUNBOOK_DOC, `### ${PHASE1_RUNBOOK_SECTION_TITLE}`, ['access.json']],
       [RUNBOOK_DOC, `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`, ['access.json']],
     ])
   })
 
-  test(`the only allowed hits: access.json in ${RUNBOOK_DOC} under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}" (SRJ-1108, SRJ-1109, SRJ-1516); with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
+  test(`the only allowed hits: access.json in ${RUNBOOK_DOC} under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}"; with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
     const terms = ALL_FORBIDDEN_TERMS.filter(([label]) => label === 'access.json')
     expect(terms.map(([label]) => label)).toEqual(['access.json'])
     const runbooks = operatorText(RUNBOOK_DOC)
@@ -1835,9 +1823,9 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     )
   })
 
-  test(`the SR-1.7 entry names the three keys, says they are rejected and that the configuration must be rewritten as personas`, () => {
-    const entry = flat(requiredSection(readRepoFile(SR_1_7_EXCEPTION.file), SR_1_7_EXCEPTION.heading, SR_1_7_EXCEPTION.file))
-    for (const key of SR_1_7_EXCEPTION.terms) expect(entry).toContain(`\`${key}\``)
+  test(`the entry names the three keys, says they are rejected and that the configuration must be rewritten as personas`, () => {
+    const entry = flat(requiredSection(readRepoFile(DELIVERY_WORDING_EXCEPTION.file), DELIVERY_WORDING_EXCEPTION.heading, DELIVERY_WORDING_EXCEPTION.file))
+    for (const key of DELIVERY_WORDING_EXCEPTION.terms) expect(entry).toContain(`\`${key}\``)
     expect(entry).toMatch(/\brejected\b/i)
     expect(entry).toMatch(/\brewrit\w*\b[^.]*\bpersonas\b/i)
   })
@@ -1849,11 +1837,11 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
    * RegExp names a line whose text is read from the file.
    */
   const NOT_HITS_BY_DESIGN: [file: string, snippet: string | RegExp, reason: string][] = [
-    [SR_1_7_EXCEPTION.file, "## A persona's routing settings were changed by a confirmed change", "E14 decision 12: a persona's channel and DM settings"],
-    [SR_1_7_EXCEPTION.file, '#a-personas-routing-settings-were-changed-by-a-confirmed-change', "E14 decision 12: that heading's anchor"],
-    [SR_1_7_EXCEPTION.file, '`[slack] persona-routing: ', "E14 decision 12: the server's real log prefix"],
-    [SR_1_7_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
-    [RUNBOOK_DOC, 'remove any token environment variables you exported for the previous version', "E14 decision 12's upgrade wording: variables are banned by name and export form"],
+    [DELIVERY_WORDING_EXCEPTION.file, "## A persona's routing settings were changed by a confirmed change", "A persona's channel and DM settings"],
+    [DELIVERY_WORDING_EXCEPTION.file, '#a-personas-routing-settings-were-changed-by-a-confirmed-change', "That heading's anchor"],
+    [DELIVERY_WORDING_EXCEPTION.file, '`[slack] persona-routing: ', "The server's real log prefix"],
+    [DELIVERY_WORDING_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
+    [RUNBOOK_DOC, 'remove any token environment variables you exported for the previous version', "Upgrade wording: variables are banned by name and export form"],
     [SERVER_SETTINGS_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
@@ -1869,10 +1857,10 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
 
 /**
  * Self-checks for the scanner and the exemption, on in-memory text only: each
- * term is flagged, the SR-1.7 exemption covers only its three keys and only
+ * term is flagged, the exemption covers only its three keys and only
  * inside its section, and persona wording is left alone.
  */
-describe('AC 46: forbidden-term scanner self-checks', () => {
+describe('forbidden-term scanner self-checks', () => {
   /** One sample per term, so a term added to the list needs a sample here. */
   const SAMPLES: Record<string, string> = {
     'MCP-disconnection message loss': 'Messages sent while its MCP connection is down are lost.',
@@ -1909,7 +1897,7 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
   }
 
   /**
-   * More must-flag samples for the terms decision 13 narrowed: each form of
+   * More must-flag samples for the terms the current rule narrowed: each form of
    * the `routes` key, each route-keyed noun phrase, and each curl header
    * flag form.
    */
@@ -1946,33 +1934,33 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     ['routing settings and the log prefix', "## A persona's routing settings\n`[slack] persona-routing: lost-message notice`"],
     ['persona channel and DM wording', 'Each persona lists its `channels`, each with a `delivery`, and a per-persona `dm.enabled` switch.'],
     ['frontmatter tool list', 'allowed-tools: [Read, Write, Edit, Bash, Glob]'],
-    ["decision 12's upgrade wording", 'Remove any token environment variables you exported for the previous version.'],
+    ["upgrade wording", 'Remove any token environment variables you exported for the previous version.'],
     ['a non-token environment variable', 'Your persona key is in the `CSCB_PERSONA` environment variable. export CSCB_CRON_DIR=~/cron'],
     ['the curl config header line', `  h='header = "Authorization: Bearer %s"\\n'`],
     ['a token-like name, as the README now words it', 'a token-like name is redacted there too'],
-    ['"routes" as a verb (decision 13)', 'The server routes each Slack event to every persona that receives it.'],
+    ['"routes" as a verb', 'The server routes each Slack event to every persona that receives it.'],
     ['pasted agent-director `cwd` output', '{\n  "instance_id": "cscb_alpha",\n  "cwd": "/home/me/work",\n  "label": { "service": "cscb" }\n}'],
     ['the redaction wording, not the name rule', 'A config error never echoes a value that looks like a Slack token.'],
     ['the curl config header line, unindented', 'header = "Authorization: Bearer %s"'],
-    ['b.omv SR-8.1 unsaved-message loss', buildMessageNotSavedNotice('Alpha', 'U0SENDER1')],
+    ['unsaved-message loss', buildMessageNotSavedNotice('Alpha', 'U0SENDER1')],
     ['storage failure before acceptance', 'Messages that cannot be stored are lost after Slack stops retrying.'],
     ['corrupt queue records', 'An unreadable queued record is kept aside and will not be delivered.'],
     ['explicit downgrade loss', 'Drain the queue before downgrading, or accept that undelivered messages are lost.'],
     ['MCP wait without loss', 'Messages sent while MCP is down are kept; they are not lost.'],
-    ['b.omv SR-8.8 unreadable-record non-delivery', buildQueueRecordUnreadableNotice('Alpha', 2, '/state/queue/quarantined.jsonl')],
+    ['unreadable-record non-delivery', buildQueueRecordUnreadableNotice('Alpha', 2, '/state/queue/quarantined.jsonl')],
     ['conversation history loss', 'The transcript is missing; conversation history was lost.'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
 
-  const FILE = SR_1_7_EXCEPTION.file
-  /** A synthetic debugging skill: the SR-1.7 section (with a subsection) between two other sections. */
+  const FILE = DELIVERY_WORDING_EXCEPTION.file
+  /** A synthetic debugging skill: the section (with a subsection) between two other sections. */
   const skill = (earlier: string, entry: string, later: string) =>
     [
       '# Debugging', //                                  l.1
       '## Earlier', //                                   l.2
       earlier, //                                        l.3
-      SR_1_7_EXCEPTION.heading, //                       l.4
+      DELIVERY_WORDING_EXCEPTION.heading, //                       l.4
       entry, //                                          l.5
       '### Detail', //                                   l.6
       'Still inside: `default_route` is rejected.', //   l.7
@@ -1981,7 +1969,7 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     ].join('\n')
   const ENTRY = '`routes`, `default_route` and `default_dm_session` are rejected.'
 
-  test('inside the SR-1.7 section, including its subsections, the three keys are allowed, not hits', () => {
+  test('inside the section, including its subsections, the three keys are allowed, not hits', () => {
     const { hits, allowed } = auditText(FILE, skill('-', ENTRY, '-'), ALL_FORBIDDEN_TERMS)
     expect(hits).toEqual([])
     expect(allowed.map((hit) => `${hit.line}: ${hit.term}`)).toEqual(['5: routes', '5: default_route', '7: default_route', '5: default_dm_session'])
@@ -2009,22 +1997,22 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     ['a token variable', 'Unset SLACK_BOT_TOKEN too.', 'SLACK_BOT_TOKEN'],
     ['the access-control file', 'Delete access.json too.', 'access.json'],
     ['route-keyed wording', 'Each per-route setting is gone.', 'per-route'],
-  ])('%s inside the SR-1.7 section is a hit', (_label, line, term) => {
+  ])('%s inside the section is a hit', (_label, line, term) => {
     const { hits } = auditText(FILE, skill('-', `${ENTRY}\n${line}`, '-'), ALL_FORBIDDEN_TERMS)
     expect(hits.map((hit) => `${hit.line}: ${hit.term}`)).toEqual([`6: ${term}`])
   })
 
   test.each([
-    ['removed', (text: string) => text.replace(`${SR_1_7_EXCEPTION.heading}\n`, '')],
-    ['renamed', (text: string) => text.replace(SR_1_7_EXCEPTION.heading, '## Legacy configuration')],
-    ['moved to another level', (text: string) => text.replace(SR_1_7_EXCEPTION.heading, `#${SR_1_7_EXCEPTION.heading}`)],
-  ])('with the SR-1.7 heading %s, the audit fails naming it and exempts nothing', (_how, edit) => {
+    ['removed', (text: string) => text.replace(`${DELIVERY_WORDING_EXCEPTION.heading}\n`, '')],
+    ['renamed', (text: string) => text.replace(DELIVERY_WORDING_EXCEPTION.heading, '## Legacy configuration')],
+    ['moved to another level', (text: string) => text.replace(DELIVERY_WORDING_EXCEPTION.heading, `#${DELIVERY_WORDING_EXCEPTION.heading}`)],
+  ])('with the heading %s, the audit fails naming it and exempts nothing', (_how, edit) => {
     expect(() => auditText(FILE, edit(skill('-', ENTRY, '-')), ALL_FORBIDDEN_TERMS)).toThrow(
-      `${FILE} has no heading "${SR_1_7_EXCEPTION.heading}"`,
+      `${FILE} has no heading "${DELIVERY_WORDING_EXCEPTION.heading}"`,
     )
   })
 
-  /** The two runbook exemptions (b.jg5 SRJ-1108, SRJ-1109, SRJ-1516), on a synthetic runbook page. */
+  /** The two runbook exemptions, on a synthetic runbook page. */
   describe('the two runbook exemptions', () => {
     const README = RUNBOOK_DOC
     const SAVE = 'Keep a copy of `access.json`.'
@@ -2121,11 +2109,11 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC 46: the README's receiving section (b.av2 SR-12, SR-4.4)
+// the README's receiving section
 // ---------------------------------------------------------------------------
 
 /**
- * Every `via` value (b.av2 SR-4.4), with the README row that delivers it.
+ * Every `via` value, with the README row that delivers it.
  * src/delivery-decision.ts exports only `type Via`, no runtime list, so the
  * list is written out here; typing it `Record<Via, …>` fails the typecheck
  * when a value is added to or removed from `Via` until this list follows.
@@ -2141,7 +2129,7 @@ const VIA_VALUES = Object.keys(VIA_ROWS) as Via[]
 
 const RECEIVING_HEADING = '## How a persona receives messages'
 
-/** The two injected kinds' rows in the receiving table: they carry no `via` (b.av2 SR-12). */
+/** The two injected kinds' rows in the receiving table: they carry no `via`. */
 const INJECTED_ROWS = ['Scheduled prompt', '`/interject` message']
 
 /** Every pipe table in `section`, each as its header cells and body rows (the `|---|` line skipped). */
@@ -2162,7 +2150,7 @@ function pipeTables(section: string): { header: string[]; rows: string[][] }[] {
   return tables
 }
 
-describe(`AC 46: ${BOTS_DOC} "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
+describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
   const bots = readRepoFile(BOTS_DOC)
   const section = () => requiredSection(bots, RECEIVING_HEADING, BOTS_DOC)
 
@@ -2212,13 +2200,13 @@ describe(`AC 46: ${BOTS_DOC} "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC 74 (shipped-docs leg): no reload wording in the MCP instructions (b.av2 SR-8.8)
+// (shipped-docs leg): no reload wording in the MCP instructions
 // ---------------------------------------------------------------------------
 
 // `RELOAD_TERMS` (tests/test-helpers/reload-terms.ts) is the list the CLI and
 // MCP tool-list cases use too. The README and the skills may describe the
 // gesture and are not checked.
-describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
+describe('the MCP instructions carry no reload wording', () => {
   test.each(RELOAD_TERMS.map((term) => [String(term), term] as const))('%s is absent', (_label, term) => {
     const text = mcpInstructionsText()
     expect(typeof term === 'string' ? text.includes(term) : term.test(text)).toBe(false)
@@ -2226,7 +2214,7 @@ describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC 47 (shipped-docs leg): clear-latch is not offered to a bot (b.jg5 SRJ-511)
+// (shipped-docs leg): clear-latch is not offered to a bot
 // ---------------------------------------------------------------------------
 
 // `CLEAR_LATCH_TERMS` (tests/test-helpers/clear-latch-terms.ts) is the list the
@@ -2234,7 +2222,7 @@ describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
 // README and the debugging skill describe it, so they are not read here and the
 // command is not one of `FORBIDDEN_TERMS`; the manifest, the crontable header
 // and the CLI usage text are not read either.
-describe('AC 47: the MCP instructions and the Reply Guard reminder do not name clear-latch (SRJ-511)', () => {
+describe('the MCP instructions and the Reply Guard reminder do not name clear-latch', () => {
   const BOT_FACING_TEXTS: [name: string, read: () => string][] = [
     [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
     [`${REPLY_REMINDER_FILE} (reminder text)`, replyReminderText],
@@ -2249,7 +2237,7 @@ describe('AC 47: the MCP instructions and the Reply Guard reminder do not name c
 })
 
 // ---------------------------------------------------------------------------
-// The agent-director refusal classes point to the switch-over runbook (b.jg5 SRJ-208)
+// The agent-director refusal classes point to the switch-over runbook
 // ---------------------------------------------------------------------------
 
 /** The two startup refusal classes for an agent-director binary that is too old. */
@@ -2288,22 +2276,22 @@ function labelItem(section: string, label: string, where: string): string {
   return flat(item.join('\n'))
 }
 
-/** The debugging skill's section for a stop by the runtime re-check (b.jg5 SRJ-205, SRJ-1104), under the refusal section. */
+/** The debugging skill's section for a stop by the runtime re-check, under the refusal section. */
 const RUNTIME_STOP_HEADING = '### Found while the server was running'
 
 /** `RUNBOOK_COMMAND_SPANS`' key for the debugging skill's runtime-stop remedy. */
 const RUNTIME_STOP_REMEDY = "the debugging skill's runtime-stop remedy"
 
 /**
- * Ruling C-1 (b.jg5 SRJ-1104, SRJ-1108): the backticked agent-director
+ * Ruling C-1: the backticked agent-director
  * command lines an operator text may carry where `UPGRADE_FORMS` applies,
  * each removed exactly (that span, as written) before the forms are applied;
  * any other backticked agent-director command line there still fails. No
  * pattern is narrowed. The runbook's refusal block and the debugging skill's
  * runtime-stop remedy (under `RUNTIME_STOP_HEADING`, and only there) name the
  * process `agent-director serve` among those stopped around the binary change
- * (SRJ-1104, SRJ-1108; HO C15); step 1's version item runs
- * `agent-director version` (SRJ-1108).
+ * (HO C15); step 1's version item runs
+ * `agent-director version`.
  */
 const RUNBOOK_COMMAND_SPANS: Record<'refusal block' | "step 1's version item" | typeof RUNTIME_STOP_REMEDY, string> = {
   'refusal block': code('agent-director serve'),
@@ -2326,14 +2314,14 @@ function refusalSectionForUpgradeForms(skill: string): string {
   return flat([...lines.slice(0, range.start), remedy, ...lines.slice(range.end)].join('\n'))
 }
 
-/** The label of `UPGRADE_FORMS`' re-install row (E36 T2 ruling; SRJ-1101); throws when the helper has no such row. */
+/** The label of `UPGRADE_FORMS`' re-install row (ruling); throws when the helper has no such row. */
 const REINSTALL_FORM: string = (() => {
   const row = UPGRADE_FORMS.find(([label]) => /\bre-install\b/i.test(label))
   if (row === undefined) throw new Error('UPGRADE_FORMS has no re-install row')
   return row[0]
 })()
 
-describe('the agent-director refusal classes name the switch-over runbook (b.jg5 SRJ-208)', () => {
+describe('the agent-director refusal classes name the switch-over runbook', () => {
   const debugSkill = operatorText(DEBUG_SKILL_FILE)
   const runbooks = operatorText(RUNBOOK_DOC)
   const runbookAnchor = headingSlug(PHASE1_RUNBOOK_SECTION_TITLE)
@@ -2360,7 +2348,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     })
 
     test.each(UPGRADE_FORMS.map(([form, pattern]) => [form, pattern] as const))(
-      `the refusal section carries no %s, once the runtime-stop remedy's ${RUNBOOK_COMMAND_SPANS[RUNTIME_STOP_REMEDY]} span is removed (ruling C-1; SRJ-1104)`,
+      `the refusal section carries no %s, once the runtime-stop remedy's ${RUNBOOK_COMMAND_SPANS[RUNTIME_STOP_REMEDY]} span is removed (ruling C-1)`,
       (_form, pattern) => {
         expect(refusalSectionForUpgradeForms(debugSkill)).not.toMatch(pattern)
       },
@@ -2408,7 +2396,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     )
   })
 
-  // E2 gate (b.jg5 SRJ-1108): the section the refusals name exists once, under
+  // gate: the section the refusals name exists once, under
   // `## Migration`, and every link into it resolves.
   test(`exactly one heading of the user docs carries the title every refusal names, a \`###\` under \`## Migration\` in ${RUNBOOK_DOC}`, () => {
     expect(runbookTitleProblems(runbooks)).toEqual([])
@@ -2442,7 +2430,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     expect(UPGRADE_FORMS.filter(([, pattern]) => pattern.test(pointer)).map(([form]) => form)).toEqual([])
   })
 
-  // The re-install row (E36 T2 ruling; SRJ-1101, HO C8): it flags each
+  // The re-install row ( ruling, HO C8): it flags each
   // re-install advice the install and startup texts gave, and neither the
   // remedies that replaced them nor re-installing a Slack app or CSCB.
   test.each([
@@ -2474,7 +2462,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   })
 })
 
-describe('the runtime re-check\'s pointer names a debug skill section that exists (b.jg5 SRJ-1104)', () => {
+describe('the runtime re-check\'s pointer names a debug skill section that exists', () => {
   test(`${DEBUG_SKILL_PATH} has exactly one heading titled "${DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE}"`, () => {
     const titles = headings(readRepoFile(DEBUG_SKILL_PATH)).map((h) => h.title)
     expect(titles.filter((title) => title === DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE)).toHaveLength(1)
@@ -2487,12 +2475,12 @@ const MIGRATION_HEADING = '## Migration'
 /** The switch-over section's heading as `RUNBOOK_DOC` writes it: a `###` under `## Migration`. */
 const SWITCH_OVER_HEADING = `### ${PHASE1_RUNBOOK_SECTION_TITLE}`
 
-/** The README section the switch-over runbook replaced (b.jg5 SRJ-1103): no user-doc heading carries it and no link reaches it. */
+/** The README section the switch-over runbook replaced: no user-doc heading carries it and no link reaches it. */
 const GONE_TITLE = 'First start on a host with running bots'
 
 /**
- * What is wrong with the `RUNBOOK_DOC` heading the refusals name (E2 gate,
- * b.jg5 SRJ-1108): exactly one heading carries `PHASE1_RUNBOOK_SECTION_TITLE`,
+ * What is wrong with the `RUNBOOK_DOC` heading the refusals name ( gate,
+ *): exactly one heading carries `PHASE1_RUNBOOK_SECTION_TITLE`,
  * at `###`, inside `## Migration`. Pure; `[]` when all holds.
  */
 function runbookTitleProblems(readme: string): string[] {
@@ -2543,7 +2531,7 @@ function runbookLinkProblems(readme: string, texts: readonly [file: string, text
 }
 
 // ---------------------------------------------------------------------------
-// The switch-over runbook (b.jg5 SRJ-1108; the E2-gate and E5 hatch notes)
+// The switch-over runbook (the -gate and design notes)
 // ---------------------------------------------------------------------------
 
 /** `value` with every RegExp metacharacter escaped, so a pattern built around it matches it literally. */
@@ -2567,47 +2555,47 @@ function lazy<T>(build: () => T): () => T {
   return () => (built ??= { value: build() }).value
 }
 
-/** agent-director's home install path, which the client looks at first (SRJ-1301): the `homeBinary` and `findMissingCron` rows' common part. */
+/** agent-director's home install path, which the client looks at first: the `homeBinary` and `findMissingCron` rows' common part. */
 const AD_HOME_BINARY = '$HOME/.config/agent-director/bin/agent-director'
 
 /**
  * agent-director vocabulary the operator texts name and CSCB defines nowhere,
- * each row citing its source (HO: agent-director's handoff notes; ADSRD: its
- * SRD). Everything CSCB defines (versions, settings keys, defaults, minimums,
+ * each row citing its source (HO: agent-director's handoff notes; agent-director contract: its
+ * contract). Everything CSCB defines (versions, settings keys, defaults, minimums,
  * the margin, the verbs, the store path, titles, labels) is imported instead.
- * `ceiling <name>` rows are ADSRD SR-13.2's ceiling formulas as the runbook
- * lists them (b.jg5 SRJ-213), one per ceiling CSCB calls.
+ * `ceiling <name>` rows are agent-director contract ceiling formulas as the runbook
+ * lists them, one per ceiling CSCB calls.
  */
 const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
-  homeBinary: { text: AD_HOME_BINARY, source: "agent-director's client discovery: its home install, found before the first `agent-director` on PATH (b.jg5 SRJ-1301; SRJ-1104, SRJ-1108)" },
-  findMissingCron: { text: `* * * * * ${AD_HOME_BINARY} find-missing`, source: "HO C19; b.jg5 SRJ-1101: the README Migration section's cron line, with no flags, run as the workers' user on their tmux socket (C7)" },
-  stoppingSetItem: { text: '"Stopping a set of agents before a binary change"', source: 'HO rev 27: the "Operator actions" item a human follows to stop a set of agents, CSCB\'s bots included; SRJ-1104, SRJ-1108' },
-  tmuxMinimum: { text: '3.2', source: 'HO rev 17: tmux 3.2 or later; b.jg5 SRJ-1108 step 1, SRJ-1103' },
-  remainOnExit: { text: code('remain-on-exit'), source: 'HO rev 17: kept off; SRJ-1108 step 1' },
-  baseIndex: { text: 'base-index', source: 'HO rev 17: agent-director depends on it not at all; SRJ-1108 step 1 names it not' },
-  paneBaseIndex: { text: 'pane-base-index', source: 'HO rev 17; SRJ-1108 step 1 names it not' },
+  homeBinary: { text: AD_HOME_BINARY, source: "agent-director's client discovery: its home install, found before the first `agent-director` on PATH" },
+  findMissingCron: { text: `* * * * * ${AD_HOME_BINARY} find-missing`, source: "HO C19; the README Migration section's cron line, with no flags, run as the workers' user on their tmux socket (C7)" },
+  stoppingSetItem: { text: '"Stopping a set of agents before a binary change"', source: 'HO rev 27: the "Operator actions" item a human follows to stop a set of agents, CSCB\'s bots included' },
+  tmuxMinimum: { text: '3.2', source: 'HO rev 17: tmux 3.2 or later step 1' },
+  remainOnExit: { text: code('remain-on-exit'), source: 'HO rev 17: kept off step 1' },
+  baseIndex: { text: 'base-index', source: 'HO rev 17: agent-director depends on it not at all step 1 names it not' },
+  paneBaseIndex: { text: 'pane-base-index', source: 'HO rev 17step 1 names it not' },
   hookIgnored: { text: code('ad.hook.ignored'), source: 'HO rev 24, rev 31: the event of a hook on a Claude Code too old for exec-form hooks' },
   noExecForm: { text: code('no_exec_form'), source: "HO rev 24, rev 31: that event's reason" },
   sessionStartCapSeconds: { text: '540', source: "HO rev 25; A-33: the cap on agent-director's SessionStart wait, in seconds" },
-  waitMinutes: { text: '5', source: 'SRJ-1108 steps 4 and 6, SRJ-1109 step 4: the waits for a row to read `ended` or `missing`, in minutes' },
-  operatorActions: { text: '"Operator actions"', source: "HO rev 27; A-2, A-26: the section of agent-director's README a human follows; SRJ-1109 steps 3 to 5" },
-  notThisLaunch: { text: "not this launch's session", source: "HO §2; SRJ-1109 steps 4 and 5: a `kill`'s CONFLICT on a leftover of an earlier launch" },
-  downgradeRecipe: { text: 'emergency downgrade recipe', source: "HO C15; ADA question 8; SRJ-1109 step 6: the only way the previous agent-director is restored" },
-  downgradeSchemaVersion: { text: '4', source: 'HO C15; ADA question 8; SRJ-1109 step 6: the schema version the recipe stamps' },
-  sqliteBackup: { text: code('.backup'), source: "HO C15; SRJ-1108 step 8: sqlite3's online-consistent copy of the WAL-mode store" },
-  migrationColumns: { text: 'thirteen', source: "HO rev 15: the columns Phase 1's schema migration adds (and the downgrade recipe drops, SRJ-1109 step 6)" },
+  waitMinutes: { text: '5', source: 'steps 4 and 6step 4: the waits for a row to read `ended` or `missing`, in minutes' },
+  operatorActions: { text: '"Operator actions"', source: "HO rev 27; A-2, A-26: the section of agent-director's README a human follows steps 3 to 5" },
+  notThisLaunch: { text: "not this launch's session", source: "HO §2steps 4 and 5: a `kill`'s CONFLICT on a leftover of an earlier launch" },
+  downgradeRecipe: { text: 'emergency downgrade recipe', source: "HO C15; ADA question 8step 6: the only way the previous agent-director is restored" },
+  downgradeSchemaVersion: { text: '4', source: 'HO C15; ADA question 8step 6: the schema version the recipe stamps' },
+  sqliteBackup: { text: code('.backup'), source: "HO C15step 8: sqlite3's online-consistent copy of the WAL-mode store" },
+  migrationColumns: { text: 'thirteen', source: "HO rev 15: the columns Phase 1's schema migration adds (and the downgrade recipe drops step 6)" },
   storeMeta: { text: code('store_meta'), source: "HO rev 15, rev 19: the one-row table holding the store's id" },
-  configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD SR-4.1: agent-director's answer to a malformed settings file" },
-  ownerLabel: { text: code('@ad_owner'), source: "HO rev 15; b.jg5 SRJ-612: the session label by which agent-director proves a session is a row's" },
-  paneLabel: { text: code('@ad_pane'), source: 'HO rev 17; b.jg5 SRJ-612, SRJ-613: the per-pane label' },
+  configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD agent-director's answer to a malformed settings file" },
+  ownerLabel: { text: code('@ad_owner'), source: "HO rev 15; the session label by which agent-director proves a session is a row's" },
+  paneLabel: { text: code('@ad_pane'), source: 'HO rev 17; the per-pane label' },
   unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as; the E4 hatch note (`ad-shim-catalog-incomplete`)" },
-  expireAll: { text: code('--older-than 0d'), source: 'HO C6; SRJ-1108 step 11: never used' },
-  'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD SR-13.2; SRJ-213' },
-  'ceiling read-pane': { text: '3Q + A + 4W', source: 'ADSRD SR-13.2; SRJ-213' },
-  'ceiling send-keys': { text: '3Q + 2A + 5W', source: 'ADSRD SR-13.2; SRJ-213' },
-  'ceiling pause': { text: `3Q + 2A + 5W, plus ${code(`[${AD_PAUSE_TABLE}] ${AD_PAUSE_TIMEOUT_KEY}`)} (times 1000)`, source: 'ADSRD SR-13.2; SRJ-213: with its configured wait' },
-  [`ceiling ${AD_LAUNCH_CEILING_VERBS.join('/')}`]: { text: 'the larger of Q + C + 2A + 4W and 2Q + C + 3W', source: 'ADSRD SR-13.2; SRJ-213: the launch row' },
-  'ceiling find-missing': { text: 'B + Q + W', source: 'ADSRD SR-13.2; SRJ-213: the sweep row' },
+  expireAll: { text: code('--older-than 0d'), source: 'HO C6step 11: never used' },
+  'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD' },
+  'ceiling read-pane': { text: '3Q + A + 4W', source: 'ADSRD' },
+  'ceiling send-keys': { text: '3Q + 2A + 5W', source: 'ADSRD' },
+  'ceiling pause': { text: `3Q + 2A + 5W, plus ${code(`[${AD_PAUSE_TABLE}] ${AD_PAUSE_TIMEOUT_KEY}`)} (times 1000)`, source: 'ADSRD with its configured wait' },
+  [`ceiling ${AD_LAUNCH_CEILING_VERBS.join('/')}`]: { text: 'the larger of Q + C + 2A + 4W and 2Q + C + 3W', source: 'ADSRD the launch row' },
+  'ceiling find-missing': { text: 'B + Q + W', source: 'ADSRD the sweep row' },
 }
 
 /** One vocabulary row's text; throws naming a key the table lacks. */
@@ -2627,10 +2615,10 @@ const CSCB_CEILINGS: readonly string[] = [
 /** The verbs of the ceiling table CSCB never calls (`expire`). */
 const UNCALLED_VERBS: readonly string[] = AD_CEILING_VERBS.filter((v) => !v.cscbCalls).map((v) => v.verb)
 
-/** The three windows step 1 confirms (b.jg5 SRJ-209). */
+/** The three windows step 1 confirms. */
 const AD_WINDOWS: readonly AdTmuxKey[] = ['pending_grace_seconds', 'stopping_window_seconds', 'starting_session_seconds']
 
-/** The switch-over runbook's step count (SRJ-1108: steps 1 to 11). */
+/** The switch-over runbook's step count (steps 1 to 11). */
 const SWITCH_OVER_STEP_COUNT = 11
 
 /** A runbook as one carrier holds it: its section body, its frame, its steps and its blocks' heading level. */
@@ -2676,8 +2664,8 @@ function readRunbookCarrier(file: string, text: string, heading: string, count: 
 
 /**
  * Every carrier of the switch-over runbook: its name and its reader. The
- * `RUNBOOK_DOC` section, and the CHANGELOG release entry's copy (b.jg5 SRJ-1107;
- * hatch A3), read through `OPERATOR_TEXTS` from the entry only.
+ * `RUNBOOK_DOC` section, and the CHANGELOG release entry's copy (
+ * design A3), read through `OPERATOR_TEXTS` from the entry only.
  */
 // The historical release entry keeps the old directory and flag spellings.
 // Normalize only those spellings for the legacy content checks; current release
@@ -2730,13 +2718,13 @@ function missingItems(carrier: RunbookCarrier, text: string, required: readonly 
 /** A link to step n's heading in the carrier, as Markdown writes its target. */
 const stepLink = (n: number) => (carrier: RunbookCarrier) => `(#${carrier.stepAnchors[n - 1]})`
 
-/** The `RUNBOOK_DOC` section that keeps the conversion steps the switch-over's steps 1 and 7 point to (b.jg5 SRJ-1103). */
+/** The `RUNBOOK_DOC` section that keeps the conversion steps the switch-over's steps 1 and 7 point to. */
 const UPGRADING_TITLE = 'Upgrading to personas'
 
 /**
  * A link to the `RUNBOOK_DOC` heading titled `title` as the carrier writes
  * it: a same-file anchor in `RUNBOOK_DOC`, `docs/migration.md#…` in the
- * CHANGELOG copy (b.jg5 SRJ-1107; the E35 T1 PM note).
+ * CHANGELOG copy (the PM note).
  */
 const readmeLink = (title: string) => (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? RUNBOOK_DOC : ''}#${headingSlug(title)})`
 
@@ -2752,7 +2740,7 @@ const repoLink = (file: string) => (carrier: RunbookCarrier) =>
 const upgradingLink = readmeLink(UPGRADING_TITLE)
 
 /**
- * SRJ-1101's words for a kill a runbook step tells a human to run: its result
+ * words for a kill a runbook step tells a human to run: its result
  * checked, and nothing deleted or respawned on an error (switch-over step 6,
  * rollback steps 4 and 5; the README's advice to kill leftover workers).
  */
@@ -2762,9 +2750,9 @@ const KILL_CAVEAT = "check its result; on an error, don't delete or respawn"
 const OPERATOR_ACTION = '(operator action)'
 
 /**
- * One row per SRJ-1108 element: where it sits (`frame`, `step <n>` or
+ * One row element: where it sits (`frame`, `step <n>` or
  * `step <n> › <item lead>`), the element, and the items its text must hold.
- * The `operator action` rows mark each operator-only action SRJ-1108 names
+ * The `operator action` rows mark each operator-only action names
  * (C6, C7, C15, the go-ahead of steps 1 and 8 (A-19), the §6 prompt, the
  * host's autostart for CSCB) at its step.
  */
@@ -2776,7 +2764,7 @@ const HISTORICAL_RUNBOOK_CLAUDE = HISTORICAL_PHASE1_CLAUDE_CODE_VERSION
 
 const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
   // The section-level statements.
-  ['frame', "the SRJ-1515 sentence: Phase 1 is installed together with this release, which changes no agent-director code, and both roll back together", [
+  ['frame', "the sentence: Phase 1 is installed together with this release, which changes no agent-director code, and both roll back together", [
     ci('requires agent-director Phase 1, installed on the host together with it; CSCB changes no agent-director code'),
     `rolled back together, by "${ROLLBACK_RUNBOOK_SECTION_TITLE}"`,
   ]],
@@ -2809,7 +2797,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('if there is no go-ahead, stop here, before anything goes down'),
   ]],
   ['step 1 › The go-ahead', 'operator action: the go-ahead (C15; A-19)', [OPERATOR_ACTION]],
-  ['step 1 › The go-ahead', "the go-ahead is the operator's decision and agent-director ships no install-gate file or record; the install gate is the CSCB fixes Phase 1 needs on a host, which this release installed with Phase 1 meets (A-19; bug b.7sd)", [
+  ['step 1 › The go-ahead', "the go-ahead is the operator's decision and agent-director ships no install-gate file or record; the install gate is the CSCB fixes Phase 1 needs on a host, which this release installed with Phase 1 meets (A-19)", [
     ci("the go-ahead is the operator's decision, and agent-director ships no install-gate file or record"),
     ci("agent-director's Phase 1 install gate is the set of CSCB fixes that must be in place on a host before Phase 1 is installed there"),
     ci('this release, installed together with agent-director Phase 1 as this runbook does, meets it'),
@@ -2834,10 +2822,10 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('the three share one HOME'),
     ci('record the result in the switch-over log'),
   ]],
-  ['step 1 › The tmux socket', "the host's sweep schedule named generically: whatever runs agent-director find-missing on a schedule, a cron entry, a systemd timer or a loop script (b.3ut)", [
+  ['step 1 › The tmux socket', "the host's sweep schedule named generically: whatever runs agent-director find-missing on a schedule, a cron entry, a systemd timer or a loop script", [
     ci('the sweep schedule is whatever runs `agent-director find-missing` on a schedule on your host: a cron entry, a systemd timer or a loop script'),
   ]],
-  ['step 1 › The tmux socket', 'a host with no sweep schedule checks the other two and runs the one step 11 adds in the same environment (b.3ut)', [
+  ['step 1 › The tmux socket', 'a host with no sweep schedule checks the other two and runs the one step 11 adds in the same environment', [
     ci('a host with no sweep schedule checks the other two, and runs the one step 11 adds in the same environment'),
   ]],
   ['step 1 › The tmux socket', 'operator action: pinning the tmux socket (C7)', [OPERATOR_ACTION]],
@@ -2919,11 +2907,11 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
   ['step 1 › The orchestrator prompt', 'the shared orchestrator prompt\'s §6 "ship now" wording may go out any time before', [
     ci('the shared orchestrator prompt\'s "ship now" wording may go out any time before'),
   ]],
-  ['step 1 › The orchestrator prompt', 'the shared orchestrator prompt named generically, at its first use: the system prompt the orchestrator bots load, for example the append_system_prompt_file file (b.3ut)', [
+  ['step 1 › The orchestrator prompt', 'the shared orchestrator prompt named generically, at its first use: the system prompt the orchestrator bots load, for example the append_system_prompt_file file', [
     ci(`the shared orchestrator prompt is the system prompt your orchestrator bots load, for example the file ${code('append_system_prompt_file' satisfies (typeof SERVER_PATH_SETTINGS)[number])} names`),
   ]],
   ['step 1 › The orchestrator prompt', 'operator action: the §6 "ship now" wording', [OPERATOR_ACTION]],
-  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
+  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (the E35 T1 PM note)`, [upgradingLink]],
 
   // Steps 2 to 11.
   ['step 2', "the host's autostart for CSCB disabled until step 10", [ci("disable the host's autostart for CSCB until step 10")]],
@@ -2980,7 +2968,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('if the session or one of its windows remains, end the session with the exact-name `tmux kill-session -t =<name>`, and make the gone check again'),
     ci(`\`agent-director find-missing\` until the row reads \`ended\` or \`missing\`, for at most ${vocab('waitMinutes')} minutes`),
   ]],
-  ['step 6', "the kill's result is checked, and on an error nothing is deleted or respawned (SRJ-1101)", [
+  ['step 6', "the kill's result is checked, and on an error nothing is deleted or respawned", [
     ci(`${code('agent-director kill --instance-id <id>')} and ${KILL_CAVEAT}`),
   ]],
   ['step 6', 'a leftover that cannot be ended means no Phase 1 install: step 8\'s "no go", investigated by session name', [
@@ -3002,7 +2990,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`passes on the still-installed ${HISTORICAL_RUNBOOK_AD}, with its note`),
   ]],
   ['step 7', 'from this step the new CSCB is deployed but not started', [ci('from this step the new CSCB is deployed but not started')]],
-  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
+  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (the E35 T1 PM note)`, [upgradingLink]],
   ['step 8 › The go-ahead', "the go-ahead for this host confirmed as still standing, and recorded in the switch-over log (A-19)", [
     ci('confirm that the go-ahead for this host still stands, and record it in the switch-over log'),
   ]],
@@ -3097,7 +3085,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci("add it to the host's sweep schedule, the one step 1's socket check names: whatever runs `agent-director find-missing` on a schedule on your host, such as a cron entry, a systemd timer or a loop script"),
     ci('nothing on the host runs `expire` before this step'),
   ]],
-  ['step 11', "a host with no sweep schedule adds one now (operator action), as the workers' user in the pinned tmux environment, running both find-missing on a schedule (Migration, linked, shows it as a cron entry) and the daily expire (b.3ut; the User's ruling)", [
+  ['step 11', "a host with no sweep schedule adds one now (operator action), as the workers' user in the pinned tmux environment, running both find-missing on a schedule (Migration, linked, shows it as a cron entry) and the daily expire (the User's ruling)", [
     ci("a host with no sweep schedule must add one now (operator action), as the workers' user in the tmux environment step 1 pinned, running both `agent-director find-missing` on a schedule"),
     (carrier) => `([Migration]${readmeLink(MIGRATION_HEADING.slice('## '.length))(carrier)} shows it as a cron entry) and the daily \`expire\`.`,
   ]],
@@ -3158,7 +3146,7 @@ function refusalOrderItems(carrier: RunbookCarrier): { n: number; text: string }
 }
 
 /**
- * The refusal block's ordered elements (SRJ-1108; hatch A3), each with the
+ * The refusal block's ordered elements (design A3), each with the
  * pattern that finds its list item and the items it must hold. The block acts
  * in this order, so the four are items 1 to 4 of its list.
  */
@@ -3187,7 +3175,7 @@ const REFUSAL_ORDER: [element: string, anchor: RegExp, required: readonly Item[]
   ['then the runbook from step 1, by a link to its heading', ci('start the runbook at'), [stepLink(1)]],
 ]
 
-/** The refusal block's branches and pointers after its ordered list (SRJ-1108; hatch A3), each found by the part it sits in. */
+/** The refusal block's branches and pointers after its ordered list (hatch A3), each found by the part it sits in. */
 const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[]][] = [
   ["a refusal after Phase 1 was installed: at step 10 or any later start of the new CSCB, on a host whose Phase 1 install was step 8's or a publishing host's own, and only it", ci('a refusal at step 10'), [
     ci('installing agent-director Phase 1 migrates agent-director\'s store'),
@@ -3232,7 +3220,7 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
   ]],
 ]
 
-/** The publishing-host block's elements (SRJ-1108; the E5 hatch note; hatch A3). */
+/** The publishing-host block's elements (the hatch note; hatch A3). */
 const PUBLISHING_HOST_ELEMENTS: [element: string, required: readonly Item[]][] = [
   [`/publish needs an agent-director binary the client accepts (${HISTORICAL_RUNBOOK_CLIENT_MIN} or later)`, [
     ci('`/publish` checks that the publishing host has an agent-director binary the client accepts'),
@@ -3287,7 +3275,7 @@ function helperLoadPath(entry: string, read: (relPath: string) => string): { fil
   return { files, problems }
 }
 
-describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1108)`, () => {
+describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}"`, () => {
   describe(`the step reader's load path, from ${RUNBOOKS_HELPER} (ruling Q13; the /ci image's /tests)`, () => {
     test(`${RUNBOOKS_HELPER} and everything it imports sit in ${IMAGE_SAFE_HELPERS_DIR}, import nothing from src/, agent-director or any package, and read and write nothing`, () => {
       expect(helperLoadPath(RUNBOOKS_HELPER, readRepoFile)).toEqual({ files: [RUNBOOKS_HELPER, 'tests/test-helpers/markdown.ts'], problems: [] })
@@ -3422,14 +3410,14 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       expect(order).toEqual([...order].sort((a, b) => a - b))
     })
 
-    // SRJ-1101's placement of `tmux kill-session` (steps 5 and 6 only, always
+    // placement of `tmux kill-session` (steps 5 and 6 only, always
     // `-t =`) and its terms (include-finished, agent-director delete) are
-    // checked over the whole of each carrier file by E36 T4's whole-file
+    // checked over the whole of each carrier file by whole-file
     // cases: `killSessionsOutsideSteps`, the step-reader count case,
-    // `offListTmuxCommands` and `SRJ_1101_TERMS`.
+    // `offListTmuxCommands` and `FORBIDDEN_OPERATOR_TERMS`.
   })
 
-  describe(`the "${REFUSAL_BLOCK_HEADING}" block (E2 gate; hatch A3)`, () => {
+  describe(`the "${REFUSAL_BLOCK_HEADING}" block (gate; hatch A3)`, () => {
     test.each(SWITCH_OVER_CARRIERS)("%s: the helper's heading is the section's first subsection, one level below it, before step 1", (_name, read) => {
       const carrier = read()
       const [first] = headings(carrier.section)
@@ -3494,7 +3482,7 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
     })
   })
 
-  describe(`the "${PUBLISHING_HOST_BLOCK_HEADING}" block (E5 hatch note)`, () => {
+  describe(`the "${PUBLISHING_HOST_BLOCK_HEADING}" block (hatch note)`, () => {
     test.each(overCarriers(PUBLISHING_HOST_ELEMENTS))('%s: %s', (_name, element, required, read) => {
       const carrier = read()
       expect({ element, missing: missingItems(carrier, publishingHostBlock(carrier), required) }).toEqual({ element, missing: [] })
@@ -3564,10 +3552,10 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
 })
 
 // ---------------------------------------------------------------------------
-// The rollback runbook (b.jg5 SRJ-1109; hatch A3; ruling C-2)
+// The rollback runbook (design A3; ruling C-2)
 // ---------------------------------------------------------------------------
 
-/** The rollback runbook's step count (SRJ-1109: steps 1 to 9). */
+/** The rollback runbook's step count (steps 1 to 9). */
 const ROLLBACK_STEP_COUNT = 9
 
 /** Every carrier of the rollback runbook: its name and its reader. The `RUNBOOK_DOC` section and the CHANGELOG release entry's copy, as for `SWITCH_OVER_CARRIERS`. */
@@ -3587,11 +3575,11 @@ function countWord(n: number): string {
   return word
 }
 
-/** The old CSCB's tmux session names, which the previous CSCB uses again after the rollback (SRJ-1109 step 5). */
+/** The old CSCB's tmux session names, which the previous CSCB uses again after the rollback (step 5). */
 const OLD_SESSION_NAMES = [`${PERSONA_TMUX_SESSION_PREFIX}<name>_<channel>`, `${PERSONA_TMUX_SESSION_PREFIX}<channel ID>`]
 
 /**
- * One row per SRJ-1109 element: where it sits (`frame`, `step <n>` or
+ * One row element: where it sits (`frame`, `step <n>` or
  * `step <n> › <item lead>`), the element, and the items its text must hold.
  * The `operator action` rows mark each operator-only action at its step.
  * Links are checked only in `RUNBOOK_DOC` (ruling C-2, below), so the rows hold
@@ -3665,7 +3653,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     ci(`a row still live after that (for example a retired key whose kill failed, which ${code(CLI_COMMAND_STOP_BOTS)} does not cover) is ended by a human`),
     ci('run `agent-director kill --instance-id <id>`, and check its result'),
   ]],
-  ['step 4', "the kill's result is checked, and on an error nothing is deleted or respawned (SRJ-1101)", [
+  ['step 4', "the kill's result is checked, and on an error nothing is deleted or respawned", [
     ci(`${code('agent-director kill --instance-id <id>')}, and ${KILL_CAVEAT}`),
   ]],
   ['step 4', `a kill refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}") meets a leftover of an earlier launch, handled as ${vocab('operatorActions')} describes`, [
@@ -3690,7 +3678,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     ci("re-enable the host's autostart for CSCB"),
   ]],
   ['step 4', "operator action: the new CSCB's restart, the expire and the autostart", [ci(`autostart for CSCB ${OPERATOR_ACTION}`)]],
-  ['step 4', `a refused restart: the new CSCB stays stopped until agent-director has dealt with the worker, then the refusal block's after-install branch (SRJ-1108)`, [
+  ['step 4', `a refused restart: the new CSCB stays stopped until agent-director has dealt with the worker, then the refusal block's after-install branch`, [
     ci('if that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker'),
     ci('then follow "A refusal after Phase 1 was installed"'),
     REFUSAL_BLOCK_HEADING,
@@ -3707,7 +3695,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     code(`agent-director kill --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`),
     ci(`when that \`kill\` is refused with "${vocab('notThisLaunch')}", handle it as ${vocab('operatorActions')} describes`),
   ]],
-  ['step 5', "the live row's kill: its result checked, and on an error nothing deleted or respawned (SRJ-1101)", [
+  ['step 5', "the live row's kill: its result checked, and on an error nothing deleted or respawned", [
     ci(`${code(`agent-director kill --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`)}, and ${KILL_CAVEAT}`),
   ]],
   ['step 5', `a finished row's own leftover session: as ${vocab('operatorActions')} describes`, [
@@ -3788,7 +3776,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     ci('reinstall the previous CSCB, the version switch-over step 1 recorded, or else the version the host ran before'),
     'bun install -g claude-slack-channel-bots@<the previous version>',
   ]],
-  ['step 8', "switch-over step 1's files put back: the pre-persona config.json, crontable, /interject callers, access.json and the Slack token environment variables (SRJ-1516)", [
+  ['step 8', "switch-over step 1's files put back: the pre-persona config.json, crontable, /interject callers, access.json and the Slack token environment variables", [
     ci('put back what switch-over step 1 saved'),
     ci(`the pre-persona ${code(CONFIG_FILE_NAME)}, the crontable, the \`/interject\` callers`),
     ci("the host crontab's `curl` lines included"),
@@ -3811,7 +3799,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 9', "operator action: re-enabling the host's autostart for CSCB", [ci(`autostart for CSCB ${OPERATOR_ACTION}`)]],
 ]
 
-/** The steps that send a human beyond `agent-director kill`, each naming agent-director's "Operator actions" by title (SRJ-1109). */
+/** The steps that send a human beyond `agent-director kill`, each naming agent-director's "Operator actions" by title. */
 const OPERATOR_ACTIONS_STEPS: readonly number[] = [3, 4, 5]
 
 /** True when `path`, read repo-relative (the CHANGELOG copy) or relative to `RUNBOOK_DOC`'s directory, names a user doc. */
@@ -3822,10 +3810,10 @@ function isUserDocPath(path: string): boolean {
 
 /**
  * What in a rollback step-8 text names a tool or command for the rebuild by
- * hand (hatch A3): a fenced block other than the previous CSCB's reinstall, a
+ * hand (design A3): a fenced block other than the previous CSCB's reinstall, a
  * code span naming a script or a CSCB subcommand, a link to a file, or
  * conversion wording tied to a tool, script or command. A link to a heading
- * of a user doc (the CHANGELOG copy's form of a same-file link, b.jg5 SRJ-1107,
+ * of a user doc (the CHANGELOG copy's form of a same-file link,
  * or a link to the user doc that now holds a section the README once held) is
  * not a file. Takes the flattened step text. Pure; `[]`
  * when none.
@@ -3856,7 +3844,7 @@ function linksWithText(text: string): { text: string; path: string; anchor: stri
 }
 
 /**
- * What is wrong with the rollback section's heading (b.jg5 SRJ-1109): exactly
+ * What is wrong with the rollback section's heading: exactly
  * one heading carries `ROLLBACK_RUNBOOK_SECTION_TITLE`, at `###`, inside
  * `## Migration`, after the switch-over section ends. Pure; `[]` when all holds.
  */
@@ -3876,7 +3864,7 @@ function rollbackTitleProblems(readme: string): string[] {
 }
 
 /**
- * Ruling C-2 (hatch A3): the switch-over runbook's pointers to the rollback
+ * Ruling C-2 (design A3): the switch-over runbook's pointers to the rollback
  * runbook are links that resolve. Each pointer phrase, wherever it is
  * written, must be the text of a link resolving to its target: the frame's
  * "rolled back together, by "<title>"" and the refusal block's
@@ -3922,7 +3910,7 @@ function rollbackPointerProblems(readme: string): string[] {
   return problems
 }
 
-describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1109)`, () => {
+describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}"`, () => {
   const readme = operatorText(RUNBOOK_DOC)
 
   test(`exactly one ${RUNBOOK_DOC} heading carries the rollback title, a \`###\` under \`## Migration\`, after the switch-over section`, () => {
@@ -3998,8 +3986,8 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
   describe('cross-step rows', () => {
     // No `tmux kill-session`, include-finished, include_finished or
-    // agent-director delete in the section: E36 T4's whole-file cases
-    // (`killSessionsOutsideSteps`, `SRJ_1101_TERMS`) check every carrier file.
+    // agent-director delete in the section: whole-file cases
+    // (`killSessionsOutsideSteps`, `FORBIDDEN_OPERATOR_TERMS`) check every carrier file.
 
     test.each(overRollbackCarriers(OPERATOR_ACTIONS_STEPS.map((n) => [n] as const)))(
       `%s: step %d, which sends a human beyond \`agent-director kill\`, names ${vocab('operatorActions')} by title`,
@@ -4031,7 +4019,7 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
     test.each([
       ['a same-file heading link', '(see [Upgrading to personas](#upgrading-to-personas))', []],
-      [`a ${RUNBOOK_DOC} heading link, the CHANGELOG copy's form of it (SRJ-1107)`, `(see [Upgrading to personas](${RUNBOOK_DOC}#upgrading-to-personas))`, []],
+      [`a ${RUNBOOK_DOC} heading link, the CHANGELOG copy's form of it`, `(see [Upgrading to personas](${RUNBOOK_DOC}#upgrading-to-personas))`, []],
       [`a link to ${RUNBOOK_DOC} itself`, `(see [the migration page](${RUNBOOK_DOC}))`, ['link to a file']],
     ] as const)('self-check (hatch A3): a step 8 with %s', (_label, text, kinds) => {
       expect(conversionToolsIn(flat(`Rebuild it by hand ${text}.`)).map((found) => found.split(':')[0])).toEqual([...kinds])
@@ -4089,7 +4077,7 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
 
 /**
  * Paths that exist on one host only, which neither runbook names in either
- * carrier, nor the Migration section of `RUNBOOK_DOC` (b.3ut): the steps name
+ * carrier, nor the Migration section of `RUNBOOK_DOC`: the steps name
  * the host's sweep schedule and the shared orchestrator prompt generically
  * instead. Read over those sections only: elsewhere the user docs quote a
  * server log line naming the sweep script, and `team_admin` is an example
@@ -4106,7 +4094,7 @@ const RUNBOOK_SECTIONS: [name: string, read: () => string][] = [
   ...ROLLBACK_CARRIERS.map(([name, read]): [string, () => string] => [`${name}, rollback`, () => read().section]),
 ]
 
-describe('the runbooks name no host-specific path (b.3ut)', () => {
+describe('the runbooks name no host-specific path', () => {
   test.each([
     ...RUNBOOK_SECTIONS,
     [`${RUNBOOK_DOC} "${MIGRATION_HEADING}" (to the next \`##\`, both runbooks included)`, () => requiredSection(operatorText(RUNBOOK_DOC), MIGRATION_HEADING, RUNBOOK_DOC)],
@@ -4136,13 +4124,12 @@ describe('the runbooks name no host-specific path (b.3ut)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The CHANGELOG release entry (b.jg5 SRJ-1107; hatch A3), read through OPERATOR_TEXTS
+// The CHANGELOG release entry (design A3), read through OPERATOR_TEXTS
 // ---------------------------------------------------------------------------
 
 /**
- * The release that introduced the switch-over and rollback runbooks (b.jg5
- * SRJ-1107). Its CHANGELOG entry, the release entry, carries the two runbook
- * copies and the release notes SRJ-1107 checks. A later runbook change is
+ * The release that introduced the switch-over and rollback runbooks. Its CHANGELOG entry, the release entry, carries the two runbook
+ * copies and the release notes checks. A later runbook change is
  * made in that copy in place, and the file's first, unreleased entry says
  * what changed (the doc-writing guide's "Release notes (CHANGELOG.md)").
  */
@@ -4229,7 +4216,7 @@ function noteUnitProblems(changelog: string, anchor: RegExp, check: (unit: strin
   return check(units[0])
 }
 
-/** The heading title of b.ob2's dropped section (SRJ-1107: replaced by the switch-over runbook). */
+/** The heading title of the contract dropped section (replaced by the switch-over runbook). */
 const UPGRADE_STEPS_TITLE = 'Upgrade steps'
 
 /** Each heading titled `UPGRADE_STEPS_TITLE` in `text`, and each link to its anchor. Pure. */
@@ -4240,7 +4227,7 @@ function upgradeStepsProblems(text: string): string[] {
   ]
 }
 
-/** b.ob2's wording for the prompt-open relaunch, which SRJ-1107 replaces with a check through agent-director. */
+/** wording for the prompt-open relaunch, which replaces with a check through agent-director. */
 const TMUX_FIRST = ci('checks its tmux session first')
 
 /** Each "checks its tmux session first" in `text`, flattened. Pure. */
@@ -4251,7 +4238,7 @@ function tmuxFirstProblems(text: string): string[] {
 /** A word that tells the reader to delete a file. */
 const DELETE_WORDS = /\b(?:delet\w*|remov\w*|rm|eras\w*|discard\w*)\b/i
 
-/** SRJ-1107's breaking note, one row per part, each found in the release notes' text with links read as their text. */
+/** breaking note, one row per part, each found in the release notes' text with links read as their text. */
 const BREAKING_NOTE: [part: string, pattern: RegExp][] = [
   ['this release requires agent-director Phase 1 or later', ci('requires agent-director Phase 1 or later')],
   ['it exits at startup on an older binary', ci('exits at startup on an older agent-director binary')],
@@ -4269,10 +4256,10 @@ const AD_NAMED_VERSION = /\bagent-director v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\
 const ROW_DELETION_ELEMENT = 'the row-deletion note names `agent-director-admin`, and the agent-director version it names is the Phase 1 floor'
 
 /**
- * One row per SRJ-1107 element of the release entry: its name and its check,
+ * One row element of the release entry: its name and its check,
  * which returns the CHANGELOG text's problems (`[]` when the element holds).
  * Each check is self-checked below on the CHANGELOG with that element reverted
- * to b.ob2's wording, or, for an element b.ob2 lacked, broken.
+ * to wording, or, for an element lacked, broken.
  */
 const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => string[]][] = [
   ['exactly one unreleased entry, the first `##` entry in the file', (changelog) => {
@@ -4295,9 +4282,9 @@ const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => s
     noteUnitProblems(changelog, ci('prompt or question open'), (unit) => lacking(unit, [ci('checks the session through agent-director')]))],
   [`the note "The server's own tmux commands act only on a bot's own session" is gone (E17, E18)`, (changelog) =>
     [...flat(changelog).matchAll(/the server's own tmux commands/gi)].map((m) => `the dropped note is back: ${m[0]}`)],
-  [`the prefix-key note's reason is SRJ-1102's sentence and does not name agent-director ${HISTORICAL_RUNBOOK_AD} (SRJ-1102)`, (changelog) =>
+  [`the prefix-key note's reason is sentence and does not name agent-director ${HISTORICAL_RUNBOOK_AD}`, (changelog) =>
     noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => [
-      // DOCS_PREFIX_KEY_REASON: from the loader's builder, with SRJ-1102's other checks below.
+      // DOCS_PREFIX_KEY_REASON: from the loader's builder, with other checks below.
       ...lacking(unit, [DOCS_PREFIX_KEY_REASON]),
       ...(unit.includes('0.10.0') ? [`names ${HISTORICAL_RUNBOOK_AD}: ${unit}`] : []),
     ])],
@@ -4326,23 +4313,23 @@ function releaseCheck(element: string): (changelog: string) => string[] {
 }
 
 /**
- * The names the hatch-note entries introduce (the Task's ruling: only these
+ * The names the design-note entries introduce (the section's ruling: only these
  * are pinned, each through the `src/` export that defines it, no sentence
- * pinned), with the Epic and source of each.
+ * pinned), with the component and source of each.
  */
 const HATCH_NOTE_NAMES: [name: string, source: string][] = [
-  [CLEAR_LATCH_COMMAND, 'E31: src/clear-latch.ts CLEAR_LATCH_COMMAND (SRJ-509)'],
-  [SERVER_PORT_FILE_NAME, 'E31: src/clear-latch.ts SERVER_PORT_FILE_NAME (SRJ-510)'],
-  [CLI_TEARDOWN_FAILED_LABEL, 'E33: src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL (SRJ-909, SRJ-1013)'],
-  [PERSONA_KILL_FAILED_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL (SRJ-1013)'],
-  [PERSONA_KILL_SURVIVOR_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL (SRJ-1013)'],
-  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL (SRJ-906, SRJ-1013)'],
-  ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding (SRJ-1015)']),
+  [CLEAR_LATCH_COMMAND, 'E31: src/clear-latch.ts CLEAR_LATCH_COMMAND'],
+  [SERVER_PORT_FILE_NAME, 'E31: src/clear-latch.ts SERVER_PORT_FILE_NAME'],
+  [CLI_TEARDOWN_FAILED_LABEL, 'E33: src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL'],
+  [PERSONA_KILL_FAILED_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL'],
+  [PERSONA_KILL_SURVIVOR_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL'],
+  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL'],
+  ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding']),
   [UNAVAILABLE_RETRY_CAUSE_COLLISION, "E36 T1: src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename, reconcile ruling)"],
 ]
 
 /**
- * The start summary's five counts SRJ-1015 added, as src/session-manager.ts's
+ * The start summary's five counts added, as src/session-manager.ts's
  * `startupSummaryEnding` writes them: each count given its own number, then
  * its label read after that number. Throws naming a count it can't find.
  */
@@ -4407,11 +4394,11 @@ const RUNBOOK_COPIES: [title: string, heading: string][] = [
   [ROLLBACK_RUNBOOK_SECTION_TITLE, ROLLBACK_HEADING],
 ]
 
-describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-1107; SRJ-1101 list)', () => {
+describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (list)', () => {
   const changelog = () => operatorText(CHANGELOG_FILE)
 
   describe('OPERATOR_TEXTS', () => {
-    test("holds exactly SRJ-1101's operator texts, the README's sections now spread over the user docs and CONTRIBUTING.md, each read from the repository", () => {
+    test("holds exactly operator texts, the README's sections now spread over the user docs and CONTRIBUTING.md, each read from the repository", () => {
       expect(OPERATOR_TEXTS.map(([name]) => name)).toEqual([
         'README.md',
         'docs/configuration.md',
@@ -4441,11 +4428,11 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       expect(names.filter((name) => name === CHANGELOG_FILE || (name.startsWith('docs/') && !(USER_DOC_FILES as readonly string[]).includes(name)))).toEqual([])
     })
 
-    test.each(OPERATOR_TEXTS)(`%s: no heading titled "${UPGRADE_STEPS_TITLE}" and no link to its anchor (SRJ-1107)`, (_name, read) => {
+    test.each(OPERATOR_TEXTS)(`%s: no heading titled "${UPGRADE_STEPS_TITLE}" and no link to its anchor`, (_name, read) => {
       expect(upgradeStepsProblems(read())).toEqual([])
     })
 
-    test.each(OPERATOR_TEXTS)('%s: no "checks its tmux session first" (SRJ-1107)', (_name, read) => {
+    test.each(OPERATOR_TEXTS)('%s: no "checks its tmux session first"', (_name, read) => {
       expect(tmuxFirstProblems(read())).toEqual([])
     })
 
@@ -4453,7 +4440,7 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       ['a heading', `### ${UPGRADE_STEPS_TITLE}\n\nTake these steps in order.`, upgradeStepsProblems, [`heading "### ${UPGRADE_STEPS_TITLE}"`]],
       ['a link to its anchor', `Stop the old bots (step 1 of [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)})).`, upgradeStepsProblems, [`link (#${headingSlug(UPGRADE_STEPS_TITLE)})`]],
       ['the relaunch wording, wrapped', 'but the server checks its tmux\nsession first and relaunches it', tmuxFirstProblems, ['checks its tmux session first']],
-    ] as const)("self-check: b.ob2's %s is reported", (_label, text, problems, expected) => {
+    ] as const)("self-check: %s is reported", (_label, text, problems, expected) => {
       expect(problems(text)).toEqual([...expected])
     })
   })
@@ -4468,20 +4455,20 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
       [RELEASE_ENTRY_CHECKS[0][0], 'an earlier release entry placed first', (text) => text.replace(/^## /m, '## 1.0.0\n\nAn earlier release.\n\n## ')],
       [RELEASE_ENTRY_CHECKS[0][0], 'a second unreleased entry', (text) => `${text}\n## Unreleased (patch)\n\nMore.\n`],
       [RELEASE_ENTRY_CHECKS[0][0], 'the unreleased entry published, none left', (text) => text.replace(/^## Unreleased\b.*$/m, '## 0.11.1 (2026-10-07)')],
-      ...BREAKING_NOTE.map(([part]): [string, string, (text: string) => string] => [`the breaking note: ${part}`, "the breaking note dropped, as in b.ob2's entry", breakingNote]),
+      ...BREAKING_NOTE.map(([part]): [string, string, (text: string) => string] => [`the breaking note: ${part}`, "the breaking note dropped, as in the contract entry", breakingNote]),
       ['`access.json` is kept until rollback is no longer wanted, because the previous CSCB reads it', 'the keep sentence dropped', (text) =>
         text.replace(/ Keep `access\.json` until rollback is no longer wanted, because the previous CSCB reads it\./, '')],
-      ['nothing in the file tells the reader to delete `access.json`', "b.ob2's upgrade note back", (text) =>
+      ['nothing in the file tells the reader to delete `access.json`', "upgrade note back", (text) =>
         `${text}\n### Upgrade note: leftover \`access.json\`\n\nAn upgraded host keeps any existing \`access.json\` in the state directory. The server never reads it, so it is an ignored file. Delete it by hand once the personas are running:\n\n\`\`\`sh\nrm "\${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/access.json"\n\`\`\`\n`],
-      ['the prompt-open relaunch note says the server checks the session through agent-director', "b.ob2's tmux-first wording", (text) =>
+      ['the prompt-open relaunch note says the server checks the session through agent-director', "tmux-first wording", (text) =>
         text.replace('checks the session through agent-director', 'checks its tmux session first')],
-      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith('the note "'))![0], "b.ob2's note back", (text) =>
+      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith('the note "'))![0], "note back", (text) =>
         text.replace(/^- \*\*One stuck persona/m, "- **The server's own tmux commands act only on a bot's own session.** When the server ends a bot's leftover tmux session before a relaunch, it now names the session exactly.\n- **One stuck persona")],
-      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], "b.ob2's reason", (text) =>
+      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], "reason", (text) =>
         text.replace(/The reason: [^\n]*?could reach another persona's session\./, `agent-director ${HISTORICAL_RUNBOOK_AD} finds a persona's tmux session by a name that also matches the start of a longer one, so with such a pair it could read, type into or end the other persona's session.`)],
       [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], 'the reason sentence dropped, no version named', (text) =>
         text.replace(/ The reason: [^\n]*?could reach another persona's session\./, '')],
-      ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', "b.ob2's pointer to the upgrade steps", (text) =>
+      ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', "pointer to the upgrade steps", (text) =>
         text.replace(/(starts fresh once\.[^\n]*?)\(see \[[^\]]*\]\([^)]*\)\)/i, `$1(step 1 of [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)}))`)],
       [ROW_DELETION_ELEMENT, 'another agent-director version named', (text) =>
         text.replace(`agent-director ${HISTORICAL_RUNBOOK_FLOOR}, its Phase 1 release`, `agent-director ${HISTORICAL_RUNBOOK_AD}, its Phase 1 release`)],
@@ -4505,7 +4492,7 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
     })
   })
 
-  describe(`the runbook copies (SRJ-1107; hatch A3: the ${RUNBOOK_DOC} section is the maintained copy)`, () => {
+  describe(`the runbook copies (hatch A3: the ${RUNBOOK_DOC} section is the maintained copy)`, () => {
     test.each(RUNBOOK_COPIES)(`the copy of "%s" sits in the ${RUNBOOK_RELEASE_VERSION} entry, the release that introduced it, and nowhere else in the file`, (_title, heading) => {
       const text = changelog()
       const { start, end } = releaseEntryRange(text)
@@ -4541,7 +4528,7 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
     })
 
     // The audit reads only SHIPPED_TEXTS, so the runbooks' token-variable check does not reach the CHANGELOG's.
-    test.each(RUNBOOK_COPIES)('the copy of "%s" names no Slack token environment variable (SRJ-1516: the runbooks never name one)', (_title, heading) => {
+    test.each(RUNBOOK_COPIES)('the copy of "%s" names no Slack token environment variable (the runbooks never name one)', (_title, heading) => {
       const group = FORBIDDEN_TERMS.find((g) => g.name === 'the token environment variables')
       if (group === undefined) throw new Error('FORBIDDEN_TERMS has no group "the token environment variables"')
       const section = requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE)
@@ -4568,8 +4555,8 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
 })
 
 // ---------------------------------------------------------------------------
-// Bug b.7sd: no operator text sends the operator to an agent-director
-// install-gate record. agent-director ships none (SRD A-19); the go-ahead is
+// no operator text sends the operator to an agent-director
+// install-gate record. agent-director ships none (contract A-19); the go-ahead is
 // the operator's, recorded in the switch-over log.
 // ---------------------------------------------------------------------------
 
@@ -4641,12 +4628,12 @@ const SWITCH_OVER_OPERATOR_TEXTS: [name: string, read: () => string][] = [
   ['docs/registry-install-runbook.md', () => readRepoFile('docs/registry-install-runbook.md')],
 ]
 
-describe('bug b.7sd: no operator text sends the operator to an agent-director install-gate record (SRD A-19)', () => {
+describe('no operator text sends the operator to an agent-director install-gate record (contract A-19)', () => {
   test.each(SWITCH_OVER_OPERATOR_TEXTS)('%s: names no install-gate record, go line or post-install check line for the operator to read or write', (name, read) => {
     expect(installGateHits(name, read()).map(formatHit)).toEqual([])
   })
 
-  // 0.11.0's runbook wording, which these cases report (bug b.7sd).
+  // 0.11.0's runbook wording, which these cases report.
   test.each([
     [
       "step 1's go-line item",
@@ -4680,9 +4667,9 @@ describe('bug b.7sd: no operator text sends the operator to an agent-director in
 })
 
 // ---------------------------------------------------------------------------
-// E36 T1: the kill-failure alerts' sentences (the E20 note) and the README's
-// and debugging skill's `auto-restart disabled` lines (the E8 note), read
-// through OPERATOR_TEXTS; the E8 note's raw-command forms are E36 T4's
+// the kill-failure alerts' sentences (the note) and the README's
+// and debugging skill's `auto-restart disabled` lines (the note), read
+// through OPERATOR_TEXTS; the note's raw-command forms are
 // ---------------------------------------------------------------------------
 
 /** The persona the rendered alerts concern. */
@@ -4746,8 +4733,8 @@ function killFailureAlertRenderings(): AlertRendering[] {
  */
 function quotableAlertParts(text: string, version: KillFailureAlertVersion, variables: readonly string[]): string[] {
   let rest = text.replace(ALERT_TITLE, '\n')
-  // SRJ-1001's human-only sentence (the shared pattern): every notice that
-  // names a command or "Operator actions" carries it, so it is SRJ-1001's
+  // human-only sentence (the shared pattern): every notice that
+  // names a command or "Operator actions" carries it, so it is
   // sentence, not the alert's, and the engineering guide states it as the rule.
   for (const sentence of humanOnlySentencesIn(rest)) rest = rest.split(sentence).join('\n')
   for (const closing of ALERT_CLOSINGS[version]) rest = rest.split(killFailureClosingSentence(version, closing)).join('\n')
@@ -4815,7 +4802,7 @@ function alertPartsQuotedIn(text: string): string[] {
 /** Each operator text, made comparable once. */
 const COMPARABLE_OPERATOR_TEXTS = new Map(OPERATOR_TEXTS.map(([name, read]) => [name, lazy(() => quoteComparable(read()))] as const))
 
-describe('E20: operator texts quote the Kill failed and Process outlived kill alerts only by title and closing sentence (b.jg5 SRJ-1001, SRJ-1007)', () => {
+describe(': operator texts quote the Kill failed and Process outlived kill alerts only by title and closing sentence', () => {
   test.each(OPERATOR_TEXTS.flatMap(([name]) => KILL_ALERT_PARTS.map(([version, part]) => [name, version, part] as const)))(
     '%s does not quote the %s alert sentence "%s"',
     (name, _version, part) => {
@@ -4859,7 +4846,7 @@ describe('E20: operator texts quote the Kill failed and Process outlived kill al
 })
 
 // ---------------------------------------------------------------------------
-// E36 T2: the prefix-key rule's reason (b.jg5 SRJ-1102, AC 78), read through
+// the prefix-key rule's reason, read through
 // OPERATOR_TEXTS
 // ---------------------------------------------------------------------------
 
@@ -4867,7 +4854,7 @@ describe('E20: operator texts quote the Kill failed and Process outlived kill al
 const PREFIX_PAIR = ['dev', 'dev_2'] as const
 
 /**
- * SRJ-1102's reason sentence as the operator texts state it, from the
+ * reason sentence as the operator texts state it, from the
  * loader's own builder: the example session is the shorter persona's, what it
  * could reach is "another persona's session", and `=` and the example command
  * are code spans.
@@ -4898,16 +4885,16 @@ const renderedPrefixKeyMessage = lazy((): string => {
 
 /**
  * The spans an operator text may carry a `tmux attach -t` without `=` in
- * (b.jg5 SRJ-1102; SRJ-1101's one exception), file-local and built from the
+ * (one exception), file-local and built from the
  * src builders, never written out: the reason sentence in the operator
  * texts' form, and the validation text rendered for `PREFIX_PAIR`, which the
- * debugging skill quotes (SRJ-1101's literal exception, the Task's ruling).
+ * debugging skill quotes (literal exception, the section's ruling).
  * Each is removed, as written, from the flattened text before a check looks
  * for the example or an attach without `=`; nothing else is.
  */
 const PREFIX_KEY_REASON_SPANS: readonly [label: string, span: () => string][] = [
-  ['the reason sentence in the operator texts (SRJ-1102)', () => DOCS_PREFIX_KEY_REASON],
-  [`the validation text rendered for ${PREFIX_PAIR.join(' then ')}, which the debugging skill quotes (SRJ-1101's literal exception)`, renderedPrefixKeyMessage],
+  ['the reason sentence in the operator texts', () => DOCS_PREFIX_KEY_REASON],
+  [`the validation text rendered for ${PREFIX_PAIR.join(' then ')}, which the debugging skill quotes (literal exception)`, renderedPrefixKeyMessage],
 ]
 
 /** `text`, whitespace collapsed, with each `PREFIX_KEY_REASON_SPANS` span removed. */
@@ -4919,7 +4906,7 @@ function withoutPrefixKeyReason(text: string): string {
 const PREFIX_KEY_EXAMPLE = new RegExp(`\\btmux attach(?:-session)?\\s+-t\\s+${escapeRegExp(personaTmuxSessionName(PREFIX_PAIR[0]))}(?![\\w-])`, 'g')
 
 /**
- * The carriers of the reason (SRJ-1102; the Task's ruling): each text and the
+ * The carriers of the reason (the section's ruling): each text and the
  * section that states it, found by title. The CHANGELOG's note is a row of
  * `RELEASE_ENTRY_CHECKS`.
  */
@@ -4937,10 +4924,10 @@ function reasonCarrierSection(file: string, heading: HeadingMatch, text: string 
 }
 
 /**
- * The claim SRJ-1102 bars (file-local): that CSCB or agent-director targets,
+ * The claim bars (file-local): that CSCB or agent-director targets,
  * finds or passes a tmux session by prefix or by a bare name. A sentence here
  * runs to a full stop followed by whitespace, so a version's dots stay inside
- * it. Each with a synthetic string it must match, b.ob2's and E35's wording.
+ * it. Each with a synthetic string it must match and wording.
  */
 const SAME_SENTENCE = '(?:[^.]|\\.(?=\\S))'
 const PREFIX_TARGETING_CLAIMS: readonly [label: string, pattern: RegExp, sample: string][] = [
@@ -4961,7 +4948,7 @@ const PREFIX_TARGETING_CLAIMS: readonly [label: string, pattern: RegExp, sample:
   ],
 ]
 
-describe("E36 T2: the prefix-key rule's reason is SRJ-1102's in every carrier, and its example stands nowhere else (b.jg5 SRJ-1102, AC 78)", () => {
+describe("the prefix-key rule's reason is in every carrier, and its example stands nowhere else", () => {
   test.each(PREFIX_KEY_REASON_CARRIERS)('%s, under %s, states the reason sentence', (file, heading) => {
     expect(reasonCarrierSection(file, heading)).toContain(DOCS_PREFIX_KEY_REASON)
   })
@@ -4984,7 +4971,7 @@ describe("E36 T2: the prefix-key rule's reason is SRJ-1102's in every carrier, a
       for (const [label, span] of PREFIX_KEY_REASON_SPANS) expect({ label, examples: span().match(PREFIX_KEY_EXAMPLE)?.length }).toEqual({ label, examples: 1 })
     })
 
-    test.each(PREFIX_KEY_REASON_CARRIERS)("%s fails with the reason reverted to b.ob2's wording", (file, heading) => {
+    test.each(PREFIX_KEY_REASON_CARRIERS)("%s fails with the reason reverted to wording", (file, heading) => {
       const text = operatorText(file)
       // As written, so wrapped across lines in the wizard.
       const asWritten = new RegExp(escapeRegExp(DOCS_PREFIX_KEY_REASON).replace(/ /g, '\\s+'))
@@ -5018,16 +5005,16 @@ describe("E36 T2: the prefix-key rule's reason is SRJ-1102's in every carrier, a
 })
 
 // ---------------------------------------------------------------------------
-// E36 T2: the README's install and startup texts point to the runbook and
-// name no install, re-install or removal (the E2-gate, E4 and E5 hatch notes;
-// b.jg5 SRJ-208, SRJ-212, SRJ-1101), read through OPERATOR_TEXTS
+// the README's install and startup texts point to the runbook and
+// name no install, re-install or removal (the -gate, and design notes;
+//), read through OPERATOR_TEXTS
 // ---------------------------------------------------------------------------
 
 const INSTALL_CHECK_HEADING = '## Checking your agent-director install'
 const PREFLIGHT_GATES_HEADING = '### Preflight gates'
 const TROUBLESHOOTING_HEADING = '# Troubleshooting'
 
-/** The script SR-2.5 runs in `/publish`'s preflight (b.jg5 SRJ-211). */
+/** The script runs in `/publish`'s preflight. */
 const AD_VERSION_CHECK_SCRIPT = 'scripts/ad-version-check.ts'
 
 /** The README's list item for `label` under `heading`, a nested item (`  - \`label\``) read as a top-level one. */
@@ -5037,11 +5024,11 @@ function readmeLabelItem(heading: string, label: string, readme: string): string
 }
 
 /**
- * The install-check and startup-error entries of the classes this Task
+ * The install-check and startup-error entries of the classes this section
  * rewrote (the too-old and below-floor lines of "Startup errors" are checked
- * under SRJ-208 above): each names the switch-over runbook section by its
+ * under the contract above): each names the switch-over runbook section by its
  * title, and the install check's not-found entry its publishing-host block by
- * its heading (the E35 hatch note's third bullet). The startup gate's
+ * its heading (the design note's third bullet). The startup gate's
  * not-found entry runs on a bot host, so it names the section's step 1, never
  * that block (the code-review fix; `startupNotFoundItemProblems`).
  */
@@ -5113,7 +5100,7 @@ function sameUserItem(readme: string): string {
   return items[0]
 }
 
-/** The same-user item's problems (the E2-gate ruling): run as the file's owner, the runbook section, no re-install and no removal but the ruling's own words. */
+/** The same-user item's problems (the -gate ruling): run as the file's owner, the runbook section, no re-install and no removal but the ruling's own words. */
 function sameUserProblems(readme: string = referenceText()): string[] {
   const item = sameUserItem(readme)
   const rest = item.split(NEVER_REMOVE_THE_FILE).join('')
@@ -5130,13 +5117,13 @@ function sameUserProblems(readme: string = referenceText()): string[] {
  * tests/test-helpers/agent-director-versions.ts), each citing where it stood.
  */
 const HISTORICAL_VERSIONS = {
-  /** b.ob2's agent-director requirement for reboot recovery, "≥ 0.8.0", in README "Bots come back with no memory" and the `resume_enabled` row (removed by the E5 hatch note). */
+  /** agent-director requirement for reboot recovery, "≥ 0.8.0", in README "Bots come back with no memory" and the `resume_enabled` row (removed by the hatch note). */
   resumeRecoveryMinimum: '0.8.0',
-  /** b.ob2's agent-director series that passed the old install check, written `0.7.x`, in the same Troubleshooting paragraph (the E5 hatch note). */
+  /** agent-director series that passed the old install check, written `0.7.x`, in the same Troubleshooting paragraph (the hatch note). */
   oldInstallCheckSeries: '0.7.x',
-  /** The Claude Code minimum for agent-director's exec-form hooks, which b.ob2's README prerequisites named before RN-9 (HO rev 31; SRJ-1304) raised it to `MIN_CLAUDE_CODE_VERSION`. */
+  /** The Claude Code minimum for agent-director's exec-form hooks, which README prerequisites named before RN-9 (HO rev 31) raised it to `MIN_CLAUDE_CODE_VERSION`. */
   execFormHooksClaudeCode: '2.1.139',
-  /** The zombie agent-director release README "Note on agent-director versions" named (b.ob2; removed by E36 T4, SRJ-1103). */
+  /** The zombie agent-director release README "Note on agent-director versions" named (removed by ). */
   zombieRelease: 'v0.4.1',
 } as const
 
@@ -5148,7 +5135,7 @@ const AD_VERSION_CLAIM = /\bagent-director`?[^.|]{0,40}?\d+\.\d+\.\d+/g
 
 /**
  * The README Troubleshooting paragraph "Bots come back with no memory …" (the
- * E5 hatch note): it names the below-floor refusal and no version (b.ob2's
+ * design note): it names the below-floor refusal and no version (
  * "≥ 0.8.0" and install check's `0.7.0` floor are gone), and the
  * `resume_enabled` row names no agent-director version.
  */
@@ -5164,10 +5151,10 @@ function noMemoryProblems(readme: string = referenceText()): string[] {
 }
 
 /**
- * README "Preflight gates" (the E5 hatch note; b.jg5 SRJ-211): the count its
+ * README "Preflight gates" (the design note): the count its
  * lead names matches its numbered gates, and exactly one gate runs
  * `scripts/ad-version-check.ts`, naming its exit (`AD_VERSION_CHECK_FAIL_EXIT_CODE`
- * and its value), its `SR-2.5 (preflight)` line and the below-floor note's
+ * and its value), its `(preflight)` line and the below-floor note's
  * prefix, the runbook section and its publishing-host block, with no upgrade
  * form.
  */
@@ -5196,7 +5183,7 @@ function preflightGateProblems(readme: string = operatorText(CONTRIBUTING_FILE))
   ]
 }
 
-describe("E36 T2: the README's install and startup texts point to the runbook and name no install, re-install or removal (E2 gate, E4, E5; b.jg5 SRJ-208, SRJ-212, SRJ-1101)", () => {
+describe("the README's install and startup texts point to the runbook and name no install, re-install or removal (gate, , )", () => {
   test.each(README_REMEDY_ITEMS)('README.md "%s": the `%s` item names %p and carries no upgrade or re-install form', (heading, label, required) => {
     expect(remedyItemProblems(heading, label, required)).toEqual([])
   })
@@ -5223,16 +5210,16 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
     expect(noMemoryProblems()).toEqual([])
   })
 
-  test(`"${PREFLIGHT_GATES_HEADING.slice(4)}" lists SR-2.5 (${AD_VERSION_CHECK_SCRIPT}, exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE}, the below-floor note) and counts its gates`, () => {
+  test(`"${PREFLIGHT_GATES_HEADING.slice(4)}" lists (${AD_VERSION_CHECK_SCRIPT}, exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE}, the below-floor note) and counts its gates`, () => {
     expect(existsSync(resolve(REPO_ROOT, AD_VERSION_CHECK_SCRIPT))).toBe(true)
     expect(preflightGateProblems()).toEqual([])
   })
 
-  test.each(OPERATOR_TEXTS)("%s: no text advises re-installing agent-director (UPGRADE_FORMS' re-install row; SRJ-1101, HO C8)", (_name, read) => {
+  test.each(OPERATOR_TEXTS)("%s: no text advises re-installing agent-director (UPGRADE_FORMS' re-install row, HO C8)", (_name, read) => {
     expect(upgradeFormsIn(flat(read())).filter((form) => form === REINSTALL_FORM)).toEqual([])
   })
 
-  describe('self-checks (each edits an in-memory README back to the wording this Task replaced)', () => {
+  describe('self-checks (each edits an in-memory README back to the wording the earlier wording used)', () => {
     const readme = () => referenceText()
 
     test.each([
@@ -5273,7 +5260,7 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
       expect(sameUserProblems(edited)).toEqual(expect.arrayContaining([REINSTALL_FORM, 'a removal: remove']))
     })
 
-    test("the Troubleshooting paragraph fails with b.ob2's version advice back", () => {
+    test("the Troubleshooting paragraph fails with version advice back", () => {
       const text = readme()
       const edited = text.replace(/(### Symptom: Bots come back with no memory[^\n]*\n\n)[^\n]*/, `$1If it comes back amnesiac, confirm the system-installed \`agent-director\` is **≥ ${HISTORICAL_VERSIONS.resumeRecoveryMinimum}** (\`agent-director version\`). Its client floor is \`${CLIENT_MIN_VERSION}\`, so install-check passes on a \`${HISTORICAL_VERSIONS.oldInstallCheckSeries}\` binary.`)
       expect(edited).not.toBe(text)
@@ -5287,7 +5274,7 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
       expect(noMemoryProblems(edited)).toEqual([`the resume_enabled row: agent-director\` ≥ ${HISTORICAL_VERSIONS.resumeRecoveryMinimum}`])
     })
 
-    test('"Preflight gates" fails as the six-gate list without SR-2.5', () => {
+    test('"Preflight gates" fails as the six-gate list without', () => {
       const text = operatorText(CONTRIBUTING_FILE)
       const edited = text
         .replace(/^6\. \*\*The host's agent-director[^\n]*\n/m, '')
@@ -5307,9 +5294,9 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
 })
 
 // ---------------------------------------------------------------------------
-// E36 T3: the architecture doc and the engineering guide match the build
-// (b.jg5 SRJ-1105, SRJ-1106, SRJ-612; AC 78), read through OPERATOR_TEXTS.
-// SRJ-1101's term checks over every operator text are not here; these are the
+// the architecture doc and the engineering guide match the build
+// read through OPERATOR_TEXTS.
+// term checks over every operator text are not here; these are the
 // passage and presence checks the terms cannot express.
 // ---------------------------------------------------------------------------
 
@@ -5334,10 +5321,10 @@ describe('generic project guides', () => {
   })
 })
 
-/** The two texts SRJ-1105 and SRJ-1106 describe. */
+/** The two texts and describe. */
 const DESIGN_DOCS: readonly string[] = [ARCHITECTURE_FILE, ENGINEERING_GUIDE_FILE]
 
-/** The one source audit both docs point to for the rules they state (b.jg5 SRJ-716, SRJ-612, SRJ-601). */
+/** The one source audit both docs point to for the rules they state. */
 const SOURCE_AUDIT_FILE = 'tests/fmk-source-audit.test.ts'
 
 /**
@@ -5410,7 +5397,7 @@ function affirmedClaims(text: string, claims: readonly [label: string, pattern: 
 }
 
 /**
- * A tmux call made by the server (SRJ-1105, SRJ-1106: neither doc describes
+ * A tmux call made by the server (neither doc describes
  * one), file-local: a raw tmux sub-command that ends, probes, starts, reads
  * or types into a session, pane or server, named with or without `tmux`
  * (agent-director's own verb `send-keys` counts only after `tmux`), and an
@@ -5432,8 +5419,8 @@ const AFFIRMED_TMUX_CALLS: readonly [label: string, pattern: RegExp][] = [
 ]
 
 /**
- * A row delete described as live (SRJ-1105: the delete-then-spawn, start
- * sweep and persona teardown deletes are gone; b.jg5 SRJ-716), file-local,
+ * A row delete described as live (the delete-then-spawn, start
+ * sweep and persona teardown deletes are gone), file-local,
  * read through `affirmedClaims`.
  */
 const ROW_DELETE_CLAIMS: readonly [label: string, pattern: RegExp][] = [
@@ -5443,7 +5430,7 @@ const ROW_DELETE_CLAIMS: readonly [label: string, pattern: RegExp][] = [
   ['a delete attempted', /\b(?:attempts?|tries|makes?|calls?|runs?|issues?)\s+(?:the\s+|a\s+|its\s+|one\s+)?`?delete\b/gi],
 ]
 
-/** The approver's dead-state streak (SRJ-1105, SRJ-402), file-local, named at all; its constant is a `REMOVED_IDENTIFIERS` entry. */
+/** The approver's dead-state streak, file-local, named at all; its constant is a `REMOVED_IDENTIFIERS` entry. */
 const DEAD_STATE_STREAK_CLAIMS: readonly [label: string, pattern: RegExp][] = [
   ["the approver's dead-state streak", /\bdead-state streak\b|\b(?:polls|laps|reads) in a row\b[^.]{0,60}?\bdead\b/gi],
 ]
@@ -5451,7 +5438,7 @@ const DEAD_STATE_STREAK_CLAIMS: readonly [label: string, pattern: RegExp][] = [
 /** A pointer to an incident write-up: history, not the current rule (the docs describe only the current design). */
 const HISTORY_POINTERS: readonly [label: string, pattern: RegExp][] = [['an incident write-up', /\bincident-[\w.-]+/gi]]
 
-/** The source audit's word rules both docs keep too (SRJ-1105, SRJ-1106): the row-delete helpers, the finished-row option and the removed identifiers. */
+/** The source audit's word rules both docs keep too: the row-delete helpers, the finished-row option and the removed identifiers. */
 const DOC_WORD_RULES: readonly SourceWordRule[] = ['delete-helper', 'finished-row-option', 'removed-identifier']
 
 /** One source audit word rule's pattern; throws naming a rule `SOURCE_WORD_RULES` lacks. */
@@ -5466,7 +5453,7 @@ const SOURCE_INVARIANTS_HEADING = '## Source Invariants'
 
 /**
  * The two passages that list the row-delete helpers on purpose, so a reader
- * knows which names must never come back (b.jg5 SRJ-716; the engineering
+ * knows which names must never come back (the engineering
  * guide's Source Invariants): each [file, section heading, the list item's
  * lead]. Each item, and only it, is left out before `DOC_WORD_RULES`' row
  * `delete-helper` reads its doc.
@@ -5506,13 +5493,13 @@ function staleDesignProblems(file: string, text: string): string[] {
   ]
 }
 
-// SRJ-1106: the engineering guide's rule
+// the engineering guide's rule
 
-/** SRJ-1106's section of the engineering guide (file-local, citing SRJ-1106): its heading and its rule sentence. */
-const SRJ_1106_HEADING = '## The Server Reaches a Session Only Through agent-director'
-const SRJ_1106_RULE = `The server starts no tmux process and reaches a session only through agent-director, and never touches agent-director's ${vocab('ownerLabel')} label or its per-pane ${vocab('paneLabel')} label`
+/** section of the engineering guide (file-local, citing): its heading and its rule sentence. */
+const AD_SESSION_BOUNDARY_HEADING = '## The Server Reaches a Session Only Through agent-director'
+const AD_SESSION_BOUNDARY_RULE = `The server starts no tmux process and reaches a session only through agent-director, and never touches agent-director's ${vocab('ownerLabel')} label or its per-pane ${vocab('paneLabel')} label`
 
-/** The section the old raw-tmux guidance stood under, replaced by SRJ-1106's rule. */
+/** The section the old raw-tmux guidance stood under, replaced by the contract rule. */
 const OLD_RAW_TMUX_TITLE = 'Raw tmux Calls'
 
 /** The old raw-tmux guidance's passages, file-local: its known-gap bullet and its bullet's reason that persona keys can prefix one another. */
@@ -5530,37 +5517,37 @@ function oldRawTmuxGuidance(text: string): string[] {
   ]
 }
 
-/** What SRJ-1106's section lacks: the rule sentence, a link to Source Invariants that resolves, and the source audit by its path. */
-function srj1106SectionProblems(guide: string): string[] {
-  const section = flat(requiredSection(guide, SRJ_1106_HEADING, ENGINEERING_GUIDE_FILE))
+/** What section lacks: the rule sentence, a link to Source Invariants that resolves, and the source audit by its path. */
+function troubleshootingSectionProblems(guide: string): string[] {
+  const section = flat(requiredSection(guide, AD_SESSION_BOUNDARY_HEADING, ENGINEERING_GUIDE_FILE))
   const invariants = headingSlug(SOURCE_INVARIANTS_HEADING.slice('## '.length))
   return [
-    ...lacking(section, [SRJ_1106_RULE, code(SOURCE_AUDIT_FILE), `](#${invariants})`]),
+    ...lacking(section, [AD_SESSION_BOUNDARY_RULE, code(SOURCE_AUDIT_FILE), `](#${invariants})`]),
     ...(headingAnchors(guide).includes(invariants) ? [] : [`no heading "${SOURCE_INVARIANTS_HEADING}" for the link`]),
   ]
 }
 
-/** Each mention of agent-director's labels (the source audit's `ad-label` rule) in the engineering guide outside SRJ-1106's section. */
+/** Each mention of agent-director's labels (the source audit's `ad-label` rule) in the engineering guide outside section. */
 function labelsOutsideRule(guide: string): string[] {
-  return [...outsideSection(guide, SRJ_1106_HEADING, ENGINEERING_GUIDE_FILE).matchAll(sourceWordRule('ad-label'))].map((m) => m[0])
+  return [...outsideSection(guide, AD_SESSION_BOUNDARY_HEADING, ENGINEERING_GUIDE_FILE).matchAll(sourceWordRule('ad-label'))].map((m) => m[0])
 }
 
-/** The engineering guide's Layering section and its two rules (the Task's hatch note: CSCB never touches tmux and never replicates agent-director). */
+/** The engineering guide's Layering section and its two rules (the section's hatch note: CSCB never touches tmux and never replicates agent-director). */
 const LAYERING_HEADING = '## Layering: agent-director Owns tmux'
 const LAYERING_RULES: readonly string[] = ['- **CSCB never touches tmux.**', '- **CSCB never replicates agent-director functionality.**']
 
-/** What the Layering section lacks: each rule as a list item, and a link to SRJ-1106's section. */
+/** What the Layering section lacks: each rule as a list item, and a link to section. */
 function layeringProblems(guide: string): string[] {
   const units = textUnits(requiredSection(guide, LAYERING_HEADING, ENGINEERING_GUIDE_FILE))
   return [
     ...LAYERING_RULES.filter((rule) => !units.some((unit) => unit.startsWith(rule))).map((rule) => `no item "${rule}"`),
-    ...(units.some((unit) => unit.includes(`](#${headingSlug(SRJ_1106_HEADING.slice('## '.length))})`)) ? [] : [`no link to "${SRJ_1106_HEADING}"`]),
+    ...(units.some((unit) => unit.includes(`](#${headingSlug(AD_SESSION_BOUNDARY_HEADING.slice('## '.length))})`)) ? [] : [`no link to "${AD_SESSION_BOUNDARY_HEADING}"`]),
   ]
 }
 
 const START_SWEEP_HEADING = '## The Start Sweep'
 
-/** The Start Sweep's pre-persona-row rule (SRJ-1106, SRJ-714): the one sentence that says what a pre-persona row's kill is; it says the kill is checked and the row kept, and names no delete. */
+/** The Start Sweep's pre-persona-row rule: the one sentence that says what a pre-persona row's kill is; it says the kill is checked and the row kept, and names no delete. */
 function prePersonaRuleProblems(guide: string): string[] {
   const sentences = flat(requiredSection(guide, START_SWEEP_HEADING, ENGINEERING_GUIDE_FILE))
     .split(/(?<=\.)\s+/)
@@ -5569,7 +5556,7 @@ function prePersonaRuleProblems(guide: string): string[] {
   return [...lacking(sentences[0], [/\bchecked\b/, /\bkept\b/]), ...(/\bdelet\w*/i.test(sentences[0]) ? [`a delete: ${sentences[0]}`] : [])]
 }
 
-// SRJ-1105: one passage per topic of the architecture doc
+// one passage per topic of the architecture doc
 
 /** Where a topic's passage stands in the architecture doc, and how it is read (flattened). */
 interface Passage {
@@ -5595,7 +5582,7 @@ function itemPassage(heading: HeadingMatch, lead: string): Passage {
 }
 
 /**
- * SRJ-1105's topics (file-local, citing SRJ-1105; the titles are the
+ * topics (file-local, citing; the titles are the
  * architecture doc's, built from a `src/` constant where one names them):
  * each topic's passage and what it must name, every name an imported `src/`
  * export or value (`exportName`), or agent-director's vocabulary
@@ -5623,7 +5610,7 @@ function withParagraph(text: string, paragraph: string): string {
   return `${text}\n\n${paragraph}\n`
 }
 
-describe('E36 T3: the architecture doc and the engineering guide match the build (b.jg5 SRJ-1105, SRJ-1106, SRJ-612; AC 78)', () => {
+describe('the architecture doc and the engineering guide match the build', () => {
   describe('both docs, read through OPERATOR_TEXTS', () => {
     test.each(DESIGN_DOCS.map((file) => [file] as const))(
       '%s describes no tmux call made by the server, no live row delete, no dead-state streak and no incident write-up, and names no row-delete helper, finished-row option or removed identifier',
@@ -5643,24 +5630,24 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
     })
   })
 
-  describe(`${ENGINEERING_GUIDE_FILE} (SRJ-1106)`, () => {
+  describe(`${ENGINEERING_GUIDE_FILE}`, () => {
     const guide = () => operatorText(ENGINEERING_GUIDE_FILE)
 
-    test(`"${SRJ_1106_HEADING}" states SRJ-1106's rule, links Source Invariants and names ${SOURCE_AUDIT_FILE}`, () => {
-      expect(srj1106SectionProblems(guide())).toEqual([])
+    test(`"${AD_SESSION_BOUNDARY_HEADING}" states rule, links Source Invariants and names ${SOURCE_AUDIT_FILE}`, () => {
+      expect(troubleshootingSectionProblems(guide())).toEqual([])
       expect(existsSync(resolve(REPO_ROOT, SOURCE_AUDIT_FILE))).toBe(true)
     })
 
-    test(`agent-director's labels (${vocab('ownerLabel')}, ${vocab('paneLabel')}) are named only inside "${SRJ_1106_HEADING}"`, () => {
+    test(`agent-director's labels (${vocab('ownerLabel')}, ${vocab('paneLabel')}) are named only inside "${AD_SESSION_BOUNDARY_HEADING}"`, () => {
       expect(labelsOutsideRule(guide())).toEqual([])
-      expect(lacking(flat(requiredSection(guide(), SRJ_1106_HEADING, ENGINEERING_GUIDE_FILE)), [vocab('ownerLabel'), vocab('paneLabel')])).toEqual([])
+      expect(lacking(flat(requiredSection(guide(), AD_SESSION_BOUNDARY_HEADING, ENGINEERING_GUIDE_FILE)), [vocab('ownerLabel'), vocab('paneLabel')])).toEqual([])
     })
 
-    test(`"${LAYERING_HEADING}" keeps both rules (CSCB never touches tmux; CSCB never replicates agent-director) and links "${SRJ_1106_HEADING}"`, () => {
+    test(`"${LAYERING_HEADING}" keeps both rules (CSCB never touches tmux; CSCB never replicates agent-director) and links "${AD_SESSION_BOUNDARY_HEADING}"`, () => {
       expect(layeringProblems(guide())).toEqual([])
     })
 
-    test(`"${START_SWEEP_HEADING}": the pre-persona-row rule says the kill is checked and the row kept (SRJ-714)`, () => {
+    test(`"${START_SWEEP_HEADING}": the pre-persona-row rule says the kill is checked and the row kept`, () => {
       expect(prePersonaRuleProblems(guide())).toEqual([])
     })
   })
@@ -5671,11 +5658,11 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
 
     test.each([
       [
-        'the raw-tmux passage (b.1ix)',
-        "- **Raw tmux calls address one session exactly (b.1ix).** Four paths still call tmux directly: the self-heal kill (`kill-session`), the approver's pane read and Enter for an `ended`/`missing` row (`capture-pane`, `send-keys`), the liveness probe (`has-session`) and the reconnect's `start-server`.",
+        'the raw-tmux passage',
+        "- **Raw tmux calls address one session exactly.** Four paths still call tmux directly: the self-heal kill (`kill-session`), the approver's pane read and Enter for an `ended`/`missing` row (`capture-pane`, `send-keys`), the liveness probe (`has-session`) and the reconnect's `start-server`.",
         ['a tmux sub-command that ends, probes, starts, reads or types into a session', 'a raw tmux call', 'a direct tmux call'],
       ],
-      ['the b.m4r raw kill example', 'A bot killed mid-turn (e.g. `tmux kill-session` on its session) leaves its AD row at `working`.', ['a tmux sub-command that ends, probes, starts, reads or types into a session']],
+      ['the raw kill example', 'A bot killed mid-turn (e.g. `tmux kill-session` on its session) leaves its AD row at `working`.', ['a tmux sub-command that ends, probes, starts, reads or types into a session']],
       [
         "the approver's raw pane read and Enter",
         'For those states the loop reads the pane with raw `tmux capture-pane -p -t =slack_bot_<key>:` and sends Enter with raw `tmux send-keys -t =slack_bot_<key>: Enter`.',
@@ -5687,7 +5674,7 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
       ["the destructive modify's delete", '**Fresh.** The teardown kills `cscb_<key>` and deletes its agent-director row, so the launch in step 6 finds no row and spawns a new instance.', ['a kill or pause, then a delete', 'a row deleted']],
       ["the start sweep's delete", 'A failed kill of a swept row still attempts the delete.', ['a delete attempted']],
       ["the ladder's config_dir delete", "A changed directory has a different `config_dir` label, so the ladder's `config_dir` guard deletes the row and spawns fresh.", ['a row deleted']],
-      ['an incident write-up', 'The rule follows the b.qps outage (see `incident-2026-09-18-clean_restart.md`).', ['an incident write-up']],
+      ['an incident write-up', 'The rule follows the outage (see `incident-2026-09-18-clean_restart.md`).', ['an incident write-up']],
       ['the finished-row request field', 'Every kill passes `include_finished: true`.', ['finished-row-option']],
       ['the finished-row CLI flag', 'Run `agent-director kill --include-finished`.', ['finished-row-option']],
     ] as const)('%s, put back into each doc, is reported', (_label, paragraph, expected) => {
@@ -5727,9 +5714,9 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
       expect(sourceWordsIn(file, text)).toEqual([])
     })
 
-    test(`the old "${OLD_RAW_TMUX_TITLE}" section put back in place of SRJ-1106's fails each engineering-guide case`, () => {
+    test(`the old "${OLD_RAW_TMUX_TITLE}" section put back in place of the contract fails each engineering-guide case`, () => {
       const text = guide()
-      const range = sectionRange(text, SRJ_1106_HEADING)!
+      const range = sectionRange(text, AD_SESSION_BOUNDARY_HEADING)!
       const lines = text.split('\n')
       const old = [
         `## ${OLD_RAW_TMUX_TITLE}`,
@@ -5737,12 +5724,12 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
         'The server makes no raw tmux call: no raw tmux path is left in `src/`.',
         '',
         '- **Address a session exactly in an operator command.** Build the target with `tmuxExactSessionTarget`; never pass a bare name. Why: tmux resolves a bare name by prefix, and persona keys can prefix one another.',
-        "- **Known gap: agent-director's own tmux calls still prefix-match.** Until the b.fmk version, claim exactness only for the operator's `attach` target.",
+        "- **Known gap: agent-director's own tmux calls still prefix-match.** Until the version, claim exactness only for the operator's `attach` target.",
         '',
       ]
       const edited = [...lines.slice(0, range.start), ...old, ...lines.slice(range.end)]
         .join('\n')
-        .replace(`](#${headingSlug(SRJ_1106_HEADING.slice('## '.length))})`, `](#${headingSlug(OLD_RAW_TMUX_TITLE)})`)
+        .replace(`](#${headingSlug(AD_SESSION_BOUNDARY_HEADING.slice('## '.length))})`, `](#${headingSlug(OLD_RAW_TMUX_TITLE)})`)
       expect(edited).not.toBe(text)
       expect(oldRawTmuxGuidance(edited)).toEqual([
         `heading "## ${OLD_RAW_TMUX_TITLE}"`,
@@ -5750,15 +5737,15 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
         'the known-gap passage: Known gap',
         'the old raw-tmux reason: can prefix one another',
       ])
-      expect(() => srj1106SectionProblems(edited)).toThrow(SRJ_1106_HEADING)
-      expect(layeringProblems(edited)).toEqual([`no link to "${SRJ_1106_HEADING}"`])
+      expect(() => troubleshootingSectionProblems(edited)).toThrow(AD_SESSION_BOUNDARY_HEADING)
+      expect(layeringProblems(edited)).toEqual([`no link to "${AD_SESSION_BOUNDARY_HEADING}"`])
     })
 
-    test("SRJ-1106's rule sentence reverted to the old raw-tmux intro is reported", () => {
+    test("rule sentence reverted to the old raw-tmux intro is reported", () => {
       const text = guide()
-      const edited = text.replace(SRJ_1106_RULE, 'The server makes no raw tmux call')
+      const edited = text.replace(AD_SESSION_BOUNDARY_RULE, 'The server makes no raw tmux call')
       expect(edited).not.toBe(text)
-      expect(srj1106SectionProblems(edited)).toEqual([`lacks ${SRJ_1106_RULE}`])
+      expect(troubleshootingSectionProblems(edited)).toEqual([`lacks ${AD_SESSION_BOUNDARY_RULE}`])
     })
 
     test(`a label named in "${SOURCE_INVARIANTS_HEADING}", as the ad-label bullet once did, is reported`, () => {
@@ -5776,8 +5763,8 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
     })
 
     test.each([
-      ['the kill unchecked and the row deleted', 'A pre-persona row (b.1ix) is killed when live, then deleted.', ['lacks /\\bchecked\\b/', 'lacks /\\bkept\\b/', 'a delete']],
-      ['the kill unchecked', 'A pre-persona row (b.1ix) is killed when live, and kept.', ['lacks /\\bchecked\\b/']],
+      ['the kill unchecked and the row deleted', 'A pre-persona row is killed when live, then deleted.', ['lacks /\\bchecked\\b/', 'lacks /\\bkept\\b/', 'a delete']],
+      ['the kill unchecked', 'A pre-persona row is killed when live, and kept.', ['lacks /\\bchecked\\b/']],
     ] as const)("the Start Sweep's pre-persona-row rule with %s is reported", (_label, sentence, expected) => {
       const text = guide()
       const edited = text.replace(/A pre-persona row is killed when live[^.]*\./, sentence)
@@ -5804,22 +5791,22 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
 })
 
 // ---------------------------------------------------------------------------
-// E36 T4: SRJ-1101's term and placement checks over every operator text, the
-// layering rule's tmux allow-list, and SRJ-1103's README and SRJ-1104's
-// debugging-skill sections (b.jg5 SRJ-1101, SRJ-1103, SRJ-1104; SRJ-1105 and
-// SRJ-1106 through the term checks; AC 78, AC 79), read through OPERATOR_TEXTS
+// term and placement checks over every operator text, the
+// layering rule's tmux allow-list, and README and
+// debugging-skill sections (and
+// through the term checks), read through OPERATOR_TEXTS
 // ---------------------------------------------------------------------------
 
 /**
- * SRJ-1101's terms (file-local, citing SRJ-1101's Test line and the Task's
- * hatch notes): `has-session`, `tmux-kill`, `agent-director delete`,
+ * terms (file-local, citing Test line and the section's
+ * design notes): `has-session`, `tmux-kill`, `agent-director delete`,
  * `find-missing --timeout`, the finished-row option in both spellings
- * (`include_finished` beside `include-finished`, the orchestrator's hatch
+ * (`include_finished` beside `include-finished`, the orchestrator's design
  * note), and tmux's two other raw kills, `kill-pane` and `kill-server`
  * (`tmux kill-session` is placed by its own case). Case-insensitive, a space
  * matching any whitespace, so a term wrapped across lines is found.
  */
-const SRJ_1101_TERMS: readonly Term[] = [
+const FORBIDDEN_OPERATOR_TERMS: readonly Term[] = [
   ['has-session', /\bhas-session\b/gi],
   ['tmux-kill', /\btmux-kill\b/gi],
   ['agent-director delete', /\bagent-director\s+delete\b/gi],
@@ -5831,12 +5818,12 @@ const SRJ_1101_TERMS: readonly Term[] = [
 ]
 
 /**
- * The raw-command advice the E8 note removed that SRJ-1101's own checks do
+ * The raw-command advice the note removed that own checks do
  * not name (file-local): an `agent-director kill` with a positional id rather
  * than `--instance-id` (a log line's "`agent-director kill of …`" is
  * no command), and kill-and-respawn advice, checked over every operator text.
  * The note's other forms are this section's own checks: `has-session`,
- * `tmux-kill` and `kill-server` (`SRJ_1101_TERMS`), an attach target without
+ * `tmux-kill` and `kill-server` (`FORBIDDEN_OPERATOR_TERMS`), an attach target without
  * `=` (`unexactAttaches`) and `tmux kill-session` (`killSessionsOutsideSteps`).
  * A space matches any whitespace, so a wrapped form is found in raw text.
  */
@@ -5868,15 +5855,15 @@ function hitsOutsideSpans(file: string, text: string, terms: readonly Term[], sp
   return findTermsAt(file, text, terms).filter(({ index }) => !offsets.some(([start, end]) => index >= start && index < end))
 }
 
-/** The prefix-key reason's spans (`PREFIX_KEY_REASON_SPANS`), built: the one place an operator text may show an attach without `=` (SRJ-1102). */
+/** The prefix-key reason's spans (`PREFIX_KEY_REASON_SPANS`), built: the one place an operator text may show an attach without `=`. */
 function prefixKeyReasonSpans(): string[] {
   return PREFIX_KEY_REASON_SPANS.map(([, span]) => span())
 }
 
-/** A raw tmux session kill, wrapped or not; SRJ-1101 allows it only in switch-over steps 5 and 6, with `=`. */
+/** A raw tmux session kill, wrapped or not allows it only in switch-over steps 5 and 6, with `=`. */
 const KILL_SESSION: Term = ['tmux kill-session', /\btmux\s+kill-session\b/gi]
 
-/** The switch-over steps SRJ-1101 lets name `tmux kill-session -t =<name>` (SRJ-1108 steps 5 and 6). */
+/** The switch-over steps lets name `tmux kill-session -t =<name>` (steps 5 and 6). */
 const KILL_SESSION_STEPS: readonly number[] = [5, 6]
 
 /** The files that carry the switch-over runbook (`SWITCH_OVER_CARRIERS`' names). */
@@ -5908,7 +5895,7 @@ function killSessionsOutsideSteps(file: string, text: string): TermHit[] {
   return findTerms(file, text, [KILL_SESSION]).filter((hit) => !ranges.some((range) => hit.line > range.start && hit.line <= range.end))
 }
 
-/** A `tmux attach -t` (or `attach-session -t`) target without `=` (SRJ-1101, SRJ-1102; the E8 note), wrapped, for the raw text of every operator text. */
+/** A `tmux attach -t` (or `attach-session -t`) target without `=` (the note), wrapped, for the raw text of every operator text. */
 const UNEXACT_ATTACH: Term = ['a tmux attach target without =', /\btmux\s+attach(?:-session)?\s+-t\s*(?!=)[^\s`]+/g]
 
 /** Each `tmux attach -t` (or `attach-session -t`) without `=` in `text`, outside `spans` (the prefix-key reason's, by default). Pure. */
@@ -5950,22 +5937,22 @@ const TMUX_COMMAND: RegExp = new RegExp(
 )
 
 /**
- * The layering rule's allow-list (the Task's ruling, citing the engineering
+ * The layering rule's allow-list (the section's ruling, citing the engineering
  * guide's "CSCB never touches tmux"; file-local): the tmux commands an
  * operator text may name, each a human's read-only or exact-target command.
- * The exact-target attach (SRJ-1101); the runbooks' read-only `tmux ls`,
+ * The exact-target attach; the runbooks' read-only `tmux ls`,
  * `tmux list-windows -a` or `-t =<name>` and `tmux display-message -p`
- * (SRJ-1108 steps 1 and 5); and the exact-name `tmux kill-session -t =` of
+ * (steps 1 and 5); and the exact-name `tmux kill-session -t =` of
  * switch-over steps 5 and 6, whose placement its own case checks. Each form
  * is matched against a command's text from `tmux` on, flattened; a command
  * matching none, global flags included, is off the list.
  */
 const TMUX_ALLOWED_FORMS: readonly [form: string, pattern: RegExp][] = [
-  ['`tmux attach -t =<name>` (SRJ-1101)', /^tmux\s+attach(?:-session)?\s+-t\s*=/i],
-  ['`tmux ls`, read-only (SRJ-1108 steps 1 and 5)', /^tmux\s+ls(?![\w-])/i],
-  ['`tmux list-windows -a` or `-t =<name>`, read-only (SRJ-1108 step 5)', /^tmux\s+list-windows\s+(?:-a(?![\w-])|-t\s*=)/i],
-  ['`tmux display-message -p …`, read-only (SRJ-1108 step 1)', /^tmux\s+display-message\s+-p(?![\w-])/i],
-  ['`tmux kill-session -t =<name>` (SRJ-1101: switch-over steps 5 and 6 only)', /^tmux\s+kill-session\s+-t\s*=/i],
+  ['`tmux attach -t =<name>`', /^tmux\s+attach(?:-session)?\s+-t\s*=/i],
+  ['`tmux ls`, read-only (steps 1 and 5)', /^tmux\s+ls(?![\w-])/i],
+  ['`tmux list-windows -a` or `-t =<name>`, read-only (step 5)', /^tmux\s+list-windows\s+(?:-a(?![\w-])|-t\s*=)/i],
+  ['`tmux display-message -p …`, read-only (step 1)', /^tmux\s+display-message\s+-p(?![\w-])/i],
+  ['`tmux kill-session -t =<name>` (switch-over steps 5 and 6 only)', /^tmux\s+kill-session\s+-t\s*=/i],
 ]
 
 /** Each tmux command in `text` that no `TMUX_ALLOWED_FORMS` form allows, outside `spans` (the prefix-key reason's, by default), with file and line. Pure. */
@@ -5979,7 +5966,7 @@ function offListTmuxCommands(file: string, text: string, spans: readonly string[
 }
 
 /**
- * SRJ-613's claim (file-local, citing SRJ-613 and SRJ-1101): that a pane, a
+ * claim (file-local, citing and): that a pane, a
  * `read-pane` answer or a GONE (`ErrTmuxCaptureFailed`) proves, shows or
  * means a worker gone. Its groups: the `subject` up to the verb, the `verb`,
  * and the `object` up to the gone word, which holds no negated verb of its
@@ -6012,10 +5999,10 @@ const KILL_INSTRUCTION = /`agent-director kill --instance-id[=\s][^`]*`/g
 /** A fenced command line that runs `agent-director kill`, in any form: a fenced block carries no sentence that checks its result. */
 const FENCED_KILL = /^\s*(?:\$\s+)?(?:\S*\/)?agent-director\s+kill\b/m
 
-/** SRJ-1101: an `agent-director kill` named with its result checked. */
+/** an `agent-director kill` named with its result checked. */
 const CHECKS_THE_RESULT = /\bcheck(?:s|ed|ing)? (?:the|its) result\b/i
 
-/** SRJ-1101: the README's advice to kill a leftover worker adds "check the result; on an error, don't delete or respawn". */
+/** the README's advice to kill a leftover worker adds "check the result; on an error, don't delete or respawn". */
 const CHECKS_AND_DOES_NOT_DELETE = /\bchecks? (?:the|its) result; on an error, don't delete or respawn\b/i
 
 /** The rest of the sentence of flattened `text` from offset `at`: up to its next full stop followed by whitespace, or the end. */
@@ -6044,7 +6031,7 @@ function noticeTitle(text: string): string {
 }
 
 /**
- * The Slack notices README "Troubleshooting" gives an entry each (SRJ-1103:
+ * The Slack notices README "Troubleshooting" gives an entry each (
  * the retry timer's, `tmux-unresponsive`'s, the kill-failure alert's two
  * versions and the other new notices), each title rendered by the `src/`
  * builder or head that posts it.
@@ -6212,12 +6199,12 @@ const viaSymptom = (titlePart: string | (() => string), heading: string) => (tex
   return sectionOf(REFERENCE_NAME, heading)(text)
 }
 
-/** The debugging skill's sections the SRI-1105 symptoms point to. */
+/** The debugging skill's sections the symptoms point to. */
 const SILENT_INVITED_SKILL_HEADING = '## A persona is silent in a channel its app was invited to'
 const RECEIVES_EVERYTHING_SKILL_HEADING = '### A persona receives every message in a channel'
 const UNCLAIMED_SKILL_HEADING = `### ${code(UNCLAIMED_CHANNEL)}`
 
-/** The debugging skill's sections the SRJ-1103 symptom rows read (each symptom entry links its own). */
+/** The debugging skill's sections the symptom rows read (each symptom entry links its own). */
 const HELD_CONFLICT_SKILL_HEADING = '## A persona posts a Held: tmux session conflict notice'
 const HELD_UNUSABLE_SKILL_HEADING = '## A persona posts a Held: unusable tmux session name notice'
 const HELD_LAUNCH_START_SKILL_HEADING = '## A persona posts a Held: launch start not recorded notice'
@@ -6238,7 +6225,7 @@ function underscored(n: number): string {
 }
 
 /**
- * The startup call-timeout warning as the README shows it (SRJ-213): the line
+ * The startup call-timeout warning as the README shows it: the line
  * `buildAdCallTimeoutWarningLine` renders at the defaults for a value one
  * below the need, with the value, the need and the ceiling's name replaced by
  * the README's placeholders `<value>`, `<need>` and `<verb>`. Throws when a
@@ -6263,29 +6250,29 @@ function callTimeoutWarningTemplate(): string {
 /** The README's clear-latch CLI entry heading. */
 const CLEAR_LATCH_CLI_HEADING = `## \`claude-slack-channel-bots ${CLEAR_LATCH_COMMAND}\``
 
-/** The all-interfaces `bind`, the other value through which `clear-latch` reaches the server (SRJ-510); the loopback one is `CLEAR_LATCH_DIAL_HOST`. */
+/** The all-interfaces `bind`, the other value through which `clear-latch` reaches the server; the loopback one is `CLEAR_LATCH_DIAL_HOST`. */
 const ALL_INTERFACES_BIND = '0.0.0.0'
 const CALL_TIMEOUT_SIZING_HEADING = '### Sizing the agent-director call timeout'
 
-/** The README's timing-settings section (SRJ-209, SRJ-1103). */
+/** The README's timing-settings section. */
 const TIMING_SETTINGS_HEADING = "## agent-director's timing settings"
 
 /** The README's prerequisites section. */
 const PREREQUISITES_HEADING = '## Prerequisites'
 
-/** The re-check interval in the words the docs use: "every 2 minutes" (`LATCH_RECHECK_INTERVAL_MS`, SRJ-505). */
+/** The re-check interval in the words the docs use: "every 2 minutes" (`LATCH_RECHECK_INTERVAL_MS`). */
 const LATCH_RECHECK_WORDS = `every ${LATCH_RECHECK_INTERVAL_MS / 60_000} minutes`
 
 /**
- * SRJ-1103's README rows (AC 78, AC 79): the prerequisites, one row per item;
- * then one row per section SRJ-1103 names. Values CSCB defines are imported;
+ * README rows: the prerequisites, one row per item;
+ * then one row per section names. Values CSCB defines are imported;
  * agent-director's from `AD_VOCABULARY`. Each row is self-checked below: each
- * item cut from its passage is reported, and the rows SRJ-1103's Test line
+ * item cut from its passage is reported, and the rows Test line
  * names fail on the README with that item reverted.
  */
-const README_SRJ_1103_ROWS: readonly DocRow[] = [
+const README_NOTICE_ROWS: readonly DocRow[] = [
   // The prerequisites.
-  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), CSCB's supported minimum and the fleet's version (b.9v8)`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [Claude Code]'), [
+  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), CSCB's supported minimum and the fleet's version`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [Claude Code]'), [
     `Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers`,
     ci('installed and authenticated'),
     ci("CSCB's supported minimum"),
@@ -6295,7 +6282,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci(`\`agent-director\` ${PHASE1_FLOOR_VERSION} or later`),
     ci('installed system-wide'),
   ]],
-  ['migration: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf(RUNBOOK_DOC, SWITCH_OVER_HEADING, 'This release requires'), [
+  ['migration: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code', unitOf(RUNBOOK_DOC, SWITCH_OVER_HEADING, 'This release requires'), [
     ci('requires agent-director Phase 1, installed on the host together with it'),
     ci('The two are installed together, by this runbook'),
     ci('rolled back together'),
@@ -6317,7 +6304,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci("the job must run as the workers' user and resolve their tmux socket"),
     ci('the socket switch-over step 1 pins'),
   ]],
-  ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule (b.3ut)", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
+  ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
     ci('a host that follows the switch-over runbook runs one'),
     '[switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none',
     ci("run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule)"),
@@ -6338,7 +6325,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci('a session conflict'),
     ci("conflicting labels on the persona's own row"),
   ]],
-  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS}, how a hold ends, clear-latch, and "Operator actions" for a human only`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),
     ci('**How a hold clears.**'),
     docLink(DEBUG_SKILL_FILE, DEBUG_SKILL_FILE, headingSlug(`Clearing a hold by hand: ${code(CLEAR_LATCH_COMMAND)}`)),
@@ -6354,7 +6341,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     vocab('operatorActions'),
   ]],
 
-  // A pending launch and the stuck-launch post (SRJ-410 to SRJ-412, SRJ-1017).
+  // A pending launch and the stuck-launch post.
   ["\"A persona's instance is still starting\": a pending launch is never launched over, its retries check it after agent-director's grace period", viaSymptom("**A persona's instance is still starting**", LAUNCH_STUCK_SKILL_HEADING), [
     code('pending_grace_seconds'),
     ci("before agent-director's grace period (`pending_grace_seconds`) has passed since the launch's start, the persona's retries only read its state"),
@@ -6366,7 +6353,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci(`the later of ${DIALOG_READY_TIMEOUT_MS / 60_000} minutes and agent-director's \`pending_grace_seconds\` plus ${AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS} s`),
   ]],
 
-  // agent-director's timing settings (SRJ-209, SRJ-210).
+  // agent-director's timing settings.
   [`timing settings: the nine [${AD_TMUX_TABLE}] keys of ~/${AD_SETTINGS_RELATIVE_PATH}, read at start and every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s with agent-director's rule; agent-director's answers decide`, sectionOf(USER_DOCS_NAME, TIMING_SETTINGS_HEADING), [
     code(`[${AD_TMUX_TABLE}]`),
     code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
@@ -6377,21 +6364,21 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
   ['timing settings: each key\'s default as src/ad-settings.ts holds it', sectionOf(USER_DOCS_NAME, TIMING_SETTINGS_HEADING), AD_TMUX_KEYS.map((key) => `| ${code(key)} | ${code(String(DEFAULT_AD_SETTINGS.tmux[key]))} |`)],
 
-  // The ad-config-malformed outage (SRJ-316).
+  // The ad-config-malformed outage.
   [`the *${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}* entry (${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED}): CSCB acts on nothing and retries`, viaSymptom(() => `*${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}*`, AD_REFUSES_SKILL_HEADING), [
     code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
     ci('Nothing is killed, deleted or relaunched because of it'),
     ci("the persona's retries start with the `config` cause"),
   ]],
 
-  // The call timeout, under "Configuration" (SRJ-213).
+  // The call timeout, under "Configuration".
   [`Server-wide settings: agent_director_call_timeout_ms, default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, range [${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS}]`, (readme) => readme.split('\n').find((line) => line.startsWith(`| ${code('agent_director_call_timeout_ms')} |`)) ?? '', [
     `| number | ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))} |`,
     `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`,
     docLink(SERVER_SETTINGS_DOC, AGENT_DIRECTOR_DOC, headingSlug(CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, ''))),
   ]],
 
-  // The fresh system prompt switch, under "Configuration" (b.b1j SR-6.1, SR-5.6).
+  // The fresh system prompt switch, under "Configuration".
   ['Server-wide settings: fresh_system_prompt, a boolean defaulting to true, the flag pair, the next-start rule, the Claude Code version and the new-conversation note', (readme) => readme.split('\n').find((line) => line.startsWith(`| ${code('fresh_system_prompt')} |`)) ?? '', [
     `| boolean | ${code('true')} |`,
     code('--system-prompt-snapshot off'),
@@ -6404,14 +6391,14 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci('the largest ceiling among the agent-director verbs CSCB calls'),
     ci(`plus a ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin (${AD_CALL_TIMEOUT_NEED_MARGIN_MS} ms`),
   ]],
-  ['call timeout: the ceilings\' formulas, one table row per ceiling CSCB calls (ADSRD SR-13.2; SRJ-213)', sectionOf(USER_DOCS_NAME, CALL_TIMEOUT_SIZING_HEADING),
+  ['call timeout: the ceilings\' formulas, one table row per ceiling CSCB calls (ADSRD)', sectionOf(USER_DOCS_NAME, CALL_TIMEOUT_SIZING_HEADING),
     CSCB_CEILINGS.map((name) => `| ${vocab(`ceiling ${name}`)} |`)],
   ['call timeout: the startup warning, its line in server.log', sectionOf(USER_DOCS_NAME, CALL_TIMEOUT_SIZING_HEADING), [
     ci('**The startup warning.**'),
     callTimeoutWarningTemplate(),
   ]],
 
-  // clear-latch under "CLI Reference" (SRJ-510).
+  // clear-latch under "CLI Reference".
   [`clear-latch: it reaches the server at ${CLEAR_LATCH_DIAL_HOST}, so bind is ${CLEAR_LATCH_DIAL_HOST} or ${ALL_INTERFACES_BIND}`, sectionOf(USER_DOCS_NAME, CLEAR_LATCH_CLI_HEADING), [
     `It reaches the server at ${code(CLEAR_LATCH_DIAL_HOST)}`,
     `${code(CLEAR_LATCH_DIAL_HOST)} (the default) or ${code(ALL_INTERFACES_BIND)}`,
@@ -6422,7 +6409,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci('or by a server restart, which drops every hold'),
   ]],
 
-  // The retry timer (SRJ-301).
+  // The retry timer.
   ['"A persona is retried after agent-director refuses it": the retry timer\'s schedule, whatever session_restart_delay and health_check_interval are, never toward the restart limit', viaSymptom('**A persona is retried after agent-director refuses it**', AD_REFUSES_SKILL_HEADING), [
     ci(`${UNAVAILABLE_RETRY_BASE_S} s after the refusal`),
     ci(`then every ${UNAVAILABLE_RETRY_CEILING_S} s`),
@@ -6430,11 +6417,11 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci("the server doesn't count that against the persona's restart limit"),
   ]],
 
-  // The files and the PID file (SRJ-510, SRJ-802).
+  // The files and the PID file.
   [`Files beside the config file: ${RETIRED_KEYS_FILE_NAME}`, sectionOf(USER_DOCS_NAME, '## Files beside the config file'), [`| ${code(RETIRED_KEYS_FILE_NAME)} | The retired-key record`]],
   [`PID file: ${SERVER_PORT_FILE_NAME}`, sectionOf(USER_DOCS_NAME, '## PID file'), [ci(`${code(`STATE_DIR/${SERVER_PORT_FILE_NAME}`)} records the server's process ID and the port it actually listens on`)]],
 
-  // The permission wedge (SRJ-1012, SRJ-1101).
+  // The permission wedge.
   ['the permission-wedge entry names agent-director read-pane and kill, the kill with its result checked and nothing deleted or respawned, for a human only', (readme) => troubleshootingEntry(readme, '**Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**'), [
     code('agent-director read-pane --instance-id <id>'),
     `${code('agent-director kill --instance-id <id>')} and check the result; on an error, don't delete or respawn`,
@@ -6442,7 +6429,7 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci('for a human only'),
   ]],
 
-  // The *Still not answering* read-only check (E19; SRJ-1101).
+  // The *Still not answering* read-only check .
   [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, viaSymptom(() => `*${troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')()}*`, NOT_ANSWERING_SKILL_HEADING), [
     `agent-director read-pane --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`,
     docLink(DEBUG_SKILL_FILE, DEBUG_SKILL_FILE, headingSlug('Listing instances')),
@@ -6451,16 +6438,16 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 ]
 
-/** The element of the one `README_SRJ_1103_ROWS` row that starts with `prefix`; throws unless exactly one does. */
+/** The element of the one `README_NOTICE_ROWS` row that starts with `prefix`; throws unless exactly one does. */
 function readmeRow(prefix: string): string {
-  const rows = README_SRJ_1103_ROWS.filter(([element]) => element.startsWith(prefix))
-  if (rows.length !== 1) throw new Error(`${rows.length} README_SRJ_1103_ROWS rows start with "${prefix}", expected 1`)
+  const rows = README_NOTICE_ROWS.filter(([element]) => element.startsWith(prefix))
+  if (rows.length !== 1) throw new Error(`${rows.length} README_NOTICE_ROWS rows start with "${prefix}", expected 1`)
   return rows[0][0]
 }
 
-/** The README rows SRJ-1103's Test line names, each with an edit reverting one of its items, and the row it must fail. */
+/** The README rows Test line names, each with an edit reverting one of its items, and the row it must fail. */
 const README_REVERTS: readonly [row: string, how: string, edit: (readme: string) => string][] = [
-  [readmeRow('prerequisites: Claude Code'), `the Claude Code line without ${MIN_CLAUDE_CODE_VERSION} (b.ob2's line)`, (readme) =>
+  [readmeRow('prerequisites: Claude Code'), `the Claude Code line without ${MIN_CLAUDE_CODE_VERSION} (line)`, (readme) =>
     readme.replace(/^- \[Claude Code\]\(([^)]+)\) [^\n]*$/m, '- [Claude Code]($1) installed and authenticated')],
   [readmeRow('prerequisites: Claude Code'), 'an older Claude Code version', (readme) =>
     readme.replace(`) ${MIN_CLAUDE_CODE_VERSION} or later for the workers`, `) ${HISTORICAL_VERSIONS.execFormHooksClaudeCode} or later for the workers`)],
@@ -6484,8 +6471,8 @@ const README_REVERTS: readonly [row: string, how: string, edit: (readme: string)
     readme.replace(`| ${vocab(`ceiling ${CSCB_CEILINGS[0]}`)} |`, '| 2Q + 2A |')],
 ]
 
-/** The SRJ-1013 classes (`startup-errors.log`), each as `src/` exports it; README "Startup errors" lists each, and the debugging skill describes each. */
-const SRJ_1013_CLASSES: readonly string[] = [
+/** The classes (`startup-errors.log`), each as `src/` exports it; README "Startup errors" lists each, and the debugging skill describes each. */
+const STARTUP_ERROR_CLASSES: readonly string[] = [
   AD_BELOW_PHASE1_FLOOR,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
@@ -6505,7 +6492,7 @@ function readmeListsClass(readme: string, label: string): boolean {
 /** The debugging skill's section on a persona the two CLI teardown commands could not stop, its heading built from their names in src/cli-teardown.ts. */
 const CLI_TEARDOWN_SECTION_HEADING = `## ${code(CLI_COMMAND_STOP_BOTS)} or ${code(CLI_COMMAND_CLEAN_RESTART)} could not stop a persona`
 
-/** The debugging skill's section describing each SRJ-1013 class (file-local; SRJ-1104: an entry per class with its cause and fix). */
+/** The debugging skill's section describing each class (file-local; an entry per class with its cause and fix). */
 const DEBUG_SKILL_CLASS_SECTIONS: Readonly<Record<string, HeadingMatch>> = {
   [AD_BELOW_PHASE1_FLOOR]: classHeading(AD_BELOW_PHASE1_FLOOR),
   [PERSONA_KILL_FAILED_LABEL]: '## A persona posts a Kill failed or Process outlived kill notice',
@@ -6530,7 +6517,7 @@ function debugClassSectionNames(skill: string, label: string): boolean {
   return text.includes(code(label)) || text.includes(`[${label}]`)
 }
 
-/** The refusal entries' old ending, which the "Arrived here from a startup refusal?" block replaced (E2-gate note; SRJ-1108). */
+/** The refusal entries' old ending, which the "Arrived here from a startup refusal?" block replaced (-gate note). */
 const START_AGAIN = ci('start the server again')
 
 /**
@@ -6551,7 +6538,7 @@ function readmeRefusalItemProblems(label: string, readme: string): string[] {
   ]
 }
 
-/** README "Startup errors"' paragraph on a stop by the runtime re-check (SRJ-205): its one unit opening "**Found while the server was running.**". */
+/** README "Startup errors"' paragraph on a stop by the runtime re-check: its one unit opening "**Found while the server was running.**". */
 function readmeRuntimeParagraph(readme: string): string {
   const units = textUnits(requiredSection(readme, SKILL_STARTUP_ERRORS_HEADING, REFERENCE_NAME)).filter((unit) => unit.startsWith(`**${RUNTIME_STOP_HEADING.slice('### '.length)}.**`))
   if (units.length !== 1) throw new Error(`${REFERENCE_NAME} "${SKILL_STARTUP_ERRORS_HEADING}": ${units.length} units open with the runtime-stop lead, expected 1`)
@@ -6581,12 +6568,12 @@ function runtimeStopSection(skill: string): string {
 }
 
 /**
- * SRJ-1104's runtime-stop remedy (its Test line; hatch A3), one row per
+ * runtime-stop remedy (its Test line; design A3), one row per
  * element, each found in the debugging skill's `RUNTIME_STOP_HEADING` section.
  */
 const RUNTIME_STOP_REMEDY_ROWS: readonly [element: string, required: readonly (string | RegExp)[]][] = [
   ['the binary the server finds is not the one the running server started with', [ci('the agent-director binary the server finds is not the one the running server started with')]],
-  ['the lookup order: the home binary first, then the first agent-director on PATH (SRJ-1301)', [`${code(vocab('homeBinary'))} first, then the first ${code('agent-director')} on ${code('PATH')}`]],
+  ['the lookup order: the home binary first, then the first agent-director on PATH', [`${code(vocab('homeBinary'))} first, then the first ${code('agent-director')} on ${code('PATH')}`]],
   ["`<path> version` on the binary path the startup-errors entry names, as the workers' user in the bot server's launcher environment", [
     ci('take the binary path the startup-errors entry names'),
     code('<path> version'),
@@ -6620,7 +6607,7 @@ const RUNTIME_STOP_REMEDY_ROWS: readonly [element: string, required: readonly (s
   ]],
 ]
 
-/** The forms the runtime-stop remedy must not carry (SRJ-1104; hatch A3): a `command -v agent-director`; `UPGRADE_FORMS` apply through ruling C-1's span list. */
+/** The forms the runtime-stop remedy must not carry (hatch A3): a `command -v agent-director`; `UPGRADE_FORMS` apply through ruling C-1's span list. */
 const COMMAND_V = /\bcommand -v agent-director\b/
 
 /** The runtime-stop remedy's problems: its rows' missing items, a `command -v agent-director`, and the upgrade forms once ruling C-1's span is removed. */
@@ -6633,7 +6620,7 @@ function runtimeStopProblems(skill: string): string[] {
   ]
 }
 
-/** The debugging skill's refusal entries' Fix lines (SRJ-1104, SRJ-1108; the E2-gate note): the refusal block by title, step 10, no "start the server again". */
+/** The debugging skill's refusal entries' Fix lines (the -gate note): the refusal block by title, step 10, no "start the server again". */
 function debugRefusalEntryProblems(label: string, skill: string): string[] {
   const entry = flat(requiredSection(skill, classHeading(label), DEBUG_SKILL_FILE))
   return [
@@ -6642,14 +6629,14 @@ function debugRefusalEntryProblems(label: string, skill: string): string[] {
   ]
 }
 
-/** The one-line `read-pane` check SRJ-1101 gives the debugging skill, as its fenced block holds it. */
+/** The one-line `read-pane` check gives the debugging skill, as its fenced block holds it. */
 const READ_PANE_CHECK = `agent-director read-pane --instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`
 
 /**
- * SRJ-1104's debugging-skill rows, one per section it names (AC 78): each
+ * debugging-skill rows, one per section it names: each
  * passage and its items; titles rendered from `src/`, labels imported.
  */
-const DEBUG_SKILL_SRJ_1104_ROWS: readonly DocRow[] = [
+const DEBUG_SKILL_NOTICE_ROWS: readonly DocRow[] = [
   ['retired persona: a removed persona\'s row is kept until expire and never resumed', sectionOf(DEBUG_SKILL_FILE, '## A persona was added or removed by a confirmed change'), [
     ci("its agent-director row is kept until agent-director's `expire` removes it"),
     ci('which is never resumed'),
@@ -6709,7 +6696,7 @@ const DEBUG_SKILL_SRJ_1104_ROWS: readonly DocRow[] = [
     `["${REFUSAL_BLOCK_HEADING}"](../../${RUNBOOK_DOC}#${headingSlug(REFUSAL_BLOCK_HEADING)})`,
     ci('never starts the server on its own after a refusal'),
   ]],
-  [`the install check's below-floor note points to the switch-over runbook (SRJ-1104, SRJ-1108; hatch A3)`, (skill) =>
+  [`the install check's below-floor note points to the switch-over runbook (hatch A3)`, (skill) =>
     textUnits(skill).filter((unit) => /\binstall[- ]check\b/i.test(unit) && /\bnote\b/i.test(unit)).join(' '), [
     /\binstall[- ]check\b/i,
     /\bnote\b/i,
@@ -6721,7 +6708,7 @@ const DEBUG_SKILL_SRJ_1104_ROWS: readonly DocRow[] = [
   ]],
 ]
 
-/** The debugging skill's "Listing instances" read-pane check's problems (SRJ-1101, SRJ-613; the E19 note): the fenced command, both caveats and the pointer. */
+/** The debugging skill's "Listing instances" read-pane check's problems (the note): the fenced command, both caveats and the pointer. */
 function readPaneCheckProblems(skill: string): string[] {
   const raw = requiredSection(skill, '## Listing instances', DEBUG_SKILL_FILE)
   const text = flat(raw)
@@ -6738,8 +6725,8 @@ function readPaneCheckProblems(skill: string): string[] {
   ]
 }
 
-describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, SRJ-1106 through it; AC 78)', () => {
-  test.each(OPERATOR_TEXTS.flatMap(([name, read]) => SRJ_1101_TERMS.map(([label, pattern]) => [name, label, pattern, read] as const)))(
+describe('over every operator text (through it)', () => {
+  test.each(OPERATOR_TEXTS.flatMap(([name, read]) => FORBIDDEN_OPERATOR_TERMS.map(([label, pattern]) => [name, label, pattern, read] as const)))(
     '%s: no %s',
     (name, label, pattern, read) => {
       expect(findTerms(name, read(), [[label, pattern]]).map(formatHit)).toEqual([])
@@ -6757,7 +6744,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     expect(findTerms(name, text, [KILL_SESSION])).toHaveLength(inSteps)
   })
 
-  test.each(OPERATOR_TEXTS)('%s: every `tmux attach -t` is written with `=`, apart from the prefix-key reason sentence (SRJ-1102)', (name, read) => {
+  test.each(OPERATOR_TEXTS)('%s: every `tmux attach -t` is written with `=`, apart from the prefix-key reason sentence', (name, read) => {
     expect(unexactAttaches(name, read())).toEqual([])
   })
 
@@ -6765,7 +6752,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     expect(offListTmuxCommands(name, read())).toEqual([])
   })
 
-  test.each(OPERATOR_TEXTS)('%s: no pane, read-pane answer or GONE is taken as proof a worker is gone (SRJ-613)', (_name, read) => {
+  test.each(OPERATOR_TEXTS)('%s: no pane, read-pane answer or GONE is taken as proof a worker is gone', (_name, read) => {
     expect(goneAsProofClaims(read())).toEqual([])
   })
 
@@ -6783,17 +6770,17 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
     expect(killAdviceProblems(text, CHECKS_AND_DOES_NOT_DELETE)).toEqual([])
   })
 
-  test(`${DEBUG_SKILL_FILE}: "Listing instances" carries the one-line read-pane check, both caveats and the "Operator actions" pointer (SRJ-1101, SRJ-613)`, () => {
+  test(`${DEBUG_SKILL_FILE}: "Listing instances" carries the one-line read-pane check, both caveats and the "Operator actions" pointer`, () => {
     expect(readPaneCheckProblems(operatorText(DEBUG_SKILL_FILE))).toEqual([])
   })
 
   describe('self-checks (synthetic texts, or an operator text with the old wording put back)', () => {
-    test.each(SRJ_1101_TERMS.map(([label]) => [label] as const))('%s, wrapped and in other letter case, is reported with file and line', (label) => {
+    test.each(FORBIDDEN_OPERATOR_TERMS.map(([label]) => [label] as const))('%s, wrapped and in other letter case, is reported with file and line', (label) => {
       const sample = `Line one.\nThen ${label.toUpperCase().replace(' ', '\n  ')} here.`
-      expect(findTerms('sample.md', sample, SRJ_1101_TERMS).map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual([`sample.md:2: ${label}`])
+      expect(findTerms('sample.md', sample, FORBIDDEN_OPERATOR_TERMS).map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual([`sample.md:2: ${label}`])
     })
 
-    test('each SRJ-1101 term of the old wording is reported: the has-session check, the cron flag, the finished-row option, a row delete', () => {
+    test('each term of the old wording is reported: the has-session check, the cron flag, the finished-row option, a row delete', () => {
       const old = [
         'timeout 10 tmux has-session -t =slack_bot_<key>',
         '* * * * * /usr/local/bin/agent-director find-missing --timeout 30s',
@@ -6802,7 +6789,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
         'then `agent-director delete --instance-id <id>`',
         'end it with tmux-kill and respawn it',
       ].join('\n')
-      expect(findTerms('old.md', old, SRJ_1101_TERMS).map((hit) => `${hit.line}: ${hit.term}`).sort()).toEqual(
+      expect(findTerms('old.md', old, FORBIDDEN_OPERATOR_TERMS).map((hit) => `${hit.line}: ${hit.term}`).sort()).toEqual(
         ['1: has-session', '2: find-missing --timeout', '3: include-finished', '4: include_finished', '5: agent-director delete', '6: tmux-kill'].sort(),
       )
     })
@@ -6900,11 +6887,11 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
       'If the pane is missing, that shows the worker has gone: a read-pane answer of ErrTmuxCaptureFailed confirms it is gone.',
       'A GONE from read-pane means no pane is left, so the worker is gone.',
       'A pane read that fails, and no other check, shows the worker is gone.',
-    ])('SRJ-613: the claim %p is reported', (text) => {
+    ])('the claim %p is reported', (text) => {
       expect(goneAsProofClaims(text)).not.toEqual([])
     })
 
-    test("SRJ-613: the debugging skill's caveats and the alert's wording are not reported", () => {
+    test("the debugging skill's caveats and the alert's wording are not reported", () => {
       const fine = [
         '`ErrTmuxCaptureFailed`: no session of the row\'s current launch is there. That does not prove the worker gone after a kill failure whose description says no session or pane of this launch was found.',
         'A pane read can show a leftover\'s pane, and a failed read does not prove the worker gone.',
@@ -6941,7 +6928,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
       expect(findTerms('sample.md', text, RAW_COMMAND_FORMS).map((hit) => hit.term)).toEqual([label])
     })
 
-    test('the E8 note: the checked kill, a kill log line, a bare `agent-director kill` and "don\'t delete or respawn" are not reported', () => {
+    test('the note: the checked kill, a kill log line, a bare `agent-director kill` and "don\'t delete or respawn" are not reported', () => {
       const fine = [
         `run \`agent-director kill --instance-id ${personaInstanceId(ALERT_KEY)}\` and check the result; on an error, don't delete or respawn`,
         `run \`agent-director kill --instance-id=${personaInstanceId(ALERT_KEY)}\` and check the result`,
@@ -6951,7 +6938,7 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
       expect(findTerms('sample.md', fine, RAW_COMMAND_FORMS)).toEqual([])
     })
 
-    test("the prefix-key reason's spans are the attaches without = left out, and any other attach without = is still reported (SRJ-1102)", () => {
+    test("the prefix-key reason's spans are the attaches without = left out, and any other attach without = is still reported", () => {
       const session = personaTmuxSessionName(PREFIX_PAIR[0])
       const spans = prefixKeyReasonSpans()
       expect(spans.map((span) => unexactAttaches('sample.md', span, []).length)).toEqual(spans.map(() => 1))
@@ -6966,13 +6953,13 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
       }
     })
 
-    test("the README's runbook kills fail their rows with the delete-or-respawn caveat dropped, in each step (SRJ-1101)", () => {
+    test("the README's runbook kills fail their rows with the delete-or-respawn caveat dropped, in each step", () => {
       const readme = userDocsText()
       const edited = readme.replaceAll(`; on an error, don't delete or respawn`, '')
       expect(edited).not.toBe(readme)
       const switchOver = readRunbookCarrier(USER_DOCS_NAME, edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
       const rollback = readRunbookCarrier(USER_DOCS_NAME, edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
-      const caveatRows = <T extends readonly [string, string, readonly Item[]]>(rows: readonly T[]) => rows.filter(([, element]) => element.includes('deleted or respawned (SRJ-1101)'))
+      const caveatRows = <T extends readonly [string, string, readonly Item[]]>(rows: readonly T[]) => rows.filter(([, element]) => element.includes('deleted or respawned'))
       const failing = [
         ...caveatRows(SWITCH_OVER_ELEMENTS).filter(([where, , required]) => missingItems(switchOver, textAt(switchOver, where), required).length > 0).map(([where]) => `switch-over ${where}`),
         ...caveatRows(ROLLBACK_ELEMENTS).filter(([where, , required]) => missingItems(rollback, textAt(rollback, where), required).length > 0).map(([where]) => `rollback ${where}`),
@@ -7008,16 +6995,16 @@ describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, S
   })
 })
 
-/** The title of b.ob2's README version note, which SRJ-1103 removes. */
+/** The title of the contract README version note, which removes. */
 const VERSION_NOTE_TITLE = 'Note on agent-director versions'
 
-/** The README's version note, put back: a problem when the README names its title anywhere (SRJ-1103). */
+/** The README's version note, put back: a problem when the README names its title anywhere. */
 function versionNoteProblems(readme: string): string[] {
   return ci(VERSION_NOTE_TITLE).test(readme) ? [`names "${VERSION_NOTE_TITLE}"`] : []
 }
 
 /**
- * The prerequisites' base-index sentences (SRJ-1103; HO rev 17): at least one
+ * The prerequisites' base-index sentences (HO rev 17): at least one
  * names `base-index`, and each that does says agent-director does not depend
  * on it.
  */
@@ -7035,7 +7022,7 @@ function prerequisiteBaseIndexProblems(readme: string): string[] {
 const OLD_SYSTEM_BINARY_PATH = '/usr/local/bin/agent-director'
 
 /**
- * Migration's cron line (SRJ-1101; C7, C19): the `cron` blocks of the
+ * Migration's cron line (C7, C19): the `cron` blocks of the
  * section's preamble are exactly `AD_VOCABULARY`'s `findMissingCron`, and the
  * README names the old system binary path nowhere.
  */
@@ -7084,10 +7071,10 @@ describe(`${TROUBLESHOOTING_DOC} indexes the debugging skill's "${SYMPTOM_REFERE
   })
 })
 
-describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79)', () => {
+describe('the user docs describe the build', () => {
   const readme = () => referenceText()
 
-  test.each(README_SRJ_1103_ROWS)('%s', (element, passage, required) => {
+  test.each(README_NOTICE_ROWS)('%s', (element, passage, required) => {
     expect({ element, problems: docRowProblems(passage, required, readme()) }).toEqual({ element, problems: [] })
   })
 
@@ -7096,7 +7083,7 @@ describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79
     expect(entries.map((entry) => entry.title)).toHaveLength(1)
   })
 
-  test.each(SRJ_1013_CLASSES.map((label) => [label] as const))(`"${SKILL_STARTUP_ERRORS_HEADING}" lists the SRJ-1013 class %s`, (label) => {
+  test.each(STARTUP_ERROR_CLASSES.map((label) => [label] as const))(`"${SKILL_STARTUP_ERRORS_HEADING}" lists the class %s`, (label) => {
     expect(readmeListsClass(readme(), label)).toBe(true)
   })
 
@@ -7108,19 +7095,19 @@ describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79
     expect(versionNoteProblems(readme())).toEqual([])
   })
 
-  test(`Migration's cron line is SRJ-1101's, "${vocab('findMissingCron')}", and no other agent-director path or flag (C19)`, () => {
+  test(`Migration's cron line is, "${vocab('findMissingCron')}", and no other agent-director path or flag (C19)`, () => {
     expect(migrationCronProblems(readme())).toEqual([])
   })
 
-  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate; SRJ-1108)`, (label) => {
+  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate)`, (label) => {
     expect(readmeRefusalItemProblems(label, readme())).toEqual([])
   })
 
-  test(`"${SKILL_STARTUP_ERRORS_HEADING}": the runtime-stop paragraph links the debugging skill's "${RUNTIME_STOP_HEADING.slice('### '.length)}" (SRJ-1104; hatch A3)`, () => {
+  test(`"${SKILL_STARTUP_ERRORS_HEADING}": the runtime-stop paragraph links the debugging skill's "${RUNTIME_STOP_HEADING.slice('### '.length)}" (hatch A3)`, () => {
     expect(readmeRuntimeParagraphProblems(readme())).toEqual([])
   })
 
-  test(`"${CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, '')}" sits under "${TIMING_SETTINGS_HEADING}" in ${AGENT_DIRECTOR_DOC}, which the configuration reference's Server-wide settings row links (SRJ-1103)`, () => {
+  test(`"${CALL_TIMEOUT_SIZING_HEADING.replace(/^#+ /, '')}" sits under "${TIMING_SETTINGS_HEADING}" in ${AGENT_DIRECTOR_DOC}, which the configuration reference's Server-wide settings row links`, () => {
     const doc = operatorText(AGENT_DIRECTOR_DOC)
     const configuration = sectionRange(doc, TIMING_SETTINGS_HEADING)
     const sizing = sectionRange(doc, CALL_TIMEOUT_SIZING_HEADING)
@@ -7134,7 +7121,7 @@ describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79
   })
 
   describe('self-checks', () => {
-    test.each(README_SRJ_1103_ROWS)('%s: each of its items, cut from its maintained documentation passage, is reported by the row', (element, passage, required) => {
+    test.each(README_NOTICE_ROWS)('%s: each of its items, cut from its maintained documentation passage, is reported by the row', (element, passage, required) => {
       for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
@@ -7145,7 +7132,7 @@ describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79
       const text = readme()
       const edited = edit(text)
       expect(edited).not.toBe(text)
-      const [, passage, required] = README_SRJ_1103_ROWS.find(([element]) => element === row)!
+      const [, passage, required] = README_NOTICE_ROWS.find(([element]) => element === row)!
       expect(docRowProblems(passage, required, edited)).not.toEqual([])
     })
 
@@ -7166,12 +7153,12 @@ describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79
       expect(prerequisiteBaseIndexProblems(dropped)).toEqual([`no prerequisites sentence names ${vocab('baseIndex')}`])
     })
 
-    test("Migration's old cron line is reported, by the cron case and by SRJ-1101's term", () => {
+    test("Migration's old cron line is reported, by the cron case and by the contract term", () => {
       const text = readme()
       const edited = text.replace(vocab('findMissingCron'), `* * * * * ${OLD_SYSTEM_BINARY_PATH} find-missing --timeout 30s`)
       expect(edited).not.toBe(text)
       expect(migrationCronProblems(edited)).toHaveLength(2)
-      expect(findTerms(USER_DOCS_NAME, edited, SRJ_1101_TERMS).map((hit) => hit.term)).toEqual(['find-missing --timeout'])
+      expect(findTerms(USER_DOCS_NAME, edited, FORBIDDEN_OPERATOR_TERMS).map((hit) => hit.term)).toEqual(['find-missing --timeout'])
     })
 
     test.each(REFUSAL_LABELS)('the `%s` item fails with "then start the server again" back', (label) => {
@@ -7226,14 +7213,14 @@ describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79
   })
 })
 
-describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78)', () => {
+describe('the debugging skill describes the build', () => {
   const skill = () => operatorText(DEBUG_SKILL_FILE)
 
-  test.each(DEBUG_SKILL_SRJ_1104_ROWS)('%s', (element, passage, required) => {
+  test.each(DEBUG_SKILL_NOTICE_ROWS)('%s', (element, passage, required) => {
     expect({ element, problems: docRowProblems(passage, required, skill()) }).toEqual({ element, problems: [] })
   })
 
-  test.each(SRJ_1013_CLASSES.map((label) => [label, String(DEBUG_SKILL_CLASS_SECTIONS[label])] as const))('the SRJ-1013 class %s is described in its section, %s', (label) => {
+  test.each(STARTUP_ERROR_CLASSES.map((label) => [label, String(DEBUG_SKILL_CLASS_SECTIONS[label])] as const))('the class %s is described in its section, %s', (label) => {
     expect(debugClassSectionNames(skill(), label)).toBe(true)
   })
 
@@ -7245,7 +7232,7 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
     expect(debugClassSectionNames(`## Other\n\`${RETIRED_KEYS_UNREADABLE_LABEL}\`\n`, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(false)
   })
 
-  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again" (E2 gate; SRJ-1108)`, (label) => {
+  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again" (E2 gate)`, (label) => {
     expect(debugRefusalEntryProblems(label, skill())).toEqual([])
   })
 
@@ -7253,7 +7240,7 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
     expect(flat(requiredSection(skill(), `## ${REFUSAL_SECTION_TITLE}`, DEBUG_SKILL_FILE))).not.toMatch(START_AGAIN)
   })
 
-  test.each(RUNTIME_STOP_REMEDY_ROWS)(`"${RUNTIME_STOP_HEADING.slice('### '.length)}": %s (SRJ-1104; hatch A3)`, (element, required) => {
+  test.each(RUNTIME_STOP_REMEDY_ROWS)(`"${RUNTIME_STOP_HEADING.slice('### '.length)}": %s (hatch A3)`, (element, required) => {
     expect({ element, missing: lacking(runtimeStopSection(skill()), required) }).toEqual({ element, missing: [] })
   })
 
@@ -7268,7 +7255,7 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
   })
 
   describe('self-checks', () => {
-    test.each(DEBUG_SKILL_SRJ_1104_ROWS)('%s: each of its items, cut from its passage in the skill, is reported by the row', (element, passage, required) => {
+    test.each(DEBUG_SKILL_NOTICE_ROWS)('%s: each of its items, cut from its passage in the skill, is reported by the row', (element, passage, required) => {
       for (const item of required.map(resolveItem)) {
         const edited = withItemCut(skill(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
@@ -7307,8 +7294,8 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
 })
 
 // ---------------------------------------------------------------------------
-// E39 T5: tests/README.md names the integration scripts and keeps the start
-// sweep's rows (b.jg5 SRJ-1112). Each later scenario Epic names its script
+// tests/README.md names the integration scripts and keeps the start
+// sweep's rows. Each later scenario component names its script
 // there, and this block enforces it. tests/README.md is no shipped
 // description, so the forbidden-term audit does not read it.
 // ---------------------------------------------------------------------------
@@ -7353,7 +7340,7 @@ function removedScriptsNamed(readme: string, scripts: readonly string[]): string
 const NAMES_SWEEP = /\bsweep\b|\breconcileOrphans\b/i
 
 /**
- * A start sweep that loses rows (SRJ-1112: it deletes none, so the rows
+ * A start sweep that loses rows (it deletes none, so the rows
  * earlier scripts leave stay), file-local, read through `affirmedClaims`, so
  * a negation that governs the verb passes ("never deletes a row", "does not
  * delete", "No row is deleted"). Any delete verb counts, a backticked
@@ -7374,7 +7361,7 @@ function sweepDeleteClaims(readme: string): string[] {
     .flatMap((unit) => affirmedClaims(unit, SWEEP_DELETE_CLAIMS))
 }
 
-/** SRJ-1112's Test 10 passage, element by element: [element, pattern over the flattened passage]. */
+/** Test 10 passage, element by element: [element, pattern over the flattened passage]. */
 const TEST_10_SWEEP_ELEMENTS: readonly [element: string, pattern: RegExp][] = [
   ['the sweep kills live rows', /\bkills\b[^.;]*?\blive\b/i],
   ['it deletes none', /\b(?:deletes\s+(?:no\s+rows?|none|nothing)|never\s+deletes|does\s+not\s+delete)\b/i],
@@ -7402,7 +7389,7 @@ function withTest10Passage(readme: string, passage: string): string {
   return [...paragraphs.slice(0, at[0]), passage, ...paragraphs.slice(at[0] + 1)].join('\n\n')
 }
 
-/** The Test 10 passage the README carried before SRJ-1112: the sweep killed and deleted rows, and the rows were gone. */
+/** The Test 10 passage the README carried before the sweep killed and deleted rows, and the rows were gone. */
 const OLD_TEST_10_PASSAGE = `Test 10's live start runs the server's start sweep (\`reconcileOrphans\`,
 \`src/session-manager.ts\`), which kills and deletes every \`service=cscb\`
 agent-director row whose persona is not in Test 10's own config (and any row
@@ -7414,7 +7401,7 @@ container is ephemeral and the scripts run one at a time. The sweep reaches
 only the shared store: an fmk script's rows are in its own store, which no
 other script's start sees.`
 
-describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps the start sweep's rows (b.jg5 SRJ-1112)`, () => {
+describe(`${TESTS_README_FILE} names every integration script and keeps the start sweep's rows`, () => {
   const readme = () => readRepoFile(TESTS_README_FILE)
 
   test(`every ${INTEGRATION_DIR}/test-*.sh on disk is named in ${TESTS_README_FILE}`, () => {
@@ -7523,24 +7510,23 @@ describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps 
 })
 
 // ---------------------------------------------------------------------------
-// b.deo SRI-1308: the README describes both channel modes (SRI-1101 to
-// SRI-1105, SRI-805; AC 42). T1's cases above pin the key tables, both
+// the README describes both channel modes. cases above pin the key tables, both
 // complete examples and the in-place row; these pin the rest.
 // ---------------------------------------------------------------------------
 
-/** The channel-modes page (`CHANNEL_MODES_DOC`, b.deo SRI-1102), the page after the server settings. */
+/** The channel-modes page (`CHANNEL_MODES_DOC`), the page after the server settings. */
 const CHANNEL_MODES_HEADING = '# Channel modes'
 const SERVER_SETTINGS_HEADING = '# Server settings'
 const WHAT_EACH_MODE_SERVES_HEADING = '## What each mode serves'
-/** The security subsection (b.deo SRI-1104), read before turning fungible mode on, so right after what each mode serves. */
+/** The security subsection, read before turning fungible mode on, so right after what each mode serves. */
 const WHO_CAN_REACH_HEADING = '## Who can reach a persona in fungible mode'
 const TURNING_FUNGIBLE_HEADING = '## Turning fungible mode on or off'
 const FUNGIBLE_DELIVERY_HEADING = '## Channel delivery in fungible mode'
 const FUNGIBLE_PROMPTS_HEADING = '## Permission prompts in fungible mode'
-/** The page's sections, in order: the four of b.deo SRI-1102, the security section and the fungible-mode example. */
+/** The page's sections, in order: the four of the contract, the security section and the fungible-mode example. */
 const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_FUNGIBLE_HEADING, FUNGIBLE_DELIVERY_HEADING, FUNGIBLE_PROMPTS_HEADING, FUNGIBLE_EXAMPLE_HEADING] as const
 
-/** The downgrade section, under `## Migration` right after "Upgrading to personas" (b.deo SRI-1105). */
+/** The downgrade section, under `## Migration` right after "Upgrading to personas". */
 const DOWNGRADE_HEADING = '### Downgrading to an earlier release'
 
 /** Other README headings the rows read. */
@@ -7574,7 +7560,7 @@ const SWITCH = code(MODE_SWITCH_SETTING)
 const TOOL = code(SET_CHANNEL_DELIVERY_TOOL)
 const INVALID = code(INVALID_PREFIX.replace(/:$/, ''))
 
-/** The five tools that take a target (src/registry.ts builds them inline in `createSessionServer` and exports no list); with `set_channel_delivery`, the tools table's six rows (b.deo SRI-1103). */
+/** The five tools that take a target (src/registry.ts builds them inline in `createSessionServer` and exports no list); with `set_channel_delivery`, the tools table's six rows. */
 const TARGETING_TOOLS = ['reply', 'react', 'edit_message', 'fetch_messages', 'download_attachment'] as const
 
 /** A README section's flattened text (a row's passage). */
@@ -7624,7 +7610,7 @@ const R55_DOWNGRADE_ROWS: readonly DocRow[] = [
   ]],
 ]
 
-/** The troubleshooting entries b.deo SRI-1105 names, by their titles (T17's closing note). */
+/** The troubleshooting entries names, by their titles (T17's closing note). */
 const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to'
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
@@ -7637,7 +7623,7 @@ function previewSample(): { name: string; key: string } {
 
 /**
  * The switch's preview line as README "Reading the preview" and the wizard's
- * Step 10 quote it (b.deo SRI-803): `modeSwitchLine` rendered for `mode`
+ * Step 10 quote it: `modeSwitchLine` rendered for `mode`
  * with one persona, the mode replaced by `<mode>` and the persona list by
  * `…`. Each carrier's row reads the quote of each direction, so a carrier's
  * one quote stands for both only while both directions give the same text.
@@ -7657,7 +7643,7 @@ function switchLineNoPersonaEnding(): string {
 }
 
 /**
- * A recorded line as README "Reading the preview" quotes it (b.deo SRI-804):
+ * A recorded line as README "Reading the preview" quotes it:
  * `recordedLine` for a change to the section of `mode`'s, from ` changed in
  * the`, after `…`. The declarative section's for `channels`, the fungible
  * section's for `invited`.
@@ -7671,7 +7657,7 @@ function recordedLineQuote(section: ChannelMode): string {
 }
 
 /**
- * The README rows of b.deo SRI-1101 to SRI-1105 that T1's cases do not read
+ * The README rows of the contract that cases do not read
  * (`DocRow`, read by `docRowProblems`; each item self-checked by
  * `withItemCut`): one row per element, its passage the narrowest section,
  * unit, table row or entry that holds it. Setting names come from `src/` or
@@ -7679,7 +7665,7 @@ function recordedLineQuote(section: ChannelMode): string {
  * thunks built when the row runs; labels from their exports.
  */
 const README_DEO_ROWS: readonly DocRow[] = [
-  // SRI-1102, the two modes: "## Channel modes" (T20 S2).
+  // the two modes: "## Channel modes" ( S2).
   ['Channel modes: what each mode serves, the switch, who sets delivery and the destination, per mode', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
     ci(`| The switch | ${SWITCH} absent or ${code('false')}, the default | ${code(`${MODE_SWITCH_SETTING}: true`)} |`),
     ci(`The channels listed in its ${code(CHANNELS_KEY)} | Every public or private channel its Slack app is a member of that Slack marks as not externally shared`),
@@ -7733,7 +7719,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`**${DM_VALUE}, written or by default:** a DM from the persona's app to its ${code(DM_CONTACT)}`),
   ]],
 
-  // SRI-1101, the configuration sections T1's cases do not read (T20 S3).
+  // the configuration sections cases do not read ( S3).
   [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} and the reminder default as applying immediately`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
     ci('Confirmed changes take effect at the next server start, with exceptions'),
     ci(`${SWITCH} applies in place at once`),
@@ -7792,7 +7778,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`a change that turns it off is ${INVALID} when a persona's ${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} breaks the declarative-mode rules`),
   ]],
 
-  // SRI-1102, receiving; SRI-1104, security (T20 S4).
+  // receiving, security ( S4).
   ...(['mention', 'broadcast'] as const).map((via): DocRow => [`receiving: the ${via} row, scoped per mode`, kindRowOf(via), [
     ci(`In declarative mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
     ci('In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery'),
@@ -7848,7 +7834,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('After a restart, the first event from each channel a persona hears in fungible mode logs its line again'),
   ]],
 
-  // SRI-1103, the introduction, "Personas (config.json)" and "Tools" (T20 S5).
+  // the introduction, "Personas (config.json)" and "Tools" ( S5).
   ['introduction: the channels a persona serves, per mode', unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
     ci('in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared'),
   ]],
@@ -7882,11 +7868,11 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`Each accepted call logs one ${code(PERSONA_CHANNEL_DELIVERY_SET)} line`),
     ci('It changes no configuration and applies no reload'),
   ]],
-  ['Tools: the known residual in an externally shared channel the app is in (SRI-603)', readmeSection(TOOLS_HEADING), [
+  ['Tools: the known residual in an externally shared channel the app is in', readmeSection(TOOLS_HEADING), [
     ci("CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM"),
     ci('So in fungible mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),
   ]],
-  ['Tools: the known residual in a group DM the app is in, where Slack refuses reads (SRI-603)', readmeSection(TOOLS_HEADING), [
+  ['Tools: the known residual in a group DM the app is in, where Slack refuses reads', readmeSection(TOOLS_HEADING), [
     ci('The same holds in a group DM the app belongs to, except that Slack refuses reads there'),
     ci(`the app has no ${code('mpim:history')} scope`),
   ]],
@@ -7896,7 +7882,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
 
-  // SRI-1103, Reload outside "What a confirmation applies" (T20 S6).
+  // Reload outside "What a confirmation applies" ( S6).
   [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, what it holds, only the server writes it, never edit it by hand`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
     ci("The stored-choice file: each persona's stored channel-delivery choices"),
     ci('It holds no token and no message text'),
@@ -7913,7 +7899,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, its fix is moving it aside`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
     ci('To fix it, move the file aside, then restart the server; this discards every stored choice'),
   ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the residual of restoring an unreadable file (SRI-409)`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
+  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the residual of restoring an unreadable file`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
     ci('If you restore that same file in place instead of moving it aside, a persona removed and added back with the same'),
     ci('while it was unreadable gets its earlier choices again'),
   ]],
@@ -7944,7 +7930,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   [`Confirming a change: ${RELOAD_NOOP} covers a confirmation of recorded changes only`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_NOOP}:`), [
     ci('as for a confirmation whose only changes are recorded ones (changes to the section not in force)'),
   ]],
-  [`Confirming a change: ${RELOAD_RECORD_WRITE_FAILED} names the stored-choice file (SRI-408)`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [
+  [`Confirming a change: ${RELOAD_RECORD_WRITE_FAILED} names the stored-choice file`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [
     ci(`The line can also name the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)})`),
     ci('a confirmation that brings up a persona whose stored choices were dropped earlier, by a write that failed, first writes that file'),
     ci("when it can't, nothing is applied, the retired-key record is not written, and the change stays pending"),
@@ -7953,7 +7939,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`Server-wide settings take effect at the next server start, except ${SWITCH} and the inherited ` + code('stop_hook_bootstrap') + ` reminder setting: both take effect when the change is confirmed, and need no ${code(CLI_COMMAND_CLEAN_RESTART)}`),
   ]],
 
-  // SRI-1105, troubleshooting and downgrade (T20 S8).
+  // troubleshooting and downgrade ( S8).
   [`"${SILENT_INVITED_TITLE}": declarative mode, listing the channel or turning fungible mode on`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci(`No match, or ${code('false')}, is declarative mode`),
     ci('not delivered: no applied persona lists this channel'),
@@ -8009,7 +7995,7 @@ const WIZARD_TAKES_EFFECT_HEADING = /^### Step \d+ — How the change takes effe
 
 /**
  * The switch's preview line in its second carrier, the setup wizard's step on
- * how a change takes effect (b.deo SRI-803): the step quotes the line as
+ * how a change takes effect: the step quotes the line as
  * README "Reading the preview" does, so it is read against `modeSwitchLine`
  * in each direction (`switchLineQuote`) as the README's row is. Read here, so
  * the wizard's own suite renders no builder.
@@ -8053,7 +8039,7 @@ function placementProblems(readme: string, p: Placement): string[] {
 }
 
 /**
- * The headings b.deo SRI-1102, SRI-1104 and SRI-1105 add, where the user docs
+ * The headings and add, where the user docs
  * place them: `# Channel modes`, its own page (`CHANNEL_MODES_DOC`), between
  * the server settings and Reload in the docs' order, with its sections in
  * order inside it (the security section right after "What each mode serves",
@@ -8071,7 +8057,7 @@ const README_DEO_PLACEMENTS: readonly Placement[] = [
   { heading: DOWNGRADE_HEADING, parent: MIGRATION_HEADING, previous: `### ${UPGRADING_TITLE}` },
 ]
 
-/** Each declarative-scoped configuration section and the channel-modes page's section its pointer must link (b.deo SRI-1101). */
+/** Each declarative-scoped configuration section and the channel-modes page's section its pointer must link. */
 const DECLARATIVE_POINTERS: readonly [section: string, target: string][] = [
   ['### Channel entries', WHAT_EACH_MODE_SERVES_HEADING],
   ['### Channel delivery', FUNGIBLE_DELIVERY_HEADING],
@@ -8113,7 +8099,7 @@ function withLineEdited(readme: string, match: (line: string) => boolean, edit: 
   return lines.map((line) => (match(line) ? edit(line) : line)).join('\n')
 }
 
-describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to SRI-1105; AC 42)', () => {
+describe('the README describes both channel modes', () => {
   const readme = () => referenceText()
 
   describe('headings', () => {
@@ -8156,7 +8142,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
   })
 
-  describe('pointers from the declarative-scoped sections (SRI-1101)', () => {
+  describe('pointers from the declarative-scoped sections', () => {
     test.each(DECLARATIVE_POINTERS)('"%s" links "%s", and the link resolves', (section, target) => {
       expect(pointerProblems(readme(), section, target)).toEqual([])
     })
@@ -8171,7 +8157,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
   })
 
-  describe(`the tools table (SRI-1103)`, () => {
+  describe(`the tools table`, () => {
     const toolsTable = (text: string) => firstTable(requiredSection(text, TOOLS_HEADING, USER_DOCS_NAME))
 
     test(`its first column lists exactly six tools: ${TARGETING_TOOLS.join(', ')} and ${SET_CHANNEL_DELIVERY_TOOL}`, () => {
@@ -8204,8 +8190,8 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
   })
 
-  describe('"Reading the preview": the lines it quotes are the builders\' (SRI-803, SRI-804)', () => {
-    describe(`the switch's line in its second carrier, ${WIZARD_FILE} (SRI-803)`, () => {
+  describe('"Reading the preview": the lines it quotes are the builders\'', () => {
+    describe(`the switch's line in its second carrier, ${WIZARD_FILE}`, () => {
       const wizard = () => operatorText(WIZARD_FILE)
       const [element, passage, required] = WIZARD_SWITCH_LINE_ROW
 
@@ -8288,7 +8274,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
   })
 
-  describe('troubleshooting entries (SRI-1105)', () => {
+  describe('troubleshooting entries', () => {
     test.each([SILENT_INVITED_TITLE, RECEIVES_EVERYTHING_TITLE, UNCLAIMED_ENTRY_TITLE])('self-check: a second entry titled "%s" fails its rows', (title) => {
       const edited = withLineEdited(readme(), (line) => line.trim() === `${SYMPTOM_PREFIX}${title}`, (line) => `${line}\n\n${line}`)
       const rows = README_DEO_ROWS.filter(([element]) => element.startsWith(`"${title}"`))
@@ -8303,11 +8289,11 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
   })
 
   /**
-   * The downgrade steps (SRI-1105). Each step's row (`downgradeStep(n)`)
+   * The downgrade steps. Each step's row (`downgradeStep(n)`)
    * already requires step n's own lead in the nth place, so the order is read
    * there; this case adds only that there are exactly four steps.
    */
-  describe('downgrade steps (b.omv R55)', () => {
+  describe('downgrade steps (R55)', () => {
     /** The numbers of the downgrade steps, in order, comma-separated. */
     const stepNumbers = (text: string) => downgradeSteps(text).map((step) => /^\d+/.exec(step)![0]).join(',')
 
@@ -8367,8 +8353,8 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
   })
 })
 
-/** E5 only: the shipped failure catalogue, separate from E8's broad doc migration. */
-describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
+/** only: the shipped failure catalogue, separate from broad doc migration. */
+describe('shipped delivery and MCP guidance', () => {
   const skill = () => operatorText(DEBUG_SKILL_FILE)
   const delivery = () => requiredSection(skill(), '## Delivery notices', DEBUG_SKILL_FILE)
   const mcp = () => flat(requiredSection(skill(), "## A persona's instance runs but isn't connected", DEBUG_SKILL_FILE))
@@ -8405,15 +8391,15 @@ describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
   })
 })
 
-// b.m2o: maintained release instructions and historical release notes have
+// maintained release instructions and historical release notes have
 // different contracts. These checks protect the released installer path.
-describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
+describe('released agent-director 0.12 migration instructions', () => {
   const migration = () => operatorText(RUNBOOK_DOC)
   const upgrade = () => readRunbookCarrier(RUNBOOK_DOC, migration(), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const rollback = () => readRunbookCarrier(RUNBOOK_DOC, migration(), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
   const workerReleaseNotes = requiredSection(operatorText(CHANGELOG_FILE), /^## 0\.16\.0 \(/, CHANGELOG_FILE)
 
-  // b.omv SR-7.6: every earlier-release bot starts fresh once; marked rows resume later.
+  // every earlier-release bot starts fresh once; marked rows resume later.
   const resumeRequirements = [
     'Every earlier-release bot starts a fresh conversation once',
     'Memory files are kept',
@@ -8433,7 +8419,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     HISTORICAL_VERSIONS.execFormHooksClaudeCode, 'exec-form hooks', '`pending`',
   ].filter((phrase) => !flat(passage).toLowerCase().includes(phrase))
 
-  test('the supported Claude Code floor agrees across worker prerequisites, migration and released notes (b.9v8)', () => {
+  test('the supported Claude Code floor agrees across worker prerequisites, migration and released notes', () => {
     const passages = [
       userDocsText().split('\n').find((line) => line.startsWith('- [Claude Code]')) ?? '',
       textAt(upgrade(), 'step 1 › Claude Code'),
@@ -8447,7 +8433,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     }
   })
 
-  test('the exec-form hook cutoff and pending-launch diagnosis remain in migration, released notes and the debugging skill (b.9v8)', () => {
+  test('the exec-form hook cutoff and pending-launch diagnosis remain in migration, released notes and the debugging skill', () => {
     const passages = [
       textAt(upgrade(), 'step 1 › Claude Code'),
       workerReleaseNotes,
@@ -8461,7 +8447,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     }
   })
 
-  test('step 10 documents the one-time tag-prompt upgrade and later marked resume (b.omv SR-7.6)', () => {
+  test('step 10 documents the one-time tag-prompt upgrade and later marked resume', () => {
     expect(resumeGuidanceProblems(textAt(upgrade(), 'step 10'))).toEqual([])
   })
 
@@ -8471,12 +8457,12 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     expect(resumeGuidanceProblems(step.replace(phrase, ''))).toContain(phrase)
   })
 
-  test('the former unqualified fresh-once advice fails the existing-persona resume requirements (b.9v8)', () => {
+  test('the former unqualified fresh-once advice fails the existing-persona resume requirements', () => {
     const oldAdvice = 'Each persona starts fresh once. Pre-persona rows are kept and never resumed.'
     expect(resumeGuidanceProblems(oldAdvice)).toContain(resumeRequirements[2])
   })
 
-  test('existing-persona upgrades retain their files and rollback restores applied and retired state (b.9v8)', () => {
+  test('existing-persona upgrades retain their files and rollback restores applied and retired state', () => {
     const checks = [
       [textAt(upgrade(), 'step 1'), 'retain the current persona configuration and credentials files',
         '`config.json.last-applied` and `retired-keys.json` when present'],
@@ -8494,8 +8480,8 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     }
   })
 
-  // v0.16.1 shipped the b.9v8 corrections, so they sit in that release's entry (the Unreleased entry holds only what comes after it).
-  test('the 0.16.1 release notes record both the worker-floor correction and existing-persona resume correction (b.9v8)', () => {
+  // v0.16.1 shipped the corrections, so they sit in that release's entry (the Unreleased entry holds only what comes after it).
+  test('the 0.16.1 release notes record both the worker-floor correction and existing-persona resume correction', () => {
     const released = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split(/^## 0\.16\.1 \(/m)[1]?.split('\n## ')[0] ?? ''
     expect(released).not.toBe('')
     for (const phrase of [`Workers need Claude Code ${MIN_CLAUDE_CODE_VERSION} or later`,
@@ -8597,7 +8583,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   })
 })
 
-// b.omv SR-7.1/2/4/6 shipped in 0.17.0; Unreleased holds later changes.
+// shipped in 0.17.0; Unreleased holds later changes.
 const QUEUED_DELIVERY_RELEASE_HEADING = '## 0.17.0 (2026-10-19)'
 test('0.17.0 records fresh conversations, retained memory and the typed launch contract', () => {
   const released = requiredSection(operatorText(CHANGELOG_FILE), QUEUED_DELIVERY_RELEASE_HEADING, CHANGELOG_FILE)
@@ -8606,7 +8592,7 @@ test('0.17.0 records fresh conversations, retained memory and the typed launch c
 
 const OBSOLETE_SLACK_REDELIVERY = /(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:10|ten)[ -]minutes?|(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:clear\w*|reset\w*|forgotten|forget\w*)[^.]*restart/i
 
-/** Uncovered R44 facts only; E4's marker and E5's fixed notice rows stay above. */
+/** Uncovered R44 facts only; marker and fixed notice rows stay above. */
 const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch | undefined, element: string, required: readonly (string | RegExp)[], example: string])[] = [
   [BOTS_DOC, RECEIVING_HEADING, 'CSCB types the tag; channel names and split parts are explained', [
     /CSCB[^.]*typ\w*[^.]*tag/i, '`channel_name`', /(?:name[^.]*without `#`|without `#`[^.]*name)/i,
@@ -8724,7 +8710,7 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
   ], '/interject answers change; agent-director 0.12.0 is required. No channels launch flag. Durable ordered at-least-once delivery. Scheduled fires queue: queued, queue-failed, queued=N failed=M, independent of `bind`. Not receiving messages retired. Message not saved; Delivery stuck; Message not taken in; Messages waiting; Queue record unreadable. Remove the Claude Code pin. Follow docs/migration.md#downgrading-to-an-earlier-release.'],
 ]
 
-describe('b.omv R44: queued-delivery documentation', () => {
+describe('R44: queued-delivery documentation', () => {
   test.each(QUEUED_DOC_ROWS)('%s: %s — %s', (file, heading, element, required) => {
     const passage = heading === undefined ? flat : sectionOf(file, heading)
     expect({ file, element, missing: docRowProblems(passage, required, operatorText(file)) }).toEqual({ file, element, missing: [] })
@@ -8772,7 +8758,7 @@ describe('b.omv R44: queued-delivery documentation', () => {
   })
 })
 
-describe('b.omv AC64: MCP-loss wording sensitivity', () => {
+describe('MCP-loss wording sensitivity', () => {
   test.each([
     'Messages sent while its MCP connection is down are lost.',
     'Messages received when the bot is disconnected are dropped.',
@@ -8842,7 +8828,7 @@ function downgradeOperationProblems(script: string): string[] {
   })
 }
 
-describe('b.omv R55: documented downgrade matches the executed safety barriers', () => {
+describe('R55: documented downgrade matches the executed safety barriers', () => {
   const script = () => readRepoFile('tests/integration/test-40-fmk-real-downgrade.sh')
   const helper = () => downgradeExecutableText(readRepoFile('tests/integration/lib/real-scenario.sh'))
 

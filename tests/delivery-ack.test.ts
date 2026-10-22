@@ -1,4 +1,4 @@
-/** b.omv SR-8.7: durable final receipts trigger reactions through the owning app. */
+/** durable final receipts trigger reactions through the owning app. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -130,7 +130,7 @@ async function flushUntil(h: QueuedAckHarness, condition: () => boolean) {
   expect(condition()).toBe(true)
 }
 
-test('b.p3h: durable acceptance adds queued while AD working, after envelope ack and before any keys', async () => {
+test('durable acceptance adds queued while AD working, after envelope ack and before any keys', async () => {
   const h = await queuedSetup()
   let adoptions = 0
   const remember = h.e.queue.rememberQueuedReaction
@@ -151,7 +151,7 @@ test('b.p3h: durable acceptance adds queued while AD working, after envelope ack
   expect(h.stub('beta').calls.reactionsAdd).toEqual([])
 })
 
-test('b.p3h: successful send/receipt without durable delivered append keeps queued; final durable receipt replaces it', async () => {
+test('successful send/receipt without durable delivered append keeps queued; final durable receipt replaces it', async () => {
   const h = await queuedSetup()
   await h.receive()
   h.e.failAppend('delivered')
@@ -171,7 +171,7 @@ test('b.p3h: successful send/receipt without durable delivered append keeps queu
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: failed acceptance has no visible or envelope acknowledgement; the successful retry does', async () => {
+test('failed acceptance has no visible or envelope acknowledgement; the successful retry does', async () => {
   const h = await queuedSetup()
   h.failures.add('alpha')
   await h.receive()
@@ -185,7 +185,7 @@ test('b.p3h: failed acceptance has no visible or envelope acknowledgement; the s
   expect(h.visible()).toEqual([h.settings.queued_ack_reaction])
 })
 
-test('b.p3h: partial fanout acknowledges the retained target even while a sibling store suppresses aggregate ack', async () => {
+test('partial fanout acknowledges the retained target even while a sibling store suppresses aggregate ack', async () => {
   const h = await queuedSetup()
   h.failures.add('beta')
   let aggregateAcks = 0
@@ -207,7 +207,7 @@ test('b.p3h: partial fanout acknowledges the retained target even while a siblin
   }
 })
 
-test('b.p3h: concurrent duplicate envelopes and received/delivered notifications never repeat a stage', async () => {
+test('concurrent duplicate envelopes and received/delivered notifications never repeat a stage', async () => {
   const h = await queuedSetup()
   await Promise.all([h.receive(), h.receive(), h.receive()])
   h.reporting.received('alpha', h.item()); h.reporting.received('alpha', h.item())
@@ -224,7 +224,7 @@ test('b.p3h: concurrent duplicate envelopes and received/delivered notifications
   expectOnlyOneStage(h)
 })
 
-test.each(['queued', 'delivered'] as const)('b.p3h: first successful correlated reply clears %s and later delivery/redelivery cannot resurrect it', async stage => {
+test.each(['queued', 'delivered'] as const)('first successful correlated reply clears %s and later delivery/redelivery cannot resurrect it', async stage => {
   const h = await queuedSetup()
   await h.receive()
   if (stage === 'delivered') await h.deliver()
@@ -246,7 +246,7 @@ test.each(['queued', 'delivered'] as const)('b.p3h: first successful correlated 
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: a failed reply preserves queued, and wrong message/persona correlation cannot clear another acknowledgement', async () => {
+test('a failed reply preserves queued, and wrong message/persona correlation cannot clear another acknowledgement', async () => {
   const h = await queuedSetup()
   await h.receive(); await h.receive('beta')
   h.stub().script.post.push({ kind: 'platform', error: 'not_in_channel' })
@@ -262,7 +262,7 @@ test('b.p3h: a failed reply preserves queued, and wrong message/persona correlat
 })
 
 test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['reply', 'teardown'].map(race => ({ point, race }))))(
-  'b.p3h: $race during $point leaves no reaction when held Slack work settles', async ({ point, race }) => {
+  '$race during $point leaves no reaction when held Slack work settles', async ({ point, race }) => {
     const h = await queuedSetup()
     const held = point === 'queued-add' ? h.hold('reactionsAdd') : undefined
     await h.receive()
@@ -285,7 +285,7 @@ test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['re
   },
 )
 
-test('b.p3h: failed queued removal never adds a second visible stage, blocks no delivery, and reply can still clear queued', async () => {
+test('failed queued removal never adds a second visible stage, blocks no delivery, and reply can still clear queued', async () => {
   const h = await queuedSetup()
   await h.receive()
   h.stub().script.reactionsRemove.push({ kind: 'platform', error: 'not_in_channel' })
@@ -298,7 +298,7 @@ test('b.p3h: failed queued removal never adds a second visible stage, blocks no 
   expectOnlyOneStage(h)
 })
 
-test.each(['queued', 'delivered'] as const)('b.p3h: Slack %s add rejection cannot block the FIFO or another persona', async stage => {
+test.each(['queued', 'delivered'] as const)('Slack %s add rejection cannot block the FIFO or another persona', async stage => {
   const h = await queuedSetup()
   if (stage === 'queued') h.stub().script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
   await h.receive()
@@ -313,7 +313,7 @@ test.each(['queued', 'delivered'] as const)('b.p3h: Slack %s add rejection canno
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: stalled queued Slack add does not block envelope ack, FIFO delivery or a sibling persona', async () => {
+test('stalled queued Slack add does not block envelope ack, FIFO delivery or a sibling persona', async () => {
   const h = await queuedSetup(), held = h.hold('reactionsAdd')
   await h.receive()
   expect(h.envelopeAcks).toBe(1)
@@ -329,7 +329,7 @@ test('b.p3h: stalled queued Slack add does not block envelope ack, FIFO delivery
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: identical stage emojis keep one reaction through delivery and remove it on reply', async () => {
+test('identical stage emojis keep one reaction through delivery and remove it on reply', async () => {
   const h = await queuedSetup()
   h.settings.queued_ack_reaction = h.settings.ack_reaction = 'same_stage'
   await h.receive(); await h.deliver()
@@ -343,7 +343,7 @@ test('b.p3h: identical stage emojis keep one reaction through delivery and remov
   expectOnlyOneStage(h)
 })
 
-test.each(['queued', 'delivered'] as const)('b.p3h: reply removes captured %s emoji on its original client after settings/client change', async stage => {
+test.each(['queued', 'delivered'] as const)('reply removes captured %s emoji on its original client after settings/client change', async stage => {
   const h = await queuedSetup()
   await h.receive()
   if (stage === 'delivered') await h.deliver()
@@ -363,7 +363,7 @@ test.each(['queued', 'delivered'] as const)('b.p3h: reply removes captured %s em
   expect(h.stub('beta').calls.reactionsRemove).toEqual([])
 })
 
-test('b.p3h: delivery removes the captured queued emoji before adding the currently configured delivered emoji', async () => {
+test('delivery removes the captured queued emoji before adding the currently configured delivered emoji', async () => {
   const h = await queuedSetup()
   await h.receive()
   const queuedName = h.settings.queued_ack_reaction
@@ -377,7 +377,7 @@ test('b.p3h: delivery removes the captured queued emoji before adding the curren
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: teardown and reacceptance serialize old cleanup before the new life reaction', async () => {
+test('teardown and reacceptance serialize old cleanup before the new life reaction', async () => {
   const h = await queuedSetup(), held = h.hold('reactionsAdd')
   await h.receive()
   forgetPersonaAcks('alpha')
@@ -397,7 +397,7 @@ test('b.p3h: teardown and reacceptance serialize old cleanup before the new life
 test.each([
   { outcome: { kind: 'network' as const }, applied: true },
   { outcome: { kind: 'http' as const, status: 503 }, applied: false },
-])('b.p3h: ambiguous add $outcome.kind (applied=$applied) requires removal before replacement, even after removal failure', async ({ outcome, applied }) => {
+])('ambiguous add $outcome.kind (applied=$applied) requires removal before replacement, even after removal failure', async ({ outcome, applied }) => {
   const h = await queuedSetup(), held = h.hold('reactionsAdd')
   await h.receive()
   const args = { channel: h.event.channel, timestamp: h.event.ts, name: h.settings.queued_ack_reaction }
@@ -416,7 +416,7 @@ test.each([
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: already_reacted retains cleanup ownership; no_reaction allows the next stage', async () => {
+test('already_reacted retains cleanup ownership; no_reaction allows the next stage', async () => {
   const h = await queuedSetup()
   const args = { channel: h.event.channel, timestamp: h.event.ts, name: h.settings.queued_ack_reaction }
   h.applyReaction('alpha', 'add', args)
@@ -434,7 +434,7 @@ test('b.p3h: already_reacted retains cleanup ownership; no_reaction allows the n
   expectOnlyOneStage(h)
 })
 
-test('b.p3h: multipart work stays queued until the last durable receipt', async () => {
+test('multipart work stays queued until the last durable receipt', async () => {
   const h = await queuedSetup()
   const result = await h.e.queue.accept('alpha', slackInput({ channel: h.event.channel, ts: h.event.ts, key: { chat_id: h.event.channel, ts: h.event.ts } }))
   if (result.status === 'failed' || !result.item) throw new Error('store failed')
@@ -451,7 +451,7 @@ test('b.p3h: multipart work stays queued until the last durable receipt', async 
   expectOnlyOneStage(h)
 })
 
-test.each([false, true])('b.p3h restart: retained sent work removes its actual queued emoji before recovered delivery (changed setting=%p)', async changed => {
+test.each([false, true])('restart: retained sent work removes its actual queued emoji before recovered delivery (changed setting=%p)', async changed => {
   const h = await queuedSetup()
   await h.receive()
   h.e.failAppend('delivered')
@@ -475,7 +475,7 @@ test.each([false, true])('b.p3h restart: retained sent work removes its actual q
   expectOnlyOneStage(h)
 })
 
-test.each([false, true])('b.p3h restart: startup recovery preserves one stage with a changed queued setting=%p', async changed => {
+test.each([false, true])('restart: startup recovery preserves one stage with a changed queued setting=%p', async changed => {
   const h = await queuedSetup()
   await h.receive()
   const accepted = structuredClone(h.item().accepted)
@@ -493,7 +493,7 @@ test.each([false, true])('b.p3h restart: startup recovery preserves one stage wi
 // The restart cases above enforce the new one-stage contract without assuming
 // durable reply-history storage (Main accepted that exception explicitly).
 
-test('b.p3h blocker: stalled queued add cannot hold remaining reply chunks, uploads or the tool result', async () => {
+test('blocker: stalled queued add cannot hold remaining reply chunks, uploads or the tool result', async () => {
   const h = await queuedSetup(), held = h.hold('reactionsAdd')
   await h.receive()
   h.settings.reply_chunk_limit = 6
@@ -517,7 +517,7 @@ test('b.p3h blocker: stalled queued add cannot hold remaining reply chunks, uplo
   expectOnlyOneStage(h)
 })
 
-test('b.p3h blocker: reporting forget plus tracker forget restores queued feedback on same-key recovery', async () => {
+test('blocker: reporting forget plus tracker forget restores queued feedback on same-key recovery', async () => {
   const h = await queuedSetup()
   await h.receive()
   const accepted = structuredClone(h.item().accepted)
@@ -535,7 +535,7 @@ test('b.p3h blocker: reporting forget plus tracker forget restores queued feedba
   expectOnlyOneStage(h)
 })
 
-test('b.p3h blocker: unavailable queued client is retried by recovery without duplicate received logs', async () => {
+test('blocker: unavailable queued client is retried by recovery without duplicate received logs', async () => {
   const h = await queuedSetup()
   h.unavailableClients.add('alpha')
   await h.receive()
@@ -552,7 +552,7 @@ test('b.p3h blocker: unavailable queued client is retried by recovery without du
   expect(h.e.keyCalls()).toEqual([])
 })
 
-test.each(['reply', 'teardown'] as const)('b.p3h metadata: %s during legacy adoption cancels the old owner before any Slack add', async race => {
+test.each(['reply', 'teardown'] as const)('metadata: %s during legacy adoption cancels the old owner before any Slack add', async race => {
   const h = await queuedSetup(), gate = Promise.withResolvers<void>()
   const remember = h.e.queue.rememberQueuedReaction
   let entered = false

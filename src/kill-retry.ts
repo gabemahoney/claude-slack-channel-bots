@@ -1,6 +1,5 @@
 /**
- * kill-retry.ts — The bounded retry of a live row's kill (b.jg5 SRJ-702,
- * SRJ-110): up to 3 tries 2 s apart on UNAVAILABLE, one `status` read of the
+ * kill-retry.ts — The bounded retry of a live row's kill: up to 3 tries 2 s apart on UNAVAILABLE, one `status` read of the
  * row before each further try, a caller's keep-going check, the start
  * sweep's pass budget, the survivor tracking with the decision of which
  * kill-failure alert the tries call for, and one log line per try and per
@@ -37,11 +36,11 @@
  *     the tries with no further kill when it answers false (or throws), the
  *     last try's outcome standing; the result says so (`stopped`), so a
  *     caller can answer `latched`;
- *   - a pass budget (the start sweep's, AC 56): once one kill with it has used
+ * - a pass budget (the start sweep's): once one kill with it has used
  *     all its tries with an UNAVAILABLE outcome standing, every later kill
  *     with it makes one try. A kill that ends in a success, in another class,
  *     or by a read or a stop does not spend it;
- *   - an old-life wait's hold-end query (SRJ-702, SRJ-811; option A): asked
+ * - an old-life wait's hold-end query (option A): asked
  *     after each wait between tries, before the keep-going check and before
  *     the read, again after a read that did not find the row finished, and
  *     once more when a try's UNAVAILABLE outcome would stand. A hold that has
@@ -49,7 +48,7 @@
  *     or read, as a finished read does; asked before the keep-going check,
  *     the hold's end wins over a stop that lands in the same window.
  *
- * Survivor tracking (SRJ-702, SRJ-110, SRJ-1007): a try's `ErrTmuxKillFailed`
+ * Survivor tracking: a try's `ErrTmuxKillFailed`
  * whose description names a surviving pid (`survivorPids` from
  * `src/ad-description-phrases.ts`, the one module that holds the form) is
  * kept as the latest survivor-naming description. A retried `kill` re-checks
@@ -76,7 +75,7 @@
  * and loads no server-only module (no notifier, outage state, Slack client,
  * latch, episodes or server module), so the CLI process can use it too.
  *
- * Log lines (SRJ-1014), through the caller's sink with its prefix: one per
+ * Log lines, through the caller's sink with its prefix: one per
  * try ({@link killRetryTryLine}: instance id, try number, the outcome through
  * `describeKillOutcome`, `kill_sent` and the redacted description included),
  * one per read ({@link killRetryReadLine}: the state, or the class and the
@@ -118,10 +117,10 @@ import { isSafeIdentifier, renderLogMessageText } from './persona-connection-err
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Tries of a live row's kill on UNAVAILABLE before its outcome stands (SRJ-702). */
+/** Tries of a live row's kill on UNAVAILABLE before its outcome stands. */
 export const KILL_RETRY_TRIES = 3
 
-/** The wait between two tries, in ms (SRJ-702). */
+/** The wait between two tries, in ms. */
 export const KILL_RETRY_SPACING_MS = 2_000
 
 // ---------------------------------------------------------------------------
@@ -163,7 +162,7 @@ const KILL_RETRY_SEED_LIVE = 'live'
 /** The path did not read the row live: it read it finished, read no row, or did not read it. */
 const KILL_RETRY_SEED_NOT_LIVE = 'not-live'
 
-/** The row state the kill's path last read before the kill (SRJ-702). */
+/** The row state the kill's path last read before the kill. */
 export type KillRetrySeed =
   | { readonly kind: typeof KILL_RETRY_SEED_STATE; readonly state: string }
   | { readonly kind: typeof KILL_RETRY_SEED_LIVE }
@@ -217,7 +216,7 @@ export type KillRetryRead =
   | { readonly kind: typeof KILL_RETRY_READ_FAILED; readonly error: unknown }
 
 // ---------------------------------------------------------------------------
-// The pass budget (AC 56)
+// The pass budget
 // ---------------------------------------------------------------------------
 
 /**
@@ -265,7 +264,7 @@ export const KILL_RETRY_END_READ_LATCHED = 'read-latched'
 /** The keep-going check answered false (or the wait failed): the last try's outcome stands. */
 export const KILL_RETRY_END_STOPPED = 'stopped'
 /**
- * An old-life wait's kill only (SRJ-702, SRJ-811; option A): its hold ended
+ * An old-life wait's kill only (option A): its hold ended
  * while the tries ran (`KillRetryOptions.holdEnded`), between tries or during
  * a try whose UNAVAILABLE outcome would stand: the `row-finished` success
  * (read `hold-ended`), never a stop.
@@ -285,14 +284,14 @@ export type KillRetryEnd =
 
 /** No kill-failure alert. */
 export const KILL_RETRY_ALERT_NONE = 'none'
-/** The kill-failure alert's survivor version (SRJ-1007). */
+/** The kill-failure alert's survivor version. */
 export const KILL_RETRY_ALERT_SURVIVOR = 'survivor'
-/** The kill-failure alert's ordinary version (SRJ-1007). */
+/** The kill-failure alert's ordinary version. */
 export const KILL_RETRY_ALERT_ORDINARY = 'ordinary'
 
 /**
  * Which kill-failure alert the tries call for, with the descriptions it
- * quotes (SRJ-702, SRJ-1007). Every description is agent-director's, raw:
+ * quotes. Every description is agent-director's, raw:
  * redact it before any log line, record or notice.
  */
 export type KillRetryAlert =
@@ -307,7 +306,7 @@ export type KillRetryAlert =
        * The latest survivor-naming description of an earlier try, when one
        * came and the last outcome is not itself a survivor-naming
        * `ErrTmuxKillFailed`. With `lastKillFailedDescription` too, both are
-       * quoted (SRJ-1007's "and, earlier in these tries" form).
+       * quoted ("and, earlier in these tries" form).
        */
       readonly earlierSurvivorDescription?: string
     }
@@ -374,7 +373,7 @@ export interface KillRetryOptions<O extends AnyKillOutcome = KillOutcome> {
   /** The start sweep's pass budget. Absent: every live row's kill gets its tries. */
   readonly budget?: KillRetryPassBudget
   /**
-   * An old-life wait's kill only (SRJ-702, SRJ-811; option A): whether the
+   * An old-life wait's kill only (option A): whether the
    * hold the kill serves has ended. Asked after each wait between tries
    * (before the keep-going check and the read), after a read that did not
    * find the row finished (before the keep-going check), and when a try's
@@ -396,7 +395,7 @@ interface SurvivorTrack {
 }
 
 /**
- * The bounded retry of a kill (SRJ-702). Never throws or rejects, and leaves
+ * The bounded retry of a kill. Never throws or rejects, and leaves
  * no timer pending once it settles.
  */
 export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
@@ -424,7 +423,7 @@ export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
     }
     return result
   }
-  /** The `hold-ended` success when the old-life hold has ended (SRJ-702, SRJ-811; option A), with its one line. */
+  /** The `hold-ended` success when the old-life hold has ended (option A), with its one line. */
   const endedByHold = (when: string): KillRetryResult<O> | undefined => {
     if (!holdHasEnded(options)) return undefined
     emit(options, killRetryHoldEndedLine(options.logPrefix, options.instanceId, when))
@@ -437,7 +436,7 @@ export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
     const next = afterTry(outcome, tries, maxTries, live, budgetSpent)
     emit(options, killRetryTryLine(options.logPrefix, options.instanceId, tries, maxTries, outcome, next))
     if (next !== KILL_RETRY_NEXT_AGAIN) {
-      // SRJ-702, SRJ-811 (option A): a hold that ended during the try whose
+      // (option A): a hold that ended during the try whose
       // UNAVAILABLE outcome would stand, the last try included, ends the tries as a success.
       if (isUnavailableOutcome(outcome)) {
         const held = endedByHold(`after try ${tries}`)
@@ -452,7 +451,7 @@ export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
     } catch {
       waited = false
     }
-    // SRJ-702, SRJ-811 (option A): the hold's end is asked first, so it wins over a stop in the same window.
+    // (option A): the hold's end is asked first, so it wins over a stop in the same window.
     const heldBeforeTry = endedByHold(`before try ${tries + 1}`)
     if (heldBeforeTry !== undefined) return heldBeforeTry
     if (!waited) {
@@ -470,7 +469,7 @@ export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
     if (verdict.kind === KILL_RETRY_VERDICT_FINISHED) {
       return finish({ kind: KILL_OUTCOME_ROW_FINISHED, read: verdict.read }, KILL_RETRY_END_ROW_FINISHED)
     }
-    // SRJ-702, SRJ-811 (option A): a hold that ended while the read ran ends the tries as a success.
+    // (option A): a hold that ended while the read ran ends the tries as a success.
     const heldAfterRead = endedByHold(`before try ${tries + 1}`)
     if (heldAfterRead !== undefined) return heldAfterRead
     if (verdict.kind === KILL_RETRY_VERDICT_LATCHED) return finish(outcome, KILL_RETRY_END_READ_LATCHED)
@@ -681,7 +680,7 @@ function noteTry(track: SurvivorTrack, outcome: AnyKillOutcome): void {
   if (namesSurvivor(description)) track.latestSurvivor = description
 }
 
-/** The alert decision for the outcome that stands (SRJ-702, SRJ-704, SRJ-1007). */
+/** The alert decision for the outcome that stands. */
 function alertDecision(outcome: AnyKillOutcome, track: SurvivorTrack): KillRetryAlert {
   const survivor = track.latestSurvivor
   if (killLetsNextStepRun(outcome)) {
@@ -737,7 +736,7 @@ function tryNextText(next: KillRetryTryNext): string {
 }
 
 /**
- * One try's line (SRJ-1014):
+ * One try's line:
  *   `<prefix>: kill try <n> of <max> for <id>: <describeKillOutcome>[ (names a surviving pid)] — <what follows>`
  * The outcome carries `kill_sent` and the description, redacted. Never throws.
  */
@@ -750,7 +749,7 @@ export function killRetryTryLine(
   next: KillRetryTryNext,
 ): string {
   const survivor = namesSurvivor(killFailedDescriptionOfOutcome(outcome)) ? ' (names a surviving pid)' : ''
-  return `${prefix}: kill try ${tryNumber} of ${maxTries} for ${renderId(instanceId)}: ${describeKillOutcome(outcome)}${survivor} — ${tryNextText(next)} (b.jg5 SRJ-702)`
+  return `${prefix}: kill try ${tryNumber} of ${maxTries} for ${renderId(instanceId)}: ${describeKillOutcome(outcome)}${survivor} — ${tryNextText(next)}`
 }
 
 /** A read's answer, for its line: the state, or the class and the redacted failure. */
@@ -811,7 +810,7 @@ function readVerdictText(verdict: KillRetryReadVerdict, read: KillRetryRead, las
 }
 
 /**
- * One read's line (SRJ-1014):
+ * One read's line:
  *   `<prefix>: status read before kill try <n> for <id>: <state, or the class and the redacted failure> — <what it decides>`
  * `lastRead` is the state last read before this read. Never throws.
  */
@@ -823,7 +822,7 @@ export function killRetryReadLine(
   verdict: KillRetryReadVerdict,
   lastRead: KillRetrySeed,
 ): string {
-  return `${prefix}: status read before kill try ${nextTry} for ${renderId(instanceId)}: ${describeRead(read)} — ${readVerdictText(verdict, read, lastRead)} (b.jg5 SRJ-702)`
+  return `${prefix}: status read before kill try ${nextTry} for ${renderId(instanceId)}: ${describeRead(read)} — ${readVerdictText(verdict, read, lastRead)}`
 }
 
 /** A stop line's reason: the wait between tries failed. */
@@ -833,24 +832,24 @@ export const KILL_RETRY_STOP_WAIT_FAILED = 'the wait between tries failed'
 export const KILL_RETRY_STOP_KEEP_GOING_FALSE = "the caller's keep-going check answered false"
 
 /**
- * The line when the tries stop before try `nextTry` (SRJ-702, SRJ-1014),
+ * The line when the tries stop before try `nextTry`,
  * `why` {@link KILL_RETRY_STOP_WAIT_FAILED} or
  * {@link KILL_RETRY_STOP_KEEP_GOING_FALSE}:
  *   `<prefix>: kill tries for <id> stop before try <n>: <why> — no further kill; the last try's outcome stands`
  */
 export function killRetryStopLine(prefix: string, instanceId: string, nextTry: number, why: string): string {
-  return `${prefix}: kill tries for ${renderId(instanceId)} stop before try ${nextTry}: ${why} — no further kill; the last try's outcome stands (b.jg5 SRJ-702)`
+  return `${prefix}: kill tries for ${renderId(instanceId)} stop before try ${nextTry}: ${why} — no further kill; the last try's outcome stands`
 }
 
 /**
  * The line when an old-life wait's hold ended while its kill's tries ran
- * (SRJ-702, SRJ-811, SRJ-1014; option A); `when` is `before try <n>` or
+ * (option A); `when` is `before try <n>` or
  * `after try <n>`:
  *   `<prefix>: kill tries for <id> end <when>: the old-life hold ended (another call read the old row finished) — the tries end as a success with no further kill or status read`
  * Never throws.
  */
 export function killRetryHoldEndedLine(prefix: string, instanceId: string, when: string): string {
-  return `${prefix}: kill tries for ${renderId(instanceId)} end ${when}: the old-life hold ended (another call read the old row finished) — the tries end as a success with no further kill or status read (b.jg5 SRJ-702, SRJ-811)`
+  return `${prefix}: kill tries for ${renderId(instanceId)} end ${when}: the old-life hold ended (another call read the old row finished) — the tries end as a success with no further kill or status read`
 }
 
 /**
@@ -859,5 +858,5 @@ export function killRetryHoldEndedLine(prefix: string, instanceId: string, when:
  *   `<prefix>: kill tries for <id> ended (<end>) after <n> kill(s) and <m> read(s): <describeKillOutcome> — alert=<none|survivor|ordinary>`
  */
 export function killRetryEndLine(prefix: string, instanceId: string, result: KillRetryResult<AnyKillOutcome>): string {
-  return `${prefix}: kill tries for ${renderId(instanceId)} ended (${result.end}) after ${result.tries} kill(s) and ${result.reads} read(s): ${describeKillOutcome(result.outcome)} — alert=${result.alert.kind} (b.jg5 SRJ-702)`
+  return `${prefix}: kill tries for ${renderId(instanceId)} ended (${result.end}) after ${result.tries} kill(s) and ${result.reads} read(s): ${describeKillOutcome(result.outcome)} — alert=${result.alert.kind}`
 }

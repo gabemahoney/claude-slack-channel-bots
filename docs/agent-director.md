@@ -155,13 +155,13 @@ At agent-director's defaults, `pause` sets the need: its 9 s plus 30 s is 39 s, 
 **The startup warning.** Once per start, right after the server reads agent-director's settings and before any persona is brought up, the server writes one line to `server.log` when the setting is at or below the need:
 
 ```text
-[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)
+[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1"
 ```
 
 `<verb>` names the row whose ceiling sets the need: its verb, or `resume/spawn-with-reuse/plain-spawn` for the launch row those three share. When `[pause] timeout_seconds` holds a value that is not used, the line is this one instead, whatever the setting is:
 
 ```text
-[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)
+[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the switch-over runbook in docs/migration.md, section "Switching over to agent-director Phase 1"
 ```
 
 `<found>` is the number (for example `0`) or the kind of value, never the file's text. At agent-director's defaults, the default `60000` writes no line; a setting of `54000` writes the first line, naming `pause`.

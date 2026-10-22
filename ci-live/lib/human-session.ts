@@ -4,8 +4,7 @@
  * `<@U…>`, `<!here>`, `<!channel>`), editing, opening DMs, reading history
  * and replies, and waiting for a persona's answer with a deadline.
  *
- * The channel gestures of the invited-channel checks (b.deo SRI-1502,
- * SRI-1505, SRI-1506): `createChannel` (a public channel, returning only its
+ * The channel gestures of the invited-channel checks: `createChannel` (a public channel, returning only its
  * ID), `invite`, `kick` (a user already gone is fine) and `archive` (a
  * channel already archived is fine). Any other Slack refusal is a
  * `HumanCallError` naming only the method and a safe error code.

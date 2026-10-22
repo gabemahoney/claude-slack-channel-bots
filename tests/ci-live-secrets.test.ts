@@ -1,6 +1,6 @@
 /**
  * ci-live-secrets.test.ts — Tests for the /ci-live runner's host-side
- * secrets and state (bug b.1cx): the mode checks and private writes in
+ * secrets and state: the mode checks and private writes in
  * `ci-live/lib/secrets.ts`, the `SecretStore` (config token, password,
  * live.json, credentials files) with its dry-run guard, the config-dir layout
  * in `lib/paths.ts`, and `apps.json` in `lib/apps-state.ts`.

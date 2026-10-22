@@ -405,7 +405,7 @@ export interface RecoveryHarnessOptions {
   healthCheckInterval?: number
   /**
    * The condition's alert threshold accessor, in ms, read at the arm and at
-   * every check: E6's `adAlertThresholdMsInEffect` (over `adSettings`) when
+   * every check: `adAlertThresholdMsInEffect` (over `adSettings`) when
    * unset; `false` arms no alert check.
    */
   alertThresholdMs?: (() => number) | false
@@ -415,15 +415,15 @@ export interface RecoveryHarnessOptions {
   restartDeps?: Partial<RestartDeps>
   /** Clock flushes `advance` waits at most for in-flight runs; `DEFAULT_SETTLE_FLUSHES` when unset. */
   settleFlushes?: number
-  /** Install the controller as the outage state's trigger sink (b.jg5 SRJ-301); true when unset. */
+  /** Install the controller as the outage state's trigger sink; true when unset. */
   triggerSink?: boolean
-  /** Install the `tmux-unresponsive` condition as the outage state's condition sink (b.jg5 SRJ-307); true when unset. */
+  /** Install the `tmux-unresponsive` condition as the outage state's condition sink; true when unset. */
   conditionSink?: boolean
   /** Real ms `settle` waits at most for the launches in flight; `DEFAULT_SETTLE_MS` when unset. */
   settleMs?: number
 
   /**
-   * The retired-key record the store reads at build (b.jg5 SRJ-807): the
+   * The retired-key record the store reads at build: the
    * entries by key, given the harness's persona keys, written into `stateDir`
    * through `writeRetiredKeysRecord` before the store loads; no file (an
    * empty record) when unset.
@@ -432,7 +432,7 @@ export interface RecoveryHarnessOptions {
   /**
    * Put the session manager's clock (`_setNow`) on the harness clock at
    * build, and back on the real one at `cleanup()` (`_resetNow`), so each
-   * launch call's window (b.jg5 SRJ-407, `launchCallWindowOf`) is recorded on
+   * launch call's window (`launchCallWindowOf`) is recorded on
    * harness-clock times; `scriptTimedLaunch` needs it. False when unset: the
    * working-row wait, its deferral runs and the findMissing memo's window
    * read the same clock, and a case that bounds the wait in real ms (a short
@@ -442,20 +442,20 @@ export interface RecoveryHarnessOptions {
 
   pendingRowRule?: boolean
   /**
-   * Bind the latch re-check (b.jg5 SRJ-505) to the latch as `main()` binds
+   * Bind the latch re-check to the latch as `main()` binds
    * it (`bindLatchRecheck`), so a persona that latches gets its re-check
    * timer and its rounds; false when unset: the re-check is built through
    * the same builder but its observer is not bound, so no latch arms a timer
    * and the suites that assert no call or timer for a latched persona on
-   * the other automated paths keep their meaning. Opt-in by decision (E30
-   * T1's PM finding; see the module comment's `latchRecheck`): binding it by
+   * the other automated paths keep their meaning. Opt-in by decision (
+   * PM finding; see the module comment's `latchRecheck`): binding it by
    * default broke 84 tests in 8 files.
    */
   latchRecheck?: boolean
   /**
    * The latch re-check's interval, handed to `buildLatchRecheck` as `main()`
    * hands it the test-only override block's `latch_recheck_interval_ms`
-   * (b.2nr); unset: `LATCH_RECHECK_INTERVAL_MS`, as production.
+   * unset: `LATCH_RECHECK_INTERVAL_MS`, as production.
    */
   latchRecheckIntervalMs?: number
 }
@@ -483,8 +483,7 @@ export const RECOVERY_STUB_VERBS = [
 export type RecoveryStubVerb = (typeof RECOVERY_STUB_VERBS)[number]
 
 /**
- * One stub call as the harness stamped it when it was made (b.jg5 SRJ-410,
- * AC 33): the verb, the harness clock's time, and the `instance_id`
+ * One stub call as the harness stamped it when it was made: the verb, the harness clock's time, and the `instance_id`
  * it named (undefined for a verb that names none, such as `findMissing`).
  */
 export interface RecoveryTimedCall {
@@ -616,7 +615,7 @@ export interface RecoverySequenceRequest {
   readonly launches?: boolean
   /** The kill-failure alert's context; `recovery` when unset. */
   readonly alertContext?: KillFailureAlertContext
-  /** The store's reading of the key when the launch attempt began (b.jg5 SRJ-806); absent when unset, so the start entry reads it. */
+  /** The store's reading of the key when the launch attempt began; absent when unset, so the start entry reads it. */
   readonly retiredAtStart?: RetiredKeyAttemptStart
 }
 
@@ -642,21 +641,21 @@ interface LostMessageDriver {
 /** The harness's latch, read-only: the latched query, the record and the latch's own set observer entry. */
 export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record' | 'addSetObserver'>
 
-/** The harness latch's own set entries, through which a latching site sets it (and the probe-dropped mark, b.jg5 SRJ-505). */
+/** The harness latch's own set entries, through which a latching site sets it (and the probe-dropped mark). */
 export type RecoveryLatchSetEntries = Pick<ConflictLatch, 'set' | 'setFromConflict' | 'setFromUnusableName' | 'setLaunchStartNotRecorded' | 'setProbeDropped'>
 
 /**
- * The harness's latch re-check timers, read-only (b.jg5 SRJ-505): the
+ * The harness's latch re-check timers, read-only: the
  * controller's queries, and the tracked re-check timers on the harness clock;
  * and the builder's one clear entry and after-clear sequence (`clear`,
- * `clearAndRecover`; b.jg5 SRJ-506), as `buildLatchRecheck` answers them;
- * and the clear by hand over them (`clearByHand`, b.jg5 SRJ-510).
+ * `clearAndRecover`), as `buildLatchRecheck` answers them;
+ * and the clear by hand over them (`clearByHand`).
  */
 export interface RecoveryLatchRecheckView
   extends Pick<LatchRecheckController, 'isArmed' | 'armedKeys' | 'whenRoundSettled'>,
     Pick<LatchRecheck, 'clear' | 'clearAndRecover'> {
   /**
-   * The clear by hand the `/clear-latch` route uses (b.jg5 SRJ-510, SRJ-506):
+   * The clear by hand the `/clear-latch` route uses:
    * `clearByHandOf` over this harness's re-check, the same binding `main()`
    * makes over its own. Answers whether P was latched once the clear has run
    * in P's serializer turn; the find-missing and the retry follow, unawaited.
@@ -672,7 +671,7 @@ export interface RecoveryLatchRecheckView
 export type RecoveryInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'beganUnder' | 'heldKeys'>
 
 /**
- * One retry at once the version-changed listener ran (b.jg5 SRJ-207): the
+ * One retry at once the version-changed listener ran: the
  * persona, the clock time it was asked for at, and the retry entry's outcome
  * once it settled (undefined until then).
  */
@@ -683,7 +682,7 @@ export interface RecoveryRetryAtOnce {
 }
 
 /**
- * One retry at once the old-life hold's end observer ran (b.jg5 SRJ-810;
+ * One retry at once the old-life hold's end observer ran (
  * `createOldLifeHoldEndRetry` bound to the controller's `runNow`, as `main()`
  * binds it): the persona, the clock time the hold ended at, and what
  * `runNow` answered.
@@ -696,7 +695,7 @@ export interface RecoveryHoldEndRetry {
 
 /**
  * The version re-check `versionRecheck` installed on the harness clock
- * (b.jg5 SRJ-204): what its binary resolve answers, set by the case, and what
+ * what its binary resolve answers, set by the case, and what
  * it did.
  */
 export interface RecoveryVersionRecheck {
@@ -714,7 +713,7 @@ export interface RecoveryVersionRecheck {
 
 /**
  * The persona teardown's dependencies `teardownDeps()` binds over the
- * harness's own instances, as `main()` binds them (b.jg5 SRJ-715); see the
+ * harness's own instances, as `main()` binds them; see the
  * module comment.
  */
 export type RecoveryTeardownDeps = Required<
@@ -735,7 +734,7 @@ export type RecoveryTeardownDeps = Required<
 >
 
 /**
- * The harness's one old-life hold set, read-only (b.jg5 SRJ-809): its
+ * The harness's one old-life hold set, read-only: its
  * queries, each answering copies (`OldLifeHold`: instance id, old key,
  * directory and its real path, cause, kill-failed mark, waiting personas).
  */
@@ -794,14 +793,14 @@ export interface RecoveryHarness {
   advanceToRecheck(): Promise<number>
   /**
    * The harness's one `ErrInvalidFlags` hold, read-only (`isHeld`,
-   * `beganUnder`, `heldKeys`; b.jg5 SRJ-207); composed as `main()` composes
+   * `beganUnder`, `heldKeys`); composed as `main()` composes
    * it. A tick case binds `invalidFlagsHold.isHeld` as `HealthCheckDeps.isHeld` itself.
    */
   readonly invalidFlagsHold: RecoveryInvalidFlagsHoldView
   /** Every retry at once the version-changed listener ran, in order. */
   readonly retriesAtOnce: RecoveryRetryAtOnce[]
   /**
-   * The harness's one retired-key store (b.jg5 SRJ-807), loaded over
+   * The harness's one retired-key store, loaded over
    * `stateDir` and installed in the session manager as `main()` loads and
    * installs it; see the module comment.
    */
@@ -812,14 +811,14 @@ export interface RecoveryHarness {
   failRetiredKeyWrites(count?: number): void
   /**
    * Record `key` through the installed store's `record` and, with
-   * `options.mark`, set its mark through `mark` (b.jg5 SRJ-805, SRJ-806);
+   * `options.mark`, set its mark through `mark`;
    * throws unless each went through. See the module comment.
    */
   retireKey(key: string, options?: RecoveryRetireKeyOptions): void
   /** `key`'s entry read through the store's queries; see the module comment. */
   retiredEntry(key: string): RecoveryRetiredEntry
   /**
-   * The harness's one old-life hold set, read-only (b.jg5 SRJ-809), built and
+   * The harness's one old-life hold set, read-only, built and
    * installed in the session manager as `main()` builds and installs it; see
    * the module comment.
    */
@@ -876,21 +875,20 @@ export interface RecoveryHarness {
   script(knobs: RecoveryStubScript): void
   launch(key: string): Promise<SpawnPersonaResult>
   /**
-   * The harness clock with each wait between a kill's tries tracked (b.jg5
-   * SRJ-702): the restart kill adapter's, and the one a
+   * The harness clock with each wait between a kill's tries tracked: the restart kill adapter's, and the one a
    * case hands the start sweep (`reconcileOrphans(config, clock)`), so
    * `drive` moves the clock to its waits.
    */
   readonly killRetryClock: KillRetryClock
   /**
    * Await `work` while moving the clock to each pending wait between a
-   * kill's tries as it is set (b.jg5 SRJ-702); see the module comment.
+   * kill's tries as it is set; see the module comment.
    */
   drive<T>(work: Promise<T>): Promise<T>
   /** The live-row sequence's dependencies, from the session manager's builder; see the module comment. */
   readonly sequenceDeps: LiveRowSequenceDeps
   /**
-   * The reuse spawns the stub recorded (b.jg5 SRJ-112, SRJ-708): its `spawn`
+   * The reuse spawns the stub recorded: its `spawn`
    * calls carrying the reuse field (`reuse_finished`), in order; read-only.
    */
   reuseSpawns(): readonly SpawnParams[]
@@ -916,7 +914,7 @@ export interface RecoveryHarness {
   driveSequence<T>(work: Promise<T>): Promise<T>
   /**
    * Start the old-life wait on held instance id `instanceId` through the
-   * session manager's ensure entry (`ensureOldLifeWait`, b.jg5 SRJ-811),
+   * session manager's ensure entry (`ensureOldLifeWait`),
    * resolving at once, before its first call; throws unless the entry
    * answered `started`. Answers the outcome promise (the registry's
    * `_whenSettledOn`), which resolves once the wait has settled and its end
@@ -929,16 +927,15 @@ export interface RecoveryHarness {
   oldLifeWaitRunning(instanceId: string): boolean
   /**
    * Every retry at once the old-life hold's end observer ran, in order
-   * (b.jg5 SRJ-810); see the module comment.
+   * see the module comment.
    */
   readonly holdEndRetries: readonly RecoveryHoldEndRetry[]
   /**
    * Decide one MCP session whose roots working directory is `rootsPath`, as
-   * `handleInitialized` decides it (b.av2 SR-6.3, SR-6.4; b.jg5 SRJ-810,
-   * SRJ-1505); see the module comment.
+   * `handleInitialized` decides it; see the module comment.
    */
   admitSession(rootsPath: string): SessionAdmission
-  /** Whether the old-life wait's unclassified-error episode on held instance id `instanceId` is open (read-only; b.jg5 SRJ-313, SRJ-811). */
+  /** Whether the old-life wait's unclassified-error episode on held instance id `instanceId` is open (read-only). */
   oldLifeWaitUnclassifiedOpen(instanceId: string): boolean
   /**
    * The registry's test-only settle query by instance id (`_whenSettledOn`):
@@ -964,7 +961,7 @@ export interface RecoveryHarness {
   restartServer(key: string): Promise<void>
   /**
    * Whether persona `key`'s open stuck-launch episode has used its one abort
-   * (b.jg5 SRJ-412): the installed pending-row rule's abort state
+   * the installed pending-row rule's abort state
    * (`StuckLaunchAbort.isAbortUsed`), read-only. False once the episode
    * closes (a read of the row live out of `pending`, a latch, a teardown's or
    * `restartServer`'s `episodes.forget(key)`, `shutdown()`). Throws when no
@@ -984,7 +981,7 @@ export interface RecoveryHarness {
   teardown(key: string): void
   /**
    * The persona teardown's dependencies over the harness's own instances,
-   * each bound as `main()` binds it (b.jg5 SRJ-715); see the module comment.
+   * each bound as `main()` binds it; see the module comment.
    */
   teardownDeps(): RecoveryTeardownDeps
   /** Drop persona `key` from the applied configuration. */
@@ -1016,11 +1013,11 @@ export interface RecoveryHarness {
  * tests/server-startup-wiring.test.ts).
  */
 function lostMessageArmLine(key: string): string {
-  return `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`
+  return `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one`
 }
 
 /**
- * The pending-row rule's own-launch slot as the abort it is (b.jg5 SRJ-412):
+ * The pending-row rule's own-launch slot as the abort it is:
  * `buildPendingRowRuleDeps` fills it with `createStuckLaunchAbort`'s
  * instance, typed as the slot (`PendingRowOwnLaunchHooks`); `undefined` when
  * the slot is empty or carries no abort-state read.
@@ -1082,13 +1079,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, upQuery)
 
   // As main()'s two in-flight bindings. "Blocks a retry"
-  // (`isPersonaRetryBlocked`, b.jg5 SRJ-303): exactly when the session
+  // (`isPersonaRetryBlocked`): exactly when the session
   // manager's `personaRetryBlockCause` names a cause: a launch call
   // (`isLaunchInFlight`), a running live-row sequence
-  // (`isLiveRowSequenceRunning`, SRJ-706) or an old-life wait step for a
-  // hold P waits on (`isOldLifeWaitRunningFor`, SRJ-811), never a running
+  // (`isLiveRowSequenceRunning`) or an old-life wait step for a
+  // hold P waits on (`isOldLifeWaitRunningFor`), never a running
 
-  // the cause query. "In flight for P" (`isPersonaWorkInFlight`, SRJ-315,
+  // the cause query. "In flight for P" (`isPersonaWorkInFlight`,
 
   // `tmux-unavailable` retry check receive it.
   const isPersonaRetryBlocked = (key: string): boolean => personaRetryBlockCause(key) !== undefined
@@ -1096,7 +1093,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
-  // As main()'s `retryRunGate` (b.jg5 SRJ-303, SRJ-305, SRJ-404): the retry
+  // As main's `retryRunGate`: the retry
   // action's gate before any call, one object for the retry action and the
 
   // below), so that run is gated as a retry's is.
@@ -1105,10 +1102,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     canRelaunch,
     isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
     isShuttingDown: () => shuttingDown,
-    // As main() binds it (b.jg5 SRJ-303, SRJ-305): a retry of a latched
+    // As main binds it: a retry of a latched
     // persona makes no call and stops the timer.
     isLatched: (key) => latch.isLatched(key),
-    // As main() binds it (b.jg5 SRJ-207, SRJ-303, SRJ-305): so does a retry
+    // As main binds it: so does a retry
     // of a persona held on ErrInvalidFlags.
     isHeld: (key) => invalidFlagsHold.isHeld(key),
   }
@@ -1116,7 +1113,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     readRow: readPersonaRowState,
     retry: runRestartRetry,
     ...retryRunGate,
-    // As main() binds it (b.jg5 SRJ-303): only work that blocks a retry
+    // As main binds it: only work that blocks a retry
 
     // skip's again-reason and the restart retry's skip line name the cause.
     isInFlight: isPersonaRetryBlocked,
@@ -1127,7 +1124,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
       clearOutageFlag(key, 'tmux-unavailable', reading)
     },
-    // As main() binds it (b.jg5 SRJ-409, SRJ-411): a pending-only retry whose
+    // As main binds it: a pending-only retry whose
     // row read shows `pending` reads the applied persona's row once more and
     // takes the one pending-row step: a covered or undecided row is armed
     // pending-only and kept; one that is not covered starts the live-row
@@ -1143,7 +1140,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
     // As main() binds it: every real stop of a persona's timer cancels the
     // condition's pending alert check, with the stop's reason, and then tells
-    // the unclassified-error episodes (b.jg5 SRJ-313), each step isolated.
+    // the unclassified-error episodes, each step isolated.
     // Each call is recorded in `stops` first.
     onStopped: (key, reason) => {
       stops.push({ key, reason })
@@ -1185,8 +1182,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     healthCheckOn: () => appliedConfig().health_check_interval !== 0,
     ...(alertThresholdMs === false ? {} : { alertThresholdMs }),
   })
-  // As main() builds them (b.jg5 SRJ-313, SRJ-1009): the unclassified-error
-  // episodes over the same episodes instance, at E6's alert threshold in
+  // As main builds them: the unclassified-error
+  // episodes over the same episodes instance, at alert threshold in
   // effect, the configured-key lookup over the live applied set, and the
   // log-only route through `recordStartupError` into the harness's
   // startup-errors capture.
@@ -1197,14 +1194,14 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isConfigured: (key) => applied.has(key),
     logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text)),
   })
-  // As main() builds it (b.jg5 SRJ-610, SRJ-1010, SRJ-1016): the one
+  // As main builds it: the one
   // slow-recovery tracker over the same episodes instance, so its count and
   // its episode live there (a case's `episodes.forget(key)` and `shutdown()`'s
   // close drop them, and `cleanup()`'s forget-all clears them); its lines go
   // to `lines`. It is the restart deps' slow-recovery observer below, and its
   // latch end is the latch's fourth hold.
   const slowRecovery = createSlowRecoveryTracker({ episodes, log })
-  // As main() builds them (b.jg5 SRJ-704, SRJ-1007, SRJ-1016): the
+  // As main builds them: the
   // kill-failure alerts over the same episodes instance, so a destination
   // post lands in `episodeNotices` and the episode is forgotten and closed
   // with the others; the configured-key lookup over the live applied set (a
@@ -1219,7 +1216,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     logOnly: (classLabel, entry) => recordStartupError(classLabel, entry),
   })
 
-  // As main() builds it (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch per
+  // As main builds it: one latch per
   // harness, its lines to `lines`. A recorder observer first (it only records
   // the set in `latchEvents`), then, in main()'s order, the holds (the timer's
   // stop with the latch's reason, the condition's silent end, the
@@ -1258,12 +1255,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
           hold(key, 'unclassified-error end')
           unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_LATCHED)
         },
-        // As main() binds it (b.jg5 SRJ-610, SRJ-1016): the count reset and
+        // As main binds it: the count reset and
         // the episode ended silently; not recorded in `latchEvents`.
         endSlowRecovery: (key) => {
           slowRecovery.endForLatch(key)
         },
-        // As main() binds it (b.jg5 SRJ-1016): the persona's stuck-launch
+        // As main binds it: the persona's stuck-launch
         // episode ended silently over the same episodes instance; not
         // recorded in `latchEvents` (a case reads it through
         // `episodes.isOpen`).
@@ -1275,7 +1272,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     ),
     bindConflictNotice(latch, noticeEpisodes),
   ]
-  // As main() builds it (b.jg5 SRJ-505), right after the notice: the latch
+  // As main builds it, right after the notice: the latch
   // re-check through the session manager's one builder, over the latch, the
   // harness clock (each re-check timer tracked, so `latchRecheck.nextDueAt`
   // and `advanceToRecheck` find it), the harness's serializer (main()'s
@@ -1322,15 +1319,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     appliedConfig,
     log: (line) => console.error(line),
     episodes: noticeEpisodes,
-    // As main() passes it (b.av2 SR-6.4): each round's launch asks the
+    // As main passes it: each round's launch asks the
     // harness's relaunch gate, so `setUp(key, false)` refuses it.
     canRelaunch: (key) => canRelaunch(key),
-    // As main() passes it (b.av2 SR-6.3; bug b.xkd): the restart cap over the
+    // As main passes it: the restart cap over the
     // real failure counter, so a persona `recordFailure`d to
     // `RESTART_FAILURE_CAP` gets its reads in a round but no launch and no run
     // of the restart path's decision.
     isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
-    // As main() passes it (b.av2 SR-6.3; b.jg5 SRJ-509; bug b.ebi): the reset
+    // As main passes it: the reset
     // of that same real failure counter, handed to the clear by hand only, so
     // a clear by hand that clears P's latch resets P's count before its retry
     // at once; the re-check's own clears leave it as it is.
@@ -1340,11 +1337,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   /** Every key a latch re-check round may run for: the configured and the armed. */
   const recheckKeys = (): string[] => [...new Set([...keys, ...latchRecheck.armedKeys()])]
 
-  // As main() builds it (b.jg5 SRJ-207, SRJ-1008, SRJ-305): one hold per
+  // As main builds it: one hold per
   // harness, its lines to `lines`, its set reaction bound to the controller's
   // stop entry with the hold's reason and to the episodes, so a new hold
   // stops the persona's timer (a real stop shows in `stops`) and then posts
-  // SRJ-1008's alert once in its episode (in `episodeNotices`). Installed in
+  // alert once in its episode (in `episodeNotices`). Installed in
   // the session manager with the other installs below.
   const invalidFlagsHold = createInvalidFlagsHold({ log })
   const unbindHold = bindInvalidFlagsHoldSetReaction(invalidFlagsHold, {
@@ -1363,7 +1360,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
   })
 
-  // As main() reads its one retired-key store at start (b.jg5 SRJ-802), over
+  // As main reads its one retired-key store at start, over
   // the harness's state directory, its lines to `console.error` (so to
   // `errors`); the record a case asked for is written there first. Its writes
   // go through the production durable writer, each recorded, and the next
@@ -1388,19 +1385,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     throw new Error('recovery harness: the retired-key record the case seeded cannot be read')
   }
   const retiredKeys = retiredKeysStart.store
-  // As main() builds it (b.jg5 SRJ-809), right after the store: the one
+  // As main builds it, right after the store: the one
   // old-life hold set, in memory only, its lines to `console.error` (so to
   // `errors`), directories compared by the production real-path resolver.
   // Installed in the session manager below, right after the store.
   const oldLifeHolds = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
   const stub = installStubSpawnPath(home)
-  // b.omv SR-5.3: an ordinary live terminal has an empty composer. Explicit
+  // an ordinary live terminal has an empty composer. Explicit
   // pane/error scripts replace this non-enumerable knob as usual.
   Object.defineProperty(stub.calls, 'readPaneResults', { value: [cannedReadPaneResult(IDLE_PANE)], writable: true, configurable: true, enumerable: false })
   // Every agent-director verb of the stub client is wrapped, in place, so
-  // each call is stamped with the harness clock when it is made (b.jg5
-  // SRJ-410, AC 33: the cadence of a persona's calls), before the stub
+  // each call is stamped with the harness clock when it is made (
+  // the cadence of a persona's calls), before the stub
   // records and answers it. A verb a case replaces later (`holdFindMissing`,
   // `holdSpawns`' held calls) is stamped only through its replacement.
   const timedCalls: RecoveryTimedCall[] = []
@@ -1419,12 +1416,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // between laps and its cap timer are harness-clock timers, tracked here so
 
   // With `options.harnessNow`, the session manager's own clock (`_setNow`) is
-  // the harness clock too: each launch call's window (b.jg5 SRJ-407) is read
+  // the harness clock too: each launch call's window is read
   // on it, as are the working-row wait, its deferral runs and the findMissing
   // memo's window. Undone by `cleanup()` (`_resetNow`).
   const harnessNow = options.harnessNow === true
   if (harnessNow) _setNow(clock.now)
-  // The bounded retry of a kill (b.jg5 SRJ-702) waits on the harness clock,
+  // The bounded retry of a kill waits on the harness clock,
   // each wait between tries tracked so `drive` can move the clock to it. As
   // main() binds it: the restart kill adapter gets this clock (below); the
   // live-row sequence's kills run on the sequence clock.
@@ -1447,14 +1444,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
     // As the production sink (the controller) has it: a launch's
     // `ErrTmuxSessionCreate`, a successful launch and the one pending-row
-    // step arm pending-only through it (b.jg5 SRJ-112, SRJ-113, SRJ-301,
-    // SRJ-409), recorded with the cause it arms.
+    // step arm pending-only through it, recorded with the cause it arms.
     armPendingOnly(key) {
       triggers.push({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
       controller.armPendingOnly(key)
     },
   }
-  // The live-row sequence (b.jg5 SRJ-705), composed as main() composes it:
+  // The live-row sequence, composed as main composes it:
   // its dependencies from the session manager's one builder, with the
   // harness's kill-failure alerts and the trigger sink as its retry arm; its
   // clock is the harness clock with each sequence timer tracked, so
@@ -1483,7 +1479,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     log,
     appliedConfig,
   })
-  // As main() builds it (b.jg5 SRJ-706, SRJ-811): the one registry over those
+  // As main builds it: the one registry over those
   // dependencies, each sequence that ends in a launch in its own recovery
   // attempt detached from its starter's (`runDetachedRecoveryAttempt`), each
   // old-life wait outside every attempt (`runOutsideAttempts`); installed
@@ -1533,16 +1529,16 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // As main() installs it, before any launch: the collision ladder latches
   // through it and launches no latched persona.
   setConflictLatch(latch)
-  // As main() installs it, before any launch (b.jg5 SRJ-207): a reuse
+  // As main installs it, before any launch: a reuse
   // spawn's ErrInvalidFlags holds the persona through it, and no held
   // persona's launch makes an agent-director call.
   setInvalidFlagsHold(invalidFlagsHold)
-  // As main() installs it (b.jg5 SRJ-706): the sequence registry, after the
+  // As main installs it: the sequence registry, after the
   // latch and before any launch, so the latch's set observer stops a latched
   // persona's running sequence.
   setLiveRowSequenceRegistry(sequences)
   // As main() installs it, right after the registry and before any launch
-  // (b.jg5 SRJ-410, SRJ-404): the one pending-row rule, built through its
+  // the one pending-row rule, built through its
   // factory over the session manager's one dependency builder, given the
   // applied-persona lookup, the one episodes instance (so its held post
   // lands in `episodeNotices`) and `console.error` as its log (so its lines
@@ -1567,7 +1563,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // with `options.pendingRowRule: false`.
   let stuckLaunchAbort: StuckLaunchAbort | undefined
   if (options.pendingRowRule !== false) {
-    // As main() gives them (b.jg5 SRJ-412, SRJ-702, SRJ-704): the abort kill's
+    // As main gives them: the abort kill's
     // waits between tries on `killRetryClock` (tracked, so `drive` moves the
     // clock to them) and its alerts through the harness's kill-failure alerts.
     const ruleDeps = buildPendingRowRuleDeps({
@@ -1584,29 +1580,27 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       gate: retryRunGate,
     })
   }
-  // As main() installs it, beside the latch (b.jg5 SRJ-114): a key counts as
+  // As main installs it, beside the latch: a key counts as
   // configured while it is in the live applied set, so a note on a persona's
   // own row latches it and a key outside the set, or removed from it, does not.
   setConfiguredPersonaQuery((key) => appliedPersona(key) !== undefined)
-  // As main() installs it, right after the configured-persona query (b.jg5
-  // SRJ-807): any key's own row read live other than pending while the store
+  // As main installs it, right after the configured-persona query: any key's own row read live other than pending while the store
   // has the key recorded with its mark set clears its entry.
   setRetiredKeyStore(retiredKeys)
   // As main() installs it, right after the store and before the start sweep
-  // (b.jg5 SRJ-809): every row read the session manager makes ends or
+  // every row read the session manager makes ends or
   // re-points a hold, and the start sweep begins its holds here.
   setOldLifeHolds(oldLifeHolds)
-  // As main() installs them, before any launch (b.jg5 SRJ-704, SRJ-1016):
+  // As main installs them, before any launch:
   // the restart path's kill and the live-row sequence's kills raise through
   // them, and the session manager's own-row reads end a persona's episode.
   setKillFailureAlerts(killFailureAlerts)
-  // As main() installs it, before the start pass (b.jg5 SRJ-1016): the one
+  // As main installs it, before the start pass: the one
   // episodes instance, so every own-row read of the session manager that
   // reads the row live out of `pending` ends the persona's stuck-launch
   // episode silently.
   setStuckLaunchEpisodes(episodes)
-  // As main() installs them with the registry (b.jg5 SRJ-811, SRJ-812,
-  // SRJ-1512): the old-life wait's bindings. Each waiting persona's timer is
+  // As main installs them with the registry: the old-life wait's bindings. Each waiting persona's timer is
   // armed through the trigger sink (recorded in `triggers`, then armed on the
   // controller; main() hands the controller itself), never the old key's; the
   // wait's waits are sequence timers (`driveSequence` moves the clock to
@@ -1617,8 +1611,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // entries "during the wait" and the old key's unclassified entry). A wait
   // starts only through the session manager's entry (`ensureOldLifeWait`,
   // `startOldLifeWait`); a hold's end and `shutdown()`'s close stop it. The
-  // wait's own unclassified-error episodes (b.jg5 SRJ-313), built as main()
-  // builds them, on the harness clock: keyed by the held instance id, at E6's
+  // wait's own unclassified-error episodes, built as main
+  // builds them, on the harness clock: keyed by the held instance id, at
   // alert threshold in effect, their lines to `console.error` (`errors`),
   // their one alert per episode the log-only `persona-unclassified-error`
   // entry in the harness's `startup-errors.log`; `shutdown()` and
@@ -1638,7 +1632,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
     unclassifiedErrorEpisodes: waitUnclassifiedErrors,
   })
-  // As main() registers it (b.jg5 SRJ-810), on the one hold set after the
+  // As main registers it, on the one hold set after the
   // session manager's own end observer (`setOldLifeHolds` above), so the
   // hold's wait is stopped first: each persona recorded as waiting on the
   // hold that ended, still applied and not latched, is retried at once
@@ -1656,7 +1650,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       isApplied: (key) => appliedPersona(key) !== undefined,
     }),
   )
-  // As main() installs it (b.jg5 SRJ-702, SRJ-305): a kill's tries stop once
+  // As main installs it: a kill's tries stop once
   // the persona is not up (the up predicate over the relaunch gate's
   // connection, bring-up outcome and live applied set) or the server is
   // shutting down; the session manager asks the latch itself.
@@ -1679,16 +1673,16 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => connected.has(key),
 
-    // As main() builds it: with the latch's latched query (b.jg5 SRJ-502).
+    // As main builds it: with the latch's latched query.
     reconnectSession: _buildReconnectSessionAdapter(appliedPersona, (key) => latch.isLatched(key), appliedPersona),
     // As main() binds it: the verdict an escalate-dead relaunch carries is
-    // passed on unchanged, into the ladder (b.jg5 SRJ-611).
+    // passed on unchanged, into the ladder.
     launchSession: (key, _cwd, _sessionId, deadEvidence) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch, deadEvidence }),
     getRestartDelay: () => config.session_restart_delay,
     isShuttingDown: () => shuttingDown,
     // As main() binds it, after recording the key: the cap notice, the
     // silent end of the persona's unclassified-error episode, then the stop
-    // of its retry timer in either mode (b.jg5 SRJ-305; a real stop shows in
+    // of its retry timer in either mode (a real stop shows in
     // `stops`), each isolated.
     onCapReached: (key) => {
       capReached.push(key)
@@ -1709,14 +1703,14 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       }
     },
     serialize: serializer.run,
-    // As main() binds it (b.jg5 SRJ-314, SRJ-301): every `unknown` liveness
+    // As main binds it: every `unknown` liveness
     // reading at the restart work arms the persona's timer on the controller
     // with the read-error cause, straight to the controller (not through the
     // trigger sink, so it is not recorded in `triggers`).
     armRetryTimer: (key) => {
       controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
     },
-    // As main() binds it (b.jg5 SRJ-314, SRJ-409, SRJ-411): a restart run
+    // As main binds it: a restart run
     // whose liveness reads `pending` (its first probe or the re-probe) hands
     // the reading to the server's `pending` deferral, awaited, with its launch
     // start, over the harness's applied-persona lookup. For an applied persona
@@ -1726,23 +1720,23 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // sequence, with the deferral's per-answer lines (row no longer pending,
     // gone, refused) in `errors`; a step that throws is logged there and the
     // deferral still answers `pending`. At a retry of the persona's timer
-    // (b.jg5 SRJ-410) a covered row gets the pending-row rule's one run, and
+    // a covered row gets the pending-row rule's one run, and
     // a row the rule or the step's own `get` reads `ended`, `missing` or gone
     // answers gone. The answer is returned, as main()'s binding returns it,
     // so a gone row lets the restart work go on to its dead branch in the
     // same run.
     deferPendingRow: async (key, reading) => deferPendingRow(key, reading.launchStartedAt, appliedPersona),
-    // As main() binds it (b.jg5 SRJ-502): a latched persona's restart work
+    // As main binds it: a latched persona's restart work
     // makes no agent-director call.
     isLatched: (key) => latch.isLatched(key),
-    // As main() binds it (b.jg5 SRJ-207, SRJ-303): nor does a held persona's.
+    // As main binds it: nor does a held persona's.
     isHeld: (key) => invalidFlagsHold.isHeld(key),
-    // As main() binds it (b.jg5 SRJ-706, SRJ-303, SRJ-811): while the
+    // As main binds it: while the
     // persona's live-row sequence runs, its restart work makes no
     // agent-director call; when what runs on its own row is an old-life
     // wait, the gate also arms its retry timer (`held-for-old-life`).
     isLiveRowSequenceRunning: (key) => liveRowSequenceGate(key, 'runRestartWork'),
-    // As main() binds it (b.jg5 SRJ-810, SRJ-812): while an old life may
+    // As main binds it: while an old life may
     // still run in the applied persona's working directory (a hold on its
     // own row excepted), the session manager's hold step records it as
     // waiting, starts the hold's wait and arms its timer, and the restart
@@ -1751,7 +1745,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       const persona = appliedPersona(key)
       return persona !== undefined && oldLifeHoldStep(persona, 'runRestartWork')
     },
-    // As main() binds it (b.jg5 SRJ-610): each run's readings and verdicts
+    // As main binds it: each run's readings and verdicts
     // feed the slow-recovery tracker.
     slowRecovery,
     ...options.restartDeps,
@@ -1770,7 +1764,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
   })
 
-  // As main() registers it (b.jg5 SRJ-204, SRJ-207): the one version-changed
+  // As main registers it: the one version-changed
   // listener, the hold's version-change reaction over the episodes, the
   // live applied set and a retry at once through the restart module's retry
   // entry (no delay gate) with "blocks a retry". Each retry is recorded in
@@ -1896,7 +1890,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   /**
    * Await `work`, moving the clock to each pending wait between a kill's
-   * tries (b.jg5 SRJ-702) as it is set, in 1 ms real-time steps for at most
+   * tries as it is set, in 1 ms real-time steps for at most
    * `settleMs` steps that find no wait pending.
    */
   async function drive<T>(work: Promise<T>): Promise<T> {
@@ -2002,7 +1996,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     return readFileSync(path, 'utf-8').split('\n').filter((line) => line !== '')
   }
 
-  // The lost-message driver (b.jg5 SRJ-1011): one Slack stub per persona,
+  // The lost-message driver: one Slack stub per persona,
   // and the routing and notifier, built at the first `loseMessage`.
   const lostMessageNotices: RecoveryNotice[] = []
   const slackStubs = new Map<string, StubSlack>(keys.map((key) => [key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
@@ -2018,7 +2012,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   /** The persona's Slack client in the driver's routing and notifier: its own stub. */
   const slackClientFor = (key: string): WebClient | undefined => slackStubs.get(key)?.web as unknown as WebClient | undefined
 
-  // As main()'s `tmuxUnavailableRetryDeps` (b.jg5 SRJ-311): the outage
+  // As main's `tmuxUnavailableRetryDeps`: the outage
   // state's flag, the controller's armed read, the latch's latched query,
 
   // ENVIRONMENT arm, straight to the
@@ -2037,7 +2031,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   /**
    * The driver's routing, built once, bound as `main()` binds it, its one
-   * lost-message row read and its in-flight gate included (b.jg5 SRJ-1011).
+   * lost-message row read and its in-flight gate included.
    */
   function driver(): LostMessageDriver {
     if (lostMessageDriver !== undefined) return lostMessageDriver
@@ -2056,30 +2050,30 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
       isLatched: (key) => latch.isLatched(key),
       isTmuxUnresponsive: (key) => tmuxUnresponsive.holds(key),
-      // As main() binds it (b.jg5 SRJ-1011 as amended: state 5 applies only
+      // As main binds it (state 5 applies only
       // while P's retry timer is armed): the one controller's `isArmed`,
       // exactly true.
       isRetryArmed: (key) => controller.isArmed(key) === true,
-      // As main() binds it (b.jg5 SRJ-1011, SRJ-401): state 6's member is a
+      // As main binds it: state 6's member is a
 
       isLaunchRunning: (key) => isLaunchInFlight(key),
-      // As main() binds them (b.jg5 SRJ-1011, SRJ-115): the read gate's
+      // As main binds them: the read gate's
 
       // read is the harness's liveness adapter, so it shows as a stub `status`.
       isWorkInFlight: isPersonaWorkInFlight,
       readRowLiveness: isSessionAliveAdapter,
-      // As main() binds it (b.jg5 SRJ-706, SRJ-811, SRJ-1011): while P's
+      // As main binds it: while P's
       // live-row sequence, or an old-life wait step for a hold P waits on,
       // runs, the message reports `restarting`, read at call time.
       isSequenceOrWaitRunning: (key) => isSequenceOrOldLifeWaitRunning(key),
-      // As main() binds it (b.jg5 SRJ-1011 state 4, SRJ-812): P's
+      // As main binds it (state 4): P's
       // kill-failure episode is open, read at call time from the harness's
       // alerts, or P waits on an old-life hold marked kill-failed.
       isKillFailed: (key) => killFailureAlerts.isOpen(key) === true || waitsOnKillFailedHold(key),
-      // As main() binds it (b.jg5 SRJ-1011 state 3, SRJ-207): P is held on
+      // As main binds it (state 3): P is held on
       // ErrInvalidFlags, read at call time from the harness's hold.
       isHeldOnInvalidFlags: (key) => invalidFlagsHold.isHeld(key) === true,
-      // As main() binds it (b.jg5 SRJ-311): nothing while shutting down, else
+      // As main binds it: nothing while shutting down, else
       // the server's one check over the harness's own holders.
       armRetryTimerIfMissing: (key) => {
         if (shuttingDown) return
@@ -2184,11 +2178,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       holdsWaitedOnBy: (persona: Parameters<OldLifeHoldSet['holdsWaitedOnBy']>[0]) => oldLifeHolds.holdsWaitedOnBy(persona),
       waitsOnKillFailed: (persona: Parameters<OldLifeHoldSet['waitsOnKillFailed']>[0]) => oldLifeHolds.waitsOnKillFailed(persona),
     }),
-    // As main() hands the reload controller the set (b.jg5 SRJ-809): apply
+    // As main hands the reload controller the set: apply
     // step 1 begins its holds through `begin` alone.
     beginOldLifeHold: (begin) => oldLifeHolds.begin(begin),
     markOldLifeKillFailed: (instanceId) => oldLifeHolds.markKillFailed(instanceId),
-    // As main() runs it (b.jg5 SRJ-714): over the applied configuration, on
+    // As main runs it: over the applied configuration, on
     // the kill-retry clock, its shutdown query the shutting-down flag.
     startSweep: (isShuttingDown = () => shuttingDown) => drive(reconcileOrphans(appliedConfig(), killRetryClock, isShuttingDown)),
     versionRecheck(initial = { version: PHASE1_RC_VERSION }) {
@@ -2322,8 +2316,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     holdEndRetries,
 
-    // As handleInitialized decides it (b.av2 SR-6.3, SR-6.4; b.jg5 SRJ-810,
-    // SRJ-1505): the applied personas, the real up predicate over the same
+    // As handleInitialized decides it: the applied personas, the real up predicate over the same
     // serving connection, bring-up outcome and live applied set as the
     // relaunch gate, its line to `console.error` (`errors`), and the session
     // manager's held-directory query over the one hold set.
@@ -2363,15 +2356,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // pending-row run follows), awaited.
 
       // Its launch records: the launch-call window and "this launch's row"
-      // record (b.jg5 SRJ-407), the not-interactive record and the record of
-      // CSCB's own launch (SRJ-412).
+      // record, the not-interactive record and the record of
+      // CSCB's own launch.
       forgetLaunchCalls(key)
       // Its episodes and counts, every kind (the stuck-launch episode
-      // included, b.jg5 SRJ-1016, SRJ-1017); that episode's close disposes
-      // the abort's per-episode state (SRJ-412), as a new process starts
+      // included); that episode's close disposes
+      // the abort's per-episode state, as a new process starts
       // with none.
       episodes.forget(key)
-      // Its latch and its latch re-check timer (b.jg5 SRJ-504, SRJ-505): a
+      // Its latch and its latch re-check timer: a
       // new process holds none; dropped silently, the timer stopped through
       // the forget observer and once more directly.
       latch.forget(key)
@@ -2406,12 +2399,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     shutdown() {
       shuttingDown = true
-      // As main()'s shutdown (b.jg5 SRJ-706): every live-row sequence is
+      // As main's shutdown: every live-row sequence is
       // stopped now, not awaited, and none starts after it; before the
       // controller closes.
       void sequences.close()
       controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
-      // As main()'s shutdown (b.jg5 SRJ-505), right after the controller:
+      // As main's shutdown, right after the controller:
       // every latch re-check timer stops and none is armed again.
       latchRecheck.stopAll()
       episodes.close()
@@ -2422,50 +2415,50 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
 
     teardown(key) {
-      // As production's teardown submit (b.jg5 SRJ-404, SRJ-715): its dialog
+      // As production's teardown submit: its dialog
 
       // awaited here (the teardown's turn awaits it).
 
-      // As production's teardown submit (b.jg5 SRJ-706, SRJ-715): its
+      // As production's teardown submit: its
       // live-row sequence right after, its stop signal set now; not awaited
       // here (the teardown's turn awaits it).
       void stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)
       controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
-      // As main()'s `forgetOldLifeWaits` (b.jg5 SRJ-811), right after the
+      // As main's `forgetOldLifeWaits`, right after the
       // timer's stop: the key is forgotten as waiting, and a wait no persona
       // left in the applied configuration waits on is stopped; not awaited
       // here (the teardown's turn awaits it; `oldLifeWaitSettled` reads it).
       void forgetOldLifeWaits(key)
-      // As main()'s `forgetConflictLatch` (b.jg5 SRJ-504): silently, before
+      // As main's `forgetConflictLatch`: silently, before
       // the turn's episodes forget (the case's `episodes.forget(key)`).
       latch.forget(key)
-      // As main()'s `forgetInvalidFlagsHold` (b.jg5 SRJ-207, SRJ-715): right
+      // As main's `forgetInvalidFlagsHold`: right
       // after the latch, silently: no post and no retry.
       invalidFlagsHold.forget(key)
     },
 
     teardownDeps: () => ({
-      // As main() binds them in createPersonaLifecycle (b.jg5 SRJ-404,
+      // As main binds them in createPersonaLifecycle (
 
       stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
       whenLaunchSettled: (key) => whenLaunchSettled(key),
       cancelLaunchWait: (key) => cancelWorkingRowWait(key),
-      // b.jg5 SRJ-305, SRJ-309: the timer's stop, then the condition's alert check.
+      // the timer's stop, then the condition's alert check.
       stopRetryTimer: (key) => {
         controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
         tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       },
-      // b.jg5 SRJ-811: the session manager's teardown member, over the harness's one hold set and registry.
+      // the session manager's teardown member, over the harness's one hold set and registry.
       forgetOldLifeWaits: (key) => forgetOldLifeWaits(key),
-      // b.jg5 SRJ-504, SRJ-207, SRJ-1016: silently, each over the harness's one instance.
+      // silently, each over the harness's one instance.
       forgetConflictLatch: (key) => latch.forget(key),
       forgetInvalidFlagsHold: (key) => invalidFlagsHold.forget(key),
       forgetNoticeEpisodes: (key) => episodes.forget(key),
       resetOutageState: (keys) => resetAllToHealthy(keys),
-      // b.jg5 SRJ-715, SRJ-110, SRJ-702: the bounded retry on the harness's kill-retry clock.
+      // the bounded retry on the harness's kill-retry clock.
       killInstance: (key) => killPersonaInstanceForTeardown(key, { clock: killRetryClock }),
-      // b.jg5 SRJ-704: not latched, on the persona-teardown route.
+      // not latched, on the persona-teardown route.
       raiseKillFailureAlert: (key, decision) =>
         killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN }),
     }),
@@ -2578,7 +2571,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 /**
  * What the latch's notice reaction gets: `episodes`' own `begin`, `post` and
  * `end` (the reaction's silent end of the other latch kinds' episodes on a
- * set, b.jg5 SRJ-512), with each post that went out (a CONFLICT or a hold
+ * set), with each post that went out (a CONFLICT or a hold
  * notice) also handed to `posted` once the episodes' sink has it. Nothing
  * else changes.
  */
@@ -2609,14 +2602,13 @@ export function personaOf(h: RecoveryHarness, key: string): Persona {
 /**
  * Put persona `key` at the restart cap through the real backoff state (its
  * one copy, tests/test-helpers/persona-routing-harness.ts's): the count the
- * harness's re-check asks through its `isAtCap`, as `main()` binds it (b.av2
- * SR-6.3; bug b.xkd). The harness's `cleanup()` undoes it.
+ * harness's re-check asks through its `isAtCap`, as `main()` binds it. The harness's `cleanup()` undoes it.
  */
 export { putAtRestartCap } from './persona-routing-harness.ts'
 
 /**
- * The latch re-check's at-the-cap lines (`latchRecheckAtCapLine`, b.av2
- * SR-6.3; bug b.xkd) logged to `errors` for persona `key`, whatever call they
+ * The latch re-check's at-the-cap lines (`latchRecheckAtCapLine`
+ *) logged to `errors` for persona `key`, whatever call they
  * name.
  */
 export function recheckAtCapLinesOf(h: RecoveryHarness, key: string): string[] {
@@ -2634,8 +2626,7 @@ export function personaRow(h: RecoveryHarness, key: string, overrides: PersonaGe
 }
 
 /**
- * How the retired-key store's clear lines name the read that cleared (b.jg5
- * SRJ-807): the state it read and the site's `<site>: <what>`, as the session
+ * How the retired-key store's clear lines name the read that cleared: the state it read and the site's `<site>: <what>`, as the session
  * manager words it inline (no exported builder).
  */
 function retiredClearReadText(state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
@@ -2644,7 +2635,7 @@ function retiredClearReadText(state: string, at: Pick<OwnRowReadSite, 'site' | '
 
 /**
  * The retired-key store's one line for a clear of persona `key`'s entry from
- * the record at `path`, on its row read `state` at `at` (b.jg5 SRJ-807).
+ * the record at `path`, on its row read `state` at `at`.
  */
 export function retiredEntryClearedLine(path: string, key: string, state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
   return retiredKeysClearedLine(key, JSON.stringify(path), retiredClearReadText(state, at), '')
@@ -2698,8 +2689,7 @@ export function expectUntouched(h: RecoveryHarness, other: string): void {
 }
 
 /**
- * Persona `key`'s retry timer watches a `pending` row (b.jg5 SRJ-301,
- * SRJ-409): armed and waiting in pending-only mode with the pending-row
+ * Persona `key`'s retry timer watches a `pending` row: armed and waiting in pending-only mode with the pending-row
  * cause among its recorded causes, and a pending-row trigger recorded for it
  * (the trigger sink's pending-only arm). A timer already in full mode keeps
  * its mode on a pending-only arm, so a case expecting that reads
@@ -2744,7 +2734,7 @@ export function retryLinesOf(h: RecoveryHarness, key: string): string[] {
 }
 
 /**
- * The wording no post or line may give a collision (b.jg5 SRJ-713): a
+ * The wording no post or line may give a collision: a
  * collision is never a "dispatcher bug". Not global, so it keeps no
  * `lastIndex` between tests.
  */
@@ -2760,15 +2750,15 @@ export function dispatcherBugWordingIn(h: RecoveryHarness): string[] {
   return [...h.lines, ...h.errors, ...notices, ...h.startupErrors()].filter((text) => DISPATCHER_BUG_WORDING.test(text))
 }
 
-/** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */
+/** States 1 to 5 of those that apply before the lost-message row read is made. */
 const EARLY_LOST_MESSAGE_STATES: readonly LostMessageState[] = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('session-starting'))
 
 /**
  * Accept one disconnected message through `h.loseMessage` and assert one
  * stored row, acknowledgment, no lost-message notice, and the exact stub
  * calls `opts.calls` (by verb), by default none for `state` in states 1 to 5
- * and, in any later state, one `statusCalls`, the routing's row read (b.jg5
- * SRJ-1011; nothing in flight for the persona), every `status` among them of
+ * and, in any later state, one `statusCalls`, the routing's row read (
+ * nothing in flight for the persona), every `status` among them of
  * the persona's own instance; and no restart asked for or pending, unless
  * `opts.restartRequested` (then the ask must be seen, and whether one is
  * pending is the case's to check on the outcome). Resolves with the outcome.
@@ -2834,7 +2824,7 @@ export function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetRe
 }
 
 /**
- * Script persona `key`'s next launch (b.jg5 SRJ-207): its optimistic spawn
+ * Script persona `key`'s next launch: its optimistic spawn
  * collides and the collision `get` reads its row `ended` in another
  * directory (the harness HOME), so the launch replaces the row by a reuse
  * spawn of the same id, which answers `err` (an `ErrInvalidFlags` of
@@ -2845,7 +2835,7 @@ export function scriptReuseInvalidFlags(h: RecoveryHarness, key: string, err: Er
 }
 
 /**
- * Hold persona `key` through a real reuse (b.jg5 SRJ-207): its start-pass
+ * Hold persona `key` through a real reuse: its start-pass
  * launch (`h.launch`) over the row `scriptReuseInvalidFlags` scripts, whose
  * reuse spawn answers `ErrInvalidFlags`. Asserts the launch answered `held`
  * and the harness's hold holds `key`.
@@ -2859,7 +2849,7 @@ export async function holdThroughReuse(h: RecoveryHarness, key: string): Promise
 /**
  * Script persona `key`'s next launch to meet its own row read `waiting`
  * (live) in another directory (the harness HOME) at a collision ladder
- * replacement site (b.jg5 SRJ-707): the optimistic spawn collides and the
+ * replacement site: the optimistic spawn collides and the
  * collision `get` reads that row, so the ladder starts the persona's
  * live-row sequence and answers `sequence-waiting` with no call of its own;
  * every later `get` of the row (the sequence's) reads it `ended` in the
@@ -2941,8 +2931,7 @@ export function recordCallOrder(h: RecoveryHarness, during?: { readonly at: numb
 }
 
 /**
- * A kill answer the live-row sequence gets after it was stopped (b.jg5
- * SRJ-706): its label, its builder, and the tries the bounded retry makes of
+ * A kill answer the live-row sequence gets after it was stopped: its label, its builder, and the tries the bounded retry makes of
  * a row read live before that answer stands (an UNAVAILABLE one is tried
  * again until its tries are used; a CONFLICT never is).
  */
@@ -3001,7 +2990,7 @@ export async function runSequenceStoppedAtKill(
  * run is held by `hold` (`holdFindMissing` over the harness's stub client),
  * moving the clock to each sequence timer on the way (`driveSequence`: a
  * `pending` row's wait until G), so the sequence is running with that run
- * outstanding (b.jg5 SRJ-706). The case scripts the sequence's `get`
+ * outstanding. The case scripts the sequence's `get`
  * answers.
  */
 export async function startSequenceHeldAtRun(
@@ -3037,8 +3026,7 @@ export function ownRowsLiveThenMissing(h: RecoveryHarness): void {
 }
 
 /**
- * Persona `key`'s reuse spawn as the stub records it (b.jg5 SRJ-112,
- * SRJ-708), for `toEqual`: a `spawn` of `cscb_<key>` with the reuse flag set
+ * Persona `key`'s reuse spawn as the stub records it, for `toEqual`: a `spawn` of `cscb_<key>` with the reuse flag set
  * and the persona's `extra_env` (`personaSpawnEnv`, prompt suggestions off).
  */
 export function reuseSpawnOf(h: RecoveryHarness, key: string): SpawnParams {
@@ -3124,7 +3112,7 @@ export type TimedLaunchEnd = LaunchTimeoutForm | typeof TIMED_LAUNCH_SUCCESS
 
 /**
  * Where `scriptTimedLaunch` places the row's launch start against the call's
- * window `[start, end]` (b.jg5 SRJ-407; both ends belong to the window):
+ * window `[start, end]` (both ends belong to the window):
  * `at-start` and `at-end` on a bound, `inside` at `start + floor(takes / 2)`,
  * `before` at `start - offMs`, `after` at `end + offMs`, `none` with no
  * launch start (`SAMPLE_LAUNCH_START_NONE`: the field left out).
@@ -3166,7 +3154,7 @@ export interface TimedLaunch {
 }
 
 /**
- * Script persona `key`'s next launch call of `options.verb` (b.jg5 SRJ-407)
+ * Script persona `key`'s next launch call of `options.verb`
  * through the stub's per-call knobs (`spawnFn`, `resumeFn`, `getFn`):
  *
  * - The first matching call (persona `key`'s instance; for `spawn`, of the
@@ -3294,7 +3282,7 @@ export interface ModelLaunchOptions {
 
 /**
  * Script the next launch call (`spawn`, plain or reuse, or `resume`) of
- * persona `row.key`'s pending-row model `row` (b.jg5 SRJ-407, SRJ-412; AC
+ * persona `row.key`'s pending-row model `row` (AC
  * 31): the model's own launch (state `pending`, its launch start the clock's
  * now, its pane `dialogOnLaunch`), made at the call's start, then the call
  * takes `takesMs` on the harness clock (timers due by then fire), the launch
@@ -3352,7 +3340,7 @@ export async function launchOwnPending(h: RecoveryHarness, row: PendingRowModel)
 }
 
 /**
- * Another process's launch of persona `row.key`'s row (b.jg5 SRJ-412; AC
+ * Another process's launch of persona `row.key`'s row (AC
  * 48): its pending-row model `row` reads `pending` with a launch start the
  * server never recorded, `launchStartText(atMs)` (the harness clock's now by
  * default), so the own-launch query answers no for it. Throws when that
@@ -3380,7 +3368,7 @@ export async function driveToB(h: RecoveryHarness, row: PendingRowModel): Promis
   await h.drive(h.settle())
 }
 
-// The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310), through
+// The `tmux-unresponsive` condition's log lines, through
 // src/persona-episodes.ts's builders; a case gives the seconds from its clock
 // and the threshold in effect. The recovery and silent-end lines have no
 // builder of their own: their words are held here, after the builders' prefix.
@@ -3439,7 +3427,7 @@ export function conditionSilentEndLine(key: string): string {
   return tmuxUnresponsiveLine(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
 }
 
-// The unclassified-error episodes' log lines (b.jg5 SRJ-313, SRJ-1009). As
+// The unclassified-error episodes' log lines. As
 // above, the fixed words are held here; the kind, the startup-errors label and
 // the rendering of an outcome come from `src/`. Each outcome builder takes the
 // thrown value and renders it as the episodes do when the site gives no
@@ -3490,8 +3478,7 @@ export function unclassifiedLoggedLine(key: string, elapsedMs: number, threshold
   return `${unclassifiedLinePrefix(key)}alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
 }
 
-// The kill-failure alert's texts as the harness captures them (b.jg5
-// SRJ-704, SRJ-1007), each built with `src/kill-failure-alert.ts`'s builders
+// The kill-failure alert's texts as the harness captures them, each built with `src/kill-failure-alert.ts`'s builders
 // for persona `key`'s own session and instance id; every description is the
 // thrown value's own (`killFailedDescriptionOf`), raw, so the builders redact
 // it as the alert does.
@@ -3617,7 +3604,7 @@ export function killFailureLoggedLine(key: string, version: KillFailureAlertVers
 }
 
 /**
- * The stopped-retry text (`killFailureStoppedRetryText`, b.jg5 SRJ-702) of an
+ * The stopped-retry text (`killFailureStoppedRetryText`) of an
  * ordinary decision whose tries were stopped for `cause`, at the restart path
  * (context `recovery`): the decision quotes `quoted`'s descriptions, as
  * `ordinaryAlertContent` takes them, and the last outcome's class is
@@ -3638,7 +3625,7 @@ function killFailureStoppedRecovery(
   return killFailureStoppedRetryText({ key, decision, context: KILL_FAILURE_CONTEXT_RECOVERY, lastOutcomeClass, stopCause: cause })
 }
 
-/** The one line of an ordinary decision whose tries were stopped for `cause` (b.jg5 SRJ-702): see `killFailureStoppedRecovery`. */
+/** The one line of an ordinary decision whose tries were stopped for `cause`: see `killFailureStoppedRecovery`. */
 export function killFailureNotRaisedLine(
   key: string,
   cause: string,
@@ -3650,7 +3637,7 @@ export function killFailureNotRaisedLine(
 
 /**
  * The `persona-kill-failed` entry of a stopped retry for persona `key` no
- * longer in the applied configuration (b.jg5 SRJ-702, SRJ-1013): the stop's
+ * longer in the applied configuration: the stop's
  * line content with the context `recovery`, and no alert text.
  */
 export function killFailureStoppedEntry(
@@ -3662,12 +3649,12 @@ export function killFailureStoppedEntry(
   return killFailureStoppedRecovery(key, cause, quoted, lastOutcomeClass).entry
 }
 
-/** The line of a stopped retry's `persona-kill-failed` entry, after its not-raised line (b.jg5 SRJ-702). */
+/** The line of a stopped retry's `persona-kill-failed` entry, after its not-raised line. */
 export function killFailureStoppedEntryLine(key: string): string {
   return `${killFailureLinePrefix(key)}stopped retry's log line (no alert text) written to the server log and startup-errors.log (${PERSONA_KILL_FAILED_LABEL}) — stopped`
 }
 
-/** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */
+/** The outage class a CONFIG answer raises. */
 const AD_CONFIG_MALFORMED_CLASS: OutageClass = 'ad-config-malformed'
 
 /** The outage state's raise lines for persona `key`'s `ad-config-malformed` outage (one per raise), in `errors`. */

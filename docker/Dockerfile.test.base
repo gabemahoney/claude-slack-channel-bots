@@ -342,13 +342,13 @@ RUN set -eu; \
     "${AD_CHECK}" --client "${GLOBAL_CLIENT}"
 
 ENV DISABLE_AUTOUPDATER=1
-# b.omv SR-14.3: genuine native agents, selected through AD's launch paths;
+# genuine native agents, selected through AD's launch paths;
 # the ordinary scenario stub remains the only Claude on its PATH.
 COPY docker/install-real-agents.sh docker/install-real-codex.sh /opt/cscb-ci/
 RUN bash /opt/cscb-ci/install-real-agents.sh 2.1.280 2.1.296 && bash /opt/cscb-ci/install-real-codex.sh
 
-# b.omv SR-14.8: npm publication 2026-10-14T17:20:30.700Z, the last
-# published version preceding b.omv. Preserve the separate 0.10.0 fixture.
+# npm publication 2026-10-14T17:20:30.700Z, the last
+# published version preceding. Preserve the separate 0.10.0 fixture.
 ARG CSCB_DOWNGRADE_VERSION=0.16.1
 ARG CSCB_DOWNGRADE_SHA256=95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164
 RUN set -eu; \

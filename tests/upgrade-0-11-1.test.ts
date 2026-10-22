@@ -1,6 +1,5 @@
 /**
- * upgrade-0-11-1.test.ts — An upgrade from 0.11.1 stays declarative (b.deo
- * SRI-1307, SRI-106, SRI-1204).
+ * upgrade-0-11-1.test.ts — An upgrade from 0.11.1 stays declarative.
  *
  * What this suite proves: a 0.11.1 `config.json`, with neither the
  * `allow_invited_channels` switch nor any `invited` section, loads unchanged
@@ -15,18 +14,18 @@
  * - never gets a stored-choice file (`CHANNEL_DELIVERY_FILE_NAME`);
  * - logs, previews and posts nothing that names the switch, fungible mode or
  *   a class this work adds (the term list below), so no line suggests
- *   fungible mode (SRI-106) and, with the switch absent, no recorded line
- *   can appear (SRI-804);
+ * fungible mode and, with the switch absent, no recorded line
+ * can appear;
  * - previews a 0.11.1-style edit as the counted header and the persona's
  *   in-place line, and once it is confirmed updates only that persona in
  *   place, with the edit in effect for the next event;
  * - posts each notice to the persona's `permission_prompts` destination;
- * - decides sample events from listed and unlisted channels as SRI-308 says;
+ * - decides sample events from listed and unlisted channels as says;
  * - lists `set_channel_delivery` and refuses it with the declarative
  *   refusal, and sends `MCP_INSTRUCTIONS` as the session instructions: the
- *   two agent-visible additions SRI-106 allows.
+ * two agent-visible additions allows.
  *
- * Fixtures (SRI-1204), owned by this suite and pinned by SHA-256 so an edit
+ * Fixtures, owned by this suite and pinned by SHA-256 so an edit
  * to either fails:
  *
  * - `tests/fixtures/upgrade-0.11.1/readme-example.json`: the json block
@@ -36,13 +35,13 @@
  *   Its `"port": 3100` is as the README has it; no case binds or reaches a
  *   port.
  * - `tests/fixtures/upgrade-0.11.1/two-personas.json`: the shape of
- *   SRI-1405's phase A, the configuration test-29's declarative phase
+ * phase A, the configuration test-29's declarative phase
  *   writes, with fixed IDs and `~/` paths: `alpha` in A1 (`all`) and A2
  *   (`mentions`), DMs off, prompts to A1; `bravo` in B1 (`mentions`), DMs on
- *   with a contact, prompts by `"dm"`; SRI-1401's server-wide keys.
+ * with a contact, prompts by `"dm"`server-wide keys.
  *
  * Every `~/` path expands under a temp home inside the test's own
- * `mkdtempSync` root, never the operator's home (SRI-1201). Tokens are the
+ * `mkdtempSync` root, never the operator's home. Tokens are the
  * fakes of `tests/test-helpers/credentials.ts`.
  *
  * SPDX-License-Identifier: MIT
@@ -114,7 +113,7 @@ import {
 import { makeAppMention, makeChannelMessage, mentionText, stubOpenedDmId, type SlackEvent } from './test-helpers/slack-stub.ts'
 
 // ---------------------------------------------------------------------------
-// The fixtures (b.deo SRI-1204): paths and bytes, read once
+// The fixtures: paths and bytes, read once
 // ---------------------------------------------------------------------------
 
 /** A persona entry as a 0.11.1 fixture writes it. */
@@ -153,7 +152,7 @@ function readFixture(file: string): UpgradeFixture {
 
 /** The README at `619a67a`, "#### Example": planner, reviewer and helpdesk. */
 const README_EXAMPLE = readFixture('readme-example.json')
-/** SRI-1405's phase A: alpha and bravo. */
+/** phase A: alpha and bravo. */
 const TWO_PERSONAS = readFixture('two-personas.json')
 const FIXTURES = [README_EXAMPLE, TWO_PERSONAS] as const
 
@@ -173,7 +172,7 @@ function channelPersonas(fixture: UpgradeFixture): FixturePersona[] {
 }
 
 // ---------------------------------------------------------------------------
-// The term list (b.deo SRI-106, SRI-1307) and its checker
+// The term list and its checker
 // ---------------------------------------------------------------------------
 
 /** One term: a label naming its `src/` export, and the text. */
@@ -198,7 +197,7 @@ function modeSwitchLineHead(mode: (typeof CHANNEL_MODES)[number]): string {
  * What no log line, preview or pending-file text, or Slack-posted text of a
  * 0.11.1 configuration may carry. Every entry is imported from `src/`. It
  * does not apply to `set_channel_delivery`'s listing, its declarative
- * refusal or the session instructions: SRI-106 allows those additions, and
+ * refusal or the session instructions: allows those additions, and
  * they are checked by equality with their exported texts.
  */
 const TERM_LIST: readonly Term[] = [
@@ -217,7 +216,7 @@ const TERM_LIST: readonly Term[] = [
 ]
 
 /**
- * Beside the list: the words "fungible" and "invited", in any case. SRI-106
+ * Beside the list: the words "fungible" and "invited", in any case.
  * says no line may suggest fungible mode, and the 0.11.1 source holds
  * neither word.
  */
@@ -329,8 +328,8 @@ function resolvedDm(entry: FixturePersona): { enabled: boolean; contact?: string
 // The switch key's pin, the fixtures' pins and the direct load
 // ---------------------------------------------------------------------------
 
-describe('upgrade fixtures and the term list (b.deo SRI-1204, SRI-1201, SRI-106)', () => {
-  test('the switch key in the term list is a top-level key the loader accepts (its single pin, SRI-1201)', () => {
+describe('upgrade fixtures and the term list', () => {
+  test('the switch key in the term list is a top-level key the loader accepts (its single pin)', () => {
     expect(PERSONA_TOP_LEVEL_KEYS).toContain(MODE_SWITCH_SETTING)
   })
 
@@ -358,7 +357,7 @@ describe('upgrade fixtures and the term list (b.deo SRI-1204, SRI-1201, SRI-106)
   )
 })
 
-describe('a 0.11.1 configuration loaded directly stays declarative (b.deo SRI-1307, SRI-106)', () => {
+describe('a 0.11.1 configuration loaded directly stays declarative', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s loads through loadPersonaConfig in declarative mode with its bytes unchanged, no load-time message and no stored-choice file',
     (_file, fixture) => {
@@ -441,7 +440,7 @@ async function startFixture(h: ReloadHarness, fixture: UpgradeFixture): Promise<
 }
 
 /**
- * The facts every step leaves (b.deo SRI-1307): `config.json` holds `bytes`,
+ * The facts every step leaves: `config.json` holds `bytes`,
  * the last-applied record is a byte copy of them, the configuration the
  * server runs is in declarative mode with no fungible destination, and no
  * stored-choice file exists, at `h.channelDeliveryFile` or by its name
@@ -511,7 +510,7 @@ function expectNoLeak(h: ReloadHarness, run: ReloadRun, placed: PlacedFixture, e
   assertNoLeak(h.serverSideFiles(...placed.credentialsFiles))
 }
 
-describe('a 0.11.1 configuration through a reload-harness start stays declarative (b.deo SRI-1307, SRI-106)', () => {
+describe('a 0.11.1 configuration through a reload-harness start stays declarative', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s, first start with no record: config.json keeps its bytes, the record is a byte copy, declarative mode, no stored-choice file, and each notice posts to its permission_prompts destination',
     async (_file, fixture) => {
@@ -631,7 +630,7 @@ function recordedLinesOf(h: ReloadHarness, fixture: UpgradeFixture): string[] {
   )
 }
 
-describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (b.deo SRI-1307, SRI-106, SRI-804's switch-absent half)", () => {
+describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-absent half)", () => {
   test.each(FIXTURES.flatMap((f) => EDITS.map((e) => [f.file, e.edit, f, e] as const)))(
     '%s, %s: the preview is the header and the in-place line, with no recorded line, no switch line and no term; the confirmation updates that persona in place, records the edited bytes and stays declarative',
     async (_file, _edit, fixture, edit) => {
@@ -796,9 +795,9 @@ async function startWithSessions(h: ReloadHarness, fixture: UpgradeFixture) {
   return started
 }
 
-/** The sample events and SRI-308's outcome for each, per fixture. */
+/** The sample events and outcome for each, per fixture. */
 const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixture) => Array<readonly [SampleEvent, Omit<SampleOutcome, 'event'>]>>> = {
-  // SRI-1405's phase-A set.
+  // phase-A set.
   'two-personas.json': (h, f) => {
     const [a1, a2, b1] = [listed(f, 'alpha', 0), listed(f, 'alpha', 1), listed(f, 'bravo', 0)]
     return [
@@ -808,7 +807,7 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
       [{ event: 'bravo, B1, mention', to: 'bravo', kind: 'mention', channel: b1 }, { deliveries: deliveredTo(f, 'bravo', b1, 'mention'), dropLines: [] }],
       [
         { event: 'alpha, an unlisted channel, a mention as both its events', to: 'alpha', kind: 'mention', channel: UNLISTED_CHANNEL, bothEvents: true },
-        // b.omv SR-3.4: only accepted Slack keys are durable dedupe facts;
+        // only accepted Slack keys are durable dedupe facts;
         // both rejected envelopes are diagnosed without creating a queue row.
         { deliveries: noDelivery(f), dropLines: Array.from({ length: 2 }, () => unclaimedLine(h, f, 'alpha', UNLISTED_CHANNEL)) },
       ],
@@ -822,7 +821,7 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
       [{ event: 'planner, the shared channel, plain', to: 'planner', kind: 'plain', channel: shared }, { deliveries: deliveredTo(f, 'planner', shared, 'receive_all'), dropLines: [] }],
       [{ event: 'reviewer, the shared channel, plain', to: 'reviewer', kind: 'plain', channel: shared }, { deliveries: noDelivery(f), dropLines: [notMentioned(h, 'reviewer', shared)] }],
       [{ event: 'reviewer, the shared channel, mention', to: 'reviewer', kind: 'mention', channel: shared }, { deliveries: deliveredTo(f, 'reviewer', shared, 'mention'), dropLines: [] }],
-      // A channel another applied persona lists logs nothing (SRI-308).
+      // A channel another applied persona lists logs nothing.
       [{ event: "reviewer, planner's home channel, mention", to: 'reviewer', kind: 'mention', channel: home }, { deliveries: noDelivery(f), dropLines: [] }],
       [{ event: 'planner, an unlisted channel, plain', to: 'planner', kind: 'plain', channel: UNLISTED_CHANNEL }, { deliveries: noDelivery(f), dropLines: [unclaimedLine(h, f, 'planner', UNLISTED_CHANNEL)] }],
     ]
@@ -861,7 +860,7 @@ async function openListingClient(run: ReloadRun, name: string): Promise<Client> 
   return client
 }
 
-describe('a 0.11.1 configuration decides sample events as SRI-308 says (b.deo SRI-1307, SRI-308, SRI-106)', () => {
+describe('a 0.11.1 configuration decides sample events as says', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s: listed channels deliver by their entries, each dropped unlisted event logs one unclaimed-channel line, a channel another persona lists logs nothing',
     async (_file, fixture) => {
@@ -882,7 +881,7 @@ describe('a 0.11.1 configuration decides sample events as SRI-308 says (b.deo SR
   )
 })
 
-describe('set_channel_delivery is listed and refused, and the instructions are MCP_INSTRUCTIONS (b.deo SRI-1307, SRI-106, SRI-503, SRI-604)', () => {
+describe('set_channel_delivery is listed and refused, and the instructions are MCP_INSTRUCTIONS', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s: every channel persona lists the tool, gets the declarative refusal for one of its channels at all, and receives MCP_INSTRUCTIONS',
     async (_file, fixture) => {

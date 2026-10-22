@@ -1,5 +1,5 @@
 /** Accepted work survives a failed first fixed append without another event
- * or restart (b.omv SR-3.3/4.1/5.1); the unfixed head still owns the FIFO. */
+ * or restart; the unfixed head still owns the FIFO. */
 import { afterEach, expect, test } from 'bun:test'
 import { createPersonaRouting } from '../src/persona-routing.ts'
 import { RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'

@@ -1,4 +1,4 @@
-/** Durable per-persona FIFO journals. No import-time I/O (b.omv SR-3). */
+/** Durable per-persona FIFO journals. No import-time I/O. */
 import type { GetResult } from 'agent-director'
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
@@ -39,7 +39,7 @@ interface BaseRecord { v: 1; seq: number }
 export interface AcceptedRecord extends BaseRecord, AcceptedInput {
   kind: 'accepted'; received_at: number; ts: string; attempt_high_watermark?: number
 }
-/** Compaction keeps dedupe facts without message content (SR-3.4/3.5). */
+/** Compaction keeps dedupe facts without message content. */
 export interface QueueKeyRecord extends BaseRecord {
   kind: 'accepted'; compact: 'key'; key: SlackKey; received_at: number; delivered_at: number
 }
@@ -173,7 +173,7 @@ interface Journal extends AppendRollback {
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
 }
 function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0 } }
-/** All file access is explicit; construction allocates only memory (SR-13.1). */
+/** All file access is explicit; construction allocates only memory. */
 export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
   const fs = options.fs ?? nodeFs
   const now = options.now ?? Date.now
@@ -210,7 +210,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     if (durableDirectory?.dev === stat.dev && durableDirectory.ino === stat.ino && (stat.mode & 0o7777) === QUEUE_DIRECTORY_MODE) return
     durableDirectory = undefined
     fs.chmodSync(dir, QUEUE_DIRECTORY_MODE)
-    // Persist a new/replaced queue directory before any acceptance (SR-3.3).
+    // Persist a new/replaced queue directory before any acceptance.
     // Publish this identity only after success; a failed sync remains retryable.
     syncDir(options.stateDir)
     durableDirectory = { dev: stat.dev, ino: stat.ino }
@@ -321,7 +321,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       let raw: Record<string, unknown> | undefined
       try { const parsed: unknown = JSON.parse(text); if (object(parsed)) raw = parsed } catch {
         // A torn or syntactically damaged send can still identify its item. Retain
-        // conservative unknown-outcome evidence, never the damaged text (SR-3.6).
+        // conservative unknown-outcome evidence, never the damaged text.
         const kind = /(?:^|[,{])\s*"kind"\s*:\s*"([^"\\]+)"/.exec(text)?.[1]
         const seqText = /(?:^|[,{])\s*"seq"\s*:\s*(\d+)(?=\s*[,}])/.exec(text)?.[1]
         const attemptText = /(?:^|[,{])\s*"attempt"\s*:\s*(\d+)(?=\s*[,}])/.exec(text)?.[1]

@@ -1,6 +1,6 @@
 /**
  * test-helpers/reload-terms.ts — The reload wording no advertised surface may
- * carry (b.av2 SR-8.8, AC 74): the CLI usage text (cli.test.ts), the MCP tool
+ * carry: the CLI usage text (cli.test.ts), the MCP tool
  * list (registry.test.ts) and the MCP instructions (shipped-docs.test.ts).
  * The README and the skills may describe the gesture and are not checked.
  *

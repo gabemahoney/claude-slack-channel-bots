@@ -1,45 +1,44 @@
 /**
- * notice-texts.test.ts — The notice catalogue: every exported SRJ-10xx notice
+ * notice-texts.test.ts — The notice catalogue: every exported catalogued notice
  * builder and every other server notice posted to Slack, rendered for every
- * variant it has, held against rules that apply to every notice (b.jg5
- * SRJ-1001). E31 checks SRJ-511 (AC 47): no notice names `clear-latch` in any
- * spelling (tests/test-helpers/clear-latch-terms.ts). E36 extends the same
- * catalogue, never a second one, with the rest of SRJ-1001 (AC 40, 67, 78,
+ * variant it has, held against rules that apply to every notice. checks no notice names `clear-latch` in any
+ * spelling (tests/test-helpers/clear-latch-terms.ts). extends the same
+ * catalogue, never a second one, with the rest of the contract (67, 78,
  * 85, 86).
  *
- * `NOTICE_CATALOGUE` is one table of entries, each keyed by its SRJ id and
+ * `NOTICE_CATALOGUE` is one table of entries, each keyed by its behavior group and
  * naming its builder and variant: the CONFLICT notice for every row of the
  * conflict-case table, a description-less (note) latch and a token-bearing
- * description (SRJ-1004); the recovery notice for each latch kind and each
- * reason, "cleared by hand" included (SRJ-1005); the `tmux-unresponsive`
- * onset, alert and recovery (SRJ-1006); the kill-failure alert's ordinary
+ * description; the recovery notice for each latch kind and each
+ * reason, "cleared by hand" included; the `tmux-unresponsive`
+ * onset, alert and recovery; the kill-failure alert's ordinary
  * version for each `ErrTmuxKillFailed` description, each instance id, each
  * closing and each form, with no description and with both, and its survivor
- * version for each pid list and closing (SRJ-1007); the `ErrInvalidFlags` hold
- * (SRJ-1008); the unclassified-error alert (SRJ-1009); slow recovery
- * (SRJ-1010); typed delivery notices (b.omv SR-8); the
- * permission wedge warning (SRJ-1012); the startup-errors entries' texts
- * (SRJ-1013); the stuck-launch posts, the held
- * one with and without the attach line (SRJ-1017); the `ad-config-malformed`
- * onset (SRJ-1018); the unusable-name post for each fault (SRJ-1019); the
- * launch-start-not-recorded post (SRJ-1020); the re-bound socket's onset and
- * the all-clear (SRJ-1021); and, under SRJ-1001 (whose rules hold for every
+ * version for each pid list and closing; the `ErrInvalidFlags` hold
+ * the unclassified-error alert; slow recovery
+ * typed delivery notices; the
+ * permission wedge warning; the startup-errors entries' texts
+ * the stuck-launch posts, the held
+ * one with and without the attach line; the `ad-config-malformed`
+ * onset; the unusable-name post for each fault; the
+ * launch-start-not-recorded post; the re-bound socket's onset and
+ * the all-clear; and, under the contract (whose rules hold for every
  * server notice posted to Slack), the persona prefix, every outage onset and
  * the all-clear, the spawn-failure notice for each remediation and the
- * restart-cap notice, b.f2b's not-connected notice in every rendering,
- * the JSONL persistence safeguard's storage and AD-reference notices (SRJ-122: they name no
+ * restart-cap notice not-connected notice in every rendering,
+ * the JSONL persistence safeguard's storage and AD-reference notices (they name no
  * command and keep their text) and the `ErrJsonlMissing` diagnosis's three
- * notices (SRJ-712: both uncertainty shapes, each quoting
+ * notices (both uncertainty shapes, each quoting
  * agent-director and naming no command). The teardown window's notices
- * (SRJ-1003) are the kill outcome's one-line renderings. Each builder that quotes
+ * are the kill outcome's one-line renderings. Each builder that quotes
  * agent-director also has one redaction-and-cap row (`CAP_VARIANT`): a
  * token-bearing description longer than `MAX_LOGGED_MESSAGE_LENGTH`.
  * agent-director's words come from the stub's descriptions; a fake token
  * (`sentinelInMessage`) rides in every quoted description that can carry one.
  *
- * Checks, each a `test.each` whose case title names the SRJ id, the builder
+ * Checks, each a `test.each` whose case title names the behavior group, the builder
  * and the variant:
- *   - no entry names a `clear-latch` term (SRJ-511);
+ * - no entry names a `clear-latch` term;
  *   - CSCB's own text (`cscbOwnText` from tests/test-helpers/conflict-cases.ts,
  *     with agent-director's words "no kill was sent", "retry kill later" and
  *     "never delete this row" let through) names none of
@@ -56,7 +55,7 @@
  *     (`HUMAN_ONLY_SENTENCE` from tests/test-helpers/conflict-cases.ts) since
  *     its wordings differ; "Operator
  *     actions" appears only as its quoted title; the log-only texts
- *     (`LOG_ONLY_SRJS`: SRJ-1003, SRJ-1013) quote agent-director's own
+ * (`LOG_ONLY_GROUPS`:) quote agent-director's own
  *     pointer and are held to the other rules only;
  *   - only the ordinary kill-failure alert (and the startup-errors entry
  *     carrying it) and the wedge warning name `agent-director kill`, each
@@ -67,7 +66,7 @@
  *   - every Slack notice that quotes agent-director's description
  *     (`SLACK_QUOTING_NOTICES`) escapes Slack's control characters in it
  *     exactly once;
- *   - the completeness guard holds every id from SRJ-1001 to SRJ-1021 either
+ * - the completeness guard holds every id from the contract either
  *     in the catalogue or in `NOT_APPLICABLE` with its reason, never both,
  *     and every notice in `NAMED_SLACK_NOTICES` in every variant;
  *   - self-checks show each pattern finds what it looks for, and that
@@ -264,12 +263,12 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 // The catalogue
 // ---------------------------------------------------------------------------
 
-/** An SRJ-10xx requirement id. */
-type NoticeSrj = `SRJ-10${string}`
+/** An catalogued requirement id. */
+type NoticeGroup = typeof GUARDED_IDS[number]
 
-/** One rendered notice: its SRJ id, the builder that renders it, the variant and a renderer. */
+/** One rendered notice: its behavior group, the builder that renders it, the variant and a renderer. */
 interface NoticeEntry {
-  readonly srj: NoticeSrj
+  readonly group: NoticeGroup
   readonly builder: string
   readonly variant: string
   /** Renders the text; a builder that throws fails its own case. */
@@ -287,13 +286,13 @@ function withToken(text: string, label: string): string {
   return `${text} (${sentinelInMessage(label)})`
 }
 
-function entry(srj: NoticeSrj, builder: string, variant: string, render: () => string): NoticeEntry {
-  return Object.freeze({ srj, builder, variant, render })
+function entry(group: NoticeGroup, builder: string, variant: string, render: () => string): NoticeEntry {
+  return Object.freeze({ group, builder, variant, render })
 }
 
 /**
- * SRJ-1004's list-line renderings beyond a plain name (the Epic's hatch note
- * "orchestrator ruling after E13"): a name the line shell-quotes with a `'\''`
+ * list-line renderings beyond a plain name (the component's design note
+ * "orchestrator ruling after "): a name the line shell-quotes with a `'\''`
  * in it, and names the line leaves out for the unsafe-name sentence.
  */
 const CONFLICT_LIST_NAME_VARIANTS: readonly (readonly [variant: string, sessionName: string])[] = [
@@ -304,10 +303,10 @@ const CONFLICT_LIST_NAME_VARIANTS: readonly (readonly [variant: string, sessionN
   ['list line left out: a token-bearing name, which rendering redacts', `bot ${sentinelInMessage('list-name')}`],
 ]
 
-/** SRJ-1004: the CONFLICT notice. */
+/** the CONFLICT notice. */
 function conflictEntries(): NoticeEntry[] {
   const byRow = CONFLICT_CASE_ROWS.map((row) =>
-    entry('SRJ-1004', 'conflictNoticeText', row.name, () => {
+    entry("conflict", 'conflictNoticeText', row.name, () => {
       const record = row.record(KEY)
       return conflictNoticeText({
         sessionName: record.sessionName,
@@ -319,11 +318,11 @@ function conflictEntries(): NoticeEntry[] {
   const session = personaTmuxSessionName(KEY)
   return [
     ...byRow,
-    // A latch from a `provenance_conflict` note has no description (hatch A2).
-    entry('SRJ-1004', 'conflictNoticeText', 'note latch: conflicting labels, no description', () =>
+    // A latch from a `provenance_conflict` note has no description (design A2).
+    entry("conflict", 'conflictNoticeText', 'note latch: conflicting labels, no description', () =>
       conflictNoticeText({ sessionName: session, latchCase: LATCH_CASE_CONFLICTING_LABELS as ConflictLatchCase }),
     ),
-    entry('SRJ-1004', 'conflictNoticeText', 'token-bearing description', () =>
+    entry("conflict", 'conflictNoticeText', 'token-bearing description', () =>
       conflictNoticeText({
         sessionName: session,
         latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase,
@@ -331,14 +330,14 @@ function conflictEntries(): NoticeEntry[] {
       }),
     ),
     ...CONFLICT_LIST_NAME_VARIANTS.map(([variant, sessionName]) =>
-      entry('SRJ-1004', 'conflictNoticeText', variant, () =>
+      entry("conflict", 'conflictNoticeText', variant, () =>
         conflictNoticeText({ sessionName, latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase }),
       ),
     ),
   ]
 }
 
-/** SRJ-1005's reasons, "cleared by hand" (the `clear-latch` clear) included. */
+/** reasons, "cleared by hand" (the `clear-latch` clear) included. */
 const RECOVERY_REASONS: readonly (readonly [label: string, reason: LatchRecoveryReason])[] = [
   ['row reads ended', latchRecoveryReasonRowReads('ended')],
   ['row reads missing', latchRecoveryReasonRowReads('missing')],
@@ -348,26 +347,26 @@ const RECOVERY_REASONS: readonly (readonly [label: string, reason: LatchRecovery
   ['cleared by hand', LATCH_RECOVERY_REASON_CLEARED_BY_HAND],
 ]
 
-/** SRJ-1005: the recovery notice, for each latch kind and reason. */
+/** the recovery notice, for each latch kind and reason. */
 function recoveryEntries(): NoticeEntry[] {
   const kinds: readonly LatchKind[] = [LATCH_KIND_CONFLICT, LATCH_KIND_HOLD]
   return kinds.flatMap((kind) =>
     RECOVERY_REASONS.map(([label, reason]) =>
-      entry('SRJ-1005', 'latchRecoveryText', `${kind} latch, ${label}`, () =>
+      entry("latch-recovery", 'latchRecoveryText', `${kind} latch, ${label}`, () =>
         latchRecoveryText(kind, reason, personaTmuxSessionName(KEY)),
       ),
     ),
   )
 }
 
-/** SRJ-1006: `tmux-unresponsive`. */
+/** `tmux-unresponsive`. */
 function tmuxUnresponsiveEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1006', 'tmuxUnresponsiveOnsetText', 'onset', () => tmuxUnresponsiveOnsetText(KEY)),
-    entry('SRJ-1006', 'tmuxUnresponsiveAlertText', 'alert at the default threshold', () =>
+    entry("tmux-unresponsive", 'tmuxUnresponsiveOnsetText', 'onset', () => tmuxUnresponsiveOnsetText(KEY)),
+    entry("tmux-unresponsive", 'tmuxUnresponsiveAlertText', 'alert at the default threshold', () =>
       tmuxUnresponsiveAlertText(KEY, adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)),
     ),
-    entry('SRJ-1006', 'tmuxUnresponsiveRecoveryText', 'recovery', () => tmuxUnresponsiveRecoveryText(KEY)),
+    entry("tmux-unresponsive", 'tmuxUnresponsiveRecoveryText', 'recovery', () => tmuxUnresponsiveRecoveryText(KEY)),
   ]
 }
 
@@ -405,7 +404,7 @@ function killFailedDescription(description: (typeof KILL_FAILED_DESCRIPTIONS)[nu
   return withToken(errTmuxKillFailed(personaTmuxSessionName(KEY), description, pids).errDescription, 'kill-failed')
 }
 
-/** SRJ-1007: the kill-failure alert, both versions. */
+/** the kill-failure alert, both versions. */
 function killFailureEntries(): NoticeEntry[] {
   const ids: readonly (readonly [label: string, id: string])[] = [
     ['own id', personaInstanceId(KEY)],
@@ -426,7 +425,7 @@ function killFailureEntries(): NoticeEntry[] {
     ordinaryQuotes.flatMap(([quoteLabel, quotes]) =>
       ORDINARY_CLOSINGS.flatMap((closing) =>
         FORMS.map(([formLabel, forSlack]) =>
-          entry('SRJ-1007', 'killFailureAlertText', `ordinary, ${idLabel}, ${quoteLabel}, closing ${closing}, ${formLabel}`, () =>
+          entry("kill-failure", 'killFailureAlertText', `ordinary, ${idLabel}, ${quoteLabel}, closing ${closing}, ${formLabel}`, () =>
             killFailureAlertText(ordinaryContent(id, quotes?.()), closing, forSlack),
           ),
         ),
@@ -440,7 +439,7 @@ function killFailureEntries(): NoticeEntry[] {
   const survivor = pidLists.flatMap(([pidLabel, pids]) =>
     SURVIVOR_CLOSINGS.flatMap((closing) =>
       FORMS.map(([formLabel, forSlack]) =>
-        entry('SRJ-1007', 'killFailureAlertText', `survivor, ${pidLabel}, closing ${closing}, ${formLabel}`, () =>
+        entry("kill-failure", 'killFailureAlertText', `survivor, ${pidLabel}, closing ${closing}, ${formLabel}`, () =>
           killFailureAlertText(
             {
               version: KILL_FAILURE_VERSION_SURVIVOR,
@@ -457,9 +456,9 @@ function killFailureEntries(): NoticeEntry[] {
   return [...ordinary, ...survivor]
 }
 
-/** SRJ-1008: the `ErrInvalidFlags` hold alert, a fixed text. */
+/** the `ErrInvalidFlags` hold alert, a fixed text. */
 function invalidFlagsEntries(): NoticeEntry[] {
-  return [entry('SRJ-1008', 'INVALID_FLAGS_HOLD_ALERT_TEXT', 'the alert', () => INVALID_FLAGS_HOLD_ALERT_TEXT)]
+  return [entry("invalid-flags", 'INVALID_FLAGS_HOLD_ALERT_TEXT', 'the alert', () => INVALID_FLAGS_HOLD_ALERT_TEXT)]
 }
 
 /** An unclassified answer whose message carries a fake token. */
@@ -467,28 +466,28 @@ function unclassifiedQuote() {
   return classifyAdError(errGeneric('spawn', 'ErrFromALaterBinary', withToken('something new went wrong', 'unclassified')))
 }
 
-/** SRJ-1009: the unclassified-error alert, posted and log-only. */
+/** the unclassified-error alert, posted and log-only. */
 function unclassifiedEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1009', 'unclassifiedErrorAlertText', 'Slack', () => unclassifiedErrorAlertText(unclassifiedQuote())),
-    entry('SRJ-1009', 'unclassifiedErrorAlertText', 'log-only', () =>
+    entry("unclassified-error", 'unclassifiedErrorAlertText', 'Slack', () => unclassifiedErrorAlertText(unclassifiedQuote())),
+    entry("unclassified-error", 'unclassifiedErrorAlertText', 'log-only', () =>
       unclassifiedErrorAlertText(unclassifiedQuote(), { escapeForSlack: false }),
     ),
-    entry('SRJ-1009', 'unclassifiedErrorAlertText', 'no name and no message', () =>
+    entry("unclassified-error", 'unclassifiedErrorAlertText', 'no name and no message', () =>
       unclassifiedErrorAlertText({}),
     ),
   ]
 }
 
-/** SRJ-1010: slow dead-session recovery. */
+/** slow dead-session recovery. */
 function slowRecoveryEntries(): NoticeEntry[] {
-  return [entry('SRJ-1010', 'slowRecoveryText', 'the post', () => slowRecoveryText(KEY))]
+  return [entry("slow-recovery", 'slowRecoveryText', 'the post', () => slowRecoveryText(KEY))]
 }
 
-/** SRJ-1012: the permission wedge warning, for a persona whose name and key differ. */
+/** the permission wedge warning, for a persona whose name and key differ. */
 function wedgeWarningEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1012', 'buildWedgeWarningText', 'the warning', () => buildWedgeWarningText(PERSONA, personaInstanceId(KEY))),
+    entry("permission-wedge", 'buildWedgeWarningText', 'the warning', () => buildWedgeWarningText(PERSONA, personaInstanceId(KEY))),
   ]
 }
 
@@ -516,7 +515,7 @@ function conflictAtKill() {
   return new ErrTmuxSessionConflict('kill', ERR_TMUX_SESSION_CONFLICT_NAME, description)
 }
 
-/** SRJ-1003: the teardown window's notices for a kill's refusal or non-success (one builder an old-life wait uses too). */
+/** the teardown window's notices for a kill's refusal or non-success (one builder an old-life wait uses too). */
 function teardownEntries(): NoticeEntry[] {
   const refusals = [
     ['CONFLICT', AD_ERROR_CLASS_CONFLICT, conflictAtKill] as const,
@@ -524,14 +523,14 @@ function teardownEntries(): NoticeEntry[] {
   ]
   const kill = refusals.flatMap(([label, errorClass, error]) =>
     ([KILL_REFUSAL_AT_KILL, KILL_REFUSAL_AT_READ] as const).map((at) =>
-      entry('SRJ-1003', 'teardownKillRefusalNoticeText', `${label} at ${at}`, () =>
+      entry("teardown", 'teardownKillRefusalNoticeText', `${label} at ${at}`, () =>
         teardownKillRefusalNoticeText(personaInstanceId(OLD_KEY), { at, errorClass, error: error() }),
       ),
     ),
   )
   const wait = refusals.flatMap(([label, errorClass, error]) =>
     ([OLD_LIFE_WAIT_AT_KILL, OLD_LIFE_WAIT_AT_STATUS_READ, OLD_LIFE_WAIT_AT_GET, OLD_LIFE_WAIT_AT_FIND_MISSING] as readonly OldLifeWaitRefusalAt[]).map((at) =>
-      entry('SRJ-1003', 'oldLifeWaitRefusalNoticeText', `${label} at ${at}`, () =>
+      entry("teardown", 'oldLifeWaitRefusalNoticeText', `${label} at ${at}`, () =>
         oldLifeWaitRefusalNoticeText(personaInstanceId(OLD_KEY), { at, errorClass, error: error() }),
       ),
     ),
@@ -539,13 +538,13 @@ function teardownEntries(): NoticeEntry[] {
   return [
     ...kill,
     ...wait,
-    entry('SRJ-1003', 'teardownKillNotSucceededNoticeText', 'ErrTmuxKillFailed after 3 kills', () =>
+    entry("teardown", 'teardownKillNotSucceededNoticeText', 'ErrTmuxKillFailed after 3 kills', () =>
       teardownKillNotSucceededNoticeText(personaInstanceId(KEY), killFailedOutcome(), 3),
     ),
   ]
 }
 
-/** SRJ-1013: the texts of the startup-errors classes. */
+/** the texts of the startup-errors classes. */
 function startupErrorEntries(): NoticeEntry[] {
   const persona = { name: PERSONA.name, key: KEY }
   const ordinaryLog = () =>
@@ -558,20 +557,20 @@ function startupErrorEntries(): NoticeEntry[] {
   ]
   return [
     ...([FOUND_BY_STARTUP_CHECK, FOUND_BY_RUNTIME_RECHECK] as const).flatMap((foundBy) => [
-      entry('SRJ-1013', 'buildBelowPhase1FloorMessage', `ad-below-phase1-floor, ${foundBy}`, () =>
+      entry("startup-errors", 'buildBelowPhase1FloorMessage', `ad-below-phase1-floor, ${foundBy}`, () =>
         buildBelowPhase1FloorMessage({ foundVersion: DEV_PLACEHOLDER_VERSION, binaryPath: STUB_RESOLVE_DEFAULT_PATH }, foundBy),
       ),
-      entry('SRJ-1013', 'buildSystemInstallTooOldMessage', `ad-system-install-too-old, ${foundBy}`, () =>
+      entry("startup-errors", 'buildSystemInstallTooOldMessage', `ad-system-install-too-old, ${foundBy}`, () =>
         buildSystemInstallTooOldMessage({ foundVersion: BELOW_CLIENT_MIN_VERSION, requiredVersion: CLIENT_MIN_VERSION, binaryPath: STUB_RESOLVE_DEFAULT_PATH }, foundBy),
       ),
     ]),
     ...contexts.map(([label, context]) =>
-      entry('SRJ-1013', 'killFailureAlertEntryText', `persona-kill-failed, ${label}`, () =>
+      entry("startup-errors", 'killFailureAlertEntryText', `persona-kill-failed, ${label}`, () =>
         killFailureAlertEntryText(`persona=${KEY}`, context, ordinaryLog()),
       ),
     ),
     ...(['line', 'entry'] as const).map((part) =>
-      entry('SRJ-1013', 'killFailureStoppedRetryText', `persona-kill-failed, a stopped retry's ${part}`, () =>
+      entry("startup-errors", 'killFailureStoppedRetryText', `persona-kill-failed, a stopped retry's ${part}`, () =>
         killFailureStoppedRetryText({
           key: KEY,
           decision: { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescription('unverifiable-session-present') },
@@ -581,7 +580,7 @@ function startupErrorEntries(): NoticeEntry[] {
       ),
     ),
     ...([PERSONA_TEARDOWN_NOTICE_RAISED, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER, PERSONA_TEARDOWN_NOTICE_DURING_WAIT] as const satisfies readonly PersonaTeardownNoticeOccasion[]).map((occasion) =>
-      entry('SRJ-1013', 'personaTeardownNoticeEntryText', `persona-teardown-notice, ${occasion}`, () =>
+      entry("startup-errors", 'personaTeardownNoticeEntryText', `persona-teardown-notice, ${occasion}`, () =>
         personaTeardownNoticeEntryText(
           `persona=${KEY}`,
           teardownKillRefusalNoticeText(personaInstanceId(KEY), { at: KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: conflictAtKill() }),
@@ -589,106 +588,106 @@ function startupErrorEntries(): NoticeEntry[] {
         ),
       ),
     ),
-    entry('SRJ-1013', 'unclassifiedErrorAlertText', 'persona-unclassified-error', () =>
+    entry("startup-errors", 'unclassifiedErrorAlertText', 'persona-unclassified-error', () =>
       personaUnclassifiedErrorEntryText(KEY, unclassifiedErrorAlertText(unclassifiedQuote(), { escapeForSlack: false })),
     ),
     ...([CLI_COMMAND_STOP_BOTS, CLI_COMMAND_CLEAN_RESTART] as const).map((command) =>
-      entry('SRJ-1013', 'teardownFailureLine', `cli-teardown-failed, ${command}`, () =>
+      entry("startup-errors", 'teardownFailureLine', `cli-teardown-failed, ${command}`, () =>
         teardownFailureLine(command, persona, teardownErrorReportOf(conflictAtKill())),
       ),
     ),
-    entry('SRJ-1013', 'cleanRestartNotRestartedAlert', 'clean-restart-not-restarted', () =>
+    entry("startup-errors", 'cleanRestartNotRestartedAlert', 'clean-restart-not-restarted', () =>
       cleanRestartNotRestartedAlert([{ persona, errorClass: 'UNAVAILABLE' }]),
     ),
-    entry('SRJ-1013', 'retiredKeysUnreadableMessage', 'retired-keys-unreadable', () =>
+    entry("startup-errors", 'retiredKeysUnreadableMessage', 'retired-keys-unreadable', () =>
       retiredKeysUnreadableMessage('/state/retired-keys.json', 'is not valid JSON at line 2, column 5'),
     ),
   ]
 }
 
-/** SRJ-1017: the stuck-launch posts. */
+/** the stuck-launch posts. */
 function stuckLaunchEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1017', 'stuckLaunchRelaunchingText', 'relaunching, default B', () =>
+    entry("stuck-launch", 'stuckLaunchRelaunchingText', 'relaunching, default B', () =>
       stuckLaunchRelaunchingText(KEY, adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)),
     ),
-    entry('SRJ-1017', 'stuckLaunchHeldText', 'held, with the attach line', () => stuckLaunchHeldText(KEY, SAMPLE_LAUNCH_START_DEFAULT, false)),
-    entry('SRJ-1017', 'stuckLaunchHeldText', 'held, not started by CSCB (no attach line)', () =>
+    entry("stuck-launch", 'stuckLaunchHeldText', 'held, with the attach line', () => stuckLaunchHeldText(KEY, SAMPLE_LAUNCH_START_DEFAULT, false)),
+    entry("stuck-launch", 'stuckLaunchHeldText', 'held, not started by CSCB (no attach line)', () =>
       stuckLaunchHeldText(KEY, SAMPLE_LAUNCH_START_DEFAULT, true),
     ),
   ]
 }
 
-/** SRJ-1018: the `ad-config-malformed` onset. */
+/** the `ad-config-malformed` onset. */
 function adConfigMalformedEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1018', 'adConfigMalformedOnset', "the stub's description", () => adConfigMalformedOnset(errConfigMalformed())),
-    entry('SRJ-1018', 'adConfigMalformedOnset', 'token-bearing description', () =>
+    entry("ad-config-malformed", 'adConfigMalformedOnset', "the stub's description", () => adConfigMalformedOnset(errConfigMalformed())),
+    entry("ad-config-malformed", 'adConfigMalformedOnset', 'token-bearing description', () =>
       adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', withToken(classifyAdError(errConfigMalformed()).message ?? '', 'config'))),
     ),
-    entry('SRJ-1018', 'ALL_CLEAR_TEMPLATE', 'all-clear listing ad-config-malformed', () =>
+    entry("ad-config-malformed", 'ALL_CLEAR_TEMPLATE', 'all-clear listing ad-config-malformed', () =>
       ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>([['ad-config-malformed', {} as ClassRecord]])),
     ),
   ]
 }
 
-/** SRJ-1019: the unusable-recorded-name post, for each fault. */
+/** the unusable-recorded-name post, for each fault. */
 function unusableNameEntries(): NoticeEntry[] {
   return [
     ...UNUSABLE_NAME_FAULTS.map((fault) =>
-      entry('SRJ-1019', 'unusableNameNoticeText', fault, () => unusableNameNoticeText(KEY, classifyAdError(errUnusableName(fault)).message)),
+      entry("unusable-name", 'unusableNameNoticeText', fault, () => unusableNameNoticeText(KEY, classifyAdError(errUnusableName(fault)).message)),
     ),
-    entry('SRJ-1019', 'unusableNameNoticeText', 'token-bearing description', () =>
+    entry("unusable-name", 'unusableNameNoticeText', 'token-bearing description', () =>
       unusableNameNoticeText(KEY, withToken(classifyAdError(errUnusableName('empty')).message ?? '', 'unusable')),
     ),
   ]
 }
 
-/** SRJ-1020: the launch-start-not-recorded post. */
+/** the launch-start-not-recorded post. */
 function launchStartEntries(): NoticeEntry[] {
-  return [entry('SRJ-1020', 'launchStartNotRecordedNoticeText', 'the post', () => launchStartNotRecordedNoticeText(KEY))]
+  return [entry("launch-start-missing", 'launchStartNotRecordedNoticeText', 'the post', () => launchStartNotRecordedNoticeText(KEY))]
 }
 
-/** SRJ-1021: the re-bound socket's `tmux-unavailable` onset and its (existing) all-clear. */
+/** the re-bound socket's `tmux-unavailable` onset and its (existing) all-clear. */
 function tmuxServerChangedEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1021', 'tmuxServerChangedOnset', 'the onset', () => tmuxServerChangedOnset()),
-    entry('SRJ-1021', 'ALL_CLEAR_TEMPLATE', 'all-clear listing tmux-unavailable', () =>
+    entry("tmux-server-changed", 'tmuxServerChangedOnset', 'the onset', () => tmuxServerChangedOnset()),
+    entry("tmux-server-changed", 'ALL_CLEAR_TEMPLATE', 'all-clear listing tmux-unavailable', () =>
       ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>([['tmux-unavailable', {} as ClassRecord]])),
     ),
   ]
 }
 
-/** SRJ-1001: its rules hold for every server notice: the persona prefix and every outage onset. */
+/** its rules hold for every server notice: the persona prefix and every outage onset. */
 function commonEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1001', 'formatPersonaNotice', 'the persona prefix on a recovery post', () =>
+    entry("common", 'formatPersonaNotice', 'the persona prefix on a recovery post', () =>
       formatPersonaNotice(PERSONA, latchRecoveryText(LATCH_KIND_CONFLICT, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, personaTmuxSessionName(KEY))),
     ),
     ...OUTAGE_CLASS_ORDER.map((outage) =>
-      entry('SRJ-1001', 'ONSET_TEMPLATES', `${outage} onset`, () => ONSET_TEMPLATES[outage]('/usr/local/bin/agent-director')),
+      entry("common", 'ONSET_TEMPLATES', `${outage} onset`, () => ONSET_TEMPLATES[outage]('/usr/local/bin/agent-director')),
     ),
-    entry('SRJ-1001', 'ALL_CLEAR_TEMPLATE', 'all-clear listing every class', () =>
+    entry("common", 'ALL_CLEAR_TEMPLATE', 'all-clear listing every class', () =>
       ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>(OUTAGE_CLASS_ORDER.map((outage) => [outage, {} as ClassRecord]))),
     ),
-    entry('SRJ-1001', 'spawnFailureNoticeText', 'token-bearing description', () =>
+    entry("common", 'spawnFailureNoticeText', 'token-bearing description', () =>
       spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', withToken('tmux new-session failed', 'spawn-failure'))),
     ),
   ]
 }
 
 /**
- * SRJ-1001: the spawn-failure notice for each remediation (its description
+ * the spawn-failure notice for each remediation (its description
  * redacted and capped; its Slack escape is checked in `SLACK_QUOTING_NOTICES`)
  * and the restart-cap notice.
  */
 function spawnFailureEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1001', 'spawnFailureNoticeText', 'ErrSpawnNotFound', () => spawnFailureNoticeText(errSpawnNotFound())),
-    entry('SRJ-1001', 'spawnFailureNoticeText', 'any other error, token-bearing description', () =>
+    entry("common", 'spawnFailureNoticeText', 'ErrSpawnNotFound', () => spawnFailureNoticeText(errSpawnNotFound())),
+    entry("common", 'spawnFailureNoticeText', 'any other error, token-bearing description', () =>
       spawnFailureNoticeText(errGeneric('spawn', 'ErrFromALaterBinary', withToken('the launch failed', 'spawn-failure'))),
     ),
-    entry('SRJ-1001', 'restartCapReachedNoticeText', 'the restart cap', () => restartCapReachedNoticeText()),
+    entry("common", 'restartCapReachedNoticeText', 'the restart cap', () => restartCapReachedNoticeText()),
   ]
 }
 
@@ -711,32 +710,32 @@ function notConnectedVariants(): readonly (readonly [label: string, notice: NotC
   ]
 }
 
-/** SRJ-1001: b.f2b's not-connected notices, which name `tmux attach` and so carry the human-only sentence. */
+/** not-connected notices, which name `tmux attach` and so carry the human-only sentence. */
 function notConnectedEntries(): NoticeEntry[] {
   return notConnectedVariants().map(([label, notice]) =>
-    entry('SRJ-1001', 'buildNotConnectedNotice', label, () => buildNotConnectedNotice(KEY, notice)),
+    entry("common", 'buildNotConnectedNotice', label, () => buildNotConnectedNotice(KEY, notice)),
   )
 }
 
-/** b.omv SR-8: variants join the existing catalogue and all its safety checks. */
+/** variants join the existing catalogue and all its safety checks. */
 const DELIVERY_STUCK_REASONS: readonly DeliveryStuckReason[] = [
   'relay-off', 'mcp', 'refused', 'transcript',
   'queue-unwritable', 'not-taken-in', 'dialog-hold',
 ]
 function deliveryEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1001', buildMessageNotSavedNotice.name, 'store failed', () => buildMessageNotSavedNotice(PERSONA.name, 'U0SENDER1')),
-    ...DELIVERY_STUCK_REASONS.map((reason) => entry('SRJ-1001', buildDeliveryStuckNotice.name, reason, () =>
+    entry("common", buildMessageNotSavedNotice.name, 'store failed', () => buildMessageNotSavedNotice(PERSONA.name, 'U0SENDER1')),
+    ...DELIVERY_STUCK_REASONS.map((reason) => entry("common", buildDeliveryStuckNotice.name, reason, () =>
       buildDeliveryStuckNotice(PERSONA.name, KEY, 2, DELIVERY_STUCK_AFTER_MS + 1, reason, 3))),
-    entry('SRJ-1001', buildMessageNotTakenInNotice.name, 'unconfirmed first retype', () => buildMessageNotTakenInNotice(PERSONA.name, 'U0SENDER1')),
-    ...MESSAGES_WAITING_STATES.map((state) => entry('SRJ-1001', buildMessagesWaitingNotice.name, state, () =>
+    entry("common", buildMessageNotTakenInNotice.name, 'unconfirmed first retype', () => buildMessageNotTakenInNotice(PERSONA.name, 'U0SENDER1')),
+    ...MESSAGES_WAITING_STATES.map((state) => entry("common", buildMessagesWaitingNotice.name, state, () =>
       buildMessagesWaitingNotice(PERSONA.name, 2, DELIVERY_STUCK_AFTER_MS, state))),
-    entry('SRJ-1001', buildQueueRecordUnreadableNotice.name, 'unreadable accepted record', () =>
+    entry("common", buildQueueRecordUnreadableNotice.name, 'unreadable accepted record', () =>
       buildQueueRecordUnreadableNotice(PERSONA.name, 2, '/scratch/queue/quarantined.jsonl')),
   ]
 }
 
-/** The JSONL persistence safeguard's storage and AD-reference notices (b.zak; SRJ-122 keeps their text): one per variant. */
+/** The JSONL persistence safeguard's storage and AD-reference notices (keeps their text): one per variant. */
 const JSONL_NON_PERSISTENT = 'non-persistent storage'
 const JSONL_ROTATED = 'AD rotated transcript reference'
 
@@ -782,11 +781,11 @@ function jsonlSafeguardNotice(variant: string): string {
   return text
 }
 
-/** SRJ-1001 (SRJ-122): the JSONL persistence safeguard's notices, which name no command. */
+/** the JSONL persistence safeguard's notices, which name no command. */
 function jsonlSafeguardEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1001', 'runPersonaStorageCheck', JSONL_NON_PERSISTENT, () => jsonlSafeguardNotice(JSONL_NON_PERSISTENT)),
-    entry('SRJ-1001', 'runJsonlPersistenceSafeguard', JSONL_ROTATED, () => jsonlSafeguardNotice(JSONL_ROTATED)),
+    entry("common", 'runPersonaStorageCheck', JSONL_NON_PERSISTENT, () => jsonlSafeguardNotice(JSONL_NON_PERSISTENT)),
+    entry("common", 'runJsonlPersistenceSafeguard', JSONL_ROTATED, () => jsonlSafeguardNotice(JSONL_ROTATED)),
   ]
 }
 
@@ -813,16 +812,16 @@ function jsonlPathsTried(label: string): string {
 const JSONL_SAMPLE_PROVENANCE = 'sample provenance of the paths below'
 
 /**
- * SRJ-1001 (SRJ-712): the `ErrJsonlMissing` diagnosis's two uncertainty notices, each quoting agent-director's paths or
+ * the `ErrJsonlMissing` diagnosis's two uncertainty notices, each quoting agent-director's paths or
  * description, which hold a fake token and {@link JSONL_SLACK_CONTROLS};
  * they name no command.
  */
 function jsonlDiagnosisEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1001', 'jsonlRowAbsentInconclusiveNoticeText', 'inconclusive, row absent, token-bearing description', () =>
+    entry("common", 'jsonlRowAbsentInconclusiveNoticeText', 'inconclusive, row absent, token-bearing description', () =>
       jsonlRowAbsentInconclusiveNoticeText(withToken(`${errJsonlMissing().errDescription} ${JSONL_SLACK_CONTROLS}`, 'jsonl-row-absent')),
     ),
-    entry('SRJ-1001', 'jsonlCandidatesInconclusiveNoticeText', 'inconclusive, unattributable zero, token-bearing candidates', () =>
+    entry("common", 'jsonlCandidatesInconclusiveNoticeText', 'inconclusive, unattributable zero, token-bearing candidates', () =>
       jsonlCandidatesInconclusiveNoticeText('agent-director references do not verify transcript readability', JSONL_SAMPLE_PROVENANCE, jsonlPathsTried('jsonl-candidates')),
     ),
   ]
@@ -843,27 +842,27 @@ function overCapDescription(label: string, lead = ''): string {
   return `${lead}${sentinelInMessage(label)} ${filler.repeat(Math.ceil(MAX_LOGGED_MESSAGE_LENGTH / filler.length) + 1)}${CAP_TAIL}`
 }
 
-/** SRJ-1001: one redaction-and-cap row per builder that quotes agent-director. */
+/** one redaction-and-cap row per builder that quotes agent-director. */
 function capEntries(): NoticeEntry[] {
   const session = personaTmuxSessionName(KEY)
   const refusal = (label: string) => errGeneric('kill', 'ErrTmuxSessionConflict', overCapDescription(label))
   const ordinary = (label: string, closing: KillFailureClosing, forSlack: boolean) =>
     killFailureAlertText(ordinaryContent(personaInstanceId(KEY), { lastKillFailedDescription: overCapDescription(label) }), closing, forSlack)
   return [
-    entry('SRJ-1003', 'teardownKillRefusalNoticeText', CAP_VARIANT, () =>
+    entry("teardown", 'teardownKillRefusalNoticeText', CAP_VARIANT, () =>
       teardownKillRefusalNoticeText(personaInstanceId(OLD_KEY), { at: KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: refusal('cap-teardown') }),
     ),
-    entry('SRJ-1003', 'oldLifeWaitRefusalNoticeText', CAP_VARIANT, () =>
+    entry("teardown", 'oldLifeWaitRefusalNoticeText', CAP_VARIANT, () =>
       oldLifeWaitRefusalNoticeText(personaInstanceId(OLD_KEY), { at: OLD_LIFE_WAIT_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: refusal('cap-old-life') }),
     ),
-    entry('SRJ-1003', 'teardownKillNotSucceededNoticeText', CAP_VARIANT, () =>
+    entry("teardown", 'teardownKillNotSucceededNoticeText', CAP_VARIANT, () =>
       teardownKillNotSucceededNoticeText(personaInstanceId(KEY), killFailedOutcome(overCapDescription('cap-not-killed')), 3),
     ),
-    entry('SRJ-1004', 'conflictNoticeText', CAP_VARIANT, () =>
+    entry("conflict", 'conflictNoticeText', CAP_VARIANT, () =>
       conflictNoticeText({ sessionName: session, latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase, description: overCapDescription('cap-conflict') }),
     ),
-    entry('SRJ-1007', 'killFailureAlertText', `ordinary, ${CAP_VARIANT}`, () => ordinary('cap-kill-failed', KILL_FAILURE_CLOSING_DESTINATION, true)),
-    entry('SRJ-1007', 'killFailureAlertText', `survivor, ${CAP_VARIANT}`, () =>
+    entry("kill-failure", 'killFailureAlertText', `ordinary, ${CAP_VARIANT}`, () => ordinary('cap-kill-failed', KILL_FAILURE_CLOSING_DESTINATION, true)),
+    entry("kill-failure", 'killFailureAlertText', `survivor, ${CAP_VARIANT}`, () =>
       killFailureAlertText(
         {
           version: KILL_FAILURE_VERSION_SURVIVOR,
@@ -874,13 +873,13 @@ function capEntries(): NoticeEntry[] {
         true,
       ),
     ),
-    entry('SRJ-1009', 'unclassifiedErrorAlertText', CAP_VARIANT, () =>
+    entry("unclassified-error", 'unclassifiedErrorAlertText', CAP_VARIANT, () =>
       unclassifiedErrorAlertText(classifyAdError(errGeneric('spawn', 'ErrFromALaterBinary', overCapDescription('cap-unclassified')))),
     ),
-    entry('SRJ-1013', 'killFailureAlertEntryText', CAP_VARIANT, () =>
+    entry("startup-errors", 'killFailureAlertEntryText', CAP_VARIANT, () =>
       killFailureAlertEntryText(`persona=${KEY}`, KILL_FAILURE_CONTEXTS[0], ordinary('cap-entry', KILL_FAILURE_CLOSING_LOG_ONLY, false)),
     ),
-    entry('SRJ-1013', 'killFailureStoppedRetryText', CAP_VARIANT, () => {
+    entry("startup-errors", 'killFailureStoppedRetryText', CAP_VARIANT, () => {
       const { line, entry: startupEntry } = killFailureStoppedRetryText({
         key: KEY,
         decision: { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: overCapDescription('cap-stopped-retry') },
@@ -889,34 +888,34 @@ function capEntries(): NoticeEntry[] {
       })
       return `${line}\n${startupEntry}`
     }),
-    entry('SRJ-1013', 'personaTeardownNoticeEntryText', CAP_VARIANT, () =>
+    entry("startup-errors", 'personaTeardownNoticeEntryText', CAP_VARIANT, () =>
       personaTeardownNoticeEntryText(
         `persona=${KEY}`,
         teardownKillRefusalNoticeText(personaInstanceId(KEY), { at: KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: refusal('cap-teardown-entry') }),
       ),
     ),
-    entry('SRJ-1013', 'teardownFailureLine', CAP_VARIANT, () =>
+    entry("startup-errors", 'teardownFailureLine', CAP_VARIANT, () =>
       teardownFailureLine(CLI_COMMAND_STOP_BOTS, { name: PERSONA.name, key: KEY }, teardownErrorReportOf(refusal('cap-cli'))),
     ),
-    entry('SRJ-1018', 'adConfigMalformedOnset', CAP_VARIANT, () =>
+    entry("ad-config-malformed", 'adConfigMalformedOnset', CAP_VARIANT, () =>
       adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', overCapDescription('cap-config'))),
     ),
-    entry('SRJ-1019', 'unusableNameNoticeText', CAP_VARIANT, () => unusableNameNoticeText(KEY, overCapDescription('cap-unusable'))),
-    entry('SRJ-1001', 'spawnFailureNoticeText', CAP_VARIANT, () =>
+    entry("unusable-name", 'unusableNameNoticeText', CAP_VARIANT, () => unusableNameNoticeText(KEY, overCapDescription('cap-unusable'))),
+    entry("common", 'spawnFailureNoticeText', CAP_VARIANT, () =>
       spawnFailureNoticeText(errGeneric('spawn', 'ErrFromALaterBinary', overCapDescription('cap-spawn'))),
     ),
-    entry('SRJ-1001', 'jsonlRowAbsentInconclusiveNoticeText', CAP_VARIANT, () =>
+    entry("common", 'jsonlRowAbsentInconclusiveNoticeText', CAP_VARIANT, () =>
       jsonlRowAbsentInconclusiveNoticeText(overCapDescription('cap-jsonl-row-absent')),
     ),
-    entry('SRJ-1001', 'jsonlCandidatesInconclusiveNoticeText', CAP_VARIANT, () =>
+    entry("common", 'jsonlCandidatesInconclusiveNoticeText', CAP_VARIANT, () =>
       jsonlCandidatesInconclusiveNoticeText('agent-director references do not verify transcript readability', JSONL_SAMPLE_PROVENANCE, overCapDescription('cap-jsonl-candidates')),
     ),
   ]
 }
 
 /**
- * Every Slack notice's output, by SRJ id: every SRJ-10xx notice builder, and
- * under SRJ-1001 every other server notice it names (`NAMED_SLACK_NOTICES`).
+ * Every Slack notice's output, by behavior group: every catalogued notice builder, and
+ * under the contract every other server notice it names (`NAMED_SLACK_NOTICES`).
  * A new notice joins here (and an id leaves `NOT_APPLICABLE` once a builder
  * is exported).
  */
@@ -945,24 +944,24 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...tmuxServerChangedEntries(),
 ])
 
-/** The SRJ-10xx ids from SRJ-1001 to SRJ-1021 with no notice builder in the catalogue, each with its reason. */
-const NOT_APPLICABLE: Readonly<Partial<Record<NoticeSrj, string>>> = Object.freeze({
-  'SRJ-1011': 'SR-4.2 removes Message lost; accepted inputs remain in the queue and recovery posts nothing.',
-  'SRJ-1002': 'log-only routing: it routes other notices and has no text of its own',
-  'SRJ-1014': 'log lines, not notices: each is asserted with its behaviour',
-  'SRJ-1015': 'the start summary line is a server-log line, not a notice',
-  'SRJ-1016': 'episodes rate-limit notices and have no text of their own',
+/** The catalogued ids from the contract to with no notice builder in the catalogue, each with its reason. */
+const NOT_APPLICABLE: Readonly<Partial<Record<NoticeGroup, string>>> = Object.freeze({
+  "queued-delivery": 'removes Message lost; accepted inputs remain in the queue and recovery posts nothing.',
+  "routing": 'log-only routing: it routes other notices and has no text of its own',
+  "settings-log": 'log lines, not notices: each is asserted with its behaviour',
+  "startup-summary": 'the start summary line is a server-log line, not a notice',
+  "episodes": 'episodes rate-limit notices and have no text of their own',
 })
 
-/** Every id the completeness guard covers: SRJ-1001 to SRJ-1021. */
-const GUARDED_IDS: readonly NoticeSrj[] = Array.from({ length: 21 - 1 + 1 }, (_, i) => `SRJ-10${String(1 + i).padStart(2, '0')}` as NoticeSrj)
+/** Every id the completeness guard covers: to. */
+const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed'] as const
 
 /**
- * The server notices posted to Slack that SRJ-1001 names beyond the SRJ-10xx
+ * The server notices posted to Slack that names beyond the catalogued
  * builders, by the builder that renders each (the JSONL safeguard's by its
  * entry points, which have no pure builder): the wedge warning, the
  * lost-message notice, the outage onsets and all-clear, the spawn-failure
- * and restart-cap notices, b.f2b's not-connected notices, the JSONL
+ * and restart-cap notices not-connected notices, the JSONL
  * safeguard's notices and the `ErrJsonlMissing` diagnosis's three notices.
  * Each has a catalogue entry.
  */
@@ -984,7 +983,7 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   jsonlCandidatesInconclusiveNoticeText.name,
 ])
 
-/** The `ErrJsonlMissing` diagnosis's notice builders (SRJ-712), each of which quotes agent-director. */
+/** The `ErrJsonlMissing` diagnosis's notice builders, each of which quotes agent-director. */
 const JSONL_DIAGNOSIS_BUILDERS: readonly string[] = Object.freeze([
   jsonlRowAbsentInconclusiveNoticeText.name,
   jsonlCandidatesInconclusiveNoticeText.name,
@@ -995,30 +994,30 @@ const SLACK_MARKUP_DESCRIPTION = 'quoted <!channel> & <@U0MENTION> end'
 
 /**
  * Every Slack-bound notice that quotes agent-director's description, each
- * rendering `description` in its Slack form (SRJ-1001): the escaping audit's
+ * rendering `description` in its Slack form: the escaping audit's
  * table.
  */
 const SLACK_QUOTING_NOTICES: readonly (readonly [title: string, render: (description: string) => string])[] = [
-  ['SRJ-1004 conflictNoticeText', (description) =>
+  ['conflictNoticeText', (description) =>
     conflictNoticeText({ sessionName: personaTmuxSessionName(KEY), latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase, description })],
-  ['SRJ-1007 killFailureAlertText (Slack)', (description) =>
+  ['killFailureAlertText (Slack)', (description) =>
     killFailureAlertText(ordinaryContent(personaInstanceId(KEY), { lastKillFailedDescription: description }), KILL_FAILURE_CLOSING_DESTINATION, true)],
-  ['SRJ-1009 unclassifiedErrorAlertText (Slack)', (description) => unclassifiedErrorAlertText(classifyAdError(errGeneric('spawn', 'ErrFromALaterBinary', description)))],
-  ['SRJ-1018 adConfigMalformedOnset', (description) => adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', description))],
-  ['SRJ-1019 unusableNameNoticeText', (description) => unusableNameNoticeText(KEY, description)],
-  ['SRJ-1001 spawnFailureNoticeText', (description) => spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', description))],
-  ['SRJ-712 jsonlCandidatesInconclusiveNoticeText (a candidate\'s note)', (description) =>
+  ['unclassifiedErrorAlertText (Slack)', (description) => unclassifiedErrorAlertText(classifyAdError(errGeneric('spawn', 'ErrFromALaterBinary', description)))],
+  ['adConfigMalformedOnset', (description) => adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', description))],
+  ['unusableNameNoticeText', (description) => unusableNameNoticeText(KEY, description)],
+  ['spawnFailureNoticeText', (description) => spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', description))],
+  ['jsonlCandidatesInconclusiveNoticeText (a candidate\'s note)', (description) =>
     jsonlCandidatesInconclusiveNoticeText(
       'agent-director references do not verify transcript readability',
       JSONL_SAMPLE_PROVENANCE,
       jsonlCandidatesText([{ source: 'persisted', path: '/data/proj/sess.jsonl', note: description }]),
     )],
-  ['SRJ-712 jsonlRowAbsentInconclusiveNoticeText (agent-director\'s description)', (description) => jsonlRowAbsentInconclusiveNoticeText(description)],
+  ['jsonlRowAbsentInconclusiveNoticeText (agent-director\'s description)', (description) => jsonlRowAbsentInconclusiveNoticeText(description)],
 ]
 
-/** `<SRJ id> <builder>: <variant>`, for case titles. */
+/** `<behavior group> <builder>: <variant>`, for case titles. */
 function titleOf(e: NoticeEntry): string {
-  return `${e.srj} ${e.builder}: ${e.variant}`
+  return `${e.group} ${e.builder}: ${e.variant}`
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,7 +1044,7 @@ describe('the clear-latch term finder (tests/test-helpers/clear-latch-terms.ts)'
   })
 })
 
-describe('SRJ-511 (AC 47): no SRJ-10xx notice names clear-latch', () => {
+describe('no catalogued notice names clear-latch', () => {
   test.each(NOTICE_CATALOGUE.map((e) => [titleOf(e), e] as const))('%s', (_title, e) => {
     const text = e.render()
     expect(text.trim()).not.toBe('')
@@ -1053,7 +1052,7 @@ describe('SRJ-511 (AC 47): no SRJ-10xx notice names clear-latch', () => {
   })
 
   test('the "cleared by hand" recovery text, which a clear-latch clear posts, is in the catalogue', () => {
-    expect(NOTICE_CATALOGUE.filter((e) => e.srj === 'SRJ-1005' && e.variant.endsWith('cleared by hand')).map((e) => e.variant)).toEqual([
+    expect(NOTICE_CATALOGUE.filter((e) => e.group === "latch-recovery" && e.variant.endsWith('cleared by hand')).map((e) => e.variant)).toEqual([
       `${LATCH_KIND_CONFLICT} latch, cleared by hand`,
       `${LATCH_KIND_HOLD} latch, cleared by hand`,
     ])
@@ -1064,20 +1063,20 @@ describe('SRJ-511 (AC 47): no SRJ-10xx notice names clear-latch', () => {
     assertNoLeak(Object.fromEntries(texts.map(([e, text]) => [titleOf(e), text])), 'notices')
     // Not vacuous: the fake tokens reach every builder that quotes agent-director, as its redaction placeholder.
     const redacted = [REDACTED_TOKEN_PLACEHOLDER, escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER)]
-    expect([...new Set(texts.filter(([, text]) => redacted.some((r) => text.includes(r))).map(([e]) => e.srj))].sort()).toEqual([
-      'SRJ-1001',
-      'SRJ-1003',
-      'SRJ-1004',
-      'SRJ-1007',
-      'SRJ-1009',
-      'SRJ-1013',
-      'SRJ-1018',
-      'SRJ-1019',
-    ])
+    expect([...new Set(texts.filter(([, text]) => redacted.some((r) => text.includes(r))).map(([e]) => e.group))].sort()).toEqual(([
+      "common",
+      "teardown",
+      "conflict",
+      "kill-failure",
+      "unclassified-error",
+      "startup-errors",
+      "ad-config-malformed",
+      "unusable-name",
+    ] as NoticeGroup[]).sort())
   })
 })
 
-describe('SRJ-1001: a Slack notice quoting agent-director escapes its description exactly once', () => {
+describe('a Slack notice quoting agent-director escapes its description exactly once', () => {
   test.each(SLACK_QUOTING_NOTICES)('%s', (_title, render) => {
     const text = render(SLACK_MARKUP_DESCRIPTION)
     const escaped = escapeSlackControlCharacters(SLACK_MARKUP_DESCRIPTION)
@@ -1094,15 +1093,15 @@ describe('SRJ-1001: a Slack notice quoting agent-director escapes its descriptio
   })
 })
 
-describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every named Slack notice)', () => {
+describe('the notice catalogue is complete (to, and every named Slack notice)', () => {
   test('every id has a catalogue entry or a not-applicable reason, never both', () => {
-    const catalogued = new Set(NOTICE_CATALOGUE.map((e) => e.srj))
+    const catalogued = new Set(NOTICE_CATALOGUE.map((e) => e.group))
     expect(GUARDED_IDS.filter((id) => !catalogued.has(id) && NOT_APPLICABLE[id] === undefined)).toEqual([])
     expect(GUARDED_IDS.filter((id) => catalogued.has(id) && NOT_APPLICABLE[id] !== undefined)).toEqual([])
   })
 
   test('every not-applicable id is guarded and has a reason', () => {
-    const entries = Object.entries(NOT_APPLICABLE) as [NoticeSrj, string][]
+    const entries = Object.entries(NOT_APPLICABLE) as [NoticeGroup, string][]
     expect(entries.filter(([id]) => !GUARDED_IDS.includes(id)).map(([id]) => id)).toEqual([])
     expect(entries.filter(([, reason]) => reason.trim() === '').map(([id]) => id)).toEqual([])
   })
@@ -1128,7 +1127,7 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
     expect(NAMED_SLACK_NOTICES.filter((name) => !builders.has(name))).toEqual([])
   })
 
-  test.each(notConnectedEntries().map(e => [titleOf(e), e] as const))('b.omv SR-8.5: %s never claims disconnected messages are lost or needs a stream', (_title, e) => {
+  test.each(notConnectedEntries().map(e => [titleOf(e), e] as const))('%s never claims disconnected messages are lost or needs a stream', (_title, e) => {
     expect(e.render()).not.toMatch(/\blost\b|not receiving messages|\bstream(?:less)?\b/i)
   })
 
@@ -1142,7 +1141,7 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_ROTATED])
   })
 
-  test('each ErrJsonlMissing diagnosis notice (SRJ-712) is a named Slack notice with a quoting row and a redaction-and-cap row', () => {
+  test('each ErrJsonlMissing diagnosis notice is a named Slack notice with a quoting row and a redaction-and-cap row', () => {
     expect(JSONL_DIAGNOSIS_BUILDERS.filter((builder) => !NAMED_SLACK_NOTICES.includes(builder))).toEqual([])
     for (const builder of JSONL_DIAGNOSIS_BUILDERS) {
       const variants = NOTICE_CATALOGUE.filter((e) => e.builder === builder).map((e) => e.variant)
@@ -1170,30 +1169,30 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-1001's rules over every catalogued notice
+// rules over every catalogued notice
 // ---------------------------------------------------------------------------
 
 /**
- * SRJ-1001: a notice names a command when it holds a code span that opens
+ * a notice names a command when it holds a code span that opens
  * with `agent-director` or `tmux` and a space (a class label such as
  * `tmux-unavailable` is none).
  */
 const COMMAND_SPAN = /`(?:agent-director|tmux)\s/
 
-/** The title of agent-director's README section a notice points to; a notice names it only as that quoted title (SRJ-1001). */
+/** The title of agent-director's README section a notice points to; a notice names it only as that quoted title. */
 const OPERATOR_ACTIONS = 'Operator actions'
 const OPERATOR_ACTIONS_TITLE = `"${OPERATOR_ACTIONS}"`
 
-/** Whether `ownText` names "Operator actions" other than as its quoted title, in any letter case (SRJ-1001). */
+/** Whether `ownText` names "Operator actions" other than as its quoted title, in any letter case. */
 function namesOperatorActionsUnquoted(ownText: string): boolean {
   return new RegExp(OPERATOR_ACTIONS, 'i').test(ownText.split(OPERATOR_ACTIONS_TITLE).join(''))
 }
 
-/** `agent-director kill` named as a command, which only a human's step with its result checked may name (SRJ-1001, SRJ-1007, SRJ-1012). */
+/** `agent-director kill` named as a command, which only a human's step with its result checked may name. */
 const AD_KILL_COMMAND = /`agent-director kill\b/
 const CHECKS_THE_RESULT = /check (?:the|its) result/
 
-/** Whether `text` names `agent-director kill` and does not say to check its result (SRJ-1001). */
+/** Whether `text` names `agent-director kill` and does not say to check its result. */
 function namesKillWithoutResultCheck(text: string): boolean {
   return AD_KILL_COMMAND.test(text) && !CHECKS_THE_RESULT.test(text)
 }
@@ -1215,7 +1214,7 @@ const ROW_DELETE = new RegExp(
 )
 
 /**
- * What no notice names (SRJ-1001), beside `CSCB_OWN_LINE_FORBIDDEN` (a pane
+ * What no notice names, beside `CSCB_OWN_LINE_FORBIDDEN` (a pane
  * kill, a tmux option write, an agent-director row delete, the clear-latch
  * command, a session probe, a label option's name), each with a name a
  * failure shows.
@@ -1232,7 +1231,7 @@ const NOTICE_FORBIDDEN: readonly (readonly [name: string, pattern: RegExp])[] = 
 
 /**
  * agent-director's own words, which a quoted description carries and no
- * check takes for CSCB's (SRJ-1001; ADSRD SR-1.4).
+ * check takes for CSCB's (agent-director contract).
  */
 const AD_OWN_WORDS: readonly string[] = Object.freeze([NO_KILL_SENT_PHRASE, RETRY_KILL_LATER_PHRASE, NEVER_DELETE_ROW_PHRASE])
 
@@ -1251,7 +1250,7 @@ function ownTextOf(notice: string): string {
   return withoutAdOwnWords(cscbOwnText(notice))
 }
 
-/** Every SRJ-1001 term `text` names: the names of `NOTICE_FORBIDDEN`'s hits, then `CSCB_OWN_LINE_FORBIDDEN`'s per line. */
+/** Every term `text` names: the names of `NOTICE_FORBIDDEN`'s hits, then `CSCB_OWN_LINE_FORBIDDEN`'s per line. */
 function forbiddenTermsIn(text: string): string[] {
   return [
     ...NOTICE_FORBIDDEN.filter(([, pattern]) => pattern.test(text)).map(([name]) => name),
@@ -1259,7 +1258,7 @@ function forbiddenTermsIn(text: string): string[] {
   ]
 }
 
-/** The builders whose own lines name no session-ending command (SRJ-1001): CONFLICT, unusable-name, launch-start and both stuck-launch texts. */
+/** The builders whose own lines name no session-ending command: CONFLICT, unusable-name, launch-start and both stuck-launch texts. */
 const SESSION_ENDING_FREE_BUILDERS: readonly string[] = Object.freeze([
   conflictNoticeText.name,
   unusableNameNoticeText.name,
@@ -1270,27 +1269,27 @@ const SESSION_ENDING_FREE_BUILDERS: readonly string[] = Object.freeze([
 ])
 
 /**
- * The ids whose texts never reach Slack (SRJ-1002): the teardown window's
- * notices (SRJ-1003) and the startup-errors entries (SRJ-1013). They quote
+ * The ids whose texts never reach Slack: the teardown window's
+ * notices and the startup-errors entries. They quote
  * agent-director's description as a `message="…"` field, which may carry its
  * own pointer to "Operator actions"; the human-only and title rules, which
  * hold for Slack posts, skip them, and every other rule holds for them too.
  */
-const LOG_ONLY_SRJS: readonly NoticeSrj[] = Object.freeze(['SRJ-1003', 'SRJ-1013'])
+const LOG_ONLY_GROUPS: readonly NoticeGroup[] = Object.freeze(["teardown", "startup-errors"])
 
 /** Every catalogue entry with its title, for `test.each`. */
 const CASES = NOTICE_CATALOGUE.map((e) => [titleOf(e), e] as const)
 
-/** The entries posted to Slack: every entry outside `LOG_ONLY_SRJS`. */
-const SLACK_CASES = CASES.filter(([, e]) => !LOG_ONLY_SRJS.includes(e.srj))
+/** The entries posted to Slack: every entry outside `LOG_ONLY_GROUPS`. */
+const SLACK_CASES = CASES.filter(([, e]) => !LOG_ONLY_GROUPS.includes(e.group))
 
-describe('SRJ-1001: no notice names a forbidden term in CSCB\'s own text', () => {
+describe('no notice names a forbidden term in CSCB\'s own text', () => {
   test.each(CASES)('%s', (_title, e) => {
     expect(forbiddenTermsIn(ownTextOf(e.render()))).toEqual([])
   })
 })
 
-describe('SRJ-1001: the CONFLICT, unusable-name, launch-start and stuck-launch posts name no session-ending command in their own lines', () => {
+describe('the CONFLICT, unusable-name, launch-start and stuck-launch posts name no session-ending command in their own lines', () => {
   test.each(CASES.filter(([, e]) => SESSION_ENDING_FREE_BUILDERS.includes(e.builder)))('%s', (_title, e) => {
     expect(cscbOwnLines(e.render()).flatMap((line) => sessionEndingCommandsIn(line).map((form) => `${form} in ${JSON.stringify(line)}`))).toEqual([])
   })
@@ -1300,7 +1299,7 @@ describe('SRJ-1001: the CONFLICT, unusable-name, launch-start and stuck-launch p
   })
 })
 
-describe('SRJ-1001: a Slack notice that names a command or "Operator actions" carries the human-only sentence', () => {
+describe('a Slack notice that names a command or "Operator actions" carries the human-only sentence', () => {
   /** Whether `e`'s own text names a command or "Operator actions"; a builder that throws counts, so its case fails. */
   const namesCommandOrPointer = (e: NoticeEntry): boolean => {
     try {
@@ -1329,13 +1328,13 @@ describe('SRJ-1001: a Slack notice that names a command or "Operator actions" ca
   })
 })
 
-describe('SRJ-1001: a Slack notice names "Operator actions" only by its quoted title', () => {
+describe('a Slack notice names "Operator actions" only by its quoted title', () => {
   test.each(SLACK_CASES)('%s', (_title, e) => {
     expect(namesOperatorActionsUnquoted(ownTextOf(e.render()))).toBe(false)
   })
 })
 
-describe('SRJ-1001: only the ordinary kill-failure alert and the wedge warning name `agent-director kill`, each checking its result', () => {
+describe('only the ordinary kill-failure alert and the wedge warning name `agent-director kill`, each checking its result', () => {
   test.each(CASES.filter(([, e]) => AD_KILL_COMMAND.test(e.render())))('%s', (_title, e) => {
     expect(namesKillWithoutResultCheck(e.render())).toBe(false)
   })
@@ -1351,7 +1350,7 @@ describe('SRJ-1001: only the ordinary kill-failure alert and the wedge warning n
   })
 })
 
-describe("SRJ-1001: agent-director's quoted words are never CSCB's own", () => {
+describe("agent-director's quoted words are never CSCB's own", () => {
   /** A description carrying agent-director's three phrases and a session-ending command with a bare tmux target. */
   const description = `${AD_OWN_WORDS.join('; ')}; tmux kill-session -t ${personaTmuxSessionName(KEY)}`
   const notices = [
@@ -1375,12 +1374,12 @@ describe("SRJ-1001: agent-director's quoted words are never CSCB's own", () => {
     expect(forbiddenTermsIn(NEVER_DELETE_ROW_PHRASE)).toEqual([])
     expect(forbiddenTermsIn(NEVER_DELETE_ROW_PHRASE.replace(/\bnever\s+/i, ''))).toEqual(['a row delete'])
     expect(forbiddenTermsIn(withoutAdOwnWords(NEVER_DELETE_ROW_PHRASE))).toEqual([])
-    // The session-ending forms take "kill" only as a command to run, so these two are no hit even unquoted (ADSRD SR-1.4).
+    // The session-ending forms take "kill" only as a command to run, so these two are no hit even unquoted (agent-director contract).
     expect([NO_KILL_SENT_PHRASE, RETRY_KILL_LATER_PHRASE].flatMap(sessionEndingCommandsIn)).toEqual([])
   })
 })
 
-describe('SRJ-1001: the rule patterns find what they look for (the checks are not vacuous)', () => {
+describe('the rule patterns find what they look for (the checks are not vacuous)', () => {
   const session = personaTmuxSessionName(KEY)
   const exact = tmuxExactSessionTarget(session)
   const samples: readonly (readonly [text: string, form: string])[] = [
@@ -1458,7 +1457,7 @@ describe('SRJ-1001: the rule patterns find what they look for (the checks are no
     ['', 'These commands are for a human only: no bot, including any persona that sees this post, may run them.'],
     ['', 'This is for a human only: no bot, including any persona that sees this post, may act on it.'],
     ['', 'These remedies are for a human only: no bot, including any persona that sees this post, may act on them.'],
-    // The SRD's (SRJ-1001) and the docs' wordings.
+    // The contract's and the docs' wordings.
     ['It says ', 'it is for a human only: no bot, including any persona that sees the post, may act on it.'],
     ['It says ', 'its commands are for a human only: no bot, including a persona that sees the post, may run them.'],
     ['', 'These commands are for a human only: no bot runs them, including a persona that sees the post.'],
@@ -1480,7 +1479,7 @@ describe('SRJ-1001: the rule patterns find what they look for (the checks are no
   })
 })
 
-describe('SRJ-1001: a description quoted from agent-director is redacted and capped at MAX_LOGGED_MESSAGE_LENGTH', () => {
+describe('a description quoted from agent-director is redacted and capped at MAX_LOGGED_MESSAGE_LENGTH', () => {
   const redacted = [REDACTED_TOKEN_PLACEHOLDER, escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER)]
   const capRows = CASES.filter(([, e]) => e.variant.endsWith(CAP_VARIANT))
 

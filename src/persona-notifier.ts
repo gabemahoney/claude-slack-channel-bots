@@ -1,5 +1,5 @@
 /**
- * persona-notifier.ts — Per-persona server notices (b.av2 SR-7.1, SR-7.2).
+ * persona-notifier.ts — Per-persona server notices.
  *
  * Every server notice about a persona goes only to that persona's destination
  * (the channel the one destination rule names, or its DM with `dm.contact`),
@@ -7,33 +7,31 @@
  * one top-level message with no `thread_ts` and no username or icon override.
  * The destination is resolved, and a DM opened when needed, by the shared
  * destination resolver (`persona-destination.ts`) through the one destination
- * rule (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701) over the
- * configuration in effect at each attempt (b.deo SRI-201): its
+ * rule (`personaDestinationOf`) over the
+ * configuration in effect at each attempt: its
  * `permission_prompts` in declarative mode, its fungible destination in
- * fungible mode (b.deo SRI-702). The notifier reads no destination setting
+ * fungible mode. The notifier reads no destination setting
  * and no switch itself, the lost-message notice included, and no notice
  * carries a destination: one held before a confirmed switch change posts at
- * the destination of the mode turned on (b.deo SRI-703). The notifier adds the
+ * the destination of the mode turned on. The notifier adds the
  * persona reference to every notice text, so callers pass only the key and
  * the notice body.
  *
  * Routing of one notice, first match wins:
- * - the key's persona teardown window is open (b.jg5 SRJ-1003, below): one
+ * - the key's persona teardown window is open (below): one
  *   log line and one startup-errors entry, never a Slack post, never held,
  *   never dropped;
- * - the all-clear of an outage whose onset the key's window routed (b.jg5
- *   SRJ-1002, SRJ-1003), whenever it comes, after the window has closed
+ * - the all-clear of an outage whose onset the key's window routed, whenever it comes, after the window has closed
  *   included: one log line and one `persona-teardown-notice` entry, never a
  *   Slack post; an all-clear that also lists a class whose onset was not
  *   routed so is split when it can be (`PersonaNoticeOutage.allClearOf`):
  *   the marked classes' all-clear is written, the rest routes on below;
- * - the onset of an outage that is a notice episode of its own (b.jg5
- *   SRJ-1016: `ad-config-malformed`) for a key whose teardown is submitted
+ * - the onset of an outage that is a notice episode of its own (
+ * `ad-config-malformed`) for a key whose teardown is submitted
  *   and whose window is not open yet: one log line, no Slack post and no
- *   entry; its all-clear is then written as one the window routed (b.jg5
- *   SRJ-1003);
+ * entry; its all-clear is then written as one the window routed;
  * - no applied persona has the key: one log line, the notice is dropped;
- * - dry run (b.av2 SR-3.4): one log line with the persona reference and the
+ * - dry run: one log line with the persona reference and the
  *   notice's first line only, no Slack call;
  * - a persona whose client is not validated yet (channel or `dm`
  *   destination): held in that persona's own queue, in raised order, until
@@ -50,7 +48,7 @@
  *   (or taken from the resolver's cache) at the attempt, so a notice held
  *   before validation opens it only when flushed after, never before. When
  *   the post fails at the destination (the open or the post refused, Slack
- *   unreachable) the hold keeps the notice and retries it on the SR-3.2
+ * unreachable) the hold keeps the notice and retries it on the
  *   backoff, logging one `persona-destination-failed` line per episode, not
  *   one per notice or attempt; the notice is never lost to it. A post that
  *   fails for the message itself (`invalid_blocks`, `msg_too_long`, …) is
@@ -62,10 +60,10 @@
  *   resolver refuses (DMs off or no contact, which the loader rejects) is
  *   logged by the resolver and not posted.
  *
- * Held notices are per persona (b.av2 SR-3.3): flushing one persona never
+ * Held notices are per persona: flushing one persona never
  * touches another's queue.
  *
- * The persona teardown window (b.jg5 SRJ-1002, SRJ-1003, SRJ-1013). The
+ * The persona teardown window. The
  * persona teardown (`runTeardown`, `src/persona-lifecycle.ts`) opens a window
  * for its persona when its serializer turn starts (`openTeardownWindow`,
  * given the persona's name and key, so a key no longer applied is still
@@ -77,7 +75,7 @@
  * a notice built for Slack are written as `&`, `<` and `>`): of class `persona-teardown-notice`
  * (`PERSONA_TEARDOWN_NOTICE_LABEL`), or `persona-kill-survivor` for the
  * kill-failure alert's survivor version (`PersonaNoticeOptions.teardownEntryClass`,
- * b.jg5 SRJ-704). The entry is `personaTeardownNoticeEntryText`'s: the
+ *). The entry is `personaTeardownNoticeEntryText`'s: the
  * persona reference, "raised during its teardown", the notice's text. No
  * Slack call is made, nothing is held and nothing is dropped: this branch
  * comes before the drop for a key no longer applied, the dry-run branch, the
@@ -99,15 +97,14 @@
  * answers `submitted` from the submit until the window opens, `open` while
  * it is open, and `none` otherwise. The notifier's own routing reads only
  * the open window; the notice episodes (`src/persona-episodes.ts`) read the
- * state, so from the submit on they post nothing to Slack for the key (b.jg5
- * SRJ-1003).
+ * state, so from the submit on they post nothing to Slack for the key.
  *
  * Shared helpers: `formatPersonaNotice` (a notice text carrying the persona
  * reference) is pure and exported. The permission poller uses it for its
  * stuck-prompt warning, which needs the post's outcome and so cannot go
  * through `notify`; the poller posts through the same destination hold and
  * resolver, except while the persona's teardown window is open, when it hands
- * the warning to `notify` so the window writes it (b.jg5 SRJ-1003).
+ * the warning to `notify` so the window writes it.
  * `personaTeardownNoticeEntryText` builds every
  * `persona-teardown-notice` entry (and the survivor version's entry raised in
  * a window), the episodes' log-only teardown route included.
@@ -122,7 +119,7 @@
  * and, only on a failure, `… not posted, and its startup-errors entry was not
  * written: <reason>` in place of the written part.
  *
- * Pure module (b.av2 SR-13.1): no module-scope state, no I/O of its own, no
+ * Pure module: no module-scope state, no I/O of its own, no
  * timers of its own and nothing runs at import. All state lives in the
  * instance the factory returns; the Slack client, the persona lookup, the
  * destination hold (or the resolver to build one), the dry-run predicate,
@@ -167,8 +164,7 @@ export interface PersonaNoticeOptions {
    */
   onPostFailure?: (failure: DestinationFailure) => void
   /**
-   * The kill-failure alert's survivor version (b.jg5 SRJ-704, SRJ-1003,
-   * SRJ-1013): while the key's teardown window is open the notice's entry is
+   * The kill-failure alert's survivor version: while the key's teardown window is open the notice's entry is
    * of this class, `persona-kill-survivor`, in place of
    * `persona-teardown-notice`. Outside a window it changes nothing.
    */
@@ -178,7 +174,7 @@ export interface PersonaNoticeOptions {
    * concerns (the outage state's notices, `src/outage-state.ts`): an onset
    * the teardown window routes marks its classes for the key, and an
    * all-clear listing a marked class takes the teardown route whenever it
-   * comes (b.jg5 SRJ-1002, SRJ-1003).
+   * comes.
    */
   outage?: PersonaNoticeOutage
 }
@@ -198,12 +194,12 @@ export interface PersonaNoticeOutage {
 }
 
 /**
- * The outage classes that are notice episodes of their own (b.jg5 SRJ-1016:
+ * The outage classes that are notice episodes of their own (
  * `ad-config-malformed`, whose flag is its once-per-episode latch): from a
  * persona teardown's submit until its window opens, their onset for the key
  * is muted (one log line, no Slack post, no entry) and marked like an onset
  * the window routed, so that outage's all-clear is written, never posted
- * (b.jg5 SRJ-1003, SRJ-1002). The other outage classes are not SRJ-1016
+ * The other outage classes are not
  * kinds and route as any notice until the window opens.
  */
 export const PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES: readonly string[] = Object.freeze(['ad-config-malformed'])
@@ -214,7 +210,7 @@ export const PERSONA_NOTICE_OUTAGE_ONSET = 'onset'
 export const PERSONA_NOTICE_OUTAGE_ALL_CLEAR = 'all-clear'
 
 /**
- * Where a key stands with its persona teardown (b.jg5 SRJ-1003): `none`;
+ * Where a key stands with its persona teardown: `none`;
  * `submitted`, from the teardown's submit until its window opens; `open`,
  * while its window is open.
  */
@@ -241,7 +237,7 @@ export type PersonaNotify = (key: string, text: string, options?: PersonaNoticeO
  * `destinationHold` is not given. When `destinations` is not given,
  * `getPersonaConfig` is (`PersonaDestinationsSource`): the notifier builds a
  * resolver of its own over it, reading the configuration in effect at each
- * attempt (b.deo SRI-201).
+ * attempt.
  */
 export type PersonaNotifierDeps = PersonaNotifierOwnDeps & PersonaDestinationsSource
 
@@ -264,7 +260,7 @@ interface PersonaNotifierOwnDeps {
   log(line: string): void
   /**
    * Writes one startup-errors entry: every notice the persona teardown
-   * window routes (b.jg5 SRJ-1003, SRJ-1013). Production binds
+   * window routes. Production binds
    * `recordStartupError` with its default log directory; tests pass one over
    * a temp `logDir`. Absent: the notice's log line says no entry was written
    * (no recorder is installed); it is still never posted.
@@ -290,18 +286,18 @@ export interface PersonaNotifier {
    */
   flush(key: string): Promise<void>
   /**
-   * Drop the persona's pre-validation queue unposted (b.av2 SR-6.5, a
+   * Drop the persona's pre-validation queue unposted (a
    * teardown), so a persona added later with the same key never posts the
    * removed persona's notices. Leaves the destination hold alone (the
    * teardown cancels it) and every other persona's queue. No Slack call;
    * logs one line when notices were dropped. A no-op for an unknown key.
    * Only notices held before the persona's teardown window opened are in the
    * queue: a notice raised while it is open is written, never held, so none
-   * is dropped here (b.jg5 SRJ-1003).
+   * is dropped here.
    */
   forget(key: string): void
   /**
-   * The persona teardown's submit (b.jg5 SRJ-1003): from now until the
+   * The persona teardown's submit: from now until the
    * matching `settleTeardown`, `teardownWindowState` answers at least
    * `submitted` for the key. Counted, so two teardowns of one key pair up.
    * Changes no routing of the notifier's own.
@@ -310,7 +306,7 @@ export interface PersonaNotifier {
   /** The end of a teardown `submitTeardown` registered. A no-op when none is registered. */
   settleTeardown(key: string): void
   /**
-   * Open the persona's teardown window (b.jg5 SRJ-1003) at the start of its
+   * Open the persona's teardown window at the start of its
    * teardown's serializer turn: until `closeTeardownWindow`, every notice
    * for `persona.key` is written (log line and startup-errors entry naming
    * the persona), never posted, held or dropped. Counted, so a nested open
@@ -350,7 +346,7 @@ export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text
 
 /**
  * The `startup-errors.log` class of a notice raised during a persona teardown
- * (b.jg5 SRJ-1003, SRJ-1013): every notice the teardown window routes but the
+ * every notice the teardown window routes but the
  * kill-failure alert's survivor version, and the all-clear of an outage whose
  * onset was raised during one. Re-exported from `src/kill-failure-alert.ts`,
  * the pure module that holds every kill-failure class, so one constant
@@ -358,20 +354,20 @@ export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text
  */
 export { PERSONA_TEARDOWN_NOTICE_LABEL }
 
-/** A `persona-teardown-notice` entry's occasion: a notice raised while the teardown window was open (b.jg5 SRJ-1013). */
+/** A `persona-teardown-notice` entry's occasion: a notice raised while the teardown window was open. */
 export const PERSONA_TEARDOWN_NOTICE_RAISED = 'raised during its teardown'
 
 /**
  * A `persona-teardown-notice` entry's occasion: the all-clear of an outage
  * whose onset the teardown window routed, coming after the window has closed
- * (b.jg5 SRJ-1002, SRJ-1013).
+ *
  */
 export const PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER = 'the all-clear of an outage raised during its teardown'
 
 /**
  * A `persona-teardown-notice` entry's occasion: a CONFLICT or an unusable
- * recorded name met in an old-life wait for the old key (b.jg5 SRJ-811,
- * SRJ-1002, SRJ-1013: "or during the wait"), written by the session manager's
+ * recorded name met in an old-life wait for the old key (
+ * "or during the wait"), written by the session manager's
  * wait end handler, never by the teardown window.
  */
 export const PERSONA_TEARDOWN_NOTICE_DURING_WAIT = 'raised during its old-life wait'
@@ -383,7 +379,7 @@ export type PersonaTeardownNoticeOccasion =
   | typeof PERSONA_TEARDOWN_NOTICE_DURING_WAIT
 
 /**
- * One teardown-route startup-errors entry (b.jg5 SRJ-1003, SRJ-1013): the
+ * One teardown-route startup-errors entry: the
  * persona reference (`persona "<name>" (key=<key>)`, or `persona=<key>` where
  * only the key is known), the occasion and the notice's text, as
  * `<ref>, <occasion>: <text>`. `text` is the notice's own text (no persona
@@ -400,8 +396,7 @@ export function personaTeardownNoticeEntryText(
 }
 
 /**
- * The head of a teardown-route log line for `persona` (b.jg5 SRJ-1003,
- * SRJ-1002): a notice raised while the window was open, or the all-clear of
+ * The head of a teardown-route log line for `persona`: a notice raised while the window was open, or the all-clear of
  * an outage whose onset the window routed.
  */
 function teardownNoticeLineHead(persona: Pick<Persona, 'name' | 'key'>, occasion: PersonaTeardownNoticeOccasion): string {
@@ -412,8 +407,7 @@ function teardownNoticeLineHead(persona: Pick<Persona, 'name' | 'key'>, occasion
 }
 
 /**
- * The one log line of a notice the teardown route wrote (b.jg5 SRJ-1003,
- * SRJ-1002): `persona`, the entry's class `classLabel`, the occasion, and
+ * The one log line of a notice the teardown route wrote: `persona`, the entry's class `classLabel`, the occasion, and
  * the first line of `text`, the notice as handed in, with Slack's
  * control-character escapes undone:
  *
@@ -503,7 +497,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   const submitted = new Map<string, number>()
   /**
    * Outage classes whose onset a teardown window routed, by key, with the
-   * persona the window named (b.jg5 SRJ-1002): their all-clear takes the
+   * persona the window named: their all-clear takes the
    * teardown route whenever it comes.
    */
   const teardownOutages = new Map<string, { persona: Pick<Persona, 'name' | 'key'>; classes: Set<string> }>()
@@ -514,7 +508,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   }
 
   /**
-   * The teardown route (b.jg5 SRJ-1003): one startup-errors entry of
+   * The teardown route: one startup-errors entry of
    * `classLabel` through the recorder, then one log line saying so. Never a
    * Slack call. The text is written with Slack's control-character escapes
    * undone (`unescapeSlackControlCharacters`): a notice built for Slack (the
@@ -559,8 +553,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
 
   /**
    * Route a notice for `key` on the teardown route when its window is open,
-   * or when it is the all-clear of an outage a window routed (b.jg5 SRJ-1002,
-   * SRJ-1003); and mute the onset of an outage that is a notice episode of
+   * or when it is the all-clear of an outage a window routed; and mute the onset of an outage that is a notice episode of
    * its own (`PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES`) from the key's
    * teardown submit until its window opens. Answers undefined when the
    * notice was fully routed so; otherwise what is left to route as any
@@ -635,7 +628,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   }
 
   /**
-   * b.jg5 SRJ-1003, SRJ-1016: an onset of an outage that is a notice episode
+   * an onset of an outage that is a notice episode
    * of its own (`PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES`) for a key
    * whose teardown is submitted and whose window is not open yet: one log
    * line, no Slack post and no entry, and its classes are marked, so that
@@ -710,7 +703,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     const queue = held.get(key)
     if (!queue || queue.length === 0) return
     if (!deps.clientFor(key)) return
-    // b.jg5 SRJ-1003: nothing is posted for a key under teardown; the
+    // nothing is posted for a key under teardown; the
     // teardown's `forget` drops what was held before its window opened.
     if (windows.has(key)) return
     held.delete(key)

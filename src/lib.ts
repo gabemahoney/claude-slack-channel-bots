@@ -36,7 +36,7 @@ function inStateDirOutsideInbox(path: string, stateDir: string, inboxDir: string
 }
 
 /**
- * Throws if `filePath` must not be sent (b.av2 SR-5.2):
+ * Throws if `filePath` must not be sent:
  *
  * - it resolves to inside `stateDir` but outside `inboxDir`, by either of two
  *   path-boundary-aware prefix tests (`isWithinDir`: `<stateDir>/inbox-old/`

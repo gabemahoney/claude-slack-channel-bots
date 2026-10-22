@@ -6,29 +6,29 @@ useImmediateTypingLifecycle()
  * persona-connections.test.ts — persona credentials file and bring-up
  * pre-checks.
  *
- * Covers b.av2 SR-1.4 (credentials-file reader and local validity), SR-6.1
+ * Covers (credentials-file reader and local validity)
  * steps 1 and 2 as pure checks (credentials check, working-directory check,
- * both causes reported), SR-10.3 (credentials and directory class labels and
+ * both causes reported)(credentials and directory class labels and
  * the diagnostic line) and ENG-2 (a success value never prints a token).
- * E2 Task 2 adds SR-3.2 (Slack validation-outcome classification on both
- * legs, the 5 s → 300 s backoff schedule and `retryAfter`) and the SR-10.3
+ * section 2 adds (Slack validation-outcome classification on both
+ * legs, the 5 s → 300 s backoff schedule and `retryAfter`) and the
  * `persona-slack-unreachable` / `persona-credentials-refused` episode lines,
  * every row driven through the shared Slack stub with sentinel-bearing
- * errors. E2 Task 3 adds the supervised connection manager: SR-3.1 (validate,
- * connect, identity, event tagging), SR-3.3 (client options, reopen rules, the
+ * errors. section 3 adds the supervised connection manager: (validate,
+ * connect, identity, event tagging)(client options, reopen rules, the
  * 10 s start() bound, late settlement, isolation, the unhandledRejection
- * handler), SR-3.4 (dry run), SR-10.3 (`persona-connection-lost` /
- * `persona-connection-restored`), SR-13.1 and the AC 5 walk-through (each
- * clause a case named "AC 5: …"), plus the connection legs of AC 20, AC 23, AC 24
- * and AC 47. E5 Task 1 adds the manager's 10 s bound on `auth.test`, the
- * bring-up controller's outcomes through the real start pass (AC 23, AC 24: one
+ * handler)(dry run)(`persona-connection-lost` /
+ * `persona-connection-restored`)and the walk-through (each
+ * clause a case named "…"), plus the connection legs of the contract
+ * and. section 1 adds the manager's 10 s bound on `auth.test`, the
+ * bring-up controller's outcomes through the real start pass (one
  * broken persona per cause beside a healthy one, the pass returning while a
  * persona retries, the `persona-start` and cause lines, a credentials refusal
- * on a later reopen) and its per-persona retry timers (AC 66: the directory
+ * on a later reopen) and its per-persona retry timers (the directory
  * backoff with held credentials, Slack retries launching on recovery, a
  * launch after a retry that fails, combined causes, independence, dry run,
- * cancellation). E5 Task 2 adds the surviving-instance leg of AC 23, AC 24
- * (SR-6.3, SR-6.4): for every not-up cause the persona's agent-director row
+ * cancellation). section 2 adds the surviving-instance leg of the contract
+ * for every not-up cause the persona's agent-director row
  * survives the start sweep, the start pass and its retries, and its instance's
  * MCP registration is refused through the real admission decision while the
  * healthy persona's is accepted; a directory-broken persona that comes up
@@ -36,18 +36,18 @@ useImmediateTypingLifecycle()
  * persona refused on reopen has its session dropped, while a reopen in
  * progress keeps it; the controller's `onLeftUp` fires once per change out of
  * `up` (never for a persona that was never up, a failing listener logged), and
- * `describePersonaNotUp` gives the cause text. E11 Task 2 adds SR-8.3's held
+ * `describePersonaNotUp` gives the cause text. section 2 adds held
  * credentials digest: the stat-first `readCredentialsFile`, `credentialsDigest`
  * (exact bytes, the missing and unreadable markers) and
  * `checkPersonaCredentialsAndDigest` (checkPersonaCredentials's results
  * unchanged), and the controller's `credentialsDigest(key)` for an up,
  * retrying, credentials-broken, collision-broken (nothing held), dry-run,
- * unknown and cancelled persona. E12 Task 2 adds SR-6.6 for the controller:
+ * unknown and cancelled persona. section 2 adds for the controller:
  * every fixture wires the real per-persona serializer as server.ts does, and
  * a directory re-check (through the launch it triggers) and a launch after a
  * Slack retry wait behind a blocked lifecycle operation for their persona,
  * never another persona's, and check cancelled, applied and already launched
- * when they start. SR-6.1 / SR-6.5 at a confirmed apply: a persona outside
+ * when they start. at a confirmed apply: a persona outside
  * the start set brought up against the applied set ends up, broken or
  * retrying with the start pass's classes and lines while the running
  * personas get no Slack call, takes its tokens from its file (never the
@@ -56,24 +56,24 @@ useImmediateTypingLifecycle()
  * included), close the socket with no reopen and no lost or restored line,
  * and forget its state, digest and identity; `cancelAll` covers a persona
  * added after the start; a `start()` settling after `stop` is no connection.
- * E13 Task 1 adds the manager's credentials reconnect (b.av2 SR-8.6
- * credentials row, SR-3.1 overlap, SR-3.3 reconnect part): the new
- * connection opens (SR-3.3 option sets, new tokens) before the old one
+ * section 1 adds the manager's credentials reconnect (
+ * credentials rowoverlapreconnect part): the new
+ * connection opens (option sets, new tokens) before the old one
  * closes, a refusal or Slack-unreachable keeps the old connection, a
  * never-settling `start()` is abandoned at 10 s, retries follow the backoff,
  * a later reconnect, `stop` and shutdown cancel a pending one, a retrying
  * persona takes new tokens (`replaceRetryTokens`), and the
- * `persona-credentials-change-failed` line per cause; and bug b.ujn: the
+ * `persona-credentials-change-failed` line per cause; and the
  * first `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`
  * from a Web API call on a persona's current client marks it
  * credentials-broken at once (one line, no delivery, later calls refused
  * locally), whatever the serializer holds, while other errors, stale
- * clients and B change nothing. E13 Task 3 closes the AC 20 connection leg:
+ * clients and B change nothing. section 3 closes the connection leg:
  * every occasion that builds clients (bring-up and its retry, a reopen and its
  * retry, a credentials reconnect and its retry, replaced retry tokens, the
  * recovery bring-up of a credentials-broken persona) gives each client its
- * exact SR-3.3 options with `attachOriginalToWebAPIRequestError: false`, each
- * socket a library logger of its own (`socketModeSlackLogger`, E13 decisions
+ * exact options with `attachOriginalToWebAPIRequestError: false`, each
+ * socket a library logger of its own (`socketModeSlackLogger`, decisions
  * 12 and 15: every library line dropped but the allowlisted connection-health
  * lines, forwarded to the manager's log with the persona reference, the
  * failed-ping line without its error text) and each Web API client
@@ -84,7 +84,7 @@ useImmediateTypingLifecycle()
  * reconnected client, a late rejection of an abandoned reconnect `start()`, a
  * failing close, the unhandledRejection handler on a reconnect's failure
  * shapes) and `WebApiCallRefusedLocallyError` leak nothing.
- * E14 Task 0 (operator decision B1) keeps a thrown value's message in log
+ * section 0 (operator decision B1) keeps a thrown value's message in log
  * lines: `describeThrownValue` gives it redacted (`redactSlackLogText`), on
  * one line, capped at `MAX_LOGGED_MESSAGE_LENGTH` and JSON-quoted; a thrown
  * string likewise; any other non-`Error` value by its type only; a
@@ -96,7 +96,7 @@ useImmediateTypingLifecycle()
  * `checkConfigDir` resolving against the test's own home. `stop(key,
  * endReason)` ends the persona's open lost, unreachable or refused episode
  * with one cleared line; a `stop` without a reason (a teardown) logs nothing.
- * E14 Task 4 adds the integration suite's Slack API base URL override
+ * section 4 adds the integration suite's Slack API base URL override
  * (`CSCB_SLACK_API_URL`, director decisions 1 and 14): it is honoured only
  * for an `http:` URL on the literal loopback address `127.0.0.1` or `[::1]`
  * (never `localhost`) with no user info, query or fragment, as its
@@ -106,7 +106,7 @@ useImmediateTypingLifecycle()
  * sets nothing (a bad value never stops the start); each option builder adds
  * `slackApiUrl` only when given one (a socket's in its `clientOptions`), and
  * the manager passes it to every client it builds.
- * The E14 merge-prep pass adds the error message on a
+ * The merge-prep pass adds the error message on a
  * `persona-slack-unreachable` start line: a Slack-unreachable outcome
  * carries its thrown value's message as `describeLogMessage` renders it
  * (redacted, one line, capped), after the cause, never for a timeout marker;
@@ -123,7 +123,7 @@ useImmediateTypingLifecycle()
  * as root (docker CI). The real-permission variants are skipped under root,
  * which bypasses permission bits; their names say so.
  *
- * Isolation (b.av2 SR-13.2): every path is under a mkdtempSync directory that
+ * Isolation: every path is under a mkdtempSync directory that
  * afterEach removes, and every path is passed explicitly. Nothing touches the
  * real home, starts a server or runs the CLI. Tokens are sentinel-bearing
  * fakes from the credentials helper, and assertNoLeak runs over every
@@ -519,7 +519,7 @@ function snapshotTree(root: string): Record<string, string> {
 }
 
 // ---------------------------------------------------------------------------
-// Credentials reader (SR-1.4)
+// Credentials reader
 // ---------------------------------------------------------------------------
 
 describe('checkPersonaCredentials: valid, missing and unreadable', () => {
@@ -776,7 +776,7 @@ describe('checkPersonaCredentials: invalid content', () => {
     for (const fragment of absent) expect(failure.cause).not.toContain(fragment)
   })
 
-  // The parse error's text quotes the file (E14 director decision 2): it is
+  // The parse error's text quotes the file: it is
   // never logged, not even redacted. The token and URL rows would pass the
   // leak check if the text were quoted redacted, so the cause is pinned whole.
   test.each<[string, string]>([
@@ -851,10 +851,10 @@ describe('checkPersonaCredentials: real-path collision with another applied pers
 })
 
 // ---------------------------------------------------------------------------
-// The stat-first reader and the digest held for a read (b.av2 SR-8.3)
+// The stat-first reader and the digest held for a read
 // ---------------------------------------------------------------------------
 
-describe('readCredentialsFile and credentialsDigest (SR-8.3)', () => {
+describe('readCredentialsFile and credentialsDigest', () => {
   /** Write `bytes` as `persona`'s credentials file, creating its directory; the path. */
   function writeRaw(persona: BringUpPersona, bytes: string | Uint8Array): string {
     mkdirSync(join(dir, persona.key), { recursive: true })
@@ -1045,13 +1045,13 @@ describe('readCredentialsFile and credentialsDigest (SR-8.3)', () => {
     expect(both.result).toEqual(result)
     expect(withDigest.lines).toEqual(plain.lines)
     expect(both.digest).toBe(expected(persona.credentials_file))
-    // Each check opens the file once, a collision's included (Director decision 1 reversed).
+    // Each check opens the file once, a collision's included.
     expect(opens).toEqual([persona.credentials_file, persona.credentials_file])
     if (both.digest.startsWith('sha256:')) expect(plain.lines.some(line => line.includes(both.digest.slice('sha256:'.length)))).toBe(false)
     assertNoLeak({ result, both, json: JSON.stringify(both.digest), lines: [...plain.lines, ...withDigest.lines] })
   })
 
-  // A persona broken by a shared credentials file (Director decision 1 reversed): the file is read
+  // A persona broken by a shared credentials file: the file is read
   // stat-first only to be hashed, never parsed, and the collision failure is unchanged.
   // Rows: label, arrange (returns the others list and any injected fstatFile), the ops after the open, the expected digest.
   test.each<[string, (persona: BringUpPersona) => [OtherBringUpPersona[], Partial<CredentialsFs>], string[], (path: string) => string]>([
@@ -1088,7 +1088,7 @@ describe('readCredentialsFile and credentialsDigest (SR-8.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Working-directory check (SR-6.1 step 2)
+// Working-directory check (step 2)
 // ---------------------------------------------------------------------------
 
 describe('checkPersonaWorkingDirectory', () => {
@@ -1356,7 +1356,7 @@ describe('no writes', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Diagnostics: rendering and logging (SR-10.3)
+// Diagnostics: rendering and logging
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
@@ -1538,12 +1538,12 @@ describe('success value secrecy', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Slack validation legs, driven through the Slack stub (SR-3.2)
+// Slack validation legs, driven through the Slack stub
 // ---------------------------------------------------------------------------
 
 /**
  * One validation leg: `auth.test` checks the bot token, the Socket Mode open
- * the app token. The `web-api` check (bug b.ujn) is a running persona's call,
+ * the app token. The `web-api` check is a running persona's call,
  * not a validation leg; it has its own block below.
  */
 type Leg = Exclude<SlackValidationCheck, 'web-api'>
@@ -1555,7 +1555,7 @@ const LEG_KEY = { 'auth.test': 'bot_token', 'socket-mode': 'app_token' } as cons
 const LEG_CHECK_TEXT = { 'auth.test': 'auth.test', 'socket-mode': 'Socket Mode open' } as const
 
 /**
- * The only fields a failure outcome may hold (SR-10.3: nothing else is copied
+ * The only fields a failure outcome may hold (nothing else is copied
  * from the error; `message` is a Slack-unreachable outcome's error message,
  * redacted by `describeLogMessage`).
  */
@@ -1732,7 +1732,7 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     ],
     // Slack-unreachable: a PlatformError without a well-formed Slack error code
     // (the library builds these from a 200 body that is not JSON). Decision on
-    // t3.ob2.z9.pa.y4: a transport fault, never a refusal.
+    // a transport fault, never a refusal.
     ['a PlatformError without data.error', { kind: 'platform' }, 'slack-unreachable', both({ reason: 'unknown' })],
     ['a PlatformError whose error is empty', { kind: 'platform', error: '' }, 'slack-unreachable', both({ reason: 'unknown' })],
     [
@@ -1827,7 +1827,7 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
   })
 })
 
-describe('persona-slack-unreachable: the start line carries the error message, redacted (E14 merge-prep)', () => {
+describe('persona-slack-unreachable: the start line carries the error message, redacted (merge-prep)', () => {
   const LEGS: Leg[] = ['auth.test', 'socket-mode']
 
   /** Classify `value` on `leg` and run the outcome through a tracker: its start line, then its cleared line. */
@@ -1898,10 +1898,10 @@ describe('persona-slack-unreachable: the start line carries the error message, r
 })
 
 // ---------------------------------------------------------------------------
-// Backoff schedule and retryAfter (SR-3.2)
+// Backoff schedule and retryAfter
 // ---------------------------------------------------------------------------
 
-/** The SR-3.2 ladder in seconds; the schedule's API is milliseconds. */
+/** The ladder in seconds; the schedule's API is milliseconds. */
 const LADDER_S = [5, 10, 20, 40, 80, 160, 300, 300]
 
 /** The plain wait after `priorFailures` failures, in milliseconds. */
@@ -2012,7 +2012,7 @@ describe('retryAfter', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Episode logging (SR-10.3)
+// Episode logging
 // ---------------------------------------------------------------------------
 
 describe('Slack episode lines', () => {
@@ -2148,7 +2148,7 @@ describe('Slack episode lines', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Connection manager harness (E2 Task 3; E5 extends these sections)
+// Connection manager harness ( section 3; extends these sections)
 // ---------------------------------------------------------------------------
 
 /** A persona the manager runs, with the tokens the credentials reader returned (none in dry run). */
@@ -2174,9 +2174,9 @@ interface Harness {
   events: ForwardedEvent[]
   statuses: [string, PersonaConnectionStatus][]
   /**
-   * An agent-director recorder beside the manager, as E3's wiring will hold
+   * An agent-director recorder beside the manager, as wiring will hold
    * one. The manager has no agent-director dependency (decisions.md), so its
-   * count stays zero unless that changes; the SR-13.1 source check pins the
+   * count stays zero unless that changes; the source check pins the
    * missing import.
    */
   agentDirector: { callCount(): number }
@@ -2190,7 +2190,7 @@ interface HarnessOptions {
   onEvent?: PersonaEventHandler
   /** Called after each status report is recorded (a status listener beside the recorder). */
   onStatus?: (key: string, status: PersonaConnectionStatus) => void
-  /** The per-persona serializer's `run`, passed to the manager as `serialize` (bug b.ujn). Default: none, so the close runs at once. */
+  /** The per-persona serializer's `run`, passed to the manager as `serialize`. Default: none, so the close runs at once. */
   serialize?: PersonaSerialize
   /** The integration suite's Slack API base URL, passed to the manager as `slackApiUrl` when the key is given (even as `undefined`). Default: the key left out. */
   slackApiUrl?: string
@@ -2212,7 +2212,7 @@ function fileTokensOf(persona: BringUpPersona): { botToken: string; appToken: st
   return { botToken: fakeToken(BOT_TOKEN_PREFIX, `${persona.key}-bot`), appToken: fakeToken(APP_TOKEN_PREFIX, `${persona.key}-app`) }
 }
 
-/** Write `persona`'s credentials file and read it back through the Task 1 reader (AC 47: tokens come from the file). */
+/** Write `persona`'s credentials file and read it back through the section 1 reader (tokens come from the file). */
 function readTokens(persona: BringUpPersona): PersonaSlackTokens {
   const { botToken, appToken } = fileTokensOf(persona)
   writeCreds(persona, { bot_token: botToken, app_token: appToken })
@@ -2337,10 +2337,10 @@ function sentinelSlackError(code: string, slackError?: string): Error {
 const HOUR_MS = 3_600_000
 
 // ---------------------------------------------------------------------------
-// Bring-up and identity (SR-3.1)
+// Bring-up and identity
 // ---------------------------------------------------------------------------
 
-describe('connection manager: bring-up and identity (SR-3.1)', () => {
+describe('connection manager: bring-up and identity', () => {
   test('a persona is up once auth.test on its own validation client returned both IDs, before its socket is built and started', async () => {
     const h = makeHarness()
 
@@ -2424,14 +2424,14 @@ describe('connection manager: bring-up and identity (SR-3.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Client options (SR-3.3, AC 20 connection leg) and tokens (AC 47)
+// Client options (connection leg) and tokens
 // ---------------------------------------------------------------------------
 
-/** The Web API options of a validation client and of a socket client's `apps.connections.open` client (SR-3.3). */
+/** The Web API options of a validation client and of a socket client's `apps.connections.open` client. */
 const NO_RETRY_OPTIONS = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
 
 /**
- * Each client kind's exact SR-3.3 options, the token and the library logger
+ * Each client kind's exact options, the token and the library logger
  * aside (`expectBuiltWith` checks each logger by what it does). The long-lived
  * client keeps the library's retry policy: no retryConfig, no
  * rejectRateLimitedCalls. A socket's `clientOptions` carry no logger, so the
@@ -2451,8 +2451,8 @@ const TICKET_URL = ticketUrl('wss://wss-primary.slack.invalid')
 const UPLOAD_URL = `https://files.slack.invalid/upload/v1/${LEAK_SENTINEL}-upload?sig=${LEAK_SENTINEL}`
 
 /**
- * Text the Socket Mode library's own error lines hold under Bun (E13
- * decision 12): a failed handshake's WebSocket URL with its connection
+ * Text the Socket Mode library's own error lines hold under Bun (
+ * the current rule): a failed handshake's WebSocket URL with its connection
  * ticket, and a fake token beside it.
  */
 const SOCKET_LOG_TEXT =
@@ -2554,7 +2554,7 @@ function expectNothingShared(builds: readonly StubClientBuild[]): void {
 
 const LOG_METHODS = ['debug', 'info', 'warn', 'error'] as const
 
-describe('socketModeSlackLogger: the allowlisted connection-health lines reach the server log, every other library line is dropped (E13 decisions 12, 15)', () => {
+describe('socketModeSlackLogger: the allowlisted connection-health lines reach the server log, every other library line is dropped (decisions 12, 15)', () => {
   // Rows: the library line (method and text) and the text forwarded.
   test.each<[string, 'warn' | 'error', string, string]>([
     ['the ping timeout', 'warn', PING_TIMEOUT_TEXT, PING_TIMEOUT_TEXT],
@@ -2671,7 +2671,7 @@ describe('socketModeSlackLogger: the allowlisted connection-health lines reach t
     expect(second.logger.getLevel()).toBe(LogLevel.INFO)
   })
 
-  test('socketModeClientOptions: exactly the SR-3.3 options, the app token given and the persona’s socket logger over the sink given, its clientOptions with no logger; nothing shared between two calls', () => {
+  test('socketModeClientOptions: exactly the options, the app token given and the persona’s socket logger over the sink given, its clientOptions with no logger; nothing shared between two calls', () => {
     const appToken = fakeToken(APP_TOKEN_PREFIX, 'options')
     const { lines, log } = capture()
     const first = socketModeClientOptions(appToken, LOG_PERSONA, log)
@@ -2687,7 +2687,7 @@ describe('socketModeSlackLogger: the allowlisted connection-health lines reach t
   })
 })
 
-describe('redactingSlackLogger and redactSlackLogText: Web API library lines reach the console with URL-like, then token-like text replaced (E13 decision 15)', () => {
+describe('redactingSlackLogger and redactSlackLogText: Web API library lines reach the console with URL-like, then token-like text replaced', () => {
   // Rows: what the text holds, the text, and the text redacted.
   test.each<[string, string, string]>([
     [
@@ -2801,7 +2801,7 @@ describe('redactingSlackLogger and redactSlackLogText: Web API library lines rea
   test.each<[string, () => WebClientOptions, Record<string, unknown>]>([
     ['validationWebClientOptions', validationWebClientOptions, NO_RETRY_OPTIONS],
     ['longLivedWebClientOptions', longLivedWebClientOptions, SR33_OPTIONS.web],
-  ])('%s: exactly its SR-3.3 options and a redacting logger of its own, fresh per call', (_name, build, expected) => {
+  ])('%s: exactly its options and a redacting logger of its own, fresh per call', (_name, build, expected) => {
     const first = build()
     const second = build()
 
@@ -2813,7 +2813,7 @@ describe('redactingSlackLogger and redactSlackLogText: Web API library lines rea
   })
 })
 
-describe('connection manager: client options (SR-3.3, AC 20 connection leg) and tokens from the file (AC 47)', () => {
+describe('connection manager: client options (connection leg) and tokens from the file', () => {
   // Rows: the occasion, what A does up to and through it (B is up first), and the kinds of every
   // client built for A, in order, the occasion's last. A reopen builds a socket only, never a
   // validation or long-lived client. Every row ends with A up.
@@ -2868,7 +2868,7 @@ describe('connection manager: client options (SR-3.3, AC 20 connection leg) and 
       const rotated = rotateCredentials(h, h.a)
       expect(await h.manager.bringUp(h.a, rotated.tokens)).toEqual({ state: 'up', identity: rotated.identity })
     }, ['validation', 'web', 'socket', 'validation', 'web', 'socket']],
-  ])('AC 20 connection leg, %s: every client built gets exactly its SR-3.3 options, attachOriginalToWebAPIRequestError false on every Web API leg, a socket its persona’s socket logger over the manager’s log and a Web API client a redacting logger, each its own; B undisturbed', async (_occasion, occasion, kinds) => {
+  ])('connection leg, %s: every client built gets exactly its options, attachOriginalToWebAPIRequestError false on every Web API leg, a socket its persona’s socket logger over the manager’s log and a Web API client a redacting logger, each its own; B undisturbed', async (_occasion, occasion, kinds) => {
     const h = makeHarness()
     expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
 
@@ -2882,7 +2882,7 @@ describe('connection manager: client options (SR-3.3, AC 20 connection leg) and 
     await expectBUndisturbed(h)
   })
 
-  test('AC 47: every client receives the credentials file’s tokens, never the environment’s', async () => {
+  test('every client receives the credentials file’s tokens, never the environment’s', async () => {
     const envTokens = [fakeToken(BOT_TOKEN_PREFIX, 'env-connection'), fakeToken(APP_TOKEN_PREFIX, 'env-connection')] as const
     const saved = ENV_KEYS.map(key => process.env[key])
     setEnvTokens(envTokens)
@@ -2905,7 +2905,7 @@ describe('connection manager: client options (SR-3.3, AC 20 connection leg) and 
 })
 
 // ---------------------------------------------------------------------------
-// The integration suite's Slack API base URL override (E14 Task 4, director decision 1)
+// The integration suite's Slack API base URL override ( section 4, the current rule)
 // ---------------------------------------------------------------------------
 
 /** The Slack stub's base URL, as the docker suite sets it. */
@@ -2990,7 +2990,7 @@ function resolveOverride(env: NodeJS.ProcessEnv): { url: string | undefined; lin
   return { url, lines }
 }
 
-describe('Slack API base URL override: resolveSlackApiUrlOverride (E14 Task 4, director decisions 1 and 14)', () => {
+describe('Slack API base URL override: resolveSlackApiUrlOverride (section 4, director decisions 1 and 14)', () => {
   test.each<[string, NodeJS.ProcessEnv]>([
     ['unset', {}],
     ['empty', { CSCB_SLACK_API_URL: '' }],
@@ -3034,12 +3034,12 @@ describe('Slack API base URL override: resolveSlackApiUrlOverride (E14 Task 4, d
   })
 })
 
-describe('Slack API base URL override: the option builders (E14 Task 4)', () => {
-  // Rows: the builder and its exact SR-3.3 options, the logger aside.
+describe('Slack API base URL override: the option builders (section 4)', () => {
+  // Rows: the builder and its exact options, the logger aside.
   test.each<[string, (slackApiUrl?: string) => WebClientOptions, Record<string, unknown>]>([
     ['validationWebClientOptions', validationWebClientOptions, NO_RETRY_OPTIONS],
     ['longLivedWebClientOptions', longLivedWebClientOptions, SR33_OPTIONS.web],
-  ])('%s: with a URL, exactly its SR-3.3 options plus slackApiUrl and its redacting logger; with undefined, exactly its SR-3.3 options and no slackApiUrl key', (_name, build, expected) => {
+  ])('%s: with a URL, exactly its options plus slackApiUrl and its redacting logger; with undefined, exactly its options and no slackApiUrl key', (_name, build, expected) => {
     const withUrl = build(STUB_API_URL)
     const without = build(undefined)
 
@@ -3053,7 +3053,7 @@ describe('Slack API base URL override: the option builders (E14 Task 4)', () => 
     expect(build(STUB_API_URL)).not.toBe(withUrl)
   })
 
-  test('socketModeClientOptions: with a URL, slackApiUrl inside clientOptions only (so apps.connections.open goes there), every other option unchanged; with undefined, exactly the SR-3.3 options and no slackApiUrl key anywhere', () => {
+  test('socketModeClientOptions: with a URL, slackApiUrl inside clientOptions only (so apps.connections.open goes there), every other option unchanged; with undefined, exactly the options and no slackApiUrl key anywhere', () => {
     const appToken = fakeToken(APP_TOKEN_PREFIX, 'override')
     const { lines, log } = capture()
     const withUrl = socketModeClientOptions(appToken, LOG_PERSONA, log, STUB_API_URL)
@@ -3074,7 +3074,7 @@ describe('Slack API base URL override: the option builders (E14 Task 4)', () => 
   })
 })
 
-describe('Slack API base URL override: the connection manager passes it to every client it builds (E14 Task 4)', () => {
+describe('Slack API base URL override: the connection manager passes it to every client it builds (section 4)', () => {
   // Rows: the occasion, what A does up to and through it (B is up first), and the kinds of every
   // client built for A, in order. Together they build each client kind on first bring-up and again later.
   test.each<[string, (h: Harness) => Promise<void>, StubClientKind[]]>([
@@ -3096,7 +3096,7 @@ describe('Slack API base URL override: the connection manager passes it to every
       const rotated = rotateCredentials(h, h.a)
       expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toMatchObject({ kind: 'swapped' })
     }, ['validation', 'web', 'socket', 'validation', 'web', 'socket']],
-  ])('%s: every client built (validation, long-lived, and the socket’s clientOptions) carries slackApiUrl, every other SR-3.3 option unchanged', async (_occasion, occasion, kinds) => {
+  ])('%s: every client built (validation, long-lived, and the socket’s clientOptions) carries slackApiUrl, every other option unchanged', async (_occasion, occasion, kinds) => {
     const h = makeHarness({ slackApiUrl: STUB_API_URL })
     expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
 
@@ -3127,7 +3127,7 @@ describe('Slack API base URL override: the connection manager passes it to every
     assertNoLeak(h.lines)
   })
 
-  test('a rejected value, resolved and passed as server.ts does (slackApiUrl: undefined): every client gets exactly its SR-3.3 options, no slackApiUrl key anywhere', async () => {
+  test('a rejected value, resolved and passed as server.ts does (slackApiUrl: undefined): every client gets exactly its options, no slackApiUrl key anywhere', async () => {
     const resolved = resolveOverride({ CSCB_SLACK_API_URL: SECRET_BEARING_API_URLS[0]![1] })
     expect(resolved).toEqual({ url: undefined, lines: [OVERRIDE_IGNORED_LINE] })
     const h = makeHarness({ slackApiUrl: resolved.url })
@@ -3145,7 +3145,7 @@ describe('Slack API base URL override: the connection manager passes it to every
 })
 
 // ---------------------------------------------------------------------------
-// No module-scope effects (SR-13.1)
+// No module-scope effects
 // ---------------------------------------------------------------------------
 
 const CONNECTION_MODULES = [
@@ -3155,7 +3155,7 @@ const CONNECTION_MODULES = [
   'persona-bringup-controller.ts',
 ]
 
-describe('connection manager: no module-scope effects (SR-13.1)', () => {
+describe('connection manager: no module-scope effects', () => {
   test('creating a manager builds no client, schedules no timer and reports nothing until a persona is brought up', () => {
     const h = makeHarness()
 
@@ -3194,10 +3194,10 @@ describe('connection manager: no module-scope effects (SR-13.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Event tagging and isolation (SR-3.1)
+// Event tagging and isolation
 // ---------------------------------------------------------------------------
 
-describe('connection manager: event tagging and isolation (SR-3.1)', () => {
+describe('connection manager: event tagging and isolation', () => {
   test('message, app_mention and interactive events reach the handler tagged with their own persona, payload unchanged, never acked by the manager', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
@@ -3240,18 +3240,18 @@ describe('connection manager: event tagging and isolation (SR-3.1)', () => {
     for (const line of h.lines) {
       expect(line).toContain(renderPersonaRef(h.a.name, h.a.key))
       expect(line).toContain('personas[0]')
-      // The handler's message is kept, redacted (E14 B1).
+      // The handler's message is kept, redacted ( B1).
       expect(line).toContain(`message="handler failed (${REDACTED_SENTINEL_TAIL})"`)
     }
   })
 })
 
 // ---------------------------------------------------------------------------
-// AC 5: the isolation walk-through (sprint demo)
+// the isolation walk-through (sprint demo)
 // ---------------------------------------------------------------------------
 
-describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
-  test('AC 5: A drops and reopens at once while B keeps delivering; after the reopen A has one live socket and each event reaches A exactly once', async () => {
+describe('per-persona isolation walk-through (fake clock)', () => {
+  test('A drops and reopens at once while B keeps delivering; after the reopen A has one live socket and each event reaches A exactly once', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     await expectDelivers(h, h.a)
@@ -3275,7 +3275,7 @@ describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
     expect(statesOf(h, h.b)).toEqual(['connecting', 'up'])
   })
 
-  test('AC 5: the reopen is socket-only: no auth.test, no new long-lived Web API client, same client and identity', async () => {
+  test('the reopen is socket-only: no auth.test, no new long-lived Web API client, same client and identity', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     const web = h.manager.webClient(h.a.key)
@@ -3292,7 +3292,7 @@ describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
     expect(h.manager.identity(h.a.key)).toEqual(identity!)
   })
 
-  test('AC 5: a rejected reopen for A leaves the process running and B delivering; retries wait 5 s, then 10 s, and a later success restores A', async () => {
+  test('a rejected reopen for A leaves the process running and B delivering; retries wait 5 s, then 10 s, and a later success restores A', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     stubOf(h, h.a).script.connect.push({ kind: 'network' }, { kind: 'http', status: 503 })
@@ -3331,7 +3331,7 @@ describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
     ['the WebSocket phase never reaches hello', { kind: 'never' }, 0],
     ['apps.connections.open never answers', { kind: 'open-never-answers' }, 0],
     ['apps.connections.open answers after 9 s, then the WebSocket phase never reaches hello', { kind: 'never' }, 9_000],
-  ])('AC 5: a reopen whose start() never settles (%s) is abandoned 10 s into its WebSocket phase on the fake clock, counts as Slack-unreachable and is retried on the backoff while B keeps delivering', async (_label, hang, openAnswersAfterMs) => {
+  ])('a reopen whose start() never settles (%s) is abandoned 10 s into its WebSocket phase on the fake clock, counts as Slack-unreachable and is retried on the backoff while B keeps delivering', async (_label, hang, openAnswersAfterMs) => {
     const h = makeHarness()
     await bringUpBoth(h)
     const slowOpen = makeDeferredConnect()
@@ -3370,7 +3370,7 @@ describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
     await expectDelivers(h, h.b)
   })
 
-  test('AC 5: no agent-director call is made for A across a drop, a rejected reopen, an abandoned reopen and a refused reopen', async () => {
+  test('no agent-director call is made for A across a drop, a rejected reopen, an abandoned reopen and a refused reopen', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     stubOf(h, h.a).script.connect.push({ kind: 'network' }, { kind: 'never' }, { kind: 'platform', error: 'invalid_auth' })
@@ -3386,10 +3386,10 @@ describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Reopen rules (SR-3.3)
+// Reopen rules
 // ---------------------------------------------------------------------------
 
-describe('connection manager: reopen rules (SR-3.3)', () => {
+describe('connection manager: reopen rules', () => {
   // Rows: label, arrangement after both are up, and whether A's socket emits `disconnected` on the stop.
   test.each<[string, (h: Harness) => void, boolean]>([
     ['while A is up', () => {}, true],
@@ -3436,7 +3436,7 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
     expect(liveSocketsOf(h, h.a)).toBe(0)
     expect(h.manager.status(h.a.key)).toBeUndefined()
     expect(h.manager.webClient(h.a.key)).toBeUndefined()
-    // A teardown's close (b.av2 SR-6.5): the identity is dropped and nothing is
+    // A teardown's close: the identity is dropped and nothing is
     // logged, so no persona-connection-lost, -restored or unreachable line.
     expect(h.manager.identity(h.a.key)).toBeUndefined()
     expect(h.lines.slice(linesBefore)).toEqual([])
@@ -3500,7 +3500,7 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
     await expectDelivers(h, h.b)
   })
 
-  test('stop(A, endReason) with no episode open (A up) logs nothing; stop(A) with no reason during an open lost episode (a teardown, b.av2 SR-6.5) logs nothing', async () => {
+  test('stop(A, endReason) with no episode open (A up) logs nothing; stop(A) with no reason during an open lost episode (a teardown) logs nothing', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     const linesBefore = h.lines.length
@@ -3696,7 +3696,7 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Late settlement of a stopped or abandoned start() (SR-3.1, SR-3.3, b.av2 SR-6.5)
+// Late settlement of a stopped or abandoned start
 // ---------------------------------------------------------------------------
 
 describe('connection manager: late settlement of a stopped or abandoned start()', () => {
@@ -3785,12 +3785,12 @@ describe('connection manager: late settlement of a stopped or abandoned start()'
 })
 
 // ---------------------------------------------------------------------------
-// Bring-up connection legs of AC 23, AC 24
+// Bring-up connection legs of the contract
 // ---------------------------------------------------------------------------
 
 /**
  * Bring-up connect legs that leave a persona Slack-unreachable, never
- * credentials-broken (AC 23, AC 24). Rows: label, the connect outcome, when
+ * credentials-broken. Rows: label, the connect outcome, when
  * apps.connections.open answers (0: at once), when the manager abandons it
  * (0: it fails at once), and the outcome's reason. The 10 s bound restarts
  * when the WebSocket phase begins, so a slow open is abandoned 10 s after it
@@ -3803,7 +3803,7 @@ const UNREACHABLE_CONNECT_LEGS: [string, SettledConnectOutcome, number, number, 
   ['start() never settles: apps.connections.open answers after 9 s, then the WebSocket never reaches hello', { kind: 'never' }, 9_000, 19_000, 'timeout'],
 ]
 
-describe('connection manager: bring-up connection legs of AC 23, AC 24', () => {
+describe('connection manager: bring-up connection legs of the contract', () => {
   test.each(UNREACHABLE_CONNECT_LEGS)('%s: A is Slack-unreachable and retrying, never credentials-broken, while B comes up and delivers', async (_label, connect, openAnswersAfterMs, abandonAtMs, reason) => {
     const h = makeHarness()
     const slowOpen = makeDeferredConnect()
@@ -3845,7 +3845,7 @@ describe('connection manager: bring-up connection legs of AC 23, AC 24', () => {
   })
 })
 
-describe('connection manager: the 10 s bound on auth.test (E2 carry)', () => {
+describe('connection manager: the 10 s bound on auth.test (carry)', () => {
   test('an auth.test that never answers is abandoned at 10 s on the fake clock: A is Slack-unreachable (timeout), never refused, no socket is built, and its retry 5 s later comes up; B is unaffected', async () => {
     const h = makeHarness()
     stubOf(h, h.a).script.authTest.push({ kind: 'never' })
@@ -3907,10 +3907,10 @@ describe('connection manager: the 10 s bound on auth.test (E2 carry)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// No cross-persona coupling (SR-3.3)
+// No cross-persona coupling
 // ---------------------------------------------------------------------------
 
-describe('connection manager: no cross-persona coupling (SR-3.3)', () => {
+describe('connection manager: no cross-persona coupling', () => {
   test('while A’s reopen start() hangs after two failures, B drops, fails once and reopens on its own 5 s step; A’s failure count never lengthens B’s wait', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
@@ -3939,10 +3939,10 @@ describe('connection manager: no cross-persona coupling (SR-3.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Log classes (SR-10.3)
+// Log classes
 // ---------------------------------------------------------------------------
 
-describe('connection manager: log classes (SR-10.3)', () => {
+describe('connection manager: log classes', () => {
   const LOST = PERSONA_CONNECTION_LOST
   const RESTORED = PERSONA_CONNECTION_RESTORED
   const U = PERSONA_SLACK_UNREACHABLE
@@ -4002,10 +4002,10 @@ describe('connection manager: log classes (SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Dry run (SR-3.4)
+// Dry run
 // ---------------------------------------------------------------------------
 
-describe('connection manager: dry run (SR-3.4)', () => {
+describe('connection manager: dry run', () => {
   test('reads no credentials file, builds no client, makes no Slack call, and brings every persona up with a distinct placeholder identity derived from its key', async () => {
     // No credentials file is written: each persona points at a missing path.
     const h = makeHarness({ dryRun: true })
@@ -4032,15 +4032,15 @@ describe('connection manager: dry run (SR-3.4)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// unhandledRejection handler (SR-3.3)
+// unhandledRejection handler
 // ---------------------------------------------------------------------------
 
-describe('unhandledRejection handler (SR-3.3)', () => {
+describe('unhandledRejection handler', () => {
   // Rows: label, what gives the rejection reason, and pieces the line must
   // carry. The stub rows take the value a client of the stub (leak marker on,
-  // built without the SR-3.3 options, so a request error keeps its `original`
+  // built without the options, so a request error keeps its `original`
   // with the Authorization header) rejects with or emits: a reconnect's
-  // worst case. A message is kept, redacted (E14 B1), so a message built here
+  // worst case. A message is kept, redacted ( B1), so a message built here
   // carries the sentinel only inside a token and a URL (`sentinelInMessage`).
   // Called directly; never installed on the real process.
   test.each<[string, () => unknown, string[]]>([
@@ -4108,10 +4108,10 @@ describe('unhandledRejection handler (SR-3.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// slackPlatformReason (SR-10.3): data.error only when it is a short identifier
+// slackPlatformReason: data.error only when it is a short identifier
 // ---------------------------------------------------------------------------
 
-describe('slackPlatformReason (SR-10.3)', () => {
+describe('slackPlatformReason', () => {
   /** An Error carrying `data` as a Slack platform error does. */
   const withData = (data: unknown): Error => Object.assign(new Error(`An API error occurred ${LEAK_SENTINEL}`), { data })
 
@@ -4168,10 +4168,10 @@ describe('slackPlatformReason (SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// isSafeIdentifier (SR-10.3): the short-identifier check, exported for callers
+// isSafeIdentifier: the short-identifier check, exported for callers
 // ---------------------------------------------------------------------------
 
-describe('isSafeIdentifier (SR-10.3)', () => {
+describe('isSafeIdentifier', () => {
   test.each<[string, string]>([
     ['a Slack error code', 'missing_scope'],
     ['a library code', 'slack_webapi_platform_error'],
@@ -4212,7 +4212,7 @@ describe('isSafeIdentifier (SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// describeThrownValue (SR-10.3, AC 20, E14 B1): the message kept, redacted,
+// describeThrownValue ( B1): the message kept, redacted,
 // on one line, capped; a base agent-director error's errName
 // ---------------------------------------------------------------------------
 
@@ -4244,11 +4244,11 @@ function occurrences(text: string, needle: string): number {
   return text.split(needle).length - 1
 }
 
-describe('describeThrownValue: the message is kept, redacted, on one line and capped (SR-10.3, AC 20, E14 B1)', () => {
+describe('describeThrownValue: the message is kept, redacted, on one line and capped (B1)', () => {
   const TOKEN = REDACTED_TOKEN_PLACEHOLDER
   const URL = REDACTED_URL_PLACEHOLDER
 
-  test('the cap is 300 characters (E14 director decision 2)', () => {
+  test('the cap is 300 characters', () => {
     expect(MAX_LOGGED_MESSAGE_LENGTH).toBe(300)
   })
 
@@ -4406,10 +4406,10 @@ describe('describeThrownValue: the message is kept, redacted, on one line and ca
   })
 })
 
-// describeThrownValueWithoutStack (b.jg5 SRJ-1014): the same one-line
+// describeThrownValueWithoutStack: the same one-line
 // description with no stack frames, for a line naming an expected failure's
 // cause (the retry timer's armed line), so it carries no host path.
-describe('describeThrownValueWithoutStack: describeThrownValue\'s head and message, never a frame (b.jg5 SRJ-1014)', () => {
+describe('describeThrownValueWithoutStack: describeThrownValue\'s head and message, never a frame', () => {
   test.each<[string, () => unknown]>([
     ['an Error with a code and a message holding a token and a URL', () => Object.assign(new TypeError(`bad (${sentinelInMessage('no-stack')})`), { code: 'EIO' })],
     ['a plain Error with no message', () => new Error()],
@@ -4425,7 +4425,7 @@ describe('describeThrownValueWithoutStack: describeThrownValue\'s head and messa
   })
 })
 
-describe('describeThrownValue: a base AgentDirectorError names its checked errName beside its redacted message (SR-10.3, AC 20, E14 B1)', () => {
+describe('describeThrownValue: a base AgentDirectorError names its checked errName beside its redacted message (B1)', () => {
   /** A description that carries the sentinel in a fake token and a URL, so an unredacted one fails the leak check. */
   const desc = (): string => `refused ${sentinelInMessage('desc')}`
   /** `desc()` as the description logs it. */
@@ -4498,10 +4498,10 @@ describe('describeThrownValue: a base AgentDirectorError names its checked errNa
 })
 
 // ---------------------------------------------------------------------------
-// describeSlackCallFailure (SR-10.3): the token-safe tail of a failed-call line
+// describeSlackCallFailure: the token-safe tail of a failed-call line
 // ---------------------------------------------------------------------------
 
-describe('describeSlackCallFailure (SR-10.3)', () => {
+describe('describeSlackCallFailure', () => {
   test.each<[string, unknown, string | undefined]>([
     ['a sentinel-bearing platform error', sentinelSlackError('slack_webapi_platform_error', 'not_in_channel'), 'not_in_channel'],
     ['a sentinel-bearing request error (Authorization header in original)', sentinelSlackError('slack_webapi_request_error'), undefined],
@@ -4516,7 +4516,7 @@ describe('describeSlackCallFailure (SR-10.3)', () => {
     if (value !== undefined) expect(() => assertNoLeak(value)).toThrow()
   })
 
-  test('the thrown value’s message is in the tail, redacted (E14 B1)', () => {
+  test('the thrown value’s message is in the tail, redacted (B1)', () => {
     const tail = describeSlackCallFailure(sentinelSlackError('slack_webapi_platform_error', 'not_in_channel'))
 
     expect(tail).toStartWith(
@@ -4545,10 +4545,10 @@ describe('describeSlackCallFailure (SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Rejected Web API calls (AC 20)
+// Rejected Web API calls
 // ---------------------------------------------------------------------------
 
-describe('rejected Web API calls (AC 20)', () => {
+describe('rejected Web API calls', () => {
   // Rows: label, leg, the scripted rejection, the state A is left in. Rows
   // with `reject` carry the sentinel in message, original, headers and data;
   // the http rows carry it through the stub's leak marker.
@@ -4582,7 +4582,7 @@ describe('rejected Web API calls (AC 20)', () => {
     if (web === undefined) throw new Error('expected A’s long-lived Web API client')
 
     const thrown = await web.chat.postMessage({ channel: 'C0STUB0001', text: 'hello' }).catch((err: unknown) => err)
-    // Control: the same failure on a client built without the SR-3.3 option carries the Authorization header in original.
+    // Control: the same failure on a client built without the option carries the Authorization header in original.
     const control = await stub.web.chat.postMessage({ channel: 'C0STUB0001', text: 'hello' }).catch((err: unknown) => err)
 
     expect(thrown).toMatchObject({ code: 'slack_webapi_request_error' })
@@ -4594,8 +4594,8 @@ describe('rejected Web API calls (AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Credentials reconnect (E13 Task 1: b.av2 SR-8.6 credentials row, SR-3.1
-// overlap, SR-3.3 reconnect part, SR-10.3 persona-credentials-change-failed)
+// Credentials reconnect ( section 1: credentials row
+// overlap reconnect part persona-credentials-change-failed)
 //
 // `reconnectCredentials` and `replaceRetryTokens` at module level, on the
 // file harness (A and B, stub Slack, fake clock), independent of the reload
@@ -4701,7 +4701,7 @@ function laterOutcomes(): { later: PersonaReconnectLaterOutcome[]; listener: (ou
   return { later, listener: outcome => void later.push(outcome) }
 }
 
-describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials row, SR-3.1, SR-3.3)', () => {
+describe('connection manager: credentials reconnect (credentials row)', () => {
   test('success: the new validation client, Web API client and socket are built and the socket reaches hello before the old socket is let go and closed; identity is the new auth.test result; A stays up; B undisturbed', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
@@ -4752,7 +4752,7 @@ describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials ro
     await expectBUndisturbed(h)
   })
 
-  // The reconnect's client options are a row of the AC 20 connection-leg occasion table.
+  // The reconnect's client options are a row of the connection-leg occasion table.
   test('the reconnect’s validation, Web API and socket clients get the new tokens, never the old', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
@@ -4773,7 +4773,7 @@ describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials ro
     await expectBUndisturbed(h)
   })
 
-  // Rows: label, how the new credentials are refused, the check and cause the E2 classifier gives, and the clients built from them.
+  // Rows: label, how the new credentials are refused, the check and cause the classifier gives, and the clients built from them.
   test.each<[string, StubSlackOptions, 'auth.test' | 'socket-mode', string, StubClientKind[]]>([
     [
       'the bot token refused by auth.test',
@@ -5096,7 +5096,7 @@ describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials ro
 
   test('overlap: events emitted on the old and the new socket before the swap are both tagged with A; a duplicate (channel, ts) on both reaches the handler once per socket, for the routing dedupe to collapse', async () => {
     // The manager does not dedupe: the per-persona dedupe in the routing does.
-    // tests/persona-routing.test.ts, "SR-4.1 per-persona dedupe through the
+    // tests/persona-routing.test.ts, "per-persona dedupe through the
     // pipeline" (`the same \`message\` redelivered on A's one connection` and
     // `dedupe is per persona key …`), shows a redelivered (channel, ts) for
     // one key collapses to one notification, whichever connection brought it.
@@ -5155,7 +5155,7 @@ const RECONNECT_SUPERSEDED_CLEARED =
 const RECONNECT_STOPPED_CLEARED =
   'cleared: the new connection of its confirmed credentials change is no longer retried: the persona\'s connection was stopped'
 
-describe('connection manager: a credentials reconnect’s beforeSwap hook (b.av2 SR-8.6 credentials row)', () => {
+describe('connection manager: a credentials reconnect’s beforeSwap hook (credentials row)', () => {
   /** What beforeSwap saw of A when it ran: its reported status, identity, client and both sockets. */
   interface SwapView {
     status: PersonaConnectionStatus | undefined
@@ -5320,7 +5320,7 @@ describe('connection manager: a credentials reconnect’s beforeSwap hook (b.av2
   })
 })
 
-describe('connection manager: a pending credentials reconnect’s unreachable episode always ends (SR-10.3)', () => {
+describe('connection manager: a pending credentials reconnect’s unreachable episode always ends', () => {
   // Rows: label, the first reconnect's script, what ends it, and the cause of the one cleared line
   // (null: its first attempt was still in flight, so no episode was open and nothing is logged).
   test.each<[string, StubSlackOptions, 'supersede' | 'stop' | 'stopAll', string | null]>([
@@ -5367,12 +5367,12 @@ describe('connection manager: a pending credentials reconnect’s unreachable ep
 })
 
 // ---------------------------------------------------------------------------
-// Credentials reconnect secrecy (AC 20 reconnect leg): E2's secrecy cases for
+// Credentials reconnect secrecy (reconnect leg): secrecy cases for
 // the clients and closes a reconnect adds. Every failure is sentinel-bearing
 // (message, original, headers, data other than data.error).
 // ---------------------------------------------------------------------------
 
-describe('connection manager: credentials reconnect secrecy (AC 20 reconnect leg)', () => {
+describe('connection manager: credentials reconnect secrecy (reconnect leg)', () => {
   /**
    * Unhandled rejections seen by a test-scoped process listener, added by
    * `watchUnhandled` and removed after each test. `bun test` also fails the
@@ -5404,7 +5404,7 @@ describe('connection manager: credentials reconnect secrecy (AC 20 reconnect leg
     const web = h.manager.webClient(h.a.key)!
 
     const thrown = await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'on the reconnected client' }))
-    // Control: the same failure on a client of the new credentials built without the SR-3.3 option.
+    // Control: the same failure on a client of the new credentials built without the option.
     const control = await rejectionOf(rotated.stub.web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'control' }))
     await h.clock.flush()
 
@@ -5501,7 +5501,7 @@ describe('connection manager: credentials reconnect secrecy (AC 20 reconnect leg
     assertNoLeak({ outcome, statuses: h.statuses })
   })
 
-  test.each(FAILED_CLOSES)('the close of a reconnected socket whose bot token is then revoked (bug b.ujn), its disconnect() %s: no unhandled rejection, only the one refusal line', async (_label, failing) => {
+  test.each(FAILED_CLOSES)('the close of a reconnected socket whose bot token is then revoked, its disconnect() %s: no unhandled rejection, only the one refusal line', async (_label, failing) => {
     watchUnhandled()
     const h = makeHarness()
     await bringUpBoth(h)
@@ -5528,7 +5528,7 @@ describe('connection manager: credentials reconnect secrecy (AC 20 reconnect leg
   })
 })
 
-describe('connection manager: a retrying persona takes the new credentials (replaceRetryTokens, b.av2 SR-8.6)', () => {
+describe('connection manager: a retrying persona takes the new credentials (replaceRetryTokens)', () => {
   test('A Slack-unreachable at bring-up keeps its pending retry; the retry uses only the new tokens and comes up with their identity; B undisturbed', async () => {
     const h = makeHarness()
     stubOf(h, h.a).script.authTest.push({ kind: 'network' })
@@ -5626,7 +5626,7 @@ describe('connection manager: a retrying persona takes the new credentials (repl
   })
 })
 
-describe('persona-credentials-change-failed lines (SR-10.3)', () => {
+describe('persona-credentials-change-failed lines', () => {
   // Rows: label, the cause as the failing check words it, what the persona keeps, and fragments the cause must hold.
   test.each<[string, (persona: BringUpPersona, other: OtherBringUpPersona) => Promise<string>, CredentialsChangeKept, string[]]>([
     ['missing', async persona => checkCause(checkPersonaCredentials(persona, { others: [] })), 'connection', ['does not exist']],
@@ -5699,7 +5699,7 @@ function checkCause(result: ReturnType<typeof checkPersonaCredentials>): string 
 }
 
 // ---------------------------------------------------------------------------
-// Revoked bot token while running: the Web API auth-error watch (bug b.ujn)
+// Revoked bot token while running: the Web API auth-error watch
 //
 // The manager wraps every long-lived Web API client it hands out; the first
 // `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed` from a
@@ -5762,7 +5762,7 @@ function brokenReportsOf(h: Harness, p: ManagedPersona): number {
   return h.statuses.filter(([key, status]) => key === p.key && status.state === 'broken').length
 }
 
-describe('connection manager: a revoked bot token while running (the Web API auth-error watch, bug b.ujn)', () => {
+describe('connection manager: a revoked bot token while running (the Web API auth-error watch)', () => {
   test.each([...WEB_API_AUTH_CODES])('%s from a call on A’s client marks A broken at once: the caller gets the original rejection, the listener hears broken once, one line names A and its credentials path, A’s socket is closed as the manager’s own close with no reopen, a later call never reaches Slack; B is untouched', async code => {
     const h = makeHarness()
     await bringUpBoth(h)
@@ -6197,7 +6197,7 @@ describe('connection manager: a revoked bot token while running (the Web API aut
     ['a method name that is a fake bot token', fakeToken(BOT_TOKEN_PREFIX, 'method'), undefined],
     ['a method name holding a fake app token after a dot', `apps.${fakeToken(APP_TOKEN_PREFIX, 'method')}`, undefined],
     ['a method name holding a fake token after a newline', `chat.postMessage\n${fakeToken(BOT_TOKEN_PREFIX, 'line')}`, undefined],
-  ])('AC 20: a local refusal’s WebApiCallRefusedLocallyError for %s carries no token in message, stack, data or any field, for every auth code', (_label, method, named) => {
+  ])('a local refusal’s WebApiCallRefusedLocallyError for %s carries no token in message, stack, data or any field, for every auth code', (_label, method, named) => {
     for (const code of WEB_API_AUTH_CODES) {
       const err = new WebApiCallRefusedLocallyError(method, code)
 
@@ -6221,8 +6221,8 @@ describe('connection manager: a revoked bot token while running (the Web API aut
 })
 
 // ---------------------------------------------------------------------------
-// Bring-up outcomes, the start pass and per-persona retry timers (E5 Task 1:
-// b.av2 SR-6.1 outcomes, SR-6.4, SR-7.2 part, SR-10.3 part; AC 23, 24, 66)
+// Bring-up outcomes, the start pass and per-persona retry timers ( section 1:
+// outcomespartpart, 24, 66)
 //
 // The real bring-up controller over the real connection manager
 // (`makeConnectionHarness` with `files: true`: stub Slack factory, fake
@@ -6325,7 +6325,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
         return status
       },
       status: key => h.manager.status(key),
-      // A claude_config_dir hold closes the persona's connection through it (E14 B3).
+      // A claude_config_dir hold closes the persona's connection through it ( B3).
       stop: (key, endReason) => h.manager.stop(key, endReason),
     },
     // Resolved against this test's own home, never the OS home's `.claude`.
@@ -6441,7 +6441,7 @@ function repairDirectory(path: string): void {
   mkdirSync(path)
 }
 
-describe('bring-up outcomes (E5)', () => {
+describe('bring-up outcomes ()', () => {
   const originalError = console.error
   let consoleLines: string[]
   let savedStateDir: string | undefined
@@ -6499,7 +6499,7 @@ describe('bring-up outcomes (E5)', () => {
     else process.env['SLACK_STATE_DIR'] = savedStateDir
   })
 
-  test('SR-13.1: creating a controller reads no file, schedules no timer, logs nothing and brings nothing up until bringUp', () => {
+  test('creating a controller reads no file, schedules no timer, logs nothing and brings nothing up until bringUp', () => {
     const f = makeBringUpFixture()
     const [a] = f.personas as [Persona, Persona]
 
@@ -6514,7 +6514,7 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The start pass (AC 23, AC 24)
+  // The start pass
   // -------------------------------------------------------------------------
 
   /** Push `outcome` enough times that every retry in the test's hour of fake time fails too. */
@@ -6575,7 +6575,7 @@ describe('bring-up outcomes (E5)', () => {
   ]
 
   // -------------------------------------------------------------------------
-  // A not-up persona's surviving instance (AC 23, AC 24; b.av2 SR-6.3, SR-6.4)
+  // A not-up persona's surviving instance
   //
   // The agent-director stub holds rows (`holdRows`), the start sweep and the start pass run as
   // server.ts runs them, and each MCP registration goes through the real `decideSessionAdmission`
@@ -6587,7 +6587,7 @@ describe('bring-up outcomes (E5)', () => {
 
   /**
    * A live row of a persona absent from the config: the sweep's control, which it kills and keeps
-   * (no delete; b.jg5 SRJ-714, SRJ-1506 beside b.av2 SR-6.3).
+   * (no delete beside).
    */
   const ORPHAN_ID = 'cscb_gone'
   /** The rows the agent-director stub holds, by instance ID (see holdRows). */
@@ -6731,8 +6731,8 @@ describe('bring-up outcomes (E5)', () => {
   /** The session-refused lines naming `persona`. */
   const refusalsOf = (f: BringUpFixture, persona: Persona) => linesOf(f, persona).filter(line => line.startsWith('[slack] Session refused: '))
 
-  describe('the start pass: one broken persona per cause beside a healthy one (AC 23, AC 24)', () => {
-    test.each(NOT_UP_CAUSES)('AC 23, AC 24: %s — A ends %s and keeps its surviving agent-director row through the sweep, the pass and its retries; B is up, launched and serving; A is not launched; A’s instance’s MCP registration is refused while B’s is admitted; nothing is posted, now or after later retries', async (_label, outcome, cls, pathOf, arrange, abandonAtMs, slackBuilt) => {
+  describe('the start pass: one broken persona per cause beside a healthy one', () => {
+    test.each(NOT_UP_CAUSES)('%s — A ends %s and keeps its surviving agent-director row through the sweep, the pass and its retries; B is up, launched and serving; A is not launched; A’s instance’s MCP registration is refused while B’s is admitted; nothing is posted, now or after later retries', async (_label, outcome, cls, pathOf, arrange, abandonAtMs, slackBuilt) => {
       holdRows()
       const f = makeBringUpFixture({ spawn: true })
       const [a, b] = f.personas as [Persona, Persona]
@@ -6821,7 +6821,7 @@ describe('bring-up outcomes (E5)', () => {
       assertNoLeak(f.captured({ result, consoleLines, admissions: [fromA.admission, fromB.admission, later.admission] }))
     })
 
-    test('AC 23, AC 24: the start pass returns while A is still retrying (its start() never settled), B’s launch did not wait for A, and A is launched from its own retry once Slack answers', async () => {
+    test('the start pass returns while A is still retrying (its start() never settled), B’s launch did not wait for A, and A is launched from its own retry once Slack answers', async () => {
       const f = makeBringUpFixture({ spawn: true, slack: { [OUTCOME_A]: { connect: [{ kind: 'never' }] } } })
       const [a, b] = f.personas as [Persona, Persona]
       let result: StartupSessionManagerResult | undefined
@@ -6857,7 +6857,7 @@ describe('bring-up outcomes (E5)', () => {
       assertNoLeak(f.captured({ result, consoleLines }))
     })
 
-    test('AC 23, AC 24 diagnostics: one persona-start line per applied persona, broken ones included; each broken line has its class, name and key, personas[i] and path; a doubly broken persona gets both lines from one pass', async () => {
+    test('diagnostics: one persona-start line per applied persona, broken ones included; each broken line has its class, name and key, personas[i] and path; a doubly broken persona gets both lines from one pass', async () => {
       const f = makeBringUpFixture({ spawn: true, names: [OUTCOME_A, OUTCOME_B, OUTCOME_C] })
       const [a, b, c] = f.personas as [Persona, Persona, Persona]
       rmSync(a.credentials_file)
@@ -6901,9 +6901,9 @@ describe('bring-up outcomes (E5)', () => {
     })
 
     // The no-agent-director-call, no-launch and B-keeps-delivering legs of a refused reopen are
-    // pinned by 'AC 5: no agent-director call …', 'a credentials error on reopen …' (both above)
+    // pinned by 'no agent-director call …', 'a credentials error on reopen …' (both above)
     // and tests/persona-bringup.test.ts's end-to-end case; this one adds the controller's side.
-    test('AC 23, AC 24 later credentials failure: a running persona whose reopen is refused (token_revoked) ends broken, logged once with personas[i] and the credentials path; no retry timer, no post', async () => {
+    test('later credentials failure: a running persona whose reopen is refused (token_revoked) ends broken, logged once with personas[i] and the credentials path; no retry timer, no post', async () => {
       const f = makeBringUpFixture()
       const [a] = f.personas as [Persona, Persona]
       await bringUpEach(f)
@@ -6931,7 +6931,7 @@ describe('bring-up outcomes (E5)', () => {
 
   // The surviving instance after its persona recovers or stops being up (the helpers are above the
   // start pass, whose per-cause table covers the row surviving and the instance being refused).
-  describe('a not-up persona’s surviving instance (AC 23, AC 24)', () => {
+  describe('a not-up persona’s surviving instance', () => {
     beforeEach(() => holdRows())
 
     // Rows: the row's state, how the row spells A's directory, what the ladder does with it and
@@ -6940,7 +6940,7 @@ describe('bring-up outcomes (E5)', () => {
       ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 4, sendKeys: 2 }],
       ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1 }],
       ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 4, sendKeys: 2 }],
-    ])('AC 23, AC 24: a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
+    ])('a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
       let launched: Awaited<ReturnType<typeof spawnForPersona>> | undefined
       const f: BringUpFixture = makeBringUpFixture({
         dropSessions: true,
@@ -6992,7 +6992,7 @@ describe('bring-up outcomes (E5)', () => {
       assertNoLeak(f.captured({ result, launched, consoleLines, admissions: [whileRetrying.admission, afterUp.admission] }))
     })
 
-    test('AC 23, AC 24: a running persona whose reopen is refused (token_revoked) has its MCP session dropped — entry and session-ID mapping removed, transport closed with nothing left to restart — while B’s session is unchanged; no agent-director call, restart or post; its next registration is refused', async () => {
+    test('a running persona whose reopen is refused (token_revoked) has its MCP session dropped — entry and session-ID mapping removed, transport closed with nothing left to restart — while B’s session is unchanged; no agent-director call, restart or post; its next registration is refused', async () => {
       const f = makeBringUpFixture({ dropSessions: true })
       const [a, b] = f.personas as [Persona, Persona]
       await bringUpEach(f)
@@ -7043,7 +7043,7 @@ describe('bring-up outcomes (E5)', () => {
       ['is still in flight (lost; its WebSocket never reaches hello)', [{ kind: 'never' }], 'lost'],
       ['is still retrying (Slack unreachable)', [{ kind: 'network' }], 'retrying'],
       ['succeeds', [], 'up'],
-    ])('AC 23, AC 24: a running persona whose reopen %s stays up and keeps its registered MCP session; nothing is dropped', async (_label, reopen, state) => {
+    ])('a running persona whose reopen %s stays up and keeps its registered MCP session; nothing is dropped', async (_label, reopen, state) => {
       const f = makeBringUpFixture({ dropSessions: true })
       const [a, b] = f.personas as [Persona, Persona]
       await bringUpEach(f)
@@ -7075,7 +7075,7 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Leaving up (b.av2 SR-6.3, SR-6.4): the controller's `onLeftUp` listener and
+  // Leaving up: the controller's `onLeftUp` listener and
   // the not-up description used by the refusal and drop lines
   // -------------------------------------------------------------------------
 
@@ -7175,7 +7175,7 @@ describe('bring-up outcomes (E5)', () => {
       ],
       ['retrying with a Slack cause only', { outcome: 'retrying', causes: { slack: failure('slack', 'unreachable') } }, 'retrying: unreachable'],
       [
-        'retrying, held for its claude_config_dir only (bug b.g57)',
+        'retrying, held for its claude_config_dir only',
         { outcome: 'retrying', causes: { configDir: failure('claude-config-dir', 'config dir unresolvable') } },
         'retrying: config dir unresolvable',
       ],
@@ -7185,17 +7185,17 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Per-persona retry timers (SR-6.4, SR-6.1 held credentials; AC 66)
+  // Per-persona retry timers (held credentials)
   // -------------------------------------------------------------------------
 
   describe('per-persona retry timers', () => {
-    /** More steps than the restart cap allows: the SR-3.2 ladder, then the 300 s ceiling repeated. */
+    /** More steps than the restart cap allows: the ladder, then the 300 s ceiling repeated. */
     const DIRECTORY_STEPS_S = [5, 10, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300]
 
     test.each<['missing' | 'unusable', string]>([
       ['missing', PERSONA_DIRECTORY_MISSING],
       ['unusable', PERSONA_DIRECTORY_UNUSABLE],
-    ])('AC 66: a working directory that is %s is re-checked on 5 s doubling to a 300 s ceiling with no cap and no Slack client; once usable, A comes up with no confirmation using the credentials read at its original bring-up, not the edited file', async (how, cls) => {
+    ])('a working directory that is %s is re-checked on 5 s doubling to a 300 s ceiling with no cap and no Slack client; once usable, A comes up with no confirmation using the credentials read at its original bring-up, not the edited file', async (how, cls) => {
       const f = makeBringUpFixture()
       const [a, b] = f.personas as [Persona, Persona]
       const original = f.h.tokens(a)
@@ -7412,7 +7412,7 @@ describe('bring-up outcomes (E5)', () => {
       assertNoLeak(f.captured())
     })
 
-    test('dry run (SR-3.4): a persona whose directory is missing still retries and comes up once it exists; no credentials file is read and no Slack call is made at any step', async () => {
+    test('dry run: a persona whose directory is missing still retries and comes up once it exists; no credentials file is read and no Slack call is made at any step', async () => {
       // The healthy persona first, so the retrying one is personas[1].
       const f = makeBringUpFixture({ dryRun: true, names: [OUTCOME_B, OUTCOME_A] })
       const [healthy, retrying] = f.personas as [Persona, Persona]
@@ -7532,16 +7532,16 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The live applied set (b.av2 SR-8.6). From a confirmed apply's step 1 on,
+  // The live applied set. From a confirmed apply's step 1 on,
   // a retry for a key outside the applied set brings nothing up and launches
   // nothing, even before its teardown cancels it; a directory re-check checks
-  // against the applied set as it is now (the E11 stale-set carry), and a
+  // against the applied set as it is now (the stale-set carry), and a
   // launch after a retry launches the current declaration. Only launches are
   // guarded: stopping the connection manager's own Slack retry is the apply's
   // step 2 (teardown), so a removed persona may still be validated here.
   // -------------------------------------------------------------------------
 
-  describe('bring-up retries and the live applied set (b.av2 SR-8.6)', () => {
+  describe('bring-up retries and the live applied set', () => {
     const refOf = (persona: Persona) => renderPersonaRef(persona.name, persona.key)
 
     // server.ts binds the controller's `isApplied` into `isPersonaUp` and the
@@ -7603,7 +7603,7 @@ describe('bring-up outcomes (E5)', () => {
       assertNoLeak(f.captured())
     })
 
-    // E11 carry: a re-check used the set the persona was brought up with, so
+    // carry: a re-check used the set the persona was brought up with, so
     // a persona colliding with one an apply removed or moved never came up.
     test.each<['removed' | 'moved to its own directory']>([['removed'], ['moved to its own directory']])(
       'two personas sharing a working directory both retry; once B is %s by an apply, A\'s next re-check reads the live applied set and A comes up and is launched once',
@@ -7687,7 +7687,7 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Serialized retries (b.av2 SR-6.6). Each retry attempt, through to the
+  // Serialized retries. Each retry attempt, through to the
   // launch it triggers, runs through the persona's lifecycle serializer: it
   // waits behind an operation already running for its persona (a restart's
   // work, an apply's teardown), never behind another persona's, and decides
@@ -7695,7 +7695,7 @@ describe('bring-up outcomes (E5)', () => {
   // The test holds the persona's turn with an operation of its own.
   // -------------------------------------------------------------------------
 
-  describe('bring-up retries are serialized per persona (SR-6.6)', () => {
+  describe('bring-up retries are serialized per persona', () => {
     /** Occupy the persona's turn until `release()`; `settled` resolves once the blocking operation has. */
     function blockPersona(f: BringUpFixture, persona: Persona): { release: () => void; settled: Promise<void> } {
       const gate = Promise.withResolvers<void>()
@@ -7836,7 +7836,7 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Cancellation (shutdown now, teardown in E12)
+  // Cancellation (shutdown now, teardown in )
   // -------------------------------------------------------------------------
 
   describe('cancellation', () => {
@@ -7914,13 +7914,13 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // A confirmed apply (b.av2 SR-6.1, SR-6.5): the controller and manager legs
+  // A confirmed apply: the controller and manager legs
   // the lifecycle calls, driven directly. The production apply and teardown
-  // (their steps, order and AC 19, AC 57, AC 64 cases) are tested in
+  // (their steps, order and cases) are tested in
   // tests/persona-lifecycle.test.ts and tests/reload-apply.test.ts.
   // -------------------------------------------------------------------------
 
-  describe('a confirmed apply: an added persona\'s bring-up, and a teardown\'s cancel and stop of a queued re-check (SR-6.1, SR-6.5)', () => {
+  describe('a confirmed apply: an added persona\'s bring-up, and a teardown\'s cancel and stop of a queued re-check', () => {
     /** A, B and C, with only A and B applied and brought up at the start; C is added later. */
     async function startWithoutC(): Promise<{ f: BringUpFixture; a: Persona; b: Persona; c: Persona }> {
       const f = makeBringUpFixture({ names: [OUTCOME_A, OUTCOME_B, OUTCOME_C] })
@@ -7950,7 +7950,7 @@ describe('bring-up outcomes (E5)', () => {
       f.directoryStats.filter(([path]) => path === persona.working_directory).map(([, at]) => at)
 
     // Rows: C's outcome, and its arrangement (returning the declaration the apply adds). The other
-    // causes are the start pass's (the E5 start table) and the apply's (tests/reload-apply.test.ts).
+    // causes are the start pass's (the start table) and the apply's (tests/reload-apply.test.ts).
     test.each<[string, 'up' | 'retrying', (c: Persona, a: Persona) => Persona, PersonaDiagnosticClass[]]>([
       ['healthy', 'up', c => c, []],
       ['working directory that of the running A (a real-path collision with the applied set)', 'retrying', (c, a) => ({ ...c, working_directory: a.working_directory }), [PERSONA_DIRECTORY_UNUSABLE]],
@@ -8029,7 +8029,7 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The held credentials digest (E11, b.av2 SR-8.3): what each persona
+  // The held credentials digest : what each persona
   // connected with, is retrying with or broke with, by digest only
   // -------------------------------------------------------------------------
 
@@ -8162,7 +8162,7 @@ describe('bring-up outcomes (E5)', () => {
       expectDigestsLeakNothing(f, { summaries: [...summaries.values()] })
     })
 
-    test('personas broken by a shared credentials file (a record-start real-path collision) each hold the digest of their own path’s bytes, read once and never used to connect; a third persona holds its own (Director decision 1 reversed)', async () => {
+    test('personas broken by a shared credentials file (a record-start real-path collision) each hold the digest of their own path’s bytes, read once and never used to connect; a third persona holds its own', async () => {
       const f = makeBringUpFixture({ names: [OUTCOME_A, OUTCOME_B, OUTCOME_C] })
       const [a, b, c] = f.personas as [Persona, Persona, Persona]
       // B's credentials file becomes a symlink to A's: the same file by real path.
@@ -8197,7 +8197,7 @@ describe('bring-up outcomes (E5)', () => {
       expectDigestsLeakNothing(f, { summaries: [...summaries.values()] })
     })
 
-    test('dry run (SR-3.4): no credentials file is read and every persona, up or retrying, holds nothing', async () => {
+    test('dry run: no credentials file is read and every persona, up or retrying, holds nothing', async () => {
       const f = makeBringUpFixture({ dryRun: true })
       const [a, b] = f.personas as [Persona, Persona]
       f.fsOverride.openFile = () => { throw new Error('no credentials file may be opened in dry run') }
@@ -8238,7 +8238,7 @@ describe('bring-up outcomes (E5)', () => {
     })
   })
 
-  describe('a confirmed credentials change while a Web API call refuses the running persona (changeCredentials, bug b.ujn)', () => {
+  describe('a confirmed credentials change while a Web API call refuses the running persona (changeCredentials)', () => {
     // Rows: label, whether a Web API call refuses A's current connection while the reconnect's first
     // attempt waits at its Socket Mode open, how that open then settles, and what changeCredentials
     // resolves with. The controls show `cameBackUp` and `connection: 'broken'` only follow the refusal.

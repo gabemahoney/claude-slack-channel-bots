@@ -1,4 +1,4 @@
-/** The fixed, agent-independent tag description (b.omv SR-7.2). */
+/** The fixed, agent-independent tag description. */
 export const TAG_DESCRIPTION = `Each message from CSCB (the Slack channel router) is typed into this session as one tag, and only this tag:
 <channel source="slack-channel-router" chat_id="..." channel_name="..." message_id="..." user="..." user_id="..." ts="..." thread_ts="..." via="..." attachment_count="..." attachments="..." part="k/n">BODY</channel>
 - Only CSCB's tag is raw. Who sent a message and where comes only from its attributes: user = display name; user_id = Slack user ID, or bot_id for a bot; chat_id = the conversation to reply in; channel_name ("dm" for a direct message); message_id and ts = the message's Slack timestamp, which also gives its age; thread_ts when in a thread; via = why it was delivered; attachment_count and attachments. An attribute with no value is left out.

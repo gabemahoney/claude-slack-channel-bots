@@ -38,7 +38,7 @@ import { countTokenShaped } from './redact.ts'
 import type { ProcResult, SpawnFn } from './proc.ts'
 
 export const BASE_IMAGE = 'cscb-ci-base:v8'
-/** Claude Code 2.1.296 for typed delivery (b.omv SR-13.6); the base pin is separate. */
+/** Claude Code 2.1.296 for typed delivery; the base pin is separate. */
 export const LIVE_IMAGE = 'cscb-ci-live:v2'
 export const CONTAINER_LABEL_KEY = 'cscb-live'
 export const CONTAINER_LABEL = `${CONTAINER_LABEL_KEY}=1`
@@ -72,7 +72,7 @@ export const CONTAINER_PIDS_LIMIT = 2048
 
 /** Where the container sees its inputs. */
 export const CONTAINER_TARBALL = '/tmp/package.tgz'
-/** The credentials mount: beside the state directory (`~/.config/claude-slack-channel-bots`, bugs b.fc4, b.smv), never over it, so the server can write there. */
+/** The credentials mount: beside the state directory (`~/.config/claude-slack-channel-bots`, bugs), never over it, so the server can write there. */
 export const CONTAINER_CREDENTIALS_DIR = `${CONTAINER_HOME}/.config/cscb-credentials`
 
 /** The named build context that holds the staged agent-director binary (Dockerfile.live copies it). */

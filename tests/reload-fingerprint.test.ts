@@ -1,6 +1,6 @@
 /**
  * reload-fingerprint.test.ts — Tests for the pure parts of reload detection
- * (b.av2 SR-8.1, SR-8.3): `reloadFingerprint`, the pending file's layout
+ * `reloadFingerprint`, the pending file's layout
  * (`composePendingFile`, `parsePendingFingerprint`) in
  * src/reload-fingerprint.ts. `referencedCredentialsPaths`, which supplies the
  * fingerprint's credentials paths, lives in src/config.ts and is tested in
@@ -65,7 +65,7 @@ function lengthBytes(n: number): Buffer {
 // reloadFingerprint
 // ---------------------------------------------------------------------------
 
-describe('reloadFingerprint (b.av2 SR-8.3)', () => {
+describe('reloadFingerprint', () => {
   test('is 64 lower-case hex digits, and equal inputs give the same fingerprint, whatever the byte container', () => {
     const first = reloadFingerprint(CONFIG, baseEntries())
     const again = reloadFingerprint(
@@ -152,7 +152,7 @@ describe('reloadFingerprint (b.av2 SR-8.3)', () => {
 // Pending file layout
 // ---------------------------------------------------------------------------
 
-describe('composePendingFile and parsePendingFingerprint (b.av2 SR-8.1)', () => {
+describe('composePendingFile and parsePendingFingerprint', () => {
   const fp = reloadFingerprint(CONFIG, baseEntries())
   const other = reloadFingerprint(CONFIG, [])
 

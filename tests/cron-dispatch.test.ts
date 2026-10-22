@@ -70,7 +70,7 @@ test('target resolution reads configuration anew at fire time', async () => {
   const path = prompt(); config = makeMultiPersonaConfig([{ name: 'reviewer' }], dir); await fire(schedule(path)); expect(attempts).toEqual(['reviewer']); expect(lines()[0]!.outcome).toBe('unknown-persona'); expect(texts('reviewer')).toEqual(['prompt'])
 })
 
-// b.omv SR-8.6: every scheduled fire reports independently after its outcome.
+// every scheduled fire reports independently after its outcome.
 test('each repeated cron fire reports received only after queued is logged', async () => {
   const diagnostics: string[] = []
   const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: async () => '',

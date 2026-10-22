@@ -1,4 +1,4 @@
-/** b.omv SR-9: intake accepts a connected session without a GET stream. */
+/** intake accepts a connected session without a GET stream. */
 import { beforeEach, afterEach, test, expect } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

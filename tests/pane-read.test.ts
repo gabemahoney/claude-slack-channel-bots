@@ -1,11 +1,11 @@
 /**
  * pane-read.test.ts — the outcome of one `read-pane` of a persona's own row
- * and its class mapper (`src/pane-read.ts`; b.jg5 SRJ-117 over SRJ-104's
+ * and its class mapper (`src/pane-read.ts`over
  * classes), and the full-read line count the session manager's reads use.
  *
  * One row per value S1 names, each mapped to exactly one outcome through
  * `src/ad-error-class.ts`: by class, and an `ErrUnknownErrorName` by the name
- * it carries where SRJ-104 lists that name. Every value is built with the
+ * it carries where lists that name. Every value is built with the
  * stub's builders. The Phase-1-only and store-open names an
  * `ErrUnknownErrorName` carries come from `src/agent-director-errors.ts` as
  * strings. Kinds, class labels and the line count are
@@ -84,7 +84,7 @@ const ROWS: readonly Row[] = [
   ['ErrTmuxNotAvailable, socket not accessible', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, VERB), PANE_READ_ENVIRONMENT, AD_ERROR_CLASS_ENVIRONMENT],
   ['ErrTmuxNotAvailable, a different tmux server', () => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, VERB), PANE_READ_ENVIRONMENT, AD_ERROR_CLASS_ENVIRONMENT],
   ...UNAVAILABLE_FORMS.map(([label, make]): Row => [label, () => make(VERB), PANE_READ_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE]),
-  // A Phase-1-only name carried by ErrUnknownErrorName is a later name, never its own class (SRJ-104).
+  // A Phase-1-only name carried by ErrUnknownErrorName is a later name, never its own class.
   ...PHASE1_ONLY_ERR_NAMES.map((name): Row => [`ErrUnknownErrorName carrying ${name}`, () => errUnknownErrorName(name), PANE_READ_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE]),
   ['a thrown non-error value', () => 'boom', PANE_READ_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE],
   ['ErrInternal without the unusable-name phrase', () => errInternal(), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
@@ -100,7 +100,7 @@ const ROWS: readonly Row[] = [
 /** The kinds whose outcome keeps the thrown value so the caller can latch. */
 const KEEPS_ERROR: ReadonlySet<PaneReadFailureKind> = new Set([PANE_READ_CONFLICT, PANE_READ_UNUSABLE_NAME])
 
-describe('paneReadFailureOf: each value a read-pane throws maps to exactly one outcome (b.jg5 SRJ-117, SRJ-104)', () => {
+describe('paneReadFailureOf: each value a read-pane throws maps to exactly one outcome', () => {
   test.each(ROWS)('%s → its kind and class, the described failure on one line', (_label, make, kind, errorClass) => {
     const value = make()
     const outcome = paneReadFailureOf(value)
@@ -118,7 +118,7 @@ describe('paneReadFailureOf: each value a read-pane throws maps to exactly one o
     expect(kinds.size).toBe(PANE_READ_FAILURE_KINDS.length + 2)
   })
 
-  test.each([ERR_SCHEMA_MIGRATION_REQUIRED_NAME, ERR_STORE_OPEN_NAME])('ErrUnknownErrorName carrying %s: the description names the reported name, never the client\'s placeholder (b.jg5 SRJ-104)', (name) => {
+  test.each([ERR_SCHEMA_MIGRATION_REQUIRED_NAME, ERR_STORE_OPEN_NAME])('ErrUnknownErrorName carrying %s: the description names the reported name, never the client\'s placeholder', (name) => {
     const value = errUnknownErrorName(name)
     const outcome = paneReadFailureOf(value)
     expect(outcome.description.startsWith(`${name} `)).toBe(true)

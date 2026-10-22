@@ -1,6 +1,6 @@
 /**
  * test-timer-overrides.test.ts — Unit tests for the test-only timer override
- * block's start-time install (`src/test-timer-overrides.ts`, bug b.2nr).
+ * block's start-time install (`src/test-timer-overrides.ts`).
  *
  * The block's validation is pinned in `tests/config.test.ts`, its feeds in
  * the tests of the modules they reach (`conflict-latch.test.ts`,
@@ -84,7 +84,7 @@ function installedRecheck(): { clock: ReturnType<typeof createFakeClock>; calls:
 }
 
 describe('effectiveTestTimer and effectiveTestTimers', () => {
-  test('pin: the production delivery-stuck wait is five minutes (b.omv SR-8.2)', () => {
+  test('pin: the production delivery-stuck wait is five minutes', () => {
     expect(DELIVERY_STUCK_AFTER_MS).toBe(300_000)
   })
 
@@ -180,7 +180,7 @@ describe('installTestTimerOverrides', () => {
     expect(calls).toHaveLength(0)
   })
 
-  // Regression (b.2nr): before the fix nothing read the block, so B stayed 300 s and the re-check 120 s whatever the config said.
+  // Regression: before the fix nothing read the block, so B stayed 300 s and the re-check 120 s whatever the config said.
   test('the block shortens B\'s floor and the installed version re-check\'s interval, logs the one loud line once, and answers the timers in effect', async () => {
     const { clock, calls } = installedRecheck()
     const lines: string[] = []
@@ -204,7 +204,7 @@ describe('installTestTimerOverrides', () => {
     expect(clock.pending().map((t) => t.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS])
   })
 
-  test('the delivery-stuck override is captured at start and logged once without changing the defaults or other timers (b.omv SR-14.1)', () => {
+  test('the delivery-stuck override is captured at start and logged once without changing the defaults or other timers', () => {
     const { clock } = installedRecheck()
     const lines: string[] = []
     const overrides: TestTimerOverrides = { delivery_stuck_after_ms: 7_000 }
@@ -242,7 +242,7 @@ describe('installTestTimerOverrides', () => {
 
 // Exercise the actual shell oracle without sourcing or running a scenario.
 // Rows/hooks/checked-kill outcomes here are modeled AD records, not CI proof.
-describe('b.acu CI round 3: test-26 recovery observation deadline', () => {
+describe('CI round 3: test-26 recovery observation deadline', () => {
   const source = readFileSync(join(import.meta.dir, 'integration/test-26-fmk-timing-settings.sh'), 'utf8')
   const declaration = (name: string) => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]
   const input = (name: string) => Number(source.match(new RegExp(`^${name}=(\\d+)`, 'm'))![1])

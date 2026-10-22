@@ -1,4 +1,4 @@
-/** Post-accept immutable fixation shared by fresh and recovered work (b.omv SR-2.5/4). */
+/** Post-accept immutable fixation shared by fresh and recovered work. */
 import type { WebClient } from '@slack/web-api'
 import type { DeliveryQueue, QueueAccept, QueueItem, QueueEvent } from './delivery-queue.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, type TagMessage } from './tag-wrapper.ts'
@@ -12,9 +12,9 @@ export interface DeliveryPreparationDeps {
   queue: DeliveryQueue
   resolveUserName(key: string, user: string): Promise<string>
   clientFor(key: string): WebClient | undefined
-  /** E3 binds this; E2's production binding is inert. Fixed is durable before this call. */
+  /** binds this; production binding is inert. Fixed is durable before this call. */
   wake?(key: string): void | Promise<void>
-  /** Post-ack ownership starts E3 even when fixation must retry. */
+  /** Post-ack ownership starts even when fixation must retry. */
   onPending?(key: string): void
   onEvent?(event: QueueEvent): void
   /** Called only from post-ack/answer preparation or startup recovery. */
@@ -68,7 +68,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     return result
   }
   async function fix(key: string, item: QueueItem): Promise<void> {
-    // b.omv SR-4.1/13.6: post-ack fixation must not clone every queued item
+    // post-ack fixation must not clone every queued item
     // while a burst's remaining events still await durable acceptance.
     item = deps.queue.item(key, item.accepted.seq) ?? item
     if (stopped || item.delivered) return
@@ -111,7 +111,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     }).catch(error => {
       // Fixation is entered only after Slack's ack. Retain ownership even
       // when startup recover uses allSettled and this was the only message
-      // (b.omv SR-3.3/4.1/5.1). No later item can pass this unfixed head.
+      //. No later item can pass this unfixed head.
       if (!stopped) {
         const retry = old ?? { key, item, step: 0 }
         const spacing = deps.retryBackoffMs ?? RETYPE_BACKOFF_MS

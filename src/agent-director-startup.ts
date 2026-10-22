@@ -1,8 +1,8 @@
 /**
- * agent-director-startup.ts — SR-5.1 startup gate for the agent-director
+ * agent-director-startup.ts — startup gate for the agent-director
  * library dependency.
  *
- * Runs the boot sequence the SRD requires before any other CSCB work:
+ * Runs the boot sequence the contract requires before any other CSCB work:
  *
  *   1. import { Client } from 'agent-director'   — covered at module load
  *      time; module-not-found surfaces as a top-level import error caught
@@ -15,9 +15,8 @@
  *      The factory resolves to a constructed Client (production injects
  *      `Client.create`). `opts` comes from `buildAdClientOptions`, the one
  *      place the client options are built; `runStartupGate`'s
- *      `callTimeoutMs` option sets the client's `callTimeoutMs` (b.jg5
- *      SRJ-213), and without it no key is passed.
- *   3. CSCB's Phase 1 floor (b.jg5 SRJ-203)      — the client's
+ * `callTimeoutMs` option sets the client's `callTimeoutMs`, and without it no key is passed.
+ * 3. CSCB's Phase 1 floor — the client's
  *      `binaryVersion` (never its `version()` method, which reports the npm
  *      package's version) must pass `meetsPhase1Floor`; below the floor or
  *      unparseable is refused as `ad-below-phase1-floor`. The check runs
@@ -28,7 +27,7 @@
  *      refusal; ordinary versions and prereleases below 0.12.0 fail step 2.
  *      An unparseable probe also fails step 2, as unreachable. Step 3 keeps
  *      failing closed on inconsistent injected or stale-client results.
- *   3.5. API surface probes (SR-6.1 publish-skew defense)  — short-circuit,
+ * 3.5. API surface probes (publish-skew defense) — short-circuit,
  *      run in order: probeGetPermission (ad-shim-missing-get-permission) →
  *      probeErrorCatalog (ad-shim-catalog-incomplete) → probeDecideArgv
  *      (ad-shim-decide-drops-token). These exist because a passing version
@@ -38,7 +37,7 @@
  *      geteuid(). ENOENT passes (the row is created on first verb call);
  *      other stat errors are fatal.
  *
- * The persona client (b.jg5 SRJ-213): the server's gate runs before the
+ * The persona client: the server's gate runs before the
  * configuration is read, so its client has the client's default call
  * timeout. Once the start has resolved its configuration, the server builds a
  * second client with the configured `agent_director_call_timeout_ms`
@@ -114,7 +113,7 @@ const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
  * that mentions the names even when the class is absent — so the match must
  * anchor on the class declaration.
  *
- * The three Phase-1-only names (`PHASE1_ONLY_ERR_NAMES`, b.jg5 SRJ-102) are
+ * The three Phase-1-only names (`PHASE1_ONLY_ERR_NAMES`) are
  * required: CSCB recognises those errors by the client's own classes
  * (`src/agent-director-errors.ts`), and a client without them turns a Phase 1
  * binary's errors into `ErrUnknownErrorName`, which the classifier would
@@ -191,7 +190,7 @@ export interface StartupGateDeps {
   createClient: (opts: object) => Promise<unknown>
   /** Hook that returns the client's `close()` for the failure-path cleanup. */
   closeClient: (client: unknown) => void
-  /** Stat hook for the SR-5.1 same-user check. */
+  /** Stat hook for the same-user check. */
   statSync: (path: string) => { uid: number }
   /** Effective UID hook. Returns undefined on platforms without geteuid. */
   geteuid: () => number | undefined
@@ -300,11 +299,11 @@ function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
 
 /**
  * The options of every agent-director client CSCB builds: the store path,
- * create-if-missing and the filtered logger (b.brv: AD's per-poll
+ * create-if-missing and the filtered logger (AD's per-poll
  * `SubprocessClient: <verb> ok` success dumps stay out of server.log at
  * default verbosity; CSCB_AD_VERBOSE restores them; failures and warnings
  * still pass through), plus `callTimeoutMs` when a call timeout is given
- * (b.jg5 SRJ-213). With none, no `callTimeoutMs` key is set and the client
+ * With none, no `callTimeoutMs` key is set and the client
  * uses its own default. The gate's client and the persona client differ only
  * in that key. The client fixes the timeout at construction.
  */
@@ -324,7 +323,7 @@ function buildAdClientOptions(callTimeoutMs?: number): ClientOptions {
 /** Refusal kind: the client's own too-old refusal (`ErrSystemInstallTooOld`). */
 export const REFUSAL_KIND_CLIENT_TOO_OLD = 'client-too-old'
 
-/** Refusal kind: CSCB's Phase 1 floor refused the binary (b.jg5 SRJ-203). */
+/** Refusal kind: CSCB's Phase 1 floor refused the binary. */
 export const REFUSAL_KIND_BELOW_PHASE1_FLOOR = 'below-phase1-floor'
 
 /** Refusal kind: every other gate failure. */
@@ -332,7 +331,7 @@ export const REFUSAL_KIND_OTHER = 'other'
 
 /**
  * Which check refused a failed gate. Callers branch on this, never on the
- * class label or message text (b.jg5 SRJ-203, SRJ-902).
+ * class label or message text.
  */
 export type StartupGateRefusalKind =
   | typeof REFUSAL_KIND_CLIENT_TOO_OLD
@@ -343,8 +342,7 @@ export type StartupGateRefusalKind =
  * Per-step result tag used by the gate to drive a single switch at the call
  * site. Production callers read it: `initClient` in `cli.ts` carries
  * `classLabel`, `message` and `refusalKind` into `StartupGateFailedError`, and
- * `refusalKind` exists so callers branch on which check refused (b.jg5
- * SRJ-902). `phase` is diagnostic; tests assert on it.
+ * `refusalKind` exists so callers branch on which check refused. `phase` is diagnostic; tests assert on it.
  */
 export type StartupGateOutcome =
   | { ok: true; client: unknown; adVersion: string }
@@ -359,7 +357,7 @@ export type StartupGateOutcome =
 /** Behaviour options for {@link runStartupGate}. */
 export interface StartupGateOptions {
   /**
-   * Leave CSCB's Phase 1 floor check out (b.jg5 SRJ-203). Defaults to false:
+   * Leave CSCB's Phase 1 floor check out. Defaults to false:
    * the floor runs. It changes nothing else: the client's own too-old
    * refusal, the API-surface probes and the same-user check still run. Only
    * `stop --stop-bots`'s client initialization is meant to set it; the
@@ -370,7 +368,7 @@ export interface StartupGateOptions {
   skipPhase1Floor?: boolean
   /**
    * The call timeout, in milliseconds, the gate's client is built with, as
-   * its `callTimeoutMs` (b.jg5 SRJ-213). Absent, no `callTimeoutMs` is passed
+   * its `callTimeoutMs`. Absent, no `callTimeoutMs` is passed
    * and the client uses its own default. The CLI passes the configured value
    * (it reads its configuration first); the server's gate, run before the
    * configuration is read, passes none (its version probe may use the
@@ -479,7 +477,7 @@ async function constructClient(
 
 /**
  * Step 3, shared by the gate and the persona client: CSCB's Phase 1 floor
- * (b.jg5 SRJ-203) on a client that is not installed yet. `Client.create()`
+ * on a client that is not installed yet. `Client.create()`
  * enforces the client's own minimum, now 0.12.0, but admits `0.0.0-dev`.
  * That sentinel is the released client's reachable floor refusal. Below
  * the floor or unparseable results from an injected or stale client still
@@ -506,7 +504,7 @@ function refuseBelowPhase1Floor(d: StartupGateDeps, client: unknown, adVersion: 
 }
 
 /**
- * Run the SR-5.1 startup sequence without exiting. The dispatcher
+ * Run the startup sequence without exiting. The dispatcher
  * (runAgentDirectorStartupGate) wraps this with the recordStartupError +
  * exit() side effects so tests can inspect both the raw outcome and the
  * exit-vs-no-exit decision.
@@ -529,7 +527,7 @@ export async function runStartupGate(
   if (!built.ok) return built
   const { client, adVersion } = built
 
-  // Step 3: CSCB's Phase 1 floor (b.jg5 SRJ-203), before the client is
+  // Step 3: CSCB's Phase 1 floor, before the client is
   // installed as the singleton.
   if (options?.skipPhase1Floor !== true) {
     const refusal = refuseBelowPhase1Floor(d, client, adVersion)
@@ -676,15 +674,15 @@ export type PersonaClientDeps = Pick<StartupGateDeps, 'createClient' | 'closeCli
 
 /**
  * Build the client the server makes its persona calls with, carrying
- * `callTimeoutMs` (b.jg5 SRJ-213, SRJ-121), and install it as the singleton.
+ * `callTimeoutMs`, and install it as the singleton.
  *
  * Why a second client: the client fixes `callTimeoutMs` at
  * construction, and the server's gate builds its client before the start has
- * read the configuration that holds the setting (SRJ-213 lets the gate's
+ * read the configuration that holds the setting (lets the gate's
  * version probe use the client's default). Once the start has resolved its
  * configuration, this builds a client with the configured value, through the
  * gate's own construction ({@link buildAdClientOptions}, the same catches)
- * and the Phase 1 floor (b.jg5 SRJ-202) on its `binaryVersion`. It repeats no API-surface
+ * and the Phase 1 floor on its `binaryVersion`. It repeats no API-surface
  * probe and no same-user check: they cover the installed package and the
  * store, which the gate has already checked in this process.
  *
@@ -739,7 +737,7 @@ export async function buildPersonaClientOrExit(
   return { client: outcome.client, adVersion: outcome.adVersion }
 }
 
-/** Lazy, independent delivery clients; never swap the singleton (b.omv SR-5.1, D8). */
+/** Lazy, independent delivery clients; never swap the singleton (D8). */
 export function createDeliveryClientFactory(callTimeoutMs: number, deps?: Partial<PersonaClientDeps>): {
   clientFor(key: string): Promise<Client>
   close(): Promise<void>

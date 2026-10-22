@@ -1,6 +1,6 @@
 /**
- * liveness-reading.ts — The four readings of a persona's liveness (b.jg5
- * SRJ-314, HO C12), and the map from an agent-director row state to one.
+ * liveness-reading.ts — The four readings of a persona's liveness (
+ * HO C12), and the map from an agent-director row state to one.
  *
  * The liveness adapter (`_buildIsSessionAliveAdapter`, `src/server.ts`)
  * answers one reading per probe, and `RestartDeps.isSessionAlive`
@@ -18,14 +18,14 @@
  *
  * Only `dead` leads to a launch; no kill is sent for a row just read
  * `ended`, `missing` or gone. Installation failure supplies no agent-state
- * observation and cannot authorize recovery (b.jpf). A reading is an object whose
+ * observation and cannot authorize recovery. A reading is an object whose
  * `kind` names it; consumers decide on `livenessKindOf(reading)`. A `pending`
  * reading also carries the row's launch start (`launchStartedAt`) when the
- * `status` result showed one (b.jg5 SRJ-115, SRJ-406): read raw, as
+ * `status` result showed one: read raw, as
  * agent-director wrote it, by `pendingLaunchStartOf`. Nothing here parses or
  * ages it.
  *
- * The row states come from agent-director's spawn state machine (SR-11).
+ * The row states come from agent-director's spawn state machine.
  * `AGENT_DIRECTOR_LIVE_STATES` is kept here, the one list of live states, and
  * re-exported by `src/session-manager.ts`, so the restart and health-check
  * modules can import the readings without loading the session manager.
@@ -40,14 +40,14 @@
 import type { StatusResult } from 'agent-director'
 
 // ---------------------------------------------------------------------------
-// Row states (agent-director's spawn state machine, SR-11)
+// Row states (agent-director's spawn state machine)
 // ---------------------------------------------------------------------------
 
 /** The row state of a launch whose session has not started. */
 export const AGENT_DIRECTOR_PENDING_STATE = 'pending'
 
 /**
- * Live states per SR-11 (agent-director Spawn state machine), `pending`
+ * Live states (agent-director Spawn state machine), `pending`
  * included. Terminal states (`AGENT_DIRECTOR_DEAD_STATES`) and the typed
  * `ErrSpawnNotFound` rejection from `client.status(...)` are treated as dead
  * by callers.
@@ -64,7 +64,7 @@ export const AGENT_DIRECTOR_LIVE_STATES: ReadonlySet<string> = new Set([
 export const AGENT_DIRECTOR_DEAD_STATES: ReadonlySet<string> = new Set(['ended', 'missing'])
 
 // ---------------------------------------------------------------------------
-// Readings (b.jg5 SRJ-314)
+// Readings
 // ---------------------------------------------------------------------------
 
 /** `live`: a live state other than `pending`. */
@@ -100,7 +100,7 @@ export interface PendingLivenessReading {
 /**
  * Legacy source retained to recognize obsolete dead-shaped readings from
  * `ErrSystemInstallDisappeared`. `livenessKindOf` rejects these as unknown
- * because no agent state was observed (b.jpf).
+ * because no agent state was observed.
  */
 export const LIVENESS_DEAD_SOURCE_INSTALL_GONE = 'install-gone'
 
@@ -111,7 +111,7 @@ export const LIVENESS_DEAD_ROW_MISSING = 'missing'
 /** A `dead` row read's `rowRead`: the read answered `ErrSpawnNotFound`, no row. */
 export const LIVENESS_DEAD_ROW_NO_ROW = 'no-row'
 
-/** What a `dead` row read found (b.jg5 SRJ-501: the state the path last read). */
+/** What a `dead` row read found (the state the path last read). */
 export type DeadRowRead = typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING | typeof LIVENESS_DEAD_ROW_NO_ROW
 
 /**
@@ -119,7 +119,7 @@ export type DeadRowRead = typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_
  * `missing`, or `no-row` for `ErrSpawnNotFound`); absent for caller lifecycle
  * bookkeeping made without a `status` call. The optional `source` accepts
  * the legacy shape for compatibility only: its kind is normalized to
- * `unknown`, so it cannot authorize recovery (b.jpf).
+ * `unknown`, so it cannot authorize recovery.
  */
 export interface DeadLivenessReading {
   readonly kind: typeof LIVENESS_DEAD
@@ -132,7 +132,7 @@ export interface UnknownLivenessReading {
   readonly kind: typeof LIVENESS_UNKNOWN
 }
 
-/** What one liveness probe answers (b.jg5 SRJ-314). */
+/** What one liveness probe answers. */
 export type LivenessReading =
   | LiveLivenessReading
   | PendingLivenessReading
@@ -162,7 +162,7 @@ export const LIVENESS_READING_DEAD_NO_ROW: DeadLivenessReading = Object.freeze({
 })
 /** The `unknown` reading, as a value. */
 export const LIVENESS_READING_UNKNOWN: UnknownLivenessReading = Object.freeze({ kind: LIVENESS_UNKNOWN })
-/** @deprecated Legacy name; installation failure is unknown, never dead (b.jpf). */
+/** @deprecated Legacy name; installation failure is unknown, never dead. */
 export const LIVENESS_READING_DEAD_INSTALL_GONE: UnknownLivenessReading = LIVENESS_READING_UNKNOWN
 
 const KINDS: ReadonlySet<unknown> = new Set<unknown>(LIVENESS_KINDS)
@@ -175,7 +175,7 @@ const KINDS: ReadonlySet<unknown> = new Set<unknown>(LIVENESS_KINDS)
  * The reading for a row state `status` answered: `pending` gives `pending`;
  * every other state in `AGENT_DIRECTOR_LIVE_STATES` gives `live`; `ended` and
  * `missing` (`AGENT_DIRECTOR_DEAD_STATES`) give `dead` carrying that state as
- * its `rowRead`; any other value gives `unknown` (SRJ-314's `dead`
+ * its `rowRead`; any other value gives `unknown` (`dead`
  * list is closed, so a state CSCB does not know is never read as dead).
  */
 export function livenessReadingForState(state: unknown): LivenessReading {
@@ -256,7 +256,7 @@ export function deadLivenessReading(rowRead?: DeadRowRead): DeadLivenessReading 
 }
 
 // ---------------------------------------------------------------------------
-// A `pending` row's launch start (b.jg5 SRJ-115, SRJ-406)
+// A `pending` row's launch start
 // ---------------------------------------------------------------------------
 
 /**

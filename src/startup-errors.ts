@@ -20,7 +20,7 @@
  * The CLI's teardown recorder (`stop --stop-bots`, `clean_restart`) sets
  * `options.omitStderr`: it prints each line to the terminal itself, so the
  * entry goes to the log file alone and each line reaches the terminal once
- * (b.jg5 SRJ-909). A disk failure still writes its one-line warning to fd 2.
+ * A disk failure still writes its one-line warning to fd 2.
  *
  * SPDX-License-Identifier: MIT
  */

@@ -1,4 +1,4 @@
-/** Delivery reporting consumes durable facts and never authorizes keys (b.omv SR-8). */
+/** Delivery reporting consumes durable facts and never authorizes keys. */
 import type { QueueEvent, QueueItem, DeliveryQueue, AcceptedRecord } from './delivery-queue.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
@@ -16,7 +16,7 @@ export function deliveryAge(ageMs: number): string {
   const seconds = Math.max(0, Math.floor(ageMs / 1000))
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`
 }
-/** The one permitted dispatch excerpt, at first actual Slack typing (b.omv SR-8.6). */
+/** The one permitted dispatch excerpt, at first actual Slack typing. */
 export function buildDeliveryDispatchLine(persona: string, accepted: AcceptedRecord): string {
   return `[slack] dispatch: persona=${safe(persona)} ${deliveryIdentity(accepted)} text=${JSON.stringify(safe(accepted.text.slice(0, 80)))}`
 }

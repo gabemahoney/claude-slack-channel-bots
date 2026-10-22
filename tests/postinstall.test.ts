@@ -1,18 +1,18 @@
 /**
- * postinstall.test.ts — Tests for runPostinstall() and the SR-5.2
+ * postinstall.test.ts — Tests for runPostinstall and the
  * agent-director probe.
  *
- * Isolation (b.av2 SR-13.2): every runPostinstall() call goes through
+ * Isolation: every runPostinstall call goes through
  * `postinstall()`, which refuses options without `homeDir`, and every sandbox
  * from `makeSandbox()` puts the home (so the skills link target
  * `<home>/.claude/skills`), the state dir and the MCP config path under one
  * `mkdtempSync` root, removed in afterEach. No call falls back to the OS home.
  * Cases that leave `stateDir` unset control SLACK_STATE_DIR in-process and
  * restore it (and the working directory) in afterEach. The default state
- * directory (`<home>/.config/claude-slack-channel-bots`, b.fc4) is chosen from the case's own `env`
+ * directory (`<home>/.config/claude-slack-channel-bots`) is chosen from the case's own `env`
  * option, never from the run's environment, so it lies under the case's home.
  *
- * Skill links (b.669): the default package root is this checkout, which
+ * Skill links: the default package root is this checkout, which
  * postinstall's detection never links from, so the link cases force linking
  * with `linkSkills: true` (`makeSandbox().opts`). The detection cases leave
  * `linkSkills` unset and pass `packageDir` (a package copy under the sandbox
@@ -23,12 +23,12 @@
  * checkout for its .git entry or for lying outside node_modules before it
  * reads CI, so the host's CI does not change their result.
  *
- * The agent-director probe (b.jg5 SRJ-121) is driven in process with an
+ * The agent-director probe is driven in process with an
  * injected install check (`deps.runInstallCheck`) answering canned results
  * from `tests/test-helpers/install-check-fixtures.ts`, so no case runs the
  * real install check, resolves the host binary, builds a client or opens an
  * agent-director store. Every probe case checks that the probe adds no
- * install, upgrade or `bun add` advice of its own (AC 81); a failure warning
+ * install, upgrade or `bun add` advice of its own; a failure warning
  * carries the install check's message, which is excluded from that scan.
  *
  * SPDX-License-Identifier: MIT
@@ -133,7 +133,7 @@ interface Sandbox {
   skillsDir: string
   stateDir: string
   mcpConfigPath: string
-  /** The home, state dir and MCP path only: the skill-link detection decides (b.669). */
+  /** The home, state dir and MCP path only: the skill-link detection decides. */
   paths: PostinstallOptions
   /** `paths` plus `linkSkills: true`, so the skills link from this checkout. */
   opts: PostinstallOptions
@@ -256,7 +256,7 @@ describe('directory creation', () => {
 // ---------------------------------------------------------------------------
 
 describe('config.json — creation', () => {
-  test('a fresh install writes config.json as {"personas": []}, which loads through the persona loader with zero personas (b.av2 SR-1.7)', () => {
+  test('a fresh install writes config.json as {"personas": []}, which loads through the persona loader with zero personas', () => {
     const s = makeSandbox()
     const loaderHome = makeTempDir()
 
@@ -347,10 +347,10 @@ describe('migration: routing.json → config.json', () => {
 })
 
 // ---------------------------------------------------------------------------
-// access.json — retired (b.av2 SR-10.1)
+// access.json — retired
 // ---------------------------------------------------------------------------
 
-describe('access.json — retired (b.av2 SR-10.1)', () => {
+describe('access.json — retired', () => {
   test('a fresh run creates no access.json: config.json is the only file in the state dir', () => {
     const s = makeSandbox()
 
@@ -425,12 +425,12 @@ describe('homeDir — the base of every default', () => {
   test.each([
     ['unset', undefined],
     ['empty (counts as unset)', ''],
-  ])('with only homeDir and SLACK_STATE_DIR %s, a fresh run writes exactly the state and MCP config under that home, and no skills directory: the default package root is this checkout (b.669)', (_label, envValue) => {
+  ])('with only homeDir and SLACK_STATE_DIR %s, a fresh run writes exactly the state and MCP config under that home, and no skills directory: the default package root is this checkout', (_label, envValue) => {
     const s = makeSandbox()
 
     postinstall({ homeDir: s.home, env: envValue === undefined ? {} : { SLACK_STATE_DIR: envValue } })
 
-    // b.fc4: the default state directory is outside ~/.claude.
+    // the default state directory is outside ~/.claude.
     expect(listTree(s.root)).toEqual([
       'home',
       join('home', '.claude'),
@@ -445,10 +445,10 @@ describe('homeDir — the base of every default', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The default state directory, and the window before the server moves the old one (b.fc4)
+// The default state directory, and the window before the server moves the old one
 // ---------------------------------------------------------------------------
 
-describe('default state directory (b.fc4, b.smv)', () => {
+describe('default state directory', () => {
   /** A real config.json, so a skeleton overwriting it, or sitting beside the wrong one, shows. */
   const REAL_CONFIG = '{"personas":[{"name":"keep"}]}\n'
 
@@ -519,7 +519,7 @@ describe('default state directory (b.fc4, b.smv)', () => {
     expect(lstatSync(legacyDir).isSymbolicLink()).toBe(true)
   })
 
-  // Bug b.smv: the default folder is named after the package; 0.14.0 and 0.15.0 used ~/.config/cscb.
+  // the default folder is named after the package; 0.14.0 and 0.15.0 used ~/.config/cscb.
   test('a 0.15.0 host (a real ~/.config/cscb holding the configuration, the old directory a link to it): ~/.config/cscb is the state directory, the new folder is not made', () => {
     const { s, legacyDir, newDir, run } = makeDefaultSandbox()
     const legacyXdgDir = join(s.home, '.config', 'cscb')
@@ -613,7 +613,7 @@ describe('SLACK_STATE_DIR env override', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Skill links: the debugging skill in, the retired skill's link out (SR-10.1)
+// Skill links: the debugging skill in, the retired skill's link out
 // ---------------------------------------------------------------------------
 
 describe('skill links — debug-slack-channel-bots', () => {
@@ -816,10 +816,10 @@ describe('skill links — the retired claude-slack-channels-config link', () => 
 })
 
 // ---------------------------------------------------------------------------
-// Skill links: managed only for an installed copy of the package (b.669)
+// Skill links: managed only for an installed copy of the package
 // ---------------------------------------------------------------------------
 
-describe('skill links — managed only for an installed copy (b.669)', () => {
+describe('skill links — managed only for an installed copy', () => {
   /** The one line a run that leaves the skill links alone prints about them. */
   const skipLine = (s: Sandbox, reason: string): string => `skipped: ${s.skillsDir} (skill links left alone: ${reason})`
 
@@ -953,10 +953,10 @@ describe('running twice', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.2 / b.jg5 SRJ-121: the agent-director probe over an injected install check
+// the agent-director probe over an injected install check
 // ---------------------------------------------------------------------------
 
-describe('runAgentDirectorPostinstallProbe (SR-5.2, b.jg5 SRJ-121)', () => {
+describe('runAgentDirectorPostinstallProbe', () => {
   let warnLines: string[]
   let logLines: string[]
   let warnSpy: ReturnType<typeof spyOn>
@@ -991,7 +991,7 @@ describe('runAgentDirectorPostinstallProbe (SR-5.2, b.jg5 SRJ-121)', () => {
 
   /**
    * The probe's own text in every captured line carries no install, upgrade
-   * or `bun add` advice (AC 81). `checkMessage`, when given, is the install
+   * or `bun add` advice. `checkMessage`, when given, is the install
    * check's message a failure warning carries; it must appear in a captured
    * line and is removed before the scan, so only the probe's own text is
    * checked.

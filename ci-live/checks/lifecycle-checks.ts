@@ -1,5 +1,5 @@
 /**
- * lifecycle-checks.ts — testplans/b.yko Parts 8–10 and 12: the queued message
+ * lifecycle-checks.ts — testplans/live-acceptance.md Parts 8–10 and 12: the queued message
  * (24, with its setup and teardown), runtime add and remove (25–27), the
  * reboot (28, a `docker restart` of the container with the start-at-boot
  * marker set) and the closing secrecy check (29a), plus the optional 26 and
@@ -82,8 +82,8 @@ function nowTs(ctx: CheckContext): string {
 }
 
 /**
- * Copied from the fixed E5 builder: ci-live may not import delivery-notices.ts.
- * Unit tests pin this text to buildMessagesWaitingNotice (b.omv SR-13.6).
+ * Copied from the fixed builder: ci-live may not import delivery-notices.ts.
+ * Unit tests pin this text to buildMessagesWaitingNotice.
  */
 export function check24WaitingNotice(age: string): string {
   return `:warning: *Messages waiting* — 1 message(s) for "persona_a" (key=persona_a) are waiting; the oldest has waited ${age}. The persona is down with automatic restarts off. The messages are kept and delivered once the persona is up.`
@@ -116,7 +116,7 @@ export const check24Setup: CheckDef<CheckContext> = {
 
 export const check24: CheckDef<CheckContext> = {
   id: '24',
-  title: 'Check 24: a message to a downed persona stays queued, with one waiting notice at its destination (b.omv SR-13.6)',
+  title: 'Check 24: a message to a downed persona stays queued, with one waiting notice at its destination',
   needs: LIVE,
   row: '24',
   async run(ctx) {
@@ -224,7 +224,7 @@ export const check24Teardown: CheckDef<CheckContext> = {
 
 export const check25: CheckDef<CheckContext> = {
   id: '25',
-  title: 'Check 25: a persona added on the running server comes up after the confirmation, with no restart (AC 19, AC 22)',
+  title: 'Check 25: a persona added on the running server comes up after the confirmation, with no restart',
   needs: LIVE,
   row: '25',
   async run(ctx) {
@@ -306,7 +306,7 @@ export const check26: CheckDef<CheckContext> = {
 
 /**
  * Check 27: whether the row of `removed` is among `before` (the rows before
- * its removal), so its teardown keeps it (b.jg5 SRJ-715, AC 77). Pure.
+ * its removal), so its teardown keeps it. Pure.
  */
 export function rowKeptByRemoval(before: readonly Row[], removed: PersonaLetter): boolean {
   return before.some((r) => r.id === personaRowId(removed))
@@ -325,7 +325,7 @@ export const CHECK27_PROMPT = /removal-prompt\.txt/
 
 export const check27: CheckDef<CheckContext> = {
   id: '27',
-  title: 'Check 27: a confirmed removal tears down only that persona (AC 57)',
+  title: 'Check 27: a confirmed removal tears down only that persona',
   needs: LIVE,
   row: '27',
   async run(ctx) {
@@ -357,14 +357,14 @@ export const check27: CheckDef<CheckContext> = {
     const step6 = await sinceGrepE(ctx, m, 'reload-(applied|noop|stale-confirmation|invalid):|persona-start:|at apply|spawnForPersona|Session (connected|disconnected)|persona teardown|updated in place')
     f.expect(step6.some((l) => l.includes('[slack] persona teardown of "persona_d" (key=persona_d): starting')), 'no teardown starting line for D')
     f.expect(step6.some((l) => l.trimEnd().endsWith('[slack] persona teardown of "persona_d" (key=persona_d): complete')), 'no clean teardown complete line for D')
-    f.expect(step6.filter((l) => isTeardownKeptRowLine(l, 'd')).length === 1, "not one teardown line for D's kill that succeeded, its row kept (b.jg5 SRJ-715)")
+    f.expect(step6.filter((l) => isTeardownKeptRowLine(l, 'd')).length === 1, "not one teardown line for D's kill that succeeded, its row kept")
     f.expect(step6.filter((l) => l.includes(appliedLine({ removed: 1 }))).length === 1, 'not one reload-applied line for one removal')
     f.expect(step6.every((l) => !/persona_[abc]\b/.test(l) && !l.includes('persona-start:')), 'a line names A, B or C, or a persona-start line appeared')
     if (step6.some((l) => l.includes('Session disconnected'))) f.note('Check 27: a Session disconnected line for D appeared')
     f.expect(await recorded(ctx), 'config.json and the record differ')
     f.expect(!(await fileExists(ctx, '"$S/config.json.pending"')) && !(await fileExists(ctx, '"$S/config.json.apply"')), 'a pending or apply file remains')
     f.expect((await serverPid(ctx)) === pid, 'the server PID changed')
-    // The teardown kills D's row and keeps it (b.jg5 SRJ-715, AC 77). A kill never changes a row's state:
+    // The teardown kills D's row and keeps it. A kill never changes a row's state:
     // agent-director's evidence-based find-missing marks the row once its agent process is gone, so it is
     // run here (it marks no row whose agent still runs) before the rows are judged.
     const fm = await guarded(ctx, 'agent-director find-missing')
@@ -403,7 +403,7 @@ export const check27: CheckDef<CheckContext> = {
 
 export const check28: CheckDef<CheckContext> = {
   id: '28',
-  title: 'Check 28: after a reboot every applied persona comes back, an unconfirmed edit stays pending, a pending credentials change is applied (AC 13, AC 70, AC 72)',
+  title: 'Check 28: after a reboot every applied persona comes back, an unconfirmed edit stays pending, a pending credentials change is applied',
   needs: LIVE,
   row: '28 (reboot)',
   async run(ctx) {
@@ -420,7 +420,7 @@ export const check28: CheckDef<CheckContext> = {
     f.expect(await recorded(ctx), 'step 1: config.json and the record differ')
     f.expect(!(await fileExists(ctx, '"$S/config.json.pending"')), 'step 1: a change is pending')
     // One live row per configured persona, plus D's row, kept and not live, when Check 27 found it before removing D
-    // (whether or not D connected in Check 25): a teardown kills the row and keeps it (b.jg5 SRJ-715, AC 77).
+    // (whether or not D connected in Check 25): a teardown kills the row and keeps it.
     const keptRows = rebootKeptRows(ctx.shared.dRowKept)
     const rowsAt1 = await rows(ctx)
     const rows1 = rowsAt1.map((r) => r.id).sort()
@@ -476,7 +476,7 @@ export const check28: CheckDef<CheckContext> = {
     f.expect(complete !== null, 'step 5: no start summary within 10 minutes of the reboot')
     const running = await run(ctx, 'kill -0 "$(cat "$S/server.pid")" && echo running')
     f.expect(running.out.includes('running'), 'step 5: the server is not running')
-    // Each persona's Session connected line, not only B's: a persona parked on a `working` row (b.f2b)
+    // Each persona's Session connected line, not only B's: a persona parked on a `working` row
     // connects after the summary (about 60 s after, when the row is stale).
     await waitBringUp(ctx, bmark, ['a', 'b', 'c'])
     const l5 = await since(ctx, bmark)
@@ -595,8 +595,7 @@ export function personaCountsProblem(letter: string, value: string | undefined):
 /**
  * The state files Check 29a's token-shape count and leak count read, as shell
  * words for its `F=(…)` array: the config, the record, the pending file and
- * the stored-choice file the server writes in fungible mode (b.deo SRI-401,
- * SRI-1501; b.av2 AC 20), the server logs, the startup-errors log, the
+ * the stored-choice file the server writes in fungible mode, the server logs, the startup-errors log, the
  * permission trail and the boot-start log. An absent file (the pending file
  * after a clean run, the stored-choice file in a dry run or a run with no
  * fungible mode) is no finding.
@@ -614,7 +613,7 @@ export const CHECK29A_STATE_FILES: readonly string[] = [
 
 export const check29a: CheckDef<CheckContext> = {
   id: '29a',
-  title: 'Check 29a: no credential in any file the run wrote (AC 20), plus the host-side scan of the results',
+  title: 'Check 29a: no credential in any file the run wrote, plus the host-side scan of the results',
   needs: [],
   row: '29a',
   // A leak matters however far the run got.
@@ -625,7 +624,7 @@ export const check29a: CheckDef<CheckContext> = {
       `F=(${CHECK29A_STATE_FILES.join(' ')})`,
       "mapfile -d '' T < <(find ~/.claude/projects/ -path '*-cscb-live-[abcd]/*' -name '*.jsonl' -print0 2>/dev/null)",
       'echo "TRANSCRIPTS=${#T[@]}"',
-      // Per persona: its transcripts, and final receipt confirmations (b.omv SR-13.6).
+      // Per persona: its transcripts, and final receipt confirmations.
       'for l in a b c d; do',
       '  n=$(find ~/.claude/projects/ -path "*-cscb-live-$l/*" -name \'*.jsonl\' 2>/dev/null | wc -l)',
       '  d=$(cat "$S"/server.log* 2>/dev/null | grep -cF "[slack] message-delivered: persona=\\"persona_$l\\" (key=persona_$l) ")',
@@ -700,5 +699,5 @@ export const check29b: CheckDef<CheckContext> = {
 /** Parts 8–10, in run order. */
 export const LIFECYCLE_CHECKS = [check24Setup, check24, check24Teardown, check25, check26, check27, check28]
 
-/** Part 12, the closing checks: they run last, after every check that writes logs or files (b.deo SRI-1501). */
+/** Part 12, the closing checks: they run last, after every check that writes logs or files. */
 export const CLOSING_CHECKS = [check29a, check29b]

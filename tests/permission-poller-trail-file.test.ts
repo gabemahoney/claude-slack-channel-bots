@@ -1,16 +1,16 @@
 import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * permission-poller-trail-file.test.ts — End-to-end persistence test for the
- * SR-V Epic 2 trail emissions. Drives `runTick` against a real
+ * Permission trail trail emissions. Drives `runTick` against a real
  * `permission-trail.jsonl` file under a temp `SLACK_STATE_DIR`, reads the
  * file from disk, and verifies the persisted `cscb.poller.row_decision` and
  * `cscb.chat_post.attempted` events survive `JSON.stringify` → `writeSync` →
- * file → `JSON.parse` intact, including SR-V-1.4 `action_id` reversibility
+ * file → `JSON.parse` intact, including `action_id` reversibility
  * from the persisted `blocks` array.
  *
  * Rows carry the persona label, and the poller and click handler reach Slack
- * through the persona's own client (b.av2 SR-7.1). The persisted `channel`
- * field keeps its meaning (b.av2 SR-11): the Slack channel of the prompt
+ * through the persona's own client. The persisted `channel`
+ * field keeps its meaning: the Slack channel of the prompt
  * message, i.e. the persona's destination channel ID, never its key.
  *
  * SPDX-License-Identifier: MIT
@@ -165,7 +165,7 @@ const checkPermRow = () => cannedListRow({ state: 'check_permission' }, A, tempD
 // Happy path
 // ---------------------------------------------------------------------------
 
-describe('permission-poller — trail file end-to-end (Epic 2)', () => {
+describe('permission-poller — trail file end-to-end ()', () => {
   test('success: row_decision{post_attempted} + chat_post.attempted{ok=true} persisted with matching ts', async () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
@@ -201,7 +201,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     expect((stubA.calls.postMessage as Array<{ channel: string }>).map((c) => c.channel)).toEqual([CHANNEL_CH])
   })
 
-  test('SR-V-1.4 decode round-trip: persisted blocks yield both Allow and Deny action_ids that decode back to (decision, instance, token)', async () => {
+  test('decode round-trip: persisted blocks yield both Allow and Deny action_ids that decode back to (decision, instance, token)', async () => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -241,7 +241,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     for (const el of actions!.elements) expect(personaKeyFromActionId(el.action_id)).toBe(KEY_A)
   })
 
-  test('closure persists on disk: row_decision{reconciled_closed} + chat_update.attempted{operator_allow} land with the original prompt ts (SRD §10 Q5)', async () => {
+  test('closure persists on disk: row_decision{reconciled_closed} + chat_update.attempted{operator_allow} land with the original prompt ts (contract §10 Q5)', async () => {
     let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
       cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
     ]
@@ -284,7 +284,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     expect(closure['verdict_tag']).toBe('operator_allow')
     expect(closure['triggered_by']).toBe('poller')
     expect(closure['ok']).toBe(true)
-    // SRD §10 Q5: closure renders on the same ts the original post returned.
+    // contract §10 Q5: closure renders on the same ts the original post returned.
     expect(closure['message_ts']).toBe(post['slack_ts'])
     expect(closure['channel']).toBe(CHANNEL_CH)
     // The closure update went through A's own client, on the recorded channel and ts.
@@ -340,7 +340,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     // Tick 1: seed the live entry
     await ivl.tick(20)
 
-    // Simulate the inbound Slack click: SR-V-2.9 then SR-V-2.6
+    // Simulate the inbound Slack click: then
     const USER = 'U_OPERATOR'
     const actionId = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
     emitBlockActionReceived(actionId, {

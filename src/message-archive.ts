@@ -20,7 +20,7 @@
  *   )
  *
  * Name lookups for an event run on the client of the persona that received
- * it (b.av2 SR-4.1): `createPersonaNameResolverSource` keeps one resolver per
+ * it: `createPersonaNameResolverSource` keeps one resolver per
  * persona (rebuilt when the persona's client changes), and `createPersonaArchiveWriter` is the fire-and-forget writer the
  * persona-routing archive seam calls. A persona with no client (dry run, not
  * up) still gets its row, with IDs in place of names.
@@ -180,7 +180,7 @@ export const ID_ONLY_NAME_RESOLVER: NameResolver = {
   resolveUserName: async (userId) => userId,
 }
 
-/** Per-persona name resolvers for the message archive (b.av2 SR-4.1). */
+/** Per-persona name resolvers for the message archive. */
 export interface PersonaNameResolverSource {
   /**
    * The resolver for persona `key`: one `createNameResolver` over that

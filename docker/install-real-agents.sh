@@ -1,5 +1,5 @@
 #!/bin/bash
-# Native programs only; never put these directories on PATH (b.omv SR-14.3).
+# Native programs only; never put these directories on PATH.
 set -euo pipefail
 [[ -e /etc/cscb-ci-image ]] || { echo 'ERROR: native agent install requires the CI image' >&2; exit 2; }
 release_root=https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases

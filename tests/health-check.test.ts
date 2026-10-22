@@ -145,7 +145,7 @@ function armedIntervals(arm: () => void): Array<{ callback: () => unknown; ms: n
 }
 
 // ---------------------------------------------------------------------------
-// Persona fixtures (b.av2 SR-6.3): the tick's work list is persona key →
+// Persona fixtures: the tick's work list is persona key →
 // working directory. `KEY` / `WD` are the default persona's key and working
 // directory, from `makePersonaConfig` under this file's own temp directory.
 // ---------------------------------------------------------------------------
@@ -175,8 +175,8 @@ function workList(...names: string[]): Record<string, string> {
 // ---------------------------------------------------------------------------
 
 type DepsOpts = {
-  isSessionAliveResult?: LivenessReading  // default: LIVENESS_READING_DEAD (b.jg5 SRJ-314)
-  // b.jg5 SRJ-314: per-persona scripted liveness answers, consumed
+  isSessionAliveResult?: LivenessReading  // default: LIVENESS_READING_DEAD
+  // per-persona scripted liveness answers, consumed
   // one-per-isSessionAlive call like connectedSequence (the last repeats once
   // exhausted). An `Error` entry is thrown instead of answered. Takes
   // precedence over isSessionAliveResult and throwOnKey for that persona.
@@ -184,7 +184,7 @@ type DepsOpts = {
   isRestartPendingResult?: boolean   // simulates: timer scheduled, not yet fired
   isActiveLaunchingResult?: boolean  // simulates: launchSession actively in progress
   isAtCapResult?: boolean            // default: false; set true to simulate a capped persona
-  // b.9a7: per-call scripted skip flags. Each is a queue consumed
+  // per-call scripted skip flags. Each is a queue consumed
   // one-per-isRestartPendingOrActive / isAtCap call across ticks, with the last
   // value repeating once exhausted. Lets a test open a skip window for a bounded
   // number of ticks (e.g. [false, true, false, false]) and assert the streak was
@@ -192,8 +192,8 @@ type DepsOpts = {
   // isRestartPendingResult / isActiveLaunchingResult / isAtCapResult knobs.
   pendingSequence?: boolean[]
   atCapSequence?: boolean[]
-  isSessionConnectedResult?: boolean // default: true (MCP connected); false → alive-but-disconnected (b.9a7)
-  // b.9a7: per-persona scripted connectedness. Each entry is a queue of results
+  isSessionConnectedResult?: boolean // default: true (MCP connected); false → alive-but-disconnected
+  // per-persona scripted connectedness. Each entry is a queue of results
   // consumed one-per-isSessionConnected-call, so a test can drive an exact
   // sequence of observations across ticks (e.g. [false, true, false]) however
   // many ticks the case drives past its end. When the queue
@@ -210,11 +210,11 @@ type DepsOpts = {
   personasSequence?: Array<Record<string, string>>
   throwOnKey?: string               // isSessionAlive throws for this persona key
   maxTicks?: number                  // stop after this many tick bodies (isShuttingDown turns true)
-  // b.jg5 SRJ-311: when set, `isRetryArmed` is present, answers this for every
+  // when set, `isRetryArmed` is present, answers this for every
   // persona and records each key asked (isRetryArmedCalls). Absent: the dep
   // is absent, as every case that leaves it alone expects.
   retryArmedResult?: boolean
-  // b.jg5 SRJ-311: when true, `armRetryTimer` is present and records each arm
+  // when true, `armRetryTimer` is present and records each arm
   // with the tick it came on (armRetryTimerCalls). Otherwise it is absent.
   recordRetryArms?: boolean
 }
@@ -230,9 +230,9 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   // called for that persona at fire time. Lets a test assert a reconnect was
   // scheduled on the Nth disconnected observation (streak semantics).
   scheduleRestartAtConnectedCount: number[]
-  /** b.jg5 SRJ-311: every key `isRetryArmed` was asked for (present only with `retryArmedResult`). */
+  /** every key `isRetryArmed` was asked for (present only with `retryArmedResult`). */
   isRetryArmedCalls: string[]
-  /** b.jg5 SRJ-311: every `armRetryTimer` call, with its tick number (present only with `recordRetryArms`). */
+  /** every `armRetryTimer` call, with its tick number (present only with `recordRetryArms`). */
   armRetryTimerCalls: Array<{ key: string; tick: number }>
 } {
   const scheduleRestartCalls: Array<{ key: string; cwd: string }> = []
@@ -410,18 +410,18 @@ describe('the tick body: dead-session detection, skips, per-persona error isolat
     expect(deps.scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot'])
   })
 
-  // AC 20 (b.av2 SR-10.3): the per-persona catch logs the error's description
+  // the per-persona catch logs the error's description
   // (type, safe code, message through `redactSlackLogText`, frames), never the
   // error itself. The message carries the leak marker only inside a fake token
   // and a `ticket=` URL, both of which redaction replaces. Every console.error
-  // argument is kept unformatted, so a raw error fails the leak check. b.jg5
-  // SRJ-314: a throwing liveness probe no longer reaches that catch; its line
+  // argument is kept unformatted, so a raw error fails the leak check.
+  // a throwing liveness probe no longer reaches that catch; its line
   // is the tick's `liveness unknown` skip, which describes the error the same
   // way.
   test.each<[string, 'statRoute' | 'isSessionAlive', string]>([
     ['the working-directory stat', 'statRoute', '[slack] health-check: error checking persona=failing_bot: '],
     ['the liveness probe (read as unknown)', 'isSessionAlive', '[slack] health-check: liveness unknown for persona=failing_bot (isSessionAlive failed: '],
-  ])('AC 20: %s throws an error carrying fake tokens — one line naming its type, code and redacted message; the other persona is still restarted; nothing leaks', async (_label, site, prefix) => {
+  ])('%s throws an error carrying fake tokens — one line naming its type, code and redacted message; the other persona is still restarted; nothing leaks', async (_label, site, prefix) => {
     const personas = workList('failing_bot', 'dead_bot')
     const deps = makeDeps({ personas, maxTicks: 1 })
     const thrown = Object.assign(new Error(`status failed (${sentinelInMessage('msg')})`), {
@@ -486,7 +486,7 @@ describe('startHealthCheck', () => {
     expect(deps.isSessionAliveCalls).toHaveLength(0)
   })
 
-  // T26: Health check starts only after sessions.json is written.
+  // Health check starts only after sessions.json is written.
   // Architectural invariant enforced in server.ts: startHealthCheck() is called
   // only after startupSessionManager() returns and writeSessions() completes.
   // The unit-level guarantee is that initHealthCheck() alone does NOT start the
@@ -643,20 +643,20 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
 })
 
 // ---------------------------------------------------------------------------
-// isAtCap tick-guard (SR-25.3/25.4) — Task C subtask 7r
+// isAtCap tick-guard — section C subtask 7r
 //
 // The health-check tick must skip capped personas (isAtCap=true) and not call
 // scheduleRestart for them. Other personas in the same tick are unaffected.
 // A persona with isAtCap=false continues to behave as before this feature.
 // ---------------------------------------------------------------------------
 
-describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
+describe('isAtCap tick-guard', () => {
   // -------------------------------------------------------------------------
   // Cap-guard: capped persona is skipped (no scheduleRestart, no isSessionAlive)
   // -------------------------------------------------------------------------
 
-  test('SR-25.3: capped persona is SKIPPED — scheduleRestart not called, isSessionAlive not called', async () => {
-    // SR-25.3/25.4: once a persona is at cap, the health-check tick must not
+  test('capped persona is SKIPPED — scheduleRestart not called, isSessionAlive not called', async () => {
+    // once a persona is at cap, the health-check tick must not
     // re-schedule restarts. The tick logs a message and continues past the persona.
     const deps = makeDeps({
       isAtCapResult: true,
@@ -676,7 +676,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
   // Cap-guard: un-capped persona proceeds normally (isAtCap=false baseline)
   // -------------------------------------------------------------------------
 
-  test('SR-25.3: non-capped persona proceeds — dead session triggers scheduleRestart', async () => {
+  test('non-capped persona proceeds — dead session triggers scheduleRestart', async () => {
     const deps = makeDeps({
       isAtCapResult: false,
       isSessionAliveResult: LIVENESS_READING_DEAD,
@@ -688,10 +688,10 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
   })
 
-  // b.4q8: the tick's own liveness read can count the persona's resumed
+  // the tick's own liveness read can count the persona's resumed
   // launch as failed (its row ended before reporting in) and reach the cap;
   // the cap is asked again right after the read.
-  test('b.4q8: a dead persona below the cap before the read and at it right after: the read is made, then the persona is skipped with one at-cap line and no scheduleRestart', async () => {
+  test('a dead persona below the cap before the read and at it right after: the read is made, then the persona is skipped with one at-cap line and no scheduleRestart', async () => {
     const deps = makeDeps({
       atCapSequence: [false, true],
       isSessionAliveResult: LIVENESS_READING_DEAD,  // would trigger restart if not capped
@@ -709,7 +709,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
   // Cap-guard: mixed personas — capped persona skipped, live persona processed
   // -------------------------------------------------------------------------
 
-  test('SR-25.4: mixed personas — capped persona skipped while uncapped dead persona gets scheduleRestart', async () => {
+  test('mixed personas — capped persona skipped while uncapped dead persona gets scheduleRestart', async () => {
     // capped_bot is at cap (isAtCap=true) → must be skipped
     // dead_bot is not at cap (isAtCap=false) and dead → scheduleRestart must be called
     const cappedKeys = new Set(['capped_bot'])
@@ -736,7 +736,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
         return false
       },
       isAtCap(key) {
-        // SR-25.3/25.4: capped personas are skipped by the tick
+        // capped personas are skipped by the tick
         return cappedKeys.has(key)
       },
       statRoute(_cwd) {
@@ -763,35 +763,35 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.9a7 — alive-but-disconnected tick recovery
+// alive-but-disconnected tick recovery
 //
-// Before b.9a7 the tick did `if (!alive) scheduleRestart(...)`, so a persona in
+// Before the tick did `if (!alive) scheduleRestart(...)`, so a persona in
 // an AD live state (e.g. `waiting`) whose MCP session was disconnected
 // (isSessionAlive reads live, isSessionConnected === false) was NEVER scheduled
 // for recovery by any periodic mechanism — the gap was unbounded. The fix routes
 // alive-but-disconnected rows through scheduleRestart, but only after TWO
-// consecutive disconnected observations (design decision 2: the freshly-launched
+// consecutive disconnected observations (the freshly-launched
 // window). These tests assert that debounce, its resets, and its interactions
 // with the dead-session and cap paths.
 // ---------------------------------------------------------------------------
 
-describe('b.9a7 alive-but-disconnected tick recovery', () => {
+describe('alive-but-disconnected tick recovery', () => {
   test('1/5. REGRESSION: alive but !connected → scheduleRestart fires on the 2nd consecutive tick, not the 1st', async () => {
-    // Core fails-before/passes-after test. With the pre-b.9a7 condition
+    // Core fails-before/passes-after test. With the pre-condition
     // (`if (!alive) scheduleRestart`), alive===true short-circuits and
     // scheduleRestart is NEVER called for this persona. Post-fix it is called —
     // and specifically on the SECOND disconnected observation (the debounce
-    // covers the freshly-launched, not-yet-connected window, AC 6).
+    // covers the freshly-launched, not-yet-connected window).
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
     await driveTicks(4)
 
     // A stranded alive-but-disconnected persona IS scheduled within a bounded
-    // number of ticks — no inbound message, no server restart (AC 2/5).
+    // number of ticks — no inbound message, no server restart.
     expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }, { key: KEY, cwd: WD }])
     // Each fire happened on the 2nd disconnected observation of its streak,
-    // never the 1st (AC 6 debounce): connected-call-counts 2 and 4.
+    // never the 1st (debounce): connected-call-counts 2 and 4.
     expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4])
   })
 
@@ -835,7 +835,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
   })
 
   test('4. no racing reconnect: restart pending/active suppresses tick-driven scheduling', async () => {
-    // AC 4: while a restart is pending or a launch is active, the tick skips the
+    // while a restart is pending or a launch is active, the tick skips the
     // persona entirely — even when alive && !connected. This is the existing
     // isRestartPendingOrActive skip; it must cover the new reconnect path too.
     const deps = makeDeps({
@@ -853,7 +853,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
   })
 
   test('4b. active launch (freshly-launched window) suppresses tick-driven scheduling', async () => {
-    // AC 6: a launch in progress is the freshly-launched window; the tick must
+    // a launch in progress is the freshly-launched window; the tick must
     // not poke it. isActiveLaunchingResult drives isRestartPendingOrActive true.
     const deps = makeDeps({
       isSessionAliveResult: LIVENESS_READING_LIVE,
@@ -871,7 +871,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
   test('4c. dead session still schedules immediately on the FIRST tick (no debounce regression)', async () => {
     // The two-tick debounce applies ONLY to the alive-but-disconnected path. A
     // dead session (isSessionAlive reads dead) must still schedule on the first tick,
-    // as before b.9a7. isSessionConnected is irrelevant on the dead path — the
+    // as before. isSessionConnected is irrelevant on the dead path — the
     // fire happens with connected-call-count 0 (never probed).
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD, isSessionConnectedResult: false })
     initHealthCheck(deps)
@@ -885,7 +885,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
   })
 
   test('7. capped persona fully skipped including reconnects (alive && !connected on consecutive ticks)', async () => {
-    // AC 7 / design decision 1: a capped persona gets NO tick-driven reconnect,
+    // / a capped persona gets NO tick-driven reconnect,
     // even when alive && !connected across many ticks. The isAtCap skip precedes
     // the connectedness probe.
     const deps = makeDeps({
@@ -936,7 +936,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
   })
 
   test('10. streak cleared on pending-skip: a pre-skip disconnected tick does NOT carry across a restart cycle', async () => {
-    // b.9a7 round-2 fix: "consecutive" means consecutive *observed* ticks, not
+    // round-2 fix: "consecutive" means consecutive *observed* ticks, not
     // observations separated by a whole restart cycle. Timeline (per tick):
     //   tick1: pending=false → alive && !connected → streak=1 (connected call 1)
     //   tick2: pending=true  → SKIP (streak must be cleared; no connected probe)
@@ -965,7 +965,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // Analogous to test 10 for the isAtCap skip. The cap skip also clears the
     // streak, so a fresh uncapped observation starts a new consecutive count.
     // A tick that reaches the liveness read asks the cap twice, before the
-    // read and right after it (b.4q8); a tick capped before the read, once.
+    // read and right after it; a tick capped before the read, once.
     //   tick1: cap=false, false → !connected → streak=1 (connected call 1)
     //   tick2: cap=true         → SKIP (streak cleared; no connected probe)
     //   tick3: cap=false, false → !connected → fresh streak=1 (call 2)
@@ -985,7 +985,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
   })
 
-  test('11b. b.4q8: streak cleared on a cap-skip after the read: a tick whose own liveness read took the persona to the cap does NOT carry a pre-cap streak across', async () => {
+  test('11b. streak cleared on a cap-skip after the read: a tick whose own liveness read took the persona to the cap does NOT carry a pre-cap streak across', async () => {
     // As test 11, but the cap is met by the cap asked right after tick 2's
     // read (the read counted the persona's resumed launch as failed).
     //   tick1: cap=false, false → !connected → streak=1 (connected call 1)
@@ -1008,7 +1008,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     expect(lines.filter((line) => line === healthCheckAtCapSkipLine(KEY))).toHaveLength(1)
   })
 
-  test('12. streak cleared on not-up skip: a persona the relaunch gate leaves out of a tick\'s work list does NOT carry its disconnected streak back in (b.av2 SR-6.4)', async () => {
+  test('12. streak cleared on not-up skip: a persona the relaunch gate leaves out of a tick\'s work list does NOT carry its disconnected streak back in', async () => {
     // The third count-resetting skip, beside pending (10) and cap (11): the
     // relaunch gate leaves a persona that is not up out of the work list, and
     // the tick drops its streak. STAY is in every tick's list and healthy, so
@@ -1041,7 +1041,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.omv SR-9: connected sessions need no standalone GET stream.
+// connected sessions need no standalone GET stream.
 describe('connection-only health', () => {
   test('a live connected persona stays healthy on every tick', async () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true })
@@ -1052,13 +1052,13 @@ describe('connection-only health', () => {
   })
 })
 
-// b.av2 SR-6.3 — the tick's work list and streaks are keyed by persona
+// the tick's work list and streaks are keyed by persona
 //
 // A persona listed in two channels is one instance, so it is checked once per
 // tick. Ticks are bounded with `maxTicks` so per-tick counts are exact.
 // ---------------------------------------------------------------------------
 
-describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
+describe('persona-keyed work list and streaks', () => {
   test('buildPersonaWorkList: a two-channel persona is one entry; one tick probes and schedules once per persona key', async () => {
     // A name that is not already in key form, so key ≠ name ≠ any channel ID.
     const config = makeMultiPersonaConfig([
@@ -1120,7 +1120,7 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.5 — a teardown forgets the persona's disconnected streak
+// a teardown forgets the persona's disconnected streak
 //
 // `forgetDisconnectedStreak(key)` drops one persona's streak at once, while it
 // may still be in the next tick's work list; the tick itself drops the streak
@@ -1143,7 +1143,7 @@ async function capturingErrors(fn: () => Promise<void>): Promise<string[]> {
   return lines
 }
 
-describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () => {
+describe('forgetDisconnectedStreak — per-persona teardown', () => {
   test('B\'s streak is dropped at once and silently, A\'s is kept; B then leaves the work list (not probed) and is re-added with a fresh streak', async () => {
     const full = workList('persona_a', 'persona_b')
     const onlyA = { persona_a: full.persona_a }
@@ -1183,13 +1183,13 @@ describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () 
 })
 
 // ---------------------------------------------------------------------------
-// b.f2b — a launch in flight, the delay-0 not-connected notice, and pending
+// a launch in flight, the delay-0 not-connected notice, and pending
 // working-row evidence
 //
 // A start launch still waiting in the background for a `working` row (or any
 // launch in flight) owns its session: the tick still reads the persona but
-// makes no attempt of its own for it (b.jg5 SRJ-315; the full rule is pinned
-// in the SRJ-315 describe below). With session_restart_delay 0, scheduleRestart only logs and
+// makes no attempt of its own for it (the full rule is pinned
+// in the describe below). With session_restart_delay 0, scheduleRestart only logs and
 // returns, so an alive persona the tick would reconnect gets the not-connected
 // notice, worded for why it is undeliverable (the real session-manager
 // notifier here: once per episode, and a healthy tick ends the episode). While the
@@ -1198,13 +1198,13 @@ describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () 
 // undeliverable observation instead of the second.
 // ---------------------------------------------------------------------------
 
-describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending working-row evidence', () => {
+describe('launches in flight, the delay-0 not-connected notice, pending working-row evidence', () => {
   afterEach(() => {
     setSessionNotifier(undefined)
     _resetNotConnectedEpisodes()
   })
 
-  test('a persona whose launch is in flight is still stat\'d and probed but not scheduled (b.jg5 SRJ-315), and its streak does not carry across the launch', async () => {
+  test('a persona whose launch is in flight is still stat\'d and probed but not scheduled, and its streak does not carry across the launch', async () => {
     //   tick1: not in flight → alive && !connected → streak 1 (connected call 1)
     //   tick2: in flight     → stat'd and probed (call 2), no attempt, streak cleared
     //   tick3: → fresh streak 1 (call 3); tick4: → streak 2 → scheduled (call 4)
@@ -1275,7 +1275,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-314 — an `unknown` reading, or a probe that threw, skips the tick
+// an `unknown` reading, or a probe that threw, skips the tick
 //
 // Only `dead` schedules a restart. An `unknown` reading (a `status` error
 // agent-director could not answer) or a thrown probe skips the persona for the
@@ -1284,7 +1284,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
 // clears it (ruling (b)). The tick has no retry-timer hook, so it arms nothing.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona for the tick', () => {
+describe('an unknown reading or a thrown probe skips the persona for the tick', () => {
   const UNSURE: Array<[string, LivenessReading | Error]> = [
     ['an unknown reading', LIVENESS_READING_UNKNOWN],
     ['a thrown probe', new Error('simulated status failure')],
@@ -1363,7 +1363,7 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-314 — a `pending` row is never counted healthy
+// a `pending` row is never counted healthy
 //
 // A `pending` reading takes the alive branches, but only `live` is healthy. A
 // `pending` row connected with its stream takes the not-deliverable path (the
@@ -1374,7 +1374,7 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
 // included. Each case runs with and without a launch start on the reading.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-314: a pending row is never counted healthy', () => {
+describe('a pending row is never counted healthy', () => {
   const PENDING_READINGS: Array<[string, LivenessReading]> = [
     ['no launch start', LIVENESS_READING_PENDING],
     ['a launch start', pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)],
@@ -1425,7 +1425,7 @@ describe('b.jg5 SRJ-314: a pending row is never counted healthy', () => {
 })
 
 /**
- * Every tick reading that is not healthy (b.jg5 SRJ-310, SRJ-312), each row
+ * Every tick reading that is not healthy, each row
  * scripting `persona`'s answers. It takes a name fixed when the table is
  * built, not the file's KEY: KEY is only set in beforeAll, after the table
  * exists.
@@ -1442,7 +1442,7 @@ function notHealthyReadings(persona: string): Array<[string, DepsOpts]> {
 }
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-310 rule 2 (tick half) — a live healthy tick ends tmux-unresponsive
+// rule 2 (tick half) — a live healthy tick ends tmux-unresponsive
 //
 // A tick that finds the persona `live`, connected and with its stream calls
 // `endTmuxUnresponsive(key)` for that persona (production binds it to the
@@ -1453,7 +1453,7 @@ function notHealthyReadings(persona: string): Array<[string, DepsOpts]> {
 // leaves the hook at its default (absent).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona\'s tmux-unresponsive condition', () => {
+describe('a live, connected tick with its stream ends the persona\'s tmux-unresponsive condition', () => {
   const P = 'healed_bot'
   const B = 'other_bot'
 
@@ -1510,7 +1510,7 @@ describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-311, SRJ-312 — the healthy branch clears tmux-unavailable
+// the healthy branch clears tmux-unavailable
 //
 // A tick that finds the persona `live`, connected and with its stream clears
 // its `tmux-unavailable` outage through the real outage state: one all-clear
@@ -1524,7 +1524,7 @@ describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona
 // wrappers raise it.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the persona\'s tmux-unavailable outage', () => {
+describe('a live, connected tick with its stream clears the persona\'s tmux-unavailable outage', () => {
   const P = 'healed_bot'
   const B = 'other_bot'
 
@@ -1595,7 +1595,7 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-610 — a live healthy tick resets the persona's slow-recovery count
+// a live healthy tick resets the persona's slow-recovery count
 //
 // A tick that finds the persona `live`, connected and with its stream calls
 // `resetSlowRecoveryCount(key)` for that persona, last in the healthy branch,
@@ -1609,7 +1609,7 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
 // case in this file leaves the hook at its default (absent).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-610: a live, connected tick with its stream resets the persona\'s slow-recovery count', () => {
+describe('a live, connected tick with its stream resets the persona\'s slow-recovery count', () => {
   const P = 'healed_bot'
   const Q = 'healthy_bot'
   const B = 'other_bot'
@@ -1707,19 +1707,19 @@ describe('b.jg5 SRJ-610: a live, connected tick with its stream resets the perso
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-312, SRJ-314, SRJ-316 — a CONFIG answer at the health tick
+// a CONFIG answer at the health tick
 //
 // On the tick's path only the real liveness adapter raises and clears
 // `ad-config-malformed`, so these cases plug `_buildIsSessionAliveAdapter`
 // over the stub client into the deps' liveness read. A CONFIG answer
-// (`ErrConfigMalformed`) reads `unknown`, so the tick skips P (SRJ-314): one
+// (`ErrConfigMalformed`) reads `unknown`, so the tick skips P: one
 // onset for the episode, nothing scheduled and no not-connected notice
-// (SRJ-316). A `status` that succeeds, or that answers `ErrSpawnNotFound`,
-// clears it with one all-clear listing the bare class (SRJ-312). B, read dead
+//. A `status` that succeeds, or that answers `ErrSpawnNotFound`,
+// clears it with one all-clear listing the bare class. B, read dead
 // beside P, is scheduled on every tick and never flagged.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-316: a CONFIG answer at the health tick', () => {
+describe('a CONFIG answer at the health tick', () => {
   const P = 'config_bot'
   const B = 'other_bot'
   const CONFIG = errConfigMalformed()
@@ -1798,10 +1798,10 @@ describe('b.jg5 SRJ-316: a CONFIG answer at the health tick', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-315 — no attempt, still read
+// no attempt, still read
 //
-// While a persona is latched (`isLatched`, b.jg5 SRJ-502; checked first), is
-// held on `ErrInvalidFlags` (`isHeld`, b.jg5 SRJ-207; checked next), has
+// While a persona is latched (`isLatched`; checked first), is
+// held on `ErrInvalidFlags` (`isHeld`; checked next), has
 // work in flight (`isLaunchInFlight`) or has its
 // `tmux-unavailable` outage raised, the tick makes no attempt of its own for
 // it: no `scheduleRestart` and no not-connected notice. It still runs the
@@ -1810,14 +1810,14 @@ describe('b.jg5 SRJ-316: a CONFIG answer at the health tick', () => {
 // ended, tmux-unavailable cleared). Any other reading clears its streak. A
 // restart pending or active, and the cap, still skip it before any read, and
 // come first. The tick-end (onset) hook runs once per tick under every rule
-// (pinned in the SRJ-308 cases below). Another persona under neither rule is
+// (pinned in the cases below). Another persona under neither rule is
 // checked as today. Under `tmux-unavailable` only, a tick that reads the
 // persona not healthy with no retry timer armed (`isRetryArmed` false) arms
-// one (`armRetryTimer`, b.jg5 SRJ-311; production binds both to the retry
+// one (`armRetryTimer`; production binds both to the retry
 // controller, pinned in tests/server-startup-wiring.test.ts).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-315: no attempt, still read', () => {
+describe('no attempt, still read', () => {
   const P = 'held_bot'
   const B = 'other_bot'
   const ONSET = ONSET_TEMPLATES['tmux-unavailable']()
@@ -1851,12 +1851,12 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
       return personas
     }
   }
-  // b.jg5 SRJ-502: production binds `isLatched` to the server's latch
+  // production binds `isLatched` to the server's latch
   // (pinned in tests/server-startup-wiring.test.ts); the tick only asks it.
   const latched: NoAttemptRule = (deps, active = () => true) => {
     deps.isLatched = (key) => key === P && active(deps.tickCount())
   }
-  // b.jg5 SRJ-207: production binds `isHeld` to the server's ErrInvalidFlags
+  // production binds `isHeld` to the server's ErrInvalidFlags
   // hold (pinned in tests/server-startup-wiring.test.ts); the tick only asks it.
   const held: NoAttemptRule = (deps, active = () => true) => {
     deps.isHeld = (key) => key === P && active(deps.tickCount())
@@ -1864,8 +1864,8 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
   const RULES: Array<[string, NoAttemptRule, boolean]> = [
     ['a launch in flight', inFlight, false],
     ['tmux-unavailable raised', tmuxUnavailable, true],
-    ['P latched (b.jg5 SRJ-502)', latched, false],
-    ['P held on ErrInvalidFlags (b.jg5 SRJ-207)', held, false],
+    ['P latched', latched, false],
+    ['P held on ErrInvalidFlags', held, false],
   ]
 
   /** Auto-restart disabled, with every attempt-side and healthy-side hook recorded. */
@@ -1890,7 +1890,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }, []],
     ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }, [P, P]],
     ['pending, connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }, [P, P]],
-    // Skipped after the read (b.jg5 SRJ-314), so never probed for its connection.
+    // Skipped after the read, so never probed for its connection.
     ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }, []],
   ]
 
@@ -2038,7 +2038,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated in-flight failure'))).toHaveLength(1)
   })
 
-  test('b.jg5 SRJ-502: a throwing latched query ends P\'s work for the tick before any read, logged; B is still checked', async () => {
+  test('a throwing latched query ends P\'s work for the tick before any read, logged; B is still checked', async () => {
     const personas = workList(P, B)
     const deps = makeDeps({ personas, maxTicks: 1 })
     deps.isLatched = (key) => {
@@ -2054,7 +2054,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated latch failure'))).toHaveLength(1)
   })
 
-  test('b.jg5 SRJ-207: a throwing held query ends P\'s work for the tick before any read, logged; B is still checked', async () => {
+  test('a throwing held query ends P\'s work for the tick before any read, logged; B is still checked', async () => {
     const personas = workList(P, B)
     const deps = makeDeps({ personas, maxTicks: 1 })
     deps.isHeld = (key) => {
@@ -2070,7 +2070,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated held-query failure'))).toHaveLength(1)
   })
 
-  test('b.jg5 SRJ-207: the held query is asked right after the latched one and before the in-flight one: P held, with an in-flight predicate that would throw for it, is still read and makes no attempt; a latched P is never asked it', async () => {
+  test('the held query is asked right after the latched one and before the in-flight one: P held, with an in-flight predicate that would throw for it, is still read and makes no attempt; a latched P is never asked it', async () => {
     const personas = workList(P)
     const deps = makeDeps({ personas, maxTicks: 1 })
     held(deps)
@@ -2098,7 +2098,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(latchedDeps.scheduleRestartCalls).toEqual([])
   })
 
-  test('b.jg5 SRJ-502: the latch is asked first: P latched, with an in-flight predicate that would throw for it, is still read and makes no attempt', async () => {
+  test('the latch is asked first: P latched, with an in-flight predicate that would throw for it, is still read and makes no attempt', async () => {
     const personas = workList(P)
     const deps = makeDeps({ personas, maxTicks: 1 })
     latched(deps)
@@ -2117,7 +2117,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(lines).toEqual([])
   })
 
-  // b.jg5 SRJ-311: a raised tmux-unavailable outage does not guarantee a retry
+  // a raised tmux-unavailable outage does not guarantee a retry
   // timer, so a tick that reads P not healthy under that rule with none armed
   // (`isRetryArmed` answers exactly false) arms one, logging one line before
   // it, and still schedules nothing and posts nothing. A healthy tick clears
@@ -2151,7 +2151,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     'dead',
     'live but disconnected',
   )
-  // Skipped after the read (b.jg5 SRJ-314): never reaches that branch.
+  // Skipped after the read: never reaches that branch.
   const SKIPPED_READINGS = readingsLabelled('unknown', 'a thrown probe')
 
   test.each(READ_NOT_HEALTHY)('tmux-unavailable raised with no retry timer armed, read %s on two ticks with auto-restart disabled: the tick arms P\'s timer once per tick, each after its line; nothing scheduled, no not-connected notice, the flag stays raised', async (_label, opts) => {
@@ -2255,10 +2255,10 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
   })
 
-  // b.jg5 SRJ-502, SRJ-207: the latch and the ErrInvalidFlags hold each stop
+  // the latch and the ErrInvalidFlags hold each stop
   // P's retry timer, so the tick never arms a new one for a latched or held
   // P, even with its tmux-unavailable outage raised.
-  test.each(READ_NOT_HEALTHY.flatMap(([label, opts]) => ([['latched', latched], ['held on ErrInvalidFlags', held]] as const).map(([rule, apply]) => [rule, label, opts, apply] as const)))('b.jg5 SRJ-502, SRJ-207: P %s with tmux-unavailable raised too and no retry timer armed, read %s on two ticks: that reason wins, so nothing is armed, nothing scheduled and the flag stays raised', async (_rule, _label, opts, apply) => {
+  test.each(READ_NOT_HEALTHY.flatMap(([label, opts]) => ([['latched', latched], ['held on ErrInvalidFlags', held]] as const).map(([rule, apply]) => [rule, label, opts, apply] as const)))('P %s with tmux-unavailable raised too and no retry timer armed, read %s on two ticks: that reason wins, so nothing is armed, nothing scheduled and the flag stays raised', async (_rule, _label, opts, apply) => {
     const deps = makeDeps({ personas: workList(P), ...opts, retryArmedResult: false, recordRetryArms: true, maxTicks: 2 })
     apply(deps)
     tmuxUnavailable(deps)
@@ -2275,7 +2275,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
   })
 
-  // b.jg5 SRJ-311: the tick decides P's no-attempt reason before awaiting its
+  // the tick decides P's no-attempt reason before awaiting its
   // reads, so the arm re-checks it at arm time. Here the reason changes inside
   // the `isSessionAlive` read, after the tick decided `tmux-unavailable` (so
   // the tick still takes its no-attempt branch on the `dead` reading): the
@@ -2297,7 +2297,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     ['by a real clear (clearOutageFlag)', () => clearOutageFlag(P, 'tmux-unavailable'), [ONSET, ALL_CLEAR]],
   ]
 
-  test.each(CLEARS_DURING_READ)('b.jg5 SRJ-311: tmux-unavailable raised with no retry timer armed, the flag cleared %s during P\'s liveness read, which then reads dead: nothing is armed and no arming line logged', async (_how, clear, texts) => {
+  test.each(CLEARS_DURING_READ)('tmux-unavailable raised with no retry timer armed, the flag cleared %s during P\'s liveness read, which then reads dead: nothing is armed and no arming line logged', async (_how, clear, texts) => {
     const deps = makeDeps({ personas: workList(P), retryArmedResult: false, recordRetryArms: true, maxTicks: 1 })
     tmuxUnavailable(deps)
     changingAtRead(deps, clear)
@@ -2313,7 +2313,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(notices).toEqual(texts.map((text) => ({ key: P, text })))
   })
 
-  test('b.jg5 SRJ-311: tmux-unavailable raised with no retry timer armed, a launch going in flight during P\'s liveness read, which then reads dead: nothing is armed and no arming line logged; the flag stays raised', async () => {
+  test('tmux-unavailable raised with no retry timer armed, a launch going in flight during P\'s liveness read, which then reads dead: nothing is armed and no arming line logged; the flag stays raised', async () => {
     const deps = makeDeps({ personas: workList(P), retryArmedResult: false, recordRetryArms: true, maxTicks: 1 })
     tmuxUnavailable(deps)
     let launched = false
@@ -2331,7 +2331,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(notices).toEqual([{ key: P, text: ONSET }])
   })
 
-  test('b.jg5 SRJ-502: tmux-unavailable raised with no retry timer armed, P latching during its liveness read, which then reads dead: nothing is armed and no arming line logged; the flag stays raised', async () => {
+  test('tmux-unavailable raised with no retry timer armed, P latching during its liveness read, which then reads dead: nothing is armed and no arming line logged; the flag stays raised', async () => {
     const deps = makeDeps({ personas: workList(P), retryArmedResult: false, recordRetryArms: true, maxTicks: 1 })
     tmuxUnavailable(deps)
     let isLatched = false
@@ -2365,7 +2365,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-308 — the tick-end hook (the onset check with the health check on)
+// the tick-end hook (the onset check with the health check on)
 //
 // Each tick body reads its start time from `now` once, before any of its work,
 // and calls `onTickEnd(tickStartedAt)` once when the body ends, after every
@@ -2382,7 +2382,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
 // Every other case in this file leaves both deps at their defaults (absent).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick\'s start time', () => {
+describe('the tick-end hook runs once per tick body with the tick\'s start time', () => {
   const TICK_END_FAILED = '[slack] health-check: the tick-end hook failed: '
   const START_UNREAD = '[slack] health-check: the tick\'s start time could not be read: '
   const TICK_FAILED = '[slack] health-check: the tick failed: '
@@ -2457,8 +2457,8 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
   test.each<[string, DepsOpts, (deps: ReturnType<typeof makeDeps>) => void]>([
     ['a restart pending', { isRestartPendingResult: true }, bindNothing],
     ['a launch in flight', {}, (deps) => { deps.isLaunchInFlight = () => true }],
-    ['latched (b.jg5 SRJ-502)', {}, (deps) => { deps.isLatched = () => true }],
-    ['held on ErrInvalidFlags (b.jg5 SRJ-207)', {}, (deps) => { deps.isHeld = () => true }],
+    ['latched', {}, (deps) => { deps.isLatched = () => true }],
+    ['held on ErrInvalidFlags', {}, (deps) => { deps.isHeld = () => true }],
     ['tmux-unavailable raised', {}, () => {
       setOutageFlag('persona_a', 'tmux-unavailable')
       setOutageFlag('persona_b', 'tmux-unavailable')
@@ -2691,7 +2691,7 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.3 / SR-6.4 / SR-7.2 / SR-11 — only personas that are up are checked
+// only personas that are up are checked
 //
 // The server builds the tick's work list as
 // `buildPersonaWorkList(config, canRelaunch)`, where `canRelaunch` is
@@ -2718,7 +2718,7 @@ function configDirCheckUnder(base: string): (persona: Persona) => ReturnType<typ
   return (persona) => checkPersonaConfigDir(persona, { home })
 }
 
-describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', () => {
+describe('only personas that are up are checked', () => {
   let dir: string
   let managers: PersonaConnectionManager[]
   let controllers: PersonaBringUpController[]
@@ -2834,21 +2834,21 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     const up = h.p('Up Desk')
     const notUp = ['Creds Missing', 'Slack Refused', 'Dir Missing'].map((name) => h.p(name))
     expect(outcomes).toEqual({ 'Up Desk': 'up', 'Creds Missing': 'broken', 'Slack Refused': 'broken', 'Dir Missing': 'retrying' })
-    // Neither local failure opened a Slack connection (SR-6.4).
+    // Neither local failure opened a Slack connection.
     expect([h.manager.status(notUp[0].key), h.manager.status(notUp[2].key)]).toEqual([undefined, undefined])
 
     const { calls, tick } = startSteppedTicks(() => buildPersonaWorkList(h.config!, canRelaunch))
     for (let i = 0; i < 3; i++) await tick()
 
     // Only the up persona reached any tick step, once per tick (the cap
-    // twice: before the read and right after it, b.4q8).
+    // twice: before the read and right after it).
     expect(calls.pending).toEqual([up.key, up.key, up.key])
     expect(calls.atCap).toEqual([up.key, up.key, up.key, up.key, up.key, up.key])
     expect(calls.stat).toEqual([up.working_directory, up.working_directory, up.working_directory])
     expect(calls.alive).toEqual([up.key, up.key, up.key])
     expect(calls.scheduled).toEqual([up.key, up.key, up.key])
     // No outage flag and no notice for anyone: Dir Missing's absent directory
-    // raised no cwd-unreachable, and nothing reached Slack (SR-7.2).
+    // raised no cwd-unreachable, and nothing reached Slack.
     for (const p of [up, ...notUp]) expect(getOutageFlags(p.key).size).toBe(0)
     expect(notices).toEqual([])
     // The tick left every outcome as it was; no retry launched anyone.
@@ -2864,7 +2864,7 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
 
     const { calls, tick } = startSteppedTicks(() => buildPersonaWorkList(h.config!, canRelaunch))
     await tick()
-    // First re-check (5 s on the SR-3.2 schedule): still missing, still retrying.
+    // First re-check (5 s on the schedule): still missing, still retrying.
     await h.clock.advance(5_000)
     expect(controller.state(retrying.key)?.outcome).toBe('retrying')
     await tick()
@@ -2886,7 +2886,7 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     assertNoLeak({ lines, managerLines: h.lines, calls })
   })
 
-  test('SR-11: an up persona whose directory vanishes after it came up keeps today\'s path — cwd-unreachable raised once with a notice, restarts scheduled, then skipped at cap; no directory retry opens', async () => {
+  test('an up persona whose directory vanishes after it came up keeps today\'s path — cwd-unreachable raised once with a notice, restarts scheduled, then skipped at cap; no directory retry opens', async () => {
     let capped = false
     const { h, controller, canRelaunch, launches, lines } = await bringUpAll(['Up Desk'])
     const up = h.p('Up Desk')
@@ -2908,7 +2908,7 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
 
     // At the restart cap the tick skips it, as for any capped persona: one ask
     // of the cap, before any read (each earlier tick asked twice, before the
-    // read and right after it, b.4q8).
+    // read and right after it).
     capped = true
     await tick()
     expect(calls.atCap).toEqual([up.key, up.key, up.key, up.key, up.key])
@@ -2925,24 +2925,24 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-502, SRJ-512, SRJ-513 — a tick whose own liveness read latches P
+// a tick whose own liveness read latches P
 //
 // The real liveness adapter applies the own-row `status` step, with the
 // configured-persona query installed as `main()` installs it (here: P and
 // B). So P latches on the first tick through the installed latch (whose
 // notice reaction, bound as `main()` binds it over a real episodes instance,
-// posts once per episode) when P's `status` answers UNUSABLE NAME (SRJ-512:
-// "unusable recorded name", the state unreadable, SRJ-1019) or P's own row
-// reads `pending` with no launch start (SRJ-513: "launch start not recorded",
-// the state `pending`, SRJ-1020). The read gives `unknown`: the tick skips
+// posts once per episode) when P's `status` answers UNUSABLE NAME (
+// "unusable recorded name", the state unreadable) or P's own row
+// reads `pending` with no launch start ("launch start not recorded",
+// the state `pending`). The read gives `unknown`: the tick skips
 // P, schedules nothing and asks for no not-connected notice, whether P's
 // session is connected or not. P is still read on each later tick, as a
-// latched persona is (SRJ-315); each read meets the same case again, which
+// latched persona is; each read meets the same case again, which
 // posts nothing more. The tick asks the latch again after its own read, so P
 // latched while the read ran (here by another path, the read itself
 // answering dead) is not scheduled either. Controls: a phrase-less
-// `ErrInternal` latches no one and keeps E9's skip on `unknown`; a `pending`
-// row with a launch start latches no one and keeps E9's two-tick streak,
+// `ErrInternal` latches no one and keeps skip on `unknown`; a `pending`
+// row with a launch start latches no one and keeps two-tick streak,
 // then `scheduleRestart`. B beside P, read dead, is scheduled on every tick.
 // Each hold case runs one fault row or one no-launch-start form per
 // connection here: every fault and form is covered at the adapters, in
@@ -2950,7 +2950,7 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
 // each awaited to its end.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () => {
+describe('a tick whose own liveness read latches P', () => {
   const P = 'held_bot'
   const B = 'other_bot'
   const DEAD_ROW = cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })
@@ -3020,10 +3020,10 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
 
   /** P's own-row `status` step line at the liveness read for an UNUSABLE NAME answer `err`. */
   const unusableStepLine = (err: unknown) => (outcome: string): string =>
-    `[slack] isSessionAlive: status for persona=${P}: ${describeAdFailureForLog(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)`
+    `[slack] isSessionAlive: status for persona=${P}: ${describeAdFailureForLog(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it`
   /** P's own-row `status` step line at the liveness read for its `pending` row with no launch start. */
   const launchStartStepLine = (outcome: string): string =>
-    `[slack] isSessionAlive: status for persona=${P}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — ${outcome}; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`
+    `[slack] isSessionAlive: status for persona=${P}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — ${outcome}; nothing more is called for it`
 
   /** [label, P's status answer, P connected, P's expected record, its one post, its step line by outcome]. */
   const HOLD_CASES: ReadonlyArray<readonly [string, () => Error | ReturnType<typeof cannedStatusResult>, boolean, () => ConflictLatchRecord, () => string, (err: unknown) => (outcome: string) => string]> = [
@@ -3086,8 +3086,8 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
     assertNoLeak({ lines, latchLines, posts, notices })
   })
 
-  // Control (b.jg5 SRJ-313): without the phrase the answer is not UNUSABLE
-  // NAME: P latches no one and nothing is posted; E9's skip on `unknown`
+  // Control: without the phrase the answer is not UNUSABLE
+  // NAME: P latches no one and nothing is posted; skip on `unknown`
   // stands on every tick.
   test('control: P\'s status answers a phrase-less ErrInternal on three ticks: no latch, no post; P is skipped on unknown each tick, never scheduled; B is scheduled each tick', async () => {
     const { deps, notified, personas } = latchDeps(errInternal(), 3)
@@ -3106,7 +3106,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
     assertNoLeak({ lines, latchLines, posts, notices })
   })
 
-  // Control (b.jg5 SRJ-314, SRJ-408): with a launch start the row latches no
+  // Control: with a launch start the row latches no
   // one; read `pending`, it is never healthy and takes the two-tick streak,
   // then scheduleRestart (whose run defers it), asking for the notice only
   // when disconnected.
@@ -3130,9 +3130,9 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
   })
 })
 
-// b.omv SR-7.6: installed upgrade inspection must not suppress ordinary
+// installed upgrade inspection must not suppress ordinary
 // dead-persona recovery, even when inspection would defer or fail.
-describe('E4 guard: health liveness with upgrade inspection installed', () => {
+describe('guard: health liveness with upgrade inspection installed', () => {
   afterEach(resetClientForTests)
 
   test.each([
@@ -3172,7 +3172,7 @@ describe('E4 guard: health liveness with upgrade inspection installed', () => {
   })
 })
 
-describe('b.jpf: install discovery failure supplies no health recovery evidence', () => {
+describe('install discovery failure supplies no health recovery evidence', () => {
   afterEach(resetClientForTests)
 
   test('repeated install failures retain ad-unreachable without scheduling or resetting health; a fresh missing row permits recovery', async () => {

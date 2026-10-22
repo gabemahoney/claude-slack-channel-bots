@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
-/** Local sequential heavy coordinator; never discovered by /ci (b.omv SR-14.4).
+/** Local sequential heavy coordinator; never discovered by /ci.
  * Future scheduler jobs use SCHEDULER_JOB_CONTRACT once secrets are supported;
- * this runner deliberately submits no scheduler work. E7 can extend the
+ * this runner deliberately submits no scheduler work. can extend the
  * manifest with a local-only agent leg without changing Claude's contract.
  */
 import { closeSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
@@ -46,7 +46,7 @@ export function assertCodexJobComplete(extension: LocalAgentExtension, results: 
   if (expected.size) throw new Error('Codex job omitted required scenarios/trials')
 }
 // Local jobs obey the committed /ci shard caps. The future scheduler's
-// distinct 8GiB/4CPU reservation is recorded below (b.omv SR-14.4).
+// distinct 8GiB/4CPU reservation is recorded below.
 export const MATRIX_MEMORY = String(SHARD_MEMORY_CAP_BYTES)
 export const MATRIX_CPUS = CPUS_PER_SHARD
 export const MATRIX_TIMEOUT_MS = 3 * 60 * 60 * 1000
@@ -217,7 +217,7 @@ export function matrixOptions(args: readonly string[], repo = resolve(dirname(im
   return { output, repo, planOnly, ...(codexOnly ? { codexOnly: true } : {}), ...(claudeVersions ? { claudeVersions } : {}), ...(aiOnly ? { aiOnly: true } : {}), ...(aiCriteria ? { aiCriteria } : {}), ...(keepGoing ? { keepGoing: true } : {}) }
 }
 export async function runMatrix(options: MatrixOptions): Promise<boolean> {
-  // b.omv SR-14.7: focused acceptance uses the same local Codex lifecycle.
+  // focused acceptance uses the same local Codex lifecycle.
   // Its distinct verdict must never certify the unexecuted Claude matrix.
   const codexOnly = options.codexOnly === true
   const claudeOnly = options.claudeVersions !== undefined
@@ -226,7 +226,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   const selection = codexOnly ? 'codex-only' : options.aiCriteria ? 'claude-ai-selected' : options.aiOnly ? 'claude-ai-only' : claudeOnly ? 'claude-only' : 'full'
   const recordPrefix = codexOnly ? 'REAL-AGENT-CODEX' : options.aiCriteria ? 'REAL-AGENT-CLAUDE-AI-SELECTED' : options.aiOnly ? 'REAL-AGENT-CLAUDE-AI' : claudeOnly ? 'REAL-AGENT-CLAUDE' : 'REAL-AGENT'
   const key = codexOnly ? '' : process.env.CI_ANTHROPIC_API_KEY ?? '', model = codexOnly ? '' : process.env.CI_ANTHROPIC_MODEL ?? ''
-  // Decision 19: an owner-selected available model can run the AI trials.
+  // an owner-selected available model can run the AI trials.
   // This is explicit routing, never a refusal-triggered or hidden fallback.
   const explicitAiModel = codexOnly ? undefined : process.env.CI_ANTHROPIC_AI_MODEL
   const aiModel = explicitAiModel ?? model

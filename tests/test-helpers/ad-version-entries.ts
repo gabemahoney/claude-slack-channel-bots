@@ -1,6 +1,6 @@
 /**
  * ad-version-entries.ts — the shared check of a runtime version re-check's
- * startup-errors entry (b.jg5 SRJ-205, SRJ-208, SRJ-1013; hatch A3): of
+ * startup-errors entry (design A3): of
  * either class (`ad-below-phase1-floor`, `ad-system-install-too-old`), it
  * points to the debug skill and to neither the switch-over runbook nor the
  * install skill, and carries no instruction to upgrade or install

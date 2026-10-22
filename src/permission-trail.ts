@@ -1,6 +1,6 @@
 /**
  * permission-trail.ts — Append-only JSONL event store for the CSCB-side
- * visibility trail of the AD↔CSCB tool-permission relay (SRD t1.cdb.4g).
+ * visibility trail of the AD↔CSCB tool-permission relay.
  *
  * One JSON object per newline-terminated line in
  *   <SLACK_STATE_DIR>/permission-trail.jsonl
@@ -12,9 +12,9 @@
  *   - emitTrailEvent(event)       — raw, accepts caller-supplied `ts`
  *   - _resetTrailFdForTests()     — test-only fd reset
  *
- * The emitter is the single enforcement point for SR-V-1 (correlation
- * envelope), SR-V-3 (no truncation in the canonical store), and SR-V-4.5
- * (RFC 3339 sub-second `ts`, stable hierarchical `event` identifier).
+ * The emitter enforces the correlation envelope, no truncation in the
+ * canonical store, RFC 3339 sub-second `ts`, and a stable hierarchical
+ * `event` identifier.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -30,27 +30,26 @@ import { resolveServerStateDir } from './config.ts'
 
 /**
  * Required envelope fields enforced by the type system on every emitted line.
- * `event` is a stable hierarchical identifier in the `cscb.*` namespace
- * (SR-V-4.5). `ts` is RFC 3339 with at least millisecond precision
- * (SR-V-4.3, SR-V-4.5).
+ * `event` is a stable hierarchical identifier in the `cscb.*` namespace. `ts` is RFC 3339 with at least millisecond
+ * precision.
  */
 export interface TrailEventBase {
   ts: string
   event: string
-  /** SR-V-1.1: AD-minted UUID, absent for events before token assignment (SR-V-1.2). */
+  /** AD-minted UUID, absent for events before token assignment. */
   request_token?: string
-  /** SR-V-1.2: present whenever known. */
+  /** present whenever known. */
   instance_id?: string
-  /** SR-V-1.3: Slack channel id for events that touch Slack. */
+  /** Slack channel id for events that touch Slack. */
   channel?: string
-  /** SR-V-1.3: Slack message ts for events that touch Slack. */
+  /** Slack message ts for events that touch Slack. */
   message_ts?: string
 }
 
 /**
  * One emitted JSONL line. Extends the required envelope with an open index
- * signature so per-event-class fields pass through verbatim (no truncation
- * per SR-V-3.1) without a cast at the call site.
+ * signature so per-event-class fields pass through verbatim without truncation
+ * or a cast at the call site.
  */
 export type TrailEvent = TrailEventBase & { [extra: string]: unknown }
 
@@ -60,10 +59,10 @@ export type TrailEvent = TrailEventBase & { [extra: string]: unknown }
 
 /**
  * The six canonical row-decision identifiers used as the `action` field on
- * `cscb.poller.row_decision` events (SR-V-2.3). Exported for type-narrowing
+ * `cscb.poller.row_decision` events. Exported for type-narrowing
  * at the emission site.
  *
- * The set is open to extension per SR-V-2.3: the `(string & {})` widening
+ * The set is open to extension: the `(string & {})` widening
  * keeps existing literals discoverable in editor completions while still
  * accepting new identifiers without a type change.
  */
@@ -78,19 +77,18 @@ export const ROW_DECISION_ACTIONS = [
 
 export type CanonicalRowDecisionAction = (typeof ROW_DECISION_ACTIONS)[number]
 
-/** Open string-literal union per SR-V-2.3 — canonical values plus any new identifier. */
+/** Open string-literal union — canonical values plus any new identifier. */
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type RowDecisionAction = CanonicalRowDecisionAction | (string & {})
 
 /**
- * The canonical verdict tags carried on `cscb.chat_update.attempted` events
- * (SR-V-2.5). 6 are emitted by the poller's `renderClosureUpdate`; the
+ * The canonical verdict tags carried on `cscb.chat_update.attempted` events. Six are emitted by the poller's `renderClosureUpdate`; the
  * `click_handler_*` tags are emitted by the click handler's verdict-render
  * path. Open to extension.
  *
  * `click_handler_relay_fallen_back` is not a verdict — it records that AD
  * refused the click because the request's relay window had already elapsed
- * (b.qi1); the real answer is given at the tmux pane.
+ * the real answer is given at the tmux pane.
  */
 export const CLOSURE_VERDICT_TAGS = [
   'operator_allow',
@@ -109,13 +107,13 @@ export type CanonicalClosureVerdictTag = (typeof CLOSURE_VERDICT_TAGS)[number]
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type ClosureVerdictTag = CanonicalClosureVerdictTag | (string & {})
 
-/** Which surface triggered a closure `chat.update` (SR-V-2.5). Open to extension. */
+/** Which surface triggered a closure `chat.update`. Open to extension. */
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type TriggeredBy = 'poller' | 'click_handler' | (string & {})
 
 /**
  * Stable reasons a `cscb.block_action.received` event records when the
- * inbound `action_id` failed `parsePermissionActionId` (SR-V-2.9). Open to
+ * inbound `action_id` failed `parsePermissionActionId`. Open to
  * extension. `stale_prompt` is intentionally NOT in this set — stale clicks
  * decode fine and show up as `cscb.click_handler.invoked{live_pending:false}`.
  */
@@ -129,12 +127,12 @@ export type CanonicalParseFailureReason = (typeof PARSE_FAILURE_REASONS)[number]
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type ParseFailureReason = CanonicalParseFailureReason | (string & {})
 
-/** Decoded permission decision carried on inbound click events (SR-V-2.6 / SR-V-2.9). */
+/** Decoded permission decision carried on inbound click events. */
 export type ClickDecision = 'allow' | 'deny'
 
 /**
  * Classification of an agent-director `decide` response on the CSCB call
- * side (SR-V-2.7). The named error classes match the AD error
+ * side. The named error classes match the AD error
  * identifiers in `src/agent-director-errors.ts`. `"other"` is the catch-all
  * for any other thrown value; the emit additionally carries a
  * `raw_error_message` string in that case. Open extension allowed.

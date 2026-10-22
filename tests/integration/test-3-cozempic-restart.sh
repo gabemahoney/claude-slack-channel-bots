@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Test 3 (b.set, b.d6n): stop + restart daemon, verify clean restart.
+# Test 3: stop + restart daemon, verify clean restart.
 # Depends on Tests 1 and 2 having passed (daemon must be running going in).
 # ci-requires: test-2
 #
 # `stop --stop-bots` reads the persona config from the path the server loads
-# and tears down each persona's instance cscb_<key> (b.av2 SR-8.7). Dry run
+# and tears down each persona's instance cscb_<key>. Dry run
 # never spawned one, so it reports no spawn row for each persona. The restart
-# runs with SLACK_BOT_TOKEN and SLACK_APP_TOKEN unset (AC 47).
+# runs with SLACK_BOT_TOKEN and SLACK_APP_TOKEN unset.
 # Runs only in a cscb-ci image: without its marker, refuse before any other step.
 if [[ ! -e /etc/cscb-ci-image ]]; then
     echo "FAIL: test-3-cozempic-restart: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2

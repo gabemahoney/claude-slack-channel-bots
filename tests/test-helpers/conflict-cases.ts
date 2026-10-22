@@ -146,8 +146,8 @@ import {
 
 /**
  * One of the liveness checks' `read-pane` sites of persona P's own row as a
- * site kind (b.jg5 SRJ-117's E18 columns): b.d61's working-row verdict
- * (`checkWorkingRowPane`), b.f2b's waiting-row check (`checkWaitingRowPane`)
+ * site kind ( columns): working-row verdict
+ * (`checkWorkingRowPane`)waiting-row check (`checkWaitingRowPane`)
  * and the launch wait's evidence read (`staleWorkingRowIsIdle`), each through
  * the shared reader of P's own row (`readPersonaOwnPane`).
  */
@@ -156,13 +156,13 @@ const WORKING = latchRowStateRead('working')
 const WAITING = latchRowStateRead('waiting')
 
 /**
- * The row state each liveness pane site records for a CONFLICT (b.jg5
- * SRJ-501: the state the calling path last read): `working` for the
+ * The row state each liveness pane site records for a CONFLICT (
+ * the state the calling path last read): `working` for the
  * working-row verdict and the launch wait's evidence read (the wait's poll
  * read `working`), `waiting` for the waiting-row check.
  */
 
-/** Every liveness pane site kind, in SRJ-117's column order. */
+/** Every liveness pane site kind, in the contract column order. */
 
 /** Whether `site` is one of the liveness checks' `read-pane` site kinds. */
 
@@ -171,7 +171,7 @@ type PaneOrKillSite = 'kill' | 'read-pane' | 'send-keys' | 'pause'
 
 /**
  * The reconnect's one `send-keys` of `/mcp reconnect` as a site kind
- * (`reconnectMcpWithCause`, b.jg5 SRJ-118's reconnect row).
+ * (`reconnectMcpWithCause`reconnect row).
  */
 export const RECONNECT_SITE = 'reconnect send-keys'
 
@@ -184,44 +184,44 @@ export function isReconnectSite(site: string): site is ReconnectSite {
 }
 
 /**
- * One of b.jdc's `read-pane` sites of persona P's own `ask_user` or
- * `check_permission` row as a site kind (b.jg5 SRJ-117's two b.jdc columns,
- * SRJ-606, SRJ-607): the reconnect verdict (`promptRowReconnectVerdict`) and
+ * One of the contract `read-pane` sites of persona P's own `ask_user` or
+ * `check_permission` row as a site kind (two columns,
+ *): the reconnect verdict (`promptRowReconnectVerdict`) and
  * the ladder action (`launchOnPromptRow`), each one one-line read through the
  * shared reader of P's own row (`readPersonaOwnPane`).
  */
 export type PromptRowPaneSite = 'prompt-row reconnect verdict' | 'prompt-row ladder action'
 
-/** Every prompt-row pane site kind, in SRJ-117's column order: the reconnect verdict, then the ladder action. */
+/** Every prompt-row pane site kind, in the contract column order: the reconnect verdict, then the ladder action. */
 export const PROMPT_ROW_PANE_SITES: readonly PromptRowPaneSite[] = Object.freeze([
   'prompt-row reconnect verdict',
   'prompt-row ladder action',
 ] as const)
 
-/** Whether `site` is one of b.jdc's prompt-row `read-pane` site kinds. */
+/** Whether `site` is one of the contract prompt-row `read-pane` site kinds. */
 export function isPromptRowPaneSite(site: string): site is PromptRowPaneSite {
   return (PROMPT_ROW_PANE_SITES as readonly string[]).includes(site)
 }
 
 /**
  * The restart path's kill before a relaunch as a site kind
- * (`_buildKillSessionAdapter`, `src/server.ts`; b.jg5 SRJ-110, E20).
+ * (`_buildKillSessionAdapter`, `src/server.ts`, ).
  */
 export const RESTART_KILL_SITE = 'restart kill'
 
-/** The reuse spawn as a site kind (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708; E22). */
+/** The reuse spawn as a site kind (`reuseSpawnForPersona`; ). */
 export const REUSE_SPAWN_SITE = 'reuse spawn'
 
-/** The live-row sequence's step-1 kill as a site kind (b.jg5 SRJ-705 step 1, SRJ-110; E21). */
+/** The live-row sequence's step-1 kill as a site kind (step 1; ). */
 export const SEQUENCE_STEP1_KILL_SITE = 'sequence step-1 kill'
 
-/** The live-row sequence's step-4 kill as a site kind (b.jg5 SRJ-705 step 4, SRJ-110; E21). */
+/** The live-row sequence's step-4 kill as a site kind (step 4; ). */
 export const SEQUENCE_STEP4_KILL_SITE = 'sequence step-4 kill'
 
 /**
  * The live-row sequence's step-6 `resume` as a site kind: the sequence-launch
- * entry's `resume` leg (`launchForLiveRowSequence`; b.jg5 SRJ-705 step 6,
- * SRJ-113).
+ * entry's `resume` leg (`launchForLiveRowSequence`step 6,
+ *).
  */
 export const SEQUENCE_RESUME_SITE = 'sequence resume'
 
@@ -243,7 +243,7 @@ export function isSequenceKillSite(site: string): site is SequenceKillSite {
 }
 
 /**
- * The stuck-launch abort's kill as a site kind (b.jg5 SRJ-412, SRJ-110; E29):
+ * The stuck-launch abort's kill as a site kind :
  * `src/session-manager.ts`'s `STUCK_LAUNCH_ABORT_SITE`, the abort kill's own
  * site (`abortKillOwnStuckLaunch`) and the head of its tries', reads' and
  * latch lines, re-exported here.
@@ -259,9 +259,9 @@ export function isStuckLaunchAbortSite(site: string): site is StuckLaunchAbortSi
 }
 
 /**
- * One of the checked kill's site kinds: the restart path's kill (E20), one
- * of the live-row sequence's two kills (E21), or the stuck-launch abort's
- * kill (E29). The collision ladder makes no kill (E22).
+ * One of the checked kill's site kinds: the restart path's kill , one
+ * of the live-row sequence's two kills , or the stuck-launch abort's
+ * kill . The collision ladder makes no kill .
  */
 export type KillSite = typeof RESTART_KILL_SITE | SequenceKillSite | StuckLaunchAbortSite
 
@@ -297,10 +297,10 @@ export interface ConflictCaseRow {
   readonly refusedOperation: RefusedOperation
   /** The row state the latch records on this path. */
   readonly rowState: LatchRowState
-  /** The CONFLICT notice for the row's case, quoted session and description (SRJ-1004). */
+  /** The CONFLICT notice for the row's case, quoted session and description. */
   readonly notice: ExpectedConflictNotice
   /**
-   * Set on the reconnect's "not this launch's session" rows only: SRJ-613's
+   * Set on the reconnect's "not this launch's session" rows only:
    * leftover case (on a live row that is not `pending`, a leftover of an
    * earlier launch holds the persona's session).
    */
@@ -310,7 +310,7 @@ export interface ConflictCaseRow {
    * abort's kill rows only, false: the recorded state is the one the path
    * hands the kill, so no latch-time `status` read is made. At the restart
    * kill it is the state the run's `dead` reading carries (`ended`, `missing`
-   * or no row; b.jg5 SRJ-501), and `rowState` is that of the `dead` reading a
+   * or no row), and `rowState` is that of the `dead` reading a
    * case hands the kill (`ended`, `LIVENESS_READING_DEAD_ENDED`); at a
    * sequence kill it is the state the sequence last read; at the abort's kill
    * it is `pending`, the state the pending-row rule's `get` last read.
@@ -318,10 +318,10 @@ export interface ConflictCaseRow {
   readonly latchTimeRead?: false
   /**
    * Set on the "not this launch's session" row of the sequence step-1 kill on
-   * a `pending` seed and of the stuck-launch abort's kill only: SRJ-613's
+   * a `pending` seed and of the stuck-launch abort's kill only:
    * kill backstop (a kill on a live row, `pending` included, answering "not
-   * this launch's session" latches the persona with nothing sent; E19 and
-   * E20 hatch notes).
+   * this launch's session" latches the persona with nothing sent; and
+   * design notes).
    */
   readonly killBackstop?: true
   /**
@@ -331,7 +331,7 @@ export interface ConflictCaseRow {
    */
   readonly noRowWritten?: true
   /**
-   * Set on the plain spawn's rows only (b.jg5 SRJ-111; HO rev 15, rev 20):
+   * Set on the plain spawn's rows only (HO rev 15, rev 20):
    * the row agent-director leaves for the persona's id after the refusal, so
    * a case scripts the stub's reads of it after the refusal: `none` after the
    * pre-spawn scan's refusal (nothing written, no row created), `ended` after
@@ -341,8 +341,8 @@ export interface ConflictCaseRow {
    */
   readonly rowAfter?: PlainSpawnRowAfter
   /**
-   * Set on {@link PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS} only (E30 T3; b.jg5
-   * SRJ-505, hatch A3): the plain first spawn's latch-time `status` read
+   * Set on {@link PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS} only (
+   * design A3): the plain first spawn's latch-time `status` read
    * failed (`unreadable`) or read the row live other than `pending`
    * (`waiting`), so the record shows no row that had not reported in.
    */
@@ -355,7 +355,7 @@ export interface ConflictCaseRow {
    * state; answers the set's outcome.
    */
   readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome | undefined
-  /** The re-check's columns for this row (E30; b.jg5 SRJ-505): see {@link RecheckColumns}. */
+  /** The re-check's columns for this row (): see {@link RecheckColumns}. */
   readonly recheck: RecheckColumns
   /**
    * Set on the `resume` and reuse "this row's own id" rows only: the
@@ -370,7 +370,7 @@ export interface ConflictCaseRow {
 export type PlainSpawnRowAfter = 'none' | typeof LIVENESS_DEAD_ROW_ENDED
 
 // ---------------------------------------------------------------------------
-// The expected CONFLICT notice (b.jg5 SRJ-1004)
+// The expected CONFLICT notice
 // ---------------------------------------------------------------------------
 
 /** Which must-not-be-ended line a notice carries: another row's, another store's, or none. */
@@ -394,7 +394,7 @@ export interface ConflictNoticeCarries {
 
 /** One expected CONFLICT notice body (the persona notifier adds the prefix). */
 export interface ExpectedConflictNotice {
-  /** Its lines, in SRJ-1004's order. */
+  /** Its lines, in the contract order. */
   readonly lines: readonly string[]
   /** The lines joined by `CONFLICT_NOTICE_LINE_SEPARATOR`. */
   readonly text: string
@@ -422,7 +422,7 @@ export interface ExpectedConflictNoticeSource {
   readonly listLineUnsafe?: boolean
 }
 
-/** The flags SRJ-1004 sets for a case, a session name and the record's `listLineUnsafe`. */
+/** The flags sets for a case, a session name and the record's `listLineUnsafe`. */
 function carriesFor(latchCase: ConflictLatchCase, sessionName: string, listLineUnsafe: boolean): ConflictNoticeCarries {
   const mustNotEnd: MustNotEndLine =
     latchCase === LATCH_CASE_DIFFERENT_ID ? 'row' : latchCase === LATCH_CASE_ANOTHER_STORE ? 'store' : 'none'
@@ -456,7 +456,7 @@ export function expectedConflictListLine(sessionName: string): string {
 }
 
 /**
- * The CONFLICT notice SRJ-1004 gives for `source`, assembled line by line
+ * The CONFLICT notice gives for `source`, assembled line by line
  * from `src/conflict-latch.ts`'s exported fixed lines and case sentences:
  * the first line (`"<session>"`, with the case sentence unless the case takes
  * the unrecognised-text wording), the description line (left out when the
@@ -502,13 +502,13 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
 }
 
 /**
- * Where SRJ-1019's notice opens its quoted description, inside its first
+ * Where notice opens its quoted description, inside its first
  * sentence: the reason, then `agent-director said: "`.
  */
 const INLINE_DESCRIPTION_OPEN = UNUSABLE_NAME_NOTICE_REASON + CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD
 
 /**
- * Where SRJ-1019's notice closes its quoted description: the closing quote,
+ * Where notice closes its quoted description: the closing quote,
  * the sentence's end, the separator and the pointer sentence.
  */
 const INLINE_DESCRIPTION_CLOSE =
@@ -518,7 +518,7 @@ const INLINE_DESCRIPTION_CLOSE =
   UNUSABLE_NAME_NOTICE_POINTER
 
 /**
- * `line` with a description quoted inside a sentence cut out (SRJ-1019's
+ * `line` with a description quoted inside a sentence cut out (
  * form): everything between the first {@link INLINE_DESCRIPTION_OPEN} and
  * the last {@link INLINE_DESCRIPTION_CLOSE} after it is removed, the frame
  * itself and every other word kept. A line without that frame is returned
@@ -537,7 +537,7 @@ export function withoutInlineDescription(line: string): string {
  * CSCB's own lines of a notice: its lines without agent-director's quoted
  * description. A CONFLICT notice's description line (the one that opens with
  * `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`) is dropped; a description quoted
- * inside a sentence (SRJ-1019) is cut out of its line
+ * inside a sentence is cut out of its line
  * ({@link withoutInlineDescription}).
  */
 export function cscbOwnLines(notice: string): string[] {
@@ -568,7 +568,7 @@ export function conflictNoticeForPersona(key: string, err: ReturnType<typeof con
 }
 
 // ---------------------------------------------------------------------------
-// Session-ending command forms (ADSRD SR-1.4; b.jg5 SRJ-1001)
+// Session-ending command forms (agent-director contract)
 // ---------------------------------------------------------------------------
 
 // Defined once in the import-free `session-ending-commands.ts`, which the
@@ -581,8 +581,8 @@ export {
 } from './session-ending-commands.ts'
 
 /**
- * What CSCB's own notice and recovery lines never spell, beyond SR-1.4's five
- * session-ending forms (b.jg5 SRJ-1001; SRJ-716's label option names): a pane
+ * What CSCB's own notice and recovery lines never spell, beyond five
+ * session-ending forms (label option names): a pane
  * kill, a tmux option write, an agent-director row delete, the latch-clearing
  * command, a session probe, and either label option's name. Not global, so
  * no pattern keeps a `lastIndex` between tests.
@@ -602,22 +602,22 @@ export function cscbOwnLineForbiddenIn(line: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// The human-only sentence (b.jg5 SRJ-1001)
+// The human-only sentence
 // ---------------------------------------------------------------------------
 
 /** What a human-only sentence opens with: "This is", "These commands are", "These remedies are", "Both notices are", "it is", "its commands are". */
 const HUMAN_ONLY_LEAD = String.raw`(?:(?:This|It|it) is|(?:These|these|its) (?:commands|remedies) are|Both notices are)`
 
-/** The persona it names: "any persona that sees this post" in the notices, "a persona that sees the post" in the SRD's and the docs' wordings. */
+/** The persona it names: "any persona that sees this post" in the notices, "a persona that sees the post" in the contract's and the docs' wordings. */
 const HUMAN_ONLY_PERSONA = String.raw`(?:any|a) persona that sees (?:this|the) post`
 
 /**
- * SRJ-1001's human-only sentence, the one pattern every test file uses for
+ * human-only sentence, the one pattern every test file uses for
  * it. A notice that names a command or points to "Operator actions" carries
  * it. Its wordings differ, so no src constant is matched: the notices'
  * "no bot, including any persona that sees this post, may act on it" (a
  * pointer), "… may act on them" (several remedies) and "… may run them"
- * (commands), the SRD's "… any persona that sees the post, may act on it",
+ * (commands), the contract's "… any persona that sees the post, may act on it",
  * and the docs' "no bot runs them, including a persona that sees the post"
  * and "no bot acts on it" (or "on them"). Not global, so it keeps no
  * `lastIndex` between tests; {@link humanOnlySentencesIn} finds every one.
@@ -642,7 +642,7 @@ const ASK_USER = latchRowStateRead('ask_user')
 const CHECK_PERMISSION = latchRowStateRead('check_permission')
 
 // ---------------------------------------------------------------------------
-// The re-check columns (E30; b.jg5 SRJ-505, SRJ-506, SRJ-1005, SRJ-1304)
+// The re-check columns
 // ---------------------------------------------------------------------------
 
 /** The read step 1 makes of P's row: `get` for "conflicting labels" (only `get` shows a note), `status` otherwise. */
@@ -660,7 +660,7 @@ export interface RecheckAnswer {
   readonly answer: () => Error | undefined
 }
 
-/** An answer that clears the latch, with SRJ-1005's reason for the recovery notice. */
+/** An answer that clears the latch, with reason for the recovery notice. */
 export interface RecheckClearingAnswer extends RecheckAnswer {
   readonly reason: LatchRecoveryReason
 }
@@ -671,8 +671,8 @@ export interface RecheckRelatchingAnswer extends RecheckAnswer {
 }
 
 /**
- * What the answers to one re-check call do (b.jg5 SRJ-505's "Still latched"
- * and "Cleared" columns, SRJ-506's retry answers), for the calls whose verb
+ * What the answers to one re-check call do ("Still latched"
+ * and "Cleared" columns retry answers), for the calls whose verb
  * is one: the probe and the lap `read-pane` (`read-pane`), a plain spawn or a
  * reuse (`spawn`) and a `resume`. A run of the restart path's decision and
  * the finished-row retry have none here (their answers are a run's, and
@@ -691,7 +691,7 @@ export interface RecheckAnswers {
   readonly stillLatched: readonly RecheckAnswer[]
   /** Clear the latch (a retry's answer that was not refused, a definite failure, the lap `read-pane`'s pane or GONE). */
   readonly cleared: readonly RecheckClearingAnswer[]
-  /** The probe only: answers that find the condition cleared; P stays latched (SRJ-506's `find-missing` and single retry follow). */
+  /** The probe only: answers that find the condition cleared; P stays latched (`find-missing` and single retry follow). */
   readonly probeFoundCleared: readonly RecheckAnswer[]
   /** Relatch P: a CONFLICT with another case at a retry or the lap `read-pane`, and UNUSABLE NAME at any call. */
   readonly relatches: readonly RecheckRelatchingAnswer[]
@@ -715,7 +715,7 @@ export type RecheckReadingName =
 
 /**
  * One entry of a row's re-check columns: what step 1's read gave and what
- * the re-check then does, as SRJ-505 says.
+ * the re-check then does, as says.
  */
 export interface RecheckEntry {
   readonly name: RecheckReadingName
@@ -725,23 +725,22 @@ export interface RecheckEntry {
    * The re-check's decision for the row's record and that reading, whole
    * (`decideLatchRecheck`'s answer, `LatchRecheckDecision`): step 1's
    * outcome, the action, the one call after the read (none for a "still
-   * latched" reading) and, for a reading that clears, SRJ-1005's reason.
+   * latched" reading) and, for a reading that clears reason.
    */
   readonly decision: LatchRecheckDecision
-  /** The call when the key is recorded in `retired-keys.json` (b.jg5 SRJ-805): a `resume` or a plain spawn is the reuse. */
+  /** The call when the key is recorded in `retired-keys.json`: a `resume` or a plain spawn is the reuse. */
   readonly retiredKeyCall: LatchRecheckCall
   /** What the call's answers do; absent for no call, a run of the restart path's decision and the finished-row retry. */
   readonly answers?: RecheckAnswers
 }
 
 /**
- * The re-check's columns of one latch case row (E30; b.jg5 SRJ-505,
- * SRJ-1304): the read step 1 makes, SRJ-505's table action for the row's
+ * The re-check's columns of one latch case row ( *): the read step 1 makes table action for the row's
  * refused operation and case, and one entry per state step 1 can read.
  */
 export interface RecheckColumns {
   readonly readVerb: RecheckReadVerb
-  /** SRJ-505's "Re-check action" for the row's (refused operation, case): `RECHECK_ACTION_*`. */
+  /** "Re-check action" for the row's (refused operation, case): `RECHECK_ACTION_*`. */
   readonly action: LatchRecheckAction
   readonly entries: readonly RecheckEntry[]
 }
@@ -752,7 +751,7 @@ export type RecheckLatchEntries = Pick<ConflictLatch, 'set' | 'setFromConflict' 
 /** The live state a row reads once its session has reported in, as the entries read it. */
 const REPORTED_IN_STATE = cannedStatusResult().state
 
-/** The live states a row has reported in by (SRJ-505 step 1): every live state but `pending`. */
+/** The live states a row has reported in by (step 1): every live state but `pending`. */
 const REPORTED_IN_STATES: ReadonlySet<string> = new Set([...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE))
 
 /** A step-1 reading of a row in `state`, with the note (a `get`'s) or not; a `status` reading says nothing of the note. */
@@ -793,7 +792,7 @@ interface RecheckStubCase {
   readonly options: ConflictOptions
 }
 
-/** The cases SRJ-505's no-probe retry row names for a `resume`, a reuse or a bring-up. */
+/** The cases no-probe retry row names for a `resume`, a reuse or a bring-up. */
 const NO_PROBE_RETRY_CASES: ReadonlySet<LatchCase> = new Set<LatchCase>([
   LATCH_CASE_NO_VALID_ID,
   LATCH_CASE_DIFFERENT_ID,
@@ -807,7 +806,7 @@ function isLatchedLaunch(refusedOperation: RefusedOperation): boolean {
 }
 
 /**
- * SRJ-505's table action for a record: the first table row that matches its
+ * table action for a record: the first table row that matches its
  * refused operation and case (the "this row's own id" probe dropped for the
  * episode, then the probe, then the no-probe retry, the plain spawn, "not
  * this launch's session", "conflicting labels", the two hold cases, and
@@ -835,7 +834,7 @@ function isUnmatchedPair(record: RecheckRecord): boolean {
 
 /**
  * Whether the latch record shows the row had not reported in when the latch
- * was set (SRJ-505 step 1): it then read `pending`, `ended` or `missing`, or
+ * was set (step 1): it then read `pending`, `ended` or `missing`, or
  * there was no row. An unreadable state, or a live one, did not.
  */
 function recordedBeforeReportingIn(rowState: LatchRowState): boolean {
@@ -850,8 +849,8 @@ function decision(step: LatchRecheckStep, action: LatchRecheckAction, call: Latc
 
 /**
  * The re-check's decision for `record` on step 1's `reading`, written from
- * SRJ-505's text (step 1's three bullets, then the first matching table
- * row, HO rev 28's gate on a latched `resume` or reuse, and hatch A3's
+ * text (step 1's three bullets, then the first matching table
+ * row, HO rev 28's gate on a latched `resume` or reuse, and design A3's
  * unmatched pair), so the table checks `decideLatchRecheck` independently.
  */
 function expectedRecheckDecision(record: RecheckRecord, reading: LatchRecheckReading): LatchRecheckDecision {
@@ -912,7 +911,7 @@ function expectedRecheckDecision(record: RecheckRecord, reading: LatchRecheckRea
   }
 }
 
-/** `call` as made for a key recorded in `retired-keys.json` (b.jg5 SRJ-805): a `resume` or a plain spawn is the reuse. */
+/** `call` as made for a key recorded in `retired-keys.json`: a `resume` or a plain spawn is the reuse. */
 function retiredKeyCallOf(call: LatchRecheckCall): LatchRecheckCall {
   return call === RECHECK_CALL_RESUME || call === RECHECK_CALL_PLAIN_SPAWN ? RECHECK_CALL_REUSE_SPAWN : call
 }
@@ -978,7 +977,7 @@ export const RECHECK_UNUSABLE_NAME_ANSWER: RecheckRelatchingAnswer = Object.free
 
 /**
  * The answers that give a re-check no information at a call of `verb`
- * (b.jg5 SRJ-505, AC 71): UNAVAILABLE (`ErrTmuxUnresponsive`,
+ * UNAVAILABLE (`ErrTmuxUnresponsive`,
  * `ErrCallTimeout`, `ErrUnknownErrorName`), ENVIRONMENT
  * (`ErrTmuxNotAvailable`) and UNCLASSIFIED (an `ErrInternal` that is no
  * unusable recorded name, `ErrSchemaMismatch`); at `read-pane` also an
@@ -1101,7 +1100,7 @@ export interface FinishedRowRetryEntry {
   readonly hasSessionId: boolean
   /** The launch (`decideFinishedRowLaunch`'s answer): a `resume`, a reuse, the plain first spawn, or none. */
   readonly call: LatchRecheckCall
-  /** The launch for a key recorded in `retired-keys.json`: the reuse in place of a `resume` or a plain spawn (b.jg5 SRJ-805). */
+  /** The launch for a key recorded in `retired-keys.json`: the reuse in place of a `resume` or a plain spawn. */
   readonly retiredKeyCall: LatchRecheckCall
   /** What the launch's answers do; a launch that is not refused clears with "its row finished and a relaunch was not refused". */
   readonly answers?: RecheckAnswers
@@ -1113,8 +1112,8 @@ function finishedRowEntry(name: string, reading: LatchRecheckReading, hasSession
 }
 
 /**
- * A "not this launch's session" latch's finished-row retry (b.jg5 SRJ-505;
- * hatch A3; HO rev 28), one entry per state its one `get` can read: a
+ * A "not this launch's session" latch's finished-row retry (
+ * design A3; HO rev 28), one entry per state its one `get` can read: a
  * failed read and a row read live (`pending` included) make no launch; a row
  * read `ended` or `missing` gets a `resume` when it has a session id, else a
  * reuse; no row left gets the plain first spawn. Never a kill and never a
@@ -1204,7 +1203,7 @@ export type ReconnectLastRead = 'waiting' | 'working'
 
 /**
  * The latch row state the reconnect's rows record for each state its caller
- * last read (b.jg5 SRJ-501), in row order: `waiting`, then `working`.
+ * last read, in row order: `waiting`, then `working`.
  */
 export const RECONNECT_ROW_STATES: Readonly<Record<ReconnectLastRead, LatchRowState>> = Object.freeze({
   waiting: WAITING,
@@ -1269,11 +1268,11 @@ const KILL_CASES: readonly (readonly [ConflictCase, ConflictLatchCase])[] = [
 ]
 
 /**
- * The restart path's kill CONFLICT rows (E20; b.jg5 SRJ-110, SRJ-501, the E13
- * hatch note): one row per case `kill` answers, each refusing P's next check
+ * The restart path's kill CONFLICT rows (the
+ * design note): one row per case `kill` answers, each refusing P's next check
  * or recovery and recording the state the run's `dead` reading carries
- * (`ended`), with no latch-time `status` read (`latchTimeRead` false, b.jg5
- * SRJ-501): the restart path kills only after a `dead` reading.
+ * (`ended`), with no latch-time `status` read (`latchTimeRead` false
+ *): the restart path kills only after a `dead` reading.
  */
 const RESTART_KILL_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stubCase, latchCase]) =>
   Object.freeze({
@@ -1295,11 +1294,10 @@ export const SEQUENCE_KILL_ROW_STATES: Readonly<Record<SequenceKillLastRead, Lat
 const SEQUENCE_KILL_LAST_READS = Object.keys(SEQUENCE_KILL_ROW_STATES) as SequenceKillLastRead[]
 
 /**
- * The live-row sequence's kill CONFLICT rows (E21; b.jg5 SRJ-110, SRJ-501,
- * SRJ-705): for each sequence kill and each state the sequence last read,
+ * The live-row sequence's kill CONFLICT rows ( *): for each sequence kill and each state the sequence last read,
  * one row per case `kill` answers, each refusing P's next check or recovery
  * and recording that state with no latch-time `status` read. The step-1
- * kill's "not this launch's session" row on a `pending` seed is SRJ-613's
+ * kill's "not this launch's session" row on a `pending` seed is
  * kill backstop (`killBackstop`).
  */
 const SEQUENCE_KILL_ROWS: readonly ConflictCaseRow[] = SEQUENCE_KILL_SITES.flatMap((site) =>
@@ -1318,11 +1316,10 @@ const SEQUENCE_KILL_ROWS: readonly ConflictCaseRow[] = SEQUENCE_KILL_SITES.flatM
 )
 
 /**
- * The stuck-launch abort's kill CONFLICT rows (E29; b.jg5 SRJ-412, SRJ-110,
- * SRJ-501, SRJ-613): one row per case `kill` answers, each refusing P's next
+ * The stuck-launch abort's kill CONFLICT rows ( *): one row per case `kill` answers, each refusing P's next
  * check or recovery and recording `pending` (the abort kills only a row the
  * rule's `get` read `pending`) with no latch-time `status` read. The "not
- * this launch's session" row is SRJ-613's kill backstop (`killBackstop`).
+ * this launch's session" row is kill backstop (`killBackstop`).
  */
 const STUCK_LAUNCH_ABORT_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stubCase, latchCase]) =>
   Object.freeze({
@@ -1333,7 +1330,7 @@ const STUCK_LAUNCH_ABORT_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stu
 )
 
 /**
- * The plain spawn's CONFLICT rows (b.jg5 SRJ-111, SRJ-501, SRJ-507; HO rev
+ * The plain spawn's CONFLICT rows (HO rev
  * 15, rev 20), each refusing the plain spawn and carrying the row
  * agent-director leaves (`rowAfter`): none after the pre-spawn scan's
  * refusals ("left over from an earlier life", and "conflicting labels" in its
@@ -1355,8 +1352,8 @@ export const PLAIN_SPAWN_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object
 
 /**
  * What a plain first spawn's latch-time `status` read gave, for the latches
- * whose record shows no row that had not reported in (b.jg5 SRJ-501,
- * SRJ-505, hatch A3): the read failed, or it read the row live other than
+ * whose record shows no row that had not reported in (
+ * design A3): the read failed, or it read the row live other than
  * `pending` (agent-director's end write after "duplicate session" was not
  * applied, or another agent-director write changed the row).
  */
@@ -1369,13 +1366,13 @@ export const PLAIN_SPAWN_LATCH_TIME_ROW_STATES: Readonly<Record<PlainSpawnLatchT
 })
 
 /**
- * The plain spawn's latches recorded unreadable or live (E30 T3; b.jg5
- * SRJ-505's "a plain-spawn latch recorded live or unreadable", hatch A3):
+ * The plain spawn's latches recorded unreadable or live (
+ * "a plain-spawn latch recorded live or unreadable", design A3):
  * for each {@link PlainSpawnLatchTimeReading}, one row per
  * {@link PLAIN_SPAWN_CONFLICT_CASE_ROWS} row (the same case, option set and
  * `rowAfter`), recording that reading's state, named `plain spawn (recorded
  * <reading>): <stub case>`. Step 1 clears none of them on a live reading, so
- * their re-check columns show the plain-spawn row of SRJ-505's table on every
+ * their re-check columns show the plain-spawn row of the contract table on every
  * state step 1 can read: no row, the plain spawn; `ended` or `missing`, a
  * spawn with `--reuse-finished`; `pending` and another live state
  * (`waiting`), no retry. They are not in {@link CONFLICT_CASE_ROWS} (the
@@ -1404,7 +1401,7 @@ export const PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS: readonly ConflictCaseRow[] = O
 )
 
 /**
- * The reuse spawn's CONFLICT rows (E22; b.jg5 SRJ-112, SRJ-501, SRJ-507; HO
+ * The reuse spawn's CONFLICT rows (HO
  * rev 15, rev 20): one row per stub case a spawn can answer, each refusing
  * the reuse spawn. A reuse of an id with no row is an ordinary fresh spawn:
  * its pre-spawn scan's refusals record no row and are marked `noRowWritten`.
@@ -1426,7 +1423,7 @@ const REUSE_SPAWN_ROWS: readonly ConflictCaseRow[] = [
 ]
 
 /**
- * The `resume` CONFLICT rows (b.jg5 SRJ-113, SRJ-501; HO rev 15, rev 20):
+ * The `resume` CONFLICT rows (HO rev 15, rev 20):
  * a `resume` on the finished-row path records `ended`, the state its path
  * last read; unrecognised text records unreadable, where the path could not
  * read the row's state. "another agent-director store" in both its forms
@@ -1451,8 +1448,8 @@ export type SequenceResumeLastRead = typeof LIVENESS_DEAD_ROW_ENDED | typeof LIV
 
 /**
  * The latch row state the sequence `resume` rows record for each state the
- * sequence's last `get` read before its step-6 `resume` (b.jg5 SRJ-501,
- * SRJ-705 step 3), in row order. A row read with no row has no session id,
+ * sequence's last `get` read before its step-6 `resume` (
+ * step 3), in row order. A row read with no row has no session id,
  * so its step 6 is a reuse, never a `resume`.
  */
 export const SEQUENCE_RESUME_ROW_STATES: Readonly<Record<SequenceResumeLastRead, LatchRowState>> = Object.freeze({
@@ -1461,8 +1458,7 @@ export const SEQUENCE_RESUME_ROW_STATES: Readonly<Record<SequenceResumeLastRead,
 })
 
 /**
- * The live-row sequence's step-6 `resume` CONFLICT rows (b.jg5 SRJ-113,
- * SRJ-501, SRJ-705): for each state in
+ * The live-row sequence's step-6 `resume` CONFLICT rows: for each state in
  * {@link SEQUENCE_RESUME_ROW_STATES}, one row per `resume` row (the same
  * case, option set and latch case), each refusing the `resume` and
  * recording the state the sequence's last `get` read, named
@@ -1497,7 +1493,7 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (no row after), then the
   // "duplicate session" answers (the row `ended` after).
   ...PLAIN_SPAWN_CONFLICT_CASE_ROWS,
-  // A spawn with `--reuse-finished` (E22): of a finished row, and of an id
+  // A spawn with `--reuse-finished` : of a finished row, and of an id
   // with no row (an ordinary fresh spawn, which the pre-spawn scan refuses).
   ...REUSE_SPAWN_ROWS,
   // A `resume` on the finished-row path; unrecognised text where the path
@@ -1514,25 +1510,25 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   paneOrKill('kill', 'never-reported-in', LATCH_CASE_NEVER_REPORTED_IN, PENDING),
   paneOrKill('kill', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, WORKING),
 
-  // The liveness checks' `read-pane` sites (E18).
+  // The liveness checks' `read-pane` sites .
 
-  // The reconnect's `send-keys` (E19 T1).
+  // The reconnect's `send-keys` .
   ...RECONNECT_ROWS,
-  // b.jdc's prompt-row `read-pane` sites (E19 T2).
+  // prompt-row `read-pane` sites .
   ...PROMPT_ROW_PANE_ROWS,
-  // The checked kill's sites (E20): the restart path's kill.
+  // The checked kill's sites : the restart path's kill.
   ...RESTART_KILL_ROWS,
-  // The live-row sequence's two kills (E21).
+  // The live-row sequence's two kills .
   ...SEQUENCE_KILL_ROWS,
-  // The stuck-launch abort's kill (E29).
+  // The stuck-launch abort's kill .
   ...STUCK_LAUNCH_ABORT_ROWS,
 ])
 
-/** The liveness checks' `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E18), for `test.each`. */
+/** The liveness checks' `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (), for `test.each`. */
 
 /** The liveness pane CONFLICT rows of one site kind, for `test.each`. */
 
-/** The reconnect's `send-keys` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E19 T1), for `test.each`. */
+/** The reconnect's `send-keys` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (), for `test.each`. */
 export const RECONNECT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => isReconnectSite(caseRow.site)),
 )
@@ -1542,7 +1538,7 @@ export function reconnectConflictRowsAt(lastRead: ReconnectLastRead): readonly C
   return RECONNECT_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.rowState === RECONNECT_ROW_STATES[lastRead])
 }
 
-/** b.jdc's prompt-row `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E19 T2), for `test.each`. */
+/** prompt-row `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (), for `test.each`. */
 export const PROMPT_ROW_PANE_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => isPromptRowPaneSite(caseRow.site)),
 )
@@ -1557,7 +1553,7 @@ export function promptRowPaneConflictRowsAt(site: PromptRowPaneSite, state: stri
   )
 }
 
-/** The reuse spawn's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E22), for `test.each`. */
+/** The reuse spawn's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (), for `test.each`. */
 export const REUSE_SPAWN_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === REUSE_SPAWN_SITE),
 )
@@ -1567,12 +1563,12 @@ export function reuseSpawnScanRows(): readonly ConflictCaseRow[] {
   return REUSE_SPAWN_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.noRowWritten === true)
 }
 
-/** The restart path's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E20), for `test.each`. */
+/** The restart path's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (), for `test.each`. */
 export const RESTART_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === RESTART_KILL_SITE),
 )
 
-/** The live-row sequence's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E21), for `test.each`. */
+/** The live-row sequence's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (), for `test.each`. */
 export const SEQUENCE_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => isSequenceKillSite(caseRow.site)),
 )
@@ -1584,7 +1580,7 @@ export function sequenceKillConflictRowsAt(site: SequenceKillSite, lastRead: Seq
 
 /**
  * The stuck-launch abort's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS}
- * (E29; one per case `kill` answers, each recording `pending`; the "not this
+ * (one per case `kill` answers, each recording `pending`; the "not this
  * launch's session" row carries `killBackstop`), for `test.each`.
  */
 export const STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
@@ -1592,12 +1588,12 @@ export const STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] =
 )
 
 // ---------------------------------------------------------------------------
-// The expected latch record of a hold case (b.jg5 SRJ-501)
+// The expected latch record of a hold case
 // ---------------------------------------------------------------------------
 
 /**
  * The record a latch of persona `key` holds for the set input `input`, as
- * SRJ-501 says a record holds it: the case, the refused operation and the
+ * says a record holds it: the case, the refused operation and the
  * row state as given; the session and the description rendered by
  * `renderLogMessageText` (redacted, on one line, capped), the session
  * `slack_bot_<key>` (`personaTmuxSessionName`) when that is empty, no
@@ -1623,7 +1619,7 @@ export function expectedLatchRecord(key: string, input: ConflictLatchSetInput): 
 }
 
 // ---------------------------------------------------------------------------
-// The unusable recorded name (b.jg5 SRJ-512, SRJ-1019)
+// The unusable recorded name
 // ---------------------------------------------------------------------------
 
 export type UnusableNameSite =
@@ -1683,13 +1679,13 @@ export interface UnusableNameCaseRow {
   readonly description: string
   /** The session the record holds for persona `key`. */
   readonly sessionName: (key: string) => string
-  /** The SRJ-1019 notice body for persona `key` (the persona notifier adds the prefix). */
+  /** The notice body for persona `key` (the persona notifier adds the prefix). */
   readonly notice: (key: string) => string
   /** The whole latch record a latch of persona `key` from this row holds ({@link expectedLatchRecord} of `unusableNameSetInput`). */
   readonly record: (key: string) => ConflictLatchRecord
   /** Latch persona `key` as the row's site does, through the latch's `setFromUnusableName` with the row's error and state. */
   readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome | undefined
-  /** The re-check's columns (E30; b.jg5 SRJ-505's "unusable recorded name" row: `status` only). */
+  /** The re-check's columns ("unusable recorded name" row: `status` only). */
   readonly recheck: RecheckColumns
 }
 
@@ -1708,13 +1704,13 @@ const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, Reconne
   // read no state; its pane verbs follow the lap's `pending` read.
 
   // The restart path's kill records the state its run's `dead` reading
-  // carries (b.jg5 SRJ-501), with no latch-time `status` read: `ended` here.
+  // carries, with no latch-time `status` read: `ended` here.
   [RESTART_KILL_SITE]: ENDED,
-  // The reuse spawn records the state its path last read (b.jg5 SRJ-501),
+  // The reuse spawn records the state its path last read,
   // with no latch-time `status` read: `ended` here, a finished row.
   [REUSE_SPAWN_SITE]: ENDED,
   // The stuck-launch abort's kill records `pending`, the state the
-  // pending-row rule's `get` last read (b.jg5 SRJ-412, SRJ-501), with no
+  // pending-row rule's `get` last read, with no
   // latch-time `status` read.
   [STUCK_LAUNCH_ABORT_SITE]: PENDING,
 })
@@ -1772,27 +1768,27 @@ export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.fr
   ),
 )
 
-/** The reconnect's `send-keys` UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E19 T1), for `test.each`. */
+/** The reconnect's `send-keys` UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (), for `test.each`. */
 export const RECONNECT_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isReconnectSite(caseRow.site)),
 )
 
-/** The restart path's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E20), for `test.each`. */
+/** The restart path's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (), for `test.each`. */
 export const RESTART_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === RESTART_KILL_SITE),
 )
 
-/** The live-row sequence's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E21), for `test.each`. */
+/** The live-row sequence's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (), for `test.each`. */
 export const SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isSequenceKillSite(caseRow.site)),
 )
 
-/** The reuse spawn's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E22), for `test.each`. */
+/** The reuse spawn's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (), for `test.each`. */
 export const REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === REUSE_SPAWN_SITE),
 )
 
-/** The stuck-launch abort's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E29; one per fault, each recording `pending`), for `test.each`. */
+/** The stuck-launch abort's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (; one per fault, each recording `pending`), for `test.each`. */
 export const STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isStuckLaunchAbortSite(caseRow.site)),
 )
@@ -1808,7 +1804,7 @@ export function reconnectUnusableNameRowsAt(lastRead: ReconnectLastRead): readon
 }
 
 // ---------------------------------------------------------------------------
-// The launch start not recorded (b.jg5 SRJ-513, SRJ-408, SRJ-1020)
+// The launch start not recorded
 // ---------------------------------------------------------------------------
 
 /** What each read shape answers, as the stub's canned builders build it. */
@@ -1825,7 +1821,7 @@ export type LaunchStartReadShape = keyof LaunchStartReadResults
 export const LAUNCH_START_READ_SHAPES: readonly LaunchStartReadShape[] = Object.freeze(['status', 'get', 'list'] as const)
 
 /**
- * Which of persona P's rows a latching row is (SRJ-513: "whether or not it is
+ * Which of persona P's rows a latching row is ("whether or not it is
  * P's current life"): P's current life, or P's own row with a `cwd` or a
  * `config_dir` label other than P's.
  */
@@ -1838,7 +1834,7 @@ export const LAUNCH_START_ROW_VARIANTS: readonly LaunchStartRowVariant[] = Objec
   'other config_dir',
 ] as const)
 
-/** A form of "no launch start" (SRJ-408): the field absent, `null`, or a value that does not parse. */
+/** A form of "no launch start": the field absent, `null`, or a value that does not parse. */
 export type NoLaunchStartForm = 'absent' | 'null' | 'unparseable'
 
 /**
@@ -1868,7 +1864,7 @@ export const NO_LAUNCH_START_FORM_NAMES: readonly NoLaunchStartForm[] = Object.f
 export const LAUNCH_START_ANOTHER_CALLERS_ID = 'another-caller-instance'
 /** A key no configured persona uses: an absent persona's. */
 export const LAUNCH_START_ABSENT_PERSONA_KEY = 'absent_persona'
-/** The key of a pre-persona row's id (`cscb_<key>`, labelled `service=cscb` only, b.1ix). */
+/** The key of a pre-persona row's id (`cscb_<key>`, labelled `service=cscb` only). */
 export const LAUNCH_START_PRE_PERSONA_KEY = 'legacy'
 
 /** The fields a row variant or kind overrides: those every read shape's builder takes. */
@@ -1983,19 +1979,19 @@ export interface LaunchStartCaseRowOf<S extends LaunchStartReadShape> extends La
   readonly rowState: LatchRowState
   /** The session the record holds for persona `key`: `personaTmuxSessionName(key)`. */
   readonly sessionName: (key: string) => string
-  /** The SRJ-1020 notice body for persona `key` (the persona notifier adds the prefix). */
+  /** The notice body for persona `key` (the persona notifier adds the prefix). */
   readonly notice: (key: string) => string
   /** The whole latch record a latch of persona `key` from this row holds: {@link launchStartRecord}. */
   readonly record: (key: string) => ConflictLatchRecord
   /** Latch persona `key` as the reading site does, through the latch's `setLaunchStartNotRecorded` with `pending`. */
   readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome
-  /** The re-check's columns (E30; b.jg5 SRJ-505's "launch start not recorded" row: `status` only). */
+  /** The re-check's columns ("launch start not recorded" row: `status` only). */
   readonly recheck: RecheckColumns
 }
 
 /**
  * The record a "launch start not recorded" latch of persona `key` holds
- * (SRJ-501, SRJ-513): {@link expectedLatchRecord} of `src/conflict-latch.ts`'s
+ * {@link expectedLatchRecord} of `src/conflict-latch.ts`'s
  * `launchStartNotRecordedSetInput(key, pending)`: the case "launch start not
  * recorded", the refused operation "none", the state `pending`, the session
  * `slack_bot_<key>` as the record stores it, and no description.
@@ -2081,17 +2077,16 @@ export const LAUNCH_START_CASE_ROWS: readonly LaunchStartCaseRow[] = Object.free
 /**
  * P's current-life `get` row reading `pending` with no launch start (absent)
  * and carrying `provenanceNote`: the launch-start decision only, never the
- * note's "conflicting labels" (SRJ-513's precedence).
+ * note's "conflicting labels" (precedence).
  */
 export const LAUNCH_START_AND_NOTE_ROW: LaunchStartCaseRowOf<'get'> = launchStartRow('get', 'current life', 'absent', provenanceNote)
 
 // ---------------------------------------------------------------------------
-// The note latch (b.jg5 SRJ-114, SRJ-501, SRJ-505)
+// The note latch
 // ---------------------------------------------------------------------------
 
 /**
- * One latch from the `provenance_conflict` note on P's own row (b.jg5
- * SRJ-114, SRJ-501): "conflicting labels", P's bring-up refused, the row's
+ * One latch from the `provenance_conflict` note on P's own row: "conflicting labels", P's bring-up refused, the row's
  * state as the `get` read it. Its re-check reads with `get`.
  */
 export interface NoteLatchCaseRow {
@@ -2110,7 +2105,7 @@ export interface NoteLatchCaseRow {
   readonly record: (key: string) => ConflictLatchRecord
   /** Latch persona `key` as the shared own-row read does, through the latch's `set`. */
   readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome
-  /** The re-check's columns (b.jg5 SRJ-505's "conflicting labels" row, a latch from a note: `get` first). */
+  /** The re-check's columns ("conflicting labels" row, a latch from a note: `get` first). */
   readonly recheck: RecheckColumns
 }
 
@@ -2140,7 +2135,7 @@ function noteLatchRow(state: string): NoteLatchCaseRow {
 }
 
 /**
- * The note latches (b.jg5 SRJ-114, SRJ-505): P's own row read with the note
+ * The note latches: P's own row read with the note
  * `pending` (with the stub's sample launch start, so no launch-start latch),
  * `waiting` (a live, reported-in row) and `ended`, for `test.each`.
  */
@@ -2242,7 +2237,7 @@ export const LAUNCH_START_NON_LATCHING_ROWS: readonly LaunchStartNonLatchingRow[
 )
 
 // ---------------------------------------------------------------------------
-// The tmux-touching verbs (HO C24; ADSRD SR-1.4; b.jg5 SRJ-502)
+// The tmux-touching verbs (HO C24; agent-director contract)
 // ---------------------------------------------------------------------------
 
 /** One tmux-touching verb and the stub call-log list that records its calls. */
@@ -2256,9 +2251,9 @@ export interface TmuxTouchingStubVerb {
  * each: `resume`, `spawn` in both forms (plain and `--reuse-finished`, both
  * in `spawnCalls`), `read-pane`, `send-keys`, `kill` and `pause`. HO C24
  * says no tmux-touching call is made for an unusable recorded name, and
- * ADSRD SR-1.4 is where agent-director names these verbs as the ones that
+ * agent-director contract is where agent-director names these verbs as the ones that
  * reach tmux; a `kill` counts here whatever row it was declared for, so a
- * test's "no tmux-touching call" check is never weaker than SRJ-502's.
+ * test's "no tmux-touching call" check is never weaker than.
  */
 export const TMUX_TOUCHING_STUB_VERBS: readonly TmuxTouchingStubVerb[] = Object.freeze([
   Object.freeze({ verb: 'resume', log: 'resumeCalls' }),

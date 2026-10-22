@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# The per-shard in-container runner (b.uqm SR-11). The host runner,
+# The per-shard in-container runner. The host runner,
 # scripts/ci-run.ts, starts one shard container per shard; docker/entrypoint.sh
 # passes this runner the container's arguments unchanged. It runs only the
 # scripts it is given, in the given order, and leaves its evidence in fixed
 # formats in its shard subdirectory, mounted at /test-results, for the host
 # runner to merge and check.
 #
-# Arguments, in this order (b.uqm SR-11.2):
+# Arguments, in this order:
 #   <shard number>          a whole number of at least 1, with no leading zero
 #   <canary>                32 lowercase hexadecimal characters
 #   --keep-going           optional: continue independent scripts after cleanup
@@ -17,7 +17,7 @@
 # Malformed arguments print one line on stderr beginning `usage: ` and exit 64,
 # writing nothing.
 #
-# What it writes in /test-results, and nothing else (b.uqm SR-11.3):
+# What it writes in /test-results, and nothing else:
 #   canary.txt              the canary and one LF, before any script runs
 #   package.sha256          the SHA-256 of /tmp/package.tgz, 64 lowercase
 #                           hexadecimal characters and one LF, before any
@@ -40,11 +40,11 @@
 # By default its first failure stops this shard. With --keep-going, failed
 # prerequisites and unsafe cleanup block continuation explicitly. It writes
 # `done`, then stays running, idle, until the host runner
-# kills its container (b.uqm SR-11.4). As the container's PID 1 it ignores
+# kills its container. As the container's PID 1 it ignores
 # SIGTERM; after `done` it ignores it explicitly too.
 #
 # The canary goes only into canary.txt: this runner exports nothing, so no
-# script's environment changes (b.uqm SR-13.1).
+# script's environment changes.
 #
 # Runs only in a cscb-ci image: its first step checks for the image marker
 # /etc/cscb-ci-image (docker/Dockerfile.test.base) and, when it is absent,
@@ -58,7 +58,7 @@ if [[ ! -e /etc/cscb-ci-image ]]; then
 fi
 
 # The host runner's exported names and texts (scripts/ci-run.ts), each spelled
-# exactly as the export of the same name: the single source (b.uqm SR-11.5).
+# exactly as the export of the same name: the single source.
 USAGE_PREFIX='usage: '
 USAGE_EXIT_STATUS=64
 RUNNER_FAIL_OPTION='--fail'
@@ -88,7 +88,7 @@ CANARY_PATTERN="^[0-9a-f]{${CANARY_LENGTH}}\$"
 SHA256_HEX_PATTERN="^[0-9a-f]{${SHA256_HEX_LENGTH}}\$"
 # The installed packages' directory, and a package.json that sits in a package
 # directory directly in a node_modules directory, or directly in an @<scope>
-# directory within one (b.uqm SR-11.3).
+# directory within one.
 NODE_MODULES_DIR='/test-repo/node_modules'
 PACKAGE_JSON_PATH_PATTERN='.*/node_modules/(@[^/]+/)?[^/]+/package\.json'
 
@@ -161,7 +161,7 @@ package_lines() {
 }
 
 # Prints the dependency fingerprint: the SHA-256 of package_lines, sorted
-# bytewise under the C locale with repeats removed (b.uqm SR-11.3).
+# bytewise under the C locale with repeats removed.
 dependency_fingerprint() {
     package_lines | LC_ALL=C sort -u | sha256_hex
 }
@@ -275,7 +275,7 @@ read_dependencies() {
     done
 }
 
-# --- The arguments (b.uqm SR-11.2): checked whole before anything is written ---
+# --- The arguments: checked whole before anything is written ---
 
 (( $# >= 1 )) || usage "the shard number is missing"
 [[ $1 =~ ${SHARD_NUMBER_PATTERN} ]] || usage "argument 1 is not a shard number: a whole number of at least 1, with no leading zero"
@@ -318,7 +318,7 @@ for (( index = 0; index < ${#fail_names[@]}; index++ )); do
     is_in "${name}" "${fail_names[@]:0:index}" && usage "argument ${position}: ${RUNNER_FAIL_OPTION} names a file a second time"
 done
 
-# --- The early files (b.uqm SR-11.3): before any script runs ---
+# --- The early files: before any script runs ---
 
 tests_dir="$(cd "$(dirname "$0")" && pwd)"
 declare -A dependencies=() outcomes=() infrastructure=()
@@ -339,7 +339,7 @@ else
     echo "runner.sh: the SHA-256 of ${INTEGRITY_TARBALL_MOUNT_TARGET} could not be taken; ${PACKAGE_SHA256_FILE_NAME} is not written" >&2
 fi
 
-# --- The assigned scripts, in order (b.uqm SR-11.3, SR-11.4) ---
+# --- The assigned scripts, in order ---
 
 failed=0
 unsafe_cleanup=0
@@ -367,7 +367,7 @@ for (( index = 0; index < ${#assigned[@]}; index++ )); do
     fi
 
     : > "${INTEGRITY_RESULTS_MOUNT_TARGET}/${name}${SCRIPT_LOG_SUFFIX}" || exit 1
-    # Keep all ordinary work shared; measure AC76 with no other managed
+    # Keep all ordinary work shared; measure with no other managed
     # script/build running. Stop the intentional dry-run baseline first.
     if [[ ${name} == test-32-* ]]; then
         daemon_pid=''; daemon_start=''

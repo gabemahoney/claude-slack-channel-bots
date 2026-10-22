@@ -250,7 +250,7 @@ check_cadence() {
 }
 
 # status_rounds <step> <from-mark> [<to-mark>]: U's status-only rounds, from
-# E42 T1's reader (`ad_cscb_calls`): every CSCB-parented call of U's row after
+# reader (`ad_cscb_calls`): every CSCB-parented call of U's row after
 # <from-mark> (up to <to-mark>) must be the bot server's `status`, or the
 # driver's (checked in step 3c); fails on any other verb from the bot server
 # and on a call from any other CSCB process. Prints one line per `status`,
@@ -436,7 +436,7 @@ EOF
     echo "${TEST_NAME}: ${step}: ${U_ID} reads ${U_FINISHED_STATE}; ${U_SESSION} is gone"
 }
 
-# Step 2a [harness]: E39's scenario 25 statement on U's finished row.
+# Step 2a [harness]: scenario 25 statement on U's finished row.
 step_unusable_name() {
     local step="step 2: U's recorded name made unusable"
     [[ -z "$(server_pid)" ]] || fail "${step}: a server is running"
@@ -470,7 +470,7 @@ other_row_unusable() {
 }
 
 # Step 2b [harness]: the other caller's row, spawned by the harness and then
-# edited (SRJ-1427 bullet 2).
+# edited (bullet 2).
 step_other_row() {
     local step="step 2: the other caller's row" dir pid out
     [[ -z "$(server_pid)" ]] || fail "${step}: a server is running"

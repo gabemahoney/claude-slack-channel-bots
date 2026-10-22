@@ -1,6 +1,6 @@
 /**
- * invited-checks.ts — testplans/b.yko Part 11: invited channels against the
- * test workspace (b.deo SRI-1501 to SRI-1506, b.deo AC 46). They run after
+ * invited-checks.ts — testplans/live-acceptance.md Part 11: invited channels against the
+ * test workspace. They run after
  * Check 28 and before the closing checks (29a, then the optional 29b), so
  * 29a scans every log and file they write.
  *
@@ -17,7 +17,7 @@
  * - Check 33: the switch goes on again, the human kicks C's app; asked by
  *   DM, C's `reply` and `fetch_messages` on the channel are refused with
  *   Slack's code, and the outcomes of `react`, `edit_message` and
- *   `fetch_messages` with `thread_ts` are recorded as notes (SRI-603, RN-2);
+ * `fetch_messages` with `thread_ts` are recorded as notes (RN-2);
  * - Check 34: whatever 30–33 found, it restores the config.json bytes Check
  *   30 copied, kicks C's app if it is still in the channel, archives the
  *   channel, and passes only when C is in no channel, archived ones included.
@@ -200,7 +200,7 @@ export function invitedPersonas(names: readonly string[]): string[] {
   return names.filter((n) => known.has(n))
 }
 
-/** Check 30's preview and applied counts for config.json naming `names` (b.deo SRI-802, SRI-803). Pure. */
+/** Check 30's preview and applied counts for config.json naming `names`. Pure. */
 export function switchOnPreview(names: readonly string[]): { preview: string[]; counts: { in_place: number; settings: number } } {
   const touched = invitedPersonas(names)
   const counts = { in_place: touched.length, settings: 1 }
@@ -219,8 +219,7 @@ export interface ConfigView {
 }
 
 /**
- * Check 34's restore of `copy` over the applied `record` (b.deo SRI-802 to
- * SRI-804): the preview the server writes and the line its confirmation
+ * Check 34's restore of `copy` over the applied `record`: the preview the server writes and the line its confirmation
  * logs, worked out from the state Checks 30–33 left. The personas present in
  * both whose `invited` section differs are recorded (the copy, in
  * declarative mode, has none). With the switch changed, the header counts
@@ -351,7 +350,7 @@ function notRun(reason: string, f: Findings): CheckResult {
 
 export const check30: CheckDef<CheckContext> = {
   id: '30',
-  title: 'Check 30: an invite is enough: with the switch on, C answers a mention in a channel its app was invited to (b.deo AC 46)',
+  title: 'Check 30: an invite is enough: with the switch on, C answers a mention in a channel its app was invited to',
   needs: LIVE,
   row: '30',
   async run(ctx) {
@@ -400,7 +399,7 @@ export const check30: CheckDef<CheckContext> = {
 
 export const check31: CheckDef<CheckContext> = {
   id: '31',
-  title: 'Check 31: asked in the channel, C switches it to all with set_channel_delivery, then answers a message that does not mention it (b.deo AC 46)',
+  title: 'Check 31: asked in the channel, C switches it to all with set_channel_delivery, then answers a message that does not mention it',
   needs: LIVE,
   row: '31',
   async run(ctx) {
@@ -444,7 +443,7 @@ export const check31: CheckDef<CheckContext> = {
 
 export const check32: CheckDef<CheckContext> = {
   id: '32',
-  title: "Check 32: with the switch off and C's app still in the channel, a mention is not delivered, and one unclaimed-channel line says so (b.deo AC 46)",
+  title: "Check 32: with the switch off and C's app still in the channel, a mention is not delivered, and one unclaimed-channel line says so",
   needs: LIVE,
   row: '32',
   async run(ctx) {
@@ -476,7 +475,7 @@ export const check32: CheckDef<CheckContext> = {
 // Check 33
 // ---------------------------------------------------------------------------
 
-/** The three calls whose outcome after the kick Check 33 records, never judges (b.deo SRI-603, RN-2). */
+/** The three calls whose outcome after the kick Check 33 records, never judges (RN-2). */
 export const CHECK33_RECORDED_CALLS = ['react', 'edit_message on C\'s earlier post', 'fetch_messages with thread_ts'] as const
 export type Check33RecordedCall = (typeof CHECK33_RECORDED_CALLS)[number]
 
@@ -497,7 +496,7 @@ export function recordedOutcome(tool: string, channel: string, call: ToolCall | 
 
 /**
  * The note line for a recorded call, in the fixed form the run's report and
- * T23's residual step read from results.md:
+ * residual step read from results.md:
  * `Check 33 residual: <call> after the kick: accepted | refused by Slack (<code>) | refused with no Slack code | made, with no result | not made`.
  */
 export function residualNote(call: Check33RecordedCall, outcome: RecordedOutcome): string {
@@ -516,7 +515,7 @@ export function residualNote(call: Check33RecordedCall, outcome: RecordedOutcome
 
 export const check33: CheckDef<CheckContext> = {
   id: '33',
-  title: "Check 33: after C's app is kicked, reply and fetch_messages on the channel are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded (b.deo AC 46)",
+  title: "Check 33: after C's app is kicked, reply and fetch_messages on the channel are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded",
   needs: LIVE,
   row: '33',
   async run(ctx) {
@@ -671,10 +670,10 @@ async function restoreChannel(ctx: CheckContext, f: Findings, channel: { id: str
 
 export const check34: CheckDef<CheckContext> = {
   id: '34',
-  title: 'Check 34: the cast is restored: config.json as Check 30 found it, nothing pending, the run channel archived, C in no channel (b.deo AC 46)',
+  title: 'Check 34: the cast is restored: config.json as Check 30 found it, nothing pending, the run channel archived, C in no channel',
   needs: LIVE,
   row: '34',
-  // Under --only, a selection of any of 30 to 33 runs it too (b.deo SRI-1506).
+  // Under --only, a selection of any of 30 to 33 runs it too.
   undoes: ['30', '31', '32', '33'],
   async run(ctx) {
     const copy = ctx.shared.invitedConfigCopy

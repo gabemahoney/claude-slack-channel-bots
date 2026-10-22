@@ -1,20 +1,20 @@
 /**
  * cli-teardown.test.ts — The pure pieces of the CLI's teardown commands
- * (`src/cli-teardown.ts`; b.jg5 SRJ-901, SRJ-117's CLI-precheck column,
- * SRJ-903, SRJ-316): the precheck's verdict over one `get` or `read-pane`
+ * (`src/cli-teardown.ts`CLI-precheck column,
+ *): the precheck's verdict over one `get` or `read-pane`
  * answer, its two operator line builders, its tries and spacing, and the
  * config-file display name; the teardown's pause verdict over one `pause`
  * answer, its state-read verdict over one `status` answer and its
  * per-persona outcome; the kill's mapping from the bounded retry's result to
  * that outcome with its kill-failure alert decision, and its read between
- * tries (b.jg5 SRJ-904, SRJ-702, SRJ-907); the teardown's report: each
+ * tries; the teardown's report: each
  * persona's failure line, the last line and the per-persona report plan
  * (lines printed, `server.log` lines and at most one startup-errors entry,
- * whose `cli-teardown-failed` message is the failure line; b.jg5 SRJ-907,
- * SRJ-909, SRJ-1013); `clean_restart`'s not-restarted alert and its class,
- * its answer check's line and its restart lines (SRJ-906, SRJ-1013); both
- * commands' initialization-failed line (SRJ-901 step 1); and the bounds of
- * the precheck's and the teardown's cost (SRJ-908). The precheck
+ * whose `cli-teardown-failed` message is the failure line,
+ *); `clean_restart`'s not-restarted alert and its class,
+ * its answer check's line and its restart lines; both
+ * commands' initialization-failed line (step 1); and the bounds of
+ * the precheck's and the teardown's cost. The precheck
  * runner, the teardown's tries, poll and kill on the CLI's injected clock,
  * both commands' order, where each report line goes, and `clean_restart`'s
  * answer check and the routes of its not-restarted alert are
@@ -25,8 +25,8 @@
  * the classifier reads as UNCLASSIFIED, save the look-alike rows that pin
  * exactly that); class labels, finished and live
  * states, notes and launch starts are imported. The
- * SRD's numbers (3 tries, 2 s apart), the config file's name and one line of
- * each builder are pinned once as literals, the forms SRJ-901 and SRJ-907
+ * contract's numbers (3 tries, 2 s apart), the config file's name and one line of
+ * each builder are pinned once as literals, the forms and
  * state. The kill-failure alert's text and closing sentences come from
  * `src/kill-failure-alert.ts`'s builders.
  *
@@ -249,7 +249,7 @@ const failOf = (verdict: PrecheckVerdict): { errorClass: AdErrorClass; descripti
 }
 
 /**
- * The classes SRJ-117's CLI-precheck column and its notes fail on, common to
+ * The classes CLI-precheck column and its notes fail on, common to
  * both calls: CONFLICT, ENVIRONMENT, UNUSABLE NAME and UNCLASSIFIED fail with
  * no retry; UNAVAILABLE is retried; CONFIG fails at once.
  */
@@ -274,7 +274,7 @@ function failingRows(verb: PrecheckCall): ErrorRow[] {
   ]
 }
 
-/** SRJ-117's CLI-precheck column at `read-pane`: GONE and `ErrSpawnNotFound` (its GONE column) pass. */
+/** CLI-precheck column at `read-pane`: GONE and `ErrSpawnNotFound` (its GONE column) pass. */
 const READ_PANE_ERROR_ROWS: readonly ErrorRow[] = [
   ['ErrTmuxCaptureFailed (GONE)', () => errTmuxCaptureFailed(), PRECHECK_VERDICT_PASS, null],
   ['ErrSpawnNotFound (the GONE column)', () => errSpawnNotFound(), PRECHECK_VERDICT_PASS, null],
@@ -296,7 +296,7 @@ const GET_ERROR_ROWS: readonly ErrorRow[] = [
 
 /**
  * The failure's description, redacted and on one line; a CONFIG failure's
- * names the config file. b.jg5 SRJ-104: a value the classifier reports a name
+ * names the config file. a value the classifier reports a name
  * or message for (an UNCLASSIFIED, UNUSABLE NAME or CONFIG error: the
  * `unknownName` of an `ErrUnknownErrorName`, else its `errName`, and
  * agent-director's own description, the envelope's `err_description`)
@@ -318,7 +318,7 @@ function expectDescription(description: string, value: unknown, shown: AdErrorCl
   }
 }
 
-describe('precheckVerdictOf: a get that answered (b.jg5 SRJ-901 step 2)', () => {
+describe('precheckVerdictOf: a get that answered (step 2)', () => {
   test.each<[string, PrecheckRow | null]>([
     ['no row', null],
     ...[...AGENT_DIRECTOR_DEAD_STATES].map((state): [string, PrecheckRow] => [`a finished row (${state})`, { state }]),
@@ -330,11 +330,11 @@ describe('precheckVerdictOf: a get that answered (b.jg5 SRJ-901 step 2)', () => 
   test.each<[string, PrecheckRow]>([
     ...[...AGENT_DIRECTOR_LIVE_STATES].map((state): [string, PrecheckRow] => [`a ${state} row`, { state }]),
     ['a row in a state CSCB does not know', { state: UNKNOWN_STATE }],
-    // b.jg5 SRJ-114, SRJ-901 step 5: a note alone fails nothing; the read-pane decides.
+    // step 5: a note alone fails nothing; the read-pane decides.
     [`a waiting row carrying ${provenanceNote}`, { state: 'waiting', liveness_note: provenanceNote }],
     ...nonLatchingNotes.map((note): [string, PrecheckRow] => [`a waiting row carrying ${note}`, { state: 'waiting', liveness_note: note }]),
     [`a waiting row carrying a note CSCB does not know (${unknownNote})`, { state: 'waiting', liveness_note: unknownNote }],
-    // b.jg5 SRJ-513 latches only in the server; the precheck reads the pane.
+    // latches only in the server; the precheck reads the pane.
     ['a pending row with no launch start', { state: AGENT_DIRECTOR_PENDING_STATE }],
     ['a pending row with a launch start, carrying the note', { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_DEFAULT, liveness_note: provenanceNote }],
   ])('%s is live: it passes the get, and the one-line read-pane follows', (_label, row) => {
@@ -342,7 +342,7 @@ describe('precheckVerdictOf: a get that answered (b.jg5 SRJ-901 step 2)', () => 
   })
 })
 
-describe('precheckVerdictOf: a read-pane that answered a pane passes (b.jg5 SRJ-117, SRJ-613)', () => {
+describe('precheckVerdictOf: a read-pane that answered a pane passes', () => {
   test.each(['> ', ''])('the pane %p passes (and proves nothing; the teardown is the backstop)', (pane) => {
     expect(precheckVerdictOf({ call: PRECHECK_CALL_READ_PANE })).toEqual({ kind: PRECHECK_VERDICT_PASS })
   })
@@ -351,7 +351,7 @@ describe('precheckVerdictOf: a read-pane that answered a pane passes (b.jg5 SRJ-
 describe.each<[PrecheckCall, readonly ErrorRow[]]>([
   [PRECHECK_CALL_READ_PANE, READ_PANE_ERROR_ROWS],
   [PRECHECK_CALL_GET, GET_ERROR_ROWS],
-])('precheckVerdictOf: a %s that threw (SRJ-117\'s CLI-precheck column; SRJ-901 steps 2 to 4)', (call, rows) => {
+])('precheckVerdictOf: a %s that threw (CLI-precheck column steps 2 to 4)', (call, rows) => {
   test.each(rows)('%s → its verdict, the class it is reported under and its redacted one-line description', (_label, make, kind, shown) => {
     const value = make()
     const verdict = precheckVerdictOf({ call, error: value })
@@ -375,10 +375,10 @@ describe.each<[PrecheckCall, readonly ErrorRow[]]>([
   })
 })
 
-describe('precheck failure lines (b.jg5 SRJ-901)', () => {
+describe('precheck failure lines', () => {
   const PERSONA = { name: 'Ops Bot', key: 'ops_bot' } as const
 
-  test('SRJ-901\'s two forms, exactly (pinned once): the persona line and the closing line, with no [slack] prefix', () => {
+  test('two forms, exactly (pinned once): the persona line and the closing line, with no [slack] prefix', () => {
     expect(precheckFailureLine(CLI_COMMAND_STOP_BOTS, PERSONA, { errorClass: AD_ERROR_CLASS_CONFLICT, description: 'what agent-director said' })).toBe(
       'stop --stop-bots: precheck failed for persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot": CONFLICT: what agent-director said',
     )
@@ -389,7 +389,7 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
     expect(precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART)).toBe('clean_restart: nothing was stopped')
   })
 
-  test('SRJ-902\'s too-old closing line, exactly (pinned once), with no [slack] prefix', () => {
+  test('too-old closing line, exactly (pinned once), with no [slack] prefix', () => {
     expect(onlyServerStoppedLine()).toBe('stop --stop-bots: only the server was stopped; every worker and row was left as it is')
   })
 
@@ -400,7 +400,7 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
     expect(agentDirectorInitFailedLine(CLI_COMMAND_CLEAN_RESTART, 'd')).toBe('[slack] clean_restart: agent-director initialization failed: d')
   })
 
-  test('the tries, their spacing and the config file\'s display name are SRJ-901\'s (pinned once): 3 tries 2 s apart, ~/.config/agent-director/config.toml, built from the settings path', () => {
+  test('the tries, their spacing and the config file\'s display name are (pinned once): 3 tries 2 s apart, ~/.config/agent-director/config.toml, built from the settings path', () => {
     expect([PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS]).toEqual([3, 2_000])
     expect(AD_CONFIG_FILE_DISPLAY_NAME).toBe('~/.config/agent-director/config.toml')
     expect(AD_CONFIG_FILE_DISPLAY_NAME).toBe(join('~', AD_SETTINGS_RELATIVE_PATH))
@@ -424,7 +424,7 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The teardown (b.jg5 SRJ-903, SRJ-119, SRJ-316; hatch note E12)
+// The teardown (design note )
 // ---------------------------------------------------------------------------
 
 /** The verb of every `pause` answer below. */
@@ -434,9 +434,9 @@ const STATUS_VERB = 'status'
 
 /**
  * A teardown failure's report: the classifier's class, unchanged; the
- * description `describeReportedAdFailure` renders (SRJ-104), redacted and on
+ * description `describeReportedAdFailure` renders, redacted and on
  * one line; a CONFIG failure's description led by the config file's name
- * (SRJ-316).
+ *
  */
 function expectTeardownReport(report: TeardownErrorReport, value: unknown, errorClass: AdErrorClass): void {
   expect(report.errorClass).toBe(errorClass)
@@ -456,11 +456,11 @@ function expectTeardownReport(report: TeardownErrorReport, value: unknown, error
 type PauseRow = readonly [label: string, make: () => unknown, kind: PauseVerdict['kind'], errorClass: AdErrorClass]
 
 /**
- * SRJ-903's table, one row per answer: GONE escalates; UNAVAILABLE retries;
+ * table, one row per answer: GONE escalates; UNAVAILABLE retries;
  * CONFLICT, ENVIRONMENT, UNUSABLE NAME and another `ErrInternal` fail at
  * once; CONFIG fails at once naming the config file; `ErrSpawnNotPausable`
  * on a `pending` row, `ErrSpawnNotFound`, `ErrPauseTimeout`, the three store
- * names and every other answer escalate to the kill (hatch A3).
+ * names and every other answer escalate to the kill (design A3).
  */
 const PAUSE_ERROR_ROWS: readonly PauseRow[] = [
   ['ErrTmuxSendKeys (GONE)', () => errTmuxSendKeys(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_GONE],
@@ -486,7 +486,7 @@ const PAUSE_ERROR_ROWS: readonly PauseRow[] = [
   ['ErrCwdNotFound (DIRECTORY)', () => errCwdNotFound(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_DIRECTORY],
 ]
 
-describe('pauseVerdictOf: each pause answer by class (b.jg5 SRJ-903, SRJ-119; hatch note E12)', () => {
+describe('pauseVerdictOf: each pause answer by class (hatch note )', () => {
   test('a pause that succeeded is done: the poll follows', () => {
     expect(pauseVerdictOf({ paused: true })).toEqual({ kind: PAUSE_VERDICT_DONE })
   })
@@ -545,7 +545,7 @@ const STATE_READ_ERROR_ROWS: readonly StateReadErrorRow[] = [
   ['ErrCwdNotFound (DIRECTORY, kept)', () => errCwdNotFound(STATUS_VERB), AD_ERROR_CLASS_DIRECTORY],
 ]
 
-describe('stateReadVerdictOf: the teardown\'s own status reads, before the pause and in the poll (b.jg5 SRJ-903, SRJ-316)', () => {
+describe('stateReadVerdictOf: the teardown\'s own status reads, before the pause and in the poll', () => {
   test('no row (null) is absent: the persona is stopped', () => {
     expect(stateReadVerdictOf({ row: null })).toEqual({ kind: STATE_READ_VERDICT_ABSENT })
   })
@@ -571,7 +571,7 @@ describe('stateReadVerdictOf: the teardown\'s own status reads, before the pause
   })
 })
 
-describe('the teardown\'s per-persona outcome and its error report (b.jg5 SRJ-903, SRJ-104, SRJ-316)', () => {
+describe('the teardown\'s per-persona outcome and its error report', () => {
   test('teardownStopped carries its reason; teardownFailed its step and the report, field by field', () => {
     for (const reason of [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED] as const) {
       expect(teardownStopped(reason)).toEqual({ kind: TEARDOWN_OUTCOME_STOPPED, reason })
@@ -602,7 +602,7 @@ describe('the teardown\'s per-persona outcome and its error report (b.jg5 SRJ-90
   })
 })
 
-describe('src/cli-teardown.ts is pure (b.jg5 SRJ-114, SRJ-115, SRJ-801, SRJ-908)', () => {
+describe('src/cli-teardown.ts is pure', () => {
   const code = stripComments(readFileSync(SOURCE, 'utf-8'))
 
   test('it loads no server-only module (the session manager, the conflict latch …), no Slack module, never src/cli.ts, the retired-key record module or the settings reader (the config file\'s name comes from src/ad-config-file.ts)', () => {
@@ -622,7 +622,7 @@ describe('src/cli-teardown.ts is pure (b.jg5 SRJ-114, SRJ-115, SRJ-801, SRJ-908)
 })
 
 // ---------------------------------------------------------------------------
-// The teardown's kill (b.jg5 SRJ-904, SRJ-702, SRJ-110, SRJ-907; hatch A3)
+// The teardown's kill (design A3)
 // ---------------------------------------------------------------------------
 
 /** The verb of every `kill` answer below. */
@@ -706,7 +706,7 @@ const SUCCESS_RESULTS: ReadonlyArray<readonly [string, () => KillRetryResult<Any
 /** A failure a retry can end in, with the class the CLI reports it under. */
 type FailureRow = readonly [label: string, make: () => unknown, errorClass: AdErrorClass]
 
-/** Every kill answer that is no success, after its tries: UNAVAILABLE after them, every other at once (b.jg5 SRJ-904). */
+/** Every kill answer that is no success, after its tries: UNAVAILABLE after them, every other at once. */
 const NOT_KILLED_ROWS: readonly FailureRow[] = [
   ...UNAVAILABLE_FORMS.map(([label, make]): FailureRow => [`${label} (UNAVAILABLE, after its tries)`, () => make(KILL_VERB), AD_ERROR_CLASS_UNAVAILABLE]),
   ...CONFLICT_CASES.map((c): FailureRow => [`ErrTmuxSessionConflict, ${c} (CONFLICT)`, () => errTmuxSessionConflict(KILL_VERB, c), AD_ERROR_CLASS_CONFLICT]),
@@ -725,7 +725,7 @@ const NOT_KILLED_ROWS: readonly FailureRow[] = [
   ['ErrConfigMalformed at a try (CONFIG)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
 ]
 
-/** Kill answers SRJ-110 gives no row: the checked kill's UNCLASSIFIED with the classifier's class kept, which the CLI reports. */
+/** Kill answers gives no row: the checked kill's UNCLASSIFIED with the classifier's class kept, which the CLI reports. */
 const UNLISTED_ROWS: readonly FailureRow[] = [
   ['ErrSpawnNotInteractive, a STATE name other than ErrSpawnNotFound', () => errSpawnNotInteractive(KILL_VERB), AD_ERROR_CLASS_STATE],
   ['ErrCwdNotFound (DIRECTORY)', () => errCwdNotFound(KILL_VERB), AD_ERROR_CLASS_DIRECTORY],
@@ -734,8 +734,8 @@ const UNLISTED_ROWS: readonly FailureRow[] = [
 
 /**
  * GONE kill answers: under `TEARDOWN_KILL_OPTIONS` the checked kill's GONE
- * non-success, which the retry never tries again (b.jg5 SRJ-904, SRJ-702;
- * hatch A3). The second carries a fake token in its session name.
+ * non-success, which the retry never tries again (
+ * design A3). The second carries a fake token in its session name.
  */
 const GONE_ROWS: readonly FailureRow[] = [
   ['ErrTmuxSendKeys', () => errTmuxSendKeys(), AD_ERROR_CLASS_GONE],
@@ -749,7 +749,7 @@ function killReportOf(outcome: PersonaTeardownOutcome): TeardownKillReport {
   return outcome.kill
 }
 
-describe('teardownKillOutcomeOf: a success stops the persona (b.jg5 SRJ-904 bullet 1, SRJ-110)', () => {
+describe('teardownKillOutcomeOf: a success stops the persona (bullet 1)', () => {
   test.each(SUCCESS_RESULTS)('%s → stopped (killed), carrying the retry\'s result and no alert', (_label, make) => {
     const result = make()
     expect(teardownKillOutcomeOf(result) as unknown).toEqual({ kind: TEARDOWN_OUTCOME_STOPPED, reason: TEARDOWN_STOPPED_KILLED, kill: result })
@@ -762,7 +762,7 @@ describe('teardownKillOutcomeOf: a success stops the persona (b.jg5 SRJ-904 bull
   })
 })
 
-describe('teardownKillOutcomeOf: every other answer fails the persona with its class (b.jg5 SRJ-904 bullets 2 to 4 and 6; hatch A3)', () => {
+describe('teardownKillOutcomeOf: every other answer fails the persona with its class (bullets 2 to 4 and 6; hatch A3)', () => {
   test.each(NOT_KILLED_ROWS)('%s → failed at the kill with the classifier\'s class and the reported description; the retry\'s result is carried', (_label, make, errorClass) => {
     const value = make()
     const unavailable = errorClass === AD_ERROR_CLASS_UNAVAILABLE
@@ -813,7 +813,7 @@ describe('teardownKillOutcomeOf: every other answer fails the persona with its c
   })
 })
 
-describe('teardownKillOutcomeOf: the alert decision after a survivor-naming try (b.jg5 SRJ-904 bullet 7, SRJ-907, SRJ-1007)', () => {
+describe('teardownKillOutcomeOf: the alert decision after a survivor-naming try (bullet 7)', () => {
   // The CLI's retry gives the survivor version only on a success end, so a stopped persona carries it as it is.
   test.each<[string, unknown, AnyKillOutcome['kind']]>([
     ['ErrSpawnNotFound (a success)', errSpawnNotFound(), KILL_OUTCOME_ROW_GONE],
@@ -862,7 +862,7 @@ describe('teardownKillOutcomeOf: the alert decision after a survivor-naming try 
   })
 })
 
-describe('teardownKillOutcomeOf: CONFIG at a status read between tries (b.jg5 SRJ-904 bullet 4, SRJ-702, SRJ-316)', () => {
+describe('teardownKillOutcomeOf: CONFIG at a status read between tries (bullet 4)', () => {
   /** A CONFIG read ends the CLI's tries whatever state the row was last read in: each row's tries before it, its last read state and the retry's decision. */
   const CONFIG_READ_ROWS: ReadonlyArray<readonly [string, () => {
     readonly answers: readonly unknown[]
@@ -910,7 +910,7 @@ describe('teardownKillOutcomeOf: CONFIG at a status read between tries (b.jg5 SR
   )
 })
 
-describe('teardownKillReadOf: the read between kill tries latches nothing in the CLI (b.jg5 SRJ-904 bullet 5, SRJ-702, SRJ-115)', () => {
+describe('teardownKillReadOf: the read between kill tries latches nothing in the CLI (bullet 5)', () => {
   test('no row (null) → no row', () => {
     expect(teardownKillReadOf({ row: null })).toEqual({ kind: KILL_RETRY_READ_NO_ROW })
   })
@@ -944,7 +944,7 @@ describe('teardownKillReadOf: the read between kill tries latches nothing in the
 })
 
 // ---------------------------------------------------------------------------
-// The teardown's report (b.jg5 SRJ-907, SRJ-909, SRJ-1013, SRJ-1007; hatch A3)
+// The teardown's report (design A3)
 // ---------------------------------------------------------------------------
 
 /** Both teardown commands. */
@@ -990,8 +990,8 @@ function failedKillOutcome(value: unknown, errorClass: AdErrorClass, alert: Kill
   return outcome
 }
 
-describe('the failure line and the last line (b.jg5 SRJ-907, SRJ-1013)', () => {
-  test.each(forEachReportCommand<[number]>([[1], [2]]))('%s: SRJ-907\'s forms, exactly (pinned once), with no [slack] prefix: the failure line, and the last line for a count of %p', (command, count) => {
+describe('the failure line and the last line', () => {
+  test.each(forEachReportCommand<[number]>([[1], [2]]))('%s: forms, exactly (pinned once), with no [slack] prefix: the failure line, and the last line for a count of %p', (command, count) => {
     const persona: CliTeardownPersona = { name: 'Ops Bot', key: 'ops_bot' }
     expect(teardownFailureLine(command, persona, { errorClass: AD_ERROR_CLASS_CONFLICT, description: 'what agent-director said' })).toBe(
       `${command}: could not stop persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot": CONFLICT: what agent-director said`,
@@ -1010,7 +1010,7 @@ describe('the failure line and the last line (b.jg5 SRJ-907, SRJ-1013)', () => {
       .map((name) => [`a store name (${name})`, () => errUnknownErrorName(name), AD_ERROR_CLASS_UNCLASSIFIED, [name]] as const),
   ]
 
-  test.each(forEachReportCommand(LINE_ROWS))('%s: the line for %s holds, in SRJ-907\'s order, the command, the persona, its session, the class and the redacted description', (command, _label, make, errorClass, names) => {
+  test.each(forEachReportCommand(LINE_ROWS))('%s: the line for %s holds, in the contract order, the command, the persona, its session, the class and the redacted description', (command, _label, make, errorClass, names) => {
     const value = make()
     const report = teardownErrorReportOf(value)
     expectTeardownReport(report, value, errorClass)
@@ -1060,7 +1060,7 @@ describe('teardownRejectedOutcomeOf: a persona\'s teardown that rejected fails i
   })
 })
 
-describe('personaTeardownReportOf: each persona\'s report plan (b.jg5 SRJ-907, SRJ-909, SRJ-1013, SRJ-1007)', () => {
+describe('personaTeardownReportOf: each persona\'s report plan', () => {
   const STOPPED_REASONS: readonly TeardownStoppedReason[] = [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED]
 
   test.each(forEachReportCommand<[string, () => PersonaTeardownOutcome]>([
@@ -1196,13 +1196,13 @@ describe('personaTeardownReportOf: each persona\'s report plan (b.jg5 SRJ-907, S
 })
 
 // ---------------------------------------------------------------------------
-// clean_restart's not-restarted alert and its class (b.jg5 SRJ-906, SRJ-1013)
+// clean_restart's not-restarted alert and its class
 // ---------------------------------------------------------------------------
 
-describe('the not-restarted alert and its class, the answer check\'s line and the restart lines (b.jg5 SRJ-906, SRJ-1013)', () => {
+describe('the not-restarted alert and its class, the answer check\'s line and the restart lines', () => {
   const SECOND_PERSONA: CliTeardownPersona = { name: 'Beta', key: personaKey('Beta') }
 
-  test('SRJ-906\'s answer check line, the line before the restart and the start-failed line, exactly (pinned once)', () => {
+  test('answer check line, the line before the restart and the start-failed line, exactly (pinned once)', () => {
     expect(answerCheckFailedTryLine(2, { errorClass: AD_ERROR_CLASS_UNAVAILABLE, description: 'what agent-director said' })).toBe(
       '[slack] clean_restart: agent-director answer check: list try 2 of 3 failed: UNAVAILABLE: what agent-director said',
     )
@@ -1227,7 +1227,7 @@ describe('the not-restarted alert and its class, the answer check\'s line and th
     assertNoLeak(lines)
   })
 
-  test('SRJ-1013\'s class label, closing sentence and one alert, exactly (pinned once)', () => {
+  test('class label, closing sentence and one alert, exactly (pinned once)', () => {
     expect(CLEAN_RESTART_NOT_RESTARTED_LABEL).toBe('clean-restart-not-restarted')
     expect(CLEAN_RESTART_NOT_STARTED_SENTENCE).toBe('the server was not started: start it once agent-director answers')
     expect(cleanRestartNotRestartedAlert([{ persona: { name: 'Ops Bot', key: 'ops_bot' }, errorClass: AD_ERROR_CLASS_CONFLICT }])).toBe(
@@ -1286,10 +1286,10 @@ describe('the not-restarted alert and its class, the answer check\'s line and th
 })
 
 // ---------------------------------------------------------------------------
-// Bounded cost (b.jg5 SRJ-908)
+// Bounded cost
 // ---------------------------------------------------------------------------
 
-describe('the precheck\'s and the teardown\'s bounds (b.jg5 SRJ-908)', () => {
+describe('the precheck\'s and the teardown\'s bounds', () => {
   const CALL_TIMEOUTS = [0, MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS] as const
   const EXIT_TIMEOUTS = [0, 1, 5] as const
   /** The precheck's calls of one persona, each with its own tries: its get, then its read-pane. */

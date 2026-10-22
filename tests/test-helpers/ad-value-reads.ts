@@ -3,10 +3,10 @@
  * file holds an agent-director export as a value, shared by two suites:
  *
  * - `tests/host-safety.test.ts` runs `agentDirectorValueReads` over
- *   `Client` and `resolveSystemBinary` (b.jg5 SRJ-1301, SRJ-121);
+ * `Client` and `resolveSystemBinary`;
  * - `tests/fmk-source-audit.test.ts` runs it, and
  *   `agentDirectorNamespaceArguments`, over the three Phase-1-only error
- *   classes (b.jg5 SRJ-101, SRJ-103), which `src/` takes only as plain named
+ * classes, which `src/` takes only as plain named
  *   re-exports.
  *
  * Also exported: `agentDirectorNamespaces`, which both audits collect the

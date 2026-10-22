@@ -194,7 +194,7 @@ function expectNoStrayWrite(): void {
   expect(existsSync(stateDir)).toBe(false)
 }
 
-describe("recordStartupError's omitStderr option (b.jg5 SRJ-909)", () => {
+describe("recordStartupError's omitStderr option", () => {
   test('with omitStderr: one one-line entry under the given class in logDir, and nothing on fd 2', () => {
     const { stderr, stdout } = record({ logDir, omitStderr: true })
     const logged = linesOf(readFileSync(join(logDir, LOG_NAME), 'utf-8'))
@@ -236,7 +236,7 @@ describe("recordStartupError's omitStderr option (b.jg5 SRJ-909)", () => {
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1013: one entry per class, read from the case's log directory
+// one entry per class, read from the case's log directory
 // ===========================================================================
 
 /** The real `recordStartupError` into `dir`, as the server's recorder writes an entry (its fd-2 copy included). */
@@ -244,7 +244,7 @@ function recorderInto(dir: string): (classLabel: string, message: string) => voi
   return (classLabel, message) => recordStartupError(classLabel, message, undefined, { logDir: dir })
 }
 
-/** The CLI's recorder (`src/cli.ts`): the real `recordStartupError` into `dir`, with no fd-2 copy (b.jg5 SRJ-909). */
+/** The CLI's recorder (`src/cli.ts`): the real `recordStartupError` into `dir`, with no fd-2 copy. */
 function cliRecorderInto(dir: string): (classLabel: string, message: string) => void {
   return (classLabel, message) => recordStartupError(classLabel, message, undefined, { logDir: dir, omitStderr: true })
 }
@@ -267,17 +267,17 @@ function expectNames(text: string, named: readonly string[], absent: readonly st
   for (const part of absent) expect(text).not.toContain(part)
 }
 
-/** Fails if `text` carries an instruction to upgrade agent-director or an upgrade or install command (b.jg5 SRJ-208). */
+/** Fails if `text` carries an instruction to upgrade agent-director or an upgrade or install command. */
 function expectNoUpgradeForm(text: string): void {
   for (const [, pattern] of UPGRADE_FORMS) expect(flat(text)).not.toMatch(pattern)
 }
 
 // ---------------------------------------------------------------------------
 // The two version classes, from the startup gate and from a runtime re-check
-// (SRJ-203, SRJ-204, SRJ-205, SRJ-208; hatch A3)
+// (design A3)
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-system-install-too-old, from the startup gate and from a runtime re-check', () => {
+describe('(hatch A3): ad-below-phase1-floor and ad-system-install-too-old, from the startup gate and from a runtime re-check', () => {
   const rechecks: AdVersionRecheck[] = []
 
   afterEach(() => {
@@ -372,8 +372,8 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
 
 // ---------------------------------------------------------------------------
 // The kill-failure classes, the teardown notice and the unclassified-error
-// alert, on their log-only routes (SRJ-704, SRJ-1003, SRJ-1007, SRJ-1009;
-// the E20 and E25 hatch notes)
+// alert, on their log-only routes (
+// the and design notes)
 // ---------------------------------------------------------------------------
 
 /**
@@ -396,7 +396,7 @@ interface NoticeRig {
   remove(): void
 }
 
-describe('b.jg5 SRJ-1013, SRJ-704, SRJ-1003: persona-kill-failed, persona-kill-survivor, persona-teardown-notice and persona-unclassified-error on their log-only routes', () => {
+describe('persona-kill-failed, persona-kill-survivor, persona-teardown-notice and persona-unclassified-error on their log-only routes', () => {
   let rig: NoticeRig | undefined
 
   afterEach(async () => {
@@ -506,10 +506,10 @@ describe('b.jg5 SRJ-1013, SRJ-704, SRJ-1003: persona-kill-failed, persona-kill-s
 
 // ---------------------------------------------------------------------------
 // The CLI teardown's classes, and its route of the kill classes with the
-// command as context (SRJ-904, SRJ-906, SRJ-907, SRJ-909; the E33 hatch note)
+// command as context (the design note)
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-1013, SRJ-909: cli-teardown-failed, clean-restart-not-restarted and the CLI route of the kill classes, through the CLI\'s recorder', () => {
+describe('cli-teardown-failed, clean-restart-not-restarted and the CLI route of the kill classes, through the CLI\'s recorder', () => {
   const PERSONA: CliTeardownPersona = { name: 'Ops Bot', key: 'ops_bot' }
   const OTHER: CliTeardownPersona = { name: 'dev', key: 'dev' }
 
@@ -596,10 +596,10 @@ describe('b.jg5 SRJ-1013, SRJ-909: cli-teardown-failed, clean-restart-not-restar
 })
 
 // ---------------------------------------------------------------------------
-// retired-keys-unreadable (SRJ-802)
+// retired-keys-unreadable
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-1013, SRJ-802: retired-keys-unreadable', () => {
+describe('retired-keys-unreadable', () => {
   test('a record that cannot be read at start (a directory at its path) is one entry naming the file and the remedy', () => {
     mkdirSync(stateDir)
     const path = retiredKeysPath(stateDir)
@@ -614,11 +614,11 @@ describe('b.jg5 SRJ-1013, SRJ-802: retired-keys-unreadable', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The recovery harness's classes: the start sweep's orphan-cleanup (SRJ-714;
-// the E26 hatch note) and the start pass's spawn-failed (the E17 hatch note)
+// The recovery harness's classes: the start sweep's orphan-cleanup (
+// the design note) and the start pass's spawn-failed (the design note)
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-1013, SRJ-714: orphan-cleanup from the start sweep, and spawn-failed from a start-pass launch', () => {
+describe('orphan-cleanup from the start sweep, and spawn-failed from a start-pass launch', () => {
   let harness: RecoveryHarness | undefined
 
   afterEach(() => {
@@ -680,8 +680,8 @@ describe('b.jg5 SRJ-1013, SRJ-714: orphan-cleanup from the start sweep, and spaw
 })
 
 // ===========================================================================
-// b.jg5 SRJ-702, SRJ-704, SRJ-1013 (AC 64): a launch or recovery attempt's
-// kill whose tries SRJ-702's stop rule stopped between tries
+// a launch or recovery attempt's
+// kill whose tries stop rule stopped between tries
 //
 // P's launch meets its own row read live in another directory and starts P's
 // live-row sequence (`scriptLiveRowElsewhere`, `launchThroughSequence`), whose
@@ -690,7 +690,7 @@ describe('b.jg5 SRJ-1013, SRJ-714: orphan-cleanup from the start sweep, and spaw
 // builders over `src/`'s (`killFailureStoppedRetryText`).
 // ===========================================================================
 
-describe('b.jg5 SRJ-702, SRJ-704, SRJ-1013 (AC 64): a stopped kill retry posts nothing and raises neither version', () => {
+describe('a stopped kill retry posts nothing and raises neither version', () => {
   let harness: RecoveryHarness | undefined
 
   afterEach(() => {
@@ -794,10 +794,10 @@ describe('b.jg5 SRJ-702, SRJ-704, SRJ-1013 (AC 64): a stopped kill retry posts n
 })
 
 // ---------------------------------------------------------------------------
-// The default log directory (b.fc4)
+// The default log directory
 // ---------------------------------------------------------------------------
 
-describe('recordStartupError without a logDir writes under the server\'s state directory (b.fc4)', () => {
+describe('recordStartupError without a logDir writes under the server\'s state directory', () => {
   /** `recordStartupError` with no `logDir` in a child with the fake home, SLACK_STATE_DIR unset, and `env` more. */
   function recordWithoutLogDir(opts: { env?: Record<string, string> }): void {
     const res = runInFakeHome({

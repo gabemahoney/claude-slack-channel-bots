@@ -1,5 +1,5 @@
 /**
- * publish-promote-exit-table.test.ts — bug b.42j: `/publish`'s promote exit
+ * publish-promote-exit-table.test.ts — `/publish`'s promote exit
  * table had no row for exit 70 (SR-7.1, `sanitize-global.sh` failed), which
  * `scripts/publish-promote.sh` exits with and `/publish promote`'s table
  * documents, so an LLM driving `/publish` had no recovery for that exit.
@@ -99,7 +99,7 @@ function aliasFindings(publishText: string): string[] {
   return findings
 }
 
-describe('b.42j: the promote exit codes agree across the script and both skills', () => {
+describe('the promote exit codes agree across the script and both skills', () => {
   test("the script's header and /publish promote's exit table list exactly the codes the script exits with, SR-7.1's once each", () => {
     expect({ header: headerExitCodes(header).sort((a, b) => a - b), promoteSkill: codesOf(promoteRows) }).toEqual({
       header: SCRIPT_CODES,
@@ -114,7 +114,7 @@ describe('b.42j: the promote exit codes agree across the script and both skills'
     expect(aliasFindings(publishSkill)).toEqual([])
   })
 
-  test("the alias check flags /publish's promote table without its SR-7.1 row, as it was before b.42j", () => {
+  test("the alias check flags /publish's promote table without its SR-7.1 row, as it was before", () => {
     const [row] = rowsFor(publishSkillPromoteRows(publishSkill), SR71_CODE!)
     expect(row).toBeDefined()
     const without = publishSkill.replace(`${row}\n`, '')

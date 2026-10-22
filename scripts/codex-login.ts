@@ -1,4 +1,4 @@
-/** Import-safe SR-14.7 admission. Token values live only in the lease closure. */
+/** Import-safe admission. Token values live only in the lease closure. */
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { CODEX_CONFIG_MAX_BYTES, encodeCodexHostConfigKeys, readCodexConfigModel, scanCodexConfigKeyPaths } from '../src/codex-config-keys.ts'

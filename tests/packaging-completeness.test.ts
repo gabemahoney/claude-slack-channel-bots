@@ -1,5 +1,5 @@
 /**
- * packaging-completeness.test.ts — b.q9t regression guard.
+ * packaging-completeness.test.ts — regression guard.
  *
  * The bug: the declared package version (0.8.2) was one whose PUBLISHED npm
  * artifact shipped none of the cron code, while the working tree already
@@ -24,7 +24,7 @@
  *      the tag-wrapper, delivery-queue, delivery-intake and delivery-notices modules. The npm
  *      probe gives the authoritative file list and skips only if npm is absent.
  *
- * b.av2 AC 27 guard (SR-12, SR-13.5): the shipped debugging skill
+ * guard: the shipped debugging skill
  * `skills/debug-slack-channel-bots/SKILL.md` must be in the npm pack list
  * (same probe and skip/error contract as guard 2), with a hermetic companion
  * that needs no npm (the file exists with a `name` matching its directory and
@@ -37,13 +37,13 @@
  * side-effect free) gets the same heading check in its own `test.each`, plus
  * a non-empty, duplicate-free check on the list. The stored-choice store's
  * own closed list, CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES (src/channel-delivery.ts,
- * imported; b.deo SRI-901), gets the same heading check in its own
+ * imported), gets the same heading check in its own
  * `test.each`, behind a non-empty guard; the list's exact content is pinned
  * in tests/channel-delivery.test.ts, not here. The forbidden-term audit and
- * the SR-1.7 exception over all shipped text live in
+ * the exception over all shipped text live in
  * tests/shipped-docs.test.ts.
  *
- * b.deo SRI-1108 (AC 43): the debugging skill's fungible-mode content, read
+ * the debugging skill's fungible-mode content, read
  * by heading title through the markdown helper, with every class label, drop
  * reason, `unclaimed-channel` reason text, file name and setting name
  * imported from `src/`:
@@ -82,12 +82,12 @@
  * relative link in the skill resolves to a heading, or a file and its
  * heading.
  *
- * b.av2 SR-12: the setup wizard's credentials script,
+ * the setup wizard's credentials script,
  * `scripts/write-credentials.sh` (which `claude-slack-channel-bots
  * credentials` runs), is in the npm pack list, with the same hermetic
  * companion (the file exists and package.json `files` covers it).
  *
- * b.jg5 SRJ-209: the TOML parser CSCB reads agent-director's settings file
+ * the TOML parser CSCB reads agent-director's settings file
  * with, `smol-toml`, is a runtime dependency pinned at exactly one version
  * (no range): `package.json` `dependencies` names it with that exact spec
  * (never in `devDependencies`), and `bun.lock` records the same spec for the
@@ -97,11 +97,11 @@
  * (the root workspace's spec, the other sections naming the package, and the
  * resolved entry with its source).
  *
- * b.jg5 SRJ-101, part of SRJ-1203's merge check: the shipped `package.json`
+ * part of the contract merge check: the shipped `package.json`
  * depends on agent-director at exactly the Phase 1 release's version — one
  * exact version, with no range operator, pre-release suffix or build
- * metadata, equal to CSCB's floor (`PHASE1_FLOOR_VERSION`, SRJ-201) — and
- * `bun.lock` resolves to it. `srj101PinVerdict` is that rule as a pure,
+ * metadata, equal to CSCB's floor (`PHASE1_FLOOR_VERSION`) — and
+ * `bun.lock` resolves to it. `clientPinVerdict` is that rule as a pure,
  * file-local checker: given a spec and the floor it answers whether the spec
  * is the pin, and names the first rule broken (a range, a dist-tag such as
  * `latest`, a file, git or URL source, a pre-release, build metadata or
@@ -111,16 +111,15 @@
  * workspace spec, a release-candidate resolution and a file source.
  *
  * The real files are checked with both: `package.json` names agent-director
- * in `dependencies` and in no other section, with a spec `srj101PinVerdict`
+ * in `dependencies` and in no other section, with a spec `clientPinVerdict`
  * accepts against the floor; `bun.lock`'s root workspace names the same
  * spec, in `dependencies` only; and its `packages` entry resolves
  * `agent-director@<floor>` from the default registry, with an integrity hash.
  *
  * Every npm-backed test shares one memoised pack probe per file load. Each npm
- * child's environment is a direct `hostSafeChildEnv` call (b.jg5 SRJ-1301,
- * SRJ-1302): the probe's temp dir as HOME, only `npm` and `node` on PATH, and a
+ * child's environment is a direct `hostSafeChildEnv` call: the probe's temp dir as HOME, only `npm` and `node` on PATH, and a
  * throwaway cache and user config inside that dir as extras, so it never reads
- * or writes the real HOME (b.av2 SR-13.2) and inherits nothing else from the
+ * or writes the real HOME and inherits nothing else from the
  * parent environment. The children stay local: `npm --version` and
  * `npm pack --dry-run` only.
  *
@@ -243,7 +242,7 @@ function versionCarriesConfiguredCron(declaredVersion: string): boolean {
 // 1. Version gate — cron in the tree ⇒ version must be >= 0.9.0
 // ---------------------------------------------------------------------------
 
-describe('b.q9t: version gate for the cron feature', () => {
+describe('version gate for the cron feature', () => {
   test('with cron in the tree, declared version is >= 0.9.0 (FAILS-BEFORE-FIX at 0.8.2)', () => {
     // Precondition: the guard is only meaningful while the tree actually ships
     // cron. If a future change removes cron, this documents why the assertion
@@ -401,7 +400,7 @@ function runtimeSrcFiles(): string[] {
     .sort()
 }
 
-describe('b.q9t: npm pack ships every runtime src file', () => {
+describe('npm pack ships every runtime src file', () => {
   const probe = packProbe()
 
   // Skip ONLY when the npm toolchain is absent. With npm present, a pack or
@@ -409,7 +408,7 @@ describe('b.q9t: npm pack ships every runtime src file', () => {
   // a real packaging fault.
   test.skipIf(probe.kind === 'skip')(
     // Superset over ALL runtime src/*.ts, so the five cron files that motivated
-    // b.q9t (cron-bootstrap, cron-dispatch, cron-log, cron-scheduler, crontable)
+    // (cron-bootstrap, cron-dispatch, cron-log, cron-scheduler, crontable)
     // are covered as a special case, along with any future new src file.
     'the packed file set is a superset of the repo runtime src/*.ts files',
     () => {
@@ -429,7 +428,7 @@ describe('b.q9t: npm pack ships every runtime src file', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 3. b.av2 AC 27 — the debugging skill ships
+// 3. the debugging skill ships
 // ---------------------------------------------------------------------------
 
 const SKILL_NAME = 'debug-slack-channel-bots'
@@ -482,21 +481,21 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-describe('b.av2 AC 27: the debugging skill ships in the package', () => {
+describe('the debugging skill ships in the package', () => {
   const probe = packProbe()
 
   // Same contract as guard 2: skip only when npm is absent; a pack or parse
   // error is a hard failure.
   test.skipIf(probe.kind === 'skip')(
-    `AC 27: the npm pack file list includes ${SKILL_REL}`,
+    `the npm pack file list includes ${SKILL_REL}`,
     () => {
       if (probe.kind === 'error') throw new Error(probe.message)
       expect(probe.kind === 'ok' ? probe.files : []).toContain(SKILL_REL)
     },
   )
 
-  // Hermetic companion: guards AC 27 where npm is unavailable.
-  test('AC 27 (hermetic): the skill file exists, is non-empty and has name and description frontmatter', () => {
+  // Hermetic companion: guards where npm is unavailable.
+  test('(hermetic): the skill file exists, is non-empty and has name and description frontmatter', () => {
     const path = resolve(REPO_ROOT, SKILL_REL)
     expect(existsSync(path)).toBe(true)
     const text = readFileSync(path, 'utf-8')
@@ -507,19 +506,19 @@ describe('b.av2 AC 27: the debugging skill ships in the package', () => {
     expect(fm?.description ?? '').not.toBe('')
   })
 
-  test(`AC 27 (hermetic): package.json files covers ${SKILL_REL} and no ! entry excludes it`, () => {
+  test(`(hermetic): package.json files covers ${SKILL_REL} and no ! entry excludes it`, () => {
     expect(filesCover(readPkg().files ?? [], SKILL_REL)).toBe(true)
   })
 })
 
 // ---------------------------------------------------------------------------
-// 3b. The setup wizard's credentials script ships (b.av2 SR-12)
+// 3b. The setup wizard's credentials script ships
 // ---------------------------------------------------------------------------
 
 /** The script `claude-slack-channel-bots credentials` runs, from the package root. */
 const CREDENTIALS_SCRIPT_REL = 'scripts/write-credentials.sh'
 
-describe('b.av2 SR-12: the credentials script ships in the package', () => {
+describe('the credentials script ships in the package', () => {
   const probe = packProbe()
 
   // Same contract as guard 2: skip only when npm is absent; a pack or parse
@@ -552,16 +551,16 @@ function skillHasClassHeading(label: string): boolean {
   return headings(text).some((heading) => heading.level >= 2 && heading.level <= 4 && re.test(heading.title))
 }
 
-describe('b.av2 AC 27: the debugging skill covers every persona diagnostic class', () => {
-  test('b.omv SR-8.6: delivery diagnostic labels belong to the audited persona catalogue', () => {
+describe('the debugging skill covers every persona diagnostic class', () => {
+  test('delivery diagnostic labels belong to the audited persona catalogue', () => {
     expect(DELIVERY_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
     expect(new Set(DELIVERY_DIAGNOSTIC_CLASSES).size).toBe(DELIVERY_DIAGNOSTIC_CLASSES.length)
     expect(PERSONA_DIAGNOSTIC_CLASSES).toEqual(expect.arrayContaining([...DELIVERY_DIAGNOSTIC_CLASSES]))
   })
   // Labels come from the exported closed set, never a hand-copied list, so a
-  // class added later without a skill entry fails here (b.av2 SR-12).
+  // class added later without a skill entry fails here.
   test.each([...PERSONA_DIAGNOSTIC_CLASSES])(
-    'AC 27: the skill has a heading for class %s',
+    'the skill has a heading for class %s',
     (label) => {
       expect(skillHasClassHeading(label)).toBe(true)
       if ((DELIVERY_DIAGNOSTIC_CLASSES as readonly string[]).includes(label)) {
@@ -573,9 +572,9 @@ describe('b.av2 AC 27: the debugging skill covers every persona diagnostic class
   )
 })
 
-describe('b.av2 SR-12: the debugging skill covers every reload diagnostic class', () => {
+describe('the debugging skill covers every reload diagnostic class', () => {
   // The reload classes are their own exported closed set, kept apart from the
-  // persona classes (E11 Director decision 3). Imported, never hand-copied, so
+  // persona classes. Imported, never hand-copied, so
   // a reload class added without a skill entry fails here.
   test('RELOAD_DIAGNOSTIC_CLASSES is non-empty and has no duplicates', () => {
     expect(RELOAD_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
@@ -585,14 +584,14 @@ describe('b.av2 SR-12: the debugging skill covers every reload diagnostic class'
   })
 
   test.each([...RELOAD_DIAGNOSTIC_CLASSES])(
-    'SR-12: the skill has a heading for class %s',
+    'the skill has a heading for class %s',
     (label) => {
       expect(skillHasClassHeading(label)).toBe(true)
     },
   )
 })
 
-describe("b.deo SRI-901: the debugging skill covers every class in the stored-choice store's closed list", () => {
+describe("the debugging skill covers every class in the stored-choice store's closed list", () => {
   // The store's own closed class list (src/channel-delivery.ts), kept apart
   // from the persona and reload classes. Imported, never hand-copied; its
   // exact content is pinned in tests/channel-delivery.test.ts.
@@ -601,7 +600,7 @@ describe("b.deo SRI-901: the debugging skill covers every class in the stored-ch
   })
 
   test.each([...CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES])(
-    'SRI-901: the skill has a heading for class %s',
+    'the skill has a heading for class %s',
     (label) => {
       expect(skillHasClassHeading(label)).toBe(true)
     },
@@ -609,7 +608,7 @@ describe("b.deo SRI-901: the debugging skill covers every class in the stored-ch
 })
 
 // ---------------------------------------------------------------------------
-// 3c. b.deo SRI-1108 — the debugging skill's fungible-mode content (AC 43)
+// 3c. the debugging skill's fungible-mode content
 // ---------------------------------------------------------------------------
 
 let skillCache: string | undefined
@@ -657,10 +656,10 @@ function rowHolding(section: string, has: string, where: string): string {
   return row
 }
 
-/** The classes SRI-1108 gives an entry each: the two persona classes this work adds and the store's class. */
-const SRI_1108_CLASSES = [PERSONA_INVITED_CHANNEL, PERSONA_CHANNEL_DELIVERY_SET, CHANNEL_DELIVERY_UNREADABLE] as const
+/** The classes gives an entry each: the two persona classes this work adds and the store's class. */
+const INVITED_CHANNEL_CLASSES = [PERSONA_INVITED_CHANNEL, PERSONA_CHANNEL_DELIVERY_SET, CHANNEL_DELIVERY_UNREADABLE] as const
 
-/** The parts SRI-1108 asks of each entry, each a bold-lead bullet (`- **Line:**`). */
+/** The parts asks of each entry, each a bold-lead bullet (`- **Line:**`). */
 const ENTRY_PARTS = ['Line', 'Meaning', 'Cause', 'Fix'] as const
 
 /** A bullet whose bold lead is `part` (`- **Fix:**`), at the start of a line. */
@@ -686,7 +685,7 @@ const DECLARATIVE_LEAD = '**Declarative mode**'
 const FUNGIBLE_LEAD = '**Fungible mode**'
 
 /**
- * What `unclaimed-channel`'s entry in `text` lacks under SRI-1108: both
+ * What `unclaimed-channel`'s entry in `text` lacks under both
  * per-mode parts; in the declarative part, a Fix that offers fungible mode as
  * a second fix for a public or private channel that is not externally shared
  * and never for a group DM; in the fungible part, the line, and for each
@@ -753,12 +752,12 @@ const DM_SPAN = `\`"?${escapeRegExp(DM_DESTINATION)}"?\``
 /** The `"dm"` default stated beside `"dm"`: "default" or "absent" within one clause of the span, either side. */
 const DM_DEFAULT = new RegExp(`${DM_SPAN}.{0,80}\\b(?:default|absent)\\b|\\b(?:default|absent)\\b.{0,80}${DM_SPAN}`)
 
-/** What a passage lacks of the fungible destination setting's name (b.deo SRI-1108). */
+/** What a passage lacks of the fungible destination setting's name. */
 function settingProblems(passage: string): string[] {
   return flat(passage).includes(FUNGIBLE_DESTINATION_SETTING) ? [] : [`names no ${FUNGIBLE_DESTINATION_SETTING}`]
 }
 
-/** What a destination passage lacks: the fungible destination setting, and its `"dm"` default (b.deo SRI-1108, SRI-702). */
+/** What a destination passage lacks: the fungible destination setting, and its `"dm"` default. */
 function destinationProblems(passage: string): string[] {
   return [...settingProblems(passage), ...(DM_DEFAULT.test(flat(passage)) ? [] : [`names no "${DM_DESTINATION}" default`])]
 }
@@ -797,7 +796,7 @@ function triageStep(text: string, n: number): string {
 
 /**
  * Every passage that describes a persona's destination as its
- * `permission_prompts` value, each located in the skill (T18's closing notes,
+ * `permission_prompts` value, each located in the skill ( closing notes,
  * report-deo-e1 (d)). Each must also give the fungible-mode wording:
  * `invited.permission_prompts`, or `"dm"` when it is absent.
  */
@@ -859,13 +858,13 @@ function passageAfterCut(passageOf: (text: string) => string, cut: (passage: str
   return passageOf(edited)
 }
 
-describe('b.deo SRI-1108: the debugging skill describes fungible mode (AC 43)', () => {
+describe('the debugging skill describes fungible mode', () => {
   describe('the three entries', () => {
-    test.each([...SRI_1108_CLASSES])('the entry for %s quotes its line and has its Line, Meaning, Cause and Fix', (label) => {
+    test.each([...INVITED_CHANNEL_CLASSES])('the entry for %s quotes its line and has its Line, Meaning, Cause and Fix', (label) => {
       expect(entryProblems(debugSkill(), label)).toEqual([])
     })
 
-    test.each(SRI_1108_CLASSES.flatMap((label) => ENTRY_PARTS.map((part) => [label, part] as const)))(
+    test.each(INVITED_CHANNEL_CLASSES.flatMap((label) => ENTRY_PARTS.map((part) => [label, part] as const)))(
       'self-check: the entry for %s with its %s lead cut fails on that part alone',
       (label, part) => {
         const cut = editSection(debugSkill(), classHeading(label), (body) => body.replace(partLead(part), `- ${part}:`))
@@ -873,7 +872,7 @@ describe('b.deo SRI-1108: the debugging skill describes fungible mode (AC 43)', 
       },
     )
 
-    test.each([...SRI_1108_CLASSES])('self-check: the entry for %s with its line cut fails on the line alone', (label) => {
+    test.each([...INVITED_CHANNEL_CLASSES])('self-check: the entry for %s with its line cut fails on the line alone', (label) => {
       const cut = editSection(debugSkill(), classHeading(label), (body) => body.replaceAll(`[slack] ${label}:`, ''))
       expect(entryProblems(cut, label)).toEqual(['the line'])
     })
@@ -1028,17 +1027,17 @@ function personaLineTemplate(label: PersonaDiagnosticClass, cause: string): stri
   return formatPersonaDiagnostic({ class: label, name: NAME, key: KEY, index: 0, cause }).replace('personas[0]', 'personas[<i>]')
 }
 
-/** The section quoting the start's `[slack] state-migrate:` lines (bug b.fc4). */
+/** The section quoting the start's `[slack] state-migrate:` lines. */
 const STATE_LOCATION_HEADING = "## The state directory's location and its move at start"
 
-/** The placeholders the skill writes in the state directory's lines (bug b.fc4). */
+/** The placeholders the skill writes in the state directory's lines. */
 const OLD_STATE = '<old>'
 const NEW_STATE = '<new>'
 const STATE_TARGET = '<target>'
 const STATE_NAME = '<name>'
 const STATE_CAUSE = '<cause>'
 
-/** The two legacy paths the skill writes literally in the repoint lines (bug b.smv): the old server directory and the 0.15.0 default. */
+/** The two legacy paths the skill writes literally in the repoint lines: the old server directory and the 0.15.0 default. */
 const LEGACY_SERVER_DIR = '~/.claude/channels/slack'
 const LEGACY_XDG_DIR = '~/.config/cscb'
 
@@ -1083,13 +1082,12 @@ function modeSwitchTemplate(mode: ChannelMode): string {
 /**
  * Each text the debugging skill quotes from a `src/` builder, rendered by the
  * builder with the skill's placeholders, and the section that quotes it: the
- * `set_channel_delivery` refusals and failed-write texts (b.deo SRI-502,
- * SRI-503, SRI-506), the store's lines (SRI-904, SRI-905), the stored-choice
- * `reload-record-write-failed` line (SRI-408), and the switch's and the
- * recorded change's preview lines (SRI-803, SRI-804), and the
+ * `set_channel_delivery` refusals and failed-write texts, the store's lines, the stored-choice
+ * `reload-record-write-failed` line, and the switch's and the
+ * recorded change's preview lines, and the
  * `persona-invited-channel`, `persona-channel-delivery-set` and fungible-mode
- * `unclaimed-channel` lines (SRI-902, SRI-903), and the start's state directory lines, `[slack] state-migrate:` and
- * `[slack] Warning: state-migrate:` (bug b.fc4). Rendered when a case runs,
+ * `unclaimed-channel` lines, and the start's state directory lines, `[slack] state-migrate:` and
+ * `[slack] Warning: state-migrate:`. Rendered when a case runs,
  * never at collection.
  */
 const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][] = [
@@ -1320,7 +1318,7 @@ function quotes(section: string, text: string): boolean {
   return flat(section).includes(flat(text))
 }
 
-describe("the debugging skill's quoted texts are their builders' renderings (b.deo SRI-1108)", () => {
+describe("the debugging skill's quoted texts are their builders' renderings", () => {
   test.each(QUOTED_TEXTS)('%s', (label, where, render) => {
     const rendered = render()
     assertNoLeak(rendered, label)
@@ -1391,14 +1389,14 @@ describe("the debugging skill's links resolve", () => {
 })
 
 // ---------------------------------------------------------------------------
-// 4. b.jg5 SRJ-209 — the TOML parser is pinned at exactly one version
+// 4. the TOML parser is pinned at exactly one version
 // ---------------------------------------------------------------------------
 
 /** The package CSCB parses agent-director's settings file with. */
 const TOML_PARSER = 'smol-toml'
 
 /**
- * SRJ-209's pin of the third-party parser: the one version, with no range,
+ * pin of the third-party parser: the one version, with no range,
  * that package.json and bun.lock must name. The only place it is written.
  */
 const TOML_PARSER_PIN = '1.9.0'
@@ -1480,7 +1478,7 @@ function isExactVersion(spec: string): boolean {
   return semver.valid(spec) === spec
 }
 
-describe(`b.jg5 SRJ-209: ${TOML_PARSER} is a runtime dependency at exactly its pinned version (hermetic)`, () => {
+describe(`${TOML_PARSER} is a runtime dependency at exactly its pinned version (hermetic)`, () => {
   test(`package.json dependencies name ${TOML_PARSER} with the exact spec ${TOML_PARSER_PIN}, no range`, () => {
     const spec = readPkg().dependencies?.[TOML_PARSER]
     expect([spec, isExactVersion(spec ?? '')]).toEqual([TOML_PARSER_PIN, true])
@@ -1503,14 +1501,14 @@ describe(`b.jg5 SRJ-209: ${TOML_PARSER} is a runtime dependency at exactly its p
 })
 
 // ---------------------------------------------------------------------------
-// 5. b.jg5 SRJ-101 — agent-director is pinned at the Phase 1 floor
+// 5. agent-director is pinned at the Phase 1 floor
 // ---------------------------------------------------------------------------
 
 /** The agent-director npm client, CSCB's runtime dependency. */
 const AD_PACKAGE = 'agent-director'
 
 /**
- * SRJ-101's rules for the pin, in the order they are checked:
+ * rules for the pin, in the order they are checked:
  *   - `version`: the spec is a version or range at all (not a dist-tag, or a
  *     file, link, tarball, git or URL source);
  *   - `no-range`: it is the bare version text — no range operator (`^`, `~`,
@@ -1524,11 +1522,11 @@ type PinRule = 'version' | 'no-range' | 'no-pre-release' | 'no-build-metadata' |
 type PinVerdict = { ok: true } | { ok: false; broken: PinRule }
 
 /**
- * SRJ-101's pin check: whether `spec` is one exact version equal to `floor`,
+ * pin check: whether `spec` is one exact version equal to `floor`,
  * with no range operator, pre-release suffix or build metadata; otherwise the
  * first {@link PinRule} it breaks.
  */
-function srj101PinVerdict(spec: string, floor: string): PinVerdict {
+function clientPinVerdict(spec: string, floor: string): PinVerdict {
   const parsed = semver.parse(spec)
   if (parsed === null) {
     return { ok: false, broken: semver.validRange(spec) === null ? 'version' : 'no-range' }
@@ -1547,9 +1545,9 @@ const LATER_MINOR_VERSION = semver.inc(PHASE1_FLOOR_VERSION, 'minor')!
 /** The floor's x-range (`<major>.<minor>.x`). */
 const FLOOR_X_RANGE = `${semver.major(PHASE1_FLOOR_VERSION)}.${semver.minor(PHASE1_FLOOR_VERSION)}.x`
 
-describe(`b.jg5 SRJ-101: the pin checker gives each spec its verdict against the floor ${PHASE1_FLOOR_VERSION}`, () => {
+describe(`the pin checker gives each spec its verdict against the floor ${PHASE1_FLOOR_VERSION}`, () => {
   test('the floor itself is the pin', () => {
-    expect(srj101PinVerdict(PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
+    expect(clientPinVerdict(PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
   })
 
   test.each<[string, string, PinRule]>([
@@ -1570,7 +1568,7 @@ describe(`b.jg5 SRJ-101: the pin checker gives each spec its verdict against the
     ['the release before Phase 1', OLD_AD_VERSION, 'equals-floor'],
     ['a later minor version', LATER_MINOR_VERSION, 'equals-floor'],
   ])('refuses %s (%s), breaking rule %s', (_label, spec, broken) => {
-    expect(srj101PinVerdict(spec, PHASE1_FLOOR_VERSION)).toEqual({ ok: false, broken })
+    expect(clientPinVerdict(spec, PHASE1_FLOOR_VERSION)).toEqual({ ok: false, broken })
   })
 })
 
@@ -1587,7 +1585,7 @@ function fixtureLock(root: NonNullable<BunLock['workspaces']>[string], entry: un
   return { workspaces: { '': root }, packages: { [AD_PACKAGE]: entry } }
 }
 
-describe('b.jg5 SRJ-101: the bun.lock pin reader reports what each fixture lock pins', () => {
+describe('the bun.lock pin reader reports what each fixture lock pins', () => {
   const fileSource = `file:../${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`
 
   test.each<[string, BunLock, LockPin]>([
@@ -1640,7 +1638,7 @@ describe('b.jg5 SRJ-101: the bun.lock pin reader reports what each fixture lock 
   })
 })
 
-describe(`b.jg5 SRJ-101: the real package.json and bun.lock pin ${AD_PACKAGE} at the floor ${PHASE1_FLOOR_VERSION} (hermetic)`, () => {
+describe(`the real package.json and bun.lock pin ${AD_PACKAGE} at the floor ${PHASE1_FLOOR_VERSION} (hermetic)`, () => {
   test(`package.json names ${AD_PACKAGE} in dependencies and in no other section`, () => {
     const pkg = readPkg()
     expect(pkg.dependencies?.[AD_PACKAGE]).toBeDefined()
@@ -1648,12 +1646,12 @@ describe(`b.jg5 SRJ-101: the real package.json and bun.lock pin ${AD_PACKAGE} at
   })
 
   test(`package.json's ${AD_PACKAGE} spec is the pin: one exact version equal to the floor`, () => {
-    expect(srj101PinVerdict(readPkg().dependencies?.[AD_PACKAGE] ?? '', PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
+    expect(clientPinVerdict(readPkg().dependencies?.[AD_PACKAGE] ?? '', PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
   })
 
   test(`bun.lock's root workspace names ${AD_PACKAGE} with package.json's exact spec, in dependencies only`, () => {
     const { workspaceSpec, otherSections } = lockPin(readBunLock(), AD_PACKAGE)
-    expect([workspaceSpec, otherSections, srj101PinVerdict(workspaceSpec ?? '', PHASE1_FLOOR_VERSION)]).toEqual([
+    expect([workspaceSpec, otherSections, clientPinVerdict(workspaceSpec ?? '', PHASE1_FLOOR_VERSION)]).toEqual([
       readPkg().dependencies?.[AD_PACKAGE],
       [],
       { ok: true },

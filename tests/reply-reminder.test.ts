@@ -51,7 +51,7 @@ async function send(queue: ReplyReminderQueue, key = 'alpha', input: AcceptedInp
 }
 const nudges = (q: ReplyReminderQueue, key = 'alpha') => q.items(key).filter(item => item.accepted.reminder_for !== undefined)
 
-describe('AD row reply reminders (b.js7)', () => {
+describe('AD row reply reminders', () => {
   test.each([undefined, '0'])('a legacy Claude row with reply preallow marker %s gets no reminder, including after resume', async marker => {
     const q = await open(), h = harness(q)
     const labels = { ...h.row('working').labels }

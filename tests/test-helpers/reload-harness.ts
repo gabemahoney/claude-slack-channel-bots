@@ -345,7 +345,7 @@ export interface ReloadLifecycleRecord {
   /**
    * Apply bring-up only, and only when set: the step-6 recovery bring-up of a
    * persona broken by its credentials whose credentials file changed (the
-   * controller passed `{ recovery: true }`, b.av2 SR-6.4). Absent for an
+   * controller passed `{ recovery: true }`). Absent for an
    * added persona's bring-up, so its record compares as before.
    */
   readonly recovery?: true
@@ -356,14 +356,14 @@ export interface ReloadLifecycleRecord {
    * (`spawnForPersona`) did, set once it resolved (`spawned`, `resumed`,
    * `reconnected`, `deferred`, `failed`, …; `fresh-retired`,
    * `SPAWN_ACTION_FRESH_RETIRED`, for a recorded retired key's reuse that
-   * began its new life, b.jg5 SRJ-806). Absent for a recorded-only launch.
+   * began its new life). Absent for a recorded-only launch.
    */
   action?: SpawnPersonaResult['action']
   /**
    * Launch via `restart` only (`run.relaunch`): what the restart module's
    * `launchSession` answered (`true`, `false`, `'skipped'` when the
    * relaunch gate refused it or the launch was deferred, or `'refused'` when
-   * the launch's UNAVAILABLE retry timer owns the persona, b.jg5 SRJ-301),
+   * the launch's UNAVAILABLE retry timer owns the persona),
    * set once resolved.
    */
   restart?: LaunchSessionResult
@@ -420,7 +420,7 @@ export interface ReloadLifecycleRecorder {
    * calls (a recovery bring-up included) in the
    * order they started and settled (`start`, then `settled` or `rejected`),
    * across personas and steps, so step order is asserted without timing
-   * (b.av2 SR-8.6). A held call's `start` comes when it arrives, its
+   * A held call's `start()` comes when it arrives, its
    * `settled` after its body ran. Start-pass bring-ups are not here, and
    * neither is step 5 (see `applyTimeline`).
    */
@@ -466,7 +466,7 @@ export interface RealLifecycleComposition {
   /**
    * The agent-director `kill` calls in call order, as `kill <instance ID>`
    * (one per try of a teardown's bounded retry). No CSCB path deletes a row
-   * (b.jg5 SRJ-715, SRJ-716); a `delete` call would show here too, as
+   * a `delete` call would show here too, as
    * `delete <instance IDs>`, and leave the row as it was.
    */
   readonly agentDirectorOrder: readonly string[]
@@ -512,7 +512,7 @@ export interface RealLifecycleComposition {
    * Hold every `find-missing` call the stub gets from now on until the case
    * settles it (the stub's `holdFindMissing`): with `opts.realLaunch`, a
    * live-row sequence's run (`run.startSequence`) stays outstanding while
-   * the case drives an apply (b.jg5 SRJ-706). The case releases every held
+   * the case drives an apply. The case releases every held
    * call before the harness's cleanup.
    */
   holdFindMissing(): FindMissingHold
@@ -529,12 +529,12 @@ export interface RealLifecycleComposition {
    * Every entry the run's kill-failure alerts wrote through their log-only
    * route (production's `recordStartupError`: the server log and
    * `startup-errors.log`), in order, as its class label and entry text: a
-   * persona teardown's alert (b.jg5 SRJ-704, SRJ-715) is one
+   * persona teardown's alert is one
    * `persona-teardown-notice` (ordinary) or `persona-kill-survivor` entry.
    * Unless `opts.oldLifeWait` is `false`, the old-life wait's entries join them: its
    * kill-failure alerts (`persona-kill-failed`, `persona-kill-survivor`)
    * and its startup-errors recorder's (`persona-teardown-notice` "during
-   * the wait", b.jg5 SRJ-811, SRJ-1002). Nothing on this route reaches Slack.
+   * the wait"). Nothing on this route reaches Slack.
    */
   readonly killFailureEntries: ReadonlyArray<{ readonly classLabel: string; readonly entry: string }>
 }
@@ -579,7 +579,7 @@ function errorName(err: unknown): string {
  * (`waiting`, the reuse's `cwd` and labels), creates a missing one, and
  * collides with a live row; a resume sets it `waiting` and a kill that
  * succeeds `ended`, and a failed kill leaves it as it was. Nothing removes a
- * row: no CSCB path deletes one (b.jg5 SRJ-715), so a torn-down persona's
+ * row: no CSCB path deletes one, so a torn-down persona's
  * row is kept, `ended`. `get` answers it and `status` its state (a `working`
  * row answers `waiting`, its turn over), a `pending` row's with its launch
  * start. `h.seedRow` sets or changes it.
@@ -714,8 +714,8 @@ export interface BotTokenRevocation {
 
 /**
  * `run.admitSession`'s answer: the registered session when the persona was
- * admitted; `held` when its working directory is held for an old life (b.jg5
- * SRJ-810, SRJ-1505; with `opts.realLaunch` only).
+ * admitted; `held` when its working directory is held for an old life (
+ * with `opts.realLaunch` only).
  */
 export type ReloadSessionAdmission =
   | { readonly kind: 'admitted'; readonly session: SessionEntry }
@@ -836,7 +836,7 @@ export interface ReloadRunActivity {
 /**
  * A run that did nothing: `expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)`
  * shows a stretch of ticks logged, wrote, deleted, called a lifecycle op,
- * built a Slack client and called Slack not at all (AC 55).
+ * built a Slack client and called Slack not at all.
  */
 export const NO_RUN_ACTIVITY: Readonly<ReloadRunActivity> = Object.freeze({
   logs: [],
@@ -848,7 +848,7 @@ export const NO_RUN_ACTIVITY: Readonly<ReloadRunActivity> = Object.freeze({
 })
 
 // ---------------------------------------------------------------------------
-// Preview emissions in the log (b.av2 SR-8.4, SR-10.3)
+// Preview emissions in the log
 // ---------------------------------------------------------------------------
 
 /** Start of every `reload-preview` log line. */
@@ -995,7 +995,7 @@ export interface ReloadRunOptions {
   leaveSpawnsPending?: (id: string) => boolean
   /**
    * With `realLaunch`: install the old-life wait's bindings
-   * (`setOldLifeWaitBindings`, b.jg5 SRJ-811), as `main()` installs them
+   * (`setOldLifeWaitBindings`), as `main()` installs them
    * beside the live-row sequence registry, so a launch the old-life gate
    * holds back starts the hold's wait (its kill and `find-missing` steps on
    * the old key, with no launch), and the waiting persona's retry timer is
@@ -1012,8 +1012,7 @@ export interface ReloadRunOptions {
    * picks (asked at each kill) leaves the row's state as it was, instead of
    * `ended`: a worker the kill did not end, so the reads after it (a live-row
    * sequence's or an old-life wait's `get`, `status`) still read it live and
-   * the sequence goes on to its `find-missing` steps (b.jg5 SRJ-705,
-   * SRJ-811). Absent: every successful kill ends the row.
+   * the sequence goes on to its `find-missing` steps. Absent: every successful kill ends the row.
    */
   killLeavesRowLive?: (id: string) => boolean
   /**
@@ -1044,10 +1043,10 @@ export type ReloadLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 /** A run's `ErrInvalidFlags` hold, read-only: the held query and the version a hold began under. */
 export type ReloadInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'beganUnder'>
 
-/** A run's old-life hold set, read-only: its queries (b.jg5 SRJ-809). */
+/** A run's old-life hold set, read-only: its queries. */
 export type ReloadOldLifeHoldsView = Pick<OldLifeHoldSet, 'holdOf' | 'holdsOnDirectory' | 'holdsWaitedOnBy' | 'waitsOnKillFailed' | 'snapshot'>
 
-/** A realLaunch run's UNAVAILABLE retry timers, read-only: their queries (b.jg5 SRJ-301, SRJ-810). */
+/** A realLaunch run's UNAVAILABLE retry timers, read-only: their queries. */
 export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'isArmed' | 'armedKeys' | 'whenRunSettled'>
 
 /** One server start over the harness's files; see the file comment. */
@@ -1075,18 +1074,18 @@ export interface ReloadRun {
   readonly removes: readonly ReloadRemoveRecord[]
   /**
    * The run's retired-key store (`loadRetiredKeyStore` over `h.stateDir`,
-   * b.jg5 SRJ-802), built at the run's start as `main()` builds its one
+   *), built at the run's start as `main()` builds its one
    * store, and handed to the controller (`retiredKeys`): its writes and
    * deletes go through the run's writer and delete, so they are in
    * `run.writes` / `run.removes` and `h.failWrites` / `h.failRemoves` count
    * them with the record's; its lines go to `run.logs`; its times come from
    * `run.clock`. A later run (a restart) loads a new store from the disk.
    * With `opts.realLaunch` it is also the session manager's installed store
-   * (`setRetiredKeyStore`) until the run stops (b.jg5 SRJ-805, SRJ-806).
+   * (`setRetiredKeyStore`) until the run stops.
    */
   readonly retiredKeys: RetiredKeyStore
   /**
-   * The run's one stored-choice store (b.deo SRI-403, SRI-1203):
+   * The run's one stored-choice store:
    * `loadChannelDeliveryAtStart` over `h.stateDir`, loaded by
    * `run.resolveStart()` once the start resolves to an applied configuration
    * (in dry run too), with the start rules over the applied personas and
@@ -1102,8 +1101,8 @@ export interface ReloadRun {
    */
   readonly channelDelivery: ChannelDeliveryStore
   /**
-   * The run's old-life hold set, read-only (`createOldLifeHoldSet`, b.jg5
-   * SRJ-809), built empty at the run's start as `main()` builds its one set,
+   * The run's old-life hold set, read-only (`createOldLifeHoldSet`
+   *), built empty at the run's start as `main()` builds its one set,
    * and handed to the controller (`oldLifeHolds`), so a confirmed apply's
    * step 1 begins its holds here; its lines go to `run.logs`. With
    * `opts.realLaunch` it is also the session manager's installed set
@@ -1140,7 +1139,7 @@ export interface ReloadRun {
   /**
    * Deliver `event` on the persona's current socket stub
    * (`run.stub(name).socket.deliver`), through the event router and the
-   * routing (b.av2 SR-13.1, b.deo SRI-1203). `envelope` is passed to the
+   * routing. `envelope` is passed to the
    * stub unchanged: its overrides of the envelope's fields (for example
    * `is_ext_shared_channel`, an `ENVELOPE_FLAG_FORMS` entry); with none the
    * envelope carries `is_ext_shared_channel: false`.
@@ -1159,8 +1158,7 @@ export interface ReloadRun {
    * Call MCP tool `tool` with `args` as the persona's instance: an in-memory
    * MCP client over `createSessionServer` for its registered session (the
    * real tool handlers, whose posting scope reads the applied persona at
-   * each call), with the run's tool deps as server.ts binds them (b.deo
-   * SRI-1203): the client lookup, the channel mode of `run.serverConfig()`,
+   * each call), with the run's tool deps as server.ts binds them: the client lookup, the channel mode of `run.serverConfig()`,
    * the run's stored-choice store (`set_channel_delivery` writes through it,
    * so `h.failChannelDeliveryWrites` fails its write), the routing's heard
    * set and the applied personas, each read at call time; its
@@ -1168,7 +1166,7 @@ export interface ReloadRun {
    * Needs `run.registerSession` first. No file may be sent (the file guard
    * refuses every path).
    *
-   * `session` (b.deo SRI-502): an entry kept from `run.session(name)`; the
+   * `session`: an entry kept from `run.session(name)`; the
    * call goes through a client over that entry, even after the registry
    * dropped it or a newer registration replaced it, so the tool resolves
    * the session it was given. Without it the call goes through the
@@ -1212,7 +1210,7 @@ export interface ReloadRun {
   /**
    * Every path the detection tick's credentials reads opened (its
    * `CredentialsFs.openFile`, through `opts.credentialsFs` when given), in
-   * order. Empty for a whole run in dry run (b.av2 SR-3.4, SR-8.2). The
+   * order. Empty for a whole run in dry run. The
    * start's bring-up reads are not here (they use `bringUpFs`). Not part of
    * `since`: slice it by length around a stretch of ticks.
    */
@@ -1248,7 +1246,7 @@ export interface ReloadRun {
    * was rewritten and the applied set swapped, before step 2 starts (the
    * moment `opts.onApplied` is called, with the same configuration). E.g. to
    * retarget a symlink so a credentials real path collides with another
-   * applied persona's after the candidate was validated (b.av2 SR-1.4, apply
+   * applied persona's after the candidate was validated (apply
    * part). A throw is logged by the controller as a failed `onApplied`.
    */
   beforeApplySteps(hook: (applied: PersonaConfig) => void): void
@@ -1277,7 +1275,7 @@ export interface ReloadRun {
    */
   socketActivity(name: string): string[]
   /**
-   * Make the persona's bot token look revoked to Slack (bug b.ujn): the next
+   * Make the persona's bot token look revoked to Slack: the next
    * call on each Web API queue of its current stub (`currentStub`, or
    * `opts.credentials`) answers the platform error `opts.error` (default
    * `token_revoked`), put at the front of each queue. Whichever call a
@@ -1290,8 +1288,7 @@ export interface ReloadRun {
    */
   revokeBotToken(name: string, opts?: BotTokenRevocation): () => void
   /**
-   * Make a running persona credentials-broken by a refused reopen (b.av2
-   * SR-3.3): Slack drops its live socket and the reopen's `start()` is
+   * Make a running persona credentials-broken by a refused reopen: Slack drops its live socket and the reopen's `start()` is
    * refused with `error` (default `invalid_auth`). Resolves once the manager
    * reports it `broken` (phase `reopen`); throws if it never does. Its
    * instance is kept and its MCP session dropped (`onLeftUp`, as server.ts
@@ -1336,7 +1333,7 @@ export interface ReloadRun {
    */
   relaunch(name: string): Promise<LaunchSessionResult>
   /**
-   * Start the persona's live-row sequence (b.jg5 SRJ-706; `opts.realLaunch`)
+   * Start the persona's live-row sequence (`opts.realLaunch`)
    * through the session manager's start entry, as later start sites reach
    * the run's registry: from step 1, the row last read live (`waiting`
    * unless `lastReadState` says otherwise), its launch kept, the recovery
@@ -1350,22 +1347,22 @@ export interface ReloadRun {
   /** Every session-manager notice raised (spawn failure, restart cap, lost history) with `opts.realLaunch`, by persona key, in order. */
   readonly sessionNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
   /**
-   * The run's one latch, read-only (`isLatched`, `record`; b.jg5 SRJ-501):
+   * The run's one latch, read-only (`isLatched`, `record`):
    * a CONFLICT at a real launch's ladder spawn or `resume` sets it, the
    * teardown's `forgetConflictLatch` forgets the key, and a later run starts
    * with none (a server restart drops every latch).
    */
   readonly latch: ReloadLatchView
   /**
-   * The run's one `ErrInvalidFlags` hold, read-only (`isHeld`, `beganUnder`;
-   * b.jg5 SRJ-207): a real launch's reuse spawn answering `ErrInvalidFlags`
+   * The run's one `ErrInvalidFlags` hold, read-only (`isHeld`, `beganUnder`
+   * ): a real launch's reuse spawn answering `ErrInvalidFlags`
    * sets it, the teardown's `forgetInvalidFlagsHold` forgets the key, and a
    * later run starts with none (a server restart ends every hold).
    */
   readonly invalidFlagsHold: ReloadInvalidFlagsHoldView
   /**
    * Every post of the run's notice episodes (the CONFLICT notice's body,
-   * b.jg5 SRJ-1004, and the `ErrInvalidFlags` hold's alert, SRJ-1008), by
+   * and the `ErrInvalidFlags` hold's alert), by
    * persona key, in order, as handed to the run's notifier (which posts it
    * to the persona's destination).
    */
@@ -1407,7 +1404,7 @@ export type ReloadPersonaFiles = Pick<PersonaInput, 'name' | 'credentials_file' 
 export interface ReloadHarness {
   /** The `mkdtempSync` root (real path); every other path is under it. */
   readonly root: string
-  /** The configuration directory: only the SR-8.1 files live here. */
+  /** The configuration directory: only the files live here. */
   readonly dir: string
   /** The temp home handed to the controller for `~` expansion, and the spawn home of a real launch (nothing is created in it). */
   readonly home: string
@@ -1433,25 +1430,25 @@ export interface ReloadHarness {
   rowOf(name: string): AgentDirectorRow | undefined
   /** `reloadFilePaths(<dir>/config.json)`. */
   readonly paths: ReloadFilePaths
-  /** The retired-key record's path, `retiredKeysPath(stateDir)` (b.jg5 SRJ-802). */
+  /** The retired-key record's path, `retiredKeysPath(stateDir)`. */
   readonly retiredKeysFile: string
-  /** A writer call on the retired-key record, as `run.writes` holds it: apply step 1's record, or a restore (b.jg5 SRJ-803, SRJ-804). */
+  /** A writer call on the retired-key record, as `run.writes` holds it: apply step 1's record, or a restore. */
   retiredKeysWrite(ok?: boolean): ReloadRunActivity['writes'][number]
   /** A writer call on the last-applied record (`paths.lastApplied`), as `run.writes` holds it. */
   lastAppliedWrite(ok?: boolean): ReloadRunActivity['writes'][number]
-  /** The stored-choice file's path, `channelDeliveryPath(stateDir)` (b.deo SRI-401, SRI-1203). */
+  /** The stored-choice file's path, `channelDeliveryPath(stateDir)`. */
   readonly channelDeliveryFile: string
   /**
    * A writer call on the stored-choice file, as `run.writes` holds it: a
    * drop's write, the write of unwritten drops before a bring-up, or a
-   * stored choice's write (b.deo SRI-404 to SRI-408, SRI-1203).
+   * stored choice's write.
    */
   channelDeliveryWrite(ok?: boolean): ReloadRunActivity['writes'][number]
   /**
    * The stored-choice record as the module's parser reads it
    * (`readChannelDeliveryRecord` over `h.stateDir`, from
    * `tests/test-helpers/channel-delivery.ts`), or null when there is no file
-   * (b.deo SRI-1203). Throws when the parser refuses the file. Seed a
+   * Throws when the parser refuses the file. Seed a
    * valid record with `writeChannelDeliveryRecord(h.stateDir, entries)`
    * (`tests/test-helpers/channel-delivery.ts`).
    */
@@ -1459,7 +1456,7 @@ export interface ReloadHarness {
   /**
    * Put exactly `bytes` at `h.channelDeliveryFile`, outside every seam and
    * record (not in `run.writes`, not in `run.captured()`), for an invalid or
-   * unreadable seed (b.deo SRI-403, SRI-1203); returns them. A valid seed
+   * unreadable seed; returns them. A valid seed
    * goes through `writeChannelDeliveryRecord` instead.
    */
   writeChannelDeliveryBytes(bytes: string | Uint8Array): Buffer
@@ -1486,7 +1483,7 @@ export interface ReloadHarness {
   /** The names in the configuration directory, sorted. */
   configDirEntries(): string[]
   /**
-   * The AC 20 directory sweep: every regular file under the root but
+   * The directory sweep: every regular file under the root but
    * `excluded` (the operator-written ones: `config.json`, credentials files,
    * a hand-edited record), as a `writtenFile` keyed by its root-relative
    * path, for `assertNoLeak`, which checks both the key (the file's name)
@@ -1564,7 +1561,7 @@ export interface ReloadHarness {
   /** Write raw bytes to `paths.pending` (a leftover or hand-placed file); returns them. */
   writePendingBytes(bytes: string | Uint8Array): Buffer
   /**
-   * The operator's confirmation gesture (b.av2 SR-8.5, AC 73): rename
+   * The operator's confirmation gesture: rename
    * `paths.pending` to `paths.apply`, content unchanged. Throws when there is
    * no pending file.
    */
@@ -1623,7 +1620,7 @@ export interface ReloadHarness {
   clearRemoveFailure(): void
   /**
    * Make the stored-choice store's writer fail (default every `openSync`
-   * call, `EIO`) until cleared (b.deo SRI-1203): the same `WriteFailure`
+   * call, `EIO`) until cleared: the same `WriteFailure`
    * options as `failWrites`, on its own seam, which fails only the store's
    * writes and counts their calls apart from `failWrites` (whose seam never
    * fails a stored-choice write). `{ step: 'fsyncSync', call: 2 }` fails the
@@ -1807,7 +1804,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
   const writeSeam = makeFailureSeam('openSync')
   const removeSeam = makeFailureSeam('unlinkSync')
-  /** The stored-choice store's own write-failure seam (b.deo SRI-1203), counted apart from `writeSeam`. */
+  /** The stored-choice store's own write-failure seam, counted apart from `writeSeam`. */
   const channelDeliveryWriteSeam = makeFailureSeam('openSync')
 
   /** Runs that reached their `opts.stopBeforeWrite` stop point and were not stopped yet. */
@@ -1921,7 +1918,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         bringUp: (persona, tokens) => connections.connections.bringUp(persona, tokens),
         status: (key) => connections.manager.status(key),
         // As server.ts wires it (the manager itself): a claude_config_dir
-        // hold that starts later closes the persona's connection (bug b.g57).
+        // hold that starts later closes the persona's connection.
         stop: (key) => connections.manager.stop(key),
       },
       clock: connections.clock,
@@ -1931,7 +1928,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       launch: (persona) => launch(persona, 'retry'),
       // As server.ts wires it: a persona's claude_config_dir is checked
       // before its Slack step, and re-checked while it is held, exactly as
-      // the launch checks it (bug b.g57). Without a real launch, against the
+      // the launch checks it. Without a real launch, against the
       // temp home as the reload controller checks it, never the process home.
       checkConfigDir: realLaunch ? checkLaunchConfigDir : (persona) => checkPersonaConfigDir(persona, { home }),
       // As server.ts wires it: a persona that stops being up (a refused
@@ -1964,7 +1961,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const res = await client.users.info({ user: userId })
       return res.user?.profile?.display_name || userId
     }
-    // As server.ts wires its destination resolver (b.deo SRI-201, SRI-701):
+    // As server.ts wires its destination resolver:
     // the switch is read from the configuration in effect at each attempt.
     const noticeStack = makeNotifierStack({
       getPersona: getAppliedPersona,
@@ -1973,7 +1970,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       isDryRun: () => dryRun,
       getPersonaConfig: appliedConfig,
     })
-    // As main() builds them (b.jg5 SRJ-1016, SRJ-501, SRJ-508): the run's one
+    // As main builds them: the run's one
     // set of notice episodes, on the run's fake clock, posting through the
     // run's notifier (each post also recorded in `episodeNotices`), and the
     // run's one latch, in memory only, so a later run (a server restart) and
@@ -1992,7 +1989,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     })
     const latch = createConflictLatch({ log })
     bindConflictNotice(latch, episodes)
-    // As main() builds it (b.jg5 SRJ-207, SRJ-1008): the run's one
+    // As main builds it: the run's one
     // ErrInvalidFlags hold, in memory only, its set reaction bound to the
     // run's episodes (one alert per hold episode). The run has no UNAVAILABLE
     // retry controller, so the reaction's timer stop stops nothing.
@@ -2014,8 +2011,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       archive: () => undefined,
       log,
       now: connections.clock.now,
-      // As server.ts wires it (b.av2 SR-4.2 beside b.deo SRI-305, SRI-403,
-      // SRI-1203): the stored choices and their readability, read at each
+      // As server.ts wires it (beside,
+      //): the stored choices and their readability, read at each
       // fungible-mode event from the run's one stored-choice store (the one
       // `run.channelDelivery` exposes). The holder, not that getter: before
       // the start loads the store, and after a refused start, it is
@@ -2032,8 +2029,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     )
 
     /**
-     * The run's UNAVAILABLE retry timers (`opts.realLaunch`; b.jg5 SRJ-301,
-     * SRJ-810), as `main()` builds its one controller: on `run.clock`, its
+     * The run's UNAVAILABLE retry timers (`opts.realLaunch`,
+     *), as `main()` builds its one controller: on `run.clock`, its
      * lines to `run.logs`, its action `retryLaunch`. Bound below as `main()`
      * binds it: the old-life wait's arm (`setOldLifeWaitBindings`), the hold
      * set's end observer (`createOldLifeHoldEndRetry` over its `runNow`) and
@@ -2056,8 +2053,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
      * hold the persona waits on) is a refusal naming it, with no call. Then
      * the restart path's old-life hook, bound as `main()` binds
      * `RestartDeps.isHeldForOldLife` (`oldLifeHoldStep(persona,
-     * 'runRestartWork')`, asked after the shutdown and not-up checks; b.jg5
-     * SRJ-810, SRJ-812): a held persona is recorded as waiting, the hold's
+     * 'runRestartWork')`, asked after the shutdown and not-up checks
+     *): a held persona is recorded as waiting, the hold's
      * wait started and its timer armed by the step, and the retry is a
      * refusal naming what blocks it (`sequenceWaitingAgainReason`) with no
      * call and no launch record. Else
@@ -2138,7 +2135,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             return result
           })
         },
-        // No CSCB path deletes a row (b.jg5 SRJ-715, SRJ-716): a delete is
+        // No CSCB path deletes a row: a delete is
         // only recorded (`agentDirectorOrder`, `instanceCallsOf`), so a case's
         // exact expectation fails on it, and it changes no row.
         delete(params: Parameters<typeof stub.delete>[0]) {
@@ -2231,7 +2228,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         notify: (key) => void calls.push(['outage-notice', key]),
       })
       outageStateInstalled = true
-      // As main() builds them (b.jg5 SRJ-704): the kill-failure alerts over
+      // As main builds them: the kill-failure alerts over
       // the run's notice episodes, a key configured while the run's applied
       // configuration holds it, and the log-only route (production's
       // `recordStartupError`) recorded in `killFailureEntries`, never Slack.
@@ -2277,8 +2274,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           },
         },
         // The run's routing's per-key forget, as server.ts binds it, so a
-        // torn-down key's dedupe store and heard set are dropped (b.av2
-        // SR-6.5, b.deo SRI-307).
+        // torn-down key's dedupe store and heard set are dropped.
         routing: { forget: rec('routing.forget', (key) => routing.forget(key)) },
         // The real tracker's per-key forget, as server.ts binds it, so a key
         // added again starts with no ack-reaction entry.
@@ -2292,9 +2288,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // An apply here never runs during shutdown.
         isShuttingDown: () => false,
         log,
-        // As main() binds it (b.jg5 SRJ-404, SRJ-715): a teardown stops the
+        // As main binds it: a teardown stops the
 
-        // As main() binds it (b.jg5 SRJ-706, SRJ-715): right after the
+        // As main binds it: right after the
 
         // manager's stop entry (with a realLaunch run's registry installed;
         // with none it stops nothing).
@@ -2302,21 +2298,21 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         whenLaunchSettled: rec('whenLaunchSettled', (key) => whenLaunchSettled(key)),
         cancelRestartTimer: rec('cancelRestartTimer', () => false),
         // With the real launch path, as main() binds it: the run's retry
-        // timers stop the key's timer (b.jg5 SRJ-305); else a recording
+        // timers stop the key's timer; else a recording
         // no-op, as such a run arms no UNAVAILABLE retry timer.
         stopRetryTimer: rec('stopRetryTimer', (key) => retryTimers?.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)),
-        // With the real launch path, as main() binds it (b.jg5 SRJ-811):
+        // With the real launch path, as main binds it:
         // right after each retry-timer stop before the kill, the key is
         // forgotten from every old-life hold's waiting record, and a wait no
         // persona left in the applied configuration waits on is stopped.
         ...(realLaunch ? { forgetOldLifeWaits: rec('forgetOldLifeWaits', (key) => forgetOldLifeWaits(key)) } : {}),
         forgetFailures: rec('forgetFailures'),
         forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
-        // As main() binds them (b.jg5 SRJ-504, SRJ-1016): the run's latch
+        // As main binds them: the run's latch
         // forgets the key silently, then the run's episodes end every kind of
         // the key's episode (its CONFLICT episode included), silently.
         forgetConflictLatch: rec('forgetConflictLatch', (key) => latch.forget(key)),
-        // As main() binds it (b.jg5 SRJ-207, SRJ-715): the run's hold forgets
+        // As main binds it: the run's hold forgets
         // the key silently (no post, no retry), right after its latch.
         forgetInvalidFlagsHold: rec('forgetInvalidFlagsHold', (key) => invalidFlagsHold.forget(key)),
         forgetNoticeEpisodes: rec('forgetNoticeEpisodes', (key) => episodes.forget(key)),
@@ -2325,7 +2321,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         forgetPersonaPrompts: rec('forgetPersonaPrompts', () => 0),
         dropSession: rec('dropSession', async () => undefined),
-        // As main() binds it (b.jg5 SRJ-715, SRJ-110, SRJ-702): the
+        // As main binds it: the
         // teardown's kill with the bounded retry, its waits between tries on
         // the run's fake clock (`run.clock`), never a real timer; there is no
         // delete, so the row is kept whatever the outcome.
@@ -2333,7 +2329,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           calls.push(['killInstance', key])
           return killPersonaInstanceForTeardown(key, { clock: connections.clock })
         },
-        // As main() binds it (b.jg5 SRJ-704): the retry's kill-failure alert
+        // As main binds it: the retry's kill-failure alert
         // decision through the run's kill-failure alerts, with the context
         // 'persona teardown' (the log-only route: `killFailureEntries`).
         raiseKillFailureAlert: (key, decision) => {
@@ -2640,7 +2636,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // The run's writer and delete: the controller's, and the retired-key
     // store's, so both reach the disk through the same seams and records.
     const write = writerOver(writeSeam.fs)
-    // The stored-choice store's writer (b.deo SRI-1203): the same writer
+    // The stored-choice store's writer: the same writer
     // path, over its own failure seam (`h.failChannelDeliveryWrites`), so
     // `h.failWrites` never fails a stored-choice write and neither seam
     // counts the other's calls.
@@ -2657,24 +2653,24 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       removes.push({ path, ok: true, removed, unsynced: false })
       return removed
     }
-    // As main() loads its one store before the start resolution (b.jg5 SRJ-802).
+    // As main loads its one store before the start resolution.
     const loadedRetiredKeys = loadRetiredKeyStore(stateDir, { write, remove, log, now: () => connections.clock.now() })
     if (loadedRetiredKeys.kind !== 'loaded') {
       throw new Error(`reload-harness: the run cannot load the retired-key record: ${loadedRetiredKeys.message}`)
     }
     const retiredKeys = loadedRetiredKeys.store
-    // As main() builds its one set beside the store (b.jg5 SRJ-809): in
+    // As main builds its one set beside the store: in
     // memory only, so each run (a server start) begins with none.
     const oldLifeHolds = createOldLifeHoldSet({ log })
     /**
-     * The run's one stored-choice store (b.deo SRI-403, SRI-1203): loaded by
+     * The run's one stored-choice store: loaded by
      * `run.resolveStart()` once the start resolves to an applied
      * configuration, as `main()` loads its one store; undefined before that
      * and after a refused start.
      */
     let channelDeliveryStore: ChannelDeliveryStore | undefined
     /**
-     * As `main()` loads it (b.deo SRI-403, SRI-407): right after the start
+     * As `main()` loads it: right after the start
      * resolved the configuration it runs and before the start bring-up pass,
      * behind no branch (both modes, dry run too), the start rules over the
      * applied personas and the run's retired-key store. Its lines go to
@@ -2700,18 +2696,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       onQueueRetained: key => queue.retained(key),
       paths,
       retiredKeys,
-      // As main() passes it (b.deo SRI-406, SRI-408, SRI-502): an accessor
+      // As main passes it: an accessor
       // over the run's one stored-choice store, with main()'s guard for an
       // apply before the start loaded it.
       channelDelivery: () => {
         if (channelDeliveryStore === undefined) throw new Error('a confirmed apply ran before the start loaded the stored-choice store')
         return channelDeliveryStore
       },
-      // As main() passes it (b.jg5 SRJ-809): apply step 1 begins its holds in
+      // As main passes it: apply step 1 begins its holds in
       // the run's one set, the set a realLaunch run installs for the session
       // manager.
       oldLifeHolds,
-      // As main() binds it (b.jg5 SRJ-808, SRJ-404): apply step 1 stops the
+      // As main binds it: apply step 1 stops the
 
       // stood; with the real launch path also the session manager's real stop
 
@@ -2816,7 +2812,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       resolveUserName,
       consumeAck,
       serverPort: 0,
-      // As server.ts binds them (b.deo SRI-201, SRI-502, SRI-1203), each read
+      // As server.ts binds them, each read
       // at call time over the run's own objects: the channel mode of the
       // configuration in effect; the run's one stored-choice store (its
       // holder, undefined before the start loads it, so the tool refuses and
@@ -2825,7 +2821,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // heard set; and the applied personas of the configuration in effect.
       // The tool's `persona-channel-delivery-set` line goes to `run.logs` in
       // every run (server.ts sends it to `console.error`, the `[slack]`
-      // stream; b.deo SRI-505).
+      // stream).
       getChannelMode: () => channelModeOf(serverConfig()),
       getChannelDelivery: () => channelDeliveryStore,
       heardChannels: (key) => routing.heardChannels(key),
@@ -3042,7 +3038,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           isPersonaUp,
           describeNotUp: (k) => describePersonaNotUp(bringUps.state(k)),
           log,
-          // As server.ts passes it (b.jg5 SRJ-810, SRJ-1505): the session
+          // As server.ts passes it: the session
           // manager's held-directory query over the installed hold set, the
           // run's own with the real launch path.
           ...(realLaunch ? { heldDirectory: oldLifeHeldDirectory } : {}),
@@ -3113,13 +3109,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetRetiredKeyStore()
           installedRetiredKeys = undefined
         }
-        // Likewise its old-life hold set, which the process's end drops (b.jg5 SRJ-809).
+        // Likewise its old-life hold set, which the process's end drops.
         if (installedOldLifeHolds === oldLifeHolds) {
           _resetOldLifeHolds()
           installedOldLifeHolds = undefined
         }
         // Its end-retry observer leaves its set, and its old-life wait bindings
-        // the session manager, when they are the installed ones (b.jg5 SRJ-810, SRJ-811).
+        // the session manager, when they are the installed ones.
         removeOldLifeEndRetry?.()
         removeOldLifeEndRetry = undefined
         if (installedWaitBindingsOwner === run) {
@@ -3131,10 +3127,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         noticeStack.hold.cancelAll()
         // As main()'s shutdown closes them: nothing opens or posts after it.
         episodes.close()
-        // As main()'s shutdown (b.jg5 SRJ-706): every live-row sequence is
+        // As main's shutdown: every live-row sequence is
         // stopped, none starts after it.
         void sequences?.close()
-        // As main()'s shutdown (b.jg5 SRJ-301): every retry timer is stopped,
+        // As main's shutdown: every retry timer is stopped,
         // and no later arm is taken.
         retryTimers?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
         for (const client of toolClients.values()) await client.close()
@@ -3164,33 +3160,33 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         sessionNotices.push({ key, text })
         return noticeStack.notifier.notify(key, text, options)
       })
-      // As main() installs it before the start pass (b.jg5 SRJ-501, SRJ-502):
+      // As main installs it before the start pass:
       // the collision ladder latches through the run's latch on a CONFLICT at
       // a spawn or resume, and launches no latched persona.
       setConflictLatch(latch)
-      // As main() installs it beside the latch (b.jg5 SRJ-207): a reuse
+      // As main installs it beside the latch: a reuse
       // spawn's ErrInvalidFlags holds the persona through the run's hold, and
       // no held persona's launch makes an agent-director call.
       setInvalidFlagsHold(invalidFlagsHold)
-      // As main() installs it beside the latch (b.jg5 SRJ-114): a key counts
+      // As main installs it beside the latch: a key counts
       // as configured while the run's applied configuration holds it, read at
       // each call, so a note on a configured persona's own row latches it.
       setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
       // As main() installs it right after the configured-persona query
-      // (b.jg5 SRJ-805, SRJ-806, SRJ-807): the run's one retired-key store,
+      // the run's one retired-key store,
       // the controller's, so a launch reads the keys apply step 1 records, a
       // reuse success for a recorded key sets its mark through it, and an
       // own-row read clears through it.
       setRetiredKeyStore(retiredKeys)
       installedRetiredKeys = retiredKeys
       // As main() installs it beside the store, before its start sweep
-      // (b.jg5 SRJ-809): the run's one old-life hold set, the controller's,
+      // the run's one old-life hold set, the controller's,
       // so the session manager's reads end or re-point the holds apply step 1
       // begins, a recorded key's new life ends its hold, and the teardown's
       // kill marks one kill-failed.
       setOldLifeHolds(oldLifeHolds)
       installedOldLifeHolds = oldLifeHolds
-      // As main() builds and installs it after the latch (b.jg5 SRJ-706): the
+      // As main builds and installs it after the latch: the
       // run's one live-row sequence registry, its dependencies from the
       // session manager's builder on the run's clock over the configuration
       // the server runs, each sequence in its own detached recovery attempt.
@@ -3205,8 +3201,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         runAttempt: runDetachedRecoveryAttempt,
       })
       setLiveRowSequenceRegistry(sequences)
-      // As main() installs them beside the registry (b.jg5 SRJ-811, SRJ-812,
-      // SRJ-1512): the old-life wait's bindings, its arm the run's retry
+      // As main installs them beside the registry: the old-life wait's bindings, its arm the run's retry
       // timers (a waiting persona's arm, cause held-for-old-life), its waits
       // and its kill's waits between tries on `run.clock`, its lines to
       // `run.logs`, the configuration the server runs, the run's kill-failure
@@ -3230,8 +3225,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         installedWaitBindingsOwner = undefined
       }
       // As main() registers it, after the session manager's own end observer
-      // (`setOldLifeHolds` above), so a hold's wait is stopped first (b.jg5
-      // SRJ-810): once a hold ends, each persona recorded as waiting on it
+      // (`setOldLifeHolds` above), so a hold's wait is stopped first: once a hold ends, each persona recorded as waiting on it
       // that is still applied and not latched is retried at once through the
       // run's retry timers (`runNow`, armed with the held-for-an-old-life
       // cause when it was not). Removed at `run.stop()`.

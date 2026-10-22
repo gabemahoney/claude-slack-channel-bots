@@ -1,6 +1,6 @@
 /**
- * cron-log.ts — Dedicated cron-fire log (R1/R2 on b.grx, PD-3/PD-4/PD-5 on
- * b.he5). Records every cron fire outcome — success and failure — as one
+ * cron-log.ts — Dedicated cron-fire log (R1/R2 on the contract, PD-3/PD-4/PD-5 on
+ *). Records every cron fire outcome — success and failure — as one
  * greppable, human-triageable plain-text line in the file at
  * `cron_log_path`, and keeps that file under `cron_log_max_bytes` when the key
  * is set. This module is the single owner of appends to (and prunes of) that
@@ -17,7 +17,7 @@
  *
  *   I/O HALF — `createCronLog(path, { maxBytes })` returns a writer handle
  *   whose single internal append function is the only code path that touches
- *   the file, and the choke point E5's whole-line pruning hangs off.
+ * the file, and the choke point whole-line pruning hangs off.
  *   Lazy-open append-mode fd, mkdir parent on first open (allowed — the log is
  *   server-owned output; D-Q1's no-mkdir rule is crontable-only). Appends
  *   never throw into the caller: on failure one `[slack] cron-log`-prefixed
@@ -25,7 +25,7 @@
  *   (self-healing — a deliberate improvement over permission-trail.ts, which
  *   keeps its fd).
  *
- *   Size cap (E5, `cron_log_max_bytes`, PD-5). With no `maxBytes` the log is
+ * Size cap (`cron_log_max_bytes`, PD-5). With no `maxBytes` the log is
  *   append-only: no size check, no read-back, no rewrite. With one, each
  *   successful append is followed by one `fstat` of the fd; only when the file
  *   is over the cap is it read back and rewritten without its OLDEST whole
@@ -38,7 +38,7 @@
  * Line layout (five space-delimited fields; one record = one physical line):
  *   <ISO-8601 UTC ms timestamp> <identity|-> <target|-> <outcome> <detail>
  * `target` is the persona target exactly as written in the crontable (a
- * persona name or key, b.av2 SR-9.3), or `-` when the line has none.
+ * persona name or key), or `-` when the line has none.
  * The first four fields are single tokens (internal whitespace escaped) so
  * `grep <outcome-class>` matches exactly that class's records. `detail` leads
  * with key=value tokens (prompt=, status=, errno=, line=) then free text.
@@ -64,8 +64,8 @@ import { describeThrownValueWithoutStack } from './persona-connection-errors.ts'
  * a single token in the outcome field so `grep <class>` is exact.
  *
  * `fanout-deferred` (the "all-bots fan-out not yet enabled" skip) is emitted by
- * the cron dispatcher for all-bots schedules while fan-out remains deferred to
- * E4. It STAYS in the union even after that so old log lines remain
+ * the cron dispatcher for all-bots schedules while fan-out remains deferred to.
+ * It STAYS in the union even after that so old log lines remain
  * interpretable. Do not omit it.
  */
 export type CronOutcome =
@@ -87,7 +87,7 @@ export type CronOutcome =
   | 'parse-error'
   /** Belt-and-braces class for an unexpected HTTP status (503→no-session and 404→unknown-persona are handled separately) or a network failure on the localhost POST. */
   | 'http-error'
-  /** All-bots fire skipped while fan-out remains deferred to E4 — emitted by the cron dispatcher. */
+  /** All-bots fire skipped while fan-out remains deferred to — emitted by the cron dispatcher. */
   | 'fanout-deferred'
 
 /**
@@ -133,7 +133,7 @@ const ABSENT = '-'
 
 /**
  * Escape embedded CR/LF in any value so a record can never span physical
- * lines. Applied to EVERY value — the whole-line-pruning invariant (E5)
+ * lines. Applied to EVERY value — the whole-line-pruning invariant
  * depends on one record being exactly one line.
  */
 function escapeNewlines(value: string): string {
@@ -231,7 +231,7 @@ export function formatSummaryLine(
 /**
  * Format an informational line. Shares the five-field layout with `info` in
  * the outcome position — a deliberate public seam for the scheduler's future
- * "scheduler started, N schedules loaded" marker (PD-4; Task 3 consumes this).
+ * "scheduler started, N schedules loaded" marker (PD-4; section 3 consumes this).
  * `identity` and `target` default to `-` since info lines are not fire-scoped.
  */
 export function formatInfoLine(
@@ -272,15 +272,14 @@ export function formatWarnLine(
 }
 
 // ---------------------------------------------------------------------------
-// Pure half — whole-line prune (E5)
+// Pure half — whole-line prune
 // ---------------------------------------------------------------------------
 
 /** The byte that ends every record (`\n`). */
 const NEWLINE = 0x0a
 
 /**
- * Where to cut the cron log's `bytes` so what is kept fits `maxBytes` (E5,
- * PD-5): the offset of the first byte to KEEP; 0 means drop nothing. Only
+ * Where to cut the cron log's `bytes` so what is kept fits `maxBytes` ( * PD-5): the offset of the first byte to KEEP; 0 means drop nothing. Only
  * whole lines are dropped, oldest first: the cut is the earliest line start
  * (0, or just after a `\n`) that leaves at most `maxBytes` bytes, so the kept
  * bytes never start mid-line and are never empty. The newest line (the last
@@ -309,7 +308,7 @@ export function cronLogPruneOffset(bytes: Uint8Array, maxBytes: number): number 
 
 /**
  * Writer handle returned by `createCronLog`. All four append methods funnel
- * through one internal append function (the choke point E5's pruning hangs
+ * through one internal append function (the choke point pruning hangs
  * off) — they differ only in which pure formatter builds the line.
  */
 export interface CronLog {
@@ -335,7 +334,7 @@ export type CronLogWriter = (path: string, bytes: Uint8Array) => void
 export interface CronLogOptions {
   /**
    * The size cap in bytes (`cron_log_max_bytes`, a positive integer the config
-   * loader validated). Absent: append-only, exactly as before E5 — no size
+   * loader validated). Absent: append-only, exactly as before — no size
    * check, no read-back, no rewrite.
    */
   maxBytes?: number
@@ -356,7 +355,7 @@ export interface CronLogOptions {
  * self-healing, a deliberate improvement over permission-trail.ts which keeps
  * its fd across failures.
  *
- * Pruning (E5, PD-5), only with `maxBytes`: after each successful append, one
+ * Pruning (PD-5), only with `maxBytes`: after each successful append, one
  * `fstat` of the fd. Only when the file is over the cap is it read back, and
  * only while `path` still names the fd's file (same device and inode): when
  * `path` was replaced or removed while the server runs (log rotation, a move,

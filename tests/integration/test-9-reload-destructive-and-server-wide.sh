@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 9 (t3.ob2.5e.u7.9n; E13 dry-run leg): a destructive modify and a
+# Test 9 ( dry-run leg): a destructive modify and a
 # server-wide change through the confirmed reload, in dry run.
 #
 # A running server with two personas, alpha and bravo:
@@ -21,7 +21,7 @@
 #    its new directory. Then `stop` again.
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
-# (E14 decision 14; lib/scenario.sh "Matchers"), each quoted from src/: the
+# ( the current rule; lib/scenario.sh "Matchers"), each quoted from src/: the
 # reload file names (src/reload.ts reloadFilePaths) and start line
 # (resolveStart), the preview lines (src/reload-plan.ts renderPreviewLines:
 # destructiveLine, settingLine; renderPreviewLogLines), the applied line

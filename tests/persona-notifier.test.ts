@@ -1,13 +1,12 @@
 /**
- * persona-notifier.test.ts — Per-persona server notices (b.av2 SR-7.2; b.deo
- * SRI-702).
+ * persona-notifier.test.ts — Per-persona server notices.
  *
  * Every notice about a persona goes only to that persona's destination
  * channel, through that persona's own Web client, as one top-level message
  * whose text carries the persona reference built from the persona's stored
  * key: its `permission_prompts` in declarative mode, its fungible destination
- * (`invited.permission_prompts`, `dm` when absent) in fungible mode (b.deo
- * SRI-702, beside b.av2 SR-7.1 and SR-7.2), proven for a channel, an explicit
+ * (`invited.permission_prompts`, `dm` when absent) in fungible mode (
+ * beside and), proven for a channel, an explicit
  * and a defaulted `dm` fungible destination with the resolver reading the
  * switch at each attempt, as `src/server.ts` wires it. A `dm` destination gets
  * its notices in the persona's DM with its
@@ -17,9 +16,9 @@
  * and flushed per persona (at most
  * `MAX_HELD_NOTICES_PER_PERSONA` per persona: past it the oldest held notice
  * is dropped with one log line and never posted). A notice whose open or post
- * fails at the destination (b.av2 SR-7.1: `missing_scope` on the DM open,
+ * fails at the destination (`missing_scope` on the DM open,
  * `not_in_channel`, Slack unreachable) is handed to the destination hold: it
- * is held, never lost, and retried on the SR-3.2 backoff (5 s, 10 s, 20 s …)
+ * is held, never lost, and retried on the backoff (5 s, 10 s, 20 s …)
  * with one `persona-destination-failed` line per episode (naming `im:write`
  * for `missing_scope` on the open) and one cleared line, posted in raised
  * order once the cause clears, and its failure callback runs once however
@@ -28,12 +27,11 @@
  * hold's own schedule, epochs and cap are proven in
  * `persona-destination-hold.test.ts`; this file keeps one case per failure
  * kind and the notifier-level rules. Nothing rejects. An injected resolver is
- * the one used (its cached DM is reused). A teardown's `forget(key)` (b.av2
- * SR-6.5) drops the persona's pre-validation queue unposted, with one line
+ * the one used (its cached DM is reused). A teardown's `forget(key)` drops the persona's pre-validation queue unposted, with one line
  * only when notices were dropped, so the key added again never posts them;
  * it leaves the destination hold and other personas' queues alone.
  *
- * The persona teardown window (b.jg5 SRJ-1003, SRJ-1002, SRJ-1013, AC 65):
+ * The persona teardown window:
  * while a persona's window is open every notice for its key is one log line
  * and one startup-errors entry (`persona-teardown-notice`, or
  * `persona-kill-survivor` for the kill-failure alert's survivor version),
@@ -213,7 +211,7 @@ const PAIRS = [
 // Destination and identity
 // ---------------------------------------------------------------------------
 
-describe('destination and identity (SR-7.2)', () => {
+describe('destination and identity', () => {
   test.each(PAIRS)(
     'notices for %s post top-level to its permission_prompts channel (not its first channel) through its own client only',
     async (_label, pick, other) => {
@@ -262,7 +260,7 @@ describe('destination and identity (SR-7.2)', () => {
 // Stored key: a stand-in persona whose key is not derived from its name
 // ---------------------------------------------------------------------------
 
-describe('the persona reference uses the stored key (SR-7.2)', () => {
+describe('the persona reference uses the stored key', () => {
   const STAND_IN = 'C0STAND01'
 
   /** A stand-in persona (the route→persona adapter's shape): name and key are both the channel ID. */
@@ -317,10 +315,10 @@ describe('the persona reference uses the stored key (SR-7.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fungible mode: notices at the fungible destination (b.deo SRI-702)
+// Fungible mode: notices at the fungible destination
 // ---------------------------------------------------------------------------
 
-describe('fungible mode: notices go to the fungible destination (b.deo SRI-702, beside b.av2 SR-7.1, SR-7.2)', () => {
+describe('fungible mode: notices go to the fungible destination (beside)', () => {
   // F's fungible destination is a channel; X names `dm` explicitly; Y has no
   // `invited` section, so its fungible destination is `dm` by default.
   const F_DEST = 'C0FUNGNOT1'
@@ -395,14 +393,14 @@ describe('fungible mode: notices go to the fungible destination (b.deo SRI-702, 
 })
 
 // ---------------------------------------------------------------------------
-// dm destination (SR-7.1, SR-7.2)
+// dm destination
 // ---------------------------------------------------------------------------
 
-describe('dm-destination notices (SR-7.2)', () => {
+describe('dm-destination notices', () => {
   const dmId = () => stubOpenedDmId(f.D.dm.contact!)
   const methods = (p: Persona) => h.stub(p.key).callLog.map((c) => c.method)
 
-  test('SR-7.2: a DM-only persona\'s notice raised before validation is held with no Slack call, then on flush opens the DM on its own client and posts there', async () => {
+  test('a DM-only persona\'s notice raised before validation is held with no Slack call, then on flush opens the DM on its own client and posts there', async () => {
     await h.notifier.notify(f.D.key, 'Spawn failure:\n  Error: boom')
     await h.notifier.flush(f.D.key)
     expect(methods(f.D)).toEqual([])
@@ -571,7 +569,7 @@ describe('notices that are logged, not posted', () => {
     expect(h.logs[0]).not.toContain('Error:')
   })
 
-  test('SR-3.4: in dry run a notice for a persona whose stub would fail makes no Slack call and nothing is held', async () => {
+  test('in dry run a notice for a persona whose stub would fail makes no Slack call and nothing is held', async () => {
     h.validate(f.A.key)
     h.validate(f.D.key)
     h.setDryRun(true)
@@ -608,7 +606,7 @@ describe('notices that are logged, not posted', () => {
 // Hold and flush per persona
 // ---------------------------------------------------------------------------
 
-describe('hold and flush per persona (SR-7.2)', () => {
+describe('hold and flush per persona', () => {
   test.each(PAIRS)(
     'validating %s first flushes only its held notices, in raised order, exactly once',
     async (_label, pick, other) => {
@@ -717,10 +715,10 @@ describe('hold and flush per persona (SR-7.2)', () => {
 
 
 // ---------------------------------------------------------------------------
-// A teardown forgets the persona's held notices (b.av2 SR-6.5)
+// A teardown forgets the persona's held notices
 // ---------------------------------------------------------------------------
 
-describe('forget(key): a teardown drops the persona\'s pre-validation queue (b.av2 SR-6.5)', () => {
+describe('forget(key): a teardown drops the persona\'s pre-validation queue', () => {
   const droppedLine = (p: Persona, n: number) =>
     `[slack] persona-notifier: persona=${p.key}: dropped ${n} held notice(s), not posted — the persona was torn down`
 
@@ -788,7 +786,7 @@ describe('forget(key): a teardown drops the persona\'s pre-validation queue (b.a
 // Destination failures: held, retried on backoff, logged once per episode
 // ---------------------------------------------------------------------------
 
-describe('destination failures are held and retried, one line per episode (SR-7.1, SR-10.3)', () => {
+describe('destination failures are held and retried, one line per episode', () => {
   // [label, persona, the stub queue that fails, its outcome, failed step, code, names im:write]
   test.each<[string, (x: Fixture) => Persona, 'open' | 'post', WebApiOutcome, string, string, boolean]>([
     ['missing_scope on the DM open', (x) => x.D, 'open', { kind: 'platform', error: 'missing_scope' }, 'conversations.open', 'missing_scope', true],
@@ -821,7 +819,7 @@ describe('destination failures are held and retried, one line per episode (SR-7.
       expect(failures[0]).toMatchObject({ outcome: 'failed', step, code })
       expect(h.hold.view(p.key)).toEqual({ held: true, heldNotices: 2, nextDueAt: 5_000 })
 
-      // Retries on the SR-3.2 backoff: nothing before each is due, one attempt each, no line, no callback.
+      // Retries on the backoff: nothing before each is due, one attempt each, no line, no callback.
       await h.clock.advance(4_999)
       expect(attempts()).toBe(1)
       const retriedAt: number[] = []
@@ -918,7 +916,7 @@ const FAILURES: [string, WebApiOutcome, string][] = [
   ['reject(undefined)', { kind: 'reject', value: undefined }, 'unknown_error'],
 ]
 
-describe('failed posts and the failure callback (SR-11 spawn-failure-post class)', () => {
+describe('failed posts and the failure callback (spawn-failure-post class)', () => {
   test.each(FAILURES)(
     'a rejected immediate post (%s): notify resolves and the callback gets the whole failure, the rejection included',
     async (_label, outcome, code) => {
@@ -1030,7 +1028,7 @@ describe('failed posts and the failure callback (SR-11 spawn-failure-post class)
 // Failure log lines: Slack platform reason, and the error's message logged redacted
 // ---------------------------------------------------------------------------
 
-describe('failure log lines (SR-10.3 token-safe)', () => {
+describe('failure log lines (token-safe)', () => {
   test.each<[string, (x: Fixture) => Persona, string, (x: Fixture) => string]>([
     ['invalid_blocks on a channel destination', (x) => x.A, 'invalid_blocks', (x) => x.A.permission_prompts!],
     ['msg_too_long in the opened DM', (x) => x.D, 'msg_too_long', (x) => stubOpenedDmId(x.D.dm.contact!)],
@@ -1069,10 +1067,10 @@ describe('failure log lines (SR-10.3 token-safe)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The persona teardown window (b.jg5 SRJ-1003, SRJ-1002, SRJ-1013, AC 65)
+// The persona teardown window
 // ---------------------------------------------------------------------------
 
-describe('the persona teardown window: every notice for the key is a log line and a startup-errors entry, never posted, held or dropped (b.jg5 SRJ-1003)', () => {
+describe('the persona teardown window: every notice for the key is a log line and a startup-errors entry, never posted, held or dropped', () => {
   /** The line a notice written by the window logs (`teardownNoticeLine`): `<class>` its entry's class, the notice's first line. */
   const windowLine = (p: Persona, text: string, classLabel: string = PERSONA_TEARDOWN_NOTICE_LABEL) =>
     teardownNoticeLine(p, text, PERSONA_TEARDOWN_NOTICE_RAISED, classLabel)
@@ -1080,7 +1078,7 @@ describe('the persona teardown window: every notice for the key is a log line an
   /** The line an all-clear written after the window closed logs. */
   const allClearLine = (p: Persona, text: string) => teardownNoticeLine(p, text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)
 
-  // The teardown route's one literal pin (b.jg5 SRJ-1003, SRJ-1013): the two
+  // The teardown route's one literal pin: the two
   // occasions, an entry's text and both forms of the line, the notice's first
   // line only, its Slack escapes undone. Every other case builds them with
   // `teardownNoticeEntry` and `teardownNoticeLine`.
@@ -1189,7 +1187,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expectNoSlackCallOrHold()
   })
 
-  test('b.jg5 SRJ-704, SRJ-1013: the survivor option writes one persona-kill-survivor entry and no persona-teardown-notice one, and posts nothing; outside a window the option changes nothing', async () => {
+  test('the survivor option writes one persona-kill-survivor entry and no persona-teardown-notice one, and posts nothing; outside a window the option changes nothing', async () => {
     h.validate(f.A.key)
     const survivor: PersonaNoticeOptions = { teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }
 
@@ -1205,7 +1203,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.startupEntries()).toHaveLength(1)
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003, SRJ-1013: each kind of notice the notifier
+  // each kind of notice the notifier
   // carries, raised once in A's window, while B beside it (no window) gets the
   // same notice: A's is one line and one entry of its class, never posted and
   // its failure callback never called; B's is posted to its destination. In
@@ -1274,7 +1272,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.startupEntries()).toEqual([])
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003 (hatch A3): the all-clear of an outage whose onset the window routed.
+  // (design A3): the all-clear of an outage whose onset the window routed.
   test('an onset routed by the window marks its outage: the all-clear that comes after the window closed is written (the all-clear occasion) and never reaches the new half\'s destination; a later all-clear of that class posts as usual', async () => {
     h.validate(f.A.key)
     applyCase(f.A, true) // the new half, validated, sends its notices to another channel
@@ -1392,7 +1390,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.logs).toEqual([])
   })
 
-  // b.jg5 SRJ-1003: a notice built for Slack (here the CONFLICT notice, whose
+  // a notice built for Slack (here the CONFLICT notice, whose
   // session name and description are escaped for Slack) is written with the
   // escapes undone, in the entry and the line's first line, so it reads as the
   // unescaped notices' entries do; a persona name holding the same characters
@@ -1424,7 +1422,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     assertNoLeak({ lines: h.logs, entries: h.startupEntries(), file: writtenFile(h.startupErrorsPath) })
   })
 
-  // b.jg5 SRJ-1003, SRJ-1016: an outage that is a notice episode of its own
+  // an outage that is a notice episode of its own
   // (ad-config-malformed) has its onset muted from the teardown's submit
   // until its window opens, and its all-clear is then written, never posted.
   test('the outage classes whose onset a submitted teardown mutes (pin)', () => {
@@ -1481,7 +1479,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.startupEntries()).toEqual([])
   })
 
-  // b.jg5 SRJ-1002, SRJ-1003: an all-clear listing a class whose onset the
+  // an all-clear listing a class whose onset the
   // window routed and one whose onset was posted is split by its
   // `allClearOf`: the marked classes' all-clear is written, the rest posted
   // to the destination naming only its own classes.

@@ -1,4 +1,4 @@
-/** Shared ownership of every automatic keystroke (b.omv SR-5.5/6.6). */
+/** Shared ownership of every automatic keystroke. */
 import { NOT_NOW_RETRY_MS } from './delivery-constants.ts'
 
 export { NOT_NOW_RETRY_MS } from './delivery-constants.ts'

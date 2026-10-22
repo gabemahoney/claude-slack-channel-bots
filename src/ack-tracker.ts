@@ -1,5 +1,5 @@
 /**
- * Per-persona Slack acknowledgement lifecycle (b.p3h).
+ * Per-persona Slack acknowledgement lifecycle.
  * Durable acceptance requests queued; durable final receipts request delivered.
  * Each message serializes only its own Slack mutations, independently of delivery.
  * Replies and teardown cancel pending stages synchronously and clean up the

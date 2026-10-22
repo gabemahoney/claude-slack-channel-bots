@@ -1,15 +1,15 @@
 /**
  * row-read-rules.ts — The pure decisions over one read of a persona's own
- * agent-director row (b.jg5 SRJ-114, SRJ-115, SRJ-116, SRJ-513, SRJ-807).
+ * agent-director row.
  *
  * The rule has two latch decisions, asked of every read the server makes at
- * SRJ-114's and SRJ-115's sites of a configured persona's own row (the row
+ * and sites of a configured persona's own row (the row
  * `cscb_<key>` of a persona in the applied configuration). A row that is not
  * a configured persona's own (another caller's id, a pre-persona id, or the
  * `cscb_<key>` row of a key outside the applied configuration) gets neither
- * (C14, C24; SRJ-408).
+ * (C14, C24).
  *
- *   1. "launch start not recorded" (SRJ-513): the row reads `pending` with
+ * 1. "launch start not recorded": the row reads `pending` with
  *      no launch start (`isPendingWithNoLaunchStart`, `src/pending-row.ts`:
  *      absent, `null` or unparseable). It latches persona P with that case,
  *      the refused operation "none" and the recorded state `pending`,
@@ -17,16 +17,16 @@
  *      whatever its retired mark, and a `cwd` or `config_dir` mismatch
  *      included), and whether or not it carries a note: a row that also
  *      carries `provenance_conflict` answers this decision only.
- *   2. "conflicting labels" (SRJ-114): the row's `liveness_note` reads
+ * 2. "conflicting labels": the row's `liveness_note` reads
  *      exactly `provenance_conflict` ({@link LATCHING_LIVENESS_NOTE}). It
  *      latches P with that case and the refused operation "P's bring-up by
  *      the restart path's decision", recording the row's state as that read
- *      gave it (b.jg5 SRJ-501). No other note latches (`tmux_server_changed`,
+ * gave it. No other note latches (`tmux_server_changed`,
  *      `process_not_seen_*`, `probe_eacces`, `tmux_session_name_*`, and any
  *      note CSCB does not know). Matching is exact equality with the
  *      constant: no prefix, substring or case-folded match.
  *
- * Beside them, one entry-clear decision (SRJ-807): the own row `cscb_<key>`
+ * Beside them, one entry-clear decision: the own row `cscb_<key>`
  * of a key the caller says is recorded as retired with its "new life has
  * begun" mark set, read in a live state other than `pending`
  * ({@link RETIRED_ENTRY_CLEARING_STATES}: `waiting`, `working`, `ask_user`,
@@ -56,19 +56,18 @@
  * of decision the same way. The persona teardown kill's `status` read
  * between its tries (`readTeardownKillRow`) asks only the entry clear
  * ({@link decideRetiredEntryClear}) and acts on it, latching nothing
- * (SRJ-715, SRJ-115). None of the decisions applies at the permission
+ * None of the decisions applies at the permission
  * poller's `list` and `get` or at the JSONL persistence safeguard's `get`,
- * which are not SRJ-114's sites (b.jg5 SRJ-122).
+ * which are not sites.
  *
- * A `list` row (the start sweep's, SRJ-116) has the same shape
+ * A `list` row (the start sweep's) has the same shape
  * ({@link RowReadRow}), so the decisions, the clear included, answer for a
- * listed own row as for a `get` row. The CLI precheck (SRJ-901) latches
+ * listed own row as for a `get` row. The CLI precheck latches
  * nothing and never acts on a clear decision: the CLI installs no store and
- * never writes the retired-key record (SRJ-801).
+ * never writes the retired-key record.
  *
  * Pure: no module-scope state, no timer, no agent-director call, no log line,
- * nothing run at import. No label option name is spelled here (b.jg5
- * SRJ-716).
+ * nothing run at import. No label option name is spelled here.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -91,7 +90,7 @@ import { isPendingWithNoLaunchStart } from './pending-row.ts'
 import { personaInstanceId } from './persona-identity.ts'
 
 /**
- * The one liveness note that latches a persona (b.jg5 SRJ-114, SRJ-501):
+ * The one liveness note that latches a persona:
  * two sessions carry the launch's label, or a label value is set at the
  * server, global or global-window scope.
  */
@@ -102,7 +101,7 @@ export type RowReadState = StatusResult['state']
 
 /**
  * The row states that clear a retired key's entry when its mark is set
- * (b.jg5 SRJ-807): the live states other than `pending`
+ * the live states other than `pending`
  * (`AGENT_DIRECTOR_LIVE_STATES` less `AGENT_DIRECTOR_PENDING_STATE`), that is
  * `waiting`, `working`, `ask_user` and `check_permission`.
  */
@@ -134,13 +133,13 @@ export interface OwnRowReadInput {
   readonly configured: boolean
   /**
    * Whether `key` is recorded as retired with its "new life has begun" mark
-   * set (b.jg5 SRJ-806, SRJ-807), as the caller's retired-key store answers.
+   * set, as the caller's retired-key store answers.
    * Absent counts as false: no clear decision.
    */
   readonly retiredMarked?: boolean
 }
 
-/** A decision to latch the persona: the latch record's case, refused operation and row state (b.jg5 SRJ-501). */
+/** A decision to latch the persona: the latch record's case, refused operation and row state. */
 export interface RowReadLatchDecision {
   readonly latchCase: LatchCase
   readonly refusedOperation: RefusedOperation
@@ -149,7 +148,7 @@ export interface RowReadLatchDecision {
 
 /**
  * A decision to clear the read key's entry from the retired-key record
- * (b.jg5 SRJ-807), with the live state the read gave.
+ * with the live state the read gave.
  */
 export interface RowReadClearDecision {
   readonly stateRead: RowReadState
@@ -163,7 +162,7 @@ export interface RowReadClearDecision {
 export interface RowReadDecision {
   /** Set when the read latches the persona. */
   readonly latch?: RowReadLatchDecision
-  /** Set when the read clears the key's retired-key entry (b.jg5 SRJ-807). */
+  /** Set when the read clears the key's retired-key entry. */
   readonly clearRetiredEntry?: RowReadClearDecision
 }
 
@@ -171,7 +170,7 @@ export interface RowReadDecision {
 export const ROW_READ_NO_DECISION: RowReadDecision = Object.freeze({})
 
 /**
- * The launch-start decision (b.jg5 SRJ-513): latch with the case "launch
+ * The launch-start decision: latch with the case "launch
  * start not recorded", the refused operation "none" and the recorded state
  * `pending`.
  */
@@ -194,7 +193,7 @@ export function isPersonaOwnRow(row: Pick<RowReadRow, 'instance_id'>, key: strin
 }
 
 /**
- * The entry-clear decision over one read of key `key`'s row (b.jg5 SRJ-807):
+ * The entry-clear decision over one read of key `key`'s row:
  * set when the row is `key`'s own, it reads one of
  * {@link RETIRED_ENTRY_CLEARING_STATES}, and `retiredMarked` is exactly true;
  * undefined otherwise. Whether `key` is configured plays no part. Pure.
@@ -228,15 +227,15 @@ function decideOwnRowLatch(input: OwnRowReadInput): RowReadLatchDecision | undef
  *
  *   1. the row reads `pending` with no launch start
  *      (`isPendingWithNoLaunchStart`): {@link ROW_READ_LAUNCH_START_NOT_RECORDED}
- *      (b.jg5 SRJ-513), also for a row that carries the latching note and
+ * , also for a row that carries the latching note and
  *      whatever the key's retired mark;
  *   2. the row carries exactly the latching note: a latch decision with the
  *      case "conflicting labels", the refused operation "P's bring-up" and
  *      the row's state as read (`latchRowStateRead`; a `waiting` row's state
- *      is a live state) (b.jg5 SRJ-114).
+ * is a live state).
  *
  * The entry clear, independently of the latch and of whether `key` is
- * configured ({@link decideRetiredEntryClear}, b.jg5 SRJ-807): the row is
+ * configured ({@link decideRetiredEntryClear}): the row is
  * `key`'s own, reads a live state other than `pending`, and the key is
  * recorded with its mark set. A read with no clear answers the latch
  * decision alone: {@link ROW_READ_NO_DECISION} with no latch,

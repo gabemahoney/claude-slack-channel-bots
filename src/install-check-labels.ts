@@ -21,15 +21,14 @@ export const AD_SYSTEM_INSTALL_TOO_OLD = 'ad-system-install-too-old'
 
 /**
  * Class label for CSCB's own Phase 1 floor refusal: a binary the client admits
- * whose version is below `PHASE1_FLOOR_VERSION` or does not parse (b.jg5
- * SRJ-203, SRJ-1013). Written by the startup gate.
+ * whose version is below `PHASE1_FLOOR_VERSION` or does not parse. Written by the startup gate.
  */
 export const AD_BELOW_PHASE1_FLOOR = 'ad-below-phase1-floor'
 
 /**
  * Class label for the startup gate's error-catalogue refusal: the client's
  * dist declares no class for one or more of the error names CSCB requires
- * (b.jg5 SRJ-102, SRJ-1013). Written by the startup gate.
+ * Written by the startup gate.
  */
 export const AD_SHIM_CATALOG_INCOMPLETE = 'ad-shim-catalog-incomplete'
 

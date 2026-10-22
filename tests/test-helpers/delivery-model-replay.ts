@@ -1,4 +1,4 @@
-/** E3's adapter for the frozen E1 trace map (b.omv SR-1.2/15.6).
+/** adapter for the frozen trace map.
  * This translates observations only; all choices and head selection are the
  * production exports. No model decision implementation lives in the tests. */
 import assert from 'node:assert/strict'

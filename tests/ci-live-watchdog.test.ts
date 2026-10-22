@@ -1,6 +1,6 @@
 /**
  * ci-live-watchdog.test.ts — Tests for the /ci-live runner's memory watchdog
- * (bug b.1cx): `ci-live/lib/memory-watchdog.ts` and the reading of Chrome's
+ * `ci-live/lib/memory-watchdog.ts` and the reading of Chrome's
  * process tree it takes from `ci-live/lib/proc-tree.ts`.
  *
  * The rules under test:

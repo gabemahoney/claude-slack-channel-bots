@@ -1,6 +1,6 @@
 /**
  * test-helpers/channel-delivery.ts — The stored-choice record for tests
- * (b.deo SRI-1204): `writeChannelDeliveryRecord` seeds the record in a state
+ * `writeChannelDeliveryRecord` seeds the record in a state
  * directory, `readChannelDeliveryRecord` reads it back, and `declarationOf`
  * builds a persona's declaration as the server records it.
  *
@@ -30,7 +30,7 @@
  *   answers. A seed with no channels is left out, as the module never holds a
  *   key with no channels.
  *
- * Isolation (b.deo SRI-1204; b.jg5 SRJ-1301): both take the state directory
+ * Isolation: both take the state directory
  * explicitly and never resolve a default one; the writer writes only the
  * record in that directory, and refuses, writing nothing, the real home, the
  * OS temp directory itself and any directory not under it. No module-scope

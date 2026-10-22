@@ -1,5 +1,5 @@
 /** Async-local client ownership lets shared guards retain their production
- * classification while engine reconnects use the isolated client (SR-5.1/5.8). */
+ * classification while engine reconnects use the isolated client. */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Client } from 'agent-director'
 export interface DeliveryAdScope {

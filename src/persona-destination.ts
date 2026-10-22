@@ -1,19 +1,19 @@
 /**
  * persona-destination.ts — Where a persona's permission prompts and server
- * notices go, and the post there (b.av2 SR-7.1, SR-5.1).
+ * notices go, and the post there.
  *
  * A persona's destination comes from one rule, `personaDestinationOf`
- * (b.av2 SR-7.1, b.deo SRI-701), over the configuration in effect: its
+ * over the configuration in effect: its
  * `permission_prompts` setting in declarative mode, its fungible destination
  * (`invited.permission_prompts`, `dm` by default) in fungible mode; either way
  * a channel ID, or `dm`. The resolver reads the configuration in effect
- * through its injected `getPersonaConfig` at each attempt (b.deo SRI-201),
+ * through its injected `getPersonaConfig` at each attempt,
  * which every resolver is given. The destination hold and the permission poller ask the resolver
  * (`destinationOf`, `refusalOf`, `settingOf`), so all of them read the one
  * switch. In fungible mode prompts and notices go to the fungible
- * destination on the persona's own client (b.deo SRI-702), and after a
+ * destination on the persona's own client, and after a
  * confirmed switch change the next attempt goes to the destination of the
- * mode turned on (b.deo SRI-703). A channel destination is that channel. A
+ * mode turned on. A channel destination is that channel. A
  * `dm` destination is the persona's DM conversation with its `dm.contact`,
  * explicit or by default in fungible mode, obtained with
  * `conversations.open` on the persona's own client (Slack returns the existing
@@ -35,14 +35,14 @@
  *   opens again;
  * - `forget(key)` drops the persona's entry (a reload, teardown).
  * The cache holds one entry per persona key: no entry, lock or timer spans two
- * personas (b.av2 SR-3.3), so one persona's failed open never affects
+ * personas, so one persona's failed open never affects
  * another's destination.
  *
- * Defensive refusal (b.av2 SR-5.1): the loader guarantees a `dm` destination
- * has `dm.enabled` on and `dm.contact` set (SR-1.5, b.deo SRI-104). Should
+ * Defensive refusal: the loader guarantees a `dm` destination
+ * has `dm.enabled` on and `dm.contact` set. Should
  * either be missing anyway, nothing is opened or posted: the refusal is logged
  * and returned. Its line names the destination setting in force
- * (`destinationSettingOf`, b.deo SRI-906): `permission_prompts` in
+ * (`destinationSettingOf`): `permission_prompts` in
  * declarative mode, `invited.permission_prompts` in fungible mode. It does
  * not go through the MCP tool-scope check (`checkPersonaTarget`).
  *
@@ -50,7 +50,7 @@
  * hold's `persona-destination-failed` lines, the permission poller's
  * refusal) takes it from the resolver (`settingOf`, read through
  * `destinationSettingFrom`) in the same step as the destination it names, so
- * it names the setting that destination came from (b.deo SRI-906).
+ * it names the setting that destination came from.
  *
  * A failed open or post is returned, never thrown, with the step that failed
  * and the Slack error code (`classifySlackError`), so a caller can log it,
@@ -58,10 +58,10 @@
  * caller's token-safe description only (`describeDestinationFailure`,
  * `describeDestinationFailureCause`); it is never logged here.
  *
- * Dry run (b.av2 SR-3.4) never reaches this module: the notifier's dry-run
+ * Dry run never reaches this module: the notifier's dry-run
  * branch returns first and the permission poller does not run.
  *
- * Pure module (b.av2 SR-13.1): no module-scope state, no I/O of its own, no
+ * Pure module: no module-scope state, no I/O of its own, no
  * timers and nothing runs at import. The cache lives in the instance the
  * factory returns; the Slack client and the logger are injected.
  *
@@ -90,10 +90,10 @@ const CHANNEL_NOT_FOUND_ERROR = 'channel_not_found'
 /** Failure code of a `conversations.open` that succeeded but returned no conversation ID. */
 export const NO_CONVERSATION_ID_CODE = 'no_conversation_id'
 
-/** The setting that names a persona's destination in declarative mode (b.av2 SR-1.2 as amended by b.deo SRI-102, SRI-202). */
+/** The setting that names a persona's destination in declarative mode. */
 export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
 
-/** The setting that names a persona's destination in fungible mode (b.deo SRI-102, SRI-702). */
+/** The setting that names a persona's destination in fungible mode. */
 export const FUNGIBLE_DESTINATION_SETTING = 'invited.permission_prompts'
 
 // ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ export const FUNGIBLE_DESTINATION_SETTING = 'invited.permission_prompts'
 export type DestinationSlackClient = Pick<WebClient, 'chat' | 'conversations'>
 
 /**
- * Where a persona's permission prompts and server notices go (b.av2 SR-7.1):
+ * Where a persona's permission prompts and server notices go:
  * a channel, with its ID, or `dm`.
  */
 type PersonaDestination =
@@ -116,7 +116,7 @@ export type DmDestinationRefusal = 'dm_disabled' | 'no_dm_contact'
 
 /**
  * The setting that names a persona's destination in the mode in force
- * (`destinationSettingOf`, b.deo SRI-906).
+ * (`destinationSettingOf`).
  */
 export type DestinationSetting = typeof DECLARATIVE_DESTINATION_SETTING | typeof FUNGIBLE_DESTINATION_SETTING
 
@@ -177,7 +177,7 @@ export interface PersonaDestinationsDeps {
   /** Writes one log line. */
   log(line: string): void
   /**
-   * The configuration in effect, read at each attempt (b.deo SRI-201), never
+   * The configuration in effect, read at each attempt, never
    * a copy taken earlier: the destination rule takes the switch from it.
    * Production passes the server's applied configuration.
    */
@@ -187,7 +187,7 @@ export interface PersonaDestinationsDeps {
 /**
  * Where a consumer that builds a destination resolver of its own when none is
  * given gets one: the given resolver, or the configuration in effect that its
- * own resolver reads (b.deo SRI-201). A consumer never builds a resolver
+ * own resolver reads. A consumer never builds a resolver
  * without the configuration in effect.
  */
 export type PersonaDestinationsSource =
@@ -220,7 +220,7 @@ export interface PersonaDestinations {
   /**
    * The setting that names the persona's destination now
    * (`destinationSettingOf` over the configuration in effect at this call,
-   * b.deo SRI-906): the one a line naming the destination `destinationOf`
+   *): the one a line naming the destination `destinationOf`
    * gives at the same moment names. Read through `destinationSettingFrom`.
    */
   settingOf(persona: PersonaDestinationFields): DestinationSetting
@@ -242,9 +242,9 @@ interface DmCacheEntry {
 export type PersonaDestinationFields = Pick<Persona, 'permission_prompts' | 'fungible_destination'>
 
 /**
- * The one destination rule (b.av2 SR-7.1, b.deo SRI-701): a persona's
+ * The one destination rule: a persona's
  * destination, `dm` or a channel ID, by the channel mode of `config`, the
- * configuration in effect when the caller acts (b.deo SRI-201,
+ * configuration in effect when the caller acts (
  * `channelModeOf`). Fungible mode: its fungible destination
  * (`invited.permission_prompts`, `dm` when that is absent). Declarative mode:
  * its `permission_prompts` (`dm` when that is absent, which no loaded
@@ -257,7 +257,7 @@ export type PersonaDestinationFields = Pick<Persona, 'permission_prompts' | 'fun
  * refused by `dmDestinationRefusal` unless DMs are on with a contact.
  *
  * The one place a destination consumer reads `permission_prompts` or
- * `fungible_destination` (b.deo SRI-202): the resolver below, its DM
+ * `fungible_destination`: the resolver below, its DM
  * refusal, the destination hold, the permission poller and the notifier all
  * go through it. Pure.
  */
@@ -268,7 +268,7 @@ export function personaDestinationOf(config: DestinationConfig, persona: Persona
 
 /**
  * The setting that names a persona's destination under `config`, the
- * configuration in effect when the caller acts (b.deo SRI-906, SRI-201):
+ * configuration in effect when the caller acts:
  * `permission_prompts` in declarative mode, `invited.permission_prompts` in
  * fungible mode. It reads the same switch the one destination rule reads
  * (`channelModeOf`), so a line naming it names the setting that
@@ -281,7 +281,7 @@ export function destinationSettingOf(config: DestinationConfig): DestinationSett
 
 /**
  * The setting in force for `persona`, asked of a resolver
- * (`PersonaDestinations.settingOf`, b.deo SRI-906). Every line outside this
+ * (`PersonaDestinations.settingOf`). Every line outside this
  * module that names a destination setting reads it here.
  */
 export function destinationSettingFrom(
@@ -292,7 +292,7 @@ export function destinationSettingFrom(
 }
 
 /**
- * The loop guard's input (b.deo SRI-305, SRI-504): each of `personas` (the
+ * The loop guard's input: each of `personas` (the
  * applied personas of the configuration in effect) with its destination by
  * the one destination rule over `config`, in their order. The one builder of
  * that input: the routing passes it to the delivery decision at each
@@ -322,7 +322,7 @@ function resolvePersonaDestination(config: DestinationConfig, persona: PersonaDe
  * Why the persona's `dm` destination must not be opened (DMs off, or no
  * contact), or undefined when it may be, or when the destination is a
  * channel. The destination comes from the one destination rule over `config`,
- * the configuration in effect (`personaDestinationOf`, b.deo SRI-701). Pure.
+ * the configuration in effect (`personaDestinationOf`). Pure.
  */
 export function dmDestinationRefusal(
   config: DestinationConfig,
@@ -340,7 +340,7 @@ export function describeDmDestinationRefusal(reason: DmDestinationRefusal): stri
 }
 
 /**
- * Map an unknown Slack error to a stable error-class string (SR-V-2.4, the
+ * Map an unknown Slack error to a stable error-class string (, the
  * trail's `error` field). Slack platform errors expose `data.error` (e.g.
  * `channel_not_found`); other errors collapse to short class labels.
  */
@@ -412,7 +412,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
   /**
    * The persona's cache entry for its DM with its current contact, opening it
    * on `client` unless cached; or the logged refusal, naming the destination
-   * setting in force under `config` (b.deo SRI-906). Never throws.
+   * setting in force under `config`. Never throws.
    */
   function dmEntry(
     config: DestinationConfig,

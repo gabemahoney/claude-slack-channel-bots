@@ -25,7 +25,7 @@ const httpServer = Bun.serve({hostname:'127.0.0.1',port:0,fetch:(req,server)=>ha
 const HTTP_URL = `http://127.0.0.1:${httpServer.port}/interject`
 afterAll(()=>httpServer.stop(true))
 function bodyOfBytes(bytes: number) {const head='é';const overhead=Buffer.byteLength(JSON.stringify({persona:B_NAME,message:head}));const message=head+'x'.repeat(bytes-overhead);return {text:JSON.stringify({persona:B_NAME,message}),message}}
-describe('/interject status table (SR-9.1)', () => {
+describe('/interject status table', () => {
   test.each([
     ['GET', 405],
     ['PUT', 405],
@@ -64,7 +64,7 @@ describe('/interject status table (SR-9.1)', () => {
     ['null persona', { persona: null, message: 'hi' }],
     ['object persona', { persona: { name: B_NAME }, message: 'hi' }],
     ['empty persona', { persona: '', message: 'hi' }],
-    ['legacy channel-only body (SR-10.2)', { channel: 'C0TEST002', message: 'hi' }],
+    ['legacy channel-only body', { channel: 'C0TEST002', message: 'hi' }],
     ['JSON array body', '[]'],
     ['JSON string body', JSON.stringify(B_NAME)],
     ['JSON number body', '42'],
@@ -96,7 +96,7 @@ describe('/interject status table (SR-9.1)', () => {
 
   test.each([
     ['unknown name', 'nobody'],
-    ['a channel ID of a persona (channels are not targets, SR-10.2)', 'C0TEST002'],
+    ['a channel ID of a persona (channels are not targets)', 'C0TEST002'],
     ['the name in another case', 'REVIEWER'],
     ["A's key with a trailing space", `${A_KEY} `],
   ])('%s → 404, nothing delivered', async (_label, persona) => {
@@ -141,14 +141,14 @@ describe('/interject 32 KB body cap (in-process HTTP, port 0)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC 50 — only the named persona is reached
+// only the named persona is reached
 // ---------------------------------------------------------------------------
 
-describe('AC 50: /interject reaches only the named persona', () => {
+describe('/interject reaches only the named persona', () => {
   test.each([
     ['by name', A_NAME],
     ['by key', A_KEY],
-  ])("AC 50: persona A addressed %s → 200 with A's name, one notification on A, none on B", async (_label, persona) => {
+  ])("persona A addressed %s → 200 with A's name, one notification on A, none on B", async (_label, persona) => {
     const res = await interject({ persona, message: 'for A only' })
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
@@ -158,7 +158,7 @@ describe('AC 50: /interject reaches only the named persona', () => {
     expect(logs.some((l) => l.includes(renderPersonaRef(A_NAME, A_KEY)))).toBe(true)
   })
 
-  test('AC 50: a request for B reaches only B', async () => {
+  test('a request for B reaches only B', async () => {
     const res = await interject({ persona: B_NAME, message: 'for B only' })
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
@@ -166,7 +166,7 @@ describe('AC 50: /interject reaches only the named persona', () => {
     expect(queue.items(A_KEY)).toHaveLength(0)
   })
 
-  test('AC 50: a real loopback HTTP request by key reaches only that persona', async () => {
+  test('a real loopback HTTP request by key reaches only that persona', async () => {
     const res = await fetch(HTTP_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -211,7 +211,7 @@ describe('server.ts wires /interject and cron targets by persona (static audit)'
     throw new Error('unbalanced createCronDispatcher call')
   }
 
-  test('imports handleInterject from ./interject.ts', () => {
+  test('imports handleInterject ./interject.ts', () => {
     expect(SERVER_CODE).toMatch(/import\s*\{[^}]*\bhandleInterject\b[^}]*\}\s*from\s*['"]\.\/interject\.ts['"]/)
   })
 
@@ -263,7 +263,7 @@ test('a throwing accept function answers Message not stored with no success log'
   expect(result.status).toBe(500); expect(await result.json()).toEqual({ error: 'Message not stored' }); expectNoDelivery(); expect(logs).toEqual([])
 })
 
-// b.omv SR-8.6: injected acceptance reports after the HTTP answer, without a body.
+// injected acceptance reports after the HTTP answer, without a body.
 test('received reporting follows the successful interject response', async () => {
   const clock = createFakeClock(), diagnostics: string[] = []
   let answered = false

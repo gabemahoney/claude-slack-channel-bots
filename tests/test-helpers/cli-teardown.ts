@@ -1,11 +1,11 @@
 /**
  * test-helpers/cli-teardown.ts — Fixtures shared by the CLI teardown's two
  * suites (`tests/cli-teardown.test.ts`, the pure pieces, and
- * `tests/cli.test.ts`, the commands; b.jg5 SRJ-901, SRJ-904, SRJ-907,
- * SRJ-909, SRJ-1007).
+ * `tests/cli.test.ts`, the commands,
+ *).
  *
  *   - {@link UNKNOWN_STATE}: a row state CSCB does not know, which the
- *     precheck and the teardown take as live (SRJ-901 step 2, hatch A3);
+ * precheck and the teardown take as live (step 2, design A3);
  *   - {@link teardownKillFailedDescription}: the raw description of an
  *     `ErrTmuxKillFailed` as the teardown's kill-failure alert decision quotes
  *     it, read through the checked kill under `TEARDOWN_KILL_OPTIONS`, as the
@@ -30,7 +30,7 @@ import {
 } from '../../src/kill-failure-alert.ts'
 import { renderPersonaRef } from '../../src/persona-identity.ts'
 
-/** A row state CSCB does not know: live (b.jg5 SRJ-901 step 2, hatch A3). */
+/** A row state CSCB does not know: live (step 2, hatch A3). */
 export const UNKNOWN_STATE = 'a_state_cscb_does_not_know'
 
 /**
@@ -49,7 +49,7 @@ export function teardownKillFailedDescription(error: unknown): string {
 
 /**
  * The kill-failure alert line a CLI teardown under `command` gives `persona`
- * for `content` (b.jg5 SRJ-704, SRJ-1007, SRJ-909): E20's log-line and entry
+ * for `content`: log-line and entry
  * form, the CLI teardown's context naming the command, the text unescaped
  * with the CLI closing sentence.
  */

@@ -79,7 +79,7 @@ RUNBOOK_PKG="${STAGED_PKG}"
 # The two state directories. The old 0.10.0 package keeps everything, config.json
 # included, in OLD_STATE_DIR, and its CLI reads config.json from there whatever
 # SLACK_STATE_DIR says (it is never exported here anyway). The build under test
-# defaults to NEW_STATE_DIR since b.smv and, at its first start (step 10), moves
+# defaults to NEW_STATE_DIR and, at its first start (step 10), moves
 # OLD_STATE_DIR there and leaves a symbolic link at the old name. Until that
 # start the scenario's files are in OLD_STATE_DIR and neither NEW_STATE_DIR nor
 # LEGACY_XDG_DIR (0.14.0 and 0.15.0's default, which a 0.13 host never had)
@@ -106,7 +106,7 @@ declare -A PERSONA_OF=([C0T13A01]="${SCENARIO_TAG}_alpha" [C0T13B01]="${SCENARIO
 # Each persona's fake-token label (letters and digits; the Slack stub maps it).
 declare -A TOKEN_LABEL=([C0T13A01]="${SCENARIO_TAG}alpha" [C0T13B01]="${SCENARIO_TAG}bravo")
 
-# CSCB's own timings for the new build, set through config.json (SRJ-1401):
+# CSCB's own timings for the new build, set through config.json:
 # health ticks run (Q12), a restart would come soon enough to be seen, and a
 # stop waits briefly for a bot to exit.
 HEALTH_CHECK_INTERVAL_S=5
@@ -155,7 +155,7 @@ RUNBOOK_NEXT=1
 RUNBOOK_CURRENT=""
 RUNBOOK_COUNT=""
 
-# The substitution kinds SRJ-1402 allows (see the table in the header).
+# The allowed substitution kinds (see the table in the header).
 SUBSTITUTION_KINDS=(operator-go-ahead container-settings one-socket claude-code-check-skipped
     staging-build-under-test slack-fixtures prompt-wording-skipped autostart-skipped
     harness-stops-agents release-install-script no-agents-restarted container-list expire-skipped)
@@ -223,7 +223,7 @@ runbook_step() {
     record "entered: ${title}"
 }
 
-# runbook_substitute <n> <kind> <reason>: record one SRJ-1402 substitution of
+# runbook_substitute <n> <kind> <reason>: record one substitution of
 # step <n>, inside that step's section.
 runbook_substitute() {
     local n="$1" kind="$2" reason="$3" k known=0
@@ -232,7 +232,7 @@ runbook_substitute() {
     for k in "${SUBSTITUTION_KINDS[@]}"; do
         [[ "${k}" == "${kind}" ]] && known=1
     done
-    (( known )) || fail "runbook: '${kind}' is not one of SRJ-1402's substitutions"
+    (( known )) || fail "runbook: '${kind}' is not one of the documented substitutions"
     printf 'step %s\t%s\t%s\n' "${n}" "${kind}" "${reason}" >> "${SUBSTITUTIONS}"
     record "substitution (${kind}): ${reason}"
     echo "${TEST_NAME}: step ${n}: substitution (${kind}): ${reason}"
@@ -1075,7 +1075,7 @@ grep -qF 'agent-director install check: FAILED (ad-system-install-too-old)' "${S
 record "install check refuses the pre-0.12 install (exit ${rc}); step 8 installs the release"
 
 # E4_EARLIER_RELEASE_PROVENANCE
-# b.omv SR-7.6/SR-13.6: create real 0.10.0 worker conversations, with persona
+# create real 0.10.0 worker conversations, with persona
 # identity but no tag_prompt and no appended system prompt. Merely relabelling
 # a current-build conversation would not establish earlier-release provenance.
 declare -A E4_OLD_SESSION=() E4_MEMORY=()

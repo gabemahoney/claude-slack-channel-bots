@@ -125,7 +125,7 @@ export interface ToolCall {
 export const CSCB_MCP_SERVER_NAME = 'slack-channel-router'
 
 /**
- * The script `toolCalls` hands the container (b.deo SRI-1505): every call of
+ * The script `toolCalls` hands the container: every call of
  * the CSCB session tool `tool` (named `mcp__<server>__<tool>`; another
  * server's tool of the same name is not one) in persona `letter`'s current
  * transcript, one compact JSON line each, in call order: the projection
@@ -254,7 +254,7 @@ export function personaRowId(letter: PersonaLetter): string {
 /**
  * What is wrong with `rows`, judged against one row per persona in `live`,
  * live, and one per persona in `kept`, kept and not live (a removed persona's
- * row: a teardown kills the row and keeps it, b.jg5 SRJ-715, AC 77). Each row
+ * row: a teardown kills the row and keeps it). Each row
  * has its persona's instance id and persona label; no other row is there.
  * Pure; empty when the rows are as expected.
  */
@@ -280,9 +280,9 @@ export function keptRowSetProblems(rows: readonly Row[], live: readonly PersonaL
 
 /**
  * True when `line` is a persona teardown's line for a kill of the persona's
- * row that succeeded, the row kept (src/persona-lifecycle.ts, b.jg5 SRJ-715):
+ * row that succeeded, the row kept (src/persona-lifecycle.ts):
  * `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of
- * cscb_<key>: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)`.
+ * cscb_<key>: <outcome> after <n> kill(s); the row is kept`.
  * A failed kill's line (`… kill of cscb_<key> failed: …`) is not one.
  */
 export function isTeardownKeptRowLine(line: string, letter: PersonaLetter): boolean {
@@ -290,12 +290,12 @@ export function isTeardownKeptRowLine(line: string, letter: PersonaLetter): bool
   const start = `[slack] persona teardown of "${n}" (key=${n}): agent-director kill of ${personaRowId(letter)}: `
   const at = line.indexOf(start)
   if (at < 0) return false
-  return / after \d+ kill\(s\); the row is kept \(b\.jg5 SRJ-715\)$/.test(line.slice(at + start.length).trimEnd())
+  return / after \d+ kill\(s\); the row is kept$/.test(line.slice(at + start.length).trimEnd())
 }
 
 /**
- * Check 27's row judgement after a confirmed removal of `removed` (b.jg5
- * SRJ-715, AC 77: the teardown kills the row and keeps it). `before` is the
+ * Check 27's row judgement after a confirmed removal of `removed` (
+ * the teardown kills the row and keeps it). `before` is the
  * rows before the removal. The removed persona's row is kept and not live;
  * every other row of `before` is unchanged (its instance id and persona
  * label, still live); no row is added or deleted. Pure; empty when the rows
@@ -548,7 +548,7 @@ export function previewHeader(counts: Parameters<typeof countsText>[0]): string 
 
 /**
  * A persona's removal line in the reload preview, as src/reload-plan.ts's
- * `removedLine` renders it (b.jg5 SRJ-1510): `DESTRUCTIVE: persona "<name>"
+ * `removedLine` renders it: `DESTRUCTIVE: persona "<name>"
  * (key=<key>) is removed: the persona will be retired: its session stopped
  * and never resumed; <count> open queued items kept, delivered only if a
  * persona with the same key is added again.`. The prefix and clauses are src/'s own
@@ -613,7 +613,7 @@ export const START_FAILURE_RE = '\\) not brought up:|persona-(credentials|direct
 /**
  * A start's `startupSessionManager: complete` line's ending, from the failed
  * count on, as src/'s builder writes it (`startupSummaryEnding`,
- * `src/startup-summary-ending.ts`; b.f2b, b.jg5 SRJ-1015): every count 0
+ * `src/startup-summary-ending.ts`): every count 0
  * except the ones given.
  */
 export function startSummaryEnding(counts: Partial<StartupSummaryEndingCounts> = {}): string {
@@ -633,9 +633,9 @@ export function startSummaryEnding(counts: Partial<StartupSummaryEndingCounts> =
 /**
  * How a clean start's `startupSessionManager: complete` line ends: no launch
  * failed, every persona was brought up, none was left running but not
- * reconnected (b.f2b), and none was latched, left retrying, waiting on a
+ * reconnected, and none was latched, left retrying, waiting on a
  * live-row sequence, held on invalid flags or brought up fresh as a retired
- * key (SRJ-1015's five counts). Built by src/'s builder with every count 0
+ * key (five counts). Built by src/'s builder with every count 0
  * (`startSummaryEnding`). Only this current ending is accepted: the start
  * under test is always this package's.
  */
@@ -644,7 +644,7 @@ export const START_SUMMARY_END = startSummaryEnding()
 /**
  * Wait for the start's summary line and a Session connected line per persona,
  * since `m`. The summary alone is not enough: a persona whose launch waits on
- * a `working` row is parked (b.f2b), left out of the summary's counts, and
+ * a `working` row is parked, left out of the summary's counts, and
  * connects after it (about 60 s after, when the row is stale).
  */
 export async function waitBringUp(ctx: CheckContext, m: string, letters: readonly PersonaLetter[], timeoutMs = BRINGUP_TIMEOUT_MS): Promise<boolean> {

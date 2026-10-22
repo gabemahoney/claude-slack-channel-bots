@@ -1,4 +1,4 @@
-/** Durable one-part-at-a-time delivery executor (b.omv SR-5/6).
+/** Durable one-part-at-a-time delivery executor.
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
@@ -16,7 +16,7 @@ export type { DeliveryLifecycle, DeliveryClock } from './delivery-lifecycle.ts'
 
 export * from './delivery-constants.ts'
 export type DeliveryReason = 'state' | 'marker' | 'mcp' | 'relay-off' | 'held' | 'dialog-hold' | 'transcript-unreadable' | 'queue-unwritable' | 'not-now' | 'receipt' | 'backoff'
-/** Safe operational facts; never composer or message body text (b.omv SR-8). */
+/** Safe operational facts; never composer or message body text. */
 export interface DeliveryStatus {
   key: string; seq: number; count: number; ageMs: number; retypeCount: number
   row?: string; marker: boolean; relay: boolean; connected: boolean; up: boolean
@@ -44,7 +44,7 @@ export interface DeliveryEngineDeps {
   isUp(key: string): boolean; isLatched(key: string): boolean; isHeld(key: string): boolean; isConnected(key: string): boolean
   prepare(key: string, item: QueueItem): Promise<void>
   onRow?(key: string, row: GetResult): boolean
-  /** E4's shared replacement when a fresh own-row marker is unproved, under the engine's client and call budget. */
+  /** shared replacement when a fresh own-row marker is unproved, under the engine's client and call budget. */
   inspectUpgrade?(key: string, row: GetResult, client: DeliveryClient, beforeCall: () => void): Promise<void>
   /** Ask AD's shared sweep to publish a provisional Claude transcript reference. */
   refreshTranscript?(key: string, client: DeliveryClient, beforeCall: () => void): Promise<boolean>
@@ -144,7 +144,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (row.state === 'ended' || row.state === 'missing') restart(key, s)
       if (deps.onRow?.(key, row)) { wait(key, s, 'held'); return false }
       const markerMissing = row.labels?.tag_prompt !== '1'
-      // b.omv SR-7.6: this fresh own-row get already proves the current
+      // this fresh own-row get already proves the current
       // marker. Independent send-gate reads still recheck it before keys.
       if (deps.inspectUpgrade && (markerMissing || row.instance_id !== deps.instanceId(key))) {
         if (markerMissing) release(s)
@@ -210,7 +210,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const p = deps.persona(key)
     if (!p || s.restarted) return
     // GONE bars every further key in this launch, including when someone
-    // else already scheduled its restart (SR-5.6).
+    // else already scheduled its restart.
     s.restarted = true; release(s)
     if (goneRow && deps.recoverGone) {
       s.gone = { row: goneRow }
@@ -587,7 +587,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   life.setRecovery(api.recoverBeforeReconnect)
   life.setReconnect(async key => {
     if (stopped || !deps.persona(key) || (deps.isConnected(key) && !life.reconnectInput(key))) { life.clearDeferred(key); return }
-    // b.omv SR-5.5, b.jg5 SRJ-502: only the latch re-check may call
+    // only the latch re-check may call
     // agent-director while latched. Keep the reconnect for after the clear,
     // and recheck after client creation awaits.
     if (deps.isLatched(key)) { life.defer(key); return }

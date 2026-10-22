@@ -144,7 +144,7 @@ function utcAt(date: string, time = '12:00:00'): string {
 }
 
 // ---------------------------------------------------------------------------
-// parseLaunchStart — valid forms (SRJ-406: with or without the fraction)
+// parseLaunchStart — valid forms (with or without the fraction)
 // ---------------------------------------------------------------------------
 
 describe('parseLaunchStart: a valid launch start gives its instant', () => {
@@ -211,7 +211,7 @@ describe('parseLaunchStart: a valid launch start gives its instant', () => {
 })
 
 // ---------------------------------------------------------------------------
-// parseLaunchStart — no launch start (SRJ-408: absent or unparseable = none)
+// parseLaunchStart — no launch start (absent or unparseable = none)
 // ---------------------------------------------------------------------------
 
 describe('parseLaunchStart: an absent or unparseable launch start gives none', () => {
@@ -260,7 +260,7 @@ describe('parseLaunchStart: an absent or unparseable launch start gives none', (
 })
 
 // ---------------------------------------------------------------------------
-// isPendingWithNoLaunchStart (SRJ-408, SRJ-513)
+// isPendingWithNoLaunchStart
 // ---------------------------------------------------------------------------
 
 /** A `status` result, `get` row and `list` row with the given fields. */
@@ -319,12 +319,12 @@ describe('isPendingWithNoLaunchStart', () => {
 })
 
 // ---------------------------------------------------------------------------
-// parseLaunchStart over the stub's rows (SRJ-406, SRJ-1303)
+// parseLaunchStart over the stub's rows
 // ---------------------------------------------------------------------------
 
 /**
  * Launch starts as a row carries them, with the instant each names: the
- * stub's sample forms (SRJ-1303: with fractional seconds, without, none), a
+ * stub's sample forms (with fractional seconds, without, none), a
  * numeric offset and a fraction longer than milliseconds.
  */
 const ROW_LAUNCH_STARTS: ReadonlyArray<readonly [string, string | undefined, number | undefined]> = [
@@ -344,7 +344,7 @@ describe('parseLaunchStart: a launch start reads the same from a status result, 
 })
 
 // ---------------------------------------------------------------------------
-// A `pending` row's ageing (SRJ-406, SRJ-408; AC 30, AC 80)
+// A `pending` row's ageing
 // ---------------------------------------------------------------------------
 
 /** The clock of the case, if it made one; `afterEach` asserts it has no timer left. */
@@ -405,7 +405,7 @@ const G_DOUBLED: AdConfigTables = { tmux: { pending_grace_seconds: DEFAULT_AD_SE
 /**
  * A resumed launch's `pending` `get` row: launch start `raw`, and a
  * `started_at` at `startedAtMs`, the original spawn's time, which no wait
- * may read (SRJ-406).
+ * may read.
  */
 function resumedRow(raw: string, startedAtMs: number): ReturnType<typeof cannedGetResult> {
   return cannedGetResult({
@@ -416,7 +416,7 @@ function resumedRow(raw: string, startedAtMs: number): ReturnType<typeof cannedG
   })
 }
 
-/** Both forms of G a check or an arm takes: the E6 accessor itself, and its value read as a number. */
+/** Both forms of G a check or an arm takes: the accessor itself, and its value read as a number. */
 const GRACE_WAITS: ReadonlyArray<readonly [string, () => number | (() => number)]> = [
   ['the G accessor', () => adGraceMsInEffect],
   ['G as a number', () => adGraceMsInEffect()],
@@ -554,7 +554,7 @@ describe('armPendingRowWait: never early, from the launch start, on createFakeCl
     expect(fired).toEqual([launchStartMs + newGraceMs])
   })
 
-  test('a G beyond the timer maximum at the pending wait\'s arm (E6; the rule\'s harness has its own case at a retry): no fire after 1 ms, one timer at a time none asking more than the maximum, and one fire exactly at launch start + G', async () => {
+  test('a G beyond the timer maximum at the pending wait\'s arm (; the rule\'s harness has its own case at a retry): no fire after 1 ms, one timer at a time none asking more than the maximum, and one fire exactly at launch start + G', async () => {
     installSettings({ tmux: { pending_grace_seconds: BigInt(Math.ceil(MAX_TIMER_DELAY_MS / MS_PER_SECOND)) } })
     const graceMs = adGraceMsInEffect()
     expect(graceMs).toBeGreaterThan(MAX_TIMER_DELAY_MS)
@@ -620,10 +620,10 @@ describe('armPendingRowWait: never early, from the launch start, on createFakeCl
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-408's own-row leg: a configured persona's own row with no launch start
+// own-row leg: a configured persona's own row with no launch start
 // ---------------------------------------------------------------------------
 
-describe('a configured persona\'s own pending row with no launch start latches through E16\'s decision and is never aged or armed (SRJ-408, SRJ-513)', () => {
+describe('a configured persona\'s own pending row with no launch start latches through \'s decision and is never aged or armed', () => {
   /** P's own rows: its current life (the covered shape) and a row whose cwd is not P's, each read shape and form. */
   const OWN_ROWS = LAUNCH_START_CASE_ROWS.filter((row) => row.variant === 'current life' || row.variant === 'other cwd').map(
     (row) => [row.name, row] as const,
@@ -652,16 +652,16 @@ describe('a configured persona\'s own pending row with no launch start latches t
 })
 
 // ---------------------------------------------------------------------------
-// Whether a `pending` row is covered (b.jg5 SRJ-409, SRJ-411, SRJ-408, SRJ-513)
+// Whether a `pending` row is covered
 // ---------------------------------------------------------------------------
 
 /** A row comparison that matches P: `cwd` and `config_dir` label both P's, both directories resolved. */
 const MATCHING: PendingRowComparison = { cwdMatches: true, cwdCheckDeferred: false, configDirResolved: true, configDirMatches: true }
 /** The comparison of a row whose `cwd` resolves elsewhere. */
 const CWD_ELSEWHERE: Partial<PendingRowComparison> = { cwdMatches: false }
-/** The comparison when neither P's working directory nor the row's `cwd` resolves now (b.av2 SR-6.4). */
+/** The comparison when neither P's working directory nor the row's `cwd` resolves now. */
 const CWD_UNRESOLVED: Partial<PendingRowComparison> = { cwdMatches: false, cwdCheckDeferred: true }
-/** The comparison when P's `claude_config_dir` does not resolve (b.g57): no label verdict. */
+/** The comparison when P's `claude_config_dir` does not resolve: no label verdict. */
 const CONFIG_DIR_UNRESOLVED: Partial<PendingRowComparison> = { configDirResolved: false, configDirMatches: undefined }
 /** The comparison of a row whose `config_dir` label is missing or differs. */
 const CONFIG_DIR_ELSEWHERE: Partial<PendingRowComparison> = { configDirMatches: false }
@@ -713,7 +713,7 @@ const SITES: ReadonlyArray<readonly [string, boolean | undefined]> = [
   ['a status-only site', true],
 ]
 
-describe('decidePendingRowCover: whether a pending row is P\'s current life (SRJ-409, SRJ-411), never for an own row with no launch start (SRJ-408, SRJ-513)', () => {
+describe('decidePendingRowCover: whether a pending row is P\'s current life, never for an own row with no launch start', () => {
   // None of these inputs pairs a cwd that resolves elsewhere with a directory
   // that does not resolve, so every site answers the same (the site's order
   // is the table below).
@@ -743,7 +743,7 @@ describe('decidePendingRowCover: whether a pending row is P\'s current life (SRJ
     },
   )
 
-  // SRJ-409 (ruling R8): at a status-only site a directory that cannot be
+  // (ruling R8): at a status-only site a directory that cannot be
   // resolved leaves the row undecided before any mismatch is checked; the
   // ladder keeps its order, a cwd that resolves elsewhere first.
   const CONFIG_DIR_UNDECIDED = undecided(PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED)
@@ -766,7 +766,7 @@ describe('decidePendingRowCover: whether a pending row is P\'s current life (SRJ
     expect(decidePendingRowCover(coverInput({ ...options, statusOnlySite: true }))).toEqual(statusOnly)
   })
 
-  // SRJ-408, SRJ-513 (the E16 hatch note): every shape, covered or not, answers "no launch start".
+  // (the design note): every shape, covered or not, answers "no launch start".
   const NO_LAUNCH_START_SHAPES: ReadonlyArray<readonly [string, Parameters<typeof coverInput>[0]]> = [
     ['P\'s current life (the covered shape)', {}],
     ['a recorded key after its mark', { retired: RECORDED_MARKED }],
@@ -785,7 +785,7 @@ describe('decidePendingRowCover: whether a pending row is P\'s current life (SRJ
 })
 
 // ---------------------------------------------------------------------------
-// The status-only sites' comparison (b.jg5 SRJ-411, hatch A3; b.av2 SR-6.4)
+// The status-only sites' comparison (design A3)
 // ---------------------------------------------------------------------------
 
 /** A row comparison as `compareRowToPersona` answers it: both directories resolved and the row matching P, unless `overrides` says otherwise. */
@@ -817,10 +817,10 @@ describe('pendingRowComparisonFor: a working directory with no real path leaves 
 })
 
 // ---------------------------------------------------------------------------
-// The stuck-launch post's texts, pinned (b.jg5 SRJ-1017): the one literal block
+// The stuck-launch post's texts, pinned: the one literal block
 // ---------------------------------------------------------------------------
 
-describe('the stuck-launch post\'s texts, pinned (b.jg5 SRJ-1017; AC 67)', () => {
+describe('the stuck-launch post\'s texts, pinned', () => {
   test('for key dev and the fractional sample: the relaunching text at the default settings (5 minutes) and with pending_grace_seconds 300 (6 minutes), and the held text with and without the attach line', () => {
     const key = 'dev'
     const relaunchingAtDefaults =
@@ -856,10 +856,10 @@ describe('the stuck-launch post\'s texts, pinned (b.jg5 SRJ-1017; AC 67)', () =>
 })
 
 // ---------------------------------------------------------------------------
-// The stuck-launch post's builders, through the exports (b.jg5 SRJ-1017)
+// The stuck-launch post's builders, through the exports
 // ---------------------------------------------------------------------------
 
-/** Persona keys for the builder cases: two that prefix one another (b.1ix), and one with no digit. */
+/** Persona keys for the builder cases: two that prefix one another, and one with no digit. */
 const PREFIX_KEY = 'dev'
 const PREFIXED_KEY = 'dev_2'
 const BUILDER_KEYS = [PREFIX_KEY, PREFIXED_KEY, 'ops_bot'] as const
@@ -881,7 +881,7 @@ function sameInstantForms(raw: string): ReadonlyArray<readonly [string, unknown]
   ]
 }
 
-describe('stuckLaunchRelaunchingText: B in whole minutes, rounded down, and P\'s quoted session (b.jg5 SRJ-1017, SRJ-210)', () => {
+describe('stuckLaunchRelaunchingText: B in whole minutes, rounded down, and P\'s quoted session', () => {
   /** [settings, the agent-director settings written (none: the defaults), whether B is whole minutes there]. */
   const B_SETTINGS: ReadonlyArray<readonly [string, AdConfigTables | undefined, boolean]> = [
     ['the default settings', undefined, true],
@@ -906,7 +906,7 @@ describe('stuckLaunchRelaunchingText: B in whole minutes, rounded down, and P\'s
 
 })
 
-describe('both texts name P\'s own session, quoted (b.jg5 SRJ-1017, SRJ-1001; b.1ix)', () => {
+describe('both texts name P\'s own session, quoted', () => {
   test.each([
     [PREFIX_KEY, PREFIXED_KEY],
     [PREFIXED_KEY, PREFIX_KEY],
@@ -935,7 +935,7 @@ describe('both texts name P\'s own session, quoted (b.jg5 SRJ-1017, SRJ-1001; b.
   })
 })
 
-describe('stuckLaunchHeldText: with and without the attach line (b.jg5 SRJ-1017)', () => {
+describe('stuckLaunchHeldText: with and without the attach line', () => {
   test.each(BUILDER_KEYS.flatMap((key) => VALID_LAUNCH_STARTS.map(([form, raw]) => [key, form, raw] as const)))(
     'persona %s, the %s launch start: unflagged, the head and all three remedies and the human-only line; flagged, the clause after the launch start and no attach line',
     (key, _form, raw) => {
@@ -965,7 +965,7 @@ describe('stuckLaunchHeldText: with and without the attach line (b.jg5 SRJ-1017)
   )
 })
 
-describe('the launch start in the held text: one renderer, ISO 8601 UTC ending in Z (b.jg5 SRJ-1017, hatch A3)', () => {
+describe('the launch start in the held text: one renderer, ISO 8601 UTC ending in Z (hatch A3)', () => {
   /** An ISO 8601 UTC timestamp with milliseconds, ending in `Z`, as `Date.prototype.toISOString` writes one. */
   const ISO_UTC_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 
@@ -994,7 +994,7 @@ describe('the launch start in the held text: one renderer, ISO 8601 UTC ending i
   })
 })
 
-describe('neither stuck-launch text names a session-ending command (b.jg5 SRJ-1001, C22)', () => {
+describe('neither stuck-launch text names a session-ending command (C22)', () => {
   /** Every text, in every form, for every key and launch start, at the default B and with `pending_grace_seconds` 300. */
   function everyStuckLaunchText(): string[] {
     const texts: string[] = []
@@ -1017,19 +1017,19 @@ describe('neither stuck-launch text names a session-ending command (b.jg5 SRJ-10
     const lines = everyStuckLaunchText().flatMap((text) => text.split('\n'))
     expect(CSCB_OWN_LINE_FORBIDDEN.length).toBeGreaterThan(0)
     expect(lines.flatMap(cscbOwnLineForbiddenIn)).toEqual([])
-    // Every `-t` target any line names is an exact one (SRJ-1001: no tmux target without `=`).
+    // Every `-t` target any line names is an exact one (no tmux target without `=`).
     const targets = lines.flatMap((line) => [...line.matchAll(/-t\s+(\S+)/g)].map((match) => match[1]!))
     expect(targets.length).toBeGreaterThan(0)
     for (const target of targets) expect(target.startsWith(tmuxExactSessionTarget(''))).toBe(true)
   })
 
-  test('no text calls anything a "dispatcher bug" (b.jg5 SRJ-713)', () => {
+  test('no text calls anything a "dispatcher bug"', () => {
     for (const text of everyStuckLaunchText()) expect(text).not.toMatch(DISPATCHER_BUG_WORDING)
   })
 })
 
 // ---------------------------------------------------------------------------
-// The stuck-launch posters (b.jg5 SRJ-1017, SRJ-1016)
+// The stuck-launch posters
 // ---------------------------------------------------------------------------
 
 /** One stuck-launch text as a poster posts it: its mark, its held form, its poster and its text for a key. */
@@ -1126,7 +1126,7 @@ const isOpen = (rig: PosterRig, key: string): boolean => rig.episodes.isOpen(key
 /** A row state whose read ends the episode (a live state out of `pending`). */
 const LIVE_OUT_OF_PENDING = [...AGENT_DIRECTOR_LIVE_STATES].find((state) => state !== AGENT_DIRECTOR_PENDING_STATE)!
 
-describe('the stuck-launch posters: each text at most once per stuck-launch episode (b.jg5 SRJ-1017, SRJ-1016; AC 67)', () => {
+describe('the stuck-launch posters: each text at most once per stuck-launch episode', () => {
   /** Each text against each text with the other mark, in both orders. */
   const ORDERED_PAIRS = TEXT_CASES.flatMap((first) =>
     TEXT_CASES.filter((second) => second.mark !== first.mark).map((second) => [first.name, second.name, first, second] as const),
@@ -1222,7 +1222,7 @@ describe('the stuck-launch posters: each text at most once per stuck-launch epis
   })
 })
 
-describe('the stuck-launch posters: nothing posted and no episode begun while tmux-unavailable is raised (b.jg5 SRJ-1017, SRJ-410 step 3)', () => {
+describe('the stuck-launch posters: nothing posted and no episode begun while tmux-unavailable is raised (step 3)', () => {
   test.each(TEXT_CASES.map((text) => [text.name, text] as const))('%s while P\'s outage is raised: suppressed, nothing posted, no episode begun; Q still posts', (_name, text) => {
     const rig = posterRig()
     rig.raised.add(P)
@@ -1270,7 +1270,7 @@ describe('the stuck-launch posters: nothing posted and no episode begun while tm
   })
 })
 
-describe('the stuck-launch posters: closed episodes, a submitted teardown, and failures (b.jg5 SRJ-1017, SRJ-1003)', () => {
+describe('the stuck-launch posters: closed episodes, a submitted teardown, and failures', () => {
   test.each(TEXT_CASES.map((text) => [text.name, text] as const))('%s after the episodes are closed (shutdown): closed, nothing posted', (_name, text) => {
     const rig = posterRig()
     rig.episodes.close()
@@ -1363,7 +1363,7 @@ describe('the stuck-launch posters: closed episodes, a submitted teardown, and f
   })
 })
 
-describe('isStuckLaunchEpisodeEndState: a live state out of pending ends the episode; pending, ended, missing and no row do not (b.jg5 SRJ-1016)', () => {
+describe('isStuckLaunchEpisodeEndState: a live state out of pending ends the episode; pending, ended, missing and no row do not', () => {
   test.each([...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE))('%s ends it', (state) => {
     expect(isStuckLaunchEpisodeEndState(state)).toBe(true)
   })
@@ -1380,7 +1380,7 @@ describe('isStuckLaunchEpisodeEndState: a live state out of pending ends the epi
   })
 })
 
-describe('assertNoLeak over the stuck-launch texts and lines (b.jg5 SRJ-1017)', () => {
+describe('assertNoLeak over the stuck-launch texts and lines', () => {
   test('a key carrying a fake token: every text and line carries it only as the key, and nothing else token-like', () => {
     const key = `p_${fakeToken(BOT_TOKEN_PREFIX, 'key')}`
     const texts = [
@@ -1407,10 +1407,10 @@ describe('assertNoLeak over the stuck-launch texts and lines (b.jg5 SRJ-1017)', 
 })
 
 // ---------------------------------------------------------------------------
-// The pending-row rule's pure decisions (b.jg5 SRJ-410, SRJ-117, SRJ-118)
+// The pending-row rule's pure decisions
 // ---------------------------------------------------------------------------
 
-describe('pendingRowAgeOf: the rule\'s step from the launch start, G before B, with the derived waits read at each call (b.jg5 SRJ-410, SRJ-406, SRJ-408)', () => {
+describe('pendingRowAgeOf: the rule\'s step from the launch start, G before B, with the derived waits read at each call', () => {
   test.each(VALID_LAUNCH_STARTS)('%s launch start at the defaults: younger than G one tick before G, from G at G and one tick before B, at B at B', (_form, raw) => {
     const launchStartMs = parseLaunchStart(raw)!
     const graceMs = adGraceMsInEffect()
@@ -1452,7 +1452,7 @@ describe('pendingRowAgeOf: the rule\'s step from the launch start, G before B, w
     expect(pendingRowAgeOf(SAMPLE_LAUNCH_START_WHOLE, Number.MAX_SAFE_INTEGER, { graceMs: 0, launchBoundMs: AD_WAIT_NEVER_ENDS })).toBe(PENDING_ROW_AGE_FROM_G)
   })
 
-  test('a G beyond the timer maximum is compared, never armed: younger one tick before launch start + G, from G at it (E6)', () => {
+  test('a G beyond the timer maximum is compared, never armed: younger one tick before launch start + G, from G at it ()', () => {
     const graceMs = MAX_TIMER_DELAY_MS + MINUTE_MS
     const waits = { graceMs, launchBoundMs: graceMs + MINUTE_MS }
     expect(pendingRowAgeOf(SAMPLE_LAUNCH_START_WHOLE, WHOLE_INSTANT + graceMs - 1, waits)).toBe(PENDING_ROW_AGE_YOUNGER_THAN_G)
@@ -1471,7 +1471,7 @@ describe('pendingRowAgeOf: the rule\'s step from the launch start, G before B, w
   })
 })
 
-describe('readPendingRowRun: the round\'s reading of its run and its get; never step 3 on an earlier read (b.jg5 SRJ-410, SRJ-120)', () => {
+describe('readPendingRowRun: the round\'s reading of its run and its get; never step 3 on an earlier read', () => {
   const pendingGet: PendingRowRuleGet = { kind: PENDING_ROW_GET_ROW, state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: SAMPLE_LAUNCH_START_WHOLE }
   const refusedErr = errCallTimeout('get')
 
@@ -1507,7 +1507,7 @@ describe('readPendingRowRun: the round\'s reading of its run and its get; never 
   })
 })
 
-describe('decidePendingRowStepThree: still pending at B, judged or not (b.jg5 SRJ-410, SRJ-412, SRJ-1017)', () => {
+describe('decidePendingRowStepThree: still pending at B, judged or not', () => {
   const quiet: PendingRowStepThreeInput = {
     tmuxUnavailableRaised: false,
     latched: false,
@@ -1552,7 +1552,7 @@ function abortKillAnswer(kind: StuckLaunchAbortKillAnswer['kind'], killSent?: bo
 const abortKillLineStart = (answer: StuckLaunchAbortKillAnswer, key = P): string => stuckLaunchAbortKillLine(key, answer, '').split(' — ')[0]!
 
 // ---------------------------------------------------------------------------
-// The pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC 32, AC 33, AC 84)
+// The pending-row rule on the recovery harness
 // ---------------------------------------------------------------------------
 
 /** The harness of the rule's harness cases; `afterEach` leak-checks and cleans it up. */
@@ -1562,7 +1562,7 @@ let ruleHarness: RecoveryHarness | undefined
 function ruleHarnessOf(options: RecoveryHarnessOptions = {}): { h: RecoveryHarness; p: string } {
   const h = (ruleHarness = makeRecoveryHarness(options))
   expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
-  // Every run must make a new find-missing call however long the memo window (SRJ-120: bypassing).
+  // Every run must make a new find-missing call however long the memo window (bypassing).
   _setFindMissingMemoTtlMs(Number.MAX_SAFE_INTEGER)
   return { h, p: h.keys[0]! }
 }
@@ -1581,7 +1581,7 @@ function wrapModelKnob<K extends 'spawnFn' | 'resumeFn' | 'getFn' | 'readPaneFn'
 /** Whether a stub call's params ask the lap's read: the rule's `read-pane` (40 lines, `allow_pending`). */
 const isLapRead = (params: unknown): boolean => (params as { allow_pending?: unknown }).allow_pending === true
 
-/** One origin of a covered `pending` row for AC 30: how P's row comes to read `pending` with P's timer armed pending-only. */
+/** One origin of a covered `pending` row for how P's row comes to read `pending` with P's timer armed pending-only. */
 interface RuleOrigin {
   readonly name: string
   /** Bring P's row about over `model` (P's own options merged in) and settle; answers the row. */
@@ -1599,7 +1599,7 @@ const ORIGIN_START_PASS: RuleOrigin = {
   },
 }
 
-/** A launch call that fails having left P's row `pending` (b.jg5 SRJ-713; HO rev 28): which call of P's own id, and its answer. */
+/** A launch call that fails having left P's row `pending` (HO rev 28): which call of P's own id, and its answer. */
 interface FailedLaunch {
   /** A plain spawn, a reuse spawn (`reuse_finished`) or a `resume`. */
   readonly call: 'plain spawn' | 'reuse spawn' | 'resume'
@@ -1745,11 +1745,11 @@ function cleanUpRuleHarness(): void {
   }
 }
 
-describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC 32, AC 33, AC 84)', () => {
+describe('the pending-row rule on the recovery harness', () => {
   afterEach(cleanUpRuleHarness)
 
-  // AC 30, SRJ-410, SRJ-405, SRJ-1010.
-  test.each(RULE_ORIGINS)('AC 30, %s: nothing before G; from G a lap and a bypassing run, then the get, on the timer; nothing more before B; waits doubling to the ceiling; one held post at B naming the session; no kill or launch while pending; the post is the persona\'s only notice; brought up once marked missing', async (_name, origin) => {
+  //.
+  test.each(RULE_ORIGINS)(', %s: nothing before G; from G a lap and a bypassing run, then the get, on the timer; nothing more before B; waits doubling to the ceiling; one held post at B naming the session; no kill or launch while pending; the post is the persona\'s only notice; brought up once marked missing', async (_name, origin) => {
     const { h, p } = ruleHarnessOf()
     const row = await origin.begin(h, p, { judgment: judgeNotJudged })
     expectPendingOnlyWatch(h, p)
@@ -1780,7 +1780,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     for (const round of rounds) expect(round.posts).toBe(round.at >= launchStartMs + boundMs ? 1 : 0)
     expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, row.launchStartedAt(), false)])
     expect(heldPostsOf(h, p)[0]).toContain(quotedPersonaSessionName(p))
-    // SRJ-405, SRJ-1010: while the launch does not report in, the held post is the persona's only post about it.
+    // while the launch does not report in, the held post is the persona's only post about it.
     expect(noticesOf(h, p).slice(noticesBefore.length)).toEqual(heldPostsOf(h, p))
     // Never a kill or a launch while pending.
     expect(row.calls.slice(fromOrigin).filter((call) => KILL_OR_LAUNCH.includes(call.verb))).toEqual([])
@@ -1796,14 +1796,14 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(h.stops).toContainEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_ROW_GONE })
     expect(row.state()).toBe(AGENT_DIRECTOR_PENDING_STATE)
     expect(row.launchStartMs()).toBeGreaterThan(launchStartMs)
-    // SRJ-713 (AC 6's unit half): no post or line of the whole case, the origin's own included, calls anything a "dispatcher bug".
+    // (unit half): no post or line of the whole case, the origin's own included, calls anything a "dispatcher bug".
     expect(dispatcherBugWordingIn(h)).toEqual([])
   })
 
-  // AC 30's conditions: the timer keeps running while the row is pending.
+  // conditions: the timer keeps running while the row is pending.
 
-  // AC 30's outage: no held post while tmux-unavailable is raised; step 3 at the first retry after it clears.
-  test('AC 30, a row left pending by a plain spawn\'s ErrTmuxNotAvailable: no held post while tmux-unavailable stays raised past B; the held post at the first retry after it clears', async () => {
+  // outage: no held post while tmux-unavailable is raised; step 3 at the first retry after it clears.
+  test(', a row left pending by a plain spawn\'s ErrTmuxNotAvailable: no held post while tmux-unavailable stays raised past B; the held post at the first retry after it clears', async () => {
     const { h, p } = ruleHarnessOf()
     const row = await failedSpawnOrigin(() => errTmuxNotAvailable(undefined, 'spawn')).begin(h, p, { })
     expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
@@ -1831,10 +1831,10 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(row.calls.filter((call) => KILL_OR_LAUNCH.includes(call.verb))).toEqual([])
   })
 
-  // AC 32.
+  //.
 
-  // AC 33.
-  test('AC 33: from the harness\'s call times, the laps and the runs are never closer than the timer\'s interval in effect', async () => {
+  //.
+  test('from the harness\'s call times, the laps and the runs are never closer than the timer\'s interval in effect', async () => {
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { })
     const findMissingBefore = h.callTimes('findMissing').length
@@ -1851,12 +1851,12 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     }
   })
 
-  // AC 84 (SRJ-410; HO C21 steps 2 and 3).
+  // (HO C21 steps 2 and 3).
   test.each<[string, bigint, PendingRowModelOptions['judgment']]>([
     ['pending_grace_seconds at its minimum, the runs leaving the row in neither list', pendingGraceMinimumSeconds(DEFAULT_AD_SETTINGS.tmux.create_timeout_ms, DEFAULT_AD_SETTINGS.tmux.pipe_close_wait_ms), judgeNotJudged],
     ['pending_grace_seconds 400 (B 460 s), the runs leaving the row in neither list', 400n, judgeNotJudged],
     ['pending_grace_seconds 400 (B 460 s), the runs judging the row (unverified_ids) while it stays pending', 400n, judgeUnverified],
-  ])('AC 84, %s: no escalation, post or kill before B; at B, judged or not, one held post and no kill', async (_label, graceSeconds, judgment) => {
+  ])(', %s: no escalation, post or kill before B; at B, judged or not, one held post and no kill', async (_label, graceSeconds, judgment) => {
     expect(graceSeconds).not.toBe(DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds)
     const { h, p } = ruleHarnessOf({ adSettings: { tmux: { pending_grace_seconds: graceSeconds } } })
     expect(adGraceMsInEffect()).toBe(Number(graceSeconds) * MS_PER_SECOND)
@@ -1875,11 +1875,11 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect([starts, row.callTimes('kill'), h.notices.filter((n) => n.key === p)]).toEqual([[], [], []])
   })
 
-  // SRJ-406 (E28 bullet 1): the rule's legs measure from the launch start, never from started_at.
+  // ( bullet 1): the rule's legs measure from the launch start, never from started_at.
   test.each([
     ['whole', 10 * MINUTE_MS],
     ['fractional', 10 * MINUTE_MS + 123],
-  ])('SRJ-406, a resumed row whose started_at is older than G and whose launch start (%s form) is recent: no lap, run or post before G from the launch start, and no held post before B from it', async (_form, launchStartMs) => {
+  ])(', a resumed row whose started_at is older than G and whose launch start (%s form) is recent: no lap, run or post before G from the launch start, and no held post before B from it', async (_form, launchStartMs) => {
     const { h, p } = ruleHarnessOf()
     await h.clock.advanceTo(launchStartMs)
     const graceMs = adGraceMsInEffect()
@@ -1899,8 +1899,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     for (const round of rounds) expect(round.posts).toBe(round.at >= launchStartMs + boundMs ? 1 : 0)
   })
 
-  // E6: never-early waits through the accessors.
-  test('E6, a G raised while P\'s timer waits delays the first lap and run past the old G to the new one', async () => {
+  // never-early waits through the accessors.
+  test(', a G raised while P\'s timer waits delays the first lap and run past the old G to the new one', async () => {
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { })
     const launchStartMs = row.launchStartMs()!
@@ -1928,10 +1928,10 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(h.controller.isArmed(p)).toBe(true)
   })
 
-  // SRJ-117's lap column, end to end: what is typed, whether the run follows,
+  // lap column, end to end: what is typed, whether the run follows,
   // and the answer's own effect (tmux-unavailable raised, or CONFIG's cause armed).
 
-  // SRJ-118, SRJ-412 (R13): after a send-keys answered ErrSpawnNotInteractive, no further lap on that launch.
+  // (R13): after a send-keys answered ErrSpawnNotInteractive, no further lap on that launch.
   test.each<[string, number, (h: RecoveryHarness, p: string) => Promise<PendingRowModel>]>([
 
   ])('after %s answered ErrSpawnNotInteractive: no further lap on that launch (the run still follows each retry), and the held post at B drops the attach line', async (_label, lapsBefore, begin) => {
@@ -1950,10 +1950,10 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(heldPostsOf(h, p)[0]).not.toContain(stuckLaunchAttachRemedyLine(p))
   })
 
-  // SRJ-502 (E13): no lap, run or kill for a latched P.
+  // no lap, run or kill for a latched P.
 
-  // E16, SRJ-513: an own pending row with no launch start latches through E16's read.
-  test('an own pending row with no launch start latches through E16\'s read: no lap, run or kill, and none as time passes', async () => {
+  // an own pending row with no launch start latches through read.
+  test('an own pending row with no launch start latches through \'s read: no lap, run or kill, and none as time passes', async () => {
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { launchStartedAt: SAMPLE_LAUNCH_STARTS.none, })
     expect(h.latch.isLatched(p)).toBe(true)
@@ -1964,7 +1964,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect([h.stub.calls.readPaneCalls, h.callTimes('findMissing'), heldPostsOf(h, p)]).toEqual([[], [], []])
   })
 
-  // E28 bullet 2, SRJ-411: no post for an uncovered row; undecided rows get no rule run.
+  // bullet 2, no post for an uncovered row; undecided rows get no rule run.
   test('an uncovered pending row past B (its cwd elsewhere): its live-row sequence is started; no lap, run or stuck-launch post', async () => {
     const { h, p } = ruleHarnessOf()
     const row = makePendingRowModel(h, p, { launchStartedAt: launchStartText(0), row: { cwd: h.home } })
@@ -1991,7 +1991,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(h.controller.isArmed(p)).toBe(true)
   })
 
-  // The Task's ruling: a failed get after the run ends the round; never step 3 on an earlier read.
+  // The section's ruling: a failed get after the run ends the round; never step 3 on an earlier read.
   test('a failed get after the run at B: nothing more that round and no post; the next retry\'s round posts', async () => {
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { })
@@ -2021,8 +2021,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(heldPostsOf(h, p)).toHaveLength(1)
   })
 
-  // SRJ-810 (Task reconcile note): no lap, run or post while P's working directory is held for an old life.
-  test('SRJ-810: while P\'s working directory is held for an old life, a retry on P\'s covered pending row past G makes no read-pane, send-keys or find-missing of its own and posts nothing; once the hold ends, the next retry runs the rule', async () => {
+  // (section reconcile note): no lap, run or post while P's working directory is held for an old life.
+  test('while P\'s working directory is held for an old life, a retry on P\'s covered pending row past G makes no read-pane, send-keys or find-missing of its own and posts nothing; once the hold ends, the next retry runs the rule', async () => {
     const { h, p } = ruleHarnessOf()
     const directory = personaOf(h, p).working_directory
     // The old life's row reads live in P's directory, so its wait keeps the hold until its run lists it.
@@ -2057,7 +2057,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
 })
 
 // ---------------------------------------------------------------------------
-// CSCB's own stuck launch at B on the recovery harness (b.jg5 SRJ-412; AC 9, AC 31, AC 48, AC 67, AC 84)
+// CSCB's own stuck launch at B on the recovery harness
 // ---------------------------------------------------------------------------
 
 /** The session id of the row CSCB's own launch resumed, so the abort's sequence ends in a `resume` that keeps it. */
@@ -2144,14 +2144,14 @@ const abortAlertLinesOf = (h: RecoveryHarness, p: string): string[] =>
 const otherNoticesOf = (h: RecoveryHarness, p: string): string[] =>
   noticesOf(h, p).filter((text) => text !== relaunchingTextOf(p) && !text.startsWith(STUCK_LAUNCH_HELD_HEAD))
 
-describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill, the live-row sequence from step 2 (recovery harness; b.jg5 SRJ-412; AC 9, AC 31, AC 48, AC 67, AC 84)', () => {
+describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill, the live-row sequence from step 2 (recovery harness)', () => {
   afterEach(cleanUpRuleHarness)
 
-  // AC 9; AC 84 and SRJ-410 step 2 / SRJ-1426: at B, judged or not, the own launch is aborted.
+  // and step 2 / at B, judged or not, the own launch is aborted.
   test.each<[string, PendingRowModelOptions['judgment']]>([
     ['its runs leaving the row in neither ids nor unverified_ids', judgeNotJudged],
     ['its runs judging it and leaving it live (unverified_ids)', judgeUnverified],
-  ])('AC 9, a resumed launch CSCB started, held at an unrecognised prompt, %s: at B one relaunching post, one kill with kill_sent true, the sequence from step 2 (no step-1 kill) and a resume of the same row; nothing counted', async (_label, judgment) => {
+  ])(', a resumed launch CSCB started, held at an unrecognised prompt, %s: at B one relaunching post, one kill with kill_sent true, the sequence from step 2 (no step-1 kill) and a resume of the same row; nothing counted', async (_label, judgment) => {
     const { h, p, row } = ownStuckLaunchOf({ judgment })
     const launchStart = await launchOwnPending(h, row)
     expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: row.instanceId }])
@@ -2174,13 +2174,13 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([row.state(), row.launchStartMs(), isCscbOwnLaunch(p, row.launchStartedAt())]).toEqual([AGENT_DIRECTOR_PENDING_STATE, atB, true])
   })
 
-  // AC 84 (SRJ-410; HO C21 steps 2 and 3), the own-launch half at non-default
+  // (HO C21 steps 2 and 3), the own-launch half at non-default
   // G (the held half is in the rule's harness describe above).
   test.each<[string, bigint, PendingRowModelOptions['judgment']]>([
     ['pending_grace_seconds at its minimum, the runs leaving the row in neither list', pendingGraceMinimumSeconds(DEFAULT_AD_SETTINGS.tmux.create_timeout_ms, DEFAULT_AD_SETTINGS.tmux.pipe_close_wait_ms), judgeNotJudged],
     ['pending_grace_seconds 400 (B 460 s), the runs leaving the row in neither list', 400n, judgeNotJudged],
     ['pending_grace_seconds 400 (B 460 s), the runs judging the row (unverified_ids) while it stays pending', 400n, judgeUnverified],
-  ])('AC 84, CSCB\'s own stuck launch with %s: no post, kill or alert before B while the retries run; at B, judged or not, one relaunching post and one abort, no held post', async (_label, graceSeconds, judgment) => {
+  ])(', CSCB\'s own stuck launch with %s: no post, kill or alert before B while the retries run; at B, judged or not, one relaunching post and one abort, no held post', async (_label, graceSeconds, judgment) => {
     expect(graceSeconds).not.toBe(DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds)
     const { h, p, row } = ownStuckLaunchOf({ judgment }, ABORT_ORIGIN_RETRY, { adSettings: { tmux: { pending_grace_seconds: graceSeconds } } })
     expect(adGraceMsInEffect()).toBe(Number(graceSeconds) * MS_PER_SECOND)
@@ -2205,7 +2205,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
   })
 
-  // SRJ-412, SRJ-713: a later launch call of P that answers
+  // a later launch call of P that answers
   // ErrInstanceIdCollision started no launch, so CSCB's own launch keeps its
   // record and still gets the relaunching post and its abort at B.
   test('a later spawn of P colliding with CSCB\'s own pending launch keeps that launch\'s own-launch record: at B the relaunching post and the abort\'s one kill, no held post', async () => {
@@ -2232,8 +2232,8 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(h.stuckLaunchAbortUsed(p)).toBe(true)
   })
 
-  // AC 31: a timed-out launch inside its window is CSCB's own; a kill_sent false success goes on to the sequence.
-  test('AC 31, a launch that timed out with its launch start inside its window: aborted at B; its kill answering kill_sent false goes on to the sequence and its resume', async () => {
+  // a timed-out launch inside its window is CSCB's own; a kill_sent false success goes on to the sequence.
+  test(', a launch that timed out with its launch start inside its window: aborted at B; its kill answering kill_sent false goes on to the sequence and its resume', async () => {
     const { h, p, row } = ownStuckLaunchOf({ ...PLAIN_SPAWN_LAUNCH, kill: [cannedKillResult(false)] })
     scriptModelLaunch(h, row, { takesMs: MINUTE_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
     await launchOwnPending(h, row)
@@ -2248,12 +2248,12 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(heldPostsOf(h, p)).toEqual([])
   })
 
-  // AC 9, AC 31, AC 48: every other pending row at B gets the held post and is never killed.
+  // every other pending row at B gets the held post and is never killed.
   type NotOwnArrange = (h: RecoveryHarness, p: string, row: PendingRowModel) => Promise<void>
   test.each<[string, PendingRowModelOptions, NotOwnArrange, boolean]>([
 
     [
-      'another process\'s launch over CSCB\'s own (AC 48)',
+      'another process\'s launch over CSCB\'s own',
       {},
       async (h, _p, row) => {
         await launchOwnPending(h, row)
@@ -2263,7 +2263,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
       false,
     ],
     ...(['before', 'after'] as const).map((placement): [string, PendingRowModelOptions, NotOwnArrange, boolean] => [
-      `a launch whose launch start lies ${placement} its call's window (AC 31)`,
+      `a launch whose launch start lies ${placement} its call's window`,
       PLAIN_SPAWN_LAUNCH,
       async (h, p, row) => {
         scriptModelLaunch(h, row, { takesMs: MINUTE_MS, launchStart: placement })
@@ -2286,7 +2286,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([relaunchingPostsOf(h, p), row.callTimes('kill'), launchesOf(row)]).toEqual([[], [], launches])
   })
 
-  // SRJ-1017's Test clause; SRJ-412: at most one abort per stuck-launch episode.
+  // Test clause; at most one abort per stuck-launch episode.
   test('a relaunch still pending at B in the same episode: the held text once and no kill, and no second relaunching post', async () => {
     const { h, p, row } = ownStuckLaunchOf()
     await launchOwnPending(h, row)
@@ -2305,7 +2305,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(h.stuckLaunchAbortUsed(p)).toBe(true)
   })
 
-  // AC 67, SRJ-702, SRJ-704: ErrTmuxKillFailed after its tries uses the abort; one alert; then the held text once.
+  // ErrTmuxKillFailed after its tries uses the abort; one alert; then the held text once.
   test('the abort kill answering ErrTmuxKillFailed at each of its 3 tries, 2 s apart: one ordinary alert with the stuck-launch abort context; not retried; no launch or delete; the held text once at the next retry, never in the same round', async () => {
     const { h, p, row } = ownStuckLaunchOf()
     const failed = errTmuxKillFailed(personaTmuxSessionName(p))
@@ -2328,12 +2328,12 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([row.callTimes('kill').length, otherNoticesOf(h, p).length, relaunchingPostsOf(h, p).length, launchesOf(row)]).toEqual([KILL_RETRY_TRIES, 1, 1, launches])
   })
 
-  // SRJ-501, SRJ-505, SRJ-512, SRJ-613 (AC 9): the abort kill's CONFLICT and UNUSABLE NAME latch P, never retried.
-  // End to end, SRJ-613's kill backstop ("not this launch's session") and one
+  // the abort kill's CONFLICT and UNUSABLE NAME latch P, never retried.
+  // End to end kill backstop ("not this launch's session") and one
   // UNUSABLE NAME row; every row is session-manager.test.ts's at unit level.
   const ABORT_KILL_LATCHES: ReadonlyArray<readonly [string, () => Error, (key: string) => ConflictLatchRecord, (key: string) => string]> = [
     ...STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.killBackstop === true).map((caseRow) => [
-      `CONFLICT (${caseRow.name}, SRJ-613's kill backstop)`,
+      `CONFLICT (${caseRow.name}kill backstop)`,
       caseRow.build,
       (key: string) =>
         expectedLatchRecord(key, {
@@ -2367,10 +2367,10 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([row.callTimes('kill'), launchesOf(row), h.stub.calls.deleteCalls, heldPostsOf(h, p), otherNoticesOf(h, p).length]).toEqual([[atB], launches, [], [], 1])
   })
 
-  // SRD hatch A2 and Q-12: the abort's kill is part of the round's attempt; a kill that did nothing is made again at the next retry reaching step 3.
+  // contract design A2 and Q-12: the abort's kill is part of the round's attempt; a kill that did nothing is made again at the next retry reaching step 3.
   const ABORT_KILL_ATTEMPTS: ReadonlyArray<readonly [string, () => Error, (h: RecoveryHarness, p: string) => boolean]> = [
     ['ErrTmuxUnresponsive, a tmux-touching UNAVAILABLE: starts tmux-unresponsive', () => errTmuxUnresponsive('kill'), (h, p) => h.tmuxUnresponsive.holds(p)],
-    ['ErrCallTimeout, UNAVAILABLE: arms its cause (SRJ-105)', () => errCallTimeout('kill'), (h, p) => h.triggers.some((t) => t.key === p && t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)],
+    ['ErrCallTimeout, UNAVAILABLE: arms its cause', () => errCallTimeout('kill'), (h, p) => h.triggers.some((t) => t.key === p && t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)],
   ]
 
   test.each(ABORT_ORIGINS.flatMap((origin) => ABORT_KILL_ATTEMPTS.map(([label, make, holds]) => [origin, label, make, holds] as const)))('from %s, the abort kill answering %s at each try: no alert, the abort not used, no launch; the next retry reaching step 3 makes the same abort with no second relaunching post', async (origin, _label, make, holds) => {
@@ -2391,9 +2391,9 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), h.stuckLaunchAbortUsed(p)]).toEqual([[relaunchingTextOf(p)], [], true])
   })
 
-  // AC 67, SRJ-111's ErrTmuxNotAvailable row: no abort while tmux-unavailable is raised; the same abort once it clears.
+  // ErrTmuxNotAvailable row: no abort while tmux-unavailable is raised; the same abort once it clears.
 
-  // SRJ-316 (E12): a CONFIG answer raises ad-config-malformed, and the abort waits for it to clear.
+  // a CONFIG answer raises ad-config-malformed, and the abort waits for it to clear.
   test('the abort kill answering CONFIG: ad-config-malformed raised, no further try, the abort not used and no launch; the next retry\'s reads clear it, and the same abort follows with no second relaunching post', async () => {
     const { h, p, row } = ownStuckLaunchOf()
     row.scriptKill(errConfigMalformed())
@@ -2409,7 +2409,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), h.stuckLaunchAbortUsed(p)]).toEqual([[relaunchingTextOf(p)], [], true])
   })
 
-  // SRJ-702, SRJ-412: an abort kill SRJ-702's stop rule stopped uses up no abort and raises no alert.
+  // an abort kill stop rule stopped uses up no abort and raises no alert.
   test('the abort kill\'s tries stopped because P stopped being up: no alert of either version, the abort not used; once P is up, the next retry reaching step 3 makes the same abort with no second relaunching post', async () => {
     const { h, p, row } = ownStuckLaunchOf()
     row.scriptKill(errTmuxUnresponsive('kill'))
@@ -2423,7 +2423,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
 
     const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_RETRY)
     expect(row.callTimes('kill')).toEqual([atB])
-    // SRJ-702, SRJ-1014: the stop's one record, naming its cause and the last outcome's class; no alert text.
+    // the stop's one record, naming its cause and the last outcome's class; no alert text.
     const stoppedLine = killFailureStoppedRetryText({
       key: p,
       decision: { kind: KILL_RETRY_ALERT_NONE },
@@ -2440,7 +2440,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([relaunchingPostsOf(h, p), h.stuckLaunchAbortUsed(p), launchesOf(row)]).toEqual([[relaunchingTextOf(p)], true, [...launches, 'resume']])
   })
 
-  // SRJ-702, SRJ-704: a survivor-naming failure, then a non-success: the ordinary alert, once.
+  // a survivor-naming failure, then a non-success: the ordinary alert, once.
   test('the abort kill naming a survivor at its first try, then ErrTmuxUnresponsive: one ordinary alert with the stuck-launch abort context, quoting the survivor-naming description; the abort not used', async () => {
     const { h, p, row } = ownStuckLaunchOf()
     const survivor = errTmuxKillFailed(personaTmuxSessionName(p), 'pane-process-survived')
@@ -2456,11 +2456,11 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(h.stuckLaunchAbortUsed(p)).toBe(false)
   })
 
-  // AC 67: an own stuck launch at B while a lap's read-pane raised tmux-unavailable: neither text and no kill until it clears.
+  // an own stuck launch at B while a lap's read-pane raised tmux-unavailable: neither text and no kill until it clears.
 
-  // SRJ-502: no abort for a latched P.
+  // no abort for a latched P.
 
-  // SRJ-412: the record is in memory only; a server restart forgets it.
+  // the record is in memory only; a server restart forgets it.
   test('after a server restart the same pending row is no longer CSCB\'s own: at B the held post, no relaunching post and no kill', async () => {
     const { h, p, row } = ownStuckLaunchOf({}, ABORT_ORIGIN_RETRY)
     const launchStart = await launchOwnPending(h, row)
@@ -2486,8 +2486,8 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     })
   }
 
-  // SRJ-717 after the abort's kill: the sequence stops on an unjudged run; the abort is used; the held text once.
-  test('the abort\'s sequence stopping at its first run that leaves the row pending in neither list (SRJ-717): no alert and no launch; the held text once at the next retry, and no further kill', async () => {
+  // after the abort's kill: the sequence stops on an unjudged run; the abort is used; the held text once.
+  test('the abort\'s sequence stopping at its first run that leaves the row pending in neither list: no alert and no launch; the held text once at the next retry, and no further kill', async () => {
     const { h, p, row } = ownStuckLaunchOf()
     await launchOwnPending(h, row)
     keepPendingAfterKill(h, row)
@@ -2504,7 +2504,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect([row.callTimes('kill'), relaunchingPostsOf(h, p).length]).toEqual([[atB], 1])
   })
 
-  // SRJ-705 step 5 with the abort's context.
+  // step 5 with the abort's context.
   test('the abort\'s sequence reaching step 5 (the row still pending after runs that judged it and its step-4 kill): the ordinary alert with no description and the stuck-launch abort context; no launch', async () => {
     const { h, p, row } = ownStuckLaunchOf({ judgment: judgeUnverified })
     await launchOwnPending(h, row)
@@ -2520,11 +2520,11 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(launchesOf(row)).toEqual(launches)
   })
 
-  // SRJ-404, hatch A3: the abort stops P's running approver first, with its own stop reason, and no rule run follows that stop.
+  // design A3: the abort stops P's running approver first, with its own stop reason, and no rule run follows that stop.
 
 })
 
-describe('SRJ-713: a failed launch\'s pending row, never CSCB\'s own, waited out through the rule until it reads missing (recovery harness; b.jg5 SRJ-713, SRJ-111, SRJ-410, SRJ-412; AC 6, AC 30)', () => {
+describe('a failed launch\'s pending row, never CSCB\'s own, waited out through the rule until it reads missing (recovery harness)', () => {
   afterEach(cleanUpRuleHarness)
 
   test('HO rev 18: a lost-reply row (its launch call timed out) marked missing past G, before B, by the rule\'s run: that step hands P to the restart decision, whose get-then-act resumes the row, keeping its conversation; no kill, no post, nothing counted', async () => {

@@ -22,7 +22,7 @@ CSCB relies on agent-director (AD) for agent state and does not parse an agent's
 
 ## State and decision map
 
-One persona owns a durable ordered queue, one active delivery target, a typing gate, timers, authoritative AD observations and exact own-message receipt facts. Personas are independent. The runtime map is in [architecture.md](../../docs/architecture.md#delivery-model-code-map-bomv-sr-156). `delivery-policy.ts` exposes the pure engine/gate vocabulary; conformance renders explicit AD and receipt observations and checks production decisions.
+One persona owns a durable ordered queue, one active delivery target, a typing gate, timers, authoritative AD observations and exact own-message receipt facts. Personas are independent. The runtime map is in [architecture.md](../../docs/architecture.md#delivery-model-code-map). `delivery-policy.ts` exposes the pure engine/gate vocabulary; conformance renders explicit AD and receipt observations and checks production decisions.
 
 An unconfirmed durable own send becomes eligible for a persisted recovery Enter after normal backoff and fresh AD waiting. Its durable attempt identity is retained; the volatile completion identity prevents repeating that recovery step within the same live engine. Enter is followed by a receipt wait, then full retype only while confirmation remains absent. Recovery precedes disconnected reconnect. Server restart forgets volatile identity, never durable accepted work. Refusals retain queued work and existing backoff.
 

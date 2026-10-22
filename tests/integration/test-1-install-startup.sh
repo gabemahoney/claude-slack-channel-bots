@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 1 (b.j9i): install package, start daemon in dry-run, verify startup.
+# Test 1: install package, start daemon in dry-run, verify startup.
 #
 # Right after the install, the image's client-under-test check
 # (/opt/agent-director/check/ad-client-check.sh --package) checks the
@@ -12,14 +12,14 @@
 # the test with one FAIL line naming the fixture's first failing check, and a
 # passed one logs the fixture's PASS line. Tests 2 onward use this install.
 #
-# The config is a persona config (b.av2 SR-13.5): persona "alpha" in two
+# The config is a persona config: persona "alpha" in two
 # channels (delivery all, prompts to the first), and the zero-channel persona
 # "bravo" with DMs on and prompts to its DM contact. Neither credentials file
-# exists: dry run reads no credentials file (SR-3.4). Every `start` runs with
-# SLACK_BOT_TOKEN and SLACK_APP_TOKEN unset (AC 47).
+# exists: dry run reads no credentials file. Every `start` runs with
+# SLACK_BOT_TOKEN and SLACK_APP_TOKEN unset.
 #
 # Before the main flow, a pre-persona leg starts against a `routes` config in
-# its own temp SLACK_STATE_DIR and must fail with the SR-1.7 conversion error.
+# its own temp SLACK_STATE_DIR and must fail with the conversion error.
 # Runs only in a cscb-ci image: without its marker, refuse before any other step.
 if [[ ! -e /etc/cscb-ci-image ]]; then
     echo "FAIL: test-1-install-startup: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2
@@ -35,7 +35,7 @@ PID_FILE="${STATE_DIR}/server.pid"
 CLI="./node_modules/.bin/claude-slack-channel-bots"
 FIXTURES="$(realpath "$(dirname "$0")")/fixtures"
 
-# The SR-1.7 conversion error for a "routes" key (src/config.ts
+# The conversion error for a "routes" key (src/config.ts
 # prePersonaConversionMessage), as the server logs it.
 CONVERSION_ERROR='"routes" belongs to the pre-persona configuration shape, which is no longer accepted. The configuration must be converted to personas: rewrite it by hand as a "personas" array. Nothing is converted automatically and the file has not been changed.'
 
@@ -109,7 +109,7 @@ grep -qF "[slack] Fatal: configuration error — " /tmp/test-1-pre-persona.err \
     || fail "pre-persona leg: start stderr missing '[slack] Fatal: configuration error — '"
 
 grep -qF "${CONVERSION_ERROR}" /tmp/test-1-pre-persona.err \
-    || fail "pre-persona leg: start stderr missing the SR-1.7 conversion error"
+    || fail "pre-persona leg: start stderr missing the conversion error"
 
 test ! -e "${PRE_STATE_DIR}/server.pid" \
     || fail "pre-persona leg: PID file ${PRE_STATE_DIR}/server.pid exists"

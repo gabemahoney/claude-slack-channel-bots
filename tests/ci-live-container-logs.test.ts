@@ -1,6 +1,6 @@
 /**
  * ci-live-container-logs.test.ts — Tests for the copy of the /ci-live test
- * container's own logs into the results (bug b.1cx, `ci-live/lib/container-logs.ts`).
+ * container's own logs into the results (`ci-live/lib/container-logs.ts`).
  *
  * The rules under test:
  * - the files copied are CSCB's server.log and its rotated generations,

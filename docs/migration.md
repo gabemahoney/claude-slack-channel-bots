@@ -301,7 +301,7 @@ Earlier releases ignore this release’s queue and can resume a bot without thei
 
 ---
 
-## Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)
+## Upgrading from pre-v0.6 (v0.5.x → v0.6.x)
 
 If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up by hand; no install step removes them.
 

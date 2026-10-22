@@ -1,4 +1,4 @@
-/** Transcript I/O and schemas are private to this adapter (b.omv SR-6). */
+/** Transcript I/O and schemas are private to this adapter. */
 import * as nodeFs from 'node:fs'
 import { locateTranscript } from './session-transcript.ts'
 import type { QueueItem, SentRecord, DeliveredRecord } from './delivery-queue.ts'
@@ -22,7 +22,7 @@ function textBlocks(value: unknown, type: string): string | undefined {
   const blocks = value.filter(b => object(b)?.type === type && typeof b.text === 'string')
   return blocks.length ? blocks.map(b => b.text).join('') : undefined
 }
-/** Exact match, allowing only SR-6.2's optional LFs beside each paste block.
+/** Exact match, allowing only optional LFs beside each paste block.
  * Matching against the target bounds the search; no greedy whitespace trim. */
 export function receiptTextMatches(record: string, expected: string): boolean {
   if (record === expected) return true
@@ -83,7 +83,7 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
   const fs = options.fs ?? nodeFs, files = new Map<string, CachedFile>()
   // Freeze each known file's pre-send EOF when the durable attempt first
   // appears. An absent entry means the file was discovered after that send,
-  // so its entire contents are eligible (SR-6.2). Keep this independently of
+  // so its entire contents are eligible. Keep this independently of
   // the parsed cache, including when a file cannot currently be opened.
   const observed = new Map<string, number>(), windows = new Map<string, ReadonlyMap<string, number>>()
   const sendIdentity = (seq: number, send: SentRecord): string => `${seq}:${send.part}:${send.attempt}`

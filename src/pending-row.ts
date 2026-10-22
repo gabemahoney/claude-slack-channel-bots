@@ -31,7 +31,7 @@ import type { MUTED_BY_TEARDOWN, PERSONA_EPISODE_KIND_STUCK_LAUNCH, PersonaEpiso
 import { personaTmuxSessionName, quotedPersonaSessionName, tmuxExactSessionTarget } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
-// The launch start (b.jg5 SRJ-406, SRJ-408)
+// The launch start
 // ---------------------------------------------------------------------------
 
 /**
@@ -55,7 +55,7 @@ function daysInMonth(year: number, month: number): number {
 
 /**
  * The instant of a raw launch start, in epoch milliseconds, or `undefined`
- * for "no launch start" (b.jg5 SRJ-406, SRJ-408). Accepts an RFC 3339
+ * for "no launch start". Accepts an RFC 3339
  * date-time with `Z` or a numeric offset and with or without a fractional
  * part of any length (milliseconds are its first three digits; further
  * digits are dropped), whose fields are in range (a leap second, `:60`, is
@@ -94,7 +94,7 @@ export function parseLaunchStart(raw: unknown): number | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// A `pending` row with no launch start (b.jg5 SRJ-408, SRJ-513)
+// A `pending` row with no launch start
 // ---------------------------------------------------------------------------
 
 /**
@@ -120,16 +120,16 @@ export function isPendingWithNoLaunchStart(row: PendingRowFields | null | undefi
 }
 
 // ---------------------------------------------------------------------------
-// A `pending` row's ageing (b.jg5 SRJ-406, SRJ-408)
+// A `pending` row's ageing
 // ---------------------------------------------------------------------------
 
 /**
  * True when `waitMs` has passed at `nowMs` since the launch start
  * `rawLaunchStart` names ({@link parseLaunchStart}), by a plain
- * `elapsed >= wait` comparison (b.jg5 SRJ-406). `waitMs` is a fixed number
+ * `elapsed >= wait` comparison. `waitMs` is a fixed number
  * or the derived-wait accessor itself (for example `adGraceMsInEffect`),
  * read once at this call. False for a launch start that is absent or does
- * not parse (a row with no launch start is never aged, SRJ-408), for a wait
+ * not parse (a row with no launch start is never aged), for a wait
  * of `AD_WAIT_NEVER_ENDS`, and for an accessor that throws or answers NaN.
  * Pure; never throws.
  */
@@ -162,14 +162,14 @@ export type PendingRowWaitArm = PendingRowWaitArmed | typeof PENDING_ROW_WAIT_NO
 /**
  * Arm a wait of `waitMs` on a `pending` row, measured from the launch start
  * `rawLaunchStart` names ({@link parseLaunchStart}), never from `started_at`
- * (b.jg5 SRJ-406): `armNeverEarlyWait` on `clock` with `waitMs` passed
+ * `armNeverEarlyWait` on `clock` with `waitMs` passed
  * through, so the accessor itself (for example `adGraceMsInEffect` or
  * `adLaunchBoundMsInEffect`) is read at every fire and a value raised while
- * armed is honoured (SRJ-210). `callback` runs once, from a timer, when the
+ * armed is honoured. `callback` runs once, from a timer, when the
  * wait has passed. Answers the launch start and the cancel.
  *
  * For a launch start that is absent or does not parse, arms nothing, never
- * runs `callback`, and answers {@link PENDING_ROW_WAIT_NOT_ARMED} (SRJ-408:
+ * runs `callback`, and answers {@link PENDING_ROW_WAIT_NOT_ARMED} (
  * such a row is never aged), so no `RangeError` for the start ever escapes.
  * A fixed `waitMs` that is NaN, or an accessor that answers NaN or throws
  * while arming, throws out of this call as from `armNeverEarlyWait`, before
@@ -188,36 +188,36 @@ export function armPendingRowWait(
 }
 
 // ---------------------------------------------------------------------------
-// Whether a `pending` row is covered (b.jg5 SRJ-409, SRJ-411, SRJ-408)
+// Whether a `pending` row is covered
 // ---------------------------------------------------------------------------
 
-/** {@link decidePendingRowCover}: a configured persona's own `pending` row with no launch start. It latches (SRJ-513); never covered, never exempted. */
+/** {@link decidePendingRowCover}: a configured persona's own `pending` row with no launch start. It latches; never covered, never exempted. */
 export const PENDING_ROW_NO_LAUNCH_START = 'no-launch-start'
-/** {@link decidePendingRowCover}: the row is the persona's current life, a launch in progress (SRJ-409). */
+/** {@link decidePendingRowCover}: the row is the persona's current life, a launch in progress. */
 export const PENDING_ROW_COVERED = 'covered'
-/** {@link decidePendingRowCover}: the row is not the persona's current life (SRJ-411); its reason says why. */
+/** {@link decidePendingRowCover}: the row is not the persona's current life; its reason says why. */
 export const PENDING_ROW_NOT_COVERED = 'not-covered'
-/** {@link decidePendingRowCover}: a directory the decision needs could not be resolved, so there is no verdict yet (b.av2 SR-6.4, b.g57). */
+/** {@link decidePendingRowCover}: a directory the decision needs could not be resolved, so there is no verdict yet. */
 export const PENDING_ROW_UNDECIDED = 'undecided'
 
-/** Not covered: a retired key's old life, read before its new life has begun (SRJ-411, SRJ-805). */
+/** Not covered: a retired key's old life, read before its new life has begun. */
 export const PENDING_ROW_REASON_RETIRED_OLD_LIFE = 'retired-key-old-life'
-/** Not covered: the row's `cwd` is not the persona's working directory by real path (SRJ-411, SRJ-1503). */
+/** Not covered: the row's `cwd` is not the persona's working directory by real path. */
 export const PENDING_ROW_REASON_CWD_MISMATCH = 'cwd-mismatch'
-/** Not covered: the row's `config_dir` label is missing or differs from the persona's (SRJ-411, SRJ-1504). */
+/** Not covered: the row's `config_dir` label is missing or differs from the persona's. */
 export const PENDING_ROW_REASON_CONFIG_DIR_MISMATCH = 'config-dir-mismatch'
-/** An old release's row cannot receive startup answers (b.omv SR-7.6). */
+/** An old release's row cannot receive startup answers. */
 export const PENDING_ROW_REASON_TAG_PROMPT_MISSING = 'tag-prompt-missing'
 /**
- * Undecided: the `cwd` condition cannot be evaluated now (b.av2 SR-6.4): the
+ * Undecided: the `cwd` condition cannot be evaluated now: the
  * working directory has no real path, and the row's `cwd` has none either or
  * equals it lexically; at a status-only site, the working directory has no
- * real path, whatever the row's `cwd` (SRJ-411).
+ * real path, whatever the row's `cwd`.
  */
 export const PENDING_ROW_REASON_CWD_UNRESOLVED = 'cwd-unresolved'
 /**
- * Undecided: the persona's `claude_config_dir` has no real path now (b.g57);
- * at a status-only site, whatever the row's `cwd` (SRJ-409).
+ * Undecided: the persona's `claude_config_dir` has no real path now;
+ * at a status-only site, whatever the row's `cwd`.
  */
 export const PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED = 'config-dir-unresolved'
 
@@ -244,13 +244,13 @@ export type PendingRowCover =
  * passed in so this module stays pure.
  */
 export interface PendingRowComparison {
-  /** b.omv SR-7.6; a returned production comparison always supplies it. */
+  /**; a returned production comparison always supplies it. */
   readonly tagPrompt?: boolean
   /** The row's `cwd` and the persona's working directory have the same real path. */
   readonly cwdMatches: boolean
-  /** The `cwd` condition cannot be evaluated now (b.av2 SR-6.4). */
+  /** The `cwd` condition cannot be evaluated now. */
   readonly cwdCheckDeferred: boolean
-  /** The persona's `claude_config_dir` resolved to a real path (b.g57). */
+  /** The persona's `claude_config_dir` resolved to a real path. */
   readonly configDirResolved: boolean
   /** The row carries the persona's `config_dir` label; no verdict while the directory is unresolved. */
   readonly configDirMatches: boolean | undefined
@@ -263,7 +263,7 @@ export interface PendingRowCoverInput {
   /** Whether the row is a configured persona's own (`cscb_<key>` of a persona of the applied configuration). */
   readonly ownConfigured: boolean
   /**
-   * The retired-key store's reading of the key (SRJ-805, SRJ-806): recorded,
+   * The retired-key store's reading of the key: recorded,
    * and whether its "new life has begun" mark is set, a mark held only in
    * memory after a failed write counted as set.
    */
@@ -273,7 +273,7 @@ export interface PendingRowCoverInput {
   /**
    * The row was read at a site that reads it with `status` only and then one
    * `get` for this decision (the restart path's deferral and its re-probe, a
-   * pending-only retry; SRJ-409, SRJ-411). There, a directory that cannot be
+   * pending-only retry). There, a directory that cannot be
    * resolved leaves the row undecided before any mismatch is checked. Absent
    * or false (the collision ladder): the mismatch of a `cwd` that resolves
    * elsewhere is checked first.
@@ -282,8 +282,7 @@ export interface PendingRowCoverInput {
 }
 
 /**
- * Whether a `pending` row is the persona's current life (b.jg5 SRJ-409,
- * SRJ-411, SRJ-408, SRJ-513), decided in this order:
+ * Whether a `pending` row is the persona's current life, decided in this order:
  *   1. a configured persona's own row with no launch start
  *      ({@link isPendingWithNoLaunchStart}): {@link PENDING_ROW_NO_LAUNCH_START},
  *      whatever else is true, so it is never exempted from its latch;
@@ -300,7 +299,7 @@ export interface PendingRowCoverInput {
  *   7. otherwise {@link PENDING_ROW_COVERED}.
  * An unresolved directory is decided before the retired-key and label checks,
  * as the collision ladder decides it before them. At a status-only site
- * (`statusOnlySite` true, SRJ-409), steps 3 and 4 come before step 2: a
+ * (`statusOnlySite` true), steps 3 and 4 come before step 2: a
  * working directory or `claude_config_dir` that cannot be resolved leaves
  * the row undecided before any mismatch is checked, so the order there is
  * 1, 3, 4, 2, 5, 6, 7. Pure: no I/O, clock or module state; calls nothing
@@ -328,11 +327,11 @@ export function decidePendingRowCover(input: PendingRowCoverInput): PendingRowCo
 }
 
 // ---------------------------------------------------------------------------
-// A launch call's window (b.jg5 SRJ-407)
+// A launch call's window
 // ---------------------------------------------------------------------------
 
 /**
- * One launch call's window (b.jg5 SRJ-407), in wall-clock epoch milliseconds
+ * One launch call's window, in wall-clock epoch milliseconds
  * on the session manager's clock: `startMs`, taken just before the call, and
  * `endMs`, taken when the call returned success or ended in a launch timeout
  * (when CSCB received the `ErrTmuxUnresponsive` answer, or when the client
@@ -345,7 +344,7 @@ export interface LaunchCallWindow {
 
 /**
  * True when the raw launch start `rawLaunchStart` ({@link parseLaunchStart})
- * lies inside `window`, both ends included (b.jg5 SRJ-407): the window's
+ * lies inside `window`, both ends included: the window's
  * start is at or before it and its end at or after it. False for a launch
  * start that is absent or does not parse, for no window, for a window with
  * no end, and for a bound that is not a finite time. The check fails safe:
@@ -381,7 +380,7 @@ export function launchStartInstantOf(launchStart: unknown): number | undefined {
 
 /**
  * The one renderer of a launch start, for a log line and for the stuck-launch
- * post's held text (b.jg5 SRJ-1017: `<the launch start>`), only in a form
+ * post's held text (`<the launch start>`), only in a form
  * CSCB builds itself: the instant {@link launchStartInstantOf} reads, as an
  * ISO 8601 UTC timestamp ending in `Z`, so both launch-start forms of one
  * instant render alike; `none` for a launch start that is absent, does not
@@ -399,18 +398,18 @@ export function describeLaunchStartForLog(launchStart: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// The stuck-launch post's two texts (b.jg5 SRJ-1017, SRJ-1001)
+// The stuck-launch post's two texts
 // ---------------------------------------------------------------------------
 
-/** The relaunching text's head (b.jg5 SRJ-1017): CSCB's own stuck launch. */
+/** The relaunching text's head: CSCB's own stuck launch. */
 export const STUCK_LAUNCH_RELAUNCHING_HEAD = ':hourglass_flowing_sand: *Launch stuck*'
 
-/** The held text's head (b.jg5 SRJ-1017): any other `pending` row. */
+/** The held text's head: any other `pending` row. */
 export const STUCK_LAUNCH_HELD_HEAD = ':hourglass_flowing_sand: *Session not starting*'
 
 /**
- * The held text's first remedy line for persona `key` (b.jg5 SRJ-1017): attach
- * to the session by its exact name (`=slack_bot_<key>`, b.1ix). Left out when
+ * The held text's first remedy line for persona `key`: attach
+ * to the session by its exact name (`=slack_bot_<key>`). Left out when
  * the row's current launch met `ErrSpawnNotInteractive`.
  */
 export function stuckLaunchAttachRemedyLine(key: string): string {
@@ -418,14 +417,14 @@ export function stuckLaunchAttachRemedyLine(key: string): string {
 }
 
 /**
- * The held text's end-the-launch remedy line (b.jg5 SRJ-1017): it points to
+ * The held text's end-the-launch remedy line: it points to
  * agent-director's README and names no command that ends a session
- * (SRJ-1001, C22).
+ * (C22).
  */
 export const STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE =
   "• end the launch: follow the \"Operator actions\" section of agent-director's README; CSCB's next `find-missing` run then marks the row missing, and this persona is brought up again;"
 
-/** The held text's last remedy line for persona `key` (b.jg5 SRJ-1017): list what holds the session. */
+/** The held text's last remedy line for persona `key`: list what holds the session. */
 export function stuckLaunchListRemedyLine(key: string): string {
   return `• see what holds the session: \`agent-director list --tmux-session-name ${personaTmuxSessionName(key)}\` (on the command line).`
 }
@@ -433,21 +432,20 @@ export function stuckLaunchListRemedyLine(key: string): string {
 /**
  * The clause the held text adds after "since its launch at <the launch
  * start>" when a `send-keys` on the row answered `ErrSpawnNotInteractive`
- * during its current launch (b.jg5 SRJ-1017, SRJ-118).
+ * during its current launch.
  */
 export const STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE = ", and the session holding its name was not started by CSCB's launch"
 
-/** The held text's closing line (b.jg5 SRJ-1017): the remedies are a human's. */
+/** The held text's closing line: the remedies are a human's. */
 export const STUCK_LAUNCH_HUMAN_ONLY_LINE =
   'These remedies are for a human only: no bot, including any persona that sees this post, may act on them.'
 
 /**
- * The stuck-launch post's relaunching text for persona `key` (b.jg5
- * SRJ-1017), for CSCB's own stuck launch: `launchBoundMs` is B in effect,
+ * The stuck-launch post's relaunching text for persona `key`, for CSCB's own stuck launch: `launchBoundMs` is B in effect,
  * read by the caller at post time (`adLaunchBoundMsInEffect`), stated in
  * whole minutes, rounded down (`wholeMinutes`); `<session>` is
  * `quotedPersonaSessionName`'s. The persona notifier adds the persona
- * prefix. Names no command that ends a session (SRJ-1001). Pure.
+ * prefix. Names no command that ends a session. Pure.
  */
 export function stuckLaunchRelaunchingText(key: string, launchBoundMs: number): string {
   return (
@@ -458,7 +456,7 @@ export function stuckLaunchRelaunchingText(key: string, launchBoundMs: number): 
 }
 
 /**
- * The stuck-launch post's held text for persona `key` (b.jg5 SRJ-1017), for
+ * The stuck-launch post's held text for persona `key`, for
  * any other `pending` row: `launchStart` is the row's launch start, raw or
  * parsed, rendered by {@link describeLaunchStartForLog} (built only for a row
  * with a launch start); `metNotInteractive` is whether a `send-keys` on the
@@ -468,7 +466,7 @@ export function stuckLaunchRelaunchingText(key: string, launchBoundMs: number): 
  * is left out (answering that session's prompt would put an earlier
  * launch's worker on this row). One line each, joined by newlines; the
  * persona notifier adds the persona prefix. Names no command that ends a
- * session (SRJ-1001). Pure.
+ * session. Pure.
  */
 export function stuckLaunchHeldText(key: string, launchStart: unknown, metNotInteractive: boolean): string {
   const clause = metNotInteractive ? STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE : ''
@@ -483,7 +481,7 @@ export function stuckLaunchHeldText(key: string, launchStart: unknown, metNotInt
 }
 
 // ---------------------------------------------------------------------------
-// The stuck-launch poster (b.jg5 SRJ-1017, SRJ-1016)
+// The stuck-launch poster
 // ---------------------------------------------------------------------------
 
 /**
@@ -519,8 +517,8 @@ export const STUCK_LAUNCH_NOT_POSTED_CLOSED = 'closed'
  * line, {@link stuckLaunchPostFailedLine}). Kept apart from
  * {@link STUCK_LAUNCH_SUPPRESSED}, so a caller never takes a failed post for
  * the `tmux-unavailable` gate, nor the gate for a failed post (the abort of
- * CSCB's own stuck launch follows only a relaunching text posted, b.jg5
- * SRJ-412).
+ * CSCB's own stuck launch follows only a relaunching text posted
+ *).
  */
 export const STUCK_LAUNCH_POST_FAILED = 'failed'
 
@@ -561,8 +559,7 @@ function stuckLaunchTextName(mark: StuckLaunchTextMark, metNotInteractive: boole
 }
 
 /**
- * The line of a stuck-launch poster's answer for persona `key` (b.jg5
- * SRJ-1017, SRJ-1003), one per call:
+ * The line of a stuck-launch poster's answer for persona `key`, one per call:
  *
  *   [slack] pending-row: persona=<key> stuck-launch <text> posted
  *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — muted, its persona teardown was submitted; it counts as posted in its episode
@@ -616,14 +613,14 @@ export const STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED =
 
 /**
  * The line of a stuck-launch text not posted for persona `key` at step 3
- * (b.jg5 SRJ-1017), with why (one of the `STUCK_LAUNCH_POST_SKIP_*` texts):
+ * with why (one of the `STUCK_LAUNCH_POST_SKIP_*` texts):
  *
- *   [slack] pending-row: persona=<key> stuck-launch post not made — <why> (b.jg5 SRJ-1017)
+ * [slack] pending-row: persona=<key> stuck-launch post not made — <why>
  *
  * Pure.
  */
 export function stuckLaunchPostSkippedLine(key: string, why: string): string {
-  return `${stuckLaunchLineHead(key)} post not made — ${why} (b.jg5 SRJ-1017)`
+  return `${stuckLaunchLineHead(key)} post not made — ${why}`
 }
 
 /** The line for an end of persona `key`'s stuck-launch episode that threw inside (an episodes call): nothing more was done. */
@@ -651,8 +648,7 @@ function tmuxUnavailableRaisedFor(deps: StuckLaunchPosterDeps, key: string): boo
 }
 
 /**
- * Post `text` under `mark` in persona `key`'s stuck-launch episode (b.jg5
- * SRJ-1017, SRJ-1016): nothing, and no episode begun, while `tmux-unavailable`
+ * Post `text` under `mark` in persona `key`'s stuck-launch episode: nothing, and no episode begun, while `tmux-unavailable`
  * is raised; otherwise begin or keep the episode and post at most once per
  * mark in it. One line per call ({@link stuckLaunchPostLine}). Never throws:
  * an episodes call that throws logs {@link stuckLaunchPostFailedLine} and
@@ -673,7 +669,7 @@ function postStuckLaunchText(
     if (tmuxUnavailableRaisedFor(deps, key)) return line(STUCK_LAUNCH_SUPPRESSED)
     const { episodes } = deps
     if (episodes.begin(key, STUCK_LAUNCH_KIND) === 'closed') return line(STUCK_LAUNCH_NOT_POSTED_CLOSED)
-    // b.jg5 SRJ-1003: read before the post, which a submitted teardown mutes
+    // read before the post, which a submitted teardown mutes
     // (the episode still counts it as posted).
     const muted = episodes.teardownWindowState(key) === 'submitted'
     if (!episodes.post(key, STUCK_LAUNCH_KIND, buildText(), mark)) return line(STUCK_LAUNCH_ALREADY_POSTED)
@@ -687,8 +683,7 @@ function postStuckLaunchText(
 /**
  * Post the relaunching text ({@link stuckLaunchRelaunchingText}, B from
  * `launchBoundMs`) for persona `key`'s own stuck launch, at most once per
- * stuck-launch episode, under {@link STUCK_LAUNCH_MARK_RELAUNCHING} (b.jg5
- * SRJ-1017): see {@link postStuckLaunchText}. The `ad-config-malformed` gate
+ * stuck-launch episode, under {@link STUCK_LAUNCH_MARK_RELAUNCHING}: see {@link postStuckLaunchText}. The `ad-config-malformed` gate
  * is the caller's. Goes through `deps.episodes` only, never straight to
  * Slack. Never throws.
  */
@@ -700,7 +695,7 @@ export function postStuckLaunchRelaunching(deps: StuckLaunchPosterDeps, key: str
  * Post the held text ({@link stuckLaunchHeldText}) for persona `key`'s
  * `pending` row with the launch start `launchStart`, in the form
  * `metNotInteractive` picks, at most once per stuck-launch episode, under
- * {@link STUCK_LAUNCH_MARK_HELD} (b.jg5 SRJ-1017): see
+ * {@link STUCK_LAUNCH_MARK_HELD}: see
  * {@link postStuckLaunchText}. Goes through `deps.episodes` only, never
  * straight to Slack. Never throws.
  */
@@ -714,12 +709,11 @@ export function postStuckLaunchHeld(
 }
 
 // ---------------------------------------------------------------------------
-// The stuck-launch episode's end (b.jg5 SRJ-1016)
+// The stuck-launch episode's end
 // ---------------------------------------------------------------------------
 
 /**
- * True for a row state whose read ends the stuck-launch episode (b.jg5
- * SRJ-1016): `waiting`, `working`, `ask_user` or `check_permission`, the
+ * True for a row state whose read ends the stuck-launch episode: `waiting`, `working`, `ask_user` or `check_permission`, the
  * live states out of `pending`. False for `pending`, `ended`, `missing`, any
  * other value and no row. Pure; never throws.
  */
@@ -741,7 +735,7 @@ export function stuckLaunchEpisodeEndedLine(key: string, reason: string): string
 }
 
 /**
- * End persona `key`'s open stuck-launch episode silently (b.jg5 SRJ-1016):
+ * End persona `key`'s open stuck-launch episode silently:
  * nothing is posted; one line ({@link stuckLaunchEpisodeEndedLine}) when one
  * was open. A later post begins a new episode, whose texts post again.
  * Answers whether one was open. Never throws.
@@ -763,7 +757,7 @@ export function endStuckLaunchEpisode(
 }
 
 /**
- * The latch's hold for the stuck-launch episode (b.jg5 SRJ-1016): end
+ * The latch's hold for the stuck-launch episode: end
  * persona `key`'s episode silently, with {@link STUCK_LAUNCH_END_LATCHED}.
  * `main()` binds it into the latch's hold observer
  * (`ConflictLatchHolds.endStuckLaunch`, `src/conflict-latch.ts`) over its
@@ -774,10 +768,10 @@ export function endStuckLaunchEpisodeForLatch(episodes: Pick<PersonaEpisodes, 'e
 }
 
 // ---------------------------------------------------------------------------
-// The pending-row rule's pure decisions (b.jg5 SRJ-410, SRJ-117, SRJ-118)
+// The pending-row rule's pure decisions
 // ---------------------------------------------------------------------------
 
-/** {@link pendingRowAgeOf}: the row has no launch start (absent, or it does not parse): never aged (SRJ-408). */
+/** {@link pendingRowAgeOf}: the row has no launch start (absent, or it does not parse): never aged. */
 export const PENDING_ROW_AGE_NO_LAUNCH_START = 'no-launch-start'
 /** {@link pendingRowAgeOf}: younger than G: step 1, nothing (a refusal). */
 export const PENDING_ROW_AGE_YOUNGER_THAN_G = 'younger-than-g'
@@ -803,10 +797,9 @@ export interface PendingRowRuleWaits {
 
 /**
  * The pending-row rule's step for a `pending` row whose raw launch start is
- * `rawLaunchStart`, at `nowMs` (b.jg5 SRJ-410, SRJ-406, SRJ-408): no launch
+ * `rawLaunchStart`, at `nowMs`: no launch
  * start (it never ages); younger than G (step 1); G or older (step 2); B or
- * older. G and B are read from their accessors at this call (b.jg5
- * SRJ-210), through {@link isPendingRowAged}, so a wait of
+ * older. G and B are read from their accessors at this call, through {@link isPendingRowAged}, so a wait of
  * `AD_WAIT_NEVER_ENDS`, NaN or a throwing accessor never ages the row early,
  * and a wait beyond the timer maximum is compared, never armed. G is
  * checked first: a row not past G is younger than G whatever B says. Pure;
@@ -824,13 +817,13 @@ export function pendingRowAgeOf(rawLaunchStart: unknown, nowMs: number, waits: P
 export const PENDING_ROW_RUN_MARKED_MISSING = 'marked-missing'
 /** Judged and left live (in `unverified_ids`). */
 export const PENDING_ROW_RUN_LEFT_LIVE = 'judged-left-live'
-/** In neither list while last read `pending`: the run did not judge it (b.jg5 SRJ-120). */
+/** In neither list while last read `pending`: the run did not judge it. */
 export const PENDING_ROW_RUN_NOT_JUDGED = 'not-judged'
 /** In neither list while last read in another state: judged alive. */
 export const PENDING_ROW_RUN_JUDGED_ALIVE = 'judged-alive'
-/** The run, or the post-run `get` of P's row, was refused by class (b.jg5 SRJ-105, SRJ-120): the round ends. */
+/** The run, or the post-run `get` of P's row, was refused by class: the round ends. */
 export const PENDING_ROW_RUN_REFUSED = 'refused'
-/** P is latched once the run is done (b.jg5 SRJ-502): no further call. */
+/** P is latched once the run is done: no further call. */
 export const PENDING_ROW_RUN_LATCHED = 'latched'
 /** The run failed in any other way (logged, not memoized): the caller goes on, with no judgment of the row. */
 export const PENDING_ROW_RUN_FAILED = 'failed'
@@ -851,7 +844,7 @@ export const PENDING_ROW_GET_ROW = 'row'
 export const PENDING_ROW_GET_ABSENT = 'absent'
 /** Step 2's `get` latched P (a note, UNUSABLE NAME, a configured persona's own `pending` row with no launch start), or found it latched. */
 export const PENDING_ROW_GET_LATCHED = 'latched'
-/** Step 2's `get` failed with any other error (its own error rows applied, b.jg5 SRJ-105). */
+/** Step 2's `get` failed with any other error (its own error rows applied). */
 export const PENDING_ROW_GET_REFUSED = 'refused'
 
 /** What step 2's one `get` of P's row answered, through the shared own-row read. */
@@ -887,8 +880,7 @@ export type PendingRowRunReading =
   | { readonly kind: typeof PENDING_ROW_READING_PENDING; readonly judged: boolean; readonly launchStartedAt: unknown }
 
 /**
- * Whether the round stops at its run, before its `get` (b.jg5 SRJ-410,
- * SRJ-120): latched, or refused by class (a refusal: the round ends).
+ * Whether the round stops at its run, before its `get`: latched, or refused by class (a refusal: the round ends).
  * `undefined` when the `get` follows: every placement, and a failure of any
  * other kind. Pure.
  */
@@ -902,7 +894,7 @@ export function pendingRowRunStops(
 
 /**
  * The round's reading over step 2's run (`run`) and the `get` after it
- * (`get`) (b.jg5 SRJ-410, SRJ-120, SRJ-105):
+ * (`get`):
  *
  *   - the run latched or was refused: {@link pendingRowRunStops}' answer;
  *   - the `get` latched: latched; failed: read refused (nothing more, never
@@ -941,11 +933,11 @@ export function readPendingRowRun(run: PendingRowRunPlacement, get: PendingRowRu
 
 /** {@link decidePendingRowStepThree}: P's `tmux-unavailable` outage is raised: no stuck-launch post and no abort (its onset is P's notice). */
 export const PENDING_ROW_STEP3_TMUX_UNAVAILABLE = 'tmux-unavailable'
-/** {@link decidePendingRowStepThree}: P is latched: nothing (SRJ-502). */
+/** {@link decidePendingRowStepThree}: P is latched: nothing. */
 export const PENDING_ROW_STEP3_LATCHED = 'latched'
 /** {@link decidePendingRowStepThree}: CSCB's own stuck launch while `ad-config-malformed` is raised, its abort available or used: neither text and no abort until it clears. */
 export const PENDING_ROW_STEP3_CONFIG_MALFORMED = 'config-malformed'
-/** {@link decidePendingRowStepThree}: CSCB's own stuck launch: the relaunching text, then the abort (SRJ-412). */
+/** {@link decidePendingRowStepThree}: CSCB's own stuck launch: the relaunching text, then the abort. */
 export const PENDING_ROW_STEP3_RELAUNCH = 'relaunch'
 /** {@link decidePendingRowStepThree}: any other `pending` row: the held text; the row is left and never killed. */
 export const PENDING_ROW_STEP3_HELD = 'held'
@@ -956,7 +948,7 @@ export interface PendingRowStepThreeInput {
   readonly tmuxUnavailableRaised: boolean
   /** P is latched. */
   readonly latched: boolean
-  /** The row's current launch is CSCB's own (SRJ-412): the own-launch slot's answer; false with no slot filled. */
+  /** The row's current launch is CSCB's own: the own-launch slot's answer; false with no slot filled. */
   readonly ownLaunch: boolean
   /** P's `ad-config-malformed` outage is raised. */
   readonly configMalformedRaised: boolean
@@ -975,14 +967,14 @@ export type PendingRowStepThree =
   | { readonly kind: typeof PENDING_ROW_STEP3_HELD; readonly attachLine: boolean }
 
 /**
- * Step 3 of the pending-row rule (b.jg5 SRJ-410, SRJ-412, SRJ-1017), for a
+ * Step 3 of the pending-row rule, for a
  * row still `pending` at B or older after step 2, whether or not the run
  * judged it (HO C21 steps 2 and 3):
  *   1. `tmux-unavailable` raised: nothing, whatever else holds;
  *   2. P latched: nothing;
  *   3. CSCB's own stuck launch while `ad-config-malformed` is raised:
  *      nothing, neither text and no abort, whether or not its one abort is
- *      still available (SRJ-1017);
+ * still available;
  *   4. CSCB's own stuck launch with its one abort still available: the
  *      relaunching text and the abort;
  *   5. any other row, and CSCB's own launch once its abort is used: the held
@@ -999,7 +991,7 @@ export function decidePendingRowStepThree(input: PendingRowStepThreeInput): Pend
 }
 
 // ---------------------------------------------------------------------------
-// The pending-row rule's driver (b.jg5 SRJ-410, SRJ-404, SRJ-502, SRJ-810)
+// The pending-row rule's driver
 // ---------------------------------------------------------------------------
 
 /** The rule runs at a retry of P's retry timer (either mode). */
@@ -1044,7 +1036,7 @@ export type PendingRowRelaunchAnswer =
   | { readonly kind: typeof PENDING_ROW_RELAUNCH_KEPT; readonly why: string }
 
 /**
- * The slot for step 3's own-launch branch (b.jg5 SRJ-412): whether the row's
+ * The slot for step 3's own-launch branch: whether the row's
  * current launch is CSCB's own, whether the stuck-launch episode's one abort
  * is still available, and the branch itself (the relaunching post and the
  * abort). Production fills it with {@link createStuckLaunchAbort} (the
@@ -1067,16 +1059,16 @@ export interface PendingRowRuleDeps {
   readonly now: () => number
   /** Receives the rule's `[slack] pending-row:` lines (the server log). A throwing log is swallowed. */
   readonly log: (line: string) => void
-  /** The latch's latched query (SRJ-502). A throw counts as latched. */
+  /** The latch's latched query. A throw counts as latched. */
   readonly isLatched: (key: string) => boolean
   /**
-   * What work in flight blocks a retry of P (SRJ-303: a launch call, a
+   * What work in flight blocks a retry of P (a launch call, a
    * live-row sequence or an old-life wait step), by name, or `undefined`;
    * `withinOwnLaunch` leaves out P's own launch in flight. A throw counts
    * as blocked.
    */
   readonly retryBlockedBy: (key: string, withinOwnLaunch: boolean) => string | undefined
-  /** Whether P's working directory is held for an old life (SRJ-810). A throw counts as held. */
+  /** Whether P's working directory is held for an old life. A throw counts as held. */
   readonly isHeldForOldLife: (key: string) => boolean
   /** Whether this launch previously met a send-keys refusal for an uninteractive row. */
   readonly launchMetNotInteractive: (key: string, launchStart: unknown) => boolean
@@ -1096,7 +1088,7 @@ export interface PendingRowRuleDeps {
   readonly ownLaunch?: PendingRowOwnLaunchHooks
 }
 
-/** The rule's answer: a refusal (the row kept `pending`; the retry is a refusal, SRJ-302). */
+/** The rule's answer: a refusal (the row kept `pending`; the retry is a refusal). */
 export const PENDING_ROW_RULE_REFUSAL = 'refusal'
 /** The rule's answer: the row reads `ended` or `missing`, or there is no row: the restart path's decision recovers it. */
 export const PENDING_ROW_RULE_GONE = 'gone'
@@ -1155,13 +1147,13 @@ function pendingRowRuleLineHead(ref: string, origin: PendingRowRuleOrigin): stri
 }
 
 /**
- * The rule's one line for an acting round (b.jg5 SRJ-410): P's reference,
+ * The rule's one line for an acting round: P's reference,
  * where it runs from, the launch start (the one renderer,
  * {@link describeLaunchStartForLog}), what each step did (`steps`, whose
  * agent-director descriptions are already redacted and on one line) and
  * what follows:
  *
- *   [slack] pending-row: <ref> rule (<origin>): launch started <ISO>; <step>; <step>… — <follows> (b.jg5 SRJ-410)
+ * [slack] pending-row: <ref> rule (<origin>): launch started <ISO>; <step>; <step>… — <follows>
  *
  * Pure.
  */
@@ -1172,24 +1164,23 @@ export function pendingRowRuleRoundLine(
   steps: readonly string[],
   follows: string,
 ): string {
-  return `${pendingRowRuleLineHead(ref, origin)}: launch started ${describeLaunchStartForLog(launchStart)}; ${steps.join('; ')} — ${follows} (b.jg5 SRJ-410)`
+  return `${pendingRowRuleLineHead(ref, origin)}: launch started ${describeLaunchStartForLog(launchStart)}; ${steps.join('; ')} — ${follows}`
 }
 
 /**
- * The rule's line for a run its gate refused before any call (b.jg5
- * SRJ-410, SRJ-502, SRJ-303, SRJ-810), with why:
+ * The rule's line for a run its gate refused before any call, with why:
  *
- *   [slack] pending-row: <ref> rule (<origin>): no lap, run or post — <why> (b.jg5 SRJ-410)
+ * [slack] pending-row: <ref> rule (<origin>): no lap, run or post — <why>
  *
  * None is logged for a row younger than G. Pure.
  */
 export function pendingRowRuleGateLine(ref: string, origin: PendingRowRuleOrigin, why: string): string {
-  return `${pendingRowRuleLineHead(ref, origin)}: no lap, run or post — ${why} (b.jg5 SRJ-410)`
+  return `${pendingRowRuleLineHead(ref, origin)}: no lap, run or post — ${why}`
 }
 
 /** The rule's line for a run that threw inside (`described`, through `describeThrownValue`): nothing more was done. */
 export function pendingRowRuleFailedLine(ref: string, origin: PendingRowRuleOrigin, described: string): string {
-  return `${pendingRowRuleLineHead(ref, origin)}: failed: ${described} — nothing more this round (b.jg5 SRJ-410)`
+  return `${pendingRowRuleLineHead(ref, origin)}: failed: ${described} — nothing more this round`
 }
 
 /** The rule's answer in words, for a caller's line. Pure. */
@@ -1244,15 +1235,15 @@ function refusal(reason: PendingRowRuleRefusalReason): PendingRowRuleAnswer {
 const RULE_LATCHED: PendingRowRuleAnswer = Object.freeze({ kind: PENDING_ROW_RULE_LATCHED })
 
 /**
- * Build one pending-row rule instance over `deps` (b.jg5 SRJ-410). Its one
+ * Build one pending-row rule instance over `deps`. Its one
  * entry, `run`, runs the rule once for P on the row read the caller holds
  * (a row the cover decision answered covered), and answers what it found:
  *
- *   - **Gate**, before any call: P latched (SRJ-502) answers latched; work
+ * - **Gate**, before any call: P latched answers latched; work
  *     in flight that blocks a retry (a launch call, a live-row sequence or
- *     an old-life wait step, SRJ-303; P's own launch left out from its
- *     ladder), P's working directory held for an old life (SRJ-810), a row
- *     not `pending`, or a row with no launch start (SRJ-408) answer a
+ * an old-life wait step; P's own launch left out from its
+ * ladder), P's working directory held for an old life, a row
+ * not `pending`, or a row with no launch start answer a
  *     refusal, each with one gate line.
  *   - **Step 1**, younger than G: a refusal, no call and no line.
  *   - **Step 2**, G or older: one bypassing `find-missing` run and one
@@ -1297,12 +1288,12 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
     const blocked = blockedBy(key, input.withinOwnLaunch === true)
     if (blocked !== undefined) return gate(`work in flight blocks it (${blocked})`, refusal('blocked'))
     if (askQuery(() => deps.isHeldForOldLife(key), true)) {
-      return gate('its working directory is held for an old life, SRJ-810', refusal('held-for-old-life'))
+      return gate('its working directory is held for an old life', refusal('held-for-old-life'))
     }
     if (row.state !== AGENT_DIRECTOR_PENDING_STATE) return gate('the row it was given is not pending', refusal('not-pending'))
     const launchStart = row.launchStartedAt
     const age = pendingRowAgeOf(launchStart, deps.now(), deps.waits)
-    if (age === PENDING_ROW_AGE_NO_LAUNCH_START) return gate('the row has no launch start, so it is never aged, SRJ-408', refusal('no-launch-start'))
+    if (age === PENDING_ROW_AGE_NO_LAUNCH_START) return gate('the row has no launch start, so it is never aged', refusal('no-launch-start'))
     if (age === PENDING_ROW_AGE_YOUNGER_THAN_G) return refusal('younger-than-g')
 
     const steps: string[] = []
@@ -1388,7 +1379,7 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
         return round(`at B: CSCB's own stuck launch: the relaunching post and the abort (${answer.kind})`, { kind: PENDING_ROW_RULE_RELAUNCH, answer })
       }
       case PENDING_ROW_STEP3_HELD: {
-        // SRJ-412: CSCB's own launch reaches the held branch only once its
+        // CSCB's own launch reaches the held branch only once its
         // episode's one abort is used; said here, where the held text is the outcome.
         if (ownLaunch) log(stuckLaunchAbortSkippedLine(key, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT))
         const text = branch.attachLine ? 'the held text' : 'the held text without the attach line'
@@ -1411,7 +1402,7 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
 }
 
 // ---------------------------------------------------------------------------
-// CSCB's own stuck launch: its one abort per stuck-launch episode (b.jg5 SRJ-412)
+// CSCB's own stuck launch: its one abort per stuck-launch episode
 // ---------------------------------------------------------------------------
 
 /** The abort kill succeeded (`kill_sent` true or false, the row already gone, the session gone, or a read between tries found the row finished): the sequence follows. */
@@ -1427,7 +1418,7 @@ export const STUCK_LAUNCH_ABORT_KILL_LATCHED = 'latched'
  */
 export const STUCK_LAUNCH_ABORT_KILL_TRY_LATER = 'try-later'
 /**
- * The abort kill's tries were stopped by SRJ-702's stop rule (P's teardown, P
+ * The abort kill's tries were stopped by the contract stop rule (P's teardown, P
  * no longer up, a server shutdown, or a version re-check that stops the
  * server): no alert of either version was raised, and the abort is not used.
  */
@@ -1448,7 +1439,7 @@ export type StuckLaunchAbortKillAnswer =
 
 /**
  * Whether the abort kill's answer uses up the stuck-launch episode's one
- * abort (b.jg5 SRJ-412, Q-12): a success, `ErrTmuxKillFailed` after tries no
+ * abort (Q-12): a success, `ErrTmuxKillFailed` after tries no
  * stop ended, and a latch do; "try again later" and a stopped kill do not.
  * Pure.
  */
@@ -1474,7 +1465,7 @@ export type StuckLaunchAbortSequenceStart =
 export const STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT = "the stuck-launch episode's one abort was used, so the row is any other pending row and gets the held text"
 /** The abort was not made: P's `tmux-unavailable` outage is raised. */
 export const STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE = 'its tmux-unavailable outage is raised; the abort waits until it clears'
-/** The abort was not made: P's `ad-config-malformed` outage is raised (SRJ-316: no kill of a row read `pending`). */
+/** The abort was not made: P's `ad-config-malformed` outage is raised (no kill of a row read `pending`). */
 export const STUCK_LAUNCH_ABORT_SKIP_CONFIG_MALFORMED = 'its ad-config-malformed outage is raised, and no row read pending is killed while it is; the abort waits until it clears'
 /** The abort was not made: an abort of this persona's launch is already in progress. */
 export const STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS = 'an abort of its launch is already in progress'
@@ -1491,7 +1482,7 @@ export const STUCK_LAUNCH_ABORT_KEPT_KILL_FAILED =
 /** Why: the abort kill did nothing; Q-12. */
 export const STUCK_LAUNCH_ABORT_KEPT_TRY_LATER =
   'the abort kill did nothing: the abort is not used, and the same abort is made at the next retry that reaches step 3, with no second relaunching post'
-/** Why: the abort kill's tries were stopped by SRJ-702's stop rule. */
+/** Why: the abort kill's tries were stopped by the contract stop rule. */
 export const STUCK_LAUNCH_ABORT_KEPT_STOPPED =
   "the abort kill's tries were stopped: no alert, the abort is not used, and the same abort is made at the next retry that reaches step 3, with no second relaunching post"
 
@@ -1501,53 +1492,51 @@ function stuckLaunchAbortLineHead(key: string): string {
 }
 
 /**
- * The abort's start line (b.jg5 SRJ-412), after the relaunching post:
+ * The abort's start line, after the relaunching post:
  *
- *   [slack] pending-row: persona=<key> stuck-launch abort started for <ref> (launch started <ISO>) — one checked kill of its row (b.jg5 SRJ-412)
+ * [slack] pending-row: persona=<key> stuck-launch abort started for <ref> (launch started <ISO>) — one checked kill of its row
  *
  * Pure.
  */
 export function stuckLaunchAbortStartedLine(key: string, ref: string, launchStart: unknown): string {
-  return `${stuckLaunchAbortLineHead(key)} started for ${ref} (launch started ${describeLaunchStartForLog(launchStart)}) — one checked kill of its row (b.jg5 SRJ-412)`
+  return `${stuckLaunchAbortLineHead(key)} started for ${ref} (launch started ${describeLaunchStartForLog(launchStart)}) — one checked kill of its row`
 }
 
 /**
- * The line of an abort not made for persona `key` (b.jg5 SRJ-412), with why
+ * The line of an abort not made for persona `key`, with why
  * (one of the `STUCK_LAUNCH_ABORT_SKIP_*` texts):
  *
- *   [slack] pending-row: persona=<key> stuck-launch abort not made — <why> (b.jg5 SRJ-412)
+ * [slack] pending-row: persona=<key> stuck-launch abort not made — <why>
  *
  * Pure.
  */
 export function stuckLaunchAbortSkippedLine(key: string, why: string): string {
-  return `${stuckLaunchAbortLineHead(key)} not made — ${why} (b.jg5 SRJ-412)`
+  return `${stuckLaunchAbortLineHead(key)} not made — ${why}`
 }
 
 /**
- * The line of the abort kill's answer for persona `key` (b.jg5 SRJ-412,
- * SRJ-702, SRJ-704), with what follows:
+ * The line of the abort kill's answer for persona `key`, with what follows:
  *
- *   [slack] pending-row: persona=<key> stuck-launch abort kill: <kind> (<description>) — <follows> (b.jg5 SRJ-412)
+ * [slack] pending-row: persona=<key> stuck-launch abort kill: <kind> (<description>) — <follows>
  *
  * `<description>` is the answer's own, already redacted. Pure.
  */
 export function stuckLaunchAbortKillLine(key: string, answer: StuckLaunchAbortKillAnswer, follows: string): string {
-  return `${stuckLaunchAbortLineHead(key)} kill: ${answer.kind} (${answer.description}) — ${follows} (b.jg5 SRJ-412)`
+  return `${stuckLaunchAbortLineHead(key)} kill: ${answer.kind} (${answer.description}) — ${follows}`
 }
 
 /**
- * The line of the abort's live-row sequence start for persona `key` (b.jg5
- * SRJ-412, SRJ-705):
+ * The line of the abort's live-row sequence start for persona `key`:
  *
- *   [slack] pending-row: persona=<key> stuck-launch abort: the live-row sequence started at its second step, keeping a resumed launch's conversation (b.jg5 SRJ-412, SRJ-705)
- *   [slack] pending-row: persona=<key> stuck-launch abort: the live-row sequence did not start (<why>) — nothing more this round (b.jg5 SRJ-412, SRJ-705)
+ * [slack] pending-row: persona=<key> stuck-launch abort: the live-row sequence started at its second step, keeping a resumed launch's conversation
+ * [slack] pending-row: persona=<key> stuck-launch abort: the live-row sequence did not start (<why>) — nothing more this round
  *
  * Pure.
  */
 export function stuckLaunchAbortSequenceLine(key: string, start: StuckLaunchAbortSequenceStart): string {
   return start.kind === STUCK_LAUNCH_ABORT_SEQUENCE_STARTED
-    ? `${stuckLaunchAbortLineHead(key)}: the live-row sequence started at its second step, keeping a resumed launch's conversation (b.jg5 SRJ-412, SRJ-705)`
-    : `${stuckLaunchAbortLineHead(key)}: the live-row sequence did not start (${start.why}) — nothing more this round (b.jg5 SRJ-412, SRJ-705)`
+    ? `${stuckLaunchAbortLineHead(key)}: the live-row sequence started at its second step, keeping a resumed launch's conversation`
+    : `${stuckLaunchAbortLineHead(key)}: the live-row sequence did not start (${start.why}) — nothing more this round`
 }
 
 /** What the abort uses of the server's one episodes instance: the close hook of the stuck-launch episode. */
@@ -1568,7 +1557,7 @@ export interface StuckLaunchAbortDeps {
    * counts as not own.
    */
   readonly isOwnLaunch: (key: string, launchStart: unknown) => boolean
-  /** The latch's latched query (SRJ-502). A throw counts as latched. */
+  /** The latch's latched query. A throw counts as latched. */
   readonly isLatched: (key: string) => boolean
   /** Whether P's `tmux-unavailable` outage is raised. A throw counts as raised. */
   readonly isTmuxUnavailableRaised: (key: string) => boolean
@@ -1586,7 +1575,7 @@ export interface StuckLaunchAbortDeps {
 
 /** One persona's abort state in its open stuck-launch episode. */
 interface StuckLaunchAbortState {
-  /** The episode's one abort is used (SRJ-412). */
+  /** The episode's one abort is used. */
   used: boolean
   /** An abort is running now (its kill or sequence start). */
   inProgress: boolean
@@ -1607,7 +1596,7 @@ function relaunchKept(why: string): PendingRowRelaunchAnswer {
 const RELAUNCH_LATCHED: PendingRowRelaunchAnswer = Object.freeze({ kind: PENDING_ROW_RELAUNCH_LATCHED })
 
 /**
- * Build the abort of CSCB's own stuck launch (b.jg5 SRJ-412, SRJ-410 step 3)
+ * Build the abort of CSCB's own stuck launch (step 3)
  * over `deps`: the pending-row rule's own-launch slot
  * ({@link PendingRowOwnLaunchHooks}), with the per-episode abort state.
  *
@@ -1628,14 +1617,14 @@ const RELAUNCH_LATCHED: PendingRowRelaunchAnswer = Object.freeze({ kind: PENDING
  *     is kept for the open episode; the latch and both outages are asked
  *     again (no kill while P is
  *     latched, while `tmux-unavailable` is raised, or of a row read `pending`
- *     while `ad-config-malformed` is raised; SRJ-316); the one checked kill
+ * while `ad-config-malformed` is raised); the one checked kill
  *     (`deps.abortKill`). Then by the kill's answer:
  *       - success: the abort is used, and the live-row sequence starts at
  *         step 2 (`deps.startSequence`), answering "sequence started";
  *       - `ErrTmuxKillFailed`: the abort is used; nothing more this round
  *         (the held text comes at the next retry that reaches step 3);
  *       - latched: the abort is used; answers latched;
- *       - try again later, or stopped by SRJ-702's stop rule: the abort is
+ * - try again later, or stopped by the contract stop rule: the abort is
  *         not used; nothing more this round; the next retry that reaches
  *         step 3 makes the same abort with no second relaunching post (Q-12).
  * At most one abort of a persona runs at a time: a call while one runs

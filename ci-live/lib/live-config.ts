@@ -1,6 +1,6 @@
 /**
  * live-config.ts — the persona config and system prompt the runner writes in
- * the container, exactly as the setup wizard's answers in testplans/b.yko
+ * the container, exactly as the setup wizard's answers in testplans/live-acceptance.md
  * Part 1.5 would produce them (A: a-home `all` + coordination `mentions`, DMs
  * off, prompts to a-home; B: coordination `mentions`, DMs on with the human
  * as contact, prompts by DM; C: no channel, DMs on, prompts by DM;
@@ -9,13 +9,13 @@
  * The runner writes these instead of running the wizard (a deviation the
  * results' Notes record). The configuration also names the container's
  * crontable (`cron_table_path`, `CONTAINER_CRON_TABLE_PATH`), which the
- * wizard leaves out: the path is the default's (bug b.fc4: the state
+ * wizard leaves out: the path is the default's (the state
  * directory, `~/.config/claude-slack-channel-bots`, now holds the crontable), written out so the
  * start's default-crontable preparation is not in play. Neither the configuration it writes nor D's entry
  * carries the invited-channel switch or an `invited` section: every check
- * before Check 30 runs with the switch absent (b.deo SRI-1507).
+ * before Check 30 runs with the switch absent.
  *
- * Check 30's switch-on edit (`switchOnFilter`, b.deo SRI-1501) is a jq filter
+ * Check 30's switch-on edit (`switchOnFilter`) is a jq filter
  * applied to config.json through the plan's confirmed edit. It sets the
  * switch and gives every persona an `invited.permission_prompts` that keeps
  * the change valid and keeps the persona's destination where it is: A the
@@ -46,7 +46,7 @@ export interface WorkspaceIds {
 
 /**
  * The container's state directory (the default, `~/.config/claude-slack-channel-bots`
- * since bug b.smv; no SLACK_STATE_DIR). The runner's read-only credentials mount is a
+ * since; no SLACK_STATE_DIR). The runner's read-only credentials mount is a
  * sibling directory, `CONTAINER_CREDENTIALS_DIR` (`~/.config/cscb-credentials`),
  * so the server can write here.
  */
@@ -56,7 +56,7 @@ export const SYSTEM_PROMPT_PATH = `${CONTAINER_STATE_DIR}/system-prompt.md`
 /**
  * The container's crontable, named in config.json (`cron_table_path`) in the
  * state directory. A deviation from the wizard's answers, which leave the key
- * out: the default is this same path (`<state dir>/crontab`, bug b.fc4), and
+ * out: the default is this same path (`<state dir>/crontab`), and
  * writing it out keeps the run independent of the default-crontable
  * preparation. The state directory exists before the first start (the runner
  * writes config.json in it), as a written path needs (the server never makes
@@ -75,7 +75,7 @@ export interface PersonaEntry {
   channels?: { id: string; delivery: 'all' | 'mentions' }[]
   dm?: { enabled: boolean; contact?: string }
   permission_prompts: string
-  /** The fungible section (b.deo SRI-102): only Check 30's edit writes it. */
+  /** The fungible section: only Check 30's edit writes it. */
   invited?: { permission_prompts: string }
 }
 
@@ -85,13 +85,13 @@ export interface LiveConfig {
   append_system_prompt_file: string
   /** The container's crontable (`CONTAINER_CRON_TABLE_PATH`): not a wizard answer. */
   cron_table_path: string
-  /** The invited-channel switch (`SWITCH_KEY`, b.deo SRI-101): only Checks 30, 32 and 33's edits write it. */
+  /** The invited-channel switch (`SWITCH_KEY`): only Checks 30, 32 and 33's edits write it. */
   [SWITCH_KEY]?: boolean
 }
 
-/** The invited-channel switch's key (src/config.ts's `allow_invited_channels`, b.deo SRI-101). */
+/** The invited-channel switch's key (src/config.ts's `allow_invited_channels`). */
 export const SWITCH_KEY = 'allow_invited_channels'
-/** The fungible section's key (b.deo SRI-102). */
+/** The fungible section's key. */
 export const INVITED_KEY = 'invited'
 /** The fungible section's destination key (src/config.ts's `PERSONA_INVITED_KEYS`). */
 export const INVITED_PERMISSION_PROMPTS_KEY = 'permission_prompts'
@@ -112,7 +112,7 @@ export function invitedDestinationFor(letter: PersonaLetter, ids: WorkspaceIds):
 }
 
 /**
- * Check 30's switch-on edit as a jq filter over config.json (b.deo SRI-1501):
+ * Check 30's switch-on edit as a jq filter over config.json:
  * the switch set to true, and each persona of A to D present in the file
  * given its `invited.permission_prompts` (`invitedDestinationFor`). A persona
  * absent from the file (D, after Check 27) gets nothing; every other key is

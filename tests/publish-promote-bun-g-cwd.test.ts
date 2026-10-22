@@ -1,7 +1,7 @@
 /**
- * publish-promote-bun-g-cwd.test.ts — guard + behavioral tests for bug b.bpp.
+ * publish-promote-bun-g-cwd.test.ts — guard + behavioral tests for.
  *
- * Bug b.bpp: `scripts/publish-promote.sh` does `cd "${REPO_ROOT}"` at the top,
+ * `scripts/publish-promote.sh` does `cd "${REPO_ROOT}"` at the top,
  * so the post-publish `bun remove -g` / `bun install -g` calls ran with the
  * CSCB project as CWD. Bun, invoked from a directory whose package.json is
  * named "claude-slack-channel-bots", resolves the LOCAL dependency graph
@@ -82,7 +82,7 @@ function readFixedScript(): string {
 // Static parser guard — the $HOME-subshell wrap (primary fix)
 // ---------------------------------------------------------------------------
 
-describe('b.bpp: publish-promote.sh isolates every executed `bun -g` in a $HOME subshell', () => {
+describe('publish-promote.sh isolates every executed `bun -g` in a $HOME subshell', () => {
   test('at least one executed `bun -g` site exists (parser sanity)', () => {
     const sites = findExecutedBunGSites(readFixedScript())
     expect(sites.length).toBeGreaterThanOrEqual(2)
@@ -284,7 +284,7 @@ function runSr75(
   return { code, dirty: out.split('\n').filter(Boolean).sort() }
 }
 
-describe('b.bpp: SR-7.5 post-verify snapshot reverts promote-induced pkg/lock dirt only', () => {
+describe('SR-7.5 post-verify snapshot reverts promote-induced pkg/lock dirt only', () => {
   beforeAll(() => {
     fixture = initRepo()
   })

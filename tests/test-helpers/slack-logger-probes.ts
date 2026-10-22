@@ -1,6 +1,6 @@
 /**
  * test-helpers/slack-logger-probes.ts — Shared probes for the Slack
- * libraries' log output (E13 decisions 12 and 15): the connection-ticket URL
+ * libraries' log output ( decisions 12 and 15): the connection-ticket URL
  * the library's error lines carry, the allowlisted pong-timeout text, the
  * server-log line a persona's socket logger writes, and a recorder of
  * everything written to the console, `process.stdout` and `process.stderr`.

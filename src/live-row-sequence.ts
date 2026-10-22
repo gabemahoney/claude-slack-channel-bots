@@ -1,26 +1,25 @@
 /**
- * live-row-sequence.ts — The live-row sequence (b.jg5 SRJ-705, SRJ-706,
- * SRJ-717): the one way persona P's live row `cscb_<key>` (`pending`
+ * live-row-sequence.ts — The live-row sequence: the one way persona P's live row `cscb_<key>` (`pending`
  * included) is replaced, or, with no launch at the end, an old life's row
  * ended.
  *
  * The steps, in order (`runLiveRowSequence`):
  *   1. one kill, checked, with the bounded retry (`src/kill-retry.ts`): a
  *      non-success aborts the sequence by its class, and the retry's
- *      kill-failure alert decision is raised (SRJ-702, SRJ-704). A starter
+ * kill-failure alert decision is raised. A starter
  *      that made the first kill itself enters at step 2.
  *   2. one `get`: a `pending` row is waited on until G past its launch start
  *      (`armPendingRowWait`, `src/pending-row.ts`, with the G accessor
- *      itself; never from `started_at`; SRJ-406, SRJ-210). A
+ * itself; never from `started_at`). A
  *      row with no launch start has no wait; a configured persona's own such
- *      row has latched P through the shared read, which stops the sequence
- *      (SRJ-513). A row read `ended`, `missing` or absent here still goes on
+ *      row has latched P through the shared read, which stops the sequence.
+ * A row read `ended`, `missing` or absent here still goes on
  *      to step 3.
  *   3. up to three bypassing `find-missing` runs, 5 s apart, the first at
  *      once, each followed by one `get`: `ended`, `missing` or no row goes to
  *      step 6. A run that puts a `pending` row in neither `ids` nor
  *      `unverified_ids` did not judge it, and the sequence stops that episode
- *      at once (SRJ-717). A run refused by class (SRJ-120's refusal) ends the
+ * at once. A run refused by class ends the
  *      sequence without its launch; a run that latched P stops it; any other
  *      failed run judges nothing and the step goes on.
  *   4. one more kill as in step 1, a 5 s pause, one more run and one more
@@ -33,12 +32,12 @@
  *      has a session id and P keeps its conversation, otherwise a reuse spawn
  *      of the same id (`decideLiveRowLaunchKind`), made through the session
  *      manager's sequence-launch entry, whose reuse is the session manager's
- *      one reuse spawn (SRJ-112). A launch whose result is no success
+ * one reuse spawn. A launch whose result is no success
  *      (`liveRowLaunchSucceeded`: `failed`, `retrying`, `deferred`, `latched`, `held`), a reuse
  *      that collided with a live row (not launched, `reuse-collision`), a
  *      `resume` that answered `ErrSpawnNotResumable` (not launched, after the
  *      entry's one re-read of the row: `not-resumable` for a lost race,
- *      `not-resumable-pending` for a launch in progress; SRJ-710, never a
+ * `not-resumable-pending` for a launch in progress, never a
  *      second sequence) or a launch that throws ends the sequence without
  *      its launch, with no further call: no delete, no kill and no further
  *      launch. A re-read that latched P (`not-resumable-latched`) stops the
@@ -46,11 +45,11 @@
  *      as "row finished".
  * At most 4 runs and 2 kills (each with its tries) per sequence.
  *
- * What a step may do (SRJ-706): before every agent-director call the
+ * What a step may do: before every agent-director call the
  * sequence asks whether it was stopped (P's latch, its teardown, shutdown:
  * the stop signal) or P is latched, and makes no call when so; no kill is
  * made of a row last read `pending` while P's `ad-config-malformed` outage is
- * raised (SRJ-316); every kill's retry is seeded with the state last read and
+ * raised; every kill's retry is seeded with the state last read and
  * keeps going only while the sequence is neither stopped nor P latched. An
  * answer that arrives once the stop signal is set for a teardown or shutdown
  * (a kill's, a `get`'s, a run's, the step-6 launch's, a latch's, a
@@ -71,19 +70,19 @@
  * them).
  *
  * Every end without the launch arms P's retry timer through the injected arm
- * (SRJ-301): with the not-judged cause after SRJ-717's stop, with the
- * collision cause after a reuse collision at step 6 (SRJ-112, SRJ-705),
+ * with the not-judged cause after a not-judged stop, with the
+ * collision cause after a reuse collision at step 6,
  * with the lost-race cause after a step-6 `resume`'s `ErrSpawnNotResumable`
- * whose re-read found a lost race (SRJ-710), with the other-end cause
+ * whose re-read found a lost race, with the other-end cause
  * otherwise, that `ErrSpawnNotResumable` on a row re-read `pending`, a step-6
  * launch that failed or threw
  * included, whether or not the launch's own refusal handling armed it too; a
  * stop for a latch, a teardown, shutdown or a persona that is not up, an
  * abort that latched P, an abort whose version re-check stops the server, a
- * launch that latched P, held it on `ErrInvalidFlags` (SRJ-207) or whose
+ * launch that latched P, held it on `ErrInvalidFlags` or whose
  * version re-check stops the server, a
  * launch whose `ErrTmuxSessionCreate` armed the timer in pending-only mode
- * itself (SRJ-112, SRJ-113, SRJ-409), and the no-launch form arm nothing
+ * itself, and the no-launch form arm nothing
  * here. Nothing here counts a failure: the session manager's
  * sequence-launch entry counts its launch's result once.
  *
@@ -91,7 +90,7 @@
  * (`LiveRowSequenceDeps`): every agent-director call, the latch, the alert,
  * the retry arm and the clock are the caller's.
  *
- * The registry (`createLiveRowSequenceRegistry`, SRJ-706, SRJ-811), one per
+ * The registry (`createLiveRowSequenceRegistry`), one per
  * server, schedules the sequences: its start entry starts one without
  * awaiting it and answers at once, at most one per instance id at a time,
  * and at most one ending in a launch per persona; each that ends in a launch
@@ -108,40 +107,40 @@
  * A no-launch request's stop for its hold's end (`hold-ended`) drops no
  * answer, as a latch's stop does not: the call in flight is acted on (a
  * kill's tries end as the `hold-ended` success, whose survivor version is
- * raised, SRJ-702; option A), and the wait makes no further call.
+ * raised; option A), and the wait makes no further call.
  *
  * Its production starters, all through the session manager's start entry
  * `startLiveRowSequence`, are:
- *   - the collision ladder's replacement sites (SRJ-707; the session
+ * - the collision ladder's replacement sites (the session
  *     manager's replace step, `replacePersonaRow`): a row the ladder cannot
  *     keep (`resume_enabled` false, a `cwd` mismatch, a `config_dir` label
  *     missing or different, the last at a resume and at a `pending` row,
  *     or a retired key's old life: a live row, `pending` included, of a key
- *     recorded as retired with no "new life has begun" mark, SRJ-805)
+ * recorded as retired with no "new life has begun" mark)
  *     that it last read live, `pending` included: the collision `get`'s or a
  *     re-read's live state, or a dead-session path's earlier live read only
- *     when that path holds dead evidence (SRJ-609, SRJ-611). Each such
+ * when that path holds dead evidence. Each such
  *     request enters at step 1, seeded with the state the ladder last read,
  *     with the conversation not kept, the retired-key flag set for a retired
  *     key, a launch at the end and the alert context `recovery`, so its
  *     step 6 is a reuse spawn of the same id;
  *   - the collision ladder's `resume` answering `ErrSpawnNotResumable` on a
- *     path that holds dead evidence (SRJ-710, SRJ-611), whose re-read finds
+ * path that holds dead evidence, whose re-read finds
  *     the row in a live state other than `pending`: the same request with
  *     the re-read state as its seed and the conversation kept, so its step 6
  *     is a `resume` when the row has a session id and P may resume it;
- *   - the restart path's reconnect adapter (SRJ-805), for a retired key with
+ * - the restart path's reconnect adapter, for a retired key with
  *     no mark whose row reads live other than `pending`: the same request as
  *     the replacement sites', with the retired-key flag, in place of its
  *     `/mcp reconnect`.
  * The ladder answers `sequence-waiting` whatever the start answers. While
  * P's key is recorded as retired the start entry sets the retired-key flag
- * whatever the starter asked (SRJ-805), and step 6 reads the store again
+ * whatever the starter asked, and step 6 reads the store again
  * through P's facts, so no sequence ends in a `resume` for a key recorded
  * at its start or while it ran. The request carries the store's reading of
  * the key when its launch attempt began (`retiredAtStart`), which step 6
  * hands its launch unchanged, so a reuse marks a new life only when no
- * recording named the key since (SRJ-806).
+ * recording named the key since.
  *
  * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier
@@ -185,15 +184,15 @@ import { PENDING_ROW_WAIT_NOT_ARMED, armPendingRowWait, parseLaunchStart, type P
 // Constants
 // ---------------------------------------------------------------------------
 
-/** The wait between one run's `get` and the next run at step 3, in ms (SRJ-705). */
+/** The wait between one run's `get` and the next run at step 3, in ms. */
 export const LIVE_ROW_SEQUENCE_RUN_SPACING_MS = 5_000
 
-/** Step 4's pause between its kill and its run, in ms (SRJ-705). */
+/** Step 4's pause between its kill and its run, in ms. */
 export const LIVE_ROW_SEQUENCE_STEP4_PAUSE_MS = 5_000
 
 /**
  * The wait before step 2's G wait is armed again after the G accessor threw
- * or answered NaN while arming, in ms (SRJ-210, SRJ-705): the wait is never
+ * or answered NaN while arming, in ms: the wait is never
  * ended early for it.
  */
 export const LIVE_ROW_SEQUENCE_GRACE_REARM_MS = 5_000
@@ -207,16 +206,16 @@ export const LIVE_ROW_SEQUENCE_GRACE_REARM_MS = 5_000
  */
 export const LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS = 60_000
 
-/** The number of runs step 3 makes at most (SRJ-705). */
+/** The number of runs step 3 makes at most. */
 export const LIVE_ROW_SEQUENCE_STEP3_RUNS = 3
 
 /**
- * The most `find-missing` runs one sequence makes (SRJ-705, SRJ-1204): step
+ * The most `find-missing` runs one sequence makes: step
  * 3's runs and step 4's one run.
  */
 export const LIVE_ROW_SEQUENCE_MAX_RUNS = LIVE_ROW_SEQUENCE_STEP3_RUNS + 1
 
-/** The most kills one sequence makes, each with its tries (SRJ-705). */
+/** The most kills one sequence makes, each with its tries. */
 export const LIVE_ROW_SEQUENCE_MAX_KILLS = 2
 
 /** The sequence's site name: its log lines' head and its agent-director calls' log prefix. */
@@ -227,7 +226,7 @@ export const LIVE_ROW_SEQUENCE_LOG_PREFIX = `[slack] ${LIVE_ROW_SEQUENCE_SITE}:`
 
 /** Entry at step 1: the sequence makes the first kill. */
 export const LIVE_ROW_SEQUENCE_ENTRY_KILL = 1
-/** Entry at step 2: the starter made the first kill itself (the stuck-launch abort, SRJ-412). */
+/** Entry at step 2: the starter made the first kill itself (the stuck-launch abort). */
 export const LIVE_ROW_SEQUENCE_ENTRY_GET = 2
 
 /** The step a sequence enters at. */
@@ -242,7 +241,7 @@ export const LIVE_ROW_SEQUENCE_NO_ROW = 'no-row'
 
 /**
  * What the installed retired-key store said of a persona's key when a launch
- * attempt started (SRJ-806): whether the key was recorded, whether its "new
+ * attempt started: whether the key was recorded, whether its "new
  * life has begun" mark was set, and its record generation (undefined when
  * the key was not recorded or the generation could not be read). A reuse
  * spawn made in that attempt sets the mark at its success only when the key
@@ -258,7 +257,7 @@ export interface RetiredKeyAttemptStart {
 
 /** What a starter asks for. */
 export interface LiveRowSequenceRequest {
-  /** b.omv SR-7.6: recheck eligibility and provenance before each upgrade kill. */
+  /** recheck eligibility and provenance before each upgrade kill. */
   readonly tagUpgrade?: boolean
   /** Persona P's key. */
   readonly key: string
@@ -278,11 +277,11 @@ export interface LiveRowSequenceRequest {
    * The retired-key store's reading of P's key when the launch attempt that
    * started the sequence began (the collision ladder's start, or the start
    * entry's own read, `startLiveRowSequence`), handed to step 6's launch
-   * (SRJ-806). Absent: the launch reads the store just before its reuse call.
+   * Absent: the launch reads the store just before its reuse call.
    */
   readonly retiredAtStart?: RetiredKeyAttemptStart
   /**
-   * Whether P was below the restart cap when the sequence started (b.4q8; the
+   * Whether P was below the restart cap when the sequence started (the
    * start entry's own read, `startLiveRowSequence`), handed to step 6's launch,
    * which makes no call when P was below it then and is at it now: a read of
    * P's row while the sequence ran counted P's resumed launch as failed and
@@ -338,9 +337,9 @@ export const LIVE_ROW_RUN_MARKED_MISSING = 'marked-missing'
 export const LIVE_ROW_RUN_LEFT_LIVE = 'judged-left-live'
 /** The run judged a row last read live other than `pending` alive (it is in neither list). */
 export const LIVE_ROW_RUN_JUDGED_ALIVE = 'judged-alive'
-/** The run did not judge a row last read `pending` (it is in neither list; SRJ-717). */
+/** The run did not judge a row last read `pending` (it is in neither list). */
 export const LIVE_ROW_RUN_NOT_JUDGED = 'not-judged'
-/** The run was refused by class (UNAVAILABLE, ENVIRONMENT, CONFIG, UNCLASSIFIED; SRJ-120). */
+/** The run was refused by class (UNAVAILABLE, ENVIRONMENT, CONFIG, UNCLASSIFIED). */
 export const LIVE_ROW_RUN_REFUSED = 'refused'
 /** P is latched once the run is done. */
 export const LIVE_ROW_RUN_LATCHED = 'latched'
@@ -364,7 +363,7 @@ const JUDGED_PLACEMENTS: ReadonlySet<string> = new Set<string>([
 ])
 
 // ---------------------------------------------------------------------------
-// The launch kind (SRJ-705 step 6)
+// The launch kind (step 6)
 // ---------------------------------------------------------------------------
 
 /** Step 6 resumes the row. */
@@ -411,7 +410,7 @@ export type LiveRowSequenceLaunchReason =
  * comparison (`compareRowToPersona`): `resume_enabled`, and whether the
  * row's `cwd` and `config_dir` label match P. A comparison that cannot be
  * made (no row) answers both as matching. `retired` is the installed
- * retired-key store's reading at step 6 (SRJ-805): true while P's key is
+ * retired-key store's reading at step 6: true while P's key is
  * recorded, marked or not, so a key recorded after the sequence started
  * still ends in a reuse, never a `resume`; absent reads as not recorded.
  */
@@ -439,7 +438,7 @@ export interface LiveRowLaunchKindDecision {
 }
 
 /**
- * Step 6's launch kind (SRJ-705): `resume` only when the request keeps P's
+ * Step 6's launch kind: `resume` only when the request keeps P's
  * conversation, the key is not retired, a row was read and carries a
  * non-empty session id, P is applied with `resume_enabled` true, and the
  * row's `cwd` and `config_dir` label match P; `reuse` in every other case,
@@ -475,7 +474,7 @@ export interface LiveRowSequenceLaunchResult {
   readonly stopping?: true
   /**
    * The launch's `ErrTmuxSessionCreate` armed P's retry timer at once in
-   * pending-only mode (SRJ-112, SRJ-113, SRJ-409): the sequence arms no
+   * pending-only mode: the sequence arms no
    * cause of its own after it.
    */
   readonly pendingOnlyArmed?: true
@@ -483,34 +482,34 @@ export interface LiveRowSequenceLaunchResult {
 
 /**
  * Not launched: the reuse spawn answered `ErrInstanceIdCollision`, so the row
- * is live and nothing was launched (SRJ-112, SRJ-705). Nothing is counted;
+ * is live and nothing was launched. Nothing is counted;
  * the end arms the collision cause.
  */
 export const LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION = 'reuse-collision'
 /**
  * Not launched: the `resume` answered `ErrSpawnNotFound` and the plain spawn
  * after it answered `ErrInstanceIdCollision`, so the row is live and nothing
- * was launched (SRJ-111, SRJ-713). Nothing is counted; the end arms the
+ * was launched. Nothing is counted; the end arms the
  * collision cause, as for a reuse collision, and that retry's run is the
- * get-then-act (SRJ-705, SRJ-706: none runs inside the sequence).
+ * get-then-act (none runs inside the sequence).
  */
 export const LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION = 'spawn-collision'
 /**
  * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
  * of the row found a lost race: a live state other than `pending`, `ended`,
- * `missing` or no row, or the read failed (SRJ-710: no second sequence).
+ * `missing` or no row, or the read failed (no second sequence).
  * Nothing is counted; the end arms the lost-race cause.
  */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE = 'not-resumable'
 /**
  * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
- * found the row `pending`, a launch in progress (SRJ-710: no second
+ * found the row `pending`, a launch in progress (no second
  * sequence). Nothing is counted or posted; the end arms the other-end cause.
  */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING = 'not-resumable-pending'
 /**
  * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
- * latched P (SRJ-710, SRJ-706): the sequence ends stopped for the latch, with
+ * latched P: the sequence ends stopped for the latch, with
  * nothing armed.
  */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED = 'not-resumable-latched'
@@ -518,12 +517,12 @@ export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED = 'not-resumable-latche
 export const LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED = 'not-applied'
 /**
  * Not launched: the sequence was stopped (its teardown, shutdown, P's latch)
- * while its launch waited for another launch of P to settle (SRJ-706: no call
+ * while its launch waited for another launch of P to settle (no call
  * once the sequence is stopped).
  */
 export const LIVE_ROW_NOT_LAUNCHED_STOPPED = 'stopped'
 /**
- * Not launched: P reached the restart cap while the sequence ran (b.4q8): it
+ * Not launched: P reached the restart cap while the sequence ran: it
  * was below the cap when the sequence started (the request's
  * `belowCapAtStart`) and is at it at step 6. A read of P's row (the
  * sequence's own included) can count P's resumed launch as failed, its row
@@ -550,11 +549,11 @@ export const LIVE_ROW_LAUNCH_ANSWER_LAUNCHED = 'launched'
 /**
  * The launch results that are a success: the session manager's launch result
  * actions that leave P's session running (`launchSession` maps each to true,
- * but `resumed`, whose count waits until its row reports in, b.4q8).
+ * but `resumed`, whose count waits until its row reports in).
  * Every other answer of a launch call (`failed`, `deferred`, `latched`,
  * `held`) ends the sequence without its launch. `fresh-retired` is the
  * session manager's `SPAWN_ACTION_FRESH_RETIRED`: a reuse spawn for a
- * retired key that began its new life (SRJ-806, SRJ-112), a success as
+ * retired key that began its new life, a success as
  * `spawned` is.
  */
 export const LIVE_ROW_LAUNCH_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
@@ -572,7 +571,7 @@ export const LIVE_ROW_LAUNCH_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
 export const LIVE_ROW_LAUNCH_RESULT_LATCHED = 'latched'
 
 /**
- * The launch result action of a P held on `ErrInvalidFlags` (SRJ-207): the
+ * The launch result action of a P held on `ErrInvalidFlags`: the
  * launch's reuse spawn held it, or the launch found it held. The sequence
  * ends with nothing armed, as for a latch: the hold stops P's retry timer.
  */
@@ -581,7 +580,7 @@ export const LIVE_ROW_LAUNCH_RESULT_HELD = 'held'
 /**
  * The successes that are a launch call's own (a spawn, a reuse spawn or a
  * `resume` that returned success): the session manager's after-launch step
- * arms P's retry timer in pending-only mode after each (SRJ-301, SRJ-409).
+ * arms P's retry timer in pending-only mode after each.
  * A reconnect or a no-op made no launch call.
  */
 export const LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
@@ -619,9 +618,9 @@ export const LIVE_ROW_OUTCOME_LAUNCHED = 'launched'
 export const LIVE_ROW_OUTCOME_NOT_LAUNCHED = 'not-launched'
 /** The no-launch form reached step 6: the row is finished. */
 export const LIVE_ROW_OUTCOME_ROW_FINISHED = 'row-finished'
-/** A run did not judge a `pending` row: the episode stops (SRJ-717). */
+/** A run did not judge a `pending` row: the episode stops. */
 export const LIVE_ROW_OUTCOME_NOT_JUDGED = 'not-judged'
-/** Upgrade observer lost eligibility or found a replacement already installed (b.omv SR-7.6). */
+/** Upgrade observer lost eligibility or found a replacement already installed. */
 export const LIVE_ROW_OUTCOME_UPGRADE_DEFERRED = 'upgrade-deferred'
 /** A kill's standing non-success aborted the sequence by its class. */
 export const LIVE_ROW_OUTCOME_ABORTED = 'aborted'
@@ -629,11 +628,11 @@ export const LIVE_ROW_OUTCOME_ABORTED = 'aborted'
 export const LIVE_ROW_OUTCOME_ESCALATED = 'escalated'
 /** Step 5 with no run that judged the row: no alert. */
 export const LIVE_ROW_OUTCOME_NO_JUDGED_RUN = 'no-judged-run'
-/** No kill: the row was last read `pending` while P's `ad-config-malformed` outage is raised (SRJ-316). */
+/** No kill: the row was last read `pending` while P's `ad-config-malformed` outage is raised. */
 export const LIVE_ROW_OUTCOME_CONFIG_MALFORMED = 'config-malformed-no-kill'
 /** A `get` failed. */
 export const LIVE_ROW_OUTCOME_READ_REFUSED = 'read-refused'
-/** A run was refused by class (SRJ-120). */
+/** A run was refused by class. */
 export const LIVE_ROW_OUTCOME_RUN_REFUSED = 'run-refused'
 /** The sequence was stopped (`reason`). */
 export const LIVE_ROW_OUTCOME_STOPPED = 'stopped'
@@ -649,9 +648,9 @@ export const LIVE_ROW_STOP_SHUTDOWN = 'shutdown'
 /** A kill's tries were stopped because P is not up or the server is stopping (the server's keep-going query). */
 export const LIVE_ROW_STOP_NOT_UP = 'not-up'
 /**
- * A no-launch request only (an old-life wait, SRJ-811): the hold it serves
+ * A no-launch request only (an old-life wait): the hold it serves
  * ended. Like a stop for a latch it drops no answer: the call in flight is
- * acted on, a kill's tries end as the `hold-ended` success (SRJ-702; option
+ * acted on, a kill's tries end as the `hold-ended` success (option
  * A), and no further call is made.
  */
 export const LIVE_ROW_STOP_HOLD_ENDED = 'hold-ended'
@@ -665,8 +664,7 @@ export type LiveRowSequenceStopReason =
   | typeof LIVE_ROW_STOP_HOLD_ENDED
 
 /**
- * The stop's cause for a kill retry the sequence's own stop ended (b.jg5
- * SRJ-702), for the stopped retry's one line and entry. Never throws.
+ * The stop's cause for a kill retry the sequence's own stop ended, for the stopped retry's one line and entry. Never throws.
  */
 export function liveRowStopCauseText(reason: LiveRowSequenceStopReason): string {
   switch (reason) {
@@ -686,7 +684,7 @@ export function liveRowStopCauseText(reason: LiveRowSequenceStopReason): string 
 }
 
 /**
- * Arm P's retry timer with the not-judged cause (SRJ-717). The same string
+ * Arm P's retry timer with the not-judged cause. The same string
  * as the retry controller's cause label for it
  * (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED` in `src/unavailable-retry.ts`,
  * not imported here: that module loads Slack modules), so the end line and
@@ -694,22 +692,22 @@ export function liveRowStopCauseText(reason: LiveRowSequenceStopReason): string 
  */
 export const LIVE_ROW_ARM_NOT_JUDGED = 'sequence-not-judged'
 /**
- * Arm P's retry timer with the other-end cause (SRJ-301). The same string as
+ * Arm P's retry timer with the other-end cause. The same string as
  * the retry controller's cause label for it
  * (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`), as for the not-judged cause.
  */
 export const LIVE_ROW_ARM_ENDED = 'sequence-ended-without-launch'
 /**
- * Arm P's retry timer with the collision cause (SRJ-112, SRJ-301): a
+ * Arm P's retry timer with the collision cause: a
  * reuse collision at step 6, or a collision of the plain spawn after the
- * `resume`'s `ErrSpawnNotFound` (SRJ-111), ended the sequence without its
+ * `resume`'s `ErrSpawnNotFound`, ended the sequence without its
  * launch. The same
  * string as the retry controller's cause label for it
  * (`UNAVAILABLE_RETRY_CAUSE_COLLISION`), as for the other causes.
  */
 export const LIVE_ROW_ARM_COLLISION = 'collision'
 /**
- * Arm P's retry timer with the lost-race cause (SRJ-710, SRJ-301): step 6's
+ * Arm P's retry timer with the lost-race cause: step 6's
  * `resume` answered `ErrSpawnNotResumable` and the re-read found a lost race
  * (`LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE`). The same string as the retry
  * controller's cause label for it (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`), as
@@ -836,7 +834,7 @@ function callIsolated(fn: () => void): void {
 
 /** What step 1's and step 4's kill is given. */
 export interface LiveRowSequenceKillOptions {
-  /** b.omv SR-7.6: between-try reads retain upgrade eligibility. */
+  /** between-try reads retain upgrade eligibility. */
   readonly tagUpgrade?: boolean
   /** The row state last read: the kill retry's seed (`killRetrySeedOfState`). */
   readonly lastReadState: string
@@ -846,8 +844,8 @@ export interface LiveRowSequenceKillOptions {
   readonly keepGoing: () => boolean
   /**
    * True once the sequence was stopped for its hold's end (a no-launch
-   * request's `hold-ended` stop, SRJ-811): an old-life wait's kill takes it
-   * as its hold ended (SRJ-702; option A), even when a new hold has begun on
+   * request's `hold-ended` stop): an old-life wait's kill takes it
+   * as its hold ended (option A), even when a new hold has begun on
    * the same id since. Absent: never.
    */
   readonly stoppedForHoldEnd?: () => boolean
@@ -879,7 +877,7 @@ export interface LiveRowSequenceDeps {
    * Raise a kill retry's alert decision with the request's context. For tries
    * the sequence's own stop ended, `stopCause` names that stop, and for tries
    * P's latch ended (the keep-going check, or a between-try read that
-   * latched P), the latch (`liveRowStopCauseText`; b.jg5 SRJ-702: the stop's
+   * latched P), the latch (`liveRowStopCauseText`; the stop's
    * cause); absent, the binding tells the cause itself.
    */
   raiseKillAlert(key: string, retried: KillRetryResult, context: KillFailureAlertContext, ref: string, stopCause?: string): void
@@ -890,9 +888,9 @@ export interface LiveRowSequenceDeps {
   /**
    * Step 6's launch through the session manager's sequence-launch entry. The
    * sequence's stop signal goes with it: a launch that waits for another
-   * launch of P to settle makes no call once the signal is set (SRJ-706).
+   * launch of P to settle makes no call once the signal is set.
    * The sequence always passes it, and the request's `retiredAtStart`
-   * (SRJ-806) and `belowCapAtStart` (b.4q8) as they are.
+   * and `belowCapAtStart` as they are.
    */
   launch(
     key: string,
@@ -939,35 +937,35 @@ function head(ref: string): string {
 
 /**
  * The start line:
- *   `[slack] live-row-sequence: <ref>: started at step <n> for <id> (last read <state>; <launch form>; alert context <context>) (b.jg5 SRJ-705)`
+ * `[slack] live-row-sequence: <ref>: started at step <n> for <id> (last read <state>; <launch form>; alert context <context>)`
  */
 export function liveRowSequenceStartLine(ref: string, request: LiveRowSequenceRequest): string {
   const form = request.launches ? 'ends in a launch' : 'no launch (old-life form)'
-  return `${head(ref)}: started at step ${request.entryStep} for ${renderId(request.instanceId)} (last read ${renderState(request.lastReadState)}; ${form}; alert context ${request.alertContext}) (b.jg5 SRJ-705)`
+  return `${head(ref)}: started at step ${request.entryStep} for ${renderId(request.instanceId)} (last read ${renderState(request.lastReadState)}; ${form}; alert context ${request.alertContext})`
 }
 
 /**
  * A kill's line, after its tries:
- *   `[slack] live-row-sequence: <ref>: step <n> kill: <describeKillOutcome> after <t> kill(s) and <r> read(s) (end=<end>; alert=<kind>) (b.jg5 SRJ-705, SRJ-702)`
+ * `[slack] live-row-sequence: <ref>: step <n> kill: <describeKillOutcome> after <t> kill(s) and <r> read(s) (end=<end>; alert=<kind>)`
  */
 export function liveRowSequenceKillLine(ref: string, step: 1 | 4, retried: KillRetryResult): string {
-  return `${head(ref)}: step ${step} kill: ${describeKillOutcome(retried.outcome)} after ${retried.tries} kill(s) and ${retried.reads} read(s) (end=${retried.end}; alert=${retried.alert.kind}) (b.jg5 SRJ-705, SRJ-702)`
+  return `${head(ref)}: step ${step} kill: ${describeKillOutcome(retried.outcome)} after ${retried.tries} kill(s) and ${retried.reads} read(s) (end=${retried.end}; alert=${retried.alert.kind})`
 }
 
 /**
- * The line for a kill not made under SRJ-316's rule:
- *   `[slack] live-row-sequence: <ref>: step <n>: no kill — the row was last read pending and agent-director refuses its config file (ad-config-malformed) (b.jg5 SRJ-706, SRJ-316)`
+ * The line for a kill not made under the contract rule:
+ * `[slack] live-row-sequence: <ref>: step <n>: no kill — the row was last read pending and agent-director refuses its config file (ad-config-malformed)`
  */
 export function liveRowSequenceNoKillLine(ref: string, step: 1 | 4): string {
-  return `${head(ref)}: step ${step}: no kill — the row was last read pending and agent-director refuses its config file (ad-config-malformed) (b.jg5 SRJ-706, SRJ-316)`
+  return `${head(ref)}: step ${step}: no kill — the row was last read pending and agent-director refuses its config file (ad-config-malformed)`
 }
 
 /**
  * A `get`'s line:
- *   `[slack] live-row-sequence: <ref>: step <n> get: state=<state> | no row (ErrSpawnNotFound) | failed: <describeReadFailure> | the read latched the persona (b.jg5 SRJ-705, SRJ-114)`
+ * `[slack] live-row-sequence: <ref>: step <n> get: state=<state> | no row (ErrSpawnNotFound) | failed: <describeReadFailure> | the read latched the persona`
  */
 export function liveRowSequenceGetLine(ref: string, step: 2 | 3 | 4, read: LiveRowSequenceRead): string {
-  return `${head(ref)}: step ${step} get: ${describeRead(read)} (b.jg5 SRJ-705, SRJ-114)`
+  return `${head(ref)}: step ${step} get: ${describeRead(read)}`
 }
 
 /** A read's answer, in words; a failure through {@link describeReadFailure}. */
@@ -985,7 +983,7 @@ function describeRead(read: LiveRowSequenceRead): string {
 }
 
 /**
- * A failed read, as the kill line reports a failure (b.jg5 SRJ-104): the
+ * A failed read, as the kill line reports a failure: the
  * classification's class, reported name and rendered message
  * (`describeAdErrorClassification`) when it carries a name or a message, so
  * an `ErrUnknownErrorName` reports its `unknownName` and agent-director's own
@@ -1010,7 +1008,7 @@ export const LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT = 'could not be read (the w
  * `AD_WAIT_NEVER_ENDS`; as {@link LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT}
  * for any other value (NaN: G could not be read). No deadline is rendered
  * from a value that is not finite:
- *   `[slack] live-row-sequence: <ref>: step 2: waiting on the pending row until G past its launch start (launch start=<iso>; G=<G>[; deadline=<iso>]) (b.jg5 SRJ-705, SRJ-406)`
+ * `[slack] live-row-sequence: <ref>: step 2: waiting on the pending row until G past its launch start (launch start=<iso>; G=<G>[; deadline=<iso>])`
  */
 export function liveRowSequenceWaitArmedLine(ref: string, launchStartMs: number, graceMs: number): string {
   const start = renderInstant(launchStartMs) ?? 'unknown'
@@ -1020,7 +1018,7 @@ export function liveRowSequenceWaitArmedLine(ref: string, launchStartMs: number,
       ? LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT
       : LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT
   const deadline = Number.isFinite(graceMs) ? renderInstant(launchStartMs + graceMs) : undefined
-  return `${head(ref)}: step 2: waiting on the pending row until G past its launch start (launch start=${start}; G=${grace}${deadline === undefined ? '' : `; deadline=${deadline}`}) (b.jg5 SRJ-705, SRJ-406)`
+  return `${head(ref)}: step 2: waiting on the pending row until G past its launch start (launch start=${start}; G=${grace}${deadline === undefined ? '' : `; deadline=${deadline}`})`
 }
 
 /**
@@ -1032,26 +1030,26 @@ export function liveRowSequenceWaitArmedLine(ref: string, launchStartMs: number,
  * `describeLogMessage`: redacted, one line, capped, JSON-quoted); for any
  * other value, `describeThrownValue`, which reads no stack for it; `unknown`
  * when the error cannot be read. Never the error:
- *   `[slack] live-row-sequence: <ref>: step 2: G could not be read while arming the wait (<described>) — the wait is not ended; armed again in <n> ms (b.jg5 SRJ-705, SRJ-210)`
+ * `[slack] live-row-sequence: <ref>: step 2: G could not be read while arming the wait (<described>) — the wait is not ended; armed again in <n> ms`
  */
 export function liveRowSequenceWaitArmFailedLine(ref: string, described: string): string {
-  return `${head(ref)}: step 2: G could not be read while arming the wait (${described}) — the wait is not ended; armed again in ${LIVE_ROW_SEQUENCE_GRACE_REARM_MS} ms (b.jg5 SRJ-705, SRJ-210)`
+  return `${head(ref)}: step 2: G could not be read while arming the wait (${described}) — the wait is not ended; armed again in ${LIVE_ROW_SEQUENCE_GRACE_REARM_MS} ms`
 }
 
 /**
  * The step-2 wait's end line:
- *   `[slack] live-row-sequence: <ref>: step 2: G has passed since the launch start — the runs begin (b.jg5 SRJ-705, SRJ-406)`
+ * `[slack] live-row-sequence: <ref>: step 2: G has passed since the launch start — the runs begin`
  */
 export function liveRowSequenceWaitEndedLine(ref: string): string {
-  return `${head(ref)}: step 2: G has passed since the launch start — the runs begin (b.jg5 SRJ-705, SRJ-406)`
+  return `${head(ref)}: step 2: G has passed since the launch start — the runs begin`
 }
 
 /**
- * The step-2 line when a `pending` row has no launch start (an old key's row; SRJ-408):
- *   `[slack] live-row-sequence: <ref>: step 2: the pending row has no launch start — no wait (b.jg5 SRJ-705, SRJ-408)`
+ * The step-2 line when a `pending` row has no launch start (an old key's row):
+ * `[slack] live-row-sequence: <ref>: step 2: the pending row has no launch start — no wait`
  */
 export function liveRowSequenceNoWaitLine(ref: string): string {
-  return `${head(ref)}: step 2: the pending row has no launch start — no wait (b.jg5 SRJ-705, SRJ-408)`
+  return `${head(ref)}: step 2: the pending row has no launch start — no wait`
 }
 
 /** A placement, in words. */
@@ -1075,20 +1073,19 @@ function describePlacement(placement: LiveRowSequenceRunPlacement): string {
 }
 
 /**
- * A run's line, with one tag group (SRJ-717 added for a run that did not judge the row):
- *   `[slack] live-row-sequence: <ref>: step <n> run <k> of <max>: <placement> (b.jg5 SRJ-705, SRJ-120[, SRJ-717])`
+ * A run's line, with one tag group (added for a run that did not judge the row):
+ * `[slack] live-row-sequence: <ref>: step <n> run <k> of <max>: <placement> ([])`
  */
 export function liveRowSequenceRunLine(ref: string, step: 3 | 4, runNumber: number, placement: LiveRowSequenceRunPlacement): string {
-  const tags = placement === LIVE_ROW_RUN_NOT_JUDGED ? 'b.jg5 SRJ-705, SRJ-120, SRJ-717' : 'b.jg5 SRJ-705, SRJ-120'
-  return `${head(ref)}: step ${step} run ${runNumber} of ${LIVE_ROW_SEQUENCE_MAX_RUNS}: ${describePlacement(placement)} (${tags})`
+  return `${head(ref)}: step ${step} run ${runNumber} of ${LIVE_ROW_SEQUENCE_MAX_RUNS}: ${describePlacement(placement)}`
 }
 
 /**
  * Step 6's line, before the launch:
- *   `[slack] live-row-sequence: <ref>: step 6: <resume|reuse> — <reason> (b.jg5 SRJ-705)`
+ * `[slack] live-row-sequence: <ref>: step 6: <resume|reuse> — <reason>`
  */
 export function liveRowSequenceLaunchLine(ref: string, decision: LiveRowLaunchKindDecision): string {
-  return `${head(ref)}: step 6: ${decision.kind} — ${decision.reason} (b.jg5 SRJ-705)`
+  return `${head(ref)}: step 6: ${decision.kind} — ${decision.reason}`
 }
 
 /** Why a sequence stopped, in words. */
@@ -1140,11 +1137,11 @@ function describeOutcome(outcome: LiveRowSequenceOutcome): string {
 }
 
 /**
- * The end line's account of P's retry timer (b.jg5 SRJ-301, SRJ-409), one of:
+ * The end line's account of P's retry timer, one of:
  *   - `the retry timer armed (<cause>)`: the sequence armed a cause at its end;
  *   - `the retry timer armed by the launch (pending-only)`: a step-6 launch
  *     whose `ErrTmuxSessionCreate` armed the timer in pending-only mode itself
- *     (SRJ-112, SRJ-113);
+ * ;
  *   - `no cause armed by the sequence; the launch's success arms the
  *     pending-only watch (pending-row)`: a launch call that succeeded
  *     (`LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS`), whose after-launch step arms
@@ -1165,29 +1162,29 @@ export function liveRowSequenceEndArmText(outcome: LiveRowSequenceOutcome): stri
 
 /**
  * The end line, one per sequence:
- *   `[slack] live-row-sequence: <ref>: <outcome> — runs=<n> kills=<n> judged=<n>; <timer> (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
+ * `[slack] live-row-sequence: <ref>: <outcome> — runs=<n> kills=<n> judged=<n>; <timer>`
  * where `<timer>` is `liveRowSequenceEndArmText`'s.
  */
 export function liveRowSequenceEndLine(ref: string, outcome: LiveRowSequenceOutcome): string {
   const armed = liveRowSequenceEndArmText(outcome)
-  return `${head(ref)}: ${describeOutcome(outcome)} — runs=${outcome.runs} kills=${outcome.kills} judged=${outcome.judgedRuns}; ${armed} (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
+  return `${head(ref)}: ${describeOutcome(outcome)} — runs=${outcome.runs} kills=${outcome.kills} judged=${outcome.judgedRuns}; ${armed}`
 }
 
 /**
  * The line when a result arrives after the sequence was stopped:
- *   `[slack] live-row-sequence: <ref>: the <what> answered after the sequence was stopped — its answer is dropped; no further call (b.jg5 SRJ-706)`
+ * `[slack] live-row-sequence: <ref>: the <what> answered after the sequence was stopped — its answer is dropped; no further call`
  */
 export function liveRowSequenceDroppedLine(ref: string, what: string): string {
-  return `${head(ref)}: the ${what} answered after the sequence was stopped — its answer is dropped; no further call (b.jg5 SRJ-706)`
+  return `${head(ref)}: the ${what} answered after the sequence was stopped — its answer is dropped; no further call`
 }
 
 /**
  * The line when a dependency threw; `described` is a redacting describer's
  * output (`describeThrownValue`), never the error:
- *   `[slack] live-row-sequence: <ref>: <what> failed: <described> — the sequence ends without its launch (b.jg5 SRJ-705)`
+ * `[slack] live-row-sequence: <ref>: <what> failed: <described> — the sequence ends without its launch`
  */
 export function liveRowSequenceFailedLine(ref: string, what: string, described: string): string {
-  return `${head(ref)}: ${what} failed: ${described} — the sequence ends without its launch (b.jg5 SRJ-705)`
+  return `${head(ref)}: ${what} failed: ${described} — the sequence ends without its launch`
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,7 +1198,7 @@ type StepEnd = OutcomeBody | undefined
 type GetAnswer = { readonly finished: boolean } | { readonly end: OutcomeBody }
 
 /**
- * Run one live-row sequence (SRJ-705, SRJ-706, SRJ-717) for `request`,
+ * Run one live-row sequence for `request`,
  * through `deps`, until it launches, ends or `stop` is set; see the module
  * comment for the steps. Answers the outcome after its end line, with the
  * retry cause it armed. Never throws or rejects, and leaves no timer of its
@@ -1242,11 +1239,11 @@ export async function runLiveRowSequence(
 
   /**
    * The stop that drops an answer arriving after it: a teardown or shutdown
-   * stop. A stop for P's latch (the latch's set observer, SRJ-502)
+   * stop. A stop for P's latch (the latch's set observer)
    * drops nothing: the answer is handled as for a latched P (the sequence's
    * own latching call included), and `halted()` ends the sequence before its
    * next call. Nor does a no-launch request's stop for its hold's end
-   * (SRJ-811): the answer is acted on, and `halted()` ends the wait before
+   * the answer is acted on, and `halted()` ends the wait before
    * its next call.
    */
   const dropStop = (): LiveRowSequenceStopReason | undefined =>
@@ -1279,8 +1276,8 @@ export async function runLiveRowSequence(
   /**
    * Wait until G past the launch start `launchStartedAt` names (raw), through
    * `armPendingRowWait` (`src/pending-row.ts`: never early, with the G
-   * accessor read at every fire; SRJ-406, never from `started_at`); ends
-   * early (false) once stopped. Never ends early (SRJ-210: waiting too short
+   * accessor read at every fire, never from `started_at`); ends
+   * early (false) once stopped. Never ends early (waiting too short
    * never leads to a destructive step): a G accessor that throws or answers
    * NaN while arming arms nothing, and the arm is tried again after
    * `LIVE_ROW_SEQUENCE_GRACE_REARM_MS` on the clock, until it arms or the
@@ -1310,7 +1307,7 @@ export async function runLiveRowSequence(
         try {
           armed = armPendingRowWait(deps.clock, launchStartedAt, deps.graceMs, () => settle(true))
         } catch (err) {
-          // SRJ-210: G could not be read while arming; the wait is not ended, the arm is tried again.
+          // G could not be read while arming; the wait is not ended, the arm is tried again.
           // Name and message only: a stack would put absolute file paths on the line.
           let described = 'unknown'
           try {
@@ -1341,7 +1338,7 @@ export async function runLiveRowSequence(
           return
         }
         if (armed === PENDING_ROW_WAIT_NOT_ARMED) {
-          // Not reached: step 2 read a launch start; a row with none has no wait (SRJ-408).
+          // Not reached: step 2 read a launch start; a row with none has no wait.
           settle(true)
           return
         }
@@ -1368,30 +1365,29 @@ export async function runLiveRowSequence(
   }
 
   /**
-   * The retry cause an end arms with (SRJ-301, SRJ-717), or none. A step-6
+   * The retry cause an end arms with, or none. A step-6
    * launch whose result is no success ends without the launch and arms with
-   * the other-end cause (SRJ-301, SRJ-112, SRJ-113), unless P latched or is
-   * held on `ErrInvalidFlags` (SRJ-207), the result says the server is
+   * the other-end cause, unless P latched or is
+   * held on `ErrInvalidFlags`, the result says the server is
    * stopping, or the launch's
    * `ErrTmuxSessionCreate` armed the timer in pending-only mode itself
-   * (SRJ-112, SRJ-113, SRJ-409: pending-only unless another cause holds); an
+   * (pending-only unless another cause holds); an
    * arm the launch's own refusal handling made already keeps its due time. A
    * reuse collision at step 6, and a collision of the plain spawn after the
-   * `resume`'s `ErrSpawnNotFound`, arm the collision cause (SRJ-112,
-   * SRJ-111, SRJ-705); a `resume`'s `ErrSpawnNotResumable` whose re-read found a lost
+   * `resume`'s `ErrSpawnNotFound`, arm the collision cause; a `resume`'s `ErrSpawnNotResumable` whose re-read found a lost
    * race arms the lost-race cause, and one whose re-read found the row
-   * `pending` the other-end cause (SRJ-710). A step 6 that made no launch
+   * `pending` the other-end cause. A step 6 that made no launch
    * because P reached the restart cap while the sequence ran arms nothing
-   * (b.4q8): the cap stopped P's retry timer.
+   * the cap stopped P's retry timer.
    */
   const armCauseFor = (body: OutcomeBody): LiveRowSequenceArmCause | undefined => {
     if (!request.launches) return undefined
-    // SRJ-301, SRJ-706: a sequence stopped by teardown or shutdown arms nothing, whatever its last step answered.
+    // a sequence stopped by teardown or shutdown arms nothing, whatever its last step answered.
     if (stop.reason !== undefined) return undefined
     switch (body.kind) {
       case LIVE_ROW_OUTCOME_LAUNCHED:
         if (liveRowLaunchSucceeded(body.result)) return undefined
-        // SRJ-502, SRJ-207, SRJ-205: a latch or a hold stops P's retry timer, and a stop ends the server.
+        // a latch or a hold stops P's retry timer, and a stop ends the server.
         if (body.result.action === LIVE_ROW_LAUNCH_RESULT_LATCHED || body.result.action === LIVE_ROW_LAUNCH_RESULT_HELD) {
           return undefined
         }
@@ -1405,7 +1401,7 @@ export async function runLiveRowSequence(
         if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE) {
           return latchedNow() ? undefined : LIVE_ROW_ARM_LOST_RACE
         }
-        // b.4q8: at the restart cap P's retry timer is stopped; nothing is armed.
+        // at the restart cap P's retry timer is stopped; nothing is armed.
         if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_CAPPED) return undefined
         break
       case LIVE_ROW_OUTCOME_ROW_FINISHED:
@@ -1424,7 +1420,7 @@ export async function runLiveRowSequence(
     return latchedNow() ? undefined : LIVE_ROW_ARM_ENDED
   }
 
-  /** Step 1's or step 4's kill: the SRJ-316 rule, then the kill through the bounded retry, then its outcome by class. */
+  /** Step 1's or step 4's kill: the rule, then the kill through the bounded retry, then its outcome by class. */
   const killStep = async (step: 1 | 4): Promise<StepEnd> => {
     const stopped = halted()
     if (stopped) return stopped
@@ -1455,25 +1451,25 @@ export async function runLiveRowSequence(
     log(liveRowSequenceKillLine(ref, step, retried))
     const droppedBy = dropStop()
     if (droppedBy !== undefined && retried.end !== KILL_RETRY_END_STOPPED && retried.end !== KILL_RETRY_END_HOLD_ENDED) {
-      // SRJ-706: the kill answered after the stop; its answer is dropped:
+      // the kill answered after the stop; its answer is dropped:
       // no latch, no alert, no arm. Tries the keep-going check stopped go on
       // below to their log-only alert (`stopped`), which posts nothing; tries
       // an old-life wait's hold's end ended go on to their success, whose
-      // survivor version is raised (SRJ-702, SRJ-811: the hold's end wins
+      // survivor version is raised (the hold's end wins
       // over a stop in the same window).
       log(liveRowSequenceDroppedLine(ref, `step ${step} kill`))
       return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy }
     }
     const { outcome } = retried
     if (killLetsNextStepRun(outcome)) {
-      // SRJ-702, SRJ-704: a survivor version is raised before the next step.
+      // a survivor version is raised before the next step.
       raiseKillAlert(retried)
       return halted()
     }
     if (killRetryStopped(retried)) {
-      // SRJ-513, SRJ-502: a between-try read that latched the row's persona ends as a latch.
+      // a between-try read that latched the row's persona ends as a latch.
       const latched = stop.reason === undefined && (retried.end === KILL_RETRY_END_READ_LATCHED || latchedNow())
-      // SRJ-702: the stop's cause, when the sequence's own stop or P's latch
+      // the stop's cause, when the sequence's own stop or P's latch
       // (the keep-going check's other stop) ended the tries.
       const stoppedBy = stop.reason ?? (latched ? LIVE_ROW_STOP_LATCHED : undefined)
       raiseKillAlert(retried, stoppedBy === undefined ? undefined : liveRowStopCauseText(stoppedBy))
@@ -1487,17 +1483,17 @@ export async function runLiveRowSequence(
     }
     let latched = false
     const latching = outcome.errorClass === AD_ERROR_CLASS_CONFLICT || outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME
-    // SRJ-110: the no-launch form latches nothing; its starter routes the answer.
+    // the no-launch form latches nothing; its starter routes the answer.
     if (latching && request.launches) {
       latched = await deps.latchOnKillOutcome(key, outcome, lastRead, ref)
       const stoppedBy = dropStop()
       if (stoppedBy !== undefined) {
-        // SRJ-706: stopped while the latch ran; nothing follows it.
+        // stopped while the latch ran; nothing follows it.
         log(liveRowSequenceDroppedLine(ref, `step ${step} kill's latch`))
         return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stoppedBy }
       }
     }
-    // SRJ-702, SRJ-704: the ordinary version follows the outcome's own handling.
+    // the ordinary version follows the outcome's own handling.
     raiseKillAlert(retried)
     return { kind: LIVE_ROW_OUTCOME_ABORTED, step, errorClass: outcome.errorClass, latched }
   }
@@ -1616,7 +1612,7 @@ export async function runLiveRowSequence(
     } catch {
       facts = undefined
     }
-    // SRJ-805: the store is read again here, so a key recorded while the
+    // the store is read again here, so a key recorded while the
     // sequence ran ends in a reuse as one recorded at its start does.
     const decision = decideLiveRowLaunchKind({
       keepsConversation: request.keepsConversation,
@@ -1628,12 +1624,12 @@ export async function runLiveRowSequence(
     const answer = await deps.launch(key, decision.kind, lastRead, ref, stop, request.retiredAtStart, request.belowCapAtStart)
     const droppedBy = dropStop()
     if (droppedBy !== undefined) {
-      // SRJ-706: the launch ran to its end; its result is dropped.
+      // the launch ran to its end; its result is dropped.
       log(liveRowSequenceDroppedLine(ref, 'step 6 launch'))
       return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy }
     }
     if (answer.kind === LIVE_ROW_OUTCOME_NOT_LAUNCHED) {
-      // SRJ-710, SRJ-706: a re-read after `ErrSpawnNotResumable` that
+      // a re-read after `ErrSpawnNotResumable` that
       // latched P ends the sequence as any latch does, with nothing armed.
       if (answer.reason === LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED) {
         return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED }
@@ -1694,7 +1690,7 @@ export async function runLiveRowSequence(
     log(liveRowSequenceFailedLine(ref, 'a step', describeThrownValue(err)))
     const droppedBy = dropStop()
     if (droppedBy !== undefined) {
-      // SRJ-706: the failure arrived after the stop; it is dropped like any answer.
+      // the failure arrived after the stop; it is dropped like any answer.
       log(liveRowSequenceDroppedLine(ref, 'failed step'))
       return finish({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy })
     }
@@ -1703,7 +1699,7 @@ export async function runLiveRowSequence(
 }
 
 // ---------------------------------------------------------------------------
-// The registry (SRJ-706, SRJ-811)
+// The registry
 // ---------------------------------------------------------------------------
 
 /** The start entry started the sequence; it runs in the background. */
@@ -1730,9 +1726,9 @@ export type LiveRowSequenceAttemptRunner = <T>(key: string, run: () => Promise<T
 /**
  * Runs `run` outside every launch or recovery attempt (production:
  * `runOutsideAttempts` in `src/unavailable-retry.ts`), and settles with its
- * result: a no-launch request's run (an old-life wait, SRJ-811), so no call
+ * result: a no-launch request's run (an old-life wait), so no call
  * it makes is taken as one of its starter's attempt or arms a retry timer for
- * its old key by the attempt rule (SRJ-1512). Injected, as the attempt runner is.
+ * its old key by the attempt rule. Injected, as the attempt runner is.
  */
 export type LiveRowSequenceOutsideAttemptRunner = <T>(run: () => Promise<T>) => Promise<T>
 
@@ -1766,7 +1762,7 @@ export interface LiveRowSequenceStartOptions {
 /** One server's live-row sequences: at most one per instance id, and at most one ending in a launch per persona. */
 export interface LiveRowSequenceRegistry {
   /**
-   * Start a sequence for `request` without awaiting it (SRJ-706, SRJ-811).
+   * Start a sequence for `request` without awaiting it.
    * Answers `started` when nothing runs on the request's instance id and, for
    * a request that ends in a launch, no other such request runs for its
    * persona (the sequence's first call comes after this answer);
@@ -1781,11 +1777,11 @@ export interface LiveRowSequenceRegistry {
   start(request: LiveRowSequenceRequest, options?: LiveRowSequenceStartOptions): LiveRowSequenceStartAnswer
   /**
    * Stop persona `key`'s running sequence that ends in a launch, with
-   * `reason` (SRJ-706): its stop signal is set before this returns, so it
+   * `reason`: its stop signal is set before this returns, so it
    * makes no further call and holds no timer once its call in flight, if
    * any, has returned. A no-launch request keyed by `key` is not stopped here
    * (`stopNoLaunch`): a latch or a persona's stop never stops an old-life
-   * wait (SRJ-811). Resolves true once the sequence has settled (that call
+   * wait. Resolves true once the sequence has settled (that call
    * returned and its end logged), so a caller that awaits it waits for the
    * call in flight as it waits for a launch in flight; false at once when
    * none runs. Never rejects.
@@ -1793,7 +1789,7 @@ export interface LiveRowSequenceRegistry {
   stop(key: string, reason: LiveRowSequenceStopReason): Promise<boolean>
   /**
    * Stop the no-launch request running on `instanceId` (an old-life wait,
-   * SRJ-811), with `reason`: its hold's end (`hold-ended`), or the teardown
+   *), with `reason`: its hold's end (`hold-ended`), or the teardown
    * of the last persona waiting on its hold (`teardown`). A request that ends
    * in a launch on that id is never stopped here. Resolves true once it has
    * settled; false at once when no no-launch request runs there. Never rejects.
@@ -1844,26 +1840,26 @@ interface RegisteredSequence {
 
 /**
  * The line when a start is refused:
- *   `[slack] live-row-sequence: <ref>: not started for <id> — <a sequence already runs | the server is shutting down> (b.jg5 SRJ-706)`
+ * `[slack] live-row-sequence: <ref>: not started for <id> — <a sequence already runs | the server is shutting down>`
  */
 export function liveRowSequenceNotStartedLine(ref: string, instanceId: string, answer: Exclude<LiveRowSequenceStartAnswer, typeof LIVE_ROW_START_STARTED>): string {
   const why =
     answer === LIVE_ROW_START_CLOSED
       ? 'the server is shutting down; no sequence starts'
       : 'a sequence already runs for this persona or instance id; nothing more is started'
-  return `${head(ref)}: not started for ${renderId(instanceId)} — ${why} (b.jg5 SRJ-706)`
+  return `${head(ref)}: not started for ${renderId(instanceId)} — ${why}`
 }
 
 /**
  * The line when a stop is asked of a running sequence:
- *   `[slack] live-row-sequence: <ref>: stop asked — <reason>; no further call (b.jg5 SRJ-706)`
+ * `[slack] live-row-sequence: <ref>: stop asked — <reason>; no further call`
  */
 export function liveRowSequenceStopAskedLine(ref: string, reason: LiveRowSequenceStopReason): string {
-  return `${head(ref)}: stop asked — ${describeStopReason(reason)}; no further call (b.jg5 SRJ-706)`
+  return `${head(ref)}: stop asked — ${describeStopReason(reason)}; no further call`
 }
 
 /**
- * Build one server's live-row sequence registry (SRJ-706, SRJ-811). Holds its
+ * Build one server's live-row sequence registry. Holds its
  * state in the returned object only; reads, starts and schedules nothing when
  * built. Each entry is keyed by its instance id and records its key and
  * whether it ends in a launch; it is removed when its sequence settles,
@@ -1899,7 +1895,7 @@ export function createLiveRowSequenceRegistry(options: LiveRowSequenceRegistryOp
       // Always awaited, so the sequence's first call comes after the start entry answered.
       await Promise.resolve()
       const run = (): Promise<LiveRowSequenceOutcome> => runLiveRowSequence(request, sequenceDeps, entry.stop)
-      // SRJ-811, SRJ-1512: a no-launch request runs outside every attempt, so
+      // a no-launch request runs outside every attempt, so
       // nothing it meets is taken as an attempt's for its old key.
       outcome = entry.launches ? await runAttempt(entry.key, run) : await runOutside(run)
     } catch (err) {

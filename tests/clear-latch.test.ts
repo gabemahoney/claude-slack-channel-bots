@@ -1,5 +1,5 @@
 /**
- * clear-latch.test.ts — `clear-latch` (b.jg5 SRJ-509, SRJ-510): the server's
+ * clear-latch.test.ts — `clear-latch`: the server's
  * `POST /clear-latch` route, the `server.port` record and their wiring in
  * src/server.ts, and the command's lines, exit codes and request (`createCli`,
  * src/cli.ts).
@@ -14,7 +14,7 @@
  *   retry, is tests/conflict-latch.test.ts's.
  * - The record: write, read and removal in the test's own `mkdtempSync`
  *   directory standing in for the state directory, and the write-failure
- *   line (b.jg5 SRJ-1014) for a failed write whose error carries a fake
+ * line for a failed write whose error carries a fake
  *   token and URL: the path, the safe code and the redacted message.
  * - The wiring: `main()` cannot run in a test, so "the record holds the
  *   server's PID and bound port while it runs and is gone after shutdown" and
@@ -24,7 +24,7 @@
  *   members `clear-latch` must not use throw (the loaders, spawns, kill,
  *   director verbs, the credentials runner, the client init, `unlinkSync`), a
  *   recording dial with scripted answers, a `createFakeClock` clock and the
- *   same stand-in state directory: one pin table of SRJ-509's seven lines
+ * same stand-in state directory: one pin table of the contract seven lines
  *   and its usage-text entry, one
  *   case per row with its exact stderr line and exit code, the PID-checked
  *   `server.port`, the bounded wait, an in-process run against the real
@@ -43,7 +43,7 @@
  *
  * Every value compared (the route, the log lines, the causes, the cap, the
  * command's lines and wait) comes from src/; the response bodies are the
- * handler's own literals, and SRJ-509's lines are pinned once, in the pin
+ * handler's own literals, and lines are pinned once, in the pin
  * table. Every argument that must never be repeated is built with
  * `fakeToken`, and `assertNoLeak` runs over every captured line and response
  * body.
@@ -145,7 +145,7 @@ const A_KEY = personaKey(A_NAME)
 const B_NAME = 'reviewer'
 const B_KEY = personaKey(B_NAME)
 
-/** A target no persona has, shaped like a token typed by mistake (SRJ-509: never repeated). */
+/** A target no persona has, shaped like a token typed by mistake (never repeated). */
 const TYPO_TOKEN = fakeToken(BOT_TOKEN_PREFIX, 'typo')
 
 let dir: string
@@ -290,7 +290,7 @@ async function holdResettingListener(port = 0): Promise<ResettingListener> {
 }
 
 // ---------------------------------------------------------------------------
-// The route (SRJ-510)
+// The route
 // ---------------------------------------------------------------------------
 
 describe('POST /clear-latch: the route', () => {
@@ -486,7 +486,7 @@ describe('POST /clear-latch: the route', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The server.port record (SRJ-510)
+// The server.port record
 // ---------------------------------------------------------------------------
 
 describe('the server.port record', () => {
@@ -548,7 +548,7 @@ describe('the server.port record', () => {
     )
   })
 
-  test('a write that fails is rethrown, and the line server.ts logs for it (the record\'s path and the error through describeThrownValue) holds the safe code and the redacted message; nothing leaks (SRJ-1014)', () => {
+  test('a write that fails is rethrown, and the line server.ts logs for it (the record\'s path and the error through describeThrownValue) holds the safe code and the redacted message; nothing leaks', () => {
     // No stack frame, so the described error is known in full.
     const err = Object.assign(new Error(`write refused (${sentinelInMessage('port')})`), { code: 'EACCES', detail: LEAK_SENTINEL, stack: undefined })
     let thrown: unknown
@@ -848,7 +848,7 @@ describe('src/server.ts wires the route and the record (static audit)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The command (SRJ-509; SRJ-510's CLI half): `createCli(…).clearLatch` over a
+// The command (CLI half): `createCli(…).clearLatch` over a
 // local `CliDeps`, with `dir` as the server's state directory.
 // ---------------------------------------------------------------------------
 
@@ -936,7 +936,7 @@ function snapshotTree(root: string): Record<string, string | null> {
  * `exit` records and throws `ExitSignal`; every member `clear-latch` must not
  * use throws and is recorded. Fails unless the run ended in exactly one
  * `exit`, used no such member and left `dir` byte-for-byte unchanged
- * (`clear-latch` writes and removes nothing; SRJ-510, hatch A3).
+ * (`clear-latch` writes and removes nothing, design A3).
  */
 async function runClearLatch(args: readonly string[], o: CliRunOptions = {}): Promise<CliRun> {
   const before = snapshotTree(dir)
@@ -1019,7 +1019,7 @@ async function runClearLatch(args: readonly string[], o: CliRunOptions = {}): Pr
   return { code, stderr: stderr.slice(firstLine), dials, reads, exitAt, sleeps }
 }
 
-describe('clear-latch: the command (SRJ-509; SRJ-510\'s CLI half)', () => {
+describe('clear-latch: the command (CLI half)', () => {
   let errorSpy: ReturnType<typeof spyOn>
 
   beforeEach(() => {
@@ -1037,8 +1037,8 @@ describe('clear-latch: the command (SRJ-509; SRJ-510\'s CLI half)', () => {
     for (const clock of clocks) expect(clock.pending()).toEqual([])
   })
 
-  describe('SRJ-509\'s lines, pinned once', () => {
-    // The only place the lines are written out: each row is the SRD's text
+  describe('lines, pinned once', () => {
+    // The only place the lines are written out: each row is the contract's text
     // with its placeholders filled from the case. Every other case compares
     // with the exported line or builder.
     test.each([
@@ -1321,7 +1321,7 @@ describe('clear-latch: the command (SRJ-509; SRJ-510\'s CLI half)', () => {
     test.each([
       ['received before the wait ran out, its clear still waiting in P\'s turn', false],
       ['received only after the wait ran out', true],
-    ])('a clear %s still runs once, and the CLI ended on "did not confirm" (SRJ-510; hatch A3)', async (_label, late) => {
+    ])('a clear %s still runs once, and the CLI ended on "did not confirm" (hatch A3)', async (_label, late) => {
       writeRunningServer()
       const gate = Promise.withResolvers<boolean>()
       const received = Promise.withResolvers<void>()
@@ -1540,7 +1540,7 @@ describe('dialClearLatch: the production dial', () => {
     expect(await answered).toEqual({ status: 200, body: truncated })
   })
 
-  test('a proxy in HTTP_PROXY and http_proxy, with no NO_PROXY, is not used: the dial still reaches the real handler on 127.0.0.1 (SRJ-510)', async () => {
+  test('a proxy in HTTP_PROXY and http_proxy, with no NO_PROXY, is not used: the dial still reaches the real handler on 127.0.0.1', async () => {
     // The runtime's own environment (`Bun.env`): other suites replace `process.env` with a plain
     // copy, which the runtime no longer reads. A variable is unset by blanking it before the
     // delete: a bare delete leaves the runtime's `fetch` on the old proxy, poisoning later suites.

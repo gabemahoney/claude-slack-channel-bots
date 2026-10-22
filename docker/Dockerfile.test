@@ -9,7 +9,7 @@ COPY tests /tests
 COPY testplans /test-repo/testplans
 
 # Consolidated into one RUN: each separate RUN incurs ~25s of docker-daemon
-# container-lifecycle overhead on this host (per b.5oh). Chained chmods +
+# container-lifecycle overhead on this host. Chained chmods +
 # useradd + chown pay that overhead once.
 # Precreate the regular-file target for the read-only performance lock mount.
 RUN chmod +x /usr/local/bin/entrypoint.sh && \

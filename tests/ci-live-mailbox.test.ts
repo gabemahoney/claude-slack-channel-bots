@@ -1,6 +1,6 @@
 /**
  * ci-live-mailbox.test.ts — Tests for the /ci-live runner's test mailbox
- * (bug b.1cx): `ci-live/lib/mailbox.ts` (mailbox.json, the mail.tm client,
+ * `ci-live/lib/mailbox.ts` (mailbox.json, the mail.tm client,
  * the extractors, the wait for Slack's code and the `mailbox` command's
  * report), `ci-live/lib/sign-in-code.ts` (answering Slack's emailed sign-in
  * code from the mailbox) and the dry run's stub mailbox

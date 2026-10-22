@@ -19,7 +19,7 @@ export function auditCodexDelivery(options: {
   journal: any[]; completedPrefix?: any[]; rollout: CodexRollout; path: string; instance: string; shim: string; events: any[]; key: string; log: string
 }) {
   const { rollout, path, instance, events } = options
-  // b.omv SR-14.2: queue startup compacts delivered items during the real
+  // queue startup compacts delivered items during the real
   // harness crash. Audit their actual earlier journal alongside the surviving
   // suffix; never restore these historical records to the production queue.
   const prefix = options.completedPrefix ?? []

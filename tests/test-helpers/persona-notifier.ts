@@ -1,6 +1,6 @@
 /**
  * test-helpers/persona-notifier.ts — The real per-persona notifier over stub
- * Slack clients (b.av2 SR-7.2, SR-13.4 with b.deo SRI-1203).
+ * Slack clients (with).
  *
  * `makeNotifierHarness(config, opts?)` builds the real `createPersonaNotifier`
  * with one `makeStubSlack` stub per persona of `config`, so a test can assert
@@ -18,7 +18,7 @@
  *   notice starts no real timer and its retries run only when the test moves
  *   the clock (`h.clock.runNext()`, `h.clock.advance(ms)`).
  *
- * - the notifier's startup-errors recorder (b.jg5 SRJ-1003, SRJ-1013) is the
+ * - the notifier's startup-errors recorder is the
  *   real `recordStartupError` over `h.logDir`, a `startup-errors` directory
  *   under the harness's own temp root, which is made at the first entry
  *   written (a harness that writes none makes no directory) and removed by
@@ -53,7 +53,7 @@
  *
  * `makeNoticeAlertsRig(h, opts)` composes the notice episodes, the
  * kill-failure alerts and the unclassified-error episodes over harness `h`
- * as `main()` composes them (b.jg5 SRJ-704, SRJ-1003, SRJ-1013): the
+ * as `main()` composes them: the
  * episodes hand their posts to `h.notifier` and read its teardown window, on
  * `h.clock` (the one fake clock the harness's hold runs on too); a persona
  * counts as configured while it is in `h.personas`; each log-only route is
@@ -70,7 +70,7 @@
  * tests/test-helpers/persona-routing-managed.ts) build their notifier with
  * it; the harness passes its `getPersonaConfig` option through.
  *
- * Isolation (b.av2 SR-13.2): no module-scope state, no real timers, no token
+ * Isolation: no module-scope state, no real timers, no token
  * literal, and no I/O but the startup-errors entries, written only under the
  * harness's own temp root (a test that can open a teardown window calls
  * `h.cleanup()` after it). The stubs' failures carry `leakMarker` when given.
@@ -130,11 +130,11 @@ export interface NotifierStackDeps {
   isDryRun?: () => boolean
   /** Every line the resolver, the hold and the notifier log. */
   log(line: string): void
-  /** The notifier's startup-errors recorder (b.jg5 SRJ-1003). Default: none installed. */
+  /** The notifier's startup-errors recorder. Default: none installed. */
   recordStartupError?: PersonaStartupErrorRecorder
   /**
    * The configuration in effect, read by the destination resolver at each
-   * attempt (b.deo SRI-201), as `src/server.ts` passes it.
+   * attempt, as `src/server.ts` passes it.
    */
   getPersonaConfig: () => DestinationConfig
 }
@@ -185,7 +185,7 @@ function flattenEntryText(text: string): string {
 
 /**
  * The parsed entry the persona teardown window writes for a notice of
- * `persona` (b.jg5 SRJ-1003, SRJ-1013): `classLabel` (default
+ * `persona`: `classLabel` (default
  * `persona-teardown-notice`) and the text `personaTeardownNoticeEntryText`
  * builds from the persona reference (`persona "<name>" (key=<key>)`), the
  * occasion (default "raised during its teardown") and `text`, on one line.
@@ -204,7 +204,7 @@ export function teardownNoticeEntry(
 
 /**
  * The one log line the persona teardown window writes for a notice of
- * `persona` whose entry was written (b.jg5 SRJ-1003, SRJ-1002): the builder
+ * `persona` whose entry was written: the builder
  * `personaTeardownNoticeWrittenLine`, with `teardownNoticeEntry`'s arguments
  * and defaults (the occasion "raised during its teardown", the class
  * `persona-teardown-notice`).
@@ -460,7 +460,7 @@ export interface NoticeAlertsRigOptions {
 
 /**
  * The server's notice composition over notifier harness `h`, as `main()`
- * builds it (b.jg5 SRJ-704, SRJ-1003, SRJ-1013): the notice episodes hand
+ * builds it: the notice episodes hand
  * their posts to `h.notifier` and read its teardown window, on `h.clock`;
  * the kill-failure alerts and the unclassified-error episodes run over those
  * episodes, a persona configured while it is in `h.personas`; each log-only

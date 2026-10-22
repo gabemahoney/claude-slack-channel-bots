@@ -8,7 +8,7 @@ export function requireEvidence(value: unknown, reason: string): asserts value {
   if (!value) throw new Error(reason)
 }
 
-/** AC15 alone waits for the submitted part's completed native answer before
+/** Multipart delivery waits for the submitted part's completed native answer before
  * the production engine may send its successor. Other scenarios retain the
  * ordinary working-row delivery policy. No expected answer reaches the bot. */
 export function codexMultipartSender<P extends { text?: string; no_enter?: boolean; key?: string }, R>(
@@ -16,8 +16,8 @@ export function codexMultipartSender<P extends { text?: string; no_enter?: boole
 ) {
   let pending: string | undefined, completing = false
   return async (params: P): Promise<R> => {
-    requireEvidence(!completing, 'AC15 successor preceded completed acknowledgement')
-    if (params.text !== undefined) requireEvidence(pending === undefined, 'AC15 replaced an unacknowledged part')
+    requireEvidence(!completing, 'successor preceded completed acknowledgement')
+    if (params.text !== undefined) requireEvidence(pending === undefined, 'replaced an unacknowledged part')
     const result = await send(params)
     if (params.text !== undefined && params.no_enter) pending = params.text
     else if (params.key === 'Enter' && pending !== undefined) {
@@ -65,7 +65,7 @@ export function codexAICases(ac: number) {
     expected: tagReadback(row.typed, `case_${String(i + 1).padStart(2, '0')}`) }))
 }
 
-/** Exactly decision 20's E6 generator: fixed seed, vocabulary, punctuation
+/** Exactly  generator: fixed seed, vocabulary, punctuation
  * and natural spaces at 1700/3400/5000. No expected body in model files. */
 export function codexAC15Body() {
   let state = 20261017
@@ -83,12 +83,12 @@ export function codexAC15Body() {
     }
     body += span
   }
-  requireEvidence(Buffer.byteLength(body) === 5000, 'AC15 body recipe drift')
+  requireEvidence(Buffer.byteLength(body) === 5000, 'body recipe drift')
   return body
 }
 
 export function codexAC15Message() {
-  // Preserve E6's actual DM metadata width, hence its reviewed part boundaries.
+  // Preserve actual DM metadata width, hence its reviewed part boundaries.
   const ts = '1792000100.000100'
   return { chat_id: 'D0AIAC15', channel_name: 'dm', message_id: ts, user: 'stub-u0aiac15', user_id: 'U0AIAC15', ts, via: 'dm', text: codexAC15Body() }
 }
@@ -124,21 +124,21 @@ export function assertCodexAnswer(rollout: CodexRollout, window: CodexWindow, ex
 }
 
 export function assertCodexMultipart(parts: string[], body: string, completions: { answer: string; receipt: { offset: number }; completion: { offset: number } }[]) {
-  requireEvidence(parts.length === 3 && completions.length === 3, 'AC15 requires exactly three parts and completed acknowledgements')
+  requireEvidence(parts.length === 3 && completions.length === 3, 'requires exactly three parts and completed acknowledgements')
   const bodies = parts.map((part, i) => {
-    requireEvidence(Buffer.byteLength(part) <= 1900, 'AC15 part exceeds byte limit')
-    const tag = tagReadback(part, 'AC15')
-    requireEvidence(tag.attributes.part === `${i + 1}/3`, 'AC15 part identity/order differs')
+    requireEvidence(Buffer.byteLength(part) <= 1900, 'part exceeds byte limit')
+    const tag = tagReadback(part, "AC15")
+    requireEvidence(tag.attributes.part === `${i + 1}/3`, 'part identity/order differs')
     if (i < 2) {
       let ack: any
-      try { ack = JSON.parse(completions[i]!.answer) } catch { throw new Error('AC15 nonfinal acknowledgement missing') }
-      requireEvidence(stable(ack) === stable({ status: 'received' }), 'AC15 nonfinal acknowledgement differs')
-      requireEvidence(completions[i]!.completion.offset < completions[i + 1]!.receipt.offset, 'AC15 acknowledgement did not precede next part')
+      try { ack = JSON.parse(completions[i]!.answer) } catch { throw new Error('nonfinal acknowledgement missing') }
+      requireEvidence(stable(ack) === stable({ status: 'received' }), 'nonfinal acknowledgement differs')
+      requireEvidence(completions[i]!.completion.offset < completions[i + 1]!.receipt.offset, 'acknowledgement did not precede next part')
     }
     return tag.body
   })
-  requireEvidence(JSON.stringify(bodies.map(s => Buffer.byteLength(s))) === '[1700,1700,1600]', 'AC15 reviewed part boundaries differ')
-  requireEvidence(bodies.join('') === body && Buffer.byteLength(body) === 5000, 'AC15 reassembly differs')
+  requireEvidence(JSON.stringify(bodies.map(s => Buffer.byteLength(s))) === '[1700,1700,1600]', 'reviewed part boundaries differ')
+  requireEvidence(bodies.join('') === body && Buffer.byteLength(body) === 5000, 'reassembly differs')
 }
 
 export function assertCodexDuplicateTakeins(rollout: CodexRollout, first: CodexWindow, second: CodexWindow) {

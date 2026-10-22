@@ -1,6 +1,6 @@
 /**
  * ci-live-redaction.test.ts — Tests for the /ci-live runner's output hygiene
- * (bug b.1cx): the one redactor every log line and report goes through
+ * the one redactor every log line and report goes through
  * (`ci-live/lib/redact.ts`), the error describer (`lib/errors.ts`), the run
  * log (`lib/log.ts`), the results writer (`lib/results.ts`) and the closing
  * secrecy scan (`lib/secrecy-scan.ts`).

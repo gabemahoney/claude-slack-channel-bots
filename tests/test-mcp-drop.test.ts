@@ -1,4 +1,4 @@
-/** b.omv SR-14.1 / AC102: fault-route admission, startup capture and real SDK disconnect. */
+/** fault-route admission, startup capture and real SDK disconnect. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -165,7 +165,7 @@ function listener(start: PersonaConfig) {
   })
 }
 
-describe('production startup gate and transport lifecycle (b.omv SR-14.1)', () => {
+describe('production startup gate and transport lifecycle', () => {
   test.each([undefined, false, true])('startup value %p controls existence and the one warning', async enabled => {
     const http = listener({ ...config, test_mcp_drop_endpoint: enabled })
     const response = await http.fetch(request())

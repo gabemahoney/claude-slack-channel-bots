@@ -1,6 +1,6 @@
 /**
  * ci-live-checks.test.ts — Tests for the /ci-live runner's check framework
- * and the checks a dry run runs for real (bug b.1cx): `ci-live/checks/
+ * and the checks a dry run runs for real: `ci-live/checks/
  * framework.ts` (skips, blocking, the verdict), `checks/list.ts` (the plan
  * order, the HOST and Teardown checks), `lib/host-state.ts` (the read-only
  * snapshot of the production side of the host), Part 1.4's install and
@@ -79,13 +79,13 @@
  *   the retired removal line of Checks 27 and 28, the start summary's ending
  *   and Check 1's line, the not-live row states and a teardown's kept-row
  *   line), each built by or pinned against `src/`'s own builder, never a
- *   literal (b.jg5 SRJ-1111, SRJ-1510, SRJ-1015, SRJ-715);
+ * literal;
  * - a start's summary line must end with the current ending, src/'s builder's
- *   with every count 0 (b.f2b's not-reconnected bucket, then SRJ-1015's five
+ * with every count 0 (not-reconnected bucket, then five
  *   counts): an ending that stops before them, any non-zero count in it and
  *   `10 failed` are findings, and the plan quotes the same ending, Check 1's
  *   line and both checks' retired removal lines;
- * - a removed persona's row is kept and not live (b.jg5 SRJ-715, AC 77):
+ * - a removed persona's row is kept and not live:
  *   Check 27 runs a guarded `agent-director find-missing` before it judges
  *   the rows, expects D's row kept and not live and A, B and C's unchanged,
  *   and exactly one teardown line for D's kill that succeeded with its row
@@ -94,25 +94,25 @@
  *   row when Check 27 found it (whether or not D connected in Check 25);
  * - the guarded restart and Check 28's start after the reboot wait for each
  *   persona's Session connected line, not only the summary: a persona that
- *   connects after the summary (parked on a `working` row, b.f2b) is no
+ * connects after the summary (parked on a `working` row) is no
  *   finding, and one that never connects is;
  * - the test human's `createChannel` (a public channel; only its `C…` ID is
  *   returned), `kick` (`not_in_channel` is done), `archive`
  *   (`already_archived` is done) and `conversationsOf` (archived channels
  *   included: no `exclude_archived`) send exactly their Slack method and
  *   parameters, and any other refusal is a `HumanCallError` naming only the
- *   method and a safe code (b.deo SRI-1205);
+ * method and a safe code;
  * - Part 11's invited-channel checks run 30 to 34 after every Check 28 entry
  *   and before 29a and 29b; `--only 30,31,32,33,34` runs them with the
  *   pre-flight, install, setup, Check 1, 29a, Teardown and HOST, and
  *   `--only` naming any of 30 to 33 runs Check 34 too (`undoes`); 29a hands
  *   the stored-choice file to both scans with the other state files, and an
- *   absent one is no finding (b.deo SRI-1501, SRI-1506);
+ * absent one is no finding;
  * - Check 30's switch-on edit, from the state setup and Check 1 leave and
  *   from Part 9's (with and without D), loads in fungible mode and keeps
  *   every persona's destination, changing only the switch and the `invited`
  *   sections; nothing the runner writes before Check 30 names the switch
- *   (b.deo SRI-1501, SRI-1507);
+ * ;
  * - against a scripted workspace and a scripted server that writes the
  *   package's own previews and apply lines: Check 30 starts only from the
  *   applied, nothing-pending, running state and records its config copy and
@@ -128,8 +128,7 @@
  *   file for its own), kicks C's app before it archives the channel, still
  *   undoes the channel when the config half throws, and FAILs while C is in
  *   any channel, archived ones included; Checks 31–33 never pass without
- *   Check 30's channel; none of 30–34 declares a prompt (b.deo SRI-1502 to
- *   SRI-1506);
+ * Check 30's channel; none of 30–34 declares a prompt;
  * - the tool-call reader, run by bash over a fixture transcript, prints
  *   exactly its projection of each CSCB session tool call (refused, accepted
  *   or with no result yet) and nothing of an accepted call's content;
@@ -137,13 +136,13 @@
  *   container's first boot allows the server's MCP tools as a group with no
  *   bypass mode (docker/live/entrypoint.sh, read as text);
  * - Part 11's copied texts, setting names and tool names each match src/'s
- *   builder or constant (b.deo SRI-1501);
+ * builder or constant;
  * - the plan agrees with the runner: its Results header is the one results.md
  *   renders from `RESULTS_COLUMNS` (every row with as many cells), Check
  *   29a's `F=(…)` list is `CHECK29A_STATE_FILES` in order, Part 2.1's
  *   `toolcalls` runs the runner's jq filter, and each text, command and
  *   placeholder Part 11 quotes is the runner's, rendered with the plan's
- *   placeholders (b.deo SRI-1111).
+ * placeholders.
  *
  * No docker, network or real host state: the container, the host probes, the
  * test human's session and the clock are fakes. The real teardown lines (and
@@ -600,7 +599,7 @@ function startSummary(ending: string): string {
 /**
  * A start from the record, each line with the seconds after the start at which
  * it is logged. A and B connect before the summary. C's launch waits on a
- * `working` row (b.f2b), so the summary leaves it out and C connects `cAt` s
+ * `working` row, so the summary leaves it out and C connects `cAt` s
  * after the start (never, when null).
  */
 function startLog(cAt: number | null, ending = START_SUMMARY_END): [number, string][] {
@@ -612,7 +611,7 @@ function startLog(cAt: number | null, ending = START_SUMMARY_END): [number, stri
     [80, connected('a')],
     [90, connected('b')],
     [100, startSummary(ending)],
-    [100, '[slack] startupSessionManager: 1 persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles (b.f2b)'],
+    [100, '[slack] startupSessionManager: 1 persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles'],
     ...(cAt === null ? [] : [[cAt, connected('c')] as [number, string]]),
   ]
 }
@@ -834,7 +833,7 @@ describe('the check list', () => {
     expect(PLAN_CHECKS.filter((c) => c.blocking).map((c) => c.id)).toEqual(['preflight', 'install', 'setup', '1', '24-teardown'])
   })
 
-  test("Part 11's invited-channel checks run 30 to 34 in order, after every Check 28 entry and before the closing 29a and 29b (b.deo SRI-1501)", () => {
+  test("Part 11's invited-channel checks run 30 to 34 in order, after every Check 28 entry and before the closing 29a and 29b", () => {
     const ids = PLAN_CHECKS.map((c) => c.id)
     const at = (id: string) => ids.indexOf(id)
     expect(INVITED_CHECKS.map((c) => c.id)).toEqual(['30', '31', '32', '33', '34'])
@@ -852,7 +851,7 @@ describe('the check list', () => {
     expect(runs(['workspace', 'claude'], ['30', '31', '32', '33', '34'])).toEqual(['preflight', 'install', 'setup', '1', '30', '31', '32', '33', '34', '29a', 'teardown', 'HOST'])
   })
 
-  test.each([['30,31'], ['30'], ['31'], ['32'], ['33'], ['34']])('--only %s runs Check 34 too, which undoes what Checks 30 to 33 leave (b.deo SRI-1506)', (only) => {
+  test.each([['30,31'], ['30'], ['31'], ['32'], ['33'], ['34']])('--only %s runs Check 34 too, which undoes what Checks 30 to 33 leave', (only) => {
     const selected = only.split(',')
     expect(runs(['workspace', 'claude'], selected)).toEqual(['preflight', 'install', 'setup', '1', ...selected.filter((id) => id !== '34'), '34', '29a', 'teardown', 'HOST'])
   })
@@ -945,12 +944,12 @@ describe('host-state', () => {
     const p = probe({ stdout: '{"spawns":[{"instance_id":"cscb_prod_a"}]}' }, { stdout: 'slack_bot_prod_a\nwork\n' }, config)
     const snap = await snapshotHost(p.deps, '/home/tester')
     expect(hostStorePath('/home/tester')).toBe('/home/tester/.config/agent-director/state.db')
-    // b.jg5 SRJ-1301: the HOST check's probes are exactly these two whole argvs, in order; a changed or extra probe fails.
+    // the HOST check's probes are exactly these two whole argvs, in order; a changed or extra probe fails.
     expect(p.argv).toEqual([
       ['agent-director', '--store-path', hostStorePath('/home/tester'), 'list', '--label', 'service=cscb'],
       ['tmux', 'ls', '-F', '#{session_name}'],
     ])
-    // b.fc4, b.smv: the new default's config.json, then 0.14.0's and 0.15.0's, then the oldest (a host not yet moved); only reads.
+    // the new default's config.json, then 0.14.0's and 0.15.0's, then the oldest (a host not yet moved); only reads.
     expect([p.read, p.ports]).toEqual([
       [
         '/home/tester/.config/claude-slack-channel-bots/config.json',
@@ -1292,7 +1291,7 @@ describe('Check 29a', () => {
     })
   })
 
-  test('the stored-choice file goes to both scans with the other state files (b.deo SRI-1501, SRI-401); absent, it is accepted, and a credential in it fails the check', async () => {
+  test('the stored-choice file goes to both scans with the other state files; absent, it is accepted, and a credential in it fails the check', async () => {
     expect(CHECK29A_STATE_FILES).toEqual([
       '"$S/config.json"',
       '"$S/config.json.last-applied"',
@@ -1338,7 +1337,7 @@ describe('Check 29a', () => {
 const A = DRY_RUN_IDS.bots.a
 const COORD = DRY_RUN_IDS.coordination
 
-/** Metadata-only typed-delivery evidence (b.omv SR-13.6). */
+/** Metadata-only typed-delivery evidence. */
 function deliveryLog(kind: 'message-received' | 'message-delivered', letter: PersonaLetter, channel: string, ts: string, sender = DRY_RUN_IDS.humanUserId): string {
   return `[slack] ${kind}: persona="persona_${letter}" (key=persona_${letter}) source=slack chat_id=${JSON.stringify(channel)} ts=${JSON.stringify(ts)} sender_id=${JSON.stringify(sender)}`
 }
@@ -1409,7 +1408,7 @@ describe('Check 9: one mention is delivered once', () => {
     const twice = await run([raw('message', false), raw('message', false), raw('app_mention', false)])
     expect([twice.status, twice.reason]).toEqual(['FAIL', 'RAW lines for the message: message=2 app_mention=1, not one each'])
   })
-  // b.omv SR-13.6: RAW events and a reply cannot replace correlated final evidence.
+  // RAW events and a reply cannot replace correlated final evidence.
   test.each((['message-received', 'message-delivered'] as const).flatMap((kind) => [
     [kind, 'missing', ''],
     [kind, 'duplicated', [deliveryLog(kind, 'a', COORD, HUMAN_TS), deliveryLog(kind, 'a', COORD, HUMAN_TS)].join('\n')],
@@ -1424,7 +1423,7 @@ describe('Check 9: one mention is delivered once', () => {
   })
 })
 
-// b.omv SR-13.6: the live observer must prove durable acceptance and recover
+// the live observer must prove durable acceptance and recover
 // the original FIFO head; a successful later Slack probe is not that proof.
 describe('Check 24: typed-delivery waiting and original-item recovery', () => {
   const TS = '1700000100.000001'
@@ -1589,7 +1588,7 @@ describe('Check 24: typed-delivery waiting and original-item recovery', () => {
   })
 })
 
-describe('live typed-delivery evidence reads the durable queue (b.omv SR-13.6)', () => {
+describe('live typed-delivery evidence reads the durable queue', () => {
   let home: string
   let queue: Awaited<ReturnType<typeof makeQueue>>
   const TS = '1700000100.000001'
@@ -1658,7 +1657,7 @@ ${script}`], { env: hostSafeChildEnv(home, { tools: ['bash', 'jq'] }) })
   })
 })
 
-describe('DM and edit checks consume typed-delivery evidence (b.omv SR-13.6)', () => {
+describe('DM and edit checks consume typed-delivery evidence', () => {
   const TS = '1700000100.000001'
   const DM = 'D0DRYDM001'
   test.each([undefined, 'message-received', 'message-delivered'] as const)('a disabled DM with %p evidence is judged from metadata', async (kind) => {
@@ -2363,7 +2362,7 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
   })
 
   test("the plan's Check 12 gives the runner's stop, terminal stop and lift texts", () => {
-    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'live-acceptance.md'), 'utf-8')
     const section = plan.slice(plan.indexOf('### Check 12:'), plan.indexOf('## Part 5:')).replace(/\s+/g, ' ')
     expect(section).toContain(`"@CSCB Test A @CSCB Test B ${CHECK12_STOP}"`)
     expect(section).toContain(`type "${CHECK12_PANE_STOP}"`)
@@ -2382,7 +2381,7 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
     )
     expect(start.text).toContain(`mentions \`<@${B.userId}>\``)
     expect(start.text).toContain(`mention you as \`<@${A.userId}>\``)
-    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'live-acceptance.md'), 'utf-8')
     const section = plan.slice(plan.indexOf('### Check 12:'), plan.indexOf('## Part 5:')).replace(/\s+/g, ' ')
     expect(section).toContain(`post: "${check12Start({ coordination: '<COORDINATION_CHANNEL_ID>', aUserId: '<A_BOT_USER_ID>', bUserId: '<B_BOT_USER_ID>' })}"`)
   })
@@ -2393,7 +2392,7 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
   })
 })
 
-describe('live agent control through AD (b.ou8)', () => {
+describe('live agent control through AD', () => {
   test.each([true, false])('Check 7 keeps the recovery and Slack reply oracle (reply=%s)', async reply => {
     const clock = virtualClock()
     const workspace = scriptedHuman(clock, reply ? {
@@ -2606,8 +2605,8 @@ describe("the start's lines: the summary's ending (Part 2.3's Expected items)", 
   const endingUpTo = (n: number) => START_SUMMARY_END.split(', ').slice(0, n).join(', ')
 
   test.each([
-    ['the ending before b.f2b, with no not-reconnected bucket', endingUpTo(2)],
-    ["the ending before b.jg5 SRJ-1015, without its five counts (stopping at not reconnected)", endingUpTo(3)],
+    ['the ending before, with no not-reconnected bucket', endingUpTo(2)],
+    ["the ending before, without its five counts (stopping at not reconnected)", endingUpTo(3)],
     ['a persona left running but not reconnected', startSummaryEnding({ notReconnected: 1 })],
     ['a persona not brought up', startSummaryEnding({ notBroughtUp: 1 })],
     ['a failed launch', startSummaryEnding({ failed: 1 })],
@@ -2642,7 +2641,7 @@ describe('the guarded restart waits for every persona to connect, not only for t
     return { ctx: makeCtx({ mode: 'real', clock, container }), clock }
   }
 
-  test('a persona that connects 55 s after the summary (parked on a working row, b.f2b) is waited for: no finding', async () => {
+  test('a persona that connects 55 s after the summary (parked on a working row) is waited for: no finding', async () => {
     const run = restartRun(155)
     const at = run.clock.now()
     const f = new Findings()
@@ -2703,7 +2702,7 @@ describe('Check 28 step 5: the start after the reboot waits for every persona to
   /** The findings that step 5's start lines give. */
   const START_FINDING = /^step 5|Session connected line|persona-start line|last-applied record|startupSessionManager complete|start summary|start failure/
 
-  test('C, parked on a working row (b.f2b), connects 55 s after the summary: step 5 waits for it, so its start lines give no finding', async () => {
+  test('C, parked on a working row, connects 55 s after the summary: step 5 waits for it, so its start lines give no finding', async () => {
     const r = await check28.run(rebootedRun(155))
     expect((r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))).toEqual([])
     expect(r.evidence).toContain(startSummary(START_SUMMARY_END))
@@ -2822,7 +2821,7 @@ describe("the start's lines: a persona not brought up that came up after its bri
 })
 
 // ---------------------------------------------------------------------------
-// A removed persona's row: killed and kept, not live (b.jg5 SRJ-715, AC 77)
+// A removed persona's row: killed and kept, not live
 // ---------------------------------------------------------------------------
 
 /** A row as `rows` reads it. */
@@ -2836,7 +2835,7 @@ function row(letter: PersonaLetter, state = 'idle'): Row {
  * scripts its kill): the pending preview the reload controller wrote, and the
  * server log lines from the edit on. A kill that fails waits between its
  * tries on the run's clock, which is moved until the apply settles. The run's
- * captured artifacts are leak-checked (b.av2 SR-13.2).
+ * captured artifacts are leak-checked.
  */
 async function realRemovalOfD(agentDirector: StubClientOptions = {}): Promise<{ preview: string[]; logs: string[] }> {
   const h = makeReloadHarness()
@@ -2921,7 +2920,7 @@ describe("the row helpers: one live row per persona, a removed persona's row kep
 
   test.each<[string, Row[], Row[], string[]]>([
     ["D's row still live", BEFORE, [...LIVE, row('d')], ['cscb_persona_d is idle: kept but live, not ended or missing']],
-    ["D's row deleted (the expectation before SRJ-715)", BEFORE, LIVE, ['0 cscb_persona_d row(s) after the removal, not one kept row']],
+    ["D's row deleted (the expectation before)", BEFORE, LIVE, ['0 cscb_persona_d row(s) after the removal, not one kept row']],
     ["D's kept row carrying another persona label", BEFORE, [...LIVE, { ...row('d', 'ended'), persona: personaName('c') }], ["cscb_persona_d's persona label is persona_c, not persona_d"]],
     ['A not live after the removal', BEFORE, [row('a', 'missing'), row('b'), row('c'), row('d', 'ended')], ['cscb_persona_a is missing, not live']],
     ["B's persona label changed", BEFORE, [row('a'), { ...row('b'), persona: personaName('a') }, row('c'), row('d', 'ended')], ["cscb_persona_b's persona label changed from persona_b to persona_a"]],
@@ -3029,7 +3028,7 @@ describe("Check 27: D's row is killed and kept, judged after a guarded find-miss
     expect(findingsOf(r)).toEqual(['agent-director find-missing did not run (exit 90)', 'rows after the removal: cscb_persona_d is idle: kept but live, not ended or missing'])
   })
 
-  test("the control: D's row deleted (the expectation before SRJ-715) is a finding", async () => {
+  test("the control: D's row deleted (the expectation before) is a finding", async () => {
     const r = await check27.run(removalRun(await realRemovalOfD(), { deleted: true }).ctx)
     expect(findingsOf(r)).toEqual([
       'rows after the removal: cscb_persona_a, cscb_persona_b, cscb_persona_c',
@@ -3039,7 +3038,7 @@ describe("Check 27: D's row is killed and kept, judged after a guarded find-miss
 
   test("the control: src's lines for a kill that failed after its tries give no kept-row line, which is a finding", async () => {
     const r = await check27.run(removalRun(await realRemovalOfD(failingKill())).ctx)
-    expect(findingsOf(r)).toEqual(['no clean teardown complete line for D', "not one teardown line for D's kill that succeeded, its row kept (b.jg5 SRJ-715)"])
+    expect(findingsOf(r)).toEqual(['no clean teardown complete line for D', "not one teardown line for D's kill that succeeded, its row kept"])
   })
 })
 
@@ -3094,7 +3093,7 @@ describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept 
 
 describe('no live check passes against a silent workspace', () => {
   // A gesture that only undoes its setup passes when the setup never ran: nothing to restore.
-  // Check 34 undoes what Check 30 did (b.deo SRI-1506).
+  // Check 34 undoes what Check 30 did.
   const UNDO_GESTURES = ['24-teardown', '34']
   const live = PLAN_CHECKS.filter((c) => c.needs.includes('workspace') && !c.skip && !UNDO_GESTURES.includes(c.id))
 
@@ -3136,7 +3135,7 @@ describe('no live check passes against a silent workspace', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Check 30's switch-on edit, and the switch absent before it (b.deo SRI-1501, SRI-1507)
+// Check 30's switch-on edit, and the switch absent before it
 // ---------------------------------------------------------------------------
 
 /** `config` edited by the jq `filter`, as `editConfig` runs it in the container: jq over the file, its output the new file. */
@@ -3186,7 +3185,7 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
     expect([channelModeOf(before), channelModeOf(after)]).toEqual(['declarative', 'fungible'])
     const json = JSON.parse(edited) as Record<string, unknown> & { personas: Record<string, unknown>[] }
     expect(json.personas.map((p) => typeof (p[INVITED_KEY] as Record<string, unknown> | undefined)?.[INVITED_PERMISSION_PROMPTS_KEY])).toEqual(input.personas.map(() => 'string'))
-    // T1's one destination rule, from the configuration in effect before and after.
+    // one destination rule, from the configuration in effect before and after.
     expect(after.personas.map((p) => [p.key, personaDestinationOf(after, p)])).toEqual(before.personas.map((p) => [p.key, personaDestinationOf(before, p)]))
     // The only differences: the switch and the invited sections.
     const { [SWITCH_KEY]: switchValue, ...rest } = json
@@ -3212,7 +3211,7 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
   })
 })
 
-describe('the switch is absent before Check 30 (b.deo SRI-1507)', () => {
+describe('the switch is absent before Check 30', () => {
   test('the configuration setup writes, and D\'s entry, carry no switch and no invited section', () => {
     const config = buildLiveConfig(DRY_RUN_IDS) as unknown as Record<string, unknown>
     expect(Object.keys(config)).not.toContain(SWITCH_KEY)
@@ -3233,7 +3232,7 @@ describe('the switch is absent before Check 30 (b.deo SRI-1507)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The test human's channel gestures (b.deo SRI-1502, SRI-1505, SRI-1506)
+// The test human's channel gestures
 // ---------------------------------------------------------------------------
 
 describe("the test human's createChannel, kick and archive", () => {
@@ -3432,7 +3431,7 @@ function expectNoPromptDeclared(guard: ReturnType<typeof recordingGuard>): void 
   expect([guard.expected, guard.sweeps]).toEqual([[], 0])
 }
 
-describe('Check 34: restores the config and the channel, and leaves C in no channel, archived ones included (b.deo SRI-1506)', () => {
+describe('Check 34: restores the config and the channel, and leaves C in no channel, archived ones included', () => {
   let home = ''
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'ci-live-check34-'))
@@ -3632,7 +3631,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
   })
 })
 
-describe('Checks 30 to 32 against a scripted workspace and server (b.deo SRI-1502 to SRI-1504)', () => {
+describe('Checks 30 to 32 against a scripted workspace and server', () => {
   let home = ''
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'ci-live-check30-'))
@@ -3966,7 +3965,7 @@ describe("the tool-call reader (toolCalls) over a persona's transcript", () => {
   })
 })
 
-describe("Check 33: after the kick, reply and fetch_messages are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded (b.deo SRI-1505, SRI-603)", () => {
+describe("Check 33: after the kick, reply and fetch_messages are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded", () => {
   const CH = RUN_CHANNEL.id
   const POST = '1700000050.000001'
   const DM = 'D0DRYDM001'
@@ -4389,8 +4388,8 @@ describe('expected texts match the package', () => {
     const line = startupSummaryLine(3, { ...zero, freshSpawned: 3 })
     const ending = startupSummaryEnding(zero)
     // The checks' clean ending and Check 1's whole line are the package's
-    // (b.jg5 SRJ-1111, SRJ-1015): every bucket, b.f2b's not-reconnected and
-    // SRJ-1015's five counts included, in its order and words.
+    // every bucket not-reconnected and
+    // five counts included, in its order and words.
     expect(START_SUMMARY_END).toBe(ending)
     expect(line.endsWith(`, ${START_SUMMARY_END}`)).toBe(true)
     expect(COMPLETE_FIRST_START).toBe(line)
@@ -4422,7 +4421,7 @@ describe('expected texts match the package', () => {
   })
 
   test("the plan quotes the same texts: every summary ending it gives ends with the builder's last count, it holds the clean ending, Check 1's line and both checks' retired removal lines, and no 'will be destroyed'", () => {
-    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'live-acceptance.md'), 'utf-8')
     const quoted = [...plan.matchAll(/`([^`]*\d+ failed, \d+ not brought up[^`]*)`/g)].map((m) => m[1]!)
     // The builder's last segment (`<n> fresh as retired keys`), its count any number.
     const lastWords = START_SUMMARY_END.split(', ').at(-1)!.replace(/^\d+ /, '')
@@ -4437,7 +4436,7 @@ describe('expected texts match the package', () => {
   // -------------------------------------------------------------------------
   // Part 11's copies (invited-checks.ts, live-config.ts, helpers.ts), each
   // pinned once against src/'s builder or constant, called with the checks'
-  // own values (b.deo SRI-1501).
+  // own values.
   // -------------------------------------------------------------------------
 
   const CH = 'C0RUNCH001'
@@ -4592,7 +4591,7 @@ describe('expected texts match the package', () => {
   // -------------------------------------------------------------------------
 
   describe('the plan agrees with the runner', () => {
-    const PLAN = 'testplans/b.yko/b.yko.md'
+    const PLAN = 'testplans/live-acceptance.md'
     const plan = readFileSync(join(import.meta.dir, '..', PLAN), 'utf-8')
     /** The plan's section under the heading `match` names. */
     const block = (match: HeadingMatch): string => requiredSection(plan, match, PLAN)
@@ -4816,7 +4815,7 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
   const REPO = join(import.meta.dir, '..')
   const containerHelpers = readFileSync(join(REPO, 'docker', 'live', 'cscb-live-helpers.sh'), 'utf-8')
   const planHelpers = (() => {
-    const plan = readFileSync(join(REPO, 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const plan = readFileSync(join(REPO, 'testplans', 'live-acceptance.md'), 'utf-8')
     const start = plan.indexOf("cat > ~/cscb-live-helpers.sh <<'EOF'\n")
     return plan.slice(start, plan.indexOf('\nEOF\n', start) + 1)
   })()

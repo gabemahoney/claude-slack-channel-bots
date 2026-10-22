@@ -1,6 +1,6 @@
 /**
  * credentials-command.test.ts — the setup wizard's credentials command
- * (b.av2 SR-12, SR-1.4 part): `claude-slack-channel-bots credentials
+ * (part): `claude-slack-channel-bots credentials
  * <persona>`, which runs the packaged `scripts/write-credentials.sh` for the
  * persona's `credentials_file`.
  *

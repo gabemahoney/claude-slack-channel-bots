@@ -1,7 +1,7 @@
 /**
  * persona-destination-hold.test.ts — Hold and retry a persona's prompts and
- * notices while its destination fails (b.av2 SR-7.1 failure part, SR-3.2,
- * SR-3.3, SR-10.3; b.deo SRI-702, SRI-906).
+ * notices while its destination fails (failure part,
+ *).
  *
  * The hold's policy is proven here once, so the poller and notifier suites
  * need only one representative case each:
@@ -9,7 +9,7 @@
  *   payload error) opens one episode with one `persona-destination-failed`
  *   line naming the persona, the step, the code and, for `missing_scope` on
  *   the open, `im:write`;
- * - retries follow the persona's own SR-3.2 schedule (5 s doubling to 300 s,
+ * - retries follow the persona's own schedule (5 s doubling to 300 s,
  *   no give-up, never shorter than `retryAfter`), log nothing and move only
  *   the due time;
  * - the first success logs one cleared line, resets the schedule and delivers
@@ -36,13 +36,13 @@
  * - payload errors and refusals open no episode; no token reaches a line;
  * - in fungible mode, a fungible destination channel the app is not in
  *   (`not_in_channel`, `channel_not_found`) holds and retries both prompts
- *   and notices, entered either way, as any refused destination (b.deo
- *   SRI-702, beside b.av2 SR-7.1); its opening and cleared lines are what
+ * and notices, entered either way, as any refused destination (
+ * , beside); its opening and cleared lines are what
  *   `destinationFailedCause` and `destinationClearedCause` build with the
  *   setting in force (`destinationSettingOf`), naming
  *   `invited.permission_prompts` beside `destination=<value>`, while each
  *   cause given the declarative setting is the declarative line unchanged
- *   (b.deo SRI-906, beside b.av2 SR-10.3).
+ * (beside).
  *
  * Built over the real destination resolver, one `makeStubSlack` stub per
  * persona (leak marker on) and a fake clock. `afterEach` cancels every
@@ -245,7 +245,7 @@ describe('an episode: held, retried on backoff, one start line, one cleared line
   }
   test.each<[string, EpisodeRow]>([
     [
-      'AC 44: missing_scope from conversations.open on a dm destination is held, retried on backoff, logged once naming im:write, and delivered once to the opened DM after the cause clears',
+      'missing_scope from conversations.open on a dm destination is held, retried on backoff, logged once naming im:write, and delivered once to the opened DM after the cause clears',
       {
         persona: () => D,
         queue: 'open',
@@ -1069,7 +1069,7 @@ describe('failures that open no episode', () => {
 // Isolation and secrecy
 // ---------------------------------------------------------------------------
 
-describe('isolation (SR-3.3) and secrecy (SR-10.3)', () => {
+describe('isolation and secrecy', () => {
   test('persona D in a missing_scope episode neither delays, holds nor logs for E or C: theirs post at once through their own clients', async () => {
     stick(D, 'open', 'missing_scope')
     await deliver(D, 'd1')
@@ -1109,7 +1109,7 @@ describe('isolation (SR-3.3) and secrecy (SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A fungible destination channel the app is not in (b.deo SRI-702, SRI-906)
+// A fungible destination channel the app is not in
 // ---------------------------------------------------------------------------
 
 /** The configuration in effect in each mode, as `destinationSettingOf` reads it. */
@@ -1121,7 +1121,7 @@ function destinationLine(p: Persona, cause: string): string {
   return formatPersonaDiagnostic({ class: PERSONA_DESTINATION_FAILED, name: p.name, key: p.key, index: p.index, cause })
 }
 
-describe('fungible mode: a destination channel the app is not in is held and retried (b.deo SRI-702, SRI-906)', () => {
+describe('fungible mode: a destination channel the app is not in is held and retried', () => {
   /** The fungible destination channel, which the persona's app was never invited to. */
   const F_CHANNEL = 'C0EPH0001'
   /** A persona loaded in fungible mode, its destination `invited.permission_prompts` = `F_CHANNEL`. */
@@ -1264,7 +1264,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
   )
 })
 
-describe('the causes given the declarative setting are the declarative lines (b.deo SRI-906, b.av2 SR-10.3)', () => {
+describe('the causes given the declarative setting are the declarative lines', () => {
   test('each cause reproduces the declarative line byte for byte, and C\'s logged episode lines are those', async () => {
     const at: NamedDestination = { setting: destinationSettingOf(DECLARATIVE_MODE), destination: 'C0CEE0001' }
     const was: DestinationFailedAt = { step: 'chat.postMessage', code: 'not_in_channel' }

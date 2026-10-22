@@ -1,15 +1,15 @@
 /**
  * setup-wizard-skill.test.ts — structural checks on the setup wizard skill
- * (skills/setup-slack-channel-bots/SKILL.md), b.av2 SR-12.
+ * (skills/setup-slack-channel-bots/SKILL.md).
  *
  * The wizard is Markdown that Claude follows, so these tests pin the parts that
  * decide its behaviour by key term, not its prose, and find sections by their
- * title text, never by step number: the per-persona step covers every SR-12
+ * title text, never by step number: the per-persona step covers every
  * item, tokens never go through the chat, the running-server rename is
  * explained, token rotation confirms a pending change without a restart, and
  * the wizard's cross-references resolve.
  *
- * The channel modes (b.deo SRI-1109, AC 43): the channel-mode step sits after
+ * The channel modes: the channel-mode step sits after
  * "Detect the server state" and before "Add a persona", explains fungible
  * mode, suggests declarative, states the mode in force on an existing install,
  * collects every persona's section in the switching edit, names both rule sets
@@ -97,7 +97,7 @@ describe('setup wizard: frontmatter', () => {
   })
 })
 
-describe('setup wizard: the per-persona step covers each SR-12 item', () => {
+describe('setup wizard: the per-persona step covers each item', () => {
   const IN_ADD_PERSONA = `${SKILL_FILE}, under "Add a persona",`
   test.each([
     ['Slack app', 'app from the shipped manifest', /slack-app-manifest\.yml/],
@@ -133,7 +133,7 @@ describe('setup wizard: the per-persona step covers each SR-12 item', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The channel modes (b.deo SRI-1109, AC 43)
+// The channel modes
 // ---------------------------------------------------------------------------
 
 /** `value` with every RegExp metacharacter escaped. */
@@ -185,7 +185,7 @@ const DM_ENABLED = `${DM}.${DM_ENABLED_KEY}`
 const DM_CONTACT = `${DM}.${DM_CONTACT_KEY}`
 const INVITED_DESTINATION = FUNGIBLE_DESTINATION_SETTING
 
-/** The three steps whose order SRI-1109 fixes, by title. */
+/** The three steps whose order fixes, by title. */
 const MODE_STEP_ORDER = ['Detect the server state', 'Channel mode', 'Add a persona']
 
 /** Which of `MODE_STEP_ORDER`'s `###` steps `doc` holds, in the order it holds them. */
@@ -235,7 +235,7 @@ function modePart(text: string, lead: string): string {
 /** A pinned element: its label, the part of the wizard it is read in, and its phrase (matched on `flat` text). */
 type Element = [label: string, scope: (doc: string) => string, pattern: RegExp]
 
-/** SRI-1109's first bullet: the channel-mode step, found by title, element by element. */
+/** first bullet: the channel-mode step, found by title, element by element. */
 const CHANNEL_MODE_ELEMENTS: Element[] = [
   ['names the switch, which picks the mode for every persona', channelModeStep, rx`\`${MODE_SWITCH}\` picks the channel mode for every persona`],
   [
@@ -289,7 +289,7 @@ const CHANNEL_MODE_ELEMENTS: Element[] = [
 ]
 
 /**
- * SRI-1109's second bullet: "Add a persona" in fungible mode, read in the
+ * second bullet: "Add a persona" in fungible mode, read in the
  * fungible or either-mode part of each sub-step.
  */
 const FUNGIBLE_ELEMENTS: Element[] = [
@@ -338,7 +338,7 @@ const FUNGIBLE_ELEMENTS: Element[] = [
 
 /**
  * The declarative parts of "Channels" and "Permission prompts", read on their
- * own: the SR-12 cases above read the whole sub-step, which the fungible
+ * own: the cases above read the whole sub-step, which the fungible
  * sentences alone would also pass.
  */
 const DECLARATIVE_ELEMENTS: Element[] = [
@@ -501,7 +501,7 @@ describe('setup wizard: the setting names the channel-mode cases read are loader
   })
 })
 
-describe('setup wizard: the channel-mode step (b.deo SRI-1109, AC 43)', () => {
+describe('setup wizard: the channel-mode step', () => {
   test('the step comes after "Detect the server state" and before "Add a persona"', () => {
     expect(modeStepOrder(skill)).toEqual(MODE_STEP_ORDER)
   })
@@ -511,7 +511,7 @@ describe('setup wizard: the channel-mode step (b.deo SRI-1109, AC 43)', () => {
   })
 })
 
-describe('setup wizard: "Add a persona" in fungible mode (b.deo SRI-1109, AC 43)', () => {
+describe('setup wizard: "Add a persona" in fungible mode', () => {
   test.each(FUNGIBLE_ELEMENTS)('%s', (_label, scope, pattern) => {
     expect(flat(scope(skill))).toMatch(pattern)
   })
@@ -614,7 +614,7 @@ function sentenceUnits(text: string): string[] {
 const NEGATION_BEFORE = /\b(?:never|don't|do not|must not)\s+(?:(?:ask|tell|have|let|get)\s+(?:the\s+)?(?:user|operator)\s+(?:to\s+)?)?$/i
 
 /**
- * SR-12: the phrasings the pre-persona wizard used to take tokens in chat, and
+ * the phrasings the pre-persona wizard used to take tokens in chat, and
  * variants of them. None may come back. A negatable phrasing is allowed only
  * as a prohibition (`NEGATION_BEFORE`). Keeping a token in the shell or on a
  * command line (an exported token variable, "`export` lines", a bearer token
@@ -724,9 +724,9 @@ describe('setup wizard: cross-references resolve', () => {
     "## A persona can't open a DM: re-install its app to gain `im:write`",
     '### `persona-config-dir-unresolvable`',
     '### `persona-credentials-refused`',
-    // b.deo SRI-1109: named by quoted title in "Channels" and "How the change takes effect".
+    // named by quoted title in "Channels" and "How the change takes effect".
     '## A persona is silent in a channel its app was invited to',
-    // bug b.jpc: named by quoted title in "Reusing an existing app".
+    // named by quoted title in "Reusing an existing app".
     '## The message archive shows channel IDs: re-install each app to gain `channels:read` and `groups:read`',
   ])('the debugging-skill entry the wizard points to exists: %s', (heading) => {
     const title = heading.replace(/^#+ /, '')

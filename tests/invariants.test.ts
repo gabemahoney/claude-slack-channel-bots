@@ -1,24 +1,24 @@
 import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
 /**
- * invariants.test.ts — SR-0.3 / SR-8.6 grep-style + type-level tripwires.
+ * invariants.test.ts — grep-style + type-level tripwires.
  *
- *   - SR-0.3 no-shellout: no CSCB source file invokes `agent-director` as
+ * - no-shellout: no CSCB source file invokes `agent-director` as
  *     a subprocess. The only legal reference is `from 'agent-director'`
  *     (typed import).
- *   - SR-8.6 request_id is `number`: a compile-time tripwire that fails
+ * - request_id is `number`: a compile-time tripwire that fails
  *     closed if the library widens the type.
- *   - b.av2 SR-1.2, b.deo SRI-202 the section not in force is never read:
+ * - the section not in force is never read:
  *     outside a fixed list of `src/` files, no file reads a persona's
  *     `channels`, `permission_prompts`, `invited`, `fungible_destination` or
  *     `sections`; inside it, `src/registry.ts` reads them only in the
  *     posting-scope check and its classifier, `src/persona-routing.ts` only
  *     in the decision's input, `src/persona-destination.ts` only in the one
  *     destination rule.
- *   - b.deo SRI-102 the readers of the resolved forms: `sections` is read
+ * - the readers of the resolved forms: `sections` is read
  *     only by the reload plan; `fungible_destination` only by the one
  *     destination rule, the delivery decision, the routing's input to it and
  *     the reload plan (`src/config.ts` reads it only where it builds it).
- *   - b.av2 SR-7.1, b.deo SRI-701 one destination rule: declared once, in
+ * - one destination rule: declared once, in
  *     `src/persona-destination.ts`; the destination hold, the permission
  *     poller, the persona notifier and the lost-message notice read none of
  *     the persona fields, and the hold's destination reads are calls of the
@@ -53,7 +53,7 @@ import ts from 'typescript'
 import { forEachNode, isWrapper } from './test-helpers/ad-value-reads.ts'
 
 // ---------------------------------------------------------------------------
-// SR-0.3 — no shellout to agent-director
+// no shellout to agent-director
 // ---------------------------------------------------------------------------
 
 function walkSources(dir: string): string[] {
@@ -70,7 +70,7 @@ function walkSources(dir: string): string[] {
   return out
 }
 
-describe('SR-0.3: no-shellout invariant', () => {
+describe('no-shellout invariant', () => {
   test('no src/ file invokes agent-director as a subprocess', () => {
     const srcDir = join(__dirname, '..', 'src')
     const sourceFiles = walkSources(srcDir)
@@ -102,10 +102,10 @@ describe('SR-0.3: no-shellout invariant', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-8.6 — PermissionRequestInfo.request_id is number
+// PermissionRequestInfo.request_id is number
 // ---------------------------------------------------------------------------
 
-describe('SR-8.6: PermissionRequestInfo.request_id type', () => {
+describe('PermissionRequestInfo.request_id type', () => {
   test('request_id is typed as number — fails compile if widened', () => {
     // This is a compile-time tripwire: if the agent-director library
     // widens request_id beyond `number`, this assertion stops compiling.
@@ -126,11 +126,11 @@ describe('SR-8.6: PermissionRequestInfo.request_id type', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-1.2, SR-7.1; b.deo SRI-102, SRI-202, SRI-701 — the reader audit
+// the reader audit
 // ---------------------------------------------------------------------------
 
 /**
- * The persona fields the audit follows (b.deo SRI-102, SRI-202): the
+ * The persona fields the audit follows: the
  * declarative section (`channels`, `permission_prompts`), the fungible
  * section (`invited`) and the resolved forms (`fungible_destination`,
  * `sections`).
@@ -138,7 +138,7 @@ describe('SR-8.6: PermissionRequestInfo.request_id type', () => {
 const AUDITED_FIELDS = ['channels', 'permission_prompts', 'invited', 'fungible_destination', 'sections'] as const
 type AuditedField = (typeof AUDITED_FIELDS)[number]
 
-/** b.deo SRI-202's fixed list: the only `src/` files that may read an audited field. */
+/** fixed list: the only `src/` files that may read an audited field. */
 const FIXED_READERS: readonly string[] = [
   'config.ts',
   'reload-plan.ts',
@@ -149,17 +149,17 @@ const FIXED_READERS: readonly string[] = [
   'jsonl-persistence-check.ts',
 ]
 
-/** The one destination rule (b.av2 SR-7.1, b.deo SRI-701), declared in `src/persona-destination.ts`. */
+/** The one destination rule, declared in `src/persona-destination.ts`. */
 const ONE_DESTINATION_RULE = 'personaDestinationOf'
 
-/** Where `src/config.ts` builds a persona's resolved forms (b.deo SRI-102): building them is no read. */
+/** Where `src/config.ts` builds a persona's resolved forms: building them is no read. */
 const PERSONA_BUILDER = 'parsePersonaEntry'
 
-/** b.deo SRI-102: the only files that may read `sections` (the reload plan). */
+/** the only files that may read `sections` (the reload plan). */
 const SECTIONS_READERS: readonly string[] = ['reload-plan.ts']
 
 /**
- * b.deo SRI-102: the only files that may read `fungible_destination`: the one
+ * the only files that may read `fungible_destination`: the one
  * destination rule, the delivery decision (its exported channel-delivery
  * function included), the routing's input to the decision and the reload
  * plan, and `src/config.ts`, which builds it.
@@ -167,13 +167,13 @@ const SECTIONS_READERS: readonly string[] = ['reload-plan.ts']
 const FUNGIBLE_DESTINATION_READERS: readonly string[] = ['persona-destination.ts', 'delivery-decision.ts', 'persona-routing.ts', 'reload-plan.ts', 'config.ts']
 
 /**
- * b.deo SRI-701's consumers outside the resolver: the destination hold, the
+ * consumers outside the resolver: the destination hold, the
  * permission poller, the persona notifier and the lost-message notice. None
  * reads an audited field; each goes through the rule.
  */
 const DESTINATION_CONSUMERS: readonly string[] = ['persona-destination-hold.ts', 'permission-poller.ts', 'persona-notifier.ts', 'lost-message.ts']
 
-/** The destination hold (b.av2 SR-7.1, b.deo SRI-701), and its reads of the resolver it is handed. */
+/** The destination hold, and its reads of the resolver it is handed. */
 const DESTINATION_HOLD = 'persona-destination-hold.ts'
 const HOLD_RESOLVER = 'deps.destinations'
 
@@ -191,7 +191,7 @@ interface PlacementRow {
   readonly fields: readonly AuditedField[]
 }
 
-/** b.deo SRI-202, inside the list: the part of each file its reads lie in. */
+/**, inside the list: the part of each file its reads lie in. */
 const PLACEMENT: readonly PlacementRow[] = [
   {
     file: 'registry.ts',
@@ -205,7 +205,7 @@ const PLACEMENT: readonly PlacementRow[] = [
 
 /**
  * A read of a same-named field of a non-persona object, outside the fixed
- * list (b.deo SRI-202): the file, the functions it lies in (outermost first,
+ * list: the file, the functions it lies in (outermost first,
  * joined by ` > `), the read's text, how many reads of that text lie there
  * and why it is no persona read. The reads an entry matches must number
  * exactly its `count`, or the audit fails.
@@ -219,7 +219,7 @@ interface AdmittedRead {
 }
 
 /** Why the stored-choice file's reads are admitted: its per-persona entry's own `channels`. */
-const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file (b.deo SRI-402): its own `channels` map of stored choices, never a persona's"
+const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file: its own `channels` map of stored choices, never a persona's"
 
 const ADMITTED_READS: readonly AdmittedRead[] = [
   { file: 'channel-delivery.ts', within: 'serializeChannelDelivery', read: 'entry.channels', count: 3, reason: STORED_CHOICES_ENTRY },
@@ -228,7 +228,7 @@ const ADMITTED_READS: readonly AdmittedRead[] = [
     within: 'personaEntryOf',
     read: "value['channels']",
     count: 1,
-    reason: "a persona key's entry of the stored-choice file as parsed from JSON (b.deo SRI-402), checked before it is a record",
+    reason: "a persona key's entry of the stored-choice file as parsed from JSON, checked before it is a record",
   },
   { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > set', read: 'existing?.channels', count: 2, reason: STORED_CHOICES_ENTRY },
   { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > drop', read: 'entry.channels', count: 1, reason: STORED_CHOICES_ENTRY },
@@ -468,7 +468,7 @@ function admits(entry: AdmittedRead, read: FieldRead): boolean {
 }
 
 /**
- * b.deo SRI-202, outside the list: each read in a file not on
+ * outside the list: each read in a file not on
  * `fixedReaders` that no entry of `admitted` matches, and each entry whose
  * matched reads do not number exactly its `count`.
  */
@@ -598,7 +598,7 @@ function plantedReads(code: string): { field: AuditedField; form: ReadForm }[] {
   return fieldReads(new Map([['planted.ts', code]]), 'planted.ts').map((r) => ({ field: r.field, form: r.form }))
 }
 
-describe('b.av2 SR-1.2, b.deo SRI-202: the section not in force is never read', () => {
+describe('the section not in force is never read', () => {
   const modules = srcSources()
 
   test('the walk holds every src/ module, and every file the audit names is one', () => {
@@ -628,7 +628,7 @@ describe('b.av2 SR-1.2, b.deo SRI-202: the section not in force is never read', 
   })
 })
 
-describe('b.deo SRI-102: the readers of sections and fungible_destination', () => {
+describe('the readers of sections and fungible_destination', () => {
   const modules = srcSources()
 
   test('sections is read only by the reload plan', () => {
@@ -646,7 +646,7 @@ describe('b.deo SRI-102: the readers of sections and fungible_destination', () =
   })
 })
 
-describe('b.av2 SR-7.1, b.deo SRI-701: one destination rule', () => {
+describe('one destination rule', () => {
   const modules = srcSources()
   const { sources } = auditProgram(modules)
 
@@ -680,7 +680,7 @@ describe('b.av2 SR-7.1, b.deo SRI-701: one destination rule', () => {
   })
 })
 
-describe('b.deo SRI-202: negative controls for the reader audit', () => {
+describe('negative controls for the reader audit', () => {
   test.each([
     ['a property access', 'export const f = (p: P) => p.channels', 'channels', 'property'],
     ['an optional chain', 'export const f = (p?: P) => p?.permission_prompts', 'permission_prompts', 'optional property'],
@@ -768,7 +768,7 @@ describe('b.deo SRI-202: negative controls for the reader audit', () => {
   })
 })
 
-describe('b.av2 SR-7.1, b.deo SRI-701: negative controls for the one-rule checks', () => {
+describe('negative controls for the one-rule checks', () => {
   const resolver = plantedSource(
     [
       'function personaDestinationOf(c: C, p: P) { return p.dm }',

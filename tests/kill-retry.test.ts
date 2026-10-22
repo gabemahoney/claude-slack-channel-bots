@@ -1,7 +1,7 @@
 /**
  * kill-retry.test.ts — the bounded retry of a live row's kill
- * (`src/kill-retry.ts`; b.jg5 SRJ-702, SRJ-110's survivor rule and CONFIG
- * bullet, SRJ-703, SRJ-704's and SRJ-1007's alert decision, SRJ-1014's lines).
+ * (`src/kill-retry.ts`survivor rule and CONFIG
+ * bullet and alert decision lines).
  *
  * Every case runs `runKillRetry` on `createFakeClock`: each try is one
  * checked kill (`checkedKill`) through the stub client's kill queue, and
@@ -15,10 +15,10 @@
  * GONE as no success (`goneIsFailure`, the CLI's teardown) runs the same
  * retry; its GONE answer ends the tries as a failure, beside the server
  * default's session-gone success. The alert decision carries
- * agent-director's descriptions raw by design (T3 redacts at its post), so
+ * agent-director's descriptions raw by design ( redacts at its post), so
  * the leak check covers the log lines, never the decision.
  *
- * An old-life wait's hold-end query (`holdEnded`, b.jg5 SRJ-702, SRJ-811;
+ * An old-life wait's hold-end query (`holdEnded`;
  * option A): asked after each wait, after each read that did not find the
  * row finished and when a last UNAVAILABLE outcome would stand, never for
  * another class or a success; a hold that ends during a try, the read
@@ -179,7 +179,7 @@ interface RunSpec {
   readonly lastRead?: KillRetrySeed
   readonly keepGoing?: () => boolean
   readonly budget?: KillRetryPassBudget
-  /** An old-life wait's hold-end query (b.jg5 SRJ-702, SRJ-811; option A); absent: none. */
+  /** An old-life wait's hold-end query (option A); absent: none. */
   readonly holdEnded?: () => boolean
   /** Told the number of each try once its kill has its answer, before the retry reads it. */
   readonly onKill?: (n: number) => void
@@ -321,11 +321,11 @@ function readOf(step: ReadStep): KillRetryRead {
   return step.kind === 'resolve' ? { kind: KILL_RETRY_READ_STATE, state: step.value.state } : { kind: KILL_RETRY_READ_FAILED, error: step.error }
 }
 
-/** The read line before try `nextTry` of `STUB_INSTANCE_ID`'s kill, by the module's builder (b.jg5 SRJ-1014). */
+/** The read line before try `nextTry` of `STUB_INSTANCE_ID`'s kill, by the module's builder. */
 const readLine = (nextTry: number, step: ReadStep, verdict: KillRetryReadVerdict, lastRead: KillRetrySeed): string =>
   killRetryReadLine(PREFIX, STUB_INSTANCE_ID, nextTry, readOf(step), verdict, lastRead)
 
-/** The kill's UNAVAILABLE forms (b.jg5 SRJ-104), each tried again (SRJ-702). */
+/** The kill's UNAVAILABLE forms, each tried again. */
 const RETRIED_FORMS = unavailableForms(
   ['ErrTmuxKillFailed', 'ErrTmuxKillFailed (naming no survivor)'],
   'ErrTmuxUnresponsive',
@@ -335,11 +335,11 @@ const RETRIED_FORMS = unavailableForms(
 )
 
 // ---------------------------------------------------------------------------
-// The schedule (AC 56)
+// The schedule
 // ---------------------------------------------------------------------------
 
-describe('runKillRetry: the schedule (b.jg5 SRJ-702, AC 56)', () => {
-  test('pin: SRJ-702\'s 3 tries 2 s apart', () => {
+describe('runKillRetry: the schedule', () => {
+  test('pin: 3 tries 2 s apart', () => {
     expect(KILL_RETRY_TRIES).toBe(3)
     expect(KILL_RETRY_SPACING_MS).toBe(2_000)
   })
@@ -425,9 +425,9 @@ describe('runKillRetry: the schedule (b.jg5 SRJ-702, AC 56)', () => {
 // Which outcomes are tried again
 // ---------------------------------------------------------------------------
 
-describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again (b.jg5 SRJ-702, SRJ-110)', () => {
+describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again', () => {
   test.each<[string, () => Error, KillOutcome['kind'], string | undefined]>([
-    ['CONFLICT (never retried as a kill, AC 9)', () => errTmuxSessionConflict('kill', 'not-this-launch'), KILL_OUTCOME_NOT_KILLED, AD_ERROR_CLASS_CONFLICT],
+    ['CONFLICT (never retried as a kill)', () => errTmuxSessionConflict('kill', 'not-this-launch'), KILL_OUTCOME_NOT_KILLED, AD_ERROR_CLASS_CONFLICT],
     ['UNUSABLE NAME', () => errUnusableName(), KILL_OUTCOME_NOT_KILLED, undefined],
     ['CONFIG', () => errConfigMalformed(), KILL_OUTCOME_NOT_KILLED, AD_ERROR_CLASS_CONFIG],
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'kill'), KILL_OUTCOME_NOT_KILLED, AD_ERROR_CLASS_ENVIRONMENT],
@@ -474,7 +474,7 @@ describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again 
     expect(killRetrySeedIsLive(seed)).toBe(live)
   })
 
-  // b.jg5 SRJ-702 (HO rev 23): a tmux server that is exiting after a kill
+  // (HO rev 23): a tmux server that is exiting after a kill
   // ended its last session answers by class.
   test('HO rev 23: a first try\'s ErrTmuxUnresponsive then a second try\'s ErrTmuxNotAvailable ends the tries at once with the ENVIRONMENT outcome standing', async () => {
     const gone = errTmuxNotAvailable(undefined, 'kill')
@@ -488,10 +488,10 @@ describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again 
 })
 
 // ---------------------------------------------------------------------------
-// The read before each further try (AC 84)
+// The read before each further try
 // ---------------------------------------------------------------------------
 
-describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, SRJ-110, AC 84)', () => {
+describe('runKillRetry: one status read before each further try', () => {
   test.each<[string, ReadStep, KillRowFinishedRead]>([
     ['ended', readState('ended'), KILL_ROW_FINISHED_ENDED],
     ['missing', readState('missing'), KILL_ROW_FINISHED_MISSING],
@@ -635,7 +635,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
     expect(r.lines.slice(1)).toEqual([readLine(2, latched, KILL_RETRY_VERDICT_LATCHED, SEED_WAITING), killRetryEndLine(PREFIX, STUB_INSTANCE_ID, r.result)])
   })
 
-  // b.jg5 SRJ-702, SRJ-1014: each bounded retry that the stop rule stops
+  // each bounded retry that the stop rule stops
   // writes one stop line naming the row and why, before the end line.
   test.each<[string, (asks: number) => boolean, string[], number]>([
     ['false after the wait: no read and no further kill', () => false, ['kill'], 0],
@@ -693,10 +693,10 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
 })
 
 // ---------------------------------------------------------------------------
-// The survivor rule and the alert decision (AC 63's half, AC 64)
+// The survivor rule and the alert decision (half)
 // ---------------------------------------------------------------------------
 
-describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702, SRJ-704, SRJ-1007, AC 64)', () => {
+describe('runKillRetry: the survivor rule and the alert decision', () => {
   /** The survivor-naming first try, its description, and the survivor decision quoting it. */
   function survivorFirst(): { err: Error; description: string; survivor: KillRetryAlert } {
     const err = survivorKillFailed()
@@ -716,7 +716,7 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     expect(r.result).toEqual({ outcome: rowFinished(finished), end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1, alert: survivor })
   })
 
-  // The release candidate's wording (b.jg5 SRJ-702, R14): the worker's own
+  // The release candidate's wording (R14): the worker's own
   // "(pid N)" names no survivor, alone or beside the survivor clause.
   test.each<[string, () => Error, (description: string) => KillRetryAlert]>([
     ['\'outlived-exit-wait\' (naming only the worker\'s pid), then a read of ended: no alert', plainKillFailed, () => ({ kind: KILL_RETRY_ALERT_NONE })],
@@ -803,9 +803,9 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     expect(r.result.alert).toEqual({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: description })
   })
 
-  // b.jg5 SRJ-704 (hatch A2): a status read between tries that latched P
+  // (design A2): a status read between tries that latched P
   // after an ErrTmuxKillFailed naming no survivor leaves that failure as the
-  // outcome, so the ordinary version quotes its description (T3 posts it with
+  // outcome, so the ordinary version quotes its description ( posts it with
   // the closing sentence for a latched persona).
   test('an ErrTmuxKillFailed naming no survivor, then a read that latched the persona: no further kill; the ordinary decision quoting that description alone', async () => {
     const first = plainKillFailed()
@@ -877,10 +877,10 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     expect(r.result.alert).toEqual({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: descriptionOf(last) })
   })
 
-  // b.jg5 SRJ-704: the ordinary version fires when the kill "still returns
+  // the ordinary version fires when the kill "still returns
   // ErrTmuxKillFailed" after the tries, or after a survivor-naming failure;
   // an earlier ErrTmuxKillFailed naming no survivor that a later UNAVAILABLE
-  // outcome replaced calls for none (SRJ-1007 quotes the last outcome's).
+  // outcome replaced calls for none (quotes the last outcome's).
   test('no survivor-naming failure: an ErrTmuxKillFailed naming no survivor, then ErrTmuxUnresponsive to the end: no alert decision', async () => {
     const r = await run({ kills: [cannedErr(plainKillFailed()), ...failing(KILL_RETRY_TRIES - 1, () => errTmuxUnresponsive('kill'))] })
 
@@ -891,7 +891,7 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
   test.each<[string, CannedResponse<StubKillResult>[]]>([
     ['at the first try', [cannedOk(cannedKillResult(false))]],
     ['after an ErrTmuxKillFailed naming no survivor', [cannedErr(plainKillFailed()), cannedOk(cannedKillResult(false))]],
-  ])('b.jg5 SRJ-703: a success with kill_sent false %s and no survivor-naming failure gives no alert decision', async (_label, kills) => {
+  ])('a success with kill_sent false %s and no survivor-naming failure gives no alert decision', async (_label, kills) => {
     const r = await run({ kills })
 
     expect(r.result.outcome).toEqual({ kind: KILL_OUTCOME_KILLED, killSent: false })
@@ -901,10 +901,10 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
 
 // ---------------------------------------------------------------------------
 // A caller whose checked kill counts GONE as no success (goneIsFailure; the
-// CLI's teardown, b.jg5 SRJ-904)
+// CLI's teardown)
 // ---------------------------------------------------------------------------
 
-describe('runKillRetry over checked kills with goneIsFailure (b.jg5 SRJ-702, SRJ-904, SRJ-1007; hatch A3)', () => {
+describe('runKillRetry over checked kills with goneIsFailure (hatch A3)', () => {
   const GONE_IS_FAILURE: CheckedKillOptions = { goneIsFailure: true }
 
   const GONE_ANSWERS: ReadonlyArray<readonly [string, () => Error]> = [
@@ -951,11 +951,11 @@ describe('runKillRetry over checked kills with goneIsFailure (b.jg5 SRJ-702, SRJ
 })
 
 // ---------------------------------------------------------------------------
-// The start sweep's pass budget (AC 56)
+// The start sweep's pass budget
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// An old-life wait's hold-end query (b.jg5 SRJ-702, SRJ-811; option A)
+// An old-life wait's hold-end query (option A)
 // ---------------------------------------------------------------------------
 
 /** The `hold-ended` success. */
@@ -973,7 +973,7 @@ function holdQuery(ended: () => boolean): { readonly asked: () => number; readon
   }
 }
 
-describe('runKillRetry: an old-life wait\'s hold that ends while the tries run ends them as the hold-ended success, never a stop (b.jg5 SRJ-702, SRJ-811; option A)', () => {
+describe('runKillRetry: an old-life wait\'s hold that ends while the tries run ends them as the hold-ended success, never a stop (option A)', () => {
   test('a query that never answers ended is asked after each wait, after each read that did not find the row finished, and once when the last UNAVAILABLE outcome would stand; the tries run as without it', async () => {
     const hold = holdQuery(() => false)
 
@@ -1094,7 +1094,7 @@ describe('runKillRetry: an old-life wait\'s hold that ends while the tries run e
   })
 })
 
-describe('runKillRetry: the pass budget (b.jg5 SRJ-702, AC 56)', () => {
+describe('runKillRetry: the pass budget', () => {
   test('a kill that uses its tries on UNAVAILABLE spends the budget; a later kill with it makes one try, no read and no wait', async () => {
     const budget = createKillRetryPassBudget()
     expect(budget.isSpent()).toBe(false)
@@ -1146,10 +1146,10 @@ describe('runKillRetry: the pass budget (b.jg5 SRJ-702, AC 56)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Log lines (SRJ-1014)
+// Log lines
 // ---------------------------------------------------------------------------
 
-describe('runKillRetry: each try and each read is logged, redacted (b.jg5 SRJ-702, SRJ-1014)', () => {
+describe('runKillRetry: each try and each read is logged, redacted', () => {
   test('one line per try naming its answer, and one per read; every line carries the prefix and the instance id', async () => {
     const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [readState('waiting'), cannedErr(errCallTimeout('status'))] })
 
@@ -1180,12 +1180,12 @@ describe('runKillRetry: each try and each read is logged, redacted (b.jg5 SRJ-70
     expect(tryLines).toHaveLength(1)
     expect(tryLines[0]).toContain(REDACTED_TOKEN_PLACEHOLDER)
     expect(r.lines.filter((l) => l.includes('status read before kill try'))[0]).toContain(REDACTED_SENTINEL_TAIL)
-    // The decision quotes the raw description for T3 to redact at its post.
+    // The decision quotes the raw description for to redact at its post.
     expect(r.result.alert).toEqual({ kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: descriptionOf(survivor) })
     assertNoLeak(r.lines)
   })
 
-  // b.jg5 SRJ-1014: each try's line, per outcome kind, is the module's
+  // each try's line, per outcome kind, is the module's
   // builder's: the try number, the outcome (`describeKillOutcome`, its
   // kill_sent and its redacted description) and what follows. A fake token
   // rides in every description that has a slot for one.
@@ -1235,7 +1235,7 @@ describe('runKillRetry: each try and each read is logged, redacted (b.jg5 SRJ-70
 })
 
 // ---------------------------------------------------------------------------
-// Import boundary: no server-only module (E21, E25 to E33 and the CLI reuse it)
+// Import boundary: no server-only module ( to and the CLI reuse it)
 // ---------------------------------------------------------------------------
 
 describe('kill-retry: import boundary', () => {

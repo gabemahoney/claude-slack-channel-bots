@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# b.yko shell helpers, adapted to the /ci-live container (testplans/b.yko
+# shell helpers, adapted to the /ci-live container (testplans/live-acceptance.md
 # Part 1.3). The entrypoint installs this file as ~/cscb-live-helpers.sh with
 # TEST_HOST set to the container's hostname; the runner loads it before every
 # command it runs in the container (`docker exec … bash -c 'source …'`).
@@ -28,7 +28,7 @@ for d in "$HOME/.bun/install/global/node_modules/claude-slack-channel-bots" \
 done
 
 # guard: succeeds only on the test host, as its user, in a shell with no
-# SLACK_STATE_DIR and no token variable (AC 47).
+# SLACK_STATE_DIR and no token variable.
 guard() {
   [ -n "${BASH_VERSION:-}" ] || { echo 'not a bash shell - stop'; return 1; }
   [ "$(hostname)" = "$TEST_HOST" ] && [ "$(whoami)" = "$TEST_USER" ] \

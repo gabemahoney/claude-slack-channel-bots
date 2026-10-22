@@ -14,8 +14,8 @@ TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 # Values from src/ (through the printer) and the scenario's own
 # ---------------------------------------------------------------------------
 
-# The [tmux] table scenario 24 writes (b.jg5 SRJ-1426's scenario inputs). G is
-# agent-director's minimum for the pending grace period, 30 s (the ticket b.2nr
+# The [tmux] table scenario 24 writes (scenario inputs). G is
+# agent-director's minimum for the pending grace period, 30 s (the ticket
 # shortens every wait of this script to what its checks need).
 GRACE_S=30
 STOPPING_S=30
@@ -34,7 +34,7 @@ R_WINDOW_TO_S=55
 HELD_SLOW_FROM_S=5
 HELD_SLOW_TO_S=65
 
-# The test-only timer overrides (b.2nr): the config.json `test_timer_overrides`
+# The test-only timer overrides: the config.json `test_timer_overrides`
 # block each server start of this script reads (the scenario inputs; every
 # value read back goes through the printer below, none is retyped). Every leg
 # runs with the first two; the refused-stopping, refused-grace and both
@@ -781,9 +781,9 @@ leg_sequence() {
         || fail "sequence: the restart's gate came $(seconds_between "${l_q}" "${T_GATE}")s after Q's launch start, not inside G"
     echo "${TEST_NAME}: sequence: restarted $(seconds_between "${l_q}" "${t_restart}")s after Q's launch start"
 
-    # The start sweep (b.jg5 SRJ-714) runs first: it kills the live row whose
+    # The start sweep runs first: it kills the live row whose
     # `cwd` is not the persona's working directory and makes one find-missing
-    # run after its kills. Recorded: SRJ-1426's G rule is the live-row
+    # run after its kills. Recorded: G rule is the live-row
     # sequence's, not the sweep's.
     echo "${TEST_NAME}: sequence: the restart's start sweep lines for Q (recorded):"
     log_lines "$(matcher "${SWEEP_HEAD}" "${ID[q]}")" | cut -c1-260 | sed 's/^/  | /'
@@ -940,7 +940,7 @@ split_at_marker() {
 # The marker the printer is given in place of agent-director's description
 # and the reader's reason (the scenario's own; neither text holds it).
 REFUSED_MARKER='fmk-texts-refused-marker'
-# The refused inputs (b.jg5 SRJ-1426's scenario inputs): stopping_window_seconds
+# The refused inputs (scenario inputs): stopping_window_seconds
 # below its minimum, and pending_grace_seconds as a TOML string.
 REFUSED_STOPPING_S=10
 REFUSED_GRACE_TEXT='"60"'
@@ -1001,7 +1001,7 @@ ABORT_M="$(marker_matcher "setup: the stuck-launch abort's start line" "${line}"
 UP_PERSONAS=()
 
 # refused_values_check <label> <x> <key> <key>=<value>...: one refused-value
-# sub-leg (b.jg5 SRJ-1426, SRJ-209, SRJ-316, SRJ-1018). With the accepted
+# sub-leg. With the accepted
 # TABLE in effect and every persona of UP_PERSONAS up, the settings file is
 # written with the <key>=<value> pairs, which agent-director refuses for
 # <key>; after the next bot-server probe persona <x> is added by a confirmed
@@ -1260,7 +1260,7 @@ all_up() {
 # warning, and the same launch ends in agent-director's own launch timeout
 # ---------------------------------------------------------------------------
 
-# Scenario inputs (b.jg5 SRJ-1426): create_timeout_ms raised to 40000, the two
+# Scenario inputs: create_timeout_ms raised to 40000, the two
 # call timeouts, and the tmux shim's slow-create delay, longer than the
 # create timeout.
 CREATE_RAISED_MS=40000
@@ -1566,10 +1566,10 @@ leg_call_timeout_low() {
     time_before "${warn_t}" "${T_CALL}" || fail "${step}: the warning came after the start pass's launch of T1"
     echo "${TEST_NAME}: ${step}: warning: ${line#*"${VALUES_PREFIX} "}"
 
-    # The harness reads T1's row (its state and launch start) about once a
-    # second, from its spawn until T1 is up and its retry timer has stopped:
+    # The harness reads row (its state and launch start) about once a
+    # second, from its spawn until is up and its retry timer has stopped:
     # the timer the launch timeout armed runs in full mode, and its retry
-    # finds T1 connected, nothing left to recover (the printer's stop line).
+    # finds connected, nothing left to recover (the printer's stop line).
     stopped_m="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${STOP_RECOVERED}")" || exit 1
     : > "${readings}"
     CT_DEADLINE="$(time_plus "${T_CALL}" "$(( CALL_TIMEOUT_LOW_MS / 1000 + LOG_WAIT_S ))")"
@@ -1623,7 +1623,7 @@ leg_call_timeout_low() {
     hooks_brought_up "${step}" "${x}" "${t_get}"
     echo "${TEST_NAME}: ${step}: T1's get at +$(seconds_between "${T_CALL}" "${t_get}")s read this launch's pending row; SessionStart brought T1 up"
 
-    # No launch over the row: every CSCB launch call of T1 after its spawn
+    # No launch over the row: every CSCB launch call of after its spawn
     # follows AD's ended/missing evidence and a CSCB read of the row (a get
     # or status) since the call before it. AD's trail preserves a finished
     # interval even when it falls between the harness's one-second samples.
@@ -1650,7 +1650,7 @@ leg_call_timeout_high() {
     local step="call-timeout-61000" x=t2 elapsed get_line t_get n start_raw line t prev recovered_launches=0
     leg "${step}"
     start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_HIGH_MS}"
-    # The check runs before the start pass, so by T2's spawn any warning of
+    # The check runs before the start pass, so by spawn any warning of
     # this start is logged.
     [[ "$(count_log "${WARN_STEM}")" == "${WARN_BEFORE}" ]] || fail "${step}: a call-timeout warning at the start with ${CALL_TIMEOUT_HIGH_MS}: $(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "${WARN_STEM}")"
     # The row's launch start, read with a harness get while the held create
@@ -1682,7 +1682,7 @@ leg_call_timeout_high() {
     await_call_timeout_recovery "${step}" "${x}"
     hooks_brought_up "${step}" "${x}" "${t_get}"
 
-    # No ErrCallTimeout for T2, and still no warning.
+    # No ErrCallTimeout for , and still no warning.
     n="$(count_log "$(launch_answer_line "${x}" ErrCallTimeout)")"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} ErrCallTimeout answer(s) for T2"
     n="$(log_lines_from "${T_CALL}" "" "$(matcher ErrCallTimeout)" | grep -c -F -e "${REF[${x}]}" -e "persona=${KEY[${x}]} " || true)"
@@ -1719,7 +1719,7 @@ leg_call_timeout_low
 leg_call_timeout_high
 
 # ---------------------------------------------------------------------------
-# Closing assertions (b.jg5 SRJ-1401, SRJ-1418)
+# Closing assertions
 # ---------------------------------------------------------------------------
 
 assert_no_server_tmux

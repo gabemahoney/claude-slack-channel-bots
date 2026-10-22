@@ -1,4 +1,4 @@
-/** Direct durable acceptance for each cron fire target (b.omv SR-4.4). */
+/** Direct durable acceptance for each cron fire target. */
 import { readFileSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
@@ -31,7 +31,7 @@ export interface CronDeliveryTarget {
 }
 
 /**
- * The resolve-targets stage of fire() (b.he5 E4's seam): resolve each written
+ * The resolve-targets stage of fire ( seam): resolve each written
  * target to its persona key, THEN dedupe, keeping first-seen order. Two
  * written targets that resolve to the same key (a persona named by name and by
  * key, or named twice) make one delivery, logged under the first-written text.
@@ -58,9 +58,9 @@ export function resolveDeliveryTargets(
 export interface CronDispatcherDeps {
   /** Shared durable intake, independent of HTTP/session availability. */
   accept: QueueAccept
-  /** One clock read per fire, shared by item and cron log (b.omv SR-2.4). */
+  /** One clock read per fire, shared by item and cron log. */
   now?: () => number
-  /** The cron-log writer handle (Task 1) — sole owner of log appends. */
+  /** The cron-log writer handle (section 1) — sole owner of log appends. */
   cronLog: CronLog
   /**
    * Path to the CRONTABLE file. Relative prompt paths resolve against THIS
@@ -96,7 +96,7 @@ export interface CronDispatcher {
  * $HOME convention: relative prompts resolve against the crontable's own
  * directory (dirname of cronTablePath), NOT process CWD and NOT $HOME. This is
  * chosen so a prompt can colocate with its crontable as `prompts/foo.md` and
- * stay stable regardless of who runs the server or from where. E6's crontable
+ * stay stable regardless of who runs the server or from where. crontable
  * format reference must carry this rationale forward.
  *
  * The base is the directory of `cronTablePath` as given, never of its real
@@ -143,7 +143,7 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
     const { identity } = schedule
 
     // --- resolve-targets --------------------------------------------------
-    // All-bots marker: no read or acceptance. Fan-out is not yet enabled (E4), so
+    // All-bots marker: no read or acceptance. Fan-out is not yet enabled , so
     // the target set is undefined; log one fanout-deferred line + a 0/0
     // summary (see the pinned-convention note in the module header) and stop.
     if (schedule.targets.kind === 'all-bots') {
@@ -158,7 +158,7 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
       return
     }
 
-    // Resolve at fire time (E4's seam): a changed persona set takes effect
+    // Resolve at fire time ( seam): a changed persona set takes effect
     // at the next fire. Resolution happens before the prompt read so a
     // missing prompt counts every intended delivery as failed.
     const resolvedTargets = new Map<string, string | undefined>()

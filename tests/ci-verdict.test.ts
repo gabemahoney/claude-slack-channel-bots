@@ -1,24 +1,24 @@
 /**
  * tests/ci-verdict.test.ts — The `/ci` verdict reader (`scripts/ci-verdict.ts`,
- * b.uqm SR-17, SR-21.6).
+ *).
  *
- * E3 region: the reader's module properties (b.uqm SR-1.3, the reader's
- * half); one pin case per reader constant of SR-21.5; the verbs' arguments,
- * exit 64 and how the runner's PID is found (SR-17.1); valid and invalid
- * first lines (SR-17.2); every outcome row, its example and the precedence
- * (SR-17.3); the `wait` verb (SR-17.5); the `stop` verb (SR-17.6); redaction
- * (SR-17.4) and retention (SR-16.3).
+ * region: the reader's module properties (the reader's
+ * half); one pin case per reader constant of the contract; the verbs' arguments,
+ * exit 64 and how the runner's PID is found; valid and invalid
+ * first lines; every outcome row, its example and the precedence
+ * the `wait` verb; the `stop` verb; redaction
+ * and retention.
  *
- * E13 region: the audit of the `/ci` skill (SR-18.3), added by E13.
+ * region: the audit of the `/ci` skill, added .
  *
  * Every verb runs in process through `runVerdictReader` and the reader's
- * injected dependencies (b.uqm SR-21.1), built by the file's verb harness
+ * injected dependencies, built by the file's verb harness
  * below from `tests/test-helpers/ci-run.ts`: no test runs the reader or the
  * runner as a process, starts a container or signals a real process. Every
  * wait and timer runs on `createFakeClock`; every credential comes from
  * `fakeToken`; everything a verb prints, every dependency call and every file
  * under the case's root passes `assertNoLeak`. Only the constant-pin block
- * types a reader constant's value (b.uqm SR-21.5); the report texts and
+ * types a reader constant's value; the report texts and
  * report exit codes are typed only in the outcome block's row-example table.
  *
  * SPDX-License-Identifier: MIT
@@ -109,11 +109,11 @@ function readerSource(): string {
 const RUNNER_SPECIFIER = `./${basename(RUNNER_PATH_SUFFIX)}`
 
 // ===========================================================================
-// E3 region
+// region
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// The verb harness (E3 T3.S1), shared by every case of this region
+// The verb harness (.S1), shared by every case of this region
 // ---------------------------------------------------------------------------
 //
 // `verbHarness(options?)` builds one case's world and registers it for the
@@ -129,19 +129,19 @@ const RUNNER_SPECIFIER = `./${basename(RUNNER_PATH_SUFFIX)}`
 //   (credentials for redaction cases, built with `fakeToken`).
 // - `clock`: a `createFakeClock`, started at `options.startMs`, by default
 //   the RUN_ID's time (`runStartMs()`).
-// - `processes`: E1's process table on that clock; the reader's `isPidAlive`
-//   and `readProcCmdline` answer from it (b.uqm SR-6.3).
-// - `spawns`: E1's spawn recorder on that table, answering `gh auth token`
+// - `processes`: process table on that clock; the reader's `isPidAlive`
+// and `readProcCmdline` answer from it.
+// - `spawns`: spawn recorder on that table, answering `gh auth token`
 //   only: the first lookup (its `GH_CONFIG_DIR` under `HOME`) with
 //   `options.gh.first`, the plain one with `options.gh.plain`, each failing by
 //   default (`GH_NO_TOKEN`); `ghTokenAnswer(token)` gives a token. Read the
 //   spawns' environments from `spawns.spawns()`.
-// - `signals`: E1's signal recorder on that table (the reader's `sendSignal`).
+// - `signals`: signal recorder on that table (the reader's `sendSignal`).
 //
 // Builders over that world:
 // - `runDir(runId?)`: the run directory the reader derives (none created).
-// - `buildRun(spec?)`: E1's `buildRunDirectory` in `tempDir`, RUN_ID by default.
-// - `status(spec)`: E1's `makeStatus` with RUN_ID, the RUN_ID's time and
+// - `buildRun(spec?)`: `buildRunDirectory` in `tempDir`, RUN_ID by default.
+// - `status(spec)`: `makeStatus` with RUN_ID, the RUN_ID's time and
 //   `STATUS_DEADLINE_MINUTES` by default; give `pid` and `phase`.
 // - `addRunner(options?)`: a live `/ci` runner process with RUN_ID (or
 //   `options.runId`) in the table; answers its PID. `{ alive: false }` gives a
@@ -149,7 +149,7 @@ const RUNNER_SPECIFIER = `./${basename(RUNNER_PATH_SUFFIX)}`
 // - `markPlanted(...paths)`: files the case planted credential values in on
 //   purpose (redaction cases); the leak check skips exactly these.
 //
-// Running a verb (never as a process, b.uqm SR-21.1):
+// Running a verb (never as a process):
 // - `start(argv, options?)` calls `runVerdictReader(argv, deps)` at once, so
 //   the first wait check and a stop's SIGTERM happen inside the call. It
 //   answers a `StartedVerb`: `result` (a promise) and `settled()`. Move time
@@ -161,7 +161,7 @@ const RUNNER_SPECIFIER = `./${basename(RUNNER_PATH_SUFFIX)}`
 //   `removeRunDir`, a throwing `writeStdout`); the replacement is still
 //   recorded. `options.signalFindsNoProcess` lists signals whose target PID
 //   exits just before the signal is sent, so the recorder answers
-//   `no-such-process` (a signal that finds no process, b.uqm SR-17.6).
+// `no-such-process` (a signal that finds no process).
 //
 // A `VerbResult` holds `exitCode`, `stdout` and `stderr` (one entry per line,
 // its line feed removed; each write must be exactly one line), `calls` (every
@@ -487,7 +487,7 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// Module properties (b.uqm SR-1.3, the reader's half)
+// Module properties (the reader's half)
 // ---------------------------------------------------------------------------
 
 /** One top-level expression that would run at import: a call, a `new` or an `await`. */
@@ -568,7 +568,7 @@ function listenerCounts(): Record<string, number> {
 }
 
 /**
- * The rules the reader shares with the runner (b.uqm SR-1.3), each by the
+ * The rules the reader shares with the runner, each by the
  * runner exports that hold it. The reader must import each from the runner
  * and use it. Fault normalization is `parseCiArguments`'s (the invocation's
  * `faults`), shown in a verdict through `injectedVerdictPrefix`.
@@ -616,7 +616,7 @@ function usedOutsideImports(code: string, name: string): boolean {
 }
 
 /**
- * Where `source` breaks b.uqm SR-1.3's one-definition rule: a shared rule not
+ * Where `source` breaks one-definition rule: a shared rule not
  * imported from the runner or never used, a top-level name that is one of
  * the runner's exports, or a copy of one of the runner's rule texts.
  */
@@ -640,7 +640,7 @@ function sharedRuleFindings(source: string): string[] {
   return findings
 }
 
-describe('module properties (b.uqm SR-1.3)', () => {
+describe('module properties', () => {
   test('the reader has no top-level call, new or await outside function and class bodies and its one entry block, which is last', () => {
     expect(auditTopLevel(readerSource())).toEqual({ findings: [], entryBlocks: 1, entryBlockLast: true })
   })
@@ -691,13 +691,13 @@ describe('module properties (b.uqm SR-1.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Constants (b.uqm SR-21.5): one pin case per reader constant
+// Constants: one pin case per reader constant
 // ---------------------------------------------------------------------------
 //
-// The only place the reader constants of SR-21.5 are typed, each beside the
-// imported constant, as the PRD and SRD give them: times in milliseconds, the
-// two `verdict reader failed:` texts as b.uqm SR-18.2 writes them. The
-// runner's exit 64 is pinned by E1, and the report exit codes by the outcome
+// The only place the reader constants of the contract are typed, each beside the
+// imported constant, as the contract and contract give them: times in milliseconds, the
+// two `verdict reader failed:` texts as writes them. The
+// runner's exit 64 is pinned by , and the report exit codes by the outcome
 // block's row-example table.
 
 const READER_CONSTANT_PINS: ReadonlyArray<readonly [string, unknown, unknown]> = [
@@ -731,16 +731,16 @@ const READER_CONSTANT_PINS: ReadonlyArray<readonly [string, unknown, unknown]> =
   ],
 ]
 
-describe('constants (b.uqm SR-21.5)', () => {
+describe('constants', () => {
   test.each(READER_CONSTANT_PINS)('%s', (name, actual, typed) => {
     expect((reader as Record<string, unknown>)[name]).toBe(actual)
     expect(actual).toEqual(typed)
   })
 })
 
-// --- E3 T3.S2 (.gg): arguments, exit 64 and PID resolution ---
+// --- .S2 (.gg): arguments, exit 64 and PID resolution ---
 //
-// b.uqm SR-17.1's three rules, owned here once: the command lines, the
+// three rules, owned here once: the command lines, the
 // malformed-argument rule (exit 64, one naming `usage:` line, nothing else
 // done) and the PID rule (the status file's `pid`, else a numeric `<PID>`,
 // else none). Later blocks use one alive and one gone runner only; the
@@ -752,7 +752,7 @@ const REFUSED_CI_ARGS: readonly string[] = ['--bogus']
 /** The status file's phase when a case needs one and its phase does not matter. */
 const ANY_PHASE = 'shards'
 
-/** A RUN_ID the runner refuses: the case's RUN_ID in capitals (the RUN_ID rule itself is E1's). */
+/** A RUN_ID the runner refuses: the case's RUN_ID in capitals (the RUN_ID rule itself is shared runner helpers's). */
 function refusedRunId(): string {
   const runId = RUN_ID.toUpperCase()
   if (runner.isRunId(runId)) throw new Error(`${runId} is a RUN_ID`)
@@ -884,7 +884,7 @@ const PID_ROWS: ReadonlyArray<{ readonly label: string; readonly plant: (h: Verb
   },
 ]
 
-describe('arguments, exit 64 and PID resolution (b.uqm SR-17.1)', () => {
+describe('arguments, exit 64 and PID resolution', () => {
   test.each([...MALFORMED_ROWS])('$label: exit 64, one usage line naming it, nothing read, written, removed or signalled', async (row) => {
     const h = verbHarness()
     const pid = String(h.addRunner())
@@ -925,10 +925,10 @@ describe('arguments, exit 64 and PID resolution (b.uqm SR-17.1)', () => {
   })
 })
 
-// --- E3 T3.S3 (.gu): valid first lines ---
+// --- .S3 (.gu): valid first lines ---
 //
-// b.uqm SR-17.2: a first line is valid only when its shape matches the
-// invocation (PRD AC 72, and AC 73's shape half). Each row runs `report` with
+// a first line is valid only when its shape matches the
+// invocation (contract, and shape half). Each row runs `report` with
 // grace `none`, `<PID>` `-` and no status file, so no refusal, and asserts
 // validity only: an invalid line gives the runner-died outcome, a valid one
 // does not (each row's full text is the outcome block's). Script names come
@@ -1052,7 +1052,7 @@ const FIRST_LINE_ROWS: readonly FirstLineRow[] = [
   ...firstLineRows('selection, no injection', selectedNumberForms, [
     [true, 'test-1 and every selected script in canonical order', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)],
     [true, 'the same with an added prerequisite', () => selectiveLine(canonicalList([runner.numberFormOf(PREREQUISITE_NUMBER)]), failLine())],
-    [false, 'exactly PASS (AC 72)', passLine],
+    [false, 'exactly PASS', passLine],
     [false, 'a list missing test-1', () => selectiveLine(offList(canonicalList().filter((entry) => entry !== runner.numberFormOf(EVERY_SHARD_NUMBER))), runner.PASS_VERDICT)],
     [false, 'a list missing a selected script', () => selectiveLine(offList(canonicalList().filter((entry) => entry !== runner.numberFormOf(SELECTED_NUMBERS[1]))), runner.PASS_VERDICT)],
     [false, 'a list in ascending number order, not canonical order', () => selectiveLine(offList([...canonicalList()].sort(byNumber)), runner.PASS_VERDICT)],
@@ -1066,7 +1066,7 @@ const FIRST_LINE_ROWS: readonly FirstLineRow[] = [
   ]),
   ...firstLineRows('full, injection', injectArgs, [
     [true, 'INJECTED (<normalized faults>): wrapping a valid full line', () => injectedLine(normalizedFaults(), runner.PASS_VERDICT)],
-    [false, 'exactly PASS (AC 72)', passLine],
+    [false, 'exactly PASS', passLine],
     [false, 'other faults', () => injectedLine([{ kind: 'retag' }], runner.PASS_VERDICT)],
     [false, 'the same faults in another order', () => injectedLine([...normalizedFaults()].reverse(), runner.PASS_VERDICT)],
     [false, 'a missing fault', () => injectedLine(normalizedFaults().slice(1), runner.PASS_VERDICT)],
@@ -1076,7 +1076,7 @@ const FIRST_LINE_ROWS: readonly FirstLineRow[] = [
   ]),
   ...firstLineRows('selection, injection', () => [...selectedNumberForms(), ...injectArgs()], [
     [true, 'INJECTED (<normalized faults>): wrapping a valid selective line', () => injectedLine(normalizedFaults(), selectiveLine(canonicalList(), failLine()))],
-    [false, 'exactly PASS (AC 72)', passLine],
+    [false, 'exactly PASS', passLine],
     [false, 'a missing wrapper', () => selectiveLine(canonicalList(), runner.PASS_VERDICT)],
   ]),
   ...firstLineRows('an unknown option the runner refuses', () => refusedArgs(REFUSED_CI_ARGS), [
@@ -1093,7 +1093,7 @@ const FIRST_LINE_ROWS: readonly FirstLineRow[] = [
   ]),
 ]
 
-describe('valid first lines (b.uqm SR-17.2, PRD AC 72, AC 73)', () => {
+describe('valid first lines', () => {
   test.each([...FIRST_LINE_ROWS])('$label', async (row) => {
     const h = verbHarness()
     h.buildRun({ verdict: row.verdict() })
@@ -1105,23 +1105,23 @@ describe('valid first lines (b.uqm SR-17.2, PRD AC 72, AC 73)', () => {
   })
 })
 
-// --- E3 T3.S4 (.cu): outcomes and report lines ---
+// --- .S4 (.cu): outcomes and report lines ---
 //
-// b.uqm SR-17.3: the seven outcomes in precedence, their lines and exit codes
-// (PRD AC 13, AC 73). The report texts and exit codes are typed only in the
+// the seven outcomes in precedence, their lines and exit codes
+//. The report texts and exit codes are typed only in the
 // row-example table below, each beside the reader's exports that build it;
 // every other case builds its expected lines from those exports. Removal and
-// masking are the redaction and retention block's (T3.S7), but for something
+// masking are the redaction and retention block's (.S7), but for something
 // other than a directory at the run-directory path, whose one case here also
 // shows it is never removed; first-line
-// validity is T3.S3's, so only one invalid line is used here. The helpers
+// validity is .S3's, so only one invalid line is used here. The helpers
 // up to the table serve that block too.
 
-/** The runner's PID in the report cases: the PRD's example PID, test data. */
+/** The runner's PID in the report cases: the contract's example PID, test data. */
 const REPORTED_PID = 81234
 /** A `<PID>` argument other than the PID the status file names: test data. */
 const OTHER_PID_ARGUMENT = 4242
-/** m of a signalled grace: the PRD's example deadline minutes, test data. */
+/** m of a signalled grace: the contract's example deadline minutes, test data. */
 const GRACE_LINE_MINUTES = '138'
 /** A PASS's timing summary as `results.json` holds it: test data, test-1's file name from the repository's listing. */
 function reportTimingSummary(): readonly string[] {
@@ -1189,7 +1189,7 @@ interface OutcomeRow {
   readonly verdict: string | null
   /** The `<grace>` argument; default `GRACE_NONE`. */
   readonly grace?: string
-  /** The report as the PRD's example and b.uqm SR-17.3 write it. */
+  /** The report as the contract's example and write it. */
   readonly typedLines: (runDir: string) => readonly string[]
   readonly typedExit: number
   /** The report from the reader's exported texts and builders. */
@@ -1212,8 +1212,8 @@ function notRunRow(kind: runner.RefusalKind, reason: () => string, details: read
 
 /**
  * The report's literal texts and exit codes, one row per outcome and refusal
- * kind, and one per fixed line of b.uqm SR-17.3 (the two grace lines, the
- * could-not-be-read line), the PRD's example where it has one: their pin case.
+ * kind, and one per fixed line of the contract (the two grace lines, the
+ * could-not-be-read line), the contract's example where it has one: their pin case.
  */
 const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
   [
@@ -1243,9 +1243,9 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
       'NOT RUN: cpu: 6 shard(s) need 12 CPUs; active /ci runs hold 4 of the 12 CI CPUs',
     ),
   ],
-  ['not runnable, no kind (the PRD example)', notRunRow(null, () => runner.outOfRangeReason('--shards', '7'), [], 'NOT RUN: --shards 7 is out of range: N must be a whole number from 1 to 6')],
+  ['not runnable, no kind (the contract example)', notRunRow(null, () => runner.outOfRangeReason('--shards', '7'), [], 'NOT RUN: --shards 7 is out of range: N must be a whole number from 1 to 6')],
   [
-    'runner died: a runner gone before its run directory exists (the PRD example)',
+    'runner died: a runner gone before its run directory exists (the contract example)',
     {
       ciArgs: [],
       files: null,
@@ -1291,7 +1291,7 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
     },
   ],
   [
-    'injected (the PRD example)',
+    'injected (the contract example)',
     {
       ciArgs: ['--inject', 'leak:1,2'],
       files: (h) => ({ status: reportRunningStatus(h) }),
@@ -1306,7 +1306,7 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
     },
   ],
   [
-    'selective PASS (the PRD example), with its timing summary',
+    'selective PASS (the contract example), with its timing summary',
     {
       ciArgs: ['test-23'],
       files: (h) => ({ status: reportRunningStatus(h), results: reportSummaryResults() }),
@@ -1318,7 +1318,7 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
     },
   ],
   [
-    'selective FAIL (the PRD example)',
+    'selective FAIL (the contract example)',
     {
       ciArgs: ['test-2', 'test-3'],
       files: (h) => ({ status: reportRunningStatus(h) }),
@@ -1333,7 +1333,7 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
     },
   ],
   [
-    'full PASS (the PRD example), with its timing summary',
+    'full PASS (the contract example), with its timing summary',
     {
       ciArgs: [],
       files: (h) => ({ status: reportRunningStatus(h), results: reportSummaryResults() }),
@@ -1357,7 +1357,7 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
     },
   ],
   [
-    'full FAIL (the PRD example)',
+    'full FAIL (the contract example)',
     {
       ciArgs: [],
       files: (h) => ({ status: reportRunningStatus(h) }),
@@ -1374,11 +1374,11 @@ const OUTCOME_ROWS: ReadonlyArray<readonly [string, OutcomeRow]> = [
 type RunLevelForms = 'every form' | 'full only'
 
 /**
- * The run-level FAIL lines as the PRD's examples write them (b.uqm SR-17.3:
+ * The run-level FAIL lines as the contract's examples write them (
  * run-level stops, image build failures and a shard's out-of-memory failure
  * are FAIL lines like any other), each with the forms it runs in: the
- * out-of-memory lines are the PRD's full FAIL examples, so full only. Inputs
- * only, typed here once: E1 exports no builder for them; a script's file name
+ * out-of-memory lines are the contract's full FAIL examples, so full only. Inputs
+ * only, typed here once: exports no builder for them; a script's file name
  * comes from the repository's listing.
  */
 const RUN_LEVEL_FAIL_LINES: ReadonlyArray<readonly [string, () => string, RunLevelForms]> = [
@@ -1436,7 +1436,7 @@ const RUN_LEVEL_ROWS = RUN_LEVEL_FAIL_LINES.flatMap(([stop, line, forms]) =>
   RUN_LEVEL_FORMS.filter(([, , full]) => forms === 'every form' || full).map(([form, spec]) => [`${stop}, ${form}`, line, spec] as const),
 )
 
-/** The precedence pairings of b.uqm SR-17.3, each asserted once: the run, the `<grace>` and the report it gives. */
+/** The precedence pairings of the contract, each asserted once: the run, the `<grace>` and the report it gives. */
 interface PrecedenceRow {
   readonly ciArgs: () => readonly string[]
   readonly grace: string
@@ -1520,7 +1520,7 @@ const PASS_FORMS: ReadonlyArray<readonly [string, () => readonly string[], () =>
   ],
 ]
 
-/** The results files whose timing summary cannot be read (b.uqm SR-17.3), each a valid file with one stated change, or none. */
+/** The results files whose timing summary cannot be read, each a valid file with one stated change, or none. */
 const UNREADABLE_SUMMARY_RESULTS: ReadonlyArray<readonly [string, () => RunDirectorySpec['results']]> = [
   ['no results file', () => undefined],
   ['an unparseable results file', () => ({ results: reportSummaryResults(), change: { kind: 'unparseable' } })],
@@ -1535,7 +1535,7 @@ const UNREADABLE_SUMMARY_ROWS = PASS_FORMS.flatMap((form) =>
   UNREADABLE_SUMMARY_RESULTS.filter(([, spec]) => form[0] !== 'full PASS' || spec() !== undefined).map(([results, spec]) => [`${form[0]}, ${results}`, form, spec] as const),
 )
 
-describe('outcomes and report lines (b.uqm SR-17.3)', () => {
+describe('outcomes and report lines', () => {
   test.each(OUTCOME_ROWS)('row example: %s', async (_label, row) => {
     const h = verbHarness()
     if (row.files !== null) h.buildRun({ ...row.files(h), ...(row.verdict === null ? {} : { verdict: row.verdict }) })
@@ -1683,12 +1683,12 @@ describe('outcomes and report lines (b.uqm SR-17.3)', () => {
   })
 })
 
-// --- E3 T3.S5 (.qz): wait verb ---
+// --- .S5 (.qz): wait verb ---
 
 /** Where a case's deadline comes from: the status file (`STATUS_DEADLINE_MINUTES`), or the RUN_ID's time while there is none. */
 type DeadlineSource = 'status' | 'no-status'
 
-/** The deadline fields the wait line prints for a source, counted here from the RUN_ID's time and the reader's constants (b.uqm SR-17.5). */
+/** The deadline fields the wait line prints for a source, counted here from the RUN_ID's time and the reader's constants. */
 function deadlineFieldsOf(source: DeadlineSource): Pick<reader.WaitReading, 'deadlineMs' | 'minutes' | 'graceEndsMs'> {
   const minuteMs = 60_000
   const minutes = source === 'status' ? STATUS_DEADLINE_MINUTES : NO_STATUS_DEADLINE_MINUTES
@@ -1719,7 +1719,7 @@ function waitCheckTimes(result: VerbResult): number[] {
   return result.callsTo('runPathKind').map((call) => call.atMs)
 }
 
-/** The reads of `verdict.txt`: wait only tests that it exists, never reads it (b.uqm SR-17.1, SR-17.4). */
+/** The reads of `verdict.txt`: wait only tests that it exists, never reads it. */
 function verdictFileReads(result: VerbResult): readonly DepCall[] {
   return result.callsTo('readRunFile').filter((call) => call.dep === 'readRunFile' && call.path.endsWith(`/${runner.VERDICT_FILE_NAME}`))
 }
@@ -1760,8 +1760,8 @@ const writeStatusPhase =
     expect(runner.writeStatusFile(run.runDir, statusIn(run.h, run.pid, phase))).toEqual({ ok: true })
   }
 
-describe('the wait verb (b.uqm SR-17.5)', () => {
-  test('pin: the wait line has the format SR-17.5 gives', () => {
+describe('the wait verb', () => {
+  test('pin: the wait line has the format gives', () => {
     // Test data that equals no reader constant: minutes 120 and 95, a 15 min gap to the grace end.
     expect(
       reader.waitLine('grace', {
@@ -1863,7 +1863,7 @@ describe('the wait verb (b.uqm SR-17.5)', () => {
   })
 })
 
-// --- E3 T3.S6 (.yn): stop verb ---
+// --- .S6 (.yn): stop verb ---
 
 /** Every signal the recorder kept, as the case reads it: what, to whom, how it ended and when. */
 function sentSignals(h: VerbHarness): { signal: SentSignal; target: SignalTarget; outcome: SignalOutcome; atMs: number }[] {
@@ -1883,8 +1883,8 @@ function sigtermIgnoringRun(options: { readonly permitted?: boolean } = {}): Run
   return { h, pid, runDir }
 }
 
-describe('the stop verb (b.uqm SR-17.6)', () => {
-  test('pin: the three stop lines are the ones SR-17.6 gives', () => {
+describe('the stop verb', () => {
+  test('pin: the three stop lines are the ones gives', () => {
     expect([
       reader.stopLine({ kind: 'not-alive', pid: null }),
       reader.stopLine({ kind: 'term', pid: 4321, minutes: 120 }),
@@ -1994,11 +1994,11 @@ describe('the stop verb (b.uqm SR-17.6)', () => {
   })
 })
 
-// --- E3 T3.S7 (.p8): redaction and retention ---
+// --- .S7 (.p8): redaction and retention ---
 //
-// b.uqm SR-17.4 (and the reader's half of SR-15.4): every secret value the
+// (and the reader's half of): every secret value the
 // reader holds prints as `<redacted>` in every text taken from a run file.
-// b.uqm SR-16.3 (the reader's half of PRD AC 74): only a PASS with its timing
+// (the reader's half under the documented contract): only a PASS with its timing
 // summary, or a refusal, removes the run directory, and only after the last
 // line is printed; nothing outside it is touched. The line texts are the
 // outcome block's; this block asserts masking, removal and their order. Its
@@ -2007,7 +2007,7 @@ describe('the stop verb (b.uqm SR-17.6)', () => {
 /** A gateway's URL beside a gateway key: test data. */
 const READER_GATEWAY_URL = 'https://gateway.example.invalid'
 
-/** The secret values the redaction cases plant, each from `fakeToken` with its own suffix (b.uqm SR-21.2), and one cut too short from a built one. */
+/** The secret values the redaction cases plant, each from `fakeToken` with its own suffix, and one cut too short from a built one. */
 function readerSecrets(): { rawKey: string; gatewayKey: string; ghToken: string; baseBuildToken: string; tooShort: string } {
   return {
     rawKey: fakeToken(runner.RAW_KEY_PREFIX, 'raw'),
@@ -2018,7 +2018,7 @@ function readerSecrets(): { rawKey: string; gatewayKey: string; ghToken: string;
   }
 }
 
-/** Each source of a secret value the reader masks: the value, and the harness options that make the reader hold it (b.uqm SR-17.4). */
+/** Each source of a secret value the reader masks: the value, and the harness options that make the reader hold it. */
 const SECRET_SOURCES: ReadonlyArray<readonly [string, (s: ReturnType<typeof readerSecrets>) => { readonly value: string; readonly options: VerbHarnessOptions }]> = [
   ['a raw ANTHROPIC_API_KEY', (s) => ({ value: s.rawKey, options: { env: { ANTHROPIC_API_KEY: s.rawKey } } })],
   ['a gateway ANTHROPIC_API_KEY', (s) => ({ value: s.gatewayKey, options: { env: { ANTHROPIC_API_KEY: s.gatewayKey, ANTHROPIC_BASE_URL: READER_GATEWAY_URL } } })],
@@ -2109,14 +2109,14 @@ interface RetentionRun {
   readonly files: (h: VerbHarness) => ReportRunFiles
 }
 
-/** The outcomes after which the run directory is removed (b.uqm SR-16.3). */
+/** The outcomes after which the run directory is removed. */
 const REMOVED_ROWS: ReadonlyArray<readonly [string, RetentionRun]> = [
   ['a full PASS', { files: fullPassFiles }],
   ['a selective PASS', { ciArgs: () => [runner.numberFormOf(23)], files: (h) => ({ ...fullPassFiles(h), verdict: selectiveVerdictLine([23], runner.PASS_VERDICT) }) }],
   ['a refusal', { files: (h) => ({ status: reportRefusedStatus(h, null, 'a refusal summary', ['a detail']) }) }],
 ]
 
-/** The outcomes after which the run directory is kept (b.uqm SR-16.3). */
+/** The outcomes after which the run directory is kept. */
 const KEPT_ROWS: ReadonlyArray<readonly [string, RetentionRun]> = [
   ['a full FAIL', { files: (h) => ({ status: reportRunningStatus(h), verdict: `${runner.FAIL_PREFIX}a failure` }) }],
   ['a selective FAIL', { ciArgs: () => [runner.numberFormOf(23)], files: (h) => ({ status: reportRunningStatus(h), verdict: selectiveVerdictLine([23], `${runner.FAIL_PREFIX}a failure`) }) }],
@@ -2132,7 +2132,7 @@ async function runRetention(h: VerbHarness, row: RetentionRun): Promise<VerbResu
   return h.run(reportArgv(REPORTED_PID, row.grace ?? GRACE_NONE, row.ciArgs?.() ?? []))
 }
 
-describe('redaction (b.uqm SR-17.4, SR-15.4)', () => {
+describe('redaction', () => {
   test.each(REDACTION_ROWS)('%s prints as <redacted>', async (_label, secret, plant) => {
     const { value, options } = secret(readerSecrets())
     const h = verbHarness(options)
@@ -2198,7 +2198,7 @@ describe('redaction (b.uqm SR-17.4, SR-15.4)', () => {
   })
 })
 
-describe('retention (b.uqm SR-16.3, the reader half of PRD AC 74)', () => {
+describe('retention (the reader half of contract)', () => {
   test.each(REMOVED_ROWS)('removed after %s, only once every report line is printed', async (_label, row) => {
     const h = verbHarness()
     const runDir = h.buildRun(row.files(h))
@@ -2287,17 +2287,17 @@ describe('retention (b.uqm SR-16.3, the reader half of PRD AC 74)', () => {
 })
 
 // ===========================================================================
-// E13 (t1.t6s.vd): the audit of the /ci skill (b.uqm SR-18.3); E13 adds its cases here
+// the audit of the /ci skill; adds its cases here
 // ===========================================================================
 //
-// The audit of `.claude/skills/ci/SKILL.md` (b.uqm SR-18.2, SR-18.3; b.t6s E13
-// T7.S1). `e13SkillProblems(text)` returns what is wrong with the skill's
+// The audit of `.claude/skills/ci/SKILL.md` (
+// .S1). `lifecycleSkillProblems(text)` returns what is wrong with the skill's
 // text: the committed skill gives none, and each change planted into its real
 // text is reported by name. Every exit code, limit, bound and fixed text it
-// checks is the reader's or the runner's export, never typed. Only SR-17.1's
-// argument forms are typed, from the SRD: `READER_USAGE_TEXT` writes
-// `[/ci arguments]` where SR-17.1 writes `[<the /ci arguments>]`, and the
-// skill is held to SR-17.1.
+// checks is the reader's or the runner's export, never typed. Only
+// argument forms are typed, under the documented contract: `READER_USAGE_TEXT` writes
+// `[/ci arguments]` where writes `[<the /ci arguments>]`, and the
+// skill is held to.
 //
 // A command is a line of a fenced shell block. "Finishing a run by hand" runs
 // its commands as inline code, so there each inline code span holding
@@ -2305,105 +2305,105 @@ describe('retention (b.uqm SR-16.3, the reader half of PRD AC 74)', () => {
 // skill names those three in its other prose and headings on purpose, so
 // nothing else there counts as a command. The skill's base tag and
 // release-candidate names are tests/ci-live-docker.test.ts's checks, and
-// `BEES_MCP_URL` and `host.docker.internal` tests/bees-mcp-removed.test.ts's;
+// `BEES_MCP_URL` and `host.docker.internal` tests/ci-dependency-isolation.test.ts's;
 // the 40-hex commit is checked here. Names in this region start with `e13` or
-// `E13`.
+// ``.
 
 import { findSection, flat, splitFences } from './test-helpers/markdown.ts'
 
 /** The skill, from the repository root. */
-const E13_SKILL_PATH = join('.claude', 'skills', 'ci', 'SKILL.md')
+const LIFECYCLE_SKILL_PATH = join('.claude', 'skills', 'ci', 'SKILL.md')
 
 /** The committed skill's text, read when a case runs. */
-function e13Skill(): string {
-  return readFileSync(join(REPO_ROOT, E13_SKILL_PATH), 'utf-8')
+function lifecycleSkill(): string {
+  return readFileSync(join(REPO_ROOT, LIFECYCLE_SKILL_PATH), 'utf-8')
 }
 
 /** Milliseconds in a second: the skill gives the reader's bounds in seconds. */
-const E13_MS_PER_SECOND = 1_000
+const LIFECYCLE_MS_PER_SECOND = 1_000
 
 /** A bound in milliseconds, in the seconds the skill writes. */
-function e13Seconds(ms: number): number {
-  return ms / E13_MS_PER_SECOND
+function lifecycleSeconds(ms: number): number {
+  return ms / LIFECYCLE_MS_PER_SECOND
 }
 
-/** The `/ci` arguments' placeholder, as SR-17.1 and the skill's procedure write it. */
-const E13_CI_ARGUMENTS = '<the /ci arguments>'
+/** The `/ci` arguments' placeholder, as and the skill's procedure write it. */
+const LIFECYCLE_CI_ARGUMENTS = '<the /ci arguments>'
 
-/** Each verb's arguments as SR-17.1 gives them (test data from the SRD, not `READER_USAGE_TEXT`). */
-const E13_SR_17_1_ARGUMENTS: Readonly<Record<reader.ReaderVerb, string>> = {
-  report: `<RUN_ID> <PID> <grace> [${E13_CI_ARGUMENTS}]`,
+/** Each verb's arguments as gives them (test data from the contract, not `READER_USAGE_TEXT`). */
+const LIFECYCLE_CANCELLATION_ARGUMENTS: Readonly<Record<reader.ReaderVerb, string>> = {
+  report: `<RUN_ID> <PID> <grace> [${LIFECYCLE_CI_ARGUMENTS}]`,
   wait: '<RUN_ID> <PID>',
   stop: '<RUN_ID> <PID>',
 }
 
-/** A verb's command line as SR-17.1 gives it. */
-function e13VerbLine(verb: reader.ReaderVerb): string {
-  return `${reader.READER_COMMAND} ${verb} ${E13_SR_17_1_ARGUMENTS[verb]}`
+/** A verb's command line as gives it. */
+function lifecycleVerbLine(verb: reader.ReaderVerb): string {
+  return `${reader.READER_COMMAND} ${verb} ${LIFECYCLE_CANCELLATION_ARGUMENTS[verb]}`
 }
 
-/** A verb as the procedure runs it: SR-17.1's line, with the `/ci` arguments given rather than optional. */
-function e13VerbCall(verb: reader.ReaderVerb): string {
-  return e13VerbLine(verb).replace(`[${E13_CI_ARGUMENTS}]`, E13_CI_ARGUMENTS)
+/** A verb as the procedure runs it: line, with the `/ci` arguments given rather than optional. */
+function lifecycleVerbCall(verb: reader.ReaderVerb): string {
+  return lifecycleVerbLine(verb).replace(`[${LIFECYCLE_CI_ARGUMENTS}]`, LIFECYCLE_CI_ARGUMENTS)
 }
 
 /** The hand-finishing heading's title, as both `verdict reader failed:` lines name it. */
-const E13_HAND_TITLE = /"([^"]+)" says$/.exec(WAIT_READER_FAILED_TEXT)?.[1] ?? ''
+const LIFECYCLE_HAND_TITLE = /"([^"]+)" says$/.exec(WAIT_READER_FAILED_TEXT)?.[1] ?? ''
 
-/** The launch's runner command up to its redirections: detached by `setsid`, the RUN_ID first, the `/ci` arguments after (b.uqm SR-18.2). */
-const E13_LAUNCH = `setsid bun ${RUNNER_PATH_SUFFIX} "\${RUN_ID}" ${E13_CI_ARGUMENTS}`
+/** The launch's runner command up to its redirections: detached by `setsid`, the RUN_ID first, the `/ci` arguments after. */
+const LIFECYCLE_LAUNCH = `setsid bun ${RUNNER_PATH_SUFFIX} "\${RUN_ID}" ${LIFECYCLE_CI_ARGUMENTS}`
 
 /** A PID and minutes no skill text holds, put back as `<pid>` and `<m>` in the stop line. */
-const E13_STOP_PID = 987_654_321
-const E13_STOP_MINUTES = 123_456
+const LIFECYCLE_STOP_PID = 987_654_321
+const LIFECYCLE_STOP_MINUTES = 123_456
 
 /** The info words of a fenced block whose lines are commands; an untagged block counts. */
-const E13_SHELL_INFOS = ['sh', 'bash', 'shell', '']
+const LIFECYCLE_SHELL_INFOS = ['sh', 'bash', 'shell', '']
 
 /** `codes` in ascending order, as the skill lists them: `0, 10, 11, 12 and 13`. */
-function e13List(codes: readonly number[], last: 'and' | 'or'): string {
+function lifecycleList(codes: readonly number[], last: 'and' | 'or'): string {
   const sorted = [...codes].sort((a, b) => a - b).map(String)
   return `${sorted.slice(0, -1).join(', ')} ${last} ${sorted.at(-1)}`
 }
 
 /** The stop table's rows as the reader's stop line and exit codes give them, `<pid>` and `<m>` in place: `<what it did>`, exit and `<grace>`. */
-function e13StopRows(): { what: string; exit: number; grace: string }[] {
+function lifecycleStopRows(): { what: string; exit: number; grace: string }[] {
   const outcomes: reader.StopOutcome[] = [
-    { kind: 'not-alive', pid: E13_STOP_PID },
-    { kind: 'term', pid: E13_STOP_PID, minutes: E13_STOP_MINUTES },
-    { kind: 'kill', pid: E13_STOP_PID, minutes: E13_STOP_MINUTES },
+    { kind: 'not-alive', pid: LIFECYCLE_STOP_PID },
+    { kind: 'term', pid: LIFECYCLE_STOP_PID, minutes: LIFECYCLE_STOP_MINUTES },
+    { kind: 'kill', pid: LIFECYCLE_STOP_PID, minutes: LIFECYCLE_STOP_MINUTES },
   ]
   return outcomes.map((outcome) => {
     const grace = reader.graceText(reader.stopGrace(outcome))
     const line = reader.stopLine(outcome)
     return {
-      what: line.slice(line.indexOf(' ') + 1, line.lastIndexOf(`; grace ${grace}`)).replaceAll(String(E13_STOP_PID), '<pid>'),
+      what: line.slice(line.indexOf(' ') + 1, line.lastIndexOf(`; grace ${grace}`)).replaceAll(String(LIFECYCLE_STOP_PID), '<pid>'),
       exit: reader.stopExitCode(outcome),
-      grace: grace.replace(String(E13_STOP_MINUTES), '<m>'),
+      grace: grace.replace(String(LIFECYCLE_STOP_MINUTES), '<m>'),
     }
   })
 }
 
 /** Every command line of `text`'s fenced shell blocks, trimmed; blank and comment lines left out. */
-function e13Commands(text: string): string[] {
+function lifecycleCommands(text: string): string[] {
   return splitFences(text)
-    .blocks.filter((b) => E13_SHELL_INFOS.includes(b.info))
+    .blocks.filter((b) => LIFECYCLE_SHELL_INFOS.includes(b.info))
     .flatMap((b) => b.body.split('\n').map((l) => l.trim()))
     .filter((l) => l !== '' && !l.startsWith('#'))
 }
 
 /** The inline code spans of `section`'s prose that hold whitespace, so may be commands; one span may cross a line wrap. */
-function e13Spans(section: string): string[] {
+function lifecycleSpans(section: string): string[] {
   return [...flat(splitFences(section).prose).matchAll(/`([^`]+)`/g)].map((m) => (m[1] as string).trim()).filter((s) => /\s/.test(s))
 }
 
 /** Whether `line` runs `command`: any shell word equal to it, so after a keyword (`do`, `then`), `{` or `!` as well as at a command's start. */
-function e13Runs(line: string, command: string): boolean {
+function lifecycleRuns(line: string, command: string): boolean {
   return new RegExp(`(?:^|[\\s;&|(\`{!])${command}(?=[\\s;)&|]|$)`).test(line)
 }
 
 /** The cells of every body row of `text`'s Markdown tables (the rows after a divider row). */
-function e13TableRows(text: string): string[][] {
+function lifecycleTableRows(text: string): string[][] {
   const rows: string[][] = []
   let inBody = false
   for (const line of text.split('\n').map((l) => l.trim())) {
@@ -2415,7 +2415,7 @@ function e13TableRows(text: string): string[][] {
 }
 
 /** Which of the launch line's standard input, output and error are not on `/dev/null`, so stay on the Bash call's streams. */
-function e13StreamsLeft(line: string): string[] {
+function lifecycleStreamsLeft(line: string): string[] {
   const out = /\s1?>\s*\/dev\/null(?=\s|$)/.exec(line)
   const merged = /\s2>&1(?=\s|$)/.exec(line)
   const left: string[] = []
@@ -2425,15 +2425,15 @@ function e13StreamsLeft(line: string): string[] {
   return left
 }
 
-/** What is wrong with the launch step's commands (b.uqm SR-18.2): detached, its streams on none of the call's, job control off, and the RUN_ID, PID and run directory printed. */
-function e13LaunchProblems(lines: readonly string[]): string[] {
+/** What is wrong with the launch step's commands: detached, its streams on none of the call's, job control off, and the RUN_ID, PID and run directory printed. */
+function lifecycleLaunchProblems(lines: readonly string[]): string[] {
   const at = lines.findIndex((l) => l.includes(`bun ${RUNNER_PATH_SUFFIX} `))
   if (at < 0) return [`the launch does not run bun ${RUNNER_PATH_SUFFIX}`]
   const line = lines[at] as string
   const problems: string[] = []
-  if (!line.startsWith(`${E13_LAUNCH} `)) problems.push(`the launch does not start ${E13_LAUNCH}: ${line}`)
+  if (!line.startsWith(`${LIFECYCLE_LAUNCH} `)) problems.push(`the launch does not start ${LIFECYCLE_LAUNCH}: ${line}`)
   if (!/\s&$/.test(line)) problems.push(`the launch does not run the runner in the background: ${line}`)
-  const left = e13StreamsLeft(line)
+  const left = lifecycleStreamsLeft(line)
   if (left.length > 0) problems.push(`the launch leaves ${left.join(' and ')} on the Bash call's streams: ${line}`)
   if (!lines.slice(0, at).includes('set +m')) problems.push('the launch does not turn job control off (set +m) before it starts the runner')
   if (lines[at + 1] !== 'RUNNER_PID=$!') problems.push('the launch does not take the runner PID from $! just after it starts the runner')
@@ -2448,14 +2448,14 @@ function e13LaunchProblems(lines: readonly string[]): string[] {
   return problems
 }
 
-/** What is wrong with the skill's text (b.uqm SR-18.2, SR-18.3); none for the committed skill. */
-function e13SkillProblems(text: string): string[] {
+/** What is wrong with the skill's text; none for the committed skill. */
+function lifecycleSkillProblems(text: string): string[] {
   const problems: string[] = []
   const blocks = splitFences(text).blocks
-  const commands = e13Commands(text)
-  const stopRows = e13StopRows()
+  const commands = lifecycleCommands(text)
+  const stopRows = lifecycleStopRows()
 
-  // The three verbs as SR-17.1 gives them, and each wait and stop exit beside its state.
+  // The three verbs as gives them, and each wait and stop exit beside its state.
   const verbsHeading = "## The verdict reader's verbs"
   const verbs = findSection(text, verbsHeading)
   if (verbs === undefined) problems.push(`has no "${verbsHeading}" heading`)
@@ -2463,8 +2463,8 @@ function e13SkillProblems(text: string): string[] {
     const lines = splitFences(verbs)
       .blocks.filter((b) => b.info === 'text')
       .flatMap((b) => b.body.split('\n').map((l) => l.trim()))
-    for (const verb of reader.READER_VERBS) if (!lines.includes(e13VerbLine(verb))) problems.push(`the verbs block does not name the ${verb} verb as SR-17.1 gives it: ${e13VerbLine(verb)}`)
-    const rows = e13TableRows(verbs)
+    for (const verb of reader.READER_VERBS) if (!lines.includes(lifecycleVerbLine(verb))) problems.push(`the verbs block does not name the ${verb} verb as gives it: ${lifecycleVerbLine(verb)}`)
+    const rows = lifecycleTableRows(verbs)
     for (const state of reader.WAIT_STATES) {
       const row = rows.find((r) => r[0] === `\`${state}\``)
       const exit = String(reader.waitExitCode(state))
@@ -2485,8 +2485,8 @@ function e13SkillProblems(text: string): string[] {
   const poll = findSection(text, /^### .*\bPoll$/)
   if (poll === undefined) problems.push('has no Poll step')
   else {
-    const rows = e13TableRows(poll)
-    const exits = [String(WAIT_EXIT_RUNNING), e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or'), String(WAIT_EXIT_GRACE)]
+    const rows = lifecycleTableRows(poll)
+    const exits = [String(WAIT_EXIT_RUNNING), lifecycleList([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or'), String(WAIT_EXIT_GRACE)]
     const found = rows.slice(0, exits.length).map((r) => r[0])
     if (JSON.stringify(found) !== JSON.stringify(exits)) problems.push(`the poll table's exits are ${JSON.stringify(found)}, not ${JSON.stringify(exits)}`)
     else if (!(rows[1]?.[1] ?? '').includes(`\`${GRACE_NONE}\``)) problems.push(`the poll table's ${exits[1]} row does not give the grace ${GRACE_NONE}`)
@@ -2499,17 +2499,17 @@ function e13SkillProblems(text: string): string[] {
   const phrases: [string, string][] = [
     ['the limit of unknown wait exits', `After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`],
     ['the limit of stop calls', `at most ${STOP_CALL_LIMIT} stop calls in all`],
-    ['the unknown wait exits', `a wait exit other than ${e13List(waitCodes, 'and')}`],
-    ['the unknown stop exits', `a stop exit other than ${e13List(stopRows.map((r) => r.exit), 'and')}`],
+    ['the unknown wait exits', `a wait exit other than ${lifecycleList(waitCodes, 'and')}`],
+    ['the unknown stop exits', `a stop exit other than ${lifecycleList(stopRows.map((r) => r.exit), 'and')}`],
     ['the grace after each stop exit', `\`${none.grace}\` after exit ${none.exit}, \`${term.grace}\` after ${term.exit}, \`${kill.grace}\` after ${kill.exit}`],
-    ['the report exits', `exits with its code: ${e13List(reportCodes, 'or')}`],
+    ['the report exits', `exits with its code: ${lifecycleList(reportCodes, 'or')}`],
     ['the usage exit as unknown', `counts a wait or stop exit of ${runner.USAGE_EXIT_STATUS} as unknown`],
-    ["the wait's bound and checks", `waits at most ${e13Seconds(WAIT_BOUND_MS)} s for the run to move on, checking every ${e13Seconds(WAIT_CHECK_INTERVAL_MS)} s`],
+    ["the wait's bound and checks", `waits at most ${lifecycleSeconds(WAIT_BOUND_MS)} s for the run to move on, checking every ${lifecycleSeconds(WAIT_CHECK_INTERVAL_MS)} s`],
     ['the deadline while no status file can be read', `the RUN_ID's time plus ${NO_STATUS_DEADLINE_MINUTES} min`],
     ['the grace', `The grace ends ${GRACE_MINUTES} min after the deadline`],
-    ["the stop's SIGKILL", `SIGKILL when the runner is still alive ${e13Seconds(STOP_KILL_AFTER_MS)} s later`],
-    ["a wait call's time", `a wait returns within ${e13Seconds(WAIT_BOUND_MS)} s plus its start-up`],
-    ["a stop call's time", `a stop returns within ${e13Seconds(STOP_KILL_AFTER_MS)} s plus its start-up`],
+    ["the stop's SIGKILL", `SIGKILL when the runner is still alive ${lifecycleSeconds(STOP_KILL_AFTER_MS)} s later`],
+    ["a wait call's time", `a wait returns within ${lifecycleSeconds(WAIT_BOUND_MS)} s plus its start-up`],
+    ["a stop call's time", `a stop returns within ${lifecycleSeconds(STOP_KILL_AFTER_MS)} s plus its start-up`],
   ]
   const all = flat(text)
   for (const [what, phrase] of phrases) if (!all.includes(phrase)) problems.push(`does not state ${what}: ${phrase}`)
@@ -2522,32 +2522,32 @@ function e13SkillProblems(text: string): string[] {
   for (const [verb, line] of failed) if (!blocks.some((b) => b.info === 'text' && b.body.trim() === line)) problems.push(`does not hold the ${verb} verb's verdict reader failed: line as a block of its own: ${line}`)
 
   // Finishing a run by hand.
-  const handHeading = `## ${E13_HAND_TITLE}`
+  const handHeading = `## ${LIFECYCLE_HAND_TITLE}`
   const hand = findSection(text, handHeading)
   if (hand === undefined) problems.push(`has no "${handHeading}" heading`)
   else {
     const handText = flat(hand)
-    for (const verb of reader.READER_VERBS) if (!handText.includes(`\`${e13VerbCall(verb)}\``)) problems.push(`"${E13_HAND_TITLE}" does not run the ${verb} verb as SR-17.1 gives it: ${e13VerbCall(verb)}`)
-    const until = `until it exits ${e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE, WAIT_EXIT_GRACE], 'or')}`
-    if (!handText.includes(until)) problems.push(`"${E13_HAND_TITLE}" does not wait ${until}`)
+    for (const verb of reader.READER_VERBS) if (!handText.includes(`\`${lifecycleVerbCall(verb)}\``)) problems.push(`"${LIFECYCLE_HAND_TITLE}" does not run the ${verb} verb as gives it: ${lifecycleVerbCall(verb)}`)
+    const until = `until it exits ${lifecycleList([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE, WAIT_EXIT_GRACE], 'or')}`
+    if (!handText.includes(until)) problems.push(`"${LIFECYCLE_HAND_TITLE}" does not wait ${until}`)
   }
 
   // The launch.
   const launch = findSection(text, /^### .*\bLaunch$/)
   if (launch === undefined) problems.push('has no Launch step')
-  else problems.push(...e13LaunchProblems(e13Commands(launch)))
+  else problems.push(...lifecycleLaunchProblems(lifecycleCommands(launch)))
 
-  // The commands, the hand-finishing spans among them: no sleep or timeout, no verdict.txt, and the reader run only as SR-17.1 gives it.
-  for (const line of [...commands, ...(hand === undefined ? [] : e13Spans(hand))]) {
-    for (const command of ['sleep', 'timeout']) if (e13Runs(line, command)) problems.push(`a command runs ${command}: ${line}`)
+  // The commands, the hand-finishing spans among them: no sleep or timeout, no verdict.txt, and the reader run only as gives it.
+  for (const line of [...commands, ...(hand === undefined ? [] : lifecycleSpans(hand))]) {
+    for (const command of ['sleep', 'timeout']) if (lifecycleRuns(line, command)) problems.push(`a command runs ${command}: ${line}`)
     if (line.includes(runner.VERDICT_FILE_NAME)) problems.push(`a command names ${runner.VERDICT_FILE_NAME}, which only the reader reads: ${line}`)
   }
   for (const line of commands) {
     const at = line.indexOf(`${reader.READER_COMMAND} `)
     const call = at < 0 ? undefined : (line.slice(at).split(';')[0] as string).trim()
-    if (call !== undefined && !reader.READER_VERBS.some((verb) => call === e13VerbCall(verb))) problems.push(`a command runs the reader other than as SR-17.1 gives it: ${call}`)
+    if (call !== undefined && !reader.READER_VERBS.some((verb) => call === lifecycleVerbCall(verb))) problems.push(`a command runs the reader other than as gives it: ${call}`)
   }
-  for (const verb of reader.READER_VERBS) if (!commands.some((l) => l.includes(e13VerbCall(verb)))) problems.push(`no command runs the ${verb} verb`)
+  for (const verb of reader.READER_VERBS) if (!commands.some((l) => l.includes(lifecycleVerbCall(verb)))) problems.push(`no command runs the ${verb} verb`)
 
   // No 40-hex commit.
   for (const hex of text.match(/(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])/g) ?? []) problems.push(`holds a 40-hex commit: ${hex}`)
@@ -2556,146 +2556,146 @@ function e13SkillProblems(text: string): string[] {
 }
 
 /** `text` with `from` replaced by `to` once, checked to change it (a planted row that plants nothing would pass vacuously). */
-function e13Planted(text: string, from: string | RegExp, to: string): string {
+function lifecyclePlanted(text: string, from: string | RegExp, to: string): string {
   const out = text.replace(from, () => to)
   expect(out).not.toBe(text)
   return out
 }
 
 /** A 40-hex commit for the planted row. */
-const E13_COMMIT = '0123456789abcdef'.repeat(3).slice(0, 40)
+const LIFECYCLE_COMMIT = '0123456789abcdef'.repeat(3).slice(0, 40)
 
-describe('E13: the /ci skill audit (b.uqm SR-18.2, SR-18.3; b.t6s E13 T7.S1)', () => {
+describe('the run lifecycle: the /ci skill audit (.S1)', () => {
   test('the committed skill has no problem: its verbs, exit tables, limits, bounds, failure lines, hand-finishing heading, launch and commands match the reader', () => {
-    expect(E13_HAND_TITLE).not.toBe('')
-    expect(STOP_READER_FAILED_TEXT.endsWith(`"${E13_HAND_TITLE}" says`)).toBe(true)
-    expect(e13SkillProblems(e13Skill())).toEqual([])
+    expect(LIFECYCLE_HAND_TITLE).not.toBe('')
+    expect(STOP_READER_FAILED_TEXT.endsWith(`"${LIFECYCLE_HAND_TITLE}" says`)).toBe(true)
+    expect(lifecycleSkillProblems(lifecycleSkill())).toEqual([])
   })
 
-  const waitExits = [String(WAIT_EXIT_RUNNING), e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or')]
-  const kill = (): { what: string; grace: string } => e13StopRows()[2] as { what: string; grace: string }
-  const killAfter = ` after ${e13Seconds(STOP_KILL_AFTER_MS)} s`
-  const waitCall = `${e13VerbCall('wait')}; echo`
-  const reportCall = `${e13VerbCall('report')}; echo`
+  const waitExits = [String(WAIT_EXIT_RUNNING), lifecycleList([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or')]
+  const kill = (): { what: string; grace: string } => lifecycleStopRows()[2] as { what: string; grace: string }
+  const killAfter = ` after ${lifecycleSeconds(STOP_KILL_AFTER_MS)} s`
+  const waitCall = `${lifecycleVerbCall('wait')}; echo`
+  const reportCall = `${lifecycleVerbCall('report')}; echo`
   const verdictRead = `head -n 1 "/tmp/${RUN_DIR_PREFIX}<RUN_ID>/${runner.VERDICT_FILE_NAME}"`
   const handExits = [WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE, WAIT_EXIT_GRACE]
 
   // Each row plants one change in the committed skill; the audit must name it.
   test.each<[string, (text: string) => string, () => string | string[]]>([
-    ['dropped stop verb', (t) => e13Planted(t, `${e13VerbLine('stop')}\n`, ''), () => `the verbs block does not name the stop verb as SR-17.1 gives it: ${e13VerbLine('stop')}`],
+    ['dropped stop verb', (t) => lifecyclePlanted(t, `${lifecycleVerbLine('stop')}\n`, ''), () => `the verbs block does not name the stop verb as gives it: ${lifecycleVerbLine('stop')}`],
     [
       "report verb in READER_USAGE_TEXT's form",
-      (t) => e13Planted(t, `[${E13_CI_ARGUMENTS}]`, '[/ci arguments]'),
-      () => `the verbs block does not name the report verb as SR-17.1 gives it: ${e13VerbLine('report')}`,
+      (t) => lifecyclePlanted(t, `[${LIFECYCLE_CI_ARGUMENTS}]`, '[/ci arguments]'),
+      () => `the verbs block does not name the report verb as gives it: ${lifecycleVerbLine('report')}`,
     ],
     [
       'changed wait exit',
-      (t) => e13Planted(t, `| \`gone\` | ${WAIT_EXIT_GONE} |`, `| \`gone\` | ${WAIT_EXIT_GONE + 2} |`),
+      (t) => lifecyclePlanted(t, `| \`gone\` | ${WAIT_EXIT_GONE} |`, `| \`gone\` | ${WAIT_EXIT_GONE + 2} |`),
       () => `the wait table gives gone exit ${WAIT_EXIT_GONE + 2}, not ${WAIT_EXIT_GONE}`,
     ],
     [
       'changed stop exit',
-      (t) => e13Planted(t, `| ${STOP_EXIT_SENT_SIGTERM} | \`${reader.GRACE_TERM_PREFIX}<m>\` |`, `| ${STOP_EXIT_SENT_SIGTERM + 2} | \`${reader.GRACE_TERM_PREFIX}<m>\` |`),
+      (t) => lifecyclePlanted(t, `| ${STOP_EXIT_SENT_SIGTERM} | \`${reader.GRACE_TERM_PREFIX}<m>\` |`, `| ${STOP_EXIT_SENT_SIGTERM + 2} | \`${reader.GRACE_TERM_PREFIX}<m>\` |`),
       () => `the stop table gives ${reader.GRACE_TERM_PREFIX}<m> exit ${STOP_EXIT_SENT_SIGTERM + 2}, not ${STOP_EXIT_SENT_SIGTERM}`,
     ],
     [
       'stop row that differs from the stop line',
-      (t) => e13Planted(t, `${killAfter}\` |`, '` |'),
+      (t) => lifecyclePlanted(t, `${killAfter}\` |`, '` |'),
       () => `the stop table's ${kill().grace} row says \`${kill().what.replace(killAfter, '')}\`, not the stop line's \`${kill().what}\``,
     ],
     [
       'changed poll exit',
-      (t) => e13Planted(t, new RegExp(`^\\| ${WAIT_EXIT_GRACE} \\|`, 'm'), `| ${WAIT_EXIT_GRACE + 1} |`),
+      (t) => lifecyclePlanted(t, new RegExp(`^\\| ${WAIT_EXIT_GRACE} \\|`, 'm'), `| ${WAIT_EXIT_GRACE + 1} |`),
       () => `the poll table's exits are ${JSON.stringify([...waitExits, String(WAIT_EXIT_GRACE + 1)])}, not ${JSON.stringify([...waitExits, String(WAIT_EXIT_GRACE)])}`,
     ],
     [
       'raised unknown-exit limit',
-      (t) => e13Planted(t, `After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`, `After ${UNKNOWN_WAIT_EXIT_LIMIT + 1} unknown exits in a row`),
+      (t) => lifecyclePlanted(t, `After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`, `After ${UNKNOWN_WAIT_EXIT_LIMIT + 1} unknown exits in a row`),
       () => `does not state the limit of unknown wait exits: After ${UNKNOWN_WAIT_EXIT_LIMIT} unknown exits in a row`,
     ],
     [
       'raised stop-call limit',
-      (t) => e13Planted(t, `at most ${STOP_CALL_LIMIT} stop calls in all`, `at most ${STOP_CALL_LIMIT + 2} stop calls in all`),
+      (t) => lifecyclePlanted(t, `at most ${STOP_CALL_LIMIT} stop calls in all`, `at most ${STOP_CALL_LIMIT + 2} stop calls in all`),
       () => `does not state the limit of stop calls: at most ${STOP_CALL_LIMIT} stop calls in all`,
     ],
     [
       'changed usage exit',
-      (t) => e13Planted(t, `exit of ${runner.USAGE_EXIT_STATUS} as unknown`, `exit of ${runner.USAGE_EXIT_STATUS + 1} as unknown`),
+      (t) => lifecyclePlanted(t, `exit of ${runner.USAGE_EXIT_STATUS} as unknown`, `exit of ${runner.USAGE_EXIT_STATUS + 1} as unknown`),
       () => `does not state the usage exit as unknown: counts a wait or stop exit of ${runner.USAGE_EXIT_STATUS} as unknown`,
     ],
     [
       'changed wait bound',
-      (t) => e13Planted(t, `waits at most ${e13Seconds(WAIT_BOUND_MS)} s`, `waits at most ${e13Seconds(WAIT_BOUND_MS) + 30} s`),
+      (t) => lifecyclePlanted(t, `waits at most ${lifecycleSeconds(WAIT_BOUND_MS)} s`, `waits at most ${lifecycleSeconds(WAIT_BOUND_MS) + 30} s`),
       () =>
-        `does not state the wait's bound and checks: waits at most ${e13Seconds(WAIT_BOUND_MS)} s for the run to move on, checking every ${e13Seconds(WAIT_CHECK_INTERVAL_MS)} s`,
+        `does not state the wait's bound and checks: waits at most ${lifecycleSeconds(WAIT_BOUND_MS)} s for the run to move on, checking every ${lifecycleSeconds(WAIT_CHECK_INTERVAL_MS)} s`,
     ],
     [
       'changed wait failure line',
-      (t) => e13Planted(t, WAIT_READER_FAILED_TEXT, WAIT_READER_FAILED_TEXT.replace('may still be running', 'is still running')),
+      (t) => lifecyclePlanted(t, WAIT_READER_FAILED_TEXT, WAIT_READER_FAILED_TEXT.replace('may still be running', 'is still running')),
       () => `does not hold the wait verb's verdict reader failed: line as a block of its own: ${WAIT_READER_FAILED_TEXT}`,
     ],
     [
       'changed stop failure line',
-      (t) => e13Planted(t, STOP_READER_FAILED_TEXT, STOP_READER_FAILED_TEXT.replace(`stop exited <code>`, 'stop failed <code>')),
+      (t) => lifecyclePlanted(t, STOP_READER_FAILED_TEXT, STOP_READER_FAILED_TEXT.replace(`stop exited <code>`, 'stop failed <code>')),
       () => `does not hold the stop verb's verdict reader failed: line as a block of its own: ${STOP_READER_FAILED_TEXT}`,
     ],
-    ['renamed hand-finishing heading', (t) => e13Planted(t, `## ${E13_HAND_TITLE}\n`, '## Finishing a run manually\n'), () => `has no "## ${E13_HAND_TITLE}" heading`],
+    ['renamed hand-finishing heading', (t) => lifecyclePlanted(t, `## ${LIFECYCLE_HAND_TITLE}\n`, '## Finishing a run manually\n'), () => `has no "## ${LIFECYCLE_HAND_TITLE}" heading`],
     [
       'hand finishing that stops waiting before the grace',
-      (t) => e13Planted(t, `until it exits ${e13List(handExits, 'or')}`, `until it exits ${e13List(handExits.slice(0, -1), 'or')}`),
-      () => `"${E13_HAND_TITLE}" does not wait until it exits ${e13List(handExits, 'or')}`,
+      (t) => lifecyclePlanted(t, `until it exits ${lifecycleList(handExits, 'or')}`, `until it exits ${lifecycleList(handExits.slice(0, -1), 'or')}`),
+      () => `"${LIFECYCLE_HAND_TITLE}" does not wait until it exits ${lifecycleList(handExits, 'or')}`,
     ],
-    ['sleep command', (t) => e13Planted(t, waitCall, `sleep 30\n${waitCall}`), () => 'a command runs sleep: sleep 30'],
-    ['timeout command', (t) => e13Planted(t, waitCall, `timeout 120 ${waitCall}`), () => `a command runs timeout: timeout 120 ${waitCall} "wait exit: $?"`],
+    ['sleep command', (t) => lifecyclePlanted(t, waitCall, `sleep 30\n${waitCall}`), () => 'a command runs sleep: sleep 30'],
+    ['timeout command', (t) => lifecyclePlanted(t, waitCall, `timeout 120 ${waitCall}`), () => `a command runs timeout: timeout 120 ${waitCall} "wait exit: $?"`],
     [
       'sleep after a shell keyword',
-      (t) => e13Planted(t, `${waitCall} "wait exit: $?"`, `until ${e13VerbCall('wait')}; do sleep 5; done`),
-      () => `a command runs sleep: until ${e13VerbCall('wait')}; do sleep 5; done`,
+      (t) => lifecyclePlanted(t, `${waitCall} "wait exit: $?"`, `until ${lifecycleVerbCall('wait')}; do sleep 5; done`),
+      () => `a command runs sleep: until ${lifecycleVerbCall('wait')}; do sleep 5; done`,
     ],
     [
       'sleep in a hand-finishing span',
-      (t) => e13Planted(t, 'Run it again after an', 'Run `sleep 60`, then run it again after an'),
+      (t) => lifecyclePlanted(t, 'Run it again after an', 'Run `sleep 60`, then run it again after an'),
       () => 'a command runs sleep: sleep 60',
     ],
     [
       'verdict.txt read',
-      (t) => e13Planted(t, reportCall, `${verdictRead}\n${reportCall}`),
+      (t) => lifecyclePlanted(t, reportCall, `${verdictRead}\n${reportCall}`),
       () => `a command names ${runner.VERDICT_FILE_NAME}, which only the reader reads: ${verdictRead}`,
     ],
     [
       "launch on the call's streams",
-      (t) => e13Planted(t, ' >/dev/null 2>&1 &\n', ' &\n'),
-      () => `the launch leaves standard output and standard error on the Bash call's streams: ${E13_LAUNCH} </dev/null &`,
+      (t) => lifecyclePlanted(t, ' >/dev/null 2>&1 &\n', ' &\n'),
+      () => `the launch leaves standard output and standard error on the Bash call's streams: ${LIFECYCLE_LAUNCH} </dev/null &`,
     ],
     [
       'launch in the calling session',
-      (t) => e13Planted(t, `setsid bun ${RUNNER_PATH_SUFFIX}`, `bun ${RUNNER_PATH_SUFFIX}`),
-      () => `the launch does not start ${E13_LAUNCH}: ${E13_LAUNCH.replace('setsid ', '')} </dev/null >/dev/null 2>&1 &`,
+      (t) => lifecyclePlanted(t, `setsid bun ${RUNNER_PATH_SUFFIX}`, `bun ${RUNNER_PATH_SUFFIX}`),
+      () => `the launch does not start ${LIFECYCLE_LAUNCH}: ${LIFECYCLE_LAUNCH.replace('setsid ', '')} </dev/null >/dev/null 2>&1 &`,
     ],
     [
       'launch in the foreground',
-      (t) => e13Planted(t, ' 2>&1 &\n', ' 2>&1\n'),
-      () => `the launch does not run the runner in the background: ${E13_LAUNCH} </dev/null >/dev/null 2>&1`,
+      (t) => lifecyclePlanted(t, ' 2>&1 &\n', ' 2>&1\n'),
+      () => `the launch does not run the runner in the background: ${LIFECYCLE_LAUNCH} </dev/null >/dev/null 2>&1`,
     ],
-    ['launch with job control on', (t) => e13Planted(t, 'set +m\n', ''), () => 'the launch does not turn job control off (set +m) before it starts the runner'],
-    ['launch with no PID from $!', (t) => e13Planted(t, 'RUNNER_PID=$!\n', ''), () => 'the launch does not take the runner PID from $! just after it starts the runner'],
+    ['launch with job control on', (t) => lifecyclePlanted(t, 'set +m\n', ''), () => 'the launch does not turn job control off (set +m) before it starts the runner'],
+    ['launch with no PID from $!', (t) => lifecyclePlanted(t, 'RUNNER_PID=$!\n', ''), () => 'the launch does not take the runner PID from $! just after it starts the runner'],
     [
       'poll wait with no PID',
-      (t) => e13Planted(t, waitCall, `${e13VerbCall('wait').replace(' <PID>', '')}; echo`),
-      () => [`a command runs the reader other than as SR-17.1 gives it: ${e13VerbCall('wait').replace(' <PID>', '')}`, 'no command runs the wait verb'],
+      (t) => lifecyclePlanted(t, waitCall, `${lifecycleVerbCall('wait').replace(' <PID>', '')}; echo`),
+      () => [`a command runs the reader other than as gives it: ${lifecycleVerbCall('wait').replace(' <PID>', '')}`, 'no command runs the wait verb'],
     ],
     [
       'poll table with no grace',
-      (t) => e13Planted(t, `The grace is \`${GRACE_NONE}\`; go to step 4`, 'Go to step 4'),
-      () => `the poll table's ${e13List([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or')} row does not give the grace ${GRACE_NONE}`,
+      (t) => lifecyclePlanted(t, `The grace is \`${GRACE_NONE}\`; go to step 4`, 'Go to step 4'),
+      () => `the poll table's ${lifecycleList([WAIT_EXIT_VERDICT, WAIT_EXIT_REFUSED, WAIT_EXIT_GONE], 'or')} row does not give the grace ${GRACE_NONE}`,
     ],
     [
       'printed PID with no fallback',
-      (t) => e13Planted(t, `\${RUNNER_PID:-${reader.PID_ARGUMENT_NONE}}`, '${RUNNER_PID}'),
+      (t) => lifecyclePlanted(t, `\${RUNNER_PID:-${reader.PID_ARGUMENT_NONE}}`, '${RUNNER_PID}'),
       () => `the launch does not print the runner PID, or ${reader.PID_ARGUMENT_NONE} when there is none: \${RUNNER_PID:-${reader.PID_ARGUMENT_NONE}}`,
     ],
-    ['commit', (t) => `${t}\nBuilt from commit ${E13_COMMIT}.\n`, () => `holds a 40-hex commit: ${E13_COMMIT}`],
+    ['commit', (t) => `${t}\nBuilt from commit ${LIFECYCLE_COMMIT}.\n`, () => `holds a 40-hex commit: ${LIFECYCLE_COMMIT}`],
   ])('a planted %s is reported', (_label, plant, problem) => {
-    expect(e13SkillProblems(plant(e13Skill()))).toEqual([problem()].flat())
+    expect(lifecycleSkillProblems(plant(lifecycleSkill()))).toEqual([problem()].flat())
   })
 })

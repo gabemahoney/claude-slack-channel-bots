@@ -1,4 +1,4 @@
-/** Configured storage persistence and AD transcript-reference diagnostics (b.d6n).
+/** Configured storage persistence and AD transcript-reference diagnostics.
  * Paths, archives and homes are confined to each test's temporary directory. */
 import { describe, test, expect, afterEach, beforeEach, spyOn } from 'bun:test'
 import { homedir, tmpdir } from 'node:os'

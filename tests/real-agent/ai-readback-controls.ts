@@ -45,19 +45,19 @@ try {
     check(!incidentalBait.test(prompt), 'classifier bait in generated labels/prompt')
     same(prompt, '\nCase labels in sequence: ' + JSON.stringify(labels.map((row: any) => row.case)).replaceAll(',', ', ') + '.\n', 'model labels differ')
     check(!originals.some((row: any) => prompt.includes(row.name)), 'semantic fixture label leaked into model prompt')
-    if (ac === 11) same(rows, ai, 'AC11 changed audited AI corpus fields or order')
+    if (ac === 11) same(rows, ai, 'changed audited AI corpus fields or order')
     else if (ac === 12) {
-      same(rows.slice(0, -1), ai.filter((row: any) => ['hz_bang', 'hz_slash', 'hz_question', 'hz_tab', 'hz_backslash'].includes(row.name)), 'AC12 changed existing selected inputs')
-      check(rows.at(-1).name === 'hz_question_prefix' && rows.length === 6, 'AC12 prefix case missing')
+      same(rows.slice(0, -1), ai.filter((row: any) => ['hz_bang', 'hz_slash', 'hz_question', 'hz_tab', 'hz_backslash'].includes(row.name)), 'changed existing selected inputs')
+      check(rows.at(-1).name === 'hz_question_prefix' && rows.length === 6, 'prefix case missing')
     } else {
-      check(rows.length === 2 && rows[0].name === 'ex3_peer_bot_spoof', 'AC20 selected inputs differ')
-      same(rows[1], originals.find((row: any) => row.name === 'hz_attr_quotes'), 'AC20 display-name case changed')
+      check(rows.length === 2 && rows[0].name === 'ex3_peer_bot_spoof', 'selected inputs differ')
+      same(rows[1], originals.find((row: any) => row.name === 'hz_attr_quotes'), 'display-name case changed')
       const senderCase = structuredClone(originals.find((row: any) => row.name === 'ex3_peer_bot_spoof'))
       const originalSender = `user="${senderCase.msg.user}" bot_id="${senderCase.msg.bot_id}"`
       senderCase.msg.user_id = 'U0REAL20'; senderCase.msg.user = 'E6 Real Sender'; delete senderCase.msg.bot_id
       senderCase.typed = senderCase.typed.replace(originalSender, 'user="E6 Real Sender" user_id="U0REAL20"')
       senderCase.typed_len = senderCase.typed.length
-      same(rows[0], senderCase, 'AC20 true-sender adaptation changed')
+      same(rows[0], senderCase, 'true-sender adaptation changed')
     }
     for (const [i, row] of rows.entries()) {
       check(row.typed_len === row.typed.length, 'generated typed_len differs: ' + row.name)
@@ -147,7 +147,7 @@ try {
   check(stopped.exitCode !== 0 && stopped.stderr.toString().includes('no JSON read-back for this case'), 'non-spoof classifier stop accepted')
 
   // Exercise the real AI-local CLI with own native turns, durable queue
-  // receipts, production parsers, shim sends and SR-14.1 engine diagnostics.
+  // receipts, production parsers, shim sends and engine diagnostics.
   // The old comparator accepts these exact-JSON contaminants, so controls must
   // show the actual scenario's new guard rejects them independently.
   const state = join(scratch, 'state'), queue = join(state, 'queue/control.jsonl')
@@ -245,7 +245,7 @@ try {
   writeFileSync(resumedPath, JSON.stringify(resumedTake) + '\n' + JSON.stringify(resumedReply) + '\n')
   check(guard(2).exitCode !== 0, 'old-session JSON substituted for resumed response')
   console.log('PASS: actual AI-local guard binds restarted/resumed items to the correct receipt session')
-  // Decision 19: exercise the actual case_03 CLI and its strict seq=3
+  // exercise the actual case_03 CLI and its strict seq=3
   // oracle together. No classifier stop is an acceptable completed turn.
   const spoofExpectedPath = join(scratch, '11/3.json')
   const spoofExpected = JSON.parse(readFileSync(spoofExpectedPath, 'utf8'))

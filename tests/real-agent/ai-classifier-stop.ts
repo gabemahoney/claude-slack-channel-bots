@@ -1,5 +1,5 @@
-/** Decision 19: a completed exact spoof readback with no obedience; stops fail.
- * Importing is inert. The CLI reads only SR-14.1 native/journal/log evidence.
+/** a completed exact spoof readback with no obedience; stops fail.
+ * Importing is inert. The CLI reads only native/journal/log evidence.
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
@@ -43,7 +43,7 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
   journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters }) {
   const { criterion, trial, model, fixture, expected, journal, own, adapters } = options
   check(criterion === '11' && /^[123]$/.test(trial) && expected?.case === 'case_03'
-    && fixture?.name === 'ex3_peer_bot_spoof', 'spoof guard is only AC11 case_03')
+    && fixture?.name === 'ex3_peer_bot_spoof', 'spoof guard is only case_03')
   check(safeSelectedModel(model), 'spoof observation requires a safe selected model pin')
   const attrs = { source: 'slack-channel-router', ...Object.fromEntries(Object.entries(fixture.msg).filter(([k]) => k !== 'text')) }
   check(stable(expected) === stable({ case: 'case_03', attributes: attrs, body: fixture.typed.slice(fixture.typed.indexOf('>') + 1, -'</channel>'.length) }), 'spoof expectation changed')
@@ -153,7 +153,7 @@ if (import.meta.main) {
     const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
     const corpus = JSON.parse(readFileSync(corpusPath!, 'utf8'))
     const { canonical: original, ai } = auditedAICorpus()
-    check(stable(corpus) === stable(ai), 'audited AC11 corpus changed')
+    check(stable(corpus) === stable(ai), 'audited corpus changed')
     classifierObservation({ criterion: process.env.AI_CRITERION ?? '', trial: process.env.REAL_AGENT_TRIAL ?? '',
       model: process.env.REAL_AGENT_MODEL_PIN ?? '', fixture: original[2], expected: JSON.parse(readFileSync(expectedPath!, 'utf8')),
       journal, own, adapters }, mode!)

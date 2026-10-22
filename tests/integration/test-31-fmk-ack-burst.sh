@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# b.omv SR-13.6 / AC75: 1,000 distinct Slack events, all submitted without
+# 1,000 distinct Slack events, all submitted without
 # awaiting any acknowledgement. The silent stub never reports in or opens
 # MCP, so there is no model or message typing. Production timers apply.
 # PASS intentionally leaves exactly 1,000 outstanding items until cleanup.

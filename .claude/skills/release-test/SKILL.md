@@ -1,51 +1,46 @@
 ---
 name: release-test
-description: Execute checked-in integration scenarios from the testplans fixture hive. Run inside Docker CI container.
+description: Execute the checked-in integration scenarios in testplans/README.md inside a disposable Docker CI container.
 user-invocable: true
-allowed-tools: [Bash, mcp__bees__show_ticket, mcp__bees__list_hives, mcp__bees__execute_freeform_query]
+allowed-tools: [Bash]
 ---
 
 # /release-test
 
-You are a strict test runner. Execute each test from the `testplans` fixture hive one at a time.
+Run the scenarios listed in [testplans/README.md](../../../testplans/README.md)
+one at a time, in the order given there. Read the local Markdown files with
+Bash; no external scenario service is needed.
 
-`testplans/` is the checked-in integration scenario store copied into Docker, not an Apiary workflow store. Its ticket metadata is fixture data; do not change its statuses. Apiary v4.0.3 project work uses Ideas (Doc), Plans (Epic → Task → Subtask), Bugs and Research (Report), located through the Project's `.apiary/` configuration.
-**Never try to fix problems or work around issues. If something is broken, stop.**
+Run only inside a disposable Docker CI container, never against the host's
+HOME or a production install. Preserve each scenario's prerequisites and
+assertions. Never print credentials or environment values.
 
-## Step 1 — Fetch test tickets
+**If anything is broken, stop. Do not fix, work around, debug or retry it.**
 
-1. Call `list_hives()` to confirm testplans hive exists
-2. Query all tickets in the testplans hive using `execute_freeform_query()`, or call `show_ticket()` on the root bee (b.en1) to get the suite root
-3. The test tickets are: any tickets in the hive whose title starts with "Test " — these are the tests to run
-4. Load all test ticket details via `show_ticket(all_ids)`
-5. Sort tests in topological order by `up_dependencies` (tickets with no deps first, followed by their dependents)
+## Read the scenarios
 
-Each ticket has:
-- `title`: test name (e.g. "Test 1: ...")
-- `body`: full plain English test instructions
-- `up_dependencies`: tickets that must run before this one
+1. Read the index and each of the three ordered scenario documents.
+2. Check their prerequisites before starting. The index also describes the
+   separate resume and live-acceptance scenarios; they are not part of this
+   ordered run.
+3. Use each document's heading as its test name and its body as the full
+   instructions. The preceding scenario must pass before its dependent runs.
 
-## Step 2 — Execute tests
+## Execute and report
 
-For each test in order:
+For each scenario:
 
-1. Print: `[N/TOTAL] Running: <title>`
-2. Read the ticket `body` — it contains instructions on what to install, run, and verify
-3. Execute the instructions using Bash commands
-4. If all verifications pass: print `[N/TOTAL] PASS: <title>`
-5. If anything fails: print `[N/TOTAL] FAIL: <title> — <error>` then go to Step 3
+1. Print `[N/TOTAL] Running: <title>`.
+2. Execute its setup, commands and verifications using Bash.
+3. On success, print `[N/TOTAL] PASS: <title>`.
+4. On failure, print `[N/TOTAL] FAIL: <title> — <error>` and
+   `SKIP: <title>` for each remaining dependent scenario. Then print
+   `TEST FAILED: <title> — <error>` and stop.
 
-If a test fails, skip all downstream dependents: print `SKIP: <title>` for each.
+After all three scenarios pass, print:
 
-## Step 3 — On failure
-
-1. Print the FAIL line
-2. Print: `TEST FAILED: <title> — <error>`
-3. Stop. Do not continue. Do not debug. Do not retry.
-
-## Step 4 — On full pass
-
-After all tests pass:
-```
+```text
 RELEASE TEST PASSED
 ```
+
+This manual scenario result does not replace the full `/ci` release gate.

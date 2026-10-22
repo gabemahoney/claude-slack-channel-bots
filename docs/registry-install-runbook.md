@@ -59,7 +59,7 @@ heading until the release is cut. `/publish prepare` versions them: it turns
 the first `## Unreleased` heading into the version and today's UTC date, as in
 `## 0.11.0 (2026-10-06)`, adds a fresh empty `## Unreleased` entry above it,
 and commits the file in the release commit. Do not rename the heading by hand.
-With no `## Unreleased` heading, prepare stops at `SR-3.1 (changelog)` (exit
+With no `## Unreleased` heading, prepare stops at `(changelog)` (exit
 20) and rolls back. The release commit and the annotated `v<version>` tag
 messages stay `Release v<version>`. `CHANGELOG.md` is not in `package.json`'s
 `files`, so the npm tarball does not carry it.
@@ -102,7 +102,7 @@ On any non-zero exit, the scripts print an `SR-X.Y` diagnostic with an
 claude-slack-channel-bots@<version>` → verify). Prefer letting promote do it.
 
 The manual equivalent is documented here so you understand what promote does and
-can reproduce it if promote's post-publish install step (SR-7.3) fails and tells
+can reproduce it if promote's post-publish install step fails and tells
 you to reinstall by hand.
 
 > **Which global prefix.** The canonical bun global prefix is
@@ -112,7 +112,7 @@ you to reinstall by hand.
 > `BUN_INSTALL` pointed there) is a **stale shadowing install**: it can still win
 > `command -v` via a shim such as `~/.local/bin/claude-slack-channel-bots`, which
 > makes a perfectly good new install look broken. `/publish promote` detects that
-> at SR-7.0 / SR-7.4 and prints the remediation; remove the stale
+> at the contract and prints the remediation; remove the stale
 > `<prefix>/install/global` tree and repoint the shim with `ln -sfn`. Never
 > delete the shim outright (`~/.bun/bin` is often not on the interactive PATH),
 > and never touch any `install/cache` directory — that is bun's shared package
@@ -198,7 +198,7 @@ you to reinstall by hand.
    visible. The files on disk are the only observable evidence.
 
    `/publish promote` performs this same trust-and-verify automatically at
-   SR-7.4b, warning (non-fatally) if either of the two files is still missing
+  , warning (non-fatally) if either of the two files is still missing
    after the install.
 
 ---
@@ -239,7 +239,7 @@ Run all three checks. The install is only "real" if every one passes.
    Expected: the resolved path is under `~/.bun/install/global/`. Anything else
    (another bun prefix, or a path inside the repo checkout) means a stale install
    is winning on PATH — see the global-prefix note in Phase 2. This is the same
-   check `/publish promote` makes at SR-7.4, where a mismatch is exit 72.
+   check `/publish promote` makes at the contract, where a mismatch is exit 72.
 
 3. **Cron files are present on disk** (the whole point of the release):
 
@@ -320,7 +320,7 @@ not touch the running daemon).
    `No package.json was found` when run from an arbitrary directory.)
 
    The `file:` postinstall runs in the checkout itself, so it scaffolds only
-   missing config files and leaves `~/.claude/skills/` alone (b.669): the
+   missing config files and leaves `~/.claude/skills/` alone: the
    `debug-slack-channel-bots` link keeps pointing into
    `~/.bun/install/global/node_modules/claude-slack-channel-bots/`, where the
    registry install linked it. Under the `file:` install that global package

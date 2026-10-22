@@ -1,6 +1,6 @@
 /**
  * install-check-fixtures.ts — Test helpers for
- * src/install-check.ts (the install check, b.jg5 SRJ-212) and its callers
+ * src/install-check.ts (the install check) and its callers
  * (`scripts/install-check.ts`, `src/postinstall.ts`).
  *
  * Centralizes:
@@ -23,13 +23,13 @@
  *     message names the switch-over runbook section, its publishing-host
  *     block or the client-package remedy, the copy takes that part from
  *     `src/install-check.ts`'s exported text (`RUNBOOK_SECTION_POINTER`,
- *     `PUBLISHING_HOST_BLOCK_POINTER`, `CLIENT_PACKAGE_REMEDY`; b.jg5
- *     SRJ-208, SRJ-212), never a literal.
+ * `PUBLISHING_HOST_BLOCK_POINTER`, `CLIENT_PACKAGE_REMEDY`
+ *), never a literal.
  *
  * This module has no top-level mock.module() calls — the pretest gate
  * scripts/check-no-toplevel-mock-module.ts must pass against it — and no
  * value import of `Client` or `resolveSystemBinary` (host-safety audit,
- * b.jg5 SRJ-1301): from `src/install-check.ts` it imports the three text
+ *): from `src/install-check.ts` it imports the three text
  * constants above and types only.
  *
  * SPDX-License-Identifier: MIT

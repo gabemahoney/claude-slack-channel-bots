@@ -20,14 +20,14 @@ import {
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 
 /**
- * Trailing pane lines a one-line probe asks for (b.jg5 SRJ-117's `n_lines`
- * at b.jdc's reconnect verdict, `promptRowReconnectVerdict` in
- * `src/server.ts`, and b.jdc's ladder action, `launchOnPromptRow`; SRJ-606,
- * SRJ-607). These read whether agent-director answers a pane at all, not what
- * it shows; the pane may be a single leftover's (b.jg5 SRJ-613), so its
- * answer is no proof that the worker's own session is there. SRJ-117's
- * table gives the same count to the latch re-check probe (SRJ-505) and the
- * CLI precheck (SRJ-901); neither reads a pane through this module today.
+ * Trailing pane lines a one-line probe asks for (`n_lines`
+ * at the contract reconnect verdict, `promptRowReconnectVerdict` in
+ * `src/server.ts`, and ladder action, `launchOnPromptRow`,
+ *). These read whether agent-director answers a pane at all, not what
+ * it shows; the pane may be a single leftover's, so its
+ * answer is no proof that the worker's own session is there.
+ * table gives the same count to the latch re-check probe and the
+ * CLI precheck; neither reads a pane through this module today.
  */
 export const PROBE_PANE_READ_LINES = 1
 
@@ -56,7 +56,7 @@ export const PANE_READ_UNCLASSIFIED = 'unclassified'
 /** The persona is latched: it was not read, or its CONFLICT or UNUSABLE NAME answer latched it. */
 export const PANE_READ_LATCHED = 'latched'
 
-/** Every failure kind {@link paneReadFailureOf} answers, in SRJ-117's column order. */
+/** Every failure kind {@link paneReadFailureOf} answers, in the contract column order. */
 export const PANE_READ_FAILURE_KINDS = [
   PANE_READ_GONE,
   PANE_READ_ABSENT,
@@ -77,8 +77,7 @@ export type PaneReadFailureKind = (typeof PANE_READ_FAILURE_KINDS)[number]
 
 /**
  * The read succeeded. It may be a single leftover's, so it
- * is never proof on its own that the worker's own session is there (b.jg5
- * SRJ-613); the `send-keys` that follows it is the backstop (see the module
+ * is never proof on its own that the worker's own session is there; the `send-keys` that follows it is the backstop (see the module
  * comment).
  */
 export interface PaneReadPane {
@@ -87,7 +86,7 @@ export interface PaneReadPane {
 
 /** What every failure outcome carries. */
 interface PaneReadFailureFields {
-  /** The class `classifyAdError` gave the thrown value (b.jg5 SRJ-104). */
+  /** The class `classifyAdError` gave the thrown value. */
   readonly errorClass: AdErrorClass
   /** The value as `describeAdFailureForLog` renders it: the reported name, redacted, on one line, capped. */
   readonly description: string
@@ -103,7 +102,7 @@ export interface PaneReadPlainFailure extends PaneReadFailureFields {
 
 /**
  * An UNCLASSIFIED answer. `stopping` marks one whose `ErrInvalidFlags`
- * version re-check decided that the server stops (b.jg5 SRJ-204, SRJ-205):
+ * version re-check decided that the server stops:
  * only the shared reader `readPersonaOwnPane` sets it, never
  * {@link paneReadFailureOf}. A caller given a marked outcome types nothing
  * and calls nothing more for the persona.
@@ -129,7 +128,7 @@ export interface PaneReadUnusableName extends PaneReadFailureFields {
 export type PaneReadFailure = PaneReadPlainFailure | PaneReadUnclassified | PaneReadConflict | PaneReadUnusableName
 
 /**
- * The persona is latched (b.jg5 SRJ-502): `cause` is the CONFLICT or
+ * The persona is latched: `cause` is the CONFLICT or
  * UNUSABLE NAME answer that latched it, absent when the persona was latched
  * before the read and so was not read.
  */
@@ -150,7 +149,7 @@ export const PANE_READ_NOT_READ_LATCHED: PaneReadLatched = Object.freeze({ kind:
 
 /**
  * The failure outcome of a value thrown by one `read-pane` of a persona's
- * own row (b.jg5 SRJ-104, SRJ-117); see the module comment. Decided by class
+ * own row; see the module comment. Decided by class
  * through `src/ad-error-class.ts`. Pure; never throws.
  */
 export function paneReadFailureOf(value: unknown): PaneReadFailure {

@@ -3,8 +3,8 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 /**
  * test-helpers/persona-routing-managed.ts — The real inbound routing module
  * over the real connection manager's seams, built as `src/server.ts` builds
- * it (b.av2 SR-3.1, SR-4.1 with b.deo SRI-301 and SRI-302, SR-4.2 step 2
- * with b.deo SRI-303 to SRI-309).
+ * it (with and step 2
+ * with to).
  *
  * `makeManagedRouting(h, baseDir, opts?)` takes a connection harness
  * (`makeConnectionHarness`) and builds `createPersonaRouting` with the same
@@ -28,7 +28,7 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
  * manager's per-persona identities and clients. The caller owns the restart
  * deps (`initRestart`), `resetRoutingState()` and `h.manager.stopAll()`.
  *
- * Isolation (b.av2 SR-13.2): session paths are under the caller's `baseDir`;
+ * Isolation: session paths are under the caller's `baseDir`;
  * no I/O of its own, no timers, no token literal.
  *
  * SPDX-License-Identifier: MIT
@@ -69,7 +69,7 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
   const logs: string[] = []
   const log = (line: string): void => void logs.push(line)
   // The notifier reads the same configuration as the routing, so a notice
-  // goes to the destination of the channel mode in force (b.deo SRI-701).
+  // goes to the destination of the channel mode in force.
   const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, getPersonaConfig: () => h.config, log })
   const queue = createDeliveryQueue({ stateDir: baseDir })
   const ready = queue.start()

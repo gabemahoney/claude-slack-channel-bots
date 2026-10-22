@@ -143,7 +143,7 @@ async function firstLatencyAdmission(home: string, reply: (request: string) => P
 }
 
 test.each(['held observation', 'accepted reminder', 'drained control'] as const)(
-  'AC76 pre-sample admission waits for prior reminders: %s', async mode => {
+  'pre-sample admission waits for prior reminders: %s', async mode => {
     const h = await fixture(false), clock = createFakeClock()
     // Match the real loop's preceding 33 originals; only two need reminders.
     await h.send(slackInput())
@@ -231,7 +231,7 @@ test.each(['held observation', 'accepted reminder', 'drained control'] as const)
   },
 )
 
-test('AC76 admission replays and compacts only a private copy, then obtains fresh AD waiting', async () => {
+test('admission replays and compacts only a private copy, then obtains fresh AD waiting', async () => {
   const h = await fixture(false)
   await h.send(injectedInput())
   h.options.expectedCount = 1
@@ -275,7 +275,7 @@ test('AC76 admission replays and compacts only a private copy, then obtains fres
 })
 
 test.each(['torn journal', 'swallowed replay read failure', 'compact failure', 'stop failure'] as const)(
-  'AC76 admission fails closed and removes its snapshot on %s', async mode => {
+  'admission fails closed and removes its snapshot on %s', async mode => {
     const h = await fixture(false)
     await h.send(injectedInput())
     h.options.expectedCount = 1
@@ -321,7 +321,7 @@ test.each(['torn journal', 'swallowed replay read failure', 'compact failure', '
   },
 )
 
-test.each(['replay', 'stop', 'final AD'] as const)('AC76 admission rejects journal mutation during awaited %s', async phase => {
+test.each(['replay', 'stop', 'final AD'] as const)('admission rejects journal mutation during awaited %s', async phase => {
   const h = await fixture(false)
   await h.send(injectedInput())
   h.options.expectedCount = 1
@@ -348,7 +348,7 @@ test.each(['replay', 'stop', 'final AD'] as const)('AC76 admission rejects journ
 })
 
 test.each(['historical only', 'other persona', 'latest disconnected', 'disconnect during AD', 'reconnect during AD'] as const)(
-  'AC76 admission requires unchanged own post-cursor connection: %s', async mode => {
+  'admission requires unchanged own post-cursor connection: %s', async mode => {
     const h = await fixture(false)
     await h.send(injectedInput())
     h.options.expectedCount = 1
@@ -382,7 +382,7 @@ test.each([
   ['instance', { instance_id: 'cscb_beta' }], ['session', { session_id: 'other' }],
   ['row start', { started_at: 'other' }], ['launch', { launch_started_at: 'other' }],
   ['tag prompt', { labels: {} }], ['ended', { state: 'ended' }],
-] as const)('AC76 admission rejects changed %s before replay and after audit', async (_name, changed) => {
+] as const)('admission rejects changed %s before replay and after audit', async (_name, changed) => {
   const h = await fixture(false)
   await h.send(injectedInput())
   h.options.expectedCount = 1
@@ -396,7 +396,7 @@ test.each([
 })
 
 test.each(['working', 'AD rejection', 'missing journal', 'wrong original count', 'missing receipt'] as const)(
-  'AC76 admission refuses %s despite otherwise drained work', async mode => {
+  'admission refuses %s despite otherwise drained work', async mode => {
     const h = await fixture(false)
     await h.send(injectedInput())
     h.options.expectedCount = 1
@@ -414,7 +414,7 @@ test.each(['working', 'AD rejection', 'missing journal', 'wrong original count',
   },
 )
 
-test('AC76 unresolved candidate without observed working reaches the watchdog without a DM or cancellation', async () => {
+test('unresolved candidate without observed working reaches the watchdog without a DM or cancellation', async () => {
   const h = await fixture(false)
   await h.send(slackInput())
   for (let i = 1; i < 33; i++) await h.send(injectedInput())

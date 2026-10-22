@@ -1,6 +1,6 @@
 /**
  * line-parts.ts — a line builder's own text around the parts a case cannot
- * rebuild (b.jg5 SRJ-1014: every line a test asserts comes from its exported
+ * rebuild (every line a test asserts comes from its exported
  * builder, never typed). A case hands the builder a marker (`LINE_HOLE`) for
  * each such part — a thrown value's description that carries its stack
  * frames, a label the module does not export, any value the case means to

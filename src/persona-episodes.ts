@@ -1,19 +1,19 @@
 /**
  * persona-episodes.ts — The once-per-episode latch of every per-persona
- * notice kind b.jg5 adds (b.jg5 SRJ-1016).
+ * notice kind adds.
  *
  * An episode is the span in which one notice kind posts at most once for one
  * persona. Each persona key has at most one open episode per kind, and every
  * (key, kind) pair is independent: two personas' episodes of one kind, and
  * two kinds of one persona, never share a latch. What begins and ends an
- * episode is decided by the kind's poster (SRJ-1016's table); this module
+ * episode is decided by the kind's poster (table); this module
  * only keeps the latch:
  *
  * - `begin(key, kind, caseLabel?)` opens an episode, recording its start time
  *   from the clock. While one is open it is kept, unless a case is given
  *   that differs from the open episode's: then a new episode begins, with a
  *   new start time and nothing posted in it yet (CONFLICT: a retry refused
- *   with a new case begins a new episode; the same case keeps it, SRJ-506).
+ * with a new case begins a new episode; the same case keeps it).
  *   No case given keeps the open episode.
  * - `post(key, kind, text, mark?)` hands `text` to the notice sink at most
  *   once per mark in the open episode, and never when none is open. A kind
@@ -36,10 +36,10 @@
  *   the episode (the `tmux-unresponsive` alert check) is cancelled with it.
  * - `openKeys(kind)` lists the keys with an open episode of the kind; `clock`
  *   is the clock the start times come from.
- * - `teardownWindowState(key)` reads the injected teardown query (b.jg5
- *   SRJ-1003; production: the persona notifier's `teardownWindowState`).
+ * - `teardownWindowState(key)` reads the injected teardown query (
+ * ; production: the persona notifier's `teardownWindowState`).
  *
- * A persona teardown (b.jg5 SRJ-1002, SRJ-1003). From the teardown's submit
+ * A persona teardown. From the teardown's submit
  * until its serializer turn opens its window (`submitted`), a post or a
  * `postWithoutEpisode` for the key reaches no sink: one line says it was not
  * posted, and a post still counts as posted in its episode, so an old half's
@@ -50,45 +50,45 @@
  * log-only routes below take that route too, in place of their own classes:
  * the unclassified-error alert for a key no longer applied, and every
  * kill-failure alert for the key (its route chosen with the context `persona
- * teardown`, SRJ-704's first match, so the survivor version's entry is
+ * teardown`first match, so the survivor version's entry is
  * `persona-kill-survivor`). A kill-failure decision whose tries were stopped
- * (SRJ-702) is no notice: it is decided before the window, and writes no
+ * is no notice: it is decided before the window, and writes no
  * `persona-teardown-notice` entry. The muted post's line (each poster's own
  * line then says its notice was not posted, not that it was):
  *
- *   [slack] persona-episodes: persona=<key> <kind> notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)
+ * [slack] persona-episodes: persona=<key> <kind> notice not posted — its persona teardown was submitted
  * - `count(key, kind)`, `addCount(key, kind)` and `resetCount(key, kind)`
  *   keep a per-persona, per-kind count of consecutive observations, for a
  *   kind whose post waits for a run of them (the slow dead-session recovery
  *   kind: consecutive escalate-dead verdicts whose re-probe still reads the
- *   row live, b.jg5 SRJ-610). The count runs before the episode begins (the
+ * row live). The count runs before the episode begins (the
  *   episode begins at its post), so it is kept apart from the open episode:
  *   beginning, posting in or ending an episode leaves it as it is, and only
  *   its poster adds to it or resets it. `forget(key)` clears the persona's
  *   counts of every kind with its episodes, and `forgetAll()` and `close()`
  *   clear every count; none posts anything.
  *
- * Kinds and their posters. One label per row of SRJ-1016's table
+ * Kinds and their posters. One label per row of the contract table
  * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
  * ended by its condition (below), which posts its onset, alert and recovery;
  * `unclassified-error`'s by its episodes (below), which post its one alert;
  * CONFLICT's, `unusable-recorded-name`'s and `launch-start-not-recorded`'s
  * are begun by the conflict latch's one notice reaction
  * (`src/conflict-latch.ts`), which posts each kind's one notice per episode
- * (the CONFLICT notice, SRJ-1019 and SRJ-1020) and, when it begins one, ends
+ * (the CONFLICT notice and) and, when it begins one, ends
  * the persona's open episodes of the other latch kinds silently;
  * `slow-dead-session-recovery`'s by the slow-recovery tracker
  * (`createSlowRecoveryTracker`, `src/slow-recovery.ts`), which keeps its
- * count here and posts SRJ-1010 once per episode; `kill-failure`'s by the
+ * count here and posts once per episode; `kill-failure`'s by the
  * kill-failure alerts (below), which post the ordinary version once per
  * episode and the survivor version with no episode; `invalid-flags-hold`'s
  * by the `ErrInvalidFlags` hold's reactions (`src/invalid-flags-hold.ts`),
- * which post SRJ-1008's alert once per episode; `stuck-launch`'s by the
- * stuck-launch posters (`src/pending-row.ts`), which post each of SRJ-1017's
+ * which post alert once per episode; `stuck-launch`'s by the
+ * stuck-launch posters (`src/pending-row.ts`), which post each of the contract
  * two texts once per episode; `ad-config-malformed` posts nothing here (its
  * outage flag is its latch).
  *
- * The `tmux-unresponsive` condition (b.jg5 SRJ-307 to SRJ-310, SRJ-1006).
+ * The `tmux-unresponsive` condition.
  * `createTmuxUnresponsiveCondition(deps)` builds it over one episodes
  * instance: the condition holds for a persona while its `tmux-unresponsive`
  * episode is open, and the episode's start time is the first refusal's time.
@@ -108,7 +108,7 @@
  *   tmux-touching call's UNAVAILABLE inside a launch or recovery attempt for
  *   the persona; it never throws there.
  * - `holds(key)` and `firstRefusalAt(key)` read it.
- * - The onset (SRJ-308): `onsetAtTick(tickStartedAt)`, called once per
+ * - The onset: `onsetAtTick(tickStartedAt)`, called once per
  *   health-tick body after all of the tick's per-persona work, posts it
  *   while the health check is on for every condition still holding whose
  *   first refusal precedes the tick's start (a persona the tick skipped
@@ -122,7 +122,7 @@
  *   has posted, neither posts the onset in it (one `onset not posted` line
  *   per episode instead): the alert has said more. The onset says CSCB is
  *   retrying, so neither posts it either while the persona's retry timer is
- *   stopped (SRJ-305): every stop reported to `cancelAlert(key, stopReason)`
+ * stopped: every stop reported to `cancelAlert(key, stopReason)`
  *   while the condition holds, whatever its reason and whether or not an
  *   alert check was pending, marks the episode stopped (one `onset not
  *   posted` line per episode while the mark holds the onset back; the
@@ -138,7 +138,7 @@
  *   ENVIRONMENT answer) clears nothing, and the
  *   condition never reads whether the timer is armed. The episode's close
  *   drops the mark, so a new episode starts with none.
- * - The alert (SRJ-309): one check per episode, armed at the first refusal
+ * - The alert: one check per episode, armed at the first refusal
  *   on the episodes' clock with the never-early wait (`armNeverEarlyWait`,
  *   `src/ad-settings.ts`) over the injected threshold accessor (the
  *   threshold in effect, read at every fire). It posts once the condition
@@ -163,13 +163,13 @@
  *   non-terminal stop had already cancelled it (the terminal stop withdraws
  *   that re-arm).
  * - `end(key, reason, reading?, options?)` ends a holding condition once:
- *   the recovery (SRJ-310) is posted when the episode's onset or alert was,
+ * the recovery is posted when the episode's onset or alert was,
  *   unless `options.silent` (a CONFLICT answer ends it; its notice follows:
  *   `main()`'s latch hold ends it so, with `TMUX_UNRESPONSIVE_END_LATCHED`);
  *   the episode ends, which cancels the alert check; one ended line names
  *   the reason; and the injected condition-end hook is called once with the
  *   reading the end brings (a tick's or a retry's live reading; the live
- *   state this launch's row was read in, for SRJ-310's rule 3 after a launch
+ * state this launch's row was read in, for rule 3 after a launch
  *   timeout, `TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE`; `pending` for a
  *   successful `spawn` or `resume`; none for any other tmux-touching success
  *   or GONE). It answers whether either notice had been posted
@@ -179,8 +179,8 @@
  *   drop a holding condition silently, with no post, no line and no hook
  *   call.
  *
- * Texts (SRJ-1006; `<session>` the persona's quoted session name,
- * `"slack_bot_<key>"`, SRJ-1001, from the one shared helper
+ * Texts (`<session>` the persona's quoted session name,
+ * `"slack_bot_<key>"`, from the one shared helper
  * `quotedPersonaSessionName`, `src/persona-identity.ts`): `tmuxUnresponsiveOnsetText`,
  * `tmuxUnresponsiveAlertText` and `tmuxUnresponsiveRecoveryText`.
  *
@@ -198,7 +198,7 @@
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)
  *
  * When the key's persona teardown was submitted and its window is not open
- * yet (b.jg5 SRJ-1003), the onset, the alert and the recovery reach no sink
+ * yet, the onset, the alert and the recovery reach no sink
  * but still count as posted in their episode; their lines say so in place of
  * the posted ones:
  *
@@ -213,7 +213,7 @@
  * failed: <error>` and `[slack] persona-episodes: tmux-unresponsive
  * health-check mode read failed: <error> — taken as on`.
  *
- * The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009).
+ * The unclassified-error episodes.
  * `createUnclassifiedErrorEpisodes(deps)` builds them over one episodes
  * instance: a persona's episode is its open `unclassified-error` episode, and
  * the episode's start time is its first outcome's time. They post nothing but
@@ -232,7 +232,7 @@
  *   alert is posted once, quoting this outcome. No timer: an outcome met past
  *   the threshold posts it, and none posts it otherwise.
  * - The alert's route is decided when it is posted: while the persona's
- *   teardown window is open (b.jg5 SRJ-1003) it goes, unescaped, through the
+ * teardown window is open it goes, unescaped, through the
  *   episodes' sink, whose window writes it as a `persona-teardown-notice`
  *   entry and posts nothing, whether the persona is configured or not;
  *   otherwise a persona in the applied configuration (the injected lookup)
@@ -262,7 +262,7 @@
  *   episodes' `forget(key)` (a teardown), `forgetAll()` and `close()` drop it
  *   silently with nothing left pending.
  *
- * Text (SRJ-1009): `unclassifiedErrorAlertText`, from the classifier's
+ * Text: `unclassifiedErrorAlertText`, from the classifier's
  * reported name (left out when absent) and rendered message, the message
  * escaped for Slack (`escapeSlackControlCharacters`) after its redaction and
  * cap; the log-only route and every log line carry it unescaped.
@@ -284,7 +284,7 @@
  * `alert not routed — …` (each after `persona=<key> unclassified-error`). The
  * written line is logged only after the log-only route returns.
  *
- * b.f2b's not-connected reasons keep their one shared latch
+ * not-connected reasons keep their one shared latch
  * (`notConnectedNoticeRaised` in `src/session-manager.ts`), which this module
  * neither reads nor writes. `src/persona-slack-episodes.ts` is a different
  * concern: it logs the start and end of a persona's Slack validation and
@@ -353,18 +353,18 @@ import {
 
 /**
  * Why a poster's post reached no sink: the key's persona teardown was
- * submitted and its window is not open yet (b.jg5 SRJ-1003). The post still
+ * submitted and its window is not open yet. The post still
  * counts as posted in its episode; the poster's line says it was not posted.
  * Exported for the posters outside this module (`src/slow-recovery.ts`).
  */
 export const MUTED_BY_TEARDOWN = 'muted, its persona teardown was submitted'
 
 // ---------------------------------------------------------------------------
-// Kinds (b.jg5 SRJ-1016)
+// Kinds
 // ---------------------------------------------------------------------------
 
 /**
- * CONFLICT (SRJ-506, SRJ-508): from the latch being set until it clears; a
+ * CONFLICT: from the latch being set until it clears; a
  * new case begins a new episode. Posted by the conflict latch's notice
  * reaction (`createConflictNoticeObserver`, bound in `main()` by
  * `bindConflictNotice`, `src/conflict-latch.ts`): a latch or a relatch with a
@@ -376,28 +376,28 @@ export const MUTED_BY_TEARDOWN = 'muted, its persona teardown was submitted'
 export const PERSONA_EPISODE_KIND_CONFLICT = 'conflict'
 
 /**
- * Unusable recorded name (SRJ-512, SRJ-1019): from the latch being set until
+ * Unusable recorded name: from the latch being set until
  * it clears. Posted by the conflict latch's notice reaction
  * (`createConflictNoticeObserver`, bound in `main()` by `bindConflictNotice`,
  * `src/conflict-latch.ts`): a latch, or a relatch from another case, begins
- * the episode and posts SRJ-1019 once; a latch of another kind ends it
+ * the episode and posts once; a latch of another kind ends it
  * silently. The latch's clear (`createLatchClear`) posts the recovery notice
  * in it once and ends it.
  */
 export const PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
 
 /**
- * Launch start not recorded (SRJ-513, SRJ-1020): from the latch being set
+ * Launch start not recorded: from the latch being set
  * until it clears. Posted by the conflict latch's notice reaction
  * (`createConflictNoticeObserver`, `src/conflict-latch.ts`): a latch, or a
- * relatch from another case, begins the episode and posts SRJ-1020 once; a
+ * relatch from another case, begins the episode and posts once; a
  * latch of another kind ends it silently. The latch's clear
  * (`createLatchClear`) posts the recovery notice in it once and ends it.
  */
 export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**
- * Kill failure (SRJ-704, SRJ-1016): from its ordinary version's alert until
+ * Kill failure: from its ordinary version's alert until
  * the row reads `ended` or `missing`, or is gone (`ErrSpawnNotFound`), or the
  * persona is torn down. A later kill that succeeds while the row stays live
  * does not end it. Posted by the kill-failure alerts
@@ -410,11 +410,11 @@ export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-
  */
 export const PERSONA_EPISODE_KIND_KILL_FAILURE = 'kill-failure'
 
-/** `tmux-unresponsive` (SRJ-307 to SRJ-310): from the first refusal until the condition ends. Posted by its condition (below). */
+/** `tmux-unresponsive`: from the first refusal until the condition ends. Posted by its condition (below). */
 export const PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE = 'tmux-unresponsive'
 
 /**
- * `ad-config-malformed` (SRJ-316, SRJ-1016): as the `ad-unreachable` outage's
+ * `ad-config-malformed`: as the `ad-unreachable` outage's
  * episode. Its once-per-episode latch is the `ad-config-malformed` outage
  * flag in `src/outage-state.ts` (raised by `raiseAdConfigMalformed`, which
  * posts its one onset), so this kind never posts and opens no episode here.
@@ -422,19 +422,19 @@ export const PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE = 'tmux-unresponsive'
 export const PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED = 'ad-config-malformed'
 
 /**
- * `ErrInvalidFlags` hold (SRJ-207, SRJ-1008): from the hold being set until
+ * `ErrInvalidFlags` hold: from the hold being set until
  * a re-check finds a different binary version, the persona is torn down or
  * the server restarts. Posted by the hold's set reaction
  * (`createInvalidFlagsHoldSetReaction`, bound in `main()`,
  * `src/invalid-flags-hold.ts`): a new hold begins the episode and posts
- * SRJ-1008's alert once in it. The version-change reaction ends it silently
+ * alert once in it. The version-change reaction ends it silently
  * (`endInvalidFlagsHoldsOnVersionChange`); a teardown's `forget` and
  * shutdown's `close` drop it.
  */
 export const PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD = 'invalid-flags-hold'
 
 /**
- * Unclassified error (SRJ-313): from the first UNCLASSIFIED outcome in a
+ * Unclassified error: from the first UNCLASSIFIED outcome in a
  * launch or recovery attempt until a retry finds nothing left to recover or,
  * pending-only, reads the row live out of `pending`, the persona reaches the
  * restart cap or is torn down. Posted by its episodes
@@ -444,20 +444,20 @@ export const PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD = 'invalid-flags-hold'
 export const PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR = 'unclassified-error'
 
 /**
- * Slow dead-session recovery (SRJ-610, SRJ-1010): from its post until the row
+ * Slow dead-session recovery: from its post until the row
  * reads `ended` or `missing` or is gone (`ErrSpawnNotFound`), the persona
  * latches, or it is torn down. Posted by the slow-recovery tracker
  * (`createSlowRecoveryTracker`, `src/slow-recovery.ts`): its count of
  * consecutive escalate-dead verdicts whose re-probe still reads the row live
  * is this kind's count here (`addCount`, `resetCount`), and the third begins
- * the episode and posts SRJ-1010 once. The tracker ends it on a row read of
+ * the episode and posts once. The tracker ends it on a row read of
  * `ended` or `missing` or no row, and at the latch (`main()`'s latch hold);
  * a teardown's `forget` and shutdown's `close` drop it and its count.
  */
 export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-session-recovery'
 
 /**
- * Stuck launch (SRJ-410, SRJ-1016, SRJ-1017): from its first post until the
+ * Stuck launch: from its first post until the
  * row reaches a live state out of `pending` (`waiting`, `working`,
  * `ask_user` or `check_permission`), the persona latches, or it is torn
  * down; a read of `pending`, `ended`, `missing` or no row does not end it.
@@ -474,7 +474,7 @@ export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-sessio
  */
 export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
-/** Every notice kind with a latch here, one per row of SRJ-1016's table. */
+/** Every notice kind with a latch here, one per row of the contract table. */
 export const PERSONA_EPISODE_KINDS = [
   'message-not-saved',
   'delivery-stuck',
@@ -507,7 +507,7 @@ export type PersonaEpisodesClock = PersonaConnectionClock
 /**
  * A notice's options for the sink: the kill-failure alert's survivor version
  * raised during a persona teardown carries its entry's class
- * (`persona-kill-survivor`, b.jg5 SRJ-1003, SRJ-1013).
+ * (`persona-kill-survivor`).
  */
 export type PersonaEpisodeSinkOptions = Pick<PersonaNoticeOptions, 'teardownEntryClass'>
 
@@ -530,7 +530,7 @@ export interface PersonaEpisodesDeps {
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: PersonaEpisodesClock
   /**
-   * Where the key stands with its persona teardown (b.jg5 SRJ-1003;
+   * Where the key stands with its persona teardown (
    * production: the persona notifier's `teardownWindowState`): `submitted`
    * mutes the key's posts, `open` routes the log-only routes through the sink
    * (see the module comment). Absent, or a throw: `none` (a throw is logged).
@@ -585,9 +585,9 @@ export interface PersonaEpisodes {
   post(key: string, kind: PersonaEpisodeKind, text: string, mark?: string): boolean
   /**
    * Hand `text` to the sink, with `options`, for a notice of this kind that
-   * has no episode (the kill-failure alert's survivor version, b.jg5
-   * SRJ-704, and any kill-failure alert raised during a persona teardown,
-   * SRJ-1003): no episode is read, begun or changed. Returns true when it was
+   * has no episode (the kill-failure alert's survivor version
+   * and any kill-failure alert raised during a persona teardown,
+   *): no episode is read, begun or changed. Returns true when it was
    * handed over, or muted because the key's persona teardown was submitted;
    * false after `close`.
    */
@@ -709,12 +709,12 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
 
   /**
    * Hand a notice to the sink, unless the key's persona teardown was
-   * submitted and its window is not open yet (b.jg5 SRJ-1003): then one line
+   * submitted and its window is not open yet: then one line
    * says it was not posted, and nothing reaches the sink.
    */
   function send(key: string, kind: PersonaEpisodeKind, text: string, options?: PersonaEpisodeSinkOptions): void {
     if (teardownWindowState(key) === 'submitted') {
-      safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)`)
+      safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} notice not posted — its persona teardown was submitted`)
       return
     }
     const failed = (err: unknown): void =>
@@ -842,17 +842,17 @@ function safeLog(log: (line: string) => void, line: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// The tmux-unresponsive condition (b.jg5 SRJ-307, SRJ-310)
+// The tmux-unresponsive condition
 // ---------------------------------------------------------------------------
 
 /**
  * With the health check off (`health_check_interval` 0), the onset is posted
  * at the first retry of the persona's retry timer made at least this long
- * after the first refusal (b.jg5 SRJ-308).
+ * after the first refusal.
  */
 export const TMUX_UNRESPONSIVE_ONSET_FLOOR_MS = 120_000
 
-/** The onset notice's body for persona `key` (b.jg5 SRJ-1006); the persona notifier adds the persona prefix. */
+/** The onset notice's body for persona `key`; the persona notifier adds the persona prefix. */
 export function tmuxUnresponsiveOnsetText(key: string): string {
   return (
     `:hourglass_flowing_sand: *Not answering* — agent-director or tmux is not answering for this persona's session ${quotedPersonaSessionName(key)}. ` +
@@ -861,8 +861,8 @@ export function tmuxUnresponsiveOnsetText(key: string): string {
 }
 
 /**
- * The alert notice's body for persona `key` (b.jg5 SRJ-1006), stating
- * `thresholdMs` (the alert threshold in effect, SRJ-210) in whole minutes,
+ * The alert notice's body for persona `key`, stating
+ * `thresholdMs` (the alert threshold in effect) in whole minutes,
  * rounded down (`wholeMinutes`): "over 6 minutes" at agent-director's defaults.
  */
 export function tmuxUnresponsiveAlertText(key: string, thresholdMs: number): string {
@@ -873,7 +873,7 @@ export function tmuxUnresponsiveAlertText(key: string, thresholdMs: number): str
   )
 }
 
-/** The recovery notice's body for persona `key` (b.jg5 SRJ-1006). */
+/** The recovery notice's body for persona `key`. */
 export function tmuxUnresponsiveRecoveryText(key: string): string {
   return `:white_check_mark: *Answering again* — this persona reaches its session ${quotedPersonaSessionName(key)} again.`
 }
@@ -885,17 +885,17 @@ const ALERT_MARK = 'alert'
 /** The recovery's mark. */
 const RECOVERY_MARK = 'recovery'
 
-/** End reason: a tmux-touching call for the persona succeeded or answered GONE (SRJ-310 rule 1). */
+/** End reason: a tmux-touching call for the persona succeeded or answered GONE (rule 1). */
 export const TMUX_UNRESPONSIVE_END_TMUX_VERB = 'tmux-verb'
 
-/** End reason: a health tick found the persona's row live, not `pending`, and its session connected (SRJ-310 rule 2). */
+/** End reason: a health tick found the persona's row live, not `pending`, and its session connected (rule 2). */
 export const TMUX_UNRESPONSIVE_END_TICK = 'tick'
 
-/** End reason: a retry found the persona's row live, not `pending`, and its session connected (SRJ-310 rule 2). */
+/** End reason: a retry found the persona's row live, not `pending`, and its session connected (rule 2). */
 export const TMUX_UNRESPONSIVE_END_RETRY = 'retry'
 
 /**
- * End reason: the persona latched (b.jg5 SRJ-310, SRJ-502). `main()`'s latch
+ * End reason: the persona latched. `main()`'s latch
  * hold ends the condition with it, silently (`options.silent`): no recovery
  * notice, since the CONFLICT notice follows.
  */
@@ -903,8 +903,8 @@ export const TMUX_UNRESPONSIVE_END_LATCHED = 'latched'
 
 /**
  * End reason: after a launch timeout, this launch's row (its launch start
- * inside the launch call's window) left `pending` for a live state (SRJ-310
- * rule 3, b.jg5 SRJ-407). The session manager's shared own-row reads end the
+ * inside the launch call's window) left `pending` for a live state (
+ * rule 3). The session manager's shared own-row reads end the
  * condition so through `src/outage-state.ts`'s end entry, once "this launch's
  * row" was established by a `pending` read.
  */
@@ -941,7 +941,7 @@ export type TmuxUnresponsiveEndResult = 'not-holding' | 'ended' | 'ended-after-n
 export interface TmuxUnresponsiveEndOptions {
   /**
    * End without the recovery notice even when the onset or the alert was posted: the
-   * answer that ends it is CONFLICT, whose notice follows (b.jg5 SRJ-310).
+   * answer that ends it is CONFLICT, whose notice follows.
    */
   silent?: boolean
 }
@@ -959,13 +959,13 @@ export interface TmuxUnresponsiveSink {
 /**
  * The condition-end hook: called once per end of a holding condition, with
  * the reading the end brings (a tick's or a retry's live reading, or the live
- * state this launch's row left `pending` for (SRJ-310 rule 3), a row state
+ * state this launch's row left `pending` for (rule 3), a row state
  * other than `pending`; `pending` for a successful launch call, `spawn` or
  * `resume`, whose row its success leaves `pending`), none for any other
  * tmux-touching success or GONE. Production
  * binds the retry controller's condition-end entry
  * (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, reading)`,
- * b.jg5 SRJ-306).
+ *).
  */
 export type TmuxUnresponsiveConditionEndHook = (key: string, reading: string | undefined) => unknown
 
@@ -1022,7 +1022,7 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
   ): TmuxUnresponsiveEndResult
   /**
    * The health tick's onset check, once per tick body, after all of the
-   * tick's per-persona work (b.jg5 SRJ-308): with the health check on, post
+   * tick's per-persona work: with the health check on, post
    * the onset once per episode for every persona whose condition still holds
    * and whose first refusal is strictly before `tickStartedAt` (the tick's
    * start, in the episodes' clock milliseconds), unless the episode's alert
@@ -1033,8 +1033,7 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
   onsetAtTick(tickStartedAt: number): void
   /**
    * A retry's onset check, at every fire of persona `key`'s retry timer, a
-   * fire whose retry is skipped for work in flight included (b.jg5 SRJ-308,
-   * SRJ-303): with the health check off, post the onset once per episode
+   * fire whose retry is skipped for work in flight included: with the health check off, post the onset once per episode
    * when the condition holds and `firedAt` is at least
    * `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after its first refusal, unless the
    * episode's alert has posted or a stop of the persona's retry timer holds
@@ -1066,7 +1065,7 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
 }
 
 /**
- * A `tmux-unresponsive` line (b.jg5 SRJ-307 to SRJ-310, SRJ-1014): the
+ * A `tmux-unresponsive` line: the
  * persona reference, the condition and `text`. Pure.
  *
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive <text>
@@ -1094,10 +1093,10 @@ export function tmuxUnresponsiveOnsetLine(key: string, muted: boolean, where: st
   return tmuxUnresponsiveLine(key, `${what} still not answering at ${where}, ${sinceFirstS} s after its first refusal`)
 }
 
-/** The onset held back because the episode's alert already posted (b.jg5 SRJ-308). */
+/** The onset held back because the episode's alert already posted. */
 export const TMUX_UNRESPONSIVE_ONSET_HELD_BY_ALERT = 'onset not posted — its alert already posted'
 
-/** The onset held back because a stop of the retry timer holds it (b.jg5 SRJ-308). */
+/** The onset held back because a stop of the retry timer holds it. */
 export const TMUX_UNRESPONSIVE_ONSET_HELD_BY_STOP = 'onset not posted — its retry timer stopped and no refusal has re-armed it'
 
 /**
@@ -1112,12 +1111,12 @@ export function tmuxUnresponsiveAlertLine(key: string, muted: boolean, forS: num
   )
 }
 
-/** The alert check's cancel line (b.jg5 SRJ-309), naming the retry timer's stop reason. Pure. */
+/** The alert check's cancel line, naming the retry timer's stop reason. Pure. */
 export function tmuxUnresponsiveAlertCheckCancelledLine(key: string, stopReason: string): string {
   return tmuxUnresponsiveLine(key, `alert check cancelled — its retry timer stopped: ${stopReason}`)
 }
 
-/** The alert check armed again after a cancel (b.jg5 SRJ-309). */
+/** The alert check armed again after a cancel. */
 export const TMUX_UNRESPONSIVE_ALERT_CHECK_ARMED_AGAIN = 'alert check armed again — a new refusal armed its retry timer again'
 
 /** The end line, naming the end reason's text (an unknown reason as `an unnamed reason`). Pure. */
@@ -1188,7 +1187,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
 
   /**
    * Record a stop of the persona's retry timer for its open `episode`
-   * (b.jg5 SRJ-305, SRJ-308): the onset is held back from now on. A terminal
+   * the onset is held back from now on. A terminal
    * stop is kept terminal: a later non-terminal stop in the episode never
    * weakens it.
    */
@@ -1199,7 +1198,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   }
 
   /**
-   * A refusal that continues a holding condition (b.jg5 SRJ-305, SRJ-308):
+   * A refusal that continues a holding condition:
    * the refusal's reporting point has just armed the persona's retry timer
    * again, so a non-terminal stop no longer holds the episode's onset back.
    * A terminal stop's mark stays.
@@ -1210,7 +1209,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   }
 
   /**
-   * A refusal that continues a holding condition (b.jg5 SRJ-309): when a stop
+   * A refusal that continues a holding condition: when a stop
    * of the persona's retry timer cancelled the episode's pending alert check
    * (`cancelAlert`), and the refusal's reporting point has just armed the
    * timer again (`reportAgentDirectorError` arms before it starts or
@@ -1227,7 +1226,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   }
 
   /**
-   * Arm the alert check for the persona's episode just begun (b.jg5 SRJ-309):
+   * Arm the alert check for the persona's episode just begun:
    * on the episodes' clock, from the first refusal, until the condition has
    * lasted strictly longer than the threshold in effect (the never-early wait
    * of the threshold plus 1 ms, read at every fire). Answers whether it was
@@ -1398,20 +1397,19 @@ function endText(reason: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// The unclassified-error episode (b.jg5 SRJ-313, SRJ-1009)
+// The unclassified-error episode
 // ---------------------------------------------------------------------------
 
 /**
  * The `startup-errors.log` class of an unclassified-error alert for a persona
- * no longer in the applied configuration (b.jg5 SRJ-313, SRJ-1013). `main()`
+ * no longer in the applied configuration. `main()`
  * binds the episode's log-only route to `recordStartupError` with it.
  */
 export const PERSONA_UNCLASSIFIED_ERROR_LABEL = 'persona-unclassified-error'
 
 /**
  * The `persona-unclassified-error` entry text of an unclassified-error alert
- * for persona `key`, no longer in the applied configuration (b.jg5 SRJ-313,
- * SRJ-1013): `persona=<key>: <text>`, `text` the alert's unescaped text the
+ * for persona `key`, no longer in the applied configuration: `persona=<key>: <text>`, `text` the alert's unescaped text the
  * episode's log-only route is given. `main()` binds that route to
  * `recordStartupError` with `PERSONA_UNCLASSIFIED_ERROR_LABEL` and this text.
  * Pure.
@@ -1420,41 +1418,40 @@ export function personaUnclassifiedErrorEntryText(key: string, text: string): st
   return `persona=${key}: ${text}`
 }
 
-/** End reason: a retry of the persona's timer found nothing left to recover (b.jg5 SRJ-313). */
+/** End reason: a retry of the persona's timer found nothing left to recover. */
 export const UNCLASSIFIED_ERROR_END_RECOVERED = 'a retry found nothing left to recover'
 
 /**
  * End reason: a pending-only retry of the persona's timer read its row live
- * out of `pending` (b.jg5 SRJ-313): a launch the retries made succeeded and
+ * out of `pending`: a launch the retries made succeeded and
  * the retries are over.
  */
 export const UNCLASSIFIED_ERROR_END_ROW_LIVE = 'a retry read its row live out of pending'
 
 /**
  * End reason: the persona's retry timer stopped because its `tmux-unavailable`
- * condition cleared or its `tmux-unresponsive` condition ended (b.jg5
- * SRJ-313): no retry follows.
+ * condition cleared or its `tmux-unresponsive` condition ended: no retry follows.
  */
 export const UNCLASSIFIED_ERROR_END_CONDITION_ENDED = 'its retry timer stopped when its tmux condition ended'
 
 /**
  * End reason: a pending-only retry of the persona's timer read its row ended
- * or missing, or found none (b.jg5 SRJ-313): the retries are over and the
+ * or missing, or found none: the retries are over and the
  * restart path's decision runs once.
  */
 export const UNCLASSIFIED_ERROR_END_ROW_GONE = 'a retry read its row ended or gone'
 
-/** End reason: the persona reached the restart cap (b.jg5 SRJ-313). */
+/** End reason: the persona reached the restart cap. */
 export const UNCLASSIFIED_ERROR_END_CAPPED = 'the persona reached the restart cap'
 
 /**
- * End reason: the persona latched (b.jg5 SRJ-313, SRJ-502); `main()`'s latch
+ * End reason: the persona latched; `main()`'s latch
  * hold ends the episode with it, whatever the latch's case.
  */
 export const UNCLASSIFIED_ERROR_END_LATCHED = 'the persona latched'
 
 /**
- * End reason: the old-life hold on the row ended (b.jg5 SRJ-313, SRJ-811):
+ * End reason: the old-life hold on the row ended:
  * an old-life wait's episode, keyed by the held instance id, ends with its
  * hold, and with nothing else.
  */
@@ -1485,7 +1482,7 @@ export interface UnclassifiedErrorAlertTextOptions {
 }
 
 /**
- * The unclassified-error alert's body (b.jg5 SRJ-1009); the persona notifier
+ * The unclassified-error alert's body; the persona notifier
  * adds the persona prefix. `<error name>` is the classification's reported
  * name, left out (with no placeholder) when it is absent or not a safe
  * identifier; the quoted message is its rendered message (agent-director's
@@ -1544,7 +1541,7 @@ export interface UnclassifiedErrorEpisodesDeps {
   /**
    * The reference each line names a key by; absent, `persona=<key>`. The
    * old-life wait's episodes, keyed by a held instance id, pass
-   * `instanceId=<id>` (b.jg5 SRJ-1007).
+   * `instanceId=<id>`.
    */
   ref?: (key: string) => string
   /**
@@ -1576,7 +1573,7 @@ export interface UnclassifiedErrorEpisodesDeps {
 export interface UnclassifiedErrorEpisodes extends UnclassifiedErrorSink {
   /**
    * An UNCLASSIFIED outcome `error` in a launch or recovery attempt for
-   * persona `key` (b.jg5 SRJ-313), with the site's own `classification` when
+   * persona `key`, with the site's own `classification` when
    * given. With no open episode it begins one (the time from the episodes'
    * clock, one started line). In an open episode whose alert has not been
    * posted, when the time since the episode's first outcome is strictly
@@ -1616,8 +1613,7 @@ const UNCLASSIFIED_ALERT_MARK = 'alert'
 export const UNCLASSIFIED_NOT_CONFIGURED_WORDING = 'the persona is not in the applied configuration'
 
 /**
- * Build one server's unclassified-error episodes over `deps.episodes` (b.jg5
- * SRJ-313); see the module comment. No timer, no agent-director call; nothing
+ * Build one server's unclassified-error episodes over `deps.episodes`; see the module comment. No timer, no agent-director call; nothing
  * is read, posted or logged at creation.
  */
 export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesDeps): UnclassifiedErrorEpisodes {
@@ -1663,7 +1659,7 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
       if (alerted.get(key) === episode) alerted.delete(key)
     })
     const met = `an UNCLASSIFIED outcome met ${seconds(elapsedMs)} s after the episode's first, over its alert threshold of ${seconds(thresholdMs)} s: ${describeAdErrorClassification(classification)}`
-    // b.jg5 SRJ-1003, SRJ-704's first match: during the persona's teardown
+    // first match: during the persona's teardown
     // the alert is a teardown notice, configured or not: the sink's window
     // writes it (unescaped) and posts nothing.
     if (episodes.teardownWindowState(key) === 'open') {
@@ -1748,13 +1744,13 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
 }
 
 // ---------------------------------------------------------------------------
-// The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)
+// The kill-failure alerts
 // ---------------------------------------------------------------------------
 
-/** End reason: a read of the persona's own row read it `ended` or `missing` (b.jg5 SRJ-704, SRJ-1016). */
+/** End reason: a read of the persona's own row read it `ended` or `missing`. */
 export const KILL_FAILURE_END_ROW_FINISHED = 'its own row read ended or missing'
 
-/** End reason: a read of the persona's own row found it gone (`ErrSpawnNotFound`; b.jg5 SRJ-704, SRJ-1016). */
+/** End reason: a read of the persona's own row found it gone (`ErrSpawnNotFound`). */
 export const KILL_FAILURE_END_ROW_GONE = 'its own row is gone (ErrSpawnNotFound)'
 
 /**
@@ -1764,10 +1760,10 @@ export const KILL_FAILURE_END_ROW_GONE = 'its own row is gone (ErrSpawnNotFound)
  */
 const KILL_FAILURE_STOPPED_ROUTE = 'stopped'
 
-/** What that written line names: the stop's log line, never an alert (b.jg5 SRJ-702, SRJ-1013). */
+/** What that written line names: the stop's log line, never an alert. */
 const KILL_FAILURE_STOPPED_SUBJECT = "stopped retry's log line (no alert text)"
 
-/** The stop's cause a stopped kill retry's line and entry name when its raiser gives none (`KillFailureRaiseInput.stopCause`; b.jg5 SRJ-702). */
+/** The stop's cause a stopped kill retry's line and entry name when its raiser gives none (`KillFailureRaiseInput.stopCause`). */
 export const KILL_FAILURE_STOP_CAUSE_DEFAULT = 'the persona is not up or is torn down, or the server is shutting down'
 
 /** What the stopped-retry line and entry are built from (`killFailureStoppedRetryText`). */
@@ -1775,7 +1771,7 @@ export type KillFailureStoppedRetryInput = Pick<KillFailureRaiseInput, 'key' | '
 
 /**
  * The one line, and the entry text, of an ordinary kill-failure decision
- * whose tries were stopped (b.jg5 SRJ-702, SRJ-1013): the line names the
+ * whose tries were stopped: the line names the
  * persona, the stop's cause (`KILL_FAILURE_STOP_CAUSE_DEFAULT` when none is
  * given), the last outcome's class when given, the redacted descriptions and
  * the context; the entry (written only for a persona no longer configured,
@@ -1831,7 +1827,7 @@ export interface KillFailureRaiseInput {
   /**
    * Whether the persona is latched now: by the retry's last outcome (after
    * that outcome's own handling) or by a `status` read between its tries
-   * (b.jg5 SRJ-702; hatch A2). Read only for the ordinary version at a
+   * (design A2). Read only for the ordinary version at a
    * destination, whose closing sentence it picks.
    */
   readonly latched: boolean
@@ -1841,8 +1837,7 @@ export interface KillFailureRaiseInput {
    * True when the retry's tries were stopped by its keep-going check while
    * the persona was not latched (it is torn down or not up, or the server is
    * shutting down), or the last outcome's version re-check decided that the
-   * server stops. A stopped decision, `ordinary` or `none`, is no notice (b.jg5 SRJ-702,
-   * SRJ-1003, SRJ-1013), inside a teardown window or not: neither version is
+   * server stops. A stopped decision, `ordinary` or `none`, is no notice, inside a teardown window or not: neither version is
    * raised, nothing is posted and no episode is read or changed; one line
    * names the persona, the context, the last outcome's class
    * (`lastOutcomeClass`), the stop's cause (`stopCause`) and the redacted
@@ -1854,7 +1849,7 @@ export interface KillFailureRaiseInput {
   readonly stopped?: boolean
   /**
    * With `stopped`: the class of the outcome that stands (its failure class,
-   * or its outcome kind), for the stop's line and entry (b.jg5 SRJ-702).
+   * or its outcome kind), for the stop's line and entry.
    * Absent: the line names none.
    */
   readonly lastOutcomeClass?: string
@@ -1862,7 +1857,7 @@ export interface KillFailureRaiseInput {
   readonly stopCause?: string
   /**
    * With `stopped`: the stop is a configured persona's, so only the line is
-   * written, whatever the context's route (b.jg5 SRJ-702: a configured
+   * written, whatever the context's route (a configured
    * persona's stop writes the log line only). An old-life wait's kill
    * stopped by the latch of the configured persona whose own row it is gives
    * it, since that context's route is otherwise always the log-only one.
@@ -1874,8 +1869,7 @@ export interface KillFailureRaiseInput {
   /** The row's instance id; `cscb_<key>` when absent. */
   readonly instanceId?: string
   /**
-   * The persona reference or the row's id a log-only entry names (b.jg5
-   * SRJ-1007, SRJ-1013), as `killFailureAlertEntryText` takes it:
+   * The persona reference or the row's id a log-only entry names, as `killFailureAlertEntryText` takes it:
    * `persona=<key>` when absent. An old-life wait gives its own reference
    * (`oldLifeWaitRef`, `src/old-life-wait.ts`): `persona=<old key>` for a
    * `cscb_<old key>` row, `instanceId=<id>` for an id standing in for the
@@ -1916,14 +1910,14 @@ export interface KillFailureAlertsDeps {
 /** One server's kill-failure alerts. */
 export interface KillFailureAlerts {
   /**
-   * Raise the alert the retry's decision calls for (b.jg5 SRJ-704). An
+   * Raise the alert the retry's decision calls for. An
    * ordinary or `none` decision with `stopped` is decided first, before every route
    * below, the teardown window's included: one line, and for a persona no
    * longer configured one `persona-kill-failed` entry with no alert text
-   * (SRJ-702); it answers `stopped`. While the
+   * it answers `stopped`. While the
    * key's persona teardown window is open, for any context but a start-sweep
    * or CLI teardown kill, it takes the persona-teardown
-   * route (b.jg5 SRJ-1003): handed to the sink with no episode, whose window
+   * route: handed to the sink with no episode, whose window
    * writes it (`persona-teardown-notice`, or `persona-kill-survivor` for the
    * survivor version) and posts nothing; it answers `logged`. Otherwise it
    * takes the route `selectKillFailureAlertRoute` gives for the context,
@@ -1936,20 +1930,19 @@ export interface KillFailureAlerts {
    *   - either, on a log-only route: one entry of the route's class through
    *     the log-only sink (a `persona-teardown-notice` entry built by
    *     `personaTeardownNoticeEntryText`), and no episode.
-   * A post that the key's submitted teardown mutes (SRJ-1003) still answers
+   * A post that the key's submitted teardown mutes still answers
    * `posted` and counts in its episode; its line says it was not posted.
    * A `none` decision does nothing. Never throws.
    */
   raise(input: KillFailureRaiseInput): KillFailureRaiseResult
   /** End persona `key`'s open kill-failure episode silently, with one ended line. Answers whether one was open. */
   end(key: string, reason: KillFailureEndReason): boolean
-  /** Whether persona `key`'s kill-failure episode is open (lost-message state 4, b.jg5 SRJ-1011). */
+  /** Whether persona `key`'s kill-failure episode is open (lost-message state 4). */
   isOpen(key: string): boolean
 }
 
 /**
- * Build one server's kill-failure alerts over `deps.episodes` (b.jg5
- * SRJ-704, SRJ-1007, SRJ-1016). No timer, no agent-director call; nothing is
+ * Build one server's kill-failure alerts over `deps.episodes`. No timer, no agent-director call; nothing is
  * read, posted or logged at creation.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
@@ -2021,15 +2014,15 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
   }
 
   /**
-   * An alert raised while the key's persona teardown window is open (b.jg5
-   * SRJ-1003, SRJ-704's first match): the persona-teardown route, written by
+   * An alert raised while the key's persona teardown window is open (
+   * first match): the persona-teardown route, written by
    * the sink's window (one server-log line and one entry naming the persona
    * and "raised during its teardown"; `persona-kill-survivor` for the
    * survivor version), with no episode and no Slack post. An alert of
    * another context than the persona teardown's own kill (a `recovery` or
    * `stuck-launch abort` kill whose tries ended in the window) carries that
    * context ahead of its text, as `(<context>) <text>`, so its entry names
-   * it (SRJ-1007, SRJ-1013).
+   * it.
    */
   function raiseInTeardownWindow(input: KillFailureRaiseInput, content: KillFailureAlertContent): KillFailureRaiseResult {
     const { key, context } = input
@@ -2048,8 +2041,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
   }
 
   /**
-   * An ordinary or `none` decision whose tries SRJ-702's stop rule stopped (b.jg5
-   * SRJ-702, SRJ-704, SRJ-1003, SRJ-1013): no notice, whether or not the
+   * An ordinary or `none` decision whose tries stop rule stopped: no notice, whether or not the
    * key's teardown window is open. Nothing is posted, no episode is read or
    * changed and no alert text is written: one line naming the persona, the
    * context, the last outcome's class, the stop's cause and the redacted
@@ -2086,7 +2078,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
 
   function raise(input: KillFailureRaiseInput): KillFailureRaiseResult {
     const { key, context } = input
-    // b.jg5 SRJ-702, SRJ-1003: a retry whose tries were stopped is no notice,
+    // a retry whose tries were stopped is no notice,
     // inside a teardown window or not, whatever its decision (`ordinary`, or
     // `none` for a stop with no `ErrTmuxKillFailed` standing and no
     // survivor-naming failure): it is decided before every route. A stopped
@@ -2099,7 +2091,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     )
     if (content === undefined) return 'none'
     const { version } = content
-    // b.jg5 SRJ-704: a start-sweep or CLI teardown kill matches first.
+    // a start-sweep or CLI teardown kill matches first.
     if (
       context !== KILL_FAILURE_CONTEXT_START_SWEEP &&
       context !== KILL_FAILURE_CONTEXT_CLI_TEARDOWN &&
@@ -2110,7 +2102,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     const route = selectKillFailureAlertRoute({ version, context, configured: configured(key), latched: input.latched === true })
     if (!route.destination) {
       const text = killFailureAlertText(content, route.closing, false)
-      // b.jg5 SRJ-1007, SRJ-1013: the entry names the persona reference or
+      // the entry names the persona reference or
       // the row's id (`ref`); a persona-teardown-notice entry also says
       // "raised during its teardown".
       const ref = entryRefOf(input)
@@ -2121,7 +2113,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
       return writeLogOnly(key, version, route.classLabel, entry, route.route) ? 'logged' : 'not-routed'
     }
     const text = killFailureAlertText(content, route.closing, true)
-    // b.jg5 SRJ-1003: read before the post, which a submitted teardown mutes
+    // read before the post, which a submitted teardown mutes
     // (the episode still counts it as posted).
     const muted = episodes.teardownWindowState(key) === 'submitted'
     // A destination route that opens no episode (the survivor version) posts once for this call.

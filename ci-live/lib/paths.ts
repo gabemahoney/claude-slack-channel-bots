@@ -86,7 +86,7 @@ export function dryRunLockFile(tempDir: string, uid: number): string {
 /**
  * Where a persona's credentials file lives on the host. D's lives in the
  * staging dir, so it is absent from the container's ~/.config/cscb-credentials until
- * Check 25 moves it in (AC 22: the file appears while the server runs).
+ * Check 25 moves it in (the file appears while the server runs).
  */
 export function hostCredentialsFile(paths: LivePaths, letter: PersonaLetter): string {
   const dir = letter === 'd' ? paths.stagedCredentialsDir : paths.credentialsDir

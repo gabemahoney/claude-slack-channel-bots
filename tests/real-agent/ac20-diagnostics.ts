@@ -18,7 +18,7 @@ type Emit = (event: Event) => void
 const integer = (value: unknown, max = Number.MAX_SAFE_INTEGER): value is number => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= max
 function scope(directory: string): number {
   const value = JSON.parse(readFileSync(join(directory, 'scope.json'), 'utf8'))
-  if (![0, 1, 2].includes(value.case)) throw new Error('AC20 diagnostic scope unavailable')
+  if (![0, 1, 2].includes(value.case)) throw new Error('diagnostic scope unavailable')
   return value.case
 }
 function sink(directory: string, file: string): Emit {
@@ -104,7 +104,7 @@ export function gatewayCorrelations() {
 /** node's pipes preserve bytes and backpressure. No body is parsed or copied
  * into logs; no retries, redirect following or proxy request timeout exists. */
 export function startDiagnosticGateway(upstream: URL, emit: Emit, currentCase: () => number) {
-  if (!['http:', 'https:'].includes(upstream.protocol) || upstream.username || upstream.password) throw new Error('AC20 gateway configuration unavailable')
+  if (!['http:', 'https:'].includes(upstream.protocol) || upstream.username || upstream.password) throw new Error('gateway configuration unavailable')
   const correlate = gatewayCorrelations(); let ordinal = 0
   const server = createServer((incoming, downstream) => {
     const attempt = ++ordinal, caseNumber = currentCase()
@@ -154,7 +154,7 @@ export function linkedRetryForStalledRequest(events: readonly Event[], caseNumbe
 }
 export async function observeAC20Completion(deps: DiagnosticWaitDeps) {
   const start = deps.startMs ?? deps.now(), deadline = start + AC20_COMPLETION_MS, ceiling = start + AC20_DIAGNOSTIC_CEILING_MS
-  if (!integer(start) || start > deps.now()) throw new Error('AC20 wait start unavailable')
+  if (!integer(start) || start > deps.now()) throw new Error('wait start unavailable')
   const event = (name: string, extra = {}) => deps.emit({ source: 'wait', event: name, atMs: deps.now(), case: deps.caseNumber, ...extra })
   event('completion_window', { startMs: start, deadlineMs: deadline, ceilingMs: ceiling })
   while (deps.now() <= deadline) {
@@ -178,29 +178,29 @@ export async function observeAC20Completion(deps: DiagnosticWaitDeps) {
 
 async function native(directory: string, binary: string, args: string[]) {
   const ready = JSON.parse(readFileSync(join(directory, 'gateway-ready.json'), 'utf8'))
-  if (!integer(ready.port, 65535) || ready.port === 0) throw new Error('AC20 gateway not ready')
+  if (!integer(ready.port, 65535) || ready.port === 0) throw new Error('gateway not ready')
   const url = new URL(process.env.ANTHROPIC_BASE_URL!)
   url.protocol = 'http:'; url.hostname = '127.0.0.1'; url.port = String(ready.port)
   const collectorReady = join(directory, `native-${process.pid}.ready`), deadline = Date.now() + 5000
   while (!existsSync(collectorReady) && Date.now() < deadline) await Bun.sleep(20)
   const collector = JSON.parse(readFileSync(collectorReady, 'utf8'))
-  if (!integer(collector.pid) || collector.pid === 0 || collector.nativePid !== process.pid || collector.started !== nativeProcessIdentity(process.pid)?.started) throw new Error('AC20 native collector unavailable')
+  if (!integer(collector.pid) || collector.pid === 0 || collector.nativePid !== process.pid || collector.started !== nativeProcessIdentity(process.pid)?.started) throw new Error('native collector unavailable')
   process.kill(collector.pid, 0)
   // AD associates SessionStart with the pane PID. Spawning a child here leaves
   // Bun as that pane process and makes AD reject every native hook. execve
   // preserves the PID and the terminal descriptors (stderr is the shell's
   // anonymous pipe to the independent strict collector).
   process.execve!(binary, [binary, '--debug-to-stderr', ...args], { ...process.env, ANTHROPIC_BASE_URL: url.toString() })
-  throw new Error('AC20 native exec unavailable')
+  throw new Error('native exec unavailable')
 }
 
 /** /proc's parenthesized comm may itself contain ')' or whitespace. Fields
  * after its final ')' start at state (field3); starttime is field22. Never
  * read cmdline or environ to identify the process. */
 export function parseNativeProcessStat(text: string, pid: number) {
-  if (!integer(pid) || pid === 0 || !text.startsWith(`${pid} (`)) throw new Error('AC20 native process identity unavailable')
+  if (!integer(pid) || pid === 0 || !text.startsWith(`${pid} (`)) throw new Error('native process identity unavailable')
   const close = text.lastIndexOf(')'), fields = text.slice(close + 1).trim().split(/\s+/)
-  if (close < 0 || !/^[RSDZTtXxKWPI]$/.test(fields[0]!) || !/^\d+$/.test(fields[19]!)) throw new Error('AC20 native process identity unavailable')
+  if (close < 0 || !/^[RSDZTtXxKWPI]$/.test(fields[0]!) || !/^\d+$/.test(fields[19]!)) throw new Error('native process identity unavailable')
   return { state: fields[0]!, started: fields[19]! }
 }
 function nativeProcessIdentity(pid: number) {
@@ -212,9 +212,9 @@ function nativeProcessIdentity(pid: number) {
  * debug file is created. EOF is not evidence of an exit code, and inherited
  * descendant writers cannot keep collection alive after the pane PID exits. */
 async function collectNative(directory: string, nativePid: number) {
-  if (!integer(nativePid) || nativePid === 0 || nativePid === process.pid) throw new Error('AC20 native identity unavailable')
+  if (!integer(nativePid) || nativePid === 0 || nativePid === process.pid) throw new Error('native identity unavailable')
   const identity = nativeProcessIdentity(nativePid)
-  if (!identity || /^[ZXx]$/.test(identity.state)) throw new Error('AC20 native identity unavailable')
+  if (!identity || /^[ZXx]$/.test(identity.state)) throw new Error('native identity unavailable')
   const emit = sink(directory, `native-${nativePid}.jsonl`)
   const context = () => ({ atMs: Date.now(), case: scope(directory), process: nativePid })
   const projection = nativeDebugProjection(emit, context)
@@ -247,18 +247,18 @@ async function collectNative(directory: string, nativePid: number) {
 }
 
 if (import.meta.main) {
-  const unavailable = () => { process.stderr.write('AC20 diagnostics unavailable; details withheld\n'); process.exit(1) }
+  const unavailable = () => { process.stderr.write('diagnostics unavailable; details withheld\n'); process.exit(1) }
   process.on('uncaughtException', unavailable); process.on('unhandledRejection', unavailable)
   try {
-    if (!existsSync('/etc/cscb-ci-image') || process.env.REAL_AGENT_AC20_DIAGNOSTICS !== 'decision21c') throw new Error('AC20 diagnostic execution requires its authorized CI image')
+    if (!existsSync('/etc/cscb-ci-image') || process.env.REAL_AGENT_AC20_DIAGNOSTICS !== 'decision21c') throw new Error('diagnostic execution requires its authorized CI image')
     const [command, directory, ...args] = process.argv.slice(2)
-    if (!directory || !process.env.SCENARIO_ROOT || !directory.startsWith(process.env.SCENARIO_ROOT + '/')) throw new Error('AC20 diagnostic containment required')
+    if (!directory || !process.env.SCENARIO_ROOT || !directory.startsWith(process.env.SCENARIO_ROOT + '/')) throw new Error('diagnostic containment required')
     if (command === 'gateway') {
       const server = startDiagnosticGateway(new URL(process.env.ANTHROPIC_BASE_URL!), sink(directory, 'gateway.jsonl'), () => scope(directory))
-      server.listen(0, '127.0.0.1', () => { const address = server.address(); if (!address || typeof address === 'string') throw new Error('AC20 gateway unavailable'); writeFileSync(join(directory, 'gateway-ready.json'), JSON.stringify({ port: address.port }), { mode: 0o600, flag: 'wx' }) })
+      server.listen(0, '127.0.0.1', () => { const address = server.address(); if (!address || typeof address === 'string') throw new Error('gateway unavailable'); writeFileSync(join(directory, 'gateway-ready.json'), JSON.stringify({ port: address.port }), { mode: 0o600, flag: 'wx' }) })
     } else if (command === 'verify' && args[0] === '/opt/claude-code/2.1.296/claude') {
-      if (createHash('sha256').update(readFileSync(args[0])).digest('hex') !== AC20_NATIVE_SHA256) throw new Error('AC20 native binary changed')
-      console.log('recorded: AC20 diagnostic native binary sha256=' + AC20_NATIVE_SHA256)
+      if (createHash('sha256').update(readFileSync(args[0])).digest('hex') !== AC20_NATIVE_SHA256) throw new Error('native binary changed')
+      console.log('recorded: diagnostic native binary sha256=' + AC20_NATIVE_SHA256)
     } else if (command === 'native' && args[0] === '/opt/claude-code/2.1.296/claude') await native(directory, args[0], args.slice(1))
     else if (command === 'collect' && args.length === 1 && /^\d+$/.test(args[0]!)) await collectNative(directory, Number(args[0]))
     else if (command === 'case' && ['1', '2'].includes(args[0]!)) {
@@ -267,8 +267,8 @@ if (import.meta.main) {
     }
     else if (command === 'wait' && args.length === 7) {
       const [started, state, key, shim, root, expectedPath, seq] = args, caseNumber = Number(seq), waitStarted = Number(started)
-      if (!integer(waitStarted) || waitStarted > Date.now()) throw new Error('AC20 original wait start unavailable')
-      if (![1, 2].includes(caseNumber) || scope(directory) !== caseNumber || process.env.REAL_AGENT_MODEL_PIN !== 'azure/openai/gpt-6-astra') throw new Error('AC20 completion identity changed')
+      if (!integer(waitStarted) || waitStarted > Date.now()) throw new Error('original wait start unavailable')
+      if (![1, 2].includes(caseNumber) || scope(directory) !== caseNumber || process.env.REAL_AGENT_MODEL_PIN !== 'azure/openai/gpt-6-astra') throw new Error('completion identity changed')
       const adapters = await packedReceiptAdapters(), expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
       const completed = async () => { try {
         const paths = transcriptFiles(root!), all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
@@ -281,7 +281,7 @@ if (import.meta.main) {
         return linkedRetryForStalledRequest(events, caseNumber, waitStarted + AC20_COMPLETION_MS)
       }
       const passed = await observeAC20Completion({ startMs: waitStarted, now: Date.now, sleep: ms => Bun.sleep(ms), completed, retryObserved, emit: sink(directory, `wait-${caseNumber}.jsonl`), caseNumber })
-      if (!passed) { console.error('FAIL: AC20 completion absent within180s; diagnostic observation cannot repair this failure'); process.exitCode = 1 }
-    } else throw new Error('AC20 diagnostic command invalid')
-  } catch { console.error('AC20 diagnostics unavailable; details withheld'); process.exitCode = 1 }
+      if (!passed) { console.error('FAIL: completion absent within180s; diagnostic observation cannot repair this failure'); process.exitCode = 1 }
+    } else throw new Error('diagnostic command invalid')
+  } catch { console.error('diagnostics unavailable; details withheld'); process.exitCode = 1 }
 }

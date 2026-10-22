@@ -35,7 +35,7 @@ export function isProcessRunning(pid: number): boolean {
  * - If PID file exists and the process is running: logs a [slack]-prefixed
  *   error to stderr and exits with code 1.
  * - If PID file exists but the process is not running: removes the stale
- *   file and the `server.port` record beside it (b.jg5 SRJ-510; best effort,
+ * file and the `server.port` record beside it (best effort,
  *   an absent record included) and proceeds.
  */
 export function checkPidConflict(pidFile: string): void {

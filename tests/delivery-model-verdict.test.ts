@@ -1,9 +1,9 @@
 /**
- * b.omv SR-15.6 / t3.j2a.di.th.4y: certification and trace handoff boundaries.
+ * certification and trace handoff boundaries.
  * Synthetic cases use disposable inputs and an in-memory scheduler. They never
  * certify the repository. Committed local evidence has its own complete-run
  * and independent-proof gate; it never substitutes for scheduler certification.
- * E3 owns runtime replay and ENGINE_ACTIONS conformance.
+ * owns runtime replay and ENGINE_ACTIONS conformance.
  */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'

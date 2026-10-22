@@ -1,7 +1,7 @@
 /**
  * fmk-texts-entries.test.ts — Every `src/` export the `/ci` scenarios' value
- * printer (`tests/integration/fixtures/fmk-texts.ts`, b.jg5 SRJ-1401, b.deo
- * SRI-1404; read by every fmk scenario and by the shared-mode
+ * printer (`tests/integration/fixtures/fmk-texts.ts`
+ * read by every fmk scenario and by the shared-mode
  * test-29-invited-channels.sh) names exists in `src/` with the kind the
  * printer reads it as, so a renamed, removed or retyped export fails on the
  * host, before `/ci` runs a scenario.
@@ -500,7 +500,7 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'persona-diagnostics.ts:PERSONA_DIAGNOSTIC_CLASSES:defined': () => nonEmptyStrings(personaDiagnostics.PERSONA_DIAGNOSTIC_CLASSES, true),
   }
 
-  // test-29's references (test-29-invited-channels.sh, b.deo SRI-1404), each
+  // test-29's references (test-29-invited-channels.sh), each
   // `<file>:<export>:<kind>`: the invited-channel texts it matches, the
   // persona lines' framing, the switch's key (the configuration's and the
   // mode lookup's), mode name and class labels its upgrade phase checks no

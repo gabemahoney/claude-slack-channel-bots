@@ -1,6 +1,6 @@
 /**
  * persona-web-api-watch.ts — Watch a persona's long-lived Web API client for
- * a revoked bot token (bug b.ujn).
+ * a revoked bot token.
  *
  * A persona's Socket Mode connection runs on its app token, so a bot token
  * revoked while the server runs (app reinstalled, token rotated, app removed)
@@ -54,7 +54,7 @@
  * the method name), and the local refusal's error carries only the Slack
  * error code and a method name that matches `SLACK_METHOD_NAME_RE`.
  *
- * Pure module (b.av2 SR-13.1): nothing runs at import; a watch holds nothing
+ * Pure module: nothing runs at import; a watch holds nothing
  * but its wrappers and its latch.
  *
  * SPDX-License-Identifier: MIT

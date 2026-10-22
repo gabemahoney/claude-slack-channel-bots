@@ -3,8 +3,8 @@
  *
  * Pure module: string in, records out. No mocks, no test servers. Assertions
  * are plain input-string → output-record checks. Token 7 is a list of persona
- * targets (names or keys, b.av2 SR-9.3) kept verbatim; the parser resolves
- * nothing. The AC 50 case passes a parsed schedule through the dispatcher's
+ * targets (names or keys) kept verbatim; the parser resolves
+ * nothing. The case passes a parsed schedule through the dispatcher's
  * exported resolve step with the real name-or-key resolver; its persona config
  * is built in memory (the temp dir is only a path base, nothing is written).
  */
@@ -110,7 +110,7 @@ describe('valid lines', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Persona keys always tokenize (b.av2 SR-2.1)
+// Persona keys always tokenize
 // ---------------------------------------------------------------------------
 
 describe('persona keys as token 7', () => {
@@ -317,11 +317,11 @@ describe('identity derivation', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC 50 — parse, then the dispatcher's resolve step: a name and its key
-// deliver once (b.av2 SR-9.3). Real name-or-key resolver over two personas.
+// parse, then the dispatcher's resolve step: a name and its key
+// deliver once. Real name-or-key resolver over two personas.
 // ---------------------------------------------------------------------------
 
-describe('AC 50: parse then resolve', () => {
+describe('parse then resolve', () => {
   const PLANNER = 'Planner'
   const PLANNER_KEY = personaKey(PLANNER)
   const REVIEWER = 'reviewer'

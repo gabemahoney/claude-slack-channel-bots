@@ -1,30 +1,30 @@
 /**
- * agent-director-template.test.ts — SR-3.2 / SR-3.1 template install.
+ * agent-director-template.test.ts — template install.
  *
  * Covers:
- *   - buildTemplateParams() produces the SR-3.1 shape (relay_mode='on',
+ * - buildTemplateParams produces the shape (relay_mode='on',
  *     label=['service=cscb'], deny=['AskUserQuestion'], overwrite: true,
  *     agent_args with MCP/prompt flags and the exact durable reply preallow).
  *   - The reply rule is in agent_args independently of the ephemeral allow
- *     overlay, which agent-director does not retain on resume (b.pb8).
+ * overlay, which agent-director does not retain on resume.
  *   - deriveMemoryReadAllowRules() emits one memory-subdir Read rule per
- *     distinct effective config dir across the personas (b.fae F5,
- *     b.av2 SR-6.2), never a config-dir root.
+ * distinct effective config dir across the personas (F5,
+ *), never a config-dir root.
  *   - --append-system-prompt-file is appended when the file is readable,
  *     and omitted (with a stderr warning) when accessSync throws.
- *   - `--system-prompt-snapshot off` (b.b1j SR-2) is the last two arguments
+ * - `--system-prompt-snapshot off` is the last two arguments
  *     unless fresh_system_prompt is false, whatever the append-file decision;
  *     the refresh keeps the boot install's arguments in both directions.
  *   - installSlackChannelBotTemplate() calls client.makeTemplate(...) with
  *     exactly the buildTemplateParams shape, and propagates the result.
  *   - Rejections from client.makeTemplate(...) — typed AgentDirectorError
  *     and generic Error — both record a fatal startup error and exit.
- *   - refreshSlackChannelBotTemplate() (b.av2 SR-8.6 step 5): one
+ * - refreshSlackChannelBotTemplate (step 5): one
  *     makeTemplate call with the boot install's params except `allow`, which
  *     follows the applied personas' effective config dirs as written; the
  *     applied config's server-wide values are ignored and the append file is
  *     not probed again; a rejection logs one line and resolves `failed` with
- *     no exit and no startup error, and nothing retries it (E13 decision 3).
+ * no exit and no startup error, and nothing retries it.
  *     The line names a typed error by name and description, and describes an
  *     untyped throw by its type (and stack frames) only, so a token in its
  *     message never reaches the log; the boot install keeps the message.
@@ -73,12 +73,12 @@ function memoryRule(dir: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// buildTemplateParams — SR-3.1 shape
+// buildTemplateParams — shape
 // ---------------------------------------------------------------------------
 
-describe('buildTemplateParams (SR-3.1)', () => {
-  test('produces the canonical SR-3.1 shape with overwrite=true', () => {
-    // fresh_system_prompt: false keeps the SR-3.1 array without the b.b1j pair, which its own block pins.
+describe('buildTemplateParams', () => {
+  test('produces the canonical shape with overwrite=true', () => {
+    // fresh_system_prompt: false keeps the array without the pair, which its own block pins.
     const cfg = makePersonaConfig({
       mcp_config_path: '/abs/mcp.json',
       system_prompt_mode: 'none',
@@ -102,12 +102,12 @@ describe('buildTemplateParams (SR-3.1)', () => {
     expect(params.extra_env).toBeUndefined()
   })
 
-  // b.fae F5 (code-review follow-up) — the allow array is DERIVED from the
+  // F5 (code-review follow-up) — the allow array is DERIVED from the
   // distinct effective Claude config dirs across all personas (per-persona,
   // else top-level, else Claude's default `~/.claude`), one memory-scoped Read
   // rule per dir, sorted by dir + deduped. NEVER the config-dir root (holds
   // live creds). os.homedir() is read only to compute an expected string.
-  test('reply preallow is in durable agent_args independently of the allow overlay (b.pb8)', () => {
+  test('reply preallow is in durable agent_args independently of the allow overlay', () => {
     const cfg = parsePersonaConfigBytes(
       JSON.stringify(makePersonaConfigInput({ mcp_config_path: join(baseDir, 'mcp.json'), system_prompt_mode: 'none' }, baseDir)),
       join(baseDir, 'config.json'), baseDir, { home: baseDir },
@@ -126,7 +126,7 @@ describe('buildTemplateParams (SR-3.1)', () => {
       .toEqual(['--allowedTools', REPLY_TOOL_ALLOW_RULE])
   })
 
-  test('no allow rule covers a config-dir root (credentials guard, b.fae F5)', () => {
+  test('no allow rule covers a config-dir root (credentials guardF5)', () => {
     const infhub = join(baseDir, '.claude-infhub')
     const cfg = makeMultiPersonaConfig(
       [{ name: 'Infhub Bot', claude_config_dir: infhub }, { name: 'Default Bot' }],
@@ -146,7 +146,7 @@ describe('buildTemplateParams (SR-3.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// deriveMemoryReadAllowRules — rule derivation over personas (b.fae F5, b.av2 SR-6.2)
+// deriveMemoryReadAllowRules — rule derivation over personas (F5)
 // ---------------------------------------------------------------------------
 
 describe('deriveMemoryReadAllowRules over personas', () => {
@@ -162,7 +162,7 @@ describe('deriveMemoryReadAllowRules over personas', () => {
     ['no config dir on any persona → exactly the default rule',
       () => [[{ name: 'A Bot' }, { name: 'B Bot' }]],
       (d) => [d.defaultDir]],
-    ['a persona with its own dir + one with none (+ one sharing that dir) → both rules, sorted + deduped (b.fae F5)',
+    ['a persona with its own dir + one with none (+ one sharing that dir) → both rules, sorted + deduped (F5)',
       (d) => [[{ name: 'Infhub Bot', claude_config_dir: d.infhub }, { name: 'Default Bot' }, { name: 'Infhub Two', claude_config_dir: d.infhub }]],
       (d) => [d.defaultDir, d.infhub]],
     ['several personas sharing one top-level dir → one rule',
@@ -197,11 +197,11 @@ describe('deriveMemoryReadAllowRules over personas', () => {
 })
 
 // ---------------------------------------------------------------------------
-// buildTemplateParams — the snapshot pair (b.b1j SR-2)
+// buildTemplateParams — the snapshot pair
 // ---------------------------------------------------------------------------
 
-describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () => {
-  // b.omv SR-7.1/2: operator readability affects composition, never argv.
+describe('buildTemplateParams: --system-prompt-snapshot off', () => {
+  // operator readability affects composition, never argv.
   const PAIR = ['--system-prompt-snapshot', 'off']
   const FILE = '/etc/cscb/extra.md'
   const rows: [string, Partial<PersonaConfig>][] = [
@@ -237,11 +237,11 @@ describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () =>
 })
 
 // ---------------------------------------------------------------------------
-// installSlackChannelBotTemplate — SR-3.2
+// installSlackChannelBotTemplate —
 // ---------------------------------------------------------------------------
 
-describe('installSlackChannelBotTemplate (SR-3.2)', () => {
-  test('calls client.makeTemplate with the SR-3.1 params and returns the result', async () => {
+describe('installSlackChannelBotTemplate', () => {
+  test('calls client.makeTemplate with the params and returns the result', async () => {
     const makeTemplateCalls: import('agent-director').MakeTemplateParams[] = []
     const stub = makeStubClient({
       makeTemplateResult: cannedMakeTemplate('/home/u/.config/agent-director/templates/slack-channel-bot.toml'),
@@ -274,7 +274,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     ])
   })
 
-  // b.b1j SR-2.3: the default configuration installs the pair, last, after the append flag.
+  // the default configuration installs the pair, last, after the append flag.
   test('resolves with the exact params it passed to makeTemplate, the append flag as the boot probe decided and the pair last', async () => {
     const makeTemplateCalls: MakeTemplateParams[] = []
     const cfg = makePersonaConfig({
@@ -351,10 +351,10 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// refreshSlackChannelBotTemplate — b.av2 SR-8.6 step 5 (apply-time refresh)
+// refreshSlackChannelBotTemplate — step 5 (apply-time refresh)
 // ---------------------------------------------------------------------------
 
-describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
+describe('refreshSlackChannelBotTemplate (step 5)', () => {
   const REFRESHED_PATH = '/stub/templates/slack-channel-bot.toml'
   const refreshedLine = (rules: number): string =>
     `[slack] template refresh: rewrote the agent-director template 'slack-channel-bot' with the memory-read rules ` +
@@ -443,7 +443,7 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'applied-append.md') }),
       (b) => ['--mcp-config', join(b, 'boot-mcp.json'), '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
         '--allowedTools', REPLY_TOOL_ALLOW_RULE]],
-    // b.b1j SR-2.3: fresh_system_prompt is start-time-only; the pair the start installed survives the applied config turning it off.
+    // fresh_system_prompt is start-time-only; the pair the start installed survives the applied config turning it off.
     ['start installed the snapshot pair; the applied config turns fresh_system_prompt off (the pair is kept)',
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'none', fresh_system_prompt: true }, true],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'none', fresh_system_prompt: false }),
@@ -469,7 +469,7 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
     const allow = [REPLY_TOOL_ALLOW_RULE, memoryRule(join(home, '.claude')), memoryRule(infhub)]
     expect(calls).toEqual([{ ...installed, allow, overwrite: true }])
     expect(calls[0]!.agent_args).toEqual(expectedArgs(baseDir))
-    // Scope (b.av2 SR-11): every refreshed rule reaches into projects/*/memory, never a config-dir root.
+    // Scope: every refreshed rule reaches into projects/*/memory, never a config-dir root.
     for (const rule of calls[0]!.allow?.slice(1) ?? []) expect(rule).toMatch(/\/projects\/\*\/memory\/\*\*\)$/)
     expect(calls[0]!.allow).not.toContain(`Read(/${infhub}/**)`)
     expect(result).toEqual({ kind: 'refreshed', path: REFRESHED_PATH })
@@ -507,7 +507,7 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
     expect(calls.map((p) => p.allow)).toEqual([[REPLY_TOOL_ALLOW_RULE, memoryRule(join(os.homedir(), '.claude'))]])
   })
 
-  describe('a rejected refresh is logged, not fatal, and not retried (E13 decision 3)', () => {
+  describe('a rejected refresh is logged, not fatal, and not retried', () => {
     /**
      * The leak marker as a message carries it (`sentinelInMessage`): only
      * inside a fake token and a Socket Mode `ticket=` URL. The refresh's line

@@ -61,7 +61,7 @@ export interface JsonlPersistenceSafeguardDeps {
   home?: string
   /**
    * Realpath and lstat for resolving each persona's claude_config_dir (Layer
-   * 2, bug b.g57): a persona whose directory cannot be resolved is skipped.
+   * 2): a persona whose directory cannot be resolved is skipped.
    * Default: the real file system.
    */
   configDirFs?: Partial<StrictRealPathFs>
@@ -254,11 +254,11 @@ function classifyJsonlRoots(roots: readonly string[], readMountinfo?: () => stri
 /**
  * Default AD row fetch — routed through withOutageDetection (the sanctioned
  * single CSCB→AD entry point) so an AD outage is flagged against this persona.
- * b.jg5 SRJ-122: this `get` is not one of SRJ-114's sites, so none of the
+ * this `get` is not one of the contract sites, so none of the
  * decisions of `src/row-read-rules.ts` applies here: a liveness note on the
  * row, `provenance_conflict` included, and a `pending` row with no launch
- * start (SRJ-513) latch no one, and a retired key's row read live with its
- * mark set clears no retired-key entry (SRJ-807); they change nothing.
+ * start latch no one, and a retired key's row read live with its
+ * mark set clears no retired-key entry; they change nothing.
  */
 function defaultGetRow(key: string, instanceId: string, isShuttingDown: () => boolean): Promise<GetResult> {
   return withOutageDetection(key, undefined, 'get', (client) =>
@@ -306,7 +306,7 @@ interface Layer2Effects {
  * Why the collision ladder will replace this row with a fresh spawn instead
  * of resuming it (the guards of `compareRowToPersona`), or undefined
  * when the row matches the persona. A claude_config_dir with no real path
- * gives no `config_dir` verdict, so no mismatch (bug b.g57).
+ * gives no `config_dir` verdict, so no mismatch.
  */
 function rowReplacementReason(
   row: GetResult,
@@ -318,7 +318,7 @@ function rowReplacementReason(
   if (!cmp.cwdMatches) {
     return `row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory}`
   }
-  if (!cmp.tagPrompt) return 'row tag_prompt marker missing (b.omv SR-7.6)'
+  if (!cmp.tagPrompt) return 'row tag_prompt marker missing'
   if (cmp.configDirMatches === false) {
     const was = cmp.configDirLabel === undefined ? 'missing' : `was=${cmp.configDirLabel}`
     return `row config_dir label ${was}, now=${cmp.expectedConfigDirLabel}`
@@ -335,7 +335,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   const ref = personaRef(persona)
   const instanceId = personaInstanceId(key)
 
-  // Bug b.g57: a claude_config_dir with no real path (an unmounted drive, a
+  // a claude_config_dir with no real path (an unmounted drive, a
   // dropped mount, a symlink pointing to nothing) is not checked this pass:
   // its transcript can't be located, and its launch waits for the directory
   // with the row kept, so there is no lost history to report.
@@ -367,7 +367,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   if (fx.isShuttingDown()) return
 
   // Case 7: the collision ladder will replace this row rather than resume or
-  // reconnect it (b.av2 SR-6.2), so there is no resume to warn about.
+  // reconnect it, so there is no resume to warn about.
   const replacement = rowReplacementReason(row, persona, fx.home, fx.configDirFs)
   if (replacement !== undefined) {
     console.error(
@@ -442,7 +442,7 @@ function reportStorageLayer(personas: readonly Persona[], roots: readonly string
 
 /**
  * The non-persistent-storage check (Layer 1) for one persona's effective
- * JSONL root only (b.av2 SR-6.2): a persona brought up by a confirmed apply.
+ * JSONL root only: a persona brought up by a confirmed apply.
  * Its warning goes to that persona alone, through `notify` (the per-persona
  * notifier, which holds it until the persona's client is validated), and is
  * recorded as at start; no other persona is checked or warned. Layer 2 does

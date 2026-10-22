@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# b.omv SR-14.1/14.2: real native Claude; all state belongs to this container.
+# real native Claude; all state belongs to this container.
 set -euo pipefail
 TEST_NAME="test-38-fmk-real-cron"
 source "$(dirname "$0")/lib/scenario.sh"

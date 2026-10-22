@@ -1,6 +1,6 @@
 /**
  * personas.ts — the fixed cast of the live run: the four test apps A–D, the
- * three channels, and the names the testplan (testplans/b.yko) uses for them.
+ * three channels, and the names the testplan (testplans/live-acceptance.md) uses for them.
  *
  * Pure constants and derivations; no I/O.
  */

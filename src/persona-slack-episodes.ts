@@ -1,6 +1,6 @@
 /**
  * persona-slack-episodes.ts — Cause-start / cause-clear logging latch for a
- * persona's Slack validation and connection outcomes (b.av2 SR-10.3).
+ * persona's Slack validation and connection outcomes.
  *
  * A retry is logged when its cause starts and when it clears, not on every
  * attempt. An episode is a run of outcomes of one class: Slack-unreachable,
@@ -67,17 +67,17 @@ import {
 export interface SlackEpisodeTrackerOptions {
   /** Persona name as configured; rendered JSON-quoted. */
   name: string
-  /** Persona key (b.av2 SR-2.1). */
+  /** Persona key. */
   key: string
   /** Position of the persona's entry in the config file's `personas` array. */
   index: number
-  /** The persona's credentials file path; every line carries it (b.av2 SR-10.3). */
+  /** The persona's credentials file path; every line carries it. */
   path: string
   /** Receives each line as it is produced; omitted means lines are only returned. */
   log?: PersonaDiagnosticLogger
 }
 
-/** A connection that was up dropped without the server closing it (b.av2 SR-3.3). */
+/** A connection that was up dropped without the server closing it. */
 export interface SlackConnectionLostInput {
   kind: 'connection-lost'
 }

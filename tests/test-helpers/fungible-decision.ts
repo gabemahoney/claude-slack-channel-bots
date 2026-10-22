@@ -1,6 +1,6 @@
 /**
- * test-helpers/fungible-decision.ts — The decision-table rows of b.deo
- * SRI-1301 (SRI-1204), read by `tests/delivery-decision-fungible.test.ts`.
+ * test-helpers/fungible-decision.ts — The decision-table rows of the contract
+ * read by `tests/delivery-decision-fungible.test.ts`.
  *
  * Each row holds one call of `decideDelivery`: the event (from the Slack
  * stub's event factories), the configuration (from the persona-config
@@ -9,12 +9,11 @@
  * written in the row. `decisionArgsOf(row)` turns a row into the decision's
  * four arguments the way `src/persona-routing.ts` builds them, and
  * `channelDeliveryArgsOf(row)` into `channelDeliveryFor`'s for P and the
- * row's channel. `FUNGIBLE_DECISION_GROUPS` holds SRI-1301's ten groups in
+ * row's channel. `FUNGIBLE_DECISION_GROUPS` holds ten groups in
  * its order.
  *
  * A row may also put in front of the decision what the loader never
- * produces, so the row shows that an input not in force plays no part (b.deo
- * SRI-202, SRI-308): a listing or a malformed declarative section in the
+ * produces, so the row shows that an input not in force plays no part: a listing or a malformed declarative section in the
  * decision's views in fungible mode, fungible destinations and stored choices
  * in declarative mode, or no fourth argument at all.
  *
@@ -97,15 +96,15 @@ export const Q_DESTINATION = 'C0QDEST001'
 const LISTED_ALL = 'C0LISTALL1'
 const LISTED_MENTIONS = 'C0LISTMEN1'
 
-/** The forms of the `allow_invited_channels` switch (b.deo SRI-101). */
+/** The forms of the `allow_invited_channels` switch. */
 export const SWITCH_FORMS = ['absent', 'false', 'true'] as const
 export type SwitchForm = (typeof SWITCH_FORMS)[number]
 
-/** The envelope flag's forms (b.deo SRI-301): `true`, `false`, absent, or any other value. */
+/** The envelope flag's forms: `true`, `false`, absent, or any other value. */
 export const FLAG_FORMS = ['true', 'false', 'absent', 'non-boolean'] as const
 export type FlagForm = (typeof FLAG_FORMS)[number]
 
-/** The `channel_type` values SRI-1301's completeness case spans; `absent` is an event with none. */
+/** The `channel_type` values completeness case spans; `absent` is an event with none. */
 export const CHANNEL_TYPE_FORMS = ['channel', 'group', 'im', 'mpim', 'absent'] as const
 export type ChannelTypeForm = (typeof CHANNEL_TYPE_FORMS)[number]
 
@@ -124,7 +123,7 @@ const FLAG = {
 /** One flag of each form, in `FLAG_FORMS` order. */
 const ONE_FLAG_PER_FORM: readonly unknown[] = [FLAG.true, FLAG.false, FLAG.absent, FLAG.falseString]
 
-/** Read through a section a row marks fail-if-read: the decision must never read it (b.deo SRI-202). */
+/** Read through a section a row marks fail-if-read: the decision must never read it. */
 export const FAIL_IF_READ: unique symbol = Symbol('fail-if-read')
 
 // ---------------------------------------------------------------------------
@@ -178,12 +177,12 @@ function personaOf(config: PersonaConfig, key: string): Persona {
   return persona
 }
 
-/** An object whose `channels` throws when read (b.deo SRI-202). */
+/** An object whose `channels` throws when read. */
 function withFailingChannels<T extends object>(base: T, key: string): T & { readonly channels: readonly ChannelEntry[] } {
   return Object.defineProperty({ ...base }, 'channels', {
     enumerable: true,
     get(): never {
-      throw new Error(`fungible-decision: the declarative section of ${key} was read (b.deo SRI-202)`)
+      throw new Error(`fungible-decision: the declarative section of ${key} was read`)
     },
   }) as T & { readonly channels: readonly ChannelEntry[] }
 }
@@ -272,7 +271,7 @@ export function flagFormOf(flag: unknown): FlagForm {
   return flag ? 'true' : 'false'
 }
 
-/** The `channel_type` form of an event, or undefined for a value outside SRI-1301's five. */
+/** The `channel_type` form of an event, or undefined for a value outside five. */
 export function channelTypeFormOf(event: SlackEvent): ChannelTypeForm | undefined {
   const value = event['channel_type']
   if (value === undefined) return 'absent'
@@ -408,7 +407,7 @@ const CHANNEL_KINDS = ['public', 'private'] as const
 
 // ---------------------------------------------------------------------------
 // Group 1: declarative mode is unchanged by every fungible input
-// (b.deo SRI-308, SRI-202's declarative half, SRI-309's optional inputs)
+// (declarative half optional inputs)
 // ---------------------------------------------------------------------------
 
 /** P's stored choice for the unlisted public and private channel, per flag form (none, `mentions`, `all`). */
@@ -498,7 +497,7 @@ declarativeRows.push(
 )
 
 // ---------------------------------------------------------------------------
-// Group 2: fungible mode, no stored choice, flag false (b.deo SRI-306)
+// Group 2: fungible mode, no stored choice, flag false
 // ---------------------------------------------------------------------------
 
 const noStoredChoiceRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): FungibleDecisionRow[] => {
@@ -529,7 +528,7 @@ const noStoredChoiceRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): 
 })
 
 // ---------------------------------------------------------------------------
-// Group 3: fungible mode, P's stored all (b.deo SRI-306, SRI-305's via half)
+// Group 3: fungible mode, P's stored all (via half)
 // ---------------------------------------------------------------------------
 
 const storedAllRows: FungibleDecisionRow[] = [
@@ -585,7 +584,7 @@ const storedAllRows: FungibleDecisionRow[] = [
 ]
 
 // ---------------------------------------------------------------------------
-// Group 4: fungible mode ignores channels (b.deo SRI-305, SRI-202's decision rows)
+// Group 4: fungible mode ignores channels (decision rows)
 // ---------------------------------------------------------------------------
 
 // Each row's outcome is the one groups 2 and 3 give for the same event and
@@ -664,7 +663,7 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
 ]
 
 // ---------------------------------------------------------------------------
-// Group 5: the five conditions of SRI-303, and the same events listed in
+// Group 5: the five conditions of the contract, and the same events listed in
 // declarative mode
 // ---------------------------------------------------------------------------
 
@@ -766,7 +765,7 @@ const groupDmRows: FungibleDecisionRow[] = ONE_FLAG_PER_FORM.flatMap((flag): Fun
 ])
 
 // ---------------------------------------------------------------------------
-// Group 7: the loop guard, P's stored all (b.deo SRI-305)
+// Group 7: the loop guard, P's stored all
 // ---------------------------------------------------------------------------
 
 const loopGuardRows: ChannelDeliveryRow[] = [
@@ -832,7 +831,7 @@ const firstStepRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): Fungi
 })
 
 // ---------------------------------------------------------------------------
-// Group 9: an unreadable store (b.deo SRI-305, SRI-403)
+// Group 9: an unreadable store
 // ---------------------------------------------------------------------------
 
 const unreadableStoreRows: ChannelDeliveryRow[] = [
@@ -888,15 +887,15 @@ const dmRows: FungibleDecisionRow[] = [
 ]
 
 // ---------------------------------------------------------------------------
-// The groups, in SRI-1301's order
+// The groups, in the contract order
 // ---------------------------------------------------------------------------
 
-/** One SRI-1301 group: its rows. */
+/** One group: its rows. */
 export interface FungibleDecisionGroup<R extends FungibleDecisionRow = FungibleDecisionRow> {
   readonly rows: readonly R[]
 }
 
-/** SRI-1301's ten groups, in its order. */
+/** ten groups, in its order. */
 export const FUNGIBLE_DECISION_GROUPS = {
   declarative: { rows: declarativeRows },
   noStoredChoice: { rows: noStoredChoiceRows },

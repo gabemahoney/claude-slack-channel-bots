@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 2 (b.3hy): verify the persona config loaded, startupSessionManager ran
+# Test 2: verify the persona config loaded, startupSessionManager ran
 # and dry-run skipped the spawn of both personas (the zero-channel one
 # included), then check /interject's status codes on the daemon's port.
 # Depends on Test 1 having left the daemon running with its two-persona config.
@@ -48,7 +48,7 @@ for part in '2 no-op' '0 failed' '0 not brought up'; do
     esac
 done
 
-# --- /interject (b.av2 SR-9.1) ----------------------------------------------
+# --- /interject ----------------------------------------------
 # POST a body naming `$1`; print the HTTP status code. A call that gets no
 # HTTP response (refused, timed out) prints 000 and returns 0, so the status
 # check below fails with a FAIL: line instead of `set -e` ending the script.

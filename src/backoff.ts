@@ -2,7 +2,7 @@
  * backoff.ts — Per-persona session-restart failure counter with exponential backoff.
  *
  * The session-restart counters (900 s ceiling, 5-failure cap) are keyed by
- * persona key (b.av2 SR-6.3). They are separate from the persona Slack-retry
+ * persona key. They are separate from the persona Slack-retry
  * schedule in `src/persona-retry-schedule.ts`: both are per persona, but they
  * count different things and share no state.
  *
@@ -65,7 +65,7 @@ export function recordSuccess(key: string): void {
 
 /**
  * Forget persona `key`'s consecutive-failure count and cap-notified latch
- * (b.av2 SR-6.5, a teardown; b.jg5 SRJ-509, a clear by hand that clears the
+ * (a teardown, a clear by hand that clears the
  * persona's latch): the same reset as `recordSuccess`, but not a success. No
  * other persona's state changes; logs and posts nothing.
  */
@@ -120,7 +120,7 @@ const RESTART_BACKOFF_CEILING_S = 900
  * result is in whatever unit `base` and `ceiling` are given in.
  *
  * Holds no state, so a caller that keeps its own attempt count (for example
- * a per-persona retry schedule, b.av2 SR-3.2) can reuse it without touching
+ * a per-persona retry schedule) can reuse it without touching
  * this module's session-restart counters.
  *
  * Overflow-safe for a positive `base` and a finite `ceiling`: once

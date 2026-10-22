@@ -2,7 +2,7 @@
  * permission-trail.test.ts — Single-emitter correctness tests for
  * src/permission-trail.ts. Covers schema serialization, RFC 3339 sub-second
  * `ts` formatting, append semantics, first-write directory creation, and
- * SLACK_STATE_DIR env override, and the default location (b.fc4: under the XDG
+ * SLACK_STATE_DIR env override, and the default location (under the XDG
  * configuration directory, not under ~/.claude).
  *
  * SPDX-License-Identifier: MIT
@@ -81,7 +81,7 @@ function makeEmitTrailInput(overrides?: Partial<EmitTrailInput>): EmitTrailInput
   }
 }
 
-// SR-V-4.3 / SR-V-4.5: ≥ millisecond fractional component on the ts field.
+// ≥ millisecond fractional component on the ts field.
 const ISO_MS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3,}Z$/
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ describe('emitTrailEvent — schema serialization', () => {
   })
 
   test('per-event-class fields pass through verbatim with no truncation', () => {
-    // Long blocks payload mirrors what SR-V-2.4 (Epic 2) will emit.
+    // Long blocks payload mirrors what (component 2) will emit.
     const bigBlocks = Array.from({ length: 50 }, (_, i) => ({
       type: 'section',
       block_id: `b${i}`,
@@ -242,10 +242,10 @@ describe('emitTrail — SLACK_STATE_DIR override', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The default location (b.fc4)
+// The default location
 // ---------------------------------------------------------------------------
 
-describe('emitTrail — the default state directory (b.fc4)', () => {
+describe('emitTrail — the default state directory', () => {
   const TRAIL_SRC = join(import.meta.dir, '..', 'src', 'permission-trail.ts')
 
   /** `emitTrail` in a child with the fake home as its HOME, SLACK_STATE_DIR unset, and `env` more. */

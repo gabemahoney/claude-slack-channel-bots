@@ -1,8 +1,8 @@
 /**
  * logging.test.ts — Tests for initLogging() and appendLogLine() in
  * src/logging.ts: the console redirect, the one-line append to a named log
- * file (the CLI's `server.log` lines, b.jg5 SRJ-909), repointLogging() (the
- * server moving its redirect to the moved state directory, b.fc4) and the
+ * file (the CLI's `server.log` lines), repointLogging (the
+ * server moving its redirect to the moved state directory) and the
  * rotation both share (`CSCB_LOG_MAX_BYTES`, `CSCB_LOG_KEEP`).
  *
  * SPDX-License-Identifier: MIT
@@ -271,7 +271,7 @@ describe('initLogging — switching to a different file', () => {
 })
 
 // ---------------------------------------------------------------------------
-// repointLogging — the redirect follows the state directory's move (b.fc4)
+// repointLogging — the redirect follows the state directory's move
 // ---------------------------------------------------------------------------
 
 describe('repointLogging', () => {
@@ -406,7 +406,7 @@ describe('initLogging — fallback when write fails', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Size-based rotation (b.brv)
+// Size-based rotation
 // ---------------------------------------------------------------------------
 
 describe('initLogging — size-based rotation', () => {
@@ -433,7 +433,7 @@ describe('initLogging — size-based rotation', () => {
     initLogging(logFile)
 
     // Write far more bytes than the threshold. Without rotation this file would
-    // hold everything (this is the b.brv unbounded-growth bug).
+    // hold everything (this is the unbounded-growth bug).
     for (let i = 0; i < 200; i++) console.log(`capped growth line ${i} padding padding`)
 
     const activeSize = statSync(logFile).size
@@ -504,7 +504,7 @@ describe('initLogging — size-based rotation', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Reopen recovery after a failed post-rotation open (b.brv code-review fix)
+// Reopen recovery after a failed post-rotation open (code-review fix)
 // ---------------------------------------------------------------------------
 
 describe('initLogging — reopen recovery after a failed post-rotation open', () => {
@@ -633,7 +633,7 @@ describe('initLogging — reopen recovery after a failed post-rotation open', ()
 })
 
 // ---------------------------------------------------------------------------
-// appendLogLine — one line to a named log file (b.jg5 SRJ-909)
+// appendLogLine — one line to a named log file
 // ---------------------------------------------------------------------------
 
 describe('appendLogLine — one line in the log form, through the shared rotation', () => {

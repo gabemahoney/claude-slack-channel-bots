@@ -1,13 +1,13 @@
 /**
  * test-helpers/persona-config.ts — Shared persona-configuration fixtures
- * (b.av2 SR-13.4, b.deo SRI-1203).
+ *
  *
  * Builds persona configurations in file form (`PersonaInput`,
  * `PersonaConfigInput`) and resolved form (`PersonaConfig`), and writes a
  * file-form config into a caller-owned directory. The defaults load without
  * error through `loadPersonaConfig`.
  *
- * Channel modes (b.deo SRI-101, SRI-102): every builder takes the
+ * Channel modes: every builder takes the
  * `allow_invited_channels` switch through its server-wide overrides and the
  * `invited` section through its persona overrides or specs. The defaults keep
  * declarative mode (the switch absent in file form, `false` resolved) with no
@@ -17,10 +17,10 @@
  * empty and `permission_prompts` undefined, and `fungible_destination` is
  * `invited.permission_prompts`, `dm` when that is absent.
  *
- * Isolation (b.av2 SR-13.2): every default path sits under a base directory,
+ * Isolation: every default path sits under a base directory,
  * the OS temp directory unless the caller passes its own `mkdtempSync`
  * directory, never under the real home. The helper deals only in paths: it
- * creates no credentials file or directory (E2's credentials helper writes
+ * creates no credentials file or directory ( credentials helper writes
  * credentials files) and holds no token-like literal.
  *
  * SPDX-License-Identifier: MIT
@@ -72,7 +72,7 @@ function defaultPersonaPaths(name: unknown, baseDir: string): { credentials_file
 
 /**
  * The channel mode a configuration's switch picks, with an absent switch
- * resolved as the loader resolves it (b.deo SRI-101).
+ * resolved as the loader resolves it.
  */
 function modeOf(allowInvitedChannels: boolean | undefined): ChannelMode {
   return channelModeOf({ allow_invited_channels: allowInvitedChannels ?? false })
@@ -97,7 +97,7 @@ function ownCopy<T>(value: T): T {
 
 /**
  * A persona's resolved section fields, from its section keys as written, as
- * the loader resolves them in `mode` (b.deo SRI-102): declarative mode reads
+ * the loader resolves them in `mode`: declarative mode reads
  * `channels` and `permission_prompts`; fungible mode reads `invited` only.
  * `sections` holds the three values as written, each undefined when absent,
  * in objects of its own as the loader's are. No validation runs.
@@ -146,8 +146,7 @@ export function makePersona(overrides: Partial<PersonaInput> = {}, baseDir: stri
 }
 
 /**
- * One persona entry in file form, for fungible mode (b.deo SRI-102,
- * SRI-1203): no `channels` and no top-level `permission_prompts`, a channel
+ * One persona entry in file form, for fungible mode: no `channels` and no top-level `permission_prompts`, a channel
  * ID as its fungible destination (`invited.permission_prompts`), DMs off, and
  * paths under `baseDir` derived from the name as `makePersona` derives them.
  * Written under a switch set to `true`, it loads. Overrides apply as for
@@ -185,7 +184,7 @@ export function makePersonaConfigInput(
  * A resolved configuration, as `loadPersonaConfig` returns it for
  * `makePersonaConfigInput(…, baseDir)` written into `baseDir` with
  * `SLACK_STATE_DIR` set (as the preload guard sets it, so `cron_table_path`
- * defaults beside the config, not under `$XDG_CONFIG_HOME/claude-slack-channel-bots`, bug b.avm),
+ * defaults beside the config, not under `$XDG_CONFIG_HOME/claude-slack-channel-bots`),
  * except that `mcp_config_path` also sits under `baseDir` rather than a home
  * directory.
  * `allow_invited_channels` resolves to `false` unless overridden; the default
@@ -235,7 +234,7 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
 /**
  * One persona in `makeMultiPersonaConfig`: any resolved `Persona` field except
  * `index` (always the list position), plus `invited`, the fungible section as
- * written (b.deo SRI-102). Omitted fields take the defaults described on
+ * written. Omitted fields take the defaults described on
  * `makeMultiPersonaConfig`.
  */
 export type PersonaSpec = Partial<Omit<Persona, 'index'>> & { invited?: PersonaInvitedInput }
@@ -253,7 +252,7 @@ export type PersonaSpec = Partial<Omit<Persona, 'index'>> & { invited?: PersonaI
  *   digits>` (distinct per persona); `permission_prompts`: the first
  *   channel's ID, or `dm` when the persona has no channels;
  *   `fungible_destination`: undefined.
- * - Fungible mode (b.deo SRI-102): `channels` empty and `permission_prompts`
+ * - Fungible mode: `channels` empty and `permission_prompts`
  *   undefined, as the loader leaves them, unless the spec sets them;
  *   `fungible_destination`: the spec's `invited.permission_prompts`, else
  *   `dm`.

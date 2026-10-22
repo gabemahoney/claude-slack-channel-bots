@@ -1,29 +1,29 @@
 /**
  * agent-director-client.ts — Module-level singleton wrapper for the
- * `agent-director` library Client (SR-0.1).
+ * `agent-director` library Client.
  *
  * Public API:
  *   - getClient(): Client                          — sync cached accessor for the singleton
  *   - setClient(client): void                       — install a pre-built Client (the startup module only)
- *   - closeClient(): void                           — idempotent shutdown for SR-11 Event 11 and the persona-client swap (b.jg5 SRJ-213)
+ * - closeClient: void — idempotent shutdown for Event 11 and the persona-client swap
  *   - DEFAULT_STORE_PATH / DEFAULT_TEMPLATE_NAME    — paths CSCB pins
  *   - resetClientForTests(): void                   — test-only handle reset
  *
  * Construction: AD 0.7.0+ exposes an async `Client.create()` factory; the
  * subprocess constructor is protected and `new Client(...)` is a compile-time
- * TS error. The SR-5.1 startup gate (src/agent-director-startup.ts) awaits
+ * TS error. The startup gate (src/agent-director-startup.ts) awaits
  * `Client.create()` with the options built by the one options builder in that
  * module (store path, create-if-missing, the filtered logger, plus
  * `callTimeoutMs` when a call timeout is given) and hands the resolved
  * instance to `setClient()`. Once the start has resolved its configuration,
- * the server's persona client (b.jg5 SRJ-213) replaces the gate's client
+ * the server's persona client replaces the gate's client
  * through the same `setClient()` path. Verb call sites pull the
  * installed singleton through `getClient()`; calling `getClient()` before the
  * gate has installed a Client throws an internal bug-marker error (it
  * indicates a caller-site bug, not a runtime condition).
  *
  * Concurrency: AD's Client is internally safe for concurrent verb calls
- * (the subprocess-CLI transport serializes its own dispatch) per SR-0.1,
+ * (the subprocess-CLI transport serializes its own dispatch),
  * so CSCB does NOT add its own mutex.
  *
  * SPDX-License-Identifier: MIT
@@ -44,7 +44,7 @@ import type {
 /** Default AD store path; tilde-expanded library-side. */
 export const DEFAULT_STORE_PATH = '~/.config/agent-director/state.db'
 
-/** Name of the CSCB-shipped template (SR-3.1). */
+/** Name of the CSCB-shipped template. */
 export const DEFAULT_TEMPLATE_NAME = 'slack-channel-bot'
 
 // ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ export const DEFAULT_TEMPLATE_NAME = 'slack-channel-bot'
 let singleton: Client | null = null
 
 /**
- * Return the singleton Client installed by the SR-5.1 startup gate.
+ * Return the singleton Client installed by the startup gate.
  *
  * This is a sync cached accessor; it does NOT construct the Client. The
  * startup gate (`runAgentDirectorStartupGate`) is responsible for awaiting
@@ -75,7 +75,7 @@ export function getClient(): Client {
  * Release the Client handle if open. Idempotent: a second call is a no-op.
  * `client.close()` itself never throws per the library contract.
  *
- * Called from SR-11 Event 11 (graceful shutdown) inside a try/finally.
+ * Called from the contract Event 11 (graceful shutdown) inside a try/finally.
  */
 export function closeClient(): void {
   if (singleton !== null) {
@@ -102,7 +102,7 @@ export function resetClientForTests(): void {
  * server, once more by the persona-client builder (`buildPersonaClient`),
  * which, once the start has resolved its configuration, closes the gate's
  * client through `closeClient()` and installs the client carrying the
- * configured call timeout (b.jg5 SRJ-213). Production verb call sites never invoke this — they go
+ * configured call timeout. Production verb call sites never invoke this — they go
  * through `getClient()` at call time, so none keeps a replaced client.
  * Lexically distinct from `setClientForTests` so the test helper stays
  * grep-discoverable.
@@ -122,16 +122,16 @@ export function setClientForTests(client: Client): void {
 }
 
 // ---------------------------------------------------------------------------
-// decide-wire wrapper (SR-4.1, SR-7.2)
+// decide-wire wrapper
 // ---------------------------------------------------------------------------
 
 /**
  * CSCB decide params — extends `DecideParams` with the `request_token` field
- * (SR-7.2). The snake-case JSON field flows through the subprocess-CLI
+ * The snake-case JSON field flows through the subprocess-CLI
  * transport without further marshaling on this side.
  *
  * Typing `request_token` as a required field at the wrapper boundary is how
- * SR-4.1 (unconditional pass-through) is enforced statically — every CSCB
+ * (unconditional pass-through) is enforced statically — every CSCB
  * decide call site must construct one of these.
  */
 export interface DecideParamsWithToken extends ADDecideParams {
@@ -147,7 +147,7 @@ export async function decideWithToken(
 }
 
 // ---------------------------------------------------------------------------
-// get-permission wrapper (SR-7.1)
+// get-permission wrapper
 // ---------------------------------------------------------------------------
 
 /**
@@ -157,7 +157,7 @@ export async function decideWithToken(
  * source of truth. `decision` / `decision_reason` / `decided_at` are
  * optional + nullable on AD's type because the same row shape covers both
  * open and closed states; `classifyVerdict` collapses any non-canonical
- * combination into the SR-5.2 fail-closed generic-deny path.
+ * combination into the fail-closed generic-deny path.
  */
 export type GetPermissionParams = ADGetPermissionParams
 export type GetPermissionResult = ADGetPermissionResult
@@ -172,8 +172,8 @@ export function isErrPermissionRequestNotFound(err: unknown): boolean {
 }
 
 /**
- * `get-permission` wrapper (SR-7.1). The `agent-director` package.json pin is
- * at `^0.6.0`+, which carries the verb; the SR-6.1 startup gate is the
+ * `get-permission` wrapper. The `agent-director` package.json pin is
+ * at `^0.6.0`+, which carries the verb; the startup gate is the
  * compatibility boundary that keeps stale-version installs from reaching this
  * path. The wrapper takes a structural client (rather than
  * `Pick<Client, 'getPermission'>`) because the locked `0.5.6` types do not yet

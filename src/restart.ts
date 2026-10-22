@@ -2,53 +2,52 @@
  * restart.ts — Auto-restart logic for managed Claude Code sessions.
  *
  * Schedules a delayed relaunch when an MCP session disconnects. Restart
- * guards, backoff and the failure cap are keyed by persona key (b.av2 SR-6.3):
+ * guards, backoff and the failure cap are keyed by persona key:
  * every dependency, the pending-timer map and the in-flight launch set take
  * the key, and log lines name it as `persona=<key>`.
- * A persona that is not up (broken, or retrying its bring-up; b.av2 SR-6.4)
+ * A persona that is not up (broken, or retrying its bring-up)
  * is never restarted: `RestartDeps.canRestart` is asked before a timer is
  * armed, again when it fires (before the liveness probe) and once more after
  * the probe (before any reconnect or launch; and after the re-probe that follows
- * an 'escalate-dead' reconnect, b.d61), so its instance and row are left
+ * an 'escalate-dead' reconnect), so its instance and row are left
  * alone and its failure count is unchanged. `launchSession`'s own gate is the
  * backstop for a flip before the launch.
  * A fired timer's work runs through the per-persona lifecycle serializer
- * (b.av2 SR-6.6, `RestartDeps.serialize`), so it never overlaps a teardown or
+ * (`RestartDeps.serialize`), so it never overlaps a teardown or
  * a bring-up retry's launch for the same persona, and its checks see the
  * state when the work starts. The restart timer's work does not ask the
  * restart cap: a timer fired for a persona already at the cap re-attempts the
  * launch (a success resets the cap; a further failure is counted).
- * The work runs as a recovery attempt for the persona (b.jg5 SRJ-301,
+ * The work runs as a recovery attempt for the persona (
  * `runInAttempt`), adapters included: an UNAVAILABLE, ENVIRONMENT or CONFIG
- * (`ErrConfigMalformed`, SRJ-316) outcome from any of its agent-director
+ * (`ErrConfigMalformed`) outcome from any of its agent-director
  * calls (the liveness read, the reconnect with its reads, the
- * relaunch), an UNCLASSIFIED one (SRJ-313, `ErrSystemInstallDisappeared`
+ * relaunch), an UNCLASSIFIED one (`ErrSystemInstallDisappeared`
  * included) from any of them but a `status`, `get` or `list`, or any other
  * `status`, `get` or `list` error, arms the persona's UNAVAILABLE retry timer
  * through the installed trigger sink. A relaunch
  * the timer now owns answers `'refused'`; none is ever counted toward the cap
- * (SRJ-302): a persona is never given up on for UNAVAILABLE, ENVIRONMENT,
+ * a persona is never given up on for UNAVAILABLE, ENVIRONMENT,
  * CONFIG or UNCLASSIFIED alone.
- * The liveness probe answers one of four readings (b.jg5 SRJ-314,
+ * The liveness probe answers one of four readings (
  * `src/liveness-reading.ts`), and only `dead` leads to the launch, with no
  * kill. Installation failure (`ErrSystemInstallDisappeared`) reads unknown:
- * no agent state was observed, so it cannot authorize recovery (b.jpf).
+ * no agent state was observed, so it cannot authorize recovery.
  * A re-probe that reads the row `ended`, `missing` or absent voids a
  * GONE-based verdict for an older life (`decideRelaunch`). `live`
  * takes the reconnect path; for a key
  * recorded as retired with no "new life has begun" mark the server's
  * reconnect adapter types nothing into that old life, starts the live-row
- * sequence (with the retired-key flag) and answers 'transient' (b.jg5
- * SRJ-805), so the work counts nothing; and the relaunch after a `dead`
+ * sequence (with the retired-key flag) and answers 'transient', so the work counts nothing; and the relaunch after a `dead`
  * reading of any key recorded as retired, marked or not, is the session
  * manager's reuse spawn, never a `resume`. `pending` (the row's session has
  * not started) is handed to the `pending` deferral
  * (`RestartDeps.deferPendingRow`, awaited) with the row's launch start,
  * whatever the session's connection shows, and the work returns with no
  * reconnect, kill, launch or accounting; the deferral decides whether the
- * row is covered (b.jg5 SRJ-409, SRJ-411: armed pending-only, or sent
+ * row is covered (armed pending-only, or sent
  * through the live-row sequence), and at a retry of the persona's timer
- * only, runs the pending-row rule once on a covered row (b.jg5 SRJ-410).
+ * only, runs the pending-row rule once on a covered row.
  * So does a `pending` re-probe after an 'escalate-dead' reconnect. When the
  * deferral, at a retry, answers that the row is gone (`ended`, `missing` or
  * no row), the same run goes on to its relaunch with a `dead` reading that
@@ -56,18 +55,18 @@
  * read as dead, or a probe that throws) makes the work return with no
  * reconnect, kill, launch or accounting, and call the arm hook
  * (`RestartDeps.armRetryTimer`); so does an `unknown` re-probe after an
- * 'escalate-dead' reconnect (b.d61).
+ * 'escalate-dead' reconnect.
  * A row the reconnect's escalate-dead sweep leaves live may stay live for
- * further ticks (b.jg5 SRJ-610): its re-probe then reads `live`, the run ends
+ * further ticks: its re-probe then reads `live`, the run ends
  * with no kill, launch or accounting, and each later escalate-dead tick
  * sweeps again with no step beyond the sweep. The optional slow-recovery
  * observer (`RestartDeps.slowRecovery`) is told each run's readings and
- * verdicts, so the server counts such re-probes and posts SRJ-1010 once per
+ * verdicts, so the server counts such re-probes and posts once per
  * episode after the third in a row.
  * The work answers an outcome (`RestartWorkOutcome`, one of the
  * `RESTART_OUTCOME_*` labels); the restart timer ignores it. The retry entry,
  * `runRestartRetry`, is how the UNAVAILABLE retry timer's retries rerun the
- * same decision (SRJ-303): through the same serializer, as the same recovery
+ * same decision: through the same serializer, as the same recovery
  * attempt, with none of `scheduleRestart`'s gates (the restart delay, delay 0
  * included, the pending timer) and no restart timer touched. Its first step,
  * inside its own serialized work, after the latched gate below, is the
@@ -77,7 +76,7 @@
  * behind other restart work for the persona, whose counted failure reached
  * the cap while the retry waited, answers `RESTART_OUTCOME_CAPPED` with no
  * agent-director call, nothing counted and no notice.
- * A latched persona gets no attempt (b.jg5 SRJ-502): the optional latched
+ * A latched persona gets no attempt: the optional latched
  * query (`RestartDeps.isLatched`) is the first step of the serialized work,
  * before the liveness read, so a fired restart timer, the retry entry (before
  * its in-flight and cap checks) and a human-triggered restart all answer
@@ -90,14 +89,13 @@
  * A launch that answers `'skipped'` for a persona that latched at it answers
  * the same. A latched query that throws counts as latched (fail safe). The
  * one exception is the latch re-check's own run of the restart path's
- * decision (b.jg5 SRJ-505), made through `runRestartWorkInTurn` from inside
+ * decision, made through `runRestartWorkInTurn` from inside
  * the persona's serializer turn with the re-check's permit: every latched
  * gate of the work lets that run through while the permit holds
  * (`holdsLatchRecheckPermit`, `src/unavailable-retry.ts`), and the re-check
  * revokes it at the run's first refusal. Inside a latch re-check of a
  * latched persona the arm hook is not called on an `unknown` reading.
- * A persona held on `ErrInvalidFlags` gets no attempt either (b.jg5 SRJ-207,
- * SRJ-303): the optional held query (`RestartDeps.isHeld`) is asked right
+ * A persona held on `ErrInvalidFlags` gets no attempt either: the optional held query (`RestartDeps.isHeld`) is asked right
  * after each latched gate, so a fired restart timer, the retry entry (before
  * its in-flight and cap checks) and a human-triggered restart all answer
  * `RESTART_OUTCOME_HELD` with no agent-director call, nothing recorded and
@@ -106,7 +104,7 @@
  * that throws counts as held (fail safe). `scheduleRestart` arms no timer for
  * a held persona.
  * Right after that first latched gate comes the live-row sequence gate
- * (b.jg5 SRJ-706, SRJ-303; the optional `RestartDeps.isLiveRowSequenceRunning`):
+ * (the optional `RestartDeps.isLiveRowSequenceRunning`):
  * while P's sequence runs, a fired restart timer, the retry entry and a
  * human-triggered restart answer `RESTART_OUTCOME_SEQUENCE_WAITING` with no
  * agent-director call and nothing recorded, which a retry takes as a refusal.
@@ -114,7 +112,7 @@
  * liveness probe, after an 'escalate-dead' reconnect, before the relaunch decision)
  * and once more right before the launch, since a launch outside the
  * serializer can start P's sequence during the work's awaits (a collision
- * ladder's replacement site, b.jg5 SRJ-707); a sequence found running then
+ * ladder's replacement site); a sequence found running then
  * ends the work with `RESTART_OUTCOME_SEQUENCE_WAITING` and nothing more
  * called. A launch that answers `'refused'` while P's sequence runs (its own
  * ladder started the sequence, or met it, and answered `sequence-waiting`)
@@ -122,7 +120,7 @@
  * names the sequence.
  * After the sequence gate, and after the shutdown and not-up checks, so a
  * persona not up or a server shutting down never reaches it, comes the
- * old-life gate (b.jg5 SRJ-810, SRJ-812, SRJ-302, SRJ-305; the optional
+ * old-life gate (the optional
  * `RestartDeps.isHeldForOldLife`): while an
  * old life that may still be running holds P's working directory (a hold on
  * P's own row excepted), the hook records P as waiting, starts the hold's
@@ -134,7 +132,7 @@
  * held is held the same way, and its worker is not killed. The gate is asked
  * again wherever the sequence gate is asked again before the instance is
  * touched, so the persona comes up only once the hold ends.
- * A clean exit relaunches fast (b.4vm): a restart that waits the full delay
+ * A clean exit relaunches fast: a restart that waits the full delay
  * (not human-triggered, no consecutive launch failures on record, a delay
  * above `CLEAN_EXIT_RELAUNCH_DELAY`) also gets a clean-exit check at that
  * short delay, since the MCP close can come before the SessionEnd hook writes
@@ -224,13 +222,13 @@ export const RESTART_FAILURE_CAP = 5
  * and does NOT bypass the re-entrancy guard. Combined with
  * isRestartPendingOrActive at the call site, a chatty persona gets at most one
  * in-flight launch attempt at a time and each failed attempt still counts
- * toward normal backoff/cap accounting (b.kvq).
+ * toward normal backoff/cap accounting.
  */
 export const HUMAN_TRIGGER_DELAY_CEILING = 5
 
 /**
  * Delay (seconds) of the clean-exit check `scheduleRestart` arms beside a
- * restart timer that waits the full delay (b.4vm). The MCP close can come
+ * restart timer that waits the full delay. The MCP close can come
  * before Claude Code's SessionEnd hook writes the row `ended`, so the exit's
  * reason is read this long after the disconnect, not at it. A row read
  * `ended` (a clean exit, such as `agent-director pause`'s `/exit`) relaunches
@@ -247,8 +245,7 @@ export const CLEAN_EXIT_RELAUNCH_DELAY = 3
 /**
  * The server is shutting down: nothing was probed, reconnected, killed or
  * launched; or the kill before the relaunch answered `ErrInvalidFlags` and
- * its immediate version re-check decided that the server stops (b.jg5
- * SRJ-104, SRJ-204, SRJ-205), so nothing more was called and nothing was
+ * its immediate version re-check decided that the server stops, so nothing more was called and nothing was
  * recorded.
  */
 export const RESTART_OUTCOME_SHUTTING_DOWN = 'shutting-down'
@@ -268,24 +265,24 @@ export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
  * The row reads `pending` (its session has not started): the liveness probe
  * read it `pending` and the work handed it to the `pending` deferral
  * (`RestartDeps.deferPendingRow`), whatever the session's connection showed
- * (b.jg5 SRJ-314); or the probe read it `live` and the reconnect adapter's
+ * or the probe read it `live` and the reconnect adapter's
  * own read found it `pending`, so the reconnect typed nothing and was
- * deferred (`pending`); or b.d61's re-probe after an 'escalate-dead'
+ * deferred (`pending`); or re-probe after an 'escalate-dead'
  * reconnect read it `pending`, which goes to the deferral too. No
  * reconnect, kill or launch, nothing counted. Never "nothing left to
- * recover" (SRJ-305). A deferral that answered the row gone (at a retry,
- * b.jg5 SRJ-410) does not end here: the run goes on to its relaunch.
+ * recover". A deferral that answered the row gone (at a retry,
+ *) does not end here: the run goes on to its relaunch.
  */
 export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /**
  * The launch ran and succeeded (a success was recorded), after a dead
- * liveness observation, with no kill (b.jpf).
+ * liveness observation, with no kill.
  */
 export const RESTART_OUTCOME_LAUNCHED = 'launched'
 /**
  * The launch was refused (its UNAVAILABLE retry timer was armed for it), or
- * the kill before it did not succeed and latched nothing (b.jg5 SRJ-110,
- * SRJ-701: UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED, a class the kill
+ * the kill before it did not succeed and latched nothing (
+ * UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED, a class the kill
  * has no row for included, no kill outcome, or a kill that threw), so nothing
  * was launched. Not counted.
  */
@@ -302,53 +299,53 @@ export const RESTART_OUTCOME_CAPPED = 'capped'
 /** The launch was declined by its own gate (the persona stopped being up, or the server is stopping). Not counted. */
 export const RESTART_OUTCOME_LAUNCH_SKIPPED = 'launch-skipped'
 /**
- * The liveness probe (or b.d61's re-probe) read `unknown`, or threw
- * (b.jg5 SRJ-314): agent-director could not report on the persona. No
+ * The liveness probe (or re-probe) read `unknown`, or threw
+ * agent-director could not report on the persona. No
  * reconnect, kill or launch, nothing counted; the arm hook
  * (`RestartDeps.armRetryTimer`) was called for the persona.
  */
 export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
 /**
- * The persona is latched (b.jg5 SRJ-502, `RestartDeps.isLatched`): the work's
+ * The persona is latched (`RestartDeps.isLatched`): the work's
  * first step found it so, and nothing was probed, reconnected, killed or
  * launched, and nothing was recorded; or it latched while a liveness probe
  * (or the 'escalate-dead' reconnect, or its re-probe) ran, the probe's own
- * `status` read included (an UNUSABLE NAME answer, b.jg5 SRJ-512, or the
- * persona's own row reading `pending` with no launch start, SRJ-513), and the
+ * `status` read included (an UNUSABLE NAME answer, or the
+ * persona's own row reading `pending` with no launch start), and the
  * latched query asked again right after each probe and before the instance
  * is reconnected, re-probed or killed found it so, and nothing more was done
  * or recorded (no `pending` deferral, no arm hook); or its launch answered
  * `'skipped'` because the persona latched at that launch (a CONFLICT or an
  * UNUSABLE NAME at a spawn or resume), after which nothing was recorded
  * either; or the kill before the relaunch answered a CONFLICT or an UNUSABLE
- * NAME, which latched the persona (b.jg5 SRJ-110, SRJ-501, SRJ-512), and
+ * NAME, which latched the persona, and
  * nothing was launched or recorded. A latched query that
  * threw answers this too (fail safe). The retry timer stops on it.
  */
 export const RESTART_OUTCOME_LATCHED = 'latched'
 /**
- * The persona is held on `ErrInvalidFlags` (b.jg5 SRJ-207, SRJ-303,
+ * The persona is held on `ErrInvalidFlags` (
  * `RestartDeps.isHeld`): the gate right after a latched gate found it so, so
  * nothing was probed, reconnected, killed or launched, or nothing more was
  * called; or its launch answered `'skipped'` because its reuse spawn met
  * `ErrInvalidFlags` and held it. Nothing was recorded and nothing counts
  * toward the cap. A held query that threw answers this too (fail safe). The
- * retry timer stops on it (SRJ-305).
+ * retry timer stops on it.
  */
 export const RESTART_OUTCOME_HELD = 'held'
 /**
- * A live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303,
+ * A live-row sequence runs for the persona (
  * `RestartDeps.isLiveRowSequenceRunning`): the work's gate right after the
  * latched gate found it so, so nothing was probed, reconnected, killed or
  * launched; or the gate asked again (after a probe, after an 'escalate-dead'
  * reconnect, before the relaunch decision, before the launch) found it so, and nothing
  * more was called; or the launch answered `'refused'` while the sequence ran
  * (the launch's ladder started it at a replacement site, or met it, and
- * answered `sequence-waiting`, b.jg5 SRJ-707); or the old-life hook
- * (`RestartDeps.isHeldForOldLife`, b.jg5 SRJ-810) held the persona: an old
+ * answered `sequence-waiting`); or the old-life hook
+ * (`RestartDeps.isHeldForOldLife`) held the persona: an old
  * life that may still be running holds its working directory. Nothing was
  * recorded and nothing counts toward the cap. A refusal at a retry
- * (SRJ-302): the retry timer re-arms at the doubled wait, its again-reason
+ * the retry timer re-arms at the doubled wait, its again-reason
  * `old-life-wait-in-flight` when an old-life wait step it waits on runs.
  */
 export const RESTART_OUTCOME_SEQUENCE_WAITING = 'sequence-waiting'
@@ -389,11 +386,11 @@ export type RestartRetryOutcome =
 export interface RestartDeps {
   /**
    * Whether the persona may be restarted at all: false while it is not up (its
-   * bring-up is broken or retrying, or its Slack connection is not serving;
-   * b.av2 SR-6.4). Asked when a restart is scheduled, when its timer fires
+   * bring-up is broken or retrying, or its Slack connection is not serving
+   * ). Asked when a restart is scheduled, when its timer fires
    * (before `isSessionAlive`) and again after that probe (before
    * `reconnectSession` or `launchSession`), and after the second
-   * `isSessionAlive` probe that follows an 'escalate-dead' reconnect (b.d61):
+   * `isSessionAlive` probe that follows an 'escalate-dead' reconnect:
    * a not-up persona's instance is
    * never killed, reconnected, deleted or launched, and its failure count is
    * left as it is. The server passes the relaunch gate
@@ -401,24 +398,24 @@ export interface RestartDeps {
    */
   canRestart(key: string): boolean
   /**
-   * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
+   * The persona's liveness reading (`src/liveness-reading.ts`):
    * `live`, `pending` (with the row's launch start when the `status` result
    * showed one), `dead` or `unknown`. Only `dead` leads to the launch, with
-   * no kill. Installation failure reads unknown (b.jpf). `live` takes the
+   * no kill. Installation failure reads unknown. `live` takes the
    * reconnect path; `pending` on the work's first
    * liveness probe goes to `deferPendingRow` and the work returns
    * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
-   * accounting (`pending` on the b.d61 re-probe after an 'escalate-dead'
+   * accounting (`pending` on the re-probe after an 'escalate-dead'
    * reconnect goes to `deferPendingRow` too, and returns
    * `RESTART_OUTCOME_PENDING_DEFERRED` with its own line), unless the
-   * deferral answers the row gone at a retry (b.jg5 SRJ-410): then the run
+   * deferral answers the row gone at a retry: then the run
    * goes on to its relaunch with no kill; `unknown`, a probe that
    * throws and an answer that is not a reading all read `unknown`: the work
    * returns `RESTART_OUTCOME_LIVENESS_UNKNOWN` with no reconnect, kill,
    * launch or accounting, and calls `armRetryTimer`.
    */
   isSessionAlive(key: string): Promise<LivenessReading>
-  /** b.omv SR-7.6: read provenance before pending/connected shortcuts. */
+  /** read provenance before pending/connected shortcuts. */
   inspectUpgrade?(key: string): Promise<boolean>
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(key: string): boolean
@@ -430,14 +427,14 @@ export interface RestartDeps {
    * `'transient'` is; the work answers `RESTART_OUTCOME_PENDING_DEFERRED`
    * for it, so the retry timer knows the row read `pending`.
    * The escalate-dead answer carries the verdict the adapter swept with
-   * (`ReconnectEscalateDead`, b.jg5 SRJ-611); a bare 'escalate-dead'
+   * (`ReconnectEscalateDead`); a bare 'escalate-dead'
    * carries none. A `dead` re-probe relaunches with no kill and voids
    * GONE-based evidence for an older life (`decideRelaunch`). An unknown
-   * re-probe, installation failure included, defers recovery (b.jpf).
+   * re-probe, installation failure included, defers recovery.
    *
    * The return type is widened from void: the server.ts adapter already
    * computes reconnectMcp's ReconnectMcpResult union internally and now
-   * surfaces it here so restart.ts has a success signal (SR-25.1).
+   * surfaces it here so restart.ts has a success signal.
    *
    * Returning void (e.g. from a reconnect that throws and is caught by the
    * adapter) is treated as non-success — no recordSuccess, no recordFailure
@@ -446,15 +443,15 @@ export interface RestartDeps {
   reconnectSession(key: string): Promise<ReconnectSessionResult>
   /**
    * @deprecated Retained for adapter compatibility; restart work never
-   * calls this dependency. Installation failure is unknown (b.jpf).
+   * calls this dependency. Installation failure is unknown.
    *
    * Kill the persona's instance with one checked kill
-   * (b.jg5 SRJ-110, SRJ-701), and answer its outcome (`KillOutcome`,
+   * and answer its outcome (`KillOutcome`,
    * `kill_sent` included), or `KILL_SESSION_NOT_KILLED_GUARD` when a guard
    * made no call. Every kill reports its outcome. `lastRead` carries the
    * row state the caller read (`ended`, `missing` or no row), or none,
    * and is the state a latch the kill sets
-   * records (b.jg5 SRJ-501), with no further `status` read when it carries
+   * records, with no further `status` read when it carries
    * one. The adapter's checked-kill outcome does not authorize a restart.
    */
   killSession?(key: string, lastRead: DeadLivenessReading): Promise<KillSessionResult>
@@ -462,17 +459,17 @@ export interface RestartDeps {
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
    * declined (the persona stopped being up after the last `canRestart`
    * check, or the server is stopping), which counts as neither a success nor
-   * a failure. `'refused'`: the launch answered `retrying` (b.jg5 SRJ-1015:
-   * its retry timer was armed for it, SRJ-301, so the timer owns the
-   * persona) or `sequence-waiting`; it counts as neither either (SRJ-302).
+   * a failure. `'refused'`: the launch answered `retrying` (
+   * its retry timer was armed for it, so the timer owns the
+   * persona) or `sequence-waiting`; it counts as neither either.
    * `LAUNCH_RESUMED_UNREPORTED`: the launch resumed the persona's row
-   * (`resumed`, b.4q8), which has not reported in yet; the work records
+   * (`resumed`), which has not reported in yet; the work records
    * nothing for it and answers launched, and the session manager counts it
    * once a shared own-row read settles it: a report-in as a success, the row
    * ended, missing or gone before it as one counted failure
    * (`recordLaunchResultOutsideRestartWork`). `true`: any other success,
    * recorded at once; `false`: a counted failure. `deadEvidence`: the verdict an
-   * escalate-dead answer carried (`ReconnectEscalateDead`, b.jg5 SRJ-611),
+   * escalate-dead answer carried (`ReconnectEscalateDead`),
    * passed on unchanged to the relaunch after it, which carries it into the
    * ladder, unless a read voided it (a re-probe that read the row `ended`,
    * `missing` or gone: dead evidence covers one life, `decideRelaunch`);
@@ -489,7 +486,7 @@ export interface RestartDeps {
    */
   onCapReached(key: string): void
   /**
-   * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
+   * The per-persona lifecycle serializer's `run` (
    * `persona-serializer.ts`): a fired timer's work (every check, the probe,
    * reconnect, kill and launch), and a retry entry's work with its in-flight
    * check and then the restart cap first, is submitted through it, so it
@@ -501,25 +498,25 @@ export interface RestartDeps {
    */
   serialize?: PersonaSerialize
   /**
-   * The arm hook (b.jg5 SRJ-314, SRJ-301): called once with the persona key
+   * The arm hook: called once with the persona key
    * on every `RESTART_OUTCOME_LIVENESS_UNKNOWN` return of the restart work,
    * the re-probe's included, so the persona's UNAVAILABLE retry timer is
    * armed even for a reading the adapter's own report does not arm on (a
    * probe that throws, or a `status` answer in a state CSCB does not know;
-   * a CONFIG answer is armed by the report itself, in any context, b.jg5
-   * SRJ-316). Production arms the timer through
+   * a CONFIG answer is armed by the report itself, in any context
+   *). Production arms the timer through
    * its controller with the `read-error` cause; a call while the timer is
    * armed or running its retry keeps its due time and wait count. A hook
    * that throws is logged and changes nothing else. Absent: nothing is armed.
    */
   armRetryTimer?(key: string): void
   /**
-   * The `pending` deferral (b.jg5 SRJ-314, SRJ-409, SRJ-411): called once,
+   * The `pending` deferral: called once,
    * and awaited inside the serialized restart work, with the persona key and
    * its `pending` reading, which carries the row's launch start when the
    * probe read one (`launchStartedAt`, raw), when the work's first liveness
    * probe reads `pending`, before the session's connection is looked at, and
-   * when the b.d61 re-probe after an 'escalate-dead' reconnect reads
+   * when the re-probe after an 'escalate-dead' reconnect reads
    * `pending` (after its own line). The work then answers
    * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
    * accounting, whatever the deferral did, unless the deferral answers that
@@ -528,7 +525,7 @@ export interface RestartDeps {
    * the row (`deadLivenessReading`), so the relaunch makes no kill
    * (`decideRelaunch`: `RELAUNCH_NO_KILL_ROW_READ`, or
    * `RELAUNCH_NO_KILL_VERDICT_VOIDED` after an escalate-dead verdict) and is
-   * never made over a `pending` row (b.jg5 SRJ-410, SRJ-303). Production
+   * never made over a `pending` row. Production
    * binds the server's `deferPendingRow`, which reads the row once and
    * decides whether it is covered: a covered or undecided row arms the
    * persona's retry timer in pending-only mode, and at a retry of the
@@ -543,7 +540,7 @@ export interface RestartDeps {
    */
   deferPendingRow?(key: string, reading: PendingLivenessReading): RestartPendingDeferralAnswer | Promise<RestartPendingDeferralAnswer>
   /**
-   * The latched query (b.jg5 SRJ-502): true while the persona is latched
+   * The latched query: true while the persona is latched
    * (production: the server's latch's `isLatched`). Asked first inside the
    * serialized work, before the shutdown and not-up checks and the liveness
    * read, by every path that reaches it (a fired restart timer, the retry
@@ -554,8 +551,8 @@ export interface RestartDeps {
    * latch the persona during the work's awaits: after the liveness probe
    * (with the second `canRestart` check, before `reconnectSession` or
    * `launchSession`), right after an 'escalate-dead' reconnect (before its
-   * re-probe: the reconnect's findMissing sweep may latch the persona, b.jg5
-   * SRJ-120) and right before `launchSession` (after that re-probe); a persona
+   * re-probe: the reconnect's findMissing sweep may latch the persona
+   *) and right before `launchSession` (after that re-probe); a persona
    * latched then answers the same with nothing more done. Asked again
    * when the launch answers `'skipped'`, so a persona that latched at that
    * launch answers the same. An answer of exactly `true` is latched, and so
@@ -564,7 +561,7 @@ export interface RestartDeps {
    */
   isLatched?(key: string): boolean
   /**
-   * The held query (b.jg5 SRJ-207, SRJ-303): true while the persona is held
+   * The held query: true while the persona is held
    * on `ErrInvalidFlags` (production: the server's hold's `isHeld`). Asked
    * right after each latched gate, by every path that reaches the work (a
    * fired restart timer, the retry entry before its in-flight and cap
@@ -580,7 +577,7 @@ export interface RestartDeps {
    */
   isHeld?(key: string): boolean
   /**
-   * Whether a live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303;
+   * Whether a live-row sequence runs for the persona (
    * production: the session manager's running query,
    * `isLiveRowSequenceRunning`). Asked right after the first latched gate of
    * the serialized work, before the shutdown and not-up checks and the
@@ -601,14 +598,14 @@ export interface RestartDeps {
    */
   isLiveRowSequenceRunning?(key: string): boolean
   /**
-   * The old-life hook (b.jg5 SRJ-810, SRJ-812, SRJ-302; production: the
+   * The old-life hook (production: the
    * session manager's hold step, `oldLifeHoldStep`, over the applied persona,
    * bound in `main()`): runs the hold step for the persona (records it as
    * waiting on each hold on its working directory other than one on its own
    * row, starts each hold's wait when it is not running, arms its retry
    * timer with the held-for-an-old-life cause) and answers whether it is
    * held. Asked after the live-row sequence gate and the shutdown and
-   * not-up checks of the serialized work, before the liveness read (SRJ-305:
+   * not-up checks of the serialized work, before the liveness read (
    * a persona not up, or a server shutting down, never reaches it), by
    * every path that reaches it (a fired restart timer, the retry entry, a
    * human-triggered restart, so the lost-message trigger's restart too):
@@ -616,12 +613,12 @@ export interface RestartDeps {
    * liveness read, reconnect, kill or launch), records no success or
    * failure, adds nothing toward the cap and answers
    * `RESTART_OUTCOME_SEQUENCE_WAITING`, which a retry takes as a refusal
-   * (SRJ-302: "an old-life hold still holding"). A persona already running
+   * ("an old-life hold still holding"). A persona already running
    * from a directory that becomes held is held the same way, and its worker
    * is not killed. Asked again wherever the sequence gate is asked again
    * before the instance is touched (after each liveness probe, after an
    * 'escalate-dead' reconnect, before the relaunch decision and before the
-   * launch). A hold on the persona's own row is not this hook's (SRJ-810's
+   * launch). A hold on the persona's own row is not this hook's (
    * exception: the reconnect adapter starts its live-row sequence). An
    * answer of exactly `true` is held, and so is a hook that throws (fail
    * safe, logged in the one line); any other answer is not. Absent: nothing
@@ -629,7 +626,7 @@ export interface RestartDeps {
    */
   isHeldForOldLife?(key: string): boolean
   /**
-   * The slow-recovery observer (b.jg5 SRJ-610, SRJ-1016; production: the
+   * The slow-recovery observer (production: the
    * server's slow-recovery tracker, `src/slow-recovery.ts`). It is told what
    * each run read, after the gates that follow each probe (shutdown, not up,
    * latched) have passed, so a run those gates stop tells it nothing:
@@ -662,9 +659,9 @@ export interface RestartDeps {
 
 /** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose reconnect ended with a verdict other than 'escalate-dead', or that found the session already connected. */
 export const RESTART_SLOW_RECOVERY_OTHER_VERDICT = 'other-verdict'
-/** `RestartSlowRecoveryObserver.noteOther`'s reason: an 'escalate-dead' verdict whose re-probe read `pending` (not counted, b.jg5 SRJ-610). */
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: an 'escalate-dead' verdict whose re-probe read `pending` (not counted). */
 export const RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE = 'pending-reprobe'
-/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose first liveness probe read `pending` (b.jg5 SRJ-610). */
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose first liveness probe read `pending`. */
 export const RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE = 'pending-probe'
 
 /** Why the restart work told the slow-recovery observer `noteOther`. */
@@ -675,7 +672,7 @@ export type SlowRecoveryOtherReason =
 
 /**
  * What the restart work tells about each run, for the slow dead-session
- * recovery count (b.jg5 SRJ-610; `RestartDeps.slowRecovery` says when).
+ * recovery count (`RestartDeps.slowRecovery` says when).
  * Answers are ignored.
  */
 export interface RestartSlowRecoveryObserver {
@@ -683,7 +680,7 @@ export interface RestartSlowRecoveryObserver {
   noteLive(key: string): unknown
   /** A row read of `ended` or `missing`, or no row (`ErrSpawnNotFound`). */
   noteDead(key: string): unknown
-  /** @deprecated Compatibility hook; restart work never calls it. Installation failure is unknown (b.jpf). */
+  /** @deprecated Compatibility hook; restart work never calls it. Installation failure is unknown. */
   noteInstallGone?(key: string): unknown
   /** A run whose reconnect ended with another verdict or that found the session already connected, a run whose first probe read `pending`, or an 'escalate-dead' verdict whose re-probe read `pending`. */
   noteOther(key: string, reason: SlowRecoveryOtherReason): unknown
@@ -691,7 +688,7 @@ export interface RestartSlowRecoveryObserver {
 
 /**
  * `RestartDeps.reconnectSession`'s escalate-dead answer that carries the
- * verdict the adapter swept with (b.jg5 SRJ-611): `deadEvidence`, built by
+ * verdict the adapter swept with: `deadEvidence`, built by
  * the session manager (`carriedDeadEvidenceOf`) and carried here as an
  * opaque value, of which the work reads only whether it is dead evidence
  * (`evidence === true`). The work handles every escalate-dead answer alike
@@ -702,11 +699,10 @@ export interface RestartSlowRecoveryObserver {
  *     relaunch alone, carrying no verdict, with no kill;
  *   - any other verdict (`row-not-interactive`, a row read such as
  *     `row-absent-at-pane-read`) leads to the relaunch alone, carrying the
- *     verdict, with no kill: it never by itself leads to a kill (b.jg5
- *     SRJ-609, SRJ-611), and the ladder's collision `get` reads the row
+ * verdict, with no kill: it never by itself leads to a kill, and the ladder's collision `get` reads the row
  *     itself.
  * An unknown re-probe, installation failure included, defers recovery and
- * preserves the slow-recovery episode (b.jpf).
+ * preserves the slow-recovery episode.
  */
 export interface ReconnectEscalateDead {
   readonly outcome: 'escalate-dead'
@@ -718,7 +714,7 @@ export interface ReconnectEscalateDead {
  * escalate-dead answers are `ReconnectEscalateDead`, carrying its verdict,
  * and the bare 'escalate-dead', which carries none and so is read as no dead
  * evidence (fail safe: a `dead` re-probe after it relaunches with no kill,
- * b.jg5 SRJ-611).
+ *).
  */
 export type ReconnectSessionResult =
   | 'success'
@@ -746,20 +742,19 @@ function escalateDeadOf(result: ReconnectSessionResult): EscalateDeadAnswer | un
 
 /**
  * `relaunchWithoutKillLine`'s reason: after an escalate-dead verdict that is
- * not dead evidence, or a bare 'escalate-dead' that carries none (b.jg5
- * SRJ-609, SRJ-611); the relaunch carries the verdict.
+ * not dead evidence, or a bare 'escalate-dead' that carries none; the relaunch carries the verdict.
  */
 export const RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE = 'not-dead-evidence'
 /**
  * `relaunchWithoutKillLine`'s reason: the run's first liveness read found the
  * row `ended`, `missing` or gone (`ErrSpawnNotFound`), with no escalate-dead
- * verdict (b.jg5 SRJ-110, SRJ-314); the launch carries none.
+ * verdict; the launch carries none.
  */
 export const RELAUNCH_NO_KILL_ROW_READ = 'row-read'
 /**
  * `relaunchWithoutKillLine`'s reason: after a GONE-based escalate-dead
  * verdict, the re-probe read the row `ended`, `missing` or gone, which voids
- * the verdict (b.jg5 SRJ-611, dead evidence covers one life); the relaunch
+ * the verdict (dead evidence covers one life); the relaunch
  * carries none.
  */
 export const RELAUNCH_NO_KILL_VERDICT_VOIDED = 'verdict-voided'
@@ -771,7 +766,7 @@ export type RelaunchNoKillReason =
   | typeof RELAUNCH_NO_KILL_VERDICT_VOIDED
 
 /**
- * The words naming what a `dead` reading read (b.jg5 SRJ-314): `the row
+ * The words naming what a `dead` reading read: `the row
  * ended`, `the row missing`, `no row (ErrSpawnNotFound)`, or, for a `dead`
  * reading that carries no row state, `no row state`. Pure.
  */
@@ -790,17 +785,17 @@ function describeDeadRowRead(deadRead: DeadLivenessReading | undefined): string 
 
 /**
  * The restart work's line when it launches persona `key` with no kill
- * (`decideRelaunch`, the one place that decides it; b.jg5 SRJ-110,
- * SRJ-314, SRJ-609, SRJ-611). `deadEvidence` is the escalate-dead verdict,
+ * (`decideRelaunch`, the one place that decides it,
+ *). `deadEvidence` is the escalate-dead verdict,
  * absent when none was carried (a bare 'escalate-dead', or no escalate-dead
  * answer at all); `deadRead` is the `dead` reading the decision read (the
  * first probe's, or the re-probe's). By `reason`:
  *   - `RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE` (the default):
- *     `[slack] No kill before the relaunch for persona=<key> — its escalate-dead verdict (<verdict=… | none carried>) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`
+ * `[slack] No kill before the relaunch for persona=<key> — its escalate-dead verdict (<verdict=… | none carried>) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides`
  *   - `RELAUNCH_NO_KILL_ROW_READ`:
- *     `[slack] No kill before the launch for persona=<key> — its liveness read found <what>: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict (b.jg5 SRJ-110, SRJ-314)`
+ * `[slack] No kill before the launch for persona=<key> — its liveness read found <what>: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict`
  *   - `RELAUNCH_NO_KILL_VERDICT_VOIDED`:
- *     `[slack] No kill before the relaunch for persona=<key> — its escalate-dead verdict (verdict=…) is dead evidence, but the re-probe found <what>, which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`
+ * `[slack] No kill before the relaunch for persona=<key> — its escalate-dead verdict (verdict=…) is dead evidence, but the re-probe found <what>, which voids it (dead evidence covers one life): the relaunch carries no verdict`
  */
 export function relaunchWithoutKillLine(
   key: string,
@@ -811,26 +806,26 @@ export function relaunchWithoutKillLine(
   const verdict = deadEvidence === undefined ? 'none carried' : `verdict=${String(deadEvidence.source)}`
   switch (reason) {
     case RELAUNCH_NO_KILL_ROW_READ:
-      return `[slack] No kill before the launch for persona=${key} — its liveness read found ${describeDeadRowRead(deadRead)}: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict (b.jg5 SRJ-110, SRJ-314)`
+      return `[slack] No kill before the launch for persona=${key} — its liveness read found ${describeDeadRowRead(deadRead)}: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict`
     case RELAUNCH_NO_KILL_VERDICT_VOIDED:
-      return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is dead evidence, but the re-probe found ${describeDeadRowRead(deadRead)}, which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`
+      return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is dead evidence, but the re-probe found ${describeDeadRowRead(deadRead)}, which voids it (dead evidence covers one life): the relaunch carries no verdict`
     case RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE:
-      return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`
+      return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides`
   }
 }
 
 /**
  * @deprecated Historical checked-kill log helper, retained for compatibility.
- * Restart work no longer kills after installation failure (b.jpf).
+ * Restart work no longer kills after installation failure.
  * The line when a checked kill read the row finished or gone,
- * which voids the GONE-based verdict `deadEvidence` (b.jg5 SRJ-611, dead
+ * which voids the GONE-based verdict `deadEvidence` (dead
  * evidence covers one life), so the relaunch carries none. `finishedRead`
  * is absent when the kill answered `ErrSpawnNotFound`
  * (`KILL_OUTCOME_ROW_GONE`):
- *   `[slack] The kill before the relaunch for persona=<key> answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=<source>; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`
+ * `[slack] The kill before the relaunch for persona=<key> answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=<source>; dead evidence covers one life): the relaunch carries no verdict`
  * and is what a `status` read between the kill's tries found when it ended
  * them (`KILL_OUTCOME_ROW_FINISHED`, read `ended`, `missing` or `no-row`):
- *   `[slack] The kill before the relaunch for persona=<key> ended its tries at a status read that found <the row ended | the row missing | no row (ErrSpawnNotFound)>, which voids its escalate-dead verdict (verdict=<source>; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`
+ * `[slack] The kill before the relaunch for persona=<key> ended its tries at a status read that found <the row ended | the row missing | no row (ErrSpawnNotFound)>, which voids its escalate-dead verdict (verdict=<source>; dead evidence covers one life): the relaunch carries no verdict`
  */
 export function killVoidsVerdictLine(
   key: string,
@@ -839,9 +834,9 @@ export function killVoidsVerdictLine(
 ): string {
   const verdict = `verdict=${String(deadEvidence.source)}`
   if (finishedRead === undefined) {
-    return `[slack] The kill before the relaunch for persona=${key} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (${verdict}; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`
+    return `[slack] The kill before the relaunch for persona=${key} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (${verdict}; dead evidence covers one life): the relaunch carries no verdict`
   }
-  return `[slack] The kill before the relaunch for persona=${key} ended its tries at a status read that found ${describeKillFinishedRead(finishedRead)}, which voids its escalate-dead verdict (${verdict}; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`
+  return `[slack] The kill before the relaunch for persona=${key} ended its tries at a status read that found ${describeKillFinishedRead(finishedRead)}, which voids its escalate-dead verdict (${verdict}; dead evidence covers one life): the relaunch carries no verdict`
 }
 
 /**
@@ -868,15 +863,15 @@ function describeKillFinishedRead(read: KillVoidingFinishedRead): string {
 
 /**
  * The legacy kill adapter's answer when one of its guards made no
- * call (b.jg5 SRJ-110: "its guards stay"): a launch is already in flight for
+ * call ("its guards stay"): a launch is already in flight for
  * the persona, or its `claude_config_dir` cannot be resolved to a real path.
- * Nothing was killed. Restart work no longer calls this adapter (b.jpf).
+ * Nothing was killed. Restart work no longer calls this adapter.
  */
 export const KILL_SESSION_NOT_KILLED_GUARD = 'not-killed-guard'
 
 /**
  * What `RestartDeps.killSession` answers: the kill's outcome
- * (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-701), `kill_sent` included, or
+ * (`src/checked-kill.ts`), `kill_sent` included, or
  * `KILL_SESSION_NOT_KILLED_GUARD` when a guard made no call.
  */
 export type KillSessionResult = KillOutcome | typeof KILL_SESSION_NOT_KILLED_GUARD
@@ -885,15 +880,15 @@ export type KillSessionResult = KillOutcome | typeof KILL_SESSION_NOT_KILLED_GUA
  * `relaunchAfterKillLine`'s form for a launch with no kill made: after a
  * `dead` reading that read the row, at the first probe or at the re-probe,
  * and after an escalate-dead verdict that is not dead evidence
- * (`decideRelaunch`, `relaunchWithoutKillLine`; b.jg5 SRJ-110, SRJ-314,
- * SRJ-609, SRJ-611).
+ * (`decideRelaunch`, `relaunchWithoutKillLine`,
+ *).
  */
 export const RELAUNCH_KILL_NONE = 'kill-none'
 
 /**
  * The restart work's line naming the kill's outcome, before the relaunch
  * after a kill that succeeded, a guard that made no call, or no kill at all
- * (`RELAUNCH_KILL_NONE`, SRJ-611) (b.jg5 SRJ-701, SRJ-1014): a kill's line
+ * (`RELAUNCH_KILL_NONE`): a kill's line
  * is `describeKillOutcome`'s rendering, `kill_sent` included.
  */
 export function relaunchAfterKillLine(
@@ -903,7 +898,7 @@ export function relaunchAfterKillLine(
 ): string {
   const kill =
     killed === RELAUNCH_KILL_NONE
-      ? 'none (b.jg5 SRJ-611)'
+      ? 'none'
       : killed === KILL_SESSION_NOT_KILLED_GUARD
         ? 'not killed (a guard made no call)'
         : describeKillOutcome(killed)
@@ -911,8 +906,7 @@ export function relaunchAfterKillLine(
 }
 
 /**
- * The restart work's line when the kill did not succeed (b.jg5 SRJ-110,
- * SRJ-701): no relaunch and nothing counted. `described` is the outcome's
+ * The restart work's line when the kill did not succeed: no relaunch and nothing counted. `described` is the outcome's
  * rendering (`describeKillOutcome`), or why the answer was no outcome.
  */
 export function killNotSucceededLine(key: string, described: string, latched: boolean): string {
@@ -922,7 +916,7 @@ export function killNotSucceededLine(key: string, described: string, latched: bo
 }
 
 /**
- * What a restart's launch answers when it resumed the persona's row (b.4q8):
+ * What a restart's launch answers when it resumed the persona's row:
  * launched, but not counted yet. The row reads `pending` until its session
  * reports in, and a resume whose Claude Code exits before that (a transcript
  * it cannot load) is no success: the session manager counts the launch once
@@ -935,7 +929,7 @@ export const LAUNCH_RESUMED_UNREPORTED = 'resumed-unreported'
  * What a restart's launch answers: true launched, false a counted failure,
  * `'skipped'` declined and `'refused'` handed to the retry timer, neither of
  * which is counted, and `LAUNCH_RESUMED_UNREPORTED` resumed, counted once its
- * row reports in or ends (b.4q8).
+ * row reports in or ends.
  */
 export type LaunchSessionResult = boolean | 'skipped' | 'refused' | typeof LAUNCH_RESUMED_UNREPORTED
 
@@ -951,7 +945,7 @@ const pendingRestartTimers = new Map<string, ReturnType<typeof setTimeout>>()
  */
 const activeLaunches = new Map<string, number>()
 /**
- * Per persona key, the clean-exit check timer (b.4vm) armed beside its
+ * Per persona key, the clean-exit check timer armed beside its
  * pending restart timer. Not a pending restart itself:
  * `isRestartPendingOrActive` reads the restart timer, which stays pending
  * until it fires, its check runs its work early, or it is replaced or
@@ -960,7 +954,7 @@ const activeLaunches = new Map<string, number>()
 const cleanExitCheckTimers = new Map<string, ReturnType<typeof setTimeout>>()
 /**
  * Per persona key, when (`restartNow()`, milliseconds) its last clean-exit
- * relaunch ran (b.4vm): the clean-exit loop guard. A restart scheduled
+ * relaunch ran: the clean-exit loop guard. A restart scheduled
  * within `session_restart_delay` of it gets no clean-exit check. A teardown
  * forgets the entry (`cancelRestartTimer`), so a persona brought up again
  * starts fresh.
@@ -969,7 +963,7 @@ const lastCleanExitRelaunchAt = new Map<string, number>()
 /** The clean-exit check's delay in seconds: `CLEAN_EXIT_RELAUNCH_DELAY` unless a test overrides it. */
 let cleanExitRelaunchDelay = CLEAN_EXIT_RELAUNCH_DELAY
 /**
- * The clean-exit loop guard's clock (b.4vm), in milliseconds: when a
+ * The clean-exit loop guard's clock, in milliseconds: when a
  * clean-exit relaunch ran and how long ago. `Date.now` unless a test
  * overrides it (`_setRestartNow`); `_resetRestartState` restores it.
  */
@@ -1002,7 +996,7 @@ export function initRestart(d: RestartDeps): void {
  * Schedule a delayed relaunch of the persona with this key. `cwd` is the
  * persona's working directory.
  *
- * A latched persona gets no timer (b.jg5 SRJ-502, SRJ-315): the latched query
+ * A latched persona gets no timer: the latched query
  * (`RestartDeps.isLatched`) is asked first, before any other gate, and when it
  * answers latched (or throws, which counts as latched: fail safe) this logs
  * one line saying no restart was scheduled and returns without arming a
@@ -1010,9 +1004,9 @@ export function initRestart(d: RestartDeps): void {
  * keeps reading the latched persona. Any timer already pending for the
  * persona is left as it is (its work asks the same query first and makes no
  * attempt for a latched persona). A persona held on `ErrInvalidFlags` gets no
- * timer either (b.jg5 SRJ-207: `RestartDeps.isHeld`, asked right after).
+ * timer either (`RestartDeps.isHeld`, asked right after).
  *
- * A clean exit relaunches fast (b.4vm). A restart that is not human-triggered,
+ * A clean exit relaunches fast. A restart that is not human-triggered,
  * for a persona with no consecutive launch failures on record, whose delay is
  * above `CLEAN_EXIT_RELAUNCH_DELAY`, also gets a clean-exit check at that
  * delay (`armCleanExitCheck`). The restart timer is armed exactly as without
@@ -1038,17 +1032,17 @@ export function scheduleRestart(
     return
   }
 
-  // b.jg5 SRJ-502: a latched persona gets no timer, so a pending restart never
-  // hides it from the health tick (SRJ-315).
+  // a latched persona gets no timer, so a pending restart never
+  // hides it from the health tick.
   const latched = readLatched(deps, key)
   if (latched.latched) {
-    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is latched${latchedFailure(latched)}; no timer armed (b.jg5 SRJ-502)`)
+    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is latched${latchedFailure(latched)}; no timer armed`)
     return
   }
-  // b.jg5 SRJ-207: nor does a persona held on ErrInvalidFlags.
+  // nor does a persona held on ErrInvalidFlags.
   const held = readHeld(deps, key)
   if (held.held) {
-    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is held on ErrInvalidFlags${heldFailure(held)}; no timer armed (b.jg5 SRJ-207)`)
+    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is held on ErrInvalidFlags${heldFailure(held)}; no timer armed`)
     return
   }
 
@@ -1067,18 +1061,18 @@ export function scheduleRestart(
     return
   }
 
-  // b.av2 SR-6.4: a persona that is not up gets no timer at all.
+  // a persona that is not up gets no timer at all.
   if (!deps.canRestart(key)) {
     console.error(`[slack] Not scheduling restart for persona=${key} — the relaunch gate refused it (the persona is not up, or is no longer in the applied configuration)`)
     return
   }
 
-  // Compute exponential backoff delay from the pre-failure count (SR-25.2).
+  // Compute exponential backoff delay from the pre-failure count.
   // nextBackoffDelay reads the CURRENT count (before this attempt's failure is
   // recorded) so the first failure uses base*2^0 = base, the second base*2^1, etc.
   let delay = nextBackoffDelay(key, baseDelay)
 
-  // b.kvq: an explicit human message clamps the wait DOWN to a small ceiling so
+  // an explicit human message clamps the wait DOWN to a small ceiling so
   // a message lost to a down persona doesn't leave it down for a 900s backoff. This
   // does not touch the failure counter — each attempt still counts toward
   // backoff/cap accounting — and the re-entrancy guard at the call site keeps a
@@ -1088,7 +1082,7 @@ export function scheduleRestart(
   }
 
   // Cancel any existing timer for this persona, and its clean-exit check
-  // (b.4vm), so the older restart never fires early.
+  // so the older restart never fires early.
   const existing = pendingRestartTimers.get(key)
   if (existing !== undefined) {
     clearTimeout(existing)
@@ -1102,16 +1096,16 @@ export function scheduleRestart(
 
   pendingRestartTimers.set(key, timer)
 
-  // b.4vm: a human-triggered restart is already clamped short, so only a
+  // a human-triggered restart is already clamped short, so only a
   // full-delay restart gets the clean-exit check.
   if (!opts?.humanTrigger) armCleanExitCheck(key, cwd, sessionId, timer, delay, baseDelay)
 }
 
 /**
  * The restart timer's work for persona `key`, when the timer fires or when
- * its clean-exit check runs it early (b.4vm, after clearing the timer): the
+ * its clean-exit check runs it early (after clearing the timer): the
  * pending entry goes and the key turns active in the same step, so
- * `isRestartPendingOrActive` never reads false in between (b.2ir).
+ * `isRestartPendingOrActive` never reads false in between.
  */
 async function runRestartTimer(key: string, cwd: string, sessionId: string | undefined): Promise<void> {
   pendingRestartTimers.delete(key)
@@ -1120,7 +1114,7 @@ async function runRestartTimer(key: string, cwd: string, sessionId: string | und
   try {
     const d = deps
     if (!d) return
-    // b.av2 SR-6.6: the timer body's work runs through the per-persona
+    // the timer body's work runs through the per-persona
     // lifecycle serializer, after any operation already running or queued
     // for this persona (a teardown, a bring-up retry's launch). Every check
     // below runs when the work starts, not when the timer fired. The
@@ -1134,11 +1128,11 @@ async function runRestartTimer(key: string, cwd: string, sessionId: string | und
 }
 
 // ---------------------------------------------------------------------------
-// The clean-exit check (b.4vm)
+// The clean-exit check
 // ---------------------------------------------------------------------------
 
 /**
- * Arm persona `key`'s clean-exit check (b.4vm) beside the restart timer
+ * Arm persona `key`'s clean-exit check beside the restart timer
  * `timer` that `scheduleRestart` just armed for `delay` seconds (`baseDelay`
  * is `session_restart_delay`), when that restart could be cut short: no
  * consecutive launch failures on record (a failed launch backs off as
@@ -1166,7 +1160,7 @@ function armCleanExitCheck(
 }
 
 /**
- * Persona `key`'s clean-exit check (b.4vm), fired beside the restart timer
+ * Persona `key`'s clean-exit check, fired beside the restart timer
  * `timer` (`delay` seconds). Does nothing once that timer is no longer
  * pending (it fired, or was cancelled or replaced). Asks again the gates
  * `scheduleRestart` and `armCleanExitCheck` asked, then whether a restart
@@ -1223,7 +1217,7 @@ async function runCleanExitCheck(
 
 /**
  * What stops persona `key`'s clean-exit check before its liveness read
- * (b.4vm), in this order; undefined when none does. First the gates
+ * in this order; undefined when none does. First the gates
  * `scheduleRestart` asks, asked again in its order (the latched and held
  * queries, shutdown, the relaunch gate): a restart one of them stops makes
  * no attempt when its timer fires either, so the check makes no
@@ -1250,9 +1244,9 @@ function cleanExitCheckStop(d: RestartDeps, key: string): string | undefined {
 
 /**
  * The clean-exit check's words for a reading other than the row `ended`
- * (b.4vm): `live`, `pending`, `unknown[ (isSessionAlive failed: <error>)]`,
+ * `live`, `pending`, `unknown[ (isSessionAlive failed: <error>)]`,
  * `dead: the row missing`, `dead: no row (ErrSpawnNotFound)`, or `dead: no row
- * state`. Installation failure reads `unknown` (b.jpf). Pure.
+ * state`. Installation failure reads `unknown`. Pure.
  */
 function describeCleanExitReading(probe: LivenessProbe): string {
   if (probe.kind === LIVENESS_UNKNOWN) return `${LIVENESS_UNKNOWN}${probeFailure(probe)}`
@@ -1261,18 +1255,18 @@ function describeCleanExitReading(probe: LivenessProbe): string {
 }
 
 /**
- * The clean-exit check's line when persona `key`'s row reads `ended` (b.4vm):
+ * The clean-exit check's line when persona `key`'s row reads `ended`:
  * its restart, scheduled for `delay` seconds, runs now. Pure.
  *
- *   [slack] Session for persona=<key> ended cleanly (agent-director reads its row ended) — relaunching now instead of in <N>s (b.4vm)
+ * [slack] Session for persona=<key> ended cleanly (agent-director reads its row ended) — relaunching now instead of in <N>s
  */
 export function cleanExitRelaunchLine(key: string, delay: number): string {
-  return `[slack] Session for persona=${key} ended cleanly (agent-director reads its row ended) — relaunching now instead of in ${delay}s (b.4vm)`
+  return `[slack] Session for persona=${key} ended cleanly (agent-director reads its row ended) — relaunching now instead of in ${delay}s`
 }
 
 /**
  * The clean-exit check's line when persona `key`'s restart keeps its full
- * `delay` seconds (b.4vm). `why` is what the check found: `its row does not
+ * `delay` seconds. `why` is what the check found: `its row does not
  * read ended (<reading>)` (`describeCleanExitReading`); a gate that stopped
  * it before its read, `<gate> — no liveness read`, where `<gate>` is `the
  * persona is latched[ (the latched query failed: … — taken as latched)]`,
@@ -1283,27 +1277,27 @@ export function cleanExitRelaunchLine(key: string, delay: number): string {
  * after its read; or `the check failed: <error>` (`describeThrownValue`).
  * Pure.
  *
- *   [slack] Clean-exit check for persona=<key>: <why> — the full <N>s restart delay stands (b.4vm)
+ * [slack] Clean-exit check for persona=<key>: <why> — the full <N>s restart delay stands
  */
 export function cleanExitDelayStandsLine(key: string, delay: number, why: string): string {
-  return `[slack] Clean-exit check for persona=${key}: ${why} — the full ${delay}s restart delay stands (b.4vm)`
+  return `[slack] Clean-exit check for persona=${key}: ${why} — the full ${delay}s restart delay stands`
 }
 
 /**
  * `scheduleRestart`'s line when the clean-exit loop guard arms no check for
- * persona `key` (b.4vm): its last clean-exit relaunch ran `sinceSeconds`
+ * persona `key`: its last clean-exit relaunch ran `sinceSeconds`
  * ago, within `session_restart_delay` (`baseDelay` seconds), so its restart
  * keeps its full `delay` seconds. The guard runs when the restart is
  * scheduled, before the exit's reason is read, so the line is logged for a
  * crash as well as a clean exit and names neither. Pure.
  *
- *   [slack] No clean-exit check for persona=<key> — its last clean-exit relaunch ran <S>s ago, within session_restart_delay (<base>s); the full <N>s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay) (b.4vm)
+ * [slack] No clean-exit check for persona=<key> — its last clean-exit relaunch ran <S>s ago, within session_restart_delay (<base>s); the full <N>s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay)
  */
 export function cleanExitLoopGuardLine(key: string, sinceSeconds: number, baseDelay: number, delay: number): string {
-  return `[slack] No clean-exit check for persona=${key} — its last clean-exit relaunch ran ${sinceSeconds}s ago, within session_restart_delay (${baseDelay}s); the full ${delay}s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay) (b.4vm)`
+  return `[slack] No clean-exit check for persona=${key} — its last clean-exit relaunch ran ${sinceSeconds}s ago, within session_restart_delay (${baseDelay}s); the full ${delay}s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay)`
 }
 
-/** Clear persona `key`'s clean-exit check timer (b.4vm), if one is armed. */
+/** Clear persona `key`'s clean-exit check timer, if one is armed. */
 function clearCleanExitCheck(key: string): void {
   const check = cleanExitCheckTimers.get(key)
   if (check === undefined) return
@@ -1317,12 +1311,12 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
 }
 
 // ---------------------------------------------------------------------------
-// runRestartRetry — the UNAVAILABLE retry timer's entry (b.jg5 SRJ-303)
+// runRestartRetry — the UNAVAILABLE retry timer's entry
 // ---------------------------------------------------------------------------
 
 /**
  * Rerun the restart path's decision for persona `key` now, for the
- * UNAVAILABLE retry timer's full mode (b.jg5 SRJ-303). `cwd` is the persona's
+ * UNAVAILABLE retry timer's full mode. `cwd` is the persona's
  * working directory; `isInFlight(key)` is the caller's in-flight check (the
  * server's "blocks a retry": a launch call, the persona's live-row sequence,
  * or an old-life wait step for a hold it waits on), and `blockCause(key)`,
@@ -1332,10 +1326,10 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * work goes through the same per-persona serializer as a fired restart
  * timer's (`RestartDeps.serialize`), so it never overlaps a teardown, a
  * bring-up retry's launch or a restart for the persona. Inside that work,
- * first, the latched query (`RestartDeps.isLatched`, b.jg5 SRJ-502): a
+ * first, the latched query (`RestartDeps.isLatched`): a
  * latched persona (a query that throws included) answers
  * `RESTART_OUTCOME_LATCHED` with no agent-director call. Then the held query
- * (`RestartDeps.isHeld`, b.jg5 SRJ-207): a persona held on `ErrInvalidFlags`
+ * (`RestartDeps.isHeld`): a persona held on `ErrInvalidFlags`
  * answers `RESTART_OUTCOME_HELD` with no agent-director call. Then `isInFlight(key)`: true answers `RESTART_OUTCOME_IN_FLIGHT` with no
  * agent-director call (a check that throws counts as true). Then the restart
  * cap: at the cap (an earlier restart work's counted failure reached it while
@@ -1345,7 +1339,7 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * that reached the cap). Failures are otherwise counted inside the restart
  * work, which the serializer runs one at a time per persona; a read in this
  * retry's own work that counts the persona's resumed launch as failed (its
- * row ended before reporting in, b.4q8) and takes it to the cap stops the
+ * row ended before reporting in) and takes it to the cap stops the
  * work before its kill and its launch (`skipIfCapReachedDuringWork`).
  * Otherwise the restart work runs, as one recovery attempt, with today's
  * accounting, and its outcome is answered. It bypasses only the restart delay
@@ -1376,7 +1370,7 @@ export async function runRestartRetry(
 
 /**
  * The retry entry (`runRestartRetry`) from inside the operation that already
- * holds persona `key`'s lifecycle serializer turn (b.jg5 SRJ-506): the same
+ * holds persona `key`'s lifecycle serializer turn: the same
  * gates in the same order (the latched gate, the held gate, `isInFlight` with
  * its skip line naming `blockCause`, the restart cap) and the same restart
  * work and accounting, with no serializer of its own, since awaiting the
@@ -1411,7 +1405,7 @@ export async function runRestartRetryInTurn(
  * Hold persona `key` active (`isRestartPendingOrActive`) until the answered
  * release is called, as a retry entry waiting for its turn holds it: the
  * health tick skips the persona before any read, and the lost-message path
- * sees a restart under way. For the after-clear sequence (b.jg5 SRJ-506),
+ * sees a restart under way. For the after-clear sequence,
  * from its clear to its end, so nothing outside the persona's serializer
  * reads its row before the sequence's `find-missing` has run. The release is
  * idempotent; a hold never hides another work still active. Never throws.
@@ -1439,12 +1433,12 @@ async function restartRetryWork(
   isInFlight: (key: string) => boolean,
   blockCause: ((key: string) => RetryBlockCause | undefined) | undefined,
 ): Promise<RestartRetryOutcome> {
-  // b.jg5 SRJ-502: a latched persona gets no attempt, whatever else holds.
+  // a latched persona gets no attempt, whatever else holds.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
-  // b.jg5 SRJ-207, SRJ-303: nor does a persona held on ErrInvalidFlags.
+  // nor does a persona held on ErrInvalidFlags.
   if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
   if (launchInFlight(key, isInFlight)) {
-    // b.jg5 SRJ-303: the skip line names what blocks the retry.
+    // the skip line names what blocks the retry.
     console.error(restartRetrySkippedLine(key, readRetryBlockCause(key, blockCause)))
     return RESTART_OUTCOME_IN_FLIGHT
   }
@@ -1457,7 +1451,7 @@ async function restartRetryWork(
 
 /**
  * The latch re-check's run of the restart path's decision for persona `key`
- * (b.jg5 SRJ-505, SRJ-502), from inside the operation that holds the
+ * from inside the operation that holds the
  * persona's lifecycle serializer turn: the restart work (`runRestartWork`)
  * with no serializer of its own, since awaiting the retry entry
  * (`runRestartRetry`, which submits through `RestartDeps.serialize`) from
@@ -1498,7 +1492,7 @@ export async function runRestartWorkInTurn(key: string, cwd: string, permit: Lat
 }
 
 /**
- * The retry entry's skip line for work in flight (b.jg5 SRJ-303), naming what
+ * The retry entry's skip line for work in flight, naming what
  * blocks the retry (`retryBlockSkipText`: a launch call, the persona's
  * live-row sequence, or an old-life wait step for a hold it waits on; a
  * launch when the cause is not known):
@@ -1545,39 +1539,39 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
 /**
  * The work a restart timer does when it fires, and a retry reruns, run
  * through the serializer: the shutdown and not-up checks, the liveness probe,
- * the not-up check again, then, by the reading (b.jg5 SRJ-314), a return with
+ * the not-up check again, then, by the reading, a return with
  * nothing done (`unknown`, a thrown probe included: the arm hook is called;
  * `pending`, whatever the session's connection shows: the `pending` deferral
  * is called), a reconnect (`live`), or a launch (`dead`), and the
  * success or failure accounting. A reconnect whose verdict
  * is escalate-dead is followed by a second liveness probe; only when the
- * row now reads `dead` does the same run go on to the launch (b.d61), which
- * carries the verdict the answer carried (`ReconnectEscalateDead`; b.jg5
- * SRJ-611) unless a read voided it. `decideRelaunch` chooses what the launch
+ * row now reads `dead` does the same run go on to the launch, which
+ * carries the verdict the answer carried (`ReconnectEscalateDead`
+ *) unless a read voided it. `decideRelaunch` chooses what the launch
  * carries: a row read of `ended`, `missing` or no row voids a GONE-based
  * verdict for an older life. A verdict that is not dead evidence is carried
  * into the launch's own collision ladder. Neither path sends a kill.
- * Installation failure is unknown and cannot authorize recovery (b.jpf).
+ * Installation failure is unknown and cannot authorize recovery.
  * The restart cap is not asked before the work (the retry entry asks it
  * before this work), but a
  * persona that was below the cap when the work began and reached it during
- * the work's reads (b.4q8: a read that counted its resumed launch as failed,
+ * the work's reads (a read that counted its resumed launch as failed,
  * its row ended before reporting in) gets no kill and no launch: the work
  * answers `RESTART_OUTCOME_CAPPED` (`skipIfCapReachedDuringWork`). The whole work is
- * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
+ * one recovery attempt for the persona. Answers what it did (`RestartWorkOutcome`).
  */
 async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
-  // b.jg5 SRJ-502: the gate before the liveness read; a latched persona's
+  // the gate before the liveness read; a latched persona's
   // instance is never probed, reconnected, killed or launched here. The steps
   // ask again after their awaits, before the instance is touched.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
-  // b.jg5 SRJ-207, SRJ-303: a persona held on ErrInvalidFlags gets no
+  // a persona held on ErrInvalidFlags gets no
   // attempt: no liveness read, kill or launch, nothing recorded or counted.
   if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
-  // b.jg5 SRJ-706, SRJ-303: while P's live-row sequence runs, no other launch
+  // while P's live-row sequence runs, no other launch
   // path for P starts: no liveness read, kill or launch, nothing recorded.
   // A key outside the applied set beside the old-life wait on its own row
-  // passes this gate with nothing armed (b.jg5 SRJ-1512; main()'s
+  // passes this gate with nothing armed (main's
   // `liveRowSequenceGate`), and the not-up gate below refuses it.
   if (skipIfSequenceRunning(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
@@ -1585,7 +1579,7 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
 
 /** The steps of `runRestartWork`, inside its recovery attempt. */
 async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
-  // b.4q8: read before any of the work's reads, for the cap checks before
+  // read before any of the work's reads, for the cap checks before
   // relaunch (`skipIfCapReachedDuringWork`).
   const belowCapAtStart = !isAtCap(key, RESTART_FAILURE_CAP)
   if (d.isShuttingDown()) {
@@ -1593,17 +1587,17 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_SHUTTING_DOWN
   }
 
-  // b.av2 SR-6.4: the persona stopped being up after this restart was
+  // the persona stopped being up after this restart was
   // scheduled (e.g. Slack refused a token on a reopen). Leave its instance
   // and its row alone: no liveness probe, reconnect, kill or launch, and
   // no success or failure recorded.
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
-  // b.jg5 SRJ-810, SRJ-812: while an old life may still run in P's working
+  // while an old life may still run in P's working
   // directory, the restart path attempts nothing for P: the hook records P
   // as waiting, starts the hold's wait and arms P's retry timer. Asked only
   // after the shutdown and not-up checks, so a persona not up, or a server
-  // shutting down, never reaches the hook (SRJ-305: P's timer stays stopped
+  // shutting down, never reaches the hook (P's timer stays stopped
   // while P is not up). The hook makes no agent-director call, and the
   // wait it starts runs outside every attempt (the registry's no-launch form).
   if (skipIfHeldForOldLife(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
@@ -1615,26 +1609,26 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // the last check before `reconnectSession` touches the instance;
   // `launchSession`'s own gate (`'skipped'` below) covers a later flip.
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
-  // b.jg5 SRJ-502: the latch is asked again for the same reason. A launch
+  // the latch is asked again for the same reason. A launch
   // outside the serializer (e.g. the start pass's) may have latched the
   // persona while the probe ran, or the probe's own `status` read did (an
-  // UNUSABLE NAME answer, b.jg5 SRJ-512, or its own row reading `pending`
-  // with no launch start, SRJ-513, read `unknown`); then nothing is
+  // UNUSABLE NAME answer, or its own row reading `pending`
+  // with no launch start, read `unknown`); then nothing is
   // deferred, reconnected or killed, and the arm hook is not called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
-  // b.jg5 SRJ-207: so is the held gate: a launch outside the serializer may
+  // so is the held gate: a launch outside the serializer may
   // have held the persona while the probe ran (its reuse spawn's ErrInvalidFlags).
   if (skipIfHeld(d, key, 'after its liveness probe')) return RESTART_OUTCOME_HELD
-  // b.jg5 SRJ-706: the sequence gate is asked again wherever the latched gate
+  // the sequence gate is asked again wherever the latched gate
   // is: a launch outside the serializer may have started P's live-row
   // sequence while the probe ran (a collision ladder's replacement site).
   if (skipIfSequenceRunning(d, key, 'after its liveness probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
-  // b.jg5 SRJ-810: so is the old-life hook: a hold may have begun on P's
+  // so is the old-life hook: a hold may have begun on P's
   // working directory while the probe ran; then nothing is reconnected,
   // killed or launched.
   if (skipIfHeldForOldLife(d, key, 'after its liveness probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
-  // b.jg5 SRJ-314: agent-director could not report on the persona (a
+  // agent-director could not report on the persona (a
   // `status` error, or a probe that threw). Never read as dead: no
   // reconnect, kill or launch, nothing counted, and the retry timer is armed.
   if (probe.kind === LIVENESS_UNKNOWN) {
@@ -1643,16 +1637,16 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_LIVENESS_UNKNOWN
   }
 
-  // b.omv SR-7.6: markerless rows never self-heal through the connected shortcut.
+  // markerless rows never self-heal through the connected shortcut.
   if (probe.kind !== LIVENESS_DEAD && await d.inspectUpgrade?.(key)) return RESTART_OUTCOME_RECONNECT_DEFERRED
 
-  // b.jg5 SRJ-314: the row reads `pending`, so its session has not started.
+  // the row reads `pending`, so its session has not started.
   // It goes to the `pending` deferral whatever the session's connection
   // shows (a connected `pending` row is never "already reconnected"): no
   // reconnect, kill or launch, nothing counted.
-  // b.jg5 SRJ-610: a `pending` first probe resets the slow-recovery count; an
+  // a `pending` first probe resets the slow-recovery count; an
   // open episode stays open.
-  // b.jg5 SRJ-410, SRJ-303: at a retry of the persona's timer the deferral
+  // at a retry of the persona's timer the deferral
   // may answer that the row is gone (the pending-row rule's read, or its own
   // `get`): the run then goes on to its dead branch below, with a `dead`
   // reading that read the row, so no kill and never a launch over `pending`.
@@ -1665,23 +1659,23 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     tellSlowRecovery(d, key, 'noteDead')
   }
 
-  // b.jg5 SRJ-610: a `dead` first probe resets the slow-recovery count; a
+  // a `dead` first probe resets the slow-recovery count; a
   // row read of `ended`, `missing` or no row also ends its episode.
   if (probe.kind === LIVENESS_DEAD) noteDeadReading(d, key)
 
   // `live` takes the reconnect path; only `dead` falls through to the launch,
-  // with no kill (b.jpf). `deadRead` is the run's last `dead` reading,
+  // with no kill. `deadRead` is the run's last `dead` reading,
   // which `decideRelaunch` uses to void evidence for an older life.
   // `escalation` is the
-  // escalate-dead answer and the verdict it carried (b.jg5 SRJ-611); a first
+  // escalate-dead answer and the verdict it carried; a first
   // `dead` reading has none.
   let escalation: EscalateDeadAnswer | undefined
   let deadRead = goneAfterDeferral === undefined ? deadReadingOf(probe) : deadLivenessReading(goneAfterDeferral)
   if (probe.kind !== LIVENESS_DEAD && goneAfterDeferral === undefined) {
-    // b.omv SR-9: the MCP connection alone is enough to skip reconnecting.
+    // the MCP connection alone is enough to skip reconnecting.
     if (d.isSessionConnected(key)) {
       console.error(`[slack] Session already reconnected — skipping restart for persona=${key}`)
-      // b.jg5 SRJ-610: the persona healed on its own, a verdict other than
+      // the persona healed on its own, a verdict other than
       // 'escalate-dead': the slow-recovery count resets; an open episode
       // stays open.
       tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_VERDICT)
@@ -1696,7 +1690,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
       reconnectResult = undefined
     }
 
-    // b.jg5 SRJ-610: a run whose reconnect ends with any verdict other than
+    // a run whose reconnect ends with any verdict other than
     // an escalate-dead one resets the slow-recovery count.
     const escalated = escalateDeadOf(reconnectResult)
     if (escalated === undefined) tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_VERDICT)
@@ -1707,15 +1701,15 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
       return RESTART_OUTCOME_RECONNECTED
     }
     // Non-success/non-void branches ('escalate-dead', 'transient', 'pending', or undefined):
-    // do NOT recordFailure here. SR-25.1 / single counting site: counting
+    // do NOT recordFailure here. / single counting site: counting
     // lives only at the launchSession boolean below. restart.ts does not
-    // re-enter scheduleRestart on any of these outcomes. Post-b.9a7 that is
+    // re-enter scheduleRestart on any of these outcomes. Post-that is
     // safe: the periodic health-check tick is now the retry driver. On the
     // next tick the persona is re-observed; if it is still alive &&
     // !connected (or has since gone dead), the tick calls scheduleRestart
     // again, so a failed/deferred reconnect is retried without any re-entry
-    // here. ('transient' also covers the b.9a7 hazard-2 `working` defer: the
-    // tick retries once the turn settles. b.f2b: it also covers a `working`
+    // here. ('transient' also covers the hazard-2 `working` defer: the
+    // tick retries once the turn settles. it also covers a `working`
     // row whose idle evidence is still being gathered — the tick then retries
     // on its first undeliverable observation, and the adapter reconnects the
     // row once its pane has shown the same idle screen and its transcript has
@@ -1728,32 +1722,32 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     //
     // For the escalate-dead verdicts (a `dead-session` reconnect, whatever its
     // cause, and a row whose read-pane answered GONE or found the row absent)
-    // CSCB recovers itself (b.sv7): the reconnectSession
+    // CSCB recovers itself: the reconnectSession
     // adapter fires the internal memoized findMissing sweep before returning,
     // which may reconcile the frozen `working` row to `missing`. It may also
     // leave the row live (in `unverified_ids`, or, when `pending`, not judged
-    // at all, b.jg5 SRJ-120), and the row may then stay live for further
+    // at all), and the row may then stay live for further
     // ticks: nothing promises that the re-probe or any later tick reads it
     // dead. After a run the sweep makes, each configured persona's own row
     // left in `unverified_ids` is read with one `get`, and only a
-    // `provenance_conflict` note there latches (b.jg5 SRJ-114, SRJ-120). The
+    // `provenance_conflict` note there latches. The
     // latch is asked right after the 'escalate-dead' verdict, before the
     // re-probe, so a persona latched that way gets no further agent-director
-    // call in this run (b.jg5 SRJ-502); it is asked again right before the
-    // relaunch below. b.d61: this run probes liveness again and, when the row
+    // call in this run; it is asked again right before the
+    // relaunch below. this run probes liveness again and, when the row
     // now reads `dead`, falls through to the relaunch branch below at once,
     // with no kill and the same accounting as any dead-session relaunch. When the
     // row still reads `live` (the sweep failed, left the row live, or a
     // memoized result predates the reconciliation), the run ends with no kill, launch
     // or accounting, and each later escalate-dead tick sweeps again through
-    // the adapter's ordinary sweep, with no step beyond it (b.jg5 SRJ-610):
+    // the adapter's ordinary sweep, with no step beyond it:
     // the slow-recovery observer counts such re-probes, and the third in a
-    // row posts SRJ-1010 once per episode. A `pending` re-probe returns with
-    // no relaunch and resets that count; an `unknown` one (b.jg5 SRJ-314)
+    // row posts once per episode. A `pending` re-probe returns with
+    // no relaunch and resets that count; an `unknown` one
     // returns with no relaunch, calls the arm hook and leaves the count as it
     // is. The external ~/startup/find-missing-loop.sh is belt-and-braces only
     // — recovery no longer depends on it, and removing it is a separate
-    // operator decision. b.jg5 SRJ-110, SRJ-314, SRJ-609, SRJ-611: what
+    // operator decision. what
     // follows a `dead` re-probe is decided in one place, `decideRelaunch`.
     // A verdict that is not dead evidence (`row-not-interactive`, a row read)
     // or a bare 'escalate-dead' that carries none never leads to a kill,
@@ -1762,11 +1756,11 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // (dead evidence) covers one life: a re-probe that read the row `ended`,
     // `missing` or gone voids it and the relaunch carries none.
     // `ErrSystemInstallDisappeared` is unknown: no relaunch and no change to
-    // the slow-recovery count or episode (b.jpf).
+    // the slow-recovery count or episode.
     if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
     if (escalated === undefined) return RESTART_OUTCOME_RECONNECT_DEFERRED
     escalation = escalated
-    // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
+    // the adapter's sweep may have latched the persona (a
     // post-run `get` of its own row); then no re-probe follows.
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
     if (skipIfHeld(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_HELD
@@ -1778,14 +1772,14 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   }
 
   // Only a dead observation reaches the relaunch decision; it sends no kill
-  // (b.jpf). Preserve the lifecycle gates before deciding and before launch.
+  //. Preserve the lifecycle gates before deciding and before launch.
   // A persona latched during the re-probe or reconnect is never launched;
   // a running live-row sequence likewise prevents any further call.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
   if (skipIfHeld(d, key, 'before its relaunch decision')) return RESTART_OUTCOME_HELD
   if (skipIfSequenceRunning(d, key, 'before its relaunch decision')) return RESTART_OUTCOME_SEQUENCE_WAITING
   if (skipIfHeldForOldLife(d, key, 'before its relaunch decision')) return RESTART_OUTCOME_SEQUENCE_WAITING
-  // b.4q8: a read in this work may have counted the persona's resumed launch
+  // a read in this work may have counted the persona's resumed launch
   // as failed (its row ended before reporting in) and taken it to the cap;
   // asked again before the relaunch decision and before the launch.
   if (skipIfCapReachedDuringWork(key, belowCapAtStart, 'before its relaunch decision')) return RESTART_OUTCOME_CAPPED
@@ -1797,7 +1791,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   const { deadEvidence } = decided
   let ok: LaunchSessionResult
   try {
-    // b.jg5 SRJ-611: the relaunch after an escalate-dead verdict carries it
+    // the relaunch after an escalate-dead verdict carries it
     // into the ladder unless the decision voided it; any other launch is
     // called as it always was.
     ok = deadEvidence === undefined
@@ -1809,24 +1803,24 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   }
 
   if (ok === 'skipped') {
-    // b.jg5 SRJ-502, SRJ-1015: the launch met a CONFLICT and the persona
+    // the launch met a CONFLICT and the persona
     // latched (or it was latched by the time the launch ran). Nothing is
     // recorded, and the outcome says so. A latched query that throws here
     // counts as latched too: `skipped` records nothing either way. Under the
     // latch re-check's permit, latched means latched for this call
     // (`readLatchedForCall`): the launch's refusal, or an answer that gave no
-    // information, revoked the permit (b.jg5 SRJ-505, SRJ-506); a permitted
+    // information, revoked the permit; a permitted
     // run's launch declined for another reason is launch-skipped below.
     const reading = readLatchedForCall(d, key)
     if (reading.latched) {
       console.error(`[slack] Session relaunch for persona=${key} ended latched${latchedFailure(reading)} — not counted; nothing more is done for it`)
       return RESTART_OUTCOME_LATCHED
     }
-    // b.jg5 SRJ-207: the launch's reuse spawn met ErrInvalidFlags and held the
+    // the launch's reuse spawn met ErrInvalidFlags and held the
     // persona (or it was held by the time the launch ran). Nothing is recorded.
     const heldReading = readHeld(d, key)
     if (heldReading.held) {
-      console.error(`[slack] Session relaunch for persona=${key} ended held on ErrInvalidFlags${heldFailure(heldReading)} — not counted; nothing more is done for it (b.jg5 SRJ-207)`)
+      console.error(`[slack] Session relaunch for persona=${key} ended held on ErrInvalidFlags${heldFailure(heldReading)} — not counted; nothing more is done for it`)
       return RESTART_OUTCOME_HELD
     }
     // Declined: the persona stopped being up between the last `canRestart`
@@ -1838,13 +1832,13 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   }
 
   if (ok === 'refused') {
-    // b.jg5 SRJ-706, SRJ-707: the launch met P's live-row sequence (its
+    // the launch met P's live-row sequence (its
     // ladder started one at a replacement site, or one was running), so it
     // answered `sequence-waiting`, which `launchSession` reads as refused;
     // the work answers sequence-waiting too, so a retry's re-armed line
     // names the sequence. Nothing is recorded.
     if (skipIfSequenceRunning(d, key, 'after its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
-    // b.jg5 SRJ-302, SRJ-1015: refused, not failed. The launch answered
+    // refused, not failed. The launch answered
     // `retrying`: it met an outcome that armed the persona's retry timer,
     // which owns the persona from here. A persona is never given up on for
     // UNAVAILABLE alone, so the failure counter, backoff and cap latch are
@@ -1854,7 +1848,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   }
 
   if (ok === LAUNCH_RESUMED_UNREPORTED) {
-    // b.4q8: the launch resumed the persona's row, which has not reported in
+    // the launch resumed the persona's row, which has not reported in
     // yet. Nothing is recorded now: the session manager counts the launch
     // once its row reports in (a success, which resets the failure count and
     // cap latch) or ends before it does (a counted failure, so a resume that
@@ -1868,7 +1862,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_LAUNCHED
   }
 
-  // Launch failed — increment the failure counter (SR-25.1; the restart
+  // Launch failed — increment the failure counter (the restart
   // work's launchSession boolean, and a launch whose result does not come
   // back through it, `recordLaunchResultOutsideRestartWork`, each count their
   // own launch once).
@@ -1876,11 +1870,11 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
 }
 
 /**
- * Count one launch failure for persona `key` (SR-25.1): record it, log
+ * Count one launch failure for persona `key`: record it, log
  * `failedLine`, and, once per episode when the count reaches the cap, notify
  * through `d.onCapReached` (no further timer is scheduled: the persona is
  * capped, and the tick guard, `isAtCap` in health-check.ts, keeps later
- * ticks from re-scheduling it, SR-25.3/25.4). Answers whether the persona is
+ * ticks from re-scheduling it). Answers whether the persona is
  * now at the cap.
  */
 function countLaunchFailure(
@@ -1905,9 +1899,9 @@ function countLaunchFailure(
  * Record the result of a launch for persona `key` whose result does not come
  * back through the restart work's `launchSession` (the live-row sequence's
  * final launch, `launchForLiveRowSequence`, and a latch re-check's own retry,
- * both in `src/session-manager.ts`; b.jg5 SRJ-112, SRJ-113, SRJ-506,
- * SRJ-602; and a resumed launch, counted once its row reports in or ends
- * before it does, b.4q8), as the restart work records its own launch's:
+ * both in `src/session-manager.ts`,
+ * and a resumed launch, counted once its row reports in or ends
+ * before it does), as the restart work records its own launch's:
  * a success (`launched` true) resets the persona's failure count and cap
  * latch; a counted failure is recorded, logging `failedLine`, with the cap
  * notice through the installed restart dependencies' `onCapReached` once per
@@ -1918,7 +1912,7 @@ function countLaunchFailure(
 export function recordLaunchResultOutsideRestartWork(
   key: string,
   launched: boolean,
-  failedLine = `[slack] Launch failed for persona=${key} — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`,
+  failedLine = `[slack] Launch failed for persona=${key} — counted`,
 ): typeof RESTART_OUTCOME_LAUNCHED | typeof RESTART_OUTCOME_CAPPED | typeof RESTART_OUTCOME_COUNTED_FAILURE {
   if (launched) {
     recordSuccess(key)
@@ -1931,7 +1925,7 @@ export function recordLaunchResultOutsideRestartWork(
  * Decide the verdict carried into a relaunch after an authoritative dead
  * observation. Finished or absent rows need no kill and void GONE-based
  * evidence for an older life. Installation failure is unknown and never
- * reaches this decision (b.jpf).
+ * reaches this decision.
  */
 function decideRelaunch(
   key: string,
@@ -1953,8 +1947,7 @@ function decideRelaunch(
 
 /**
  * The restart work's line when the kill answered `ErrInvalidFlags` and its
- * immediate version re-check decided that the server stops (b.jg5 SRJ-104,
- * SRJ-204, SRJ-205): no relaunch, nothing counted, nothing more called.
+ * immediate version re-check decided that the server stops: no relaunch, nothing counted, nothing more called.
  * `described` is the outcome's rendering (`describeKillOutcome`).
  */
 export function killStopsServerLine(key: string, described: string): string {
@@ -1970,24 +1963,24 @@ function deadReadingOf(probe: LivenessProbe): DeadLivenessReading {
 }
 
 /**
- * b.d61: after an 'escalate-dead' reconnect verdict (whose adapter already ran
+ * after an 'escalate-dead' reconnect verdict (whose adapter already ran
  * the findMissing sweep), probe the persona's liveness again. A swept row may
- * stay live for further ticks (b.jg5 SRJ-610): nothing promises this re-probe
+ * stay live for further ticks: nothing promises this re-probe
  * or a later one reads it dead. Returns
  * the `dead` reading (`deadReadingOf`: the row state it read) only when the
  * row now reads `dead` and this restart run should go on to the relaunch
- * branch, with no kill (b.jpf). A reading that read the row
+ * branch, with no kill. A reading that read the row
  * `ended`, `missing` or gone voids a GONE-based verdict (dead evidence
  * covers one life). Otherwise the outcome the run returns with,
- * with no relaunch (b.jg5 SRJ-314): `RESTART_OUTCOME_RECONNECT_DEFERRED` (the
+ * with no relaunch: `RESTART_OUTCOME_RECONNECT_DEFERRED` (the
  * row still reads `live`: no kill, launch or accounting; each later
  * escalate-dead tick sweeps again, and the slow-recovery observer counts the
- * reading, the third in a row posting SRJ-1010 once per episode),
+ * reading, the third in a row posting once per episode),
  * `RESTART_OUTCOME_PENDING_DEFERRED` (the row reads `pending`: its session
  * has not started; the reading is handed to the `pending` deferral, awaited,
- * as the first probe's is, b.jg5 SRJ-409, SRJ-411; a deferral that answers
+ * as the first probe's is; a deferral that answers
  * the row gone, at a retry, gives the `dead` reading it read instead, so the
- * run relaunches with no kill, b.jg5 SRJ-410),
+ * run relaunches with no kill),
  * `RESTART_OUTCOME_LIVENESS_UNKNOWN` (the re-probe read
  * `unknown` or threw: agent-director could not report on the persona, and the
  * arm hook is called), `RESTART_OUTCOME_SHUTTING_DOWN`,
@@ -1995,7 +1988,7 @@ function deadReadingOf(probe: LivenessProbe): DeadLivenessReading {
  * reading of a kind none of its cases names (no relaunch, nothing told to the
  * slow-recovery observer; the switch's `never` check makes a new kind fail
  * the typecheck), or `RESTART_OUTCOME_LATCHED` when the persona is
- * latched after the re-probe (its own read latched it, b.jg5 SRJ-512, SRJ-513, or a
+ * latched after the re-probe (its own read latched it, or a
  * latch set elsewhere): then the arm hook is not called. Shutdown and the not-up gate are asked after the
  * probe, since it is an async agent-director call; `launchSession`'s own
  * gate still applies after it.
@@ -2015,7 +2008,7 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
     return RESTART_OUTCOME_SHUTTING_DOWN
   }
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
-  // b.jg5 SRJ-502, SRJ-512, SRJ-513: the re-probe's own `status` read may
+  // the re-probe's own `status` read may
   // have latched the persona (an UNUSABLE NAME answer, or its own row
   // reading `pending` with no launch start, read `unknown`): no arm
   // hook, deferral, kill or launch, and nothing recorded.
@@ -2029,17 +2022,17 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
       noteDeadReading(d, key)
       return deadReadingOf(probe)
     case LIVENESS_UNKNOWN:
-      // b.jg5 SRJ-610: neither counts nor resets the slow-recovery count.
+      // neither counts nor resets the slow-recovery count.
       console.error(reprobeUnknownLine(key, probe.failure))
       armOnUnknown(d, key)
       return RESTART_OUTCOME_LIVENESS_UNKNOWN
     case LIVENESS_PENDING: {
       console.error(reprobePendingLine(key))
       tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE)
-      // b.jg5 SRJ-409, SRJ-411: the re-probe's `pending` goes to the deferral too.
+      // the re-probe's `pending` goes to the deferral too.
       const gone = await deferPending(d, key, probe)
       if (gone === undefined) return RESTART_OUTCOME_PENDING_DEFERRED
-      // b.jg5 SRJ-410, SRJ-303: at a retry, the deferral read the row gone;
+      // at a retry, the deferral read the row gone;
       // the relaunch follows in this run, with no kill for a row read finished.
       console.error(pendingDeferralGoneLine(key, gone))
       tellSlowRecovery(d, key, 'noteDead')
@@ -2071,28 +2064,28 @@ export function reprobeUnhandledLine(key: string, kind: unknown): string {
   return `[slack] Session re-probe after escalate-dead read an unhandled kind "${String(kind)}" — no relaunch in this restart run for persona=${key}; nothing noted`
 }
 
-/** The re-probe's line when the row reads `dead` after an 'escalate-dead' verdict (b.d61): the same run relaunches. */
+/** The re-probe's line when the row reads `dead` after an 'escalate-dead' verdict: the same run relaunches. */
 export function reprobeDeadLine(key: string): string {
-  return `[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`
+  return `[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key}`
 }
 
 /**
  * The re-probe's line when the row still reads `live` after an
- * 'escalate-dead' verdict (b.jg5 SRJ-610): no relaunch in this run, and the
+ * 'escalate-dead' verdict: no relaunch in this run, and the
  * row may stay live for further ticks, each of which sweeps again.
  */
 export function reprobeLiveLine(key: string): string {
   return `[slack] Session still reads live after escalate-dead — no relaunch in this restart run for persona=${key}; the row may stay live for further ticks, each escalate-dead tick sweeping again`
 }
 
-/** The re-probe's line when the row reads `pending` after an 'escalate-dead' verdict (b.jg5 SRJ-314). */
+/** The re-probe's line when the row reads `pending` after an 'escalate-dead' verdict. */
 export function reprobePendingLine(key: string): string {
   return `[slack] Session reads pending after escalate-dead — its session has not started; no relaunch in this restart run for persona=${key}`
 }
 
 /**
  * The re-probe's line when it reads `unknown` after an 'escalate-dead'
- * verdict (b.jg5 SRJ-314); `failure` is what a probe that threw threw, as
+ * verdict; `failure` is what a probe that threw threw, as
  * `describeThrownValue` renders it, absent when the probe answered.
  */
 export function reprobeUnknownLine(key: string, failure?: string): string {
@@ -2114,7 +2107,7 @@ interface LivenessProbe {
 }
 
 /**
- * Probe persona `key`'s liveness (b.jg5 SRJ-314): the reading's kind, with a
+ * Probe persona `key`'s liveness: the reading's kind, with a
  * probe that throws, or answers something that is not a reading, read
  * `unknown` (never `dead`), a `pending` reading's launch start, and a `dead`
  * row read's row state. Logs nothing; never rejects.
@@ -2136,7 +2129,7 @@ async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe
 /**
  * Hand persona `key`'s `pending` reading, with the launch start its probe
  * read, to the `pending` deferral (`RestartDeps.deferPendingRow`) once, and
- * await it (b.jg5 SRJ-314, SRJ-409, SRJ-411): the first probe's and the
+ * await it: the first probe's and the
  * re-probe's `pending` alike. Absent, nothing is called. A member that
  * throws or rejects is logged; never rejects.
  */
@@ -2159,20 +2152,20 @@ function isDeadRowRead(value: unknown): value is DeadRowRead {
 /**
  * What the `pending` deferral (`RestartDeps.deferPendingRow`) may answer:
  * nothing, or `'pending'` (the row is deferred), or, at a retry of the
- * persona's timer, the `DeadRowRead` of a row it read gone (b.jg5 SRJ-410).
+ * persona's timer, the `DeadRowRead` of a row it read gone.
  */
 export type RestartPendingDeferralAnswer = void | 'pending' | DeadRowRead
 
 /**
  * The restart work's line when its `pending` deferral (`deferPendingRow`)
- * answered that the row is gone (b.jg5 SRJ-410, SRJ-303), at the first probe
+ * answered that the row is gone, at the first probe
  * or the re-probe: the row is no longer `pending`, so the same run goes on
  * to its relaunch, with no kill for a row read finished:
  *
- *   [slack] Pending deferral for persona=<key> read its row <ended|missing|no-row> — no longer pending; this restart run goes on to its relaunch, with no kill for a row read finished (b.jg5 SRJ-410, SRJ-303)
+ * [slack] Pending deferral for persona=<key> read its row <ended|missing|no-row> — no longer pending; this restart run goes on to its relaunch, with no kill for a row read finished
  */
 export function pendingDeferralGoneLine(key: string, gone: DeadRowRead): string {
-  return `[slack] Pending deferral for persona=${key} read its row ${gone} — no longer pending; this restart run goes on to its relaunch, with no kill for a row read finished (b.jg5 SRJ-410, SRJ-303)`
+  return `[slack] Pending deferral for persona=${key} read its row ${gone} — no longer pending; this restart run goes on to its relaunch, with no kill for a row read finished`
 }
 
 /** ` (isSessionAlive failed: <why>)` for a probe that threw, else empty: the part of an unknown line that names the failure. */
@@ -2183,15 +2176,14 @@ function probeFailure(probe: Pick<LivenessProbe, 'failure'>): string {
 /**
  * Tell the slow-recovery observer (`RestartDeps.slowRecovery`) a `dead`
  * reading through `noteDead`. Installation failure is unknown and never
- * reaches this helper (b.jpf). Never throws.
+ * reaches this helper. Never throws.
  */
 function noteDeadReading(d: RestartDeps, key: string): void {
   tellSlowRecovery(d, key, 'noteDead')
 }
 
 /**
- * Call one note of the slow-recovery observer for persona `key` (b.jg5
- * SRJ-610). Absent, nothing is told. A note that throws is logged; never
+ * Call one note of the slow-recovery observer for persona `key`. Absent, nothing is told. A note that throws is logged; never
  * throws.
  */
 function tellSlowRecovery(
@@ -2212,12 +2204,12 @@ function tellSlowRecovery(
 
 /**
  * Call the arm hook (`RestartDeps.armRetryTimer`) for persona `key` once, on
- * an `unknown` reading (b.jg5 SRJ-314). Absent, nothing is armed. A hook that
+ * an `unknown` reading. Absent, nothing is armed. A hook that
  * throws is logged; never throws.
  */
 function armOnUnknown(d: RestartDeps, key: string): void {
   if (d.armRetryTimer === undefined) return
-  // b.jg5 SRJ-505: inside a latch re-check of a latched persona an `unknown`
+  // inside a latch re-check of a latched persona an `unknown`
   // reading gives no information, so nothing is armed.
   if (isInsideLatchRecheck(key)) return
   try {
@@ -2241,7 +2233,7 @@ interface LatchedReading {
 /**
  * `RestartDeps.isLatched` for persona `key` (`LatchedReading`): exactly
  * `true` is latched; an absent query is not; a query that throws counts as
- * latched (b.jg5 SRJ-502: never kill or launch a persona that may be
+ * latched (never kill or launch a persona that may be
  * latched). Logs nothing (the caller logs one line); never throws.
  */
 function readLatched(d: RestartDeps, key: string): LatchedReading {
@@ -2254,8 +2246,7 @@ function readLatched(d: RestartDeps, key: string): LatchedReading {
 }
 
 /**
- * `readLatched` as the work's latched checks read it (b.jg5 SRJ-502,
- * SRJ-505): a call that carries the latch re-check's permit
+ * `readLatched` as the work's latched checks read it: a call that carries the latch re-check's permit
  * (`holdsLatchRecheckPermit`: the re-check's own run of the restart path's
  * decision, until its first refusal) reads not latched, as the session
  * manager's latched gate reads it, so "latched" means latched for this call:
@@ -2272,21 +2263,21 @@ function latchedFailure(reading: LatchedReading): string {
 }
 
 /**
- * The latched gate (b.jg5 SRJ-502): when persona `key` is latched, or the
+ * The latched gate: when persona `key` is latched, or the
  * latched query throws, log one line saying the restart work makes no
  * attempt for it (naming what the query threw, if it did) and return true,
  * so the caller returns `RESTART_OUTCOME_LATCHED` before any agent-director
  * call. Records neither a success nor a failure. The one exception is the
  * latch re-check's own run of the restart path's decision
  * (`runRestartWorkInTurn`), whose permit passes the gate until the run meets
- * a refusal (`holdsLatchRecheckPermit`, b.jg5 SRJ-502's "beyond the
- * re-check", SRJ-505); every other caller still meets it.
+ * a refusal (`holdsLatchRecheckPermit`"beyond the
+ * re-check"); every other caller still meets it.
  */
 function skipIfLatched(d: RestartDeps, key: string): boolean {
   const reading = readLatchedForCall(d, key)
   if (!reading.latched) return false
   console.error(
-    `[slack] Skipping restart for persona=${key} — the persona is latched${latchedFailure(reading)}; no agent-director call, nothing recorded (b.jg5 SRJ-502)`,
+    `[slack] Skipping restart for persona=${key} — the persona is latched${latchedFailure(reading)}; no agent-director call, nothing recorded`,
   )
   return true
 }
@@ -2303,8 +2294,8 @@ interface HeldReading {
 
 /**
  * `RestartDeps.isHeld` for persona `key` (`HeldReading`): exactly `true` is
- * held; an absent query is not; a query that throws counts as held (b.jg5
- * SRJ-207: never launch a persona that may be held). Logs nothing; never
+ * held; an absent query is not; a query that throws counts as held (
+ * never launch a persona that may be held). Logs nothing; never
  * throws.
  */
 function readHeld(d: RestartDeps, key: string): HeldReading {
@@ -2322,7 +2313,7 @@ function heldFailure(reading: HeldReading): string {
 }
 
 /**
- * The held gate (b.jg5 SRJ-207, SRJ-303): when persona `key` is held on
+ * The held gate: when persona `key` is held on
  * `ErrInvalidFlags`, or the held query throws, log one line saying the
  * restart work makes no attempt for it (naming what the query threw, if it
  * did) and return true, so the caller returns `RESTART_OUTCOME_HELD` before
@@ -2335,14 +2326,14 @@ function skipIfHeld(d: RestartDeps, key: string, askedAgain?: string): boolean {
   if (!reading.held) return false
   console.error(
     askedAgain === undefined
-      ? `[slack] Skipping restart for persona=${key} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; no agent-director call, nothing recorded (b.jg5 SRJ-207)`
-      : `[slack] Restart for persona=${key} goes no further ${askedAgain} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; nothing more is called for it, nothing recorded (b.jg5 SRJ-207)`,
+      ? `[slack] Skipping restart for persona=${key} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; no agent-director call, nothing recorded`
+      : `[slack] Restart for persona=${key} goes no further ${askedAgain} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; nothing more is called for it, nothing recorded`,
   )
   return true
 }
 
 /**
- * The restart work's cap check after its reads (b.4q8): true, with one line
+ * The restart work's cap check after its reads: true, with one line
  * (`restartCapReachedLine`), when persona `key` was below the restart cap
  * when the work began (`belowCapAtStart`) and is at it now, so the caller
  * answers `RESTART_OUTCOME_CAPPED` with nothing more killed, launched or
@@ -2365,17 +2356,17 @@ function skipIfCapReachedDuringWork(key: string, belowCapAtStart: boolean, when:
 
 /**
  * The restart work's line when persona `key` reached the restart cap while
- * the work ran (b.4q8, `skipIfCapReachedDuringWork`): the work goes no
+ * the work ran (`skipIfCapReachedDuringWork`): the work goes no
  * further from `when` (`before its kill`, `before its launch`). Pure.
  *
- *   [slack] Restart for persona=<key> goes no further <when> — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it (b.4q8)
+ * [slack] Restart for persona=<key> goes no further <when> — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it
  */
 export function restartCapReachedLine(key: string, when: string): string {
-  return `[slack] Restart for persona=${key} goes no further ${when} — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it (b.4q8)`
+  return `[slack] Restart for persona=${key} goes no further ${when} — the persona reached the restart cap while this restart ran; nothing more is killed or launched for it`
 }
 
 /**
- * The live-row sequence gate (b.jg5 SRJ-706, SRJ-303): when a live-row
+ * The live-row sequence gate: when a live-row
  * sequence runs for persona `key`, or the running query throws (counted as
  * running: fail safe), log one line saying the restart work makes no attempt
  * and return true, so the caller returns `RESTART_OUTCOME_SEQUENCE_WAITING`
@@ -2395,32 +2386,31 @@ function skipIfSequenceRunning(d: RestartDeps, key: string, askedAgain?: string)
   }
   console.error(
     askedAgain === undefined
-      ? `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`
-      : `[slack] Restart for persona=${key} goes no further ${askedAgain} — its live-row sequence runs${failure}; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`,
+      ? `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting)`
+      : `[slack] Restart for persona=${key} goes no further ${askedAgain} — its live-row sequence runs${failure}; nothing more is called for it, nothing recorded (sequence-waiting)`,
   )
   return true
 }
 
 /**
- * The restart work's line when the old-life hook holds persona `key` (b.jg5
- * SRJ-810, SRJ-812): the work makes no attempt (`askedAgain` absent), or
+ * The restart work's line when the old-life hook holds persona `key`: the work makes no attempt (`askedAgain` absent), or
  * goes no further from `askedAgain` on; `failure`, when given, is what the
  * hook threw (counted as held):
  *
- *   [slack] Skipping restart for persona=<key> — its working directory is held for an old life that may still be running[ (the old-life hook failed: <thrown> — taken as held)]; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)
- *   [slack] Restart for persona=<key> goes no further <askedAgain> — its working directory is held for an old life that may still be running[ (…)]; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)
+ * [slack] Skipping restart for persona=<key> — its working directory is held for an old life that may still be running[ (the old-life hook failed: <thrown> — taken as held)]; no agent-director call, nothing recorded (sequence-waiting)
+ * [slack] Restart for persona=<key> goes no further <askedAgain> — its working directory is held for an old life that may still be running[ (…)]; nothing more is called for it, nothing recorded (sequence-waiting)
  *
  * Pure.
  */
 export function restartOldLifeHeldLine(key: string, askedAgain?: string, failure?: string): string {
   const why = `its working directory is held for an old life that may still be running${failure === undefined ? '' : ` (the old-life hook failed: ${failure} — taken as held)`}`
   return askedAgain === undefined
-    ? `[slack] Skipping restart for persona=${key} — ${why}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)`
-    : `[slack] Restart for persona=${key} goes no further ${askedAgain} — ${why}; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)`
+    ? `[slack] Skipping restart for persona=${key} — ${why}; no agent-director call, nothing recorded (sequence-waiting)`
+    : `[slack] Restart for persona=${key} goes no further ${askedAgain} — ${why}; nothing more is called for it, nothing recorded (sequence-waiting)`
 }
 
 /**
- * The old-life gate (b.jg5 SRJ-810, SRJ-812, SRJ-302): asks the old-life
+ * The old-life gate: asks the old-life
  * hook (`RestartDeps.isHeldForOldLife`), which itself runs the hold step for
  * a held persona (records it as waiting, starts the hold's wait, arms its
  * retry timer). When it answers true, or throws (counted as held: fail
@@ -2441,13 +2431,13 @@ function skipIfHeldForOldLife(d: RestartDeps, key: string, askedAgain?: string):
 }
 
 /**
- * The timer-time not-up check (b.av2 SR-6.4): when `canRestart` answers false,
+ * The timer-time not-up check: when `canRestart` answers false,
  * log that the restart is skipped and the instance left as it is, and return
  * true so the caller returns before touching the persona. Records neither a
  * success nor a failure. `canRestart` answers false for a key outside the
- * applied set too (b.av2 SR-8.6): the restart path does nothing for it. Its
+ * applied set too: the restart path does nothing for it. Its
  * one exception, an old-life wait's kill and find-missing steps on a retired
- * key (b.jg5 SRJ-1512, SRJ-811), runs in the session manager's live-row
+ * key, runs in the session manager's live-row
  * sequence registry, never through this path, and never launches that key.
  */
 function skipIfNotUp(d: RestartDeps, key: string): boolean {
@@ -2460,7 +2450,7 @@ function skipIfNotUp(d: RestartDeps, key: string): boolean {
 // cancelAllRestartTimers
 // ---------------------------------------------------------------------------
 
-/** Cancel every pending restart timer, with every clean-exit check (b.4vm), so none fires early. */
+/** Cancel every pending restart timer, with every clean-exit check, so none fires early. */
 export function cancelAllRestartTimers(): void {
   for (const [key, timer] of pendingRestartTimers) {
     clearTimeout(timer)
@@ -2477,10 +2467,10 @@ export function cancelAllRestartTimers(): void {
 
 /**
  * Cancel the pending restart timer for persona `key`, if any, so it never
- * fires (b.av2 SR-6.5, a teardown). Other personas' timers are untouched.
+ * fires (a teardown). Other personas' timers are untouched.
  * A work already started (its `activeLaunches` entry) is left alone: the
  * teardown waits for it through the lifecycle serializer. Its clean-exit
- * check (b.4vm) goes with it, so a cancelled restart never fires early, and
+ * check goes with it, so a cancelled restart never fires early, and
  * so does its last clean-exit relaunch time (the loop guard's entry,
  * `lastCleanExitRelaunchAt`), timer pending or not, so a persona torn down
  * and brought up again starts fresh. Records no success or failure and
@@ -2526,12 +2516,12 @@ export function _resetRestartState(): void {
   deps = null
 }
 
-/** Test-only seam: override the clean-exit check's delay, in seconds (b.4vm); `_resetRestartState` restores `CLEAN_EXIT_RELAUNCH_DELAY`. */
+/** Test-only seam: override the clean-exit check's delay, in seconds; `_resetRestartState` restores `CLEAN_EXIT_RELAUNCH_DELAY`. */
 export function _setCleanExitRelaunchDelay(seconds: number): void {
   cleanExitRelaunchDelay = seconds
 }
 
-/** Test-only seam: override the clean-exit loop guard's clock, in milliseconds (b.4vm; a suite passes `createFakeClock().now`); `_resetRestartState` restores `Date.now`. */
+/** Test-only seam: override the clean-exit loop guard's clock, in milliseconds (a suite passes `createFakeClock().now`); `_resetRestartState` restores `Date.now`. */
 export function _setRestartNow(now: () => number): void {
   restartNow = now
 }

@@ -3,7 +3,7 @@
  * action ID was built for.
  *
  * Production code no longer needs this: each click arrives on its persona's
- * own connection, which names the receiving persona (b.av2 SR-11). Tests still
+ * own connection, which names the receiving persona. Tests still
  * use it to check which persona a posted button targets, and to derive a
  * receiving key from the clicked action. Built only on the production decoder
  * and prefix, so it cannot drift from the wire format.

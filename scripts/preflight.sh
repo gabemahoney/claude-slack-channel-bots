@@ -48,7 +48,7 @@ sr_exit() {
 }
 
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 BUMP_KIND="${1:-}"
 case "${BUMP_KIND}" in
@@ -185,7 +185,7 @@ if npm view "claude-slack-channel-bots@${NEXT_VERSION}" version > /dev/null 2>&1
 fi
 
 # SR-2.5 — the host's agent-director binary against the installed client's
-# minimum and CSCB's Phase 1 floor (b.jg5 SRJ-211), judged by
+# minimum and CSCB's Phase 1 floor, judged by
 # scripts/ad-version-check.ts. It writes its own SR-2.5 line: on a pass, a
 # stdout line (and, below the floor, an 'SR-2.5 (preflight) NOTE' on stderr,
 # passed through unaltered); on a failure, one SR-2.5 diagnostic on stderr and

@@ -1,16 +1,15 @@
 /**
  * persona-destination-hold.ts — Hold and retry a persona's permission prompts
- * and server notices while its destination fails (b.av2 SR-7.1 failure part,
- * SR-3.2, SR-10.3; b.deo SRI-702, SRI-703, SRI-906).
+ * and server notices while its destination fails (failure part,
+ *).
  *
  * A post to a persona's destination (`persona-destination.ts`) can fail: the
  * app was not re-installed with `im:write`, so `conversations.open` answers
  * `missing_scope`; the bot is not in the channel (`not_in_channel`), a
- * fungible destination channel the app was never invited to included (b.deo
- * SRI-702); Slack cannot be reached. Such a failure is a destination failure
+ * fungible destination channel the app was never invited to included; Slack cannot be reached. Such a failure is a destination failure
  * and opens an episode for the persona. While the episode is open the
  * persona is held: nothing is attempted for it before its next retry is due,
- * on its own SR-3.2 schedule (5 s doubling to 300 s, no give-up, never
+ * on its own schedule (5 s doubling to 300 s, no give-up, never
  * shorter than a `retryAfter` the error carries). Nothing is lost and nothing
  * is spammed.
  *
@@ -27,7 +26,7 @@
  *   neither opens nor extends an episode and never holds the persona's other
  *   prompts and notices. The item follows its per-item handling: a prompt is
  *   logged once by the poller and never posted again as it was (its next
- *   attempt posts a short prompt in its place, b.zmq); a notice is handed to
+ * attempt posts a short prompt in its place); a notice is handed to
  *   its failure callback and dropped (it would fail the same way again).
  * - A refusal (a `dm` destination with DMs off or no contact, which the loader
  *   rejects) makes no Slack call and is not a failure; the resolver logs it.
@@ -56,14 +55,13 @@
  * captured when the notice was held or the episode opened, so a destination
  * or contact changed while a notice waits is honoured. Every destination this
  * module names or compares comes from the one destination rule
- * (`personaDestinationOf`, b.av2 SR-7.1, b.deo SRI-701) over the
+ * (`personaDestinationOf`) over the
  * configuration in effect, asked of the resolver (`destinations.destinationOf`)
- * for the persona of that attempt in the same step as its post (b.deo
- * SRI-201), together with the setting in force that names it
- * (`destinationSettingFrom`, b.deo SRI-906). So after a confirmed switch
+ * for the persona of that attempt in the same step as its post, together with the setting in force that names it
+ * (`destinationSettingFrom`). So after a confirmed switch
  * change, which runs no lifecycle operation, held notices are retried at the
  * destination of the mode in force, as after an in-place change of the
- * destination setting (b.deo SRI-703); nothing here reads a destination
+ * destination setting; nothing here reads a destination
  * setting or the switch itself. A retry that comes due while the persona
  * has no client (it is not up) keeps it held and waits again, with no line;
  * one whose persona or client lookup throws waits again the same way, with
@@ -77,7 +75,7 @@
  *   cause `destinationFailedCause`) naming the persona (JSON-quoted name, key
  *   beside it, `personas[i]`), the destination (`destination=` the channel
  *   ID, or `dm`; in fungible mode followed by the setting in force,
- *   `invited.permission_prompts`, b.deo SRI-906), the failed step and the
+ * `invited.permission_prompts`), the failed step and the
  *   Slack error code; for `missing_scope` on the open it names the `im:write`
  *   scope and says the app must be re-installed to gain it.
  * - A failed retry advances the schedule and logs nothing, unless it failed at
@@ -86,7 +84,7 @@
  *   per episode. An episode tracks the destinations it has named by setting
  *   and value together, so this covers an in-place change of the destination
  *   setting and a confirmed switch change alike, the latter even when both
- *   modes' settings hold the same value (b.av2 SR-7.1, b.deo SRI-703).
+ * modes' settings hold the same value.
  * - A failure from an attempt that started before the last episode change
  *   (an episode opened or closed since; e.g. the notifier's concurrent flush,
  *   all waiting on one DM open, or a slow post that fails after a retry has
@@ -132,11 +130,11 @@
  * arrive at once. The hold handles every class the same way anyway; tests
  * drive it through the Slack stub.
  *
- * Per persona (b.av2 SR-3.3): each persona has its own entry, schedule, FIFO,
+ * Per persona: each persona has its own entry, schedule, FIFO,
  * timer and in-flight guard; nothing spans two personas, so one persona's
  * episode never delays, holds or logs for another.
  *
- * Pure module (b.av2 SR-13.1): no module-scope state, no I/O of its own and
+ * Pure module: no module-scope state, no I/O of its own and
  * nothing runs at import; building a hold starts no timer. The resolver, the
  * persona and client lookups, the clock and the logger are injected.
  *
@@ -170,7 +168,7 @@ import { slackRetryAfterSeconds } from './persona-slack-validation.ts'
 // ---------------------------------------------------------------------------
 
 /**
- * Most notices held for one persona (b.av2 SR-7.2): by the notifier while the
+ * Most notices held for one persona: by the notifier while the
  * persona's client is not validated, and by the destination hold while its
  * destination fails. Past it the oldest held notice is dropped with a log
  * line, so a queue keeps the most recent notices and a persona that is broken,
@@ -291,8 +289,7 @@ export interface PersonaDestinationHold {
 }
 
 /**
- * A destination as a `persona-destination-failed` line names it (b.deo
- * SRI-906): the setting in force and its value, both read for the attempt in
+ * A destination as a `persona-destination-failed` line names it: the setting in force and its value, both read for the attempt in
  * the same step as its post.
  */
 export interface NamedDestination {
@@ -328,7 +325,7 @@ interface OpenEpisode {
   /**
    * Every destination an opening line of this episode has named, by setting
    * and value together (`namedKey`), so a switch change that keeps the value
-   * counts as a destination not yet named too (b.deo SRI-703, SRI-906).
+   * counts as a destination not yet named too.
    */
   named: Set<string>
 }
@@ -387,8 +384,7 @@ export function isDestinationFailure(failure: Pick<DestinationFailure, 'step' | 
 }
 
 /**
- * The `destination=` field of a `persona-destination-failed` line (b.av2
- * SR-10.3, b.deo SRI-906): `destination=<value>`, followed in fungible mode
+ * The `destination=` field of a `persona-destination-failed` line: `destination=<value>`, followed in fungible mode
  * by the setting in force in parentheses,
  * `destination=<value> (invited.permission_prompts)`. A declarative-mode
  * field names no setting, as every such line does in declarative mode. Pure.
@@ -400,8 +396,7 @@ function destinationField(at: NamedDestination): string {
 }
 
 /**
- * The cause of a `persona-destination-failed` opening line (b.av2 SR-7.1,
- * SR-10.3; b.deo SRI-702, SRI-906): the failed step, the destination with the
+ * The cause of a `persona-destination-failed` opening line: the failed step, the destination with the
  * setting in force (`destination=<value>`, plus ` (invited.permission_prompts)`
  * in fungible mode) and the Slack error code, then that the persona's
  * prompts and notices are held. For `missing_scope` on the open it names the
@@ -419,8 +414,7 @@ export function destinationFailedCause(at: NamedDestination, failure: Destinatio
 }
 
 /**
- * The cause of a `persona-destination-failed` cleared line (b.av2 SR-7.1,
- * SR-10.3; b.deo SRI-906): `cleared:`, the destination that accepted the
+ * The cause of a `persona-destination-failed` cleared line: `cleared:`, the destination that accepted the
  * post with the setting in force at that post (as `destinationFailedCause`
  * writes it), and the step and code of the failure the episode last named
  * (`was`). Pure.
@@ -480,8 +474,8 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   /**
    * The destination an attempt posts to, with the setting that names it: the
    * one destination rule over the configuration in effect
-   * (`destinations.destinationOf`, b.deo SRI-701) and the setting in force
-   * (`destinationSettingFrom`, b.deo SRI-906), read in the same synchronous
+   * (`destinations.destinationOf`) and the setting in force
+   * (`destinationSettingFrom`), read in the same synchronous
    * step as the resolver's `post` that follows, so they name the destination
    * that post resolves, in the mode in force at that moment.
    */
@@ -523,8 +517,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     else {
       // The destination in force changed while the episode is open: an
       // in-place change of the destination setting, or a confirmed switch
-      // change that put the other mode's setting in force (b.av2 SR-7.1,
-      // b.deo SRI-703). Name the setting and value now in force once, in a
+      // change that put the other mode's setting in force. Name the setting and value now in force once, in a
       // fresh opening line.
       if (!entry.episode.named.has(namedKey(at))) nameDestination(entry, entry.episode, persona, at, result)
       scheduleRetry(entry, result)

@@ -1953,7 +1953,7 @@ fifo_stub() {
     exec {FIFO_FD}> "${fifo}"
 }
 
-# b.omv SR-13.6: exact main-user receipt, with meaningful LFs retained.
+# exact main-user receipt, with meaningful LFs retained.
 stub_user_receipt_matches() {
     jq -se --arg text "$2" '
         [.[] | select(.type == "user")] as $users |
@@ -3585,7 +3585,7 @@ leg_tmux_server_steps() {
 # Run
 # ---------------------------------------------------------------------------
 
-# b.omv SR-14.1: counted fault contract, exercised in this one container check.
+# counted fault contract, exercised in this one container check.
 # This tiny binary is an input fixture: no real agent or alternate store is started.
 leg_real_fault_contract() {
     local dir="${SCENARIO_ROOT}/fault-controls" shim faults n pid pids=() rc start elapsed
@@ -3774,7 +3774,7 @@ for leg in "${LEGS[@]}"; do
     "leg_${leg}"
 done
 
-# The closing assertions (b.jg5 SRJ-1401), met by the live start's own lines.
+# The closing assertions, met by the live start's own lines.
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

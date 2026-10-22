@@ -202,7 +202,7 @@ afterEach(async () => {
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011, SRJ-115 through the recovery harness (its lost-message
+// through the recovery harness (its lost-message
 // driver, bound as main() binds it): the routing's row read is the one
 // liveness adapter's `status` of P's own instance, made outside any launch or
 // recovery attempt. Nothing in flight: one `status` call; a spawn held open
@@ -237,11 +237,11 @@ function expectOnlyThePendingOnlyWatch(h: RecoveryHarness, key: string, pendingR
   expect(h.clock.pendingCount()).toBe(1)
 }
 
-describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness adapter\'s one `status`, outside any attempt', () => {
+describe('through the recovery harness: the read is the liveness adapter\'s one `status`, outside any attempt', () => {
 
-  // The launch leaves its pending-only watch (b.jg5 SRJ-301, SRJ-409); the
+  // The launch leaves its pending-only watch; the
   // cap stop over a row still `pending` arms it once more, the teardown stop
-  // and a stop on a live row never do (b.jg5 SRJ-404).
+  // and a stop on a live row never do.
 
   test('with `session_restart_delay` above 0, a routing read that fails reports starting now; the restart path\'s own read then finds the row `pending` and spawns nothing', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
@@ -263,7 +263,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
   test.each<[string, () => Error, OutageClass, string]>([
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), 'ad-config-malformed', UNAVAILABLE_RETRY_CAUSE_CONFIG],
-  ])('AC 68: a read answering %s raises %s, which this message reports as not answering; no restart is asked for, and the retry timer is armed as from any verb', async (_label, make, flag, cause) => {
+  ])('a read answering %s raises %s, which this message reports as not answering; no restart is asked for, and the retry timer is armed as from any verb', async (_label, make, flag, cause) => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key, other] = h.keys as [string, string]
     h.script({ statusError: make() })
@@ -285,7 +285,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
   test.each([
     ...unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', 'a wrapped UnknownError', 'a plain Error'),
     ...unavailableForms(['ErrUnknownErrorName', 'an unknown error name']),
-  ])('SRJ-1011: a read answering %s (UNAVAILABLE) raises nothing, arms no retry timer, starts no tmux-unresponsive condition and leaves state 6 out', async (_label, make) => {
+  ])('a read answering %s (UNAVAILABLE) raises nothing, arms no retry timer, starts no tmux-unresponsive condition and leaves state 6 out', async (_label, make) => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ statusError: make('status') })
@@ -298,7 +298,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
   test.each<[string, () => Error]>([
     ['ErrInternal with no recognised phrase', () => errInternal()],
     ['ErrSchemaMismatch', () => errSchemaMismatch()],
-  ])('SRJ-1011, hatch A2: a read answering %s (UNCLASSIFIED) arms no retry timer, opens no unclassified-error episode and leaves state 6 out', async (_label, make) => {
+  ])(', hatch A2: a read answering %s (UNCLASSIFIED) arms no retry timer, opens no unclassified-error episode and leaves state 6 out', async (_label, make) => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ statusError: make() })
@@ -308,7 +308,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     expectNothingRaisedOrArmed(h, key)
   })
 
-  test('SRJ-1011, SRJ-115, hatch A2: a read answering ErrSystemInstallDisappeared raises ad-unreachable and reads unknown: state 6 is left out, nothing is armed and no episode opens', async () => {
+  test(', hatch A2: a read answering ErrSystemInstallDisappeared raises ad-unreachable and reads unknown: state 6 is left out, nothing is armed and no episode opens', async () => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ statusError: errSystemInstallDisappeared('status') })
@@ -324,7 +324,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-807 at the lost-message read (SRJ-115, SRJ-1011): the routing's
+// at the lost-message read: the routing's
 // one row read is the liveness adapter's `status`, whose own-row step clears
 // a retired key's entry, so an item accepted for P whose key is recorded with
 // its mark set, its row read live other than `pending`, clears P's entry
@@ -335,7 +335,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
 // entry shows the read clears no other key's.
 // ===========================================================================
 
-describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on its row read live other than pending with its mark set, and reports as before', () => {
+describe('the lost-message read clears a retired key\'s entry on its row read live other than pending with its mark set, and reports as before', () => {
   const SEED: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
   /** A recovery harness whose record holds every persona's key with its mark set. */
   const makeMarkedRecovery = () => makeRecovery({ retiredKeys: (keys) => Object.fromEntries(keys.map((key) => [key, SEED])) })
@@ -374,7 +374,7 @@ describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-805 at the lost-message trigger: an item accepted for P whose key
+// at the lost-message trigger: an item accepted for P whose key
 // is recorded as retired, with no mark, asks for P's human-triggered restart
 // as for any persona; that restart never resumes P and never types into its
 // old life. With P's row `ended`, its launch is one reuse of P's own id; with
@@ -385,7 +385,7 @@ describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on 
 // the asked-for restart runs.
 // ===========================================================================
 
-describe('b.jg5 SRJ-805: an item accepted for a retired key asks for a restart that never resumes it or types into its old life', () => {
+describe('an item accepted for a retired key asks for a restart that never resumes it or types into its old life', () => {
   test('P\'s row ended with a session id: the message reports starting now and asks for P\'s restart, whose launch is one reuse of cscb_<key>, no resume or keystroke; fresh-retired, with P\'s mark set', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S, resumeEnabled: true })
     const [key] = h.keys as [string]
@@ -433,7 +433,7 @@ describe('b.jg5 SRJ-805: an item accepted for a retired key asks for a restart t
 })
 
 // ===========================================================================
-// b.jg5 SRJ-409, SRJ-411 at the lost-message trigger (hatch note E22): a
+// at the lost-message trigger (design note ): a
 // message lost for P asks for P's restart, whose own liveness read finds P's
 // row `pending` and hands it to the deferral, bound as main() binds it over
 // the harness's applied persona; the deferral reads the row once (`get`). A
@@ -448,7 +448,7 @@ describe('b.jg5 SRJ-805: an item accepted for a retired key asks for a restart t
 // so the asked-for restart runs.
 // ===========================================================================
 
-describe('b.jg5 SRJ-409, SRJ-411: an item accepted for P whose restart reads P\'s row pending', () => {
+describe('an item accepted for P whose restart reads P\'s row pending', () => {
   /** A harness whose routing read of P fails and whose restart read finds P's row `pending`; P's `get`s answer `row`, then `missing`. */
   function build(row: (h: RecoveryHarness, key: string) => CannedGetResult, retired = false): { h: RecoveryHarness; key: string; ref: string } {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
@@ -511,7 +511,7 @@ async function afterSequenceKillFailed(options: RecoveryHarnessOptions = {}): Pr
   return { h, key, readRow: () => { rowReadsUntilSpawn(h, 'ended'); h.script({ killError: undefined }) } }
 }
 
-describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert reports kill failed, through the real routing', () => {
+describe('state 4: an item accepted after the kill-failure alert reports kill failed, through the real routing', () => {
   /** P's launch meeting its row read `waiting` in another directory, the step-1 kill of the sequence it starts answering `kills` in order; the sequence is driven to its end. */
   async function sequenceKill(h: RecoveryHarness, key: string, ...kills: Error[]): Promise<void> {
     scriptLiveRowElsewhere(h, key, { killQueue: kills.map((err) => cannedErr(err)) })
@@ -568,7 +568,7 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
     expect(h.killFailureOpen(key)).toBe(true)
 
     // The retry's liveness read is the real adapter's: P's row reads `ended`,
-    // which ends the episode, and no kill is sent for it (b.jg5 SRJ-110, SRJ-314).
+    // which ends the episode, and no kill is sent for it.
     readRow()
     await retryNow(h, key)
 
@@ -580,7 +580,7 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held
+// state 3, an item accepted while P is held
 // on ErrInvalidFlags reports `cannot-launch`
 //
 // Through the recovery harness's lost-message driver, whose held-on-invalid-
@@ -593,7 +593,7 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
 // and wordings come from src/lost-message.ts (`expectLostMessageReports`).
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held on ErrInvalidFlags reports cannot launch, through the real routing', () => {
+describe('state 3, an item accepted while P is held on ErrInvalidFlags reports cannot launch, through the real routing', () => {
   test('P held through a reuse: a queued Slack item reports cannot launch with its wording; no restart is asked for, scheduled or launched, and no stub call is made for P', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
@@ -658,7 +658,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held on E
 })
 
 // ===========================================================================
-// b.jg5 SRJ-706, SRJ-1011 (E21 T2): an item accepted while P's live-row
+// an item accepted while P's live-row
 // sequence runs reports `restarting`
 //
 // Through the recovery harness's lost-message driver, whose sequence/wait
@@ -671,7 +671,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held on E
 // ended the message is decided as before, with the one read.
 // ===========================================================================
 
-describe('b.jg5 SRJ-706, SRJ-1011: an item accepted while P\'s live-row sequence runs reports restarting, with no status read and no restart, through the real routing', () => {
+describe('an item accepted while P\'s live-row sequence runs reports restarting, with no status read and no restart, through the real routing', () => {
   /** Release P's held run with its row placed in `ids` and drive the sequence to its end (its next `get` reads the row missing). */
   async function endHeldSequence(h: RecoveryHarness, key: string, hold: FindMissingHold, outcome: Promise<unknown>): Promise<void> {
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
@@ -735,7 +735,7 @@ describe('b.jg5 SRJ-706, SRJ-1011: an item accepted while P\'s live-row sequence
     const hold = holdFindMissing(h.stub.client)
     ownRowsLiveThenMissing(h)
     const run = await startSequenceHeldAtRun(h, key, hold)
-    // Another path's own-row read latches P (SRJ-513); the sequence still runs until its run returns.
+    // Another path's own-row read latches P; the sequence still runs until its run returns.
     h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
     await readPersonaRowState(key)
     expect([h.latch.isLatched(key), h.sequenceRunning(key)]).toEqual([true, true])
@@ -747,7 +747,7 @@ describe('b.jg5 SRJ-706, SRJ-1011: an item accepted while P\'s live-row sequence
 })
 
 // ===========================================================================
-// Not up (b.av2 SR-6.4; regression guard for bug b.g57) — a message can
+// Not up (regression guard for) — a message can
 // still reach a persona whose bring-up outcome is not up: one that stopped
 // being up while the message was being handled, or the old half of a
 // destructive modify after its bring-up was cancelled and before its
@@ -762,7 +762,7 @@ describe('b.jg5 SRJ-706, SRJ-1011: an item accepted while P\'s live-row sequence
 
 describe('not up: a queued Slack item for a persona that is not up starts no restart', () => {
   test.each(['no session'] as const)(
-    'b.g57 REGRESSION: %s, alpha not up while its connection still delivers: three messages stay queued with no notice, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
+    'REGRESSION: %s, alpha not up while its connection still delivers: three messages stay queued with no notice, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
     async (branch) => {
       const h = makeHarness({ branch, notUp: ['alpha'] })
       // The relaunch gate over the same bring-up state: before the fix every
@@ -839,7 +839,7 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
   })
 
   // An up persona passing the check to "starting now" is the beta side of the
-  // two-persona case above; the AC 26 state table (no up check at all) fails
+  // two-persona case above; the state table (no up check at all) fails
   // if an absent check counted as not up. This one row shows an up persona
   // still falls through to a later restart-guard state.
   test('alpha up through the real up check and at the restart-failure cap: the item stays queued and nothing launches', async () => {
@@ -859,8 +859,8 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
 // Required behavior 1 — a qualifying message with no live session recovers P
 // ===========================================================================
 
-describe('b.kvq (1) a qualifying message for a sessionless persona triggers recovery', () => {
-  // REGRESSION GUARD: before b.kvq, the drop branch never called
+describe('(1) a qualifying message for a sessionless persona triggers recovery', () => {
+  // REGRESSION GUARD: before, the drop branch never called
   // scheduleRestart for a sessionless recipient, so no launch was ever
   // scheduled and nothing recovered from a human typing to the persona.
   test('REGRESSION: a message in the persona\'s SECOND channel schedules a launch keyed to the persona, not the source channel, in its working directory, and it fires; the notice goes to the destination', async () => {
@@ -932,7 +932,7 @@ describe('b.kvq (1) a qualifying message for a sessionless persona triggers reco
 // Required behavior 2 — a message that does not qualify for P triggers nothing
 // ===========================================================================
 
-describe('b.kvq (2) a message the persona does not get triggers nothing and raises no notice, with no session anywhere', () => {
+describe('(2) a message the persona does not get triggers nothing and raises no notice, with no session anywhere', () => {
   test.each<[string, 'two' | 'none', (h: Harness) => SlackEvent, 'alpha' | 'beta' | 'none']>([
     ['a channel no persona lists', 'two', () => messageIn(UNCLAIMED), 'alpha'],
     ['an unmentioned message in a `mentions` channel', 'two', () => messageIn(BETA_MENTIONS), 'beta'],
@@ -962,11 +962,11 @@ describe('b.kvq (2) a message the persona does not get triggers nothing and rais
 // Required behavior 3 — a second message while restarting does not stack.
 // While the first message's restart timer is pending, the second reports
 // "restarting"; once its launch is in flight (held open), the persona's row
-// reads `pending`, so the second reports "starting" (b.jg5 SRJ-1011 state 6),
+// reads `pending`, so the second reports "starting" (state 6),
 // never "starting now", and stacks no launch.
 // ===========================================================================
 
-describe('b.kvq (3) second message while restart pending/active does not stack a launch', () => {
+describe('(3) second message while restart pending/active does not stack a launch', () => {
   test('two messages in quick succession: a "starting now" notice, then, while the restart timer is pending, a "restarting" notice', async () => {
     // SLOW delay keeps the first restart pending across the second message.
     const h = makeHarness({ restartDelayS: SLOW_DELAY_S })
@@ -1005,15 +1005,15 @@ describe('b.kvq (3) second message while restart pending/active does not stack a
 })
 
 // ===========================================================================
-// b.av2 SR-4.1 — a duplicate of a queued Slack item triggers nothing more.
+// a duplicate of a queued Slack item triggers nothing more.
 // A channel mention reaches the persona as a `message` and an `app_mention`
 // with the same (channel, ts), and Slack may redeliver either. The persona's
 // dedupe store sits before the lost-message branch, so the pair and any later
 // redelivery give one notice and one recovery.
 // ===========================================================================
 
-describe('b.kvq x SR-4.1 a duplicated mention for a sessionless persona recovers once', () => {
-  test('AC 26: a `message` then `app_mention` of the same mention: one queued item and one launch; a redelivery after the launch adds nothing', async () => {
+describe('x a duplicated mention for a sessionless persona recovers once', () => {
+  test('a `message` then `app_mention` of the same mention: one queued item and one launch; a redelivery after the launch adds nothing', async () => {
     const h = makeHarness()
     const text = `${mentionText(h.p('alpha').stub.identity.botUserId)} are you there? ${MESSAGE_MARKER}`
     const message = makeChannelMessage({ channel: SHARED, text })
@@ -1050,7 +1050,7 @@ describe('b.kvq x SR-4.1 a duplicated mention for a sessionless persona recovers
 // Required behavior 5 — auto-restart disabled (session_restart_delay 0)
 // ===========================================================================
 
-describe('b.kvq (5) auto-restart disabled (delay 0) path', () => {
+describe('(5) auto-restart disabled (delay 0) path', () => {
   test('the disabled branch schedules no launch, even with restart.ts itself able to launch', async () => {
     // The restart deps report a nonzero delay, so had the branch called
     // scheduleRestart anyway, the launch would really fire.
@@ -1079,14 +1079,14 @@ describe('b.kvq (5) auto-restart disabled (delay 0) path', () => {
 })
 
 // ===========================================================================
-// b.av2 SR-8.6 — a key outside the applied set is never restarted. The drop
+// a key outside the applied set is never restarted. The drop
 // branch reaches the guard through `scheduleRestart`, whose `canRestart` is
 // the real relaunch gate; the gate's applied check (`isApplied`) refuses a
 // removed key even while its connection serves and its bring-up outcome is
-// `up`. RestartDeps is unchanged. The notice is E8's and not asserted here.
+// `up`. RestartDeps is unchanged. The notice is and not asserted here.
 // ===========================================================================
 
-describe('SR-8.6: a message dropped for a key outside the applied set arms no restart timer', () => {
+describe('a message dropped for a key outside the applied set arms no restart timer', () => {
   test('alpha removed from the applied set (still up and serving): a queued Slack item schedules nothing and launches nothing; once applied again, a queued Slack item arms the timer and launches', async () => {
     const h = makeHarness()
     const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0APPLIED', botId: 'B0APPLIED' } }
@@ -1127,7 +1127,7 @@ describe('SR-8.6: a message dropped for a key outside the applied set arms no re
 // it here is a legitimate observation seam.
 // ===========================================================================
 
-describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
+describe('(6) humanTrigger delay clamp (DOWN only)', () => {
   const realSetTimeout = globalThis.setTimeout
   let capturedDelays: number[] = []
 
@@ -1201,7 +1201,7 @@ describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
 // `notify` wiring is pinned in tests/server-startup-wiring.test.ts.
 // ===========================================================================
 
-describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
+describe('(7) server.ts holds no copy of the lost-message branch', () => {
   const SERVER_SRC = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8')
   const SERVER_CODE = stripComments(SERVER_SRC)
 
@@ -1230,13 +1230,13 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
     expect(indicesOf(/\.receive\s*\(/g, SERVER_CODE)).toEqual([])
   })
 
-  test('server recovery has no standalone stream probe (b.omv SR-9)', () => {
+  test('server recovery has no standalone stream probe', () => {
     expect(SERVER_CODE).not.toMatch(/\bhasSessionStream\b/)
   })
 })
 
 // ===========================================================================
-// b.jg5 SRJ-812, SRJ-1011 state 4 (E27 T2; AC 54; hatch note E15): a message
+// state 4 (design note ): a message
 // lost while Q waits on an old-life hold
 //
 // Through the recovery harness's lost-message driver, whose kill-failed input
@@ -1250,7 +1250,7 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
 // a teardown's or the start sweep's), `kill-failed` until the hold ends;
 // never after a survivor version, a CONFLICT or a `kill_sent: false` success.
 // The restart clause ("brings the persona up only once the hold ends") is
-// T3's case. States and wordings come from src/lost-message.ts
+// case. States and wordings come from src/lost-message.ts
 // (`expectLostMessageReports`); every message raises one notice for Q and
 // the wait posts nothing.
 // ===========================================================================
@@ -1280,7 +1280,7 @@ function expectOnlyQQueued(h: RecoveryHarness, q: string, messages: number): voi
   expect(h.notices).toEqual([])
 }
 
-describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): an item accepted while Q waits on an old-life hold, before any kill of the old key failed: today\'s states, and restarting while a wait step runs', () => {
+describe('an item accepted while Q waits on an old-life hold, before any kill of the old key failed: today\'s states, and restarting while a wait step runs', () => {
   test.each(Q_HOLDS)('the hold %s: no wait step, today\'s state with Q\'s one read; a wait step running (its run held), restarting with no read, Q\'s own row read pending or not; once the run lists the row in ids and the hold ends, today\'s state again', async (_label, begin) => {
     const h = makeRecovery()
     const [q, b] = h.keys as [string, string]
@@ -1305,7 +1305,7 @@ describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): an item accepted while Q waits on an 
   })
 })
 
-describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill failed, an item accepted for a persona waiting on the hold reports kill failed, until the hold ends', () => {
+describe('state 4: once the old key\'s kill failed, an item accepted for a persona waiting on the hold reports kill failed, until the hold ends', () => {
   test.each<[string, (h: RecoveryHarness, q: string, b: string) => Promise<string>]>([
     ['the wait\'s own kill (ErrTmuxKillFailed after its tries)', async (h, q, b) => {
       const id = await Q_HOLDS[0]![1](h, q, b)
@@ -1360,14 +1360,14 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
 })
 
 // ===========================================================================
-// b.jg5 SRJ-812's restart clause, SRJ-810 (E27 T3; AC 54): a restart a lost
+// restart clause: a restart a lost
 // message triggers while Q waits on an old-life hold brings Q up only once
 // the hold ends, at once
 //
 // Through the recovery harness's lost-message driver, at a short
 // `session_restart_delay` so the asked-for restart runs. Q's row is absent,
 // no wait step runs and no kill of the old key failed, so the message reports
-// starting now (SRJ-812, hatch A3: the notice is kept) and asks for Q's
+// starting now (design A3: the notice is kept) and asks for Q's
 // restart; the restart work's old-life hook holds Q: no launch, the wait
 // started (its first run held) and Q's timer armed. Once the run lists the
 // old row in its ids the hold ends and the end-retry observer runs Q's retry
@@ -1375,7 +1375,7 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
 // destination; B's stub sees nothing.
 // ===========================================================================
 
-describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a queued Slack item triggers while Q waits on a hold launches nothing, and Q comes up only once the hold ends, at once', () => {
+describe('a restart a queued Slack item triggers while Q waits on a hold launches nothing, and Q comes up only once the hold ends, at once', () => {
   test.each(Q_HOLDS)('the hold %s: the message reports starting now and asks for Q\'s restart, which launches nothing, starts the wait and arms Q\'s timer; the hold\'s end retries Q at once and Q comes up; no message-lost post', async (_label, begin) => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [q, b] = h.keys as [string, string]
@@ -1533,12 +1533,11 @@ function expectBetaUntouched(h: Harness): void {
 }
 
 /**
- * The properties every lost-message notice has: it names alpha (b.av2
- * SR-7.2), says a message was lost, names `sender` with no mention, identifies
+ * The properties every lost-message notice has: it names alpha, says a message was lost, names `sender` with no mention, identifies
  * `state` and no other, and no Slack call anywhere carries the message text.
  */
 /**
- * AC 26: the lost message made exactly one Slack post, alpha's notice, at its
+ * the lost message made exactly one Slack post, alpha's notice, at its
  * destination (for `dm`, the conversation `conversations.open` returned for
  * the contact), through alpha's own client with no username or icon override,
  * and nothing in `source`. Beta made no Slack call.
@@ -1575,7 +1574,7 @@ const INPUTS = {
     set: (h, key) => { h.notUp.add(key) },
     clear: (h, key) => { h.notUp.delete(key) },
   },
-  // E13's set entry with a real CONFLICT error; `forget` is its silent drop.
+  // set entry with a real CONFLICT error; `forget` is its silent drop.
   'latched on a CONFLICT': {
     set: (h, key) => {
       expect(h.latch.setFromConflict(key, conflictForPersona(key), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW })).toBeDefined()
@@ -1583,7 +1582,7 @@ const INPUTS = {
     },
     clear: (h, key) => { expect(h.latch.forget(key)).toBe(true) },
   },
-  // The hold's set, as a reuse spawn's ErrInvalidFlags sets it (SRJ-207); `forget` is its silent end.
+  // The hold's set, as a reuse spawn's ErrInvalidFlags sets it; `forget` is its silent end.
   'held on ErrInvalidFlags': {
     set: (h, key) => {
       expect(h.invalidFlagsHold.set(key)).toBe(true)
@@ -1595,7 +1594,7 @@ const INPUTS = {
     set: (h, key) => { h.killFailed.add(key) },
     clear: (h, key) => { h.killFailed.delete(key) },
   },
-  // E10's entry: a refusal from a tmux-touching verb starts the condition; a
+  // entry: a refusal from a tmux-touching verb starts the condition; a
   // health tick that reads the row live ends it.
   'tmux-unresponsive holds': {
     set: (h, key) => {
@@ -1603,7 +1602,7 @@ const INPUTS = {
     },
     clear: (h, key) => { expect(h.tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK)).not.toBe('not-holding') },
   },
-  // E11's one raise entry and the real clear.
+  // one raise entry and the real clear.
   'tmux-unavailable raised': {
     opts: { outageState: true },
     set: (_h, key) => {
@@ -1615,7 +1614,7 @@ const INPUTS = {
       expect(getOutageFlags(key).size).toBe(0)
     },
   },
-  // E12's one raise entry and the real clear.
+  // one raise entry and the real clear.
   'ad-config-malformed raised': {
     opts: { outageState: true },
     set: (_h, key) => {
@@ -1650,7 +1649,7 @@ const INPUTS = {
 
 type InputName = keyof typeof INPUTS
 
-/** State 5's three sources (b.jg5 SRJ-1011). */
+/** State 5's three sources. */
 const STATE_5_SOURCES = ['tmux-unresponsive holds', 'tmux-unavailable raised', 'ad-config-malformed raised'] as const satisfies readonly InputName[]
 
 /** The harness options of every named input together. */
@@ -1668,11 +1667,11 @@ function arrangeState(h: Harness, state: LostMessageState): Promise<void> | void
   return LOST_STATE_SETUPS[state].arrange(h, h.alpha.key, h.alpha.working_directory)
 }
 
-describe('AC 26: recovery selects the recovery state', () => {
+describe('recovery selects the recovery state', () => {
   const table: [LostMessageState, Destination][] = LOST_MESSAGE_STATES.flatMap((s) => (['channel', 'dm'] as const).map((d): [LostMessageState, Destination] => [s, d]))
 
   test.each(table)(
-    'AC 26, AC 68: state %s, a %s destination: stores one item without a source or destination notice; a restart is asked for only when starting now',
+    'state %s, a %s destination: stores one item without a source or destination notice; a restart is asked for only when starting now',
     async (state, destination) => {
       const setup = LOST_STATE_SETUPS[state]
       const h = makeHarness({ destination, ...setup.opts })
@@ -1693,21 +1692,21 @@ describe('AC 26: recovery selects the recovery state', () => {
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 5 (hatch notes E11, E12) — an item accepted while P is
+// state 5 (design notes ) — an item accepted while P is
 // not answering, from each of its three sources: its `tmux-unresponsive`
-// condition holding (E10), its `tmux-unavailable` outage raised (SRJ-311) or
-// its `ad-config-malformed` outage raised (SRJ-316). No restart is asked for,
+// condition holding , its `tmux-unavailable` outage raised or
+// its `ad-config-malformed` outage raised. No restart is asked for,
 // scheduled or launched, and the source's own notice (the outage onset) goes
 // to the outage state's sink, not to Slack. After the source's real end or
 // clear, the next lost message starts a restart. An open unclassified-error
 // episode, or another outage class, is not a source.
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 state 5: an item accepted while the persona is not answering starts no restart', () => {
+describe('state 5: an item accepted while the persona is not answering starts no restart', () => {
   const SOURCES: [typeof STATE_5_SOURCES[number]][] = STATE_5_SOURCES.map((source) => [source])
 
   test.each(SOURCES)(
-    'AC 68: %s: the notice says not answering and no restart is asked for or launched; after its real end the next lost message starts now with one launch',
+    '%s: the notice says not answering and no restart is asked for or launched; after its real end the next lost message starts now with one launch',
     async (source) => {
       const h = makeHarness(inputOpts(source))
       INPUTS[source].set(h, h.alpha.key)
@@ -1769,13 +1768,13 @@ describe('b.jg5 SRJ-1011 state 5: an item accepted while the persona is not answ
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 as amended (orchestrator ruling): "A persona whose retry
+// (orchestrator ruling): "A persona whose retry
 // timer is stopped at the restart cap reports restart-limit-reached, never
 // state 5's 'CSCB is retrying', whatever condition or flag is raised. In
-// SRJ-1011's order, state 5 applies only while P's retry timer is armed."
+// order, state 5 applies only while P's retry timer is armed."
 // Through the real routing, with the restart delay above 0 (so auto-restart
 // disabled does not come first) and the row read bound (answering live, a
-// restart's input): alpha at the restart cap (SRJ-305, the real backoff
+// restart's input): alpha at the restart cap (the real backoff
 // state) with each state-5 source, its retry timer still armed (the window
 // the cap closes: that timer stops at its next retry) or none, reports
 // restart limit reached; no restart is asked for, scheduled or launched,
@@ -1787,7 +1786,7 @@ describe('b.jg5 SRJ-1011 state 5: an item accepted while the persona is not answ
 // next state that applies (here starting now, with its read and restart).
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer is armed, and never at the restart cap', () => {
+describe('as amended: state 5 applies only while the retry timer is armed, and never at the restart cap', () => {
   /** Alpha under `source`, its retry timer armed first or not, the arm member bound and the row read answering live. */
   function gateHarness(source: typeof STATE_5_SOURCES[number], armed: boolean): Harness {
     const h = makeHarness({
@@ -1805,7 +1804,7 @@ describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer 
   ))
 
   test.each(CAPPED)(
-    'AC 68: alpha at the restart cap with %s, its retry timer %s: the notice says restart limit reached, never not answering; no restart is asked for, scheduled or launched, and no retry timer is asked for or armed',
+    'alpha at the restart cap with %s, its retry timer %s: the notice says restart limit reached, never not answering; no restart is asked for, scheduled or launched, and no retry timer is asked for or armed',
     async (source, _timer, armed) => {
       const h = gateHarness(source, armed)
       putAtRestartCap(h.alpha.key)
@@ -1854,13 +1853,13 @@ describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 2 (hatch note E13; SRJ-502) — an item accepted while P
-// is latched reads E13's latch instance: a CONFLICT and E13's two declared
+// state 2 (design note ) — an item accepted while P
+// is latched reads latch instance: a CONFLICT and two declared
 // hold cases each give `held-for-human`, and no restart. After the latch's
 // silent forget, the next lost message starts a restart.
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 state 2: an item accepted while the persona is latched starts no restart', () => {
+describe('state 2: an item accepted while the persona is latched starts no restart', () => {
   const conflictRow = CONFLICT_CASE_ROWS.find((row) => row.latchCase === LATCH_CASE_LEFTOVER)!
   const LATCHES: [string, (h: Harness) => void][] = [
     [
@@ -1874,7 +1873,7 @@ describe('b.jg5 SRJ-1011 state 2: an item accepted while the persona is latched 
   ]
 
   test.each(LATCHES)(
-    'AC 68, SRJ-502: latched on %s: the notice says held for a human, no restart is asked for or launched and the latch posts nothing; after the latch is forgotten the next lost message starts now',
+    'latched on %s: the notice says held for a human, no restart is asked for or launched and the latch posts nothing; after the latch is forgotten the next lost message starts now',
     async (_label, latch) => {
       const h = makeHarness()
       latch(h)
@@ -1918,14 +1917,14 @@ describe('b.jg5 SRJ-1011 state 2: an item accepted while the persona is latched 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 order, through the real routing, as adjacent pairs: with
+// order, through the real routing, as adjacent pairs: with
 // both inputs set, the earlier state is reported; with the earlier input
 // cleared, the later one. The live-row sequence or old-life wait input
-// answers `restarting` before a launch running (Task ruling; SRJ-706). No
+// answers `restarting` before a launch running (section ruling). No
 // message asks for, schedules or launches a restart.
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
+describe('the first state that applies is reported', () => {
   test.each<[InputName, InputName, LostMessageState, LostMessageState]>([
     ['not up', 'latched on a CONFLICT', 'not-up', 'held-for-human'],
     ['latched on a CONFLICT', 'held on ErrInvalidFlags', 'held-for-human', 'cannot-launch'],
@@ -1971,14 +1970,14 @@ describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 6 by the read (E15 T2) — with states 1 to 5 clear and
+// state 6 by the read — with states 1 to 5 clear and
 // nothing in flight for P, the routing makes one row read of P (the
 // harness's scripted `readRowLiveness`). A `pending` answer is state 6, which
 // comes before every restart guard: no restart is asked for, scheduled or
-// launched (SRJ-1501; AC 68, state 6 from the read). A `live` reading or no
+// launched (state 6 from the read). A `live` reading or no
 // row (`dead`) is not `pending`: the state is the next that applies, here
-// starting now, AC 68's control. A launch running is state 6 with no read
-// (the AC 68 describe); a dialog approver running, likewise (the order pairs
+// starting now control. A launch running is state 6 with no read
+// (the describe); a dialog approver running, likewise (the order pairs
 // above, and the read gate in tests/persona-routing.test.ts).
 // ===========================================================================
 
@@ -1988,18 +1987,18 @@ function expectNoFakeTimerLeft(h: Harness): void {
   expect(h.episodesClock.pendingCount()).toBe(0)
 }
 
-/** States 2 to 6 of b.jg5 SRJ-1011, where no human-triggered restart fires (SRJ-1501). */
+/** States 2 to 6 of the contract, where no human-triggered restart fires. */
 const NO_RESTART_STATES = LOST_MESSAGE_STATES.slice(
   LOST_MESSAGE_STATES.indexOf('held-for-human'),
   LOST_MESSAGE_STATES.indexOf('session-starting') + 1,
 )
 
-describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports session starting and starts no restart', () => {
+describe('state 6 by the read: a row reading `pending` reports session starting and starts no restart', () => {
   test.each<[string, InputName | undefined, boolean]>([
     ['nothing else applies', undefined, false],
     ['a restart timer is pending (state 6 comes before restarting)', 'a pending restart', true],
     ['auto-restart is disabled (state 6 comes before auto-restart disabled)', 'auto-restart disabled', false],
-  ])('AC 68: %s: one read of alpha, then the session-starting notice; no restart is asked for, scheduled or launched', async (_label, input, pending) => {
+  ])('%s: one read of alpha, then the session-starting notice; no restart is asked for, scheduled or launched', async (_label, input, pending) => {
     const h = makeHarness({ ...(input === undefined ? {} : inputOpts(input)), rowRead: { alpha: LIVENESS_READING_PENDING } })
     if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
     const asksBefore = h.restartAsks.length
@@ -2018,7 +2017,7 @@ describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports se
   test.each<[string, RowReadAnswer]>([
     ['a live reading', LIVENESS_READING_LIVE],
     ['no row (the dead reading)', LIVENESS_READING_DEAD],
-  ])('AC 68 control: %s is not `pending`: one read, then starting now, which asks the relaunch gate once and launches once', async (_label, answer) => {
+  ])('control: %s is not `pending`: one read, then starting now, which asks the relaunch gate once and launches once', async (_label, answer) => {
     const h = makeHarness({ rowRead: { alpha: answer } })
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
@@ -2033,13 +2032,13 @@ describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports se
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 — a failed read (an `unknown` reading, or a read that
+// a failed read (an `unknown` reading, or a read that
 // rejects) is never taken for `pending`: state 6 is left out and the state
 // is the next that applies. A rejection is caught and logged once, naming the
 // persona, its message redacted (the teardown leak check covers the rest).
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
+describe('a failed row read leaves state 6 out', () => {
   const FAILED: [string, RowReadAnswer][] = [
     ['an unknown reading', LIVENESS_READING_UNKNOWN],
     ['a read that rejects', ROW_READ_REJECTS],
@@ -2081,17 +2080,17 @@ describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 (Task ruling: decide again after the read) — states 1 to 5
+// (section ruling: decide again after the read) — states 1 to 5
 // are decided again over fresh answers once the read settles, so a latch or
 // an outage that begins while the read runs gives state 2 or 5, whatever
 // the read answers. (A live-row sequence or old-life wait step running for
-// P answers `restarting` with no read, SRJ-706: the read gate in
+// P answers `restarting` with no read, the read gate in
 // tests/persona-routing.test.ts.) Two messages lost together,
 // both reads in flight at once, schedule one restart: nothing is awaited
 // between the final decision and `scheduleRestart`.
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
+describe('the state is decided again after the read', () => {
   const DURING: [string, InputName, LostMessageState][] = [
     ['alpha is latched', 'latched on a CONFLICT', 'held-for-human'],
     ['alpha\'s tmux-unavailable outage is raised', 'tmux-unavailable raised', 'not-answering'],
@@ -2103,7 +2102,7 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
     ),
   )
 
-  test.each(table)('AC 68: %s while the read runs, which then answers %s: recovery selects the earlier state, and no restart is asked for, scheduled or launched', async (_label, _answerName, input, state, answer) => {
+  test.each(table)('%s while the read runs, which then answers %s: recovery selects the earlier state, and no restart is asked for, scheduled or launched', async (_label, _answerName, input, state, answer) => {
     const h = makeHarness({
       ...inputOpts(input),
       rowRead: { alpha: { answer, during: (hh, key) => INPUTS[input].set(hh as Harness, key) } },

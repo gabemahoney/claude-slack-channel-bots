@@ -2,13 +2,13 @@
 /**
  * scripts/install-check.ts — `bun run install-check` entry point.
  *
- * SR-6: standalone diagnostic command. Calls runInstallCheck() once,
+ * standalone diagnostic command. Calls runInstallCheck once,
  * renders the result to stdout (success) or stderr (failure), and exits
  * with the appropriate code.
  *
  * Success (exit 0) prints the OK block (binary, version, the client's
  * minimum). When the binary is below CSCB's Phase 1 floor, the result carries
- * the Phase 1 note (b.jg5 SRJ-212) and the block ends with it: the server
+ * the Phase 1 note and the block ends with it: the server
  * refuses to start on that binary until agent-director Phase 1 is installed,
  * see the switch-over runbook section. A binary that meets the floor prints
  * the block alone. The note line's label is `INSTALL_CHECK_NOTE_LABEL`.
@@ -34,8 +34,8 @@ import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 
 /**
  * The label the OK block's Phase 1 note line starts with, after its indent
- * (b.jg5 SRJ-212). The install skill relays the note found under this label
- * (SRJ-1110).
+ * The install skill relays the note found under this label
+ *
  */
 export const INSTALL_CHECK_NOTE_LABEL = 'note:'
 
@@ -73,7 +73,7 @@ export async function main(): Promise<void> {
   }
 
   let body = renderFailure(result)
-  // SR-6.3: append the manual-skill-install block to every failure class
+  // append the manual-skill-install block to every failure class
   // EXCEPT ad-version-floor-unreadable (the skill can't fix a corrupt AD
   // package; remediation is checking the agent-director npm package
   // installed with CSCB, with the switch-over runbook section).

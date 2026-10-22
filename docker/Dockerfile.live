@@ -23,12 +23,12 @@
 #   the base image predates this tree, and names docker/README.md's "When to
 #   bump the base image version";
 # - real Claude Code (the bot Claudes answer real Slack messages), pinned by
-#   CLAUDE_CODE_VERSION at 2.1.296 for typed delivery (b.omv SR-13.6);
+# CLAUDE_CODE_VERSION at 2.1.296 for typed delivery;
 #   the runner passes no override;
 # - `testuser` with the host's uid/gid, so the mode-600 credentials files the
 #   runner bind-mounts read-only are readable in the container;
 # - the live entrypoint and the testplan's shell helpers and pre-flight
-#   (testplans/b.yko Part 1.3 and "Pre-flight", adapted to the container).
+# (testplans/live-acceptance.md Part 1.3 and "Pre-flight", adapted to the container).
 # The package under test is not in the image: the runner mounts its tarball
 # at /tmp/package.tgz and installs it as a customer would; the install check
 # (ci-live/checks/setup-checks.ts) then checks the agent-director client it

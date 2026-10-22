@@ -1,7 +1,7 @@
 /**
  * test-helpers/host-safe-env.ts — The one way a unit test builds the
  * environment of a child process it starts, and the agent-director checks the
- * `bun test` preload guard shares (b.jg5 SRJ-1301, SRJ-1302, SRJ-1304).
+ * `bun test` preload guard shares.
  *
  * The agent-director client finds its binary at the standard install
  * path under `HOME` (`AGENT_DIRECTOR_INSTALL_PATH`), then as the first file or
@@ -501,15 +501,15 @@ export type PreloadEnvName = (typeof PRELOAD_ENV_NAMES)[number]
  * The XDG configuration directory under a home, relative to it: where
  * `XDG_CONFIG_HOME` points by default, and where the preload guard points it
  * under the new HOME. `src/` puts the server's default state directory under
- * it (bug b.fc4; the crontable's default before that, bug b.avm).
+ * it (the crontable's default before that).
  */
 export const XDG_CONFIG_DIR = '.config'
 
-/** CSCB's directory under the XDG configuration directory, relative to a home: the server's default state directory (bugs b.fc4, b.smv). */
+/** CSCB's directory under the XDG configuration directory, relative to a home: the server's default state directory. */
 export const CSCB_XDG_CONFIG_PATH = join(XDG_CONFIG_DIR, 'claude-slack-channel-bots')
 
 /**
- * The directory under the XDG configuration directory that 0.14.0 and 0.15.0 used (bug b.smv renamed it), relative to
+ * The directory under the XDG configuration directory that 0.14.0 and 0.15.0 used (renamed it), relative to
  * a home. The server moves what it holds to the new default at start and leaves a symbolic link behind, and the CLI
  * still reads it while it holds the only config; a run must reach neither (`holdsSlackState`).
  */
@@ -519,7 +519,7 @@ export const LEGACY_XDG_STATE_DIR_PATH = join(XDG_CONFIG_DIR, 'cscb')
 export const PRELOAD_STATE_DIR_PATH = CSCB_XDG_CONFIG_PATH
 
 /**
- * The server's state directory before bug b.fc4, relative to a home. The
+ * The server's state directory before, relative to a home. The
  * server moves what it holds to the new default at start and leaves a
  * symbolic link behind, and the CLI still reads it while it holds the only
  * config; a run must reach neither (`holdsSlackState`).
@@ -555,7 +555,7 @@ export type PreloadEnvSource = Readonly<PreloadEnv> | Readonly<NodeJS.ProcessEnv
  * - `XDG_CONFIG_HOME`: `<home>/XDG_CONFIG_DIR` (`<home>/.config`). An
  *   inherited one (the operator's own `~/.config`, say) would put the
  *   server's default state directory (`$XDG_CONFIG_HOME/claude-slack-channel-bots` with
- *   `SLACK_STATE_DIR` unset, bug b.fc4) in the real home; unset, it would
+ * `SLACK_STATE_DIR` unset) in the real home; unset, it would
  *   fall back to the launch-time home.
  * `TMUX`, `TMUX_PANE` and `CLAUDE_CONFIG_DIR` are absent (unset):
  * `CLAUDE_CONFIG_DIR` names a Claude configuration directory (a run started
@@ -686,7 +686,7 @@ export const CLAUDE_DIR = '.claude'
  * - `.claude`: Claude's default configuration directory
  *   (`resolveClaudeConfigDir`, the directory the Stop-hook patcher refuses,
  *   the default transcript root in `cozempic.ts`);
- * - `.claude/channels/slack`: the server's state directory before bug b.fc4
+ * - `.claude/channels/slack`: the server's state directory before
  *   (`LEGACY_STATE_DIR_PATH`);
  * - `.claude/projects`: the default JSONL transcript root
  *   (`resolveJsonlRoots`, `resolveJsonlPath`) and the root of the memory Read
@@ -701,7 +701,7 @@ export const CLAUDE_DIR = '.claude'
  *   relative) and, under it, `claude-slack-channel-bots` and its `crontab`:
  *   the server's default state directory with `SLACK_STATE_DIR` unset
  *   (`PRELOAD_STATE_DIR_PATH`), which the start creates and into which it
- *   moves the old defaults' files (bugs b.fc4, b.smv), and the crontable in
+ * moves the old defaults' files, and the crontable in
  *   it; and `cscb` (`LEGACY_XDG_STATE_DIR_PATH`), the directory 0.14.0 and
  *   0.15.0 used.
  */
@@ -846,7 +846,7 @@ export function launchTimeHomes(): string[] {
  *   the server's default state directory), at `<launchHome>/.config/cscb`
  *   (`LEGACY_XDG_STATE_DIR_PATH`, its default in 0.14.0 and 0.15.0) or at
  *   `<launchHome>/.claude/channels/slack` (`LEGACY_STATE_DIR_PATH`, its
- *   default before bug b.fc4), a dangling symlink or an entry that cannot be
+ * default before), a dangling symlink or an entry that cannot be
  *   looked at included;
  * - `derivedPathInRealHome` (passwd home known): one of
  *   `LAUNCH_HOME_DERIVED_PATHS` under `launchHome` resolves to the real home

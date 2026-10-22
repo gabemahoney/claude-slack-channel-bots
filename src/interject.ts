@@ -1,4 +1,4 @@
-/** Durable localhost injection; 200 means stored, before delivery (b.omv SR-4.3). */
+/** Durable localhost injection; 200 means stored, before delivery. */
 import type { Persona } from './config.ts'
 import type { QueueAccept } from './delivery-queue.ts'
 import { renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
@@ -35,7 +35,7 @@ export interface InterjectDeps {
    * unknown (404).
    */
   getPersonaConfig: () => { personas: readonly InterjectPersona[] } | null
-  /** Durable shared injected intake (b.omv SR-4.3). */
+  /** Durable shared injected intake. */
   accept: QueueAccept
   /** Clock in epoch milliseconds for the `ts` meta value. Defaults to `Date.now`. */
   now?: () => number

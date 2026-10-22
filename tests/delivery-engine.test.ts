@@ -2,7 +2,7 @@ import { MCP_SERVER_NAME } from '../src/config.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
 import { refreshDeliveryTranscript } from '../src/session-manager.ts'
-/** b.omv SR-5/6: production executor over a durable queue and real adapters.
+/** production executor over a durable queue and real adapters.
  * Receipt permutations and gate lifecycle live in their
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -195,7 +195,7 @@ async function goneRecovery(options: {
   }
 }
 
-describe('b.acu: AD GONE during durable startup recovery', () => {
+describe('AD GONE during durable startup recovery', () => {
   test.each([0, 60].flatMap(delay => [false, true].map(pending => [delay, pending] as const)))(
     'delay=%s, ordinary restart pending=%s: checked recovery resumes the conversation and drains FIFO', async (delay, pending) => {
       const f = await goneRecovery({ delay, pending })
@@ -801,7 +801,7 @@ describe('durable FIFO and send sequence', () => {
     expect(h.events.filter(e => e.type === 'waiting').some(e => e.reason === ('launch-settle' as string))).toBe(false)
     await delivered(h)
   })
-  test('20 sequential idle-ready messages meet AC76 with autonomous timers across empty queues', async () => {
+  test('20 sequential idle-ready messages meet with autonomous timers across empty queues', async () => {
     const h = await harness(), typing: number[] = [], confirmation: number[] = []
     for (let n = 0; n < 20; n++) {
       // A real idle gap, rather than a permanently nonempty batch, exercises
@@ -821,7 +821,7 @@ describe('durable FIFO and send sequence', () => {
       confirmation.push(h.clock.now() - at)
     }
     const p95 = (values: number[]) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * .95) - 1]!
-    // PRD N2 / AC76: these are latency requirements, independent of retry
+    // contract N2 / these are latency requirements, independent of retry
     // or receipt-wait constants that happen to have similar values.
     expect(p95(typing)).toBeLessThanOrEqual(2000)
     expect(p95(confirmation)).toBeLessThanOrEqual(10000)
@@ -1269,7 +1269,7 @@ describe('rolling load bound and lifecycle', () => {
   })
 })
 
-// b.omv SR-8.6: events distinguish a confirmed part from durable item completion.
+// events distinguish a confirmed part from durable item completion.
 describe('operational delivery events', () => {
   test('failed final append emits neither part nor whole-item completion until the receipt is durable', async () => {
     const h = await harness()

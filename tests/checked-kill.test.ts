@@ -1,7 +1,7 @@
 /**
- * checked-kill.test.ts — a kill's outcome, its class under b.jg5 SRJ-110,
+ * checked-kill.test.ts — a kill's outcome, its class under the contract,
  * whether the caller's next step may run, the one checked kill and its log
- * rendering (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-701, SRJ-703).
+ * rendering (`src/checked-kill.ts`).
  *
  * Every kill goes through the stub client's `kill` (its result, error and
  * queue members and `cannedKillResult`), every error is an instance of its
@@ -11,19 +11,19 @@
  * is a kill failure: an `ErrUnknownErrorName` carrying that name is an
  * UNAVAILABLE value like any other, with no kill-failure description. Only a
  * success (`kill_sent` true, false or absent),
- * `ErrSpawnNotFound` and GONE (SRJ-104: for `kill`, gone is success) pass the
+ * `ErrSpawnNotFound` and GONE (for `kill`, gone is success) pass the
  * predicate, GONE only with no options (every server site); under
- * `goneIsFailure` (the CLI's teardown, SRJ-904) GONE is the GONE non-success
+ * `goneIsFailure` (the CLI's teardown) GONE is the GONE non-success
  * and every other answer gives the same outcome as with no options; each
  * value of HO C2's non-success list, the unusable-name value,
  * `ErrConfigMalformed`, a value that is not an agent-director error and a
- * value of a class SRJ-110 has no kill row for (UNCLASSIFIED, its class kept
+ * value of a class has no kill row for (UNCLASSIFIED, its class kept
  * as `unlistedClass`) keep their thrown value and their class. The
  * module's import boundary is checked by walking its runtime imports through
  * `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  * The two notices built from a kill's outcome where nothing latches on it
  * (a CONFLICT or UNUSABLE NAME refusal, and a non-success no other notice
- * records; b.jg5 SRJ-1003, SRJ-110) are pinned here once; their routing is
+ * records) are pinned here once; their routing is
  * tests/persona-lifecycle.test.ts's.
  *
  * No process, no real timer, no top-level mock.module(), no value import of
@@ -147,7 +147,7 @@ async function killThroughStubWith(opts: StubClientOptions, options: CheckedKill
   return { outcome, calls }
 }
 
-/** The CLI teardown's rule: a GONE answer is no success (b.jg5 SRJ-904). */
+/** The CLI teardown's rule: a GONE answer is no success. */
 const GONE_IS_FAILURE: CheckedKillOptions = { goneIsFailure: true }
 
 /** A DIRECTORY value the stub has no builder for, built with `new` on the client's own class, its `errName` the class name. */
@@ -155,20 +155,20 @@ function errCwd(Cls: typeof ErrCwdNotFound | typeof ErrCwdNotADirectory): Error 
   return new Cls('kill', Cls.name, 'the working directory is gone')
 }
 
-/** The one call every checked kill makes: the instance id alone, no `include_finished` (SRJ-106). */
+/** The one call every checked kill makes: the instance id alone, no `include_finished`. */
 const PLAIN_KILL_CALL = { instance_id: STUB_INSTANCE_ID }
 
 /**
- * A non-success row: its label, the value the kill throws, the SRJ-110 class
- * it must carry and, for a value of a class SRJ-110 has no kill row for, that
+ * A non-success row: its label, the value the kill throws, the class
+ * it must carry and, for a value of a class has no kill row for, that
  * class (kept as `unlistedClass`).
  */
 type NonSuccessRow = readonly [label: string, build: () => unknown, expected: AdErrorClass, unlistedClass?: KillUnlistedClass]
 
 /**
- * HO C2's non-success list (SRJ-110's Test line), each built from its class, plus the
+ * HO C2's non-success list (Test line), each built from its class, plus the
  * unusable-name value, `ErrConfigMalformed`, a value that is not an
- * agent-director error, and values of a class SRJ-110 gives no row
+ * agent-director error, and values of a class gives no row
  * (UNCLASSIFIED: no step follows).
  */
 const NON_SUCCESS_ROWS: readonly NonSuccessRow[] = [
@@ -183,15 +183,15 @@ const NON_SUCCESS_ROWS: readonly NonSuccessRow[] = [
   ['errConfigMalformed', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
   ['a plain Error (not an agent-director error)', () => new Error('boom'), AD_ERROR_CLASS_UNAVAILABLE],
   ['errSystemInstallDisappeared', () => errSystemInstallDisappeared('kill'), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['errTmuxSessionCreate (LAUNCH FAILURE: no SRJ-110 row)', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_LAUNCH_FAILURE],
+  ['errTmuxSessionCreate (LAUNCH FAILURE: no row)', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_LAUNCH_FAILURE],
   ['errSpawnNotResumable (a STATE name other than ErrSpawnNotFound)', () => errSpawnNotResumable(), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
   ['errInstanceIdCollision (a STATE name other than ErrSpawnNotFound)', () => errInstanceIdCollision(), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
   ['errInvalidFlags (a STATE name other than ErrSpawnNotFound)', () => errInvalidFlags('kill'), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
-  ['ErrCwdNotFound (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotFound), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
-  ['ErrCwdNotADirectory (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotADirectory), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
+  ['ErrCwdNotFound (DIRECTORY: no row)', () => errCwd(ErrCwdNotFound), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
+  ['ErrCwdNotADirectory (DIRECTORY: no row)', () => errCwd(ErrCwdNotADirectory), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
 ]
 
-/** The GONE values (SRJ-104: for `kill`, gone is success), each built from its class with the stub. */
+/** The GONE values (for `kill`, gone is success), each built from its class with the stub. */
 const GONE_ROWS: readonly (readonly [label: string, build: () => Error & { errName: string }])[] = [
   ['errTmuxSendKeys', () => errTmuxSendKeys()],
   ['errTmuxCaptureFailed', () => errTmuxCaptureFailed(undefined, 'kill')],
@@ -204,7 +204,7 @@ const KILL_SENT_VALUES: readonly (boolean | undefined)[] = [true, false, undefin
 // Success
 // ---------------------------------------------------------------------------
 
-describe('checkedKill: success (SRJ-110, SRJ-703)', () => {
+describe('checkedKill: success', () => {
   test.each(KILL_SENT_VALUES.map((v) => [String(v), v] as const))(
     'a kill result with kill_sent %s is the killed success carrying kill_sent as given, and lets the next step run',
     async (_label, killSent) => {
@@ -236,7 +236,7 @@ describe('checkedKill: success (SRJ-110, SRJ-703)', () => {
   })
 
   test.each(GONE_ROWS.map(([label, build]) => [label, build] as const))(
-    'b.jg5 SRJ-104, SRJ-110: %s (GONE) at a kill is the session-gone success carrying its name, and lets the next step run',
+    '%s (GONE) at a kill is the session-gone success carrying its name, and lets the next step run',
     async (_label, build) => {
       const thrown = build()
       // Precondition: the classifier gives it GONE, by class.
@@ -250,7 +250,7 @@ describe('checkedKill: success (SRJ-110, SRJ-703)', () => {
     },
   )
 
-  // KILL_ROW_FINISHED_HOLD_ENDED: an old-life wait's kill whose hold ended while its tries ran (b.jg5 SRJ-702, SRJ-811; option A).
+  // KILL_ROW_FINISHED_HOLD_ENDED: an old-life wait's kill whose hold ended while its tries ran (option A).
   test.each<KillRowFinishedRead>([KILL_ROW_FINISHED_ENDED, KILL_ROW_FINISHED_MISSING, KILL_ROW_FINISHED_NO_ROW, KILL_ROW_FINISHED_HOLD_ENDED])(
     'the row-finished success (read %s) lets the next step run',
     (read) => {
@@ -265,8 +265,8 @@ describe('checkedKill: success (SRJ-110, SRJ-703)', () => {
 // Non-success
 // ---------------------------------------------------------------------------
 
-describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
-  test('KILL_FAILURE_CLASSES is SRJ-110\'s six non-success classes', () => {
+describe('checkedKill: non-success', () => {
+  test('KILL_FAILURE_CLASSES is six non-success classes', () => {
     expect(new Set(KILL_FAILURE_CLASSES)).toEqual(new Set([
       AD_ERROR_CLASS_UNAVAILABLE,
       AD_ERROR_CLASS_CONFLICT,
@@ -289,10 +289,10 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
       expect(killLetsNextStepRun(outcome)).toBe(false)
       expect(isKillOutcome(outcome)).toBe(true)
       expect(calls).toEqual([PLAIN_KILL_CALL])
-      // The class is the classifier's wherever SRJ-110 has a row for it.
+      // The class is the classifier's wherever has a row for it.
       const classified = classifyAdError(thrown).errorClass
       if ((KILL_FAILURE_CLASSES as readonly string[]).includes(classified)) expect(outcome.errorClass as AdErrorClass).toBe(classified)
-      // A class SRJ-110 has no row for (b.jg5 SRJ-104, SRJ-110) is UNCLASSIFIED
+      // A class has no row for is UNCLASSIFIED
       // with that class kept as `unlistedClass`, and nothing else; every other
       // value carries none.
       expect('unlistedClass' in outcome ? outcome.unlistedClass : undefined).toBe(unlistedClass)
@@ -303,7 +303,7 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
     },
   )
 
-  test('KILL_UNLISTED_CLASSES is the three classes SRJ-110 has no kill row for (SRJ-104, SRJ-110)', () => {
+  test('KILL_UNLISTED_CLASSES is the three classes has no kill row for', () => {
     expect(new Set(KILL_UNLISTED_CLASSES)).toEqual(new Set([AD_ERROR_CLASS_LAUNCH_FAILURE, AD_ERROR_CLASS_STATE, AD_ERROR_CLASS_DIRECTORY]))
   })
 
@@ -347,7 +347,7 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
 // One call, never throws, never retries
 // ---------------------------------------------------------------------------
 
-describe('checkedKill: one plain call that never throws (SRJ-106, SRJ-701)', () => {
+describe('checkedKill: one plain call that never throws', () => {
   test('a failed kill is not retried: the queue\'s later success is never reached', async () => {
     const { outcome, calls } = await killThroughStub({
       killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))],
@@ -379,10 +379,10 @@ describe('checkedKill: one plain call that never throws (SRJ-106, SRJ-701)', () 
 })
 
 // ---------------------------------------------------------------------------
-// A caller's rule: GONE is no success (the CLI's teardown; b.jg5 SRJ-904)
+// A caller's rule: GONE is no success (the CLI's teardown)
 // ---------------------------------------------------------------------------
 
-describe('checkedKill with goneIsFailure (b.jg5 SRJ-904, SRJ-110; hatch A3)', () => {
+describe('checkedKill with goneIsFailure (hatch A3)', () => {
   test.each(GONE_ROWS.map(([label, build]) => [label, build] as const))(
     '%s (GONE) is the GONE non-success carrying the thrown value and its name, and never lets the next step run',
     async (_label, build) => {
@@ -427,7 +427,7 @@ describe('checkedKill with goneIsFailure (b.jg5 SRJ-904, SRJ-110; hatch A3)', ()
 // The predicate on answers that are not outcomes
 // ---------------------------------------------------------------------------
 
-describe('killOutcomeStopsServer (b.jg5 SRJ-204, SRJ-205)', () => {
+describe('killOutcomeStopsServer', () => {
   const invalidFlags = (): KillOutcome => killOutcomeOf({ thrown: errInvalidFlags('kill') })
 
   test.each<[KillRecheckKind, boolean]>([
@@ -467,7 +467,7 @@ describe('killLetsNextStepRun and isKillOutcome: an answer that is not an outcom
 })
 
 // ---------------------------------------------------------------------------
-// Log rendering (SRJ-701, SRJ-1014)
+// Log rendering
 // ---------------------------------------------------------------------------
 
 describe('describeKillOutcome', () => {
@@ -503,7 +503,7 @@ describe('describeKillOutcome', () => {
     expect(describeKillOutcome({ kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_MISSING })).toBe(
       `outcome=${KILL_OUTCOME_ROW_FINISHED} read=${KILL_ROW_FINISHED_MISSING}`,
     )
-    // b.jg5 SRJ-702, SRJ-811 (option A): the old-life hold's end, named as its read; a read of no known kind is `unknown`.
+    // (option A): the old-life hold's end, named as its read; a read of no known kind is `unknown`.
     expect(describeKillOutcome({ kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_HOLD_ENDED })).toBe(
       `outcome=${KILL_OUTCOME_ROW_FINISHED} read=${KILL_ROW_FINISHED_HOLD_ENDED}`,
     )
@@ -521,7 +521,7 @@ describe('describeKillOutcome', () => {
     )
   })
 
-  // b.jg5 SRJ-1014: each outcome kind that quotes agent-director, rendered
+  // each outcome kind that quotes agent-director, rendered
   // from a description carrying a fake token, is its class and agent-director's
   // words through the shared describers: redacted, on one line.
   test.each<[string, () => Error, (thrown: Error) => string, AdErrorClass]>([
@@ -635,7 +635,7 @@ describe('describeKillOutcome', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The notices built from a kill's outcome (b.jg5 SRJ-1003, SRJ-1002, SRJ-110)
+// The notices built from a kill's outcome
 // ---------------------------------------------------------------------------
 
 describe('the notices built from a kill\'s outcome where nothing latches on it', () => {
@@ -680,7 +680,7 @@ describe('the notices built from a kill\'s outcome where nothing latches on it',
 })
 
 // ---------------------------------------------------------------------------
-// Import boundary: no server-only module (so E33's CLI can use it)
+// Import boundary: no server-only module (so CLI can use it)
 // ---------------------------------------------------------------------------
 
 describe('checked-kill: import boundary', () => {

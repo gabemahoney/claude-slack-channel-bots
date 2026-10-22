@@ -1,6 +1,6 @@
 /**
  * shutdown-deadline.test.ts — The bounded fallback exit for a shutdown that
- * nothing else ends (b.jg5 SRJ-205, AC 21: a stop by the runtime version
+ * nothing else ends (a stop by the runtime version
  * re-check exits non-zero even when `shutdown()` hangs).
  *
  * `armShutdownDeadline` is driven on `createFakeClock()` with a recording
@@ -89,7 +89,7 @@ describe('buildShutdownDeadlineLine', () => {
   })
 })
 
-describe('armShutdownDeadline (b.jg5 SRJ-205, AC 21)', () => {
+describe('armShutdownDeadline', () => {
   test('arming arms one timer at the default deadline and neither logs nor exits, even after pending microtasks run', async () => {
     const rig = makeDeadlineRig()
     expect(rig.events).toEqual([])

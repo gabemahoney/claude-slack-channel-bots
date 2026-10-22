@@ -4,7 +4,7 @@
 # Bun 1.3.13's `bun install -g .` (and the equivalent `bun install -g <local-path>`)
 # inserts an invalid empty-string dependency key into the global package.json,
 # leaving the install partially valid but blocking subsequent global operations
-# with `error: Package "@" has a dependency loop`. See CSCB bug b.6vk and
+# with `error: Package "@" has a dependency loop`. See CSCB and
 # upstream oven-sh/bun#24207.
 #
 # Workaround: use `bun add -g file:<abs-path>`, which registers the dependency
@@ -26,7 +26,7 @@ sr_exit() {
 }
 
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"

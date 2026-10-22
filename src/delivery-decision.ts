@@ -1,7 +1,7 @@
 /**
  * delivery-decision.ts — The one place inbound delivery is decided, in both
- * channel modes (b.av2 SR-4.2 channel rules with b.deo SRI-303 to SRI-308,
- * SR-4.3 direct messages, SR-4.4 `via` with b.deo SRI-306).
+ * channel modes (channel rules with to,
+ * direct messages`via` with).
  *
  * `decideDelivery` takes a raw Slack `message` / `app_mention` event, the
  * receiving persona P (key, bot user ID, bot ID, channel entries, DMs switch),
@@ -13,7 +13,7 @@
  * (with a machine-readable reason). With no fungible-mode inputs, or with
  * their mode `declarative`, the decision is declarative mode's: the stored
  * choices, the envelope flag and the fungible destinations play no part, and
- * no outcome carries a key beyond declarative mode's (b.deo SRI-308).
+ * no outcome carries a key beyond declarative mode's.
  *
  * Steps 1 to 3 run first in both modes:
  *
@@ -25,14 +25,14 @@
  *    `user` equal to P's bot user ID, or the event's `bot_id` equal to P's bot
  *    ID, is `own`. An author without `user` (webhooks, integrations) is
  *    identified by its bot ID and carries on.
- * 3. Conversation kind (SR-4.3). A DM (`channel_type` `im`, or, as a
+ * 3. Conversation kind. A DM (`channel_type` `im`, or, as a
  *    defensive fallback for an event with no `channel_type`, a conversation ID
  *    starting with `D`) depends only on P's DMs switch: on,
  *    it delivers with `via` `dm`, whatever the text mentions; off, it is
  *    `dm-disabled`. A group DM (`channel_type` `mpim`) is `group-dm`, never
  *    delivered. Neither reaches the channel steps below.
  *
- * Declarative mode (b.av2 SR-4.2; b.deo SRI-308):
+ * Declarative mode:
  *
  * 4. A channel P is not configured into is `channel-not-configured`, with
  *    `unclaimed` set when no applied persona lists it.
@@ -42,20 +42,20 @@
  *    without a label); otherwise `not-mentioned`. `<!everyone>` and user-group
  *    mentions (`<!subteam^…>`) are not mentions.
  *
- * Fungible mode (b.av2 SR-4.2 with b.deo SRI-303 to SRI-306). No persona's
+ * Fungible mode (with to). No persona's
  * channel entries are read, P's or any other's.
  *
- * 4. The fungible path (SRI-303): the event takes it only when all of these
+ * 4. The fungible path: the event takes it only when all of these
  *    hold, checked in this order, `FUNGIBLE_REFUSALS`' order: its
  *    `channel_type` is `channel` or `group`; its channel ID matches the
  *    channel-ID pattern; the envelope flag is present; it is a boolean; it is
  *    `false`. The first that fails is a `fungible-refused` drop carrying that
  *    refusal. The flag alone decides whether a channel is externally shared.
- * 5. P's channel delivery for the channel (SRI-305, `channelDeliveryFor`):
+ * 5. P's channel delivery for the channel (`channelDeliveryFor`):
  *    `mentions` when the channel is another applied persona's fungible
  *    destination (the loop guard), else P's stored choice when the store is
  *    readable, else `mentions`.
- * 6. `via` in the shipped order (SRI-306): P's mention is `mention`; else a
+ * 6. `via` in the shipped order: P's mention is `mention`; else a
  *    broadcast is `broadcast`; else a channel delivery of `all` delivers, as
  *    `receive_all_shared` when at least one other applied persona's channel
  *    delivery for the channel is `all` and as `receive_all` otherwise; else
@@ -65,12 +65,12 @@
  * Every outcome of an event that took the fungible path, deliver or drop,
  * carries `fungible`: the channel type (`public` for `channel`, `private` for
  * `group`) and P's channel delivery, so the routing logs its audit line and
- * its drop lines without deciding anything (b.deo SRI-309).
+ * its drop lines without deciding anything.
  *
  * An empty or unknown bot user ID or bot ID never matches an author or a
- * mention (b.av2 SR-3.1).
+ * mention.
  *
- * Pure and stateless (b.av2 SR-13.1, b.deo SRI-309): imports types only,
+ * Pure and stateless: imports types only,
  * creates no client, reads no file or environment variable, logs nothing, and
  * keeps no counter, rate limit, per-sender memory or cross-persona
  * arbitration. The mode, the stored choices and the destinations arrive as
@@ -85,7 +85,7 @@ import type { ChannelEntry, ChannelMode, DeliveryMode, DM_DESTINATION } from './
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Subtypes delivered like a plain message (SR-4.2 step 1). */
+/** Subtypes delivered like a plain message (step 1). */
 const DELIVERABLE_SUBTYPES: ReadonlySet<string> = new Set([
   'file_share',
   'bot_message',
@@ -111,7 +111,7 @@ const PUBLIC_CHANNEL_TYPE = 'channel'
 /** `channel_type` of a private channel. */
 const PRIVATE_CHANNEL_TYPE = 'group'
 
-/** The channel mode in which the fungible path applies (b.deo SRI-101). */
+/** The channel mode in which the fungible path applies. */
 const FUNGIBLE_MODE: ChannelMode = 'fungible'
 
 /** The channel delivery that hears every message. */
@@ -129,7 +129,7 @@ const DM_DESTINATION_VALUE: typeof DM_DESTINATION = 'dm'
 
 /**
  * Why an event that passed steps 1 to 3 does not take the fungible path
- * (b.deo SRI-303), in the order the conditions are checked: its `channel_type`
+ * in the order the conditions are checked: its `channel_type`
  * is not `channel` or `group`; its channel ID does not match the channel-ID
  * pattern; the envelope flag is missing; it is not a boolean; it is `true`
  * (externally shared).
@@ -147,7 +147,7 @@ export const FUNGIBLE_REFUSALS = [
 // ---------------------------------------------------------------------------
 
 /**
- * How a delivered message reached the persona (b.av2 SR-4.4, b.deo SRI-306),
+ * How a delivered message reached the persona,
  * first match wins: `dm` (a direct message to P), `mention` (P's user
  * mention), `broadcast` (`<!here>` / `<!channel>`), `receive_all_shared`
  * (`all` for P and at least one other applied persona: their `delivery`
@@ -158,7 +158,7 @@ export type Via = 'dm' | 'mention' | 'broadcast' | 'receive_all_shared' | 'recei
 
 /**
  * Why a persona does not get a message:
- * - `non-message`: not a deliverable message (a subtype outside SR-4.2 step 1,
+ * - `non-message`: not a deliverable message (a subtype outside step 1,
  *   a non-object, or no channel).
  * - `no-author`: neither `user` nor `bot_id`, so self-exclusion cannot tell
  *   who wrote it.
@@ -185,24 +185,23 @@ export type DeliveryDropReason =
 
 /**
  * The drop reason of a fungible-mode event that did not take the fungible
- * path (b.deo SRI-303); the outcome carries which condition failed.
+ * path; the outcome carries which condition failed.
  */
 export type FungibleDropReason = 'fungible-refused'
 
-/** One of `FUNGIBLE_REFUSALS`: the first fungible-path condition an event failed (b.deo SRI-303). */
+/** One of `FUNGIBLE_REFUSALS`: the first fungible-path condition an event failed. */
 export type FungibleRefusal = (typeof FUNGIBLE_REFUSALS)[number]
 
 /** A channel on the fungible path: `public` (`channel_type` `channel`) or `private` (`group`). */
 export type FungibleChannelType = 'public' | 'private'
 
 /**
- * What an outcome says about an event that took the fungible path (b.deo
- * SRI-309): the channel type and P's channel delivery after the loop guard.
+ * What an outcome says about an event that took the fungible path: the channel type and P's channel delivery after the loop guard.
  */
 export interface FungiblePath {
   /** `public` for `channel_type` `channel`, `private` for `group`. */
   channelType: FungibleChannelType
-  /** P's channel delivery for the channel (b.deo SRI-305). */
+  /** P's channel delivery for the channel. */
   channelDelivery: DeliveryMode
 }
 
@@ -211,7 +210,7 @@ export interface DeliverDecision {
   action: 'deliver'
   /** How the message reached P. */
   via: Via
-  /** Present only when the event took the fungible path (b.deo SRI-309). */
+  /** Present only when the event took the fungible path. */
   fungible?: FungiblePath
 }
 
@@ -220,7 +219,7 @@ export type DropDecision =
   | {
       action: 'drop'
       reason: Exclude<DeliveryDropReason, 'channel-not-configured'>
-      /** Present only when the event took the fungible path (a `not-mentioned` drop; b.deo SRI-309). */
+      /** Present only when the event took the fungible path (a `not-mentioned` drop). */
       fungible?: FungiblePath
     }
   | {
@@ -232,7 +231,7 @@ export type DropDecision =
   | {
       action: 'drop'
       reason: FungibleDropReason
-      /** The first fungible-path condition the event failed (b.deo SRI-303). */
+      /** The first fungible-path condition the event failed. */
       refusal: FungibleRefusal
     }
 
@@ -240,7 +239,7 @@ export type DropDecision =
 export type DeliveryDecision = DeliverDecision | DropDecision
 
 /**
- * The stored choices as the decision reads them (b.deo SRI-305, SRI-403):
+ * The stored choices as the decision reads them:
  * whether the store was readable at start, and P's stored choice for a
  * channel. The stored-choice store (`src/channel-delivery.ts`) satisfies it.
  */
@@ -251,14 +250,14 @@ export interface StoredChoices {
   storedChoice(key: string, channel: string): DeliveryMode | undefined
 }
 
-/** One applied persona's fungible destination (b.deo SRI-305): `dm` or a channel ID. */
+/** One applied persona's fungible destination: `dm` or a channel ID. */
 export interface PersonaFungibleDestination {
   key: string
   /** The persona's destination in fungible mode, as the one destination rule resolves it. */
   destination: string
 }
 
-/** What a channel delivery is computed from (b.deo SRI-305), besides the persona and the channel. */
+/** What a channel delivery is computed from, besides the persona and the channel. */
 export interface ChannelDeliveryInputs {
   /**
    * Every applied persona's fungible destination, P's included, from the
@@ -271,7 +270,7 @@ export interface ChannelDeliveryInputs {
 }
 
 /**
- * The fungible-mode inputs of `decideDelivery` (b.deo SRI-309), each read at
+ * The fungible-mode inputs of `decideDelivery`, each read at
  * the call. Absent, or with `mode` `declarative`, the decision is declarative
  * mode's.
  */
@@ -280,14 +279,14 @@ export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
   mode: ChannelMode
   /**
    * The envelope flag (`is_ext_shared_channel`) exactly as received: `true`,
-   * `false`, any other value, or undefined when absent (b.deo SRI-301).
+   * `false`, any other value, or undefined when absent.
    */
   isExtSharedChannel?: unknown
   /** The channel-ID pattern a fungible-path channel matches (`CHANNEL_ID_RE`). */
   channelIdPattern: RegExp
 }
 
-/** P's channel delivery for one channel (b.deo SRI-305), from `channelDeliveryFor`. */
+/** P's channel delivery for one channel, from `channelDeliveryFor`. */
 export interface ChannelDeliveryResult {
   /** `mentions` or `all`. */
   delivery: DeliveryMode
@@ -328,8 +327,7 @@ export interface AppliedPersonaView {
  * module comment for the step order). `applied` is every applied persona
  * (P's entry included), from the applied configuration, never live
  * connection state. `fungible` holds the fungible-mode inputs; absent, or
- * with its mode `declarative`, the decision is declarative mode's (b.deo
- * SRI-308, SRI-309).
+ * with its mode `declarative`, the decision is declarative mode's.
  */
 export function decideDelivery(
   event: unknown,
@@ -380,7 +378,7 @@ export function decideDelivery(
 }
 
 /**
- * Fungible mode's channel steps (b.deo SRI-303, SRI-305, SRI-306) for an
+ * Fungible mode's channel steps for an
  * event that passed steps 1 to 3: the fungible path's conditions, then P's
  * channel delivery and `via`. No persona's channel entries are read.
  */
@@ -408,7 +406,7 @@ function decideFungibleChannel(
 }
 
 /**
- * The first fungible-path condition (b.deo SRI-303) the event fails, in
+ * The first fungible-path condition the event fails, in
  * `FUNGIBLE_REFUSALS`' order, or undefined when it takes the path: its
  * `channel_type` is `channel` or `group`; `channel` matches the channel-ID
  * pattern; the envelope flag is present, is a boolean, and is `false`.
@@ -428,8 +426,7 @@ function fungibleRefusalOf(
 }
 
 /**
- * Persona `key`'s channel delivery for `channel` in fungible mode (b.deo
- * SRI-305), and whether the loop guard held it:
+ * Persona `key`'s channel delivery for `channel` in fungible mode, and whether the loop guard held it:
  *
  * - `mentions`, held, when `channel` is the fungible destination of any
  *   applied persona other than `key` (the loop guard). The persona's own
@@ -456,7 +453,7 @@ export function channelDeliveryFor(
   return { delivery: stored === DELIVERY_ALL ? DELIVERY_ALL : DELIVERY_MENTIONS, heldByLoopGuard: false }
 }
 
-/** SR-4.2 step 2: the author is P's bot user, or the event carries P's bot ID. */
+/** step 2: the author is P's bot user, or the event carries P's bot ID. */
 function isOwn(user: string | undefined, botId: string | undefined, persona: DeliveryPersona): boolean {
   const ownUser = nonEmptyString(persona.botUserId)
   const ownBot = nonEmptyString(persona.botId)
@@ -464,7 +461,7 @@ function isOwn(user: string | undefined, botId: string | undefined, persona: Del
 }
 
 /**
- * SR-4.3: what kind of conversation `channel` is. `channel_type` decides when
+ * what kind of conversation `channel` is. `channel_type` decides when
  * the event has one. An event without it (such as an `app_mention`, which
  * Slack does not send for DMs) is treated, defensively, as a DM when its
  * conversation ID starts with `D`, and as a channel otherwise.

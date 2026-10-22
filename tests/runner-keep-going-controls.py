@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""b.pb8: execute the actual shell runner with harmless scripts, inside CI only.
+"""execute the actual shell runner with harmless scripts, inside CI only.
 
 Mount tests/runner.sh at /source/runner.sh (read-only), this file at /controls.py,
 a fresh regular lock file read-only at /run/cscb-ci-performance.lock,

@@ -129,7 +129,7 @@ function startTimeConfig(): string {
   return swap![2]!
 }
 
-describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
+describe('server.ts wires the reload detection tick', () => {
   test('starts detection from exactly one call site: the start controller\'s startDetection(), inside main()', () => {
     const { controller } = startResolution(SERVER_CODE)
     const { at, receiver } = onlyMethodCall('startDetection')
@@ -181,7 +181,7 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expectBringUpControllerHandle(bringUpLookup(props, 'heldCredentialsDigest', 'credentialsDigest'))
   })
 
-  // SR-8.6 step 6: the preview tells a persona broken by its credentials
+  // step 6: the preview tells a persona broken by its credentials
   // (brought up at apply) from one that is reconnected. Without this binding
   // every credentials change would preview as a reconnect.
   test('the controller gets the bring-up controller\'s states, on the same handle as its held digests', () => {
@@ -191,7 +191,7 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expect(receiver).toBe(bringUpLookup(props, 'heldCredentialsDigest', 'credentialsDigest'))
   })
 
-  // SR-8.6 step 1: once the record holds a confirmed change, the server runs
+  // step 1: once the record holds a confirmed change, the server runs
   // its persona set, with the server-wide values it started with (they apply
   // at the next start). `onApplied` is optional in the controller's deps, so
   // only this audit makes sure production binds it; every consumer of the
@@ -220,7 +220,7 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expect(indicesOf(/\b(?:let|const|var|function)\s+configInEffect\b/g, SERVER_CODE)).toEqual([])
   })
 
-  // SR-8.2: no file watcher. Only the controller's own options are audited, so
+  // no file watcher. Only the controller's own options are audited, so
   // unrelated server code is free to use fs.watch; that the driver chains
   // timeouts rather than an interval is tested in tests/reload-timer.test.ts.
   test('the controller is passed no file watcher, and its tickDriver is the one production driver built', () => {
@@ -237,7 +237,7 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expect(drivers[0]!).toBeLessThan(optionsEnd)
   })
 
-  test('reload output goes to the server log: the controller\'s and the tick driver\'s log is console.error, never Slack (SR-7.2)', () => {
+  test('reload output goes to the server log: the controller\'s and the tick driver\'s log is console.error, never Slack', () => {
     const toServerLog = /^\(?\s*(\w+)\s*\)?\s*=>\s*console\s*\.\s*error\s*\(\s*\1\s*\)$/
     expect(controllerProps().get('log')).toMatch(toServerLog)
     const driverProps = objectProperties(onlyCallArguments(SERVER_CODE, 'createReloadTickDriver'))
@@ -246,7 +246,7 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The confirmed apply's teardown and bring-up (b.av2 SR-6.1, SR-6.5, SR-6.6)
+// The confirmed apply's teardown and bring-up
 // ---------------------------------------------------------------------------
 
 /** The top-level properties of the argument of the only call of the plain function `name`. */
@@ -254,7 +254,7 @@ function onlyCallProps(name: string): Map<string, string> {
   return objectProperties(onlyCallArguments(SERVER_CODE, name))
 }
 
-/** The latch re-check's one builder (b.jg5 SRJ-505), which takes the persona serializer's run; renaming it fails the typecheck. */
+/** The latch re-check's one builder, which takes the persona serializer's run; renaming it fails the typecheck. */
 const LATCH_RECHECK_BUILDER: keyof typeof SessionManagerModule = 'buildLatchRecheck'
 
 /** The name the one `const <name> = <factory>(…)` binds; fails unless there is exactly one. */
@@ -290,7 +290,7 @@ function lifecycleHolder(): string {
   const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
   const teardown = forwardingHolder(lifecycle, 'teardown', 1)
   // All five on the same holder. bringUp forwards its third parameter, the
-  // options carrying `recovery` (SR-8.6 step 6, SR-6.4): a binding that drops
+  // options carrying `recovery` (step 6): a binding that drops
   // it typechecks, but would bring a credentials-broken persona up as new.
   expect(forwardingHolder(lifecycle, 'updateInPlace', 1)).toBe(teardown)
   expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(teardown)
@@ -299,7 +299,7 @@ function lifecycleHolder(): string {
   return teardown
 }
 
-describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change, template refresh and bring-up (b.av2 SR-6.1, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 3 to 6)', () => {
+describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change, template refresh and bring-up (steps 3 to 6)', () => {
   // ReloadLifecycleOps.teardown, .updateInPlace, .reconnectCredentials,
   // .refreshTemplate and .bringUp are required, so the typecheck catches a
   // missing member; it cannot catch one bound to something that does
@@ -355,14 +355,14 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(indicesOf(/\bapplySteps\b/g, SERVER_CODE)).toEqual([])
   })
 
-  // The connection manager's serialize (b.ujn) is optional in its deps and
+  // The connection manager's serialize is optional in its deps and
   // defaults to running the close at once, so only this audit makes sure
   // production passes it: without it, the deferred close of a socket whose
   // Web API call was refused for its token would not wait behind a lifecycle
   // operation holding the persona. The pending-row rule's install
 
-  // stop is queued in P's turn (b.jg5 SRJ-410). So does the latch re-check's
-  // builder (`buildLatchRecheck`, b.jg5 SRJ-505): each round waits for P's
+  // stop is queued in P's turn. So does the latch re-check's
+  // builder (`buildLatchRecheck`): each round waits for P's
   // turn and runs the restart path's decision inside it, so it never overlaps
   // a teardown, a bring-up or a restart for P.
   test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the connection manager, the bring-up controller, the lifecycle, the pending-row rule\'s install and the latch re-check\'s builder, and is used nowhere else', () => {
@@ -383,7 +383,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
   // cannot catch one bound to a stub (`() => undefined`, `async () => {}`) or
   // two same-typed ones swapped (forgetFailures/forgetDisconnectedStreak).
   // Each value is pinned to the production function or object it must be.
-  // b.jg5 SRJ-715: there is no delete, so no `deleteInstance` is passed (the
+  // there is no delete, so no `deleteInstance` is passed (the
   // exact key list below) and nothing deleting a row is imported.
   test('createPersonaLifecycle gets every production dependency: nothing stubbed, nothing swapped, nothing extra', () => {
     const props = onlyCallProps('createPersonaLifecycle')
@@ -410,14 +410,14 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       ['dryRun', 'isDryRun()'],
       ['isShuttingDown', '() => shuttingDown'],
       ['whenLaunchSettled', 'whenLaunchSettled'],
-      // b.f2b: optional in the deps, so only this pin makes sure a production
+      // optional in the deps, so only this pin makes sure a production
       // teardown cancels a launch's wait for a working row instead of waiting
       // it out (up to 10 minutes).
       ['cancelLaunchWait', 'cancelWorkingRowWait'],
       ['cancelRestartTimer', 'cancelRestartTimer'],
       ['forgetFailures', 'forgetFailures'],
       ['forgetDisconnectedStreak', 'forgetDisconnectedStreak'],
-      // b.f2b: optional in the deps, so only this pin makes sure production
+      // optional in the deps, so only this pin makes sure production
       // ends a torn-down key's not-connected episode (notice latch, pane evidence).
       ['forgetNotConnectedEpisode', 'forgetNotConnectedEpisode'],
       // The silent per-key reset (never the boot reset of every persona).
@@ -426,12 +426,12 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // The silent per-key ack-tracker forget, so a key added again starts clean.
       ['forgetAcks', 'forgetPersonaAcks'],
       ['dropSession', 'dropPersonaSessionAndKeepAlive'],
-      // b.jg5 SRJ-110, SRJ-1003: optional in the deps, so only this pin makes
+      // optional in the deps, so only this pin makes
       // sure production reads the key's raised outage classes after its kill:
       // without it an ENVIRONMENT or CONFIG outcome counts as covered by an
       // onset while the key is applied, raised or not.
       ['outageFlags', 'getOutageFlags'],
-      // b.jg5 SRJ-811, SRJ-715: optional in the deps, so only this pin makes
+      // optional in the deps, so only this pin makes
       // sure a production teardown forgets the key from every old-life
       // hold's waiting record (no hold's end retries a persona that is gone)
       // and stops a wait no persona left in the applied configuration waits
@@ -506,7 +506,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     const [, stopKey, stoppingDelivery] = stopDelivery!
     expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); const remindersStopping = replyReminders?.forget(${stopKey}); await Promise.all([${stoppingDelivery}, remindersStopping]) }`)
 
-    // b.jg5 SRJ-706, SRJ-715: optional in the deps, so only this pin makes
+    // optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right
     // after delivery, waiting for its call in flight): the session
     // manager's stop entry over the installed registry for that key with the
@@ -519,7 +519,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(stopSequence).not.toBeNull()
     expect(stopSequence![2]).toBe(stopSequence![1])
 
-    // b.jg5 SRJ-715, SRJ-110, SRJ-702: the teardown's kill is the session
+    // the teardown's kill is the session
     // manager's teardown kill entry for that key (the checked kill inside the
     // bounded retry, arming nothing and latching nothing) on the production
     // kill-retry clock: not a stub, not the one-try checked kill, not another
@@ -531,7 +531,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(killInstance).not.toBeNull()
     expect(killInstance![2]).toBe(killInstance![1])
 
-    // b.jg5 SRJ-704, SRJ-715: required, so the typecheck catches it missing;
+    // required, so the typecheck catches it missing;
     // it cannot catch it bound to a stub, to a second alerts instance (one
     // over episodes a teardown never forgets and shutdown never closes), to
     // another context's route (one that posts to Slack), or with the key, the
@@ -552,12 +552,12 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       context: 'KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN',
     })
 
-    // b.jg5 SRJ-305: the teardown stops the key's UNAVAILABLE retry timer on
+    // the teardown stops the key's UNAVAILABLE retry timer on
     // the server's one retry controller (the one installed as the outage
     // state's trigger sink; pinned in tests/server-startup-wiring.test.ts),
     // with the torn-down reason: not a stub, not the restart timer's cancel,
-    // not another controller, and never every persona's timer. b.jg5
-    // SRJ-309: with the timer stopped, "CSCB keeps retrying" no longer holds,
+    // not another controller, and never every persona's timer.
+    // with the timer stopped, "CSCB keeps retrying" no longer holds,
     // so the same binding cancels the key's tmux-unresponsive alert check on
     // the server's one condition (not a local shadow, not another key's).
     const retryTimers = constOf('createUnavailableRetryController')
@@ -572,7 +572,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(stopRetry).not.toBeNull()
     expect([stopRetry![2], stopRetry![3]]).toEqual([stopRetry![1], stopRetry![1]])
 
-    // b.jg5 SRJ-1016: the teardown silently forgets the key's notice
+    // the teardown silently forgets the key's notice
     // episodes on the server's one episodes instance (its shutdown wiring is
     // pinned in tests/server-startup-wiring.test.ts): not a stub, not another
     // instance or module's forget, not a local shadow of the instance, and
@@ -585,7 +585,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(forgetEpisodes).not.toBeNull()
     expect(forgetEpisodes![2]).toBe(forgetEpisodes![1])
 
-    // b.jg5 SRJ-504: the teardown silently forgets the key's latch on the
+    // the teardown silently forgets the key's latch on the
     // server's one latch (its build and binding count are pinned in the test
     // after the template refresh's): not a stub, not another instance's
     // forget, not a local shadow of the instance, and never every persona's.
@@ -597,7 +597,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(forgetLatch).not.toBeNull()
     expect(forgetLatch![2]).toBe(forgetLatch![1])
 
-    // b.jg5 SRJ-207, SRJ-715: the teardown silently forgets the key's
+    // the teardown silently forgets the key's
     // ErrInvalidFlags hold on the server's one hold (its build and bindings
     // are pinned in tests/server-startup-wiring.test.ts): not a stub, not
     // another instance's forget, not a local shadow, never every persona's.
@@ -624,7 +624,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(launch).toBe(onlyCallProps('createPersonaBringUpController').get('launch') ?? '')
   })
 
-  // SR-8.6 step 5: the refresh rewrites only the memory-read rules; the
+  // step 5: the refresh rewrites only the memory-read rules; the
   // template's server-wide arguments keep their start-time values (the
   // server-wide row). `templateRefresh` is required, so the typecheck
   // catches it missing; it cannot catch arguments rebuilt from the applied
@@ -664,13 +664,13 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(anyCallOf('buildTemplateParams')).toEqual([])
   })
 
-  // b.jg5 SRJ-504: `forgetConflictLatch` is required, so the typecheck
+  // `forgetConflictLatch` is required, so the typecheck
   // catches it missing; it cannot catch it bound to a stub or to a second
   // latch (the removed persona would stay latched on the one the launches
   // ask), nor a second forget of the server's latch elsewhere (a forget-all
-  // at shutdown, which SRJ-504 rules out: a restart drops every latch with
+  // at shutdown, which rules out: a restart drops every latch with
   // the process). Its form is pinned in the test above.
-  test('the teardown\'s latch forget is bound exactly once, to the server\'s one latch: the instance\'s only forget in server.ts is that binding (b.jg5 SRJ-504)', () => {
+  test('the teardown\'s latch forget is bound exactly once, to the server\'s one latch: the instance\'s only forget in server.ts is that binding', () => {
     const latch = constOf('createConflictLatch')
     expect(callsOf(SERVER_CODE, 'createConflictLatch')).toHaveLength(1)
     expect(insideMain(SERVER_CODE, SERVER_CODE.search(new RegExp(`\\bconst\\s+${latch}\\s*=`)))).toBe(true)
@@ -694,7 +694,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(indicesOf(new RegExp(`(?<![\\w$.])${latch}\\s*(?:\\?\\.|!)?\\s*\\[`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  // b.jg5 SRJ-207, SRJ-715: `forgetInvalidFlagsHold` is required, so the
+  // `forgetInvalidFlagsHold` is required, so the
   // typecheck catches it missing; it cannot catch it bound to a stub or to a
   // second hold (the removed persona would stay held on the one the launch
   // entries ask, and a later version change would retry a persona that is
@@ -702,7 +702,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
   // shutdown's forget-all goes through the module-scope holder, not the
   // instance (pinned in tests/server-startup-wiring.test.ts). Its form is
   // pinned in the test above.
-  test('the teardown\'s ErrInvalidFlags hold forget is bound exactly once, to the server\'s one hold: the instance\'s only per-key forget in server.ts is that binding (b.jg5 SRJ-207, SRJ-715)', () => {
+  test('the teardown\'s ErrInvalidFlags hold forget is bound exactly once, to the server\'s one hold: the instance\'s only per-key forget in server.ts is that binding', () => {
     const hold = constOf('createInvalidFlagsHold')
     expect(callsOf(SERVER_CODE, 'createInvalidFlagsHold')).toHaveLength(1)
     expect(insideMain(SERVER_CODE, SERVER_CODE.search(new RegExp(`\\bconst\\s+${hold}\\s*=`)))).toBe(true)
@@ -728,15 +728,15 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
 
 // ---------------------------------------------------------------------------
 
-// SRJ-404, SRJ-715)
+//)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // The persona notifier's startup-errors recorder and the teardown's window
-// (b.jg5 SRJ-1003, SRJ-1013)
+//
 // ---------------------------------------------------------------------------
 
-describe('server.ts builds the one persona notifier with the production startup-errors recorder, and the teardown\'s window is that notifier\'s (b.jg5 SRJ-1003, SRJ-1013)', () => {
+describe('server.ts builds the one persona notifier with the production startup-errors recorder, and the teardown\'s window is that notifier\'s', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const NOTIFIER_FACTORY: keyof typeof PersonaNotifierModule = 'createPersonaNotifier'
   const RECORDER: keyof PersonaNotifierDeps = 'recordStartupError'
@@ -780,7 +780,7 @@ describe('server.ts builds the one persona notifier with the production startup-
 })
 
 // ---------------------------------------------------------------------------
-// In-place changes reach their consumers through the live applied config (AC 58)
+// In-place changes reach their consumers through the live applied config
 // ---------------------------------------------------------------------------
 
 /** The top-level properties of the module-scope `const <name>: <Type> = { … }` object literal. */
@@ -791,12 +791,12 @@ function constObjectProps(name: string): Map<string, string> {
   return objectProperties(SERVER_CODE.slice(SERVER_CODE.indexOf('=', decls[0]!)))
 }
 
-describe('AC 58: in-place consumers read the applied config onApplied swaps, at call time (b.av2 SR-8.6 step 3)', () => {
+describe('in-place consumers read the applied config onApplied swaps, at call time (step 3)', () => {
   // A confirmed channels, delivery, destination, DM contact or DMs-switch
   // change is applied by step 1's swap of the holder (pinned above); step 3
   // only clears per-persona caches. A consumer bound to a copy taken at start
   // would keep the old values until the next restart.
-  test('AC 58: the applied config holder is one module-scope `let`, the one onApplied reassigns', () => {
+  test('the applied config holder is one module-scope `let`, the one onApplied reassigns', () => {
     const loaded = loadedConfigName(SERVER_CODE)
     const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${loaded}\\b[^\\n]*`, 'g'))]
     expect(decls.map((d) => d[0].trim())).toEqual([`let ${loaded}: PersonaConfig | null = null`])
@@ -805,11 +805,11 @@ describe('AC 58: in-place consumers read the applied config onApplied swaps, at 
     startTimeConfig()
   })
 
-  test('AC 58: the persona routing (posting scope, delivery) reads the holder at call time', () => {
+  test('the persona routing (posting scope, delivery) reads the holder at call time', () => {
     expect(onlyCallProps('createPersonaRouting').get('getPersonaConfig')).toBe(`() => ${loadedConfigName(SERVER_CODE)}`)
   })
 
-  test('AC 58: getAppliedPersona, declared once at module scope, looks the key up in the holder at call time', () => {
+  test('getAppliedPersona, declared once at module scope, looks the key up in the holder at call time', () => {
     const decls = indicesOf(/\bfunction\s+getAppliedPersona\s*\(/g, SERVER_CODE)
     expect(decls).toHaveLength(1)
     expect(insideMain(SERVER_CODE, decls[0]!)).toBe(false)
@@ -831,23 +831,23 @@ describe('AC 58: in-place consumers read the applied config onApplied swaps, at 
   test.each([
     ['the persona notifier (destination, DM contact and switch for notices)', () => onlyCallProps('createPersonaNotifier')],
     ['the MCP session tools (reply scope)', () => constObjectProps('sessionToolDeps')],
-  ])('AC 58: %s get getPersona: getAppliedPersona', (_consumer, props) => {
+  ])('%s get getPersona: getAppliedPersona', (_consumer, props) => {
     expect(props().get('getPersona')).toBe('getAppliedPersona')
   })
 })
 
 // ---------------------------------------------------------------------------
-// Server-wide settings keep their start-time values until the next start (AC 61)
+// Server-wide settings keep their start-time values until the next start
 // ---------------------------------------------------------------------------
 
-describe('AC 61: server-wide settings keep their start-time values after a confirmed apply (b.av2 SR-8.6, the server-wide row)', () => {
+describe('server-wide settings keep their start-time values after a confirmed apply (the server-wide row)', () => {
   // Every consumer of a server-wide setting reads the applied config holder
-  // (at call time, as the AC 58 consumers above, or once at start, as the
+  // (at call time, as the consumers above, or once at start, as the
   // listener's bind and port). After an apply that holder is exactly what
   // configInEffect makes of the start-time config and the confirmed one, so
   // no consumer can see a confirmed server-wide value before the next start,
   // except the allow_invited_channels switch, the one server-wide setting
-  // applied in place (b.av2 SR-8.6, b.deo SRI-201).
+  // applied in place.
   // The acknowledgement reaction and the reply chunk settings reach their
   // consumers (the two stage callbacks and the reply tool) through the one
   // accessor getReplySettings, which reads the same holder at call time
@@ -871,7 +871,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
         system_prompt_mode: 'replace',
         resume_enabled: false,
         stop_hook_bootstrap: false,
-        fresh_system_prompt: false, // b.b1j SR-1.3: the start's true is kept
+        fresh_system_prompt: false, // the start's true is kept
         agent_director_poll_interval_ms: 12_345,
         agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
         append_system_prompt_file: '/applied/prompt.md',
@@ -931,7 +931,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     }
   })
 
-  // E13 carry: the ack reaction and the reply chunking must not follow a
+  // carry: the ack reaction and the reply chunking must not follow a
   // confirmed server-wide change before the next start. Both consumers get
   // the accessor itself (not a value taken once, not a stand-in), so each
   // use reads it again.
@@ -998,10 +998,10 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
 })
 
 // ---------------------------------------------------------------------------
-// replySettingsOf: the server-wide reply settings of a config (b.av2 SR-1.6)
+// replySettingsOf: the server-wide reply settings of a config
 // ---------------------------------------------------------------------------
 
-describe('replySettingsOf (b.av2 SR-1.6)', () => {
+describe('replySettingsOf', () => {
   const DEFAULTS: ReplySettings = { queued_ack_reaction: undefined, ack_reaction: undefined, reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }
 
   test.each([

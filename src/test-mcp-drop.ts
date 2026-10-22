@@ -1,4 +1,4 @@
-/** Startup-only, injected fault route; importing it performs no I/O (b.omv SR-14.1). */
+/** Startup-only, injected fault route; importing it performs no I/O. */
 import { isLocalAddress, INTERJECT_BODY_CAP_BYTES } from './interject.ts'
 
 export const TEST_MCP_DROP_ROUTE = '/test/drop-mcp'

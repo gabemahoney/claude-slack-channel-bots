@@ -2,7 +2,7 @@
  * session-disconnect.test.ts — the session-disconnect handler
  * (`_buildRestartDisconnectedPersona`) and the `tmux-unavailable` retry check
  * it decides through (`armMissingTmuxUnavailableRetry`), both called directly
- * over recording dependencies (b.jg5 SRJ-311, SRJ-502, SRJ-315, SRJ-1501).
+ * over recording dependencies.
  *
  * - The check: the first branch that applies, in its order (the flag not
  *   raised; a timer armed; latched; work in flight; no controller; else it
@@ -105,7 +105,7 @@ afterEach(() => {
 /** The asks the check makes before deciding, in its order. */
 const CHECK_ASKS = ['isTmuxUnavailable', 'isRetryArmed', 'isLatched', 'isWorkInFlight'] as const
 
-describe('armMissingTmuxUnavailableRetry: the first branch that applies, in order, with only the asks it needs (b.jg5 SRJ-311)', () => {
+describe('armMissingTmuxUnavailableRetry: the first branch that applies, in order, with only the asks it needs', () => {
   const ARM_LINE = 'the arm line'
 
   // Each row sets every later check to the answer that would pick another
@@ -133,7 +133,7 @@ describe('armMissingTmuxUnavailableRetry: the first branch that applies, in orde
   })
 })
 
-describe('_buildRestartDisconnectedPersona: the session-disconnect handler (b.jg5 SRJ-311, SRJ-502, SRJ-315)', () => {
+describe('_buildRestartDisconnectedPersona: the session-disconnect handler', () => {
   const VIA = ' (SSE abort)'
 
   /** The persona's disconnect line, naming its working directory. */
@@ -170,10 +170,10 @@ describe('_buildRestartDisconnectedPersona: the session-disconnect handler (b.jg
 
   // The one place this file holds the handler's literal suffixes.
   test.each<[string, RigState, string]>([
-    ['a timer armed', { armed: true }, ' — no restart scheduled; its retry timer recovers it (b.jg5 SRJ-311)'],
-    ['latched', { armed: false, latched: true }, ' and is latched — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-502)'],
-    ['work in flight', { armed: false, inFlight: true }, ' with work in flight — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-315)'],
-    ['no retry controller', { armed: undefined }, ' and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)'],
+    ['a timer armed', { armed: true }, ' — no restart scheduled; its retry timer recovers it'],
+    ['latched', { armed: false, latched: true }, ' and is latched — no restart scheduled, no retry timer armed'],
+    ['work in flight', { armed: false, inFlight: true }, ' with work in flight — no restart scheduled, no retry timer armed'],
+    ['no retry controller', { armed: undefined }, ' and no retry controller — no restart scheduled, no retry timer armed'],
   ])('the flag raised, %s: the persona line, then one line saying what was done instead; no restart, no arm', (_what, state, suffix) => {
     const rig = makeRig({ persona, raised: true, ...state })
     _buildRestartDisconnectedPersona(rig.deps)(persona.key, VIA)
@@ -184,7 +184,7 @@ describe('_buildRestartDisconnectedPersona: the session-disconnect handler (b.jg
   test('the flag raised with no timer armed, not latched, nothing in flight: the persona line, then the arm line, and the timer armed once; no restart', () => {
     const rig = makeRig({ persona, raised: true, armed: false })
     _buildRestartDisconnectedPersona(rig.deps)(persona.key, VIA)
-    expect(rig.logs).toEqual([cwdLine(VIA), `${head(VIA)} with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`])
+    expect(rig.logs).toEqual([cwdLine(VIA), `${head(VIA)} with no retry timer — no restart scheduled; arming one`])
     expect(rig.arms).toEqual([persona.key])
     expect(rig.restarts).toEqual([])
     expect(rig.asks.slice(-2)).toEqual(['log', 'armRetryTimer'])

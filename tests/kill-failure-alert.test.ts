@@ -1,14 +1,14 @@
 /**
  * kill-failure-alert.test.ts — the kill-failure alert's texts and its route
- * selection (`src/kill-failure-alert.ts`; b.jg5 SRJ-1007's texts, SRJ-704's
- * routing and survivor class, SRJ-1013's two new classes, SRJ-1001's common
- * rules for a quoted description, SRJ-613's read-pane statement), and the
+ * selection (`src/kill-failure-alert.ts`texts
+ * routing and survivor class two new classes common
+ * rules for a quoted description read-pane statement), and the
  * log-line and entry form, whose CLI-teardown context names the command
- * (SRJ-909).
  *
- * SRJ-1007's Test line names `tests/live-row-sequence.test.ts` (E21's file),
- * which drives the sequence form; E20 tests every text through the module's
- * builders here. SRJ-1007's literal texts appear only in the pin case, around
+ *
+ * Test line names `tests/live-row-sequence.test.ts` ( file),
+ * which drives the sequence form; tests every text through the module's
+ * builders here. literal texts appear only in the pin case, around
  * the stub's descriptions and pids; every other expected value is built from
  * the module's exports, `src/` (the description renderer, the Slack escape,
  * the persona ids) and the stub's description builders and pid constants, and
@@ -21,8 +21,8 @@
  * The module's import boundary is checked by walking its runtime imports
  * through `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  *
- * The route over every SRJ-1002 context, and the record of a bounded retry
- * that SRJ-702's stop rule stops (SRJ-702, SRJ-704, SRJ-1013; AC 64), are
+ * The route over every context, and the record of a bounded retry
+ * that stop rule stops, are
  * checked at the alerts layer too: the server's kill-failure alerts
  * (`createKillFailureAlerts`) over notice episodes whose sink is the real
  * persona notifier (`makeNotifierHarness`, one Slack stub per persona, a
@@ -194,12 +194,12 @@ function insertion(longer: string, shorter: string): string {
   return longer.slice(prefix, longer.length - suffix)
 }
 
-/** The code spans of `text` that open with `agent-director` or `tmux`: the commands it names (b.jg5 SRJ-1001). */
+/** The code spans of `text` that open with `agent-director` or `tmux`: the commands it names. */
 function commandSpans(text: string): string[] {
   return [...text.matchAll(/`\s*(?:agent-director|tmux)\b[^`]*`/g)].map((m) => m[0])
 }
 
-/** Every closing kind, in SRJ-1007's table order. */
+/** Every closing kind, in the contract table order. */
 const CLOSINGS: readonly KillFailureClosing[] = [
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
@@ -222,10 +222,10 @@ const ORDINARY_CLOSINGS: readonly string[] = [
 ]
 
 // ---------------------------------------------------------------------------
-// The pin: SRJ-1007's literal texts
+// The pin: literal texts
 // ---------------------------------------------------------------------------
 
-describe('kill-failure alert: SRJ-1007’s texts (pin)', () => {
+describe('kill-failure alert: texts (pin)', () => {
   test('the one pin case: the ordinary body (with one description, with two in the stated form, with none), the survivor body with its pid list, and all seven closing sentences, byte for byte', () => {
     const session = personaTmuxSessionName('sample')
     const instanceId = personaInstanceId('sample')
@@ -274,7 +274,7 @@ describe('kill-failure alert: SRJ-1007’s texts (pin)', () => {
       'CSCB does not retry this kill or check this process again.',
     ])
 
-    // SRJ-1007: the survivor version carries none of the ordinary version's
+    // the survivor version carries none of the ordinary version's
     // retry sentences, on any route.
     for (const closing of CLOSINGS) {
       const text = killFailureAlertText({ version: KILL_FAILURE_VERSION_SURVIVOR, session, survivorDescription: twoSurvivors }, closing, true)
@@ -287,7 +287,7 @@ describe('kill-failure alert: SRJ-1007’s texts (pin)', () => {
 // The ordinary version
 // ---------------------------------------------------------------------------
 
-describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
+describe('kill-failure alert: the ordinary version', () => {
   // `<id>` is the row's instance id and `<session>` the session it names: a
   // persona's own row (`cscb_<key>`, `slack_bot_<key>`), an old key's, or a
   // pre-persona row's id with the session its row names.
@@ -309,7 +309,7 @@ describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
   })
 
   // Each of the four ErrTmuxKillFailed descriptions (HO rev 17) is quoted
-  // whole, redacted on one line (b.jg5 SRJ-1001), in the one "agent-director
+  // whole, redacted on one line, in the one "agent-director
   // said" sentence, the only difference from the body with no description;
   // the Slack form escapes Slack's control characters in it too.
   test.each(KILL_FAILED_DESCRIPTIONS.flatMap((form) => [[form, false], [form, true]] as const))(
@@ -328,7 +328,7 @@ describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
     },
   )
 
-  test('a description longer than the cap is quoted capped (b.jg5 SRJ-1001)', () => {
+  test('a description longer than the cap is quoted capped', () => {
     const description = `${stubDescription('outlived-exit-wait')} ${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
     const said = insertion(ordinaryBody({ lastKillFailedDescription: description }, false), ordinaryBody(undefined, false))
 
@@ -337,7 +337,7 @@ describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
     assertNoLeak(said)
   })
 
-  test('with no description (E21\'s sequence whose kills succeeded) the "agent-director said" sentence is left out: no quote of any description, the same body as with empty quotes', () => {
+  test('with no description (\'s sequence whose kills succeeded) the "agent-director said" sentence is left out: no quote of any description, the same body as with empty quotes', () => {
     const bare = ordinaryBody(undefined, true)
 
     expect(ordinaryBody({}, true)).toBe(bare)
@@ -345,7 +345,7 @@ describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
     expect(bare).not.toContain(RETRY_KILL_LATER_PHRASE)
   })
 
-  // SRJ-1007: after a survivor-naming failure, the tries that ended in
+  // after a survivor-naming failure, the tries that ended in
   // another failure quote only that description; those that ended in an
   // ErrTmuxKillFailed naming no survivor quote both, the last first.
   test('after a survivor-naming failure: one description when the tries ended in another failure; both, the last kill failure\'s first, when they ended in an ErrTmuxKillFailed naming no survivor', () => {
@@ -385,10 +385,10 @@ describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SRJ-1001: agent-director's words are its own
+// agent-director's words are its own
 // ---------------------------------------------------------------------------
 
-describe('kill-failure alert: CSCB\'s own words (b.jg5 SRJ-1001)', () => {
+describe('kill-failure alert: CSCB\'s own words', () => {
   // Every description carries "retry kill later" and "never delete this row";
   // with the quoted description removed, no text says either. The text holds
   // them exactly where its capped quote does: the survivor description, at
@@ -428,7 +428,7 @@ const SURVIVOR_ROUTES: ReadonlyArray<readonly [string, KillFailureAlertContext, 
   ['a start-sweep kill', KILL_FAILURE_CONTEXT_START_SWEEP, false, KILL_FAILURE_CLOSING_LOG_ONLY, KILL_FAILURE_SURVIVOR_LOG_ONLY_CLOSING],
 ]
 
-describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, rev 22)', () => {
+describe('kill-failure alert: the survivor version (HO rev 17, rev 22)', () => {
   test.each(SURVIVOR_ROUTES)('for %s: its body quoting the stub\'s survivor description redacted, then its own closing sentence', (_label, context, configured, closing, sentence) => {
     const description = survivorDescription()
     const route = selectKillFailureAlertRoute({ version: KILL_FAILURE_VERSION_SURVIVOR, context, configured, latched: false })
@@ -476,8 +476,7 @@ describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, r
     assertNoLeak(body)
   })
 
-  // A long session name can put the survivor clause past the cap (b.jg5
-  // SRJ-1001): the pid list is read from the raw description, the quote is
+  // A long session name can put the survivor clause past the cap: the pid list is read from the raw description, the quote is
   // capped.
   test('a description whose survivor clause starts past the cap: the pid list names every survivor pid; the quoted description is capped before the clause', () => {
     const pids = [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1]
@@ -506,7 +505,7 @@ describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, r
   // code does today: the pid list is complete, read from the raw description,
   // and the quote is capped, which cuts agent-director's closing "never
   // delete this row". Whether a cut quote is acceptable is an open question
-  // of the E37–E38 final review; this case states the present behaviour, not
+  // of the final review; this case states the present behaviour, not
   // a ruling.
   test('a description at the release candidate\'s length (a 5-character key, the worker and three survivors): the pid list names every survivor pid; the quote is capped', () => {
     const key = 'abcde'
@@ -545,7 +544,7 @@ describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, r
 // The log line and entry form
 // ---------------------------------------------------------------------------
 
-describe('kill-failure alert: the log-line and startup-errors form (b.jg5 SRJ-1007)', () => {
+describe('kill-failure alert: the log-line and startup-errors form', () => {
   test.each(KILL_FAILURE_CONTEXTS.flatMap((context) => [[context, `persona=${KEY}`], [context, `instanceId=${personaInstanceId(LAUNCH_START_PRE_PERSONA_KEY)}`]] as const))(
     'context %s, reference %s: the text follows the reference and the context',
     (context, ref) => {
@@ -562,7 +561,7 @@ describe('kill-failure alert: the log-line and startup-errors form (b.jg5 SRJ-10
     },
   )
 
-  // b.jg5 SRJ-909, SRJ-1013: the CLI's `persona-kill-failed` and
+  // the CLI's `persona-kill-failed` and
   // `persona-kill-survivor` entries name the command that ran the teardown.
   test.each(CLI_COMMANDS.flatMap((command) => VERSIONS.map((version) => [command, version] as const)))(
     'a CLI teardown run by %s, %s version: the context names the command after the CLI-teardown context',
@@ -640,11 +639,11 @@ describe('kill-failure alert: the bounded retry\'s decision as what the alert sa
 })
 
 // ---------------------------------------------------------------------------
-// Route selection (SRJ-704, SRJ-1013)
+// Route selection
 // ---------------------------------------------------------------------------
 
 /**
- * SRJ-704's routing, first match wins, for either version, as this case
+ * routing, first match wins, for either version, as this case
  * table states it: a start-sweep kill (an `orphan-cleanup` entry); a CLI
  * teardown (printed, a `persona-kill-failed` entry); a persona teardown (a
  * `persona-teardown-notice` entry); a persona no longer in the applied
@@ -670,8 +669,8 @@ const ROUTE_ROWS = KILL_FAILURE_CONTEXTS.flatMap((context) =>
   VERSIONS.flatMap((version) => [true, false].flatMap((configured) => [false, true].map((latched) => [context, version, configured, latched] as const))),
 )
 
-describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => {
-  test('every context SRJ-1007 lists, in its order', () => {
+describe('kill-failure alert: route selection', () => {
+  test('every context lists, in its order', () => {
     expect([...KILL_FAILURE_CONTEXTS]).toEqual([
       KILL_FAILURE_CONTEXT_START_SWEEP,
       KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
@@ -686,7 +685,7 @@ describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => 
     expect([ORPHAN_CLEANUP_LABEL, PERSONA_KILL_FAILED_LABEL, PERSONA_KILL_SURVIVOR_LABEL]).toEqual(['orphan-cleanup', 'persona-kill-failed', 'persona-kill-survivor'])
   })
 
-  test.each(ROUTE_ROWS)('context %s, %s version, configured %p, latched %p: the route, class, print, episode and closing sentence SRJ-704 gives', (context, version, configured, latched) => {
+  test.each(ROUTE_ROWS)('context %s, %s version, configured %p, latched %p: the route, class, print, episode and closing sentence gives', (context, version, configured, latched) => {
     const route = selectKillFailureAlertRoute({ version, context, configured, latched })
 
     expect({ ...route }).toEqual({ ...expectedRoute(version, context, configured, latched) })
@@ -709,8 +708,8 @@ describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => 
 })
 
 // ---------------------------------------------------------------------------
-// The alerts layer: every SRJ-1002 context, and a stopped retry's record
-// (SRJ-702, SRJ-704, SRJ-1002, SRJ-1013; AC 64)
+// The alerts layer: every context, and a stopped retry's record
+//
 // ---------------------------------------------------------------------------
 
 /** Every closing sentence of either version: none may appear in a stopped retry's entry, which carries no alert text. */
@@ -770,7 +769,7 @@ async function retryOnClock(
 }
 
 /**
- * A bounded retry stopped between tries (SRJ-702), each decision its stop
+ * A bounded retry stopped between tries, each decision its stop
  * can leave: the `none` decision (an ErrTmuxUnresponsive stop with no
  * survivor-naming failure), the ordinary decision quoting an
  * ErrTmuxKillFailed naming no survivor, and the ordinary decision quoting an
@@ -786,7 +785,7 @@ const STOPPED_RETRIES: ReadonlyArray<readonly [string, (id: string) => Promise<K
   }, KILL_RETRY_ALERT_ORDINARY, survivorKillFailedAtKill],
 ]
 
-describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and a stopped retry\'s record (b.jg5 SRJ-702, SRJ-704, SRJ-1002, SRJ-1013; AC 64)', () => {
+describe('kill-failure alert: the alerts layer over every context, and a stopped retry\'s record', () => {
   let baseDir: string
   let logDir: string
   let h: NotifierHarness
@@ -843,14 +842,14 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     expect(ALL_CLOSING_SENTENCES.filter((sentence) => entry.text.includes(sentence))).toEqual([])
   }
 
-  // b.jg5 SRJ-704, SRJ-1002, SRJ-1013: the start sweep, a CLI teardown, a
+  // the start sweep, a CLI teardown, a
   // persona teardown, an old-life wait's kill and a persona no longer in the
   // applied configuration reach the log and one entry of their class, never a
   // destination; only an applied persona outside those contexts gets its
   // destination. Each case raises for the applied persona and the removed one
   // beside it.
   test.each(KILL_FAILURE_CONTEXTS.flatMap((context) => VERSIONS.map((version) => [context, version] as const)))(
-    'context %s, %s version: the applied persona and the removed one each take SRJ-704\'s route; a log-only route writes one entry of its class and posts nothing, a destination posts once through the persona\'s own client',
+    'context %s, %s version: the applied persona and the removed one each take route; a log-only route writes one entry of its class and posts nothing, a destination posts once through the persona\'s own client',
     async (context, version) => {
       const decision: KillRetryAlert =
         version === KILL_FAILURE_VERSION_SURVIVOR
@@ -884,7 +883,7 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     },
   )
 
-  // b.jg5 SRJ-702, SRJ-704, SRJ-1003: a launch or recovery attempt's kill
+  // a launch or recovery attempt's kill
   // tries stopped between tries post nothing and raise neither version,
   // whatever their decision (`none` included). An applied persona's stop, by
   // its teardown, by its stopping being up or by a server shutdown, writes
@@ -932,7 +931,7 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     expect([alerts.isOpen(kept.key), alerts.isOpen(removed.key)]).toEqual([false, false])
   })
 
-  // b.jg5 SRJ-702, SRJ-811: an old-life wait's kill stopped at a server
+  // an old-life wait's kill stopped at a server
   // shutdown or at the teardown of the last persona waiting on it: the old
   // key's persona-kill-failed entry naming the wait's reference, with no
   // alert text; nothing posted. The context's route is always the log-only
@@ -960,7 +959,7 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     await expectNoSlack()
   })
 
-  // b.jg5 SRJ-702, SRJ-714: a start-sweep kill stopped at a shutdown, raised
+  // a start-sweep kill stopped at a shutdown, raised
   // here: its orphan-cleanup entry naming the row, with no alert text.
   test.each(STOPPED_RETRIES)('a start-sweep kill stopped at a shutdown, after %s: one orphan-cleanup entry naming the row, with no alert text; answers stopped, nothing posted', async (_label, retry, kind) => {
     const instanceId = personaInstanceId(kept.key)
@@ -975,7 +974,7 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     await expectNoSlack()
   })
 
-  // The control (b.jg5 SRJ-702, SRJ-811): an old-life wait's kill whose hold
+  // The control: an old-life wait's kill whose hold
   // ends between tries is no stop. Its tries end as a success, so no
   // persona-kill-failed entry is written; after a survivor-naming failure the
   // survivor version takes the old key's route (persona-kill-survivor), and
@@ -1015,7 +1014,7 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
 })
 
 // ---------------------------------------------------------------------------
-// Import boundary: no server-only module (E25, E26, E27, E29 and E33 reuse it)
+// Import boundary: no server-only module ( and reuse it)
 // ---------------------------------------------------------------------------
 
 describe('kill-failure alert: import boundary', () => {

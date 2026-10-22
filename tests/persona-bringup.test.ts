@@ -1,6 +1,6 @@
 /**
- * persona-bringup.test.ts — The per-persona start procedure (b.av2 SR-6.1) as
- * the server runs it, and the per-persona flush of held notices (SR-7.2).
+ * persona-bringup.test.ts — The per-persona start procedure as
+ * the server runs it, and the per-persona flush of held notices.
  *
  * Drives the real bring-up controller (`createPersonaBringUpController`, which
  * runs `persona-start.ts`'s steps 1–3) over the real connection manager, built
@@ -11,23 +11,23 @@
  * over an agent-director stub client, and the controller's own launch after a
  * retry goes the same way, as server.ts wires it. Covers:
  *
- *   - the SR-6.1 order per persona: credentials check, working-directory
+ * - the order per persona: credentials check, working-directory
  *     check, Slack validation and connection, then the launch, which runs
  *     only once that persona's connection is up, with the tokens from its own
  *     file;
  *   - a Slack step that throws: broken with class `error`, one token-free
  *     line, not retried, no launch;
  *   - a credentials path that is not a regular file (directory, FIFO,
- *     character device) is refused unread through the bring-up (the E2 carry;
+ * character device) is refused unread through the bring-up (the carry;
  *     `CredentialsFs.fstatFile`);
  *   - per-persona flush: A reaching up posts only A's held notices, through
- *     A's client, once; B's are posted when B's retry brings it up (the E3
- *     Task 2 carry);
+ * A's client, once; B's are posted when B's retry brings it up (the
+ * section 2 carry);
  *   - end to end, no agent-director call is made for A across a drop, a
  *     rejected, an abandoned and a refused reopen, with the real event router,
- *     flush listener and bring-up controller wired to the manager (the E2
+ * flush listener and bring-up controller wired to the manager (the
  *     carry);
- *   - bug b.g57 (Task 0 B3: the directory-broken shape): a persona whose
+ * - (section 0 B3: the directory-broken shape): a persona whose
  *     claude_config_dir is unresolvable (an injected EIO, or a symlink
  *     pointing to nothing) when its bring-up, or a directory retry, reaches
  *     the Slack step never connects; a launch that finds it unresolvable
@@ -55,10 +55,10 @@
  * Each bring-up outcome by cause (credentials missing, unreadable, invalid or
  * refused; directory missing or unusable; Slack unreachable), both causes at
  * once, and dry run are pinned in tests/persona-connections.test.ts
- * (`bring-up outcomes (E5)`); the start pool's bookkeeping in
+ * (`bring-up outcomes `); the start pool's bookkeeping in
  * tests/session-manager.test.ts.
  *
- * Isolation (b.av2 SR-13.2): every path lives under a `mkdtempSync` directory
+ * Isolation: every path lives under a `mkdtempSync` directory
  * removed in afterEach; `SLACK_STATE_DIR` points inside it, the spawn home is
  * a temp directory, and the token environment variables are set to fakes for
  * the whole file.
@@ -387,10 +387,10 @@ function expectBLaunched(h: Harness, result: StartupSessionManagerResult): void 
 }
 
 // ---------------------------------------------------------------------------
-// SR-6.1: the order of the steps
+// the order of the steps
 // ---------------------------------------------------------------------------
 
-describe('start pass: SR-6.1 order', () => {
+describe('start pass: order', () => {
   test('each persona passes its credentials, directory and Slack steps, then is launched once, only after its connection is up, with the tokens from its own file', async () => {
     const h = makeHarness()
 
@@ -458,7 +458,7 @@ describe('bring-up controller: a Slack step that throws', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Non-regular credentials files: refused before any read (E2 carry)
+// Non-regular credentials files: refused before any read ( carry)
 // ---------------------------------------------------------------------------
 
 describe('start pass: a credentials path that is not a regular file is refused unread', () => {
@@ -511,10 +511,10 @@ describe('start pass: a credentials path that is not a regular file is refused u
 })
 
 // ---------------------------------------------------------------------------
-// Per-persona flush of held notices (b.av2 SR-7.2; E3 Task 2 carry)
+// Per-persona flush of held notices ( section 2 carry)
 // ---------------------------------------------------------------------------
 
-describe('held notices flush per persona when it is up (SR-7.2)', () => {
+describe('held notices flush per persona when it is up', () => {
   test('A coming up posts only A\'s held notices, in order, once, through A\'s client; B\'s stay held until B\'s retry brings it up', async () => {
     // B's first auth.test cannot reach Slack; its retry 5 s later succeeds.
     const h = makeHarness({ slack: { b: { authTest: [{ kind: 'network' }] } } })
@@ -565,7 +565,7 @@ describe('held notices flush per persona when it is up (SR-7.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// End to end: no agent-director call for A across its connection trouble (E2 carry)
+// End to end: no agent-director call for A across its connection trouble ( carry)
 // ---------------------------------------------------------------------------
 
 describe('end to end: A\'s connection trouble makes no agent-director call', () => {
@@ -613,7 +613,7 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
     await h.conn.clock.advance(25_000)
 
     // A's broken outcome, its refused line and "no retry timer" are pinned in
-    // tests/persona-connections.test.ts (AC 23, AC 24 later credentials failure).
+    // tests/persona-connections.test.ts (later credentials failure).
     expect(h.conn.manager.status(a.key)).toMatchObject({ state: 'broken', phase: 'reopen' })
     expect(ad.callCount()).toBe(afterLaunch)
     expect(h.retryLaunches).toEqual([])
@@ -626,12 +626,12 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
 })
 
 // ---------------------------------------------------------------------------
-// Bug b.g57: a claude_config_dir that cannot be resolved holds the persona
+// a claude_config_dir that cannot be resolved holds the persona
 // retrying with no Slack connection, its row untouched, until it resolves
-// (Task 0 B3: the directory-broken shape, b.av2 SR-6.4)
+// (section 0 B3: the directory-broken shape)
 // ---------------------------------------------------------------------------
 
-describe('b.g57: an unresolvable claude_config_dir holds the persona retrying with its Slack connection closed', () => {
+describe('an unresolvable claude_config_dir holds the persona retrying with its Slack connection closed', () => {
   const CONFIG_DIR_CLASS = 'persona-config-dir-unresolvable'
   const DANGLING = 'ENOENT: a symlink on its path points to nothing'
 
@@ -822,7 +822,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
   // A hold that starts while A is up
   // -------------------------------------------------------------------------
 
-  test('b.g57: hold while up: no agent-director call; A\'s connection is closed (stop, once) and its MCP session dropped once; its row is kept; A is retrying with the configDir cause; one line; B unchanged', async () => {
+  test('hold while up: no agent-director call; A\'s connection is closed (stop, once) and its MCP session dropped once; its row is kept; A is retrying with the configDir cause; one line; B unchanged', async () => {
     const h = makeConfigDirHarness()
 
     const afterStart = await startThenHoldA(h)
@@ -850,7 +850,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp, dropped }))
   })
 
-  test('b.g57: notices during the hold: a notice for A raised while held posts nothing; after the recovery reconnects A it is posted exactly once, through A\'s client to A\'s destination, and none on B\'s; an event on B during the hold arrives tagged with B', async () => {
+  test('notices during the hold: a notice for A raised while held posts nothing; after the recovery reconnects A it is posted exactly once, through A\'s client to A\'s destination, and none on B\'s; an event on B during the hold arrives tagged with B', async () => {
     // The server's wiring: the real notifier, event router and flush listener, with the controller as the status listener.
     const received: Array<{ key: string; text: unknown }> = []
     const notifierLines: string[] = []
@@ -916,7 +916,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp, notifierLines, received, posts: [postsOf(a.key), postsOf(b.key)] }))
   })
 
-  test('b.g57: a hold while A\'s lost connection is still reopening ends that episode with one cleared line naming the hold; the recovery connects on a fresh episode (no restored line), and a later drop opens and restores a new one', async () => {
+  test('a hold while A\'s lost connection is still reopening ends that episode with one cleared line naming the hold; the recovery connects on a fresh episode (no restored line), and a later drop opens and restores a new one', async () => {
     const h = makeConfigDirHarness()
     await h.startPass()
     const ref = renderPersonaRef(a.name, a.key)
@@ -964,7 +964,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: retry: while unresolvable, A is re-checked on 5 s doubling to 300 s with no cap; nothing connects, launches, is called or logged', async () => {
+  test('retry: while unresolvable, A is re-checked on 5 s doubling to 300 s with no cap; nothing connects, launches, is called or logged', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     const cp = {
@@ -1003,7 +1003,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: recovery: once it resolves, one cleared line, then Slack with the held credentials (the file is not re-read), then one launch that resumes A\'s row (no kill, delete or fresh spawn); A is up again', async () => {
+  test('recovery: once it resolves, one cleared line, then Slack with the held credentials (the file is not re-read), then one launch that resumes A\'s row (no kill, delete or fresh spawn); A is up again', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     await h.conn.clock.runNext() // a failed re-check at 5 s
@@ -1065,7 +1065,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp, launched }))
   })
 
-  test('b.g57: recovery with Slack unreachable: A is Slack-retrying and nothing is launched; the launch waits for the manager\'s up, then runs once', async () => {
+  test('recovery with Slack unreachable: A is Slack-retrying and nothing is launched; the launch waits for the manager\'s up, then runs once', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     // A's next auth.test (its return) cannot reach Slack; the manager's retry 5 s later succeeds.
@@ -1098,7 +1098,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: race fallback: the recovery launch\'s ladder finds the directory unresolvable again: the row is kept (no kill, delete, resume or fresh spawn), A is held again with its new connection closed; once it resolves the same row is resumed', async () => {
+  test('race fallback: the recovery launch\'s ladder finds the directory unresolvable again: the row is kept (no kill, delete, resume or fresh spawn), A is held again with its new connection closed; once it resolves the same row is resumed', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     // The directory drops again between the re-check and the ladder's comparison of A's row.
@@ -1140,7 +1140,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp, launched }))
   })
 
-  test('b.g57: cancel: cancel(A) during the hold leaves no timer; nothing is re-checked, connected or launched afterwards', async () => {
+  test('cancel: cancel(A) during the hold leaves no timer; nothing is re-checked, connected or launched afterwards', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     const resolutions = aResolutions
@@ -1158,7 +1158,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: A held, then dropped from the applied set: its next re-check probes nothing, schedules nothing and ends its retries with one line; A is never connected or launched; B unaffected', async () => {
+  test('A held, then dropped from the applied set: its next re-check probes nothing, schedules nothing and ends its retries with one line; A is never connected or launched; B unaffected', async () => {
     let applied: Persona[] | undefined
     const h = makeConfigDirHarness({ appliedPersonas: () => applied ?? cfg.personas })
     await startThenHoldA(h)
@@ -1185,7 +1185,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: hold while A retries its bring-up for Slack: the hold closes it, so no Slack retry runs while held; once the directory resolves A connects and is launched once, through its claude_config_dir return', async () => {
+  test('hold while A retries its bring-up for Slack: the hold closes it, so no Slack retry runs while held; once the directory resolves A connects and is launched once, through its claude_config_dir return', async () => {
     // A's first auth.test cannot reach Slack: retrying at the start pass, its retry due at 5 s.
     const h = makeConfigDirHarness({ slack: { a: { authTest: [{ kind: 'network' }] } } })
     const started = await h.startPass()
@@ -1223,7 +1223,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ started, leftUp }))
   })
 
-  test('b.g57: a Slack launch queued behind an operation that holds A does nothing when its turn comes, though the directory resolved by then: no spawn without a connection; the recovery\'s own launch runs once, after the reconnect', async () => {
+  test('a Slack launch queued behind an operation that holds A does nothing when its turn comes, though the directory resolved by then: no spawn without a connection; the recovery\'s own launch runs once, after the reconnect', async () => {
     const serializer = createPersonaSerializer()
     // A's first auth.test cannot reach Slack: retrying at the start pass, its retry due at 5 s.
     const h = makeConfigDirHarness({ slack: { a: { authTest: [{ kind: 'network' }] } }, serialize: serializer.run })
@@ -1287,7 +1287,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
         h.controller.cancel(a.key)
       },
     ],
-  ])('b.g57: holdForConfigDir for A %s returns false and holds nothing (no line, no timer, no stop); the launch path then logs the line itself on each attempt', async (_label, arrange) => {
+  ])('holdForConfigDir for A %s returns false and holds nothing (no line, no timer, no stop); the launch path then logs the line itself on each attempt', async (_label, arrange) => {
     const h = makeConfigDirHarness()
     await arrange(h)
     failing.add(aDir)
@@ -1315,7 +1315,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
   // Unresolvable before the Slack step: never connects
   // -------------------------------------------------------------------------
 
-  test('b.g57: bring-up: A whose claude_config_dir is a symlink pointing to nothing never connects (no Slack step, no client) and is never launched; it ends retrying with this cause; B is launched; once the drive is back A connects, then is launched', async () => {
+  test('bring-up: A whose claude_config_dir is a symlink pointing to nothing never connects (no Slack step, no client) and is never launched; it ends retrying with this cause; B is launched; once the drive is back A connects, then is launched', async () => {
     const h = makeConfigDirHarness()
     rmSync(aTarget, { recursive: true })
 
@@ -1361,7 +1361,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ result, leftUp }))
   })
 
-  test('b.g57: directory retry: A with a missing working directory and a dangling claude_config_dir is checked for the latter only once its directory is back; held there with no connection; connects and is launched once both resolve', async () => {
+  test('directory retry: A with a missing working directory and a dangling claude_config_dir is checked for the latter only once its directory is back; held there with no connection; connects and is launched once both resolve', async () => {
     const h = makeConfigDirHarness()
     rmSync(a.working_directory, { recursive: true })
     rmSync(aTarget, { recursive: true })
@@ -1409,7 +1409,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
   test.each<[string, StubSlackOptions['authTest']]>([
     ['held while up', undefined],
     ['held while retrying its bring-up for Slack', [{ kind: 'network' }]],
-  ])('b.g57: credentials change %s: retrying with no connection; nothing opens and no swap hook runs; the new file is held; A returns on the new tokens once the directory resolves', async (_label, authTest) => {
+  ])('credentials change %s: retrying with no connection; nothing opens and no swap hook runs; the new file is held; A returns on the new tokens once the directory resolves', async (_label, authTest) => {
     const h = makeConfigDirHarness(authTest === undefined ? {} : { slack: { a: { authTest } } })
     await h.startPass()
     failing.add(aDir)
@@ -1454,7 +1454,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ result, swaps, hookCalls, leftUp }))
   })
 
-  test('b.g57: credentials change while held to a file Slack would refuse: taken with no Slack call; at the return Slack refuses it: A is broken by its credentials, not launched, not retried', async () => {
+  test('credentials change while held to a file Slack would refuse: taken with no Slack call; at the return Slack refuses it: A is broken by its credentials, not launched, not retried', async () => {
     const h = makeConfigDirHarness()
     const afterStart = await startThenHoldA(h)
     const cp = { activity: h.conn.slack.activityOf(a.key).length }
@@ -1482,7 +1482,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ result, leftUp }))
   })
 
-  test('b.g57: credentials change while held to a missing file: failed with one change-failed line (it keeps its current credentials); A returns on its held tokens', async () => {
+  test('credentials change while held to a missing file: failed with one change-failed line (it keeps its current credentials); A returns on its held tokens', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     const oldDigest = h.controller.credentialsDigest(a.key)
@@ -1516,7 +1516,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     ['while its first attempt is in flight', [{ kind: 'never' }], 'in-flight'],
     ['while it is retrying (the old connection kept)', [{ kind: 'network' }], 'retrying'],
     ['while its first attempt is in flight and Slack has refused A\'s own connection', [{ kind: 'never' }], 'in-flight, own connection refused'],
-  ])('b.g57: a hold that starts during a confirmed change\'s reconnect %s closes the reconnect with the connection: no swap ever; A keeps the new file and returns on it, unless Slack refused it: then skipped, broken, the old content held', async (_label, authTest, when) => {
+  ])('a hold that starts during a confirmed change\'s reconnect %s closes the reconnect with the connection: no swap ever; A keeps the new file and returns on it, unless Slack refused it: then skipped, broken, the old content held', async (_label, authTest, when) => {
     const h = makeConfigDirHarness()
     await h.startPass()
     const cp = { activity: h.conn.slack.activityOf(a.key).length }
@@ -1590,7 +1590,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying wi
     assertNoLeak(h.captured({ result, swaps, hookCalls, leftUp }))
   })
 
-  test('b.g57: a hold on a persona Slack had refused keeps the refusal: its connection is closed, and once the directory resolves one "stays broken" cleared line; no Slack step, no launch', async () => {
+  test('a hold on a persona Slack had refused keeps the refusal: its connection is closed, and once the directory resolves one "stays broken" cleared line; no Slack step, no launch', async () => {
     const h = makeConfigDirHarness()
     await h.startPass()
     // A's reopen is refused: broken by its credentials, its instance left running.

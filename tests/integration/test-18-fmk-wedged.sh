@@ -407,7 +407,7 @@ t18_setup() {
 }
 
 # ---------------------------------------------------------------------------
-# Section 1: the start sweep under `wedge` (AC 56)
+# Section 1: the start sweep under `wedge`
 # ---------------------------------------------------------------------------
 
 t18_sweep_section() {
@@ -419,7 +419,7 @@ t18_sweep_section() {
         ids+=("${!id_var}")
     done
 
-    # The bound (AC 56): one row's KILL_RETRY_TRIES tries and the waits between
+    # The bound: one row's KILL_RETRY_TRIES tries and the waits between
     # them, plus one try per later row, each try bounded by CSCB's call timeout.
     bound_ms=$(( (KILL_TRIES + ${#ids[@]} - 1) * CALL_TIMEOUT_MS + (KILL_TRIES - 1) * SPACING_MS ))
     # The wait for the summary line: the bound, plus the sweep's `list`, the
@@ -643,7 +643,7 @@ t18_condition_section() {
         t18_gt "${t}" "${unwedge_t}" || fail "${step}: ${p}'s recovery (${t}) posted before the unwedge (${unwedge_t})"
         echo "${TEST_NAME}: ${step}: ${p}'s recovery posted $(t18_diff "${t}" "${unwedge_t}") s after the unwedge"
 
-        # At most one onset, none after the alert (SRD over Epic: at most one).
+        # At most one onset, none after the alert (contract over component: at most one).
         onset_n="$(t18_count_posts "" "${!onset_var}")"
         (( onset_n <= 1 )) || fail "${step}: ${onset_n} tmux-unresponsive onset post(s) for ${p}, not at most 1"
         while IFS= read -r t; do
@@ -695,7 +695,7 @@ t18_sweep_section
 t18_condition_section
 stop_server
 
-# The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
+# The closing assertions.
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

@@ -530,13 +530,13 @@ describe('unavailable retry: the schedule', () => {
     expect(attempts.map((a) => (a.at - armedAt) / 1000)).toEqual([30, 90, 210, 450, 750, 1050, 1350])
   })
 
-  // b.2nr: the test-only override block's unavailable_retry_base_s / unavailable_retry_ceiling_s reach the timer through `baseS` / `ceilingS`.
+  // the test-only override block's unavailable_retry_base_s / unavailable_retry_ceiling_s reach the timer through `baseS` / `ceilingS`.
   // Regression: before the fix the deps had no such keys and the timer ran at 30 s / 300 s whatever the block said.
   test.each<[string, Pick<UnavailableRetryDeps, 'baseS' | 'ceilingS'>, number[]]>([
     ['base 5 and ceiling 60', { baseS: 5, ceilingS: 60 }, [5, 15, 35, 75, 135, 195]],
     ['base 5 alone, the default ceiling 300', { baseS: 5 }, [5, 15, 35, 75, 155, 315, 615, 915]],
     ['ceiling 60 alone, the default base 30', { ceilingS: 60 }, [30, 90, 150, 210]],
-  ])('b.2nr: %s sets the retry times after the arm', async (_label, timing, expected) => {
+  ])('%s sets the retry times after the arm', async (_label, timing, expected) => {
     const { clock, controller, attempts } = makeRig(undefined, undefined, undefined, undefined, timing)
     const armedAt = clock.now()
     controller.arm(KEY, UNAVAILABLE)
@@ -544,7 +544,7 @@ describe('unavailable retry: the schedule', () => {
     expect(attempts.map((a) => (a.at - armedAt) / 1000)).toEqual(expected)
   })
 
-  test('b.2nr: the view of an armed timer states the overridden first wait', () => {
+  test('the view of an armed timer states the overridden first wait', () => {
     const { clock, controller } = makeRig(undefined, undefined, undefined, undefined, { baseS: 5, ceilingS: 60 })
     controller.arm(KEY, UNAVAILABLE)
     expect(delays(clock)).toEqual([5000])
@@ -664,7 +664,7 @@ describe('unavailable retry: the schedule', () => {
   })
 })
 
-describe('unavailable retry: its arm, retry, re-arm, mode and stop lines, each from its exported builder (SRJ-1014)', () => {
+describe('unavailable retry: its arm, retry, re-arm, mode and stop lines, each from its exported builder', () => {
   /** A host path only a stack frame would show. */
   const HOST_PATH = '/srv/cscb-host-only/src/somewhere.ts'
 
@@ -817,7 +817,7 @@ describe('unavailable retry: arming while armed', () => {
   })
 })
 
-describe('unavailable retry: what arm answers (SRJ-301)', () => {
+describe('unavailable retry: what arm answers', () => {
   test.each<[string, () => Promise<readonly [boolean, boolean]>, boolean]>([
     ['newly armed', async () => {
       const { controller } = makeRig()
@@ -922,7 +922,7 @@ describe('unavailable retry: isolation', () => {
   })
 })
 
-describe('unavailable retry: settings independence (SRJ-304)', () => {
+describe('unavailable retry: settings independence', () => {
   test('on the recovery harness with session_restart_delay and health_check_interval 0, an armed persona is retried on the schedule and scheduleRestart arms nothing', async () => {
     harness = makeRecoveryHarness({ action: 'scripted' })
     const h = harness
@@ -967,7 +967,7 @@ describe('unavailable retry: settings independence (SRJ-304)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// What arms the timer (b.jg5 SRJ-301)
+// What arms the timer
 // ---------------------------------------------------------------------------
 
 /** A site of the launch path where an agent-director call made through the wrappers meets `err`. */
@@ -978,15 +978,15 @@ interface LaunchSite {
   /**
    * The launch's action when this site's call fails: `failed` for a refusal
    * that stops the launch; for the working-row read, whose failed poll lets
-   * the wait go on (b.jg5 SRJ-605), the action of the launch whose next poll
+   * the wait go on, the action of the launch whose next poll
    * reads `waiting` and reconnects.
    */
   readonly action: SpawnPersonaResult['action']
   /**
-   * For the sites whose refusal stops the launch at once (b.jg5 SRJ-105): the
+   * For the sites whose refusal stops the launch at once: the
    * stub calls the launch makes in all. An UNAVAILABLE at the reuse spawn
    * that replaces a finished row means no further launch, kill or delete
-   * after it, only its one `get` (b.jg5 SRJ-407); one at the sweep before a
+   * after it, only its one `get`; one at the sweep before a
    * working-row wait means no row read
    * and no reconnect after it.
    */
@@ -994,13 +994,13 @@ interface LaunchSite {
   /**
    * True when this site's call is tmux-touching and nothing after it in the
    * launch touches tmux: the `tmux-unresponsive` condition an UNAVAILABLE
-   * refusal here starts still holds when the launch returns (b.jg5 SRJ-307).
+   * refusal here starts still holds when the launch returns.
    * A kill-failure cause starts no condition.
    */
   readonly leavesConditionHeld?: boolean
   /**
    * True when this site's call is not tmux-touching and the launch stops at
-   * its refusal: no `tmux-unresponsive` condition starts (b.jg5 SRJ-307).
+   * its refusal: no `tmux-unresponsive` condition starts.
    */
   readonly startsNoCondition?: boolean
 }
@@ -1010,7 +1010,7 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
   { name: 'the collision get', verb: 'get', action: 'failed', script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: err }) },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
 
-  // b.jg5 SRJ-605: the wait's first poll meets the error and goes on; its next
+  // the wait's first poll meets the error and goes on; its next
   // poll reads the stub's default `waiting` row, and the launch reconnects.
   {
     name: 'the working-row read',
@@ -1018,11 +1018,11 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
     action: 'reconnected',
     script: (h, p, err) => ({ ...workingThenWaiting(h, p), statusQueue: [cannedErr(err)] }),
   },
-  // b.jg5 SRJ-707, SRJ-1503: the collision get reads a finished row in
+  // the collision get reads a finished row in
   // another directory, so the ladder replaces it by one reuse spawn of the
   // same id, with no kill and no delete; that reuse's refusal stops the
-  // launch with nothing counted (b.jg5 SRJ-112). Its UNAVAILABLE outcome is
-  // followed by one `get` (b.jg5 SRJ-407), which reads the same finished row,
+  // launch with nothing counted. Its UNAVAILABLE outcome is
+  // followed by one `get`, which reads the same finished row,
   // so no launch follows it in the attempt: two gets, two spawns.
   {
     name: 'the reuse spawn of a finished row in another directory',
@@ -1036,7 +1036,7 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
 ]
 
 /** The first collision sees working; the later waiting poll and its fresh
- * reconnect get see the same new state (b.omv SR-5.5). */
+ * reconnect get see the same new state. */
 function workingThenWaiting(h: RecoveryHarness, p: Persona): RecoveryStubScript {
   return {
     ...collided(h, p, { state: 'waiting' }),
@@ -1047,7 +1047,7 @@ function workingThenWaiting(h: RecoveryHarness, p: Persona): RecoveryStubScript 
 /** The sites whose verb is a read (`status`, `get`). */
 const READ_SITES = LAUNCH_SITES.filter((site) => site.verb === 'status' || site.verb === 'get')
 
-/** E4's UNAVAILABLE values, each with the cause kind it arms. */
+/** UNAVAILABLE values, each with the cause kind it arms. */
 const UNAVAILABLE_VALUES = unavailableForms(
   'ErrTmuxUnresponsive',
   'ErrTmuxKillFailed',
@@ -1065,9 +1065,9 @@ const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
 
 /**
  * The result a launch that met an arming error at a site with `action`
- * answers: a failure is answered `retrying` (b.jg5 SRJ-1015); any other
- * action (the working-row wait's, which goes on past a failed read, b.jg5
- * SRJ-605) is the wait's own outcome, as it is.
+ * answers: a failure is answered `retrying`; any other
+ * action (the working-row wait's, which goes on past a failed read
+ *) is the wait's own outcome, as it is.
  */
 function armedResult(key: string, action: SpawnPersonaResult['action']): SpawnPersonaResult {
   return action === 'failed' ? { key, action: SPAWN_ACTION_RETRYING } : { key, action }
@@ -1077,7 +1077,7 @@ function armedResult(key: string, action: SpawnPersonaResult['action']): SpawnPe
  * The working-row wait's poll interval in the launch cases, in real ms. The
  * wait sleeps its configuration's `agent_director_poll_interval_ms` between
  * polls on the real timer, so a case whose wait goes on past a failed read
- * (b.jg5 SRJ-605) polls again at once.
+ * polls again at once.
  */
 const WAIT_POLL_MS = 1
 
@@ -1115,7 +1115,7 @@ function expectArmedOnce(h: RecoveryHarness, key: string, kind: string, lastRow?
  * starts the `tmux-unresponsive` condition: no alert check is armed
  * (`alertThresholdMs: false`), so the only timer on the clock is the retry
  * timer the case checks. The alert check is covered where it is part of the
- * story: the AC 26 and AC 30 alert cases below and
+ * story: the and alert cases below and
  * `tests/tmux-unresponsive.test.ts`.
  */
 const RETRY_TIMER_ONLY: RecoveryHarnessOptions = { alertThresholdMs: false }
@@ -1129,7 +1129,7 @@ function expectNothingArmed(h: RecoveryHarness): void {
 
 /**
  * The one thing armed is persona `key`'s pending-only watch on the row its
- * launch left (b.jg5 SRJ-301, SRJ-409): `pendingRowArms` pending-row
+ * launch left: `pendingRowArms` pending-row
  * triggers for it and no other trigger, its timer waiting in pending-only
  * mode with the pending-row cause alone, no other persona armed, and its
  * timer the only one on the clock.
@@ -1142,7 +1142,7 @@ function expectOnlyThePendingOnlyWatch(h: RecoveryHarness, key: string, pendingR
   expect(h.clock.pendingCount()).toBe(1)
 }
 
-describe('unavailable retry: what arms the timer (SRJ-301)', () => {
+describe('unavailable retry: what arms the timer', () => {
   const unavailableCross = UNAVAILABLE_VALUES.flatMap(([what, make, kind]) =>
     LAUNCH_SITES.map((site) => [what, site.name, site.verb, make, kind, site] as const),
   )
@@ -1191,7 +1191,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     ['a STATE answer from get', () => errSpawnNotInteractive('get'), 'get', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a GONE answer from status', () => errTmuxCaptureFailed(undefined, 'status'), 'status', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a STATE answer from list', () => errSpawnNotInteractive('list'), 'list', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
-    // b.jg5 SRJ-311: ENVIRONMENT is decided before the read-error rule, so
+    // ENVIRONMENT is decided before the read-error rule, so
     // the read verbs record the ENVIRONMENT cause too, as every other verb does.
     ['ErrTmuxNotAvailable from status', () => errTmuxNotAvailable(undefined, 'status'), 'status', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ErrTmuxNotAvailable from get', () => errTmuxNotAvailable(undefined, 'get'), 'get', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
@@ -1202,7 +1202,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     ['ErrTmuxNotAvailable from delete', () => errTmuxNotAvailable(undefined, 'delete'), 'delete', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ErrTmuxNotAvailable (the re-bound socket) from resume', () => errTmuxNotAvailableDifferentServer(), 'resume', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ErrTmuxNotAvailable with no verb known', () => errTmuxNotAvailable(), undefined, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
-    // b.jg5 SRJ-316, SRJ-301: CONFIG is its own cause from any verb, decided
+    // CONFIG is its own cause from any verb, decided
     // before the read-error rule, so the read verbs record it too.
     ['a CONFIG answer from get', () => errConfigMalformed(), 'get', UNAVAILABLE_RETRY_CAUSE_CONFIG],
     ['a CONFIG answer from status', () => errConfigMalformed(), 'status', UNAVAILABLE_RETRY_CAUSE_CONFIG],
@@ -1229,12 +1229,12 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
   })
 
   test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, SpawnPersonaResult['action'], number]>([
-    // b.jg5 SRJ-707: the stub's spawn queue answers the first spawn's
+    // the stub's spawn queue answers the first spawn's
     // collision; the reuse spawn of the same id after the resume succeeds.
     ['a STATE answer from resume (ErrJsonlNeverWritten), then the one reuse spawn', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errJsonlNeverWritten() }), 'spawned', 1],
     ['a DIRECTORY answer from spawn', () => ({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found') }), 'failed', 0],
     ['ErrSpawnNotFound from the collision get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), 'spawned', 0],
-    // b.jg5 SRJ-605: the working-row wait's poll reading the row absent is
+    // the working-row wait's poll reading the row absent is
     // 'dead-session', and the recovery resumes the row the collision read.
     ['ErrSpawnNotFound from the working-row read (status)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errSpawnNotFound())] }), 'resumed', 0],
   ])('%s inside a launch arms nothing of its own and marks nothing; a launch that returned leaves only its pending-only watch', async (_what, script, action, reuses) => {
@@ -1248,7 +1248,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     expect(h.reuseSpawns()).toEqual(Array.from({ length: reuses }, () => reuseSpawnOf(h, key)))
     expect(h.stub.calls.deleteCalls).toEqual([])
     // A launch that returned (spawned or resumed) arms P's pending-only
-    // watch on its new row (b.jg5 SRJ-301, SRJ-409); the answers met on the
+    // watch on its new row; the answers met on the
     // way arm nothing.
     const launched = action !== 'failed'
     expect(h.triggers).toEqual(launched ? [{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }] : [])
@@ -1307,13 +1307,13 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
       return h.stub.calls.statusCalls.length
     }],
-    ['the start sweep’s list (b.jg5 SRJ-116: no latch, record or kill follows the failed list)', async (h) => {
+    ['the start sweep’s list (no latch, record or kill follows the failed list)', async (h) => {
       h.script({ listError: errCallTimeout('list') })
       await reconcileOrphans(h.config, h.killRetryClock)
       expect([h.stub.calls.killCalls, h.stub.calls.findMissingCalls, h.retiredKeyWrites, h.latchEvents]).toEqual([[], [], [], []])
       return h.stub.calls.listCalls.length
     }],
-    ['a persona teardown’s kill (b.jg5 SRJ-701: it answers its non-success outcome, never throws)', async (h, key) => {
+    ['a persona teardown’s kill (it answers its non-success outcome, never throws)', async (h, key) => {
       const err = errTmuxKillFailed()
       h.script({ killError: err })
       expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNAVAILABLE, error: err })
@@ -1411,13 +1411,12 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The next retry after a launch timeout's one `get` (b.jg5 SRJ-407, SRJ-301,
-// SRJ-409): the timed-out attempt makes no launch whatever the `get` reads;
+// The next retry after a launch timeout's one `get`: the timed-out attempt makes no launch whatever the `get` reads;
 // a row that is gone or finished is brought up by the next retry, and a
 // covered `pending` row is watched, launched over by no retry while it is live
 // ---------------------------------------------------------------------------
 
-/** Both launch-timeout forms (b.jg5 SRJ-407), by the exported form names. */
+/** Both launch-timeout forms, by the exported form names. */
 const LAUNCH_TIMEOUT_FORMS = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE] as const
 
 /** The launch calls (`spawn`, `resume`) made since `before` (a `callCounts` snapshot). */
@@ -1426,7 +1425,7 @@ function launchesSince(h: RecoveryHarness, before: Record<string, number>): numb
   return (since['spawnCalls'] ?? 0) + (since['resumeCalls'] ?? 0)
 }
 
-describe('unavailable retry: the next retry after a launch timeout\'s one get (SRJ-407, SRJ-301, SRJ-409)', () => {
+describe('unavailable retry: the next retry after a launch timeout\'s one get', () => {
 
   test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))(
     'a spawn ending in a launch timeout (%s) whose one get reads its row pending and covered: the full-mode timer gains the pending-row cause with pending as the last row read, and the next retry, the row still pending, launches nothing and re-arms deferred on it',
@@ -1492,7 +1491,7 @@ function adUnreachableEpisode(h: RecoveryHarness, key: string): RecoveryNotice[]
 }
 
 // ---------------------------------------------------------------------------
-// The shared findMissing sweep (b.jg5 SRJ-301): each persona that met a failed
+// The shared findMissing sweep: each persona that met a failed
 // sweep inside its own attempt is armed once, whoever started the sweep.
 // ---------------------------------------------------------------------------
 
@@ -1506,7 +1505,7 @@ function sweepInAttempt(key: string): Promise<void> {
   return runInAttempt(key, 'recovery', () => sweepDeadTmuxChannel(key, 'dead-session'))
 }
 
-describe('unavailable retry: a shared findMissing sweep that fails arms each persona that met it inside its attempt (SRJ-301)', () => {
+describe('unavailable retry: a shared findMissing sweep that fails arms each persona that met it inside its attempt', () => {
   test('P and Q, each inside its own attempt, share one findMissing call; when it fails each is armed once with unavailable', async () => {
     const h = (harness = makeRecoveryHarness())
     const [p, q] = h.keys as [string, string]
@@ -1590,7 +1589,7 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
 })
 
 // ---------------------------------------------------------------------------
-// Attempt frames (b.jg5 SRJ-301): a continuation that outlives its attempt
+// Attempt frames: a continuation that outlives its attempt
 // ---------------------------------------------------------------------------
 
 describe('unavailable retry: an attempt started from a continuation that outlives a closed attempt', () => {
@@ -1667,7 +1666,7 @@ describe('unavailable retry: an attempt started from a continuation that outlive
 })
 
 // ---------------------------------------------------------------------------
-// Again-reasons and close (b.jg5 SRJ-303, SRJ-305) on the bare controller
+// Again-reasons and close on the bare controller
 // ---------------------------------------------------------------------------
 
 describe('unavailable retry: again-reasons and close', () => {
@@ -1722,7 +1721,7 @@ describe('unavailable retry: again-reasons and close', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The retry action (b.jg5 SRJ-303, SRJ-305), in both modes, over a stand-in
+// The retry action, in both modes, over a stand-in
 // row read and retry entry
 // ---------------------------------------------------------------------------
 
@@ -1771,9 +1770,9 @@ const PENDING_ONLY_RETRY = { retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_
 const GATES: ReadonlyArray<readonly [string, Partial<FullModeRetryDeps>, string]> = [
   ['shutting down (before everything else)', { isShuttingDown: () => true, appliedPersona: () => undefined, isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_SHUTDOWN],
   ['not applied (before the latched check)', { appliedPersona: () => undefined, isLatched: () => true, isHeld: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
-  // b.jg5 SRJ-303, SRJ-305: no attempt while P is latched; the timer stops instead.
+  // no attempt while P is latched; the timer stops instead.
   ['latched (before the held check)', { isLatched: () => true, isHeld: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_LATCHED],
-  // b.jg5 SRJ-207, SRJ-303, SRJ-305: nor while P is held on ErrInvalidFlags.
+  // nor while P is held on ErrInvalidFlags.
   ['held on ErrInvalidFlags (before the up check)', { isHeld: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_HELD],
   ['not up (before the cap)', { canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_UP],
   ['at the restart cap', { isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_CAPPED],
@@ -1896,7 +1895,7 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     expect(deps.calls).toEqual([])
   })
 
-  // b.jg5 SRJ-305, SRJ-512, SRJ-513: the latched query asked again after the
+  // the latched query asked again after the
   // row read. On the harness the latch's hold stops the timer first, so this
   // backstop is reached only here: the persona latches during the read, which
   // answers a row that would otherwise be handed to the restart path.
@@ -1919,13 +1918,13 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
 })
 
 // ---------------------------------------------------------------------------
-// The retry marker (b.jg5 SRJ-410, SRJ-303): the pending-row rule runs only
+// The retry marker: the pending-row rule runs only
 // inside a retry of the persona's own timer, in either mode, at most once per
 // retry; work the retry starts outside every attempt, and the hand-off run
 // after a pending-only stop, are no retry of the timer.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: the retry marker the pending-row rule runs inside (SRJ-410, SRJ-303)', () => {
+describe('unavailable retry: the retry marker the pending-row rule runs inside', () => {
   /** What the marker answered at one point of a run: for KEY, for OTHER, and for KEY inside `runOutsideAttempts`. */
   type MarkerSeen = readonly [forKey: boolean, forOther: boolean, outsideAttempts: boolean]
   const seen = (): MarkerSeen => [isInsideTimerRetry(KEY), isInsideTimerRetry(OTHER), runOutsideAttempts(() => isInsideTimerRetry(KEY))]
@@ -1988,7 +1987,7 @@ describe('unavailable retry: the retry marker the pending-row rule runs inside (
 })
 
 // ---------------------------------------------------------------------------
-// The full-mode retry end to end (b.jg5 SRJ-302, SRJ-303, SRJ-305) on the
+// The full-mode retry end to end on the
 // recovery harness's default action: the real restart entry over the
 // production adapters, the relaunch gate and one serializer, against the stub
 // ---------------------------------------------------------------------------
@@ -2011,7 +2010,7 @@ interface RowModel {
  * that over from another state. While a persona's row reads `pending`, a
  * `get` of it (still made on the stub, so logged and scripted as any) answers
  * that row, in the persona's own directory with its labels and the stub's
- * default launch start: covered (b.jg5 SRJ-409), so the one `get` the
+ * default launch start: covered, so the one `get` the
  * pending-row step makes reads the row the `status` read; in any other state
  * a `get` answers as the stub is scripted. Every spawn call's clock time is
  * recorded. While `refuse`, when given, answers an error, every `status`
@@ -2064,8 +2063,7 @@ const DEAD_READING_OF_ROW: Readonly<Record<'ended' | 'missing' | typeof UNAVAILA
 
 /**
  * The restart decision's liveness read found `key`'s row `state` (`ended`,
- * `missing`, or no row) and it launched `times` times with no kill (b.jg5
- * SRJ-110, SRJ-314): each launch logged its no-kill line and its `kill: none`
+ * `missing`, or no row) and it launched `times` times with no kill: each launch logged its no-kill line and its `kill: none`
  * relaunch line once.
  */
 function expectLaunchedWithNoKill(h: RecoveryHarness, key: string, state: keyof typeof DEAD_READING_OF_ROW, times = 1): void {
@@ -2090,8 +2088,8 @@ async function armBoth(h: RecoveryHarness, key: string, other: string): Promise<
   h.controller.arm(other, UNAVAILABLE)
 }
 
-describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-302, SRJ-303, SRJ-305)', () => {
-  test('AC 26: with both settings 0 and agent-director’s default settings, a refused bring-up spawns at each due time and never early, counts nothing past the cap, posts one onset at the first retry at or past the onset floor and one alert once past the alert threshold (none at it) while the retries go on, launches once when the refusal clears and posts one recovery, runs on at the next wait in pending-only mode, and its next retry reads the row once and stops with nothing pending', async () => {
+describe('unavailable retry: the full-mode retry on the recovery harness', () => {
+  test('with both settings 0 and agent-director’s default settings, a refused bring-up spawns at each due time and never early, counts nothing past the cap, posts one onset at the first retry at or past the onset floor and one alert once past the alert threshold (none at it) while the retries go on, launches once when the refusal clears and posts one recovery, runs on at the next wait in pending-only mode, and its next retry reads the row once and stops with nothing pending', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     expect(h.settings()).toEqual(DEFAULT_AD_SETTINGS_IN_EFFECT)
@@ -2104,7 +2102,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expect(row.spawnedAt).toEqual([refusedAt])
     expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(refusedAt)
 
-    // SRJ-302's alert half (b.jg5 SRJ-308 to SRJ-310): the condition's posts
+    // alert half: the condition's posts
     // so far, in order. The onset comes at the first retry at or past the
     // floor (the health check is off); the alert once the condition has
     // lasted strictly longer than the threshold in effect, between two
@@ -2174,7 +2172,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     posts.push(tmuxUnresponsiveRecoveryText(key))
     expectPosts()
     expect(postedLines('recovery')).toHaveLength(1)
-    // The launch's own pending-only arm (b.jg5 SRJ-301, SRJ-409) adds its
+    // The launch's own pending-only arm adds its
     // cause to the running timer, whose due time the retry's re-arm sets.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
@@ -2202,7 +2200,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expectPosts()
   })
 
-  // b.jg5 SRJ-1015, SRJ-302: the start pass's own tally of the launch that
+  // the start pass's own tally of the launch that
   // met UNAVAILABLE; tests/session-manager.test.ts covers every action's count.
   test('a start pass whose launch of P meets UNAVAILABLE counts it under retrying, never failed or succeeded, and arms P\'s timer once; its first retry, refused again, re-arms at the doubled wait with nothing counted', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
@@ -2246,7 +2244,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expect([getFailureCount(key), h.capReached, h.notices]).toEqual([0, [], []])
   })
 
-  test('AC 30 (its alert part): with both settings 0, a condition that ends through a successful read-pane after its onset, while a retry last read the row pending, posts one recovery, cancels its alert check and leaves the retry timer armed with its due time; that retry fires and no alert is ever posted', async () => {
+  test('(its alert part): with both settings 0, a condition that ends through a successful read-pane after its onset, while a retry last read the row pending, posts one recovery, cancels its alert check and leaves the retry timer armed with its due time; that retry fires and no alert is ever posted', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key] = h.keys as [string]
@@ -2302,15 +2300,14 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     ['live and connected with its stream: nothing left to recover, no launch', 'waiting', true, { statusCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
     ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, getCalls: 4, sendKeysCalls: 2 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
     // A `pending` liveness reading is deferred by the restart work itself
-    // (b.jg5 SRJ-314), whatever the connection shows: its one status read,
+    // whatever the connection shows: its one status read,
     // and no reconnect (so no second status read), send-keys, kill or spawn;
     // the deferral's one `get` finds the row covered and arms the pending-row
-    // cause on the running timer, which stays in full mode (b.jg5 SRJ-409).
+    // cause on the running timer, which stays in full mode.
     ['pending and not connected: the liveness read defers it, no reconnect and never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 1, getCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     ['pending and connected with its stream: never nothing left to recover; the liveness read defers it, and the timer runs on in full mode, its last row read pending', 'pending', true, { statusCalls: 1, getCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     // The launch arms its pending-only watch, adding the pending-row cause.
-    // No kill before it: the liveness read read the row finished (b.jg5
-    // SRJ-110, SRJ-314).
+    // No kill before it: the liveness read read the row finished.
     ['ended: a launch with no kill, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'ended', false, { statusCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     ['missing: a launch with no kill, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'missing', false, { statusCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
   ])('a retry that finds the row %s', async (_what, state, connected, calls, outcome) => {
@@ -2394,7 +2391,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
     expect(delays(h.clock)).toEqual([waitMs(1)])
-    // E8's condition-end entry (SRJ-306) keeps the timer on the pending row.
+    // condition-end entry keeps the timer on the pending row.
     expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_ROW_PENDING)
 
     // The session starts: the row reads live, connected with its stream.
@@ -2519,7 +2516,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
   })
 })
 
-describe('unavailable retry: the stop rules that exist now on the recovery harness (SRJ-305, AC 28)', () => {
+describe('unavailable retry: the stop rules that exist now on the recovery harness', () => {
   test('the restart cap: each counted launch failure re-arms at the doubled wait until the cap stops the timer, with onCapReached once and its notice', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
@@ -2532,7 +2529,7 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     for (let n = 1; n < RESTART_FAILURE_CAP; n++) {
       await retryNow(h, key)
       expect(getFailureCount(key)).toBe(n)
-      // Exactly one spawn per retry: none in the failed one's place (b.jg5 SRJ-602).
+      // Exactly one spawn per retry: none in the failed one's place.
       expect(h.stub.calls.spawnCalls).toHaveLength(n)
       expect(h.lines).toContain(reArmedLine(key, n, UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED, n))
       expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(n), refusals: n })
@@ -2569,7 +2566,7 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     expect(h.controller.view(key)?.phase).toBe('running')
 
     // The held launch fails with a LAUNCH FAILURE, counted, with no spawn in
-    // its place (b.jg5 SRJ-602): that failure reaches the cap.
+    // its place: that failure reaches the cap.
     hold.fail(personaInstanceId(key), errTmuxSessionCreate('spawn'))
     expect(await restart).toBe(RESTART_OUTCOME_CAPPED)
     await h.settle()
@@ -2674,12 +2671,12 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
 })
 
 // ---------------------------------------------------------------------------
-// Pending-only mode (b.jg5 SRJ-301, SRJ-303, SRJ-305) on the recovery harness's
+// Pending-only mode on the recovery harness's
 // default action, armed directly (`armPendingOnly`) or by a launch that
-// returned (b.jg5 SRJ-409). A retry that reads the row `pending` makes the
+// returned. A retry that reads the row `pending` makes the
 // pending-row step's one `get` (`modelRow` answers it covered unless a case
 // scripts another row), which arms the pending-row cause again on the
-// running timer and keeps it (b.jg5 SRJ-409); an uncovered row's case is in
+// running timer and keeps it; an uncovered row's case is in
 // the pending-row step's describe below. The pending-row rule's runs and
 // laps are later work: no case here asserts one.
 // ---------------------------------------------------------------------------
@@ -2700,7 +2697,7 @@ function expectStopped(h: RecoveryHarness, key: string): void {
   expect(h.clock.pendingCount()).toBe(0)
 }
 
-describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301, SRJ-303, SRJ-305)', () => {
+describe('unavailable retry: pending-only mode on the recovery harness', () => {
   test('a row still pending: armed at the base wait, each retry’s only agent-director calls are its row read and the pending-row step’s one get, which finds the row covered and keeps the timer, and the next wait doubles', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -2764,9 +2761,8 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     expectStopped(h, key)
   })
 
-  // Hatch note E8: the hand-off run's successful launch leaves a fresh
-  // pending-only timer watching the new `pending` row (b.jg5 SRJ-301,
-  // SRJ-409), armed through the trigger sink after the stop.
+  // design note : the hand-off run's successful launch leaves a fresh
+  // pending-only timer watching the new `pending` row, armed through the trigger sink after the stop.
   test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT] as const)('a row read %s: the timer stops, then one run of the restart decision (one launch, no kill), whose launch arms a fresh pending-only timer on its row', async (state) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
@@ -2778,7 +2774,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
 
     // The row read, then the restart decision's liveness read, spawn and
     // readiness read; no kill, since that liveness read read the row
-    // finished or gone (b.jg5 SRJ-110, SRJ-314).
+    // finished or gone.
     expect(callCounts(h)).toEqual({ statusCalls: 2, spawnCalls: 1 })
     expectLaunchedWithNoKill(h, key, state)
     expect(row.spawnedAt).toEqual([dueAt])
@@ -2861,13 +2857,13 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
 
     // The full decision on a pending row: its liveness read, which defers it
-    // (b.jg5 SRJ-314), so one status read, as a pending-only retry's row read
+    // so one status read, as a pending-only retry's row read
     // would be; the full decision shows in the retry's mode and in its
     // pending-deferred again-reason (a pending-only retry answers row-pending).
     const before = callCounts(h)
     await retryNow(h, key)
     expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
-    // The deferral's one get finds the row covered (b.jg5 SRJ-409).
+    // The deferral's one get finds the row covered.
     expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 1 })
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
     expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
@@ -2896,9 +2892,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
 
-    // The full decision: its liveness read defers the pending row (b.jg5
-    // SRJ-314), its one status read, and the deferral's one get (b.jg5
-    // SRJ-409); it answers pending-deferred, not the pending-only row-pending.
+    // The full decision: its liveness read defers the pending row, its one status read, and the deferral's one get; it answers pending-deferred, not the pending-only row-pending.
     await retryNow(h, key)
     expect(h.attempts.map((a) => [a.mode, a.at])).toEqual([[UNAVAILABLE_RETRY_MODE_FULL, dueAt]])
     expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
@@ -2914,7 +2908,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     await retryNow(h, key)
     expect(row.spawnedAt).toHaveLength(1)
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
-    // The launch's own pending-only arm adds its cause (b.jg5 SRJ-301, SRJ-409).
+    // The launch's own pending-only arm adds its cause.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
@@ -3065,17 +3059,17 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
 })
 
 // ---------------------------------------------------------------------------
-// The covered-row triggers (b.jg5 SRJ-301, SRJ-409; one case per origin that
+// The covered-row triggers (one case per origin that
 // reaches the controller), the pending-only retry's pending-row step on a row
-// that is not covered (SRJ-303, SRJ-409, SRJ-411), the restart cap's stop
-// of a pending-only timer (SRJ-305), and a pending-only stop while the
-// `tmux-unresponsive` condition holds (SRJ-305, SRJ-309; hatch note E10), on
+// that is not covered, the restart cap's stop
+// of a pending-only timer, and a pending-only stop while the
+// `tmux-unresponsive` condition holds (design note ), on
 // the recovery harness with both settings 0. A covered row is P's own
 // `pending` row in its own directory with its labels and a launch start;
 // the uncovered one is in another working directory.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: the covered-row triggers and the pending-only retry\'s pending-row step (SRJ-301, SRJ-303, SRJ-305, SRJ-409, SRJ-411)', () => {
+describe('unavailable retry: the covered-row triggers and the pending-only retry\'s pending-row step', () => {
   /** Persona `key`'s timer was armed fresh in pending-only mode with the pending-row cause, through the trigger sink, at the base wait from now. */
   function expectArmedPendingOnlyNow(h: RecoveryHarness, key: string): void {
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
@@ -3091,7 +3085,7 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
     expect(retryLinesOf(h, key)).toEqual([pendingOnlyArmedLine(key)])
   }
 
-  test('SRJ-301 trigger: a launch that returned (its spawn answered) arms P\'s timer once, in pending-only mode with the pending-row cause, at the base wait; no other persona is armed', async () => {
+  test('trigger: a launch that returned (its spawn answered) arms P\'s timer once, in pending-only mode with the pending-row cause, at the base wait; no other persona is armed', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
 
@@ -3103,7 +3097,7 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
 
   })
 
-  test('SRJ-301 trigger: a row first found pending (the restart path\'s liveness read, its deferral\'s one get finding the row covered) arms P\'s timer once, in pending-only mode with the pending-row cause; no kill or launch, nothing counted', async () => {
+  test('trigger: a row first found pending (the restart path\'s liveness read, its deferral\'s one get finding the row covered) arms P\'s timer once, in pending-only mode with the pending-row cause; no kill or launch, nothing counted', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
@@ -3116,7 +3110,7 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
     expect(getFailureCount(key)).toBe(0)
   })
 
-  test('SRJ-301 trigger: a failed fresh plain spawn (ErrTmuxSessionCreate) arms P\'s timer at once, in pending-only mode with the pending-row cause, with no get first', async () => {
+  test('trigger: a failed fresh plain spawn (ErrTmuxSessionCreate) arms P\'s timer at once, in pending-only mode with the pending-row cause, with no get first', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     h.script({ spawnError: errTmuxSessionCreate('spawn') })
@@ -3128,10 +3122,10 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
     expect(h.controller.isArmed(other)).toBe(false)
   })
 
-  // Hatch note E21 (SRJ-411): the pending-only retry sends a row that is not
+  // design note : the pending-only retry sends a row that is not
   // covered through the live-row sequence with no launch of its own, and
   // re-arms naming the sequence; its next retry, while the sequence runs, is
-  // skipped with no call (SRJ-303); the sequence's own launch then arms the
+  // skipped with no call; the sequence's own launch then arms the
   // pending-only watch again on the new row.
   test('a pending-only retry whose row is not covered (another working directory) starts one live-row sequence and makes no launch, resume or keystroke of its own; it re-arms naming the sequence, the next retry is skipped with no call while the sequence runs, and the sequence ends in one reuse whose launch arms the watch again', async () => {
     const h = (harness = makeRecoveryHarness())
@@ -3183,12 +3177,12 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
 
   })
 
-  // b.jg5 SRJ-411 (hatch A3), b.av2 SR-6.4: the pending-only retry is a
+  // (design A3), the pending-only retry is a
   // status-only site, so P's working directory with no real path leaves its
   // pending row undecided whatever the row's cwd: the timer is kept, with the
   // undecided line, and nothing is started or launched.
 
-  // Reconcile note (hatch notes E21-E22), build-lead ruling: the counted
+  // Reconcile note (design notes ), build-lead ruling: the counted
   // ErrTmuxSessionCreate that brings P to the restart cap leaves no timer
   // armed: its pending-only arm is stopped at once by the cap's stop
   // (`onCapReached`, as main() binds it), so no retry runs past the cap.
@@ -3215,12 +3209,12 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
 })
 
 // ---------------------------------------------------------------------------
-// The pending-row rule at the retries (b.jg5 SRJ-410, SRJ-303), on the
+// The pending-row rule at the retries, on the
 // recovery harness with the rule installed as main() installs it and P's own
 // covered `pending` row scripted by the pending-row model (its launch start
 // the stub's sample). Here: a pending-only run that marks the row missing
 
-// running makes the run and no lap (SRJ-303's Test line); in full mode the
+// running makes the run and no lap (Test line); in full mode the
 // rule runs through the restart path's deferral. The rule's rounds at a
 // pending-only retry before G, from G, at a lap that clears the dialog, at B
 // and for CSCB's own launch past B, with the retry timer's re-armed and
@@ -3266,7 +3260,7 @@ function expectNoKillLaunchOrKeys(h: RecoveryHarness): void {
   expect([killCalls, spawnCalls, resumeCalls, sendKeysCalls]).toEqual([[], [], [], []])
 }
 
-describe('unavailable retry: the pending-row rule at each retry of P\'s timer (SRJ-410, SRJ-303)', () => {
+describe('unavailable retry: the pending-row rule at each retry of P\'s timer', () => {
   test('pending-only, from G, a run that marks the row missing: the retry stops on the gone row and hands P to the restart decision once, one launch with no kill, whose new pending row is watched again', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
@@ -3322,7 +3316,7 @@ describe('unavailable retry: the pending-row rule at each retry of P\'s timer (S
 })
 
 // ---------------------------------------------------------------------------
-// The pending and kill-failure exceptions (b.jg5 SRJ-306): the condition-end
+// The pending and kill-failure exceptions: the condition-end
 // entry, called directly here as the conditions' owners will call it
 // ---------------------------------------------------------------------------
 
@@ -3348,7 +3342,7 @@ function expectKeptThroughEveryConditionEnd(h: RecoveryHarness, key: string, why
   expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
 }
 
-describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)', () => {
+describe('unavailable retry: the pending and kill-failure exceptions', () => {
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
     ['armed pending-only directly', async (h, key) => h.controller.armPendingOnly(key)],
     ['a full-mode retry deferred on the pending row', async (h, key) => {
@@ -3397,8 +3391,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
 })
 
 // ---------------------------------------------------------------------------
-// The `tmux-unresponsive` condition's ends and the retry timer (b.jg5 SRJ-305,
-// SRJ-306, SRJ-310) on the recovery harness, both settings 0: a retry that
+// The `tmux-unresponsive` condition's ends and the retry timer on the recovery harness, both settings 0: a retry that
 // finds the persona recovered on its own, a retry that does not, a launch's
 // successful spawn, a plain tmux-touching success and a health tick's end,
 // each reaching the condition-end entry as `main()` wires it
@@ -3408,10 +3401,10 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
  * A start-pass launch of persona `key` whose optimistic spawn is refused
  * UNAVAILABLE (`ErrTmuxUnresponsive`): it starts the condition and arms the
  * timer in full mode. The refusal is followed by its one `get` and no launch
- * (b.jg5 SRJ-407). With `readsPending` (the case's row reads `pending`, as
+ * With `readsPending` (the case's row reads `pending`, as
  * `modelRow` serves it, covered), that `get` reads the row covered and the
  * pending-row step adds its cause to the full-mode timer, `pending` the last
- * row read (b.jg5 SRJ-409); a row in any other state adds nothing. The stub's
+ * row read; a row in any other state adds nothing. The stub's
  * spawn answers again afterwards. Resolves with the first refusal's time.
  */
 async function refuseLaunch(h: RecoveryHarness, key: string, readsPending = false): Promise<number> {
@@ -3464,7 +3457,7 @@ function readPaneSucceeds(h: RecoveryHarness, key: string): Promise<unknown> {
     client.readPane({ instance_id: personaInstanceId(key), n_lines: 1 }))
 }
 
-describe('unavailable retry: the tmux-unresponsive condition’s ends and the retry timer (SRJ-305, SRJ-306, SRJ-310)', () => {
+describe('unavailable retry: the tmux-unresponsive condition’s ends and the retry timer', () => {
   beforeEach(() => {
     harnessEndCheck = (h) => expect(h.episodeNotices).toEqual([])
   })
@@ -3495,7 +3488,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
   })
 
   // A row read `pending` also gets the pending-row step's one `get`, which
-  // finds it covered (b.jg5 SRJ-409).
+  // finds it covered.
   test.each<[string, ConditionArm, RowState, boolean, Record<string, number>, (key: string) => string, boolean]>([
     ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM_ON_PENDING, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
     ['in pending-only mode reads its row pending, connected with its stream (the timer runs on)', PENDING_ONLY_ARM, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }), true],
@@ -3520,7 +3513,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(h.controller.isArmed(key)).toBe(armed)
   })
 
-  // b.jdc, b.jg5 SRJ-606, SRJ-310: the restart run's one-line read-pane of a
+  // the restart run's one-line read-pane of a
   // prompt row is tmux-touching, so a pane ends the condition while the
   // retry runs (the end is deferred); the reconnect is still deferred,
   // typing nothing, and with no pending reading the timer stops.
@@ -3560,8 +3553,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
       reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
     ])
-    // The launch's success arms the pending-only watch in the run (b.jg5
-    // SRJ-409): the pending-row cause is recorded beside the refusal's.
+    // The launch's success arms the pending-only watch in the run: the pending-row cause is recorded beside the refusal's.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
@@ -3582,7 +3574,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expectStopped(h, key)
   })
 
-  // b.jg5 SRJ-707, SRJ-705, SRJ-110: a live row in another directory is
+  // a live row in another directory is
   // replaced only through the live-row sequence, which the start-pass launch
   // starts and answers sequence-waiting for; the sequence's step-1 kill
   // refused UNAVAILABLE at every try ends it there.
@@ -3590,7 +3582,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     h.script({ ...collided(h, personaOf(h, key), { cwd: h.home }), killError: errTmuxUnresponsive('kill') })
-    // b.jg5 SRJ-702: the refusal stands after the kill's tries.
+    // the refusal stands after the kill's tries.
     const armedAt = h.clock.now() + (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
 
     expect(await h.launch(key)).toEqual({ key, action: 'sequence-waiting' })
@@ -3630,7 +3622,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     return view
   }
 
-  test('AC 30 (its tmux-unresponsive half): a condition that ends through a successful read-pane while the row was last read pending leaves the timer armed with its due time', async () => {
+  test('(its tmux-unresponsive half): a condition that ends through a successful read-pane while the row was last read pending leaves the timer armed with its due time', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     const before = await holdingOnAPendingRow(h, key)
@@ -3697,8 +3689,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
       reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
     ])
-    // The launch's success arms the pending-only watch in the run (b.jg5
-    // SRJ-409): the pending-row cause is recorded beside the refusal's.
+    // The launch's success arms the pending-only watch in the run: the pending-row cause is recorded beside the refusal's.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
@@ -3801,7 +3792,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
 
 // ---------------------------------------------------------------------------
 // The switch to pending-only mode, the last row read and a condition that
-// ends during a run (b.jg5 SRJ-301, SRJ-305, SRJ-306), on the bare controller
+// ends during a run, on the bare controller
 // with a held stand-in action
 // ---------------------------------------------------------------------------
 
@@ -3827,7 +3818,7 @@ const armUnavailable = (controller: UnavailableRetryController): void => {
   controller.arm(KEY, UNAVAILABLE)
 }
 
-describe('unavailable retry: the switch, the last row read and a condition end during a run (SRJ-301, SRJ-306)', () => {
+describe('unavailable retry: the switch, the last row read and a condition end during a run', () => {
   test.each<[string, (c: UnavailableRetryController) => void, (c: UnavailableRetryController) => void, UnavailableRetryMode, string[]]>([
     ['no other cause: the switch is taken', armUnavailable, () => {}, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
     ['unavailable armed during the run: another cause, so it stays in full mode', armUnavailable, armUnavailable, UNAVAILABLE_RETRY_MODE_FULL, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
@@ -4024,7 +4015,7 @@ describe('unavailable retry: the switch, the last row read and a condition end d
     expect(delays(clock)).toEqual([waitMs(1)])
   })
 
-  // b.jg5 SRJ-301, SRJ-306: only a full-mode arm is a refusal that starts the
+  // only a full-mode arm is a refusal that starts the
   // condition again. A pending-only arm (a covered `pending` row, such as the
   // one a launch's success arms) cancels nothing: the end deferred before it
   // is applied after the run, and the row it marks `pending` keeps the timer.
@@ -4107,7 +4098,7 @@ describe('unavailable retry: the switch, the last row read and a condition end d
 
 // ---------------------------------------------------------------------------
 // A stop's hand-off, and a pending-only stop that yields to a full-mode cause
-// armed during its retry (b.jg5 SRJ-301, SRJ-303, SRJ-305, SRJ-306), on the
+// armed during its retry, on the
 // bare controller over the server's retry action on stand-in deps
 // ---------------------------------------------------------------------------
 
@@ -4144,7 +4135,7 @@ function pendingOnlyReadRig(
   return { ...rig, deps }
 }
 
-describe('unavailable retry: a stop’s hand-off, and a pending-only stop that yields to a full-mode cause (SRJ-301, SRJ-303, SRJ-305, SRJ-306)', () => {
+describe('unavailable retry: a stop’s hand-off, and a pending-only stop that yields to a full-mode cause', () => {
   test.each<[string, (err: Error) => () => Promise<unknown>]>([
     ['throws', (err) => () => { throw err }],
     ['rejects', (err) => async () => { throw err }],
@@ -4276,7 +4267,7 @@ describe('unavailable retry: a stop’s hand-off, and a pending-only stop that y
 })
 
 // ---------------------------------------------------------------------------
-// The retry observer (`onRetryFire`, b.jg5 SRJ-308), on the bare controller
+// The retry observer (`onRetryFire`), on the bare controller
 // over a scripted or held action, and, for the in-flight skip, over the
 // server's retry action on stand-in deps
 // ---------------------------------------------------------------------------
@@ -4366,7 +4357,7 @@ function timerRecord(rig: Rig): unknown {
   return { lines: rig.lines, attempts: rig.attempts, view: rig.controller.view(KEY), delays: delays(rig.clock), now: rig.clock.now() }
 }
 
-describe('unavailable retry: the retry observer (SRJ-308)', () => {
+describe('unavailable retry: the retry observer', () => {
   test('full mode: called exactly once per retry, with the clock’s time at the retry, after its retry line and before its action', async () => {
     const { clock, controller, steps, attempts } = observedRig()
     controller.arm(KEY, UNAVAILABLE)
@@ -4496,7 +4487,7 @@ describe('unavailable retry: the retry observer (SRJ-308)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The stop observer (`onStopped`, b.jg5 SRJ-309), on the bare controller over
+// The stop observer (`onStopped`), on the bare controller over
 // a scripted or held action, and, for the early stops, over the server's
 // retry action on stand-in deps
 // ---------------------------------------------------------------------------
@@ -4763,7 +4754,7 @@ function stopRecord(rig: Rig): unknown {
   return { lines: rig.lines, attempts: rig.attempts, armed: rig.controller.armedKeys(), view: rig.controller.view(KEY), delays: delays(rig.clock), now: rig.clock.now() }
 }
 
-describe('unavailable retry: the stop observer (SRJ-309)', () => {
+describe('unavailable retry: the stop observer', () => {
   test.each(ALL_STOP_REASONS.map((reason) => [reason]))('stop(key, "%s") is observed exactly once per stopped timer, with its reason, after its stopped line; a stop that finds nothing armed is not', (reason) => {
     const run = stopRun('recording')
     const { controller } = run.build()
@@ -4843,10 +4834,10 @@ describe('unavailable retry: the stop observer (SRJ-309)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// ENVIRONMENT (`ErrTmuxNotAvailable`, b.jg5 SRJ-311, SRJ-312, AC 27, AC 36) on
+// ENVIRONMENT (`ErrTmuxNotAvailable`) on
 // the recovery harness, both settings 0: what arms the timer in and out of an
 // attempt, never counted and retried only on the backoff, a read success that
-// keeps the outage, the clears that stop the timer (SRJ-305) and SRJ-306's
+// keeps the outage, the clears that stop the timer and
 // exceptions against them, the recovery, and a kill of the last session on a
 // socket followed by answers from a tmux server that is exiting (AD handoff
 // rev 23)
@@ -4907,7 +4898,7 @@ function tickClear(key: string): void {
   clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
 }
 
-describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, is retried only on the backoff, and its clear stops the timer (SRJ-311, SRJ-312, SRJ-305, SRJ-306, AC 27, AC 36)', () => {
+describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, is retried only on the backoff, and its clear stops the timer', () => {
   test('a start-pass launch whose spawn answers ErrTmuxNotAvailable is refused and arms that persona’s timer once at the base wait with the ENVIRONMENT cause: one onset, nothing counted, no other call; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -4919,7 +4910,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(callCounts(h)).toEqual({ spawnCalls: 1 })
     expect(getFailureCount(key)).toBe(0)
     expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
-    // ENVIRONMENT never starts the tmux-unresponsive condition (SRJ-307).
+    // ENVIRONMENT never starts the tmux-unresponsive condition.
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
     expect(h.notices).toEqual([])
     expect(h.startupErrors()).toEqual([])
@@ -5013,9 +5004,8 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(h.attempts).toEqual([])
   })
 
-  // The teardown's kill and its between-try read arm nothing (b.jg5 SRJ-110,
-  // hatch A3: the case below), and the teardown makes no delete (b.jg5
-  // SRJ-715), so this trigger comes from a plain read-pane through the outage
+  // The teardown's kill and its between-try read arm nothing (
+  // design A3: the case below), and the teardown makes no delete, so this trigger comes from a plain read-pane through the outage
   // wrapper, made outside every attempt.
   test('a trigger for a key no longer in the applied configuration (a plain read-pane through the outage wrapper answers ErrTmuxNotAvailable) arms it, and its first retry stops it with no agent-director call; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
@@ -5040,11 +5030,11 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expectUntouched(h, other)
   })
 
-  // b.jg5 SRJ-110, SRJ-301 (hatch A3): a persona teardown's kill is no
+  // (design A3): a persona teardown's kill is no
   // launch or recovery attempt, so its ENVIRONMENT or CONFIG answer arms
   // nothing (no trigger, no timer); its outage is raised for the persona
   // only while it is in the applied configuration, and only logged for a key
-  // no longer applied. Flips E11's pin, in which the teardown's ENVIRONMENT
+  // no longer applied. Flips pin, in which the teardown's ENVIRONMENT
   // kill armed the persona's timer (and, for a key no longer applied, its
   // first retry stopped that stray timer).
   // The outage class is read when the case runs (the CONFIG section's constant is declared below).
@@ -5053,7 +5043,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), (key) => tmuxUnavailableOnset(key), () => 'tmux-unavailable', false],
     ['ErrConfigMalformed', () => errConfigMalformed(), configOnset, () => AD_CONFIG_MALFORMED, true],
     ['ErrConfigMalformed', () => errConfigMalformed(), configOnset, () => AD_CONFIG_MALFORMED, false],
-  ])('b.jg5 SRJ-110, SRJ-301 (hatch A3): %s from a persona teardown’s kill arms nothing; the persona applied (%p) gets its outage raised, a key no longer applied none; the other persona is untouched', async (_what, make, onset, flag, applied) => {
+  ])('(hatch A3): %s from a persona teardown’s kill arms nothing; the persona applied (%p) gets its outage raised, a key no longer applied none; the other persona is untouched', async (_what, make, onset, flag, applied) => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     if (!applied) h.remove(key)
@@ -5072,7 +5062,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expectUntouched(h, other)
   })
 
-  test('AC 36: with both settings 0, a spawn that keeps answering ErrTmuxNotAvailable is retried only at each due time from the backoff, never 1 ms early, never counted past the cap, with no delete and no kill or launch outside a retry, and exactly one onset however many retries', async () => {
+  test('with both settings 0, a spawn that keeps answering ErrTmuxNotAvailable is retried only at each due time from the backoff, never 1 ms early, never counted past the cap, with no delete and no kill or launch outside a retry, and exactly one onset however many retries', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -5105,8 +5095,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
 
     // Every spawn came at the arm or a retry's due time. No retry killed:
     // each one's liveness read read the row missing, and the restart
-    // decision launches on a row it read finished with no kill (b.jg5
-    // SRJ-110, SRJ-314).
+    // decision launches on a row it read finished with no kill.
     expect(row.spawnedAt).toEqual([armedAt, ...retryTimes])
     expect(kills).toEqual([])
     expectLaunchedWithNoKill(h, key, 'missing', retries)
@@ -5127,11 +5116,11 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
 
   test.each<[string, keyof typeof DEAD_READING_OF_ROW, Record<string, number>]>([
     // No kill: the restart decision launches on a row it read finished or
-    // gone with no kill (b.jg5 SRJ-110, SRJ-314).
+    // gone with no kill.
     ['reads the row ended (a status success); it launches with no kill, and its spawn answers ErrTmuxNotAvailable', 'ended', { statusCalls: 1, spawnCalls: 1 }],
     ['reads the row missing (a status success); it launches with no kill, and its spawn answers ErrTmuxNotAvailable', 'missing', { statusCalls: 1, spawnCalls: 1 }],
     ['reads no row (status answers ErrSpawnNotFound); it launches with no kill, and its spawn answers ErrTmuxNotAvailable', UNAVAILABLE_RETRY_ROW_ABSENT, { statusCalls: 1, spawnCalls: 1 }],
-  ])('AC 27, AC 36: a retry that %s leaves the outage raised with no all-clear and the timer armed at the doubled wait', async (_what, state, calls) => {
+  ])('a retry that %s leaves the outage raised with no all-clear and the timer armed at the doubled wait', async (_what, state, calls) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     modelRow(h, state)
@@ -5150,9 +5139,9 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(getFailureCount(key)).toBe(0)
   })
 
-  // b.jg5 SRJ-117, SRJ-604: ENVIRONMENT at a `waiting` row's read-pane types
+  // ENVIRONMENT at a `waiting` row's read-pane types
   // nothing, so the reconnect's send-keys is never reached.
-  test('AC 27: a retry whose row reads live (waiting, a status success) and whose reconnect’s read-pane answers ErrTmuxNotAvailable types nothing and leaves the outage raised and the timer armed at the doubled wait, with no kill or spawn and nothing counted', async () => {
+  test('a retry whose row reads live (waiting, a status success) and whose reconnect’s read-pane answers ErrTmuxNotAvailable types nothing and leaves the outage raised and the timer armed at the doubled wait, with no kill or spawn and nothing counted', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     modelRow(h, 'waiting')
@@ -5252,7 +5241,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(h.outageClears).toHaveLength(1)
   })
 
-  test('AC 30 (its tmux-unavailable half): a successful read-pane that clears the outage while a retry last read the row pending posts one all-clear and leaves the timer armed with its due time; the next retry still runs at it', async () => {
+  test('(its tmux-unavailable half): a successful read-pane that clears the outage while a retry last read the row pending posts one all-clear and leaves the timer armed with its due time; the next retry still runs at it', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
@@ -5314,16 +5303,16 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
 })
 
 // ---------------------------------------------------------------------------
-// A re-bound tmux socket (b.jg5 SRJ-1021, SRJ-311's AC 86 Test line): the
+// A re-bound tmux socket (Test line): the
 // `ErrTmuxNotAvailable` whose description says the socket's server is not the
-// one the worker was launched on posts SRJ-1021's onset, not today's. The row
+// one the worker was launched on posts onset, not today's. The row
 // stays live, so each retry reruns the restart path's reconnect: never a kill,
 // delete or launch, nothing counted, and the retries on the backoff until
 // tmux answers.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and no kill, delete or launch (SRJ-1021, SRJ-311, AC 86)', () => {
-  test('AC 86: with both settings 0, a live, unconnected row whose every tmux-touching verb answers the re-bound ErrTmuxNotAvailable posts one onset, SRJ-1021’s, across several retries at the backoff’s due times, with no kill, delete, spawn or resume and nothing counted; once tmux answers, the reconnect clears it with today’s all-clear and the timer stops', async () => {
+describe('unavailable retry: a re-bound tmux socket gives onset and no kill, delete or launch', () => {
+  test('with both settings 0, a live, unconnected row whose every tmux-touching verb answers the re-bound ErrTmuxNotAvailable posts one onset, across several retries at the backoff’s due times, with no kill, delete, spawn or resume and nothing counted; once tmux answers, the reconnect clears it with today’s all-clear and the timer stops', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -5340,7 +5329,7 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
     const reBoundOnset = { key, text: tmuxServerChangedOnset() }
 
     // A read-pane outside every attempt meets the re-bound socket: the
-    // outage is raised with SRJ-1021's onset and P's timer armed.
+    // outage is raised with onset and P's timer armed.
     const armedAt = h.clock.now()
     await expect(readPaneSucceeds(h, key)).rejects.toThrow()
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
@@ -5349,7 +5338,7 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
 
     // Several retries, each at its due time and never 1 ms early. Each reads
     // the row live (waiting); its reconnect's read-pane meets the re-bound
-    // socket, so nothing is typed (b.jg5 SRJ-117, SRJ-604), and it re-arms at
+    // socket, so nothing is typed, and it re-arms at
     // the doubled wait and posts nothing more.
     const retries = 4
     let dueAt = armedAt
@@ -5366,7 +5355,7 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
       expect([n, getFailureCount(key)]).toEqual([n, 0])
     }
 
-    // One onset for the stretch, SRJ-1021's; never today's install-or-repair onset.
+    // One onset for the stretch; never today's install-or-repair onset.
     expect(h.outageNotices).toEqual([reBoundOnset])
     expect(h.outageNotices.map((n) => n.text)).not.toContain(ONSET_TEMPLATES['tmux-unavailable']())
     expect(h.outageClears).toEqual([])
@@ -5407,8 +5396,8 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// The bounded retry of a live row's kill and the retry timer (b.jg5 SRJ-702,
-// SRJ-301, SRJ-306, SRJ-311; AD handoff rev 23), on the recovery harness:
+// The bounded retry of a live row's kill and the retry timer (
+// AD handoff rev 23), on the recovery harness:
 // a try's UNAVAILABLE reports nothing, and only the outcome that stands, once,
 // reaches the retry timer (the kill-failed cause for `ErrTmuxKillFailed`); a
 // tmux server that is exiting after the kill answers by class, a try's
@@ -5416,7 +5405,7 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
 // tries with one onset. The restart path's kill is one try (its dead seed),
 // so the tries are driven directly through the persona kill retry of a row
 // read live inside a recovery attempt (the one the live-row sequence's kills
-// take; the collision ladder makes no kill, b.jg5 SRJ-707). The waits run on
+// take; the collision ladder makes no kill). The waits run on
 // the harness clock (`h.drive`).
 // ---------------------------------------------------------------------------
 
@@ -5443,7 +5432,7 @@ function retriedKillInAttempt(h: RecoveryHarness, key: string): Promise<KillRetr
   )
 }
 
-describe('unavailable retry: a live row’s kill makes its tries before its outcome reaches the retry timer (SRJ-702, SRJ-301, SRJ-306, SRJ-311; AD handoff rev 23)', () => {
+describe('unavailable retry: a live row’s kill makes its tries before its outcome reaches the retry timer (AD handoff rev 23)', () => {
   test('ErrTmuxKillFailed at every try inside a recovery attempt arms the kill-failed cause once, not once per try; the condition-end entry keeps it', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
@@ -5467,8 +5456,7 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
     expectUntouched(h, other)
   })
 
-  // The waits between tries run on the clock the kill is given (b.jg5
-  // SRJ-702), here the harness's: advancing it alone finishes the tries.
+  // The waits between tries run on the clock the kill is given, here the harness's: advancing it alone finishes the tries.
   test('the waits between tries run on the harness clock: advancing it alone finishes the tries', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
@@ -5502,7 +5490,7 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
     expect(h.clock.pendingCount()).toBe(0)
   })
 
-  // b.jg5 SRJ-301, SRJ-702: the failed read between tries is a read inside
+  // the failed read between tries is a read inside
   // the attempt and arms with its own cause, once (the arming predicate
   // decides UNAVAILABLE before the read-error rule, so ErrCallTimeout's cause
   // is `unavailable` and an UNCLASSIFIED read's is `read-error`); the kill's
@@ -5580,7 +5568,7 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
     expect(h.latch.isLatched(key)).toBe(false)
     expect(getFailureCount(key)).toBe(0)
 
-    // A status read alone never clears it (SRJ-311); a tmux-touching success does, once.
+    // A status read alone never clears it; a tmux-touching success does, once.
     await _buildIsSessionAliveAdapter(() => h.config)(key)
     expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
     await readPaneSucceeds(h, key)
@@ -5593,13 +5581,13 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
 })
 
 // ---------------------------------------------------------------------------
-// CONFIG (`ErrConfigMalformed`, b.jg5 SRJ-316, SRJ-301, SRJ-305, AC 84) on the
+// CONFIG (`ErrConfigMalformed`) on the
 // recovery harness, both settings 0, the arm hook bound as `main()` binds it:
 // what arms the timer in a start-pass launch and outside every attempt, a
-// trigger while armed, AC 84 end to end (a persona up and connected, and a
+// trigger while armed end to end (a persona up and connected, and a
 // launch that met CONFIG), and a clear of the outage that is not a timer
 // stop. These cases assert no kill of any kind while calls answer CONFIG;
-// the `pending`-row half of SRJ-316's Test line is the live-row sequence's
+// the `pending`-row half of the contract Test line is the live-row sequence's
 // describe below, and its C21 half the describe after it.
 // ---------------------------------------------------------------------------
 
@@ -5735,7 +5723,7 @@ async function retriesRefusedByConfig(h: RecoveryHarness, key: string, armedAt: 
   return dueAt
 }
 
-describe('unavailable retry: CONFIG arms from any verb in any context, takes no action, is never counted, is retried only on the backoff, and its clear stops no timer (SRJ-316, SRJ-301, SRJ-305, AC 84)', () => {
+describe('unavailable retry: CONFIG arms from any verb in any context, takes no action, is never counted, is retried only on the backoff, and its clear stops no timer', () => {
   test('a start-pass launch whose spawn answers ErrConfigMalformed is refused and arms that persona’s timer once at the base wait with the CONFIG cause: one onset, the flag raised, no other call, nothing counted, no spawn-failure notice or spawn-failed entry; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -5802,7 +5790,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expectUntouched(h, other)
   })
 
-  test('AC 84, a persona up: with both settings 0, P up and connected with its stream, then every call answering ErrConfigMalformed, gives exactly one onset across retries past the restart cap, each only at its due time from the backoff; no kill, delete, spawn or resume, nothing counted, no other post; once agent-director reads its config again, the next retry finds P live and connected, the status success clears the outage with one all-clear, and the timer stops', async () => {
+  test(', a persona up: with both settings 0, P up and connected with its stream, then every call answering ErrConfigMalformed, gives exactly one onset across retries past the restart cap, each only at its due time from the backoff; no kill, delete, spawn or resume, nothing counted, no other post; once agent-director reads its config again, the next retry finds P live and connected, the status success clears the outage with one all-clear, and the timer stops', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -5843,7 +5831,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expectUntouched(h, other)
   })
 
-  test('AC 84, a launch that met it: with both settings 0, a start-pass launch whose spawn answers ErrConfigMalformed, with every later call answering it too, gives one onset and no kill, delete, spawn or resume but that launch across retries past the restart cap, nothing counted; once agent-director reads its config again, the next retry brings P up with one all-clear listing the class, and the timer stops only at the retry that finds nothing left to recover', async () => {
+  test(', a launch that met it: with both settings 0, a start-pass launch whose spawn answers ErrConfigMalformed, with every later call answering it too, gives one onset and no kill, delete, spawn or resume but that launch across retries past the restart cap, nothing counted; once agent-director reads its config again, the next retry brings P up with one all-clear listing the class, and the timer stops only at the retry that finds nothing left to recover', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -5864,7 +5852,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
 
     // The file is fixed: the next retry reads the row missing (the status
     // success clears the outage), and the restart path launches with no kill
-    // (b.jg5 SRJ-110, SRJ-314).
+    //.
     config.fix()
     dueAt += waitMs(retries)
     const before = callCounts(h)
@@ -5936,20 +5924,19 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
 })
 
 // ---------------------------------------------------------------------------
-// UNCLASSIFIED outcomes (b.jg5 SRJ-313, SRJ-1009, SRJ-105, SRJ-301, AC 69,
-// AC 80) on the recovery harness, both settings 0, with the unclassified-error
+// UNCLASSIFIED outcomes on the recovery harness, both settings 0, with the unclassified-error
 // episodes composed as `main()` composes them: never destructive, never
 // counted, retried on the backoff, one alert per episode at the first
 // UNCLASSIFIED outcome met strictly past the alert threshold in effect, the
 // log-only route for a persona no longer configured, and the episode's ends.
 // The reuse spawn half is the no-transcript reuse describe's below, and the
-// latch end E13's.
+// latch end .
 // ---------------------------------------------------------------------------
 
-/** AC 80's agent-director settings (the AC's input): an alert threshold below the defaults'. */
+/** agent-director settings (the AC's input): an alert threshold below the defaults'. */
 const AC_80_TMUX = { stopping_window_seconds: 30n, starting_session_seconds: 120n } as const satisfies AdConfigTables['tmux']
 
-/** UNCLASSIFIED values (b.jg5 SRJ-104), each built by the stub for the verb whose call meets it. */
+/** UNCLASSIFIED values, each built by the stub for the verb whose call meets it. */
 const UNCLASSIFIED_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
   ['ErrInternal without the unusable-name phrase', () => errInternal()],
   ['an error name CSCB gives no handling', (verb) => errGeneric(verb, 'ErrKillBroken', 'the kill is broken')],
@@ -6051,15 +6038,14 @@ const UNCLASSIFIED_ATTEMPTS: ReadonlyArray<readonly [string, UnclassifiedAttempt
       expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     },
     firstCalls: { spawnCalls: 1 },
-    // The dead reading (no row) launches with no kill (b.jg5 SRJ-110,
-    // SRJ-314); the refused spawn is the retry's last call.
+    // The dead reading (no row) launches with no kill; the refused spawn is the retry's last call.
     retryCalls: { statusCalls: 1, spawnCalls: 1 },
   }],
 
 ]
 
-describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or counted, are retried, and post one alert per episode past the threshold (SRJ-313, SRJ-1009, AC 69, AC 80)', () => {
-  test('SRJ-1009: the one pin case, the alert’s exact text for a sample name and message', () => {
+describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or counted, are retried, and post one alert per episode past the threshold', () => {
+  test('the one pin case, the alert’s exact text for a sample name and message', () => {
     const text = unclassifiedErrorAlertText({ reportedName: 'ErrInternal', message: 'the store could not be read' })
 
     expect(text).toBe(
@@ -6123,7 +6109,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
 
   test.each<[string, RecoveryHarnessOptions, () => number]>([
     ['agent-director’s defaults', {}, () => adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)],
-    ['AC 80’s settings, in effect before the first outcome', { adSettings: { tmux: AC_80_TMUX } }, () => adAlertThresholdMs({ ...DEFAULT_AD_SETTINGS_IN_EFFECT, tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, ...AC_80_TMUX } })],
+    ['settings, in effect before the first outcome', { adSettings: { tmux: AC_80_TMUX } }, () => adAlertThresholdMs({ ...DEFAULT_AD_SETTINGS_IN_EFFECT, tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, ...AC_80_TMUX } })],
   ])('the alert at %s: none at any retry up to the threshold; exactly one, quoting the redacted and capped message, at the first retry strictly past the accessor’s threshold; none again however far the clock goes while the retries go on', async (_settings, options, expectedThreshold) => {
     const h = (harness = makeRecoveryHarness(options))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -6190,7 +6176,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     expectUntouchedEpisode(h, other)
   })
 
-  test('ErrSchemaMismatch from every row read (SRJ-303, A-32), both settings 0: the retries read the row and call nothing else, nothing is counted past the restart cap, and the one alert past the threshold names ErrSchemaMismatch and quotes its description', async () => {
+  test('ErrSchemaMismatch from every row read (A-32), both settings 0: the retries read the row and call nothing else, nothing is counted past the restart cap, and the one alert past the threshold names ErrSchemaMismatch and quotes its description', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -6223,7 +6209,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     expectUntouchedEpisode(h, other)
   })
 
-  test('AC 69, a persona no longer configured: P’s retry spawn held past the threshold, P removed from the applied configuration without a teardown, then the spawn failing ErrInternal, gives one server-log line and one persona-unclassified-error entry naming P and the alert’s text, and nothing to Slack for any persona; the removal’s stop leaves the episode open with no second entry', async () => {
+  test(', a persona no longer configured: P’s retry spawn held past the threshold, P removed from the applied configuration without a teardown, then the spawn failing ErrInternal, gives one server-log line and one persona-unclassified-error entry naming P and the alert’s text, and nothing to Slack for any persona; the removal’s stop leaves the episode open with no second entry', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
@@ -6263,8 +6249,8 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
 })
 
 // ---------------------------------------------------------------------------
-// AC 69 at a reuse site (b.jg5 SRJ-313's "a reuse spawn included", SRJ-112,
-// SRJ-707; the E12 hatch note): the collision ladder's no-transcript reuse
+// at a reuse site ("a reuse spawn included",
+// the design note): the collision ladder's no-transcript reuse
 // spawn is the first production reuse site a retry reaches. On the recovery
 // harness with both settings 0, P's bring-up collides, the collision `get`
 // reads P's row `ended` with no session id, `resume` answers
@@ -6272,7 +6258,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
 // sets it, on every launch (`noSessionIdReuse`). Each retry runs the restart
 // path's decision on the `ended` row: its liveness read and the launch,
 // which ends at that reuse, with no kill (a row read `ended` is never
-// killed, b.jg5 SRJ-110, SRJ-314). Nothing is deleted.
+// killed). Nothing is deleted.
 // ---------------------------------------------------------------------------
 
 /** The reuse spawn's answer at `noSessionIdReuse`'s site: an error, or success when it gives none. */
@@ -6335,13 +6321,13 @@ const NO_SESSION_ID_REUSE_LAUNCH = { spawnCalls: 2, getCalls: 1, resumeCalls: 1 
 
 /**
  * The calls of each retry: its liveness read, then the launch to the reuse.
- * No kill: the read found the row finished (b.jg5 SRJ-110, SRJ-314).
+ * No kill: the read found the row finished.
  */
 const NO_SESSION_ID_REUSE_RETRY = { statusCalls: 1, ...NO_SESSION_ID_REUSE_LAUNCH } as const
 
 /**
  * The bring-up's launch to a reuse refused UNAVAILABLE: the refused reuse is
- * followed by its one `get` (b.jg5 SRJ-407), which reads the row `ended`, so
+ * followed by its one `get`, which reads the row `ended`, so
  * no launch follows it in the attempt.
  */
 const NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH = { ...NO_SESSION_ID_REUSE_LAUNCH, getCalls: NO_SESSION_ID_REUSE_LAUNCH.getCalls + 1 } as const
@@ -6349,8 +6335,8 @@ const NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH = { ...NO_SESSION_ID_REUSE_LAUNCH, 
 /** Each retry whose launch reaches a reuse refused UNAVAILABLE: its liveness read, then that launch (no kill, as above). */
 const NO_SESSION_ID_REUSE_UNAVAILABLE_RETRY = { statusCalls: 1, ...NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH } as const
 
-describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrNoSessionId, refused UNCLASSIFIED or UNAVAILABLE, is retried at each due time and never counted (SRJ-313, SRJ-112, SRJ-707, AC 69)', () => {
-  test('AC 69: an ErrInternal from the reuse at every retry, with both settings 0: no delete, no condition post and no spawn-failure notice; never counted past the restart cap; a retry at each due time; exactly one alert, at the first retry strictly past the alert threshold in effect; once the reuse succeeds P is up and its timer stops', async () => {
+describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrNoSessionId, refused UNCLASSIFIED or UNAVAILABLE, is retried at each due time and never counted', () => {
+  test('an ErrInternal from the reuse at every retry, with both settings 0: no delete, no condition post and no spawn-failure notice; never counted past the restart cap; a retry at each due time; exactly one alert, at the first retry strictly past the alert threshold in effect; once the reuse succeeds P is up and its timer stops', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -6400,7 +6386,7 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
     expectUntouchedEpisode(h, other)
   })
 
-  test('AC 69, a persona no longer configured: past the threshold, P removed from the applied configuration without a teardown while its retry\'s reuse spawn is held, then that reuse failing ErrInternal, gives one server-log line and one persona-unclassified-error entry naming P and the alert’s text, and nothing to Slack', async () => {
+  test(', a persona no longer configured: past the threshold, P removed from the applied configuration without a teardown while its retry\'s reuse spawn is held, then that reuse failing ErrInternal, gives one server-log line and one persona-unclassified-error entry naming P and the alert’s text, and nothing to Slack', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     const reuse = noSessionIdReuse(h, key, () => errInternal())
@@ -6469,7 +6455,7 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
   })
 })
 
-describe('unavailable retry: the unclassified-error episode’s ends and the stop observer (SRJ-313, SRJ-305)', () => {
+describe('unavailable retry: the unclassified-error episode’s ends and the stop observer', () => {
   test('a retry that finds nothing left to recover ends the episode silently after its alert; a later UNCLASSIFIED outcome begins a new episode that alerts again only past the threshold from its own first outcome', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
@@ -6629,7 +6615,7 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
       h.script({ statusError: err })
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
     }, { statusCalls: 1 }],
-    ['a persona teardown’s kill (b.jg5 SRJ-701: it answers its non-success outcome, never throws)', async (h, key, err) => {
+    ['a persona teardown’s kill (it answers its non-success outcome, never throws)', async (h, key, err) => {
       h.script({ killError: err })
       expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err })
     }, { killCalls: 1 }],
@@ -6655,8 +6641,7 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
 })
 
 // ---------------------------------------------------------------------------
-// The latch's holds on the timer and the unclassified-error episode (b.jg5
-// SRJ-305, SRJ-313, SRJ-502), on the recovery harness with both settings 0:
+// The latch's holds on the timer and the unclassified-error episode, on the recovery harness with both settings 0:
 // the latch composed as `main()` composes it (the holds, then the notice)
 // ---------------------------------------------------------------------------
 
@@ -6694,12 +6679,12 @@ function expectLatchedOnce(h: RecoveryHarness, key: string, err: ReturnType<type
 /** How a case arms persona `key`'s timer before the latch: full mode with a cause, or pending-only. */
 const ARMED_MODES: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => void]> = [
   ['in full mode (an UNAVAILABLE cause)', (h, key) => { h.controller.arm(key, UNAVAILABLE) }],
-  // SRJ-306's exceptions keep such a timer through a condition end; never through a latch.
+  // exceptions keep such a timer through a condition end; never through a latch.
   ['in full mode (the kill-failure cause)', (h, key) => { h.controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }) }],
   ['in pending-only mode', (h, key) => { h.controller.armPendingOnly(key) }],
 ]
 
-describe('unavailable retry: a latch stops the timer and ends the unclassified-error episode (SRJ-305, SRJ-313, SRJ-502)', () => {
+describe('unavailable retry: a latch stops the timer and ends the unclassified-error episode', () => {
   test('a retry whose launch answers CONFLICT latches P and stops its timer with the latch’s reason, nothing pending for P; past several backoff waits nothing fires or is called for P, and the other persona’s timer keeps its schedule', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -6723,7 +6708,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     h.script({ spawnError: refusal })
 
     // The liveness read and the spawn, with no kill before it (the read found
-    // no row, b.jg5 SRJ-110, SRJ-314); after the CONFLICT no kill, delete,
+    // no row); after the CONFLICT no kill, delete,
     // resume or second spawn (at most a status read).
     const since = callsSince(h, before)
     expect(since).toMatchObject({ spawnCalls: 1 })
@@ -6840,17 +6825,17 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
 
 // ---------------------------------------------------------------------------
 // The retry's row read finds P's own `pending` row with no launch start
-// (b.jg5 SRJ-303, SRJ-305, SRJ-513), on the recovery harness with both
+// on the recovery harness with both
 // settings 0 and the configured-persona query it installs as `main()` does:
 // the read latches P with "launch start not recorded" (refused operation
 // "none", the state `pending`), the latch's hold stops the timer with the
-// latch's reason, its one SRJ-1020 post is made, and no call follows the
+// latch's reason, its one post is made, and no call follows the
 // read (no send-keys, kill, `find-missing` or launch). In pending-only mode
 // the read is the timer's own row read; in full mode (armed by an
 // UNAVAILABLE launch) it is the retry entry's liveness probe. Nothing fires
 // for P however far the clock goes. Control: with a launch start the
-// pending-only retry refuses on the row as E8 T4 left it, after the
-// pending-row step's one `get` finds the row covered (b.jg5 SRJ-409).
+// pending-only retry refuses on the row as left it, after the
+// pending-row step's one `get` finds the row covered.
 // ---------------------------------------------------------------------------
 
 /** From now on persona `key`'s `status` and `get` read its own row `pending` with `launchStartedAt` (the key left out for `undefined`), in its own directory with its labels; every other persona has no row. */
@@ -6868,7 +6853,7 @@ function pendingRowFor(h: RecoveryHarness, key: string, launchStartedAt: string 
 /**
  * The retry's read latched persona `key` once with "launch start not
  * recorded" (`launchStartRecord`), and the latch's holds, the retry timer's
- * stop first, ran before its one SRJ-1020 post; the timer stopped with the
+ * stop first, ran before its one post; the timer stopped with the
  * latch's reason; nothing counted.
  */
 function expectRetryStoppedByLaunchStartLatch(h: RecoveryHarness, key: string): void {
@@ -6892,7 +6877,7 @@ function expectRetryStoppedByLaunchStartLatch(h: RecoveryHarness, key: string): 
   expect(h.tmuxUnresponsive.holds(key)).toBe(false)
 }
 
-describe('unavailable retry: a retry whose row read finds P’s own pending row with no launch start latches P and stops (SRJ-303, SRJ-305, SRJ-513)', () => {
+describe('unavailable retry: a retry whose row read finds P’s own pending row with no launch start latches P and stops', () => {
   test.each([...NO_LAUNCH_START_FORM_NAMES])('pending-only, launch start %s: the retry’s one row read latches P once and stops the timer with the latch’s reason; no call follows the read; nothing fires for P past several waits', async (form) => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -6953,7 +6938,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     expectUntouchedEpisode(h, other)
   })
 
-  test('control: pending-only, P’s own pending row with a launch start: no latch, no post; the retry’s row read and the pending-row step’s one get (the row covered) refuse on the row and re-arm at the doubled wait, as E8 T4 left it', async () => {
+  test('control: pending-only, P’s own pending row with a launch start: no latch, no post; the retry’s row read and the pending-row step’s one get (the row covered) refuse on the row and re-arm at the doubled wait, as left it', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     pendingRowFor(h, key, SAMPLE_LAUNCH_START_FRACTIONAL)
@@ -6982,7 +6967,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
 })
 
 // ---------------------------------------------------------------------------
-// A latched query that throws counts as latched (b.jg5 SRJ-502, fail safe):
+// A latched query that throws counts as latched (fail safe):
 // the retry action's own query, in both modes, over stand-ins and through the
 // bare controller; and the restart work's query, on the recovery harness
 // ---------------------------------------------------------------------------
@@ -7010,7 +6995,7 @@ const LATCHED_QUERY_MODES = [
   [UNAVAILABLE_RETRY_MODE_PENDING_ONLY, PENDING_ONLY_RETRY, (c: UnavailableRetryController, key: string) => { c.armPendingOnly(key) }, (key: string) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED)],
 ] as const
 
-describe('unavailable retry: a latched query that throws counts as latched (SRJ-502, fail safe)', () => {
+describe('unavailable retry: a latched query that throws counts as latched (fail safe)', () => {
   let errLines: string[]
   let origConsoleError: typeof console.error
 
@@ -7103,7 +7088,7 @@ describe('unavailable retry: a latched query that throws counts as latched (SRJ-
   })
 })
 
-describe('unavailable retry: a restart work whose latched query throws stops the timer (SRJ-502, fail safe), on the harness', () => {
+describe('unavailable retry: a restart work whose latched query throws stops the timer (fail safe), on the harness', () => {
   test('a full-mode retry whose restart work’s latched query throws for P stops P’s timer with the latch’s reason: no agent-director call, nothing counted, one skip line naming what it threw; the other persona’s timer keeps its schedule', async () => {
     const h = (harness = makeRecoveryHarness({
       restartDeps: {
@@ -7133,7 +7118,7 @@ describe('unavailable retry: a restart work whose latched query throws stops the
     expect(skip[0]).toStartWith(
       `[slack] Skipping restart for persona=${key} — the persona is latched (the latched query failed: Error message="latched query broke (${REDACTED_SENTINEL_TAIL})" at `,
     )
-    expect(skip[0]).toEndWith(' — taken as latched); no agent-director call, nothing recorded (b.jg5 SRJ-502)')
+    expect(skip[0]).toEndWith(' — taken as latched); no agent-director call, nothing recorded')
     expectNeverDestructive(h, key)
     expect(h.latch.isLatched(key)).toBe(false)
 
@@ -7150,13 +7135,13 @@ describe('unavailable retry: a restart work whose latched query throws stops the
 })
 
 // ---------------------------------------------------------------------------
-// A lost message (b.jg5 SRJ-1011, SRJ-311, SRJ-316; AC 36, AC 68) through the
+// A lost message through the
 // recovery harness's driver: the real routing's no-session branch, bound as
 // `main()` binds it, both settings 0. State 5 comes before
 // `auto-restart-disabled`, so the delay 0 also checks the order.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-config-malformed outage is raised reports not answering, with no restart (SRJ-1011, SRJ-311, SRJ-316, AC 36, AC 68)', () => {
+describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-config-malformed outage is raised reports not answering, with no restart', () => {
   test.each<[string, () => Error, OutageClass, string]>([
     ['ErrTmuxNotAvailable (tmux-unavailable)', () => errTmuxNotAvailable(), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['a CONFIG answer (ad-config-malformed)', () => errConfigMalformed(), AD_CONFIG_MALFORMED, UNAVAILABLE_RETRY_CAUSE_CONFIG],
@@ -7212,7 +7197,7 @@ describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-c
     const triggers = h.triggers.length
 
     // The message's one row read answers the same error, outside any attempt
-    // (SRJ-1011, hatch A2): a failed read, so not state 6, and it arms
+    // (design A2): a failed read, so not state 6, and it arms
     // nothing: the timer keeps its due time and no trigger is sent.
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
 
@@ -7224,18 +7209,18 @@ describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-c
 })
 
 // ---------------------------------------------------------------------------
-// A lost message arms a missing retry timer (b.jg5 SRJ-311, SRJ-1501): the
+// A lost message arms a missing retry timer: the
 // driver's `armRetryTimerIfMissing`, bound as `main()` binds it, both
 // settings 0, so no health tick and no restart would ever attempt for P.
 // Its `isRetryArmed` is the controller's `isArmed`, as `main()` binds it
-// (b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer is
+// (state 5 applies only while P's retry timer is
 // armed), so a state-5 condition with no timer armed that this path does
 // not arm falls through to a later state, and a P at the restart cap
 // (reached through real counted failures) reports restart limit reached
 // whatever is raised, with nothing armed by the message.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a message lost in not answering with P’s tmux-unavailable outage raised and no retry timer arms one, never a restart, and never at the restart cap (SRJ-311, SRJ-1501, SRJ-305)', () => {
+describe('unavailable retry: a message lost in not answering with P’s tmux-unavailable outage raised and no retry timer arms one, never a restart, and never at the restart cap', () => {
   /** The driver's arm lines for persona `key` since `from` (the one line `armRetryTimerIfMissing` logs when it arms). */
   const armLinesSince = (h: RecoveryHarness, key: string, from: number): string[] =>
     h.errors.slice(from).filter((line) => line.startsWith(`[slack] Lost message: persona=${key} `))
@@ -7293,7 +7278,7 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     expectStopped(h, key)
   })
 
-  // b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer is
+  // state 5 applies only while P's retry timer is
   // armed, and this path arms only for tmux-unavailable, so the message falls
   // through: its one row read (the row missing, not pending), then auto-restart
   // disabled at the delay 0.
@@ -7310,10 +7295,10 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     expectStopped(h, key)
   })
 
-  // b.jg5 SRJ-1011 as amended: the check arms nothing while a launch for P
+  // the check arms nothing while a launch for P
   // is in flight, so no timer is armed and state 5 does not apply; the launch
   // running is state 6, with no read. Once the launch returns, the only arm
-  // is its pending-only watch on its new row (b.jg5 SRJ-301, SRJ-409), never
+  // is its pending-only watch on its new row, never
   // the check's environment cause.
   test('raised while a launch for P is in flight, no timer: the check arms nothing, so not state 5: the message reports session starting, with no read; the launch, once returned, leaves only its pending-only watch', async () => {
     const h = (harness = makeRecoveryHarness())
@@ -7352,7 +7337,7 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     expectStopped(h, key)
   })
 
-  // b.jg5 SRJ-1011 as amended (orchestrator ruling): "A persona whose retry
+  // (orchestrator ruling): "A persona whose retry
   // timer is stopped at the restart cap reports restart-limit-reached, never
   // state 5's 'CSCB is retrying', whatever condition or flag is raised."
   // P reaches the cap through real counted launch failures on its own retry
@@ -7461,8 +7446,8 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
 })
 
 // ---------------------------------------------------------------------------
-// The live-row sequence and the retry timer (E21; b.jg5 SRJ-316's pending-row
-// leg, SRJ-301's live-row-sequence trigger, SRJ-705, SRJ-717)
+// The live-row sequence and the retry timer (E21pending-row
+// leg live-row-sequence trigger)
 //
 // On the recovery harness with both settings 0, its sequence driver running
 // one sequence for P inside P's recovery attempt, its end armed through the
@@ -7495,7 +7480,7 @@ interface FailedLaunchSetup {
 
 /**
  * A step-6 launch that does not succeed: its label, its setup, the calls it
- * makes (an UNAVAILABLE launch's one `get` after it included, b.jg5 SRJ-407),
+ * makes (an UNAVAILABLE launch's one `get` after it included),
  * the causes its own handling sends before the sequence's, its launch kind,
  * and the failures it counts.
  */
@@ -7509,7 +7494,7 @@ type FailedLaunch = readonly [
 ]
 
 const STEP6_FAILED_LAUNCHES: readonly FailedLaunch[] = [
-  // b.jg5 SRJ-407: the refused resume is followed by its one get, which
+  // the refused resume is followed by its one get, which
   // reads the row ended, and by no launch.
   ['a resume answering UNAVAILABLE, refused, whose own handling armed the timer first', (h, key) => {
     h.script({ getResult: personaRow(h, key, ENDED_WITH_SESSION), resumeError: errTmuxUnresponsive('resume') })
@@ -7522,7 +7507,7 @@ const STEP6_FAILED_LAUNCHES: readonly FailedLaunch[] = [
   }, [], [], LIVE_ROW_LAUNCH_REUSE, 0],
 ]
 
-describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row leg and SRJ-301\'s sequence trigger (SRJ-705, SRJ-717)', () => {
+describe('unavailable retry: the live-row sequence — pending-row leg and sequence trigger', () => {
   test('CONFIG on every call: a sequence for P on a pending seed makes no kill, no delete and no launch and raises no second onset; P is retried on its timer across several fires, never counted, and once calls succeed the outage clears with one all-clear and P comes up', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -7553,8 +7538,7 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     const fixed = callCounts(h)
     await retryNow(h, key)
 
-    // The row reads missing: the restart path launches with no kill (b.jg5
-    // SRJ-110, SRJ-314).
+    // The row reads missing: the restart path launches with no kill.
     expect(callsSince(h, fixed)).toEqual({ statusCalls: 1, spawnCalls: 1 })
     expectLaunchedWithNoKill(h, key, 'missing')
     expect(h.outageNotices).toEqual([configOnset(key, config.err), configAllClear(key)])
@@ -7639,7 +7623,7 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
   })
 
-  // SRJ-706, SRJ-301: the kill's answer after the stop is dropped (its other
+  // the kill's answer after the stop is dropped (its other
   // effects are tests/live-row-sequence.test.ts's), so neither the kill's
   // deferred report nor the sequence's end arms or starts anything.
   test.each(
@@ -7659,11 +7643,11 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
   })
 
-  // Step 6 (SRJ-705, SRJ-301; SRJ-113): every sequence below reads the row
+  // Step 6: every sequence below reads the row
   // `ended` at step 2 and after its one run, so its calls before the launch
   // are one kill, one get, one run and one get.
 
-  test.each(STEP6_FAILED_LAUNCHES)('SRJ-301: a step-6 launch that does not succeed — %s — ends the sequence with P\'s timer armed with the other-end cause, after any cause the launch sent, and no call after the launch but an UNAVAILABLE outcome\'s one get', async (_label, setup, launchCalls, before, launchKind, counted) => {
+  test.each(STEP6_FAILED_LAUNCHES)('a step-6 launch that does not succeed — %s — ends the sequence with P\'s timer armed with the other-end cause, after any cause the launch sent, and no call after the launch but an UNAVAILABLE outcome\'s one get', async (_label, setup, launchCalls, before, launchKind, counted) => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     const { request, undo } = setup(h, key)
@@ -7681,13 +7665,13 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expect(h.controller.view(key)?.causes).toEqual([...before, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED])
     expect(h.controller.armedKeys()).toEqual([key])
     // No delete, kill, plain spawn or second launch after the launch, and no
-    // get but an UNAVAILABLE outcome's one (b.jg5 SRJ-407).
+    // get but an UNAVAILABLE outcome's one.
     expect(order).toEqual(['kill', 'get', 'findMissing', 'get', ...launchCalls])
     expect(h.stub.calls.spawnCalls).toEqual([...h.reuseSpawns()])
     // No spawn-failure notice; only a counted failure is counted, once.
     expect(h.notices).toEqual([])
     expect([getFailureCount(key), getFailureCount(other)]).toEqual([counted, 0])
-    // SRJ-313: an UNCLASSIFIED outcome is reported to P's episode once.
+    // an UNCLASSIFIED outcome is reported to P's episode once.
     expect(unclassifiedStartedLines(h, key)).toHaveLength(before.includes(UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED) ? 1 : 0)
     // The sequence left no timer of its own: only P's retry timer is pending,
     // and the alert timer of P's tmux-unresponsive condition while it holds.
@@ -7696,11 +7680,11 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expectUntouched(h, other)
   })
 
-  // b.jg5 SRJ-113, SRJ-301, SRJ-409 (HO rev 28): a `resume`'s
+  // (HO rev 28): a `resume`'s
   // ErrTmuxSessionCreate may leave the row pending, so it arms P's timer at
   // once in pending-only mode, the retry's read deciding; the sequence arms
   // nothing of its own after it.
-  test('SRJ-301: a step-6 resume answering ErrTmuxSessionCreate is counted once, with one spawn-failure notice, and arms P\'s timer at once in pending-only mode with the pending-row cause; the sequence arms nothing of its own and no call follows', async () => {
+  test('a step-6 resume answering ErrTmuxSessionCreate is counted once, with one spawn-failure notice, and arms P\'s timer at once in pending-only mode with the pending-row cause; the sequence arms nothing of its own and no call follows', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     const err = errTmuxSessionCreate('resume')
@@ -7758,8 +7742,8 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
 })
 
 // ---------------------------------------------------------------------------
-// A running live-row sequence blocks P's retry (b.jg5 SRJ-303, SRJ-706; the
-// E11 and E17 notes)
+// A running live-row sequence blocks P's retry (the
+// and notes)
 //
 // On the recovery harness, whose "blocks a retry" (the full-mode retry
 // action's in-flight check, from which "in flight for P" is built) counts a
@@ -7769,7 +7753,7 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
 // work's own gate is tests/restart.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a running live-row sequence blocks P\'s retry and its restart path, a refusal at the doubled wait (SRJ-303, SRJ-706)', () => {
+describe('unavailable retry: a running live-row sequence blocks P\'s retry and its restart path, a refusal at the doubled wait', () => {
   test.each<[string, (run: RecoverySequenceRun) => Promise<boolean> | undefined, LiveRowSequenceOutcome['kind']]>([
     ['ended (its launch)', () => undefined, LIVE_ROW_OUTCOME_LAUNCHED],
     ['been stopped (the teardown reason, through the stop entry)', (run) => run.stop(LIVE_ROW_STOP_TEARDOWN), LIVE_ROW_OUTCOME_STOPPED],
@@ -7824,10 +7808,10 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
     expect([h.stub.callCount(), h.stops, getFailureCount(key)]).toEqual([0, [], 0])
   })
 
-  test('after SRJ-717\'s not-judged stop, P\'s retry timer is armed with its cause, and its next fire runs E8\'s full-mode retry', async () => {
+  test('after not-judged stop, P\'s retry timer is armed with its cause, and its next fire runs \'s full-mode retry', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
-    // A not-judged stop (SRJ-717): P's pending row past its wait, left in neither list by the first run.
+    // A not-judged stop: P's pending row past its wait, left in neither list by the first run.
     await pastSampleGrace(h)
     h.script({ getResult: personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE }) })
     expect(await h.runSequence(key, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_JUDGED })
@@ -7843,8 +7827,7 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
 })
 
 // ---------------------------------------------------------------------------
-// The collision ladder's replacement sites as SRJ-301 triggers (b.jg5
-// SRJ-301, SRJ-112, SRJ-710, SRJ-707, SRJ-706)
+// The collision ladder's replacement sites as triggers
 //
 // On the recovery harness, both settings 0, one start-pass launch each: a
 // second `ErrInstanceIdCollision` from a reuse (the first re-ran
@@ -7860,7 +7843,7 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
 // The outcome tables at each site are tests/session-manager.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: the collision ladder\'s second reuse collision, its lost race and its sequence start as triggers (SRJ-301, SRJ-112, SRJ-710, SRJ-706)', () => {
+describe('unavailable retry: the collision ladder\'s second reuse collision, its lost race and its sequence start as triggers', () => {
   test('a second collision: the reuse of a finished row in another directory collides, the re-run\'s get reads it ended, and the second reuse collides; P\'s timer is armed once with the collision cause and nothing is counted', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
@@ -7876,7 +7859,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     expectUntouched(h, other)
   })
 
-  // b.jg5 SRJ-710, SRJ-301: resume's ErrSpawnNotResumable makes one re-read;
+  // resume's ErrSpawnNotResumable makes one re-read;
   // a finished row, no row, or a live row on a path with no dead evidence is
   // a lost race, re-evaluated at P's next retry.
   test.each<[string, (h: RecoveryHarness, key: string) => CannedResponse<GetResult>]>([
@@ -7902,7 +7885,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     expectUntouched(h, other)
 
     // The retry's decision reads the row finished: its relaunch's spawn collides, its get reads the row ended, and its resume succeeds:
-    // its row reports in (waiting), so no failure is counted for the resumed launch (b.4q8).
+    // its row reports in (waiting), so no failure is counted for the resumed launch.
     const id = personaInstanceId(key)
     h.script({
       statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
@@ -7913,7 +7896,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
 
     expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
     expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(key) }, { instance_id: personaInstanceId(key) }])
-    // The resume's own pending-only arm (b.jg5 SRJ-301, SRJ-409) follows the lost race's.
+    // The resume's own pending-only arm follows the lost race's.
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     // P was launched: its timer now waits on the launch's pending row (pending-only mode).
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
@@ -7922,7 +7905,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     expect(h.stub.calls.deleteCalls).toEqual([])
   })
 
-  // b.jg5 SRJ-706, SRJ-707: the restart work's launch meets a live row in
+  // the restart work's launch meets a live row in
   // another directory; its ladder starts P's sequence and answers
   // sequence-waiting, which the work answers too (not the bare refusal).
   test('a full-mode retry whose own launch meets a live row in another directory starts P\'s sequence (held at its first run): the restart run answers sequence-waiting and the timer re-arms at the doubled wait naming the sequence; the sequence still runs, and P\'s launch made no call of its own over the row', async () => {
@@ -7957,15 +7940,14 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
 })
 
 // ---------------------------------------------------------------------------
-// ErrSpawnNotResumable's re-read as an SRJ-301 trigger (b.jg5 SRJ-710,
-// SRJ-301, SRJ-706)
+// ErrSpawnNotResumable's re-read as an trigger
 //
 // On the recovery harness, both settings 0. A `pending` re-read is a launch
 // in progress: no lost-race cause, and P's timer is armed exactly as the
 // ladder's `pending` branch arms it on the same row (Q's launch meeting that
 // row at its collision `get`: none). A path holding dead evidence whose
 // re-read finds the row `waiting` starts P's live-row sequence: no lost-race
-// arm, and a retry that fires while the sequence runs is refused (SRJ-706)
+// arm, and a retry that fires while the sequence runs is refused
 // with nothing counted. Step 6's own ErrSpawnNotResumable ends the sequence
 // without its launch; the arm its end makes
 // (tests/live-row-sequence.test.ts) brings P's next retry, which runs the
@@ -7973,7 +7955,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
 // tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pending arms only what the ladder\'s pending branch arms, a running sequence refuses the retry, step 6\'s end brings the next retry (SRJ-710, SRJ-301, SRJ-706)', () => {
+describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pending arms only what the ladder\'s pending branch arms, a running sequence refuses the retry, step 6\'s end brings the next retry', () => {
   /** P's launch through its `waiting` row's GONE dead-session route (dead evidence), its `resume` answering ErrSpawnNotResumable once and its re-read reading `reread`; every later `get` reads `after`. */
   function scriptGone(h: RecoveryHarness, key: string, reread: GetResult, after: GetResult): void {
     h.script({
@@ -8058,10 +8040,9 @@ describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pendi
 })
 
 // ---------------------------------------------------------------------------
-// The ErrInvalidFlags hold and the retry timer (b.jg5 SRJ-207, SRJ-303,
-// SRJ-305), on the recovery harness with both settings 0: the hold's set
+// The ErrInvalidFlags hold and the retry timer, on the recovery harness with both settings 0: the hold's set
 // reaction stops P's timer through the stop entry with the hold's reason
-// (never the condition-end entry, so neither SRJ-306 exception keeps it); a
+// (never the condition-end entry, so neither exception keeps it); a
 // retry of a held P makes no agent-director call and stops the timer the
 // same way, whatever armed it; a hold set by the live-row sequence's step-6
 // reuse leaves no timer; and once the binary's version changes, P is retried
@@ -8080,7 +8061,7 @@ function expectStoppedByHold(h: RecoveryHarness, key: string): void {
   expect(getFailureCount(key)).toBe(0)
 }
 
-describe('unavailable retry: a held query that throws counts as held (SRJ-207, fail safe)', () => {
+describe('unavailable retry: a held query that throws counts as held (fail safe)', () => {
   let errLines: string[]
   let origConsoleError: typeof console.error
 
@@ -8118,7 +8099,7 @@ describe('unavailable retry: a held query that throws counts as held (SRJ-207, f
   })
 })
 
-describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry is made while P is held, and P is retried at once when the binary changes (SRJ-207, SRJ-303, SRJ-305)', () => {
+describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry is made while P is held, and P is retried at once when the binary changes', () => {
   test('P\'s timer armed by an UNAVAILABLE refusal; its retry\'s reuse gets ErrInvalidFlags with a passing re-check: P held and its timer stopped with the hold\'s reason, logged once; past several backoff waits nothing fires or is called for P, and Q\'s timer keeps its schedule', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -8160,7 +8141,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
     expect(h.clock.pendingCount()).toBe(1 + rc.pendingTimers())
   })
 
-  // SRJ-306's exceptions keep a timer through a condition end; the hold's
+  // exceptions keep a timer through a condition end; the hold's
   // stop goes through the stop entry, which no exception keeps.
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
     ['armed with the kill-failure cause', async (h, key) => {
@@ -8210,7 +8191,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
 
   // The session-disconnect handler (`_buildRestartDisconnectedPersona`, as
   // main() builds it over the tmux-unavailable retry check's deps): as built
-  // that check (`armMissingTmuxUnavailableRetry`, b.jg5 SRJ-311) asks no held
+  // that check (`armMissingTmuxUnavailableRetry`) asks no held
   // query, so a held P's disconnect with its tmux-unavailable outage raised
   // and no timer arms one; that timer stops at its first fire with the hold's
   // reason and no call. With no outage raised the disconnect asks the restart
@@ -8233,7 +8214,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
   })
 
   // The retry at once itself (at the re-check's time, by one reuse, P up) is
-  // AC 23's end-to-end case in tests/session-manager.test.ts; here only the
+  // end-to-end case in tests/session-manager.test.ts; here only the
   // retry timer's side of it.
   test('retried at once after a hold set by a retry\'s reuse: the version change\'s retry does not go through P\'s stopped timer: no timer attempt and no second stop; the only arm is the launch\'s pending-only watch', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
@@ -8256,7 +8237,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
     expect(h.attempts).toHaveLength(attempts)
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_HELD }])
     // P came up: its launch leaves a fresh pending-only watch on its row
-    // (b.jg5 SRJ-301, SRJ-409), the only trigger since the hold's stop.
+    // the only trigger since the hold's stop.
     expect(h.controller.view(key)).toMatchObject({ refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
     expectPendingOnlyWatch(h, key)
     expect(h.triggers.at(-1)).toEqual({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
@@ -8265,8 +8246,8 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
 })
 
 // ---------------------------------------------------------------------------
-// A retired key at the retry timer and the start pass (b.jg5 SRJ-805,
-// SRJ-806; AC 51's retry-timer half)
+// A retired key at the retry timer and the start pass (
+// retry-timer half)
 //
 // P is recorded as retired, with no mark, through the harness's store
 // (`retireKey`). Each retry's relaunch is the restart path's `launchSession`,
@@ -8275,7 +8256,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
 // starts the live-row sequence (with the retired-key flag) and types nothing.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a retired key\'s retries launch by the reuse, never a resume, and its live old life goes through the sequence (SRJ-805, SRJ-806, AC 51)', () => {
+describe('unavailable retry: a retired key\'s retries launch by the reuse, never a resume, and its live old life goes through the sequence', () => {
   /** P's store lines saying its mark was written. */
   const markedLines = (h: RecoveryHarness, key: string): string[] => retiredKeyLinesIn(h.errors).filter((line) => line.includes(`persona=${key} marked: `))
 
@@ -8309,7 +8290,7 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
     expect(h.lines).toContain(reArmedLine(key, 3, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 3, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
 
     // The new life reads waiting: the pending-only retry stops the timer
-    // (and that read of the marked key's live row clears its entry, SRJ-807).
+    // (and that read of the marked key's live row clears its entry).
     await retryNow(h, key)
     expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
     expect([h.controller.isArmed(key), h.retiredEntry(key).recorded]).toEqual([false, false])
@@ -8360,8 +8341,8 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
 
 // ---------------------------------------------------------------------------
 // An old-life wait step blocks the retry of a persona waiting on its hold
-// (b.jg5 SRJ-302, SRJ-303, SRJ-315, SRJ-811, SRJ-1512; the E11 and E17 notes;
-// E27 T2)
+// (the and notes;
+// )
 //
 // On the recovery harness, whose "blocks a retry" is the session manager's
 // `personaRetryBlockCause` and whose cause query names it in the again-reason
@@ -8370,8 +8351,8 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
 // wait is started through the session manager's ensure entry and its first
 // run held. The health tick's in-flight member is main()'s "in flight for P"
 // composition over the same queries. A key outside the applied set beside a
-// running wait on it is refused by the relaunch gate (SRJ-1512: the wait is
-// the one exception to SR-8.6, and it never launches the key).
+// running wait on it is refused by the relaunch gate (the wait is
+// the one exception to, and it never launches the key).
 // ---------------------------------------------------------------------------
 
 /** A pre-persona row's instance id, held in Q's working directory. */
@@ -8387,7 +8368,7 @@ async function waitHeldForQ(h: RecoveryHarness, q: string): Promise<{ readonly o
   return { outcome, hold }
 }
 
-describe('unavailable retry: an old-life wait step for a hold Q waits on blocks Q\'s retry and its health tick, a refusal at the doubled wait, never counted (SRJ-303, SRJ-811)', () => {
+describe('unavailable retry: an old-life wait step for a hold Q waits on blocks Q\'s retry and its health tick, a refusal at the doubled wait, never counted', () => {
   test.each<[string, (h: RecoveryHarness, key: string) => void]>([
     ['full mode (the restart retry\'s skip line names the wait)', (h, key) => h.controller.arm(key, UNAVAILABLE)],
     ['pending-only mode', (h, key) => h.controller.armPendingOnly(key)],
@@ -8446,7 +8427,7 @@ describe('unavailable retry: an old-life wait step for a hold Q waits on blocks 
     await h.driveSequence(outcome)
   })
 
-  test('SRJ-1512: beside a running wait on B\'s own row (B removed, its hold in B\'s directory), a retry and a restart retry for B are refused by the relaunch gate, with no probe or spawn of B, and no timer for B; Q\'s retry beside it runs', async () => {
+  test('beside a running wait on B\'s own row (B removed, its hold in B\'s directory), a retry and a restart retry for B are refused by the relaunch gate, with no probe or spawn of B, and no timer for B; Q\'s retry beside it runs', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [q, b] = h.keys as [string, string]
     const bId = personaInstanceId(b)
@@ -8468,7 +8449,7 @@ describe('unavailable retry: an old-life wait step for a hold Q waits on blocks 
     hold.release(cannedFindMissing({ rows: { [bId]: 'ids' } }))
     await h.driveSequence(outcome)
 
-    // No timer is ever armed for the old key (SRJ-1512), and the relaunch gate refuses the key outside the applied set.
+    // No timer is ever armed for the old key, and the relaunch gate refuses the key outside the applied set.
     expect(bArmed).toEqual([false, []])
     expect(restart).toBe(RESTART_OUTCOME_NOT_UP)
     expect(h.lines.filter((line) => line.startsWith(`[slack] persona=${b}: not relaunched — `))).toHaveLength(1)
@@ -8480,19 +8461,19 @@ describe('unavailable retry: an old-life wait step for a hold Q waits on blocks 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-810, SRJ-1502, SRJ-301, SRJ-302 (E27 T3): a persona held back by
+// a persona held back by
 // an old-life hold is retried on its timer until the hold ends, then at once
 //
 // On the recovery harness, which composes the session manager's old-life
 // gate, the restart path's old-life hook and the hold set's end-retry
 // observer (the controller's run-now entry) as main() does. The pre-persona
 // row held in Q's working directory reads `pending` past G, so each wait
-// round the gate or the hook starts ends at once keeping the hold (SRJ-717)
+// round the gate or the hook starts ends at once keeping the hold
 // and the next retry meets the hook again. The run-now entry's own cases run
 // on a bare controller.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a launch held back by an old-life hold arms the timer uncounted, each retry while held refuses at the doubled wait and never gives up, and the hold\'s end runs the retry at once (SRJ-810, SRJ-1502, SRJ-301, SRJ-302)', () => {
+describe('unavailable retry: a launch held back by an old-life hold arms the timer uncounted, each retry while held refuses at the doubled wait and never gives up, and the hold\'s end runs the retry at once', () => {
   /** The pre-persona row held in Q's working directory, read `pending` past G; Q's own row absent until its spawn. */
   async function holdQ(h: RecoveryHarness, q: string): Promise<void> {
     await pastSampleGrace(h)
@@ -8554,7 +8535,7 @@ describe('unavailable retry: a launch held back by an old-life hold arms the tim
   })
 })
 
-describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that ends retries each persona that waited on it at once)', () => {
+describe('unavailable retry: the run-now entry (an old-life hold that ends retries each persona that waited on it at once)', () => {
   const HELD_FOR_OLD_LIFE = { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD } as const
   const WHY = UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED
 
@@ -8618,8 +8599,7 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
 })
 
 // ---------------------------------------------------------------------------
-// The latch re-check's no-information scope (b.jg5 SRJ-505, SRJ-502,
-// SRJ-313): its queries, the bare controller and the reporting point inside
+// The latch re-check's no-information scope: its queries, the bare controller and the reporting point inside
 // it, and on the harness the restart work's arm hook. The wrappers inside the
 // scope are tests/outage-state.test.ts's. The scope's latch query is a
 // stand-in each case clears; the re-check round end to end is
@@ -8659,7 +8639,7 @@ function inRecheckAt<T>(
   return runInLatchRecheck(scope, async () => ({ result: await body(), lastError: undefined }))
 }
 
-describe('unavailable retry: the latch re-check scope and its queries (SRJ-505, SRJ-502)', () => {
+describe('unavailable retry: the latch re-check scope and its queries', () => {
   test('outside every re-check: no scope, not inside one, no permit', () => {
     expect([latchRecheckScopeOf(KEY), isInsideLatchRecheck(KEY), holdsLatchRecheckPermit(KEY)]).toEqual([undefined, false, false])
   })
@@ -8793,7 +8773,7 @@ describe('unavailable retry: the latch re-check scope and its queries (SRJ-505, 
   })
 })
 
-describe('unavailable retry: nothing arms a persona\'s timer inside its latch re-check while it is latched (SRJ-505, SRJ-502, SRJ-313)', () => {
+describe('unavailable retry: nothing arms a persona\'s timer inside its latch re-check while it is latched', () => {
   /** Every cause the controller arms with, by `arm`, and the pending-row cause by `armPendingOnly`: `[name, arm, kind, what the call answers when refused]`. */
   const CONTROLLER_ARMS: ReadonlyArray<readonly [string, (c: UnavailableRetryController, key: string) => unknown, string, unknown]> = [
     ...[

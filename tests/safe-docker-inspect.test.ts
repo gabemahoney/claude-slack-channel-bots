@@ -121,7 +121,7 @@ process.exitCode = answer.code
     expect(JSON.parse(readFileSync(argvFile, 'utf8'))).toEqual(['inspect', '--type', 'container', '--size', 'safe-name'])
   })
 
-  test.each(['unset', 'empty'] as const)('b.pb8: %s Config.Env entry retains the strict inspection boundary', kind => {
+  test.each(['unset', 'empty'] as const)('%s Config.Env entry retains the strict inspection boundary', kind => {
     answer.stdout = JSON.stringify([{ Id: id, Config: {
       Env: [kind === 'unset' ? 'CSCB_INSPECT_PROBE' : 'CSCB_INSPECT_PROBE='],
     } }])

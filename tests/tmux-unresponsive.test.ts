@@ -163,7 +163,7 @@ function build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: strin
   return { h, p, b }
 }
 
-/** The working-row wait's poll interval in the launch cases, in real ms: a wait that goes on past a failed poll (b.jg5 SRJ-605) polls again at once. */
+/** The working-row wait's poll interval in the launch cases, in real ms: a wait that goes on past a failed poll polls again at once. */
 const WAIT_POLL_MS = 1
 
 /** Half the retry timer's first wait, in ms: a clock step that fires no retry. */
@@ -215,10 +215,10 @@ async function refuse(h: RecoveryHarness, key: string, make: (verb: string) => E
 }
 
 // ---------------------------------------------------------------------------
-// What starts it (SRJ-307; AC 25, AC 27)
+// What starts it
 // ---------------------------------------------------------------------------
 
-/** E4's UNAVAILABLE forms of agent-director's own errors other than `ErrTmuxKillFailed`, each built for the verb that meets it. */
+/** UNAVAILABLE forms of agent-director's own errors other than `ErrTmuxKillFailed`, each built for the verb that meets it. */
 const TMUX_STARTING_FORMS = unavailableForms(
   'ErrTmuxUnresponsive',
   'ErrTmuxUnresponsive, still stopping',
@@ -241,10 +241,10 @@ const TMUX_SITES: readonly TmuxSite[] = [
   { name: 'the reconnect of a waiting row', verb: 'send-keys', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
 ]
 
-/** When the step-1 kill's UNAVAILABLE refusal of a row read live stands: after its tries (b.jg5 SRJ-702), from the sequence's start. */
+/** When the step-1 kill's UNAVAILABLE refusal of a row read live stands: after its tries, from the sequence's start. */
 const KILL_STANDS_AFTER_MS = (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
 
-describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
+describe('tmux-unresponsive: what starts it', () => {
   // Every form at one site and every site with at least one form: the shorter
   // list cycles under the longer. The full form × site matrix is
   // session-manager's; the by-name classifier is outage-state's.
@@ -274,10 +274,9 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  // A live row's kill is the live-row sequence's (b.jg5 SRJ-707, SRJ-705):
+  // A live row's kill is the live-row sequence's:
   // P's launch meets its row read `waiting` in another directory and starts
-  // P's sequence, whose step-1 kill is tried up to 3 times 2 s apart (b.jg5
-  // SRJ-702) inside the sequence's recovery attempt; its refusal that stands
+  // P's sequence, whose step-1 kill is tried up to 3 times 2 s apart inside the sequence's recovery attempt; its refusal that stands
   // aborts the sequence, so no later call of it touches tmux.
   test.each(TMUX_STARTING_FORMS.slice(0, 3))('%s at the step-1 kill of the live-row sequence P\'s launch starts over its row read live in another directory starts P’s condition when its refusal stands, after the tries; a second refusal keeps it; B’s never starts', async (_what, make) => {
     const { h, p, b } = build()
@@ -300,7 +299,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  // b.jdc's ladder action (b.jg5 SRJ-607): a launch meeting P's colliding
+  // ladder action: a launch meeting P's colliding
   // `ask_user` row reads its pane with one one-line `read-pane` inside the
   // launch; a refused read is taken as alive (no action).
   test.each(TMUX_STARTING_FORMS)('%s answering the one-line read-pane of the ask_user row a launch meets starts P’s condition at the first refusal’s time; a second launch’s refusal keeps it; B’s never starts; nothing is counted', async (_what, make) => {
@@ -326,7 +325,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  // b.jg5 SRJ-105, SRJ-112, SRJ-707's Test line: the reuse spawn is a
+  // Test line: the reuse spawn is a
   // tmux-touching verb. Reached through the live-row sequence's final launch,
   // entered at its step-2 `get` so no kill comes before it, its UNAVAILABLE
   // answer starts P's condition inside the sequence's recovery attempt; the
@@ -353,10 +352,10 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNeverStarted(h, b)
   })
 
-  // b.jg5 SRJ-307, SRJ-704, SRJ-1011: ErrTmuxKillFailed goes to the
+  // ErrTmuxKillFailed goes to the
   // kill-failure alert, never to the condition. Its ordinary version is the
   // one post, and the episode it opens gives a message lost afterwards state 4.
-  test('ErrTmuxKillFailed from the live-row sequence\'s kill of a row read live (started at a replacement site), at every try, starts nothing; its one post is the ordinary kill-failure alert (the kill-failure cause only, once); a message lost after it reports kill failed, never not answering (SRJ-1011)', async () => {
+  test('ErrTmuxKillFailed from the live-row sequence\'s kill of a row read live (started at a replacement site), at every try, starts nothing; its one post is the ordinary kill-failure alert (the kill-failure cause only, once); a message lost after it reports kill failed, never not answering', async () => {
     const { h, p, b } = build()
     const err = errTmuxKillFailed()
     scriptLiveRowElsewhere(h, p, { killError: err })
@@ -375,7 +374,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNeverStarted(h, p)
   })
 
-  // b.jg5 SRJ-702, SRJ-704, SRJ-307: after a survivor-naming failure, tries
+  // after a survivor-naming failure, tries
   // that end in ErrTmuxUnresponsive raise the ordinary version, and the last
   // outcome keeps its own handling besides: it starts the condition once, at
   // the time it stands (the earlier try's ErrTmuxKillFailed started nothing).
@@ -395,7 +394,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectPosts(h, [killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }))])
   })
 
-  // b.jg5 SRJ-307, SRJ-1016: the kill-failure episode and the condition are
+  // the kill-failure episode and the condition are
   // kept apart: the alert neither ends a condition that holds nor is held
   // back by it, and the condition's own onset still posts at its next tick.
   test('a condition already holding for P is neither ended nor held back by the ordinary alert: the alert posts, the condition keeps its first refusal, and its onset still posts at the next tick', async () => {
@@ -418,12 +417,12 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectPosts(h, [killAlert, onset(p)])
   })
 
-  // b.jg5 SRJ-702, SRJ-307: only the outcome that stands reaches the
+  // only the outcome that stands reaches the
   // condition. A try's UNAVAILABLE that a later try's success replaces starts
   // nothing and arms no cause of its own, and the own-row `status` read
   // between the tries (not tmux-touching) neither starts the condition nor
   // ends it. The only arm is the sequence's successful launch's pending-only
-  // watch on its new row (b.jg5 SRJ-301, SRJ-409).
+  // watch on its new row.
   test('an ErrTmuxUnresponsive try then a success at the live-row sequence\'s kill of a row read live starts no condition and arms only the launch\'s pending-only watch; the sequence\'s run and reuse spawn follow, with no delete', async () => {
     const { h, p, b } = build()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
@@ -464,12 +463,12 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
   test.each<[string, string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript]>([
     ['the collision get', 'get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errCallTimeout('get') })],
-    // b.jg5 SRJ-605: the working-row wait goes on past its failed poll; its
+    // the working-row wait goes on past its failed poll; its
     // next poll reads the stub's default `waiting` row and the launch
     // reconnects, so the launch ends.
     ['the working-row read', 'status', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errCallTimeout('status'))] })],
 
-  ])('AC 27: ErrCallTimeout from %s (%s) inside a launch starts nothing and posts nothing; the retry timer is armed', async (_site, _verb, script) => {
+  ])('ErrCallTimeout from %s (%s) inside a launch starts nothing and posts nothing; the retry timer is armed', async (_site, _verb, script) => {
     const { h, p, b } = build()
     // The working-row wait sleeps its poll interval in real time between polls.
     h.config.agent_director_poll_interval_ms = WAIT_POLL_MS
@@ -518,23 +517,23 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  // launch or recovery attempt (SRJ-401, SRJ-307; hatch A2), as the tick's
+  // launch or recovery attempt (design A2), as the tick's
   // read does: none of its calls starts the condition or arms the timer. One
-  // starting form per pane verb, and AC 27's form at its status. The only arm
-  // is the launch's own pending-only watch on its new row (b.jg5 SRJ-301,
+  // starting form per pane verb, and form at its status. The only arm
+  // is the launch's own pending-only watch on its new row (
 
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, number]>([
-    // b.jg5 SRJ-110 (hatch A3): the teardown's kill answers its outcome and
-    // arms nothing, even run inside a recovery attempt. Its tries are E25's:
+    // (design A3): the teardown's kill answers its outcome and
+    // arms nothing, even run inside a recovery attempt. Its tries are :
     // today one call.
-    ['a persona teardown’s kill, even inside a recovery attempt (b.jg5 SRJ-110: it answers its outcome and arms nothing)', async (h, key) => {
+    ['a persona teardown’s kill, even inside a recovery attempt (it answers its outcome and arms nothing)', async (h, key) => {
       const err = errTmuxUnresponsive('kill')
       h.script({ killError: err })
       await runInAttempt(key, 'recovery', async () => {
         expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, error: err })
       })
     }, 1],
-    // b.jg5 SRJ-702: the sweep's kill of a row listed live makes its tries,
+    // the sweep's kill of a row listed live makes its tries,
     // with the status reads between them; none of it starts or arms anything.
     ['a start-sweep kill of the persona’s row in another directory, at every try', async (h, key) => {
       h.script({
@@ -582,7 +581,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Held apart from the outages (SRJ-307; AC 25, AC 27)
+// Held apart from the outages
 // ---------------------------------------------------------------------------
 
 /**
@@ -608,7 +607,7 @@ describe('tmux-unresponsive: held apart from the outages', () => {
     const raised = await raiseOutage(p, undefined, errTmuxNotAvailable(undefined, 'status'))
 
     // The condition's end hook alone; the health tick's own clear of
-    // tmux-unavailable (SRJ-312) is health-check's, not the condition's.
+    // tmux-unavailable is health-check's, not the condition's.
     expect(h.tickEnd(p)).toBe('ended')
 
     expect([...getOutageFlags(p)]).toEqual([raised])
@@ -617,7 +616,7 @@ describe('tmux-unresponsive: held apart from the outages', () => {
     expectNeverStarted(h, b)
   })
 
-  // b.jg5 SRJ-312: only tmux answering clears tmux-unavailable (a
+  // only tmux answering clears tmux-unavailable (a
   // tmux-touching success or GONE, or a check that finds the row live and
   // connected), and each of those ends the condition too. The wrapper's
   // success and GONE branches clear the outage first and end the condition
@@ -658,8 +657,8 @@ describe('tmux-unresponsive: held apart from the outages', () => {
     ])
     expect(holdsAtOutagePost).toEqual([true])
     // The clear came first: it reached the retry timer's condition-end entry
-    // and stopped P's timer (SRJ-306), which, as every real stop while the
-    // condition holds, cancelled its pending alert check (SRJ-309).
+    // and stopped P's timer, which, as every real stop while the
+    // condition holds, cancelled its pending alert check.
     expect(h.outageClears).toEqual([{ key: p, reading: undefined, result: 'stopped' }])
 
     // The condition: its own end (the tmux verb), once, with its own recovery,
@@ -686,7 +685,7 @@ describe('tmux-unresponsive: held apart from the outages', () => {
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_LIVE)
       expect(h.stub.calls.statusCalls).toHaveLength(before + 1)
     }],
-  ])('SRJ-312: %s that succeeds while the tmux-unavailable outage and the condition are both active clears neither and posts nothing', async (_what, read) => {
+  ])('%s that succeeds while the tmux-unavailable outage and the condition are both active clears neither and posts nothing', async (_what, read) => {
     const { h, p, b } = build()
     const at = await refuse(h, p)
     const raised = await raiseOutage(p, undefined, errTmuxNotAvailable(undefined, 'status'))
@@ -731,7 +730,7 @@ describe('tmux-unresponsive: held apart from the outages', () => {
 })
 
 // ---------------------------------------------------------------------------
-// What ends it (SRJ-310)
+// What ends it
 // ---------------------------------------------------------------------------
 
 /** A wrapped call's outcome: it resolves, or rejects with an error built at the call. */
@@ -749,7 +748,7 @@ async function wrapped(key: string, call: AdCall, outcome: CallOutcome): Promise
   }
 }
 
-describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
+describe('tmux-unresponsive: what ends it', () => {
   test.each<[string, AdCall, CallOutcome, string | undefined, UnavailableRetryConditionEndResult]>([
     ['a spawn succeeds', 'spawn', RESOLVES, UNAVAILABLE_RETRY_ROW_PENDING, 'kept'],
     ['a resume succeeds', 'resume', RESOLVES, UNAVAILABLE_RETRY_ROW_PENDING, 'kept'],
@@ -808,7 +807,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     expectNoPostYet(h)
   })
 
-  // b.jg5 SRJ-112, SRJ-310: the reuse spawn's success at the live-row
+  // the reuse spawn's success at the live-row
   // sequence's final launch, entered at its step-2 `get` so no kill comes
   // before it, is the first tmux-touching success: it ends the condition with
   // the pending reading, as a launch's spawn does.
@@ -902,10 +901,10 @@ describe('tmux-unresponsive: isolation', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The notices (SRJ-308, SRJ-309, SRJ-310's recovery, SRJ-1006)
+// The notices (recovery)
 // ---------------------------------------------------------------------------
 
-/** AC 80's agent-director settings: the alert threshold is the longer of the two plus E6's addend. */
+/** agent-director settings: the alert threshold is the longer of the two plus addend. */
 const AC_80_TMUX = { stopping_window_seconds: 30n, starting_session_seconds: 120n } as const satisfies AdConfigTables['tmux']
 
 /** The health check on (any interval but 0); the harness has no tick of its own, so a case runs each tick with `tick`. */
@@ -914,7 +913,7 @@ const HEALTH_CHECK_S = 60
 /** Health check off, every retry refused, no alert check: the onset comes at a retry past the floor. */
 const RETRY_MODE: RecoveryHarnessOptions = { action: 'scripted', alertThresholdMs: false }
 
-/** Health check on, every retry refused, the alert check over E6's threshold in effect. */
+/** Health check on, every retry refused, the alert check over threshold in effect. */
 const TICK_MODE: RecoveryHarnessOptions = { action: 'scripted', healthCheckInterval: HEALTH_CHECK_S }
 
 const FLOOR_MS = TMUX_UNRESPONSIVE_ONSET_FLOOR_MS
@@ -970,8 +969,8 @@ function noticeAndEndLines(h: RecoveryHarness, key: string): string[] {
   return conditionLines(h, key).filter((line) => !line.startsWith(`${conditionLinePrefix(key)}started`))
 }
 
-describe('tmux-unresponsive: SRJ-1006’s texts (pin)', () => {
-  test('the one pin case: the three texts for a sample session name, the 120 s floor, "over 6 minutes" at agent-director’s defaults and "over 3 minutes" (180 s) at AC 80’s settings', () => {
+describe('tmux-unresponsive: texts (pin)', () => {
+  test('the one pin case: the three texts for a sample session name, the 120 s floor, "over 6 minutes" at agent-director’s defaults and "over 3 minutes" (180 s) at the contract settings', () => {
     const ac80 = { ...DEFAULT_AD_SETTINGS_IN_EFFECT, tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, ...AC_80_TMUX } }
 
     expect(tmuxUnresponsiveOnsetText('sample')).toBe(
@@ -990,7 +989,7 @@ describe('tmux-unresponsive: SRJ-1006’s texts (pin)', () => {
   })
 })
 
-describe('tmux-unresponsive: the onset with the health check on (SRJ-308; AC 25)', () => {
+describe('tmux-unresponsive: the onset with the health check on', () => {
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
     ['a tmux-touching success before the next tick', (_h, key) => wrapped(key, 'send-keys', RESOLVES)],
     ['the next tick finding it live, before that tick’s onset check', async (h, key) => {
@@ -1059,7 +1058,7 @@ describe('tmux-unresponsive: the onset with the health check on (SRJ-308; AC 25)
   })
 })
 
-describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () => {
+describe('tmux-unresponsive: the onset with the health check off', () => {
   test('no onset at the retries before the floor; one, the builder’s text, at the first retry at or past it; none at later retries', async () => {
     const { h, p, b } = build(RETRY_MODE)
     const at = await refuse(h, p)
@@ -1130,9 +1129,9 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     expectNeverStarted(h, b)
   })
 
-  // E10's hatch note carried by E21 (SRJ-308, hatch A2): the retry skipped
-  // because P's live-row sequence is in flight (it blocks a retry, SRJ-303,
-  // SRJ-706) still posts the onset. The sequence enters at its step-2 `get`,
+  // design note carried by (design A2): the retry skipped
+  // because P's live-row sequence is in flight (it blocks a retry,
+  //) still posts the onset. The sequence enters at its step-2 `get`,
   // so it makes no kill, and its first run is held.
   test('a retry skipped because P’s live-row sequence runs, at or past the floor, posts the onset and makes no agent-director call', async () => {
     const { h, p, b } = build(RETRY_MODE)
@@ -1160,9 +1159,9 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     expectNeverStarted(h, b)
   })
 
-  // E10's hatch note carried by E27 T2 (SRJ-308, hatch A2): the retry skipped
+  // design note carried by (design A2): the retry skipped
   // because an old-life wait step runs for a hold P waits on (it blocks a
-  // retry, SRJ-303, SRJ-811) still posts the onset. The wait runs on a
+  // retry) still posts the onset. The wait runs on a
   // pre-persona row held in P's working directory, started through the
   // session manager's ensure entry, and its first run is held; its calls are
   // on the old id only.
@@ -1198,7 +1197,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     expectNeverStarted(h, b)
   })
 
-  // b.jg5 SRJ-307, SRJ-704 (AC 64): its one post is the kill-failure alert.
+  // its one post is the kill-failure alert.
   test('ErrTmuxKillFailed never posts a tmux-unresponsive notice: not at retries past the floor and the threshold, nor at a tick; its one post is the ordinary kill-failure alert', async () => {
     const { h, p } = build({ action: 'scripted' })
     const err = errTmuxKillFailed()
@@ -1215,7 +1214,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
   })
 })
 
-describe('tmux-unresponsive: the alert (SRJ-309; AC 26, AC 80)', () => {
+describe('tmux-unresponsive: the alert', () => {
   test('at agent-director’s defaults, with no onset: nothing at exactly the threshold, one alert 1 ms past it, none again however far the clock moves; retries go on and nothing is counted; B stays silent', async () => {
     const { h, p, b } = build(TICK_MODE)
     const thresholdMs = adAlertThresholdMsInEffect()
@@ -1243,7 +1242,7 @@ describe('tmux-unresponsive: the alert (SRJ-309; AC 26, AC 80)', () => {
     expectNeverStarted(h, b)
   })
 
-  test('AC 80: with the settings in effect read from agent-director’s file before the first refusal, the alert comes just past their threshold, not the defaults’, and its minutes are theirs', async () => {
+  test('with the settings in effect read from agent-director’s file before the first refusal, the alert comes just past their threshold, not the defaults’, and its minutes are theirs', async () => {
     const { h, p } = build({ ...TICK_MODE, adSettings: { tmux: AC_80_TMUX } })
     expect(h.settings().tmux).toMatchObject(AC_80_TMUX)
     const thresholdMs = adAlertThresholdMsInEffect()
@@ -1274,7 +1273,7 @@ describe('tmux-unresponsive: the alert (SRJ-309; AC 26, AC 80)', () => {
   })
 })
 
-describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
+describe('tmux-unresponsive: the recovery', () => {
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, TmuxUnresponsiveEndReason]>([
     ['a health tick finding it live', async (h, key) => tick(h, [key]), TMUX_UNRESPONSIVE_END_TICK],
     ['a tmux-touching success', (_h, key) => wrapped(key, 'send-keys', RESOLVES), TMUX_UNRESPONSIVE_END_TMUX_VERB],
@@ -1319,7 +1318,7 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
     ])
   })
 
-  test('SRJ-1014: the start, onset, alert and end lines are their exported builders\' lines, each naming the persona; the start line carries the refusal\'s description redacted, and nothing leaks', async () => {
+  test('the start, onset, alert and end lines are their exported builders\' lines, each naming the persona; the start line carries the refusal\'s description redacted, and nothing leaks', async () => {
     const { h, p } = build(TICK_MODE)
     const thresholdMs = adAlertThresholdMsInEffect()
     const refusal = (verb: string): Error => errTmuxUnresponsive(verb, `tmux did not answer (${sentinelInMessage('tmux')})`)
@@ -1430,7 +1429,7 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The alert before the onset (SRJ-308, SRJ-309)
+// The alert before the onset
 // ---------------------------------------------------------------------------
 
 /** The line when the onset is held back because the episode's alert already posted: once per episode. */
@@ -1448,8 +1447,8 @@ function alertRearmedLine(key: string): string {
   return tmuxUnresponsiveLine(key, TMUX_UNRESPONSIVE_ALERT_CHECK_ARMED_AGAIN)
 }
 
-describe('tmux-unresponsive: the alert before the onset (SRJ-308, SRJ-309)', () => {
-  test('AC 80’s settings with the health check off: the alert, then the recovery, and no onset; the retries past the floor log the held onset once', async () => {
+describe('tmux-unresponsive: the alert before the onset', () => {
+  test('settings with the health check off: the alert, then the recovery, and no onset; the retries past the floor log the held onset once', async () => {
     const { h, p, b } = build({ action: 'scripted', adSettings: { tmux: AC_80_TMUX } })
     expect(h.config.health_check_interval).toBe(0)
     const thresholdMs = adAlertThresholdMsInEffect()
@@ -1510,7 +1509,7 @@ describe('tmux-unresponsive: the alert before the onset (SRJ-308, SRJ-309)', () 
 })
 
 // ---------------------------------------------------------------------------
-// The alert and the retry timer's stops (SRJ-309)
+// The alert and the retry timer's stops
 // ---------------------------------------------------------------------------
 
 /**
@@ -1573,7 +1572,7 @@ const TIMER_STOPS: readonly [string, TimerStop][] = [
 
 // The health check is on in these cases and no tick runs, so no onset posts:
 // the alert is the only notice the stops can touch.
-describe('tmux-unresponsive: the alert and the retry timer’s stops (SRJ-309)', () => {
+describe('tmux-unresponsive: the alert and the retry timer’s stops', () => {
   test.each(TIMER_STOPS)('each stop’s terminal class is the one src declares: %s', (_what, stop) => {
     expect(UNAVAILABLE_RETRY_TERMINAL_STOPS.has(stop.reason)).toBe(stop.terminal)
   })
@@ -1677,7 +1676,7 @@ describe('tmux-unresponsive: the alert and the retry timer’s stops (SRJ-309)',
 })
 
 // ---------------------------------------------------------------------------
-// The onset and the retry timer's stops (SRJ-305, SRJ-308; AC 28)
+// The onset and the retry timer's stops
 // ---------------------------------------------------------------------------
 
 /** The line when a stop of the persona's retry timer holds its onset back: once per episode. */
@@ -1699,7 +1698,7 @@ function tmuxUnavailableOnset(key: string): RecoveryNotice {
  * Raise persona `key`'s `tmux-unavailable` outage the way any call outside
  * every attempt does: a `status` answering ENVIRONMENT (`ErrTmuxNotAvailable`).
  * Its trigger arms the persona's retry timer with the ENVIRONMENT cause when
- * none is armed (b.jg5 SRJ-311): an arm that is not a refusal of the
+ * none is armed: an arm that is not a refusal of the
  * condition.
  */
 async function raiseTmuxUnavailable(key: string): Promise<void> {
@@ -1758,7 +1757,7 @@ async function healthTick(h: RecoveryHarness, key: string): Promise<string[]> {
   return scheduled
 }
 
-describe('tmux-unresponsive: the onset and the retry timer’s stops (SRJ-305, SRJ-308; AC 28)', () => {
+describe('tmux-unresponsive: the onset and the retry timer’s stops', () => {
   test.each<[string, TimerStop]>([
     ['the restart cap', STOP_AT_CAP],
     ['the persona not up', STOP_NOT_UP],
@@ -2035,7 +2034,7 @@ describe('tmux-unresponsive: teardown and shutdown post nothing more', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A CONFLICT ends it silently (SRJ-310, SRJ-502)
+// A CONFLICT ends it silently
 // ---------------------------------------------------------------------------
 
 /**
@@ -2056,7 +2055,7 @@ function holdsAtPosts(h: RecoveryHarness, key: string, text: string): boolean[] 
   return held
 }
 
-describe('tmux-unresponsive: a CONFLICT ends it silently (SRJ-310, SRJ-502)', () => {
+describe('tmux-unresponsive: a CONFLICT ends it silently', () => {
   test.each<[string, boolean]>([
     ['after its onset', true],
     ['before any onset', false],
@@ -2162,7 +2161,7 @@ function tickRead(h: RecoveryHarness, key: string): Promise<unknown> {
   return _buildIsSessionAliveAdapter(() => h.config)(key)
 }
 
-describe('tmux-unresponsive: SRJ-310’s third end rule after a launch timeout (SRJ-310, SRJ-407)', () => {
+describe('tmux-unresponsive: third end rule after a launch timeout', () => {
 
   // Rule 3 ends nothing unless a `pending` read established this launch's
   // row: the row read afterwards is not this launch's, or the outcome was no
@@ -2201,10 +2200,10 @@ describe('tmux-unresponsive: SRJ-310’s third end rule after a launch timeout (
   })
 })
 
-// The E10 note on E28 (b.jg5 SRJ-303, SRJ-309): a pending-only retry that
+// The note on : a pending-only retry that
 // reads the row live but not connected stops the timer while the condition
 // still holds; no "keeps retrying" alert may post while no timer runs.
-describe('tmux-unresponsive: a pending-only stop while the condition holds leaves no alert to post with no timer running (SRJ-303, SRJ-309)', () => {
+describe('tmux-unresponsive: a pending-only stop while the condition holds leaves no alert to post with no timer running', () => {
   test('with the health check off, a pending-only retry reading P’s row live but not connected stops the timer and cancels its alert check with one line; nothing posts past the threshold while no timer runs; a later refusal arms the check again from the first refusal, and the alert then posts once', async () => {
     const { h, p } = build({ action: 'scripted' })
     expect(h.config.health_check_interval).toBe(0)
@@ -2251,12 +2250,12 @@ describe('tmux-unresponsive: a pending-only stop while the condition holds leave
 })
 
 // ---------------------------------------------------------------------------
-// A lost message reads the holds query (b.jg5 SRJ-1011, SRJ-307; AC 68),
+// A lost message reads the holds query,
 // through the recovery harness's driver: the real routing's no-session
 // branch, bound as `main()` binds it, both settings 0
 // ---------------------------------------------------------------------------
 
-describe('tmux-unresponsive: a lost message reads the holds query (SRJ-1011, SRJ-307)', () => {
+describe('tmux-unresponsive: a lost message reads the holds query', () => {
   test('a launch’s spawn refused ErrTmuxUnresponsive starts P’s condition: a message lost while it holds reports not answering, with no restart and no call, and B’s reports its own state; once a tmux-touching success ends it, the next lost message reports auto-restart disabled', async () => {
     const { h, p, b } = build()
     await refuse(h, p)
@@ -2278,8 +2277,8 @@ describe('tmux-unresponsive: a lost message reads the holds query (SRJ-1011, SRJ
 })
 
 // ---------------------------------------------------------------------------
-// AC 71: a latch re-check's probe or retry answering UNAVAILABLE starts
-// nothing (SRJ-307, SRJ-505; E30 T1). P latched as a case-table row's site
+// a latch re-check's probe or retry answering UNAVAILABLE starts
+// nothing . P latched as a case-table row's site
 // latches it, its row on the row model, the re-check bound as main() binds
 // it, the health check on: round after round past the alert threshold in
 // effect, its one-line read-pane probe or its retry (a plain spawn, a reuse,
@@ -2289,7 +2288,7 @@ describe('tmux-unresponsive: a lost message reads the holds query (SRJ-1011, SRJ
 // UNAVAILABLE inside a launch attempt starts the condition as before.
 // ---------------------------------------------------------------------------
 
-describe('tmux-unresponsive: a latch re-check\'s probe or retry answering UNAVAILABLE starts nothing (AC 71; SRJ-307, SRJ-505)', () => {
+describe('tmux-unresponsive: a latch re-check\'s probe or retry answering UNAVAILABLE starts nothing', () => {
   /** A resume or reuse latch row of `latchCase`, its row recorded `ended`; or the plain spawn's scan-leftover row, with no row. */
   const rowOf = (refusedOperation: string, latchCase: string, state: string | undefined) =>
     CONFLICT_CASE_ROWS.find(

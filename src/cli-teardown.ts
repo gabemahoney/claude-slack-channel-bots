@@ -2,15 +2,12 @@
  * cli-teardown.ts — The pure pieces of the CLI's persona teardown commands,
  * `stop --stop-bots` and `clean_restart` (`src/cli.ts`): the precheck's
  * verdict over one answer, its tries and spacing, its two operator lines,
- * `stop --stop-bots`' too-old line and the config-file display name (b.jg5
- * SRJ-901, SRJ-902, SRJ-117, SRJ-908); the teardown's per-persona
+ * `stop --stop-bots`' too-old line and the config-file display name; the teardown's per-persona
  * outcome, its pause verdict, its state-read verdict, its kill's options
- * and mapping, and the bounds of its cost (SRJ-903, SRJ-904, SRJ-119,
- * SRJ-316, SRJ-908); the teardown's report: each persona's
+ * and mapping, and the bounds of its cost; the teardown's report: each persona's
  * failure line, kill-failure alert and startup-errors entry, and the last
- * line (SRJ-907, SRJ-909, SRJ-1013); `clean_restart`'s answer check line,
- * not-restarted alert and its class, and its restart lines (SRJ-906,
- * SRJ-1013); and both commands' initialization-failed line.
+ * line; `clean_restart`'s answer check line,
+ * not-restarted alert and its class, and its restart lines; and both commands' initialization-failed line.
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -20,8 +17,8 @@
  *   - a `get` with no row (`ErrSpawnNotFound`) or a finished row
  *     (`AGENT_DIRECTOR_DEAD_STATES`: `ended`, `missing`): skip;
  *   - a `get` of a row in any other state, one CSCB does not know included
- *     (SRJ-901 step 2), whatever its `liveness_note` (a note alone fails
- *     nothing, SRJ-114): pass, and the `read-pane` follows;
+ * (step 2), whatever its `liveness_note` (a note alone fails
+ * nothing): pass, and the `read-pane` follows;
  *   - a `read-pane` answering a pane, GONE or `ErrSpawnNotFound`: pass;
  *   - UNAVAILABLE (timeouts included), from either call: retry;
  *   - CONFIG (`ErrConfigMalformed`), from either call: fail at once, naming
@@ -31,9 +28,9 @@
  *
  * At a `get` every other class (GONE, a STATE name other than
  * `ErrSpawnNotFound`, LAUNCH FAILURE, DIRECTORY) fails with no retry as
- * UNCLASSIFIED; at a `read-pane` those are UNCLASSIFIED by SRJ-117's table.
+ * UNCLASSIFIED; at a `read-pane` those are UNCLASSIFIED by the contract table.
  * A failure carries the class label it is reported under and the redacted
- * one-line description `describeReportedAdFailure` renders (SRJ-104: an
+ * one-line description `describeReportedAdFailure` renders (an
  * UNCLASSIFIED, UNUSABLE NAME or CONFIG error shows the name and description
  * agent-director reported, an `ErrUnknownErrorName` its `unknownName` and
  * the envelope's `err_description`); a CONFIG failure's description names
@@ -48,7 +45,7 @@
  * A failed precheck prints, per persona it could not reach,
  * {@link precheckFailureLine}, then {@link precheckNothingStoppedLine}.
  * When the client refuses the binary as too old, `stop --stop-bots` stops
- * only the server and ends with {@link onlyServerStoppedLine} (SRJ-902).
+ * only the server and ends with {@link onlyServerStoppedLine}.
  *
  * The teardown. After a passed precheck and the server stop, each persona's
  * teardown (`teardownPersona`) answers one {@link PersonaTeardownOutcome}:
@@ -57,8 +54,8 @@
  * poll or kill; or an unexpected rejection of the teardown itself, which the
  * CLI maps to a failed outcome), the classifier's class (never relabelled
  * UNCLASSIFIED, as the precheck's `get` relabels) and the redacted one-line
- * description `describeReportedAdFailure` renders (SRJ-104), a CONFIG
- * failure's naming {@link AD_CONFIG_FILE_DISPLAY_NAME} (SRJ-316).
+ * description `describeReportedAdFailure` renders, a CONFIG
+ * failure's naming {@link AD_CONFIG_FILE_DISPLAY_NAME}.
  *
  * {@link stateReadVerdictOf} decides each of the teardown's own `status`
  * reads (the read before the pause and every read of the poll): a finished
@@ -67,7 +64,7 @@
  * other error fails the persona at once with its class, with no retry.
  *
  * {@link pauseVerdictOf} decides each `pause` answer on a live row by class
- * (SRJ-903; every answer through `classifyAdError`):
+ * (every answer through `classifyAdError`):
  *
  *   - success: done, and the poll follows;
  *   - UNAVAILABLE (`ErrCallTimeout` and a non-agent-director throw
@@ -85,11 +82,11 @@
  *     to the kill.
  *
  * `pause` waits up to the host's `[pause] timeout_seconds` for the row to
- * end; CSCB's call timeout is sized above that wait (SRJ-213), so a slow
+ * end; CSCB's call timeout is sized above that wait, so a slow
  * `/exit` ends in `ErrPauseTimeout`, which escalates, rather than in
- * `ErrCallTimeout` (SRJ-119).
+ * `ErrCallTimeout`.
  *
- * The kill (SRJ-904, SRJ-702, SRJ-110), after an escalated pause or at
+ * The kill, after an escalated pause or at
  * `exit_timeout`, is one bounded retry (`runKillRetry`, `src/kill-retry.ts`)
  * of checked kills (`checkedKill`, `src/checked-kill.ts`), run by the CLI
  * under {@link TEARDOWN_KILL_OPTIONS} (`goneIsFailure`), so a GONE answer is
@@ -105,7 +102,7 @@
  * retry's kill-failure alert decision (the retry gives the survivor version
  * only on a success end and the ordinary version only on a failure end).
  *
- * The report (SRJ-907, SRJ-909, SRJ-1013, SRJ-704, SRJ-1007): after every
+ * The report: after every
  * persona has settled, {@link personaTeardownReportOf} gives each persona's
  * lines to print, lines to append to `server.log` and at most one
  * `startup-errors.log` entry. A failed persona gets
@@ -121,7 +118,7 @@
  * form names the command as the context. When any persona failed, the
  * command ends with {@link teardownNotStoppedLine}, printed only.
  *
- * The restart (SRJ-906): when any persona of a `clean_restart` failed, the
+ * The restart: when any persona of a `clean_restart` failed, the
  * CLI checks that agent-director answers, one `list` of `service=cscb` rows
  * made at most {@link PRECHECK_TRIES} times {@link PRECHECK_TRY_SPACING_MS}
  * apart, any error being a failed try, and starts the server when it does.
@@ -133,13 +130,13 @@
  * {@link CLEAN_RESTART_NOT_RESTARTED_LABEL} entry. The last line follows the
  * restart's outcome.
  *
- * The cost (SRJ-908): {@link teardownBoundMs} bounds one persona's teardown
+ * The cost: {@link teardownBoundMs} bounds one persona's teardown
  * and {@link precheckBoundMs} its precheck, each call taking the call
  * timeout, from {@link PRECHECK_TRIES}, {@link PRECHECK_TRY_SPACING_MS},
  * `KILL_RETRY_TRIES`, `KILL_RETRY_SPACING_MS` and `exit_timeout`.
  *
  * The precheck and the teardown have no side effects beyond the teardown's
- * own `pause` and `kill` (SRJ-114, SRJ-115, SRJ-801, SRJ-1002): nothing
+ * own `pause` and `kill`: nothing
  * latches, no record is written and no retired-key entry is cleared. This
  * module therefore never imports the session manager, the conflict latch,
  * the retired-key record, the settings reader (`src/ad-settings.ts`; the
@@ -225,7 +222,7 @@ export type CliTeardownCommand = typeof CLI_COMMAND_STOP_BOTS | typeof CLI_COMMA
 
 /**
  * agent-director's config file as the CLI's lines name it,
- * `~/.config/agent-director/config.toml` (b.jg5 SRJ-901, SRJ-316; defined in
+ * `~/.config/agent-director/config.toml` (defined in
  * `src/ad-config-file.ts`).
  */
 export { AD_CONFIG_FILE_DISPLAY_NAME }
@@ -236,16 +233,15 @@ export { AD_CONFIG_FILE_DISPLAY_NAME }
 
 /**
  * Most calls the precheck makes of one `get` or `read-pane` that answers
- * UNAVAILABLE (b.jg5 SRJ-901 step 3); also the most `pause` calls of one
- * persona's teardown (SRJ-903) and the most `list` calls of `clean_restart`'s
- * answer check (SRJ-906).
+ * UNAVAILABLE (step 3); also the most `pause` calls of one
+ * persona's teardown and the most `list` calls of `clean_restart`'s
+ * answer check.
  */
 export const PRECHECK_TRIES = 3
 
 /**
  * The wait between two tries of one precheck call, of one teardown's `pause`
- * and of `clean_restart`'s answer check, on the CLI's injected clock (b.jg5
- * SRJ-901, SRJ-903, SRJ-906, SRJ-908).
+ * and of `clean_restart`'s answer check, on the CLI's injected clock.
  */
 export const PRECHECK_TRY_SPACING_MS = 2_000
 
@@ -337,8 +333,8 @@ const VERDICT_SKIP: PrecheckSkipVerdict = Object.freeze({ kind: PRECHECK_VERDICT
 const VERDICT_PASS: PrecheckPassVerdict = Object.freeze({ kind: PRECHECK_VERDICT_PASS })
 
 /**
- * The verdict over one precheck answer (b.jg5 SRJ-901 steps 2 to 5,
- * SRJ-117's CLI-precheck row); see the module comment. Pure; never throws.
+ * The verdict over one precheck answer (steps 2 to 5,
+ * CLI-precheck row); see the module comment. Pure; never throws.
  */
 export function precheckVerdictOf(answer: PrecheckAnswer): PrecheckVerdict {
   if ('error' in answer) {
@@ -351,9 +347,9 @@ export function precheckVerdictOf(answer: PrecheckAnswer): PrecheckVerdict {
     return VERDICT_PASS
   }
   // A pane passes but proves nothing: it may be a single leftover's
-  // (b.jg5 SRJ-613). The backstop is the teardown's pause, or on a `pending`
+  //. The backstop is the teardown's pause, or on a `pending`
   // row its kill, which answers CONFLICT for a leftover and fails that
-  // persona's teardown (SRJ-903, SRJ-904).
+  // persona's teardown.
   return VERDICT_PASS
 }
 
@@ -478,10 +474,10 @@ export interface TeardownErrorReport {
 }
 
 /**
- * What a persona's teardown kill did (b.jg5 SRJ-904, SRJ-702): the outcome
+ * What a persona's teardown kill did: the outcome
  * that stood at the end of the bounded retry (`runKillRetry`,
  * `src/kill-retry.ts`), how the tries ended, the kills and `status` reads
- * made, and the retry's kill-failure alert decision (b.jg5 SRJ-1007): for a
+ * made, and the retry's kill-failure alert decision: for a
  * stopped persona none or the survivor version, for a failed one none or the
  * ordinary version. Every description in it is raw as agent-director wrote
  * it (redact before any line, record or print).
@@ -531,7 +527,7 @@ export function teardownFailed(step: TeardownStep, report: TeardownErrorReport):
 
 /**
  * What a teardown failure reports for a value an agent-director call threw
- * (b.jg5 SRJ-104, SRJ-316): the classifier's class, unchanged,
+ * the classifier's class, unchanged,
  * and `describeReportedAdFailure`'s description, after a lead naming
  * {@link AD_CONFIG_FILE_DISPLAY_NAME} for a CONFIG answer. Pure; never throws.
  */
@@ -608,7 +604,7 @@ const STATE_READ_ABSENT: StateReadAbsentVerdict = Object.freeze({ kind: STATE_RE
 
 /**
  * The verdict over one of the teardown's own `status` reads, the read before
- * the pause and each read of the poll (b.jg5 SRJ-903, SRJ-316): no row
+ * the pause and each read of the poll: no row
  * (`ErrSpawnNotFound`, by class) is absent; a finished row is finished; any
  * other state is live; any other error fails at once with its class, a
  * CONFIG answer naming the config file. Pure; never throws.
@@ -672,7 +668,7 @@ export type PauseVerdict = PauseDoneVerdict | PauseEscalationVerdict | PauseFail
 
 const PAUSE_DONE: PauseDoneVerdict = Object.freeze({ kind: PAUSE_VERDICT_DONE })
 
-/** The classes whose `pause` answer fails the persona's teardown at once, with no kill (b.jg5 SRJ-903). */
+/** The classes whose `pause` answer fails the persona's teardown at once, with no kill. */
 const PAUSE_FAIL_CLASSES: ReadonlySet<AdErrorClass> = new Set<AdErrorClass>([
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
@@ -681,8 +677,7 @@ const PAUSE_FAIL_CLASSES: ReadonlySet<AdErrorClass> = new Set<AdErrorClass>([
 ])
 
 /**
- * The verdict over one `pause` answer on a live row (b.jg5 SRJ-903,
- * SRJ-119); see the module comment. "Another `ErrInternal`" is an
+ * The verdict over one `pause` answer on a live row; see the module comment. "Another `ErrInternal`" is an
  * UNCLASSIFIED classification whose reported name is `ERR_INTERNAL_NAME`.
  * Pure; never throws.
  */
@@ -703,7 +698,7 @@ export function pauseVerdictOf(answer: PauseAnswer): PauseVerdict {
 
 /**
  * The verdict that stands after the last of the {@link PRECHECK_TRIES}
- * `pause` calls (b.jg5 SRJ-903): a retry escalates to the kill; any other
+ * `pause` calls: a retry escalates to the kill; any other
  * verdict stands as it is. Pure; never throws.
  */
 export function pauseVerdictAfterLastTry(verdict: PauseVerdict): PauseVerdict {
@@ -737,8 +732,7 @@ export function exitTimeoutMsOf(exitTimeoutSeconds: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * The read between kill tries as the bounded retry takes it (b.jg5 SRJ-904,
- * SRJ-702, SRJ-115), from one `status` answer: no row → `KILL_RETRY_READ_NO_ROW`;
+ * The read between kill tries as the bounded retry takes it, from one `status` answer: no row → `KILL_RETRY_READ_NO_ROW`;
  * a row → `KILL_RETRY_READ_STATE` with its state, `pending` with no launch
  * start being a live read; a thrown value → `KILL_RETRY_READ_FAILED`, an
  * UNUSABLE NAME answer included. Never `KILL_RETRY_READ_LATCHED`: nothing
@@ -753,18 +747,17 @@ export function teardownKillReadOf(answer: StateReadAnswer): KillRetryRead {
 }
 
 /**
- * The checked kill's options for every try of the teardown's kill (b.jg5
- * SRJ-904, SRJ-110; hatch A3): only SRJ-110's success forms stop a persona in
+ * The checked kill's options for every try of the teardown's kill (
+ * design A3): only success forms stop a persona in
  * the CLI, so a GONE answer is a non-success. The bounded retry then never
- * tries it again (SRJ-702), logs the try and the end as that failure, and
+ * tries it again, logs the try and the end as that failure, and
  * decides the ordinary alert version (quoting a survivor-naming description
  * of an earlier try) rather than the survivor version.
  */
 export const TEARDOWN_KILL_OPTIONS: CheckedKillOptions = Object.freeze({ goneIsFailure: true })
 
 /**
- * The bounded retry's options for the teardown's kill (b.jg5 SRJ-904,
- * SRJ-702, SRJ-316): a CONFIG answer at a `status` read between tries ends
+ * The bounded retry's options for the teardown's kill: a CONFIG answer at a `status` read between tries ends
  * them (`read-config`), with no further kill, whatever state was last read,
  * and the result keeps that read's error (`configRead`), which fails the
  * persona with class CONFIG ({@link teardownKillOutcomeOf}).
@@ -776,7 +769,7 @@ export const TEARDOWN_KILL_RETRY_OPTIONS: Pick<KillRetryOptions<AnyKillOutcome>,
 /**
  * The persona's teardown outcome from its kill's bounded retry, run under
  * {@link TEARDOWN_KILL_OPTIONS} and {@link TEARDOWN_KILL_RETRY_OPTIONS}
- * (b.jg5 SRJ-904, SRJ-702, SRJ-907; hatch A3). Pure; never throws.
+ * (design A3). Pure; never throws.
  *
  *   - a `read-config` end (a CONFIG answer at a read between tries, whatever
  *     state was last read): failed, class CONFIG, its description the read's
@@ -796,7 +789,7 @@ export const TEARDOWN_KILL_RETRY_OPTIONS: Pick<KillRetryOptions<AnyKillOutcome>,
  *     class's own name when the GONE name cannot be read);
  *   - any other outcome: failed, class UNCLASSIFIED.
  * A failure's description is `describeReportedAdFailure` of the thrown value
- * (SRJ-104): redacted, on one line. The outcome carries the retry's alert
+ * redacted, on one line. The outcome carries the retry's alert
  * decision as it is: none or the survivor version for a stopped persona,
  * none or the ordinary version for a failed one.
  */
@@ -830,7 +823,7 @@ function killFailureClassOf(outcome: AnyKillFailure): AdErrorClass {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded cost (b.jg5 SRJ-908)
+// Bounded cost
 // ---------------------------------------------------------------------------
 
 /** The precheck's calls of one persona, each with its own tries: the `get`, then the `read-pane`. */
@@ -851,8 +844,7 @@ function triesBoundMs(tries: number, spacingMs: number, callMs: number, readsBet
 }
 
 /**
- * The longest time, in ms, one persona's precheck takes (b.jg5 SRJ-908,
- * SRJ-901), each call taking `callTimeoutMs`: its `get`'s
+ * The longest time, in ms, one persona's precheck takes, each call taking `callTimeoutMs`: its `get`'s
  * {@link PRECHECK_TRIES} calls {@link PRECHECK_TRY_SPACING_MS} apart, then its
  * `read-pane`'s. Personas are checked in parallel, so this also bounds the
  * precheck of a persona set. Pure; never throws.
@@ -863,7 +855,7 @@ export function precheckBoundMs(callTimeoutMs: number): number {
 }
 
 /**
- * The longest time, in ms, one persona's teardown takes (b.jg5 SRJ-908), each
+ * The longest time, in ms, one persona's teardown takes, each
  * call taking `callTimeoutMs`. Personas are torn down in parallel, so this
  * also bounds the teardown of a persona set. Pure; never throws.
  *
@@ -902,7 +894,7 @@ function personaWithSession(persona: CliTeardownPersona): string {
 }
 
 /**
- * One persona's precheck failure line (b.jg5 SRJ-901):
+ * One persona's precheck failure line:
  * `<command>: precheck failed for persona "<name>" (key=<key>), session "slack_bot_<key>": <class>: <description>`.
  */
 export function precheckFailureLine(
@@ -913,14 +905,14 @@ export function precheckFailureLine(
   return `${command}: precheck failed for ${personaWithSession(persona)}: ${failure.errorClass}: ${failure.description}`
 }
 
-/** The last line of a failed precheck (b.jg5 SRJ-901): `<command>: nothing was stopped`. */
+/** The last line of a failed precheck: `<command>: nothing was stopped`. */
 export function precheckNothingStoppedLine(command: CliTeardownCommand): string {
   return `${command}: nothing was stopped`
 }
 
 /**
  * The line of a failed agent-director initialization, before anything is
- * stopped (b.jg5 SRJ-901 step 1, SRJ-902, SRJ-203):
+ * stopped (step 1):
  * `[slack] <command>: agent-director initialization failed: <description>`,
  * `description` being the CLI's one-line description of the failure (the
  * startup gate's own message, or the thrown value's redacted message).
@@ -932,7 +924,7 @@ export function agentDirectorInitFailedLine(command: CliTeardownCommand, descrip
 
 /**
  * The last line of `stop --stop-bots` when the agent-director client refuses
- * the binary as too old (b.jg5 SRJ-902): no agent-director call can be made,
+ * the binary as too old: no agent-director call can be made,
  * so the server alone is stopped and every worker and row is left as it is.
  * It follows the initialization-failed line that carries the gate's too-old
  * message (the version found, the version required and the switch-over
@@ -943,12 +935,12 @@ export function onlyServerStoppedLine(): string {
 }
 
 // ---------------------------------------------------------------------------
-// The teardown's report (b.jg5 SRJ-907, SRJ-909, SRJ-1013)
+// The teardown's report
 // ---------------------------------------------------------------------------
 
 /**
  * The `startup-errors.log` class of a CLI teardown failure whose line the
- * kill-failure alert does not follow (b.jg5 SRJ-1013, SRJ-909).
+ * kill-failure alert does not follow.
  */
 export const CLI_TEARDOWN_FAILED_LABEL = 'cli-teardown-failed'
 
@@ -956,7 +948,7 @@ export const CLI_TEARDOWN_FAILED_LABEL = 'cli-teardown-failed'
 export type TeardownFailureLineReport = Pick<TeardownErrorReport, 'errorClass' | 'description'>
 
 /**
- * One persona's teardown failure line (b.jg5 SRJ-907):
+ * One persona's teardown failure line:
  * `<command>: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <class>: <description>`.
  * The class is the outcome's (the classifier's, never relabelled); the
  * description is the outcome's `describeReportedAdFailure` rendering,
@@ -973,7 +965,7 @@ export function teardownFailureLine(
 
 /**
  * The teardown's last line when at least one persona could not be stopped
- * (b.jg5 SRJ-907): `<command>: could not stop <N> persona(s); rows are never
+ * `<command>: could not stop <N> persona(s); rows are never
  * deleted, so running the command again is safe`. `failedCount` counts only
  * the failed personas, never one stopped with the survivor version. Printed
  * only, never logged or recorded. Pure; never throws.
@@ -989,7 +981,7 @@ export interface CliTeardownStartupErrorEntry {
 }
 
 /**
- * One persona's report (b.jg5 SRJ-907, SRJ-909): the lines to print (stderr;
+ * One persona's report: the lines to print (stderr;
  * for `clean_restart` also `clean_restart.log`), the lines to append to
  * `server.log`, and at most one `startup-errors.log` entry.
  */
@@ -1015,8 +1007,7 @@ interface CliTeardownAlert {
 }
 
 /**
- * The kill-failure alert for `decision`, routed for a CLI teardown (b.jg5
- * SRJ-704, SRJ-1007, SRJ-1013): the route selection's closing sentence and
+ * The kill-failure alert for `decision`, routed for a CLI teardown: the route selection's closing sentence and
  * class, the text unescaped (`forSlack` false), in the log-line and entry
  * form with the persona and the CLI teardown's context naming `command`.
  * Undefined for a `none` decision. The CLI teardown's route always prints
@@ -1030,7 +1021,7 @@ function cliTeardownAlertOf(
   const content = killFailureAlertContentOf(decision, personaTmuxSessionName(persona.key), personaInstanceId(persona.key))
   if (content === undefined) return undefined
   // The CLI-teardown context matches before the configured and latched
-  // inputs are read (SRJ-704's first match).
+  // inputs are read (first match).
   const route = selectKillFailureAlertRoute({
     version: content.version,
     context: KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
@@ -1047,8 +1038,7 @@ function cliTeardownAlertOf(
 }
 
 /**
- * One persona's report from its teardown outcome under `command` (b.jg5
- * SRJ-907, SRJ-909, SRJ-1013), following the outcome's own alert decision:
+ * One persona's report from its teardown outcome under `command`, following the outcome's own alert decision:
  * a stopped persona's survivor version and a failed persona's ordinary
  * version are reported, and nothing else is. Pure; never throws.
  *
@@ -1104,17 +1094,17 @@ export function personaTeardownReportOf(
 }
 
 // ---------------------------------------------------------------------------
-// clean_restart's restart after a failed teardown (b.jg5 SRJ-906, SRJ-1013)
+// clean_restart's restart after a failed teardown
 // ---------------------------------------------------------------------------
 
 /**
  * The `startup-errors.log` class of a `clean_restart` whose teardown failed
  * and whose answer check found agent-director not answering, so the server
- * was not started (b.jg5 SRJ-906, SRJ-1013).
+ * was not started.
  */
 export const CLEAN_RESTART_NOT_RESTARTED_LABEL = 'clean-restart-not-restarted'
 
-/** The sentence the not-restarted alert ends with (b.jg5 SRJ-1013). */
+/** The sentence the not-restarted alert ends with. */
 export const CLEAN_RESTART_NOT_STARTED_SENTENCE = 'the server was not started: start it once agent-director answers'
 
 /** A persona `clean_restart` could not stop, with the class its teardown failed under. */
@@ -1124,8 +1114,7 @@ export interface CleanRestartFailedPersona {
 }
 
 /**
- * The one not-restarted alert of a `clean_restart` run (b.jg5 SRJ-906,
- * SRJ-1013): printed, appended as one `server.log` line and recorded as one
+ * The one not-restarted alert of a `clean_restart` run: printed, appended as one `server.log` line and recorded as one
  * {@link CLEAN_RESTART_NOT_RESTARTED_LABEL} entry, the same text on all three
  * routes. It names every persona that could not be stopped, in the order
  * given, with its session and class, and ends with
@@ -1147,7 +1136,7 @@ export function cleanRestartNotRestartedAlert(failures: readonly CleanRestartFai
 }
 
 /**
- * One failed try of `clean_restart`'s answer check (b.jg5 SRJ-906), printed
+ * One failed try of `clean_restart`'s answer check, printed
  * only:
  * `[slack] clean_restart: agent-director answer check: list try <n> of 3 failed: <class>: <description>`,
  * the class and description being {@link teardownErrorReportOf}'s, redacted
@@ -1162,7 +1151,7 @@ export function answerCheckFailedTryLine(tryNumber: number, report: TeardownFail
 
 /**
  * The line before `clean_restart` starts the server after a failed teardown,
- * once agent-director answered (b.jg5 SRJ-906):
+ * once agent-director answered:
  * `[slack] clean_restart: agent-director answers — starting server after the failed teardown`.
  */
 export function cleanRestartStartingAfterFailedTeardownLine(): string {
@@ -1171,7 +1160,7 @@ export function cleanRestartStartingAfterFailedTeardownLine(): string {
 
 /**
  * `clean_restart`'s line when the `start` it spawned exits non-zero, or
- * cannot be spawned (`status` null) (b.jg5 SRJ-906):
+ * cannot be spawned (`status` null):
  * `[slack] clean_restart: start failed with exit code <status>`.
  */
 export function cleanRestartStartFailedLine(status: number | null): string {

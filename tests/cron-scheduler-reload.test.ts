@@ -1,11 +1,11 @@
 /**
  * cron-scheduler-reload.test.ts — Unit tests for the crontable HOT-RELOAD step
- * at the top of the scheduler tick (E3 on b.he5; D-Q1 deleted-file semantics,
- * decision 8 double-fire protection).
+ * at the top of the scheduler tick ( on the contract; D-Q1 deleted-file semantics,
+ * the current rule double-fire protection).
  *
  * These live apart from tests/cron-scheduler.test.ts because they are
  * file-mutation heavy: every case rewrites, chmods or deletes the crontable
- * between ticks. The harness is the E2 precedent — factory-built scheduler,
+ * between ticks. The harness is the precedent — factory-built scheduler,
  * injected clock, recording dispatcher stub, direct `tick()` seam, real
  * cron-log writing into a per-test tmp dir. NO real time passes, NO sleeps, NO
  * HTTP, NO host-timezone dependence (every expression is `* * * * *` or is
@@ -276,10 +276,10 @@ describe('cron-scheduler reload — crontable edits between ticks', () => {
 })
 
 // ===========================================================================
-// Decision 8 — a reload inside a minute that already fired must not re-fire it
+// The current rule — a reload inside a minute that already fired must not re-fire it
 // ===========================================================================
 
-describe('cron-scheduler reload — decision 8 same-minute reload', () => {
+describe('cron-scheduler reload —  same-minute reload', () => {
   test('rewriting the crontable and forcing another pass inside the SAME minute fires nothing a second time', async () => {
     const clock = makeClock(START)
     const { dispatcher, scheduler } = startWith(clock, line(everyMinute, '/p/a.md'))
@@ -348,7 +348,7 @@ describe('cron-scheduler reload — unparseable content', () => {
 })
 
 // ===========================================================================
-// A line with no persona list (b.n4n) — warned once per load, counted on the
+// A line with no persona list — warned once per load, counted on the
 // reload line
 // ===========================================================================
 

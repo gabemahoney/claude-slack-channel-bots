@@ -1,6 +1,6 @@
 /**
  * persona-episodes.test.ts — The once-per-episode latch of every per-persona
- * notice kind (b.jg5 SRJ-1016, AC 41, AC 67).
+ * notice kind.
  *
  * Every declared kind posts once per episode however often it is asked to,
  * and once more in a new episode; each (persona, kind) pair has its own
@@ -10,7 +10,7 @@
  * posting nothing. An episode's start time comes from the injected clock. A
  * sink that throws or rejects is logged once, redacted, and still counts as
  * posted. A log that throws is swallowed: no post throws and no rejection
- * escapes. b.f2b's not-connected latch (`notConnectedNoticeRaised` in
+ * escapes. not-connected latch (`notConnectedNoticeRaised` in
  * `src/session-manager.ts`) is separate: neither latch raises, reads or ends
  * the other.
  *
@@ -28,8 +28,7 @@
  * nothing; a closed episode's re-arm mark does not reach the next one. Once
  * the alert has posted, neither onset check posts the onset (one line per
  * episode), and `end` answers `ended-after-notice`, posting the recovery
- * unless silent. Its onset while the retry timer is stopped (b.jg5 SRJ-305,
- * SRJ-308): every stop reported to `cancelAlert` (the cap, not up, no reason
+ * unless silent. Its onset while the retry timer is stopped: every stop reported to `cancelAlert` (the cap, not up, no reason
  * at all; a pending alert check or none) holds the onset back at a tick and
  * at a retry, with one `onset not posted` line per episode, until a
  * `continued` start clears it; a terminal stop holds it for the rest of the
@@ -44,9 +43,9 @@
  * and a throwing health-check mode accessor (taken as on). Its starts and
  * ends through the outage state are in `tests/tmux-unresponsive.test.ts`.
  *
- * The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009, SRJ-1016),
+ * The unclassified-error episodes,
  * direct over `createUnclassifiedErrorEpisodes` with the threshold from an
- * injected accessor (agent-director's defaults and AC 80's settings, through
+ * injected accessor (agent-director's defaults and settings, through
  * `adAlertThresholdMs`): a report at exactly the threshold after the
  * episode's first posts nothing, the first strictly past it posts one alert
  * (the builder's text for that report's classification, or the site's own)
@@ -59,7 +58,7 @@
  * the log-only route, a missing or throwing log-only route logged, and one
  * latch for both routes; a key no longer applied whose teardown window is
  * open takes the teardown route while a configured key beside it posts. The
- * `ref` and `notConfiguredWording` hooks (SRJ-1007, the old-life wait's):
+ * `ref` and `notConfiguredWording` hooks (the old-life wait's):
  * absent, `persona=<key>` and `UNCLASSIFIED_NOT_CONFIGURED_WORDING`; given,
  * every line names the hook's reference (a throwing hook the default) and the
  * log-only and not-routed lines the hook's wording, the routes still keyed
@@ -75,7 +74,7 @@
  * again. A throwing episodes member, threshold accessor or log breaks no
  * report.
  *
- * The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016), direct over
+ * The kill-failure alerts, direct over
  * `createKillFailureAlerts` with an injected configured-key lookup and a
  * recording log-only route, the bounded retry's decisions quoting the stub's
  * descriptions and every expected text built with `src/kill-failure-alert.ts`'s
@@ -88,7 +87,7 @@
  * not-latched or latched closing sentence (the survivor version always its
  * destination one); a key the lookup does not know gets one log-only call of
  * `persona-kill-failed` or `persona-kill-survivor` with the `recovery` entry,
- * nothing posted and no episode; stopped tries (b.jg5 SRJ-702) raise neither
+ * nothing posted and no episode; stopped tries raise neither
  * version: one redacted line naming the context, the last outcome's class and
  * the stop's cause (the generic cause and no class when none is given),
  * quoting the latest survivor-naming description, and for a persona no
@@ -96,7 +95,7 @@
  * no alert text (a refused entry logged token-safely); each persona's
  * episode is its own; and after `close` nothing posts.
  *
- * A persona teardown (b.jg5 SRJ-1003, SRJ-704, SRJ-1013), over an injected
+ * A persona teardown, over an injected
  * teardown query standing in for the persona notifier's
  * `teardownWindowState`: from the teardown's submit until its window opens,
  * no post or `postWithoutEpisode` of any kind reaches the sink (one muted line
@@ -128,7 +127,7 @@
  * `persona-teardown-notice` entry with no Slack call, and a stopped retry in
  * the same window writes no such entry.
  *
- * Per-kind counts (b.jg5 SRJ-610): `addCount` and `resetCount` answer the
+ * Per-kind counts: `addCount` and `resetCount` answer the
  * new and the prior count, per persona and kind; a count is independent of
  * the open episode of its kind (begin, post, a new case and end leave it, and
  * adding or resetting leaves the episode); `forget` clears that persona's
@@ -337,7 +336,7 @@ function buildWithTeardownQuery(): PersonaEpisodes {
 
 /** The one line a post or a `postWithoutEpisode` logs when the key's persona teardown was submitted and its window is not open yet. */
 function mutedLine(key: string, kind: PersonaEpisodeKind): string {
-  return `[slack] persona-episodes: persona=${key} ${kind} notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)`
+  return `[slack] persona-episodes: persona=${key} ${kind} notice not posted — its persona teardown was submitted`
 }
 
 /** A distinct notice body per kind and attempt, built at runtime. */
@@ -367,7 +366,7 @@ afterEach(() => {
 describe('once per episode, for every declared kind', () => {
   test('every kind label is distinct, so no two kinds share a latch', () => {
     expect(new Set(PERSONA_EPISODE_KINDS).size).toBe(PERSONA_EPISODE_KINDS.length)
-    // b.omv SR-8: these kinds participate in every shared lifecycle row below.
+    // these kinds participate in every shared lifecycle row below.
     expect(PERSONA_EPISODE_KINDS).toEqual(expect.arrayContaining(['message-not-saved', 'delivery-stuck', 'messages-waiting']))
   })
 
@@ -603,7 +602,7 @@ describe('isolation', () => {
 // Per-kind counts
 // ---------------------------------------------------------------------------
 
-describe('per-persona, per-kind counts (b.jg5 SRJ-610)', () => {
+describe('per-persona, per-kind counts', () => {
   const slow = PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY
 
   /** Every kind's count for `key`, in `PERSONA_EPISODE_KINDS` order. */
@@ -941,7 +940,7 @@ describe('a failing sink', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A persona teardown's submit and window (b.jg5 SRJ-1003): the posts
+// A persona teardown's submit and window: the posts
 // ---------------------------------------------------------------------------
 
 describe('a persona teardown\'s submit and window: every kind\'s posts', () => {
@@ -1037,7 +1036,7 @@ function throwingLog(line: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// The tmux-unresponsive condition's own rules (b.jg5 SRJ-307, SRJ-310)
+// The tmux-unresponsive condition's own rules
 // ---------------------------------------------------------------------------
 
 describe('the tmux-unresponsive condition\'s own rules', () => {
@@ -1184,7 +1183,7 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
 
   // -------------------------------------------------------------------------
   // The alert check: cancel on a retry-timer stop, re-arm, onset suppression
-  // and the recovery after the alert (b.jg5 SRJ-308, SRJ-309, SRJ-310).
+  // and the recovery after the alert.
   // -------------------------------------------------------------------------
 
   describe('the alert check: cancel, re-arm and what follows the alert', () => {
@@ -1448,8 +1447,7 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The onset while the persona's retry timer is stopped (b.jg5 SRJ-305,
-  // SRJ-308): every stop holds it back until a later refusal; a terminal
+  // The onset while the persona's retry timer is stopped: every stop holds it back until a later refusal; a terminal
   // stop for the rest of the episode.
   // -------------------------------------------------------------------------
 
@@ -1698,7 +1696,7 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
 
   // -------------------------------------------------------------------------
   // A destructive modify's old half between its teardown's submit and its
-  // serializer turn (b.jg5 SRJ-1003): both halves share the key, so a post
+  // serializer turn: both halves share the key, so a post
   // that reaches no sink reaches neither half's destination.
   // -------------------------------------------------------------------------
 
@@ -1958,13 +1956,13 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009, SRJ-1016)
+// The unclassified-error episodes
 // ---------------------------------------------------------------------------
 
-describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
+describe('the unclassified-error episodes', () => {
   const KIND = PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR
   const DEFAULT_THRESHOLD_MS = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
-  /** AC 80's agent-director settings (`stopping_window_seconds` 30, `starting_session_seconds` 120). */
+  /** agent-director settings (`stopping_window_seconds` 30, `starting_session_seconds` 120). */
   const AC_80_SETTINGS: AdSettingsInEffect = {
     ...DEFAULT_AD_SETTINGS_IN_EFFECT,
     tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, stopping_window_seconds: 30n, starting_session_seconds: 120n },
@@ -2054,7 +2052,7 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
 
   test.each([
     ["agent-director's defaults", DEFAULT_THRESHOLD_MS],
-    ["AC 80's settings", AC_80_THRESHOLD_MS],
+    ["settings", AC_80_THRESHOLD_MS],
   ])('at %s: a report at exactly the threshold posts nothing; the first strictly past it posts one alert quoting it; later reports post nothing', async (_settings, thresholdMs) => {
     const u = buildUnclassified({ alertThresholdMs: () => thresholdMs })
     const first = errInternal('the first outcome')
@@ -2124,7 +2122,7 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The text (SRJ-1009)
+  // The text
   // -------------------------------------------------------------------------
 
   test.each<[string, () => Error]>([
@@ -2316,7 +2314,7 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The reference and not-configured wording hooks (b.jg5 SRJ-1007): the
+  // The reference and not-configured wording hooks: the
   // old-life wait's episodes, keyed by a held instance id, name it as
   // `instanceId=<id>` and give their own reason for the log-only route.
   // -------------------------------------------------------------------------
@@ -2468,7 +2466,7 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // During a persona teardown (b.jg5 SRJ-1003, SRJ-1013): the alert is a
+  // During a persona teardown: the alert is a
   // teardown notice, configured or not. The sink is the persona notifier,
   // whose open window writes it to the server log and a
   // persona-teardown-notice entry (tests/persona-notifier.test.ts).
@@ -2511,7 +2509,7 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
       expect(logOnlyCalls).toEqual([])
     })
 
-    // SRJ-1003: from the submit, before the turn, a configured key's alert is
+    // from the submit, before the turn, a configured key's alert is
     // muted; it still counts as posted, so no later report posts it.
     test('a configured key whose teardown was submitted and whose window is not open yet: the alert reaches no sink and no log-only route; the muted line, then its own line saying it was not posted; it counts as posted in its episode', async () => {
       const u = buildUnclassified({ isConfigured: () => true })
@@ -2538,7 +2536,7 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
       expect(lines.filter((line) => line === mutedLine('K', KIND))).toHaveLength(1)
     })
 
-    test('b.jg5 SRJ-1002: R no longer applied, its window open, takes the teardown route (one persona-teardown-notice line, never the log-only route), while K configured beside it with no window still posts escaped', async () => {
+    test('R no longer applied, its window open, takes the teardown route (one persona-teardown-notice line, never the log-only route), while K configured beside it with no window still posts escaped', async () => {
       const u = buildUnclassified({ isConfigured: (key) => key === 'K' })
       const err = errInternal(MENTIONING)
       expect(u.report('R', errInternal())).toBe('begun')
@@ -2780,10 +2778,10 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)
+// The kill-failure alerts
 // ---------------------------------------------------------------------------
 
-describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
+describe('the kill-failure alerts', () => {
   const KIND = PERSONA_EPISODE_KIND_KILL_FAILURE
 
   /** The keys the injected configured-key lookup knows. */
@@ -2866,7 +2864,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     return alerts.raise(raiseInput(key, decision, KILL_FAILURE_CONTEXT_RECOVERY, extra))
   }
 
-  // A stopped retry's record (b.jg5 SRJ-702): built by
+  // A stopped retry's record: built by
   // `killFailureStoppedRetryText`, whose fixed words are pinned once below.
   /** The class and cause a stopped raise in these cases names. */
   const STOP: RaiseExtra = { stopped: true, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: 'its teardown began between its tries' }
@@ -2964,7 +2962,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     expect(posts).toHaveLength(2)
   })
 
-  // b.jg5 SRJ-704, SRJ-1016: the survivor version opens no episode, neither
+  // the survivor version opens no episode, neither
   // begins nor ends one, is not held back by an open one and does not count as
   // the episode's alert.
   test.each([false, true])('a survivor version with an ordinary episode open %p: posted once per raise, the open or closed state unchanged, and not the episode\'s alert', (open) => {
@@ -2997,7 +2995,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     expect(logOnlyCalls).toEqual([])
   })
 
-  // b.jg5 SRJ-704, SRJ-1013: a key the lookup does not know takes the
+  // a key the lookup does not know takes the
   // not-configured route: one entry (its writer writes the server-log line),
   // nothing posted, no episode.
   test.each<[string, () => KillRetryAlert, string]>([
@@ -3018,7 +3016,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     ])
   })
 
-  // b.jg5 SRJ-702, SRJ-1013: a retry whose tries were stopped is no notice:
+  // a retry whose tries were stopped is no notice:
   // neither version is raised, nothing is posted and no episode opens. One
   // line names the persona, the context, the last outcome's class, the stop's
   // cause and the redacted descriptions; a persona no longer configured also
@@ -3043,7 +3041,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     expect([alerts.isOpen('K'), alerts.isOpen('Q')]).toEqual([false, false])
   })
 
-  // The stopped-retry text's one literal pin (b.jg5 SRJ-702, SRJ-1013); every
+  // The stopped-retry text's one literal pin; every
   // other case builds it with `killFailureStoppedRetryText`.
   test('the stopped-retry line and entry, and the default stop cause (pin)', () => {
     const decision: KillRetryAlert = { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: 'kill failed' }
@@ -3058,7 +3056,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     )
   })
 
-  // b.jg5 SRJ-702: the stop's line quotes the latest survivor-naming
+  // the stop's line quotes the latest survivor-naming
   // description when a try returned one; still no alert of either version,
   // and a configured persona gets no entry.
   test.each<[string, () => KillRetryAlert]>([
@@ -3120,8 +3118,8 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // During a persona teardown (b.jg5 SRJ-1003, SRJ-704's first match,
-  // SRJ-1013). While the key's window is open an alert of any context but a
+  // During a persona teardown (first match,
+  //). While the key's window is open an alert of any context but a
   // start-sweep or CLI teardown kill takes the persona-teardown route: handed
   // to the sink with no episode, where the persona notifier's window writes
   // it (tests/persona-notifier.test.ts), the survivor version carrying its
@@ -3142,7 +3140,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
      * The teardown route's text for `decision`: the log-only closing,
      * unescaped; an alert of another context than the persona teardown's own
      * kill carries that context ahead of its text, as `(<context>) <text>`
-     * (SRJ-1007, SRJ-1013).
+ *
      */
     function teardownText(key: string, decision: KillRetryAlert, context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN): string {
       const text = killFailureAlertText(contentOf(key, decision), KILL_FAILURE_CLOSING_LOG_ONLY, false)
@@ -3207,7 +3205,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
       expect([alerts.isOpen('Q'), alerts.isOpen('K')]).toEqual([true, false])
     })
 
-    // SRJ-704's first match: a start-sweep or CLI teardown kill keeps its own route, window or not.
+    // first match: a start-sweep or CLI teardown kill keeps its own route, window or not.
     test.each<[KillFailureAlertContext, string, KillFailureClosing, string]>([
       [KILL_FAILURE_CONTEXT_START_SWEEP, ORPHAN_CLEANUP_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY, KILL_FAILURE_ROUTE_START_SWEEP],
       [KILL_FAILURE_CONTEXT_CLI_TEARDOWN, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_CLI_TEARDOWN, KILL_FAILURE_ROUTE_CLI_TEARDOWN],
@@ -3223,11 +3221,11 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
       expect(killLines('K')).toEqual([`[slack] persona-episodes: persona=K ${KIND} ordinary alert written to the server log and startup-errors.log (${classLabel}) — ${route}`])
     })
 
-    // SRJ-702, SRJ-1003 (the control for a retry the teardown's start
+    // (the control for a retry the teardown's start
     // stopped): a bounded retry of a launch or recovery attempt's kill (the
     // live-row sequence's and the restart path's kills, context recovery; the
     // stuck-launch abort's) stopped while the key's window is open, or between
-    // its submit and its turn, is no teardown notice: SRJ-702's one line and,
+    // its submit and its turn, is no teardown notice: one line and,
     // for a persona removed during the tries, its persona-kill-failed entry
     // with no alert text; nothing handed to the sink (so no
     // persona-teardown-notice entry and no Slack call), neither version, no
@@ -3254,7 +3252,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
       expect([alerts.isOpen('K'), alerts.isOpen('R')]).toEqual([false, false])
     })
 
-    // SRJ-1003: from the submit, before the turn, the key's posts are muted;
+    // from the submit, before the turn, the key's posts are muted;
     // the alerts' own line says the alert was not posted.
     test.each<[string, () => KillRetryAlert, string]>([
       [
@@ -3278,7 +3276,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
       expect(lines).toEqual([mutedLine('K', KIND), `[slack] persona-episodes: persona=K ${KIND} ${ownLine}`])
     })
 
-    // Controls: with no window open the routes are SRJ-704's own; the
+    // Controls: with no window open the routes are own; the
     // persona-teardown context's entry is built by the shared builder.
     test.each(versions)('control, no window open: the %s version for a configured persona in recovery goes to its destination', (_version, decision) => {
       teardownStates.set('Q', 'open')
@@ -3308,8 +3306,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Over the real persona notifier's teardown window (b.jg5 SRJ-1003,
-  // SRJ-702), wired as main() wires them: the episodes' sink is the
+  // Over the real persona notifier's teardown window, wired as main wires them: the episodes' sink is the
   // notifier's `notify` and their teardown query its `teardownWindowState`.
   // -------------------------------------------------------------------------
 
@@ -3391,10 +3388,10 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.f2b's not-connected latch is separate
+// not-connected latch is separate
 // ---------------------------------------------------------------------------
 
-describe('b.f2b\'s not-connected latch is separate', () => {
+describe('not-connected latch is separate', () => {
   const notice: NotConnectedNotice = { reason: 'auto-restart-disabled', cause: 'a test cause' }
   let notices: Post[]
   let serverLines: string[]
@@ -3433,7 +3430,7 @@ describe('b.f2b\'s not-connected latch is separate', () => {
     }
 
     expect(posts).toHaveLength(PERSONA_EPISODE_KINDS.length * 2)
-    // Q's kind posts left b.f2b's latch for Q unraised; K's is still raised.
+    // Q's kind posts left latch for Q unraised; K's is still raised.
     expect([notifyPersonaNotConnected('K', notice), notifyPersonaNotConnected('Q', notice)]).toEqual([false, true])
     expect(notices.map((n) => n.key)).toEqual(['K', 'Q'])
   })
@@ -3453,7 +3450,7 @@ describe('b.f2b\'s not-connected latch is separate', () => {
       PERSONA_EPISODE_KINDS.map(() => false),
     )
 
-    // The reverse: b.f2b's new episode is raised, then the latch here is forgotten and b.f2b's stays raised.
+    // The reverse: new episode is raised, then the latch here is forgotten and stays raised.
     expect(notifyPersonaNotConnected('K', notice)).toBe(true)
     episodes.forget('K')
     expect(notifyPersonaNotConnected('K', notice)).toBe(false)
