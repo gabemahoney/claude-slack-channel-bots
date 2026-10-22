@@ -447,6 +447,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     }
   })
 
+  test('operator request/review functions and new helpers remain secret-bearing surfaces without exemptions', () => {
+    const suite = 'tests/reload-operator.test.ts'
+    for (const [module, fn, constant] of [['reload-request', 'buildReviewRequest', 'REVIEW_REQUEST_FORMAT'], ['reload-review', 'createReviewObserver', 'RELOAD_REVIEW_OUTCOME']]) {
+      expect(SOURCE_SURFACES.some(([re]) => re.test(`src/${module}.ts`))).toBe(true)
+      for (const source of [`import { ${fn} as use } from '../src/${module}.ts'`, `const use = await import('../src/${module}.ts')`]) expect(touchReasonsOf(suite, source)).toHaveLength(1)
+      expect(touchReasonsOf(suite, `import type { Any } from '../src/${module}.ts'`)).toEqual([])
+      expect(touchReasonsOf(suite, `import { ${constant} } from '../src/${module}.ts'`)).toEqual([])
+    }
+    for (const file of ['tests/reload-operator.test.ts', 'tests/reload-request.test.ts', 'tests/reload-fixtures.test.ts']) {
+      expect(callsAssertNoLeak(file)).toBe(true); expect(file in EXEMPT).toBe(false)
+    }
+    const factory = 'makeReloadHarness'
+    expect(touchReasonsOf(suite, `import { ${factory} } from './test-helpers/reload-harness.ts'`)).toHaveLength(1)
+  })
+
   test('the test-only MCP route is a source surface: handlers and key rendering touch; constants and types alone do not; every consumer leak-checks', () => {
     const suite = 'tests/test-mcp-drop.test.ts'
     expect(SOURCE_SURFACES.some(([re]) => re.test('src/test-mcp-drop.ts'))).toBe(true)
@@ -756,6 +771,8 @@ const SINK_CALL = new RegExp(
  */
 const SAFE_DESCRIBERS = [
   'describeThrownValue',
+  'reviewRecoveredBringUpFailedLine',
+  'reviewRecoveredLifecycleFailedLine',
   'describeLogMessage',
   'describeSlackCallFailure',
   'describeAgentDirectorFailure',
@@ -1023,6 +1040,8 @@ describe("a caught error's text reaches a log line under src/ only redacted (sec
     ['an unredacted errDescription', 'log(`x: ${e.errDescription}`)', ['logs an errDescription not through redactSlackLogText']],
     ['an unchecked errName', 'console.error(`x: ${e.errName}`)', ['logs an errName not checked by isSafeIdentifier']],
     ['a wrapper that logs its error raw', 'function logFailure(what, err) { log(`${what}: ${err}`) }\ntry { f() } catch (err) { logFailure("x", err) }', ['interpolates a caught error', 'passes a caught error as a log argument']],
+    ['recovery bring-up describer', 'try { f() } catch (err) { log(reviewRecoveredBringUpFailedLine(err)) }', []],
+    ['recovery activation describer', 'try { f() } catch (err) { log(reviewRecoveredLifecycleFailedLine(err)) }', []],
     ['the describer', 'try { f() } catch (err) { log(`x: ${describeThrownValue(err)}`) }', []],
     ['a redacted errDescription', 'log(`x: ${redactSlackLogText(e.errDescription)}`)', []],
     ['a checked errName', 'log(`x: ${isSafeIdentifier(e.errName) ? e.errName : describeThrownValue(e)}`)', []],

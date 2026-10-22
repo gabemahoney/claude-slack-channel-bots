@@ -21,7 +21,9 @@ export type ChannelDeliverySetResult =
 export interface ChannelDeliveryStore {
   readonly path: string
   readonly readable: boolean
+  readableFor(key: string, channel?: string): boolean
   readonly authority: SharedChannelAuthority
+  incarnation(key: string): string | undefined
   storedChoice(key: string, channel: string): DeliveryMode | undefined
   storedChannels(key: string): string[]
   set(key: string, channel: string, delivery: DeliveryMode, declaration: ChannelDeliveryDeclaration): ChannelDeliverySetResult
@@ -37,14 +39,16 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority, cu
   return {
     path: authority.path,
     authority,
+    incarnation: key => authority.incarnation(key),
     get readable() { return authority.readable },
+    readableFor: (key, channel) => authority.readableFor(key, channel),
     storedChoice: (key, channel) => authority.choice(key, channel),
     storedChannels: key => authority.channels(key),
     set(key, channel, delivery, declaration) {
       if (!authority.readable) return { kind: CHANNEL_DELIVERY_SET_UNREADABLE, path: authority.path }
       const snapshot = authority.snapshot()
       const life = Object.hasOwn(snapshot.personas, key) ? snapshot.personas[key] : undefined
-      if (!life || retiring.has(key) || !sameSharedDeclaration(life.declaration, declaration)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'declaration' }
+      if (!life || retiring.has(key) || authority.reviewHeld(key) || !sameSharedDeclaration(life.declaration, declaration)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'declaration' }
       if (currentMembership && !currentMembership(key, channel)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'membership' }
       const previous = this.storedChoice(key, channel)
       const result = authority.assign(key, life.incarnation, channel, delivery, authority.revision)
@@ -54,6 +58,6 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority, cu
     },
     beginRetiring: keys => { for (const key of keys) retiring.add(key) },
     endRetiring: keys => { for (const key of keys) retiring.delete(key) },
-    isRetiring: key => retiring.has(key),
+    isRetiring: key => retiring.has(key) || authority.reviewHeld(key),
   }
 }

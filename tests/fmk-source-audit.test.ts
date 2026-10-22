@@ -2244,7 +2244,7 @@ ${leg.slice(editStart, leg.indexOf('\n', apply))}`, ['jq'])
     const edited = configs.at(-1)!
     const copied = structuredClone(edited)
     copied.personas[0]!.channels = structuredClone(configs[0]!.personas[0]!.channels)
-    expect(() => authority.previewReviewed(configBytes(copied))).toThrow('no channels')
+    expect(authority.previewReviewed(configBytes(copied)).personas[0]!.channels).toEqual([])
     const bytes = configBytes(edited)
     const preview = authority.previewReviewed(bytes).personas[0]!
     expect(preview.channels).toEqual([{ id: 'C0TEST001', delivery: 'mentions' }])

@@ -2266,21 +2266,25 @@ function helperHomeCheckFindings(file: string, source: string, helpers: readonly
       findings.push(`${file}:1: ${rule}: ${helper} has no step the audit can see`)
       continue
     }
-    const guard = homeGuardIndex(body)
+    // Only the operator request publisher may substitute the scratch-state
+    // guard: shared mode keeps the container HOME. It stays in this audit,
+    // and the image-first audit and executable refusal controls also cover it.
+    const guardName = helper === 'configuration_request' ? 'require_scenario_state' : HOME_GUARD
+    const guard = homeGuardIndex(body, guardName)
     if (guard < 0 || guard > firstStep) {
       const step = body[firstStep]
-      findings.push(`${file}:${step.line}: ${rule}: ${helper}: \`${step.name}\` runs before ${guard < 0 ? `any unconditional ${HOME_GUARD}` : HOME_GUARD}`)
+      findings.push(`${file}:${step.line}: ${rule}: ${helper}: \`${step.name}\` runs before ${guard < 0 ? `any unconditional ${guardName}` : guardName}`)
     }
   }
   return findings
 }
 
 /** The index in `body` of its first unconditional `require_scenario_home` (top level, not after `&&`, `||` or `|`, nor in a subshell or substitution); -1 when none. */
-function homeGuardIndex(body: readonly ShellCommand[]): number {
+function homeGuardIndex(body: readonly ShellCommand[], guardName = HOME_GUARD): number {
   let depth = 0
   for (let k = 0; k < body.length; k++) {
     const c = body[k]
-    if (depth === 0 && c.name === HOME_GUARD && isUnconditional(c)) return k
+    if (depth === 0 && c.name === guardName && isUnconditional(c)) return k
     depth += shellDepthChange(c)
   }
   return -1
@@ -2684,6 +2688,19 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     /** scenario.sh as it stands, and its scripts. */
     const scenario = (): string => readFileSync(SCENARIO_PATH, 'utf-8')
     const scripts = (): { file: string; source: string }[] => integrationScripts().map((path) => ({ file: relative(REPO_ROOT, path), source: readFileSync(path, 'utf-8') }))
+
+    test('configuration_request alone accepts the state guard; missing or delayed containment still fails', () => {
+      const source = scenario()
+      expect(homeCheckedHelpers(source)).toContain('configuration_request')
+      expect(helperHomeCheckFindings('scenario.sh', source, ['configuration_request'])).toEqual([])
+      const guard = '    require_scenario_state "configuration_request"\n'
+      expect(source).toContain(guard)
+      for (const broken of [source.replace(guard, ''), source.replace(guard, '').replace('    mv -- "${config}.request.tmp" "${config}.request"', '    mv -- "${config}.request.tmp" "${config}.request"\n' + guard)]) {
+        expect(helperHomeCheckFindings('scenario.sh', broken, ['configuration_request'])).toContainEqual(expect.stringContaining('configuration_request: `mv` runs before'))
+      }
+      const unrelated = 'other_publisher() {\n    require_scenario_state other_publisher\n    mv /a /b\n}\n'
+      expect(helperHomeCheckFindings('scenario.sh', unrelated)).toContainEqual(expect.stringContaining('any unconditional require_scenario_home'))
+    })
 
     test('the current tree: every scenario.sh function with a step, less the two lists, runs require_scenario_home before its first', () => {
       const source = scenario()
@@ -3853,7 +3870,7 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
  * `require_scenario_home` (shared mode has no scenario HOME); `/ci` always
  * carries the marker, so this static pin is the only proof of their refusal.
  */
-const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete']
+const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', 'configuration_request']
 
 /**
  * The image-check findings for `helpers` in the shell file `file`: the first

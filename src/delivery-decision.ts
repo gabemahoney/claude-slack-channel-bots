@@ -246,6 +246,8 @@ export type DeliveryDecision = DeliverDecision | DropDecision
  * channel. The stored-choice store (`src/channel-delivery.ts`) satisfies it.
  */
 export interface StoredChoices {
+  /** A still-trustworthy projection while another channel's write is unresolved. */
+  readableFor?(key: string, channel?: string): boolean
   /** Whether the store was readable at start; when false no stored choice applies. */
   readonly readable: boolean
   /** The stored choice of persona `key` for `channel`, or undefined when there is none. */
@@ -453,7 +455,7 @@ export function channelDeliveryFor(
   const held = inputs.fungibleDestinations.some((other) =>
     other.key !== key && other.destination !== DM_DESTINATION_VALUE && other.destination === channel)
   const store = inputs.storedChoices
-  const stored = store !== undefined && store.readable ? store.storedChoice(key, channel) : undefined
+  const stored = store !== undefined && (store.readableFor?.(key, channel) ?? store.readable) ? store.storedChoice(key, channel) : undefined
   if (stored === 'off') return { delivery: 'off', heldByLoopGuard: false }
   if (held) return { delivery: DELIVERY_MENTIONS, heldByLoopGuard: true }
   return { delivery: stored ?? 'off', heldByLoopGuard: false }

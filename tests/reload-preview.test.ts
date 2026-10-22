@@ -55,6 +55,8 @@ import {
   type PersonaInput,
 } from '../src/config.ts'
 import type { PersonaBringUpState } from '../src/persona-bringup-controller.ts'
+import type { MembershipReading } from '../src/channel-membership.ts'
+import type { ReviewedChannelEffect } from '../src/shared-channels.ts'
 import { credentialsReadProblem } from '../src/persona-credentials.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
@@ -63,10 +65,13 @@ import {
   PERSONA_DIRECTORY_MISSING,
   PERSONA_SLACK_UNREACHABLE,
 } from '../src/persona-diagnostics.ts'
+import { REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE } from '../src/reload-preview-clauses.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import {
   buildChangePlan,
+  reviewedChannelLine,
+  type ReviewedChannelView,
   changePlanCounts,
   DESTRUCTIVE_RETIRED_CLAUSE,
   destructiveLine,
@@ -2055,4 +2060,106 @@ test('removal receives the open queue count as a pure fact and previews exact sa
   expect(asked).toEqual(['bravo'])
   expect(plan.removed).toEqual([{ ...ref('bravo', 1), queueOpenCount: 3 }])
   expect(lines[1]).toBe('DESTRUCTIVE: persona "bravo" (key=bravo) is removed: the persona will be retired: its session stopped and never resumed; 3 open queued items kept, delivered only if a persona with the same key is added again.')
+})
+
+describe('shared review projection wording and declared intent', () => {
+  const base: ReviewedChannelView = { key: 'alpha', channel: 'C0A0001', kind: 'declared', saved: 'all', reviewed: 'all', previousOrder: 17,
+    replacement: false, membership: { kind: 'eligible', lifetime: { incarnation: 'life', boundary: 1, leaveBoundary: 0 }, identity: 'identity', generation: 'generation' }, currentEffective: 'all', effective: 'all', activatesInStrict: false }
+  test('pins saved order, independent current/reviewed projections and explicit same-value wording', () => {
+    const text = reviewedChannelLine(base)
+    expect(text).toBe('Channel persona=alpha channel=C0A0001: declared; saved=all; reviewed=all; saved order=17; membership=eligible; effective now=all; reviewed effective=all. Explicit same-value assignment.')
+    assertNoLeak(text)
+  })
+  test.each([
+    ['future', { saved: undefined, reviewed: 'mentions', membership: { kind: 'unresolved', reason: 'current-membership-missing' }, effective: 'unverified', currentEffective: 'unlisted' }, REVIEW_FUTURE_CLAUSE],
+    ['omitted', { kind: 'omitted' }, REVIEW_OMISSION_CLAUSE],
+    ['automatic', { kind: 'automatic' }, REVIEW_OMISSION_CLAUSE],
+    ['reset', { kind: 'reset', replacement: true, reviewed: undefined, effective: 'unlisted' }, REVIEW_RESET_CLAUSE],
+    ['retained', { replacement: true, inherited: 'all' }, REVIEW_RETENTION_CLAUSE],
+  ] as Array<[string, Partial<ReviewedChannelView>, string]>)('%s adds its exact clause without confusing saved and reviewed value', (_label, fields, clause) => {
+    const text = reviewedChannelLine({ ...base, ...fields })
+    expect(text).toEndWith(clause); assertNoLeak(text)
+    for (const other of [REVIEW_FUTURE_CLAUSE, REVIEW_OMISSION_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE].filter(x => x !== clause)) expect(text).not.toContain(other)
+  })
+  test('a deliberate overwrite and mode eligibility change are distinct from a same-value assignment', () => {
+    const overwrite = reviewedChannelLine({ ...base, reviewed: 'off', effective: 'off' })
+    expect(overwrite).toContain('Deliberately overwrites the current saved choice.')
+    expect(overwrite).not.toContain('Explicit same-value assignment.')
+    const eligible = reviewedChannelLine({ ...base, kind: 'copied', saved: 'mentions', reviewed: 'mentions', currentEffective: 'inactive (external-sharing)', effective: 'mentions', activatesInStrict: true })
+    expect(eligible).toContain('effective now=inactive (external-sharing); reviewed effective=mentions.')
+    expect(eligible).toEndWith('The saved mentions choice becomes eligible in strict; the saved value is unchanged.')
+    expect(eligible).not.toContain('Explicit same-value assignment.')
+    assertNoLeak([overwrite, eligible])
+  })
+})
+
+describe('buildChangePlan calculates current and reviewed channel projections', () => {
+  const eligible: MembershipReading = { kind: 'eligible', lifetime: { incarnation: 'life', boundary: 1, leaveBoundary: 0 }, identity: 'identity', generation: 'generation' }
+  const absent: MembershipReading = { kind: 'ineligible', reason: 'absent' }
+  const external: MembershipReading = { kind: 'ineligible', reason: 'external-sharing' }
+  const unresolved: MembershipReading = { kind: 'unresolved', reason: 'current-membership-missing' }
+  type Case = {
+    label: string
+    modes: [PersonaConfig['channel_mode'], PersonaConfig['channel_mode']]
+    memberships: [MembershipReading | undefined, MembershipReading | undefined]
+    otherDestination?: [boolean, boolean]
+    effect?: Partial<ReviewedChannelEffect>
+    expected: Pick<ReviewedChannelView, 'currentEffective' | 'effective' | 'membership' | 'activatesInStrict'>
+  }
+  // Expectations are contract examples, not values computed by a planner,
+  // renderer or delivery helper. In particular both sides may differ.
+  test.each<Case>([
+    { label: 'eligible membership uses the saved and reviewed values separately', modes: ['strict', 'strict'], memberships: [eligible, eligible],
+      expected: { currentEffective: 'all', effective: 'mentions', membership: eligible, activatesInStrict: false } },
+    { label: 'absent membership holds a non-off choice inactive', modes: ['strict', 'strict'], memberships: [absent, absent],
+      expected: { currentEffective: 'inactive (absent)', effective: 'inactive (absent)', membership: absent, activatesInStrict: false } },
+    { label: 'missing membership stays unverified', modes: ['open', 'open'], memberships: [undefined, undefined],
+      expected: { currentEffective: 'unverified', effective: 'unverified (current-membership-missing)', membership: unresolved, activatesInStrict: false } },
+    { label: 'explicit off stays off even without membership', modes: ['open', 'open'], memberships: [unresolved, unresolved], effect: { saved: 'off', reviewed: 'off' },
+      expected: { currentEffective: 'off', effective: 'off', membership: unresolved, activatesInStrict: false } },
+    { label: 'no saved or reviewed choice stays unlisted', modes: ['strict', 'strict'], memberships: [eligible, eligible], effect: { saved: undefined, reviewed: undefined, kind: 'omitted' },
+      expected: { currentEffective: 'unlisted', effective: 'unlisted', membership: eligible, activatesInStrict: false } },
+    { label: 'a new other-persona destination constrains only the reviewed open choice', modes: ['open', 'open'], memberships: [eligible, eligible], otherDestination: [false, true], effect: { reviewed: 'thread_hybrid' },
+      expected: { currentEffective: 'all', effective: 'mentions', membership: eligible, activatesInStrict: false } },
+    { label: 'removing the other-persona destination releases only the reviewed loop guard', modes: ['open', 'open'], memberships: [eligible, eligible], otherDestination: [true, false], effect: { reviewed: 'all' },
+      expected: { currentEffective: 'mentions', effective: 'all', membership: eligible, activatesInStrict: false } },
+    { label: 'the own destination never constrains an open choice', modes: ['open', 'open'], memberships: [eligible, eligible], effect: { reviewed: 'all' },
+      expected: { currentEffective: 'all', effective: 'all', membership: eligible, activatesInStrict: false } },
+    { label: 'strict mode ignores another persona destination', modes: ['strict', 'strict'], memberships: [eligible, eligible], otherDestination: [true, true], effect: { reviewed: 'thread_hybrid' },
+      expected: { currentEffective: 'all', effective: 'thread_hybrid', membership: eligible, activatesInStrict: false } },
+    { label: 'replacement cannot reuse eligible old membership for an explicit retention', modes: ['strict', 'strict'], memberships: [eligible, eligible], effect: { replacement: true, inherited: 'all', reviewed: 'all' },
+      expected: { currentEffective: 'all', effective: 'unverified (current-membership-missing)', membership: unresolved, activatesInStrict: false } },
+    { label: 'copied replacement reset has no reviewed choice', modes: ['open', 'open'], memberships: [eligible, eligible], effect: { replacement: true, kind: 'reset', inherited: 'all', reviewed: undefined },
+      expected: { currentEffective: 'all', effective: 'unlisted', membership: unresolved, activatesInStrict: false } },
+    { label: 'open to strict activates a saved external-sharing mentions choice', modes: ['open', 'strict'], memberships: [external, eligible], effect: { kind: 'copied', saved: 'mentions', reviewed: 'mentions' },
+      expected: { currentEffective: 'inactive (external-sharing)', effective: 'mentions', membership: eligible, activatesInStrict: true } },
+    { label: 'open to strict still refuses an absent membership', modes: ['open', 'strict'], memberships: [external, absent], effect: { kind: 'copied', saved: 'mentions', reviewed: 'mentions' },
+      expected: { currentEffective: 'inactive (external-sharing)', effective: 'inactive (absent)', membership: absent, activatesInStrict: false } },
+    { label: 'open to strict off is not an eligibility activation', modes: ['open', 'strict'], memberships: [external, eligible], effect: { kind: 'copied', saved: 'off', reviewed: 'off' },
+      expected: { currentEffective: 'off', effective: 'off', membership: eligible, activatesInStrict: false } },
+  ])('$label', ({ modes, memberships, otherDestination = [false, false], effect: fields, expected }) => {
+    const configs = modes.map((mode, i) => {
+      const input = baseInput(); input.channel_mode = mode
+      if (otherDestination[i]) {
+        const bravo = entry(input, 'bravo')
+        bravo.channels = [...bravo.channels!, { id: 'C0A0001', delivery: 'mentions' }]
+        bravo.permission_prompts = 'C0A0001'
+      }
+      return parse(input)
+    })
+    const effect: ReviewedChannelEffect = { key: 'alpha', channel: 'C0A0001', kind: 'declared', saved: 'all', reviewed: 'mentions', previousOrder: 17, replacement: false, ...fields }
+    // Same-mode cases supply the same current fact; different-mode cases must
+    // ask for the appropriate mode. The loop guard uses each config separately.
+    const plan = buildChangePlan(configs[0]!, valid(configs[1]!), facts({
+      sharedReview: { generation: 4, channels: [effect] },
+      ...(memberships[0] === undefined ? {} : { membership: (key, channel, mode) => {
+        expect([key, channel]).toEqual(['alpha', 'C0A0001'])
+        return memberships[mode === modes[0] ? 0 : 1]!
+      } }),
+    }))
+    expect(plan.valid).toBe(true)
+    if (!plan.valid) throw new Error('expected valid review')
+    expect(plan.sharedReview).toEqual({ generation: 4, channels: [{ ...effect, ...expected }] })
+    render(plan)
+  })
 })

@@ -129,3 +129,23 @@ export function makeMembershipHarness(stateDir: string, options: {
   }
 }
 export type MembershipHarness = ReturnType<typeof makeMembershipHarness>
+
+/** Applied facts and exact input, excluding only the review ledger/revision.
+ * A review metadata write is not an activation. Operator tests assert those
+ * ledger transitions separately; ordinary consumers compare every other fact. */
+export function applicationState(input: SharedChannelState | Uint8Array | undefined) {
+  let state: SharedChannelState | undefined
+  try { state = input instanceof Uint8Array ? parseSharedChannelState(input, 'fixture-authority') : input } catch { return input }
+  if (!state) return input
+  const { revision, outcomes, ...rest } = state
+  const { operatorReviews, ...otherOutcomes } = outcomes
+  return { ...rest, outcomes: otherOutcomes }
+}
+
+/** Target the actual activation boundary after the durable attempt. Used by
+ * crash/failure fixtures so added metadata writes cannot move the fault. */
+export function activationRecord(bytes: Uint8Array, path: string): boolean {
+  const state = parseSharedChannelState(bytes, path)
+  const ledger = state?.outcomes.operatorReviews as { outcomes?: Record<string, { status: string; revision: number }> } | undefined
+  return Object.values(ledger?.outcomes ?? {}).some(outcome => outcome.status === 'consumed' && outcome.revision === state!.revision)
+}

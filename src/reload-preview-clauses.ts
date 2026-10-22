@@ -32,3 +32,8 @@ export const DESTRUCTIVE_RETIRED_CLAUSE =
 export function queueRetentionClause(count: number): string {
   return `${count} open queued item${count === 1 ? '' : 's'} kept, delivered only if a persona with the same key is added again`
 }
+
+export const REVIEW_OMISSION_CLAUSE = 'Retained current choice; use an explicit off assignment to stop intake.'
+export const REVIEW_FUTURE_CLAUSE = 'A new future preference grants neither membership nor participation.'
+export const REVIEW_RESET_CLAUSE = 'Inherited preference resets with the old identity; old participation and membership are not retained.'
+export const REVIEW_RETENTION_CLAUSE = 'Deliberate assignment to the replacement; no old participation or membership is retained.'

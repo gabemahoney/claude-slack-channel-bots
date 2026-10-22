@@ -323,10 +323,6 @@ expect_record_count() {
     [[ "${got}" == "${want}" ]] || fail "${step} (stub record: ${got} matching line(s), expected ${want})"
 }
 
-inode_of() {
-    stat -c '%i' "$1"
-}
-
 # Every file the leak checks read: the state dir (server.log and its
 # rotations, the reload files, startup-errors.log, ...), the stub's record
 # and output, and the CLI's output. Not the credentials files.
@@ -562,7 +558,7 @@ configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "start: revie
 check_no_leak "start"
 
 # --- 2. Alpha's credentials change: previewed, held, confirmed -------------
-last_inode="$(inode_of "${LAST}")"
+
 applied_before="$(count_log "${APPLIED_CLASS}")"
 
 write_credentials "${ALPHA_CREDS}" alphav2
@@ -579,10 +575,12 @@ wait_for_log "${ALPHA_BODY_LOG}" 10 "alpha rotation: the reload-preview line for
 expect_count "${PREVIEW}persona ${BRAVO_REF}" 0 "alpha rotation: reload-preview lines naming ${BRAVO}"
 check_no_leak "alpha rotation preview"
 
-# Unconfirmed, for more than a full tick: the record keeps its inode and
-# bytes, no reload-applied line, and the stub sees nothing of the new pair.
+# Unconfirmed, for more than a full tick: applied choices/source/identity stay
+# intact, no reload-applied line, and the stub sees nothing of the new pair.
 hold_not_applied "${HOLD_S}" "alpha rotation unconfirmed" no_new_alpha_pair_seen
 
+ROTATION_REVIEW="${SCENARIO_ROOT}/alpha-rotation.review"
+cp -- "${PENDING}" "${ROTATION_REVIEW}"
 mv -f -- "${PENDING}" "${APPLY}"
 wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" \
     "alpha rotation: the confirmation was never applied"
@@ -606,8 +604,8 @@ check_no_fresh_bringup "alpha rotation"
 expect_count "[slack] persona-slack-unreachable:" 0 "alpha rotation: persona-slack-unreachable lines"
 expect_count "[slack] persona-credentials-change-failed:" 0 "alpha rotation: persona-credentials-change-failed lines"
 
-[[ "$(inode_of "${LAST}")" != "${last_inode}" ]] \
-    || fail "alpha rotation: config.json.last-applied was not rewritten by the apply"
+bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedReviewConsumed "${CONFIG}" "${LAST}" "${ROTATION_REVIEW}" \
+    || fail "alpha rotation: the exact reviewed transaction has no durable consumed outcome"
 configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "alpha rotation: reviewed bytes or applied configuration differ from config.json"
 [[ ! -e "${APPLY}" ]] || fail "alpha rotation: config.json.apply was not removed"
 [[ ! -e "${PENDING}" ]] || fail "alpha rotation: config.json.pending is still there after the apply"

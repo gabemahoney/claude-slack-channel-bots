@@ -135,8 +135,10 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
       results.push(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'off', authority.revision))
     })
     expect(authority.transact(1, next => { next.pendingIntent['omitted'] = undefined })).toEqual({ kind: 'applied', revision: 2 })
-    expect(results).toEqual([{ kind: 'stale', revision: 2 }])
-    expect(authority.choice('alpha', 'C0TEST001')).toBe('all')
+    expect(results).toEqual([]) // metadata alone publishes no runtime change
+    expect(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 2)).toEqual({ kind: 'applied', revision: 3 })
+    expect(results).toEqual([{ kind: 'stale', revision: 3 }])
+    expect(authority.choice('alpha', 'C0TEST001')).toBe('mentions')
     expect(Object.hasOwn(authority.snapshot().pendingIntent, 'omitted')).toBe(false)
     expect(authority.snapshot()).toEqual(readSharedState(root)!)
     check(results)

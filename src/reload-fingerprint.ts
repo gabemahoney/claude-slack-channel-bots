@@ -119,6 +119,14 @@ export function reloadFingerprint(
   return hash.digest('hex')
 }
 
+/** Bind transient content comparison to non-secret authority/current facts.
+ * Persist only this composite and its generation-bound review identity. */
+export function reloadReviewBinding(contentFingerprint: string, authorityDependency: string, session: string, intentGeneration: number, facts: unknown): string {
+  return createHash('sha256').update(JSON.stringify([
+    'cscb-review-binding-v1', contentFingerprint, authorityDependency, session, intentGeneration, facts,
+  ])).digest('hex')
+}
+
 // ---------------------------------------------------------------------------
 // Pending file layout
 // ---------------------------------------------------------------------------

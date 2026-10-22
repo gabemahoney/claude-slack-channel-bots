@@ -174,6 +174,7 @@ import { personaDestinationOf } from '../src/persona-destination.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP, renderAppliedLogLine, renderNoopLogLine } from '../src/reload-apply.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, serializeSharedChannelState } from '../src/shared-channels.ts'
 import { RELOAD_NOTHING_PENDING, reloadSharedAuthorityStartLine } from '../src/reload.ts'
+import { reviewIntentLine } from '../src/reload-request.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
 import {
   channelDeliverySetCause as srcChannelDeliverySetCause,
@@ -253,6 +254,8 @@ import { Findings, NEED_SKIP_REASONS, runChecks, skipReason, verdictOf, type Che
 import {
   appliedLine,
   checkPreview,
+  checkPreviewLog,
+  validReviewSuffix,
   checkStartLines,
   commandMatches,
   countsText,
@@ -1464,7 +1467,7 @@ describe('Check 24: typed-delivery waiting and original-item recovery', () => {
       ...(opts.received ?? [deliveryLog('message-received', 'a', COORD, TS)]), ...(opts.extraLog ?? []),
     ]
     const preview = [PENDING_HEADER, `fingerprint: sha256:${'a'.repeat(64)}`, '', previewHeader({ settings: 1 }),
-      'server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.'].join('\n')
+      'server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.', reviewIntentLine(0, 0)].join('\n')
     const c = fakeContainer([['', (script) => {
       if (script === 'mark') return MARK
       if (script === 'rows') return 'cscb_persona_a persona_a ended'
@@ -2850,6 +2853,10 @@ async function realRemovalOfD(agentDirector: StubClientOptions = {}): Promise<{ 
     h.writeConfig({ personas: [c] })
     await run.ticks.tick()
     const preview = h.pendingLines() ?? []
+    expect(preview).toEqual([previewHeader({ removed: 1 }), removedPreviewLine('d'), ...h.reviewLines()])
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.slackPosts()).toEqual([])
+    assertNoLeak(run.captured())
     h.confirm()
     let applied = false
     const applying = run.ticks.tick().then(() => {
@@ -2875,7 +2882,9 @@ describe("a teardown's kept-row line: isTeardownKeptRowLine against src's real t
     expect(kept[0]!.startsWith(`[slack] persona teardown of "${personaName('d')}" (key=${personaName('d')}): agent-director kill of ${personaRowId('d')}: `)).toBe(true)
     expect(isTeardownKeptRowLine(`[2026-09-26T19:51:41.070Z] ${kept[0]}`, 'd')).toBe(true)
     expect(logs.filter((l) => isTeardownKeptRowLine(l, 'c'))).toEqual([])
-    expect(preview).toEqual([previewHeader({ removed: 1 }), removedPreviewLine('d')])
+    const f = new Findings()
+    checkPreview(f, { header: PENDING_HEADER, fingerprint: `fingerprint: sha256:${'0'.repeat(64)}`, preview }, [previewHeader({ removed: 1 }), removedPreviewLine('d')])
+    expect(f.failures).toEqual([])
   })
 
   test("the control: a kill that failed after its tries logs src's failed-kill line, which is not one", async () => {
@@ -2969,7 +2978,7 @@ describe("Check 27: D's row is killed and kept, judged after a guarded find-miss
     const { findMissing = { stdout: `${personaRowId('d')}: missing` }, deleted = false, withoutD = false } = opts
     let marked = false
     let marks = 0
-    const log = [...real.logs.filter((l) => !l.startsWith('[slack] reload-applied:')), appliedLine({ removed: 1 })]
+    const log = [...real.logs.filter((l) => !l.startsWith('[slack] reload-applied:')).map(l => l.replace(/ \(preview in \"[^\"]+\"\)$/, ` (preview in "${S}/config.json.pending")`)), appliedLine({ removed: 1 })]
     const pending = [PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '', ...real.preview].join('\n')
     const dRow = () => (withoutD || (marked && deleted) ? [] : [rowLine('d', marked ? 'missing' : 'idle')])
     const rowsNow = () => [...(['a', 'b', 'c'] as const).map((l) => rowLine(l)), ...dRow()].join('\n')
@@ -3088,6 +3097,24 @@ describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept 
       "step 5: not one row per persona plus D's kept row: 0 cscb_persona_d row(s), not one",
     ])
   })
+})
+
+test('lifecycle preview consumers require current review grammar and every matching log line', async () => {
+  const real = await realRemovalOfD()
+  const preview = real.preview
+  const suffix = preview.slice(2)
+  expect(validReviewSuffix(suffix)).toBe(true)
+  for (const invalid of [[], suffix.slice(1), [...suffix, suffix[1]!], [reviewIntentLine(0, 1), ...suffix.slice(1)],
+    suffix.map(line => line.replace('reviewed=all', 'reviewed=unknown')), [...suffix, 'unreviewed extra line']]) {
+    expect(validReviewSuffix(invalid)).toBe(false)
+  }
+  const pending = { header: PENDING_HEADER, fingerprint: `fingerprint: sha256:${'0'.repeat(64)}`, preview }
+  const log = preview.map((line, i) => `[slack] reload-preview: ${line}${i === 0 ? ` (preview in "${S}/config.json.pending")` : ''}`)
+  const exact = new Findings(); checkPreviewLog(exact, pending, log); expect(exact.failures).toEqual([])
+  for (const broken of [log.slice(0, -1), [...log, log[1]!], log.map(line => line.replace('saved order=1', 'saved order=2')), [...log].reverse()]) {
+    const f = new Findings(); checkPreviewLog(f, pending, broken); expect(f.failures).toHaveLength(1)
+  }
+  const f = new Findings(); checkPreview(f, pending, [previewHeader({ removed: 2 }), removedPreviewLine('d')]); expect(f.failures).toHaveLength(1)
 })
 
 describe('no live check passes against a silent workspace', () => {
@@ -3311,9 +3338,18 @@ describe("the test human's createChannel, kick and archive", () => {
 
 /** The package's change plan from `record` to `config` (both config.json texts), as the server builds it in the container. */
 function srcPlan(record: string, config: string) {
-  const plan = buildChangePlan(loadLive(record), { kind: 'valid', config: loadLive(config) }, { realPath: (p) => p, home: '/home/testuser', dryRun: true })
+  const authority = createSharedChannelAuthority(`${S}/config.json.last-applied`, initialSharedChannelState(Buffer.from(record), loadLive(record)), { home: '/home/testuser', write: () => { throw new Error('preview is read-only') } })
+  const reviewed = authority.planReviewed(Buffer.from(config))
+  const plan = buildChangePlan(authority.config(), { kind: 'valid', config: reviewed.config }, { realPath: (p) => p, home: '/home/testuser', dryRun: true, sharedReview: { generation: 0, channels: reviewed.channels } })
   if (!plan.valid) throw new Error('the scripted config is invalid')
   return plan
+}
+
+/** The runner owns exact lifecycle wording; the suffix is mandatory evidence. */
+function expectLifecyclePreview(rendered: string[], expected: string[]) {
+  const findings = new Findings()
+  checkPreview(findings, { header: PENDING_HEADER, fingerprint: `fingerprint: sha256:${'0'.repeat(64)}`, preview: rendered }, expected)
+  expect(findings.failures).toEqual([])
 }
 
 /** Produce the actual authority envelope, with exact source bytes retained. */
@@ -3330,7 +3366,8 @@ function worldAuthority(world: ReloadWorld) {
 
 function worldPlan(world: ReloadWorld) {
   const authority = worldAuthority(world)
-  const plan = buildChangePlan(authority.config(), { kind: 'valid', config: authority.previewReviewed(Buffer.from(world.config)) }, { realPath: p => p, home: '/home/testuser', dryRun: true })
+  const reviewed = authority.planReviewed(Buffer.from(world.config))
+  const plan = buildChangePlan(authority.config(), { kind: 'valid', config: reviewed.config }, { realPath: p => p, home: '/home/testuser', dryRun: true, sharedReview: { generation: authority.operatorIntent().generation, channels: reviewed.channels } })
   if (!plan.valid) throw new Error('the scripted shared configuration is invalid')
   return plan
 }
@@ -3521,7 +3558,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
       { on: false, personas: JSON.parse(s.copy).personas.map((p: { name: string }) => ({ name: p.name })) },
       { on: at === 'on', personas: JSON.parse(s[at]).personas.map((p: { name: string }) => ({ name: p.name })) },
     )
-    expect(expected.preview).toEqual(renderPreviewLines(srcPlan(s[at], s.copy)))
+    expectLifecyclePreview(renderPreviewLines(srcPlan(s[at], s.copy)), expected.preview)
     expect(outcomeLines[0]).toBe(expected.outcome)
     expect(run.slack.calls.filter((c) => c.startsWith('conversations.'))).toEqual([])
   })
@@ -4494,8 +4531,8 @@ describe('expected texts match the package', () => {
       const after = jqEdit(home, state(), switchOnFilter(DRY_RUN_IDS))
       const names = (state().personas as { name: string }[]).map((p) => p.name)
       const rendered = renderPreviewLines(srcPlan(before, after))
-      expect(switchOnPreview(names).preview).toEqual(rendered)
-      expect(rendered).toHaveLength(2)
+      expectLifecyclePreview(rendered, switchOnPreview(names).preview)
+      expect(rendered).toHaveLength(3 + srcPlan(before, after).sharedReview!.channels.length)
       expect(switchOnPreview(names).counts).toEqual({ in_place: 0, settings: 1 })
     })
 
@@ -4503,7 +4540,7 @@ describe('expected texts match the package', () => {
       const fungible = jqEdit(home, part9State(false), switchOnFilter(DRY_RUN_IDS))
       const before = on ? jqEdit(home, JSON.parse(fungible), switchFilter(false)) : fungible
       const after = jqEdit(home, JSON.parse(before), switchFilter(on))
-      expect(switchOnlyPreview(on, namesOf(['a', 'b', 'c']))).toEqual(renderPreviewLines(srcPlan(before, after)))
+      expectLifecyclePreview(renderPreviewLines(srcPlan(before, after)), switchOnlyPreview(on, namesOf(['a', 'b', 'c'])))
     })
   })
 
@@ -4600,14 +4637,14 @@ describe('expected texts match the package', () => {
   test('parsePending splits the pending file the package writes', () => {
     expect(PENDING_HEADER).toBe(PENDING_FILE_HEADER)
     const fingerprint = `fingerprint: sha256:${'0'.repeat(64)}`
-    const text = [PENDING_FILE_HEADER, fingerprint, '', previewHeader({ settings: 1 }), 'line two', ''].join('\n')
+    const text = [PENDING_FILE_HEADER, fingerprint, '', previewHeader({ settings: 1 }), 'line two', reviewIntentLine(0, 0), ''].join('\n')
     const pending = parsePending(text)
-    expect(pending).toEqual({ header: PENDING_FILE_HEADER, fingerprint, preview: [previewHeader({ settings: 1 }), 'line two'] })
+    expect(pending).toEqual({ header: PENDING_FILE_HEADER, fingerprint, preview: [previewHeader({ settings: 1 }), 'line two', reviewIntentLine(0, 0)] })
     const f = new Findings()
     checkPreview(f, pending!, [previewHeader({ settings: 1 }), 'line two'])
     expect(f.failures).toEqual([])
     checkPreview(f, { ...pending!, fingerprint: 'fingerprint: none' }, ['other'])
-    expect(f.failures.length).toBe(2)
+    expect(f.failures.length).toBe(3)
     expect(parsePending('one\ntwo\nnot blank\nfour')).toBeNull()
     expect(parsePending('short')).toBeNull()
   })

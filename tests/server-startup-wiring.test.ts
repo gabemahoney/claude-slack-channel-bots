@@ -4978,11 +4978,25 @@ describe('server.ts refuses service to a persona that is not up', () => {
     expect(block.trim()).toMatch(/\breturn\s*;?$/)
   })
 
-  test('handleInitialized has no other close path: exactly the four closePendingSession calls, and no direct pending remove, keep-alive stop or transport close', () => {
+  test('a roots result from an obsolete or retiring life closes before registration and carries the matched incarnation only after the guard', () => {
+    const [start, end] = asyncFunctionBody('handleInitialized')
+    const code = SERVER_CODE.slice(start, end)
+    const snapshot = code.indexOf('const startingLives = new Map')
+    const roots = code.indexOf('await server.listRoots')
+    const guard = code.indexOf('if (!incarnation || startingLives.get(persona.key) !== incarnation || channelDeliveryStore?.isRetiring(persona.key))')
+    expect(snapshot).toBeGreaterThanOrEqual(0); expect(snapshot).toBeLessThan(roots)
+    expect(guard).toBeGreaterThan(roots)
+    const block = code.slice(...balancedAfter(code, guard, '{', '}'))
+    expect(closeCallsIn(block)).toEqual([['pendingId', 'pendingEntry.transport', 'pendingSessionCloseDeps']])
+    expect(block.trim()).toMatch(/\breturn\s*;?$/)
+    expect(code.indexOf('registerSession(realCwd, persona.key, pendingId, undefined, incarnation)')).toBeGreaterThan(guard)
+  })
+
+  test('handleInitialized has no other close path: exactly the five closePendingSession calls, and no direct pending remove, keep-alive stop or transport close', () => {
     const [start, end] = asyncFunctionBody('handleInitialized')
     const code = SERVER_CODE.slice(start, end)
     const calls = closeCallsIn(code)
-    expect(calls).toHaveLength(OTHER_CLOSE_BRANCHES.length + 1)
+    expect(calls).toHaveLength(OTHER_CLOSE_BRANCHES.length + 2)
     for (const args of calls) {
       expect(args).toHaveLength(3)
       expect(args[0]).toBe('pendingId')
@@ -5646,4 +5660,19 @@ describe('membership uses the recovered authority and real lifecycle/HTTP bounda
     expect(args[2]).toContain('readiness: membershipReadiness')
     expect(SERVER_CODE).toContain('MEMBERSHIP_READINESS_ROUTE')
   })
+})
+
+
+test('only sharedAppliedConfig grants the validated replacement destination-reset exception to the config reader', () => {
+  const callbacks = srcFiles().flatMap(([file, text]) => {
+    const code = stripComments(text)
+    return [...code.matchAll(/\bresetDestination\s*:\s*persona\s*=>/g)].map(match => ({ file, at: match.index!, code }))
+  })
+  expect(callbacks).toHaveLength(1)
+  const callback = callbacks[0]!
+  expect(callback.file).toEndWith('/shared-channels.ts')
+  const start = callback.code.indexOf('export function sharedAppliedConfig(')
+  const body = callback.code.slice(start, callback.code.indexOf('export function', start + 1))
+  expect(body).toContain('resetDestination: persona => resetDestination(state, persona, deps.realpath)')
+  expect(callback.at).toBeGreaterThan(start)
 })

@@ -1032,6 +1032,8 @@ async function handleInitialized(
   pendingId: string,
   server: import('@modelcontextprotocol/sdk/server/index.js').Server,
 ): Promise<void> {
+  const startingLives = new Map((personaConfig?.personas ?? []).map(persona =>
+    [persona.key, channelDeliveryStore?.authority.incarnation(persona.key)]))
   // Get the pending session's transport so we can wait for SSE stream
   const pendingEntry = getPendingSession(pendingId)
   if (!pendingEntry) {
@@ -1097,12 +1099,17 @@ async function handleInitialized(
   }
 
   const { persona } = admission
+  const incarnation = channelDeliveryStore?.authority.incarnation(persona.key)
+  if (!incarnation || startingLives.get(persona.key) !== incarnation || channelDeliveryStore?.isRetiring(persona.key)) {
+    await closePendingSession(pendingId, pendingEntry.transport, pendingSessionCloseDeps)
+    return
+  }
   const ref = renderPersonaRef(persona.name, persona.key)
   const existingSession = getSessionByPersona(persona.key)
 
   // Promote pending → registered (removes from pendingSessionMap internally;
   // the pending stub becomes the registered entry).
-  registerSession(realCwd, persona.key, pendingId)
+  registerSession(realCwd, persona.key, pendingId, undefined, incarnation)
   forgetNotConnectedEpisode(persona.key)
 
   // Register MCP session ID for future HTTP request routing
@@ -2800,6 +2807,7 @@ export async function main(): Promise<void> {
   // The start resolution records nothing.
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
+    membership: () => channelMembership,
     retiredKeys,
     queueOpenCount: key => deliveryQueue?.openCount(key) ?? 0,
     onQueueRetained: key => deliveryQueue?.retained(key),

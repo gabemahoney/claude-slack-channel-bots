@@ -15,7 +15,7 @@
 
 // The two src/ modules below import nothing, so the runner loads no Slack SDK
 // or agent-director client on the host; no other src/ module is imported here.
-import { DESTRUCTIVE_PREFIX, queueRetentionClause, REMOVED_RETIRED_CLAUSE } from '../../src/reload-preview-clauses.ts'
+import { DESTRUCTIVE_PREFIX, queueRetentionClause, REMOVED_RETIRED_CLAUSE, REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE } from '../../src/reload-preview-clauses.ts'
 import { startupSummaryEnding, type StartupSummaryEndingCounts } from '../../src/startup-summary-ending.ts'
 import { CONTAINER_STATE_DIR } from '../lib/live-config.ts'
 import { isFrom, messageText, type HumanSession, type SlackMessage } from '../lib/human-session.ts'
@@ -604,9 +604,47 @@ export function checkPreview(f: Findings, pending: Pending, expect: string[]): v
   f.expect(pending.header === PENDING_HEADER, 'config.json.pending has another first line')
   f.expect(/^fingerprint: sha256:[0-9a-f]{64}$/.test(pending.fingerprint), 'config.json.pending has no sha256 fingerprint line')
   f.expect(
-    JSON.stringify(pending.preview) === JSON.stringify(expect),
+    JSON.stringify(pending.preview.slice(0, expect.length)) === JSON.stringify(expect),
     `the preview is not as expected (got ${pending.preview.length} line(s): ${pending.preview.join(' / ').slice(0, 400)})`,
   )
+  const review = pending.preview.slice(expect.length)
+  // These lifecycle checks assert their complete lifecycle prefix and the
+  // mandatory review grammar. Current projections are covered independently
+  // by reload-operator; the log check below requires every review line too.
+  f.expect(validReviewSuffix(review), 'the preview has missing or invalid operator/channel review evidence')
+}
+
+export function validReviewSuffix(lines: readonly string[]): boolean {
+  if (!/^Operator intent generation=\d+; declared assignments=0\. Requests change intent only; rename the reviewed pending file to the apply name to confirm\.$/.test(lines[0] ?? '')) return false
+  const choice = '(?:none|off|mentions|all|thread_hybrid)'
+  const effective = '(?:unlisted|off|mentions|all|thread_hybrid|unverified|(?:inactive|unverified) \\((?:[a-z-]+)\\))'
+  const linePattern = new RegExp(`^Channel persona=([a-z0-9_-]+) channel=([CG][A-Z0-9]+): (automatic|omitted|reset|edited|copied); saved=${choice}; reviewed=${choice}; saved order=(?:none|[0-9]+); membership=(?:eligible|ineligible|unresolved); effective now=${effective}; reviewed effective=${effective}\\.(.*)$`)
+  const endings = [REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE]
+  const seen = new Set<string>()
+  for (const line of lines.slice(1)) {
+    const match = linePattern.exec(line)
+    if (!match || seen.has(`${match[1]}/${match[2]}`)) return false
+    seen.add(`${match[1]}/${match[2]}`)
+    let tail = match[4]!
+    for (const clause of [' Deliberately overwrites the current saved choice.', ' Explicit same-value assignment.', ...endings.map(text => ` ${text}`), ' The saved mentions choice becomes eligible in strict; the saved value is unchanged.']) {
+      if (tail.startsWith(clause)) tail = tail.slice(clause.length)
+    }
+    if (tail !== '') return false
+  }
+  return true
+}
+
+/** Require the complete pending body in the log once, including all projections. */
+export function checkPreviewLog(f: Findings, pending: Pending | null, log: readonly string[]): void {
+  const prefix = '[slack] reload-preview: '
+  const actual = log.map((line, i) => {
+    const at = line.indexOf(prefix)
+    if (at < 0) return line
+    const text = line.slice(at + prefix.length)
+    const suffix = ` (preview in "${S}/config.json.pending")`
+    return i === 0 && text.endsWith(suffix) ? text.slice(0, -suffix.length) : text
+  })
+  f.expect(pending !== null && JSON.stringify(actual) === JSON.stringify(pending.preview), 'the reload-preview log does not exactly match the complete pending review')
 }
 
 // ---------------------------------------------------------------------------

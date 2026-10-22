@@ -40,6 +40,11 @@
  */
 
 import { queueRetentionClause } from './reload-preview-clauses.ts'
+import { REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE } from './reload-preview-clauses.ts'
+import type { ReviewedChannelEffect } from './shared-channels.ts'
+import type { MembershipReading } from './channel-membership.ts'
+import { channelDeliveryFor } from './delivery-decision.ts'
+import { reviewIntentLine } from './reload-request.ts'
 import {
   channelModeOf,
   configReadFailurePredicate,
@@ -117,6 +122,8 @@ export interface AddedPersonaCause {
  * number of times.
  */
 export interface ChangePlanFacts {
+  sharedReview?: { generation: number; channels: ReviewedChannelEffect[] }
+  membership?(key: string, channel: string, mode: ChannelMode): MembershipReading
   /** External open-item fact; this planner performs no queue I/O. */
   queueOpenCount?(key: string): number
   /**
@@ -350,6 +357,8 @@ export interface ServerSettingChange {
 
 /** The plan of a valid candidate. */
 export interface ValidChangePlan {
+  /** Safe, deterministic facts from the same authority merge used at apply. */
+  sharedReview?: { generation: number; channels: ReviewedChannelView[] }
   valid: true
   /** Candidate personas whose key the applied set lacks, in candidate order. */
   added: AddedPersonaChange[]
@@ -397,6 +406,46 @@ export interface InvalidChangePlan {
 
 /** The structured change plan. */
 export type ChangePlan = ValidChangePlan | InvalidChangePlan
+
+export interface ReviewedChannelView extends ReviewedChannelEffect {
+  membership: MembershipReading
+  currentEffective: string
+  effective: string
+  activatesInStrict: boolean
+}
+function reviewedChannelViews(applied: PersonaConfig, next: PersonaConfig, facts: ChangePlanFacts): ReviewedChannelView[] {
+  return (facts.sharedReview?.channels ?? []).map(effect => {
+    const membership: MembershipReading = effect.replacement ? { kind: 'unresolved', reason: 'current-membership-missing' } :
+      facts.membership?.(effect.key, effect.channel, next.channel_mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }
+    const delivery = next.channel_mode === 'open' ? channelDeliveryFor(effect.key, effect.channel, {
+      fungibleDestinations: next.personas.map(persona => ({ key: persona.key, destination: persona.permission_prompts })),
+      storedChoices: { readable: true, storedChoice: () => effect.reviewed },
+    }).delivery : effect.reviewed
+    const effective = effect.reviewed === undefined ? 'unlisted' : effect.reviewed === 'off' ? 'off' :
+      membership.kind === 'eligible' ? delivery! : membership.kind === 'ineligible' ? `inactive (${membership.reason})` : `unverified (${membership.reason})`
+    const before = facts.membership?.(effect.key, effect.channel, applied.channel_mode)
+    const currentDelivery = applied.channel_mode === 'open' ? channelDeliveryFor(effect.key, effect.channel, {
+      fungibleDestinations: applied.personas.map(persona => ({ key: persona.key, destination: persona.permission_prompts })),
+      storedChoices: { readable: true, storedChoice: () => effect.saved },
+    }).delivery : effect.saved
+    const currentEffective = effect.saved === undefined ? 'unlisted' : effect.saved === 'off' ? 'off' :
+      before?.kind === 'eligible' ? currentDelivery! : before?.kind === 'ineligible' ? `inactive (${before.reason})` : 'unverified'
+    return { ...effect, membership, effective, currentEffective,
+      activatesInStrict: applied.channel_mode === 'open' && next.channel_mode === 'strict' &&
+        effect.reviewed === 'mentions' && membership.kind === 'eligible' && before?.kind === 'ineligible' && before.reason === 'external-sharing' }
+  }).sort((a, b) => a.key.localeCompare(b.key) || a.channel.localeCompare(b.channel) || a.kind.localeCompare(b.kind))
+}
+export function reviewedChannelLine(channel: ReviewedChannelView): string {
+  const { key, kind, saved, reviewed, replacement, membership, effective } = channel
+  const intent = kind === 'declared' || kind === 'edited'
+  const clauses = kind === 'reset' || (replacement && !intent) ? REVIEW_RESET_CLAUSE : replacement && intent ? REVIEW_RETENTION_CLAUSE :
+    intent && membership.kind !== 'eligible' ? REVIEW_FUTURE_CLAUSE : kind === 'omitted' || kind === 'automatic' ? REVIEW_OMISSION_CLAUSE : ''
+  const overwrite = intent && saved !== undefined && saved !== reviewed ? ' Deliberately overwrites the current saved choice.' : ''
+  const sameValue = intent && (replacement ? channel.inherited : saved) === reviewed ? ' Explicit same-value assignment.' : ''
+  return `Channel persona=${key} channel=${channel.channel}: ${kind}; saved=${saved ?? 'none'}; reviewed=${reviewed ?? 'none'}; ` +
+    `saved order=${channel.previousOrder ?? 'none'}; membership=${membership.kind}; effective now=${channel.currentEffective}; reviewed effective=${effective}.${overwrite}${sameValue}${clauses ? ` ${clauses}` : ''}` +
+    (channel.activatesInStrict ? ' The saved mentions choice becomes eligible in strict; the saved value is unchanged.' : '')
+}
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -597,6 +646,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
     settings: [],
     noEffectiveChange: false,
     configDirsChanged: configDirsDiffer(applied, next, facts.home),
+    ...(facts.sharedReview ? { sharedReview: { generation: facts.sharedReview.generation, channels: reviewedChannelViews(applied, next, facts) } } : {}),
   }
 
   for (const persona of next.personas) {
@@ -697,7 +747,8 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
     plan.inPlace.length === 0 &&
     plan.credentials.length === 0 &&
     plan.nextLaunch.length === 0 &&
-    plan.settings.length === 0
+    plan.settings.length === 0 &&
+    !plan.sharedReview?.channels.some(channel => channel.kind === 'declared' || channel.kind === 'edited')
   return plan
 }
 
@@ -995,9 +1046,14 @@ function inheritedConfigDirWarnings(inheritedBy: readonly InheritingPersonaRef[]
  */
 export function renderPreviewLines(plan: ChangePlan): string[] {
   if (!plan.valid) return [escapeCause(`${INVALID_PREFIX} ${plan.error} ${NOTHING_WILL_BE_APPLIED}`)]
+  const sharedLines = plan.sharedReview ? [
+    reviewIntentLine(plan.sharedReview.generation, plan.sharedReview.channels.filter(channel => channel.kind === 'declared').length),
+    ...plan.sharedReview.channels.map(reviewedChannelLine),
+  ] : []
   if (plan.noEffectiveChange) {
     return [
       `${PENDING_PREVIEW_TITLE} ${NO_EFFECTIVE_CHANGE}: applying it would change no persona and no server-wide setting.`,
+      ...sharedLines,
     ].map(escapeCause)
   }
   const lines = [`${PENDING_PREVIEW_TITLE} ${renderChangePlanCounts(changePlanCounts(plan))}.`]
@@ -1017,6 +1073,7 @@ export function renderPreviewLines(plan: ChangePlan): string[] {
   }
 
   lines.push(...plan.settings.map(settingLine))
+  lines.push(...sharedLines)
   return lines.map(escapeCause)
 }
 

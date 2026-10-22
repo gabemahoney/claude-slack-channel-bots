@@ -2,6 +2,8 @@
 
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step; run `/debug-slack-channel-bots` from Claude Code for a guided diagnosis. This page lists the common symptoms, then the server log and the startup-error log.
 
+For rejected channel requests or unusable confirmations, check current intent and the fresh preview; preserve input and authority evidence for uncertain writes. [Request diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-request-invalid), [confirmation outcomes](../skills/debug-slack-channel-bots/SKILL.md#reload-review-outcome) and [write recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed).
+
 **Installation fails or launches stay pending**
 Check Bun, the global package trust, the supported host, and the worker's Claude Code version and launcher. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-installation-fails-or-launches-stay-pending).
 

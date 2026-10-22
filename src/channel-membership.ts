@@ -548,18 +548,18 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   }
 
   function lifetime(key: string, channel: string): MembershipLifetime | undefined {
-    const life = lifeOf(authority, key)
-    return life ? { incarnation: life.incarnation, boundary: life.membership[channel]?.boundary ?? 0, leaveBoundary: life.leaves[channel]?.boundary ?? 0 } : undefined
+    const life = authority.lifetime(key, channel)
+    return life ? { incarnation: life.incarnation, boundary: life.membershipBoundary, leaveBoundary: life.leaveBoundary } : undefined
   }
   function hasUnresolved(key: string, channel: string): boolean {
     if (!CHANNEL_ID_RE.test(channel)) return false
-    if (!authority.readable || generations.get(key)?.holds.has(channel)) return true
+    if (!authority.readableFor(key, channel) || generations.get(key)?.holds.has(channel)) return true
     const life = recoveryLife(key)
     return !!life?.membershipAbsenceConflicts?.[channel] || pending(life, channel).length > 0
   }
   function read(key: string, channel: string, mode: ChannelMode): MembershipReading {
     if (!CHANNEL_ID_RE.test(channel)) return { kind: 'ineligible', reason: 'invalid-channel' }
-    if (!authority.readable) return { kind: 'unresolved', reason: 'shared-state-unreadable' }
+    if (!authority.readableFor(key, channel)) return { kind: 'unresolved', reason: 'shared-state-unreadable' }
     const generation = generations.get(key)
     if (!generation || !isCurrent(generation)) return { kind: 'unresolved', reason: 'current-membership-missing' }
     if (hasUnresolved(key, channel)) return { kind: 'unresolved', reason: generation.holds.get(channel) ?? 'event-order-conflict' }

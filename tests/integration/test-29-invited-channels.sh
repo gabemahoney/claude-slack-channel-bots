@@ -950,10 +950,16 @@ confirm_switch() {
     local authority_before="${SCENARIO_ROOT}/authority-before-${shape}.json"
     cp -- "${LAST}" "${authority_before}"
     write_persona_config "${shape}"
+    if [[ "${shape}" == fungible ]]; then
+        configuration_request "mode-${shape}" request "${ALPHA}/${F1}/mentions" "${ALPHA}/${U1}/all" \
+            "${BRAVO}/${F1}/mentions" "${BRAVO}/${F2}/mentions" "${BRAVO}/${A1}/mentions" "${BRAVO}/${U1}/all"
+    else
+        configuration_request "mode-${shape}" request
+    fi
     wait_for_file "${PENDING}" "${TICK_WAIT_S}" "${step}: config.json.pending never appeared"
     wait_until 10 "${step}: the pending file never carried the switch's line" pending_has_line "${line}"
     check_pending_layout "${step}"
-    cmp -s -- "${authority_before}" "${LAST}" || fail "${step}: authority envelope changed before confirmation"
+    configuration_application_preserved "${CONFIG}" "${authority_before}" "${LAST}" || fail "${step}: authority envelope changed before confirmation"
     mv -f -- "${PENDING}" "${APPLY}"
     wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "${step}: the confirmation was never applied"
     configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "${step}: authority does not preserve the reviewed config.json bytes"

@@ -8,9 +8,9 @@ import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
  * - request_id is `number`: a compile-time tripwire that fails
  *     closed if the library widens the type.
  * - the section not in force is never read:
- *     outside a fixed list of `src/` files, no file reads a persona's
+ *     outside a fixed list of `src/` files, no unreviewed read of a persona's
  *     `channels`, `permission_prompts`, `invited`, `fungible_destination` or
- *     `sections`; inside it, `src/registry.ts` reads them only in the
+ *     `sections` is allowed; inside it, `src/registry.ts` reads them only in the
  *     posting-scope check and its classifier, `src/persona-routing.ts` only
  *     in the decision's input, `src/persona-destination.ts` only in the one
  *     destination rule.
@@ -34,7 +34,9 @@ import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
  *   constant, imported or not, or a union of literals); a key of type
  *   `string` is no read. An object literal that builds the field, a type and
  *   a setting name held as a string are no read. A same-named field of a
- *   non-persona object is admitted only by an exact `ADMITTED_READS` entry
+ *   non-persona object, or the destination declaration bound into a durable
+ *   operator review (AC-W05/W07/W08), is admitted only by an exact
+ *   `ADMITTED_READS` entry
  *   (the file, the function, the read, how many times it occurs and the
  *   reason), and an entry whose count differs from the reads it matches
  *   fails the audit. Negative controls pin the matcher and the checks on
@@ -200,11 +202,11 @@ const PLACEMENT: readonly PlacementRow[] = [
 ]
 
 /**
- * A read of a same-named field of a non-persona object, outside the fixed
- * list: the file, the functions it lies in (outermost first,
+ * A read of a same-named field of a non-persona object or a review dependency,
+ * outside the fixed list : the file, the functions it lies in (outermost first,
  * joined by ` > `), the read's text, how many reads of that text lie there
- * and why it is no persona read. The reads an entry matches must number
- * exactly its `count`, or the audit fails.
+ * and why it does not make a runtime delivery/destination decision. The reads
+ * an entry matches must number exactly its `count`, or the audit fails.
  */
 interface AdmittedRead {
   readonly file: string
@@ -221,6 +223,8 @@ const ADMITTED_READS: readonly AdmittedRead[] = [
   { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'authority.channels', count: 1, reason: 'the shared authority method, not a persona field or independent store' },
   { file: 'channel-membership-scan.ts', within: 'parsePage', read: "value['channels']", count: 2, reason: 'validate and iterate the Slack users.conversations response array, not a persona configuration' },
   { file: 'channel-membership-scan.ts', within: 'createMembershipScanner > collect', read: 'page.channels', count: 1, reason: 'iterate the parsed users.conversations page returned by the connection manager membershipPage call, not a persona configuration' },
+  { file: 'reload.ts', within: 'createPendingDetection > candidateOf', read: 'reviewed.channels', count: 1, reason: 'channel effects returned by shared authority planReviewed for the preview, not a persona channels list or a delivery decision' },
+  { file: 'reload.ts', within: 'createPendingDetection > derive', read: 'persona.permission_prompts', count: 1, reason: 'AC-W05/W07/W08: bind applied and candidate destination declarations into reloadReviewBinding so a changed destination revokes review authorization; no destination resolution or posting' },
 ]
 
 /** How a field is read. */
@@ -605,7 +609,7 @@ describe('the section not in force is never read', () => {
     expect(syntaxFindings(modules)).toEqual([])
   })
 
-  test('outside the fixed list, no src/ file reads a persona field, and every admitted read matches its count', () => {
+  test('outside the fixed list, no src/ file has an unreviewed field read, and every admitted read matches its count', () => {
     expect(outsideListFindings(modules, FIXED_READERS, ADMITTED_READS)).toEqual([])
   })
 
@@ -734,6 +738,31 @@ describe('negative controls for the reader audit', () => {
     expect(outsideListFindings(modules, FIXED_READERS, [entry])).toEqual([])
     expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 1 }])).toEqual(['admitted read matches 2 reads, not 1: src/planted.ts p.channels (in f)'])
     expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 3 }])).toEqual(['admitted read matches 2 reads, not 3: src/planted.ts p.channels (in f)'])
+  })
+
+  test.each([
+    ['reviewed channels', 'reviewed.channels', 'createPendingDetection > candidateOf', 'persona.channels', 'channels', 'reviewed'],
+    ['review destination binding', 'persona.permission_prompts', 'createPendingDetection > derive', 'persona.channels', 'permission_prompts', 'persona'],
+  ] as const)('%s admission rejects extra, missing, adjacent and relocated reads', (_label, read, within, adjacent, field, receiver) => {
+    const file = 'reload.ts'
+    const source = readFileSync(join(SRC_DIR, file), 'utf8')
+    const admitted = ADMITTED_READS.filter(entry => entry.file === file)
+    expect(outsideListFindings(new Map([[file, source]]), FIXED_READERS, admitted)).toEqual([])
+    expect(source.split(read)).toHaveLength(2)
+    const countFinding = (count: number) => `admitted read matches ${count} reads, not 1: src/${file} ${read} (in ${within})`
+    const cases: readonly [string, string[]][] = [
+      [source.replace(read, `[${read}, ${read}]`), [countFinding(2)]],
+      [source.replace(read, 'undefined'), [countFinding(0)]],
+      [source.replace(read, `[${read}, ${adjacent}]`), [`src/${file}: property read of channels ${adjacent} (in ${within})`]],
+      [source.replace(read, 'undefined') + `\nfunction other(${receiver}: any) { return ${read} }`, [
+        `src/${file}: property read of ${field} ${read} (in other)`, countFinding(0),
+      ]],
+    ]
+    for (const [code, findings] of cases) {
+      const mutant = new Map([[file, code]])
+      expect(syntaxFindings(mutant)).toEqual([])
+      expect(outsideListFindings(mutant, FIXED_READERS, admitted)).toEqual(findings)
+    }
   })
 
   test.each([

@@ -671,6 +671,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
 
   function provenanceOf(entry: PersonaEntry, binding: SocketBinding): PersonaEventProvenance {
     const current = () => entries.get(entry.persona.key) === entry && !entry.stopped &&
+      entry.incarnation === deps.incarnationFor?.(entry.persona.key) &&
       !binding.retired && !binding.disconnected && entry.socket === binding && entry.status.state === 'up'
     return Object.freeze({ key: entry.persona.key, connectionId: binding.connectionId, incarnation: entry.incarnation, identity: binding.identity, applied: current(), candidate: binding.candidate && entry.socket !== binding, isCurrent: current })
   }

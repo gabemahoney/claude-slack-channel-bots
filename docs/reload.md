@@ -4,14 +4,15 @@ Saving `config.json` doesn't change what runs. The server runs the last configur
 
 ## Files beside the config file
 
-These files sit in the same directory as `config.json` (`~/.config/claude-slack-channel-bots/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
+These files sit beside `config.json` (`~/.config/claude-slack-channel-bots/` by default, or `SLACK_STATE_DIR`). You write requests; the server writes previews and records. Never hand-edit a preview, confirmation or authority.
 
 | File | What it is |
 |---|---|
 | `config.json.last-applied` | The sole shared authority: an envelope holding the revision, applied configuration, reviewed source and exact reviewed bytes. It also records persona identity, incarnation and ordered channel choices. A replacement never inherits old choices. Never edit it by hand. For an unresolved write, preserve the authority, prepared input and pending evidence; restore trustworthy evidence before retrying. |
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
-| `config.json.apply` | Your confirmation: the pending file, renamed. Successful application consumes it; a failed authority write preserves it (see [Confirming a change](#confirming-a-change)). |
-| `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. A confirmed change records the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed, before `config.json.last-applied` is rewritten. A server start also records, before its clean-up of old instances ends any of them, the key of every agent-director instance labelled with a persona that is not in the applied configuration (for example, a persona that `config.json` no longer names, at a start after `config.json.last-applied` was deleted; see [Start rules](#start-rules)), so a persona added back later with that key starts fresh. If that write fails, the start logs it in `server.log`, holds those keys as retired until the server stops, and records them again at the next start. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. A key's entry is removed on its own once the persona's new session is running. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](troubleshooting.md#startup-errors)). |
+| `config.json.request` | Your explicit assignment, revision, cancellation or refresh request. It changes pending intent only; deleting this file does not cancel recorded intent. |
+| `config.json.apply` | Your confirmation: the current pending file, renamed. Its durable outcome prevents reuse even if cleanup fails. Failed activation preserves evidence and needs fresh review (see [Confirming a change](#confirming-a-change)). |
+| `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. A confirmed change records the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed, before the reviewed change becomes active. A server start also records, before its clean-up of old instances ends any of them, the key of every agent-director instance labelled with a persona that is not in the applied configuration (see [Start rules](#start-rules)), so a persona added back later with that key starts fresh. If that write fails, the start logs it in `server.log`, holds those keys as retired until the server stops, and records them again at the next start. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. A key's entry is removed on its own once the persona's new session is running. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](troubleshooting.md#startup-errors)). |
 | `queue/<key>.jsonl` | The persona’s durable queue, holding message text until delivery. Removing a persona retains its queue file; delivery resumes only when the same key returns. |
 
 ## Start rules
@@ -41,7 +42,7 @@ While the server runs, it checks `config.json` and each credentials file the fil
 
 - Restarting the server or rebooting the host doesn't apply a pending `config.json` edit. The start brings back the recorded personas, and the edit stays pending.
 - A pending credentials-file change is the exception: every start reads credentials files as they stand, so the next start applies it.
-- Reverting the edit byte for byte deletes the pending file, and the server logs `reload-nothing-pending`. A revert that leaves only a whitespace difference stays pending, as `no effective change`.
+- Reverting the edit byte for byte clears the preview only if no explicit request remains. A whitespace difference stays pending as `no effective change`. Detected reversion never revives an earlier confirmation.
 - In dry run (`SLACK_DRY_RUN`), credentials files are not compared.
 
 To see what is pending:
@@ -50,6 +51,32 @@ To see what is pending:
 cat ~/.config/claude-slack-channel-bots/config.json.pending
 grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/claude-slack-channel-bots/server.log | tail
 ```
+
+To explicitly assign `planner`'s `C1234567890` choice, including reasserting an unchanged value, prepare its declaration in `config.json`, then write this request. It reads only the current generation and incarnation from the authority; it does not change that record:
+
+```sh
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
+jq -n --slurpfile s "$STATE/config.json.last-applied" --slurpfile c "$STATE/config.json" '
+  ($c[0].personas[] | select(.name == "planner")) as $p |
+  {format:"cscb-review-request-v1", request_id:"planner-choice-1",
+   intent_generation:($s[0].pendingIntent.operator.generation // 0), action:"request",
+   assignments:[{key:"planner", channel:"C1234567890", delivery:"mentions",
+     incarnation:($s[0].personas.planner.incarnation // null),
+     declaration:($p | {name, credentials_file, working_directory})}]}
+' > "$STATE/config.json.request.next"
+mv "$STATE/config.json.request.next" "$STATE/config.json.request"
+```
+
+Use a fresh `request_id` for each deliberate operation: 1–128 ASCII letters, digits, `_` or `-`, beginning with a letter or digit. `intent_generation` is the current nonnegative integer in the authority (zero when absent), also shown in the preview. `incarnation` identifies the currently applied persona, or is `null` for an absent key; `declaration` identifies the intended name, credentials location and working directory in `config.json`. Each key/channel appears once; use exactly the fields shown. `delivery` accepts `off`, `mentions`, `all` or `thread_hybrid` in strict and open mode.
+
+| Action in `config.json.request` | Required content and effect |
+|---|---|
+| `request` | The complete `assignments` array, with no outstanding request. Even byte-identical configuration can now have a pending preview. |
+| `revise` | A fresh ID, current generation and the complete replacement `assignments` array. For example, change the example to `action:"revise"`, a fresh ID/current generation and `delivery:"off"`; omitted declarations are cancelled. |
+| `refresh` | Only `format`, a fresh `request_id`, current `intent_generation` and `action:"refresh"`; omit `assignments`. Keeps the declaration set and reviews current facts. For generation 1: `{"format":"cscb-review-request-v1","request_id":"planner-refresh-2","intent_generation":1,"action":"refresh"}`. |
+| `cancel` | The same four fields with `action:"cancel"`. Clears declared intent, preserving other pending configuration edits. After that refresh at generation 2: `{"format":"cscb-review-request-v1","request_id":"planner-cancel-3","intent_generation":2,"action":"cancel"}`. |
+
+Each accepted operation advances the generation; wait for its `reload-request-recorded` line before the next operation. Replaying the same ID and payload creates no new assignment. Cancellation and successful consumption do not free an ID for reuse. Saving, requesting, revising, cancelling and refreshing apply nothing; the separate [confirming rename](#confirming-a-change) is still required. Automatic changes never rewrite your original `config.json` bytes.
 
 ## Reading the preview
 
@@ -76,7 +103,9 @@ persona "reviewer" (key=reviewer): channels changed: applied in place immediatel
 server-wide setting channel_mode changed: turns open mode on, applied in place at once, from the next event, tool call, prompt and notice, for "planner" (key=planner), "reviewer" (key=reviewer), "helpdesk" (key=helpdesk).
 ```
 
-The preview describes the full effect of the change. What each kind of change does once confirmed is in [What a confirmation applies](#what-a-confirmation-applies).
+These excerpts show lifecycle effects; the full preview also includes `Operator intent generation=<n>; declared assignments=<n>. Requests change intent only; rename the reviewed pending file to the apply name to confirm.` Each `Channel persona=… channel=…` line distinguishes `saved`, `reviewed`, `saved order`, `membership`, `effective now` and `reviewed effective`.
+
+`declared` assignments and edited channel values are intentional writes; `copied` fields are not. An explicit same-value assignment takes a new position in application order. A newer saved choice overwritten by intent is labelled `Deliberately overwrites the current saved choice.` Omitted current choices and automatic additions outside intent remain: `Retained current choice; use an explicit off assignment to stop intake.` Unverified membership does not become current merely because a preference is saved.
 
 Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In `server.log`, each preview line (everything after the `fingerprint:` line and the blank line) is prefixed `[slack] reload-preview:`, and the first one ends with where the preview is written: ` (preview in "<path of config.json.pending>")`.
 
@@ -105,23 +134,24 @@ To apply a pending change, rename `config.json.pending` to `config.json.apply` i
 cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}" && mv config.json.pending config.json.apply
 ```
 
-Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. Successful application consumes the confirmation without a restart; failed activation retains it. Next-launch and most server-wide settings are recorded and take effect later; the switch `channel_mode` and reminder setting `stop_hook_bootstrap` (own or inherited) apply in place at once (see [What a confirmation applies](#what-a-confirmation-applies)).
+Read the full current preview first. The next check, about 5 seconds later, revalidates its state and current membership; an earlier apply can delay the outcome by minutes. The reviewed mode, channel choices and persona identities become durable and visible together. Only successful activation consumes its matching intent; unrelated pending input survives. Next-launch and most server-wide settings are recorded and take effect later; the switch `channel_mode` and reminder setting `stop_hook_bootstrap` (own or inherited) apply in place at once.
 
-You can direct an agent to do the rename for you. Nothing has to be computed, copied or typed. A confirmation made while the server is stopped is processed at the first check after the next start.
+You can direct an agent to do the rename. Never compute or copy a fingerprint into a confirmation. After a stop, wait for recovery and current startup membership validation, then read and confirm the fresh preview.
 
 Each confirmation logs one of these lines in `server.log`:
 
 ```sh
-grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}/server.log" | tail
+grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed|review-(outcome|recovery))' "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}/server.log" | tail
 ```
 
 | Line | Meaning |
 |---|---|
 | `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: …); the last-applied record "<path>" now holds it` | The change is applied, and the authority’s applied configuration holds it. |
-| `[slack] reload-noop: the confirmed configuration has no effective change, …` | Nothing that runs changed, as for whitespace or an explicit default. The application revision and exact reviewed source bytes are recorded without changing channel assignment values or order, and nothing is left pending. |
+| `[slack] reload-noop: the confirmed configuration has no effective change, …` | Nothing that runs changed, as for whitespace or an explicit default. The application revision and exact reviewed source bytes are recorded without changing channel assignment values or order, and unrelated pending input is retained. |
 | `[slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: <error>` | `config.json` was invalid or missing when you confirmed. The line carries the full error. Fix the file, then confirm the new preview. |
 | `[slack] reload-stale-confirmation: the confirmation "<path>" …; nothing is applied` | See [Stale confirmations](#stale-confirmations). |
-| `[slack] reload-record-write-failed: …; application <failed or unresolved>; preserve the prepared input and authority evidence; the change remains pending…` | The shared-authority line distinguishes `application failed` from `application unresolved`: the latter means the durable outcome is uncertain. A retired-key record write failure also uses this log class. Preserve authority, prepared input, confirmation and pending evidence. For an unresolved write, restore trustworthy evidence before retrying. After a definite failure, fix the reported filesystem cause, then make a fresh confirming rename: the running server does not retry the failed gesture automatically. After restart, a retained, unconsumed confirmation is revalidated against recovered state and may apply if still valid. |
+| `[slack] reload-record-write-failed: …; application <failed or unresolved>; …` | Preserve shared authority, prepared input, confirmation and pending evidence. Definite failure needs a fresh review after the cause is fixed. Unresolved durability needs recovery of the exact prepared transaction; do not submit a second assignment or assume either outcome. See [recovery diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed). |
+| `[slack] reload-review-outcome: <status>; this confirmation cannot assign again. …` | `superseded`, `attempted`, `rejected` or `consumed`: use the current preview. Cleanup is separate from durable consumption; a consumed copy cannot become a new no-op. |
 
 ## What a confirmation applies
 
@@ -129,7 +159,7 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 
 | Change | Once confirmed | Live session |
 |---|---|---|
-| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
+| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. Explicit assignments, including the same value, are ordered; copied fields, mode-only and unrelated edits do not reassign channels. Omission retains current choices; assign `off` to stop intake. A changed DM contact is used for the next prompt. | Kept |
 | A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, its working directory unusable, or held for its `claude_config_dir` by `persona-config-dir-unresolvable`) has no connection and retries with the new content. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
 | `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts a new conversation on the same instance when the directory changed: the conversation is not resumed, nothing is deleted, and the old transcript stays in the old directory. | Kept until the next launch |
 | `stop_hook_bootstrap` changes (the persona's own or inherited) | Applied in place, immediately: subsequent reminder checks use the confirmed value. | Kept |
@@ -153,6 +183,8 @@ To make them take effect sooner, wait for the `reload-applied` line, then run `c
 
 ## Destructive changes
 
+Removal/re-add, rename/back, a changed credentials location or working directory resets inherited choices. Unchanged copied fields do not retain them. To retain a value deliberately, use the request above with the currently applied incarnation (or `null` for an absent key), the replacement's declaration and the desired value, even if unchanged. Its preview says `Deliberate assignment to the replacement; no old participation or membership is retained.` Unassigned discovered entries start `off` in strict or `mentions` in open. Equivalent paths, reconnect/relaunch, mode/value changes and same-location credential-content rotation do not independently reset preferences. A preference after verified leave is new future intent, not current membership or resurrection.
+
 `DESTRUCTIVE:` lines in the preview name the personas the change retires when you confirm it (see the table above). A retired persona's session is stopped and never resumed. Its queue is retained: add a persona with the same key to deliver its queued messages. Read the preview before you rename it. There is no undo. A persona removed and added again with the same key, or renamed and then renamed back, always starts a new conversation, even with a server restart in between: its old conversation is never resumed. A persona brought up from its new entry after a `credentials_file` path or `working_directory` change starts fresh the same way.
 
 CSCB never deletes an agent-director row, and it checks the result of every kill it makes. A teardown ends the old session, checks the result, and keeps the row; a removed persona's row stays until agent-director's `expire` removes it, and is never resumed. A kill agent-director can't carry out right now is tried up to 3 times, 2 s apart. When the kill still fails (for example, the worker outlived each of its kills), `server.log` shows the teardown's line for it, which ends `— the row is kept; nothing latches and no retry timer is armed …`. The persona's new session is then not started over the old one: the bring-up after a `credentials_file` path or `working_directory` change ends the old session first and starts the new conversation only once that succeeds. A renamed persona's new name is brought up only once the old instance has ended, and so is any other persona that shares the old instance's working directory; until then a Claude Code session started from that directory is refused (see "A persona waits on an old instance in its working directory" in [Troubleshooting](troubleshooting.md#troubleshooting)). The old conversation is never resumed either way.
@@ -161,7 +193,7 @@ Nothing about the teardown is posted to Slack. Every notice raised for the perso
 
 ## Stale confirmations
 
-A confirmation is pinned to the exact content of `config.json`, the shared authority revision and every credentials file it names. If any of them changed after the preview was written, nothing is applied. The confirmation is deleted, and one `reload-stale-confirmation` line is logged. The same happens for a confirmation that can't be read or isn't a pending file the server wrote.
+A confirmation binds the reviewed mode, identity, choices and their order, destination, declared intent, current membership/leave evidence and detected config/credential content. Superseding any dependency invalidates the review, including detected content reversion, cancellation/redeclaration and restart. Matching bytes never restore that permission. An unreadable or malformed confirmation is also refused; see [diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-stale-confirmation).
 
 To fix it, wait for the server to write `config.json.pending` again (within about 5 seconds), read it and rename it again. A confirmation is used once. If the same content comes back later, for example after a revert and a redo, confirm it again.
 

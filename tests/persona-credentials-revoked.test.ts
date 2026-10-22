@@ -282,7 +282,7 @@ describe('a Web API call refused with token_revoked marks the persona broken at 
 
     expect(h.pendingExists()).toBe(false)
     expect(run.since(cp).lifecycle).toEqual([])
-    expect(run.since(cp).writes).toEqual([])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite()]) // durable initial observation, no activation
     expect(run.stub('alpha').calls.authTest).toHaveLength(authTests)
     expect(run.isUp('alpha')).toBe(false)
     expect(isCredentialsBroken(run.bringUps.state(a.key))).toBe(true)

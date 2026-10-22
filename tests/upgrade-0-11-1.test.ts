@@ -536,7 +536,7 @@ describe('a 0.11.1 configuration through a reload-harness start stays declarativ
       expect(run.startDetection()).toBe(true)
       const cp = run.checkpoint()
       await run.ticks.ticks(3)
-      expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+      expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, writes: [h.lastAppliedWrite()] })
       expect(h.pendingExists()).toBe(false)
       expectDeclarativeAndUnchanged(h, run, fixture.bytes)
       expect(run.slackPosts()).toEqual([])
@@ -621,10 +621,12 @@ describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-ab
       expect(preview).toEqual([
         `${PENDING_PREVIEW_TITLE} ${renderChangePlanCounts({ ...NO_COUNTS, inPlace: 1 })}.`,
         startingWith(`persona ${renderPersonaRef(name, h.key(name))}: ${edit.settings.join(', ')} changed: `),
+        ...h.reviewLines(),
       ])
       expect(run.lastPreviewText()).toEqual(preview)
       expect(run.previewEmissionCount()).toBe(1)
       expect(run.since(beforeConfirm).lifecycle).toEqual([])
+      expect(run.slackPosts()).toEqual([])
       expect(preview!.filter((line) => CHANNEL_MODES.some((mode) => line.startsWith(modeSwitchLineHead(mode))))).toEqual([])
       expect(termHits([h.readPendingText()!])).toEqual({})
       expectNoTerms(run, RELOAD_PREVIEW)

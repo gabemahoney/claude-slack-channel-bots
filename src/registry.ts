@@ -101,6 +101,9 @@ export interface SessionEntry {
   cwd: string
   /** Key of the persona this session is matched to; empty on a pending stub until promotion */
   personaKey: string
+  /** Shared authority life captured at registration; a key or cwd alone
+   * cannot give an old MCP session access to a replacement. */
+  personaIncarnation?: string
   /** MCP transport for this session */
   transport: WebStandardStreamableHTTPServerTransport
   /** MCP Server instance for this session */
@@ -378,6 +381,7 @@ export function registerSession(
   personaKey: string,
   transportOrPendingId: WebStandardStreamableHTTPServerTransport | string,
   server?: Server,
+  personaIncarnation?: string,
 ): SessionEntry {
   let transport: WebStandardStreamableHTTPServerTransport
   let resolvedServer: Server
@@ -415,6 +419,8 @@ export function registerSession(
     // (e.g. tool handlers in createSessionServer) see the updated values.
     stub.cwd = cwd
     stub.personaKey = personaKey
+    if (personaIncarnation !== undefined) stub.personaIncarnation = personaIncarnation
+    else delete stub.personaIncarnation
     stub.transport = transport
     stub.server = resolvedServer
     stub.connected = true
@@ -424,6 +430,7 @@ export function registerSession(
     entry = {
       cwd,
       personaKey,
+      ...(personaIncarnation !== undefined ? { personaIncarnation } : {}),
       transport,
       server: resolvedServer,
       connected: true,
@@ -709,7 +716,7 @@ export interface SessionToolDeps {
  */
 export type SessionChannelDeliveryStore = Pick<
   ChannelDeliveryStore,
-  'path' | 'readable' | 'storedChoice' | 'storedChannels' | 'set' | 'isRetiring'
+  'path' | 'readable' | 'storedChoice' | 'storedChannels' | 'set' | 'isRetiring' | 'incarnation'
 >
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1194,12 @@ export function createSessionServer(
   deps: SessionToolDeps,
 ): Server {
   const { assertSendable, getReplySettings, getPersona, clientFor, resolveUserName, inboxDir, consumeAck } = deps
+  const currentSessionLife = (): boolean => {
+    const store = deps.getChannelDelivery?.()
+    return !store || (!store.isRetiring(entry.personaKey) &&
+      entry.personaIncarnation !== undefined && entry.personaIncarnation === store.incarnation(entry.personaKey) &&
+      getSessionByPersona(entry.personaKey) === entry)
+  }
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: '0.1.0' },
@@ -1434,6 +1447,14 @@ export function createSessionServer(
         if (kind === 'user') {
           const opened = await openDmConversation(name, persona, web, chatId)
           if (!opened.ok) return toolError(opened.message)
+          const current = getPersona(persona.key)
+          if (!current || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, persona.key))
+          const mode = deps.getChannelMode?.() ?? 'strict'
+          for (const target of [chatId, opened.id]) {
+            const scope = checkPersonaTarget(current, target, 'post', mode)
+            if (!scope.allowed) return toolError(scope.message)
+          }
+          persona = current
           dm.opened = opened.id
           where = `${opened.id} (the DM with ${chatId})`
           chatId = opened.id
@@ -1697,7 +1718,7 @@ export function createSessionServer(
     const persona = getPersona(key)
     if (!persona) return toolError(personaNotAppliedRefusal(name, key))
     const store = deps.getChannelDelivery?.()
-    if (store?.isRetiring(key) === true) return toolError(personaNotAppliedRefusal(name, key))
+    if (!currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
     if (getSessionByPersona(key) !== entry) return toolError(personaNotAppliedRefusal(name, key))
 
     // rules, in order; the first broken gives the error.
@@ -1764,9 +1785,10 @@ export function createSessionServer(
     // The calling instance's persona, resolved now (not at session creation).
     const key = entry.personaKey
     if (!key) return toolError(sessionNotMatchedRefusal(name))
-    const persona = getPersona(key)
-    if (!persona) return toolError(personaNotAppliedRefusal(name, key))
+    if (!getPersona(key) || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
     if (name === 'reply') await deps.onReplyCall?.(key)
+    const persona = getPersona(key)
+    if (!persona || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
     // The channel mode, read now with the persona.
     const mode: ChannelMode = deps.getChannelMode?.() ?? 'strict'
 

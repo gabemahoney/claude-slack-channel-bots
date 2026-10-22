@@ -308,7 +308,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             return
           }
           if (!config || !persona) return
-          if (deps.getChannelDelivery?.()?.readable === false) { storeFailed = true; return }
+          const choices = deps.getChannelDelivery?.()
+          if ((choices?.readableFor?.(key, slackKey?.chat_id) ?? choices?.readable) === false) { storeFailed = true; return }
           const identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
           const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel))
           const path = fungiblePathOf(decision)

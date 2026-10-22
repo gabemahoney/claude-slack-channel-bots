@@ -1,3 +1,4 @@
+import { reviewLedger } from '../src/reload-review.ts'
 /** Startup, confirmed application and reopen use the same durable shared authority. */
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import * as nodeFs from 'node:fs'
@@ -9,7 +10,7 @@ import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
 import { errnoSuffix } from '../src/persona-credentials.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { channelPopulation, configBytes } from './test-helpers/shared-channels.ts'
+import { activationRecord, applicationState, channelPopulation, configBytes } from './test-helpers/shared-channels.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { slackInput } from './test-helpers/delivery-queue.ts'
 let h: ReloadHarness
@@ -29,8 +30,8 @@ test('shared transaction order reservations reject invalid spans before callback
     expect(authority.transact(authority.revision, () => { callbacks++ }, span).kind).toBe('failed')
     expect(callbacks).toBe(0)
     expect(writes).toBe(initialWrites)
-    expect(authority.snapshot()).toEqual(before)
-    expect(disk()).toEqual(before)
+    expect(applicationState(authority.snapshot())).toEqual(applicationState(before))
+    expect(applicationState(disk())).toEqual(applicationState(before))
   }
   const orders: number[] = []
   const record = (next: ReturnType<typeof authority.snapshot>, order: number) => {
@@ -41,7 +42,7 @@ test('shared transaction order reservations reject invalid spans before callback
   expect(authority.transact(authority.revision, record, 3).kind).toBe('applied')
   expect(orders).toEqual([before.revision + 1, before.revision + 4])
   expect(writes).toBe(initialWrites + 2)
-  expect(disk()).toEqual(authority.snapshot())
+  expect(applicationState(disk())).toEqual(applicationState(authority.snapshot()))
   expect(disk().pendingIntent).toEqual({ reservedOrder: before.revision + 4 })
 })
 
@@ -53,8 +54,8 @@ test.each(['removal', 'replacement'] as const)('%s write failure after retiremen
   let fail = false, preparedRetirement = false
   const run = await start({
     stopDelivery: key => { stopped.push(key); return engine!.engine.forget(key) },
-    beforeWrite: path => {
-      if (fail && path === h.paths.lastApplied) {
+    beforeWrite: (path, next) => {
+      if (fail && path === h.paths.lastApplied && activationRecord(next, path)) {
         preparedRetirement = run.retiredKeys.isRecorded(h.key('alpha'))
         h.failWrites({ step: 'writeSync', code: 'ENOSPC' })
         fail = false
@@ -89,7 +90,7 @@ test.each(['removal', 'replacement'] as const)('%s write failure after retiremen
   expect(run.retiredKeys.keys()).toEqual([])
   expect(run.since(cp).lifecycle).toEqual([])
   expect(run.appliedConfigs).toEqual([])
-  expect(disk()).toEqual(previous)
+  expect(applicationState(disk())).toEqual(applicationState(previous))
   expect(h.readConfig()).toEqual(bytes)
   expect(h.readApply()).toEqual(confirmation)
   assertNoLeak(run.captured())
@@ -106,7 +107,7 @@ test.each(['removal', 'replacement'] as const)('%s write failure after retiremen
   await engine.cleanup(); engines = []
   await run.stop()
   const reopened = await start()
-  expect(reopened.controller.sharedChannels()!.snapshot()).toEqual(previous)
+  expect(applicationState(reopened.controller.sharedChannels()!.snapshot())).toEqual(applicationState(previous))
   expect(h.readConfig()).toEqual(bytes)
   expect(h.readApply()).toEqual(confirmation)
   expect(reopened.queue.openCount('alpha')).toBe(0)
@@ -130,23 +131,23 @@ test.each(['retirement', 'publication'] as const)('shutdown during %s preserves 
   authority.subscribe(() => { if (armed && phase === 'publication') run.controller.stopDetection() })
   const cp = run.checkpoint(); armed = true
   await run.ticks.tick()
-  expect(stopped).toEqual([])
+  expect(stopped).toEqual(phase === 'publication' ? ['alpha'] : [])
   expect(run.since(cp).lifecycle).toEqual([])
-  expect(run.appliedConfigs.slice(notificationsBefore)).toEqual([])
+  expect(run.appliedConfigs.slice(notificationsBefore)).toEqual(phase === 'publication' ? [authority.config()] : [])
   expect(authority.config().channel_mode).toBe(phase === 'retirement' ? 'strict' : 'open')
   expect(run.controller.applied()!.config).toEqual(authority.config())
   expect(run.retiredKeys.keys()).toEqual(phase === 'retirement' ? [] : [h.key('alpha')])
   expect(authority.snapshot().pendingIntent).toEqual(before.pendingIntent)
   expect(h.readConfig()).toEqual(bytes)
   if (phase === 'retirement') {
-    expect(authority.snapshot()).toEqual(before)
+    expect(applicationState(authority.snapshot())).toEqual(applicationState(before))
     expect(h.readApply()).toEqual(confirmation)
   }
   assertNoLeak(run.captured())
   await run.stop()
   const reopened = await start()
   expect(reopened.controller.applied()!.config.channel_mode).toBe(phase === 'retirement' ? 'strict' : 'open')
-  expect(reopened.controller.sharedChannels()!.snapshot()).toEqual(authority.snapshot())
+  expect(applicationState(reopened.controller.sharedChannels()!.snapshot())).toEqual(applicationState(authority.snapshot()))
   expect(h.readConfig()).toEqual(bytes)
 })
 
@@ -214,7 +215,7 @@ test('post-read stat failure safely refuses startup and a later reload without l
   await run.ticks.tick()
   expect(h.readPendingText()).toContain('INVALID')
   expect(h.readPendingText()).toContain('EIO')
-  expect(disk()).toEqual(before)
+  expect(applicationState(disk())).toEqual(applicationState(before))
   expect(h.readConfig()).toEqual(bytes)
   expect(run.appliedConfigs).toEqual([])
   expect(opened.size).toBe(0)
@@ -236,7 +237,7 @@ test('post-read stat failure safely refuses startup and a later reload without l
   const reopened = await start()
   expect(reopened.controller.applied()!.config.channel_mode).toBe('strict')
   expect(reopened.controller.applied()!.config.personas[0]!.permission_prompts).toBe(alpha.permission_prompts)
-  expect(readFileSync(h.paths.lastApplied)).toEqual(before)
+  expect(applicationState(readFileSync(h.paths.lastApplied))).toEqual(applicationState(before))
   await reopened.ticks.tick()
   expect(h.readPending()).toBeDefined()
   assertNoLeak(reopened.captured())
@@ -268,9 +269,9 @@ test('post-read stat failure safely refuses startup and a later reload without l
   await run.ticks.tick()
   expect(run.since(cp).lifecycle).toEqual([])
   expect(run.appliedConfigs).toEqual([])
-  expect(authority.snapshot()).toEqual(choices)
+  expect(applicationState(authority.snapshot())).toEqual(applicationState(choices))
   expect(authority.config().personas[0]!.channels).toEqual(channelPopulation(1000))
-  expect(readFileSync(h.paths.lastApplied)).toEqual(before)
+  expect(applicationState(readFileSync(h.paths.lastApplied))).toEqual(applicationState(before))
   expect(h.readConfig()).toEqual(prepared)
   expect(h.readApply()).toEqual(confirmation)
   expect(run.logsOf('reload-record-write-failed')).toEqual([
@@ -282,16 +283,17 @@ test('post-read stat failure safely refuses startup and a later reload without l
   await run.ticks.tick()
   expect(run.since(retry).writes).toEqual([])
   expect(run.since(retry).lifecycle).toEqual([])
-  expect(authority.snapshot()).toEqual(choices)
+  expect(applicationState(authority.snapshot())).toEqual(applicationState(choices))
   expect(h.readConfig()).toEqual(prepared)
   expect(h.readApply()).toEqual(confirmation)
   assertNoLeak(run.captured())
   await run.stop()
   const recovery = await start()
-  expect(recovery.controller.sharedChannels()!.snapshot()).toEqual(choices)
+  expect(applicationState(recovery.controller.sharedChannels()!.snapshot())).toEqual(applicationState(choices))
   expect(h.readApply()).toEqual(confirmation)
   expect(h.readConfig()).toEqual(prepared)
-  // Startup retains the failed prepared gesture and previous authority; make the fresh confirming rename before the next detection tick.
+  // Startup retains evidence, then its first tick supersedes the old review.
+  await recovery.ticks.tick()
   expect(h.readPending()).toBeDefined()
   assertNoLeak(recovery.captured())
   h.confirm()
@@ -313,7 +315,13 @@ test('post-read stat failure safely refuses startup and a later reload without l
  test.each(['before', 'after'] as const)('interruption %s durable activation retains trustworthy state and prepared input', async when => {
   const alpha = h.persona('alpha'); h.materialize(alpha)
   h.writeConfig({ personas: [alpha] })
-  const run = await start()
+  let armed = false
+  const run = await start({ beforeWrite: (path, bytes) => {
+    if (armed && path === h.paths.lastApplied && activationRecord(bytes, path)) {
+      armed = false
+      h.failWrites(when === 'before' ? { step: 'writeSync', code: 'ENOSPC', call: 1 } : { step: 'fsyncSync', call: 2, code: 'EIO' })
+    }
+  } })
   const authority = run.controller.sharedChannels()!
   const incarnation = authority.incarnation(h.key('alpha'))!
   expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'review' }; next.outcomes = { prior: 'retained' } }).kind).toBe('applied')
@@ -322,11 +330,10 @@ test('post-read stat failure safely refuses startup and a later reload without l
   await run.ticks.tick()
   h.confirm()
   const confirmation = h.readApply()!
-  if (when === 'before') h.failWrites({ step: 'writeSync', code: 'ENOSPC' })
-  else h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
+  armed = true
   await run.ticks.tick()
   expect(authority.config().channel_mode).toBe('strict')
-  expect(authority.snapshot()).toEqual(before)
+  expect(applicationState(authority.snapshot())).toEqual(applicationState(before))
   expect(h.readApply()).toEqual(confirmation)
   expect(h.readConfig()).toBeDefined()
   expect(h.readPending() ?? h.readApply()).toBeDefined()
@@ -337,7 +344,8 @@ test('post-read stat failure safely refuses startup and a later reload without l
   expect(reopened.controller.sharedChannels()!.incarnation(h.key('alpha'))).toBe(incarnation)
   expect(reopened.controller.applied()!.config.channel_mode).toBe(when === 'before' ? 'strict' : 'open')
   expect(disk().pendingIntent).toEqual(before.pendingIntent)
-  expect(disk().outcomes).toEqual(before.outcomes)
+  expect(disk().outcomes.prior).toEqual(before.outcomes.prior)
+  expect(Object.values(reviewLedger(disk())!.outcomes).some(outcome => outcome.status === (when === 'before' ? 'rejected' : 'consumed'))).toBe(true)
  })
 
  test('a same-value assignment invalidates an older confirmation and never replays a copied source preference', async () => {
@@ -423,7 +431,7 @@ test('post-read stat failure safely refuses startup and a later reload without l
   expect(authority.choice(key, channel)).toBe('mentions')
   assertNoLeak(run.captured())
   await (await run.confirmPending()).applying
-  expect(authority.revision).toBe(revision + 1)
+  expect(authority.revision).toBe(revision + 4)
   expect(authority.snapshot().personas[key]!.assignments[channel]).toEqual(assignment)
   expect(authority.sourceBytes()).toEqual(bytes)
   expect(Buffer.from(disk().sourceBytesBase64, 'base64')).toEqual(bytes)
@@ -517,10 +525,10 @@ test.each(removedSettings.flatMap(setting => (['strict', 'open'] as const).map(m
     assertNoLeak(run.captured())
     h.confirm()
     await run.ticks.tick()
-    expect(run.logsOf('reload-invalid').at(-1)).toBe(`[slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: ${error}`)
+    expect(run.logsOf('reload-invalid')).toContain(`[slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: ${error}`)
     expect(run.controller.applied()).toBe(applied)
-    expect(authority.snapshot()).toEqual(choices)
-    expect(readFileSync(h.paths.lastApplied)).toEqual(before)
+    expect(applicationState(authority.snapshot())).toEqual(applicationState(choices))
+    expect(applicationState(readFileSync(h.paths.lastApplied))).toEqual(applicationState(before))
     expect(h.readConfig()).toEqual(prepared)
     expect(h.readPendingText()).toContain(removalDetail(setting))
     expect(run.since(cp).lifecycle).toEqual([])

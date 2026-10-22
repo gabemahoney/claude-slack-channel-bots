@@ -1850,14 +1850,12 @@ check_pending_layout() {
 }
 
 # One poll of hold_not_applied (0 while nothing is applied): the record
-# keeps the inode and bytes it had when the hold began, the reload-applied
+# keeps its applied facts and pending intent when review metadata changes; the reload-applied
 # count is unchanged, and the extra command, if any, holds.
 _scenario_hold_ok() {
-    local record="$1" snapshot="$2" inode="$3" applied="$4"; shift 4
-    [[ "$(stat -c '%i' "${record}" 2>/dev/null || true)" == "${inode}" ]] || {
-        _SCENARIO_HOLD_WHY="config.json.last-applied was rewritten"; return 1; }
-    cmp -s -- "${snapshot}" "${record}" || {
-        _SCENARIO_HOLD_WHY="config.json.last-applied changed"; return 1; }
+    local record="$1" snapshot="$2" applied="$3"; shift 3
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved "${SLACK_STATE_DIR}/config.json" "${snapshot}" "${record}" || {
+        _SCENARIO_HOLD_WHY="config.json.last-applied application or intent changed"; return 1; }
     (( $(count_log '[slack] reload-applied:') == applied )) || {
         _SCENARIO_HOLD_WHY="a reload-applied line was logged"; return 1; }
     if (( $# > 0 )) && ! "$@"; then
@@ -1870,20 +1868,19 @@ hold_not_applied() {
     local hold_s="$1" step="$2"; shift 2
     local record="${SLACK_STATE_DIR}/config.json.last-applied"
     local pending="${SLACK_STATE_DIR}/config.json.pending"
-    local snapshot="${SCENARIO_ROOT}/hold.last-applied" inode applied deadline
+    local snapshot="${SCENARIO_ROOT}/hold.last-applied" applied deadline
     _scenario_check_timeout "${hold_s}" "${step}"
     [[ -f "${record}" ]] || fail "${step}: ${record} is missing at the start of the hold"
     cp -- "${record}" "${snapshot}" || fail "${step}: could not snapshot ${record}"
-    inode="$(stat -c '%i' "${record}")" || fail "${step}: could not stat ${record}"
     applied="$(count_log '[slack] reload-applied:')"
     _SCENARIO_HOLD_WHY=""
     deadline=$(( $(_scenario_now_ms) + hold_s * 1000 ))
     while (( $(_scenario_now_ms) < deadline )); do
-        _scenario_hold_ok "${record}" "${snapshot}" "${inode}" "${applied}" "$@" \
+        _scenario_hold_ok "${record}" "${snapshot}" "${applied}" "$@" \
             || fail "${step}: ${_SCENARIO_HOLD_WHY} before a confirmation"
         sleep "${SCENARIO_POLL_S}"
     done
-    _scenario_hold_ok "${record}" "${snapshot}" "${inode}" "${applied}" "$@" \
+    _scenario_hold_ok "${record}" "${snapshot}" "${applied}" "$@" \
         || fail "${step}: ${_SCENARIO_HOLD_WHY} before a confirmation"
     [[ -e "${pending}" ]] || fail "${step}: config.json.pending vanished before a confirmation"
 }
@@ -5711,4 +5708,44 @@ wait_membership_complete() {
     local persona="$1" route
     route="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" MEMBERSHIP_READINESS_ROUTE)" || fail 'cannot print membership readiness route'
     wait_until 30 "authenticated inventory did not complete for ${persona}" _scenario_membership_complete "${persona}" "${route}"
+}
+
+# An explicit operator request precedes its separate rename confirmation.
+# Wait for this exact request's generation in the server-written preview.
+configuration_request() {
+    require_ci_image "configuration_request"
+    require_scenario_state "configuration_request"
+    local id="$1" action="$2"; shift 2
+    local config="${SLACK_STATE_DIR}/config.json"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" operatorReviewRequest "${config}" "${config}.last-applied" "${id}" "${action}" "$@" > "${config}.request.tmp" \
+        || fail 'cannot build the operator request'
+    mv -- "${config}.request.tmp" "${config}.request"
+    wait_until 30 'operator request has no current pending review' \
+        bun "${SCENARIO_FIXTURES}/fmk-texts.ts" operatorReviewPending "${config}" "${config}.last-applied" "${config}.pending" "${id}"
+}
+
+# Shared-mode scenarios retain the container HOME. This request-only guard
+# fences every file the printer reads or the publisher writes to scratch state.
+require_scenario_state() {
+    local step="${1:-require_scenario_state}" real_root real_state name path
+    [[ -n "${SCENARIO_ROOT:-}" && -d "${SCENARIO_ROOT}" ]] \
+        || fail "${step}: refused: SCENARIO_ROOT is not a directory"
+    [[ -n "${SLACK_STATE_DIR:-}" && "${SLACK_STATE_DIR}" == "${SCENARIO_ROOT}"/* && -d "${SLACK_STATE_DIR}" ]] \
+        || fail "${step}: refused: state directory is not under SCENARIO_ROOT"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: refused: cannot resolve SCENARIO_ROOT"
+    real_state="$(realpath -e -- "${SLACK_STATE_DIR}" 2> /dev/null)" \
+        || fail "${step}: refused: cannot resolve state directory"
+    [[ "${real_state}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: state directory resolves outside SCENARIO_ROOT"
+    for name in config.json config.json.last-applied config.json.pending config.json.request config.json.request.tmp; do
+        path="${SLACK_STATE_DIR}/${name}"
+        [[ ! -L "${path}" && ( ! -e "${path}" || -f "${path}" ) ]] \
+            || fail "${step}: refused: request files must be regular files, never symlinks"
+    done
+}
+
+# Pending requests/review history may advance; these applied facts may not.
+configuration_application_preserved() {
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedApplicationPreserved "$@"
 }

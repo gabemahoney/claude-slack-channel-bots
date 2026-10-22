@@ -22,6 +22,7 @@ import {
   askAndWait,
   bot,
   checkPreview,
+  checkPreviewLog,
   checkStartLines,
   confirmedEdit,
   countsText,
@@ -257,7 +258,7 @@ export const check25: CheckDef<CheckContext> = {
     }
     f.expect(!(await fileExists(ctx, '"$S/config.json.apply"')), 'config.json.apply exists before the rename')
     const pl = await sinceGrepE(ctx, m, 'reload-(preview|invalid):')
-    f.expect(pl.length === 2 && (pl[0] ?? '').endsWith(` (preview in "${S}/config.json.pending")`), 'the reload-preview lines are not the two expected ones')
+    checkPreviewLog(f, pending, pl)
     f.expect((await lines(ctx, `since ${q(m)} | grep -F '(key=persona_d)' | grep -vF 'reload-preview:'`)).length === 0, 'D was named outside the preview before the confirmation')
     f.expect((await lines(ctx, 'tokcount "$S/config.json" "$S/config.json.pending"'))[0] === '0', 'token-shaped text in config.json or the pending file')
     f.expect((await lines(ctx, `since ${q(m)} | grep -cE 'xox[a-z]-[0-9]|xapp-[0-9]'`))[0] === '0', 'token-shaped text in the log')
@@ -349,11 +350,11 @@ export const check27: CheckDef<CheckContext> = {
     f.note(`Check 27 step 2: ${promptTs ? `ran (prompt ${promptTs} in D-home)` : 'ran, but D raised no prompt in time'}`)
 
     const preview = [previewHeader({ removed: 1 }), removedPreviewLine('d')]
-    await confirmedEdit(ctx, f, m, 'del(.personas[] | select(.name == "persona_d"))', preview)
+    const edit = await confirmedEdit(ctx, f, m, 'del(.personas[] | select(.name == "persona_d"))', preview)
     const names = await lines(ctx, `jq -r '.personas[].name' "$S/config.json"`)
     f.expect(JSON.stringify(names) === JSON.stringify(['persona_a', 'persona_b', 'persona_c']), 'config.json does not name exactly A, B and C')
     const pl = await sinceGrep(ctx, m, '[slack] reload-preview: ')
-    f.expect(pl.length === 2, 'the reload-preview lines are not the two expected ones')
+    checkPreviewLog(f, edit.pending, pl)
     await waitLog(ctx, m, '[slack] persona teardown of "persona_d" (key=persona_d): complete', 30 * SECOND)
     const step6 = await sinceGrepE(ctx, m, 'reload-(applied|noop|stale-confirmation|invalid):|persona-start:|at apply|spawnForPersona|Session (connected|disconnected)|persona teardown|updated in place')
     f.expect(step6.some((l) => l.includes('[slack] persona teardown of "persona_d" (key=persona_d): starting')), 'no teardown starting line for D')
@@ -441,7 +442,7 @@ export const check28: CheckDef<CheckContext> = {
     if (f.expect(p2 !== null, 'step 2: no pending file for the credentials change')) {
       checkPreview(f, p2!, [previewHeader({ credentials: 1 }), credsLine])
     }
-    f.expect((await sinceGrep(ctx, m1, '[slack] reload-preview: ')).length === 2, 'step 2: not two reload-preview lines')
+    checkPreviewLog(f, p2, await sinceGrep(ctx, m1, '[slack] reload-preview: '))
     f.expect((await sinceGrepE(ctx, m1, 'persona-start:|Session disconnected|persona teardown|reload-applied')).length === 0, 'step 2: something was applied')
     f.expect((await lines(ctx, 'tokcount "$S/config.json.pending"'))[0] === '0', 'step 2: token-shaped text in the pending file')
     const still = await askAndWait(ctx, ids.coordination, `${mention(ctx, 'b')} reply with the word still-here.`, 'b', 'still-here')

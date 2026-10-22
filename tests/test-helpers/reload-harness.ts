@@ -1,3 +1,7 @@
+import { buildChangePlan, reviewedChannelLine } from '../../src/reload-plan.ts'
+import { resolveRealPath } from '../../src/config.ts'
+import { reviewIntentLine } from '../../src/reload-request.ts'
+import { buildReviewRequest, composeReviewRequest, REVIEW_REQUEST_SUFFIX, type ReviewRequest, type OperatorAssignment } from '../../src/reload-request.ts'
 import { createChannelMembership, type ChannelMembership } from '../../src/channel-membership.ts'
 import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from '../../src/channel-membership-scan.ts'
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
@@ -771,6 +775,8 @@ export type DurableWriteStep = keyof DurableWriteFs
 
 /** An injected write failure: every call of `step` (or only its `call`-th) throws an error with `code`. */
 export interface WriteFailure {
+  /** Limit injection and call counting to this destination. */
+  path?: string
   step: DurableWriteStep
   /** An errno code such as `EIO`, `ENOSPC` or `EROFS`. */
   code: string
@@ -935,6 +941,9 @@ export interface PreparedPersonaState {
 // ---------------------------------------------------------------------------
 
 export interface ReloadRunOptions {
+  /** Actual MCP callbacks, held independently of the reload transaction. */
+  onReplyCall?: SessionToolDeps['onReplyCall']
+  consumeAck?: SessionToolDeps['consumeAck']
   /** Dry run, passed as a flag to the connection manager and the bring-up controller. */
   dryRun?: boolean
   /** Per-persona-name stub options (scripted Slack outcomes); the leak marker is always on. */
@@ -1025,7 +1034,8 @@ export interface ReloadRunOptions {
    * record, the pending file, the retired-key record, the stored-choice
    * file), e.g. to observe what exists when the record is written.
    */
-  beforeWrite?: (path: string) => void
+  beforeWrite?: (path: string, bytes: Uint8Array) => void
+  afterWrite?: (path: string, bytes: Uint8Array) => void
   /**
    * A server stop (a crash) just before the run's writer is first called for
    * this path (e.g. `h.paths.lastApplied`, to stop between apply step 1's
@@ -1039,7 +1049,7 @@ export interface ReloadRunOptions {
    * `run.stoppedBeforeWrite` says whether the stop point was reached. A run
    * that reached it must be stopped before the next run is built.
    */
-  stopBeforeWrite?: string
+  stopBeforeWrite?: string | ((path: string, bytes: Uint8Array) => boolean)
 }
 
 /** A run's latch, read-only: the latched query and the record. */
@@ -1056,6 +1066,8 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
+  /** Write a real operator request; a later tick records it. */
+  request(action: ReviewRequest['action'], assignments?: OperatorAssignment[], requestId?: string): ReviewRequest
   queue: ReturnType<typeof createDeliveryQueue>
   queueEvents: QueueEvent[]
   queued(name: string): QueueItem[]
@@ -1411,6 +1423,11 @@ export interface ReloadHarnessOptions {
 export type ReloadPersonaFiles = Pick<PersonaInput, 'name' | 'credentials_file' | 'working_directory'>
 
 export interface ReloadHarness {
+  /** Pure production review suffix for controller assertions; literal wording belongs to reload-preview.test.ts. */
+  reviewLines(): string[]
+  readonly requestPath: string
+  writeRequest(request: ReviewRequest): Buffer
+  writeRequestBytes(bytes: Uint8Array | string): Buffer
   /** The `mkdtempSync` root (real path); every other path is under it. */
   readonly root: string
   /** The configuration directory: only the files live here. */
@@ -1675,6 +1692,7 @@ function injectedWriteError(failure: WriteFailure): Error {
 /** A `DurableWriteFs` over the real calls, each failing while the armed failure names it. */
 interface FailureSeam {
   readonly fs: DurableWriteFs
+  forPath(path: string): DurableWriteFs
   fail(failure?: Partial<WriteFailure>): void
   clear(): void
 }
@@ -1694,7 +1712,9 @@ function makeFailureSeam(defaultStep: DurableWriteStep): FailureSeam {
     }
   }
 
-  return {
+  const direct: DurableWriteFs = { openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync }
+  const seam: FailureSeam = {
+    forPath(path) { return failure?.path && failure.path !== path ? direct : seam.fs },
     fs: {
       openSync: seamCall('openSync', (path: string, flags: string) => openSync(path, flags)),
       writeSync: seamCall('writeSync', (fd: number, buffer: Uint8Array, offset: number, length: number) =>
@@ -1706,13 +1726,14 @@ function makeFailureSeam(defaultStep: DurableWriteStep): FailureSeam {
       unlinkSync: seamCall('unlinkSync', (path: string) => unlinkSync(path)),
     },
     fail(f = {}) {
-      failure = { step: f.step ?? defaultStep, code: f.code ?? 'EIO', call: f.call }
+      failure = { step: f.step ?? defaultStep, code: f.code ?? 'EIO', call: f.call, path: f.path }
       failingStepCalls = 0
     },
     clear() {
       failure = undefined
     },
   }
+  return seam
 }
 
 /** Build the harness described in the file comment. */
@@ -2640,28 +2661,29 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // The run's writer path over one failure seam: every writer call is
     // recorded in `writes`, in order, and passes `opts.beforeWrite` and
     // `opts.stopBeforeWrite`, whichever seam it goes through.
-    const writerOver = (fs: DurableWriteFs) => (path: string, bytes: Uint8Array): void => {
-      if (stopImage === undefined && runOpts.stopBeforeWrite === path) {
+    const writerOver = (seam: FailureSeam) => (path: string, bytes: Uint8Array): void => {
+      if (stopImage === undefined && (typeof runOpts.stopBeforeWrite === 'function' ? runOpts.stopBeforeWrite(path, bytes) : runOpts.stopBeforeWrite === path)) {
         stopImage = diskImage()
         runsStoppedBeforeWrite.add(run)
       }
-      runOpts.beforeWrite?.(path)
+      runOpts.beforeWrite?.(path, bytes)
       try {
-        durableWriteFileSync(path, bytes, fs)
+        durableWriteFileSync(path, bytes, seam.forPath(path))
       } catch (err) {
         writes.push({ path, ok: false })
         throw err
       }
       writes.push({ path, ok: true })
+      runOpts.afterWrite?.(path, bytes)
     }
     // The run's writer and delete: the controller's, and the retired-key
     // store's, so both reach the disk through the same seams and records.
-    const write = writerOver(writeSeam.fs)
+    const write = writerOver(writeSeam)
     // The stored-choice store's writer: the same writer
     // path, over its own failure seam (`h.failChannelDeliveryWrites`), so
     // `h.failWrites` never fails a stored-choice write and neither seam
     // counts the other's calls.
-    const writeChannelDelivery = writerOver(channelDeliveryWriteSeam.fs)
+    const writeChannelDelivery = writerOver(channelDeliveryWriteSeam)
     const remove = (path: string): boolean => {
       let removed: boolean
       try {
@@ -2708,6 +2730,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         !dryRun && !stopped && isPersonaUp(key) && membership?.read(key, channel, 'open').kind === 'eligible')
     }
     controller = createReloadController({
+      now: () => connections.clock.now(),
+      membership: () => membership,
       stopDelivery: runOpts.stopDelivery ?? (async () => {}),
       queueOpenCount: queue.openCount,
       onQueueRetained: key => queue.retained(key),
@@ -2827,7 +2851,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       clientFor,
       inboxDir: join(root, 'inbox'),
       resolveUserName,
-      consumeAck,
+      onReplyCall: runOpts.onReplyCall,
+      consumeAck: runOpts.consumeAck ?? consumeAck,
       serverPort: 0,
       // As server.ts binds them, each read
       // at call time over the run's own objects: the channel mode of the
@@ -2855,7 +2880,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         notificationsByKey.set(key, captured)
       }
       const cwd = getAppliedPersona(key)?.working_directory ?? join(root, 'sessions', key)
-      return registerSession(cwd, key, makeTransport(`mcp-${key}-${++sessionSeq}`), makeSessionServer(captured))
+      return registerSession(cwd, key, makeTransport(`mcp-${key}-${++sessionSeq}`), makeSessionServer(captured), controller.sharedChannels()?.incarnation(key))
     }
 
     /**
@@ -2950,6 +2975,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           content: Array<{ type: string; text?: string }>
         }
         return { isError: result.isError === true, text: result.content.map((c) => c.text ?? '').join('\n') }
+      },
+      request(action, assignments = [], requestId = `fixture-request-${++nextRequestId}`) {
+        const request = buildReviewRequest(requestId, controller.sharedChannels()!.operatorIntent().generation, action, assignments)
+        h.writeRequest(request)
+        return request
       },
       appliedConfigs,
       appliedKeys: () => controller.applied()?.config.personas.map((p) => p.key),
@@ -3260,6 +3290,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     }
   }
 
+  let nextRequestId = 0
   const h: ReloadHarness = {
     root,
     dir,
@@ -3300,6 +3331,23 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return launchStartedAt === undefined ? read : { ...read, launchStartedAt }
     },
     paths,
+    reviewLines() {
+      const run = runs.at(-1)!
+      const authority = run.controller.sharedChannels()!
+      const bytes = h.readConfig()!
+      const reviewed = authority.planReviewed(bytes, authority.declaredAssignments(bytes))
+      const plan = buildChangePlan(authority.config(), { kind: 'valid', config: reviewed.config }, {
+        realPath: resolveRealPath, home, dryRun: true,
+        sharedReview: { generation: authority.operatorIntent().generation, channels: reviewed.channels },
+        membership: (key, channel, mode) => run.membership.read(key, channel, mode),
+      })
+      if (!plan.valid || !plan.sharedReview) throw new Error('expected a valid shared review')
+      return [reviewIntentLine(plan.sharedReview.generation, plan.sharedReview.channels.filter(c => c.kind === 'declared').length),
+        ...plan.sharedReview.channels.map(reviewedChannelLine)]
+    },
+    requestPath: paths.config + REVIEW_REQUEST_SUFFIX,
+    writeRequest: request => writeBytes(paths.config + REVIEW_REQUEST_SUFFIX, composeReviewRequest(request)),
+    writeRequestBytes: bytes => writeBytes(paths.config + REVIEW_REQUEST_SUFFIX, bytes),
     retiredKeysFile: retiredKeysPath(stateDir),
     retiredKeysWrite: (ok = true) => ({ path: retiredKeysPath(stateDir), ok }),
     lastAppliedWrite: (ok = true) => ({ path: paths.lastApplied, ok }),

@@ -460,10 +460,11 @@ Explain the case that matches Step 3. Link to `docs/reload.md`.
   mv config.json.pending config.json.apply
   ```
 
-  The server applies it without a restart and logs `reload-applied`. If
-  `config.json` or a credentials file changes after the preview was written,
-  the confirmation is stale and ignored (`reload-stale-confirmation`): wait for
-  the new `config.json.pending` and rename again. Do the rename yourself only
+  Successful activation applies the reviewed combination without a restart
+  and logs `reload-applied`. Changed configuration, credentials, intent,
+  persona identity or current membership/choices can supersede the review;
+  reverting content cannot revive it. Read the new `config.json.pending`
+  before confirming again. Do the rename yourself only
   when the operator explicitly directs you to, and then with absolute paths
   and no `cd`:
 
@@ -472,7 +473,14 @@ Explain the case that matches Step 3. Link to `docs/reload.md`.
   ```
 - **Record present, server stopped:** the next start runs the last-applied
   configuration, and the change (a new persona, a changed switch) stays
-  pending. After the start, confirm as above.
+  pending. After recovery and current startup membership validation, read
+  the fresh preview and confirm as above.
+
+For explicit channel assignments, unchanged-value reassertions, replacement
+retention, revision, cancellation and refresh, point the operator to
+[Editing the configuration](../../docs/reload.md#editing-the-configuration).
+The operator writes `config.json.request`; it changes intent only and does not replace the separate
+operator-directed confirming rename. Never edit the authority or a fingerprint.
 
 A change to the channel-mode switch from Step 4 applies in place: once
 confirmed, it takes effect at once, from the next event, tool call, prompt and

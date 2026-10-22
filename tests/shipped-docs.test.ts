@@ -849,8 +849,11 @@ describe('README.md', () => {
     /** The switch's row, found by the switch named in its Change cell. */
     const SWITCH_ROW: Expected = { label: `the switch ${MODE_SWITCH_SETTING}`, find: naming(MODE_SWITCH_SETTING), session: 'Kept', destructive: false }
 
+    /** Shared review also covers same-value assignments, with no ordinary in-place diff. */
+    const SHARED_REVIEW_ROW: Expected = { label: 'reviewed channel assignments', find: naming('channels'), session: 'Kept', destructive: false }
+
     /**
-     * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
+     * One entry per change kind and shared review the plan classifies,
      * the settings expanded from the plan's exported classes. A new kind in the
      * plan fails the typecheck here until it has a README row; a new setting in
      * a class needs its name in that class's row. The plan reports the
@@ -863,6 +866,7 @@ describe('README.md', () => {
       Exclude<keyof ValidChangePlan, 'valid' | 'noEffectiveChange' | 'configDirsChanged' | 'unchanged'>,
       Expected[]
     > = {
+      sharedReview: [SHARED_REVIEW_ROW],
       inPlace: [
         { label: IN_PLACE_SETTINGS.filter(s => s !== 'stop_hook_bootstrap').join(', '), find: naming(...IN_PLACE_SETTINGS.filter(s => s !== 'stop_hook_bootstrap')), session: 'Kept', destructive: false },
         { label: 'stop_hook_bootstrap', find: naming('stop_hook_bootstrap'), session: 'Kept', destructive: false },
@@ -944,16 +948,13 @@ describe('README.md', () => {
     })
 
     /**
-     * Self-checks on edited copies of the README: each of the
-     * two rows this work adds, the switch's and the recorded one, fails its
-     * case when it is removed or duplicated, when its Live session changes,
-     * and when its Once confirmed cell gains `DESTRUCTIVE:`; each leg of the
-     * server-wide exception case (the next server start, the switch, the word
-     * "exception") fails alone when cut from that row; and the recorded row's
-     * `reload-noop` case fails when the label is cut from that row.
+     * Self-checks on edited copies of the reload guide: the switch and shared
+     * review rows each fail when removed, duplicated, given a different live
+     * session effect or marked `DESTRUCTIVE:`. Each server-wide exception
+     * obligation also fails independently when cut from its row.
      */
     describe('self-checks, on edited copies', () => {
-      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW]
+      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW, SHARED_REVIEW_ROW]
 
       /** `text` with `edit` applied to the raw line of the one table row `expected` finds; an edit to '' removes the line. */
       function withRowEdited(text: string, expected: Expected, edit: (line: string) => string): string {

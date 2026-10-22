@@ -63,6 +63,17 @@
  *       Print only the named safe applied setting, never pending input.
  *   sharedAuthorityPreserved <config-path> <before-record> <after-record>
  *       Validate preserved choices, identity and reviewed input across fresh discovery.
+ *   sharedApplicationPreserved <config-path> <before-record> <after-record>
+ *       Preserve the same applied/source/lifetime facts while operator intent changes.
+ *   operatorReviewRequest <config-path> <record-path> <id> <request|revise|refresh|cancel> [name/channel/delivery...]
+ *       Print production request bytes with current generation and target identities.
+ *   operatorReviewPending <config-path> <record-path> <pending-path> <id>
+ *       Require this exact recorded request's current durable review.
+ *   sharedReviewConsumed <config-path> <record-path> <review-path>
+ *       Require the exact review's durable consumed outcome, never inode evidence.
+ *   stoppedDowngradeBaseline <config-path> <record-path>
+ *       Print applied resume=false config only when no operator intent is outstanding.
+ *       Manual stopped fixture transition retains and restores the original authority.
  *   reloadSharedAuthorityStartLine <config-path> <record-path>
  *       Build the production startup line using the validated record revision.
  *   PHASE1_FLOOR_VERSION                         src/ad-version-gate.ts, the Phase 1 floor
@@ -3978,7 +3989,8 @@ async function readSharedConfiguration(context: EntryContext, configPath: string
   const parse = await packageFunction<(bytes: Uint8Array, path: string, deps: { sourcePath: string }) =>
     { sourceBytesBase64: string; revision: number; personas: Record<string, {
       incarnation: string; declaration: unknown; assignments: unknown; leaves: unknown; removedDestinations: unknown;
-      membership: Record<string, { member: boolean; boundary: number; identity: string }>;
+      createdAt?: number; resetOrder?: number; resetDestination?: unknown;
+      membership: Record<string, { member: boolean; boundary: number; identity: string; isExtSharedChannel?: boolean; channelType?: string }>;
       membershipInventory?: { incarnation: string; identity: string };
     }>; retiredIdentities: unknown; pendingIntent?: unknown } | undefined>(context, 'shared-channels.ts', 'parseSharedChannelState')
   const applied = await packageFunction<(state: object, path: string) => { port: number; resume_enabled: boolean }>(
@@ -4016,7 +4028,7 @@ const sharedConfigurationMatches: Entry = {
   },
 }
 
-const sharedAuthorityPreserved: Entry = {
+function preservedAuthorityEntry(includeIntent: boolean): Entry { return {
   synopsis: '<config-path> <before-record> <after-record>',
   async print(args, context) {
     expectArguments('sharedAuthorityPreserved', args, ['config-path', 'before-record', 'after-record'])
@@ -4024,12 +4036,14 @@ const sharedAuthorityPreserved: Entry = {
     const before = await readSharedConfiguration(context, configPath, beforePath)
     const after = await readSharedConfiguration(context, configPath, afterPath)
     const preserved = ({ state, applied }: typeof before) => ({
-      sourceBytesBase64: state.sourceBytesBase64, applied, retiredIdentities: state.retiredIdentities, pendingIntent: state.pendingIntent,
+      sourceBytesBase64: state.sourceBytesBase64, applied, retiredIdentities: state.retiredIdentities, ...(includeIntent ? { pendingIntent: state.pendingIntent } : {}),
       personas: Object.fromEntries(Object.entries(state.personas).map(([key, life]) => [key, {
         incarnation: life.incarnation, declaration: life.declaration, assignments: life.assignments,
         leaves: life.leaves, removedDestinations: life.removedDestinations,
+        createdAt: life.createdAt, resetOrder: life.resetOrder, resetDestination: life.resetDestination,
         membership: Object.fromEntries(Object.entries(life.membership).map(([channel, fact]) => [channel, {
           member: fact.member, boundary: fact.boundary, identity: fact.identity,
+          isExtSharedChannel: fact.isExtSharedChannel, channelType: fact.channelType,
         }])),
         inventoryIdentity: life.membershipInventory && { incarnation: life.membershipInventory.incarnation, identity: life.membershipInventory.identity },
       }])),
@@ -4040,6 +4054,10 @@ const sharedAuthorityPreserved: Entry = {
     return ''
   },
 }
+
+}
+const sharedAuthorityPreserved = preservedAuthorityEntry(true)
+const sharedApplicationPreserved = preservedAuthorityEntry(false)
 
 // sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>:
 // the applied view only, never the pending input or an arbitrary JSON path.
@@ -4058,6 +4076,82 @@ const sharedConfigurationValue: Entry = {
   },
 }
 
+/** The scenario writes this result to config.json.request. All declarations
+ * and grammar come from the installed production modules. */
+const operatorReviewRequest: Entry = {
+  synopsis: '<config-path> <record-path> <request-id> <action> [<persona>/<channel>/<delivery> ...]',
+  async print(args, context) {
+    if (args.length < 4) usageFail('operatorReviewRequest needs config, record, request id and action')
+    const [configPath, recordPath, requestId, action, ...targets] = args
+    const { state, read } = await readSharedConfiguration(context, configPath, recordPath)
+    const parse = await packageFunction<typeof import('../../../src/config.ts').parsePersonaConfigBytes>(context, 'config.ts', 'parsePersonaConfigBytes')
+    const buildAssignment = await packageFunction<typeof import('../../../src/reload-request.ts').buildOperatorAssignment>(context, 'reload-request.ts', 'buildOperatorAssignment')
+    const build = await packageFunction<typeof import('../../../src/reload-request.ts').buildReviewRequest>(context, 'reload-request.ts', 'buildReviewRequest')
+    const compose = await packageFunction<typeof import('../../../src/reload-request.ts').composeReviewRequest>(context, 'reload-request.ts', 'composeReviewRequest')
+    try {
+      const candidate = parse(read(configPath), configPath, dirname(configPath))
+      const assignments = targets.map(target => {
+        const [name, channel, delivery, extra] = target.split('/')
+        const persona = candidate.personas.find(p => p.name === name)
+        if (!persona || extra !== undefined) throw new Error()
+        return buildAssignment(persona, state.personas[persona.key]?.incarnation ?? null, channel, delivery as import('../../../src/config.ts').DeliveryMode)
+      })
+      const intent = (state.pendingIntent as { operator?: { generation: number } } | undefined)?.operator
+      return compose(build(requestId, intent?.generation ?? 0, action as import('../../../src/reload-request.ts').ReviewRequest['action'], assignments)).trimEnd()
+    } catch { throw new PrinterFailure('operator request could not be built from the current input and authority', PRINTER_FAIL_EXIT) }
+  },
+}
+const operatorReviewPending: Entry = {
+  synopsis: '<config-path> <record-path> <pending-path> <request-id>',
+  async print(args, context) {
+    expectArguments('operatorReviewPending', args, ['config-path', 'record-path', 'pending-path', 'request-id'])
+    const [configPath, recordPath, pendingPath, requestId] = args
+    const { state, read } = await readSharedConfiguration(context, configPath, recordPath)
+    const ledger = await packageFunction<typeof import('../../../src/reload-review.ts').reviewLedger>(context, 'reload-review.ts', 'reviewLedger')
+    const fingerprint = await packageFunction<(text: string) => string | undefined>(context, 'reload-fingerprint.ts', 'parsePendingFingerprint')
+    const intent = (state.pendingIntent as import('../../../src/shared-channels.ts').SharedChannelState['pendingIntent'] | undefined)?.operator as import('../../../src/reload-request.ts').OperatorIntent | undefined
+    try {
+      const active = ledger(state as import('../../../src/shared-channels.ts').SharedChannelState)?.active
+      if (!intent?.requests[requestId] || intent.requests[requestId].generation !== intent.generation || !intent.requested || !active || active.intentGeneration !== intent.generation ||
+          active.fingerprint !== fingerprint(Buffer.from(read(pendingPath)).toString('utf8'))) throw new Error()
+    } catch { throw new PrinterFailure('the request has no current pending review', PRINTER_FAIL_EXIT) }
+    return ''
+  },
+}
+const sharedReviewConsumed: Entry = {
+  synopsis: '<config-path> <record-path> <review-path>',
+  async print(args, context) {
+    expectArguments('sharedReviewConsumed', args, ['config-path', 'record-path', 'review-path'])
+    const [configPath, recordPath, reviewPath] = args
+    const { state, read } = await readSharedConfiguration(context, configPath, recordPath)
+    const ledger = await packageFunction<typeof import('../../../src/reload-review.ts').reviewLedger>(context, 'reload-review.ts', 'reviewLedger')
+    const fingerprint = await packageFunction<(text: string) => string | undefined>(context, 'reload-fingerprint.ts', 'parsePendingFingerprint')
+    try {
+      const fp = fingerprint(Buffer.from(read(reviewPath)).toString('utf8'))
+      const outcome = fp && ledger(state as import('../../../src/shared-channels.ts').SharedChannelState)?.outcomes[fp]
+      if (!outcome || outcome.status !== 'consumed' || outcome.revision > state.revision) throw new Error()
+    } catch { throw new PrinterFailure('the exact reviewed transaction has not been consumed', PRINTER_FAIL_EXIT) }
+    return ''
+  },
+}
+
+// Test40's explicit, stopped manual transition. This is a fixture for a
+// deliberately limited old-release scenario, never a runtime migration.
+const stoppedDowngradeBaseline: Entry = {
+  synopsis: '<config-path> <record-path>',
+  async print(args, context) {
+    expectArguments('stoppedDowngradeBaseline', args, ['config-path', 'record-path'])
+    const [configPath, recordPath] = args
+    const { state, applied } = await readSharedConfiguration(context, configPath, recordPath)
+    if (applied.resume_enabled !== false || (state.pendingIntent as { operator?: { requested?: boolean } } | undefined)?.operator?.requested) {
+      throw new PrinterFailure('stopped downgrade requires applied resume=false and no outstanding operator request', PRINTER_FAIL_EXIT)
+    }
+    // Preserve every applied setting; the previous release validates its own
+    // format before the fixture replaces either active file.
+    return JSON.stringify((state as import('../../../src/shared-channels.ts').SharedChannelState).applied, null, 2)
+  },
+}
+
 const sharedAuthorityStartLine: Entry = {
   synopsis: '<config-path> <record-path>',
   async print(args, context) {
@@ -4071,8 +4165,14 @@ const sharedAuthorityStartLine: Entry = {
 
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
+  stoppedDowngradeBaseline,
+  operatorReviewRequest,
+  operatorReviewPending,
+  sharedReviewConsumed,
   sharedConfigurationMatches,
   sharedAuthorityPreserved,
+  sharedApplicationPreserved,
+  reviewOutcomeLine: builderEntry('reload-review.ts', 'reviewOutcomeLine', ['status']),
   sharedConfigurationValue,
   reloadSharedAuthorityStartLine: sharedAuthorityStartLine,
   // Scenario 8 (test-20-fmk-old-binary.sh).

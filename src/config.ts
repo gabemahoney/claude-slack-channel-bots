@@ -1295,19 +1295,20 @@ function parsePermissionPrompts(value: unknown, style: RuleStyle): string {
   throw ruleError(style, `permission_prompts must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`)
 }
 
-/** Validate receiving scope and the required destination. Only trusted verified-removal provenance may retain an unchanged missing channel destination. */
+/** Submitted input must have a receiving scope and a listed destination.
+ * Applied state may instead carry verified removal or choice-reset evidence. */
 function checkPersonaCrossSettings(
   { destination, channels, dm }: { destination: string; channels: readonly ChannelEntry[]; dm: PersonaDm },
   style: RuleStyle,
-  removedDestination = false,
+  trustedMissingDestination = false,
 ): void {
-  if (!removedDestination && channels.length === 0 && !dm.enabled) {
+  if (!trustedMissingDestination && channels.length === 0 && !dm.enabled) {
     throw ruleError(
       style,
       'the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.',
     )
   }
-  if (!removedDestination && destination !== DM_DESTINATION && !channels.some((channel) => channel.id === destination)) {
+  if (!trustedMissingDestination && destination !== DM_DESTINATION && !channels.some((channel) => channel.id === destination)) {
     throw ruleError(style, `permission_prompts names channel ${destination}, which is not in the persona's channels.`)
   }
   if (destination === DM_DESTINATION) {
@@ -1327,6 +1328,7 @@ function parsePersonaEntry(
   inherited: InheritedPersonaSettings,
   home: string,
   removedDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean,
+  resetDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean,
 ): Persona {
   if (!isJsonObject(raw)) {
     throw ruleError(PERSONA_RULE_STYLE, `personas[${index}] must be a JSON object, got ${jsonTypeName(raw)}.`)
@@ -1349,8 +1351,9 @@ function parsePersonaEntry(
   const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
   const dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
   const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
-  const trustedRemoval = removedDestination?.({ name, key: personaKey(name), credentials_file, working_directory, permission_prompts }) === true
-  checkPersonaCrossSettings({ destination: permission_prompts, channels, dm }, style, trustedRemoval)
+  const destinationDeclaration = { name, key: personaKey(name), credentials_file, working_directory, permission_prompts }
+  const trustedMissingDestination = removedDestination?.(destinationDeclaration) === true || resetDestination?.(destinationDeclaration) === true
+  checkPersonaCrossSettings({ destination: permission_prompts, channels, dm }, style, trustedMissingDestination)
 
   return {
     index,
@@ -1611,6 +1614,9 @@ function checkRealPathCollisions(personas: readonly Persona[]): void {
 export interface ResolvePersonaConfigOptions {
   /** Trusted applied-state provenance only; never read from submitted JSON. */
   removedDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean
+  /** Only the shared authority's applied projection supplies reset evidence.
+   * Never pass this when validating submitted input or reviewed source. */
+  resetDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean
   /**
    * Record mode (record-start part): validate a start's
    * `config.json.last-applied`. Skips only the real-path collision step
@@ -1710,7 +1716,7 @@ export function resolvePersonaConfig(
     claude_config_dir: settings.claude_config_dir,
     stop_hook_bootstrap: settings.stop_hook_bootstrap,
   }
-  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, home, options.removedDestination))
+  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, home, options.removedDestination, options.resetDestination))
 
   // Cross-persona rules, only once every entry has parsed so
   // per-entry violations are reported first.
@@ -1989,7 +1995,7 @@ export function parsePersonaConfigBytes(
   const parsed = parseConfigJsonBytes(bytes, source)
 
   try {
-    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record, env: options.env, removedDestination: options.removedDestination })
+    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record, env: options.env, removedDestination: options.removedDestination, resetDestination: options.resetDestination })
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
     throw new Error(`loadPersonaConfig: invalid persona config in "${source}": ${cause}`)

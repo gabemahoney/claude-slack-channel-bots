@@ -1,3 +1,5 @@
+import { reviewLedger, reviewOutcomeLine, RELOAD_REVIEW_OUTCOME } from '../src/reload-review.ts'
+import { applicationState } from './test-helpers/shared-channels.ts'
 import { createHash } from 'node:crypto'
 import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
 /**
@@ -247,7 +249,7 @@ function recoveryHint(): string {
 function expectOutcomeConfigIsStartPass(run: ReloadRun, ...names: string[]): void {
   const config = run.outcome?.kind === 'applied' ? run.outcome.config : undefined
   expect(run.lifecycle.startPasses).toHaveLength(1)
-  expect(config).toBe(run.lifecycle.startPasses[0]!)
+  expect(config).toEqual(run.lifecycle.startPasses[0]!)
   expect(config?.personas.map((p) => p.key)).toEqual(names.map((n) => h.key(n)))
 }
 
@@ -292,7 +294,7 @@ function loggedPreview(lines: string[] | undefined = h.pendingLines(), written =
  * once: so the logged preview is the file's body, line for line.
  */
 function pendingWritten(logs: string[] = loggedPreview()): ReloadRunActivity {
-  return { ...NO_RUN_ACTIVITY, logs, writes: [{ path: h.paths.pending, ok: true }] }
+  return { ...NO_RUN_ACTIVITY, logs, writes: [h.lastAppliedWrite(), { path: h.paths.pending, ok: true }] }
 }
 
 /** The preview header's counts, every term defaulting to 0. */
@@ -367,8 +369,9 @@ function addedLine(name: string, causes: string[] = []): string {
 }
 
 /** A stretch of checks that removed the pending file once and logged `logs` (`reload-nothing-pending`, file removed, by default), nothing else. */
-function pendingRemoved(logs: string[] = [nothingPendingRemoved()]): ReloadRunActivity {
-  return { ...NO_RUN_ACTIVITY, logs, removes: [{ path: h.paths.pending, ok: true, removed: true, unsynced: false }] }
+function pendingRemoved(logs: string[] = [nothingPendingRemoved()], observed = true): ReloadRunActivity {
+  return { ...NO_RUN_ACTIVITY,
+    writes: observed ? [h.lastAppliedWrite()] : [], logs, removes: [{ path: h.paths.pending, ok: true, removed: true, unsynced: false }] }
 }
 
 /** Matches a failure line by its opening words, the quoted `path` and the errno code (not the rest of its wording). */
@@ -496,7 +499,7 @@ async function running(
   const run = await h.startDetecting(opts)
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(false)
-  return { run, personas, recordBytes }
+  return { run, personas, recordBytes: h.readRecord()! }
 }
 
 /** Assert the run refused: nothing written, applied, brought up or launched. */
@@ -697,7 +700,7 @@ describe('a start with a record runs the record', () => {
     expect(broughtUp(run)).toEqual(keysOf('alpha', 'bravo'))
     expect(run.lifecycle.keys('launch').sort()).toEqual(keysOf('alpha', 'bravo'))
     expect(run.writes).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(h.readConfig()).toEqual(configBytes)
     expect(run.logs).toContain(reloadSharedAuthorityStartLine(h.paths.lastApplied, 1))
     assertNoLeak(run.captured())
@@ -718,7 +721,7 @@ describe('a start with a record runs the record', () => {
     expect(broughtUp(run)).toEqual(keysOf('alpha'))
     expect(run.lifecycle.outcome(h.key('alpha'))).toBe('up')
     expect(run.writes).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.logs.filter((l) => l.includes('Fatal'))).toEqual([])
     assertNoLeak(run.captured())
   })
@@ -798,7 +801,7 @@ describe('a start with a record runs the record', () => {
     expect(run.logs[0]).toContain(expected())
     expect(run.logs[0]!.endsWith(recoveryHint())).toBe(true)
     expect(existsSync(h.paths.lastApplied)).toBe(true)
-    if (recordBefore !== undefined) expect(h.readRecord()).toEqual(recordBefore)
+    if (recordBefore !== undefined) expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBefore))
     expect(h.readConfig()).toEqual(configBytes)
     assertNoLeak(run.captured())
 
@@ -925,7 +928,7 @@ describe('a start with zero personas runs', () => {
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('record')
     expect(run.lifecycle.startPasses.map((c) => c.personas)).toEqual([[]])
     expect(run.lifecycle.records).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     assertNoLeak(run.captured())
   })
 })
@@ -1166,7 +1169,7 @@ describe('a record or config file that is not a regular file refuses the start u
     expect(seam.reads).toEqual([])
     expect(seam.closes).toEqual([target()])
     expect(run.writes).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(h.readConfig()).toEqual(configBytes)
     assertNoLeak(run.captured())
   })
@@ -1233,7 +1236,7 @@ describe('detection keeps the pending file in step with the config file and appl
     const cp = run.checkpoint()
     await run.ticks.ticks(30)
 
-    expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, writes: [h.lastAppliedWrite()] })
     expect(h.pendingExists()).toBe(false)
     expect(run.logsOf(RELOAD_PREVIEW)).toEqual([])
     expect(run.logsOf(RELOAD_NOTHING_PENDING)).toEqual([])
@@ -1247,10 +1250,10 @@ describe('detection keeps the pending file in step with the config file and appl
     h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(20)
 
-    expect(run.since(cp)).toEqual(pendingWritten(loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW])))
+    expect(run.since(cp)).toEqual(pendingWritten(loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW, ...h.reviewLines()])))
     expect(h.readPendingText()?.startsWith(`${PENDING_FILE_HEADER}\n`)).toBe(true)
     expect(h.pendingFingerprint()).toMatch(/^[0-9a-f]{64}$/)
-    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+    expect(h.pendingLines()).toEqual([...[NO_EFFECTIVE_CHANGE_PREVIEW], ...h.reviewLines()])
     expectNoPostNoLeak(run)
   })
 
@@ -1274,7 +1277,7 @@ describe('detection keeps the pending file in step with the config file and appl
     // launch, reconnect or in-place update, no Slack client and no Slack call.
     expect(run.since(cp)).toEqual(pendingWritten())
     expect(h.pendingExists()).toBe(true)
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expectNoPostNoLeak(run)
   })
 
@@ -1330,7 +1333,7 @@ describe('detection keeps the pending file in step with the config file and appl
     await run.ticks.ticks(20)
 
     expect(run.since(cp)).toEqual(pendingWritten())
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(h.readConfig()).toEqual(configBytes)
     expectNoPostNoLeak(run)
   })
@@ -1352,7 +1355,7 @@ describe('detection keeps the pending file in step with the config file and appl
     h.writePendingBytes('placed by hand')
     const later = run.checkpoint()
     await run.ticks.ticks(5)
-    expect(run.since(later)).toEqual(pendingRemoved([]))
+    expect(run.since(later)).toEqual(pendingRemoved([], false))
     expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
   })
@@ -1406,19 +1409,19 @@ describe('detection keeps the pending file in step with the config file and appl
     expect(h.pendingFingerprint()).not.toBe(first)
     // The setting line's wording is reload-preview.test.ts's; here the header counts it and the log is the file's body.
     expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
-    expect(h.pendingLines()).toHaveLength(2)
+    expect(h.pendingLines()).toHaveLength(2 + h.reviewLines().length)
     expect(run.since(second)).toEqual(pendingWritten())
     expect(run.previewEmissionCount()).toBe(2)
 
     const third = run.checkpoint()
     h.writeConfig(configOf(alpha!))
     await run.ticks.ticks(5)
-    expect(h.pendingFingerprint()).toBe(first)
+    expect(h.pendingFingerprint()).not.toBe(first)
     expect(h.pendingLines()).toEqual(firstPreview)
     expect(run.since(third)).toEqual(pendingWritten())
     expect(run.previewEmissionCount()).toBe(3)
     expect(run.since(cp).lifecycle).toEqual([])
-    expect(run.since(cp).writes).toHaveLength(3)
+    expect(run.since(cp).writes).toEqual(Array.from({ length: 3 }, () => [h.lastAppliedWrite(), { path: h.paths.pending, ok: true }]).flat())
     expectNoPostNoLeak(run)
   })
 
@@ -1607,11 +1610,11 @@ async function expectHeldInvalidAppliesNothing(
 
   expect(run.since(confirmed)).toEqual({
     ...NO_RUN_ACTIVITY,
-    logs: [confirmedInvalidLogged(error)],
-    writes: [{ path: h.paths.pending, ok: true }],
+    logs: [confirmedInvalidLogged(error), invalidLogged(error)],
+    writes: [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite(), { path: h.paths.pending, ok: true }],
     removes: [applyRemoved()],
   })
-  expect(h.readRecord()).toEqual(recordBytes)
+  expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
   expect(run.controller.applied()).toBe(applied)
   expect(run.appliedConfigs).toEqual([])
   expect(channelModeOf(run.serverConfig())).toBe(mode)
@@ -1647,7 +1650,7 @@ describe('detection compares each referenced credentials file with what its pers
 
     // Checked while the pending file exists: neither the old nor the new token set (both sentinel-bearing) is in it or the log.
     assertNoLeak(run.captured())
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha!)])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha!)], ...h.reviewLines()])
     expect(h.pendingDestructiveLines()).toEqual([])
     // Logged once, as the file's body; no teardown, bring-up, launch or reconnect over the ticks.
     const since = run.since(cp)
@@ -1656,7 +1659,7 @@ describe('detection compares each referenced credentials file with what its pers
     expect(h.readPendingText()).not.toContain('"bravo"')
     expect(run.lifecycle.outcome(h.key('alpha'))).toBe('up')
     // Digests stay in memory: the tick wrote the pending file and nothing else, anywhere under the root.
-    expect(run.writes).toEqual([{ path: h.paths.pending, ok: true }])
+    expect(run.writes).toEqual([h.lastAppliedWrite(), h.lastAppliedWrite(), { path: h.paths.pending, ok: true }])
     expect(readdirSync(h.root, { recursive: true }).map(String).sort()).toEqual(
       [...filesBefore, join('config', 'config.json.pending')].sort(),
     )
@@ -1783,7 +1786,7 @@ describe('detection compares each referenced credentials file with what its pers
 
     const since = run.since(cp)
     expect(since).toEqual(pendingWritten())
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, effect, cause)])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, effect, cause)], ...h.reviewLines()])
     expect(h.readPendingText()).not.toContain('"bravo"')
     assertNoLeak(run.captured())
 
@@ -1845,11 +1848,11 @@ describe('detection compares each referenced credentials file with what its pers
     const since = run.since(cp)
     expect(since).toEqual(pendingWritten())
     // Both are broken by their credentials (the collision), so each would be brought up, not reconnected.
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       previewHeader({ credentials: 2 }),
       credentialsChangedLine(alpha, 'bring-up'),
       credentialsChangedLine(bravo, 'bring-up'),
-    ])
+    ], ...h.reviewLines()])
     expect(h.readPendingText()).not.toContain(JSON.stringify(charlie.name))
     // Checked while the pending file exists: the revert below removes it.
     assertNoLeak(run.captured())
@@ -1893,7 +1896,7 @@ describe('detection compares each referenced credentials file with what its pers
     expect(run.since(reverted)).toEqual(pendingWritten())
     expect(credentialsChangeLines()).toEqual([])
     expect(h.pendingLines()).toEqual(configOnlyPreview)
-    expect(h.pendingFingerprint()).toBe(configOnly)
+    expect(h.pendingFingerprint()).not.toBe(configOnly)
     expect(run.since(cp).lifecycle).toEqual([])
     expectNoPostNoLeak(run)
   })
@@ -1910,10 +1913,10 @@ describe('detection compares each referenced credentials file with what its pers
     const first = h.pendingFingerprint()
     expect(h.pendingExists()).toBe(true)
     expect(run.previewEmissionCount()).toBe(1)
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       previewHeader({ destructive: 1 }),
       destructiveLine('alpha', 'credentials_file', moved.credentials_file),
-    ])
+    ], ...h.reviewLines()])
     const preview = h.pendingLines()
 
     // An edit of the new file changes the fingerprint only.
@@ -1968,6 +1971,7 @@ describe('detection compares each referenced credentials file with what its pers
         pending: string
         alpha: PersonaInput
         lines: string[] | null
+        reviewLines: string[]
         since: ReloadRunActivity
       }>(`
         const alpha = h.persona('alpha')
@@ -1984,13 +1988,14 @@ describe('detection compares each referenced credentials file with what its pers
           pending: h.paths.pending,
           alpha,
           lines: h.pendingLines() ?? null,
+          reviewLines: ${JSON.stringify(which)} === 'config file' ? [] : h.reviewLines(),
           since: run.since(cp),
         }))
       `)
 
       // One pending-file write and one logged preview (or reload-invalid line); no lifecycle call, Slack client or Slack call.
       expect({ ...result.since, logs: NO_RUN_ACTIVITY.logs, writes: NO_RUN_ACTIVITY.writes }).toEqual(NO_RUN_ACTIVITY)
-      expect(result.since.writes).toEqual([{ path: result.pending, ok: true }])
+      expect(result.since.writes).toEqual([{ path: result.pending.replace(/\.pending$/, '.last-applied'), ok: true }, { path: result.pending, ok: true }])
       if (which === 'config file') {
         expect(result.lines).toHaveLength(1)
         expect(result.lines![0]).toStartWith(`INVALID: the configuration file "${result.config}" cannot be read`)
@@ -2001,6 +2006,7 @@ describe('detection compares each referenced credentials file with what its pers
         expect(result.lines).toEqual([
           previewHeader({ credentials: 1 }),
           credentialsChangedLine(result.alpha, 'kept', 'credentials file is not a regular file'),
+          ...result.reviewLines,
         ])
         expect(result.since.logs).toEqual(loggedPreview(result.lines!, true, result.pending))
       }
@@ -2027,7 +2033,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     assertNoLeak(run.captured())
     const destructive = [removedLine('bravo'), destructiveLine('charlie', 'working_directory', moved)]
-    expect(h.pendingLines()).toEqual([previewHeader({ removed: 1, destructive: 1 }), ...destructive])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ removed: 1, destructive: 1 }), ...destructive], ...h.reviewLines()])
     expect(h.pendingDestructiveLines()).toEqual(destructive)
     // Logged once, over several lines, each classed reload-preview, the header pointing at the file; nothing else
     // written, logged or applied: no teardown, bring-up, launch, reconnect or in-place update.
@@ -2061,7 +2067,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     await run.ticks.ticks(10)
 
-    expect(h.pendingLines()).toEqual([previewHeader({ removed: 1 }), removedLine('bravo')])
+    expect(h.pendingLines()).toEqual([previewHeader({ removed: 1 }), removedLine('bravo'), ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expectNoPostNoLeak(first, run)
@@ -2089,7 +2095,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     // Checked while the pending file exists: the new token set is in neither it nor the log.
     assertNoLeak(run.captured())
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     expect(run.lifecycle.outcome(h.key('alpha'))).toBe('broken')
 
@@ -2112,7 +2118,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     await run.ticks.ticks(5)
 
     // The config bytes differ, so a change is pending, but the plan finds the same real path: nothing to apply.
-    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+    expect(h.pendingLines()).toEqual([...[NO_EFFECTIVE_CHANGE_PREVIEW], ...h.reviewLines()])
     expect(h.pendingDestructiveLines()).toEqual([])
     expect(run.since(cp)).toEqual(pendingWritten())
     expectNoPostNoLeak(run)
@@ -2125,7 +2131,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     h.writeConfig(configOf(personas[0]!, delta))
     await run.ticks.ticks(3)
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta', ['working directory does not exist'])])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta', ['working directory does not exist'])], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     const fingerprint = h.pendingFingerprint()
 
@@ -2135,10 +2141,10 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     // The fingerprint (config and credentials bytes) is unchanged, so the pending state is too: one rewrite, no log.
     expect(run.since(fact)).toEqual({ ...NO_RUN_ACTIVITY, writes: [{ path: h.paths.pending, ok: true }] })
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta')], ...h.reviewLines()])
     expect(h.pendingFingerprint()).toBe(fingerprint)
     expect(run.previewEmissionCount()).toBe(1)
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expectNoPostNoLeak(run)
   })
 
@@ -2147,7 +2153,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     { label: 'an INVALID candidate', invalid: true },
   ])('$label logged while the pending file cannot be written does not point at it; the write that succeeds later logs nothing more', async ({ invalid }) => {
     const { run, personas } = await running(['alpha', 'bravo'])
-    h.failWrites()
+    h.failWrites({ path: h.paths.pending })
     const cp = run.checkpoint()
 
     if (invalid) h.writeConfigBytes(malformedWithSentinel())
@@ -2155,7 +2161,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     await run.ticks.ticks(5)
 
     const error = `loadPersonaConfig: malformed JSON in "${h.paths.config}" at line 3, column 5.`
-    const expected = invalid ? invalidPreview(error) : [previewHeader({ removed: 1 }), removedLine('bravo')]
+    const expected = invalid ? invalidPreview(error) : [previewHeader({ removed: 1 }), removedLine('bravo'), ...h.reviewLines()]
     const logged = invalid ? [invalidLogged(error, false)] : loggedPreview(expected, false)
     expect(run.since(cp).logs).toEqual([fileFailureLine('EIO'), ...logged])
     expect(h.pendingExists()).toBe(false)
@@ -2189,22 +2195,24 @@ describe('the pending-change preview in the pending file and the server log', ()
     h.writeCredentials(alpha!)
     await run.ticks.ticks(10)
 
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), unknownLine])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), unknownLine], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten([cannotCheck, ...loggedPreview()]))
+    assertNoLeak(run.captured())
 
     // Gathered again: the file gets the answer (a fact, not a state change), with no log line.
     lookupFails = false
     const good = run.checkpoint()
     await run.ticks.ticks(3)
     expect(run.since(good)).toEqual({ ...NO_RUN_ACTIVITY, writes: [{ path: h.paths.pending, ok: true }] })
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha!)])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha!)], ...h.reviewLines()])
+    assertNoLeak(run.captured())
 
     // Failing again after a good pass is logged again, once.
     lookupFails = true
     const again = run.checkpoint()
     await run.ticks.ticks(3)
     expect(run.since(again)).toEqual({ ...NO_RUN_ACTIVITY, logs: [cannotCheck], writes: [{ path: h.paths.pending, ok: true }] })
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), unknownLine])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), unknownLine], ...h.reviewLines()])
     expect(run.logsOf('reload').filter((l) => l.includes('detection check failed'))).toEqual([])
     expect(run.previewEmissionCount()).toBe(1)
     expectNoPostNoLeak(run)
@@ -2222,10 +2230,10 @@ describe('the pending-change preview in the pending file and the server log', ()
     h.writeCredentialsContent(alpha!, `{${LEAK_SENTINEL}`)
     await run.ticks.ticks(3)
 
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       previewHeader({ credentials: 1 }),
       credentialsChangedLine(alpha!, 'unchecked', CREDENTIALS_NOT_JSON),
-    ])
+    ], ...h.reviewLines()])
     const cannotCheck = expect.stringMatching(/^\[slack\] reload: cannot check the bring-up state of persona "alpha" /)
     expect(run.since(cp)).toEqual(pendingWritten([cannotCheck, ...loggedPreview()]))
     expectNoPostNoLeak(run)
@@ -2253,7 +2261,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     assertNoLeak(run.captured())
     const lines = h.pendingLines()!
-    expect(lines).toHaveLength(2)
+    expect(lines).toHaveLength(2 + h.reviewLines().length)
     expect(lines[0]).toBe(previewHeader({ added: 1 }))
     if (causes.every((c) => typeof c === 'string')) {
       expect(lines[1]).toBe(addedLine('delta', causes as string[]))
@@ -2316,7 +2324,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     h.writeConfig(configOf(personas[0]!, delta))
     await run.ticks.ticks(5)
 
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta', causes)])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta', causes)], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     // The preview never creates the directory it checks.
     expect(existsSync(dir)).toBe(false)
@@ -2333,11 +2341,11 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     h.writeConfig(configOf(personas[0]!, delta))
     await run.ticks.ticks(3)
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta', [DANGLING_CONFIG_DIR])])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta', [DANGLING_CONFIG_DIR])], ...h.reviewLines()])
 
     mkdirSync(target)
     await run.ticks.ticks(3)
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta')], ...h.reviewLines()])
     expect(run.previewEmissionCount()).toBe(1)
     assertNoLeak(run.captured())
     expectNoPostNoLeak(run)
@@ -2363,10 +2371,10 @@ describe('the pending-change preview in the pending file and the server log', ()
     await run.ticks.ticks(3)
 
     const warning = warned ? `; but at that launch it cannot come up: ${DANGLING_CONFIG_DIR}` : ''
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       previewHeader({ inPlace: 1 }),
       `${personaRef('alpha')}: claude_config_dir changed: ${NEXT_LAUNCH_FRESH}${warning}.`,
-    ])
+    ], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     // The preview never creates the directory it checks.
     expect(existsSync(dir)).toBe(false)
@@ -2387,12 +2395,12 @@ describe('the pending-change preview in the pending file and the server log', ()
     await run.ticks.ticks(3)
 
     const inheritors = `${JSON.stringify('alpha')} (key=${h.key('alpha')}), ${JSON.stringify('bravo')} (key=${h.key('bravo')})`
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       previewHeader({ settings: 1 }),
       `server-wide setting claude_config_dir changed: inherited by ${inheritors}; ` +
         "takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then; " +
         `but at that launch ${inheritors} cannot come up: ${DANGLING_CONFIG_DIR}.`,
-    ])
+    ], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     assertNoLeak(run.captured())
     expectNoPostNoLeak(run)
@@ -2411,7 +2419,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     mkdirSync(target)
     await run.ticks.ticks(3)
-    expect(h.pendingLines()).toEqual([previewHeader({ inPlace: 1 }), `${personaRef('alpha')}: claude_config_dir changed: ${NEXT_LAUNCH_FRESH}.`])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ inPlace: 1 }), `${personaRef('alpha')}: claude_config_dir changed: ${NEXT_LAUNCH_FRESH}.`], ...h.reviewLines()])
     expect(run.previewEmissionCount()).toBe(1)
     expectNoPostNoLeak(run)
   })
@@ -2426,11 +2434,11 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     h.writeConfig(configOf(alpha!, delta))
     await run.ticks.ticks(3)
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta', ['working directory does not exist'])])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta', ['working directory does not exist'])], ...h.reviewLines()])
 
     h.makeWorkingDirectory(delta)
     await run.ticks.ticks(3)
-    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ added: 1 }), addedLine('delta')], ...h.reviewLines()])
     expect(run.tickCredentialsReads).toEqual([])
     expect(run.tickDirectoryChecks.length).toBeGreaterThan(0)
     expect(run.previewEmissionCount()).toBe(1)
@@ -2450,7 +2458,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     // bravo's in-place line is worded in reload-preview.test.ts; here the header counts it.
     expect(h.pendingHeader()).toBe(previewHeader({ added: 1, inPlace: 1 }))
-    expect(h.pendingLines()).toHaveLength(3)
+    expect(h.pendingLines()).toHaveLength(3 + h.reviewLines().length)
     expect(h.pendingLines()).toContain(addedLine('delta'))
     const perCheck = [alpha!, bravo!, charlie!, delta].map((p) => p.credentials_file)
     expect(run.tickCredentialsReads.slice(reads)).toEqual([...perCheck, ...perCheck, ...perCheck])
@@ -2478,7 +2486,7 @@ describe('in dry run, detection ignores credentials files', () => {
     h.deleteCredentials(alpha!)
     await run.ticks.ticks(5)
 
-    expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, writes: [h.lastAppliedWrite()] })
     expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
   })
@@ -2490,7 +2498,7 @@ describe('in dry run, detection ignores credentials files', () => {
     const run = await h.startDetecting({ dryRun: true })
     await run.ticks.tick()
     const fingerprint = h.pendingFingerprint()
-    expect(fingerprint).toBe(reloadFingerprint(h.readConfig()!, [], run.controller.sharedChannels()!.revision))
+    expect(fingerprint).toBe(reviewLedger(run.controller.sharedChannels()!.snapshot())!.active!.fingerprint)
     const cp = run.checkpoint()
 
     // Rotated, then unusable (malformed, deleted, a directory): no credentials line and no cause, ever.
@@ -2505,7 +2513,7 @@ describe('in dry run, detection ignores credentials files', () => {
 
     expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
     expect(h.pendingFingerprint()).toBe(fingerprint)
-    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+    expect(h.pendingLines()).toEqual([...[NO_EFFECTIVE_CHANGE_PREVIEW], ...h.reviewLines()])
     expect(run.tickCredentialsReads).toEqual([])
     expectNoPostNoLeak(run)
   })
@@ -2521,7 +2529,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
     { step: 'renameSync', code: 'EROFS' },
   ] as const)('a write failing at $step ($code) is logged once over many checks, applies nothing, and succeeds at the first check after', async ({ step, code }) => {
     const { run, recordBytes } = await running(['alpha'])
-    h.failWrites({ step, code })
+    h.failWrites({ path: h.paths.pending, step, code })
     const cp = run.checkpoint()
 
     h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
@@ -2530,8 +2538,8 @@ describe('a pending-file write or delete that fails is logged once per episode a
     const failedWrites = (n: number) => Array.from({ length: n }, () => ({ path: h.paths.pending, ok: false }))
     const since = run.since(cp)
     // The failure, then the preview logged once, not pointing at a file that was never written.
-    expect(since.logs).toEqual([fileFailureLine(code), ...loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW], false)])
-    expect(since.writes).toEqual(failedWrites(10))
+    expect(since.logs).toEqual([fileFailureLine(code), ...loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW, ...h.reviewLines()], false)])
+    expect(since.writes).toEqual([h.lastAppliedWrite(), ...failedWrites(10)])
     expect({ ...since, logs: NO_RUN_ACTIVITY.logs, writes: NO_RUN_ACTIVITY.writes }).toEqual(NO_RUN_ACTIVITY)
     expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
 
@@ -2543,7 +2551,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
 
     // The success ended the episode: in the same pending state, the next failing write is logged again.
     h.remove(h.paths.pending)
-    h.failWrites({ step, code })
+    h.failWrites({ path: h.paths.pending, step, code })
     const again = run.checkpoint()
     await run.ticks.ticks(5)
     expect(run.since(again)).toEqual({ ...NO_RUN_ACTIVITY, logs: [fileFailureLine(code)], writes: failedWrites(5) })
@@ -2553,16 +2561,17 @@ describe('a pending-file write or delete that fails is logged once per episode a
   test('a write whose directory sync fails is logged once and written again at the next check', async () => {
     const { run, recordBytes } = await running(['alpha'])
     // The second fsync is the directory's, after the rename.
-    h.failWrites({ step: 'fsyncSync', call: 2 })
+    h.failWrites({ path: h.paths.pending, step: 'fsyncSync', call: 2 })
     const cp = run.checkpoint()
 
     h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(5)
 
     // An unsynced write still put the preview in place, so the logged preview points at it.
-    expect(run.since(cp).logs).toEqual([fileFailureLine('EIO'), ...loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW])])
+    expect(run.since(cp).logs).toEqual([fileFailureLine('EIO'), ...loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW, ...h.reviewLines()])])
     expect(run.logsOf('reload')).toEqual([fileFailureLine('EIO')])
     expect(run.since(cp).writes).toEqual([
+      h.lastAppliedWrite(),
       { path: h.paths.pending, ok: false },
       { path: h.paths.pending, ok: true },
     ])
@@ -2583,13 +2592,13 @@ describe('a pending-file write or delete that fails is logged once per episode a
 
     const failedRemoves = (n: number) =>
       Array.from({ length: n }, () => ({ path: h.paths.pending, ok: false, removed: undefined, unsynced: false }))
-    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [fileFailureLine('EIO')], removes: failedRemoves(10) })
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [fileFailureLine('EIO')], writes: [h.lastAppliedWrite()], removes: failedRemoves(10) })
     expect(h.pendingExists()).toBe(true)
 
     h.clearRemoveFailure()
     const cleared = run.checkpoint()
     await run.ticks.ticks(3)
-    expect(run.since(cleared)).toEqual(pendingRemoved())
+    expect(run.since(cleared)).toEqual(pendingRemoved(undefined, false))
 
     // The success ended the episode: with nothing pending still, the next failing delete is logged again.
     h.writePendingBytes('placed by hand')
@@ -2613,6 +2622,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [fileFailureLine('EIO'), nothingPendingRemoved()],
+      writes: [h.lastAppliedWrite()],
       removes: [{ path: h.paths.pending, ok: true, removed: true, unsynced: true }],
     })
     expect(h.pendingExists()).toBe(false)
@@ -2621,7 +2631,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
 
   test('each change of the pending state starts a new episode: with writes failing, an edit, a revert and the same edit again log the write failure twice', async () => {
     const { run, recordBytes } = await running(['alpha'])
-    h.failWrites()
+    h.failWrites({ path: h.paths.pending })
     const cannotWrite = fileFailureLine('EIO')
     const cp = run.checkpoint()
 
@@ -2909,7 +2919,7 @@ describe('confirmation and apply', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 })],
-      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
+      writes: [h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
 
@@ -2951,7 +2961,7 @@ describe('confirmation and apply', () => {
     expectNoPostNoLeak(run)
   })
 
-  test('a confirmation made while the server was down is applied by the first check after a start from the record', async () => {
+  test('a confirmation made while the server was down requires a new review after the first check after a start from the record', async () => {
     const { run, recordBytes, configBytes } = await pendingRemoval(['alpha', 'bravo'])
     await run.stop()
     h.confirm()
@@ -2959,9 +2969,15 @@ describe('confirmation and apply', () => {
     const next = await h.startDetecting()
     expect(next.outcome.kind === 'applied' && next.outcome.source).toBe('record')
     expect(broughtUp(next)).toEqual(keysOf('alpha', 'bravo'))
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     await next.ticks.tick()
 
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
+    expect(next.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expect(next.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
+    expect(next.appliedConfigs).toEqual([])
+    assertNoLeak(next.captured())
+    h.confirm(); await next.ticks.tick()
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(next.appliedKeys()).toEqual(keysOf('alpha'))
     expect(next.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
@@ -2977,12 +2993,15 @@ describe('confirmation and apply', () => {
       onApplied: () => void seen.push(['onApplied', h.applyExists()]),
     })
 
+    seen.length = 0
     h.confirm()
     await run.ticks.tick()
 
     expect(seen).toEqual([
-      ['record write', true],
+      ['record write', true], // spend gesture
+      ['record write', true], // activation
       ['onApplied', true],
+      ['record write', false], // post-activation observation
     ])
     expectNoPostNoLeak(run)
   })
@@ -3033,12 +3052,12 @@ describe('confirmation and apply', () => {
 
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [confirmedInvalidLogged(error())],
-      writes: [{ path: h.paths.pending, ok: true }],
+      logs: [confirmedInvalidLogged(error()), invalidLogged(error())],
+      writes: [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite(), { path: h.paths.pending, ok: true }],
       removes: [applyRemoved()],
     })
-    expect(h.readPending()).toEqual(pendingBytes)
-    expect(h.readRecord()).toEqual(started.recordBytes)
+    expect(h.readPending()).not.toEqual(pendingBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(started.recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
     expect(slots.calls).toEqual([])
@@ -3062,9 +3081,10 @@ describe('confirmation and apply', () => {
     await next.ticks.ticks(5)
 
     const error = `loadPersonaConfig: malformed JSON in "${h.paths.config}" at line 3, column 5.`
-    expect(next.invalidLines()).toEqual([confirmedInvalidLogged(error)])
+    expect(next.invalidLines()).toEqual([invalidLogged(error)])
+    expect(next.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
     expect(h.pendingLines()).toEqual(invalidPreview(error))
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(next.appliedConfigs).toEqual([])
     expect(next.lifecycle.records.filter((r) => r.via !== 'start')).toEqual([])
     expect(h.applyExists()).toBe(false)
@@ -3084,7 +3104,7 @@ describe('confirmation and apply', () => {
     // (last clause): the pending file is written again on the same check, with the current fingerprint and preview.
     expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
     expect(h.pendingFingerprint()).not.toBe(fingerprint)
-    expect(run.since(cp)).toEqual({ ...pendingWritten([staleLogged(STALE_MISMATCH), ...loggedPreview()]), removes: [applyRemoved()] })
+    expect(run.since(cp)).toEqual({ ...pendingWritten([reviewOutcomeLine('superseded'), ...loggedPreview()]), removes: [applyRemoved()] })
     expect(h.applyExists()).toBe(false)
 
     const later = run.checkpoint()
@@ -3095,19 +3115,19 @@ describe('confirmation and apply', () => {
     h.writeConfigBytes(configBytes)
     const reverted = run.checkpoint()
     await run.ticks.ticks(5)
-    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
     expect(run.since(reverted)).toEqual(pendingWritten())
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
-    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
 
     h.confirm()
     await run.ticks.tick()
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
-    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toHaveLength(1)
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toHaveLength(1)
     expectNoPostNoLeak(run)
   })
 
@@ -3124,11 +3144,11 @@ describe('confirmation and apply', () => {
     if (dryRun) {
       expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
       expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
-      expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([])
+      expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([])
     } else {
-      expect(h.readRecord()).toEqual(recordBytes)
+      expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
       expect(run.appliedConfigs).toEqual([])
-      expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+      expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
       expect(h.pendingHeader()).toBe(previewHeader({ removed: 1, credentials: 1 }))
     }
     expect(h.applyExists()).toBe(false)
@@ -3175,7 +3195,7 @@ describe('confirmation and apply', () => {
 
     // The pending file (still current) is left as it is.
     expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [staleLogged(what)], removes: [applyRemoved()] })
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
     expect(h.applyExists()).toBe(false)
@@ -3207,10 +3227,10 @@ describe('confirmation and apply', () => {
     const cp = run.checkpoint()
     await run.ticks.ticks(5)
 
-    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [staleLogged(STALE_MISMATCH)], removes: [applyRemoved()] })
-    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [reviewOutcomeLine('superseded')], removes: [applyRemoved()] })
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
     expect(run.appliedConfigs).toEqual([])
@@ -3233,7 +3253,7 @@ describe('confirmation and apply', () => {
       logs: [undeletableLogged('EISDIR'), staleLogged('cannot be read (EISDIR)')],
       removes: Array.from({ length: 10 }, applyNotRemoved),
     })
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(h.pendingExists()).toBe(true)
     expectNoPostNoLeak(run)
@@ -3250,7 +3270,7 @@ describe('confirmation and apply', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 }), undeletableLogged('EIO')],
-      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
+      writes: [h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()],
       removes: [applyNotRemoved()],
     })
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
@@ -3280,32 +3300,37 @@ describe('confirmation and apply', () => {
     expectNoPostNoLeak(run)
   })
 
-  test('an undeletable stale confirmation still applies nothing once the config is edited back to match it, until its content changes', async () => {
+  test('an undeletable stale confirmation still applies nothing once the config is edited back to match it, including edits to the old confirmation; only a fresh current review applies', async () => {
     const { run, personas, recordBytes, configBytes } = await pendingRemoval(['alpha', 'bravo'])
     const [alpha, bravo] = personas
     h.confirm()
     h.writeConfig({ ...configOf(alpha!, bravo!), stop_timeout: 45 })
     h.failRemoves()
     await run.ticks.tick()
-    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
     expect(run.logsOf('reload')).toEqual([undeletableLogged('EIO')])
 
     // Edited back: the current fingerprint (and the whole pending file) now matches the confirmation.
     h.writeConfigBytes(configBytes)
     await run.ticks.ticks(5)
-    expect(h.readPending()).toEqual(h.readApply())
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(h.readPending()).not.toEqual(h.readApply())
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.appliedConfigs).toEqual([])
-    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toHaveLength(1)
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toHaveLength(1)
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
 
     // Its content changes (the preview edited, the fingerprint kept): processed again, and it matches.
     h.writeApplyBytes(Buffer.concat([h.readApply()!, Buffer.from('an edit to the preview\n')]))
     await run.ticks.tick()
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded'), reviewOutcomeLine('superseded')])
+    assertNoLeak(run.captured())
+    h.clearRemoveFailure(); h.confirm(); await run.ticks.tick()
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
     // The delete seam fails the pending file's removal too, after the apply.
-    expect(run.logsOf('reload')).toEqual([undeletableLogged('EIO'), undeletableLogged('EIO'), fileFailureLine('EIO')])
+    expect(run.logsOf('reload')).toEqual([undeletableLogged('EIO'), undeletableLogged('EIO')])
     expectNoPostNoLeak(run)
   })
 
@@ -3330,7 +3355,7 @@ describe('confirmation and apply', () => {
     await run.ticks.tick()
     expect(outsideLifecycle(run.since(again))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [undeletableLogged('EIO'), staleLogged(STALE_MISMATCH)],
+      logs: [undeletableLogged('EIO'), reviewOutcomeLine('consumed')],
       removes: [applyNotRemoved()],
     })
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
@@ -3349,7 +3374,7 @@ describe('confirmation and apply', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 }), removedUnsyncedLogged('EIO')],
-      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
+      writes: [h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()],
       removes: [{ path: h.paths.apply, ok: true, removed: true, unsynced: true }],
     })
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
@@ -3388,7 +3413,7 @@ describe('confirmation and apply', () => {
   test.each([
     {
       label: 'before the rename (openSync)',
-      failure: { step: 'openSync', call: 3 },
+      failure: { step: 'openSync', call: 5 },
       line: () => reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code: 'EIO' }), reloadRetiredKeysPutBackClause(h.retiredKeysFile)),
       recordWrites: [false],
     },
@@ -3409,20 +3434,22 @@ describe('confirmation and apply', () => {
     // The retired-key record step 1 wrote is put back to the empty record held before the apply: removed.
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [retiredKeysLogged('recorded'), retiredKeysLogged('restored'), line()],
+      logs: [retiredKeysLogged('recorded'), retiredKeysLogged('restored'), line(), ...loggedPreview()],
       writes: [
+        h.lastAppliedWrite(),
         h.retiredKeysWrite(),
         ...recordWrites.map((ok) => h.lastAppliedWrite(ok)),
+        h.lastAppliedWrite(), h.lastAppliedWrite(),
         { path: h.paths.pending, ok: true },
       ],
       removes: [retiredKeysRemoved()],
     })
-    expect(h.readRecord()).toEqual(started.recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(started.recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
     expect(slots.calls).toEqual([])
-    expect(h.readPending()).toEqual(pendingBytes)
-    expect(run.previewEmissionCount()).toBe(1)
+    expect(h.readPending()).not.toEqual(pendingBytes)
+    expect(run.previewEmissionCount()).toBe(2)
     assertNoLeak(run.captured({ record: writtenFile(h.paths.lastApplied) }))
 
     // Failure evidence is retained with no silent retry; a fresh confirming rename permits another attempt.
@@ -3455,7 +3482,7 @@ describe('confirmation and apply', () => {
     run = started.run
     const configBytes = h.writeConfigBytes(edit(sourceBytesOf(started.recordBytes)))
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+    expect(h.pendingLines()).toEqual([...[NO_EFFECTIVE_CHANGE_PREVIEW], ...h.reviewLines()])
     const cp = run.checkpoint()
 
     h.confirm()
@@ -3464,7 +3491,7 @@ describe('confirmation and apply', () => {
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [noopLogged()],
-      writes: [h.lastAppliedWrite()],
+      writes: [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
@@ -3489,7 +3516,7 @@ describe('confirmation and apply', () => {
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [appliedLogged({ settings: 1 })],
-      writes: [h.lastAppliedWrite()],
+      writes: [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
@@ -3623,7 +3650,7 @@ describe('confirmation and apply', () => {
         ),
         appliedLogged({ removed: 1 }),
       ],
-      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
+      writes: [h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
     // Every step this removal runs (no config directory changed, so no template refresh), after step 1.
@@ -3669,7 +3696,7 @@ describe('confirmation and apply', () => {
     const since = run.since(cp)
     expect(since.writes).toEqual([])
     expect(since.removes).toEqual([])
-    expect(since.logs.filter((l) => l.startsWith('[slack] reload'))).toEqual([appliedLogged({ removed: 1 })])
+    expect(since.logs.filter((l) => l.startsWith('[slack] reload'))).toEqual([])
     expect(h.pendingExists()).toBe(false)
     expect(run.previewEmissionCount()).toBe(1)
     expectNoPostNoLeak(run)
@@ -3691,7 +3718,7 @@ describe('confirmation and apply', () => {
     await run.ticks.tick()
     candidate = h.writeConfig(configOf({ ...alpha, claude_config_dir: link }))
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+    expect(h.pendingLines()).toEqual([...[NO_EFFECTIVE_CHANGE_PREVIEW], ...h.reviewLines()])
 
     h.confirm()
     await run.ticks.tick()
@@ -3814,7 +3841,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 
       const { tokens } = h.rotateCredentials(alpha)
       await run.ticks.tick()
-      expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')])
+      expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')], ...h.reviewLines()])
       // Checked while the pending file exists: the new token set is in neither it nor the log.
       assertNoLeak(run.captured())
 
@@ -3888,7 +3915,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     // Same tokens, one more byte: a credentials change, previewed as a bring-up.
     h.writeCredentialsContent(alpha, withNewline(h.readCredentialsBytes(alpha)!).toString('utf-8'))
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')], ...h.reviewLines()])
     assertNoLeak(run.captured())
     expect(stub.calls.authTest).toHaveLength(1)
     const applyCp = run.checkpoint()
@@ -3926,7 +3953,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 
     edit(alpha)
     await run.ticks.tick()
-    const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, effect, cause)]
+    const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, effect, cause), ...h.reviewLines()]
     expect(h.pendingLines()).toEqual(preview)
     const fingerprint = h.pendingFingerprint()
     const authorityRevision = JSON.parse(h.readRecord()!.toString()).revision
@@ -3946,7 +3973,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     // The credentials stay pending under the new authority revision; the consumed confirmation cannot replay.
     expect(h.pendingLines()).toEqual(preview)
     expect(h.pendingFingerprint()).not.toBe(fingerprint)
-    expect(JSON.parse(h.readRecord()!.toString()).revision).toBe(authorityRevision + 1)
+    expect(JSON.parse(h.readRecord()!.toString()).revision).toBe(authorityRevision + 3)
     expect(run.bringUps.credentialsDigest(key)).toBe(held)
     // The old connection keeps serving: no socket opened or closed, the same identity, still up.
     expect(run.socketActivity('alpha')).toEqual(sockets)
@@ -3963,7 +3990,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 
     const { label } = h.rotateCredentials(alpha)
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'reconnect')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'reconnect')], ...h.reviewLines()])
     assertNoLeak(run.captured())
     const fix = run.checkpoint()
     h.confirm()
@@ -3989,7 +4016,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 
     notJson(alpha)
     await run.ticks.tick()
-    const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'retry', CREDENTIALS_NOT_JSON)]
+    const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'retry', CREDENTIALS_NOT_JSON), ...h.reviewLines()]
     expect(h.pendingLines()).toEqual(preview)
     assertNoLeak(run.captured())
     const cp = run.checkpoint()
@@ -4013,7 +4040,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 
     const { tokens, label } = h.rotateCredentials(alpha)
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'retry')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'retry')], ...h.reviewLines()])
     assertNoLeak(run.captured())
     const fix = run.checkpoint()
     h.confirm()
@@ -4049,7 +4076,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     const bravoBefore = bravoSide(run)
     h.rotateCredentials(alpha, { slack })
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'reconnect')])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'reconnect')], ...h.reviewLines()])
     assertNoLeak(run.captured())
     const cp = run.checkpoint()
 
@@ -4092,7 +4119,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     const bravoBefore = bravoSide(run)
     edit(alpha)
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), preview(alpha)])
+    expect(h.pendingLines()).toEqual([...[previewHeader({ credentials: 1 }), preview(alpha)], ...h.reviewLines()])
     assertNoLeak(run.captured())
     const cp = run.checkpoint()
 
@@ -4154,7 +4181,7 @@ describe('the independent credential-file safety limit', () => {
 
     await run.ticks.ticks(10)
 
-    expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, writes: [h.lastAppliedWrite()] })
     expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
   })
@@ -4198,7 +4225,7 @@ async function expectStartRefused(
   expect(run.outcome.kind === 'refused' && run.outcome.source).toBe(source)
   expect(run.logs).toEqual([startRefusal(source, detail)])
   expect(run.writes).toEqual([])
-  expect(h.readRecord()).toEqual(recordBytes)
+  expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
   expect(h.readConfig()).toEqual(configBytes)
   // The config file, the credentials files and the hand-edited record are the operator's; everything else is checked.
   const operatorWritten = [h.paths.config, ...credentialsFiles, ...(source === 'record' ? [h.paths.lastApplied] : [])]
@@ -4242,11 +4269,11 @@ async function expectInvalidCandidateStaysClean(
 
   expect(run.since(confirmed)).toEqual({
     ...NO_RUN_ACTIVITY,
-    logs: [confirmedInvalidLogged(error)],
-    writes: [{ path: h.paths.pending, ok: true }],
+    logs: [confirmedInvalidLogged(error), invalidLogged(error)],
+    writes: [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite(), { path: h.paths.pending, ok: true }],
     removes: [applyRemoved()],
   })
-  expect(h.readRecord()).toEqual(recordBytes)
+  expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
   expect(run.controller.applied()).toBe(applied)
   expect(run.appliedConfigs).toEqual([])
   expect(h.applyExists()).toBe(false)
@@ -4350,7 +4377,7 @@ describe('a token-shaped persona name is an ordinary name: previewed, applied an
     const cp = run.checkpoint()
     await run.ticks.tick()
 
-    expect(h.pendingLines()).toEqual([previewHeader(counts), ...removed.map(removedLine), addedLine(name)])
+    expect(h.pendingLines()).toEqual([...[previewHeader(counts), ...removed.map(removedLine), addedLine(name)], ...h.reviewLines()])
     expect(run.since(cp)).toEqual(pendingWritten())
     expect(run.logsOf(RELOAD_INVALID)).toEqual([])
     // Checked while the pending file exists: captured() holds it as a written file.

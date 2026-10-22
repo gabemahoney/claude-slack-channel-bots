@@ -65,7 +65,7 @@ BRAVO_DIR="$(make_workdir bravo)"
 # --- Expected text (fragments quoted from src/, see the header) -----------
 PREVIEW='[slack] reload-preview: '
 APPLIED_CLASS='[slack] reload-applied:'
-STALE_CLASS='[slack] reload-stale-confirmation:'
+STALE_CLASS='[slack] reload-review-outcome:'
 NOTHING_PENDING='[slack] reload-nothing-pending:'
 
 # A persona's preview line (in the pending file; its log line is the same
@@ -99,8 +99,8 @@ BRAVO_DELIVERY_BODY="$(in_place_body "${BRAVO}" delivery)"
 ALPHA_UPDATED_CHANNELS="$(updated_in_place_match "${ALPHA}" channels)"
 ALPHA_UPDATED_DELIVERY="$(updated_in_place_match "${ALPHA}" delivery)"
 BRAVO_UPDATED_DELIVERY="$(updated_in_place_match "${BRAVO}" delivery)"
-# The mismatch reason (src/reload-apply.ts renderStaleConfirmationLogLine).
-STALE_MATCH="$(matcher "${STALE_CLASS}" "\"${APPLY}\"" 'does not match')"
+# A durably superseded review is reported by the production outcome builder.
+STALE_MATCH="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" reviewOutcomeLine superseded)"
 APPLIED_1="$(applied_match in_place=1)"
 APPLIED_2="$(applied_match in_place=2)"
 HEADER_1="$(preview_logged_header in_place=1)"
@@ -201,6 +201,7 @@ cp -- "${LAST}" "${AUTHORITY_V0}"
 
 # --- 1. Apply: preview, hold, confirm ------------------------------------
 emit_config "${V1_ALPHA}" all | write_config
+configuration_request edit1 request "${ALPHA}/${A2}/all"
 
 wait_for_file "${PENDING}" "${TICK_WAIT_S}" "edit 1: config.json.pending never appeared"
 wait_until 10 "edit 1: config.json.pending never named persona ${ALPHA}'s channels change" \
@@ -208,12 +209,12 @@ wait_until 10 "edit 1: config.json.pending never named persona ${ALPHA}'s channe
 check_pending_layout "edit 1" in_place=1
 wait_for_log "${HEADER_1}" 10 "edit 1: reload-preview header not logged"
 expect_preview_logged "edit 1" edit1
-cmp -s -- "${AUTHORITY_V0}" "${LAST}" || fail "edit 1: config.json.last-applied changed before a confirmation"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V0}" "${LAST}" || fail "edit 1: config.json.last-applied changed before a confirmation"
 
 # An unconfirmed edit never applies: watch a full tick interval (the record
-# keeps its bytes, no reload-applied line, alpha is not updated in place).
+# keeps applied facts, no reload-applied line, alpha is not updated in place).
 hold_not_applied "${HOLD_S}" "edit 1 unconfirmed" no_alpha_channels_update
-cmp -s -- "${AUTHORITY_V0}" "${LAST}" || fail "edit 1 unconfirmed: authority envelope changed"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V0}" "${LAST}" || fail "edit 1 unconfirmed: authority envelope changed"
 
 mv -f -- "${PENDING}" "${APPLY}"
 
@@ -233,11 +234,13 @@ cp -- "${LAST}" "${AUTHORITY_V1}"
 
 # --- 2. Stale confirmation -----------------------------------------------
 emit_config "${V2_ALPHA}" all | write_config
+configuration_request edit2 request "${ALPHA}/${A2}/mentions"
 
 wait_until "${TICK_WAIT_S}" "edit 2: config.json.pending never named persona ${ALPHA}'s delivery change" \
     pending_has_line "${ALPHA_DELIVERY_BODY}"
 check_pending_layout "edit 2" in_place=1
-# Same counts as edit 1's header, so this is its second occurrence.
+# Both edits have these lifecycle counts; request processing may add a review.
+# The exact current review's full body is checked below.
 wait_for_count "${HEADER_1}" 2 10 "edit 2: reload-preview header not logged"
 expect_preview_logged "edit 2" edit2
 
@@ -252,19 +255,20 @@ fi
 
 # Edit 3; once the server has previewed it, confirm edit 2's preview.
 emit_config "${V2_ALPHA}" mentions | write_config
+configuration_request edit3 revise "${ALPHA}/${A2}/mentions" "${BRAVO}/${B1}/mentions"
 wait_until "${TICK_WAIT_S}" "edit 3: no fresh config.json.pending naming persona ${BRAVO}'s delivery change" \
     fresh_pending_for_v3
 check_pending_layout "edit 3" in_place=2
 pending_has_line "${ALPHA_DELIVERY_BODY}" || fail "edit 3: config.json.pending lost persona ${ALPHA}'s delivery change"
 wait_for_log "${HEADER_2}" 10 "edit 3: reload-preview header not logged"
 expect_preview_logged "edit 3" edit3
-cmp -s -- "${AUTHORITY_V1}" "${LAST}" || fail "edit 3: config.json.last-applied changed before a confirmation"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V1}" "${LAST}" || fail "edit 3: config.json.last-applied changed before a confirmation"
 
 mv -f -- "${STALE_COPY}" "${APPLY}"
 
-wait_for_log "${STALE_MATCH}" "${TICK_WAIT_S}" "stale confirmation: reload-stale-confirmation not logged"
+wait_for_log "${STALE_MATCH}" "${TICK_WAIT_S}" "stale confirmation: superseded review outcome not logged"
 [[ ! -e "${APPLY}" ]] || fail "stale confirmation: config.json.apply still present"
-cmp -s -- "${AUTHORITY_V1}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V1}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
 expect_count "${APPLIED_CLASS}" 1 "stale confirmation: a change was applied (reload-applied lines)"
 expect_count "${ALPHA_UPDATED_DELIVERY}" 0 "stale confirmation: persona ${ALPHA} updated in place"
 expect_count "${BRAVO_UPDATED_DELIVERY}" 0 "stale confirmation: persona ${BRAVO} updated in place"
@@ -282,7 +286,7 @@ wait_for_log "${ALPHA_UPDATED_DELIVERY}" 10 "confirm 3: persona ${ALPHA} not upd
 wait_for_log "${BRAVO_UPDATED_DELIVERY}" 10 "confirm 3: persona ${BRAVO} not updated in place"
 wait_until 10 "confirm 3: config.json.pending not removed after the apply" test ! -e "${PENDING}"
 expect_count "${APPLIED_CLASS}" 2 "confirm 3: reload-applied lines"
-expect_count "${STALE_CLASS}" 1 "confirm 3: reload-stale-confirmation lines"
+expect_count "${STALE_CLASS}" 1 "confirm 3: review outcome lines"
 
 # --- Stop -----------------------------------------------------------------
 # shellcheck disable=SC2119 # no bot was launched: no --stop-bots

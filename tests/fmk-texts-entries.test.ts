@@ -79,6 +79,9 @@ import * as registry from '../src/registry.ts'
 import * as reloadApply from '../src/reload-apply.ts'
 import * as reload from '../src/reload.ts'
 import * as reloadPlan from '../src/reload-plan.ts'
+import * as reloadRequest from '../src/reload-request.ts'
+import * as reloadReview from '../src/reload-review.ts'
+import * as reloadFingerprint from '../src/reload-fingerprint.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
@@ -125,6 +128,9 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'reload-apply.ts': reloadApply,
   'reload.ts': reload,
   'reload-plan.ts': reloadPlan,
+  'reload-request.ts': reloadRequest,
+  'reload-review.ts': reloadReview,
+  'reload-fingerprint.ts': reloadFingerprint,
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,

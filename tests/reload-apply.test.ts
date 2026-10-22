@@ -1,3 +1,4 @@
+import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
 import { membershipPage } from './test-helpers/shared-channels.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
@@ -289,8 +290,17 @@ async function expectNothingPendingAfter(run: ReloadRun): Promise<void> {
   expect(h.applyExists()).toBe(false)
   expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(h.readConfig()!.toString()))
   const cp = run.checkpoint()
+  const before = applicationState(h.readRecord()!)
+  await run.ticks.tick()
+  const first = run.since(cp)
+  expect(first.writes.length).toBeLessThanOrEqual(1)
+  expect(first.writes).toEqual(first.writes.length ? [h.lastAppliedWrite()] : [])
+  const metadataOnly = { ...first }; metadataOnly.writes = []
+  expect(metadataOnly).toEqual(NO_RUN_ACTIVITY)
+  expect(applicationState(h.readRecord()!)).toEqual(before)
+  const settled = run.checkpoint()
   await run.ticks.ticks(3)
-  expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+  expect(run.since(settled)).toEqual(NO_RUN_ACTIVITY)
 }
 
 /** Yield event-loop turns (no timer) until `cond` holds; fails if it never does. */
@@ -480,10 +490,10 @@ describe('the dry-run sprint demo: a confirmed addition (real composition, dry r
     // Edit, check: the pending file previews the addition and nothing is applied.
     h.writeConfig(configOf(alpha!, charlie))
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       `A configuration change is pending; nothing has been applied. ${ONE_ADDED}.`,
       `persona ${JSON.stringify('charlie')} (key=${charlieKey}) is added: it will be brought up and launched.`,
-    ])
+    ], ...h.reviewLines()])
     expect(run.since(cp).lifecycle).toEqual([])
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
 
@@ -761,7 +771,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(recorded(run))
     expect(run.retiredKeys.isRecorded(h.key('alpha'))).toBe(false)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
@@ -801,7 +811,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
     expect(run.retiredKeys.keys()).toEqual([])
@@ -829,6 +839,9 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     // Held at step 2's first teardown: both writes are made, the retired-key one first, before any teardown began.
     expect(writesAt).toEqual([
+      [h.paths.lastApplied, -1], // initial observation before the run is assigned
+      [h.paths.lastApplied, 0], // candidate review
+      [h.paths.lastApplied, 0], // spent attempt
       [h.retiredKeysFile, 0],
       [h.paths.lastApplied, 0],
     ])
@@ -844,7 +857,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     gate.release()
     await applying
 
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }, h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(run.lifecycle.keys('teardown')).toEqual([bravoKey, charlieKey])
     expect(run.since(cp).lifecycle.filter((r) => r.key === h.key('alpha'))).toEqual([])
     // The record is as step 1 wrote it: alpha never recorded, the teardowns change nothing in it.
@@ -866,7 +879,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     const applying = run.checkpoint()
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual(written ? [h.retiredKeysWrite(), h.lastAppliedWrite()] : [h.lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite(), ...(written ? [h.retiredKeysWrite()] : []), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(written ? recordedNow(run, { [h.key('bravo')]: RETIRED_KEY_CAUSE_REMOVED }) : seeded)
     expect(run.retiredKeys.isMarked(h.key('bravo'))).toBe(false)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
@@ -899,8 +912,8 @@ describe('apply step 1 records the retired keys before the last-applied record i
     { label: 'a removed key', held: false, cause: RETIRED_KEY_CAUSE_REMOVED },
     // Recording a key held only in memory writes the record, with the cause it holds (design A3).
     { label: 'a removed key held only in memory after a failed start-sweep write', held: true, cause: RETIRED_KEY_CAUSE_ABSENT_AT_START },
-  ])('stopped between the two writes: $label is written by step 1 and stays retired after the restart, which starts from the old last-applied record (part)', async ({ held, cause }) => {
-    const { run, personas } = await running(['alpha', 'bravo'], { stopBeforeWrite: h.paths.lastApplied })
+  ])('stopped between the two writes: $label is prepared by step 1 and rolled back to its prior retirement after restart, which starts from the old last-applied record (part; )', async ({ held, cause }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { stopBeforeWrite: (path, bytes) => path === h.paths.lastApplied && activationRecord(bytes, path) })
     const bravoKey = h.key('bravo')
     const recordBytes = h.readRecord()
     if (held) holdInMemory(run, bravoKey)
@@ -910,16 +923,16 @@ describe('apply step 1 records the retired keys before the last-applied record i
     await applyConfig(run, [personas[0]!])
 
     expect(run.stoppedBeforeWrite).toBe(true)
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }, h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expectNoPostNoLeak(run)
 
     await run.stop()
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     const restarted = await h.start()
 
     expect(restarted.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
-    expect(readRetiredKeysRecord(h.stateDir)).toEqual(recordedNow(run, { [bravoKey]: cause }))
-    expect(restarted.retiredKeys.isRecorded(bravoKey)).toBe(true)
+    expect(readRetiredKeysRecord(h.stateDir)).toEqual(held ? recordedNow(run, { [bravoKey]: cause }) : null)
+    expect(restarted.retiredKeys.isRecorded(bravoKey)).toBe(held)
     expect(restarted.retiredKeys.isHeldInMemory(bravoKey)).toBe(false)
     expectNoPostNoLeak(restarted)
   })
@@ -946,7 +959,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(recordedNow(run, { [charlieKey]: RETIRED_KEY_CAUSE_ABSENT_AT_START }))
     expect(run.retiredKeys.isHeldInMemory(charlieKey)).toBe(false)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
@@ -994,9 +1007,9 @@ describe('a failed apply undoes its recording', () => {
   // The retired-key write opens and fsyncs its temporary file and its directory first, so the last-applied
   // write's own open is the third openSync and its directory fsync the fourth fsyncSync, counted from failWrites.
   test.each<{ label: string; failure: Partial<WriteFailure>; seeded: boolean; lastAppliedWrites: boolean[] }>([
-    { label: 'before the rename, over a record seeded before the apply', failure: { step: 'openSync', call: 3 }, seeded: true, lastAppliedWrites: [false] },
-    { label: 'before the rename, with no record before the apply', failure: { step: 'openSync', call: 3 }, seeded: false, lastAppliedWrites: [false] },
-    { label: 'before the rename, with secret-bearing errno and error message', failure: { step: 'openSync', call: 3, code: fakeToken(BOT_TOKEN_PREFIX, 'apply-errno') }, seeded: true, lastAppliedWrites: [false] },
+    { label: 'before the rename, over a record seeded before the apply', failure: { step: 'openSync', call: 5 }, seeded: true, lastAppliedWrites: [false] },
+    { label: 'before the rename, with no record before the apply', failure: { step: 'openSync', call: 5 }, seeded: false, lastAppliedWrites: [false] },
+    { label: 'before the rename, with secret-bearing errno and error message', failure: { step: 'openSync', call: 5, code: fakeToken(BOT_TOKEN_PREFIX, 'apply-errno') }, seeded: true, lastAppliedWrites: [false] },
   ])('a rewrite failing $label applies nothing, logs one reload-record-write-failed line, and puts the record back: the keys it recorded removed, the marks it cleared back, keys recorded before it kept; a fresh confirmation then applies and records', async ({ failure, seeded, lastAppliedWrites }) => {
     const before = seed(seeded)
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
@@ -1014,9 +1027,12 @@ describe('a failed apply undoes its recording', () => {
 
     // Step 1 wrote the record, then put it back: written again, or removed when it was empty before.
     expect(run.since(cp).writes).toEqual([
+      h.lastAppliedWrite(),
       h.retiredKeysWrite(),
       ...lastAppliedWrites.map((ok) => h.lastAppliedWrite(ok)),
       ...(seeded ? [h.retiredKeysWrite()] : []),
+      h.lastAppliedWrite(), // reject the spent attempt
+      h.lastAppliedWrite(), // persist the next review
       { path: h.paths.pending, ok: true },
     ])
     expect(run.since(cp).removes.filter((r) => r.path === h.retiredKeysFile)).toEqual(
@@ -1036,11 +1052,11 @@ describe('a failed apply undoes its recording', () => {
     // The restore succeeded: the line says the record is put back, never that the apply's keys stay retired.
     expect(lines[0]).toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
     expect(lines[0]).not.toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
     expect(run.since(cp).lifecycle).toEqual([])
-    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
     expectNoPostNoLeak(run)
 
     // A fresh confirmation, with the writer working, applies and records.
@@ -1067,12 +1083,12 @@ describe('a failed apply undoes its recording', () => {
     const input = h.writeConfig(configOf(alpha!, movedDirectory(charlie!)))
     await run.ticks.tick()
     h.confirm()
-    h.failWrites({ step: 'fsyncSync', call: 4, code })
+    h.failWrites({ step: 'fsyncSync', call: 6, code })
     const checkpoint = run.checkpoint()
     await run.ticks.tick()
     expect(run.controller.sharedChannels()!.readable).toBe(false)
     expect(run.controller.applied()).toBe(applied)
-    expect(JSON.parse(h.readRecord()!.toString()).revision).toBe(before.revision + 1)
+    expect(JSON.parse(h.readRecord()!.toString()).revision).toBe(before.revision + 3)
     expect(h.readConfig()).toEqual(input)
     expect(run.retiredKeys.keys()).toEqual([h.key('bravo'), h.key('charlie'), ...(seeded ? ['zulu'] : [])].sort())
     expect(run.since(checkpoint).lifecycle).toEqual([])
@@ -1082,10 +1098,9 @@ describe('a failed apply undoes its recording', () => {
       reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'unresolved', errnoSuffix({ code })),
     ])
     h.clearWriteFailure()
-    h.confirm()
     await run.ticks.tick()
-    expect(run.controller.applied()).toBe(applied)
-    expect(run.since(checkpoint).lifecycle).toEqual([])
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expectNoPostNoLeak(run)
     await run.stop()
     const reopened = await h.start()
@@ -1110,8 +1125,8 @@ describe('a failed apply undoes its recording', () => {
     let failing = false
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'], {
       // From the last-applied write on, every write fails: the rewrite and the restore after it.
-      beforeWrite: (path) => {
-        if (failing && path === h.paths.lastApplied) h.failWrites({ code })
+      beforeWrite: (path, bytes) => {
+        if (failing && path === h.paths.lastApplied && activationRecord(bytes, path)) h.failWrites({ code })
       },
     })
     const [alpha, , charlie] = personas
@@ -1123,7 +1138,7 @@ describe('a failed apply undoes its recording', () => {
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes.slice(0, 3)).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite(false), h.retiredKeysWrite(false)])
+    expect(run.since(cp).writes.slice(0, 4)).toEqual([h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(false), h.retiredKeysWrite(false)])
     const lines = recordWriteFailedLines(run)
     assertNoLeak(lines)
     expect(lines).toEqual([
@@ -1157,14 +1172,14 @@ describe('a failed apply undoes its recording', () => {
     await run.ticks.tick()
     const fingerprint = h.pendingFingerprint()
     h.confirm()
-    h.failWrites(failure)
+    h.failWrites({ ...failure, path: h.retiredKeysFile })
     const cp = run.checkpoint()
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes[0]).toEqual(h.retiredKeysWrite(false))
-    expect(run.since(cp).writes.filter((w) => w.path === h.paths.lastApplied)).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.since(cp).writes[1]).toEqual(h.retiredKeysWrite(false))
+    expect(run.since(cp).writes.filter((w) => w.path === h.paths.lastApplied)).toEqual(restoreFails ? [h.lastAppliedWrite()] : [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
     expect(run.since(cp).lifecycle).toEqual([])
@@ -1172,8 +1187,8 @@ describe('a failed apply undoes its recording', () => {
     expect(lines).toHaveLength(1)
     expect(lines[0]).toContain(JSON.stringify(h.retiredKeysFile))
     // How the restore went: put back (the held-only-in-memory key written to the file), or failed too.
-    expect(lines[0]).toContain(restoreFails ? RELOAD_RETIRED_KEYS_RESTORE_FAILED : RELOAD_RETIRED_KEYS_RESTORED)
-    expect(lines[0]).not.toContain(restoreFails ? RELOAD_RETIRED_KEYS_RESTORED : RELOAD_RETIRED_KEYS_RESTORE_FAILED)
+    expect(lines[0]).toContain(restoreFails ? reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile) : reloadRetiredKeysPutBackClause(h.retiredKeysFile))
+    expect(lines[0]).not.toContain(restoreFails ? reloadRetiredKeysPutBackClause(h.retiredKeysFile) : reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
     if (held) {
       // Still retired: written by the restore, or still held only in memory when every write fails.
       expect(run.retiredKeys.isRecorded(charlieKey)).toBe(true)
@@ -1188,7 +1203,7 @@ describe('a failed apply undoes its recording', () => {
     // Still pending: with the writer working again, the next check holds the same pending change, and applies nothing.
     h.clearWriteFailure()
     await run.ticks.tick()
-    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
     expect(run.appliedConfigs).toEqual([])
     expectNoPostNoLeak(run)
   })
@@ -1198,14 +1213,31 @@ describe('after a failed rewrite, the persona it would have retired resumes its 
   beforeEach(useConfigDirs)
 
   test('a removal whose rewrite fails leaves bravo applied and unrecorded, and its next launch from an ended row resumes it: no reuse spawn, no delete', async () => {
-    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
+    let activationAttempts = 0
+    let retirementAtActivation = false
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      ...REAL_LAUNCH,
+      beforeWrite: (path, bytes) => {
+        if (path !== h.paths.lastApplied || !activationRecord(bytes, path)) return
+        activationAttempts++
+        retirementAtActivation = readRetiredKeysRecord(h.stateDir) !== null
+        h.failWrites({ path, step: 'openSync', call: 1 })
+      },
+    })
+    const before = applicationState(h.readRecord()!)
+    const cp = run.checkpoint()
     const bravoKey = h.key('bravo')
     h.writeConfig(configOf(personas[0]!))
     await run.ticks.tick()
     h.confirm()
-    h.failWrites({ step: 'openSync', call: 3 })
     await run.ticks.tick()
     h.clearWriteFailure()
+    expect(activationAttempts).toBe(1)
+    expect(retirementAtActivation).toBe(true)
+    expect(run.since(cp).writes.filter(write => !write.ok)).toEqual([h.lastAppliedWrite(false)])
+    expect(applicationState(h.readRecord()!)).toEqual(before)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
     expect(recordWriteFailedLines(run)).toHaveLength(1)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
     expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
@@ -3860,25 +3892,43 @@ describe('apply step 1 begins an old-life hold on each key it records, once the 
 
     // The teardown (the recorder's stand-in) reads no row, so the hold stays.
     expect(run.oldLifeHolds.snapshot()).toEqual([hold])
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, ...(seeded ? [] : [h.retiredKeysWrite()]), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }, h.lastAppliedWrite(), ...(seeded ? [] : [h.retiredKeysWrite()]), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expectNoPostNoLeak(run)
   })
 
-  test.each<{ label: string; failure: Partial<WriteFailure> }>([
-    { label: "step 1's own retired-key write fails", failure: { step: 'openSync', call: 1 } },
-    // The retired-key write opens and fsyncs first, so the last-applied write's own open is the third openSync and its directory fsync the fourth.
-    { label: 'the last-applied rewrite fails before its rename, and the record is put back', failure: { step: 'openSync', call: 3 } },
-  ])('$label: nothing is applied and no hold begins; the same change confirmed again with the writer working begins both holds', async ({ failure }) => {
-    const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
+  test.each([
+    { label: "step 1's own retired-key write fails", boundary: 'retirement' },
+    { label: 'the last-applied rewrite fails before its rename, and the record is put back', boundary: 'activation' },
+  ] as const)('$label: nothing is applied and no hold begins; the same change confirmed again with the writer working begins both holds', async ({ boundary }) => {
+    let armed = false, reached = 0, retirementAtActivation = false
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie'], {
+      beforeWrite: (path, bytes) => {
+        if (!armed || !(boundary === 'retirement' ? path === h.retiredKeysFile : path === h.paths.lastApplied && activationRecord(bytes, path))) return
+        armed = false; reached++
+        if (boundary === 'activation') retirementAtActivation = readRetiredKeysRecord(h.stateDir) !== null
+        h.failWrites({ path, step: 'openSync', call: 1 })
+      },
+    })
+    const before = applicationState(h.readRecord()!)
     const [alpha, bravo, charlie] = personas
     h.writeConfig(configOf(alpha!, movedDirectory(charlie!)))
     await run.ticks.tick()
     h.confirm()
-    h.failWrites(failure)
+    armed = true
+    const cp = run.checkpoint()
 
     await run.ticks.tick()
 
+    expect(reached).toBe(1)
+    if (boundary === 'activation') expect(retirementAtActivation).toBe(true)
+    expect(run.since(cp).writes.filter(write => !write.ok)).toEqual([
+      { path: boundary === 'retirement' ? h.retiredKeysFile : h.paths.lastApplied, ok: false },
+    ])
+    expect(applicationState(h.readRecord()!)).toEqual(before)
+    expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
+    expect(run.retiredKeys.keys()).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
     expect(recordWriteFailedLines(run)).toHaveLength(1)
     expect(run.appliedConfigs).toEqual([])
     expect(run.oldLifeHolds.snapshot()).toEqual([])

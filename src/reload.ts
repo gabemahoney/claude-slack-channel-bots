@@ -51,7 +51,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, reviewOutcomeLine, reviewRecoveryLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, sharedReviewDependency, RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, type DurableReview } from './reload-review.ts'
+import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic, REVIEW_REQUEST_INVALID, REVIEW_REQUEST_RECORDED, REVIEW_REQUEST_STORAGE } from './reload-request.ts'
+import type { ChannelMembership } from './channel-membership.ts'
+import type { ReviewedAssignment, ReviewedChannelEffect } from './shared-channels.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, sharedAppliedConfig, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
 import { dirname, resolve } from 'node:path'
 import {
@@ -122,6 +126,7 @@ import {
   FINGERPRINT_UNREADABLE,
   parsePendingFingerprint,
   reloadFingerprint,
+  reloadReviewBinding,
   type FingerprintContent,
   type FingerprintCredentialsEntry,
 } from './reload-fingerprint.ts'
@@ -147,12 +152,13 @@ import {
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY,
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEYS_WRITE_FAILED,
-  RETIRED_KEYS_WRITTEN,
   type OldLifeHoldBegin,
   type OldLifeHoldSet,
   type RetiredKeyStore,
   type RetiredKeysRestoreOutcome,
   type RetiredKeyToRecord,
+  retiredReviewRecovery,
+  restoreReviewedRetirement,
 } from './retired-keys.ts'
 
 export { RELOAD_INVALID, RELOAD_PREVIEW } from './reload-plan.ts'
@@ -274,6 +280,11 @@ export const RELOAD_DIAGNOSTIC_CLASSES = [
   RELOAD_APPLIED,
   RELOAD_NOOP,
   RELOAD_STALE_CONFIRMATION,
+  REVIEW_REQUEST_INVALID,
+  REVIEW_REQUEST_RECORDED,
+  REVIEW_REQUEST_STORAGE,
+  RELOAD_REVIEW_RECOVERY,
+  RELOAD_REVIEW_OUTCOME,
 ] as const
 
 /** A reload diagnostic class label (closed set). */
@@ -434,6 +445,13 @@ export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 
 /** Dependencies of `createReloadController`. */
 export interface ReloadControllerDeps {
+  /** Per-controller review epoch; restart always requires a fresh review of
+   * current membership. Injected for deterministic source-path fixtures. */
+  reviewSession?: () => string
+  now?: () => number
+  /** Current authenticated evidence, supplied by the existing membership owner.
+   * Reads only: review never starts a Slack lookup. */
+  membership?: () => Pick<ChannelMembership, 'read' | 'generation' | 'isCurrent'> | undefined
   /** facts gathered outside the pure change planner. */
   queueOpenCount?(key: string): number
   /** Confirmation-time seam; no log or notice wording. */
@@ -764,6 +782,11 @@ type ConfigFileRead =
 
 /** The pending state one detection pass derived. Holds no credentials content. */
 interface PendingState {
+  binding: string
+  review?: DurableReview
+  revalidate(): boolean
+  assignments: ReviewedAssignment[]
+  intentGeneration: number
   /**
    * The configuration file's bytes this pass read and fingerprinted, or
    * undefined when it could not be read: what a matching confirmation applies.
@@ -820,6 +843,7 @@ interface PendingDetection {
 
 /** What the detection tick asks of the controller that owns the applied state. */
 interface PendingDetectionHost {
+  recoverPending(): Promise<void>
   sharedChannels?(): SharedChannelAuthority | undefined
   /** The applied configuration now; read at the start of every derivation, so a swap is seen at once. */
   applied(): AppliedConfiguration
@@ -916,6 +940,8 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   const write = deps.write ?? durableWriteFileSync
   const remove = deps.remove ?? durableUnlinkSync
   const dryRun = deps.dryRun === true
+  const reviewSession = (deps.reviewSession ?? randomUUID)()
+  const observeReview = createReviewObserver()
   const configDir = dirname(paths.config)
   const checkConfigDir = deps.checkConfigDir ?? ((persona: Persona) => checkPersonaConfigDir(persona, { home: deps.home }))
   let logged: LoggedPendingState = { kind: 'initial' }
@@ -936,14 +962,32 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   let ignoredConfirmation: string | undefined
   /**
    * Suppress a failed activation's retained confirmation in this controller
-   * until a fresh gesture. After restart, an unconsumed confirmation may still
-   * authorize an apply after revalidation against the recovered state.
+   * until a fresh gesture. Durable attempted/consumed outcomes and the next
+   * server's review epoch also reject replay after restart.
    */
   let failedConfirmation: string | undefined
+  let reviewAttempted = false
 
   let factFailureLatched = false
   /** A fact the preview needs could not be gathered in this pass. */
   let factFailed = false
+  let requestEpisode: string | undefined
+  let channelEffects: ReviewedChannelEffect[] = []
+
+  function processRequest(): void {
+    const authority = host.sharedChannels?.()
+    if (!authority) return
+    const read = readConfigFile(paths.config + REVIEW_REQUEST_SUFFIX, deps.configFs)
+    if (!read.ok && read.missing) { requestEpisode = undefined; return }
+    const request = read.ok ? parseReviewRequestBytes(read.bytes) : undefined
+    const input = readConfigFile(paths.config, deps.configFs)
+    const result = request && (input.ok || request.action === 'cancel')
+      ? authority.requestReview(request, input.ok ? input.bytes : applied.bytes)
+      : { kind: 'invalid' as const, generation: authority.operatorIntent().generation }
+    const episode = JSON.stringify([read.ok ? createHash('sha256').update(read.bytes).digest('hex') : 'unreadable', result.kind, result.generation])
+    if (episode !== requestEpisode && result.kind !== 'duplicate') deps.log(reviewRequestDiagnostic(result.kind, result.generation))
+    requestEpisode = episode
+  }
 
   /**
    * A persona named by key, as the logs name it: its
@@ -955,13 +999,17 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     return persona !== undefined ? renderPersonaRef(persona.name, persona.key) : `(key=${key})`
   }
 
-  /** The candidate for bytes that differ from the applied bytes (default mode, so collisions are rejected). */
-  function candidateOf(read: ConfigFileRead, configChanged: boolean): ChangePlanCandidate {
+  /** Resolve the reviewed candidate; only exact recorded input keeps record-mode validation. */
+  function candidateOf(read: ConfigFileRead, assignments: readonly ReviewedAssignment[]): ChangePlanCandidate {
     if (!read.ok) return { kind: 'unreadable', path: paths.config, missing: read.missing, code: read.code }
-    if (!configChanged) return { kind: 'valid', config: applied.config }
     try {
       const authority = host.sharedChannels?.()
-      return { kind: 'valid', config: authority ? authority.previewReviewed(read.bytes) : parsePersonaConfigBytes(read.bytes, paths.config, configDir, { home: deps.home }) }
+      if (authority) {
+        const reviewed = authority.planReviewed(read.bytes, assignments)
+        channelEffects = reviewed.channels
+        return { kind: 'valid', config: reviewed.config }
+      }
+      return { kind: 'valid', config: parsePersonaConfigBytes(read.bytes, paths.config, configDir, { home: deps.home }) }
     } catch (err) {
       return { kind: 'invalid', error: errorMessage(err) }
     }
@@ -1039,11 +1087,17 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
    * credentials changed (`buildChangePlan`), from the digests of this pass's
    * reads and the held ones; the bytes are dropped when the pass returns.
    */
-  function derive(): PendingState {
+  function derive(persist = true): PendingState {
     applied = host.applied()
     const read = readConfigFile(paths.config, deps.configFs)
     const configChanged = !read.ok || !read.bytes.equals(Buffer.from(applied.bytes))
-    const candidate = candidateOf(read, configChanged)
+    const authority = host.sharedChannels?.()
+    const intent = authority?.operatorIntent()
+    let assignments: ReviewedAssignment[] = []
+    let declarationError = false
+    try { if (read.ok) assignments = authority?.declaredAssignments(read.bytes) ?? [] } catch { declarationError = true }
+    channelEffects = []
+    const candidate: ChangePlanCandidate = declarationError ? { kind: 'invalid', error: 'The declared assignment targets an obsolete persona life or declaration; revise the operator request.' } : candidateOf(read, assignments)
 
     const credentialsReads = new Map<string, CredentialsFileRead>()
     const readCredentials = (path: string): CredentialsFileRead => {
@@ -1082,6 +1136,8 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
     factFailed = false
     const facts: ChangePlanFacts = {
+      sharedReview: { generation: intent?.generation ?? 0, channels: channelEffects },
+      membership: (key, channel, mode) => deps.membership?.()?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
       realPath: realPathOf,
       queueOpenCount: key => deps.queueOpenCount?.(key) ?? 0,
       home: deps.home,
@@ -1106,16 +1162,41 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     const plan = buildChangePlan(applied.config, candidate, facts)
     if (!factFailed) factFailureLatched = false
 
-    const fingerprint = reloadFingerprint(fingerprintContentOf(read), entries, host.sharedChannels?.()?.revision)
+    const contentFingerprint = reloadFingerprint(fingerprintContentOf(read), entries)
     const credentialsChanged = plan.valid && plan.credentials.length > 0
+    const pending = configChanged || credentialsChanged || intent?.requested === true
+    const membership = deps.membership?.()
+    const memberFacts = applied.config.personas.map(persona => {
+      const generation = membership?.generation(persona.key)
+      return !generation || !membership?.isCurrent(generation) ? [persona.key, 'unverified'] : [
+        persona.key, generation.incarnation, generation.generation, generation.identityKey, generation.complete,
+        generation.observations, [...generation.positives].sort(), [...generation.absent].sort(), [...generation.holds].sort(),
+      ]
+    })
+    const declarations = [...applied.config.personas, ...(candidate.kind === 'valid' ? candidate.config.personas : [])]
+      .map(persona => [persona.key, persona.name, realPathOf(persona.credentials_file), realPathOf(persona.working_directory), persona.permission_prompts])
+    const binding = reloadReviewBinding(contentFingerprint, authority ? sharedReviewDependency(authority.snapshot()) : '', reviewSession,
+      intent?.generation ?? 0, [memberFacts, declarations])
+    const observed = authority ? observeReview(authority, binding, pending, intent?.generation ?? 0,
+      reloadFingerprint(fingerprintContentOf(read), []), persist) : undefined
+    const review = observed?.review
     return {
+      binding,
+      review,
+      revalidate: () => {
+        if (stopped) return false
+        const current = derive(false)
+        return current.binding === binding && !!review && current.review?.fingerprint === review.fingerprint && !!authority?.readable
+      },
+      assignments,
+      intentGeneration: intent?.generation ?? 0,
       bytes: read.ok ? read.bytes : undefined,
       candidate,
       configChanged,
       plan,
-      fingerprint,
+      fingerprint: review?.fingerprint ?? '',
       authorityRevision: host.sharedChannels?.()?.revision,
-      pending: configChanged || credentialsChanged,
+      pending,
     }
   }
 
@@ -1142,6 +1223,10 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
    * points at the pending file only when it holds this pass's preview.
    */
   function keepPending(state: PendingState, file: PendingFileRead): void {
+    if (!state.review) {
+      noteFileFailure(reviewRequestDiagnostic('unresolved', state.intentGeneration))
+      return
+    }
     const bytes = Buffer.from(composePendingFile(state.fingerprint, renderPreview(state.plan)), 'utf-8')
     let current = !rewriteDue && file.kind === 'bytes' && file.bytes.equals(bytes)
     if (!current) {
@@ -1275,6 +1360,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
    * applied state changed.
    */
   async function processConfirmation(state: PendingState): Promise<boolean> {
+    reviewAttempted = false
     const confirmation = readConfirmation()
     if (stopped) return false
     if (confirmation.kind === 'absent') {
@@ -1299,8 +1385,15 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
       stale = { kind: 'unreadable', code: confirmation.code }
     } else {
       const fingerprint = parsePendingFingerprint(confirmation.bytes.toString('utf-8'))
+      const authority = host.sharedChannels?.()
+      const outcome = fingerprint && authority ? reviewLedger(authority.snapshot())?.outcomes[fingerprint] : undefined
+      if (outcome) {
+        ignoredConfirmation = removeConfirmation(false) ? undefined : identity
+        deps.log(reviewOutcomeLine(outcome.status))
+        return false
+      }
       if (fingerprint === undefined) stale = { kind: 'malformed' }
-      else if (fingerprint !== state.fingerprint) stale = { kind: 'mismatch' }
+      else if (!state.review || fingerprint !== state.fingerprint) stale = { kind: 'mismatch' }
     }
     if (stale !== undefined) {
       ignoredConfirmation = removeConfirmation(false) ? undefined : identity
@@ -1308,6 +1401,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
       return false
     }
     if (stopped) return false
+    reviewAttempted = true
     const changed = await host.applyConfirmed(state)
     if (stopped) return changed
     if (changed || !state.plan.valid) ignoredConfirmation = removeConfirmation(false) ? undefined : identity
@@ -1324,13 +1418,16 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     if (stopped || running) return
     running = true
     try {
+      await host.recoverPending()
+      if (stopped) return
+      processRequest()
       let state = derive()
       if (stopped) return
       const appliedNow = await processConfirmation(state)
       // Stopped at shutdown while an apply step ran: the pass ends there.
       if (stopped) return
       // The refresh after an apply: derived again against the swapped applied state.
-      if (appliedNow) state = derive()
+      if (appliedNow || reviewAttempted) state = derive()
       const stateId = state.pending ? state.fingerprint : 'nothing'
       if (stateId !== derivedState) {
         // A new pending state, or nothing pending: its first file failure is logged again.
@@ -1466,6 +1563,46 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   let detection: PendingDetection | undefined
   let detectionStopped = false
   let applyingReviewed = false
+  let reviewedPublicationRevision: number | undefined
+  let recoveredLifecycle: Promise<void> | undefined
+  const withheldAtStart = new Set<string>()
+  // The rejection can reach disk before directory fsync succeeds. Its exact
+  // recovery removes the journal, but these local release duties still run.
+  const retirementRecoveryKeys = new Set<string>()
+  let recoveryReported = false
+
+  function recoverRetirement(starting = false): void {
+    if (!sharedChannels || detectionStopped) return
+    if (!sharedChannels.readable && sharedChannels.recoverDurability().kind !== 'applied') return
+    const interrupted = reviewLedger(sharedChannels.snapshot())?.retirement
+    if (interrupted) {
+      for (const key of interrupted.recovery.keys) retirementRecoveryKeys.add(key)
+      const restored = restoreReviewedRetirement(deps.retiredKeys, interrupted.recovery)
+      if (restored === RETIRED_KEYS_WRITE_FAILED || rejectReviewAttempt(sharedChannels, interrupted.fingerprint).kind !== 'applied') {
+        if (starting) for (const key of retirementRecoveryKeys) withheldAtStart.add(key)
+        if (!recoveryReported) deps.log(reviewRecoveryLine('unresolved'))
+        recoveryReported = true
+        return
+      }
+    }
+    if (retirementRecoveryKeys.size === 0) return
+    const keys = [...retirementRecoveryKeys]
+    retirementRecoveryKeys.clear()
+    recoveryReported = false
+    deps.log(reviewRecoveryLine('recovered'))
+    if (starting) return
+    setRetiring(deps.channelDelivery(), keys, false)
+    for (const key of keys) {
+      if (!withheldAtStart.delete(key) || detectionStopped) continue
+      const config = sharedChannels.config()
+      const persona = config.personas.find(p => p.key === key)
+      if (persona) void Promise.resolve().then(() => {
+        if (!detectionStopped) return lifecycle.bringUp(persona, config)
+      }).catch(err => {
+        deps.log(reviewRecoveredBringUpFailedLine(err))
+      })
+    }
+  }
 
   function refuse(source: AppliedConfigSource, cls: ReloadDiagnosticClass | undefined, line: string): ReloadStartOutcome {
     phase = 'refused'
@@ -1488,10 +1625,11 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
         return refuse(applied.source, RELOAD_RECORD_WRITE_FAILED, reloadSharedAuthorityStartFailedLine(paths.lastApplied, err))
       }
     }
-    sharedChannels = createSharedChannelAuthority(paths.lastApplied, sharedState, { write, home: deps.home, sourcePath: paths.config })
+    sharedChannels = createSharedChannelAuthority(paths.lastApplied, sharedState, { write, home: deps.home, sourcePath: paths.config, now: deps.now, readFs: deps.configFs })
+    recoverRetirement(true)
     sharedChannels.subscribe(config => {
       // Reviewed activation establishes old-life guards before notifying consumers.
-      if (applyingReviewed) return
+      if (applyingReviewed || reviewedPublicationRevision === sharedChannels!.revision) return
       if (appliedState !== undefined) appliedState = { config, bytes: sharedChannels!.sourceBytes(), source: 'record' }
       if (!detectionStopped) notifyApplied(config)
     })
@@ -1507,26 +1645,10 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
     phase = 'bringing-up'
     try {
-      await lifecycle.startBringUp(appliedState.config)
+      await lifecycle.startBringUp({ ...appliedState.config, personas: appliedState.config.personas.filter(persona => !withheldAtStart.has(persona.key)) })
     } finally {
       phase = 'brought-up'
     }
-  }
-
-  /**
-   * The one `reload-record-write-failed` line of a failed write of the
-   * retired-key record at step 1: names the file, says the
-   * last-applied record was not rewritten and nothing is applied, and how the
-   * restore of the record held before the apply went. The store's own line
-   * carries the write's error. No file content, no token.
-   */
-  function retiredKeysWriteFailedLine(store: RetiredKeyStore, restore: RetiredKeysRestoreOutcome): string {
-    const restored = restore === RETIRED_KEYS_WRITE_FAILED ? RELOAD_RETIRED_KEYS_RESTORE_FAILED : RELOAD_RETIRED_KEYS_RESTORED
-    return (
-      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the retired-key record ${JSON.stringify(store.path)}; ` +
-      `the last-applied record ${JSON.stringify(paths.lastApplied)} is not rewritten, and the confirmed change is ` +
-      `not applied and stays pending; ${restored}`
-    )
   }
 
   /**
@@ -1611,14 +1733,16 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     const current = appliedState
     const { plan, candidate, bytes } = state
     if (current === undefined || detectionStopped) return false
+    const review = state.review
+    if (sharedChannels === undefined || !review || !reviewMatches(sharedChannels.snapshot(), review) || !state.revalidate()) return false
     if (!plan.valid) {
+      if (beginReviewAttempt(sharedChannels, review).kind === 'applied') rejectReviewAttempt(sharedChannels, review.fingerprint)
       deps.log(renderConfirmedInvalidLogLine(plan))
       return false
     }
     // A valid plan always comes from bytes that were read and parsed.
     if (candidate.kind !== 'valid' || bytes === undefined) return false
-    const reviewedRevision = state.authorityRevision
-    if (sharedChannels === undefined || !sharedChannels.readable || reviewedRevision !== sharedChannels.revision) return false
+    if (!sharedChannels.readable || state.authorityRevision !== sharedChannels.revision) return false
     const steps = applyStepsFor(plan)
     // Resolve every planned persona before any durable mutation. The candidate
     // already includes merged automatic choices at the reviewed revision.
@@ -1632,60 +1756,86 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // keeps its retirement evidence for recovery.
     const store = deps.retiredKeys
     const batch = retiredKeysToRecord(plan, store)
-    const recorded = batch.length === 0 ? undefined : store.record(batch)
-    if (recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITE_FAILED) {
-      deps.log(retiredKeysWriteFailedLine(store, store.restore(recorded.snapshot)))
+    const recovery = batch.length ? retiredReviewRecovery(store, batch.map(entry => entry.key)) : undefined
+    const attempt = beginReviewAttempt(sharedChannels, review, recovery)
+    if (attempt.kind !== 'applied') {
+      deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, attempt.kind, sharedChannels.failure, ''))
       return false
     }
-    if (detectionStopped) {
-      if (recorded?.outcome === RETIRED_KEYS_WRITTEN) store.restore(recorded.snapshot)
+    const failAttempt = (): string => {
+      const restore = recovery ? restoreReviewedRetirement(store, recovery) : undefined
+      const rejected = restore !== RETIRED_KEYS_WRITE_FAILED ? rejectReviewAttempt(sharedChannels!, review.fingerprint) : undefined
+      if (recovery && rejected?.kind !== 'applied') for (const key of recovery.keys) retirementRecoveryKeys.add(key)
+      if (restore === RETIRED_KEYS_WRITE_FAILED) setRetiring(channelDelivery, batch.map(entry => entry.key), true)
+      return restore === undefined ? '' : retiredKeysRestoredClause(store, restore)
+    }
+    const recorded = batch.length === 0 ? undefined : store.record(batch)
+    if (recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITE_FAILED) {
+      const restored = failAttempt()
+      deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, 'failed', sharedChannels.failure, restored))
+      return false
+    }
+    if (detectionStopped || !state.revalidate() || sharedChannels.revision !== attempt.revision) {
+      failAttempt()
       return false
     }
     let result
+    let retiring = plan.destructive.map(({ key }) => key)
+    let activationReturned = false
+    const onStepFailure = (step: ApplyStepName, err: unknown): void =>
+      deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`)
+    const finishLifecycle = async (): Promise<void> => {
+      try {
+        await runApplySteps(applySlots, mergedInputs, steps.filter(step => step === TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
+      } finally {
+        setRetiring(channelDelivery, retiring, false)
+      }
+      await runApplySteps(applySlots, mergedInputs, steps.filter(step => step !== TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
+      if (!detectionStopped) deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
+    }
     applyingReviewed = true
-    try { result = sharedChannels.applyReviewed(bytes, reviewedRevision) }
-    finally { applyingReviewed = false }
+    try {
+      result = sharedChannels.commitReview(bytes, attempt.revision, review, state.assignments, merged => {
+        reviewedPublicationRevision = sharedChannels!.revision
+        appliedState = { config: merged, bytes: sharedChannels!.sourceBytes(), source: 'config' }
+        if (detectionStopped) return
+        beginStepOneHolds(plan, current.config)
+        setRetiring(channelDelivery, retiring, true)
+        notifyApplied(merged)
+        for (const { key } of batch) {
+          if (detectionStopped) return
+          stopDeliveryOf(key)
+        }
+        for (const persona of plan.removed) {
+          try { deps.onQueueRetained?.(persona.key, deps.queueOpenCount?.(persona.key) ?? 0) } catch { /* observer cannot interrupt apply */ }
+        }
+        if (activationReturned) {
+          // A directory-sync uncertainty completed at a later tick. Its one
+          // committed outcome resumes the same lifecycle, never an assignment
+          // retry. Queue it after the authority has released its write lock.
+          recoveredLifecycle = Promise.resolve().then(finishLifecycle).catch(err => {
+            deps.log(reviewRecoveredLifecycleFailedLine(err))
+          })
+        }
+      })
+    }
+    finally { applyingReviewed = false; activationReturned = true }
     if (result?.kind !== 'applied') {
-      const restored = result?.kind !== 'unresolved' && recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITTEN
-        ? retiredKeysRestoredClause(store, store.restore(recorded.snapshot)) : ''
+      // Preserve the safe activation cause before rejection metadata writes
+      // clear or replace the authority's latest failure.
       const failure = sharedChannels?.failure ?? ''
+      const restored = result?.kind !== 'unresolved' ? failAttempt() : ''
+      if (result?.kind === 'unresolved') {
+        // Recovery must release every guard acquired for this activation,
+        // including removals and add-only retirement, after protected teardown.
+        retiring = [...new Set([...retiring, ...batch.map(entry => entry.key)])]
+        setRetiring(channelDelivery, retiring, true)
+      }
       deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, result?.kind ?? 'failed', failure, restored))
       return false
     }
-    const merged = sharedChannels.config()
-    appliedState = { config: merged, bytes: sharedChannels.sourceBytes(), source: 'config' }
     if (detectionStopped) return true
-    // A failed application leaves the current delivery/reminder workers
-    // intact. Retire them only after the authority is durably applied.
-    for (const { key } of batch) {
-      if (detectionStopped) return true
-      stopDeliveryOf(key)
-    }
-    if (detectionStopped) return true
-    // the rewrite succeeded, so each key this step recorded
-    // holds its old life's working directory from now, before any teardown's
-    // kill; a failed write or rewrite above began none.
-    beginStepOneHolds(plan, current.config)
-    for (const persona of plan.removed) {
-      try { deps.onQueueRetained?.(persona.key, deps.queueOpenCount?.(persona.key) ?? 0) } catch { /* observer cannot interrupt apply */ }
-    }
-    // Each destructive modify's key is retiring from here
-    // until step 2 has settled, so no call stores a choice for it meanwhile.
-    const retiring = plan.destructive.map(({ key }) => key)
-    setRetiring(channelDelivery, retiring, true)
-    const onStepFailure = (step: ApplyStepName, err: unknown): void =>
-      deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`)
-    try {
-      if (!detectionStopped) notifyApplied(merged)
-      // Step 2 on its own, so the retiring window closes once it has
-      // settled, before step 3 starts; `runApplySteps` keeps its order and
-      // failure isolation across the two calls.
-      await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step === TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
-    } finally {
-      setRetiring(channelDelivery, retiring, false)
-    }
-    await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
-    deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
+    await finishLifecycle()
     return true
   }
 
@@ -1694,6 +1844,13 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     if (detection !== undefined || detectionStopped || deps.tickDriver === undefined) return false
     const initial = appliedState
     detection = createPendingDetection(deps, {
+      recoverPending: async () => {
+        recoverRetirement()
+        const recovery = recoveredLifecycle
+        if (recovery) {
+          try { await recovery } finally { if (recoveredLifecycle === recovery) recoveredLifecycle = undefined }
+        }
+      },
       applied: () => appliedState ?? initial,
       sharedChannels: () => sharedChannels,
       applyConfirmed,
