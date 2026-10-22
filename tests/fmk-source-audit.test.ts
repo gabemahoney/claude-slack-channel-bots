@@ -123,6 +123,7 @@ import { buildSystemInstallTooOldMessage, compareAdVersions, FOUND_BY_RUNTIME_RE
 import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
 import { decideLatchRecheckProbe, LATCH_CASE_OWN_ID, latchRecheckRoundLine, RECHECK_VERDICT_CLEARED, recogniseConflictCase } from '../src/conflict-latch.ts'
 import { parseDeliveryTranscriptRecord } from '../src/delivery-receipt.ts'
+import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 import { AD_NS, AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads, finding } from './test-helpers/ad-value-reads.ts'
 import { CLIENT_MIN_VERSION } from './test-helpers/agent-director-versions.ts'
@@ -3101,4 +3102,69 @@ test('test29 restart authority assertion accepts fresh inventory but detects cha
     expect(scenario).not.toContain('cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"')
     assertNoLeak({ logs: f.lines, manager: f.h.lines, statuses: f.h.statuses })
   } finally { await f.close(); expect(f.h.clock.pendingCount()).toBe(0); rmSync(root, { recursive: true, force: true }) }
+})
+
+// Execute only extracted shell declarations with inert AD/receipt/Slack stubs.
+// These controls never source a scenario, start a native agent or grant readiness.
+describe('latency admission wiring', () => {
+  const realScenario = readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+  const orderScenario = readFileSync(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh'), 'utf8')
+  const receipts = readFileSync(join(import.meta.dir, 'integration/fixtures/transcript-receipts.ts'), 'utf8')
+  let home: string
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'cscb-latency-wiring-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+  const run = (code: string) => spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', `set -euo pipefail\n${code}`, 'control', home], {
+    encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home),
+  })
+  const latencyLoop = (source: string) => {
+    const start = source.lastIndexOf('for n in {1..20}; do'), end = source.indexOf('\n\ncase_assert launches', start)
+    if (start < 0 || end < start) throw new Error('Missing complete 20-sample phase')
+    return source.slice(start, end)
+  }
+  const runLoop = (source: string, blocked = 0) => run(`
+REAL_KEY=alpha
+REAL_LABEL=alpha
+real_wait_latency_admission() { printf 'ready:%s\\n' "$2"; [[ "$2" != '${blocked}' ]]; }
+real_wait_idle() { printf 'idle\\n'; }
+real_dm() { printf 'dm:%s\\n' "$n"; }
+real_wait_delivery() { printf 'delivered:%s\\n' "$2"; }
+real_assert_latency() { printf 'latency:%s\\n' "$2"; }
+${latencyLoop(source)}
+`)
+  const expectedLoop = Array.from({ length: 20 }, (_, i) => [`ready:${33 + i}`, `dm:${i + 1}`, `delivered:${34 + i}`]).flat().concat('latency:20', '').join('\n')
+  test('all 20 original samples require admission and delivery, with no skipped/filtered/retried input', () => {
+    const result = runLoop(orderScenario)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toBe(expectedLoop)
+    expect(result.stderr).toBe('')
+    const blocked = runLoop(orderScenario, 35)
+    expect(blocked.status).toBe(1)
+    expect(blocked.stdout.trim().split('\n')).toEqual(expectedLoop.split('\n').slice(0, 7))
+    expect(orderScenario).toContain('case_assert reply-permission-resume "${REAL_KILLED_ROW}" "${SCENARIO_ROOT}/relaunch-${REAL_KEY}.json"\nreal_wait_delivery "${REAL_KEY}" 33')
+    expect(orderScenario).toContain("real_persona order 'For every relayed Slack message, call the Slack reply tool with text exactly OK")
+    expect(orderScenario).toContain('for n in {1..20}; do real_dm "${REAL_LABEL}" "fault order ${n}"; done')
+  })
+  test.each(['waiting only', 'omitted admission', 'fewer samples', 'ignored admission failure'])('loop audit rejects %s', mutation => {
+    let source = orderScenario
+    if (mutation === 'waiting only') source = source.replace('real_wait_latency_admission "${REAL_KEY}" "$((33+n-1))"', 'real_wait_idle "${REAL_KEY}"')
+    if (mutation === 'omitted admission') source = source.replace('real_wait_latency_admission "${REAL_KEY}" "$((33+n-1))"', ':')
+    if (mutation === 'fewer samples') source = source.replace('real_assert_latency "${REAL_KEY}" 20', 'real_assert_latency "${REAL_KEY}" 19')
+    if (mutation === 'ignored admission failure') source = source.replace('real_wait_latency_admission "${REAL_KEY}" "$((33+n-1))"', 'real_wait_latency_admission "${REAL_KEY}" "$((33+n-1))" || true')
+    expect(source).not.toBe(orderScenario)
+    const result = runLoop(source, mutation === 'ignored admission failure' ? 35 : 0)
+    if (mutation === 'ignored admission failure') expect(result.status).not.toBe(1)
+    else expect(result.stdout).not.toBe(expectedLoop)
+  })
+  test.each([
+    [2000, 10000, 20, true], [2000.001, 10000, 20, false], [2000, 10000.001, 20, false], [1, 1, 19, false],
+  ])('actual latency CLI keeps typing=%s delivery=%s count=%s boundary', (typing, delivery, count, passes) => {
+    const block = receipts.match(/const n = Number\(count\)[\s\S]*?if \(typing > 2000 \|\| delivery > 10000\) throw new Error\('[^']*latency exceeded'\)/)?.[0]
+    expect(block).toBeDefined()
+    const output: string[] = []
+    const check = () => new Function('result', 'count', 'percentile', 'console', block!)({ timings:
+      Array.from({ length: Number(count) }, (_, i) => ({ typing_ms: i < 18 ? 1 : typing, delivery_ms: i < 18 ? 1 : delivery })) },
+    20, percentile, { log: (line: string) => output.push(line) })
+    if (passes) { expect(check).not.toThrow(); expect(output[0]).toContain('samples=20') }
+    else expect(check).toThrow(count === 19 ? 'Insufficient latency samples' : 'latency exceeded')
+  })
 })
