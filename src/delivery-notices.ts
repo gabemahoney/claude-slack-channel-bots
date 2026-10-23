@@ -7,9 +7,11 @@ import { DELIVERY_STUCK_AFTER_MS } from './delivery-constants.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { renderPersonaRef } from './persona-identity.ts'
-import { MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode, type DeliveryDiagnosticClass } from './persona-diagnostics.ts'
+import { MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, OWN_POST_NOT_ENROLLED, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode, type DeliveryDiagnosticClass } from './persona-diagnostics.ts'
+import { PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED } from './persona-episodes.ts'
+import type { OwnPostOutcome } from './thread-participation.ts'
 
-export { DELIVERY_DIAGNOSTIC_CLASSES, MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, MESSAGES_WAITING, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode } from './persona-diagnostics.ts'
+export { DELIVERY_DIAGNOSTIC_CLASSES, MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, MESSAGES_WAITING, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, OWN_POST_NOT_ENROLLED, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode } from './persona-diagnostics.ts'
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 const slack = (text: string): string => escapeSlackControlCharacters(safe(text))
 export function deliveryAge(ageMs: number): string {
@@ -64,6 +66,77 @@ export function buildMessagesWaitingNotice(persona: string, count: number, ageMs
 export function buildQueueRecordUnreadableNotice(persona: string, count: number, path: string): string {
   return `:warning: *Queue record unreadable* — ${count} queued message(s) for ${slack(persona)} could not be read at start and will not be delivered. Their bytes are kept in \`${slack(path)}\`. Ask the senders to send them again.`
 }
+/** What a confirmed own post's participation still lacks, in operator terms. */
+export const OWN_POST_FINDING_CAUSES = ['storage', 'root-metadata', 'channel-eligibility', 'operation'] as const
+export type OwnPostFindingCause = typeof OWN_POST_FINDING_CAUSES[number]
+/** The own-post fields a finding's line or notice may name: identifiers only, never a body or error text. */
+export type OwnPostFinding = Pick<OwnPostOutcome, 'kind' | 'surface' | 'operation' | 'part' | 'channel' | 'ts' | 'parent' | 'root' | 'file' | 'delivery' | 'missing' | 'reason' | 'error'>
+/** Distinct finding lines logged per persona before further ones are only counted by the episode. */
+export const OWN_POST_FINDINGS_LOGGED_PER_PERSONA = 20
+export function ownPostFindingCause(finding: Pick<OwnPostOutcome, 'kind' | 'missing' | 'reason'>): OwnPostFindingCause {
+  if (finding.kind === 'gap') return finding.reason === 'storage' ? 'storage' : finding.reason === 'eligibility-unavailable' ? 'channel-eligibility' : 'operation'
+  if (finding.reason === 'operation') return 'operation'
+  return finding.missing.includes('root') ? 'root-metadata' : 'channel-eligibility'
+}
+/**
+ * Whether new-mention guidance applies: the finding names its thread (its
+ * root, or a parent or ts while the root is not missing) and records the
+ * channel's applied choice, which is not `off`, where a mention is not
+ * delivered and enrolls nothing. An unknown choice may be `off`.
+ */
+export function ownPostMentionApplies(finding: Pick<OwnPostOutcome, 'root' | 'parent' | 'ts' | 'missing' | 'delivery'>): boolean {
+  const thread = finding.root ?? (finding.missing.includes('root') ? undefined : finding.parent ?? finding.ts)
+  return thread !== undefined && finding.delivery !== undefined && finding.delivery !== 'off'
+}
+/** Corrective action per cause. `mention`: add the new-mention guidance (`ownPostMentionApplies`). */
+export function ownPostFindingAction(cause: OwnPostFindingCause, gap: boolean, mention = true): string {
+  const follow = mention
+    ? ` A new mention of the persona in that thread can also make it follow the thread${cause === 'storage' ? ', once the server can save its state again' : ''}.`
+    : ''
+  if (gap) {
+    const fix = cause === 'storage' ? "Check the server's disk and state directory." : 'Check that the persona is applied and up.'
+    return `${fix} CSCB cannot rebuild a record it never saved: restore the server's state only from a reviewed, trustworthy backup, or accept that the persona does not follow the thread.${follow}`
+  }
+  const waits = cause === 'root-metadata' ? "the thread's root message is known"
+    : cause === 'channel-eligibility' ? "the persona's channel membership and the channel's sharing are verified"
+      : 'the post is bound to the persona again'
+  return `CSCB keeps the evidence and follows the thread once ${waits}.${follow}`
+}
+const ownPostIdentity = (f: OwnPostFinding): string =>
+  `surface=${f.surface} chat_id=${JSON.stringify(f.channel)}${f.ts ? ` ts=${JSON.stringify(f.ts)}` : ''}${f.parent ? ` parent=${JSON.stringify(f.parent)}` : ''}` +
+  `${f.file ? ` file=${JSON.stringify(f.file)}` : ''} operation=${f.operation} part=${f.part}`
+/** The `own-post-not-enrolled` line: state, the exact missing evidence, cause and action; never the post's text. */
+export function buildOwnPostNotEnrolledLine(persona: string, finding: OwnPostFinding): string {
+  const cause = ownPostFindingCause(finding), gap = finding.kind === 'gap'
+  return buildDeliveryDiagnostic(OWN_POST_NOT_ENROLLED, persona, ownPostIdentity(finding),
+    `state=${gap ? 'gap' : 'pending'} missing=${finding.missing.length ? finding.missing.join(',') : 'none'} cause=${cause}` +
+    `${finding.reason ? ` reason=${finding.reason}` : ''}${finding.error !== undefined ? ` code=${queueErrorCode(finding.error)}` : ''}` +
+    ` action=${JSON.stringify(ownPostFindingAction(cause, gap, ownPostMentionApplies(finding)))}`)
+}
+/** The once-per-persona line when its finding lines reach the cap. */
+export function buildOwnPostFindingsCappedLine(persona: string): string {
+  return buildDeliveryDiagnostic(OWN_POST_NOT_ENROLLED, persona, `limit=${OWN_POST_FINDINGS_LOGGED_PER_PERSONA}`, 'further findings are not logged until this persona has none')
+}
+/** Outcomes seen before reporting started and over its buffer: not kept, so never logged one by one. */
+export function buildOwnPostOutcomesDroppedLine(persona: string, count: number): string {
+  return buildDeliveryDiagnostic(OWN_POST_NOT_ENROLLED, persona, `dropped=${count}`,
+    'outcomes seen before reporting started were not kept; recorded evidence is still reported and recovered')
+}
+const OWN_POST_CAUSE_TEXT: Readonly<Record<OwnPostFindingCause, string>> = {
+  'storage': "its state couldn't be saved",
+  'root-metadata': "the thread's root message isn't known",
+  'channel-eligibility': "its channel membership and the channel's sharing aren't verified",
+  'operation': "the post couldn't be bound to the persona's current life",
+}
+/** The Slack notice for a persona's first own-post finding in an episode. */
+export function buildOwnPostNotEnrolledNotice(persona: string, finding: OwnPostFinding): string {
+  const cause = ownPostFindingCause(finding), gap = finding.kind === 'gap'
+  const where = `channel ${slack(finding.channel)}${finding.ts ? ` (message ${slack(finding.ts)})` : finding.file ? ` (file ${slack(finding.file)})` : ''}`
+  const head = gap
+    ? `:warning: *Thread participation not saved* — ${slack(persona)} posted in ${where}, but CSCB could not save that it follows that thread: ${OWN_POST_CAUSE_TEXT[cause]}.`
+    : `:warning: *Thread not followed yet* — ${slack(persona)} posted in ${where}, but CSCB can't record yet that it follows that thread: ${OWN_POST_CAUSE_TEXT[cause]}.`
+  return `${head} The post itself succeeded; don't post it again. Replies in that thread may not reach the persona until this resolves. ${ownPostFindingAction(cause, gap, ownPostMentionApplies(finding))}`
+}
 function stuckReason(reason: DeliveryReason, status: DeliveryStatus): DeliveryStuckReason | undefined {
   if (reason === 'transcript-unreadable') return 'transcript'
   if (reason === 'not-now') return 'refused'
@@ -82,6 +155,8 @@ export interface DeliveryReportingDeps {
   now?: () => number
   /** Schedule outside the intake turn; returns cancellation for teardown. */
   defer?(run: () => void): () => void
+  /** The participation owner's unresolved own-post obligations; an episode ends only when none remains. */
+  ownPostFindings?(key: string): readonly OwnPostOutcome[]
 }
 interface SaveFailure { sender: string; channel?: string; ts?: string; edited_ts?: string }
 export function createDeliveryReporting(deps: DeliveryReportingDeps) {
@@ -90,6 +165,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   let findingFlushPending = false
   const received = new Set<string>(), completed = new Set<string>(), failures = new Map<string, number>(), unwritable = new Set<string>(), heads = new Map<string, number>()
   const participationFailures = new Map<string, Map<string, string>>()
+  const ownPostFindings = new Map<string, { open: Map<string, 'pending' | 'gap'>; logged: number }>()
   const intakes = new Map<string, { count: number }>()
   const pendingFailures = new Map<string, { notices: Map<string, SaveFailure>; cancel?: () => void }>()
   const failureId = (failure: SaveFailure) => JSON.stringify([failure.channel, failure.ts, failure.edited_ts, failure.sender])
@@ -262,6 +338,50 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     // Only a failed incoming save warrants the finite Slack retry warning.
     if (unaccepted) failureNotice(key, failure.sender, failure.channel, failure.ts, failure.edited_ts)
   }
+  /**
+   * Bounded per-persona reporting of own-post outcomes. A pending or gap
+   * finding logs once (capped) and, except for a notice's own post or at
+   * startup, posts one notice per episode. Only findings with an observation
+   * id stay open: an id-less gap leaves no obligation anything can settle.
+   * The episode and log cap end silently at the persona's next settling
+   * outcome, including a settled duplicate such as a reply into a followed
+   * thread, once no open finding remains and the owner reports none; no
+   * recovery is announced, and nothing here posts or reposts the post.
+   */
+  function ownPostObserved(outcome: OwnPostOutcome, startup = false): void {
+    const key = outcome.key, id = outcome.id
+    // A persona that is not applied, such as one removed after `forget`, gets nothing until it is applied again.
+    if (stopped || !deps.persona(key)) return
+    let own = ownPostFindings.get(key)
+    if (outcome.kind !== 'pending' && outcome.kind !== 'gap') {
+      if (!own) return
+      if (id !== undefined) own.open.delete(id)
+      const remaining = deps.ownPostFindings?.(key)
+      // A finding the owner no longer reports, such as one whose lifetime was superseded, is not open.
+      if (remaining) {
+        const ids = new Set(remaining.map(finding => finding.id))
+        for (const open of [...own.open.keys()]) if (!ids.has(open)) own.open.delete(open)
+      }
+      if (own.open.size || remaining?.length) return
+      ownPostFindings.delete(key)
+      deps.episodes.end(key, PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)
+      return
+    }
+    if (!own) { own = { open: new Map(), logged: 0 }; ownPostFindings.set(key, own) }
+    if (id !== undefined) {
+      if (own.open.get(id) === outcome.kind) return
+      own.open.set(id, outcome.kind)
+    }
+    if (own.logged < OWN_POST_FINDINGS_LOGGED_PER_PERSONA) {
+      own.logged++
+      protect(() => deps.log(buildOwnPostNotEnrolledLine(ref(key), outcome)))
+      if (own.logged === OWN_POST_FINDINGS_LOGGED_PER_PERSONA) protect(() => deps.log(buildOwnPostFindingsCappedLine(ref(key))))
+    }
+    // A notice's own finding never raises another notice.
+    if (startup || outcome.surface === 'notice') return
+    deps.episodes.begin(key, PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)
+    deps.episodes.post(key, PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED, buildOwnPostNotEnrolledNotice(ref(key), outcome))
+  }
   function participationSettled(key: string, id: string): void {
     const held = participationFailures.get(key)
     const failure = held?.get(id), pending = pendingFailures.get(key)
@@ -281,7 +401,14 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings,
     participationFailed: (key: string, id: string, event: Record<string, unknown>, error?: unknown, unaccepted = false) => protect(() => participationFailed(key, id, event, error, unaccepted)),
     participationSettled: (key: string, id: string) => protect(() => participationSettled(key, id)),
-    forget(key: string) { cancelFailureNotice(key); intakes.delete(key); failures.delete(key); participationFailures.delete(key); unwritable.delete(key); heads.delete(key) },
+    ownPostObserved: (outcome: OwnPostOutcome) => protect(() => ownPostObserved(outcome)),
+    /** Restored pending own-post evidence, after protection and notifier wiring: logged, never re-announced. */
+    ownPostStartup: (findings: readonly OwnPostOutcome[]) => { for (const finding of findings) protect(() => ownPostObserved(finding, true)) },
+    /** One line per persona for outcomes its buffer could not keep before reporting started. */
+    ownPostDropped: (counts: ReadonlyMap<string, number>) => {
+      for (const [key, count] of counts) if (count > 0) protect(() => deps.log(buildOwnPostOutcomesDroppedLine(ref(key), count)))
+    },
+    forget(key: string) { cancelFailureNotice(key); intakes.delete(key); failures.delete(key); participationFailures.delete(key); ownPostFindings.delete(key); unwritable.delete(key); heads.delete(key) },
     stop() { stopped = true; for (const key of pendingFailures.keys()) cancelFailureNotice(key); intakes.clear() },
   }
 }

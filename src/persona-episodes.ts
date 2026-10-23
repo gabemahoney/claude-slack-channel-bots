@@ -474,6 +474,15 @@ export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-sessio
  */
 export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
+/**
+ * Own post not enrolled: from the first confirmed own post whose thread
+ * participation is pending or could not be saved until none of the persona's
+ * findings remains. Begun and posted by delivery reporting
+ * (`src/delivery-notices.ts`), once per episode; a notice's own finding is
+ * logged only, never posted. Ended silently; a teardown's `forget` drops it.
+ */
+export const PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED = 'own-post-not-enrolled'
+
 /** Every notice kind with a latch here, one per row of the contract table. */
 export const PERSONA_EPISODE_KINDS = [
   'message-not-saved',
@@ -489,6 +498,7 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
+  PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED,
 ] as const
 
 /** A notice kind with a latch here. */

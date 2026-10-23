@@ -2,13 +2,17 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createThreadParticipation } from '../src/thread-participation.ts'
+import { createThreadParticipation, decideOwnPostEligibility, ownPostEligibility } from '../src/thread-participation.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { createSharedChannelAuthority } from '../src/shared-channels.ts'
 import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
 import { RETYPE_BACKOFF_MS, RECEIPT_WAIT_MS } from '../src/delivery-constants.ts'
-import { buildMessageNotSavedNotice, MESSAGE_NOT_SAVED, QUEUE_UNWRITABLE } from '../src/delivery-notices.ts'
+import { buildMessageNotSavedNotice, MESSAGE_NOT_SAVED, QUEUE_UNWRITABLE, OWN_POST_NOT_ENROLLED, OWN_POST_FINDINGS_LOGGED_PER_PERSONA,
+  buildOwnPostNotEnrolledLine, buildOwnPostNotEnrolledNotice, buildOwnPostFindingsCappedLine, buildOwnPostOutcomesDroppedLine } from '../src/delivery-notices.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
+import { PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED } from '../src/persona-episodes.ts'
+import { replyPartialFailureText } from '../src/registry.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
@@ -19,7 +23,8 @@ import { resetRoutingState, observedMembership } from './test-helpers/persona-ro
 import { makeQueue, readQueue, queuePath, seedQueue, slackInput, deliveredRecord, sentRecord } from './test-helpers/delivery-queue.ts'
 import { readSharedState, sharedChannelPath } from './test-helpers/shared-channels.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
-import { asWebClient, broadcastText, mentionText, makeDm, makeGroupDmMessage } from './test-helpers/slack-stub.ts'
+import { asWebClient, broadcastText, mentionText, makeDm, makeGroupDmMessage, makeDeferredWebApiCall } from './test-helpers/slack-stub.ts'
+import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { makeThreadHarness, threadHold, threadDisk, threadReply, observeThread, acceptObservation, tearJournal,
   THREAD_CHANNEL as C, THREAD_OTHER_CHANNEL as C2, THREAD_ROOT as ROOT, THREAD_OTHER_ROOT as ROOT2,
   type ThreadHarness } from './test-helpers/thread-participation.ts'
@@ -1180,5 +1185,864 @@ describe('retained thread work through delivery and reply owners', () => {
       expect(h.h.queue.items('alpha').filter(i => i.accepted.reminder_for !== undefined)).toHaveLength(1)
       expect(errors).toEqual([])
     } finally { await monitor.stop() }
+  })
+})
+
+const ownRecords = (h: ThreadHarness, key = 'alpha') => h.h.queue.threadRecords(key).filter(r => r.observation.post)
+/** Fresh outcomes only: a settled duplicate changes nothing and is never a second enrollment or finding. */
+const outcomes = (h: ThreadHarness, kind?: string) => h.h.ownPostOutcomes.filter(o => !o.duplicate && (kind === undefined || o.kind === kind))
+/** The settled duplicates the owner reported, so reporting can end an episode on them. */
+const duplicates = (h: ThreadHarness) => h.h.ownPostOutcomes.filter(o => o.duplicate)
+const postCount = (h: ThreadHarness, key = 'alpha') => h.h.p(key).stub.calls.postMessage.length
+const textOf = (post: unknown) => (post as { text?: string }).text
+/** Lets detached re-evaluation (the owner's onSettled) run; no wall-clock wait. */
+async function settleUntil(h: ThreadHarness, done: () => boolean) {
+  for (let i = 0; i < 50 && !done(); i++) { await h.clock.flush(); await new Promise(resolve => setImmediate(resolve)) }
+  expect(done()).toBe(true)
+}
+
+describe('confirmed own posts through the participation owner', () => {
+  test('a text root enrolls its returned timestamp and reply parts their requested parent once, with no echo, durably', async () => {
+    const h = await open()
+    const root = h.confirmPost({ channel: C, ts: ROOT })
+    // Published before the first await: a dependent reply cannot read the thread as unfollowed.
+    expect(h.read()).toBe('unresolved')
+    expect(await root.outcome).toMatchObject({ kind: 'enrolled', key: 'alpha', surface: 'text', channel: C, ts: ROOT, root: ROOT, missing: [] })
+    expect(h.read()).toBe('followed')
+    const issue = h.threads.issueOwnPost('alpha', 'text')
+    const parts = await Promise.all([1, 2, 3].map(part =>
+      h.threads.confirmOwnPost(issue, { channel: C2, ts: `1700000000.00030${part}`, parent: ROOT2, part })))
+    expect(parts.map(p => [p.kind, p.root, p.part])).toEqual([['enrolled', ROOT2, 1], ['enrolled', ROOT2, 2], ['enrolled', ROOT2, 3]])
+    // One durable enrollment per thread; later parts and duplicate confirmations confer nothing twice and are not reported again.
+    expect(ownRecords(h).map(r => [r.observation.lifetime.channel, r.observation.root, r.state])).toEqual([[C, ROOT, 'enrolled'], [C2, ROOT2, 'enrolled']])
+    expect(await h.threads.confirmOwnPost(issue, { channel: C2, ts: '1700000000.000301', parent: ROOT2, part: 1 })).toMatchObject({ kind: 'enrolled' })
+    expect(ownRecords(h)).toHaveLength(2)
+    expect(outcomes(h, 'enrolled').map(o => [o.channel, o.root])).toEqual([[C, ROOT], [C2, ROOT2]])
+    expect(duplicates(h).map(o => [o.kind, o.root, o.part])).toEqual([['enrolled', ROOT2, 2], ['enrolled', ROOT2, 3], ['enrolled', ROOT2, 1]])
+    expect(h.read(ROOT2, 'alpha', C2)).toBe('followed')
+    expect([h.read(ROOT2), h.read(ROOT, 'beta'), h.read(ROOT2, 'beta', C2)]).toEqual(['unfollowed', 'unfollowed', 'unfollowed'])
+    // Own echoes neither deliver to the posting persona nor add participation; a human reply follows the enrolled thread.
+    const identity = h.h.p('alpha').stub.identity
+    await h.receive(threadReply({ channel: C2, thread_ts: ROOT2, ts: '1700000000.000301', user: identity.botUserId, bot_id: identity.botId, text: 'own echo' }))
+    expect(accepted(h)).toEqual([])
+    expect(ownRecords(h)).toHaveLength(2)
+    expect((await h.receive(threadReply({ channel: C2, thread_ts: ROOT2, ts: '1700000000.000310' }))).acknowledged).toBe(1)
+    expect(accepted(h).map(a => [a.ts, a.via])).toEqual([['1700000000.000310', 'thread']])
+    await h.close()
+    const reopened = await open({ clock: h.clock })
+    expect([reopened.read(), reopened.read(ROOT2, 'alpha', C2)]).toEqual(['followed', 'followed'])
+    expect(reopened.threads.ownPostFindings()).toEqual([])
+  })
+
+  test('a dependent reply arriving before the first awaited save stays held and unacknowledged, then is accepted once; independent work continues', async () => {
+    const gate = threadHold()
+    const h = await open({ beforeObservationSave: async (_key, observation) => { if (observation.post) await gate.wait() } })
+    await h.receive(h.mention({ ts: ROOT2, thread_ts: undefined }), ['alpha', 'beta'])
+    const { outcome } = h.confirmPost({ channel: C, ts: ROOT })
+    await gate.entered
+    let acks = 0
+    const reply = threadReply()
+    await h.h.routing.receive(reply, () => { acks++ }, ['alpha'], false)
+    expect(acks).toBe(0)
+    expect(accepted(h).map(a => a.ts)).toEqual([ROOT2])
+    expect(h.h.routing.pendingCandidates().map(c => [c.key, c.channel, c.root])).toEqual([['alpha', C, ROOT]])
+    // A known followed thread, another persona and an independent mention all progress during the hold.
+    expect((await h.receive(threadReply({ thread_ts: ROOT2, ts: '1700000000.000201' }))).acknowledged).toBe(1)
+    expect((await h.receive(threadReply(), ['beta'])).acknowledged).toBe(1)
+    expect((await h.receive(h.mention({ ts: '1700000000.000400' }))).acknowledged).toBe(1)
+    expect(acks).toBe(0)
+    gate.release()
+    expect((await outcome).kind).toBe('enrolled')
+    await settleUntil(h, () => acks === 1)
+    expect(accepted(h).filter(a => a.ts === reply.ts).map(a => a.via)).toEqual(['thread'])
+    expect(h.h.routing.pendingCandidates()).toEqual([])
+    // Socket redelivery of the same event is a duplicate, not a second item.
+    expect((await h.receive(reply)).acknowledged).toBe(1)
+    expect(accepted(h).filter(a => a.ts === reply.ts)).toHaveLength(1)
+  })
+
+  test('unresolved eligibility keeps durable pending evidence that protects only its thread, restores before intake and enrolls on retry without posting', async () => {
+    const h = await open()
+    h.membership.set(`alpha:${C}`, { kind: 'unresolved', reason: 'history-unresolved' })
+    const pending = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    expect(pending).toMatchObject({ kind: 'pending', missing: ['channel-eligibility'], reason: 'history-unresolved', root: ROOT })
+    expect(ownRecords(h).map(r => r.state)).toEqual(['observed'])
+    expect([h.read(), h.read(ROOT2), h.read(ROOT, 'beta'), h.read(ROOT, 'alpha', C2)]).toEqual(['unresolved', 'unfollowed', 'unfollowed', 'unfollowed'])
+    expect(h.threads.ownPostFindings('alpha')).toEqual([expect.objectContaining({ kind: 'pending', id: pending.id })])
+    expect(h.threads.ownPostFindings('beta')).toEqual([])
+    // Retrying while membership is still unresolved changes nothing and writes nothing.
+    expect(await h.threads.retryOwnPost('alpha', pending.id!)).toMatchObject({ kind: 'pending' })
+    expect(ownRecords(h)).toHaveLength(1)
+    await h.close()
+    const reopened = await open({ clock: h.clock })
+    // Restored before any intake: the dependent reply is held, not discarded or acknowledged.
+    expect(reopened.read()).toBe('unresolved')
+    expect(reopened.threads.ownPostFindings()).toEqual([expect.objectContaining({ kind: 'pending', id: pending.id, missing: ['channel-eligibility'] })])
+    let acks = 0
+    await reopened.h.routing.receive(threadReply(), () => { acks++ }, ['alpha'], false)
+    expect([acks, accepted(reopened)]).toEqual([0, []])
+    expect(await reopened.threads.retryOwnPost('alpha', pending.id!)).toMatchObject({ kind: 'enrolled', root: ROOT, missing: [] })
+    await settleUntil(reopened, () => acks === 1)
+    expect(accepted(reopened).map(a => a.via)).toEqual(['thread'])
+    expect(reopened.threads.ownPostFindings()).toEqual([])
+    expect(postCount(reopened)).toBe(0)
+    expect(await reopened.threads.retryOwnPost('alpha', pending.id!)).toBeUndefined()
+    // The observed record's upgrade to enrolled is what replays.
+    await reopened.close()
+    const replayed = await open({ clock: h.clock })
+    expect(replayed.h.queue.threadRecord('alpha', pending.id!)?.state).toBe('enrolled')
+    expect([replayed.read(), replayed.threads.ownPostFindings()]).toEqual(['followed', []])
+  })
+
+  test.each([
+    ['dm', 'D0ALPHADM1', { kind: 'ineligible', reason: 'dm' }, undefined],
+    ['malformed', 'not-a-channel', { kind: 'ineligible', reason: 'invalid-channel' }, undefined],
+    ['open absent', C, { kind: 'ineligible', reason: 'absent' }, 'unfollowed'],
+    ['open external', C, { kind: 'ineligible', reason: 'external-sharing' }, 'unfollowed'],
+    ['open unresolved', C, { kind: 'pending', reason: 'event-order-conflict', missing: ['channel-eligibility'] }, 'unresolved'],
+    ['strict unlisted', SHARED_CHANNEL_IDS.private, { kind: 'ineligible', reason: 'unlisted' }, 'unfollowed'],
+  ] as const)('%s destination: own post neither invents eligibility nor enrolls', async (name, channel, expected, reading) => {
+    const h = await open({ mode: name.startsWith('open') ? 'open' : 'strict' })
+    const membership = name === 'open absent' ? { kind: 'ineligible', reason: 'absent' } as const
+      : name === 'open external' ? { kind: 'ineligible', reason: 'external-sharing' } as const
+        : name === 'open unresolved' ? { kind: 'unresolved', reason: 'event-order-conflict' } as const : undefined
+    if (membership) h.membership.set(`alpha:${C}`, membership)
+    const outcome = await h.confirmPost({ channel, ts: ROOT }).outcome
+    expect(outcome).toMatchObject({ ...expected, channel })
+    expect(outcomes(h)).toEqual([outcome])
+    // Only unresolved eligibility keeps durable evidence, and never as an enrollment.
+    expect(ownRecords(h).map(r => [r.observation.lifetime.channel, r.observation.root, r.state])).toEqual(expected.kind === 'pending' ? [[C, ROOT, 'observed']] : [])
+    if (reading) expect(h.read(ROOT, 'alpha', channel)).toBe(reading)
+  })
+
+  test.each([
+    ['unreadable choices, even over a negative membership reading', { listed: true, choiceReadable: false, choice: undefined, membership: { kind: 'ineligible', reason: 'absent' } },
+      { kind: 'unresolved', mode: 'strict', reason: 'state-unavailable' }],
+    ['a listed strict channel with a stored choice but no membership reading', { listed: true, choiceReadable: true, choice: 'thread_hybrid', membership: undefined },
+      { kind: 'unresolved', mode: 'strict', delivery: 'thread_hybrid', reason: 'current-membership-missing' }],
+  ] as const)('%s leaves own-post eligibility unresolved, never eligible or ineligible', (_name, inputs, expected) => {
+    expect(decideOwnPostEligibility({ channel: C, mode: 'strict', ...inputs })).toEqual(expected)
+  })
+
+  test('open mode reads no persona channel entries for own-post eligibility; strict mode reads the posting persona\'s', () => {
+    const personaReads: string[] = [], membershipModes: string[] = []
+    const eligibility = (mode: 'strict' | 'open', stored?: 'mentions') => ownPostEligibility({
+      config: () => ({ channel_mode: mode }),
+      persona: key => { personaReads.push(key); return { channels: [] } },
+      choices: () => ({ readableFor: () => true, storedChoice: () => stored }),
+      membership: (_key, _channel, m) => { membershipModes.push(m); return { kind: 'ineligible', reason: 'external-sharing' } },
+    })
+    expect(eligibility('open')('alpha', C)).toMatchObject({ kind: 'unresolved', mode: 'open', reason: 'choice-missing' })
+    expect(eligibility('open', 'mentions')('alpha', C)).toMatchObject({ kind: 'ineligible', mode: 'open', reason: 'external-sharing' })
+    expect(personaReads).toEqual([])
+    expect(eligibility('strict')('alpha', C)).toMatchObject({ kind: 'ineligible', mode: 'strict', reason: 'unlisted' })
+    expect(personaReads).toEqual(['alpha'])
+    expect(membershipModes).toEqual(['open', 'open', 'strict'])
+  })
+
+  test('an eligible listed off channel enrolls without changing intake; the post alone selects nothing', async () => {
+    const h = await open()
+    await h.choose('off')
+    expect(await h.confirmPost({ channel: C, ts: ROOT }).outcome).toMatchObject({ kind: 'enrolled', root: ROOT })
+    expect(h.read()).toBe('followed')
+    await h.receive(threadReply())
+    expect(accepted(h)).toEqual([])
+    await h.choose('thread_hybrid')
+    expect((await h.receive(threadReply({ ts: '1700000000.000102' }))).acknowledged).toBe(1)
+    expect(accepted(h).map(a => a.via)).toEqual(['thread'])
+  })
+
+  test('identity captured before the post binds it: an unknown or replaced issuer never enrolls a replacement', async () => {
+    const h = await open()
+    h.h.ownPostIdentity.set('alpha', undefined)
+    const unknown = h.confirmPost({ channel: C, ts: ROOT })
+    h.h.ownPostIdentity.delete('alpha')
+    expect(await unknown.outcome).toMatchObject({ kind: 'gap', reason: 'identity-unresolved', missing: [] })
+    const issue = h.threads.issueOwnPost('alpha', 'text')
+    h.h.ownPostIdentity.set('alpha', { botUserId: 'U0REPLACED', botId: 'B0REPLACED' })
+    expect(await h.threads.confirmOwnPost(issue, { channel: C, ts: ROOT })).toMatchObject({ kind: 'superseded' })
+    expect(ownRecords(h)).toEqual([])
+    expect(h.read()).toBe('unfollowed')
+    // The current identity still enrolls its own later post.
+    expect(await h.confirmPost({ channel: C, ts: ROOT }).outcome).toMatchObject({ kind: 'enrolled' })
+    expect(h.threads.ownPostFindings()).toEqual([])
+  })
+
+  test('a storage gap keeps in-memory protection for its thread only and is distinguishable from durable pending evidence', async () => {
+    const h = await open()
+    h.disk.fail('write', 'thread-participation')
+    const gap = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    expect(gap).toMatchObject({ kind: 'gap', reason: 'storage', root: ROOT })
+    expect(h.h.queue.threadRecord('alpha', gap.id!)).toBeUndefined()
+    expect(h.threads.ownPostFindings('alpha')).toEqual([expect.objectContaining({ kind: 'gap', reason: 'storage', id: gap.id })])
+    expect([h.read(), h.read(ROOT2), h.read(ROOT, 'beta')]).toEqual(['unresolved', 'unfollowed', 'unfollowed'])
+    // Elapsed time is no evidence.
+    await h.clock.advance(24 * 60 * 60 * 1000)
+    expect(h.read()).toBe('unresolved')
+    h.disk.repair()
+    expect(await h.threads.retryOwnPost('alpha', gap.id!)).toMatchObject({ kind: 'enrolled' })
+    expect(h.read()).toBe('followed')
+    expect(postCount(h)).toBe(0)
+  })
+
+  test('rootless evidence protects only unfollowed threads of its channel; a new mention settles exactly its own thread', async () => {
+    const h = await open()
+    await h.receive(h.mention({ ts: ROOT2, thread_ts: undefined }))
+    const rootless = await h.confirmPost({ channel: C }, 'alpha', 'prompt').outcome
+    expect(rootless).toMatchObject({ kind: 'pending', surface: 'prompt', missing: ['root'] })
+    expect(rootless.ts).toBeUndefined()
+    const other = '1700000000.000500'
+    expect([h.read(ROOT2), h.read(ROOT), h.read(other), h.read(ROOT, 'alpha', C2), h.read(ROOT, 'beta')])
+      .toEqual(['followed', 'unresolved', 'unresolved', 'unfollowed', 'unfollowed'])
+    expect((await h.receive(threadReply({ thread_ts: ROOT2, ts: '1700000000.000201' }))).acknowledged).toBe(1)
+    expect((await h.receive(h.mention({ ts: ROOT, thread_ts: undefined }))).acknowledged).toBe(1)
+    expect([h.read(ROOT), h.read(other)]).toEqual(['followed', 'unresolved'])
+    // Partial resolution claims no recovery: the rootless obligation stays pending.
+    expect(h.threads.ownPostFindings('alpha')).toEqual([expect.objectContaining({ kind: 'pending', missing: ['root'], id: rootless.id })])
+    expect(await h.threads.retryOwnPost('alpha', rootless.id!)).toMatchObject({ kind: 'pending' })
+  })
+
+  test('a failed enrollment write over durable pending evidence stays pending with its original missing evidence, then enrolls on repair', async () => {
+    const h = await open()
+    h.membership.set(`alpha:${C}`, { kind: 'unresolved', reason: 'history-unresolved' })
+    const pending = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    expect(pending).toMatchObject({ kind: 'pending', missing: ['channel-eligibility'] })
+    h.membership.delete(`alpha:${C}`)
+    h.disk.fail('write', 'thread-participation')
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const failed = await h.threads.retryOwnPost('alpha', pending.id!)
+      expect(failed).toMatchObject({ kind: 'pending', id: pending.id, root: ROOT, missing: ['channel-eligibility'], reason: 'history-unresolved' })
+      expect(failed!.error).toBeDefined()
+      // Never flipped to a gap: the durable copy still exists.
+      expect(h.threads.ownPostFindings('alpha')).toEqual([expect.objectContaining({ kind: 'pending', id: pending.id, missing: ['channel-eligibility'] })])
+    }
+    expect(h.disk.failures).toContain('write')
+    expect(ownRecords(h).map(r => r.state)).toEqual(['observed'])
+    expect(h.read()).toBe('unresolved')
+    h.disk.repair()
+    expect(await h.threads.retryOwnPost('alpha', pending.id!)).toMatchObject({ kind: 'enrolled', missing: [] })
+    expect(h.read()).toBe('followed')
+    expect(postCount(h)).toBe(0)
+  })
+
+  test('a post into a durably followed thread is a duplicate whatever eligibility reads: no record, no fresh outcome, no notice', async () => {
+    const h = await open()
+    await h.receive(h.mention({ thread_ts: undefined }))
+    expect(h.read()).toBe('followed')
+    for (const [i, reading] of ([{ kind: 'unresolved', reason: 'history-unresolved' }, { kind: 'ineligible', reason: 'absent' }] as const).entries()) {
+      h.membership.set(`alpha:${C}`, reading)
+      const reply = await h.confirmPost({ channel: C, ts: `1700000000.00015${i}`, parent: ROOT }).outcome
+      expect(reply).toMatchObject({ kind: 'enrolled', root: ROOT, missing: [] })
+      expect(reply.id).toBeUndefined()
+    }
+    await h.notices.flush()
+    expect([ownRecords(h), outcomes(h), h.threads.ownPostFindings()]).toEqual([[], [], []])
+    expect(duplicates(h).map(o => [o.kind, o.root, o.id])).toEqual([['enrolled', ROOT, undefined], ['enrolled', ROOT, undefined]])
+    expect(h.h.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED))).toEqual([])
+    expect(h.notices.h.totalPosts()).toBe(0)
+    expect(h.read()).toBe('followed')
+  })
+
+  test('a later part waits on the first part\'s in-flight enrollment: a silent duplicate once it lands, its own durable record when it fails', async () => {
+    const gates = [threadHold(), threadHold()]
+    let round = 0, failFirst = false
+    const h: ThreadHarness = await open({ beforeObservationSave: async (_key, observation) => {
+      if (observation.post?.part === 1) {
+        await gates[round++]!.wait()
+        if (failFirst) h.disk.fail('write', 'thread-participation')
+      } else if (observation.post) h.disk.repair()
+    } })
+    const parts = async (parent: string, gate: ReturnType<typeof threadHold>) => {
+      const issue = h.threads.issueOwnPost('alpha', 'text', C)
+      const first = h.threads.confirmOwnPost(issue, { channel: C, ts: `${parent.slice(0, -1)}1`, parent, part: 1 })
+      await gate.entered
+      let later = false
+      const second = h.threads.confirmOwnPost(issue, { channel: C, ts: `${parent.slice(0, -1)}2`, parent, part: 2 })
+      void second.then(() => { later = true })
+      for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve))
+      // Held behind the first write; the thread stays protected meanwhile.
+      expect(later).toBe(false)
+      expect(h.read(parent)).toBe('unresolved')
+      return { first, second }
+    }
+    const landed = await parts(ROOT, gates[0]!)
+    gates[0]!.release()
+    expect(await landed.first).toMatchObject({ kind: 'enrolled', part: 1, root: ROOT })
+    const duplicate = await landed.second
+    expect(duplicate).toMatchObject({ kind: 'enrolled', part: 2, root: ROOT, duplicate: true })
+    expect(duplicate.id).toBeUndefined()
+    expect(ownRecords(h).map(r => [r.observation.root, r.observation.post!.part, r.state])).toEqual([[ROOT, 1, 'enrolled']])
+    expect(outcomes(h).map(o => [o.kind, o.part])).toEqual([['enrolled', 1]])
+    failFirst = true
+    const failing = await parts(ROOT2, gates[1]!)
+    gates[1]!.release()
+    expect(await failing.first).toMatchObject({ kind: 'gap', reason: 'storage', part: 1, root: ROOT2 })
+    const own = await failing.second
+    expect(own).toMatchObject({ kind: 'enrolled', part: 2, root: ROOT2 })
+    expect(own.duplicate).toBeUndefined()
+    expect(ownRecords(h).filter(r => r.observation.root === ROOT2).map(r => [r.observation.post!.part, r.state])).toEqual([[2, 'enrolled']])
+    expect(outcomes(h).slice(1).map(o => [o.kind, o.part, o.reason])).toEqual([['gap', 1, 'storage'], ['enrolled', 2, undefined]])
+    expect(h.read(ROOT2)).toBe('followed')
+    expect(postCount(h)).toBe(0)
+  })
+
+  test('a fault after the enrollment write lands is an operation finding over the durable copy, never a gap or a repost', async () => {
+    let fault = false
+    const h = await open({ afterObservationSave: async (_key, observation) => { if (observation.post) fault = true } })
+    const status = h.authority.lifetimeStatus.bind(h.authority)
+    h.authority.lifetimeStatus = token => { if (fault) { fault = false; throw new Error('injected post-write fault') } return status(token) }
+    const outcome = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    expect(outcome).toMatchObject({ kind: 'pending', reason: 'operation', root: ROOT })
+    expect(h.h.queue.threadRecord('alpha', outcome.id!)?.state).toBe('enrolled')
+    await h.notices.flush()
+    expect(h.h.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED))).toEqual([buildOwnPostNotEnrolledLine(renderPersonaRef('alpha', 'alpha'), outcome)])
+    await h.close()
+    const reopened = await open({ clock: h.clock })
+    expect(reopened.read()).toBe('followed')
+    expect(reopened.threads.ownPostFindings()).toEqual([])
+    expect(postCount(h) + postCount(reopened)).toBe(0)
+  })
+
+  test('a malformed requested parent is pending with its root missing, persisted as unresolved, never enrolled under the reply\'s own ts', async () => {
+    const h = await open()
+    const outcome = await h.confirmPost({ channel: C, ts: ROOT, parent: 'not-a-thread' }).outcome
+    expect(outcome).toMatchObject({ kind: 'pending', ts: ROOT, missing: ['root'] })
+    expect([outcome.parent, outcome.root]).toEqual([undefined, undefined])
+    const [record] = ownRecords(h)
+    expect(record!.state).toBe('observed')
+    expect(record!.observation.root).toBeUndefined()
+    expect(record!.observation.post).toMatchObject({ ts: ROOT, parentUnresolved: true, missing: ['root'] })
+    expect(record!.observation.post!.parent).toBeUndefined()
+    // Rootless evidence: unfollowed threads of its channel stay protected, nothing is followed.
+    expect([h.read(), h.read(ROOT, 'alpha', C2)]).toEqual(['unresolved', 'unfollowed'])
+    await h.close()
+    const reopened = await open({ clock: h.clock })
+    expect(reopened.threads.ownPostFindings()).toEqual([expect.objectContaining({ kind: 'pending', id: outcome.id, missing: ['root'] })])
+    expect(reopened.read()).toBe('unresolved')
+  })
+
+  type Damage = { observation: Record<string, any>; acceptedSeq?: number }
+  test.each<[string, string, (record: Damage) => void, 'followed' | 'unresolved']>([
+    ['an intact enrolled reply', ROOT, () => {}, 'followed'],
+    ['an enrolled post still missing eligibility', ROOT, r => { r.observation.post.missing = ['channel-eligibility'] }, 'unresolved'],
+    ['a reply whose root is not its parent', ROOT2, r => { r.observation.root = ROOT2 }, 'unresolved'],
+    ['an enrolled post with no delivery choice', ROOT, r => { delete r.observation.policy.delivery }, 'unresolved'],
+    ['an own post carrying an incoming Slack key', ROOT, r => { r.observation.slackKey = { chat_id: C, ts: '1700000000.000101' }; r.acceptedSeq = 1 }, 'unresolved'],
+  ])('a restored own-post record: %s', async (_name, claimed, damage, expected) => {
+    const h = await open()
+    const enrolled = await h.confirmPost({ channel: C, ts: '1700000000.000101', parent: ROOT }).outcome
+    expect(enrolled).toMatchObject({ kind: 'enrolled', root: ROOT })
+    await h.close()
+    seedQueue(dir, readQueue(dir).map(record => {
+      if (record.kind !== 'thread-participation' || record.observation.id !== enrolled.id) return record
+      const copy = structuredClone(record) as unknown as Damage
+      damage(copy)
+      return JSON.stringify(copy) + '\n'
+    }))
+    // A refused record enrolls nothing and leaves the persona's unknown threads unresolved, never unfollowed.
+    const reopened = await open({ clock: h.clock })
+    expect(reopened.h.queue.threadRecord('alpha', enrolled.id!)?.state).toBe(expected === 'followed' ? 'enrolled' : undefined)
+    expect(reopened.read(claimed)).toBe(expected)
+    expect(reopened.read(ROOT, 'beta')).toBe('unfollowed')
+  })
+})
+
+describe('reply parts through the MCP reply tool', () => {
+  const TEXT = 'abcdefghij' + 'klmnopqrst' + 'uvw'
+  const openReply = (options: Parameters<typeof open>[0] = {}) => open({ ...options, routing: { replyChunkLimit: 10, ...options.routing } })
+  const resultText = (result: { content: Array<{ text?: string }> }) => result.content.map(c => c.text).join('')
+  /** A delivered thread reply whose ack reaction a correlated successful post removes. */
+  async function deliveredReply(h: ThreadHarness) {
+    await h.receive(h.mention()); await h.receive(threadReply())
+    const item = h.h.queued('alpha')[1]!
+    await h.h.queue.append('alpha', sentRecord(item.accepted.seq))
+    await h.h.queue.append('alpha', deliveredRecord(item.accepted.seq, h.clock.now()))
+    h.reporting.engineEvent({ type: 'item-delivered', key: 'alpha', seq: item.accepted.seq, at: h.clock.now(), waitMs: 0 })
+    await h.drainReactions()
+    return item
+  }
+
+  test('independent root chunks each enroll their own returned root and shared-parent chunks their parent once, reconstructing the exact text', async () => {
+    const h = await openReply()
+    const result = await h.h.replyResult('alpha', { chat_id: C, text: TEXT })
+    expect(result.isError).toBeFalsy()
+    const roots = h.h.p('alpha').stub.calls.postMessage
+    expect(roots.map(p => textOf(p)).join('')).toBe(TEXT)
+    expect(roots).toHaveLength(3)
+    const returned = h.h.p('alpha').stub.web.callLog.filter(c => c.method === 'chat.postMessage').map((_, i) => `1700000000.${String(i + 1).padStart(6, '0')}`)
+    expect(returned.map(ts => h.read(ts))).toEqual(['followed', 'followed', 'followed'])
+    expect(resultText(result)).toContain(`[ts: ${returned[2]}]`)
+    expect(await h.h.replyResult('alpha', { chat_id: C2, thread_ts: ROOT2, text: TEXT })).not.toMatchObject({ isError: true })
+    expect(h.h.p('alpha').stub.calls.postMessage.slice(3).map(p => [p.thread_ts, textOf(p)])).toEqual([[ROOT2, 'abcdefghij'], [ROOT2, 'klmnopqrst'], [ROOT2, 'uvw']])
+    expect(ownRecords(h).map(r => [r.observation.lifetime.channel, r.observation.root, r.observation.post!.part]))
+      .toEqual([...returned.map((ts, i) => [C, ts, i + 1]), [C2, ROOT2, 1]])
+    expect(h.read(ROOT2, 'alpha', C2)).toBe('followed')
+    expect(outcomes(h).map(o => o.kind)).toEqual(['enrolled', 'enrolled', 'enrolled', 'enrolled'])
+    // Independent roots are never duplicates; only the later shared-parent parts are.
+    expect(duplicates(h).map(o => [o.kind, o.channel, o.root, o.part])).toEqual([['enrolled', C2, ROOT2, 2], ['enrolled', C2, ROOT2, 3]])
+  })
+
+  test.each(['throwing owner', 'rejecting owner', 'storage fault'] as const)('a %s after each success still posts every authorized part exactly once and cleans the correlated ack', async fault => {
+    const h = await openReply()
+    const item = await deliveredReply(h)
+    const removals = h.h.p('alpha').stub.calls.reactionsRemove.length, before = postCount(h)
+    if (fault === 'throwing owner') h.threads.confirmOwnPost = () => { throw new Error('injected confirmation failure') }
+    else if (fault === 'rejecting owner') h.threads.confirmOwnPost = () => Promise.reject(new Error('injected async confirmation failure'))
+    else h.disk.fail('write', 'thread-participation')
+    const result = await h.h.replyResult('alpha', { chat_id: C, thread_ts: ROOT2, message_id: item.accepted.ts, text: TEXT })
+    expect(result.isError).toBeFalsy()
+    expect(resultText(result)).toContain('Sent 3 message(s) to')
+    expect(h.h.p('alpha').stub.calls.postMessage.slice(before).map(p => textOf(p))).toEqual(['abcdefghij', 'klmnopqrst', 'uvw'])
+    await h.drainReactions()
+    expect(h.h.p('alpha').stub.calls.reactionsRemove.length).toBe(removals + 1)
+    // A failed first write makes no later part a duplicate: each part attempts its own write and reports its own gap.
+    expect(outcomes(h, 'gap').map(o => [o.reason, o.part])).toEqual([1, 2, 3].map(part => [fault === 'storage fault' ? 'storage' : 'operation', part]))
+    expect(h.h.ownPostOutcomes.filter(o => o.kind !== 'gap')).toEqual([])
+    expect(h.read(ROOT2)).toBe(fault === 'storage fault' ? 'unresolved' : 'unfollowed')
+    // Repair never posts again.
+    h.disk.repair()
+    for (const finding of h.threads.ownPostFindings('alpha')) await h.threads.retryOwnPost('alpha', finding.id!)
+    expect(postCount(h)).toBe(before + 3)
+  })
+
+  test('a later chunk failure reports the confirmed prefix truthfully, keeps its participation and never reposts it', async () => {
+    const h = await openReply()
+    h.h.p('alpha').stub.script.post.push({ kind: 'ok' }, { kind: 'platform', error: 'channel_not_found' })
+    const result = await h.h.replyResult('alpha', { chat_id: C, text: TEXT })
+    const first = '1700000000.000001'
+    expect(result.isError).toBe(true)
+    expect(resultText(result)).toBe(replyPartialFailureText({ where: C, sent: 1, total: 3, lastTs: first, uploaded: 0, files: 0 }, 'channel_not_found'))
+    expect(h.h.p('alpha').stub.calls.postMessage.map(p => textOf(p))).toEqual(['abcdefghij', 'klmnopqrst'])
+    expect(h.read(first)).toBe('followed')
+    expect(h.h.ownPostOutcomes.map(o => [o.kind, o.part])).toEqual([['enrolled', 1]])
+    // The operator line goes through the server's injected log, with the counts and never the reply's text.
+    const lines = h.h.logs.filter(l => l.startsWith('[slack] Tool "reply" stopped after a partial post'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]!.startsWith(`[slack] Tool "reply" stopped after a partial post for persona ${renderPersonaRef('alpha', 'alpha')}: sent=1/3 uploaded=0/0: `)).toBe(true)
+    expect(lines[0]).toContain('channel_not_found')
+    for (const part of ['abcdefghij', 'klmnopqrst', 'uvw']) expect(lines[0]).not.toContain(part)
+  })
+
+  test.each(['reset', 'leave', 'rejoin'] as const)('a %s while a reply part is in flight supersedes that part and the rest; every part still posts once', async change => {
+    const h = await openReply()
+    const held = makeDeferredWebApiCall()
+    h.h.p('alpha').stub.script.post.push({ kind: 'ok' }, held.outcome)
+    const reply = h.h.replyResult('alpha', { chat_id: C, text: TEXT })
+    await settleUntil(h, () => postCount(h) === 2)
+    const a = h.authority, life = a.incarnation('alpha')!, before = structuredClone(a.lifetime('alpha', C))
+    const member = (event: string, joined: boolean, boundary: number) =>
+      expect(a.observeMembership('alpha', life, { event, identity: 'app', channel: C, member: joined, boundary }, a.revision).kind).toBe('applied')
+    if (change === 'reset') expect(a.transact(a.revision, (next, order) => { next.personas.alpha!.resetOrder = order })).toMatchObject({ kind: 'applied' })
+    else member('left', false, 0)
+    if (change === 'rejoin') member('joined', true, a.revision)
+    expect(a.lifetime('alpha', C)).not.toEqual(before)
+    held.settle()
+    const result = await reply
+    expect(result.isError).toBeFalsy()
+    expect(resultText(result)).toContain('Sent 3 message(s) to')
+    expect(h.h.p('alpha').stub.calls.postMessage.map(p => textOf(p))).toEqual(['abcdefghij', 'klmnopqrst', 'uvw'])
+    await h.drainReactions()
+    expect(h.h.ownPostOutcomes.map(o => [o.kind, o.part])).toEqual([['enrolled', 1], ['superseded', 2], ['superseded', 3]])
+    expect(ownRecords(h).map(r => r.observation.post!.part)).toEqual([1])
+    expect(h.threads.ownPostFindings()).toEqual([])
+  })
+
+  test.each([
+    ['the choice set to off', { mode: 'strict', delivery: 'off' }],
+    ['the strict channel entry omitted from the reviewed config', { mode: 'strict', delivery: 'thread_hybrid' }],
+    ['a strict-to-open switch', { mode: 'open', delivery: 'thread_hybrid' }],
+  ] as const)('%s while a reply part is in flight: later parts enroll under the current facts and every part posts once', async (change, policy) => {
+    const h = await openReply()
+    const held = makeDeferredWebApiCall()
+    h.h.p('alpha').stub.script.post.push({ kind: 'ok' }, held.outcome)
+    const reply = h.h.replyResult('alpha', { chat_id: C, text: TEXT })
+    await settleUntil(h, () => postCount(h) === 2)
+    if (policy.delivery === 'off') await h.choose('off')
+    else if (policy.mode === 'open') h.chooseMode('open')
+    else {
+      h.reviewConfig(applied => { const p = h.personaEntry(applied, 'alpha'); p.channels = p.channels.filter((c: { id: string }) => c.id !== C) })
+      // An omitted entry keeps its saved assignment: the applied entry and stored choice, which intake reads too, remain.
+      expect(h.h.config!.personas.find(p => p.key === 'alpha')!.channels.map(c => c.id)).toEqual([C, C2])
+      expect(h.authority.choice('alpha', C)).toBe('thread_hybrid')
+    }
+    held.settle()
+    const result = await reply
+    expect(result.isError).toBeFalsy()
+    expect(resultText(result)).toContain('Sent 3 message(s) to')
+    expect(h.h.p('alpha').stub.calls.postMessage.map(p => textOf(p))).toEqual(['abcdefghij', 'klmnopqrst', 'uvw'])
+    await h.drainReactions(); await h.notices.flush()
+    const roots = [1, 2, 3].map(i => `1700000000.${String(i).padStart(6, '0')}`)
+    expect(h.h.ownPostOutcomes.map(o => [o.kind, o.part, o.root, o.delivery])).toEqual(roots.map((root, i) => ['enrolled', i + 1, root, i ? policy.delivery : 'thread_hybrid']))
+    expect(ownRecords(h).map(r => [r.observation.post!.part, r.state, r.observation.policy]))
+      .toEqual([[1, 'enrolled', { mode: 'strict', delivery: 'thread_hybrid' }], [2, 'enrolled', policy], [3, 'enrolled', policy]])
+    expect([h.threads.ownPostFindings(), h.h.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED)), h.notices.h.totalPosts()]).toEqual([[], [], 0])
+    // Enrollment never changes intake: an off channel still takes in nothing from the followed thread.
+    expect(h.read(roots[1])).toBe('followed')
+    expect((await h.receive(threadReply({ thread_ts: roots[1], ts: '1700000000.000901' }))).acknowledged).toBe(1)
+    expect(accepted(h).map(a => a.via)).toEqual(policy.delivery === 'off' ? [] : ['thread'])
+  })
+
+  test('the persona removed while a reply part is in flight: later parts are superseded, with no record, line or notice; every part posts once', async () => {
+    const h = await openReply()
+    const held = makeDeferredWebApiCall()
+    h.h.p('alpha').stub.script.post.push({ kind: 'ok' }, held.outcome)
+    const reply = h.h.replyResult('alpha', { chat_id: C, text: TEXT })
+    await settleUntil(h, () => postCount(h) === 2)
+    h.reviewConfig(applied => { applied.personas = applied.personas.filter(p => (p.key ?? p.name) !== 'alpha') })
+    expect(h.h.config!.personas.map(p => p.key)).not.toContain('alpha')
+    h.reporting.forget('alpha')
+    held.settle()
+    const result = await reply
+    expect(result.isError).toBeFalsy()
+    expect(resultText(result)).toContain('Sent 3 message(s) to')
+    expect(h.h.p('alpha').stub.calls.postMessage.map(p => textOf(p))).toEqual(['abcdefghij', 'klmnopqrst', 'uvw'])
+    await h.drainReactions(); await h.notices.flush()
+    expect(h.h.ownPostOutcomes.map(o => [o.kind, o.part])).toEqual([['enrolled', 1], ['superseded', 2], ['superseded', 3]])
+    expect(ownRecords(h).map(r => r.observation.post!.part)).toEqual([1])
+    expect([h.threads.ownPostFindings(), h.h.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED)), h.notices.h.totalPosts()]).toEqual([[], [], 0])
+  })
+
+  test('a failed upload after posted text reports both counts; a first-call failure keeps the plain tool error and enrolls nothing', async () => {
+    const h = await openReply()
+    const file = join(dir, 'notes.txt'); fs.writeFileSync(file, 'notes')
+    h.h.p('alpha').stub.script.upload.push({ kind: 'platform', error: 'file_upload_failed' })
+    const result = await h.h.replyResult('alpha', { chat_id: C, thread_ts: ROOT, text: 'short', files: [file] })
+    expect(result.isError).toBe(true)
+    expect(resultText(result)).toBe(replyPartialFailureText({ where: C, sent: 1, total: 1, lastTs: '1700000000.000001', uploaded: 0, files: 1 }, 'file_upload_failed'))
+    expect(h.read()).toBe('followed')
+    h.h.p('beta').stub.script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    const refused = await h.h.replyResult('beta', { chat_id: C2, text: TEXT })
+    expect(refused.isError).toBe(true)
+    expect(resultText(refused)).not.toContain('partial post')
+    expect(h.h.p('beta').stub.calls.postMessage).toHaveLength(1)
+    expect(ownRecords(h, 'beta')).toEqual([])
+    expect(h.h.ownPostOutcomes.filter(o => o.key === 'beta')).toEqual([])
+  })
+})
+
+describe('own-post findings through delivery reporting, episodes and the notifier', () => {
+  const ref = (key = 'alpha') => renderPersonaRef(key, key)
+  const findingLines = (h: ThreadHarness, key = 'alpha') => h.h.logs.filter(l => l.startsWith(`[slack] ${OWN_POST_NOT_ENROLLED}: persona=${ref(key)} `))
+  const findingNotices = (h: ThreadHarness, key = 'alpha') =>
+    (h.notices.h.allPosts()[key] ?? []).filter(p => p.text.includes('*Thread not followed yet*') || p.text.includes('*Thread participation not saved*'))
+  const unresolve = (h: ThreadHarness, key = 'alpha', channel: string = C) => h.membership.set(`${key}:${channel}`, { kind: 'unresolved', reason: 'history-unresolved' })
+  const resolve = (h: ThreadHarness, key = 'alpha', channel: string = C) => h.membership.delete(`${key}:${channel}`)
+
+  test('pending findings log once each and notify once per episode per persona; the episode ends silently only when the owner has none left', async () => {
+    const h = await open()
+    unresolve(h); unresolve(h, 'beta')
+    const first = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    const second = await h.confirmPost({ channel: C, ts: ROOT2 }).outcome
+    const beta = await h.confirmPost({ channel: C, ts: ROOT }, 'beta').outcome
+    await h.notices.flush()
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), first), buildOwnPostNotEnrolledLine(ref(), second)])
+    expect(findingNotices(h).map(p => p.text)).toEqual([formatPersonaNotice(h.notices.config.personas[0]!, buildOwnPostNotEnrolledNotice(ref(), first))])
+    expect(findingNotices(h, 'beta')).toHaveLength(1)
+    expect(findingLines(h, 'beta')).toEqual([buildOwnPostNotEnrolledLine(ref('beta'), beta)])
+    // A failing enrollment write re-reports the same pending id; its open finding logs and notifies nothing new.
+    resolve(h)
+    h.disk.fail('write', 'thread-participation')
+    const again = await h.threads.retryOwnPost('alpha', first.id!)
+    expect(again).toMatchObject({ kind: 'pending', id: first.id })
+    expect(again!.error).toBeDefined()
+    expect(h.h.ownPostOutcomes.filter(o => o.id === first.id).map(o => o.kind)).toEqual(['pending', 'pending'])
+    await h.notices.flush()
+    expect(findingLines(h)).toHaveLength(2)
+    expect(findingNotices(h)).toHaveLength(1)
+    h.disk.repair()
+    expect(await h.threads.retryOwnPost('alpha', first.id!)).toMatchObject({ kind: 'enrolled' })
+    // One thread resolved: the other obligation still holds the episode open, so a new finding stays quiet.
+    unresolve(h)
+    const third = await h.confirmPost({ channel: C, ts: '1700000000.000600' }).outcome
+    await h.notices.flush()
+    expect(findingNotices(h)).toHaveLength(1)
+    expect(findingLines(h)).toHaveLength(3)
+    resolve(h)
+    for (const o of [second, third]) expect(await h.threads.retryOwnPost('alpha', o.id!)).toMatchObject({ kind: 'enrolled' })
+    expect(h.threads.ownPostFindings('alpha')).toEqual([])
+    await h.notices.flush()
+    // Ended silently: no recovery notice; beta's episode is untouched. A later finding opens a new episode.
+    expect(h.notices.h.allPosts().alpha).toHaveLength(1)
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(false)
+    expect(h.notices.rig.episodes.isOpen('beta', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(true)
+    expect(h.threads.ownPostFindings('beta')).toHaveLength(1)
+    unresolve(h)
+    await h.confirmPost({ channel: C, ts: '1700000000.000700' }).outcome
+    await h.notices.flush()
+    expect(findingNotices(h)).toHaveLength(2)
+    expect(findingNotices(h, 'beta')).toHaveLength(1)
+  })
+
+  test(`finding lines stop at ${OWN_POST_FINDINGS_LOGGED_PER_PERSONA} per persona with one capped line, and one notice`, async () => {
+    const h = await open()
+    unresolve(h)
+    for (let i = 1; i <= OWN_POST_FINDINGS_LOGGED_PER_PERSONA + 3; i++) {
+      expect(await h.confirmPost({ channel: C, ts: `1700000001.${String(i).padStart(6, '0')}` }).outcome).toMatchObject({ kind: 'pending' })
+    }
+    await h.notices.flush()
+    const lines = findingLines(h)
+    expect(lines).toHaveLength(OWN_POST_FINDINGS_LOGGED_PER_PERSONA + 1)
+    expect(lines.at(-1)).toBe(buildOwnPostFindingsCappedLine(ref()))
+    expect(lines.filter(l => l.includes('state=pending'))).toHaveLength(OWN_POST_FINDINGS_LOGGED_PER_PERSONA)
+    expect(findingNotices(h)).toHaveLength(1)
+    expect(h.threads.ownPostFindings('alpha')).toHaveLength(OWN_POST_FINDINGS_LOGGED_PER_PERSONA + 3)
+    // Once no obligation remains the cap resets with the episode: the next finding is logged again.
+    resolve(h)
+    for (const finding of h.threads.ownPostFindings('alpha')) expect(await h.threads.retryOwnPost('alpha', finding.id!)).toMatchObject({ kind: 'enrolled' })
+    unresolve(h)
+    const next = await h.confirmPost({ channel: C, ts: '1700000002.000001' }).outcome
+    await h.notices.flush()
+    expect(findingLines(h).slice(lines.length)).toEqual([buildOwnPostNotEnrolledLine(ref(), next)])
+    expect(findingNotices(h)).toHaveLength(2)
+  })
+
+  test('forgetting a persona drops only its open own-post findings: its re-reported finding logs again, another persona\'s stays deduplicated', async () => {
+    const h = await open()
+    unresolve(h); unresolve(h, 'beta')
+    const alpha = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    const beta = await h.confirmPost({ channel: C, ts: ROOT }, 'beta').outcome
+    await h.notices.flush()
+    expect([findingLines(h).length, findingLines(h, 'beta').length]).toEqual([1, 1])
+    h.reporting.forget('alpha')
+    const retryFailing = async (key: string, id: string) => {
+      resolve(h, key); h.disk.fail('write', 'thread-participation', key)
+      const outcome = await h.threads.retryOwnPost(key, id)
+      h.disk.repair()
+      expect(outcome).toMatchObject({ kind: 'pending', id })
+      return outcome!
+    }
+    const alphaAgain = await retryFailing('alpha', alpha.id!)
+    await retryFailing('beta', beta.id!)
+    await h.notices.flush()
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), alpha), buildOwnPostNotEnrolledLine(ref(), alphaAgain)])
+    expect(findingLines(h, 'beta')).toEqual([buildOwnPostNotEnrolledLine(ref('beta'), beta)])
+    expect(findingNotices(h, 'beta')).toHaveLength(1)
+  })
+
+  test('a write failing after its persona is removed is superseded, and a gap still arriving for the removed key is not reported; once the persona is applied again a finding reports normally', async () => {
+    const gate = threadHold()
+    let held = true
+    const h = await open({ beforeObservationSave: async (_key, observation) => { if (observation.post && held) { held = false; await gate.wait() } } })
+    h.disk.fail('write', 'thread-participation', 'alpha')
+    const adapterIssue = h.h.ownPosts.issue('alpha', 'text', C)
+    const { outcome } = h.confirmPost({ channel: C, ts: ROOT })
+    await gate.entered
+    let entry: Record<string, any> | undefined
+    h.reviewConfig(applied => { entry = h.personaEntry(applied, 'alpha'); applied.personas = applied.personas.filter(p => p !== entry) })
+    h.reporting.forget('alpha')
+    gate.release()
+    // The write was already under way at removal and fails after it: the removed life is owed nothing.
+    const late = await outcome
+    expect(late).toMatchObject({ kind: 'superseded', key: 'alpha', channel: C, ts: ROOT })
+    expect(h.disk.failures).toEqual(['write'])
+    expect(h.h.ownPostOutcomes).toEqual([late])
+    expect(ownRecords(h)).toEqual([])
+    // The adapter's operation fallback still reports a gap for the removed key; the reporter drops it.
+    const confirm = h.threads.confirmOwnPost
+    h.threads.confirmOwnPost = () => Promise.reject(new Error('injected owner fault'))
+    h.h.ownPosts.confirm(adapterIssue, { channel: C, ts: ROOT2 })
+    await settleUntil(h, () => h.h.ownPostOutcomes.length === 2)
+    h.threads.confirmOwnPost = confirm
+    expect(h.h.ownPostOutcomes[1]).toMatchObject({ kind: 'gap', reason: 'operation', key: 'alpha', channel: C, ts: ROOT2 })
+    await h.notices.flush()
+    expect([findingLines(h), h.h.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED)), h.notices.h.totalPosts()]).toEqual([[], [], 0])
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(false)
+    h.disk.repair()
+    h.reviewConfig(applied => { applied.personas.push(entry!) })
+    expect(h.h.config!.personas.map(p => p.key)).toContain('alpha')
+    // Removal ended the old assignment; the applied-again persona is assigned its channel afresh.
+    await h.choose('thread_hybrid')
+    unresolve(h)
+    const finding = await h.confirmPost({ channel: C, ts: ROOT2 }).outcome
+    expect(finding).toMatchObject({ kind: 'pending', key: 'alpha' })
+    await h.notices.flush()
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), finding)])
+    expect(findingNotices(h).map(p => p.text)).toEqual([formatPersonaNotice(h.notices.config.personas.find(p => p.key === 'alpha')!, buildOwnPostNotEnrolledNotice(ref(), finding))])
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(true)
+  })
+
+  test('an enrollment write failing after a destructive modify of its persona is superseded: the new life gets no line or notice, and the reply keeps its result', async () => {
+    const gate = threadHold()
+    let held = true
+    const h = await open({ beforeObservationSave: async (_key, observation) => { if (observation.post && held) { held = false; await gate.wait() } } })
+    h.disk.fail('write', 'thread-participation', 'alpha')
+    const life = h.authority.incarnation('alpha')
+    const result = await h.h.replyResult('alpha', { chat_id: C, text: 'short' })
+    await gate.entered
+    // The tool result never waits on the held participation write.
+    expect(result.isError).toBeFalsy()
+    expect(result.content.map(c => c.text).join('')).toContain('Sent 1 message(s) to')
+    const ts = '1700000000.000001'
+    h.reviewConfig(applied => { const p = h.personaEntry(applied, 'alpha'); p.working_directory = `${p.working_directory}-moved` })
+    expect(h.h.config!.personas.map(p => p.key)).toContain('alpha')
+    expect(h.authority.incarnation('alpha')).toBeDefined()
+    expect(h.authority.incarnation('alpha')).not.toBe(life)
+    h.reporting.forget('alpha')
+    gate.release()
+    await settleUntil(h, () => h.h.ownPostOutcomes.length === 1)
+    expect(h.disk.failures).toEqual(['write'])
+    expect(h.h.ownPostOutcomes).toEqual([expect.objectContaining({ kind: 'superseded', key: 'alpha', surface: 'text', channel: C, ts, root: ts })])
+    expect(ownRecords(h)).toEqual([])
+    await h.drainReactions(); await h.notices.flush()
+    expect([findingLines(h), h.h.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED)), h.notices.h.totalPosts(), h.threads.ownPostFindings()]).toEqual([[], [], 0, []])
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(false)
+    expect(h.h.p('alpha').stub.calls.postMessage.map(p => textOf(p))).toEqual(['short'])
+  })
+
+  test.each(['a fresh enrollment', 'replies only into already followed threads'] as const)('an id-less gap cannot hold the episode open: it ends at %s, and a later storage gap logs and notifies again', async settling => {
+    const h = await open()
+    const intoFollowed = settling !== 'a fresh enrollment'
+    if (intoFollowed) {
+      await h.receive(h.mention({ thread_ts: undefined }))
+      await h.receive(h.mention({ ts: ROOT2, thread_ts: undefined }))
+      expect([h.read(), h.read(ROOT2)]).toEqual(['followed', 'followed'])
+    }
+    h.h.ownPostIdentity.set('alpha', undefined)
+    const idless = await h.confirmPost({ channel: C, ts: '1700000000.000500' }).outcome
+    h.h.ownPostIdentity.delete('alpha')
+    expect(idless).toMatchObject({ kind: 'gap', reason: 'identity-unresolved' })
+    expect(idless.id).toBeUndefined()
+    await h.notices.flush()
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), idless)])
+    expect(findingNotices(h)).toHaveLength(1)
+    expect(h.threads.ownPostFindings('alpha')).toEqual([])
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(true)
+    if (intoFollowed) {
+      for (const [parent, ts] of [[ROOT, '1700000000.000501'], [ROOT2, '1700000000.000502']] as const) {
+        expect(await h.confirmPost({ channel: C, ts, parent }).outcome).toMatchObject({ kind: 'enrolled', root: parent, duplicate: true })
+      }
+      // Nothing but duplicates settled: no record, no fresh outcome, yet the episode ends.
+      expect([ownRecords(h), outcomes(h), duplicates(h).length]).toEqual([[], [idless], 2])
+    } else expect(await h.confirmPost({ channel: C, ts: ROOT2 }).outcome).toMatchObject({ kind: 'enrolled' })
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(false)
+    h.disk.fail('write', 'thread-participation')
+    const gap = await h.confirmPost({ channel: C, ts: '1700000000.000600' }).outcome
+    expect(gap).toMatchObject({ kind: 'gap', reason: 'storage' })
+    await h.notices.flush()
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), idless), buildOwnPostNotEnrolledLine(ref(), gap)])
+    expect(findingNotices(h).map(p => p.text)).toEqual([idless, gap].map(o => formatPersonaNotice(h.notices.config.personas[0]!, buildOwnPostNotEnrolledNotice(ref(), o))))
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(true)
+  })
+
+  test('a pending post whose lifetime a reset supersedes no longer holds the episode open; nothing announces recovery', async () => {
+    const h = await open()
+    unresolve(h)
+    const stale = await h.confirmPost({ channel: C, ts: ROOT }).outcome
+    expect(stale).toMatchObject({ kind: 'pending' })
+    await h.notices.flush()
+    expect(findingNotices(h)).toHaveLength(1)
+    const a = h.authority
+    expect(a.transact(a.revision, (next, order) => { next.personas.alpha!.resetOrder = order })).toMatchObject({ kind: 'applied' })
+    expect(h.threads.ownPostFindings('alpha')).toEqual([])
+    // Any later settling outcome prunes it; the episode ends silently.
+    expect(await h.confirmPost({ channel: C2, ts: ROOT2 }).outcome).toMatchObject({ kind: 'enrolled' })
+    expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(false)
+    await h.notices.flush()
+    expect(findingNotices(h)).toHaveLength(1)
+    expect(h.notices.h.allPosts().alpha).toHaveLength(1)
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), stale)])
+  })
+
+  test.each(['immediate', 'held'] as const)('a notice (%s post) enrolls its returned root through the real resolver and owner; own echoes and a repeated confirmation add nothing', async drain => {
+    const h = await open()
+    h.chooseDestination('alpha', C)
+    const stub = h.h.p('alpha').stub
+    if (drain === 'held') stub.script.post.push({ kind: 'rate-limited', retryAfter: 1 })
+    await h.h.notifier.notify('alpha', 'a persona notice')
+    await h.h.holdClock.flush()
+    if (drain === 'held') {
+      expect(h.h.hold.view('alpha').held).toBe(true)
+      expect(h.h.ownPostOutcomes).toEqual([])
+      // The drain posts to the destination current at its attempt.
+      h.chooseDestination('alpha', C2)
+      await h.h.holdClock.runNext()
+      expect(h.h.hold.view('alpha').held).toBe(false)
+    }
+    const channel = drain === 'held' ? C2 : C, ts = '1700000000.000001'
+    expect(stub.calls.postMessage.map(p => p.channel)).toEqual(drain === 'held' ? [C, C2] : [C])
+    expect(h.h.ownPostOutcomes).toEqual([expect.objectContaining({ kind: 'enrolled', surface: 'notice', channel, ts, root: ts, missing: [] })])
+    expect(h.read(ts, 'alpha', channel)).toBe('followed')
+    const echo = threadReply({ channel, thread_ts: undefined, ts, user: stub.identity.botUserId, bot_id: stub.identity.botId, text: 'a persona notice' })
+    for (let i = 0; i < 2; i++) await h.receive(echo)
+    expect(await h.confirmPost({ channel, ts }, 'alpha', 'notice').outcome).toMatchObject({ kind: 'enrolled', root: ts, duplicate: true })
+    expect(ownRecords(h).map(r => [r.observation.lifetime.channel, r.observation.root, r.state])).toEqual([[channel, ts, 'enrolled']])
+    expect([outcomes(h).length, duplicates(h).length, accepted(h)]).toEqual([1, 1, []])
+    await h.notices.flush()
+    expect([findingLines(h), h.notices.h.totalPosts()]).toEqual([[], 0])
+    expect((await h.receive(threadReply({ channel, thread_ts: ts, ts: '1700000000.000901' }))).acknowledged).toBe(1)
+    expect(accepted(h).map(a => [a.channel, a.thread_ts, a.via])).toEqual([[channel, ts, 'thread']])
+    expect(stub.calls.postMessage).toHaveLength(drain === 'held' ? 2 : 1)
+  })
+
+  test('a notice whose own enrollment fails is logged as a gap only: no further notice, no repost', async () => {
+    const h = await open()
+    h.chooseDestination('alpha', C)
+    h.disk.fail('write', 'thread-participation')
+    await h.h.notifier.notify('alpha', 'a persona notice')
+    await h.h.holdClock.flush()
+    await h.notices.flush()
+    const stub = h.h.p('alpha').stub
+    expect(stub.calls.postMessage.map(p => p.channel)).toEqual([C])
+    const gap = outcomes(h, 'gap')
+    expect(gap.map(o => [o.surface, o.reason, o.channel])).toEqual([['notice', 'storage', C]])
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), gap[0]!)])
+    expect(findingNotices(h)).toEqual([])
+    expect(h.notices.h.totalPosts()).toBe(0)
+    expect(stub.calls.postMessage).toHaveLength(1)
+  })
+
+  test('a DM destination notice is ineligible and reports nothing; a gap names its cause and repair limits without the post\'s body', async () => {
+    const h = await open()
+    await h.h.notifier.notify('alpha', 'a dm notice')
+    await h.h.holdClock.flush()
+    expect(h.h.ownPostOutcomes.map(o => [o.kind, o.reason])).toEqual([['ineligible', 'dm']])
+    expect(findingLines(h)).toEqual([])
+    h.disk.fail('write', 'thread-participation')
+    const body = 'private reply body 7f3a'
+    await h.h.reply('alpha', { chat_id: C, text: body })
+    await h.notices.flush()
+    const gap = outcomes(h, 'gap')
+    expect(gap.map(o => [o.surface, o.reason])).toEqual([['text', 'storage']])
+    const [line] = findingLines(h), [notice] = findingNotices(h)
+    expect(line).toBe(buildOwnPostNotEnrolledLine(ref(), gap[0]!))
+    expect(notice!.text).toBe(formatPersonaNotice(h.notices.config.personas[0]!, buildOwnPostNotEnrolledNotice(ref(), gap[0]!)))
+    for (const text of [line!, notice!.text]) expect(text).not.toContain(body)
+    expect(h.h.p('alpha').stub.calls.postMessage.filter(p => textOf(p) === body)).toHaveLength(1)
+  })
+
+  test('restored pending evidence at startup is logged, never announced; later outcomes still settle it silently', async () => {
+    const first = await open()
+    unresolve(first)
+    const pending = await first.confirmPost({ channel: C, ts: ROOT }).outcome
+    await first.close()
+    const h = await open({ clock: first.clock })
+    const restored = h.threads.ownPostFindings()
+    expect(restored.map(o => [o.kind, o.id, o.root])).toEqual([['pending', pending.id, ROOT]])
+    h.reporting.ownPostStartup(restored)
+    await h.notices.flush()
+    expect(findingLines(h)).toEqual([buildOwnPostNotEnrolledLine(ref(), restored[0]!)])
+    expect(findingNotices(h)).toEqual([])
+    // Outcomes the pre-reporting buffer could not keep: one line per persona with any, never a notice.
+    h.reporting.ownPostDropped(new Map([['alpha', 3], ['beta', 0]]))
+    expect(findingLines(h).slice(1)).toEqual([buildOwnPostOutcomesDroppedLine(ref(), 3)])
+    expect(findingLines(h, 'beta')).toEqual([])
+    await h.notices.flush()
+    expect(h.notices.h.totalPosts()).toBe(0)
+    expect(await h.threads.retryOwnPost('alpha', pending.id!)).toMatchObject({ kind: 'enrolled' })
+    await h.notices.flush()
+    expect(findingNotices(h)).toEqual([])
+    expect(h.threads.ownPostFindings()).toEqual([])
+  })
+})
+
+describe('the tear fixture', () => {
+  test('fails closed on an unterminated journal before any rewrite', async () => {
+    const h = await open()
+    await h.receive(h.mention())
+    await h.close()
+    const path = queuePath(dir, 'alpha'), bytes = fs.readFileSync(path)
+    fs.writeFileSync(path, bytes.subarray(0, -1))
+    expect(() => tearJournal(dir)).toThrow('fixture tear needs a newline-terminated closed journal')
+    expect(fs.readFileSync(path)).toEqual(bytes.subarray(0, -1))
   })
 })

@@ -5444,12 +5444,22 @@ describe('participation recovers before intake and shares the production owners'
     const resolution = startResolution(SERVER_CODE)
     expect(importSource(SERVER_CODE, factory)).toBe('./thread-participation.ts')
     declaredOnce(holder)
-    expect(assignmentsTo(holder).map(({ value }) => value)).toEqual([
-      'createThreadParticipation({ queue: deliveryQueue, authority: reload.sharedChannels()! })',
-    ])
-    expect([...onlyCallProps(factory)]).toEqual([
-      ['queue', 'deliveryQueue'], ['authority', `${resolution.controller}.sharedChannels()!`],
-    ])
+    expect(assignmentsTo(holder).map(({ value }) => value)).toEqual([`${factory}({`])
+    const props = onlyCallProps(factory)
+    expect([...props.keys()]).toEqual(['queue', 'authority', 'eligibility', 'identity', 'onOwnPost', 'onSettled'])
+    expect(props.get('queue')).toBe('deliveryQueue')
+    expect(props.get('authority')).toBe(`${resolution.controller}.sharedChannels()!`)
+    // Eligibility reads the applied config, the one stored-choice store and current membership at each confirmation.
+    const eligibility: keyof typeof ThreadParticipationModule = 'ownPostEligibility'
+    expect(importSource(SERVER_CODE, eligibility)).toBe('./thread-participation.ts')
+    expect(props.get('eligibility')).toBe(`${eligibility}({ config: () => personaConfig, persona: getAppliedPersona, ` +
+      'choices: () => channelDeliveryStore, membership: (key, channel, mode) => channelMembership?.read(key, channel, mode), })')
+    expect(props.get('identity')).toBe('identityFor')
+    expect(props.get('onOwnPost')).toBe('reportOwnPost')
+    // A settled thread (or rootless channel) re-evaluates only that persona's held replies there; a failure leaves them unacknowledged.
+    expect(props.get('onSettled')).toBe('(key, channel, root) => { for (const held of personaRouting.pendingCandidates()) { ' +
+      'if (held.key === key && held.channel === channel && (root === undefined || held.root === root)) { ' +
+      'void personaRouting.reevaluate(held.id).catch(() => { }) } } }')
     expect(onlyCallArgs(`${holder}.start`)).toEqual([])
     expect(SERVER_CODE.slice(queueStart - 'await '.length, queueStart)).toBe('await ')
     const ordered = [onlyCallOf('checkPidConflict'), onlyCallOf('createDeliveryQueue'), queueStart,
@@ -5457,6 +5467,16 @@ describe('participation recovers before intake and shares the production owners'
       onlyCallOf('createPersonaConnectionManager'), onlyCallOf('Bun.serve'), resolution.bringUpAt]
     expect(ordered).toEqual([...ordered].sort((a, b) => a - b))
     for (const at of [queueStart, resolution.resolveAt, built, started]) expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  })
+
+  test('the routing harness re-evaluates settled threads with server.ts\'s own onSettled, its routing in place of personaRouting', () => {
+    const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
+    const decls = indicesOf(/\bconst\s+ownPostOptions\b/g, harness)
+    expect(decls).toHaveLength(1)
+    const options = objectProperties(harness.slice(harness.indexOf('{', harness.indexOf('=', decls[0]!))))
+    const production = onlyCallProps(factory).get('onSettled')!
+    expect(production).toContain('personaRouting.')
+    expect(options.get('onSettled')?.replace(/\brouting\./g, 'personaRouting.')).toBe(production)
   })
 
   test('routing reads the current owner and authenticated connection provenance, and reports unresolved obligations separately', () => {
@@ -5469,6 +5489,36 @@ describe('participation recovers before intake and shares the production owners'
       ['beginIntake', 'key => deliveryReporting?.beginIntake(key) ?? (() => {})'],
     ]
     for (const [member, binding] of bindings) expect(props.get(member)).toBe(binding)
+  })
+
+  test('every posting surface shares one own-post observer over the current owner, and reporting replays restored findings before buffered outcomes', () => {
+    const observer: keyof typeof ThreadParticipationModule = 'createOwnPostObserver'
+    expect(importSource(SERVER_CODE, observer)).toBe('./thread-participation.ts')
+    declaredOnce('ownPosts')
+    expect(onlyCallArgs(observer)).toEqual([`() => ${holder}`, 'reportOwnPost'])
+    expect(objectProperties(spreadConstObject('sessionToolDeps')).get('ownPosts')).toBe('ownPosts')
+    expect(onlyCallProps('createPersonaDestinations').get('ownPosts')).toBe('ownPosts')
+    // Before reporting exists, outcomes are buffered (bounded); afterwards they go straight to it. Overflow counts only fresh outcomes.
+    declaredOnce('reportOwnPost')
+    const report = /\bfunction reportOwnPost\(outcome: OwnPostOutcome\): void \{([^}]*)\}/.exec(SERVER_CODE)
+    expect(report?.[1]?.replace(/\s+/g, ' ').trim()).toBe('if (deliveryReporting) deliveryReporting.ownPostObserved(outcome) ' +
+      'else if (bufferedOwnPostOutcomes.length < MAX_BUFFERED_OWN_POST_OUTCOMES) bufferedOwnPostOutcomes.push(outcome) ' +
+      'else if (!outcome.duplicate) droppedOwnPostOutcomes.set(outcome.key, (droppedOwnPostOutcomes.get(outcome.key) ?? 0) + 1)')
+    expect(onlyCallProps('createDeliveryReporting').get('ownPostFindings')).toBe(`key => ${holder}?.ownPostFindings(key) ?? []`)
+    const reporting = onlyCallOf('createDeliveryReporting')
+    const startup = onlyCallOf('deliveryReporting.ownPostStartup')
+    expect(onlyCallArgs('deliveryReporting.ownPostStartup')).toEqual([`${holder}?.ownPostFindings() ?? []`])
+    const replay = SERVER_CODE.indexOf('for (const outcome of bufferedOwnPostOutcomes.splice(0)) deliveryReporting.ownPostObserved(outcome)')
+    // The notifier is built at module load, before main(); restored protection exists (owner started) before findings are reported.
+    expect(insideMain(onlyCallOf('createPersonaNotifier'))).toBe(false)
+    expect(onlyCallProps('createDeliveryReporting').get('notify')).toBe('(key, text) => personaNotifier.notify(key, text)')
+    // Overflow beyond the buffer is counted per persona and logged once after the replay, then forgotten.
+    const dropped = onlyCallOf('deliveryReporting.ownPostDropped')
+    expect(onlyCallArgs('deliveryReporting.ownPostDropped')).toEqual(['droppedOwnPostOutcomes'])
+    const cleared = SERVER_CODE.indexOf('droppedOwnPostOutcomes.clear()')
+    const ordered = [onlyCallOf(`${holder}.start`), reporting, startup, replay, dropped, cleared]
+    expect(ordered).toEqual([...ordered].sort((a, b) => a - b))
+    for (const at of [reporting, startup, replay, dropped, cleared]) expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
   })
 
   test('shutdown stops intake and participation before draining preparation and closing the journal', () => {

@@ -1368,6 +1368,7 @@ describe('diagnostic lines', () => {
       'message-not-taken-in',
       'message-received',
       'message-retyped',
+      'own-post-not-enrolled',
       'persona-channel-delivery-set',
       'persona-config-dir-unresolvable',
       'persona-connection-lost',

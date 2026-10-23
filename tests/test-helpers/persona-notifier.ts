@@ -109,6 +109,7 @@ import {
   type UnclassifiedErrorEpisodes,
 } from '../../src/persona-episodes.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
+import type { OwnPostObserver } from '../../src/thread-participation.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.ts'
 
@@ -137,6 +138,8 @@ export interface NotifierStackDeps {
    * attempt, as `src/server.ts` passes it.
    */
   getPersonaConfig: () => DestinationConfig
+  /** The confirmed-own-post adapter the resolver reports each surfaced success to, as `src/server.ts` passes it. Default: none. */
+  ownPosts?: OwnPostObserver
 }
 
 /** The notifier and the pieces it was built with. */
@@ -158,7 +161,7 @@ export interface NotifierStack {
 export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
   const { getPersona, clientFor, log } = deps
   const clock = deps.clock ?? createFakeClock()
-  const destinations = createPersonaDestinations({ log, getPersonaConfig: deps.getPersonaConfig })
+  const destinations = createPersonaDestinations({ log, getPersonaConfig: deps.getPersonaConfig, ...(deps.ownPosts ? { ownPosts: deps.ownPosts } : {}) })
   const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
   const notifier = createPersonaNotifier({
     getPersona,

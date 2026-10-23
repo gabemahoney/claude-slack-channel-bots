@@ -510,6 +510,23 @@ retain their existing text excerpts; receipt confirmation has its own line.
 - **Cause:** The state directory or its disk cannot be written.
 - **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
 
+### `own-post-not-enrolled`
+
+- **Line:** `[slack] own-post-not-enrolled: persona="<name>" (key=<key>) surface=<text|prompt|warning|notice> chat_id="<channel>" ts="<ts>" parent="<ts>" operation=<id> part=<n> state=<pending|gap> missing=<root|channel-eligibility|root,channel-eligibility|none> cause=<cause> reason=<reason> code=<errno> action="<action>"`. `ts=`, `parent=`, `reason=` and `code=` appear only when known. After a persona's 20th finding line: `[slack] own-post-not-enrolled: persona="<name>" (key=<key>) limit=20 further findings are not logged until this persona has none`. Once at start, when posts made before reporting began overflowed its buffer: `[slack] own-post-not-enrolled: persona="<name>" (key=<key>) dropped=<n> outcomes seen before reporting started were not kept; recorded evidence is still reported and recovered`.
+- **Meaning:** The persona's post succeeded in Slack, but CSCB has not recorded that the persona follows the thread, so replies in that thread may not reach it until this resolves. `state=pending`: CSCB keeps a durable copy of the evidence and follows the thread once what `cause=` names is resolved, as the line's `action=` says. `state=gap`: no durable copy was saved, so there is nothing to resolve later.
+
+  The first finding in an episode posts one notice, *Thread not followed yet* (pending) or *Thread participation not saved* (gap); a finding about a notice, or one restored at start, is only logged. Resolving one thread settles that thread only, and elapsed time or a working queue alone settles nothing. The episode and its 20-line cap end silently, with no recovery notice, at the persona's next settled own post once none of its findings is still open; a later finding then posts a new notice.
+- **Cause:** `cause=` names one of four:
+  - `storage`: the server could not save its state; `code=` names the error.
+  - `root-metadata`: the thread's root message is not known, as for a prompt Slack returned without a `ts`.
+  - `channel-eligibility`: the persona's current channel membership, the channel's sharing or its delivery choice is not verified.
+  - `operation`: the post could not be bound to the persona's current life (the persona or channel is not applied, the server was starting or stopping, or the persona's identity was not yet known) or a bookkeeping step failed.
+
+  `missing=` lists the evidence the thread still needs, or `none`, whatever the cause; `reason=` gives the detail. A post whose persona was removed or destructively modified by a confirmed change, or left the channel, before CSCB saved its record belongs to the old life and is dropped silently, with no line or notice.
+- **Fix:** Don't post it again: the post succeeded, and fixing the evidence never reposts it or posts a fallback prompt. Follow the line's `action=`. For a gap it says to check the server's disk and state directory (`storage`) or that the persona is applied and up (other causes), then: "CSCB cannot rebuild a record it never saved: restore the server's state only from a reviewed, trustworthy backup, or accept that the persona does not follow the thread."
+
+  The action adds "A new mention of the persona in that thread can also make it follow the thread." only when the finding names its thread and the channel's choice is known and not `off` (never for `reason=choice-missing`, `reason=state-unavailable` or a gap found before the choice was read). For `storage` the sentence ends "…follow the thread, once the server can save its state again." Never delete state files to clear a finding, and don't count on Slack's finite retries to bring back replies that were not accepted.
+
 ### `persona-start`
 
 - **Line:** `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting`

@@ -1,7 +1,8 @@
 /** Production participation, queue and routing composition in caller-owned scratch state. */
 import * as fs from 'node:fs'
 import { basename, join } from 'node:path'
-import { createThreadParticipation, type ThreadObservation, type ThreadParticipation } from '../../src/thread-participation.ts'
+import { createThreadParticipation, type OwnPostPosted, type OwnPostSurface, type ThreadObservation, type ThreadParticipation } from '../../src/thread-participation.ts'
+import type { MembershipReading } from '../../src/channel-membership.ts'
 import { parseQueueRecord, type DeliveryQueueOptions, type QueueItem, type QueueRecord } from '../../src/delivery-queue.ts'
 import { createQueuedAckCallback, createDeliveryAckCallback } from '../../src/ack-tracker.ts'
 import { createDeliveryReporting } from '../../src/delivery-notices.ts'
@@ -78,6 +79,8 @@ export async function makeThreadHarness(stateDir: string, options: {
   disk?: ReturnType<typeof threadDisk>; routing?: RoutingHarnessOptions; queue?: Omit<DeliveryQueueOptions, 'stateDir'>;
   /** Runs after the real observation save resolves, before its caller continues. */
   afterObservationSave?: (key: string, observation: ThreadObservation) => Promise<void>;
+  /** Runs before the real observation save starts (the first await of an own-post confirmation). */
+  beforeObservationSave?: (key: string, observation: ThreadObservation, state?: 'observed' | 'enrolled') => Promise<void>;
   /** An error returned here is thrown in place of the production recovery call. */
   recoverFault?: (key: string, id?: string) => Error | undefined;
 } = {}) {
@@ -89,9 +92,14 @@ export async function makeThreadHarness(stateDir: string, options: {
   const reactions: Promise<void>[] = []
   let reporting: ReturnType<typeof createDeliveryReporting> | undefined
   const hooks = options.routing?.routingHooks
+  // Current membership is independent evidence: every persona eligible in both channels unless a case overrides one reading.
+  const observed = observedMembership(Object.fromEntries(names.map(n => [n, [THREAD_CHANNEL, THREAD_OTHER_CHANNEL]])))
+  const membership = new Map<string, MembershipReading>()
   const h = makeRoutingHarness(names.map(name => ({ name, channels: [THREAD_CHANNEL, THREAD_OTHER_CHANNEL].map(id => ({ id, delivery: options.delivery ?? 'thread_hybrid' })),
     dm: { enabled: true, contact: 'U0OPERATOR' }, permission_prompts: 'dm' })), stateDir, {
-    mode: options.mode ?? 'strict', membership: observedMembership(Object.fromEntries(names.map(n => [n, [THREAD_CHANNEL, THREAD_OTHER_CHANNEL]]))),
+    mode: options.mode ?? 'strict',
+    membership: { ...observed, read: (key, channel, mode) => membership.get(`${key}:${channel}`) ?? observed.read(key, channel, mode) },
+    onOwnPost: outcome => reporting?.ownPostObserved(outcome),
     participation: true, upCheck: true, preparationClock: clock, dedupeClock: clock.now,
     restartDelayS: NEVER_FIRE_RESTART_DELAY_S, channelDelivery: { stateDir }, ...options.routing,
     queueOptions: { fs: disk.fs, ...options.queue, onEvent(event) { reporting?.queueEvent(event); options.queue?.onEvent?.(event) } },
@@ -113,12 +121,13 @@ export async function makeThreadHarness(stateDir: string, options: {
   const notices = await makeDeliveryNoticeHarness({ queue: h.queue })
   reporting = createDeliveryReporting({ queue: h.queue, episodes: notices.rig.episodes, persona: key => h.config?.personas.find(p => p.key === key),
     state: key => ({ up: !h.notUp.has(key) }), now: clock.now, log: line => h.logs.push(line), notify: (key, text) => notices.h.notifier.notify(key, text), defer: notices.defer,
+    ownPostFindings: key => h.participation?.ownPostFindings(key) ?? [],
     queued(key, item) { const promise = queued(key, item); reactions.push(promise); return promise },
     delivered(key, item) { const promise = delivered(key, item); reactions.push(promise); return promise },
   })
   await h.ready
   // Installed after startup recovery and only when requested, so hook-free tests run the unwrapped production calls.
-  const { recoverFault, afterObservationSave } = options
+  const { recoverFault, afterObservationSave, beforeObservationSave } = options
   const instrument = (owner: ThreadParticipation) => {
     if (!recoverFault) return owner
     const recover = owner.recover.bind(owner)
@@ -126,16 +135,17 @@ export async function makeThreadHarness(stateDir: string, options: {
     return owner
   }
   instrument(h.participation!)
-  if (afterObservationSave) {
+  if (afterObservationSave || beforeObservationSave) {
     const save = h.queue.recordThreadObservation.bind(h.queue)
-    h.queue.recordThreadObservation = async (key, observation) => {
-      const saved = await save(key, observation)
-      await afterObservationSave(key, observation)
+    h.queue.recordThreadObservation = async (key, observation, state) => {
+      await beforeObservationSave?.(key, observation, state)
+      const saved = await save(key, observation, state)
+      await afterObservationSave?.(key, observation)
       return saved
     }
   }
   const result = {
-    h, clock, disk, stateDir, received, failed, failures, settled, reporting, notices,
+    h, clock, disk, stateDir, received, failed, failures, settled, reporting, notices, membership,
     get threads() { return h.participation! },
     get authority() { return h.channelDelivery!.authority },
     mention(overrides: Partial<SlackEvent> = {}, key = 'alpha') {
@@ -154,28 +164,37 @@ export async function makeThreadHarness(stateDir: string, options: {
       const outcome = a.assign(key, a.incarnation(key)!, channel, delivery, a.revision)
       if (outcome.kind !== 'applied') throw new Error(`fixture choice failed: ${outcome.kind}`)
     },
-    /** Applies channel_mode through the reviewed shared-config path, as a live config change does. */
-    chooseMode(mode: ChannelMode) {
+    /** Applies an edit of the applied source config through the reviewed shared-config path, as a live config change does. */
+    reviewConfig(edit: (applied: { channel_mode?: ChannelMode; personas: Array<Record<string, any>> }) => void) {
       const a = result.authority, applied = JSON.parse(a.sourceBytes().toString())
-      applied.channel_mode = mode
+      edit(applied)
       const outcome = a.applyReviewed(Buffer.from(JSON.stringify(applied)), a.revision)
-      if (outcome.kind !== 'applied' || h.config!.channel_mode !== mode) throw new Error(`fixture mode change failed: ${outcome.kind}`)
+      if (outcome.kind !== 'applied') throw new Error(`fixture config change failed: ${outcome.kind}`)
+    },
+    chooseMode(mode: ChannelMode) {
+      result.reviewConfig(applied => { applied.channel_mode = mode })
+      if (h.config!.channel_mode !== mode) throw new Error('fixture mode change failed')
+    },
+    /** A persona's applied source entry, by key; throws when the applied config has none. */
+    personaEntry(applied: { personas: Array<Record<string, any>> }, key: string) {
+      const persona = applied.personas.find(p => (p.key ?? p.name) === key)
+      if (!persona) throw new Error(`fixture config change has no persona ${key}`)
+      return persona
     },
     /** Applies a persona's permission_prompts destination through the reviewed shared-config path. */
     chooseDestination(key: string, destination: string) {
-      const a = result.authority, applied = JSON.parse(a.sourceBytes().toString())
-      const persona = applied.personas.find((p: { key?: string; name?: string }) => (p.key ?? p.name) === key)
-      if (!persona) throw new Error(`fixture destination change has no persona ${key}`)
-      persona.permission_prompts = destination
-      const outcome = a.applyReviewed(Buffer.from(JSON.stringify(applied)), a.revision)
-      if (outcome.kind !== 'applied' || h.config!.personas.find(p => p.key === key)?.permission_prompts !== destination) {
-        throw new Error(`fixture destination change failed: ${outcome.kind}`)
-      }
+      result.reviewConfig(applied => { result.personaEntry(applied, key).permission_prompts = destination })
+      if (h.config!.personas.find(p => p.key === key)?.permission_prompts !== destination) throw new Error('fixture destination change failed')
     },
     restoreOwner() {
       h.participation!.stop()
-      h.participation = instrument(createThreadParticipation({ queue: h.queue, authority: result.authority, now: clock.now }))
+      h.participation = instrument(createThreadParticipation({ queue: h.queue, authority: result.authority, ...h.ownPostOptions }))
       h.participation.start()
+    },
+    /** One confirmed own post through the production owner: identity captured at issue, Slack's success facts at confirm. */
+    confirmPost(posted: OwnPostPosted, key = 'alpha', surface: OwnPostSurface = 'text') {
+      const issue = h.participation!.issueOwnPost(key, surface)
+      return { issue, outcome: h.participation!.confirmOwnPost(issue, posted) }
     },
     async close() {
       reporting!.stop(); await result.drainReactions(); await h.close()
@@ -192,6 +211,7 @@ export type ThreadHarness = Awaited<ReturnType<typeof makeThreadHarness>>
  * The cut is a byte offset: at the midpoint, or after the first byte of the multi-byte `inside` character. */
 export function tearJournal(stateDir: string, at: 'final' | 'terminated' | 'mid' = 'final', key = 'alpha', inside?: string) {
   const kept = readQueue(stateDir, key).slice(0, -1), bytes = fs.readFileSync(queuePath(stateDir, key))
+  if (bytes.at(-1) !== 10) throw new Error('fixture tear needs a newline-terminated closed journal')
   const lines: Buffer[] = []
   for (let start = 0; start < bytes.length;) { const end = bytes.indexOf(10, start) + 1; lines.push(bytes.subarray(start, end)); start = end }
   const line = lines.pop()!.subarray(0, -1)

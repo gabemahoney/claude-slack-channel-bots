@@ -206,7 +206,7 @@ import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
-import { createThreadParticipation, type ThreadParticipation } from './thread-participation.ts'
+import { createOwnPostObserver, createThreadParticipation, ownPostEligibility, type OwnPostOutcome, type ThreadParticipation } from './thread-participation.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
@@ -701,7 +701,14 @@ function resolvePersonaUserName(personaKey: string, userId: string): Promise<str
 // persona and its client through these at call time.
 // ---------------------------------------------------------------------------
 
+/**
+ * The one confirmed-own-post adapter, shared by replies, prompts, warnings and
+ * notices. It reads the participation owner and reporting holders at each call.
+ */
+const ownPosts = createOwnPostObserver(() => threadParticipation, reportOwnPost)
+
 const sessionToolDeps: SessionToolDeps = {
+  ownPosts,
   assertSendable,
   getReplySettings,
   getPersona: getAppliedPersona,
@@ -1150,6 +1157,16 @@ let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
 /** binds event handling here; supplies facts without notices or wording. */
 export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }
+/** Own-post outcomes seen before reporting starts; recorded evidence is also exposed again at its start. */
+const bufferedOwnPostOutcomes: OwnPostOutcome[] = []
+const MAX_BUFFERED_OWN_POST_OUTCOMES = 100
+/** Per persona, outcomes past the buffer; logged once when reporting starts. */
+const droppedOwnPostOutcomes = new Map<string, number>()
+function reportOwnPost(outcome: OwnPostOutcome): void {
+  if (deliveryReporting) deliveryReporting.ownPostObserved(outcome)
+  else if (bufferedOwnPostOutcomes.length < MAX_BUFFERED_OWN_POST_OUTCOMES) bufferedOwnPostOutcomes.push(outcome)
+  else if (!outcome.duplicate) droppedOwnPostOutcomes.set(outcome.key, (droppedOwnPostOutcomes.get(outcome.key) ?? 0) + 1)
+}
 /** engine binds this hook after startup; until then queued work waits. */
 export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
@@ -1323,6 +1340,7 @@ function getReplySettings(): ReplySettings {
 const personaDestinations = createPersonaDestinations({
   log: (line) => console.error(line),
   getPersonaConfig: () => personaConfig,
+  ownPosts,
 })
 
 /**
@@ -2930,7 +2948,24 @@ export async function main(): Promise<void> {
   })
   channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>
     !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
-  threadParticipation = createThreadParticipation({ queue: deliveryQueue, authority: reload.sharedChannels()! })
+  threadParticipation = createThreadParticipation({
+    queue: deliveryQueue, authority: reload.sharedChannels()!,
+    eligibility: ownPostEligibility({
+      config: () => personaConfig,
+      persona: getAppliedPersona,
+      choices: () => channelDeliveryStore,
+      membership: (key, channel, mode) => channelMembership?.read(key, channel, mode),
+    }),
+    identity: identityFor,
+    onOwnPost: reportOwnPost,
+    onSettled: (key, channel, root) => {
+      for (const held of personaRouting.pendingCandidates()) {
+        if (held.key === key && held.channel === channel && (root === undefined || held.root === root)) {
+          void personaRouting.reevaluate(held.id).catch(() => { /* the held reply stays unacknowledged for redelivery */ })
+        }
+      }
+    },
+  })
   threadParticipation.start()
 
   // agent-director's timing settings. Read once here, after
@@ -3448,9 +3483,15 @@ export async function main(): Promise<void> {
     notify: (key, text) => personaNotifier.notify(key, text),
     queued: createQueuedAckCallback({ getReaction: () => getReplySettings().queued_ack_reaction, clientFor, queue: deliveryQueue! }),
     delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor, queue: deliveryQueue! }),
+    ownPostFindings: key => threadParticipation?.ownPostFindings(key) ?? [],
   })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
+  // Restored pending own-post evidence first, then outcomes seen before reporting started.
+  deliveryReporting.ownPostStartup(threadParticipation?.ownPostFindings() ?? [])
+  for (const outcome of bufferedOwnPostOutcomes.splice(0)) deliveryReporting.ownPostObserved(outcome)
+  deliveryReporting.ownPostDropped(droppedOwnPostOutcomes)
+  droppedOwnPostOutcomes.clear()
   deliveryLifecycle = createDeliveryLifecycle({
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
   })

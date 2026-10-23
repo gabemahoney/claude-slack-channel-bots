@@ -56,7 +56,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { DM_DESTINATION, type Persona } from '../src/config.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { describeThrownValue, describeThrownValueWithoutStack } from '../src/persona-connection-errors.ts'
 import {
   createPersonaDestinations,
   destinationSettingOf,
@@ -66,6 +66,7 @@ import {
 } from '../src/persona-destination.ts'
 import {
   MAX_HELD_NOTICES_PER_PERSONA,
+  buildHoldSettleFailedLine,
   createPersonaDestinationHold,
   destinationClearedCause,
   destinationFailedCause,
@@ -75,6 +76,7 @@ import {
   type PersonaDestinationHold,
 } from '../src/persona-destination-hold.ts'
 import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
+import type { OwnPostObserver } from '../src/thread-participation.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -126,6 +128,10 @@ let lookupThrows: 'getPersona' | 'clientFor' | undefined
 let lookupError: Error
 /** How many of the next resolver posts throw instead of settling (breaking its never-rejects contract). */
 let resolverThrows: number
+/** A logged line matching this throws after it is recorded (a failing post-success logger). */
+let logThrows: RegExp | undefined
+/** Each own post the resolver confirmed, by surface and channel. */
+let observedPosts: { surface: string; channel: string }[]
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'persona-destination-hold-'))
@@ -151,17 +157,24 @@ beforeEach(() => {
   // ticket URL: its line logs the message redacted, so no line may copy it.
   lookupError = new Error(`lookup failed (${sentinelInMessage('lookup')})`)
   resolverThrows = 0
+  logThrows = undefined
+  observedPosts = []
   const log = (line: string): void => {
     logs.push(line)
+    if (logThrows?.test(line)) throw new Error('injected log failure')
   }
-  const real = createPersonaDestinations({ log, getPersonaConfig: () => inEffect })
+  const ownPosts: OwnPostObserver = {
+    issue: (key, surface) => ({ key, surface, operation: `op-${observedPosts.length + 1}`, issuer: {} }),
+    confirm: (issue, posted) => { observedPosts.push({ surface: issue!.surface, channel: posted.channel }) },
+  }
+  const real = createPersonaDestinations({ log, getPersonaConfig: () => inEffect, ownPosts })
   const destinations: PersonaDestinations = {
-    post: (persona, c, message) => {
+    post: (persona, c, message, options) => {
       if (resolverThrows > 0) {
         resolverThrows -= 1
         return Promise.reject(new Error('resolver threw'))
       }
-      return real.post(persona, c, message)
+      return real.post(persona, c, message, options)
     },
     destinationOf: (p) => real.destinationOf(p),
     refusalOf: (p) => real.refusalOf(p),
@@ -714,6 +727,101 @@ describe('the gate (begin)', () => {
     expect(clearedLines()).toHaveLength(1)
     expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     expect(clock.pendingCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Confirmed successes survive the hold's own bookkeeping
+// ---------------------------------------------------------------------------
+
+describe('a confirmed post survives a failing settle', () => {
+  const CLEARED = /: cleared:/
+  // The line's description is the describer's, then the throw site's stack frames.
+  const settleFailed = (p: Persona) => logs.filter(l => l.startsWith(buildHoldSettleFailedLine(p.key, describeThrownValueWithoutStack(new Error('injected log failure')))))
+  /** C's one episode logged exactly one opening line, naming its not_in_channel failure at C0CEE0001. */
+  function expectOneOpening(): void {
+    expect(startLines()).toHaveLength(1)
+    expect(startLines()[0]).toContain(`persona-destination-failed: ${refOf(C)}: chat.postMessage failed for destination=C0CEE0001 with error not_in_channel`)
+  }
+
+  test('a gated success whose cleared line throws still resolves posted, releases the gate and drains the held notices once', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await hold.begin(C.key)!.post(C, client(C), { text: 'prompt 1' })
+    await deliver(C, 'n1')
+    await clock.advance(4999)
+    logThrows = CLEARED
+    // The gate opens at the due time; the held notice's retry timer then finds it in flight.
+    const retry = hold.begin(C.key)
+    expect(retry).toBeUndefined()
+    await clock.advance(1)
+    expect(postedTexts(C)).toEqual(['prompt 1', 'n1'])
+    expect(settleFailed(C)).toHaveLength(1)
+    const gated = hold.begin(C.key)!
+    expect(await gated.post(C, client(C), { text: 'prompt 2' }, { surface: 'prompt' })).toMatchObject({ outcome: 'posted', channelId: 'C0CEE0001' })
+    await clock.flush()
+    expect(postedTexts(C)).toEqual(['prompt 1', 'n1', 'prompt 2'])
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(observedPosts).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }, { surface: 'prompt', channel: 'C0CEE0001' }])
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+    hold.begin(C.key)!.release()
+  })
+
+  test('a gated success during an open episode whose cleared line throws resolves posted, never rejects, and the next attempt is admitted', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await hold.begin(C.key)!.post(C, client(C), { text: 'prompt 1' })
+    await clock.advance(5000)
+    logThrows = CLEARED
+    const result = await hold.begin(C.key)!.post(C, client(C), { text: 'prompt 2' }, { surface: 'prompt' })
+    expect(result).toMatchObject({ outcome: 'posted' })
+    expect(settleFailed(C)).toHaveLength(1)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    await deliver(C, 'after')
+    expect(postedTexts(C)).toEqual(['prompt 1', 'prompt 2', 'after'])
+    expect(observedPosts.map(p => p.surface)).toEqual(['prompt', 'notice'])
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+  })
+
+  test('a drained notice whose cleared line throws leaves the FIFO before settling: never reposted, and the notices behind it post in order', async () => {
+    stick(C, 'post', 'not_in_channel')
+    await deliver(C, 'n1')
+    await deliver(C, 'n2')
+    await deliver(C, 'n3')
+    expect(hold.view(C.key).heldNotices).toBe(3)
+    unstick(C, 'post')
+    logThrows = CLEARED
+    await clock.advance(5000)
+    await clock.flush()
+    // The first failed attempt, then each notice exactly once.
+    expect(postedTexts(C)).toEqual(['n1', 'n1', 'n2', 'n3'])
+    expect(settleFailed(C)).toHaveLength(1)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    await clock.advance(60_000)
+    expect(postedTexts(C)).toEqual(['n1', 'n1', 'n2', 'n3'])
+    expect(observedPosts).toEqual([0, 1, 2].map(() => ({ surface: 'notice', channel: 'C0CEE0001' })))
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+  })
+
+  test('a delivered notice whose opening line throws is still held and retried on schedule, then posted once; failures confirm nothing', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    logThrows = /persona-destination-failed:(?!.*: cleared:)/
+    await deliver(C, 'n1')
+    expect(settleFailed(C)).toHaveLength(1)
+    // Written once, then it threw: the settle-failure line follows it.
+    expectOneOpening()
+    expect(logs.indexOf(startLines()[0]!)).toBeLessThan(logs.indexOf(settleFailed(C)[0]!))
+    expect(hold.view(C.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5000 })
+    expect(observedPosts).toEqual([])
+    logThrows = undefined
+    await clock.advance(5000)
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
+    expect(posts(C).length).toBe(2)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(observedPosts).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }])
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
   })
 })
 

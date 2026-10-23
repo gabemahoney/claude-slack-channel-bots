@@ -160,6 +160,14 @@
  *     line still leaves the short prompt to post next. Each line is
  * asserted with its text from its builder, whose
  *     literal texts one `pin:` case holds.
+ * - Confirmed own posts: a prompt is registered at its success and a wedge
+ *     warning latched, each confirmed once (`prompt`, `warning`) with Slack's
+ *     channel and ts, through enrollment, hold-settle and trail faults; an
+ *     enrollment-faulted prompt stays at its channel and ts after a
+ *     destination change and is decided by a click on its own persona's
+ *     connection only; a prompt without a ts is never reposted until a
+ *     teardown forgets it. Through the real participation owner, a
+ *     prompt's ts becomes a followed root, once, with no echo.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -183,6 +191,7 @@ import {
   buildSpawnFailedLine,
   buildTickFailedLine,
   buildWedgeWarningBody,
+  buildPromptPostedWithoutTsLine,
   buildWedgeWarningText,
   dropPermission,
   forgetPersonaPrompts,
@@ -205,14 +214,17 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../src/persona-destination-hold.ts'
+import type { OwnPostObserver } from '../src/thread-participation.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { parsePermissionActionId } from '../src/permission-action-id.ts'
+import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
+import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
+  cannedDecideResult,
   cannedGetPermissionResponse,
   cannedGetResult,
   cannedListRow,
@@ -228,7 +240,9 @@ import {
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { HUMAN_ONLY_SENTENCE } from './test-helpers/conflict-cases.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
-import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
+import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
+import { makeThreadHarness, threadReply, THREAD_CHANNEL, type ThreadHarness } from './test-helpers/thread-participation.ts'
+import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import {
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
@@ -258,6 +272,8 @@ import {
 } from '../src/agent-director-client.ts'
 import {
   ErrSystemInstallDisappeared,
+  type Client as AgentDirectorClient,
+  type DecideParams,
 } from 'agent-director'
 import {
   _resetOutageState,
@@ -4264,9 +4280,13 @@ const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
  * up predicate over a per-persona connection status and bring-up outcome.
  * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
  * brings it up. `trailFault`, when it returns an error for an event, makes
- * the trail emitter throw it instead of capturing the event.
+ * the trail emitter throw it instead of capturing the event. `extra` adds
+ * poller deps, such as a resolver over a recording own-post adapter.
  */
-function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | undefined = () => undefined) {
+function makeNotUpScenario(
+  trailFault: (event: CapturedTrailEvent) => Error | undefined = () => undefined,
+  extra: Partial<PollerDeps> = {},
+) {
   const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
   const outcomeUp = new Set<string>([KEY_A, KEY_B, KEY_D])
   const isPersonaUp = createPersonaUpPredicate({ status: (key) => statuses.get(key) }, { isUp: (key) => outcomeUp.has(key) })
@@ -4296,6 +4316,7 @@ function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | un
       trail.emit(event)
     },
     log: (...args) => { logCalls.push(args) },
+    ...extra,
   })
   return {
     ivl,
@@ -4614,6 +4635,28 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state'
 
     expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
     expect(posts(stubB)[1]!.blocks).toEqual(posts(stubB)[0]!.blocks)
+    expect(droppedLines(s.logCalls)).toEqual([])
+  })
+
+  test('drops B\'s posted-without-ts record: B\'s open request posts again on the next tick, while A\'s, posted without a ts the same way, is not posted again', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    scriptPostTs(stubA, undefined)
+    scriptPostTs(stubB, undefined, POST_TS_2)
+    await s.drive(2)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(posts(stubB)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toBeUndefined()
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(0)
+    await s.drive(2)
+
+    expect(posts(stubB).map((c) => c.channel)).toEqual([B_DEST, B_DEST])
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ personaKey: KEY_B, channelId: B_DEST, messageTs: POST_TS_2 })
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(logLines(s.logCalls, buildPromptPostedWithoutTsLine(INSTANCE_A, TOKEN_A))).toHaveLength(1)
     expect(droppedLines(s.logCalls)).toEqual([])
   })
 
@@ -4984,5 +5027,229 @@ describe('poller tick — a throw on one row, request or closed entry is caught 
       [buildPromptFailedLine(INSTANCE_A, TOKEN_A, describeThrownValue(thrown))],
     ])
     assertNoLeak({ logCalls }, 'payload line throws')
+  })
+})
+
+/**
+ * A recording own-post adapter: each confirmation the resolver hands it, by
+ * surface, channel and ts. With `fails`, each confirmation throws once
+ * recorded (an enrollment failure right after the success).
+ */
+function recordingOwnPosts(fails = false) {
+  const confirmed: Array<{ surface: string; channel: string; ts?: string }> = []
+  const ownPosts: OwnPostObserver = {
+    issue: (key, surface) => ({ key, surface, operation: `op-${confirmed.length}`, issuer: {} }),
+    confirm: (issue, posted) => {
+      confirmed.push({ surface: issue!.surface, channel: posted.channel, ...(posted.ts ? { ts: posted.ts } : {}) })
+      if (fails) throw new Error('injected enrollment failure')
+    },
+  }
+  return { confirmed, ownPosts }
+}
+
+describe('a confirmed prompt or warning stays registered and latched through post-success faults', () => {
+  type Fault = 'enrollment' | 'hold settle' | 'trail'
+  /** Persona A's poller over the real resolver and hold, its own-post adapter recording every confirmation. */
+  function confirmedScenario(fault?: Fault) {
+    const logCalls: unknown[][] = []
+    const { confirmed, ownPosts } = recordingOwnPosts(fault === 'enrollment')
+    const log = (line: string): void => {
+      logCalls.push([line])
+      if (fault === 'hold settle' && line.includes(': cleared: ')) throw new Error('injected settle failure')
+    }
+    const destinations = createPersonaDestinations({ log, getPersonaConfig: () => config, ownPosts })
+    const clock = createFakeClock()
+    const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor: clients.clientFor, clock, log })
+    const trail = makeTrailCapture()
+    let open: PermissionRequestRow[] = [requestA()]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => getResult(open),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
+    }), {
+      destinations, destinationHold: hold, log: (...args) => { logCalls.push(args) },
+      emitTrail: (event) => {
+        if (fault === 'trail' && event.event === 'cscb.chat_post.attempted' && event['ok'] === true) throw new Error('injected trail failure')
+        trail.emit(event)
+      },
+    })
+    return { ivl, clock, logCalls, confirmed, trail, close: (rows: PermissionRequestRow[]) => { open = rows } }
+  }
+
+  test.each<[Fault, 'full' | 'short']>([
+    ['enrollment', 'full'], ['enrollment', 'short'], ['trail', 'full'], ['trail', 'short'], ['hold settle', 'full'],
+  ])('a %s fault after a %s prompt posts: registered with its returned channel and ts, never posted again or replaced by a fallback', async (fault, form) => {
+    const s = confirmedScenario(fault)
+    if (fault === 'hold settle') stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    if (form === 'short') stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+    scriptPostTs(stubA, POST_TS)
+    await s.ivl.tick()
+    if (fault === 'hold settle') { await s.clock.advance(5000); await s.ivl.tick() }
+    if (form === 'short') await s.ivl.tick()
+    const attempts = 1 + (fault === 'hold settle' ? 1 : 0) + (form === 'short' ? 1 : 0)
+    expect(posts(stubA)).toHaveLength(attempts)
+    if (form === 'short') expect(posts(stubA).at(-1)!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
+    for (let n = 0; n < 3; n++) await s.ivl.tick()
+    expect(posts(stubA)).toHaveLength(attempts)
+    expect(s.confirmed).toHaveLength(1)
+    // The original conversation still closes through the registered entry.
+    s.close([])
+    await s.ivl.tick()
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(s.confirmed).toHaveLength(1)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, `${fault} after ${form} prompt`)
+  })
+
+  test('a prompt Slack confirms without a ts is posted but not answerable: never registered, never posted again, its line says so', async () => {
+    const s = confirmedScenario()
+    scriptPostTs(stubA, undefined)
+    for (let n = 0; n < 4; n++) await s.ivl.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST }])
+    expect(logLines(s.logCalls, buildPromptPostedWithoutTsLine(INSTANCE_A, TOKEN_A))).toHaveLength(1)
+    expect(chatPosts(s.trail).filter((e) => e['ok'] === true)).toHaveLength(1)
+  })
+
+  test('a real Slack failure confirms nothing and is retried; the later success is the one confirmation', async () => {
+    const s = confirmedScenario()
+    stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    scriptPostTs(stubA, POST_TS)
+    await s.ivl.tick()
+    expect(s.confirmed).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    await s.clock.advance(5000)
+    await s.ivl.tick()
+    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ messageTs: POST_TS })
+  })
+
+  test('an enrollment-faulted prompt stays answerable: a destination change leaves it at its original channel and ts, a click through the real handler decides it there, and another persona\'s connection cannot', async () => {
+    const s = confirmedScenario('enrollment')
+    scriptPostTs(stubA, POST_TS)
+    await s.ivl.tick()
+    reconfigure(KEY_A, { permission_prompts: A_WORK })
+    await s.ivl.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+
+    const decided: DecideParams[] = []
+    const decider = { decide: async (params: DecideParams) => { decided.push(params); return cannedDecideResult('delivered') } }
+    initOutageState({ getClient: () => decider as unknown as AgentDirectorClient, notify: () => {} })
+    const click = (receivingPersonaKey: string) => handlePermissionClick(encodePermissionActionId('allow', INSTANCE_A, TOKEN_A), {
+      receivingPersonaKey, clientFor: clients.clientFor, getPersona, log: (...args) => { s.logCalls.push(args) }, emitTrail: s.trail.emit,
+    })
+    expect(await click(KEY_B)).toBe(true)
+    expect(decided).toEqual([])
+    expect(await click(KEY_A)).toBe(true)
+    expect(decided).toEqual([{ instance_id: INSTANCE_A, request_token: TOKEN_A, decision: 'allow' }])
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ handled: true })
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'enrollment-faulted prompt answered')
+  })
+
+  test.each<['none' | 'enrollment' | 'trail']>([['none'], ['enrollment'], ['trail']])(
+    'a wedge warning is confirmed once as a warning own post at its destination and, with a %s fault after it posts, stays latched: one warning however many empty ticks follow',
+    async (fault) => {
+      const own = recordingOwnPosts(fault === 'enrollment')
+      const log = (line: string): void => { s.logCalls.push([line]) }
+      const s = makeNotUpScenario(
+        (e) => fault === 'trail' && e.event === 'cscb.poller.wedge_detected' && e['ok'] === true ? new Error('injected trail failure') : undefined,
+        { destinations: createPersonaDestinations({ log, getPersonaConfig: () => config, ownPosts: own.ownPosts }) },
+      )
+      s.listed.delete(B)
+      scriptPostTs(stubA, POST_TS)
+      await s.drive(K)
+      expect(wedgeWarnings().map((c) => c.channel)).toEqual([A_DEST])
+      expect(own.confirmed).toEqual([{ surface: 'warning', channel: A_DEST, ts: POST_TS }])
+      await s.drive(K * 2)
+      expect(wedgeWarnings()).toHaveLength(1)
+      expect(own.confirmed).toHaveLength(1)
+      assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, `wedge warning, ${fault} fault`)
+    },
+  )
+})
+
+describe('a permission prompt enrolls its own thread through the real participation owner', () => {
+  const PROMPT_TS = '1700000000.000400'
+  let stateDir: string
+  let th: ThreadHarness | undefined
+  beforeEach(() => { stateDir = mkdtempSync(join(tmpdir(), 'poller-own-post-')) })
+  afterEach(async () => {
+    await th?.close()
+    th = undefined
+    resetRoutingState()
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+
+  test('the prompt\'s returned ts becomes a followed root with one durable record and no echo; a repeated confirmation or an own echo adds nothing, and a human reply in it is delivered', async () => {
+    th = await makeThreadHarness(stateDir)
+    const t = th
+    t.chooseDestination('alpha', THREAD_CHANNEL)
+    const alpha = t.h.p('alpha')
+    const key = alpha.persona.key
+    const instance = personaInstanceId(key)
+    const ownRecords = () => t.h.queue.threadRecords(key).filter((r) => r.observation.post)
+    const fresh = () => t.h.ownPostOutcomes.filter((o) => !o.duplicate)
+    async function settleUntil(done: () => boolean): Promise<void> {
+      for (let i = 0; i < 50 && !done(); i++) { await t.clock.flush(); await new Promise((resolve) => setImmediate(resolve)) }
+      expect(done()).toBe(true)
+    }
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    const getThreadPersona = (k: string): Persona | undefined => t.h.config?.personas.find((p) => p.key === k)
+    alpha.stub.script.post.push({ kind: 'ok', result: { ts: PROMPT_TS } })
+    const ivl = startManualPoller({
+      getClient: () => ({
+        list: async () => ({ spawns: [cannedListRow({ instance_id: instance, state: 'check_permission' })] }),
+        get: async () => cannedGetResult({ instance_id: instance, state: 'check_permission', permission_requests: [requestA()] }),
+        getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+          cannedGetPermissionResponse({ request_token: params.request_token, decision: null, decision_reason: null }),
+      }),
+      clientFor: t.h.clients.clientFor,
+      getPersona: getThreadPersona,
+      destinations: createPersonaDestinations({ log: (line) => { logCalls.push([line]) }, getPersonaConfig: () => t.h.config, ownPosts: t.h.ownPosts }),
+      log: (...args) => { logCalls.push(args) },
+      emitTrail: trail.emit,
+    })
+
+    await ivl.tick()
+    expect(posts(alpha.stub).map((c) => c.channel)).toEqual([THREAD_CHANNEL])
+    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ personaKey: key, channelId: THREAD_CHANNEL, messageTs: PROMPT_TS })
+    await settleUntil(() => fresh().length > 0)
+    expect(fresh()).toEqual([expect.objectContaining({
+      kind: 'enrolled', key, surface: 'prompt', channel: THREAD_CHANNEL, ts: PROMPT_TS, root: PROMPT_TS, missing: [],
+    })])
+    expect(t.read(PROMPT_TS)).toBe('followed')
+    expect(ownRecords().map((r) => [r.observation.lifetime.channel, r.observation.root, r.state])).toEqual([[THREAD_CHANNEL, PROMPT_TS, 'enrolled']])
+
+    // Later ticks neither repost nor confirm again.
+    await ivl.tick()
+    await ivl.tick()
+    expect(posts(alpha.stub)).toHaveLength(1)
+    expect(fresh()).toHaveLength(1)
+
+    // A repeated confirmation of the same post settles as a duplicate.
+    t.h.ownPosts.confirm(t.h.ownPosts.issue(key, 'prompt', THREAD_CHANNEL), { channel: THREAD_CHANNEL, ts: PROMPT_TS })
+    await settleUntil(() => t.h.ownPostOutcomes.some((o) => o.duplicate))
+    expect(fresh()).toHaveLength(1)
+    expect(ownRecords()).toHaveLength(1)
+
+    // The prompt's own echo delivers nothing to alpha and adds no participation.
+    const identity = alpha.stub.identity
+    await t.receive(makeChannelMessage({ channel: THREAD_CHANNEL, ts: PROMPT_TS, user: identity.botUserId, bot_id: identity.botId, text: 'own prompt echo' }))
+    expect(t.h.queue.items(key)).toEqual([])
+    expect(ownRecords()).toHaveLength(1)
+    const HUMAN_TS = '1700000000.000401'
+    expect((await t.receive(threadReply({ thread_ts: PROMPT_TS, ts: HUMAN_TS }))).acknowledged).toBe(1)
+    expect(t.h.queue.items(key).map((i) => [i.accepted.ts, i.accepted.via])).toEqual([[HUMAN_TS, 'thread']])
+    expect(t.h.ownPostOutcomes.filter((o) => o.kind !== 'enrolled')).toEqual([])
+    assertNoLeak({ logCalls, trail: trail.events, outcomes: t.h.ownPostOutcomes }, 'prompt enrolled through the owner')
   })
 })

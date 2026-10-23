@@ -85,6 +85,7 @@ import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, sl
 import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
+import type { OwnPostObserver } from './thread-participation.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
 // Peer-PID + sessions.json registry have been deleted. The
@@ -704,6 +705,11 @@ export interface SessionToolDeps {
    * `console.error`.
    */
   log?: (line: string) => void
+  /**
+   * Confirms each successful reply post to thread participation. Absent:
+   * nothing is observed and posting is unchanged.
+   */
+  ownPosts?: OwnPostObserver
 }
 
 /**
@@ -835,6 +841,28 @@ const TOOL_TARGET: Readonly<Record<string, { arg: string; action: PersonaTargetA
 /** A CallTool result flagged as a tool error. */
 function toolError(text: string) {
   return { content: [{ type: 'text', text }], isError: true }
+}
+
+/** What a `reply` had already posted when a later part failed; that prefix is never posted again. */
+export interface ReplyPostedPrefix {
+  where: string
+  sent: number
+  total: number
+  lastTs?: string
+  uploaded: number
+  files: number
+}
+/** The `reply` tool error after a later Slack call failed following confirmed posts. */
+export function replyPartialFailureText(prefix: ReplyPostedPrefix, reason?: string): string {
+  return `Tool "reply" stopped after a partial post${reason ? ` (${reason})` : ''}: ` +
+    `${prefix.sent} of ${prefix.total} message(s) were posted to ${prefix.where}${prefix.lastTs ? ` [ts: ${prefix.lastTs}]` : ''}` +
+    `${prefix.files ? ` and ${prefix.uploaded} of ${prefix.files} file(s) were uploaded` : ''}. ` +
+    'The posted part stays in Slack and is not posted again; send only what is missing.'
+}
+/** The `[slack]` line for that failure; the thrown value goes through the safe describer. */
+export function replyPartialFailureLogLine(ref: string, prefix: ReplyPostedPrefix, err: unknown): string {
+  return `[slack] Tool "reply" stopped after a partial post for persona ${ref}: ` +
+    `sent=${prefix.sent}/${prefix.total} uploaded=${prefix.uploaded}/${prefix.files}: ${describeThrownValue(err)}`
 }
 
 /**
@@ -1452,35 +1480,60 @@ export function createSessionServer(
 
         let lastTs = ''
         let firstChunk = true
+        // The calling persona's own ack reaction, removed through its own
+        // client at most once (first success), only when its own entry for
+        // this message existed. `chatId` is the conversation posted to (for
+        // a user target, the DM just opened). Shared by text and file successes.
+        const succeeded = () => {
+          if (!firstChunk) return
+          firstChunk = false
+          clearAck()
+        }
+        // Issued before the first post, so a later lifetime or identity change is visible at confirmation.
+        const ownPost = deps.ownPosts?.issue(persona.key, 'text', chatId)
+        // Confirmed parts survive any later failure; none is posted again.
+        let sent = 0
+        let uploaded = 0
+        const prefix = (): ReplyPostedPrefix => ({ where, sent, total: chunks.length, ...(lastTs ? { lastTs } : {}), uploaded, files: files?.length ?? 0 })
+        const partialFailure = (err: unknown) => {
+          const log = deps.log ?? ((line: string) => console.error(line))
+          log(replyPartialFailureLogLine(renderPersonaRef(persona.name, persona.key), prefix(), err))
+          return toolError(replyPartialFailureText(prefix(), slackPlatformReason(err)))
+        }
         for (const chunk of chunks) {
-          const res = await web.chat.postMessage({
-            channel: chatId,
-            text: chunk,
-            thread_ts: threadTs,
-            unfurl_links: false,
-            unfurl_media: false,
-          })
-          lastTs = (res.ts as string) || lastTs
-
-          // The calling persona's own ack reaction, removed through its own
-          // client at most once (first chunk), only when its own entry for
-          // this message existed. `chatId` is the conversation posted to (for
-          // a user target, the DM just opened).
-          if (firstChunk) {
-            firstChunk = false
-            clearAck()
+          let res: Awaited<ReturnType<WebClient['chat']['postMessage']>>
+          try {
+            res = await web.chat.postMessage({
+              channel: chatId,
+              text: chunk,
+              thread_ts: threadTs,
+              unfurl_links: false,
+              unfurl_media: false,
+            })
+          } catch (err) {
+            if (sent === 0) throw err
+            return partialFailure(err)
           }
+          sent++
+          const ts = typeof res.ts === 'string' && res.ts !== '' ? res.ts : undefined
+          lastTs = ts ?? lastTs
+          // Protection is published before reaction cleanup and before any await.
+          if (ownPost) {
+            try {
+              deps.ownPosts!.confirm(ownPost, { channel: chatId, ...(ts ? { ts } : {}), ...(threadTs ? { parent: threadTs } : {}), part: sent })
+            } catch { /* participation cannot stop the remaining authorized parts */ }
+          }
+          succeeded()
         }
 
         // Check each file again right before its upload: the text posts above
         // widen the window in which a symlink could be re-pointed at a file
         // the up-front pass would have refused.
-        let uploaded = 0
         for (const filePath of files ?? []) {
           try {
             assertSendable(filePath)
           } catch (err) {
-            const posted = `${chunks.length} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
+            const posted = `${sent} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
             return toolError(
               `${err instanceof Error ? err.message : String(err)} ` +
                 `The reply text was already posted (${posted}); ` +
@@ -1492,12 +1545,14 @@ export function createSessionServer(
             file: resolve(filePath),
           }
           if (threadTs) uploadArgs.thread_ts = threadTs
-          await web.filesUploadV2(uploadArgs as any)
-          uploaded++
-          if (firstChunk) {
-            firstChunk = false
-            clearAck()
+          try {
+            await web.filesUploadV2(uploadArgs as any)
+          } catch (err) {
+            if (sent === 0 && uploaded === 0) throw err
+            return partialFailure(err)
           }
+          uploaded++
+          succeeded()
         }
 
         return {

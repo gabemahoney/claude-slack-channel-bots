@@ -107,7 +107,8 @@ export interface DeliveryQueue {
   threadRecords(key: string): ThreadParticipationRecord[]
   threadRecord(key: string, id: string): ThreadParticipationRecord | undefined
   threadReadable(key: string): boolean
-  recordThreadObservation(key: string, observation: ThreadObservation): Promise<void>
+  /** Only own-post evidence (no Slack key) may be written directly as enrolled. */
+  recordThreadObservation(key: string, observation: ThreadObservation, state?: 'observed' | 'enrolled'): Promise<void>
   /** Serialize discard against acceptance; an already accepted Slack key wins. */
   cancelThreadObservation(key: string, observation: ThreadObservation): Promise<QueueStoredResult | undefined>
   /** A current snapshot of one item, without cloning the rest of the queue. */
@@ -709,15 +710,17 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const j = journal(key)
       return started && !stopped && j.loaded && !j.threadGap && !j.threadReplayPending && j.pendingRollback === undefined
     },
-    async recordThreadObservation(key, observation) {
+    async recordThreadObservation(key, observation, state = 'observed') {
       observation = structuredClone(observation)
       await serial(key, () => {
         if (!started || stopped) throw new Error('Queue is not writable')
         load(key)
         const j = journal(key)
-        const record: ThreadParticipationRecord = { v: 1, kind: 'thread-participation', seq: 0, state: 'observed', observation }
+        const record: ThreadParticipationRecord = { v: 1, kind: 'thread-participation', seq: 0, state, observation }
         if (!isThreadParticipationRecord(record) || observation.lifetime.key !== key) throw new Error('Invalid thread observation')
-        if (j.threads.has(observation.id)) return
+        if (state === 'enrolled' && observation.post === undefined) throw new Error('Invalid thread observation')
+        const previous = j.threads.get(observation.id)
+        if (previous && (previous.state !== 'observed' || state === 'observed')) return
         durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
         update(j, record)
       })

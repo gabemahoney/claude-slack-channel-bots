@@ -1,11 +1,44 @@
 /** Permanent thread facts and observation protection. Persistence uses the
  * queue's injected, serialized fsync writer; construction performs no I/O. */
-import { createHash } from 'node:crypto'
-import { CHANNEL_ID_RE, type ChannelMode, type DeliveryMode } from './config.ts'
+import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+import { CHANNEL_ID_RE, DELIVERY_MODES, channelModeOf, type ChannelMode, type DeliveryMode, type Persona, type ServerSettings } from './config.ts'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
-import { isThreadTimestamp } from './delivery-decision.ts'
+import { isThreadTimestamp, personaListsChannel, type StoredChoices } from './delivery-decision.ts'
+import type { MembershipReading } from './channel-membership.ts'
 import type { DeliveryQueue, QueueStoredResult, SlackKey } from './delivery-queue.ts'
 import type { SharedChannelAuthority, SharedChannelLifetime, SharedLifetimeStatus } from './shared-channels.ts'
+
+/** Surfaces that confirm an own post. `file` is reserved for upload completions. */
+export const OWN_POST_SURFACES = ['text', 'prompt', 'warning', 'notice', 'file'] as const
+export type OwnPostSurface = typeof OWN_POST_SURFACES[number]
+/** Evidence a confirmed own post still needs before it can enroll. */
+export const OWN_POST_MISSING = ['root', 'channel-eligibility'] as const
+export type OwnPostMissing = typeof OWN_POST_MISSING[number]
+/** Why no durable own-post evidence exists: no write could keep a copy. */
+export const OWN_POST_GAP_CAUSES = ['storage', 'lifetime-unresolved', 'identity-unresolved', 'eligibility-unavailable', 'operation'] as const
+export type OwnPostGapCause = typeof OWN_POST_GAP_CAUSES[number]
+const OWN_POST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
+/** The authenticated identity that issued a post, captured before its await. */
+export interface OwnPostIssuer { botUserId?: string; botId?: string }
+/** A confirmed own post's facts, bound when its success is first observed. */
+export interface OwnPostEvidence {
+  surface: OwnPostSurface
+  operation: string
+  part: number
+  /** The returned message timestamp; absent when Slack returned none. */
+  ts?: string
+  /** The requested reply parent. */
+  parent?: string
+  /** A reply was requested under a parent that is not a valid root; never with `parent`. */
+  parentUnresolved?: true
+  /** A completed file's ID, without inventing its message root. */
+  file?: string
+  issuer: OwnPostIssuer
+  missing: OwnPostMissing[]
+  /** The eligibility fault that left this evidence pending. */
+  reason?: string
+}
 
 export interface ThreadObservation {
   id: string
@@ -14,7 +47,10 @@ export interface ThreadObservation {
   root?: string
   slackKey?: SlackKey
   observedAt: number
-  policy: { mode: ChannelMode; delivery: DeliveryMode }
+  /** `delivery` is absent only for own-post evidence whose choice is unresolved. */
+  policy: { mode: ChannelMode; delivery?: DeliveryMode }
+  /** Present only for a confirmed own post; never with `slackKey`. */
+  post?: OwnPostEvidence
 }
 export interface ThreadParticipationRecord {
   v: 1
@@ -34,14 +70,32 @@ export type ThreadParticipationReading = {
 }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const integer = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+const optionalId = (v: unknown): boolean => v === undefined || (typeof v === 'string' && OWN_POST_ID_RE.test(v))
+function isOwnPostEvidence(value: unknown, root: unknown): value is OwnPostEvidence {
+  if (!object(value) || !OWN_POST_SURFACES.includes(value.surface as OwnPostSurface) || typeof value.operation !== 'string' ||
+      !OWN_POST_ID_RE.test(value.operation) || !integer(value.part) || value.part < 1 || !object(value.issuer) ||
+      !optionalId(value.issuer.botUserId) || !optionalId(value.issuer.botId) || !optionalId(value.file) || !optionalId(value.reason) ||
+      !Array.isArray(value.missing) || !value.missing.every(m => OWN_POST_MISSING.includes(m as OwnPostMissing)) ||
+      new Set(value.missing).size !== value.missing.length) return false
+  if ((value.ts !== undefined && !isThreadTimestamp(value.ts)) || (value.parent !== undefined && !isThreadTimestamp(value.parent))) return false
+  if (value.parentUnresolved !== undefined && (value.parentUnresolved !== true || value.parent !== undefined)) return false
+  // A reply enrolls its requested parent and a root its own timestamp; later
+  // root evidence may settle a post that returned neither, or a reply whose
+  // requested parent was not a valid root.
+  if (value.parent !== undefined ? root !== value.parent : !value.parentUnresolved && value.ts !== undefined && root !== value.ts) return false
+  return (root === undefined) === value.missing.includes('root')
+}
 export function isThreadObservation(value: unknown): value is ThreadObservation {
   if (!object(value) || typeof value.id !== 'string' || !/^[a-f0-9]{64}$/.test(value.id) ||
       !object(value.lifetime) || !object(value.policy) || !integer(value.observedAt)) return false
-  const l = value.lifetime, p = value.policy, key = value.slackKey
+  const l = value.lifetime, p = value.policy, key = value.slackKey, post = value.post
+  if (post !== undefined && (key !== undefined || !isOwnPostEvidence(post, value.root))) return false
+  const delivery = p.delivery === undefined
+    ? post !== undefined && (post as OwnPostEvidence).missing.includes('channel-eligibility')
+    : DELIVERY_MODES.includes(p.delivery as DeliveryMode)
   return typeof l.key === 'string' && PERSONA_KEY_RE.test(l.key) && typeof l.channel === 'string' && CHANNEL_ID_RE.test(l.channel) &&
     typeof l.incarnation === 'string' && l.incarnation.length > 0 && integer(l.resetOrder) && integer(l.membershipBoundary) && integer(l.leaveBoundary) &&
-    (l.createdAt === undefined || integer(l.createdAt)) && ['strict', 'open'].includes(String(p.mode)) &&
-    ['off', 'mentions', 'all', 'thread_hybrid'].includes(String(p.delivery)) &&
+    (l.createdAt === undefined || integer(l.createdAt)) && ['strict', 'open'].includes(String(p.mode)) && delivery &&
     (value.root === undefined || isThreadTimestamp(value.root)) &&
     (key === undefined || (p.delivery !== 'off' && object(key) && key.chat_id === l.channel && isThreadTimestamp(key.ts) &&
       (key.edited_ts === undefined || typeof key.edited_ts === 'string') && value.root !== undefined))
@@ -51,7 +105,8 @@ export function isThreadParticipationRecord(value: unknown): value is ThreadPart
     isThreadObservation(value.observation) && ['observed', 'enrolled', 'cancelled'].includes(String(value.state)) &&
     (value.acceptedSeq === undefined || (integer(value.acceptedSeq) && value.acceptedSeq > 0)) &&
     (value.state !== 'enrolled' || (value.observation.root !== undefined &&
-      (value.observation.slackKey === undefined || value.acceptedSeq !== undefined)))
+      (value.observation.slackKey === undefined || value.acceptedSeq !== undefined) &&
+      (value.observation.post === undefined || value.observation.post.missing.length === 0)))
 }
 export function parseThreadParticipationRecord(line: string): ThreadParticipationRecord | undefined {
   try { const value: unknown = JSON.parse(line); return isThreadParticipationRecord(value) ? value : undefined } catch { return undefined }
@@ -60,12 +115,165 @@ export function threadObservationId(lifetime: SharedChannelLifetime, key: SlackK
   return createHash('sha256').update(JSON.stringify([lifetime.key, lifetime.channel, lifetime.incarnation,
     lifetime.resetOrder, lifetime.createdAt ?? null, lifetime.membershipBoundary, lifetime.leaveBoundary, key.ts, key.edited_ts ?? null])).digest('hex')
 }
+/** One own post's identity within its lifetime: no Slack timestamp is needed. */
+export function ownPostObservationId(lifetime: SharedChannelLifetime, operation: string, part: number): string {
+  return createHash('sha256').update(JSON.stringify(['own-post', lifetime.key, lifetime.channel, lifetime.incarnation,
+    lifetime.resetOrder, lifetime.createdAt ?? null, lifetime.membershipBoundary, lifetime.leaveBoundary, operation, part])).digest('hex')
+}
+
+// ---------------------------------------------------------------------------
+// Confirmed own posts
+// ---------------------------------------------------------------------------
+
+/** Whether a confirmed own post may enroll, from current applied evidence. */
+export type OwnPostEligibility =
+  | { kind: 'eligible'; mode: ChannelMode; delivery: DeliveryMode }
+  | { kind: 'ineligible'; mode: ChannelMode; reason: 'dm' | 'unlisted' | 'absent' | 'external-sharing' | 'invalid-channel' }
+  | { kind: 'unresolved'; mode: ChannelMode; delivery?: DeliveryMode; reason: string }
+export interface OwnPostEligibilityInputs {
+  channel: string
+  mode: ChannelMode
+  /** The persona's configured channel entries name this channel; read in strict mode only. */
+  listed: boolean
+  /** The shared choice projection is trustworthy for this persona/channel. */
+  choiceReadable: boolean
+  choice: DeliveryMode | undefined
+  membership: MembershipReading | undefined
+}
+/**
+ * SR-1.4 for an own post. Strict inclusion is the applied shared choice;
+ * open mode relies on membership's public/private and non-external evidence.
+ * Posting success, a destination, a listed entry or an ID prefix alone proves
+ * neither membership nor sharing. An off choice may enroll without intake.
+ * Pure.
+ */
+export function decideOwnPostEligibility(inputs: OwnPostEligibilityInputs): OwnPostEligibility {
+  const { channel, mode, choice, membership } = inputs
+  if (!CHANNEL_ID_RE.test(channel)) return { kind: 'ineligible', mode, reason: channel.startsWith('D') ? 'dm' : 'invalid-channel' }
+  if (!inputs.choiceReadable) return { kind: 'unresolved', mode, reason: 'state-unavailable' }
+  if (choice === undefined) {
+    return mode === 'strict' && !inputs.listed ? { kind: 'ineligible', mode, reason: 'unlisted' } : { kind: 'unresolved', mode, reason: 'choice-missing' }
+  }
+  if (!membership) return { kind: 'unresolved', mode, delivery: choice, reason: 'current-membership-missing' }
+  if (membership.kind === 'ineligible') return { kind: 'ineligible', mode, reason: membership.reason }
+  if (membership.kind === 'unresolved') return { kind: 'unresolved', mode, delivery: choice, reason: membership.reason }
+  return { kind: 'eligible', mode, delivery: choice }
+}
+
+/** The current facts `ownPostEligibility` reads at each confirmation. */
+export interface OwnPostEligibilitySources {
+  config(): Pick<ServerSettings, 'channel_mode'> | null | undefined
+  persona(key: string): Pick<Persona, 'channels'> | undefined
+  choices(): Pick<StoredChoices, 'storedChoice'> & { readableFor(key: string, channel?: string): boolean } | undefined
+  membership(key: string, channel: string, mode: ChannelMode): MembershipReading | undefined
+}
+/** The owner's `eligibility` over the applied config, stored choices and current membership. */
+export function ownPostEligibility(sources: OwnPostEligibilitySources): (key: string, channel: string) => OwnPostEligibility {
+  return (key, channel) => {
+    const mode = channelModeOf(sources.config()), store = sources.choices()
+    const readable = store !== undefined && store.readableFor(key, channel)
+    return decideOwnPostEligibility({
+      // Open mode reads no persona's channel entries.
+      channel, mode, listed: mode === 'strict' && personaListsChannel(sources.persona(key), channel),
+      choiceReadable: readable, choice: readable ? store.storedChoice(key, channel) : undefined,
+      membership: sources.membership(key, channel, mode),
+    })
+  }
+}
+
+/** Captured before the post's await, so a replacement identity or lifetime is never rebound. */
+export interface OwnPostIssue {
+  key: string
+  surface: OwnPostSurface
+  operation: string
+  incarnation?: string
+  /** The persona's reset order, when the channel was known at issue. */
+  resetOrder?: number
+  /** The channel the post was issued for, when known before the post. */
+  channel?: string
+  /** That channel's whole lifetime at issue: a leave, rejoin or reset since supersedes the post. */
+  lifetime?: SharedChannelLifetime
+  issuer: OwnPostIssuer
+}
+/** What Slack's success response showed: the actual channel and returned timestamp. */
+export interface OwnPostPosted {
+  channel: string
+  ts?: string
+  parent?: string
+  /** 1-based part within the operation; one when absent. */
+  part?: number
+}
+/**
+ * `enrolled`: durable participation. `pending`: durable evidence awaiting
+ * root/eligibility. `gap`: no durable copy could be written. `ineligible`
+ * and `superseded` enroll nothing and need nothing more.
+ */
+export type OwnPostOutcomeKind = 'enrolled' | 'pending' | 'gap' | 'ineligible' | 'superseded'
+export interface OwnPostOutcome {
+  kind: OwnPostOutcomeKind
+  key: string
+  surface: OwnPostSurface
+  operation: string
+  part: number
+  channel: string
+  ts?: string
+  parent?: string
+  root?: string
+  /** A completed file's ID, when the post was a file completion. */
+  file?: string
+  /** The observation, when one was bound to a lifetime. */
+  id?: string
+  /** The channel's applied delivery choice, when the evidence recorded one. */
+  delivery?: DeliveryMode
+  missing: OwnPostMissing[]
+  /** Eligibility fault (pending, ineligible) or gap cause. */
+  reason?: string
+  /** For a safe code only; never logged raw. */
+  error?: unknown
+  /** A settled duplicate (already enrolled or decided): it changes nothing, but lets reporting see the persona settle. */
+  duplicate?: true
+}
+/** The posting adapters' view: never throws, never delays or fails the post. */
+export interface OwnPostObserver {
+  /** `channel` is the post's channel when known before the post, so a lifetime change during it is seen. */
+  issue(key: string, surface: OwnPostSurface, channel?: string): OwnPostIssue | undefined
+  /** Call synchronously at the success response, before any awaited bookkeeping. */
+  confirm(issue: OwnPostIssue | undefined, posted: OwnPostPosted): void
+}
+/** The shared adapter over the current owner; a fault, sync or async, becomes an operation gap. */
+export function createOwnPostObserver(owner: () => ThreadParticipation | undefined, report?: (outcome: OwnPostOutcome) => void): OwnPostObserver {
+  return {
+    issue(key, surface, channel) {
+      try { return owner()?.issueOwnPost(key, surface, channel) } catch { return undefined }
+    },
+    confirm(issue, posted) {
+      if (!issue) return
+      const fault = (error: unknown) => {
+        try {
+          report?.({ kind: 'gap', key: issue.key, surface: issue.surface, operation: issue.operation, part: posted.part ?? 1,
+            channel: posted.channel, ...(isThreadTimestamp(posted.ts) ? { ts: posted.ts } : {}),
+            ...(isThreadTimestamp(posted.parent) ? { parent: posted.parent } : {}), missing: [], reason: 'operation', error })
+        } catch { /* reporting cannot fail a successful post */ }
+      }
+      try { void Promise.resolve(owner()?.confirmOwnPost(issue, posted)).catch(fault) } catch (error) { fault(error) }
+    },
+  }
+}
+
 export type ThreadParticipationQueue = Pick<DeliveryQueue,
   'keys' | 'threadRecords' | 'threadRecord' | 'threadReadable' | 'recordThreadObservation' | 'cancelThreadObservation'>
 export interface ThreadParticipationOptions {
   queue: ThreadParticipationQueue
-  authority: Pick<SharedChannelAuthority, 'lifetime' | 'lifetimeStatus'>
+  authority: Pick<SharedChannelAuthority, 'lifetime' | 'lifetimeStatus'> & Partial<Pick<SharedChannelAuthority, 'incarnation'>>
   now?: () => number
+  /** Current synchronous own-post eligibility; absent leaves every own post a gap. */
+  eligibility?(key: string, channel: string): OwnPostEligibility
+  /** The persona's current authenticated identity. */
+  identity?(key: string): OwnPostIssuer | undefined
+  /** Each own-post outcome, for bounded reporting. Its throw is ignored. */
+  onOwnPost?(outcome: OwnPostOutcome): void
+  /** An own post settled a thread (or, rootless, its channel); re-evaluate held replies. */
+  onSettled?(key: string, channel: string, root?: string): void
 }
 export interface ThreadParticipation {
   /** Called after queue replay and authority initialization, before admission. */
@@ -82,6 +290,18 @@ export interface ThreadParticipation {
   recover(key: string, id?: string): SharedLifetimeStatus
   read(key: string, channel: string, root: string): ThreadParticipationReading
   pending(key?: string): ThreadObservation[]
+  /** Capture the issuing identity and lifetime (the channel's, when known) before the post's await. */
+  issueOwnPost(key: string, surface: OwnPostSurface, channel?: string): OwnPostIssue
+  /**
+   * Bind a confirmed post. Dependent protection is published synchronously,
+   * before the first await; the promise settles durable evidence and never
+   * rejects. Callers never await it before registering their own success.
+   */
+  confirmOwnPost(issue: OwnPostIssue, posted: OwnPostPosted): Promise<OwnPostOutcome>
+  /** Recovery: retry eligibility/enrollment of one pending own post. Never posts. */
+  retryOwnPost(key: string, id: string): Promise<OwnPostOutcome | undefined>
+  /** Unresolved own-post obligations, for startup reporting and recovery. */
+  ownPostFindings(key?: string): OwnPostOutcome[]
   stop(): void
 }
 export function createThreadParticipation(options: ThreadParticipationOptions): ThreadParticipation {
@@ -124,9 +344,62 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
     if (!started || stopped) return 'unresolved'
     return options.authority.lifetimeStatus(lifetime)
   }
+  /** For failure paths, which must not throw: an unreadable status is not superseded. */
+  function supersededNow(lifetime: SharedChannelLifetime): boolean {
+    try { return status(lifetime) === 'superseded' } catch { return false }
+  }
   function restore(key: string): void {
     for (const record of options.queue.threadRecords(key)) install(key, record)
     initialized.add(key)
+  }
+  const now = () => (options.now ?? Date.now)()
+  function report(outcome: OwnPostOutcome): OwnPostOutcome {
+    try { options.onOwnPost?.(outcome) } catch { /* reporting cannot change participation */ }
+    return outcome
+  }
+  function settled(key: string, channel: string, root?: string): void {
+    try { options.onSettled?.(key, channel, root) } catch { /* Slack redelivery still re-evaluates */ }
+  }
+  /** Durably followed only: an in-flight enrollment write may still fail. */
+  function followed(lifetime: SharedChannelLifetime, root: string): boolean {
+    return (roots.get(scope(lifetime))?.get(root)?.followed.size ?? 0) > 0
+  }
+  /** In-flight own-post enrollment writes by lifetime scope and root; later posts there wait on them. */
+  const enrolling = new Map<string, Promise<OwnPostOutcome>>()
+  const enrollingKey = (lifetime: SharedChannelLifetime, root: string) => JSON.stringify([scope(lifetime), root])
+  function durableCopy(key: string, id: string): boolean {
+    try { return options.queue.threadRecord(key, id) !== undefined } catch { return false }
+  }
+  function outcomeOf(kind: OwnPostOutcomeKind, observation: ThreadObservation, extra: Partial<OwnPostOutcome> = {}): OwnPostOutcome {
+    const post = observation.post!
+    return {
+      kind, key: observation.lifetime.key, surface: post.surface, operation: post.operation, part: post.part,
+      channel: observation.lifetime.channel, ...(post.ts ? { ts: post.ts } : {}), ...(post.parent ? { parent: post.parent } : {}),
+      ...(observation.root ? { root: observation.root } : {}), ...(post.file ? { file: post.file } : {}), id: observation.id,
+      ...(observation.policy.delivery ? { delivery: observation.policy.delivery } : {}), missing: [...post.missing],
+      ...(post.reason ? { reason: post.reason } : {}), ...extra,
+    }
+  }
+  /** Own-post writes use the queue's serialized fsync writer, like incoming observations. */
+  async function saveOwnPost(observation: ThreadObservation, state: 'observed' | 'enrolled'): Promise<OwnPostOutcome> {
+    const key = observation.lifetime.key
+    try { await options.queue.recordThreadObservation(key, observation, state) } catch (error) {
+      // A lifetime superseded during the write owes nothing, whether or not it saved.
+      if (supersededNow(observation.lifetime)) return report(outcomeOf('superseded', observation))
+      // The in-memory observation keeps protecting dependents for recovery. A
+      // failed enrollment of already durable evidence leaves that evidence pending.
+      const kept = durableCopy(key, observation.id) ? records.get(key)?.get(observation.id)?.observation : undefined
+      return report(kept?.post ? outcomeOf('pending', kept, { error }) : outcomeOf('gap', observation, { reason: 'storage', error }))
+    }
+    try {
+      if (status(observation.lifetime) === 'superseded') return report(outcomeOf('superseded', observation))
+      if (state === 'observed') return report(outcomeOf('pending', observation))
+      install(key, { v: 1, kind: 'thread-participation', seq: 0, state: 'enrolled', observation })
+      settled(key, observation.lifetime.channel, observation.root)
+      return report(outcomeOf('enrolled', observation))
+    } catch (error) {
+      return report(outcomeOf(durableCopy(key, observation.id) ? 'pending' : 'gap', observation, { reason: 'operation', error }))
+    }
   }
   const api: ThreadParticipation = {
     start() {
@@ -202,6 +475,116 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
     pending(key) {
       return [...records].filter(([k]) => key === undefined || key === k).flatMap(([, own]) => [...own.values()])
         .filter(r => r.state === 'observed' && status(r.observation.lifetime) !== 'superseded').map(r => structuredClone(r.observation))
+    },
+    issueOwnPost(key, surface, channel) {
+      const identity = options.identity?.(key)
+      const lifetime = channel !== undefined ? options.authority.lifetime(key, channel) : undefined
+      return { key, surface, operation: randomUUID(), incarnation: lifetime?.incarnation ?? options.authority.incarnation?.(key),
+        ...(lifetime ? { resetOrder: lifetime.resetOrder, channel, lifetime: structuredClone(lifetime) } : {}),
+        issuer: identity ? { botUserId: identity.botUserId, botId: identity.botId } : {} }
+    },
+    confirmOwnPost(issue, posted) {
+      const part = posted.part ?? 1
+      const ts = isThreadTimestamp(posted.ts) ? posted.ts : undefined
+      const parent = isThreadTimestamp(posted.parent) ? posted.parent : undefined
+      // A malformed requested parent names no root, and the reply's own ts is not one.
+      const parentUnresolved = posted.parent !== undefined && parent === undefined
+      const root = posted.parent !== undefined ? parent : ts
+      const base = { key: issue.key, surface: issue.surface, operation: issue.operation, part, channel: posted.channel,
+        ...(ts ? { ts } : {}), ...(parent ? { parent } : {}), ...(root ? { root } : {}) }
+      const done = (outcome: OwnPostOutcome, reported = true) => Promise.resolve(reported ? report(outcome) : outcome)
+      try {
+        if (!CHANNEL_ID_RE.test(posted.channel)) {
+          return done({ ...base, kind: 'ineligible', missing: [], reason: posted.channel.startsWith('D') ? 'dm' : 'invalid-channel' })
+        }
+        // The issuer's persona life ended during the post (removed or replaced): nothing is owed to it.
+        if (issue.incarnation !== undefined && options.authority.incarnation && options.authority.incarnation(issue.key) !== issue.incarnation) {
+          return done({ ...base, kind: 'superseded', missing: [] })
+        }
+        const lifetime = options.authority.lifetime(issue.key, posted.channel)
+        if (!lifetime || !started || stopped) return done({ ...base, kind: 'gap', missing: [], reason: 'lifetime-unresolved' })
+        // An issuer captured before the identity was known proves no persona; never bind a later one.
+        if (options.identity && !issue.issuer.botUserId && !issue.issuer.botId) {
+          return done({ ...base, kind: 'gap', missing: [], reason: 'identity-unresolved' })
+        }
+        const identity = options.identity?.(issue.key)
+        if ((issue.incarnation !== undefined && lifetime.incarnation !== issue.incarnation) ||
+            (issue.resetOrder !== undefined && lifetime.resetOrder !== issue.resetOrder) ||
+            (issue.lifetime && issue.channel === posted.channel && !isDeepStrictEqual(issue.lifetime, lifetime)) ||
+            (identity && (identity.botUserId !== issue.issuer.botUserId || identity.botId !== issue.issuer.botId))) {
+          return done({ ...base, kind: 'superseded', missing: [] })
+        }
+        const current = status(lifetime)
+        if (current === 'superseded') return done({ ...base, kind: 'superseded', missing: [] })
+        if (current === 'unresolved') return done({ ...base, kind: 'gap', missing: [], reason: 'lifetime-unresolved' })
+        const id = ownPostObservationId(lifetime, issue.operation, part)
+        const existing = records.get(issue.key)?.get(id)
+        // Settled duplicates are reported marked, so reporting can end an
+        // episode an id-less gap left open; a pending one is already reported.
+        if (existing?.observation.post) {
+          if (existing.state === 'observed') return done(outcomeOf('pending', existing.observation), false)
+          return done(outcomeOf(existing.state === 'enrolled' ? 'enrolled' : 'ineligible', existing.observation, { duplicate: true }))
+        }
+        // A durably followed thread stays followed: duplicate confirmations and
+        // later chunks of a reply add nothing, whatever eligibility reads now.
+        if (root !== undefined && followed(lifetime, root)) return done({ ...base, kind: 'enrolled', missing: [], duplicate: true })
+        // The thread stays protected by the in-flight evidence meanwhile; only
+        // its durable enrollment makes this post a duplicate.
+        const inFlight = root !== undefined ? enrolling.get(enrollingKey(lifetime, root)) : undefined
+        if (inFlight) {
+          const again = () => api.confirmOwnPost(issue, posted)
+          return inFlight.then(first => first.kind === 'enrolled' ? done({ ...base, kind: 'enrolled', missing: [], duplicate: true }) : again(), again)
+        }
+        const eligibility = options.eligibility?.(issue.key, posted.channel)
+        if (!eligibility) return done({ ...base, kind: 'gap', missing: [], reason: 'eligibility-unavailable' })
+        if (eligibility.kind === 'ineligible') return done({ ...base, kind: 'ineligible', missing: [], reason: eligibility.reason })
+        const missing: OwnPostMissing[] = [...(root === undefined ? ['root' as const] : []),
+          ...(eligibility.kind === 'unresolved' ? ['channel-eligibility' as const] : [])]
+        const reason = eligibility.kind === 'unresolved' && OWN_POST_ID_RE.test(eligibility.reason) ? eligibility.reason : undefined
+        const observation: ThreadObservation = {
+          id, lifetime: structuredClone(lifetime), ...(root ? { root } : {}), observedAt: now(),
+          policy: { mode: eligibility.mode, ...(eligibility.delivery ? { delivery: eligibility.delivery } : {}) },
+          post: { surface: issue.surface, operation: issue.operation, part, ...(ts ? { ts } : {}), ...(parent ? { parent } : {}),
+            ...(parentUnresolved ? { parentUnresolved: true as const } : {}), issuer: { ...issue.issuer }, missing, ...(reason ? { reason } : {}) },
+        }
+        if (!isThreadObservation(observation)) return done({ ...base, kind: 'gap', missing, reason: 'operation' })
+        // Dependent selection sees this evidence before the first await.
+        api.observe(observation)
+        if (missing.length) return saveOwnPost(observation, 'observed')
+        const saving = saveOwnPost(observation, 'enrolled'), at = enrollingKey(lifetime, root!)
+        enrolling.set(at, saving)
+        const clear = () => { if (enrolling.get(at) === saving) enrolling.delete(at) }
+        void saving.then(clear, clear)
+        return saving
+      } catch (error) {
+        return done({ ...base, kind: 'gap', missing: [], reason: 'operation', error })
+      }
+    },
+    async retryOwnPost(key, id) {
+      const record = records.get(key)?.get(id), observation = record?.observation
+      if (!record || record.state !== 'observed' || !observation?.post) return undefined
+      const current = status(observation.lifetime), durable = durableCopy(key, id)
+      if (current === 'superseded') return report(outcomeOf('superseded', observation))
+      if (current !== 'current') return outcomeOf(durable ? 'pending' : 'gap', observation, durable ? {} : { reason: 'lifetime-unresolved' })
+      let eligibility: OwnPostEligibility | undefined
+      try { eligibility = observation.root ? options.eligibility?.(key, observation.lifetime.channel) : undefined } catch { /* stays unresolved */ }
+      if (!eligibility || eligibility.kind === 'unresolved') return durable ? outcomeOf('pending', observation) : saveOwnPost(observation, 'observed')
+      if (eligibility.kind === 'ineligible') {
+        try { await options.queue.cancelThreadObservation(key, observation) } catch (error) {
+          if (supersededNow(observation.lifetime)) return report(outcomeOf('superseded', observation))
+          return report(outcomeOf(durable ? 'pending' : 'gap', observation, { reason: 'storage', error }))
+        }
+        install(key, { v: 1, kind: 'thread-participation', seq: 0, state: 'cancelled', observation })
+        settled(key, observation.lifetime.channel, observation.root)
+        return report(outcomeOf('ineligible', observation, { missing: [], reason: eligibility.reason }))
+      }
+      const { reason: _reason, ...post } = observation.post
+      return saveOwnPost({ ...observation, policy: { mode: eligibility.mode, delivery: eligibility.delivery }, post: { ...post, missing: [] } }, 'enrolled')
+    },
+    ownPostFindings(key) {
+      return [...records].filter(([k]) => key === undefined || key === k).flatMap(([k, own]) => [...own.values()]
+        .filter(r => r.state === 'observed' && r.observation.post && status(r.observation.lifetime) !== 'superseded')
+        .map(r => durableCopy(k, r.observation.id) ? outcomeOf('pending', r.observation) : outcomeOf('gap', r.observation, { reason: 'storage' })))
     },
     stop() { stopped = true },
   }

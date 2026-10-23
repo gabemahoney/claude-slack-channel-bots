@@ -153,6 +153,7 @@ import {
   describeDmDestinationRefusal,
   destinationSettingFrom,
   safeFailureCode,
+  type DestinationPosted,
   type DestinationSlackClient,
   type DestinationStep,
   type PersonaDestinations,
@@ -425,6 +426,12 @@ const payloadRejections = new Map<string, PayloadRejection>()
  */
 const failedRequests = new Set<string>()
 /**
+ * Composite keys of open requests whose prompt Slack confirmed without a
+ * timestamp: posted, so never posted again, but not answerable through
+ * metadata that does not exist. Forgotten as `unpostedPrompts` is.
+ */
+const postedWithoutTs = new Set<string>()
+/**
  * Composite keys of tracked entries whose closing threw, so the line is
  * logged once per entry. Apart from `failedRequests`, so a prompt failure's
  * key cannot silence a closing failure. A key is forgotten once its entry is
@@ -448,7 +455,7 @@ interface PerRequestRecord {
 
 /** The records kept per open request or tracked entry by composite key, other than the live entries. */
 function perRequestRecords(): PerRequestRecord[] {
-  return [unpostedPrompts, payloadRejections, failedRequests, failedClosings]
+  return [unpostedPrompts, payloadRejections, failedRequests, failedClosings, postedWithoutTs]
 }
 /** instance_id → wedge-detector state (F4). */
 const wedgeStates = new Map<string, WedgeState>()
@@ -556,6 +563,7 @@ export function _resetPollerState(): void {
   payloadRejections.clear()
   failedRequests.clear()
   failedClosings.clear()
+  postedWithoutTs.clear()
   failedRows.clear()
   tickFailing = false
   wedgeStates.clear()
@@ -763,6 +771,12 @@ export function buildFallbackPromptRejectedLine(
     `(the short prompt's message was rejected too; nothing more is posted for this request)${failureTail}`
 }
 
+/** A prompt Slack accepted without returning a ts: posted, never posted again, not answerable from Slack. Pure. */
+export function buildPromptPostedWithoutTsLine(instanceId: string, requestToken: string): string {
+  return `[slack] permission-poller: chat.postMessage returned no ts for ${instanceId} ` +
+    `(request_token=${requestToken}) — posted but not answerable from Slack; not posted again`
+}
+
 /** A throw past the tick's catches, caught by the interval's last-resort catch. Pure. */
 export function buildTickFailedLine(description: string): string {
   return `[slack] permission-poller: tick failed — the rest of it skipped: ${description}`
@@ -902,6 +916,7 @@ async function postWedgeWarning(
   instanceId: string,
   persona: Persona,
   text: string,
+  onPosted?: () => void,
 ): Promise<boolean> {
   const ref = renderPersonaRef(persona.name, persona.key)
   const web = deps.clientFor(persona.key)
@@ -914,9 +929,10 @@ async function postWedgeWarning(
     return false
   }
   const emit = deps.emitTrail ?? defaultEmitTrail
-  const result = await attempt.post(persona, web, { text })
+  const result = await attempt.post(persona, web, { text }, { surface: 'warning', onPosted })
   if (result.outcome === 'refused') return false
   if (result.outcome === 'posted') {
+    onPosted?.()
     emit({
       event: 'cscb.poller.wedge_detected',
       instance_id: instanceId,
@@ -1006,10 +1022,13 @@ async function observeWedgeCandidate(
       deps,
       `[slack] permission-poller: spawn ${instanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
     )
-    const warned = await postWedgeWarning(deps, attempt, instanceId, persona, text)
-    // F3: latch only on success; a failed post leaves warningFired false so
-    // a subsequent tick retries and exactly one message lands on recovery.
-    if (warned) state.warningFired = true
+    // F3: latch only on success, at the success response, so a later
+    // trail, log or enrollment fault cannot hide it; a failed post leaves
+    // warningFired false so a subsequent tick retries and exactly one
+    // message lands on recovery.
+    const latch = () => { state.warningFired = true }
+    const warned = await postWedgeWarning(deps, attempt, instanceId, persona, text, latch)
+    if (warned) latch()
   } finally {
     attempt.release()
   }
@@ -1449,7 +1468,7 @@ async function dispatchPermissionPrompt(
   compositeKey: string,
 ): Promise<void> {
   const rejection = payloadRejections.get(compositeKey)
-  if (rejection?.stage === 'skipped') return
+  if (rejection?.stage === 'skipped' || postedWithoutTs.has(compositeKey)) return
   const ref = renderPersonaRef(persona.name, persona.key)
   const destinations = destinationsFor(deps)
   const refusal = destinations.refusalOf(persona)
@@ -1599,7 +1618,28 @@ async function postPermissionPrompt(
   const { text, blocks } = prompt
   const emit = deps.emitTrail ?? defaultEmitTrail
   const compositeKey = makeCompositeKey(row.instance_id, permission.request_token)
-  const result = await attempt.post(persona, web, { text, blocks })
+  // Registered at the success response, before the hold, enrollment or trail
+  // bookkeeping can fail, so a posted prompt stays answerable and is never posted again.
+  const register = (posted: DestinationPosted) => {
+    if (posted.ts) {
+      livePermissions.set(compositeKey, {
+        instanceId: row.instance_id,
+        requestToken: permission.request_token,
+        personaKey: persona.key,
+        channelId: posted.channelId,
+        messageTs: posted.ts,
+        requestId: permission.request_id,
+        handled: false,
+        relayFallbackShown: permission.delivery === 'fallen_back',
+        awaitingDelivery: permission.delivery === 'not_confirmed' && permission.decision !== null,
+      })
+    } else {
+      postedWithoutTs.add(compositeKey)
+    }
+    payloadRejections.delete(compositeKey)
+    failedRequests.delete(compositeKey)
+  }
+  const result = await attempt.post(persona, web, { text, blocks }, { surface: 'prompt', onPosted: register })
   if (result.outcome === 'refused') return
   if (result.outcome === 'failed') {
     // failures land in BOTH server.log (real-time visibility) AND the
@@ -1638,23 +1678,8 @@ async function postPermissionPrompt(
   }
   const channelId = result.channelId
   const messageTs = result.ts
-  if (messageTs) {
-    // registered before the trail event, so a throwing emitter cannot
-    // leave a posted prompt untracked (and posted again next tick).
-    livePermissions.set(compositeKey, {
-      instanceId: row.instance_id,
-      requestToken: permission.request_token,
-      personaKey: persona.key,
-      channelId,
-      messageTs,
-      requestId: permission.request_id,
-      handled: false,
-      relayFallbackShown: permission.delivery === 'fallen_back',
-      awaitingDelivery: permission.delivery === 'not_confirmed' && permission.decision !== null,
-    })
-    payloadRejections.delete(compositeKey)
-    failedRequests.delete(compositeKey)
-  }
+  // A resolver that did not run the callback still registers before the trail event.
+  if (!livePermissions.has(compositeKey) && !postedWithoutTs.has(compositeKey)) register(result)
   // emit on success (and on the no-ts edge case below) with the
   // Slack-returned ts. Full text + blocks pass through verbatim.
   emit({
@@ -1668,7 +1693,7 @@ async function postPermissionPrompt(
     slack_ts: messageTs,
   })
   if (!messageTs) {
-    logViaDeps(deps, `[slack] permission-poller: chat.postMessage returned no ts for ${row.instance_id}`)
+    logViaDeps(deps, buildPromptPostedWithoutTsLine(row.instance_id, permission.request_token))
   }
 }
 

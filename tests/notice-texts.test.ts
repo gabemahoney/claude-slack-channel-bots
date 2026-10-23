@@ -16,7 +16,9 @@
  * closing and each form, with no description and with both, and its survivor
  * version for each pid list and closing; the `ErrInvalidFlags` hold
  * the unclassified-error alert; slow recovery
- * typed delivery notices; the
+ * typed delivery notices; the own-post participation notice for every
+ * pending missing-evidence set, every gap cause and each identifier form
+ * (`OWN_POST_FINDING_VARIANTS`); the
  * permission wedge warning; the startup-errors entries' texts
  * the stuck-launch posts, the held
  * one with and without the attach line; the `ad-config-malformed`
@@ -69,6 +71,15 @@
  * - the completeness guard holds every id from the contract either
  *     in the catalogue or in `NOT_APPLICABLE` with its reason, never both,
  *     and every notice in `NAMED_SLACK_NOTICES` in every variant;
+ *   - each own-post notice carries its own state's exported action and
+ *     never the other state's, a gap never the pending recovery promise;
+ *     the notice and line offer the new mention only for a known thread
+ *     outside an `off` channel, and the storage cause's mention waits on
+ *     saving; its `own-post-not-enrolled` line, cap line and dropped-outcomes
+ *     line are one line each, the finding line names the state, cause and
+ *     action and carries an error only as its code, and each passes
+ *     `assertNoLeak`; the hold settle-failure and no-ts prompt lines are one
+ *     line of safe identifiers that pass `assertNoLeak`;
  *   - self-checks show each pattern finds what it looks for, and that
  *     agent-director's words in a quoted description would fail the checks
  *     if the own-lines helper stopped removing the description.
@@ -153,8 +164,20 @@ import {
   buildMessageNotTakenInNotice,
   buildMessagesWaitingNotice,
   buildQueueRecordUnreadableNotice,
+  buildOwnPostFindingsCappedLine,
+  buildOwnPostNotEnrolledLine,
+  buildOwnPostNotEnrolledNotice,
+  buildOwnPostOutcomesDroppedLine,
   MESSAGES_WAITING_STATES,
+  OWN_POST_FINDING_CAUSES,
+  OWN_POST_FINDINGS_LOGGED_PER_PERSONA,
+  OWN_POST_NOT_ENROLLED,
+  ownPostFindingAction,
+  ownPostFindingCause,
+  ownPostMentionApplies,
   type DeliveryStuckReason,
+  type OwnPostFinding,
+  type OwnPostFindingCause,
 } from '../src/delivery-notices.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from '../src/jsonl-persistence-check.ts'
@@ -191,8 +214,9 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { stuckLaunchHeldText, stuckLaunchRelaunchingText } from '../src/pending-row.ts'
-import { buildWedgeWarningText } from '../src/permission-poller.ts'
-import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
+import { buildPromptPostedWithoutTsLine, buildWedgeWarningText } from '../src/permission-poller.ts'
+import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
+import { buildHoldSettleFailedLine } from '../src/persona-destination-hold.ts'
 import {
   killFailureStoppedRetryText,
   personaUnclassifiedErrorEntryText,
@@ -224,6 +248,7 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
+import { OWN_POST_GAP_CAUSES, OWN_POST_MISSING } from '../src/thread-participation.ts'
 
 import {
   cannedGetResult,
@@ -735,6 +760,96 @@ function deliveryEntries(): NoticeEntry[] {
   ]
 }
 
+/** A confirmed own post's identifiers: its channel, returned ts, requested parent, completed file and operation. */
+const OWN_POST_CHANNEL = 'C0OWNPOST1'
+const OWN_POST_TS = '1700000000.000200'
+const OWN_POST_PARENT = '1700000000.000100'
+const OWN_POST_FILE = 'F0OWNPOST1'
+const OWN_POST_OPERATION = '00000000-0000-4000-8000-000000000001'
+
+/** A gap's error: an errno-style code over a message carrying a fake token, which no rendering may show. */
+function ownPostError(label: string): Error {
+  return Object.assign(new Error(sentinelInMessage(label)), { code: 'EIO' })
+}
+
+/**
+ * Every own-post finding the reporter can render: each pending missing-evidence
+ * set, each gap cause, the ts, file and channel-only forms, and findings with
+ * and without the new-mention guidance (a known root under `mentions`, a known
+ * thread under `off`, a known root with no recorded choice, and rootless posts).
+ */
+const OWN_POST_FINDING_VARIANTS: readonly (readonly [variant: string, finding: OwnPostFinding])[] = [
+  ['pending, root missing: a prompt Slack returned no ts for', {
+    kind: 'pending', surface: 'prompt', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, missing: ['root'],
+  }],
+  ['pending, root missing: a file completion', {
+    kind: 'pending', surface: 'file', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, file: OWN_POST_FILE, missing: ['root'],
+  }],
+  ['pending, channel eligibility missing: a reply chunk', {
+    kind: 'pending', surface: 'text', operation: OWN_POST_OPERATION, part: 2, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, parent: OWN_POST_PARENT,
+    missing: ['channel-eligibility'], reason: 'current-membership-missing',
+  }],
+  ['pending, root and channel eligibility missing: a warning', {
+    kind: 'pending', surface: 'warning', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL,
+    missing: ['root', 'channel-eligibility'], reason: 'choice-missing',
+  }],
+  // A storage gap keeps the evidence's applied choice; the others have none.
+  ...OWN_POST_GAP_CAUSES.map((reason): readonly [string, OwnPostFinding] => [`gap, ${reason}: a root post${reason === 'storage' ? ' in a mentions channel' : ''}`, {
+    kind: 'gap', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, missing: [], reason,
+    ...(reason === 'storage' ? { delivery: 'mentions', error: ownPostError(`own-post-${reason}`) } : {}),
+  }]),
+  ['gap, storage: a file completion', {
+    kind: 'gap', surface: 'file', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, file: OWN_POST_FILE, missing: [], reason: 'storage',
+    error: ownPostError('own-post-file-storage'),
+  }],
+  ['gap, operation: a file completion', {
+    kind: 'gap', surface: 'file', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, file: OWN_POST_FILE, missing: [], reason: 'operation',
+  }],
+  ['gap, operation: a prompt Slack returned no ts for', {
+    kind: 'gap', surface: 'prompt', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, missing: [], reason: 'operation',
+  }],
+  ['pending, channel eligibility missing: a reply chunk under a known root in a mentions channel', {
+    kind: 'pending', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, parent: OWN_POST_PARENT,
+    root: OWN_POST_PARENT, delivery: 'mentions', missing: ['channel-eligibility'], reason: 'current-membership-missing',
+  }],
+  ['pending, channel eligibility missing: a reply chunk in an off channel', {
+    kind: 'pending', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, parent: OWN_POST_PARENT,
+    root: OWN_POST_PARENT, delivery: 'off', missing: ['channel-eligibility'], reason: 'current-membership-missing',
+  }],
+  ['pending, channel eligibility missing: a reply chunk under a known root whose channel choice is unknown', {
+    kind: 'pending', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, parent: OWN_POST_PARENT,
+    root: OWN_POST_PARENT, missing: ['channel-eligibility'], reason: 'choice-missing',
+  }],
+  ['gap, storage: a root post in an off channel', {
+    kind: 'gap', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, delivery: 'off', missing: [], reason: 'storage',
+    error: ownPostError('own-post-off-storage'),
+  }],
+]
+
+/**
+ * The sentence `ownPostFindingAction` appends for `cause` when the new mention
+ * applies, taken from the builder: its action with the mention less its action
+ * without.
+ */
+function ownPostMentionSentence(cause: OwnPostFindingCause, gap: boolean): string {
+  const without = ownPostFindingAction(cause, gap, false), withMention = ownPostFindingAction(cause, gap, true)
+  if (!withMention.startsWith(without) || withMention === without) throw new Error(`the ${cause} action no longer appends its new-mention sentence`)
+  return withMention.slice(without.length).trim()
+}
+/** What every cause's new-mention sentence shares: its general form without the full stop. */
+const OWN_POST_MENTION_STEM = ownPostMentionSentence('root-metadata', false).replace(/\.$/, '')
+
+/** Which identifier a finding's notice names besides its channel. */
+function ownPostForm(finding: OwnPostFinding): 'ts' | 'file' | 'channel only' {
+  return finding.ts ? 'ts' : finding.file ? 'file' : 'channel only'
+}
+
+/** The own-post notice delivery reporting posts once per episode, in every finding variant. */
+function ownPostEntries(): NoticeEntry[] {
+  return OWN_POST_FINDING_VARIANTS.map(([variant, finding]) =>
+    entry("common", buildOwnPostNotEnrolledNotice.name, variant, () => buildOwnPostNotEnrolledNotice(PERSONA.name, finding)))
+}
+
 /** The JSONL persistence safeguard's storage and AD-reference notices (keeps their text): one per variant. */
 const JSONL_NON_PERSISTENT = 'non-persistent storage'
 const JSONL_ROTATED = 'AD rotated transcript reference'
@@ -924,6 +1039,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...spawnFailureEntries(),
   ...notConnectedEntries(),
   ...deliveryEntries(),
+  ...ownPostEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
   ...capEntries(),
@@ -977,6 +1093,7 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildMessageNotTakenInNotice.name,
   buildMessagesWaitingNotice.name,
   buildQueueRecordUnreadableNotice.name,
+  buildOwnPostNotEnrolledNotice.name,
   runPersonaStorageCheck.name,
   runJsonlPersistenceSafeguard.name,
   jsonlRowAbsentInconclusiveNoticeText.name,
@@ -1139,6 +1256,37 @@ describe('the notice catalogue is complete (to, and every named Slack notice)', 
     expect(variantsOf(buildDeliveryStuckNotice.name)).toEqual([...DELIVERY_STUCK_REASONS])
     expect(variantsOf(buildMessagesWaitingNotice.name)).toEqual([...MESSAGES_WAITING_STATES])
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_ROTATED])
+    expect(variantsOf(buildOwnPostNotEnrolledNotice.name)).toEqual(OWN_POST_FINDING_VARIANTS.map(([variant]) => variant))
+  })
+
+  test('the own-post notice variants cover each state, cause, gap cause, missing-evidence set and identifier form', () => {
+    const findings = OWN_POST_FINDING_VARIANTS.map(([, finding]) => finding)
+    const pending = findings.filter((f) => f.kind === 'pending'), gaps = findings.filter((f) => f.kind === 'gap')
+    expect(pending.length + gaps.length).toBe(findings.length)
+    expect([...new Set(findings.map(ownPostFindingCause))].sort()).toEqual([...OWN_POST_FINDING_CAUSES].sort())
+    expect([...new Set(gaps.map((f) => f.reason))].sort()).toEqual([...OWN_POST_GAP_CAUSES].sort())
+    expect(gaps.every((f) => f.missing.length === 0)).toBe(true)
+    // Every nonempty set of missing evidence a pending post can hold.
+    const subsets = Array.from({ length: 2 ** OWN_POST_MISSING.length - 1 }, (_, i) =>
+      OWN_POST_MISSING.filter((_m, bit) => ((i + 1) >> bit) & 1).join(','))
+    expect([...new Set(pending.map((f) => [...f.missing].sort().join(',')))].sort()).toEqual(subsets.map((s) => s.split(',').sort().join(',')).sort())
+    const forms: ReturnType<typeof ownPostForm>[] = ['channel only', 'file', 'ts']
+    expect({ pending: [...new Set(pending.map(ownPostForm))].sort(), gap: [...new Set(gaps.map(ownPostForm))].sort() }).toEqual({ pending: forms, gap: forms })
+    // With and without the new-mention guidance: a known root under `mentions`,
+    // a known thread under `off` in each state, a known root with no recorded
+    // choice, a rootless post, and a storage gap with a known non-off choice.
+    expect({
+      knownRootMentions: findings.some((f) => f.root !== undefined && f.delivery === 'mentions'),
+      offPending: pending.some((f) => f.delivery === 'off' && (f.root ?? f.ts) !== undefined),
+      offGap: gaps.some((f) => f.delivery === 'off' && (f.root ?? f.ts) !== undefined),
+      knownRootUnknownChoice: findings.some((f) => f.root !== undefined && !f.missing.includes('root') && f.delivery === undefined),
+      rootless: findings.some((f) => f.missing.includes('root')),
+      storageGapKnownChoice: gaps.some((f) => f.reason === 'storage' && (f.root ?? f.ts) !== undefined && f.delivery !== undefined && f.delivery !== 'off'),
+      storageGapWithMention: gaps.some((f) => f.reason === 'storage' && ownPostMentionApplies(f)),
+    }).toEqual({
+      knownRootMentions: true, offPending: true, offGap: true, knownRootUnknownChoice: true, rootless: true,
+      storageGapKnownChoice: true, storageGapWithMention: true,
+    })
   })
 
   test('each ErrJsonlMissing diagnosis notice is a named Slack notice with a quoting row and a redaction-and-cap row', () => {
@@ -1494,5 +1642,122 @@ describe('a description quoted from agent-director is redacted and capped at MAX
     const quoting = new Set(NOTICE_CATALOGUE.filter((e) => redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
     const capped = new Set(capRows.map(([, e]) => e.builder))
     expect([...quoting].filter((builder) => !capped.has(builder)).sort()).toEqual([])
+  })
+})
+
+describe('own-post findings: the notice tells pending from gap, and the line names identifiers only', () => {
+  // Mention-free, so each is a prefix of the same action with the mention.
+  const pendingActions = OWN_POST_FINDING_CAUSES.map((cause) => ownPostFindingAction(cause, false, false))
+
+  test.each(OWN_POST_FINDING_VARIANTS)('%s: the notice names the post and only its own state\'s action', (_variant, finding) => {
+    const text = buildOwnPostNotEnrolledNotice(PERSONA.name, finding)
+    const cause = ownPostFindingCause(finding), gap = finding.kind === 'gap'
+    expect({
+      channel: text.includes(OWN_POST_CHANNEL),
+      identifier: finding.ts ? text.includes(finding.ts) : finding.file ? text.includes(finding.file) : true,
+      ownAction: text.includes(ownPostFindingAction(cause, gap, ownPostMentionApplies(finding))),
+      otherStateAction: text.includes(ownPostFindingAction(cause, !gap, false)),
+      // A gap kept no durable copy, so it never says CSCB keeps the evidence.
+      gapPromisesRecovery: gap && pendingActions.some((action) => text.includes(action)),
+    }).toEqual({ channel: true, identifier: true, ownAction: true, otherStateAction: false, gapPromisesRecovery: false })
+  })
+
+  // The rule held independently of `ownPostMentionApplies`: a mention enrolls
+  // only a known thread, an `off` channel delivers no mention, and an unknown
+  // choice may be `off`.
+  test.each(OWN_POST_FINDING_VARIANTS)('%s: the notice and line offer a new mention only for a known thread in a channel whose known choice is not off', (_variant, finding) => {
+    const text = buildOwnPostNotEnrolledNotice(PERSONA.name, finding)
+    const line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
+    const cause = ownPostFindingCause(finding), gap = finding.kind === 'gap'
+    const offered = ownPostMentionApplies(finding)
+    const threadUnknown = finding.missing.includes('root') || (finding.root ?? finding.parent ?? finding.ts) === undefined
+    const choiceAllows = finding.delivery !== undefined && finding.delivery !== 'off'
+    expect({
+      offeredWhereForbidden: offered && (!choiceAllows || threadUnknown),
+      withheldFromKnownThread: !offered && !threadUnknown && choiceAllows,
+      noticeMention: text.includes(OWN_POST_MENTION_STEM),
+      noticeOwnSentence: text.includes(ownPostMentionSentence(cause, gap)),
+      lineMention: line.includes(OWN_POST_MENTION_STEM),
+    }).toEqual({ offeredWhereForbidden: false, withheldFromKnownThread: false, noticeMention: offered, noticeOwnSentence: offered, lineMention: offered })
+  })
+
+  test('the storage cause conditions its new mention on saving working again; the other causes do not', () => {
+    const general = ownPostMentionSentence('root-metadata', false)
+    const storage = ownPostMentionSentence('storage', true)
+    expect(storage.startsWith(OWN_POST_MENTION_STEM)).toBe(true)
+    expect(storage).not.toBe(general)
+    for (const cause of OWN_POST_FINDING_CAUSES.filter((c) => c !== 'storage')) {
+      expect({ cause, pending: ownPostMentionSentence(cause, false), gap: ownPostMentionSentence(cause, true) }).toEqual({ cause, pending: general, gap: general })
+    }
+    expect(ownPostMentionSentence('storage', false)).toBe(storage)
+  })
+
+  test.each(OWN_POST_FINDING_VARIANTS)('%s: the line is one line of identifiers, state, cause and an error code only', (_variant, finding) => {
+    const line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
+    const cause = ownPostFindingCause(finding)
+    assertNoLeak(line, 'own-post line')
+    expect({
+      prefix: line.startsWith(`[slack] ${OWN_POST_NOT_ENROLLED}: persona=`),
+      oneLine: !/[\r\n]/.test(line),
+      state: line.includes(` state=${finding.kind} `),
+      cause: line.includes(` cause=${cause} `),
+      code: finding.error === undefined ? !line.includes(' code=') : line.includes(' code=EIO '),
+      action: line.endsWith(` action=${JSON.stringify(ownPostFindingAction(cause, finding.kind === 'gap', ownPostMentionApplies(finding)))}`),
+    }).toEqual({ prefix: true, oneLine: true, state: true, cause: true, code: true, action: true })
+  })
+
+  test('the cap line names the per-persona limit and leaks nothing', () => {
+    const line = buildOwnPostFindingsCappedLine(PERSONA.name)
+    assertNoLeak(line, 'own-post cap line')
+    expect(line.startsWith(`[slack] ${OWN_POST_NOT_ENROLLED}: persona=`)).toBe(true)
+    expect(line).toContain(`limit=${OWN_POST_FINDINGS_LOGGED_PER_PERSONA}`)
+  })
+
+  test('the dropped-outcomes line is one line naming its count and leaks nothing', () => {
+    const line = buildOwnPostOutcomesDroppedLine(PERSONA.name, 7)
+    assertNoLeak(line, 'own-post dropped line')
+    expect({
+      prefix: line.startsWith(`[slack] ${OWN_POST_NOT_ENROLLED}: persona=`),
+      oneLine: !/[\r\n]/.test(line),
+      count: line.includes(' dropped=7 '),
+    }).toEqual({ prefix: true, oneLine: true, count: true })
+  })
+
+  test('self-check: the leak check catches a gap\'s raw error message beside its line', () => {
+    const [, finding] = OWN_POST_FINDING_VARIANTS.find(([, f]) => f.error !== undefined)!
+    const line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
+    expect(() => assertNoLeak(`${line} ${(finding.error as Error).message}`, 'own-post line with raw error')).toThrow()
+  })
+})
+
+describe('the lines for a fault after a confirmed post are one line of safe identifiers', () => {
+  const settleError = () => Object.assign(new Error(sentinelInMessage('hold-settle')), { code: 'EIO' })
+  const REQUEST_TOKEN = 'req-own-post-0001'
+
+  test('the hold settle-failure line names the persona and carries the fault only as its safe description', () => {
+    const line = buildHoldSettleFailedLine(KEY, describeThrownValue(settleError()))
+    assertNoLeak(line, 'hold settle-failure line')
+    expect({
+      prefix: line.startsWith('[slack] persona-destination-hold: '),
+      oneLine: !/[\r\n]/.test(line),
+      persona: line.includes(`persona=${KEY}:`),
+      code: line.includes('code=EIO'),
+    }).toEqual({ prefix: true, oneLine: true, persona: true, code: true })
+  })
+
+  test('self-check: the hold line does not redact a raw message itself, so the leak check catches one', () => {
+    expect(() => assertNoLeak(buildHoldSettleFailedLine(KEY, settleError().message), 'hold line with raw message')).toThrow()
+  })
+
+  test('the no-ts prompt line names the instance and request token and leaks nothing', () => {
+    const instance = personaInstanceId(KEY)
+    const line = buildPromptPostedWithoutTsLine(instance, REQUEST_TOKEN)
+    assertNoLeak(line, 'no-ts prompt line')
+    expect({
+      prefix: line.startsWith('[slack] permission-poller: '),
+      oneLine: !/[\r\n]/.test(line),
+      instance: line.includes(instance),
+      token: line.includes(`request_token=${REQUEST_TOKEN}`),
+    }).toEqual({ prefix: true, oneLine: true, instance: true, token: true })
   })
 })

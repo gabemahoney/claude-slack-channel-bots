@@ -33,7 +33,14 @@
  * PERSONA_DIAGNOSTIC_CLASSES (imported, side-effect free) names a `##`–`####`
  * heading in the skill (the skill gives each class a `###` heading naming it),
  * so a class added without a skill entry, or an entry cut down to a passing
- * mention, fails here. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
+ * mention, fails here. The `own-post-not-enrolled` entry also names its
+ * line's state, missing, cause and action fields and every state,
+ * missing-evidence and cause value (`OWN_POST_MISSING`,
+ * `OWN_POST_FINDING_CAUSES`), and quotes the cap line from its `limit=`, the
+ * dropped-outcomes line from its `dropped=`, the remedy every gap action
+ * shares and the conditional new-mention sentence with its storage condition,
+ * and names the `off` choice the mention is never offered for, each from the
+ * exported builders, with a self-check per requirement. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
  * side-effect free) gets the same heading check in its own `test.each`, plus
  * a non-empty, duplicate-free check on the list. The stored-choice store's
  * own closed list, CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES (src/channel-delivery.ts,
@@ -173,6 +180,15 @@ import {
   stateDirRepointedLine,
   stateDirRepointFailedLine,
 } from '../src/state-dir-migration.ts'
+import {
+  buildOwnPostFindingsCappedLine,
+  buildOwnPostOutcomesDroppedLine,
+  OWN_POST_FINDING_CAUSES,
+  OWN_POST_NOT_ENROLLED,
+  ownPostFindingAction,
+  type OwnPostFindingCause,
+} from '../src/delivery-notices.ts'
+import { OWN_POST_MISSING } from '../src/thread-participation.ts'
 import { DELIVERY_MODES, DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
@@ -565,6 +581,102 @@ describe('the debugging skill covers every persona diagnostic class', () => {
       }
     },
   )
+})
+
+/**
+ * What the `own-post-not-enrolled` entry must carry, each from the exported
+ * builders: the line's state, missing, cause and action fields; each state,
+ * missing-evidence and cause value as a whole word; the cap line from its
+ * `limit=`; the dropped-outcomes line from its `dropped=`; the gap remedy
+ * every gap cause shares (its repair limit), quoted; and the conditional
+ * new-mention sentence, quoted, with its storage condition and the `off`
+ * choice it is never offered for.
+ */
+const OWN_POST_ENTRY_VALUES: readonly string[] = [...new Set(['pending', 'gap', ...OWN_POST_MISSING, ...OWN_POST_FINDING_CAUSES])]
+
+/** The sentence `ownPostFindingAction` adds when the new mention applies, for `cause`. */
+function ownPostMentionSentence(cause: OwnPostFindingCause): string {
+  const without = ownPostFindingAction(cause, false, false), withMention = ownPostFindingAction(cause, false, true)
+  if (!withMention.startsWith(without) || withMention === without) throw new Error(`the ${cause} action no longer appends its new-mention sentence`)
+  return withMention.slice(without.length).trim()
+}
+
+/** The general new-mention sentence, and the condition the storage cause adds to it. */
+function ownPostMentionParts(): { mention: string; storageCondition: string } {
+  const mention = ownPostMentionSentence('root-metadata')
+  const storage = ownPostMentionSentence('storage')
+  const stem = mention.replace(/\.$/, '')
+  if (!storage.startsWith(stem) || storage === mention) throw new Error('the storage new-mention sentence no longer adds a condition')
+  return { mention, storageCondition: storage.slice(stem.length).replace(/^[,\s]+/, '').replace(/\.$/, '') }
+}
+
+/** The dropped-outcomes line from its `dropped=` field, with the count left out. */
+function ownPostDroppedTail(): string {
+  const line = buildOwnPostOutcomesDroppedLine('<key>', 3)
+  return line.slice(line.indexOf('dropped=3') + 'dropped=3'.length).trim()
+}
+
+function ownPostEntryRequirements(): [label: string, found: (entry: string) => boolean][] {
+  const word = (value: string) => (entry: string) => new RegExp(`(?<![\\w-])${escapeRegExp(value)}(?![\\w-])`).test(entry)
+  const cap = buildOwnPostFindingsCappedLine('<key>')
+  const gapActions = OWN_POST_FINDING_CAUSES.map((cause) => ownPostFindingAction(cause, true, false))
+  // The gap actions differ only in their first sentence.
+  const gapRemedy = gapActions[0].slice(gapActions[0].indexOf('. ') + 2)
+  if (!gapActions.every((action) => action.endsWith(` ${gapRemedy}`))) throw new Error('the gap actions no longer share their remedy')
+  const { mention, storageCondition } = ownPostMentionParts()
+  const dropped = ownPostDroppedTail()
+  return [
+    ...['state=', 'missing=', 'cause=', 'action='].map((field): [string, (entry: string) => boolean] => [`the ${field} field`, (entry) => entry.includes(field)]),
+    ...OWN_POST_ENTRY_VALUES.map((value): [string, (entry: string) => boolean] => [`the value ${value}`, word(value)]),
+    ['the cap line', (entry) => flat(entry).includes(flat(cap.slice(cap.indexOf('limit=')))) && entry.includes(`[slack] ${OWN_POST_NOT_ENROLLED}:`)],
+    ['the dropped line', (entry) => entry.includes('dropped=') && flat(entry).includes(flat(dropped))],
+    ['the gap remedy', (entry) => flat(entry).includes(flat(gapRemedy))],
+    ['the new-mention sentence', (entry) => flat(entry).includes(flat(mention))],
+    ['the storage condition on the new mention', (entry) => flat(entry).includes(flat(storageCondition))],
+    ['the off choice the new mention skips', word('off')],
+  ]
+}
+
+/** The labels of the requirements `entry` misses. */
+function ownPostEntryGaps(entry: string): string[] {
+  return ownPostEntryRequirements().filter(([, found]) => !found(entry)).map(([label]) => label)
+}
+
+describe(`the debugging skill's ${OWN_POST_NOT_ENROLLED} entry names what its line carries and the gap's repair limit`, () => {
+  test('the entry has every requirement', () => {
+    expect(ownPostEntryGaps(requiredSection(debugSkill(), classHeading(OWN_POST_NOT_ENROLLED), SKILL_REL))).toEqual([])
+  })
+
+  // A synthetic entry holding each requirement once, so a cut shows that requirement alone.
+  const cap = buildOwnPostFindingsCappedLine('<key>')
+  const gapAction = ownPostFindingAction('storage', true, false)
+  const { mention, storageCondition } = ownPostMentionParts()
+  const parts: [label: string, text: string][] = [
+    ['fields', 'state= missing= cause= action='],
+    ...OWN_POST_ENTRY_VALUES.map((value): [string, string] => [`the value ${value}`, value]),
+    ['the cap line', cap],
+    ['the dropped line', buildOwnPostOutcomesDroppedLine('<key>', 3)],
+    ['the gap remedy', gapAction.slice(gapAction.indexOf('. ') + 2)],
+    ['the new-mention sentence', mention],
+    ['the storage condition on the new mention', storageCondition],
+    ['the off choice the new mention skips', 'off'],
+  ]
+  const synthetic = (without?: string) => parts.filter(([label]) => label !== without).map(([, text]) => `- ${text}`).join('\n')
+
+  test('self-check: the synthetic entry passes', () => {
+    expect(ownPostEntryGaps(synthetic())).toEqual([])
+  })
+
+  test.each(parts.filter(([label]) => label !== 'fields').map(([label]) => [label] as const))(
+    'self-check: the synthetic entry without %s fails on it alone',
+    (label) => {
+      expect(ownPostEntryGaps(synthetic(label))).toEqual([label])
+    },
+  )
+
+  test('self-check: the synthetic entry without its fields fails on each field', () => {
+    expect(ownPostEntryGaps(synthetic('fields'))).toEqual(['state=', 'missing=', 'cause=', 'action='].map((field) => `the ${field} field`))
+  })
 })
 
 describe('the debugging skill covers every reload diagnostic class', () => {

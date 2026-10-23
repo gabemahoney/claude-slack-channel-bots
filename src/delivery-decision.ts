@@ -351,6 +351,11 @@ function decideFungibleChannel(
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all', fungible: path }
 }
 
+/** Whether a persona's configured channel entries name `channel`. Pure. */
+export function personaListsChannel(persona: { channels: readonly ChannelEntry[] } | undefined, channel: string): boolean {
+  return persona?.channels.some(entry => entry.id === channel) === true
+}
+
 /** No malformed thread identifier can be replaced with an invented root. */
 export function isThreadTimestamp(value: unknown): value is string {
   return typeof value === 'string' && /^\d+\.\d{6}$/.test(value)

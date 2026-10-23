@@ -168,7 +168,9 @@ export const QUEUE_RECORD_UNREADABLE = 'queue-record-unreadable'
 export const QUEUE_UNWRITABLE = 'queue-unwritable'
 export const QUEUE_KEPT = 'queue-kept'
 export const SYSTEM_PROMPT_UNWRITABLE = 'system-prompt-unwritable'
-export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
+/** A confirmed own post whose thread participation is pending or could not be saved. */
+export const OWN_POST_NOT_ENROLLED = 'own-post-not-enrolled'
+export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, OWN_POST_NOT_ENROLLED] as const
 export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 /** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
