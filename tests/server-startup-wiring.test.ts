@@ -72,6 +72,7 @@ import type * as SessionManagerModule from '../src/session-manager.ts'
 import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
 import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
 import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
+import type * as ThreadParticipationModule from '../src/thread-participation.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
@@ -4277,6 +4278,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
+      'getParticipation', 'currentProvenance', 'onParticipationFailure', 'onParticipationSettled', 'beginIntake',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5428,6 +5430,58 @@ describe('delivery ownership wiring', () => {
     const reconnect = onlyCallProps('createDeliveryEngines').get('reconnect')!
     expect(reconnect).toContain('deliveryScope.run(key, client as Client, beforeCall, async () =>')
     expect(reconnect).toContain('await deferredReconnect(key)')
+  })
+})
+
+describe('participation recovers before intake and shares the production owners', () => {
+  const factory: keyof typeof ThreadParticipationModule = 'createThreadParticipation'
+  const holder = 'threadParticipation'
+
+  test('queue replay completes before authority recovery and participation starts before any admission', () => {
+    const queueStart = onlyCallOf('deliveryQueue.start')
+    const built = onlyCallOf(factory)
+    const started = onlyCallOf(`${holder}.start`)
+    const resolution = startResolution(SERVER_CODE)
+    expect(importSource(SERVER_CODE, factory)).toBe('./thread-participation.ts')
+    declaredOnce(holder)
+    expect(assignmentsTo(holder).map(({ value }) => value)).toEqual([
+      'createThreadParticipation({ queue: deliveryQueue, authority: reload.sharedChannels()! })',
+    ])
+    expect([...onlyCallProps(factory)]).toEqual([
+      ['queue', 'deliveryQueue'], ['authority', `${resolution.controller}.sharedChannels()!`],
+    ])
+    expect(onlyCallArgs(`${holder}.start`)).toEqual([])
+    expect(SERVER_CODE.slice(queueStart - 'await '.length, queueStart)).toBe('await ')
+    const ordered = [onlyCallOf('checkPidConflict'), onlyCallOf('createDeliveryQueue'), queueStart,
+      resolution.resolveAt, resolution.assignAt, onlyCallOf('createChannelMembership'), built, started,
+      onlyCallOf('createPersonaConnectionManager'), onlyCallOf('Bun.serve'), resolution.bringUpAt]
+    expect(ordered).toEqual([...ordered].sort((a, b) => a - b))
+    for (const at of [queueStart, resolution.resolveAt, built, started]) expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  })
+
+  test('routing reads the current owner and authenticated connection provenance, and reports unresolved obligations separately', () => {
+    const props = onlyCallProps('createPersonaRouting')
+    const bindings: Array<[keyof PersonaRoutingDeps, string]> = [
+      ['getParticipation', `() => ${holder}`],
+      ['currentProvenance', 'key => connections?.provenance(key)'],
+      ['onParticipationFailure', '(key, id, event, error, unaccepted) => deliveryReporting?.participationFailed(key, id, event, error, unaccepted)'],
+      ['onParticipationSettled', '(key, id) => deliveryReporting?.participationSettled(key, id)'],
+      ['beginIntake', 'key => deliveryReporting?.beginIntake(key) ?? (() => {})'],
+    ]
+    for (const [member, binding] of bindings) expect(props.get(member)).toBe(binding)
+  })
+
+  test('shutdown stops intake and participation before draining preparation and closing the journal', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const code = SERVER_CODE.slice(start, end)
+    const calls = ['personaRouting.stop', `${holder}?.stop`, 'deliveryPreparation?.stop', 'deliveryQueue?.stop']
+    const offsets = calls.map(name => {
+      const at = indicesOf(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(', 'g'), code)
+      expect(at).toHaveLength(1)
+      expect(callArguments(code, at[0]!)).toBe('')
+      return at[0]!
+    })
+    expect(offsets).toEqual([...offsets].sort((a, b) => a - b))
   })
 })
 

@@ -10,6 +10,7 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { deliveredRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { THREAD_ROOT } from './test-helpers/thread-participation.ts'
 
 let dir: string
 let queues: ReplyReminderQueue[]
@@ -40,7 +41,7 @@ function harness(queue: ReplyReminderQueue, options: { prepare?: (key: string, i
   return { clock, row, monitor, prepared, errors, readKeys, reads: () => reads,
     next(fn: (current: () => boolean) => Promise<GetResult | undefined>) { next = fn }, ready(value: boolean, key?: string) { if (key) readyFor.set(key, value); else ready = value }, enabled(value: boolean) { enabled = value } }
 }
-async function send(queue: ReplyReminderQueue, key = 'alpha', input: AcceptedInput = slackInput(), complete = true) {
+async function send(queue: ReplyReminderQueue, key = 'alpha', input: AcceptedInput = slackInput({ via: 'thread', thread_ts: THREAD_ROOT }), complete = true) {
   const accepted = await queue.accept(key, input)
   if (accepted.status !== 'accepted') throw new Error('fixture acceptance failed')
   const seq = accepted.seq

@@ -1,6 +1,7 @@
 import { mkdtempSync } from 'node:fs'
 
-import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, type DeliveryQueueOptions, type QueueItem } from '../../src/delivery-queue.ts'
+import { createThreadParticipation, type ThreadParticipation } from '../../src/thread-participation.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -23,7 +24,7 @@ import {
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { createChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
 import { createSharedChannelAuthority } from '../../src/shared-channels.ts'
-import { configBytes, initialSharedState, readSharedState, sharedChannelPath } from './shared-channels.ts'
+import { configBytes, initialSharedState, readSharedState, sharedChannelPath, writeSharedState } from './shared-channels.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
@@ -462,6 +463,10 @@ export interface PersonaHandle {
 }
 
 export interface RoutingHarnessOptions {
+  onReplyCall?: SessionToolDeps['onReplyCall']
+  participation?: boolean
+  queueOptions?: Omit<DeliveryQueueOptions, 'stateDir' | 'now'>
+  routingHooks?: Pick<PersonaRoutingDeps, '_afterObservation' | '_afterAcceptance' | 'onReceived' | 'currentProvenance' | 'onParticipationFailure' | 'onParticipationSettled' | 'beginIntake'>
   /** Caller-supplied current observations, never inferred from configuration. */
   membership?: PersonaRoutingDeps['membership']
   /** Names with a registered session; default every persona. */
@@ -621,6 +626,10 @@ export interface HarnessPost {
 }
 
 export interface RoutingHarness {
+  ready: Promise<void>
+  routing: ReturnType<typeof createPersonaRouting>
+  participation?: ThreadParticipation
+  close(): Promise<void>
   queue: ReturnType<typeof createDeliveryQueue>
   queued(name: string): QueueItem[]
   /** The applied config the routing reads at call time; set to null for none, or edit it. */
@@ -879,6 +888,8 @@ export function makeRoutingHarness(
   async function reply(name: string, args: Record<string, unknown>): Promise<void> {
     const { persona } = byName(name)
     const deps: SessionToolDeps = {
+      onReplyCall: opts.onReplyCall,
+      log: line => h.logs.push(line),
       assertSendable: () => {},
       getReplySettings,
       getPersona,
@@ -912,9 +923,12 @@ export function makeRoutingHarness(
     }
   }
 
-  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock })
+  const queue = createDeliveryQueue({ ...opts.queueOptions, stateDir: baseDir, now: opts.dedupeClock })
   const queueReady = queue.start()
   const h: RoutingHarness = {
+    ready: queueReady,
+    get routing() { return routing },
+    async close() { routing.stop(); h.participation?.stop(); await preparation.stop(); h.hold.cancelAll(); h.releaseLaunches(); await queue.stop() },
     queue,
     queued: name => queue.items(byName(name).persona.key),
     config,
@@ -951,13 +965,13 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: async (event, names, ack, envelope) => { await queueReady; return routing.receive(
+    receive: async (event, names, ack, envelope) => { await h.ready; return routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
       envelopeFlagOf(envelope),
     ) },
-    receiveKeys: async (event, keys, envelope) => { await queueReady; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
+    receiveKeys: async (event, keys, envelope) => { await h.ready; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
     setMode: (mode) => {
       h.config = configIn(mode)
     },
@@ -1018,6 +1032,7 @@ export function makeRoutingHarness(
     const stateDir = opts.channelDelivery?.stateDir ?? mkdtempSync(join(baseDir, 'routing-authority-'))
     const raw = { ...config, personas: config.personas.map(({ index, key, sections, ...persona }) => persona) }
     const state = readSharedState(stateDir) ?? initialSharedState(stateDir, raw)
+    if (opts.participation && !readSharedState(stateDir)) writeSharedState(stateDir, state)
     h.channelDelivery = createChannelDeliveryStore(createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
       write(path, bytes) { h.channelDeliveryWrites.push(path); durableWriteFileSync(path, bytes) },
     }))
@@ -1025,7 +1040,13 @@ export function makeRoutingHarness(
   }
 
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
+  if (opts.participation) {
+    h.participation = createThreadParticipation({ queue, authority: h.channelDelivery!.authority, now: opts.dedupeClock })
+    h.ready = queueReady.then(() => { h.participation!.start() })
+  }
   const routing = createPersonaRouting({
+    ...opts.routingHooks,
+    getParticipation: () => h.participation,
     membership: opts.membership,
     queue,
     prepare: preparation.prepare,

@@ -407,8 +407,8 @@ describe('npm pack ships every runtime src file', () => {
     },
   )
 
-  test('attempt evidence runtime module is inventoried, included, and an explicit exclusion fails coverage', () => {
-    const path = 'src/channel-delivery-attempt.ts', files = readPkg().files ?? []
+  test.each(['src/channel-delivery-attempt.ts', 'src/thread-participation.ts'])('%s is inventoried, included, and an explicit exclusion fails coverage', path => {
+    const files = readPkg().files ?? []
     expect(runtimeSrcFiles()).toContain(path)
     expect(filesCover(files, path)).toBe(true)
     expect(filesCover([...files, `!${path}`], path)).toBe(false)

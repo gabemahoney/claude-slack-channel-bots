@@ -1,5 +1,9 @@
 import { reviewLedger, reviewOutcomeLine, RELOAD_REVIEW_OUTCOME } from '../src/reload-review.ts'
-import { applicationState } from './test-helpers/shared-channels.ts'
+import { applicationState, membershipPage } from './test-helpers/shared-channels.ts'
+import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
+import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
+import { sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
+import { THREAD_ROOT, threadReply } from './test-helpers/thread-participation.ts'
 import { createHash } from 'node:crypto'
 import { queueRetentionClause, RECOVERY_PRESERVATION } from '../src/reload-preview-clauses.ts'
 import { sharedRecoveryLine } from '../src/reload-recovery.ts'
@@ -3525,6 +3529,54 @@ describe('confirmation and apply', () => {
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
+  })
+
+  test('confirmed in-place policy and reminder opt-out take effect immediately without relaunch or forgetting participation', async () => {
+    const { run, personas } = await running(['alpha'], { participation: true })
+    const persona = personas[0]!, channel = persona.channels![0]!.id, key = h.key('alpha')
+    run.stub('alpha').script.inventory.push(membershipPage([channel]))
+    await run.membershipClock.runNext(); await run.membershipClock.flush()
+    expect(run.membership.read(key, channel, 'strict').kind).toBe('eligible')
+    run.registerSession('alpha')
+    await run.deliver('alpha', makeChannelMessage({ channel, ts: THREAD_ROOT, text: mentionText(run.stub('alpha').identity.botUserId) }))
+    expect(run.participation!.read(key, channel, THREAD_ROOT).kind).toBe('followed')
+    const changed = { ...persona, channels: [{ id: channel, delivery: 'thread_hybrid' as const }] }
+    h.writeConfig(configOf(changed)); await run.ticks.tick()
+    h.confirm(); await run.ticks.tick()
+    await run.deliver('alpha', threadReply({ channel }))
+    const thread = run.queued('alpha').find(item => item.accepted.via === 'thread')!
+    expect(thread).toBeDefined()
+    await run.queue.append(key, sentRecord(thread.accepted.seq))
+    await run.queue.append(key, deliveredRecord(thread.accepted.seq, run.clock.now()))
+    const row = (state: 'working' | 'waiting') => cannedGetResult({ state, session_id: 'session', labels: Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')]) }, run.serverConfig()!.personas[0]!, h.root)
+    const errors: unknown[] = []
+    const monitor = createReplyReminders({ queue: run.queue, clock: run.clock, ready: () => true,
+      enabled: k => run.serverConfig()!.personas.find(p => p.key === k)!.stop_hook_bootstrap,
+      getRow: async () => row('waiting'), prepare: async () => {}, onError: (_key, error) => { errors.push(error) } })
+    try {
+      await monitor.observe(key, row('working'))
+      h.writeConfig(configOf({ ...changed, stop_hook_bootstrap: false, channels: [{ id: channel, delivery: 'mentions' }] }))
+      await run.ticks.tick()
+      expect(run.serverConfig()!.personas[0]!.stop_hook_bootstrap).toBe(true)
+      const before = run.checkpoint()
+      h.confirm(); await run.ticks.tick()
+      expect(run.since(before).lifecycle.filter(call => ['launch', 'teardown', 'reconnect'].includes(call.op))).toEqual([])
+      expect(run.serverConfig()!.personas[0]!.stop_hook_bootstrap).toBe(false)
+      await monitor.observe(key, row('waiting'))
+      expect(run.queue.replyReminderItems(key)).toEqual([])
+      expect(run.queued('alpha').filter(item => item.accepted.reminder_for !== undefined)).toEqual([])
+      const count = run.queued('alpha').length
+      await run.deliver('alpha', threadReply({ channel, ts: '1700000000.000102' }))
+      expect(run.queued('alpha')).toHaveLength(count)
+      expect(run.participation!.read(key, channel, THREAD_ROOT).kind).toBe('followed')
+      h.writeConfig(configOf({ ...changed, stop_hook_bootstrap: false })); await run.ticks.tick()
+      h.confirm(); await run.ticks.tick()
+      await run.deliver('alpha', threadReply({ channel, ts: '1700000000.000103' }))
+      expect(run.queued('alpha').at(-1)!.accepted.via).toBe('thread')
+      expect(run.queued('alpha').find(item => item.accepted.seq === thread.accepted.seq)!.accepted).toEqual(thread.accepted)
+      expect(errors).toEqual([])
+      expectNoPostNoLeak(run)
+    } finally { await monitor.stop() }
   })
 
   test('an untouched persona gets no lifecycle call, Slack client or auth.test from a confirmed apply of another change', async () => {

@@ -166,7 +166,7 @@ test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack
   try {
     expect(queue.items('alpha')[0]!.delivered).toBe(false)
     await routing.receive(event, () => { calls.push('ack') }, 'alpha')
-    expect(calls).toEqual(['ack'])
+    expect(calls).toEqual(['ack', 'received'])
     expect(queue.items('alpha')).toHaveLength(1)
     expect(queue.items('alpha')[0]!.fixed!.parts).toEqual(['preexisting fixed bytes'])
     expect(readQueue(dir)).toEqual(before)

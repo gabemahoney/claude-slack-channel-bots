@@ -5,13 +5,18 @@ import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { join } from 'node:path'
+import { existsSync } from 'node:fs'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
-afterEach(async () => { for (const r of runs.splice(0)) { try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines }) } finally { await r.cleanup() } } })
+afterEach(async () => { for (const r of runs.splice(0)) { try {
+  const path = join(r.root, 'queue')
+  assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines, queue: existsSync(path) ? writtenFile(path) : undefined })
+} finally { await r.cleanup() } } })
 
 test('launch timing diagnostics preserve structured engine evidence without posting a notice or requiring queued work', async () => {
   // the real-agent timing assertion consumes these JSON facts.
@@ -148,17 +153,88 @@ test('injected failures count safely without consuming the first Slack notice; s
   expect(r.h.totalPosts()).toBe(0)
   for (const user of ['U0SENDER1', 'U0LATER01']) r.reporting.queueEvent({ type: 'store-failed', key: r.alpha, source: 'slack', user, ts: '2', path: '/scratch/queue', error })
   await r.flush()
+  expect(r.h.totalPosts()).toBe(0)
+  await r.runDeferred()
   expect(r.h.posts(r.alpha)).toHaveLength(1)
   expect(r.h.posts(r.alpha)).toMatchObject([{ channel: 'C0ALPHA01', text: formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), 'U0SENDER1')) }])
   expect(r.logs).toHaveLength(4)
   expect(r.logs.map(line => line.match(/count=(\d+)/)?.[1])).toEqual(['1', '2', '3', '4'])
   await r.accept()
   r.reporting.queueEvent({ type: 'store-failed', key: r.alpha, source: 'slack', user: 'U0SENDER2', error })
-  await r.flush()
+  await r.runDeferred()
   expect(r.h.posts(r.alpha)).toHaveLength(2)
   expect(r.h.posts(r.alpha)[1]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), 'U0SENDER2')))
   expect(r.logs.at(-1)).toContain('count=1')
   expect(r.h.posts(r.beta)).toEqual([])
+})
+
+test('failed-save notices wait for all same-persona intakes while another persona can report', async () => {
+  const r = await run(), error = Object.assign(new Error(sentinelInMessage('participation')), { code: 'EIO' })
+  const event = { channel: 'C0SOURCE1', ts: '1700000000.000100', user: 'U0SENDER1', text: 'private unsaved body' }
+  const first = r.reporting.beginIntake(r.alpha), second = r.reporting.beginIntake(r.alpha)
+  r.reporting.participationFailed(r.alpha, 'first', event, error, true)
+  r.reporting.participationFailed(r.beta, 'other', event, error, true)
+  first(); first() // Release callbacks are idempotent.
+  await r.runDeferred()
+  expect(r.h.posts(r.alpha)).toEqual([])
+  expect(r.h.posts(r.beta).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), event.user))])
+  second()
+  await r.flush()
+  expect(r.h.posts(r.alpha)).toEqual([])
+  expect(r.deferredClock.pendingCount()).toBe(1)
+  const retry = r.reporting.beginIntake(r.alpha)
+  expect(r.deferredClock.pendingCount()).toBe(0)
+  await r.runDeferred()
+  expect(r.h.posts(r.alpha)).toEqual([])
+  retry(); await r.runDeferred()
+  expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), event.user))])
+  r.reporting.participationFailed(r.alpha, 'first', event, error, true)
+  await r.runDeferred()
+  expect(r.h.posts(r.alpha)).toHaveLength(1)
+  expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain(event.text)
+})
+
+test.each(['same-key', 'different-edit', 'remaining-failure'] as const)('a racing successful save suppresses only its exact deferred warning: %s', async scenario => {
+  const r = await run(), release = r.reporting.beginIntake(r.alpha)
+  const event = { channel: 'C0SOURCE1', ts: '1700000000.000100', user: 'U0SAVED01', text: 'private saved body', edited: { ts: '1700000001.000100' } }
+  const error = Object.assign(new Error(sentinelInMessage('unsaved')), { code: 'ENOSPC' })
+  r.reporting.participationFailed(r.alpha, 'first', event, error, true)
+  if (scenario === 'remaining-failure') r.reporting.participationFailed(r.alpha, 'second', { ...event, ts: '1700000000.000200', user: 'U0UNSAVED' }, error, true)
+  await r.accept({ channel: event.channel, ts: event.ts, text: event.text, key: {
+    chat_id: event.channel, ts: event.ts, edited_ts: scenario === 'different-edit' ? '1700000002.000100' : event.edited.ts,
+  } })
+  // A stored event alone cannot claim participation recovery.
+  expect(r.rig.episodes.isOpen(r.alpha, 'message-not-saved')).toBe(true)
+  release(); await r.flush()
+  expect(r.h.totalPosts()).toBe(0)
+  await r.runDeferred()
+  const sender = scenario === 'remaining-failure' ? 'U0UNSAVED' : event.user
+  expect(r.h.posts(r.alpha).map(p => p.text)).toEqual(scenario === 'same-key' ? [] : [
+    formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), sender)),
+  ])
+  expect(r.h.posts(r.beta)).toEqual([])
+  expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain(event.text)
+  r.reporting.participationSettled(r.alpha, 'first')
+  if (scenario === 'remaining-failure') {
+    expect(r.rig.episodes.isOpen(r.alpha, 'message-not-saved')).toBe(true)
+    r.reporting.participationSettled(r.alpha, 'second')
+  }
+  expect(r.rig.episodes.isOpen(r.alpha, 'message-not-saved')).toBe(false)
+})
+
+test.each(['forget', 'stop', 'settle'] as const)('%s cancels a deferred failed-save notice before it can post', async action => {
+  const r = await run(), event = { channel: 'C0SOURCE1', ts: '1700000000.000100', user: 'U0SENDER1' }
+  const release = r.reporting.beginIntake(r.alpha)
+  r.reporting.participationFailed(r.alpha, 'pending', event, new Error('store unavailable'), true)
+  release()
+  expect(r.deferredClock.pendingCount()).toBe(1)
+  if (action === 'forget') r.reporting.forget(r.alpha)
+  if (action === 'stop') r.reporting.stop()
+  if (action === 'settle') r.reporting.participationSettled(r.alpha, 'pending')
+  release()
+  expect(r.deferredClock.pendingCount()).toBe(0)
+  await r.runDeferred()
+  expect(r.h.totalPosts()).toBe(0)
 })
 
 test('startup corruption aggregates each persona once and excludes torn tails/readable accepts', async () => {

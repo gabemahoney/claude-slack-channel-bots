@@ -99,8 +99,14 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     }
     if (!stopped) await deps.wake?.(key)
   }
-  function prepare(key: string, item: QueueItem): Promise<void> {
+  function reportReceived(key: string, item: QueueItem): boolean {
+    const retained = item.accepted.key && deps.queue.lookupSlackKey(key, item.accepted.key)
+    if (retained && retained.status !== 'failed' && retained.durabilityPending) return false
     try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting never owns acceptance */ }
+    return true
+  }
+  function prepare(key: string, item: QueueItem): Promise<void> {
+    const reported = reportReceived(key, item)
     const id = `${key}:${item.accepted.seq}`
     const existing = inFlight.get(id)
     if (existing) return existing
@@ -108,6 +114,9 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     if (old?.timer !== undefined) return Promise.resolve()
     const work = fix(key, item).then(() => {
       retries.delete(id)
+      // Startup may have recovered complete but unsynced acceptance bytes.
+      // Fixation can establish their durability; report only once it has.
+      if (!reported && !stopped) reportReceived(key, item)
     }).catch(error => {
       // Fixation is entered only after Slack's ack. Retain ownership even
       // when startup recover uses allSettled and this was the only message

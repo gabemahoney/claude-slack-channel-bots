@@ -5,6 +5,7 @@ import { buildReviewRequest, composeReviewRequest, REVIEW_REQUEST_SUFFIX, type R
 import { createChannelMembership, type ChannelMembership } from '../../src/channel-membership.ts'
 import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from '../../src/channel-membership-scan.ts'
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
+import { createThreadParticipation, type ThreadParticipation } from '../../src/thread-participation.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 
 import {
@@ -951,6 +952,8 @@ export interface PreparedPersonaState {
 // ---------------------------------------------------------------------------
 
 export interface ReloadRunOptions {
+  /** Include the production participation owner for in-place consumer checks. */
+  participation?: boolean
   /** Actual MCP callbacks, held independently of the reload transaction. */
   onReplyCall?: SessionToolDeps['onReplyCall']
   consumeAck?: SessionToolDeps['consumeAck']
@@ -1082,6 +1085,7 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
+  readonly participation?: ThreadParticipation
   /** Write a real operator request; a later tick records it. */
   request(action: ReviewRequest['action'], assignments?: OperatorAssignment[], requestId?: string): ReviewRequest
   queue: ReturnType<typeof createDeliveryQueue>
@@ -2068,12 +2072,15 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const queueEvents: QueueEvent[] = []
     const queue = createDeliveryQueue({stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event)})
     const queueReady = queue.start()
+    let participation: ThreadParticipation | undefined
+    let participationReady = queueReady
     const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName})
     const membershipClock = createFakeClock()
     let membership: ChannelMembership | undefined
     let membershipScanner: MembershipScanner | undefined
     let membershipStatus: ReturnType<typeof membershipConnectionListener> | undefined
     const coreRouting = createPersonaRouting({
+      getParticipation: () => participation,
       membership: {
         read: (key, channel, mode) => membership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
         hasUnresolved: (key, channel) => membership?.hasUnresolved(key, channel) ?? true,
@@ -2096,7 +2103,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
       isPersonaUp,
     })
-    const routing = {...coreRouting, receive: async (...args: Parameters<typeof coreRouting.receive>) => {await queueReady; return coreRouting.receive(...args)}}
+    const routing = {...coreRouting, receive: async (...args: Parameters<typeof coreRouting.receive>) => {await participationReady; return coreRouting.receive(...args)}}
     connections.onEvent = createPersonaEventRouter({ routing, membership: { observe: (...args) => membership?.observe(...args) ?? false }, clientFor, getPersona: getAppliedPersona, log })
     connections.onStatus = composePersonaStatusListeners(
       (key, status) => membershipStatus?.(key, status),
@@ -2757,6 +2764,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     function loadChannelDeliveryForStart(start: PersonaConfig): void {
       const authority = controller.sharedChannels()
       if (!authority) throw new Error('reload-harness: resolved start has no shared authority')
+      if (runOpts.participation) {
+        participation = createThreadParticipation({ queue, authority, now: connections.clock.now })
+        participationReady = queueReady.then(() => participation!.start())
+      }
       membership = createChannelMembership({ authority, dryRun, log, requestReconciliation: key => membershipScanner?.request(key) })
       membershipScanner = createMembershipScanner({ authority, membership, connections: connections.manager, clock: membershipClock, dryRun, log })
       membershipStatus = membershipConnectionListener(membership, membershipScanner, connections.manager, dryRun)
@@ -3001,6 +3012,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     let stopped = false
     const run: ReloadRun = {
+      get participation() { return participation },
       async prepareQueued() { await preparation.recover(serverConfig()?.personas.map(p => p.key) ?? []) },
       queue,
       queueEvents,
@@ -3256,6 +3268,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       async stop() {
         if (stopped) return
         stopped = true
+        coreRouting.stop()
+        await participationReady
+        participation?.stop()
         membershipScanner?.close()
         membership?.close()
         await preparation.stop()

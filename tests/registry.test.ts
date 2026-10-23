@@ -2874,7 +2874,9 @@ describe('tool list and instructions', () => {
     }
     for (const token of ['channel_name', 'part', 'chat_id', 'thread_ts', 'reply', 'download_attachment', SET_CHANNEL_DELIVERY_TOOL, 'react', 'edit_message', 'fetch_messages', 'files']) expect(MCP_INSTRUCTIONS).toContain(token)
     const via = MCP_INSTRUCTIONS.split('\n').find(line => line.startsWith('via:'))!
-    for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all']) expect(via).toMatch(new RegExp(`\\b${value} =`))
+    for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all', 'thread']) expect(via).toMatch(new RegExp(`\\b${value} =`))
+    expect(via).toContain('thread = a reply delivered because you participate in that thread')
+    expect(via.split(';').find(reason => reason.trim().startsWith('thread ='))).not.toMatch(/whole.channel|exclusive|only (?:you|this persona)/i)
     expect(MCP_INSTRUCTIONS).toMatch(/<@ID> mentions a Slack user or persona/)
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
     expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')

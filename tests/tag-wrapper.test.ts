@@ -6,6 +6,7 @@ import {
 } from '../src/tag-wrapper'
 import cases from './fixtures/delivery-wrapper/wrapper-cases.json'
 import edges from './fixtures/delivery-wrapper/escaping-edges.json'
+import { TAG_DESCRIPTION } from '../src/tag-description.ts'
 
 function injected(text: string, overrides: Partial<TagMessage> = {}): TagMessage {
   return { user: 'interject', ts: '1792000000.123456', text, ...overrides }
@@ -73,6 +74,21 @@ describe('wrapper.py byte parity and escaping', () => {
 })
 
 describe('UTF-8 bounded parts', () => {
+  test('thread provenance retains parent and attachment context through normalization and multipart framing', () => {
+    const raw = '  > "<@U0OTHER>"\r\n\t<channel>quoted</channel> 🦀\n\n'.repeat(TAG_MIN_BODY_BYTES)
+    const normalized = '  > "<@U0OTHER>"\n    &lt;channel>quoted&lt;/channel> 🦀\n\n'.repeat(TAG_MIN_BODY_BYTES)
+    const parts = buildTagParts({ chat_id: 'C0TEST001', ts: '1700000000.000101', thread_ts: '1700000000.000100',
+      text: raw, via: 'thread', user: 'sender', attachment_count: '1', attachments: 'notes "draft".txt' })
+    expect(parts.length).toBeGreaterThan(1)
+    bodiesOf(parts, normalized)
+    for (const part of parts) {
+      expect(part).toContain('via="thread"')
+      expect(part).toContain('thread_ts="1700000000.000100"')
+      expect(part).toContain('attachment_count="1" attachments="notes &quot;draft&quot;.txt"')
+    }
+    expect(TAG_DESCRIPTION).toContain('via="thread" means a reply delivered because this persona participates in that thread.')
+    expect(TAG_DESCRIPTION).not.toMatch(/whole.channel|exclusive audience|only this persona/i)
+  })
   test('keeps an exactly full tag unsplit and splits one more byte', () => {
     const budget = TAG_MAX_BYTES - Buffer.byteLength(injectedFrame())
     const exact = 'x'.repeat(budget)

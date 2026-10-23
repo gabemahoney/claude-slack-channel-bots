@@ -206,6 +206,7 @@ import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
+import { createThreadParticipation, type ThreadParticipation } from './thread-participation.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
@@ -1133,6 +1134,7 @@ async function handleInitialized(
  */
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
+let threadParticipation: ThreadParticipation | undefined
 let replyReminders: ReplyReminders | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
 let deliveryEngines: DeliveryEngines | undefined
@@ -1151,6 +1153,11 @@ export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (de
 /** engine binds this hook after startup; until then queued work waits. */
 export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
+  getParticipation: () => threadParticipation,
+  currentProvenance: key => connections?.provenance(key),
+  onParticipationFailure: (key, id, event, error, unaccepted) => deliveryReporting?.participationFailed(key, id, event, error, unaccepted),
+  onParticipationSettled: (key, id) => deliveryReporting?.participationSettled(key, id),
+  beginIntake: key => deliveryReporting?.beginIntake(key) ?? (() => {}),
   membership: {
     read: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
     hasUnresolved: (key, channel) => channelMembership?.hasUnresolved(key, channel) ?? false,
@@ -1406,6 +1413,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // flight that meets UNAVAILABLE or UNCLASSIFIED starts no condition and no
   // episode), so nothing is posted and no alert check is pending after this.
   personaEpisodes?.close()
+  deliveryReporting?.stop()
   // the old-life waits' unclassified-error episodes
   // end silently with them, and none begins again.
   oldLifeWaitUnclassifiedErrors?.close()
@@ -1431,6 +1439,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
 
   // finish fixation and drain the shared writers after every
   // synchronous stop above, before closing the transports and clients.
+  personaRouting.stop()
+  threadParticipation?.stop()
   const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
   await deliveryPreparation?.stop()
@@ -2920,6 +2930,8 @@ export async function main(): Promise<void> {
   })
   channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>
     !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
+  threadParticipation = createThreadParticipation({ queue: deliveryQueue, authority: reload.sharedChannels()! })
+  threadParticipation.start()
 
   // agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,

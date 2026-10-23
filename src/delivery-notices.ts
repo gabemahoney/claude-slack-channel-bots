@@ -80,15 +80,69 @@ export interface DeliveryReportingDeps {
   delivered?(key: string, item: QueueItem): void | Promise<void>
   stuckAfterMs?: number
   now?: () => number
+  /** Schedule outside the intake turn; returns cancellation for teardown. */
+  defer?(run: () => void): () => void
 }
+interface SaveFailure { sender: string; channel?: string; ts?: string; edited_ts?: string }
 export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   const alertedAtStartup = new Set<string>()
   const pendingFindings: QueueEvent[] = []
   let findingFlushPending = false
   const received = new Set<string>(), completed = new Set<string>(), failures = new Map<string, number>(), unwritable = new Set<string>(), heads = new Map<string, number>()
+  const participationFailures = new Map<string, Map<string, string>>()
+  const intakes = new Map<string, { count: number }>()
+  const pendingFailures = new Map<string, { notices: Map<string, SaveFailure>; cancel?: () => void }>()
+  const failureId = (failure: SaveFailure) => JSON.stringify([failure.channel, failure.ts, failure.edited_ts, failure.sender])
+  let stopped = false
+  const defer = deps.defer ?? ((run: () => void) => { const timer = setTimeout(run, 0); timer.unref?.(); return () => clearTimeout(timer) })
   const ref = (key: string) => { const p = deps.persona(key); return p ? renderPersonaRef(p.name, key) : `key=${key}` }
   const protect = (run: () => unknown) => { try { const result = run(); if (result && typeof (result as Promise<unknown>).catch === 'function') void (result as Promise<unknown>).catch(() => {}) } catch { /* reporting cannot interrupt durability */ } }
   function log(kind: DeliveryDiagnosticClass, key: string, identity: string, detail = '') { protect(() => deps.log(buildDeliveryDiagnostic(kind, ref(key), identity, detail))) }
+  function cancelFailureNotice(key: string): void {
+    pendingFailures.get(key)?.cancel?.()
+    pendingFailures.delete(key)
+  }
+  function scheduleFailureNotice(key: string): void {
+    const pending = pendingFailures.get(key)
+    if (stopped || !pending || pending.cancel || intakes.get(key)?.count) return
+    pending.cancel = defer(() => protect(() => {
+      pending.cancel = undefined
+      if (stopped || pendingFailures.get(key) !== pending || intakes.get(key)?.count) return
+      pendingFailures.delete(key)
+      // A racing retry may already have retained this exact message. Never
+      // tell its sender that accepted work was lost or should be sent again.
+      for (const failure of pending.notices.values()) {
+        if (failure.channel && failure.ts) {
+          const accepted = deps.queue.lookupSlackKey(key, { chat_id: failure.channel, ts: failure.ts, ...(failure.edited_ts ? { edited_ts: failure.edited_ts } : {}) })
+          if (accepted && accepted.status !== 'failed') continue
+        }
+        deps.episodes.post(key, 'message-not-saved', buildMessageNotSavedNotice(ref(key), failure.sender))
+        return
+      }
+    }))
+  }
+  function failureNotice(key: string, sender: string, channel?: string, ts?: string, edited_ts?: string): void {
+    if (stopped) return
+    deps.episodes.begin(key, 'message-not-saved')
+    const pending = pendingFailures.get(key) ?? { notices: new Map<string, SaveFailure>() }
+    const failure = { sender, channel, ts, edited_ts }
+    pending.notices.set(failureId(failure), failure)
+    pendingFailures.set(key, pending)
+    scheduleFailureNotice(key)
+  }
+  function beginIntake(key: string): () => void {
+    const own = intakes.get(key) ?? { count: 0 }
+    own.count++; intakes.set(key, own)
+    const pending = pendingFailures.get(key)
+    pending?.cancel?.()
+    if (pending) pending.cancel = undefined
+    let released = false
+    return () => {
+      if (released || intakes.get(key) !== own) return
+      released = true
+      if (--own.count === 0) { intakes.delete(key); scheduleFailureNotice(key) }
+    }
+  }
   function move(key: string, seq?: number) {
     if (heads.get(key) === seq) return
     heads.delete(key); if (seq !== undefined) heads.set(key, seq)
@@ -116,14 +170,17 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   function queueEvent(event: QueueEvent): void {
     const key = event.key
     switch (event.type) {
-      case 'stored': failures.delete(key); deps.episodes.end(key, 'message-not-saved'); return
+      case 'stored':
+        failures.delete(key)
+        if (!participationFailures.get(key)?.size) { cancelFailureNotice(key); deps.episodes.end(key, 'message-not-saved') }
+        return
       case 'writable': unwritable.delete(key); return
       case 'store-failed': {
         const count = (failures.get(key) ?? 0) + 1; failures.set(key, count)
         const source = event.source ?? 'slack'
         const identity = deliveryIdentity({ ...event, source, ts: event.ts ?? '' })
         log(MESSAGE_NOT_SAVED, key, identity, `count=${count} path=${JSON.stringify(event.path ?? '')} code=${queueErrorCode(event.error)}`)
-        if (source === 'slack') { deps.episodes.begin(key, 'message-not-saved'); deps.episodes.post(key, 'message-not-saved', buildMessageNotSavedNotice(ref(key), event.user ?? event.bot_id ?? 'unknown')) }
+        if (source === 'slack') failureNotice(key, event.user ?? event.bot_id ?? 'unknown', event.channel, event.ts, event.edited_ts)
         return
       }
       case 'append-failed':
@@ -190,5 +247,41 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (begun === 'begun') log(DELIVERY_STUCK, key, identity, `reason=${reason} age_ms=${status.ageMs}`)
     deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1))
   }
-  return { received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) { failures.delete(key); unwritable.delete(key); heads.delete(key) } }
+  function participationFailed(key: string, id: string, event: Record<string, unknown>, error: unknown, unaccepted = false): void {
+    const held = participationFailures.get(key) ?? new Map<string, string>()
+    const first = !held.has(id)
+    const field = (name: string) => typeof event[name] === 'string' ? event[name] as string : undefined
+    const edited = event.edited
+    const failure: SaveFailure = { sender: field('user') ?? field('bot_id') ?? 'unknown', channel: field('channel'), ts: field('ts'),
+      edited_ts: typeof edited === 'object' && edited !== null && 'ts' in edited && typeof edited.ts === 'string' ? edited.ts : undefined }
+    held.set(id, failureId(failure)); participationFailures.set(key, held)
+    const identity = deliveryIdentity({ source: 'slack', channel: field('channel'), ts: field('ts') ?? '', user: field('user'), bot_id: field('bot_id') })
+    if (first) log(unaccepted ? MESSAGE_NOT_SAVED : QUEUE_UNWRITABLE, key, identity, `participation=unresolved code=${redactSlackLogText(queueErrorCode(error))}`)
+    deps.episodes.begin(key, 'message-not-saved')
+    // A read/reconciliation fault does not prove an accepted item was lost.
+    // Only a failed incoming save warrants the finite Slack retry warning.
+    if (unaccepted) failureNotice(key, failure.sender, failure.channel, failure.ts, failure.edited_ts)
+  }
+  function participationSettled(key: string, id: string): void {
+    const held = participationFailures.get(key)
+    const failure = held?.get(id), pending = pendingFailures.get(key)
+    if (failure) pending?.notices.delete(failure)
+    if (pending && !pending.notices.size) cancelFailureNotice(key)
+    held?.delete(id)
+    if (!held?.size) {
+      participationFailures.delete(key)
+      if (!failures.has(key)) { cancelFailureNotice(key); deps.episodes.end(key, 'message-not-saved') }
+    }
+  }
+  return {
+    beginIntake,
+    received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)),
+    reconcileQueued: (key: string) => protect(() => reconcileQueued(key)),
+    queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)),
+    engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings,
+    participationFailed: (key: string, id: string, event: Record<string, unknown>, error?: unknown, unaccepted = false) => protect(() => participationFailed(key, id, event, error, unaccepted)),
+    participationSettled: (key: string, id: string) => protect(() => participationSettled(key, id)),
+    forget(key: string) { cancelFailureNotice(key); intakes.delete(key); failures.delete(key); participationFailures.delete(key); unwritable.delete(key); heads.delete(key) },
+    stop() { stopped = true; for (const key of pendingFailures.keys()) cancelFailureNotice(key); intakes.clear() },
+  }
 }

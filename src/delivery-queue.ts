@@ -4,6 +4,7 @@ import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
+import { isThreadObservation, isThreadParticipationRecord, type ThreadObservation, type ThreadParticipationRecord, type ThreadParticipationGap } from './thread-participation.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
 export const REPLY_REMINDER_KEEP_MS = 24 * 60 * 60 * 1000
@@ -34,6 +35,8 @@ export interface AcceptedInput {
   reminder_for?: number
   /** Original queued emoji, retained with open work across configuration changes. */
   queued_ack_reaction?: string
+  /** Incoming enrollment shares this accepted record's durability boundary. */
+  thread_enrollment?: ThreadObservation
 }
 interface BaseRecord { v: 1; seq: number }
 export interface AcceptedRecord extends BaseRecord, AcceptedInput {
@@ -42,6 +45,7 @@ export interface AcceptedRecord extends BaseRecord, AcceptedInput {
 /** Compaction keeps dedupe facts without message content. */
 export interface QueueKeyRecord extends BaseRecord {
   kind: 'accepted'; compact: 'key'; key: SlackKey; received_at: number; delivered_at: number
+  thread_enrollment?: ThreadObservation
 }
 /** Non-content high water marks survive even an entirely delivered injected queue. */
 export interface QueueAllocationRecord extends BaseRecord {
@@ -73,19 +77,24 @@ export interface ReplyReminderRecord extends BaseRecord {
 }
 export interface ReplyCallTarget { seq: number; attempts?: number[] }
 export interface NoticedRecord extends BaseRecord { kind: 'noticed'; at: number }
-export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord
+export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord | ThreadParticipationRecord | ThreadParticipationGap
 export type ItemRecord = AcceptedRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord
 export interface QueueItem {
   accepted: AcceptedRecord; fixed?: FixedRecord; records: ItemRecord[]; delivered: boolean
   unknownSend: boolean; retypeCount: number; nextAttempt: number
 }
 export type QueueEvent =
-  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; error: unknown }
+  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; edited_ts?: string; error: unknown }
   | { type: 'stored' | 'writable'; key: string }
   | { type: 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; path?: string; seq?: number; error: unknown }
   | { type: 'record-unreadable'; key: string; line: number; quarantinePath: string; alert: boolean }
   | { type: 'retained'; key: string; count: number }
-export type QueueAcceptResult = { status: 'accepted' | 'duplicate'; item?: QueueItem; seq: number } | { status: 'failed'; error: unknown }
+export type QueueStoredResult = {
+  status: 'accepted' | 'duplicate'; item?: QueueItem; seq: number; enrollment?: ThreadObservation
+  /** Replayed bytes awaiting a successful sync; absence means confirmed durability. */
+  durabilityPending?: true
+}
+export type QueueAcceptResult = QueueStoredResult | { status: 'failed'; error: unknown; reason?: 'cancelled' }
 export type QueueAccept = (key: string, input: AcceptedInput) => Promise<QueueAcceptResult>
 export interface DeliveryQueue {
   start(): Promise<void>
@@ -94,6 +103,13 @@ export interface DeliveryQueue {
   /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
   rememberQueuedReaction(key: string, seq: number, name: string): Promise<string | undefined>
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
+  /** Permanent participation and unfinished obligations, independent of content retention. */
+  threadRecords(key: string): ThreadParticipationRecord[]
+  threadRecord(key: string, id: string): ThreadParticipationRecord | undefined
+  threadReadable(key: string): boolean
+  recordThreadObservation(key: string, observation: ThreadObservation): Promise<void>
+  /** Serialize discard against acceptance; an already accepted Slack key wins. */
+  cancelThreadObservation(key: string, observation: ThreadObservation): Promise<QueueStoredResult | undefined>
   /** A current snapshot of one item, without cloning the rest of the queue. */
   item(key: string, seq: number): QueueItem | undefined
   items(key: string): QueueItem[]
@@ -138,11 +154,15 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
   if (!object(value) || value.v !== 1 || !integer(value.seq)) return false
   const r = value
   switch (r.kind) {
+    case 'thread-participation': return isThreadParticipationRecord(r)
+    case 'thread-gap': return r.seq === 0 && Object.keys(r).every(k => ['v', 'kind', 'seq'].includes(k))
     case 'accepted':
       if (r.compact === 'allocation') return (r.injected_ts === undefined || timestamp(r.injected_ts)) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'injected_ts'].includes(k))
-      if (r.compact === 'key') return isSlackKey(r.key) && number(r.received_at) && number(r.delivered_at) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'key', 'received_at', 'delivered_at'].includes(k))
+      if (r.thread_enrollment !== undefined && (!isThreadObservation(r.thread_enrollment) || !r.thread_enrollment.slackKey || !isSlackKey(r.key) || slackKeyString(r.thread_enrollment.slackKey) !== slackKeyString(r.key))) return false
+      if (r.compact === 'key') return isSlackKey(r.key) && number(r.received_at) && number(r.delivered_at) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'key', 'received_at', 'delivered_at', 'thread_enrollment'].includes(k))
       if (r.compact !== undefined || !['slack', 'interject', 'cron'].includes(String(r.source)) || !str(r.text) || !str(r.ts) || !number(r.received_at)) return false
       if (r.reminder_for !== undefined && (!positive(r.reminder_for) || r.source !== 'interject')) return false
+      if (r.thread_enrollment !== undefined && r.source !== 'slack') return false
       if (r.attempt_high_watermark !== undefined && !integer(r.attempt_high_watermark)) return false
       if (r.queued_ack_reaction !== undefined && (!str(r.queued_ack_reaction) || !r.queued_ack_reaction.trim())) return false
       for (const k of ['sender', 'channel', 'channel_type', 'thread_ts', 'edited_ts', 'user', 'bot_id', 'username', 'bot_profile_name', 'via']) if (r[k] !== undefined && !str(r[k])) return false
@@ -171,8 +191,10 @@ interface AppendRollback { pendingRollback?: number }
 interface Journal extends AppendRollback {
   records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
+  threads: Map<string, ThreadParticipationRecord>; threadKeys: Map<string, ThreadParticipationRecord>; threadGap: boolean
+  threadReplayPending?: boolean
 }
-function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0 } }
+function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0, threads: new Map(), threadKeys: new Map(), threadGap: false } }
 /** All file access is explicit; construction allocates only memory. */
 export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
   const fs = options.fs ?? nodeFs
@@ -247,7 +269,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   }
   function update(j: Journal, record: QueueRecord, replay = false): void {
     j.records.push(record); j.nextSeq = Math.max(j.nextSeq, record.seq + 1)
-    if (!replay) indexRecord(j, record)
+    if (!replay) { indexRecord(j, record); j.threadReplayPending = false }
     if (record.kind === 'accepted') {
       const ts = 'compact' in record ? record.compact === 'allocation' ? record.injected_ts : undefined : record.source !== 'slack' ? record.ts : undefined
       if (ts) j.lastInjected = j.lastInjected !== undefined && j.lastInjected > microseconds(ts) ? j.lastInjected : microseconds(ts)
@@ -268,8 +290,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     return item
   }
   function indexRecord(j: Journal, record: QueueRecord): void {
+    if (record.kind === 'thread-gap') { j.threadGap = true; return }
+    if (record.kind === 'thread-participation') { indexThread(j, record); return }
     if (record.kind === 'reply-reminder') { j.reminders.set(record.seq, record); return }
     if (record.kind === 'accepted') {
+      if ('thread_enrollment' in record && record.thread_enrollment) indexThread(j, {
+        v: 1, kind: 'thread-participation', seq: 0, observation: record.thread_enrollment, state: 'enrolled', acceptedSeq: record.seq,
+      })
       if ('key' in record && record.key) {
         const encoded = slackKeyString(record.key)
         if (!j.slackKeys.has(encoded)) j.slackKeys.set(encoded, record)
@@ -284,12 +311,19 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     ensureReminder(j, item)
     j.openCount += Number(previous.delivered) - Number(item.delivered)
   }
+  function indexThread(j: Journal, record: ThreadParticipationRecord): void {
+    const previous = j.threads.get(record.observation.id)
+    if (previous?.state === 'enrolled' || previous?.state === 'cancelled' && record.state === 'observed') return
+    j.threads.set(record.observation.id, record)
+    if (record.state === 'enrolled' && record.observation.slackKey && record.acceptedSeq) j.threadKeys.set(slackKeyString(record.observation.slackKey), record)
+  }
   function rebuild(j: Journal): void {
     j.items = new Map(); j.slackKeys = new Map(); j.reminders = new Map(); j.openCount = 0
+    j.threads = new Map(); j.threadKeys = new Map(); j.threadGap = false
     // Replay groups records once, rather than repeatedly copying a long
     // history of retypes for the same item.
     for (const record of j.records) {
-      if (record.kind === 'accepted' || record.kind === 'reply-reminder') indexRecord(j, record)
+      if (record.kind === 'accepted' || record.kind === 'reply-reminder' || record.kind === 'thread-participation' || record.kind === 'thread-gap') indexRecord(j, record)
       else j.items.get(record.seq)?.records.push(record)
     }
     for (const [seq, previous] of j.items) {
@@ -313,7 +347,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') { stored.loaded = true; return }
       event({ type: 'recovery-failed', key, error }); throw error
     }
-    const lines: { bytes: Buffer; line: number; record?: QueueRecord; raw?: Record<string, unknown>; whole: boolean }[] = []
+    const lines: { bytes: Buffer; start: number; line: number; record?: QueueRecord; raw?: Record<string, unknown>; whole: boolean; torn: boolean }[] = []
     let offset = 0, line = 0
     while (offset < bytes.length) {
       const nl = bytes.indexOf(10, offset), end = nl < 0 ? bytes.length : nl + 1
@@ -329,7 +363,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       }
       // Buffer roundtrip rejects invalid UTF-8 rather than silently fixing stored text.
       const whole = nl >= 0 && Buffer.from(text).equals(chunk.subarray(0, chunk.length - 1))
-      lines.push({ bytes: chunk, line: ++line, record: whole ? parseQueueRecord(text) : undefined, raw, whole })
+      lines.push({ bytes: chunk, start: offset, line: ++line, record: whole ? parseQueueRecord(text) : undefined, raw, whole, torn: nl < 0 })
       offset = end
     }
     const accepted = new Set(lines.flatMap(l => l.record && isAccepted(l.record) ? [l.record.seq] : []))
@@ -338,9 +372,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const seenAccept = new Set<number>()
     for (const l of lines) {
       const r = l.record
-      const orphan = r && r.kind !== 'accepted' && r.kind !== 'reply-reminder' && !accepted.has(r.seq)
+      const orphan = r && r.kind !== 'accepted' && r.kind !== 'reply-reminder' && r.kind !== 'thread-participation' && r.kind !== 'thread-gap' && !accepted.has(r.seq)
       const duplicate = r && isAccepted(r) && seenAccept.has(r.seq)
-      if (!r || orphan || duplicate) { damaged.push(l); continue }
+      const foreign = r && (r.kind === 'thread-participation' ? r.observation.lifetime.key !== key :
+        r.kind === 'accepted' && 'thread_enrollment' in r && r.thread_enrollment?.lifetime.key !== undefined && r.thread_enrollment.lifetime.key !== key)
+      if (!r || orphan || duplicate || foreign) { damaged.push(l); continue }
       if (isAccepted(r)) seenAccept.add(r.seq)
       update(j, r, true)
     }
@@ -352,6 +388,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       durableAppend(quarantinePath, Buffer.concat(damaged.map(l => l.bytes)), stored.quarantineRollback ??= {})
       for (const l of damaged) {
         const raw = l.raw
+        // Unknown/damaged participation is not an empty followed set. Preserve
+        // the gap across startup compaction; valid positive facts still work.
+        // An unterminated final line never reached its fsync, so it was never
+        // acknowledged and records no participation.
+        if (!l.torn && (!raw || !['fixed', 'sent', 'delivered', 'refused', 'noticed', 'reply-reminder'].includes(String(raw.kind)))) {
+          if (!j.threadGap) update(j, { v: 1, kind: 'thread-gap', seq: 0 })
+        }
         const seq = raw?.seq
         if (raw?.kind === 'sent' && integer(seq) && accepted.has(seq)) {
           const item = j.items.get(seq)!
@@ -361,7 +404,25 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
       }
     }
+    // A journal first read after a failed startup read missed startup's
+    // compaction. Confirm the existing bytes before publishing that repair.
+    if (started && j.threads.size) {
+      const fd = fs.openSync(pathFor(key), 'r')
+      try { fs.fsyncSync(fd); syncDir(dir) } finally { fs.closeSync(fd) }
+    }
     stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
+    stored.threads = j.threads; stored.threadKeys = j.threadKeys; stored.threadGap = j.threadGap
+    // Remove a quarantined unfinished tail before any append can terminate it
+    // into a complete damaged line, which a later reopen must treat as a gap.
+    const tail = lines.at(-1)
+    if (tail?.torn) {
+      stored.pendingRollback = tail.start
+      if (started) try { reconcileRollback(key, stored) } catch { /* the next append or compaction reconciles first */ }
+    }
+    // A prior process may have left complete bytes after an ambiguous fsync.
+    // Startup's durable rewrite must confirm them before participation uses
+    // an enrollment or cancellation as a terminal fact. Queue contents stay.
+    stored.threadReplayPending = !started && j.threads.size > 0
   }
   function rewrite(key: string, records: QueueRecord[]): void {
     const path = pathFor(key), temp = `${path}.${randomUUID()}.tmp`
@@ -370,6 +431,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const fd = fs.openSync(temp, 'wx', QUEUE_FILE_MODE)
       try { writeAll(fd, Buffer.from(records.map(r => JSON.stringify(r) + '\n').join(''))); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
       fs.renameSync(temp, path); syncDir(dir)
+      journal(key).threadReplayPending = false
     } finally { try { fs.unlinkSync(temp) } catch { /* rename consumed temp */ } }
   }
   function lastSend(item: QueueItem): SentRecord | undefined {
@@ -433,11 +495,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const j = journal(key)
     reconcileRollback(key, j)
     const at = now(), retained: QueueRecord[] = []
+    retained.push(...j.threads.values())
+    if (j.threadGap) retained.push({ v: 1, kind: 'thread-gap', seq: 0 })
     const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
     for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
     for (const item of materialize(j)) {
       if (item.delivered) {
-        if (item.accepted.key && at - item.accepted.received_at < QUEUE_KEY_KEEP_MS) retained.push({ v: 1, kind: 'accepted', seq: item.accepted.seq, compact: 'key', key: item.accepted.key, received_at: item.accepted.received_at, delivered_at: Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : [])) })
+        if (item.accepted.key && at - item.accepted.received_at < QUEUE_KEY_KEEP_MS) retained.push({ v: 1, kind: 'accepted', seq: item.accepted.seq, compact: 'key', key: item.accepted.key, received_at: item.accepted.received_at, delivered_at: Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : [])), ...(item.accepted.thread_enrollment ? { thread_enrollment: item.accepted.thread_enrollment } : {}) })
       } else {
         const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
         const removable = new Set(item.records.flatMap(r => r.kind === 'sent' && !('unknown_outcome' in r) && refused.has(r.attempt) ? [r.attempt] : []))
@@ -462,8 +526,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function lookupSlackKey(key: string, slack: SlackKey): QueueAcceptResult | undefined {
     const j = journal(key)
     const encoded = slackKeyString(slack)
+    // Keep dedupe/FIFO visible during replay repair, without authorizing a
+    // queued acknowledgement for bytes a prior process may not have synced.
+    const durability = j.threadReplayPending ? { durabilityPending: true as const } : {}
     const r = j.slackKeys.get(encoded)
-    return r ? structuredClone({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
+    if (r) return structuredClone({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq), ...durability, ...(r.thread_enrollment ? { enrollment: r.thread_enrollment } : {}) })
+    const enrolled = j.threadKeys.get(encoded)
+    return enrolled?.acceptedSeq ? structuredClone({ status: 'duplicate' as const, seq: enrolled.acceptedSeq, enrollment: enrolled.observation, item: j.items.get(enrolled.acceptedSeq), ...durability }) : undefined
   }
   async function compact(key?: string): Promise<void> {
     await Promise.all((key ? [key] : [...journals.keys()]).map(k => serial(k, () => { try { compactOne(k) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })))
@@ -554,17 +623,24 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         return await serial(key, () => {
           load(key); const j = journal(key)
           if (input.source === 'slack' && input.key) { const existing = lookupSlackKey(key, input.key); if (existing) return existing }
+          // A terminal discard must also fence an acceptance already waiting
+          // for this writer. It is a selection outcome, not a storage failure.
+          if (input.thread_enrollment && j.threads.get(input.thread_enrollment.id)?.state === 'cancelled') {
+            return { status: 'failed' as const, reason: 'cancelled' as const, error: new Error('Thread observation was cancelled') }
+          }
           const received_at = input.received_at ?? now()
           const candidate = BigInt(Math.trunc(received_at * 1000))
           const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
           const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
           if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
+          if (record.thread_enrollment && (record.thread_enrollment.lifetime.key !== key ||
+              JSON.stringify(j.threads.get(record.thread_enrollment.id)?.observation) !== JSON.stringify(record.thread_enrollment))) throw new Error('Enrollment has no matching durable observation')
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
           update(j, record)
           event({ type: 'stored', key })
-          return { status: 'accepted' as const, seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
+          return { status: 'accepted' as const, seq: record.seq, item: structuredClone(j.items.get(record.seq)!), ...(record.thread_enrollment ? { enrollment: structuredClone(record.thread_enrollment) } : {}) }
         })
-      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, error }); return { status: 'failed', error } }
+      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, edited_ts: input.key?.edited_ts, error }); return { status: 'failed', error } }
     },
     async append(key, record) {
       try {
@@ -572,7 +648,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         record = structuredClone(record)
         await serial(key, () => {
           load(key); const j = journal(key)
-          if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder') throw new Error('Invalid append record')
+          if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder' || record.kind === 'thread-participation' || record.kind === 'thread-gap') throw new Error('Invalid append record')
           const item = j.items.get(record.seq)
           if (!item) throw new Error('Append has no accepted item')
           // Immutable fixation and stable attempt identifiers allow safe retry after failures.
@@ -618,6 +694,53 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       })
     },
     lookupSlackKey,
+    threadRecords: key => {
+      load(key); const j = journal(key)
+      if (j.threadReplayPending) throw new Error('Thread replay is not durable')
+      return structuredClone([...j.threads.values()])
+    },
+    threadRecord: (key, id) => {
+      load(key); const j = journal(key)
+      if (j.threadReplayPending) throw new Error('Thread replay is not durable')
+      const record = j.threads.get(id)
+      return record ? structuredClone(record) : undefined
+    },
+    threadReadable: key => {
+      const j = journal(key)
+      return started && !stopped && j.loaded && !j.threadGap && !j.threadReplayPending && j.pendingRollback === undefined
+    },
+    async recordThreadObservation(key, observation) {
+      observation = structuredClone(observation)
+      await serial(key, () => {
+        if (!started || stopped) throw new Error('Queue is not writable')
+        load(key)
+        const j = journal(key)
+        const record: ThreadParticipationRecord = { v: 1, kind: 'thread-participation', seq: 0, state: 'observed', observation }
+        if (!isThreadParticipationRecord(record) || observation.lifetime.key !== key) throw new Error('Invalid thread observation')
+        if (j.threads.has(observation.id)) return
+        durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
+        update(j, record)
+      })
+    },
+    async cancelThreadObservation(key, observation) {
+      observation = structuredClone(observation)
+      return serial(key, () => {
+        if (!started || stopped) throw new Error('Queue is not writable')
+        load(key)
+        const j = journal(key)
+        const record: ThreadParticipationRecord = { v: 1, kind: 'thread-participation', seq: 0, state: 'cancelled', observation }
+        if (!isThreadParticipationRecord(record) || observation.lifetime.key !== key) throw new Error('Invalid thread observation')
+        const found = observation.slackKey && lookupSlackKey(key, observation.slackKey)
+        const accepted = found && found.status !== 'failed' ? found : undefined
+        if (accepted?.enrollment?.id === observation.id) return accepted
+        const previous = j.threads.get(observation.id)
+        if (previous?.state === 'enrolled' || previous?.state === 'cancelled') return accepted
+        if (previous && JSON.stringify(previous.observation) !== JSON.stringify(observation)) throw new Error('Thread observation does not match')
+        durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
+        update(j, record)
+        return accepted
+      })
+    },
     item(key, seq) {
       const item = journal(key).items.get(seq)
       return item ? structuredClone(item) : undefined

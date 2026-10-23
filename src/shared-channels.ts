@@ -560,7 +560,7 @@ export function sharedChannelLifetime(state: SharedChannelState, key: string, ch
   const life = own(state.personas, key)
   if (!life || !CHANNEL_ID_RE.test(channel)) return undefined
   return { key, channel, incarnation: life.incarnation, resetOrder: life.resetOrder ?? 1,
-    createdAt: life.createdAt, membershipBoundary: own(life.membership, channel)?.boundary ?? 0,
+    ...(life.createdAt === undefined ? {} : { createdAt: life.createdAt }), membershipBoundary: own(life.membership, channel)?.boundary ?? 0,
     leaveBoundary: own(life.leaves, channel)?.boundary ?? 0 }
 }
 /** A deterministic proposed transition, not an applied life. Refreshes and

@@ -24,7 +24,11 @@ S=$(mktemp -d) && env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA \
 ```
 
 Omit `<files>` to run the whole suite. `bun test` does not run the bash
-scripts under `tests/integration/`.
+scripts under `tests/integration/`. Which suite covers which module is in
+the testing guide's Test File Organization table, and the shared fixtures
+under Fixture Patterns; for example, the thread participation state suite
+`tests/thread-participation.test.ts` and its fixture
+`tests/test-helpers/thread-participation.ts`.
 
 The `env … HOME=$S` prefix covers one command only. Give every `bun test`
 its own prefix and scratch directory; a second `bun test` chained after the

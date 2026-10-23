@@ -28,7 +28,7 @@ import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { channelDeliveryFor, decideDelivery, FUNGIBLE_REFUSALS, type DeliveryDecision, type FungiblePath } from '../src/delivery-decision.ts'
+import { channelDeliveryFor, decideDelivery, incomingEnrollmentRoot, FUNGIBLE_REFUSALS, type DeliveryDecision, type FungiblePath } from '../src/delivery-decision.ts'
 import {
   CHANNEL_TYPE_FORMS,
   FLAG_FORMS,
@@ -98,6 +98,13 @@ const G = FUNGIBLE_DECISION_GROUPS
 
 describe('current shared authority, eligibility and effective sibling selection', () => {
   test.each(cases(G.currentAuthority))('%s', (_title, row) => expectOutcome(row))
+})
+
+describe('scoped participation, precedence and incoming enrollment', () => {
+  test.each(cases(G.threads))('%s', (_title, row) => {
+    expectOutcome(row)
+    expect(incomingEnrollmentRoot(row.event, decideDelivery(...decisionArgsOf(row)))).toBe(row.enrollment)
+  })
 })
 
 // ---------------------------------------------------------------------------

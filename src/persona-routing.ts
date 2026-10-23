@@ -12,6 +12,9 @@ import type { ChannelMembership, MembershipReading } from './channel-membership.
 import type { PersonaEventProvenance } from './persona-connections.ts'
 import {
   decideDelivery,
+  incomingEnrollmentRoot,
+  replyThreadRoot,
+  type DeliverDecision,
   type DeliveryDecision,
   type DropDecision,
   type FungibleDecisionInputs,
@@ -30,7 +33,10 @@ import {
   unclaimedChannelCause,
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
-import type { DeliveryQueue, QueueItem, AcceptedInput } from './delivery-queue.ts'
+import type { DeliveryQueue, QueueItem, AcceptedInput, QueueStoredResult, SlackKey } from './delivery-queue.ts'
+import { slackKeyString } from './delivery-queue.ts'
+import type { ThreadObservation, ThreadParticipation } from './thread-participation.ts'
+import type { SharedChannelLifetime } from './shared-channels.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
@@ -73,6 +79,16 @@ export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_res
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
+  participation?: ThreadParticipation
+  getParticipation?(): ThreadParticipation | undefined
+  currentProvenance?(key: string): PersonaEventProvenance | undefined
+  onParticipationFailure?(key: string, id: string, event: Record<string, unknown>, error: unknown, unaccepted?: boolean): void
+  onParticipationSettled?(key: string, id: string): void
+  /** Reporting records faults during intake and posts only after its release. */
+  beginIntake?(key: string): () => void
+  /** Real-path interruption seams; registration always precedes the first one. */
+  _afterObservation?(observation: ThreadObservation): Promise<void>
+  _afterAcceptance?(key: string, item: QueueItem | undefined): Promise<void>
   membership?: Pick<ChannelMembership, 'read' | 'hasUnresolved' | 'request'>
   /** The applied persona config, read at call time; null or undefined when there is none. */
   getPersonaConfig(): PersonaRoutingConfig | null | undefined
@@ -203,6 +219,9 @@ export interface PersonaRoutingDeps {
 
 /** A persona-routing instance. */
 export interface PersonaRouting {
+  pendingCandidates(): ThreadCandidate[]
+  reevaluate(id: string): Promise<void>
+  stop(): void
   /**
    * Take one `message` or `app_mention` event received for the persona(s)
    * `personaKeys`: archive without awaiting, decide and store all accepted
@@ -236,6 +255,56 @@ export interface PersonaRouting {
   heardChannels(key: string): ReadonlySet<string>
 }
 
+/** Evidence workers resolve only this candidate's thread and captured life. */
+export interface ThreadCandidate {
+  id: string
+  key: string
+  channel: string
+  root: string
+  lifetime: SharedChannelLifetime
+}
+
+/** The event-wide half of one intake. Any recipient's hold withholds the
+ * aggregate ack; retained recipients still get queued feedback. */
+interface Intake {
+  event: unknown
+  ack: SlackAck
+  keys: readonly string[]
+  flag: unknown
+  provenance?: PersonaEventProvenance
+  /** Each recipient's lifetime, captured before any recipient awaits. */
+  lifetimes: Map<string, SharedChannelLifetime>
+  afterAck: Array<() => Promise<void>>
+  accepted: Array<() => void>
+  held: boolean
+}
+
+/** One recipient's share of an intake. The post-observation reselection
+ * replaces `config` and `persona`; post-ack work reads the latest. */
+interface Recipient {
+  key: string
+  ev: Record<string, unknown>
+  slackKey?: SlackKey
+  id?: string
+  threads?: ThreadParticipation
+  config: PersonaRoutingConfig | null | undefined
+  persona?: Persona
+}
+
+/** How one recipient's outcome settles its share of the aggregate ack. */
+interface RecipientSettlement {
+  hold(): void
+  settle(): void
+  failed(error: unknown, unaccepted?: boolean): void
+  report(item: QueueItem): void
+  post(item: QueueItem): () => Promise<void>
+  /** Reconcile an already retained item with its original obligation. */
+  retained(result: QueueStoredResult): void
+  /** Authoritatively discard the logical message, cancelling its shared
+   * observation; false while held or when a concurrent acceptance won. */
+  discard(): Promise<boolean>
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -244,6 +313,12 @@ export interface PersonaRouting {
 export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   const heardSets = new Map<string, Set<string>>()
   const postAcked = new Map<string, Set<number>>()
+  const candidates = new Map<string, { candidate: ThreadCandidate; event: unknown; ack: SlackAck;
+    keys: readonly string[]; lifetimes: Map<string, SharedChannelLifetime>; flag: unknown; provenance?: PersonaEventProvenance }>()
+  const reevaluating = new Map<string, Promise<void>>()
+  let stopped = false
+  const participation = () => deps.getParticipation?.() ?? deps.participation
+  const candidateId = (key: string, slackKey: SlackKey) => JSON.stringify([key, slackKeyString(slackKey)])
   /** The persona reference for a key: its rendered name when applied, else the bare key. */
   function refForKey(key: string): string {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
@@ -257,126 +332,293 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     isExtSharedChannel?: unknown,
     provenance?: PersonaEventProvenance,
   ): Promise<void> {
+    const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
+    const releases = keys.map(key => deps.beginIntake?.(key))
+    try { await receiveEvent(event, ack, personaKeys, isExtSharedChannel, provenance) }
+    finally { for (const release of releases) release?.() }
+  }
+
+  async function receiveEvent(
+    event: unknown,
+    ack: SlackAck,
+    personaKeys: string | readonly string[],
+    isExtSharedChannel?: unknown,
+    provenance?: PersonaEventProvenance,
+  ): Promise<void> {
+    if (stopped) return
     if (provenance?.candidate) { deps.membership?.request(provenance.key); return }
     if (provenance?.applied && !provenance.isCurrent()) { await ack(); return }
     if (provenance && !provenance.applied) return
-    const afterAck: Array<() => Promise<void>> = []
-    const accepted: Array<() => void> = []
-    let storeFailed = false
+    const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
+    const intake: Intake = {
+      event, ack, keys, flag: isExtSharedChannel, provenance, lifetimes: new Map(), afterAck: [], accepted: [], held: false,
+    }
     if (typeof event === 'object' && event !== null) {
-      const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
-      await Promise.all(keys.map(async key => {
-        try { deps.archive(key, event) } catch (err) {
-          deps.log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
-        }
-        try {
-          const ev = event as Record<string, unknown>
-          const config = deps.getPersonaConfig()
-          const mode = channelModeOf(config)
-          if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
-          const slackKey = typeof ev['channel'] === 'string' && typeof ev['ts'] === 'string'
-            ? { chat_id: ev['channel'], ts: ev['ts'], ...(typeof editedTs(ev) === 'string' ? { edited_ts: editedTs(ev) as string } : {}) } : undefined
-          // A retry after partial fanout must prepare the already retained, unfixed target too.
-          const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
-          const persona = config?.personas.find(p => p.key === key)
-          const report = (item: QueueItem) => accepted.push(() => {
-            try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
-          })
-          const post = (item: QueueItem) => async () => {
-            const posted = postAcked.get(key) ?? new Set<number>()
-            if (posted.has(item.accepted.seq)) return
-            // Claim only after the aggregate ack: retained partial fanout can
-            // retry here, but concurrent/redelivered copies recover just once.
-            posted.add(item.accepted.seq)
-            postAcked.set(key, posted)
-            const session = getSessionByPersona(key)
-            if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
-            await deps.prepare(key, item)
-          }
-          if (duplicate && duplicate.status !== 'failed') {
-            if (duplicate.item && !duplicate.item.fixed && !duplicate.item.delivered) {
-              report(duplicate.item)
-              afterAck.push(post(duplicate.item))
-            }
-            if (slackKey && deps.membership?.hasUnresolved(key, slackKey.chat_id)) {
-              storeFailed = true
-              deps.membership.request(key)
-            }
-            return
-          }
-          if (!config || !persona) return
-          const identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
-          const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel, slackKey?.chat_id))
-          if (decision.action === 'unresolved') {
-            storeFailed = true
-            deps.membership?.request(key)
-            return
-          }
-          const path = fungiblePathOf(decision)
-          if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
-          if (decision.action === 'drop') { logDrop(persona, ev, decision); return }
-          if (!slackKey) return
-          if (decision.via !== 'dm' && deps.membership) {
-            const membership = deps.membership.read(key, slackKey.chat_id, mode)
-            if (membership.kind === 'ineligible') return
-            if (membership.kind === 'unresolved' || deps.isPersonaUp?.(key) === false || (provenance && !provenance.isCurrent())) {
-              storeFailed = true
-              deps.membership.request(key)
-              return
-            }
-          }
-          const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
-          const profile = ev['bot_profile']
-          const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
-            name: typeof f.name === 'string' ? f.name : 'unnamed',
-            mimetype: typeof f.mimetype === 'string' ? f.mimetype : undefined,
-            size: typeof f.size === 'number' ? f.size : undefined,
-          })) : undefined
-          const input: AcceptedInput = {
-            source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
-            queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
-            channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
-            user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
-            bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
-            text: stringField('text') ?? '', files, via: decision.via, received_at: (deps.now ?? Date.now)(),
-          }
-          try {
-            const result = await deps.queue.accept(key, input)
-            if (result.status === 'failed') { storeFailed = true; return }
-            if (result.item && !result.item.delivered) { report(result.item); afterAck.push(post(result.item)) }
-          } catch { storeFailed = true }
-        } catch (err) {
-          // A failed selection is undecidable, never permission to discard.
-          storeFailed = true
-          deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
-        }
-      }))
+      const channel = (event as Record<string, unknown>)['channel']
+      if (typeof channel === 'string') for (const key of keys) {
+        const lifetime = participation()?.lifetime(key, channel)
+        if (lifetime) intake.lifetimes.set(key, structuredClone(lifetime))
+      }
+      await Promise.all(keys.map(key => receiveForRecipient(intake, key)))
     }
     // A failed sibling suppresses the aggregate ack, but retained targets still
     // deserve queued feedback. Preparation/recovery continue only after ack.
-    if (storeFailed) { for (const report of accepted) report(); return }
+    if (intake.held || stopped) { for (const report of intake.accepted) report(); return }
     try { await ack() } catch (err) { deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
-    for (const report of accepted) report()
-    await Promise.all(afterAck.map(async work => {
+    for (const report of intake.accepted) report()
+    await Promise.all(intake.afterAck.map(async work => {
       try { await work() } catch (err) { deps.log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
     }))
   }
 
   /**
-   * The decision's fungible-mode inputs,
-   * built only in fungible mode, from the configuration in effect and the
-   * stored choices read now: the mode, the envelope flag as received,
-   * `CHANNEL_ID_RE`, the stored choices, and each applied persona's
-   * destination through the one destination rule. Undefined in declarative
-   * mode, so the decision is declarative mode's and nothing of the fungible
-   * section is read.
+   * One recipient's selection, observation and acceptance. Everything before
+   * the first await here runs synchronously inside the caller's map, so every
+   * recipient of an event publishes its observation before any persists.
    */
+  async function receiveForRecipient(intake: Intake, key: string): Promise<void> {
+    try { deps.archive(key, intake.event) } catch (err) {
+      deps.log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
+    }
+    try {
+      const ev = structuredClone(intake.event) as Record<string, unknown>
+      const receivedAt = (deps.now ?? Date.now)()
+      const config = deps.getPersonaConfig()
+      const mode = channelModeOf(config)
+      if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
+      const slackKey = slackKeyOf(ev)
+      // A retry after partial fanout must prepare the already retained, unfixed target too.
+      const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
+      const threads = participation()
+      const r: Recipient = {
+        key, ev, slackKey, id: slackKey ? candidateId(key, slackKey) : undefined, threads,
+        config, persona: config?.personas.find(p => p.key === key),
+      }
+      const s = settlementFor(intake, r)
+      if (duplicate && duplicate.status !== 'failed') { s.retained(duplicate); return }
+      const selected = selectRecipient(intake, r, s, mode)
+      if (!selected) return
+      const { persona, decision } = selected
+      const path = fungiblePathOf(decision)
+      if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
+      if (decision.action === 'drop') {
+        if (await s.discard()) logDrop(persona, ev, decision)
+        return
+      }
+      if (!slackKey) return
+      const root = incomingEnrollmentRoot(ev, decision)
+      const delivery = root ? selected.inputs.storedChoices?.storedChoice(key, slackKey.chat_id) : undefined
+      if (root && threads && delivery === undefined) { s.hold(); return }
+      // All receivers reach this publication synchronously, before the
+      // first persistence/test await. Pending evidence is not enrollment.
+      const observation = root && threads ? threads.observeIncoming(key, slackKey, root, {
+        mode, delivery: delivery!,
+      }) : undefined
+      if (root && threads && !observation) { s.hold(); return }
+      if (decision.via !== 'dm' && deps.membership) {
+        const membership = deps.membership.read(key, slackKey.chat_id, mode)
+        if (membership.kind === 'ineligible') { await s.discard(); return }
+        if (membership.kind === 'unresolved' || deps.isPersonaUp?.(key) === false || (intake.provenance && !intake.provenance.isCurrent())) {
+          s.hold()
+          deps.membership.request(key)
+          return
+        }
+      }
+      let current = { config: selected.config, decision }
+      if (observation) {
+        const reselected = await persistAndReselect(intake, r, s, observation, selected.identity)
+        if (!reselected) return
+        current = reselected
+      }
+      await acceptRecipient(intake, r, s, acceptedInput(ev, slackKey, current.config, current.decision, observation, receivedAt), observation)
+    } catch (err) {
+      // A failed selection is undecidable, never permission to discard.
+      intake.held = true
+      deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
+    }
+  }
+
+  /** The callbacks through which one recipient settles, holds or reports. */
+  function settlementFor(intake: Intake, r: Recipient): RecipientSettlement {
+    const { key, ev, slackKey, id, threads } = r
+    const s: RecipientSettlement = {
+      hold() { intake.held = true },
+      settle() {
+        if (id) { candidates.delete(id); deps.onParticipationSettled?.(key, id) }
+      },
+      failed(error, unaccepted = false) {
+        s.hold()
+        if (id) deps.onParticipationFailure?.(key, id, ev, error, unaccepted)
+      },
+      report(item) {
+        intake.accepted.push(() => {
+          try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
+        })
+      },
+      post: item => async () => {
+        const posted = postAcked.get(key) ?? new Set<number>()
+        if (posted.has(item.accepted.seq)) return
+        // Claim only after the aggregate ack: retained partial fanout can
+        // retry here, but concurrent/redelivered copies recover just once.
+        posted.add(item.accepted.seq)
+        postAcked.set(key, posted)
+        const session = getSessionByPersona(key)
+        const { persona, config } = r
+        if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
+        await deps.prepare(key, item)
+      },
+      retained(result) {
+        if (result.durabilityPending) { s.hold(); return }
+        if (result.item && !result.item.delivered) {
+          s.report(result.item)
+          if (!result.item.fixed) intake.afterAck.push(s.post(result.item))
+        }
+        if (result.enrollment) {
+          // The original obligation, including a compacted duplicate, is
+          // reconciled without selecting old text under today's policy.
+          try {
+            if (!threads || threads.recover(key, result.enrollment.id) === 'unresolved') { s.hold(); return }
+          } catch (error) { s.failed(error); return }
+        }
+        if (slackKey && deps.membership?.hasUnresolved(key, slackKey.chat_id)) {
+          s.hold()
+          deps.membership.request(key)
+          return
+        }
+        s.settle()
+      },
+      async discard() {
+        const lifetime = intake.lifetimes.get(key)
+        if (threads && slackKey && lifetime) {
+          if (threads.lifetimeStatus(lifetime) === 'unresolved') { s.hold(); return false }
+          try {
+            const accepted = await threads.discardIncoming(lifetime, slackKey)
+            if (accepted) { s.retained(accepted); return false }
+          } catch (error) { s.failed(error); return false }
+        }
+        s.settle()
+        return true
+      },
+    }
+    return s
+  }
+
+  /**
+   * The first selection, reading participation only for a dependent reply.
+   * Undefined when the recipient has no applied persona or is held; an
+   * undecidable reply is registered as a re-evaluation candidate.
+   */
+  function selectRecipient(intake: Intake, r: Recipient, s: RecipientSettlement, mode: ChannelMode) {
+    const { key, ev, slackKey, threads, config, persona } = r
+    if (!config || !persona) return
+    const identity = intake.provenance?.key === key ? intake.provenance.identity : deps.getBotIdentity(key)
+    const inputs = fungibleInputs(config, mode, intake.flag, slackKey?.chat_id)
+    const decide = () => decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, inputs)
+    let decision = decide()
+    if (decision.action === 'unresolved' && decision.reason === 'participation-unresolved' && slackKey && threads) {
+      const root = replyThreadRoot(ev)!
+      try {
+        const reading = threads.read(key, slackKey.chat_id, root)
+        inputs.participation = new Map([[key, reading]])
+        if (reading.failure) s.failed(new Error('Thread participation storage is unavailable'))
+      }
+      catch (error) { s.failed(error); return }
+      decision = decide()
+    }
+    if (decision.action === 'unresolved') {
+      s.hold()
+      if (decision.reason === 'participation-unresolved' && slackKey) holdCandidate(intake, r, slackKey)
+      else deps.membership?.request(key)
+      return
+    }
+    return { config, persona, identity, inputs, decision }
+  }
+
+  /** Protect an undecidable reply's exact thread for re-evaluation, keeping the latest ack. */
+  function holdCandidate(intake: Intake, r: Recipient, slackKey: SlackKey): void {
+    const { key, threads, id } = r
+    const root = replyThreadRoot(r.ev), lifetime = threads?.lifetime(key, slackKey.chat_id)
+    if (!id || !root || !lifetime) return
+    const previous = candidates.get(id)
+    if (!previous || threads?.lifetimeStatus(previous.candidate.lifetime) === 'superseded') candidates.set(id, {
+      candidate: { id, key, channel: slackKey.chat_id, root, lifetime: structuredClone(lifetime) },
+      event: structuredClone(intake.event), ack: intake.ack, keys: [...intake.keys], lifetimes: intake.lifetimes,
+      flag: intake.flag, provenance: intake.provenance,
+    })
+    else previous.ack = intake.ack
+  }
+
+  /**
+   * Persist the observation, then select again under what is applied now:
+   * choices, membership and the receiving identity can change during the
+   * waits, and the observation's own policy authorizes nothing. Undefined
+   * when the recipient is held, discarded or excluded.
+   */
+  async function persistAndReselect(
+    intake: Intake,
+    r: Recipient,
+    s: RecipientSettlement,
+    observation: ThreadObservation,
+    identity: SlackBotIdentity | undefined,
+  ): Promise<{ config: PersonaRoutingConfig; decision: DeliverDecision } | undefined> {
+    const { key, ev, slackKey, threads } = r
+    try {
+      await deps._afterObservation?.(observation)
+      if (await threads!.persist(observation) !== 'current' || stopped) { s.hold(); return }
+    } catch (error) { s.failed(error, true); return }
+    const config = r.config = deps.getPersonaConfig()
+    const persona = r.persona = config?.personas.find(p => p.key === key)
+    const { provenance } = intake
+    if (!config || !persona || (provenance && !provenance.isCurrent())) { s.hold(); return }
+    const currentIdentity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
+    if (currentIdentity?.botUserId !== identity?.botUserId || currentIdentity?.botId !== identity?.botId) { s.hold(); return }
+    const mode = channelModeOf(config)
+    // Excluding this envelope decides nothing about the logical message: its
+    // paired message copy shares the observation and remains the deciding event.
+    if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
+    const decision = decideDelivery(ev, { key, botUserId: currentIdentity?.botUserId, botId: currentIdentity?.botId,
+      channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, intake.flag, slackKey!.chat_id))
+    if (decision.action === 'unresolved') { s.hold(); deps.membership?.request(key); return }
+    if (decision.action === 'drop') {
+      if (await s.discard()) logDrop(persona, ev, decision)
+      return
+    }
+    if (deps.isPersonaUp?.(key) === false) { s.hold(); return }
+    return { config, decision }
+  }
+
+  /** Accept through the queue's joint acceptance/enrollment boundary. */
+  async function acceptRecipient(
+    intake: Intake,
+    r: Recipient,
+    s: RecipientSettlement,
+    input: AcceptedInput,
+    observation: ThreadObservation | undefined,
+  ): Promise<void> {
+    const { key, threads } = r
+    try {
+      const result = await deps.queue.accept(key, input)
+      if (result.status === 'failed') {
+        if (result.reason === 'cancelled') { s.settle(); return }
+        if (observation) s.failed(result.error, true); else s.hold()
+        return
+      }
+      if (result.durabilityPending) { s.hold(); return }
+      if (result.item && !result.item.delivered) { s.report(result.item); intake.afterAck.push(s.post(result.item)) }
+      await deps._afterAcceptance?.(key, result.item)
+      if (result.enrollment && (!threads || threads.recover(key, result.enrollment.id) === 'unresolved')) { s.hold(); return }
+      s.settle()
+    } catch (error) { s.failed(error) }
+  }
+
+  /** Applied shared choices and independent membership readings in both modes.
+   * Participation is read separately, only for a dependent selection. */
   function fungibleInputs(
     config: PersonaRoutingConfig,
     mode: ChannelMode,
     isExtSharedChannel: unknown,
     channel: string | undefined,
-  ): FungibleDecisionInputs | undefined {
+  ): FungibleDecisionInputs {
     const memberships = new Map<string, MembershipReading>()
     if (channel && CHANNEL_ID_RE.test(channel)) {
       for (const persona of config.personas) {
@@ -600,10 +842,35 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
 
   return {
     receive,
+    pendingCandidates: () => [...candidates.values()].filter(c => participation()?.lifetimeStatus(c.candidate.lifetime) !== 'superseded').map(c => structuredClone(c.candidate)),
+    reevaluate(id) {
+      const running = reevaluating.get(id)
+      if (running) return running
+      const work = reevaluate(id).finally(() => { reevaluating.delete(id) })
+      reevaluating.set(id, work)
+      return work
+    },
+    stop() { stopped = true; candidates.clear() },
     forget: (key) => {
       heardSets.delete(key)
     },
     heardChannels: (key) => new Set(heardSets.get(key)),
+  }
+  async function reevaluate(id: string): Promise<void> {
+      const held = candidates.get(id), threads = participation()
+      if (!held || !threads || stopped) return
+      const status = threads.lifetimeStatus(held.candidate.lifetime)
+      if (status === 'superseded') { candidates.delete(id); deps.onParticipationSettled?.(held.candidate.key, id); return }
+      if (status !== 'current') return
+      const provenance = deps.currentProvenance?.(held.candidate.key) ?? held.provenance
+      if (provenance && (!provenance.applied || !provenance.isCurrent())) return
+      // Same receive/dedupe/fanout boundary as Socket redelivery. No lookup or
+      // parallel enqueue path is owned by this interface.
+      const keys = held.keys.filter(key => {
+        const lifetime = held.lifetimes.get(key)
+        return !lifetime || threads.lifetimeStatus(lifetime) !== 'superseded'
+      })
+      await receive(held.event, held.ack, keys, held.flag, provenance)
   }
 }
 
@@ -624,6 +891,40 @@ function fungiblePathOf(decision: DeliveryDecision): FungiblePath | undefined {
 function editedTs(ev: Record<string, unknown>): unknown {
   const edited = ev['edited']
   return typeof edited === 'object' && edited !== null ? (edited as Record<string, unknown>)['ts'] : undefined
+}
+
+/** The event's Slack dedupe key, or undefined without a string channel and ts. */
+function slackKeyOf(ev: Record<string, unknown>): SlackKey | undefined {
+  const channel = ev['channel'], ts = ev['ts'], edited = editedTs(ev)
+  if (typeof channel !== 'string' || typeof ts !== 'string') return undefined
+  return { chat_id: channel, ts, ...(typeof edited === 'string' ? { edited_ts: edited } : {}) }
+}
+
+/** The queue input for an accepted event: its original text and attachment context. */
+function acceptedInput(
+  ev: Record<string, unknown>,
+  slackKey: SlackKey,
+  config: PersonaRoutingConfig,
+  decision: DeliverDecision,
+  observation: ThreadObservation | undefined,
+  receivedAt: number,
+): AcceptedInput {
+  const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
+  const profile = ev['bot_profile']
+  const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
+    name: typeof f.name === 'string' ? f.name : 'unnamed',
+    mimetype: typeof f.mimetype === 'string' ? f.mimetype : undefined,
+    size: typeof f.size === 'number' ? f.size : undefined,
+  })) : undefined
+  return {
+    source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
+    queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
+    channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
+    user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
+    bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
+    text: stringField('text') ?? '', files, via: decision.via, received_at: receivedAt,
+    ...(observation ? { thread_enrollment: observation } : {}),
+  }
 }
 
 /** ` ts=<ts>` for a drop line when the event has a non-empty string ts; otherwise empty. */

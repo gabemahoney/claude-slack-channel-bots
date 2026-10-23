@@ -442,8 +442,8 @@ retain their existing text excerpts; receipt confirmation has its own line.
 
 ### `message-not-saved`
 
-- **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
-- **Meaning:** The incoming message could not be durably stored; it has not been accepted. Every failure is counted, including Slack retries.
+- **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`, or, when saving a message together with its thread participation fails, `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" participation=unresolved code=<errno>`
+- **Meaning:** The incoming message could not be durably stored; it has not been accepted. The `count=` form counts every failure, including Slack retries. The `participation=unresolved` form is logged once per unsaved message, not per retry, and its Slack acknowledgement stays withheld.
 - **Cause:** The queue directory or disk cannot be written.
 - **Fix:** Check free space, mount availability and permissions on the named path. For Slack, follow **Message not saved** below; retry a failed injected message once storage works.
 
@@ -491,10 +491,10 @@ retain their existing text excerpts; receipt confirmation has its own line.
 
 ### `queue-unwritable`
 
-- **Line:** `[slack] queue-unwritable: persona="<name>" (key=<key>) path="<path>" code=<errno>`
-- **Meaning:** An append failed after acceptance. CSCB retains the item and types nothing further for this persona until the write succeeds.
-- **Cause:** The queue file cannot be written or synced; one line reports each unwritable episode.
-- **Fix:** Check the server disk and the named path permissions or mount. Restore writing; the queued work resumes without resending it.
+- **Line:** `[slack] queue-unwritable: persona="<name>" (key=<key>) path="<path>" code=<errno>`, or, for a thread participation fault, `[slack] queue-unwritable: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" participation=unresolved code=<errno>`
+- **Meaning:** The `path=` form: an append failed after acceptance. CSCB retains the item and types nothing further for this persona until the write succeeds. The `participation=unresolved` form: the thread participation that this Slack message depends on could not be read, synced or reconciled. It does not mean a message was lost: retained items stay queued, this message's acknowledgement and the thread selections that depend on it stay unresolved, and other work can continue. No Slack notice is posted for it.
+- **Cause:** The `path=` form: the queue file cannot be written or synced; one line reports each unwritable episode. The `participation=unresolved` form: the persona's queue file cannot be read, written or synced; one line reports each unresolved message.
+- **Fix:** Check the server disk and the named path permissions or mount. Restore reading, writing and syncing; the queued work resumes without resending it. Don't ask senders to resend because of a `participation=unresolved` line alone.
 
 ### `queue-kept`
 

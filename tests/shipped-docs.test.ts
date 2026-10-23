@@ -411,6 +411,7 @@ import {
   channelDeliveryWriteFailedText,
   FUNGIBLE_TARGET_REFUSAL,
   MCP_INSTRUCTIONS,
+  MCP_INSTRUCTIONS_MAX_CHARS,
   personaNotAppliedRefusal,
   sessionNotMatchedRefusal,
   SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION,
@@ -423,6 +424,7 @@ import {
   channelDeliveryAttemptResultText,
   channelDeliveryCurrentFactsText,
 } from '../src/registry.ts'
+import { TAG_DESCRIPTION } from '../src/tag-description.ts'
 import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import {
   buildChangePlan,
@@ -2125,6 +2127,7 @@ const VIA_ROWS: Record<Via, string> = {
   dm: 'Direct message',
   mention: 'Direct @mention',
   broadcast: '`@here` / `@channel` broadcast',
+  thread: 'Followed thread reply',
   receive_all_shared: 'Every message, shared channel',
   receive_all: 'Every message, this persona alone',
 }
@@ -2189,6 +2192,19 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
     expect(codeSpans(viaCell(label))).toEqual([])
   })
 
+  test('the table contains each delivery reason and injected kind exactly once', () => {
+    const { viaColumn, rows } = kindsTable()
+    expect(rows.map(row => row[0]).sort()).toEqual([...Object.values(VIA_ROWS), ...INJECTED_ROWS].sort())
+    expect(rows.flatMap(row => codeSpans(row[viaColumn] ?? '')).sort()).toEqual([...VIA_VALUES].sort())
+  })
+
+  test('the receiving explanation includes thread precedence and no obsolete denial of thread following', () => {
+    const text = flat(section())
+    const precedence = text.match(/The first applicable `via` wins[^.]+/)?.[0] ?? ''
+    expect(codeSpans(precedence)).toEqual(['via', ...VIA_VALUES])
+    expect(text).not.toMatch(/(?:do(?:es)? not|never|no) (?:add |support )?thread following/i)
+  })
+
   test.each([
     ['the scheduled prompt', /\bscheduled\s+prompt\b/i],
     ['the `/interject` message', /`\/interject`\s+message\b/i],
@@ -2199,6 +2215,51 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
 
   test('no "Messages a bot receives" heading remains in any user doc', () => {
     expect(USER_DOC_FILES.flatMap((doc) => headings(readRepoFile(doc)).filter((h) => /messages a bot receives/i.test(h.title)).map((h) => `${doc}: ${h.text}`))).toEqual([])
+  })
+})
+
+/** A thread reason describes this recipient's participation, without an audience promise. */
+function threadAudienceProblems(text: string): string[] {
+  const checks: Array<[string, RegExp]> = [
+    ['whole-channel audience', /(?:every|all) messages? (?:in|from) (?:the|this) channel|(?:whole|entire) channel/i],
+    ['exclusive audience', /(?:only|just) (?:you|this persona) (?:receiv|participat|follow)|(?:exclusive|sole) (?:recipient|audience|participant)/i],
+  ]
+  return checks.filter(([, pattern]) => pattern.test(text)).map(([label]) => label)
+}
+
+describe('exported thread reason wording', () => {
+  const surfaces = [['MCP instructions', MCP_INSTRUCTIONS], ['tag description', TAG_DESCRIPTION]] as const
+  const meaning = /a reply delivered because (?:you participate|this persona participates) in that thread/i
+
+  test.each(surfaces)('%s explains thread participation without promising a channel or exclusive audience', (_name, text) => {
+    const clause = text.match(/(?:thread =|via="thread" means)\s*([^\n]*?)(?=;\s*\w+ =|\n|$)/)?.[1] ?? ''
+    expect(clause).toMatch(meaning)
+    expect(threadAudienceProblems(clause)).toEqual([])
+  })
+
+  test('the MCP instruction budget still holds', () => {
+    expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
+  })
+
+  test.each([
+    ['all messages in the channel', 'whole-channel audience'],
+    ['the entire channel', 'whole-channel audience'],
+    ['only this persona receives it', 'exclusive audience'],
+    ['just you participate', 'exclusive audience'],
+    ['an exclusive recipient', 'exclusive audience'],
+  ])('the audience audit rejects %s even beside the participation explanation', (claim, problem) => {
+    expect(threadAudienceProblems(`A reply delivered because this persona participates in that thread; ${claim}.`)).toEqual([problem])
+  })
+
+  test('the participation meaning is required, not just a thread label', () => {
+    expect('thread = an unmentioned reply').not.toMatch(meaning)
+    expect('thread = a reply delivered because another persona participates in that thread').not.toMatch(meaning)
+  })
+
+  test('the receiving row retains Slack attributes and reminder eligibility without an audience promise', () => {
+    const row = kindRowOf('thread')(referenceText())
+    expect(tableCells(row).slice(2)).toEqual(['Slack attributes', '`thread`', 'Yes'])
+    expect(threadAudienceProblems(row)).toEqual([])
   })
 })
 
@@ -7739,6 +7800,13 @@ const README_DEO_ROWS: readonly DocRow[] = [
 ['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
     ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona is currently eligible and effectively all there`),
     ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel after current membership, eligibility and loop-guard checks`),
+  ]],
+['receiving: followed replies use this persona\'s participation under effective thread_hybrid', text => tableCells(kindRowOf('thread')(text))[1] ?? '', [
+    /Neither a direct mention nor a broadcast/i,
+    /effective `thread_hybrid`/i,
+    /reply/i,
+    /this persona (?:participates in|follows) (?:that|the) thread/i,
+    /current verified eligible membership/i,
   ]],
 ['receiving: in open mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In open mode, an @mention is delivered from its'), [
     ci(`**In open mode, an @mention is delivered from its ${code('message')} event.**`),

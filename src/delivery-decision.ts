@@ -1,11 +1,12 @@
-/** Pure non-thread selection over the applied shared choices and current
+/** Pure selection over the applied shared choices and current
  * authenticated membership. An unresolved decision withholds acknowledgement;
  * it is distinct from an established exclusion. DMs and message/author filters
- * precede channel authority. Participation selection belongs to the next Epic.
+ * precede channel authority. Participation is an explicitly supplied fact.
  * SPDX-License-Identifier: MIT
  */
 import type { ChannelEntry, ChannelMode, DeliveryMode, DM_DESTINATION } from './config.ts'
 import type { MembershipReading } from './channel-membership.ts'
+import type { ThreadParticipationReading } from './thread-participation.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,7 +81,7 @@ export const FUNGIBLE_REFUSALS = [
  * entries in declarative mode, their channel deliveries in fungible mode),
  * `receive_all`.
  */
-export type Via = 'dm' | 'mention' | 'broadcast' | 'receive_all_shared' | 'receive_all'
+export type Via = 'dm' | 'mention' | 'broadcast' | 'receive_all_shared' | 'receive_all' | 'thread'
 
 /**
  * Why a persona does not get a message:
@@ -166,7 +167,7 @@ export type DropDecision =
 /** Outcome of `decideDelivery` for one receiving persona. */
 export type DeliveryDecision = DeliverDecision | DropDecision | {
   action: 'unresolved'
-  reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing'
+  reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing' | 'participation-unresolved'
 }
 
 /**
@@ -208,6 +209,8 @@ export interface ChannelDeliveryInputs {
  * cannot authorize channel selection.
  */
 export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
+  /** Only the identified reply thread, scoped to its receiving persona/channel. */
+  participation?: ReadonlyMap<string, ThreadParticipationReading>
   /** Current, synchronous observations for this event's channel, by persona.
    * Missing evidence is unresolved; configured entries are never membership. */
   memberships?: ReadonlyMap<string, MembershipReading>
@@ -305,6 +308,7 @@ export function decideDelivery(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention' }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast' }
+  if (saved === 'thread_hybrid') return decideThread(ev, channel, persona.key, fungible)
   if (saved !== 'all') return { action: 'drop', reason: 'not-mentioned' }
   const shared = applied.some((p) =>
     p.key !== persona.key && !channelAvailability(p.key, channel, fungible) &&
@@ -339,11 +343,38 @@ function decideFungibleChannel(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention', fungible: path }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast', fungible: path }
+  if (path.channelDelivery === 'thread_hybrid') return decideThread(ev, channel, persona.key, inputs, path)
   if (path.channelDelivery !== DELIVERY_ALL) return { action: 'drop', reason: 'not-mentioned', fungible: path }
   const shared = inputs.fungibleDestinations.some((other) =>
     other.key !== persona.key && !channelAvailability(other.key, channel, inputs) &&
       channelDeliveryFor(other.key, channel, inputs).delivery === DELIVERY_ALL)
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all', fungible: path }
+}
+
+/** No malformed thread identifier can be replaced with an invented root. */
+export function isThreadTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && /^\d+\.\d{6}$/.test(value)
+}
+export function replyThreadRoot(event: Record<string, unknown>): string | undefined {
+  return isThreadTimestamp(event['thread_ts']) && event['thread_ts'] !== event['ts'] ? event['thread_ts'] : undefined
+}
+/** Uses the selector's direct-mention result, including all eligibility and
+ * author filters. Broadcasts, DMs and unaccepted/off events have no enrollment. */
+export function incomingEnrollmentRoot(event: Record<string, unknown>, decision: DeliveryDecision): string | undefined {
+  if (decision.action !== 'deliver' || decision.via !== 'mention') return undefined
+  if (event['thread_ts'] !== undefined) return isThreadTimestamp(event['thread_ts']) ? event['thread_ts'] : undefined
+  return isThreadTimestamp(event['ts']) ? event['ts'] : undefined
+}
+function decideThread(event: Record<string, unknown>, channel: string, key: string,
+  inputs?: FungibleDecisionInputs, fungible?: FungiblePath): DeliveryDecision {
+  const root = replyThreadRoot(event)
+  const drop: DeliveryDecision = { action: 'drop', reason: 'not-mentioned', ...(fungible ? { fungible } : {}) }
+  if (!root) return drop
+  const reading = inputs?.participation?.get(key)
+  if (!reading || reading.key !== key || reading.channel !== channel || reading.root !== root || reading.kind === 'unresolved') {
+    return { action: 'unresolved', reason: 'participation-unresolved' }
+  }
+  return reading.kind === 'followed' ? { action: 'deliver', via: 'thread', ...(fungible ? { fungible } : {}) } : drop
 }
 
 /** Only dependent channel selection consults shared health and membership.

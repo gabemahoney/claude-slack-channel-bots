@@ -120,6 +120,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
   [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
+  [/^src\/thread-participation\.ts$/, 'durable persona policy and lifetime observations, including the shared-authority identity and queue persistence failure surface'],
   [/^src\/shared-recovery\.ts$/, 'damaged authority evidence, prepared input and recovery request parsing'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
@@ -187,6 +188,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
+  'tests/test-helpers/thread-participation.ts': { makeThreadHarness: 'builds durable persona configuration and sentinel-bearing routing clients' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
   'tests/test-helpers/slack-stub.ts': { makeStubSlackFactory: 'builds Slack clients from tokens' },
   'tests/test-helpers/ci-run.ts': {
@@ -447,6 +449,23 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     for (const file of ['tests/channel-membership.test.ts', 'tests/channel-membership-readiness.test.ts']) {
       expect(callsAssertNoLeak(file)).toBe(true); expect(file in EXEMPT).toBe(false)
     }
+  })
+
+  test('participation functions and the composition helper require leak checks without exemptions', () => {
+    const suite = 'tests/thread-participation.test.ts'
+    for (const code of [
+      "import { createThreadParticipation as create } from '../src/thread-participation.ts'",
+      "import * as participation from '../src/thread-participation.ts'",
+      "const participation = await import('../src/thread-participation.ts')",
+      "import { makeThreadHarness as create } from './test-helpers/thread-participation.ts'",
+    ]) expect(touchReasonsOf(suite, code)).toHaveLength(1)
+    for (const code of [
+      "import type { ThreadObservation } from '../src/thread-participation.ts'",
+      "import type * as Participation from '../src/thread-participation.ts'",
+      "import { threadReply, threadHold, THREAD_ROOT } from './test-helpers/thread-participation.ts'",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([])
+    expect(callsAssertNoLeak(suite)).toBe(true)
+    expect(suite in EXEMPT).toBe(false)
   })
 
   test('operator request/review functions and new helpers remain secret-bearing surfaces without exemptions', () => {
