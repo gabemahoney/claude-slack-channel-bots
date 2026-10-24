@@ -121,7 +121,9 @@ export interface PersonaRoutingDeps {
    * Whether persona P is up (production: the server's one
    * `isPersonaUp` predicate), asked for a lost message only: a message lost
    * for a persona that is not up schedules no restart and reports the
-   * `not-up` recovery state. Without it every persona counts as up.
+   * `not-up` recovery state. Intake does not ask it: a not-up persona's
+   * new messages are stored, acknowledged and queued. Without it
+   * every persona counts as up.
    */
   isPersonaUp?(key: string): boolean
   // The lost-message state inputs, each asked for a lost
@@ -418,7 +420,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       if (decision.via !== 'dm' && deps.membership) {
         const membership = deps.membership.read(key, slackKey.chat_id, mode)
         if (membership.kind === 'ineligible') { await s.discard(); return }
-        if (membership.kind === 'unresolved' || deps.isPersonaUp?.(key) === false || (intake.provenance && !intake.provenance.isCurrent())) {
+        if (membership.kind === 'unresolved' || (intake.provenance && !intake.provenance.isCurrent())) {
           s.hold()
           deps.membership.request(key)
           return
@@ -583,7 +585,6 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       if (await s.discard()) logDrop(persona, ev, decision)
       return
     }
-    if (deps.isPersonaUp?.(key) === false) { s.hold(); return }
     return { config, decision }
   }
 

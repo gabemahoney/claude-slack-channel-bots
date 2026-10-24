@@ -1,4 +1,3 @@
-import { slackInput } from './test-helpers/delivery-queue.ts'
 import { eligibleMembership } from './test-helpers/fungible-decision.ts'
 import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { livenessReadingForStatus } from '../src/liveness-reading.ts'
@@ -750,11 +749,9 @@ describe('an item accepted while P\'s live-row sequence runs reports restarting,
 })
 
 // ===========================================================================
-// Not up (regression guard for) — a message can
-// already be durably accepted for a persona whose bring-up outcome is not up: one that stopped
-// being up while the message was being handled, or the old half of a
-// destructive modify after its bring-up was cancelled and before its
-// connection is stopped. Such a message used to report "starting now" and ask
+// Not up (regression guard for) — a not-up persona's messages are stored,
+// acknowledged and queued; a lost one reports not up and schedules no restart.
+// Such a message used to report "starting now" and ask
 // for a restart the relaunch gate refused. Now the notice says "not up" and
 // nothing is scheduled: the persona's own recovery launches it. The up check
 // is the real `createPersonaUpPredicate` over a serving connection, with the
@@ -768,8 +765,6 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
     'REGRESSION: %s, alpha not up while its connection still delivers: three messages stay queued with no notice, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
     async (branch) => {
       const h = makeHarness({ branch, notUp: ['alpha'] })
-      // These three items were accepted before the not-up boundary. New
-      // admission is separately refused in the and keyed-persona cases.
       // The relaunch gate over the same bring-up state: before the fix every
       // message asked it for a restart, and it refused with a line.
       const gateLines: string[] = []
@@ -777,15 +772,9 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
       deps.canRestart = createPersonaRelaunchGate({ status: () => SERVING }, (line) => { gateLines.push(line) }, h.upOutcomes)
       initRestart(deps)
 
-      for (let i = 0; i < 3; i++) {
-        const event = messageIn(SHARED, `message ${i} ${MESSAGE_MARKER}`)
-        expect((await h.queue.accept(h.alpha.key, slackInput({ channel: SHARED,
-          ts: event.ts as string, key: { chat_id: SHARED, ts: event.ts as string },
-          user: event.user as string, text: event.text as string, via: 'receive_all' }))).status).toBe('accepted')
-        await h.deliver(event, h.alpha.key)
-      }
+      for (let i = 0; i < 3; i++) await h.deliver(messageIn(SHARED, `message ${i} ${MESSAGE_MARKER}`), h.alpha.key)
       expect(h.queued('alpha')).toHaveLength(3)
-
+      expect(h.order.filter(step => step === 'ack')).toHaveLength(3)
 
       expect(h.postsTo(SHARED)).toEqual([])
       expect(h.upAsks).toEqual(Array(6).fill(h.alpha.key))
@@ -812,14 +801,13 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
     // Beta is `mentions` in the shared channel, so it gets the message by mention.
     const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
 
-    expect((await h.queue.accept(h.alpha.key, slackInput({ channel: SHARED,
-      ts: event.ts as string, key: { chat_id: SHARED, ts: event.ts as string },
-      user: event.user as string, text: event.text as string, via: 'receive_all' }))).status).toBe('accepted')
     await h.deliver(event, [h.beta.key, h.alpha.key])
 
 
     expect(h.postsTo(SHARED)).toEqual([])
-    expect([...h.upAsks].sort()).toEqual([h.alpha.key, h.alpha.key, h.beta.key, h.beta.key, h.beta.key].sort())
+    // Only the lost-message handling asks the up check; intake never does.
+    expect([...h.upAsks].sort()).toEqual([h.alpha.key, h.alpha.key, h.beta.key, h.beta.key].sort())
+    expect(h.order.filter(step => step === 'ack')).toHaveLength(1)
     expect(h.queued('alpha')).toHaveLength(1)
     expect(h.queued('beta')).toHaveLength(1)
     expect(h.p('alpha').notifications).toEqual([])
@@ -832,16 +820,12 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
     expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
   })
 
-  test('the up check is asked with the persona\'s key, not its name', async () => {
-    const asked: string[] = []
+  test('the up check is asked with the persona\'s key, not its name; the not-up persona\'s message is queued and acknowledged', async () => {
     const h = makeRoutingHarness([{ name: 'Not Up Persona', channels: [{ id: SHARED, delivery: 'all' }] }], dir, {
       membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} },
       sessions: [],
       restartDelayS: FAST_DELAY_S,
-      isPersonaUp: (key) => {
-        asked.push(key)
-        return false
-      },
+      notUp: ['Not Up Persona'],
     })
     harnesses.push(h)
     const notUp = h.config!.personas[0]!
@@ -849,11 +833,14 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
 
     await h.receiveKeys(messageIn(SHARED), [notUp.key])
 
-    expect(asked).toEqual([notUp.key])
-    expect(h.queued('Not Up Persona')).toEqual([])
-    expect(h.order.filter(step => step === 'ack')).toEqual([])
+    expect(h.upAsks).toEqual([notUp.key])
+    expect(h.queued('Not Up Persona')).toHaveLength(1)
+    expect(h.order.filter(step => step === 'ack')).toEqual(['ack'])
 
     expect(isRestartPendingOrActive(notUp.key)).toBe(false)
+    expect(h.restartAsks).toEqual([])
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([])
   })
 
   // An up persona passing the check to "starting now" is the beta side of the
@@ -867,7 +854,7 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
     expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
-    expect(h.upAsks).toEqual([h.alpha.key, h.alpha.key, h.alpha.key])
+    expect(h.upAsks).toEqual([h.alpha.key, h.alpha.key])
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([])
   })
@@ -1697,21 +1684,12 @@ describe('recovery selects the recovery state', () => {
       await arrangeState(h, state)
       const asksBefore = h.restartAsks.length
 
-      const event = messageIn(SHARED)
-      if (state === 'not-up') {
-        await h.deliver(event, h.alpha.key)
-        expect(h.queued('alpha')).toEqual([])
-        expect(h.order.filter(step => step === 'ack')).toEqual([])
-        expect(h.restartAsks.slice(asksBefore)).toEqual([])
-        // Preserve the old recovery assertion through the actual accepted-work
-        // path, independently of the no-new-admission control above.
-        expect((await h.queue.accept(h.alpha.key, slackInput({ channel: SHARED,
-          ts: event.ts as string, key: { chat_id: SHARED, ts: event.ts as string },
-          user: event.user as string, text: event.text as string, via: 'receive_all' }))).status).toBe('accepted')
-      }
-      await h.deliver(event, h.alpha.key)
+      await h.deliver(messageIn(SHARED), h.alpha.key)
 
       expectStoredWithoutNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
+      // Every state, not up included, stores and acknowledges the new event once.
+      expect(h.queued('alpha')).toHaveLength(1)
+      expect(h.order.filter(step => step === 'ack')).toEqual(['ack'])
       // Only "starting now" asks the relaunch gate (it schedules the restart).
       expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(setup.pending)

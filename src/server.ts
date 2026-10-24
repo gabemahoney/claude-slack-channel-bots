@@ -1198,7 +1198,8 @@ const personaRouting = createPersonaRouting({
   // sets, which the session tools and the reload controller read too. Before
   // main() loads the store it is undefined, so no stored choice applies.
   getChannelDelivery: () => channelDeliveryStore,
-  // A lost message for a persona that is not up restarts nothing.
+  // Asked for a lost message only: one lost for a persona that is not up
+  // restarts nothing.
   isPersonaUp,
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,

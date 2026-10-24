@@ -623,9 +623,22 @@ describe('observed intake, deferred replies and retained feedback', () => {
     } finally { await preparation.stop() }
   })
 
-  test.each(['none', 'write', 'fsync', 'ambiguous'] as const)('off retry after up loss durably discards pending enrollment (%s cancellation fault)', async fault => {
+  test('up lost during the observation holds nothing: the mention is accepted, acknowledged and enrolled', async () => {
     const h = await open({ routing: { routingHooks: { _afterObservation: async observation => {
       if (observation.lifetime.key === 'alpha') h.h.notUp.add('alpha')
+    } } } })
+    expect((await h.receive(h.mention())).acknowledged).toBe(1)
+    expect(h.h.notUp.has('alpha')).toBe(true)
+    expect(h.read()).toBe('followed')
+    expect(h.threads.pending('alpha')).toEqual([])
+    expect(h.h.queue.threadRecords('alpha').map(r => r.state)).toEqual(['enrolled'])
+    expect(accepted(h).map(a => a.via)).toEqual(['mention'])
+    expect(h.failures).toEqual([])
+  })
+
+  test.each(['none', 'write', 'fsync', 'ambiguous'] as const)('off retry after membership loss durably discards pending enrollment (%s cancellation fault)', async fault => {
+    const h = await open({ routing: { routingHooks: { _afterObservation: async observation => {
+      if (observation.lifetime.key === 'alpha') h.membership.set(`alpha:${C}`, { kind: 'unresolved', reason: 'history-unresolved' })
     } } } })
     const mention = h.mention()
     expect((await h.receive(mention)).acknowledged).toBe(0)
@@ -633,7 +646,7 @@ describe('observed intake, deferred replies and retained feedback', () => {
     expect(h.h.queue.threadRecord('alpha', observation.id)?.state).toBe('observed')
     expect(accepted(h)).toEqual([])
     expect(h.failures).toEqual([])
-    h.h.notUp.delete('alpha')
+    h.membership.delete(`alpha:${C}`)
     let replyAcks = 0
     await h.h.routing.receive(threadReply(), () => { replyAcks++ }, 'alpha', false)
     const candidate = h.h.routing.pendingCandidates()[0]!
@@ -997,30 +1010,37 @@ describe('observed intake, deferred replies and retained feedback', () => {
       expect(h.threads.lifetimeStatus(observation.lifetime)).toBe('superseded')
     }
     await h.h.routing.reevaluate(id)
-    expect(accepted(h).map(a => a.via)).toEqual(['mention'])
-    expect(h.h.p('alpha').stub.web.callLog).toHaveLength(calls)
-    if (guard === 'off' || guard === 'mentions') {
-      // Current policy settles the reply as unselected: acknowledged, never accepted.
+    expect(accepted(h).map(a => a.via)).toEqual(guard === 'not-up' ? ['mention', 'thread'] : ['mention'])
+    if (guard === 'not-up') {
+      // The positive control: not up is no guard, so the reply is accepted, acknowledged and given its queued reaction at once.
       expect(acks).toBe(1)
-      expect(h.h.routing.pendingCandidates()).toEqual([])
-    } else if (guard === 'superseded') {
-      // A superseded lifetime retires the candidate; Slack's redelivery is decided under the replacement lifetime.
-      expect(acks).toBe(0)
-      expect(h.h.routing.pendingCandidates()).toEqual([])
-      expect(h.settled).toContain(id)
-      expect((await h.receive(event)).acknowledged).toBe(1)
-      expect(accepted(h).map(a => a.via)).toEqual(['mention'])
-    } else {
-      // Held, not dropped: unacknowledged, still pending, and accepted once the guard clears.
-      expect(acks).toBe(0)
-      expect(h.h.routing.pendingCandidates().map(c => c.id)).toEqual([id])
-      if (guard === 'membership') member = true
-      else h.h.notUp.delete('alpha')
-      await h.h.routing.reevaluate(id)
-      expect(acks).toBe(1)
-      expect(accepted(h).map(a => a.via)).toEqual(['mention', 'thread'])
+      expect(h.h.p('alpha').stub.calls.reactionsAdd.at(-1)).toMatchObject({ channel: C, timestamp: event.ts, name: accepted(h).at(-1)!.queued_ack_reaction })
       expect(accepted(h).at(-1)).toMatchObject({ ts: event.ts, text: event.text, thread_ts: ROOT })
       expect(h.h.routing.pendingCandidates()).toEqual([])
+    } else {
+      expect(h.h.p('alpha').stub.web.callLog).toHaveLength(calls)
+      if (guard === 'off' || guard === 'mentions') {
+        // Current policy settles the reply as unselected: acknowledged, never accepted.
+        expect(acks).toBe(1)
+        expect(h.h.routing.pendingCandidates()).toEqual([])
+      } else if (guard === 'superseded') {
+        // A superseded lifetime retires the candidate; Slack's redelivery is decided under the replacement lifetime.
+        expect(acks).toBe(0)
+        expect(h.h.routing.pendingCandidates()).toEqual([])
+        expect(h.settled).toContain(id)
+        expect((await h.receive(event)).acknowledged).toBe(1)
+        expect(accepted(h).map(a => a.via)).toEqual(['mention'])
+      } else {
+        // Held, not dropped: unacknowledged, still pending, and accepted once the guard clears.
+        expect(acks).toBe(0)
+        expect(h.h.routing.pendingCandidates().map(c => c.id)).toEqual([id])
+        member = true
+        await h.h.routing.reevaluate(id)
+        expect(acks).toBe(1)
+        expect(accepted(h).map(a => a.via)).toEqual(['mention', 'thread'])
+        expect(accepted(h).at(-1)).toMatchObject({ ts: event.ts, text: event.text, thread_ts: ROOT })
+        expect(h.h.routing.pendingCandidates()).toEqual([])
+      }
     }
     await h.notices.runDeferred()
     expect(h.failures).toEqual([])
