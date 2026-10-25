@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **agent-director 0.16 and 0.17.0: Displayed States are read as their raw states.** A bot those releases show as `needs_intelligence` is read as `check_permission` and one shown as `idle_screen` as `working`. Its permission prompts are relayed to Slack, and reconnects, restarts and recovery at start-up go ahead as for the raw state. On other agent-director releases CSCB reads the state as given. agent-director's `[state]` timeouts need no change for CSCB. See [agent-director's timing settings](docs/agent-director.md#agent-directors-timing-settings).
+
 ---
 
 ## 0.18.1 (2026-10-22)

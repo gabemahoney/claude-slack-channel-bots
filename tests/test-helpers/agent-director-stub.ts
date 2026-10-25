@@ -1381,6 +1381,27 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
 }
 
 /**
+ * The rows agent-director 0.16 and 0.17.0 `list` answers from `rows` for
+ * `params`, as its `listFiltered` matches them (`pkg/api/list.go`,
+ * `TestDisplayListFilter`): a row matches a `state` filter by the state it
+ * shows, so a row showing `needs_intelligence` or `idle_screen` never matches
+ * its raw state, and an absent or empty `state` filter keeps every row; each
+ * `label` entry `key=value` must match, the entries ANDed. Other params are
+ * ignored. From agent-director 0.17.1 `state` is always the raw state and a
+ * row matches a `state` filter by its `state` or its `displayed_state`, which
+ * this helper does not model.
+ */
+export function listByDisplayedState(rows: readonly ListRow[], params: ListParams = {}): ListRow[] {
+  const states = params.state ?? []
+  return rows.filter((row) =>
+    (states.length === 0 || states.includes(row.state)) &&
+    (params.label ?? []).every((entry) => {
+      const at = entry.indexOf('=')
+      return row.labels?.[entry.slice(0, at)] === entry.slice(at + 1)
+    }))
+}
+
+/**
  * Build a canned `PermissionRequestRow` for the plural-projection wire. The
  * default `request_token` is a fresh UUIDv4 (via `crypto.randomUUID()`) so
  * the encoded action_id round-trips through the anchored regex. CSCB
