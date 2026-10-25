@@ -74,6 +74,7 @@ import { recordStartupError } from './startup-errors.ts'
 import {
   closeClient as closeInstalledClient,
   DEFAULT_STORE_PATH,
+  normaliseDisplayedStates,
   setClient,
   setClientForTests,
 } from './agent-director-client.ts'
@@ -455,12 +456,16 @@ function constructFailure(err: unknown): StartupGateFailure {
 }
 
 /**
- * Step 2, shared by the gate and the persona client: build a client with
+ * Step 2, shared by the gate, the persona client and the delivery client
+ * factory: build a client with
  * {@link buildAdClientOptions} through `d.createClient`, and read its
  * `binaryVersion` (populated during `Client.create()`'s version probe of the
  * resolved system binary; never the client's `version()` method, whose field
  * is the npm package's version). A throw becomes {@link constructFailure}'s
- * outcome; nothing was built, so nothing is closed.
+ * outcome; nothing was built, so nothing is closed. A built client is
+ * answered with its displayed states normalised (`normaliseDisplayedStates`),
+ * so the gate's client, the persona client and every delivery client read raw
+ * states.
  */
 async function constructClient(
   d: StartupGateDeps,
@@ -472,6 +477,7 @@ async function constructClient(
   } catch (err) {
     return constructFailure(err)
   }
+  normaliseDisplayedStates(client)
   return { ok: true, client, adVersion: (client as { binaryVersion: string }).binaryVersion }
 }
 

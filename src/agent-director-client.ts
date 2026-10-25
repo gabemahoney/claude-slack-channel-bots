@@ -22,6 +22,27 @@
  * gate has installed a Client throws an internal bug-marker error (it
  * indicates a caller-site bug, not a runtime condition).
  *
+ * Displayed states: AD 0.16 and 0.17.0 can show `needs_intelligence` over a
+ * raw `check_permission` row and `idle_screen` over a raw `working` row, in
+ * `state`. Both are reports only, and a `list` state filter matches the shown
+ * state alone (AD `docs/caller-contract.md`, "Needs-intelligence and
+ * idle-screen rows"). From AD 0.17.1 `state` is always the raw state, the
+ * Displayed States come in `displayed_state`, which CSCB does not read, and a
+ * `list` state filter matches `state` or `displayed_state`.
+ * `normaliseDisplayedStates` normalises a client in place, keeping its
+ * identity: `get`, `status` and `list` answer each row's raw state, and a
+ * `list` state filter also asks for the displayed states shown over the raw
+ * states it names (AD before 0.16 ignores the unknown values). When it widens
+ * a filter, `list` then keeps only the rows whose raw state the caller named,
+ * so from AD 0.17.1, where normalising changes nothing, the rows answered are
+ * exactly the raw-state rows asked for. A `list` limit counts rows before
+ * that drop (CSCB passes no limit with a state filter). Every other field
+ * and verb passes through unchanged. The startup module's one client
+ * construction (the gate's, the persona client's and each delivery client's)
+ * applies it, and installing a client (`setClient`, `setClientForTests`)
+ * applies it again, idempotently, for clients built elsewhere such as test
+ * stubs. A verb assigned on the client after that is not normalised.
+ *
  * Concurrency: AD's Client is internally safe for concurrent verb calls
  * (the subprocess-CLI transport serializes its own dispatch),
  * so CSCB does NOT add its own mutex.
@@ -52,6 +73,75 @@ export const DEFAULT_TEMPLATE_NAME = 'slack-channel-bot'
 // ---------------------------------------------------------------------------
 
 let singleton: Client | null = null
+
+// ---------------------------------------------------------------------------
+// Displayed-state normalisation
+// ---------------------------------------------------------------------------
+
+/** AD's Displayed States, each mapped to the raw state it is shown over. */
+const RAW_STATE_OF_DISPLAYED: Readonly<Record<string, string>> = {
+  needs_intelligence: 'check_permission',
+  idle_screen: 'working',
+}
+
+type RowVerb = (this: unknown, ...args: unknown[]) => Promise<unknown>
+
+/** The normalising verbs installed, so a reinstall does not wrap one twice. */
+const normalisingVerbs = new WeakSet<RowVerb>()
+
+/** `row` with a displayed `state` replaced by its raw state; any other value as given. */
+function withRawState<T>(row: T): T {
+  if (row === null || typeof row !== 'object') return row
+  const raw = RAW_STATE_OF_DISPLAYED[(row as { state?: unknown }).state as string]
+  return raw === undefined ? row : { ...row, state: raw }
+}
+
+/** `params` with its `state` filter widened by the displayed states shown over the raw states it names. */
+function withDisplayedStateFilter(params: unknown): unknown {
+  const state = (params as { state?: unknown } | null | undefined)?.state
+  if (!Array.isArray(state)) return params
+  const extra = Object.entries(RAW_STATE_OF_DISPLAYED)
+    .filter(([displayed, raw]) => state.includes(raw) && !state.includes(displayed))
+    .map(([displayed]) => displayed)
+  return extra.length === 0 ? params : { ...(params as object), state: [...state, ...extra] }
+}
+
+/**
+ * The `list` result with each row's displayed state replaced by its raw state
+ * and, when `asked` is given, only the rows whose raw state is one of `asked`.
+ */
+function withRawListStates(result: unknown, asked: readonly unknown[] | null): unknown {
+  const spawns = (result as { spawns?: unknown } | null | undefined)?.spawns
+  if (!Array.isArray(spawns)) return result
+  const raw = spawns.map(withRawState)
+  const rows = asked === null
+    ? raw
+    : raw.filter((row) => asked.includes((row as { state?: unknown } | null | undefined)?.state))
+  return rows.length === spawns.length && rows.every((row, i) => row === spawns[i])
+    ? result
+    : { ...(result as object), spawns: rows }
+}
+
+/** Normalise `client`'s `get`, `status` and `list` in place (see the module header); a non-object as given. */
+export function normaliseDisplayedStates<T>(client: T): T {
+  if (client === null || typeof client !== 'object') return client
+  const verbs = client as unknown as Record<'get' | 'status' | 'list', RowVerb | undefined>
+  const wrap = (verb: 'get' | 'status' | 'list', normalised: (inner: RowVerb) => RowVerb): void => {
+    const inner = verbs[verb]
+    if (typeof inner !== 'function' || normalisingVerbs.has(inner)) return
+    const outer = normalised(inner)
+    normalisingVerbs.add(outer)
+    verbs[verb] = outer
+  }
+  wrap('get', (inner) => async (...args) => withRawState(await inner.apply(client, args)))
+  wrap('status', (inner) => async (...args) => withRawState(await inner.apply(client, args)))
+  wrap('list', (inner) => async (params, ...rest) => {
+    const widened = withDisplayedStateFilter(params)
+    const asked = widened === params ? null : (params as { state: readonly unknown[] }).state
+    return withRawListStates(await inner.apply(client, [widened, ...rest]), asked)
+  })
+  return client
+}
 
 /**
  * Return the singleton Client installed by the startup gate.
@@ -108,17 +198,18 @@ export function resetClientForTests(): void {
  * grep-discoverable.
  */
 export function setClient(client: Client): void {
-  singleton = client
+  singleton = normaliseDisplayedStates(client)
 }
 
 /**
  * Test-only helper: install a pre-built Client (typically a stub) as the
- * singleton. Skip the Client construction path entirely.
+ * singleton. Skip the Client construction path entirely. The client is
+ * normalised as `setClient` normalises it.
  *
  * @internal
  */
 export function setClientForTests(client: Client): void {
-  singleton = client
+  singleton = normaliseDisplayedStates(client)
 }
 
 // ---------------------------------------------------------------------------
