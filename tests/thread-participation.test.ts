@@ -327,10 +327,10 @@ describe('permanent participation and joint queue recovery', () => {
     expect(quarantined()).toEqual([torn])
   })
 
-  test('a torn journal whose startup rewrite failed is retried by idle recovery, which reports recovery only once thread state is readable', async () => {
+  test.each(['rewrite', 'read'] as const)('a torn journal whose startup %s failed is retried by idle recovery, which reports recovery only once thread state is readable', async fault => {
     const { clock } = await journalWithTail('slack')
     tearJournal(dir)
-    const disk = threadDisk(); disk.fail('rewrite')
+    const disk = threadDisk(); disk.fail(fault)
     const h = await open({ disk, clock }), r = attachRecovery(h)
     expect([h.h.queue.threadReadable('alpha'), h.h.queue.threadRepairable!('alpha')]).toEqual([false, true])
     r.recovery.kick('alpha'); await r.settle()
@@ -340,9 +340,52 @@ describe('permanent participation and joint queue recovery', () => {
     reading(h, ROOT3, 'unresolved', 'storage')
     disk.repair()
     await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
-    expect([h.h.queue.threadReadable('alpha'), r.recovered]).toEqual([true, ['alpha']])
+    expect([h.h.queue.threadReadable('alpha'), h.h.queue.threadRepairable!('alpha'), r.recovered]).toEqual([true, false, ['alpha']])
     expect(h.h.logs.filter(l => l === buildParticipationRecoveredLine(renderPersonaRef('alpha', 'alpha')))).toHaveLength(1)
     reading(h, ROOT, 'followed'); reading(h, ROOT3, 'unfollowed')
+  })
+
+  const rawRows = () => fs.readFileSync(queuePath(dir), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
+
+  test('a journal with no file, read but never loaded, is healthy: idle recovery writes nothing, and later acceptances hold exactly their rows', async () => {
+    const h = await open(), r = attachRecovery(h)
+    expect(fs.existsSync(queuePath(dir))).toBe(false)
+    expect([h.h.queue.items('alpha'), h.h.queue.openCount('alpha'), h.h.queue.threadRepairable!('alpha')]).toEqual([[], 0, false])
+    r.recovery.kick('alpha'); await r.settle()
+    expect([fs.existsSync(queuePath(dir)), r.findings]).toEqual([false, []])
+    for (let i = 0; i < 3; i++) expect((await h.h.queue.accept('alpha', injectedInput())).status).toBe('accepted')
+    const bytes = fs.readFileSync(queuePath(dir))
+    r.recovery.kick('alpha'); await r.settle()
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect([rawRows().filter(row => row.kind === 'accepted').length, rawRows().filter(row => 'compact' in row), r.findings]).toEqual([3, [], []])
+  })
+
+  test('an id-less own-post gap on a persona with no journal file is recovered by one idle pass, which reads the journal without writing it', async () => {
+    const h = await open(), r = attachRecovery(h)
+    expect(fs.existsSync(queuePath(dir))).toBe(false)
+    h.h.ownPostIdentity.set('alpha', undefined)
+    const idless = await h.confirmPost({ channel: C, ts: '1700000000.000500' }).outcome
+    h.h.ownPostIdentity.delete('alpha')
+    expect(idless).toMatchObject({ kind: 'gap', reason: 'identity-unresolved' })
+    expect((idless as { id?: unknown }).id).toBeUndefined()
+    await h.notices.flush()
+    expect([h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED), h.h.queue.threadReadable('alpha')]).toEqual([true, false])
+    const line = buildParticipationRecoveredLine(renderPersonaRef('alpha', 'alpha'))
+    r.recovery.kick('alpha'); await r.settle()
+    expect(h.h.logs.filter(l => l === line)).toHaveLength(1)
+    expect([fs.existsSync(queuePath(dir)), r.findings, h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)]).toEqual([false, [], false])
+    r.recovery.kick('alpha'); await r.settle()
+    expect(h.h.logs.filter(l => l === line)).toHaveLength(1)
+  })
+
+  test('a healthy journal loaded at startup is left byte for byte by idle recovery', async () => {
+    const { clock } = await journalWithTail('interject')
+    const h = await open({ clock }), r = attachRecovery(h)
+    const bytes = fs.readFileSync(queuePath(dir))
+    expect([h.h.queue.threadReadable('alpha'), h.h.queue.threadRepairable!('alpha')]).toEqual([true, false])
+    r.recovery.kick('alpha'); await r.settle()
+    expect([fs.readFileSync(queuePath(dir)).equals(bytes), r.findings]).toEqual([true, []])
+    reading(h, ROOT, 'followed')
   })
 
   test('a torn tail first loaded by recovery after a failed startup read is reconciled without an append', async () => {

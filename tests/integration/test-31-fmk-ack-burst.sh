@@ -165,8 +165,20 @@ assert collections.Counter((r.get("channel"), r.get("timestamp")) for r in react
 assert not any(r["event"] == "api" and r.get("method") == "reactions.remove" for r in stub), "queued reaction removed before reply/delivery"
 # Root messages of an `all` channel need no thread evidence: no enrollment
 # metadata call (src/participation-metadata.ts ENROLLMENT_METADATA_METHODS).
+# The one permitted conversations.info is delivery preparation's cached
+# channel-name lookup (src/delivery-intake.ts channelName), not enrollment:
+# strict mode makes no open-mode channel-evidence lookup. Both lookups send
+# only `channel`, so the count, not the arguments, rules out enrollment.
+# Not `== 1`: this block reads the stub record before the script waits for the
+# 1,000 received lines, so the channel-name request may not have reached the stub yet.
 metadata = ("conversations.replies", "conversations.info", "files.info")
-assert not any(r["event"] == "api" and r.get("method") in metadata for r in stub), "a thread-evidence metadata call during the burst"
+calls = {m: [r for r in stub if r["event"] == "api" and r.get("method") == m] for m in metadata}
+counts = " ".join(f"{m}={len(calls[m])}" for m in metadata)
+assert not calls["conversations.replies"] and not calls["files.info"], f"a thread-evidence metadata call during the burst: {counts}"
+assert len(calls["conversations.info"]) <= 1, f"conversations.info beyond the one channel-name lookup: {counts}"
+assert all(r.get("label") == label and r.get("token_kind") == "bot" and r.get("channel") == channel
+           and r.get("args_token_like") is False and not any(k in r for k in ("user", "thread_ts", "text"))
+           for r in calls["conversations.info"]), f"conversations.info is not a bot call on the burst channel with only `channel` set: {counts}"
 print(f"ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms={maximum:.3f} p95_ms={p95:.3f} over_limit={over_limit}")
 EOF
 

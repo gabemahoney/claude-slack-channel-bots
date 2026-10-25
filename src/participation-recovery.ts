@@ -99,7 +99,7 @@ export interface ParticipationRecoveryFinding {
 
 export interface ParticipationRecoveryDeps {
   participation(): ThreadParticipation | undefined
-  queue(): Pick<DeliveryQueue, 'threadReadable' | 'threadRepairable' | 'compact'> | undefined
+  queue(): Pick<DeliveryQueue, 'threadReadable' | 'threadRepairable' | 'threadRecords' | 'compact'> | undefined
   /** Routing's held undecidable replies. */
   candidates(): ThreadCandidate[]
   /** Routing's re-evaluation entry: the ordinary receive/dedupe/fanout path; repeated calls share one run. */
@@ -290,6 +290,10 @@ export function createParticipationRecovery(deps: ParticipationRecoveryDeps): Pa
     const threads = deps.participation()
     if (!threads) return { ...tally, blocked: 1 }
     const queue = deps.queue()
+    // A journal not read yet is read, never rewritten; a failed read makes it repairable below.
+    if (queue && !queue.threadReadable(key) && !queue.threadRepairable?.(key)) {
+      try { queue.threadRecords(key) } catch { /* reported below while still unreadable */ }
+    }
     // Storage first: an unreadable journal decides nothing below.
     if (queue?.threadRepairable?.(key)) {
       try { await queue.compact(key) } catch { /* reported below while still unreadable */ }

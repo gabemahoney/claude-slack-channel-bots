@@ -239,6 +239,8 @@ import { MAX_TIMER_DELAY_MS, createPersonaRetrySchedule } from '../src/persona-r
 import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../src/persona-serializer.ts'
 import {
   longLivedWebClientOptions,
+  membershipWebClientOptions,
+  metadataWebClientOptions,
   redactSlackLogText,
   redactingSlackLogger,
   resolveSlackApiUrlOverride,
@@ -2433,6 +2435,14 @@ describe('connection manager: bring-up and identity', () => {
 
 /** The Web API options of a validation client and of a socket client's `apps.connections.open` client. */
 const NO_RETRY_OPTIONS = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
+/** An enrollment-metadata or scope re-read client's options: no SDK HTTP timeout, so the metadata deadline alone ends a hung request. */
+const METADATA_OPTIONS = { ...NO_RETRY_OPTIONS, timeout: 0 }
+
+/** A signal-bound client's options with its logger and request interceptor aside, and the signal the interceptor binds a request to. */
+function signalBoundOptions(options: unknown): { rest: Record<string, unknown>; logger: unknown; bound: unknown } {
+  const { logger, requestInterceptor, ...rest } = options as WebClientOptions
+  return { rest, logger, bound: (requestInterceptor as unknown as (request: Record<string, unknown>) => Record<string, unknown>)({}).signal }
+}
 
 /**
  * Each client kind's exact options, the token and the library logger
@@ -3055,6 +3065,29 @@ describe('Slack API base URL override: the option builders (section 4)', () => {
     expect('slackApiUrl' in without).toBe(false)
     expectRedactingLogger(plainLogger)
     expect(build(STUB_API_URL)).not.toBe(withUrl)
+  })
+
+  // Rows: the signal-bound builder and its exact options, the logger and the interceptor aside.
+  // Membership discovery keeps the 10 s validation timeout; metadata has none, so its deadline owns the clock.
+  test.each<[string, (signal: AbortSignal, slackApiUrl?: string) => WebClientOptions, Record<string, unknown>]>([
+    ['membershipWebClientOptions', membershipWebClientOptions, NO_RETRY_OPTIONS],
+    ['metadataWebClientOptions', metadataWebClientOptions, METADATA_OPTIONS],
+  ])('%s: exactly its options, a redacting logger and an interceptor binding each request to its signal; slackApiUrl only when given; fresh per call', (_name, build, expected) => {
+    const controller = new AbortController(), other = new AbortController()
+    const withUrl = build(controller.signal, STUB_API_URL)
+    const without = build(controller.signal, undefined)
+
+    const bound = signalBoundOptions(withUrl)
+    expect(bound.rest).toStrictEqual({ ...expected, slackApiUrl: STUB_API_URL })
+    expectRedactingLogger(bound.logger)
+    expect(bound.bound).toBe(controller.signal)
+    const plain = signalBoundOptions(without)
+    expect(plain.rest).toStrictEqual(expected)
+    expect('slackApiUrl' in without).toBe(false)
+    expectRedactingLogger(plain.logger)
+    expect(plain.bound).toBe(controller.signal)
+    const again = build(other.signal)
+    expect([again === without, again.logger === without.logger, signalBoundOptions(again).bound]).toEqual([false, false, other.signal])
   })
 
   test('socketModeClientOptions: with a URL, slackApiUrl inside clientOptions only (so apps.connections.open goes there), every other option unchanged; with undefined, exactly the options and no slackApiUrl key anywhere', () => {
@@ -5778,7 +5811,7 @@ const METADATA_CALLS: Array<[EnrollmentMetadataMethod, Record<string, unknown>, 
 ]
 
 describe('connection manager: enrollment metadata calls on the current authenticated connection', () => {
-  test.each(METADATA_CALLS)('%s: one request with exactly its arguments, on a fresh membership-options client bound to the caller\'s signal; B is untouched', async (method, args, queue, captured) => {
+  test.each(METADATA_CALLS)('%s: one request with exactly its arguments, on a fresh metadata-options client (no SDK HTTP timeout) bound to the caller\'s signal; B is untouched', async (method, args, queue, captured) => {
     const h = makeHarness()
     await bringUpBoth(h)
     const a = stubOf(h, h.a), controller = new AbortController()
@@ -5791,10 +5824,24 @@ describe('connection manager: enrollment metadata calls on the current authentic
     expect(a.callLog.slice(calls).map(c => c.method)).toEqual([method])
     const [build] = h.slack.buildsOf(h.a.key).slice(builds)
     expect([h.slack.buildsOf(h.a.key).length - builds, build!.kind]).toEqual([1, 'web'])
-    const options = build!.options as { retryConfig?: unknown; rejectRateLimitedCalls?: unknown; requestInterceptor?: (request: Record<string, unknown>) => Record<string, unknown> }
-    expect([options.retryConfig, options.rejectRateLimitedCalls]).toEqual([{ retries: 0 }, true])
-    expect(options.requestInterceptor!({}).signal).toBe(controller.signal)
+    const options = signalBoundOptions(build!.options)
+    expect(options.rest).toStrictEqual(METADATA_OPTIONS)
+    expectRedactingLogger(options.logger)
+    expect(options.bound).toBe(controller.signal)
     expect(stubOf(h, h.b).callLog).toHaveLength(callsB)
+  })
+
+  test('a membership page, unlike a metadata call, still builds its client with the membership options and their 10 s timeout', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a), controller = new AbortController(), builds = h.slack.buildsOf(h.a.key).length
+    a.script.inventory.push({ kind: 'ok', result: { channels: [], response_metadata: { next_cursor: '' } } })
+    await h.manager.membershipPage(h.a.key, h.manager.provenance(h.a.key)!.connectionId, undefined, controller.signal)
+    const fresh = h.slack.buildsOf(h.a.key).slice(builds)
+    expect(fresh.map(b => b.kind)).toEqual(['web'])
+    const options = signalBoundOptions(fresh[0]!.options)
+    expect(options.rest).toStrictEqual(NO_RETRY_OPTIONS)
+    expect(options.bound).toBe(controller.signal)
   })
 
   test.each<[string, (h: Harness) => { connectionId: string; signal: AbortSignal; key?: string }]>([
@@ -5884,7 +5931,7 @@ describe('connection manager: re-reading the granted scopes on the current authe
   }
   const scopesOf = (h: Harness) => [...h.manager.grantedScopes(h.a.key) ?? []]
 
-  test('one auth.test on a fresh membership-options client bound to the caller\'s signal replaces the scopes; the connection is kept and B is untouched', async () => {
+  test('one auth.test on a fresh metadata-options client (no SDK HTTP timeout) bound to the caller\'s signal replaces the scopes; the connection is kept and B is untouched', async () => {
     const h = await upWithScopes()
     const a = stubOf(h, h.a), controller = new AbortController(), connectionId = h.manager.provenance(h.a.key)!.connectionId
     const builds = h.slack.buildsOf(h.a.key).length, calls = a.callLog.length, callsB = stubOf(h, h.b).callLog.length, statuses = h.statuses.length
@@ -5895,9 +5942,10 @@ describe('connection manager: re-reading the granted scopes on the current authe
     expect(a.callLog.slice(calls).map(c => c.method)).toEqual(['auth.test'])
     const fresh = h.slack.buildsOf(h.a.key).slice(builds)
     expect(fresh.map(b => b.kind)).toEqual(['web'])
-    const options = fresh[0]!.options as { retryConfig?: unknown; rejectRateLimitedCalls?: unknown; requestInterceptor?: (request: Record<string, unknown>) => Record<string, unknown> }
-    expect([options.retryConfig, options.rejectRateLimitedCalls]).toEqual([{ retries: 0 }, true])
-    expect(options.requestInterceptor!({}).signal).toBe(controller.signal)
+    const options = signalBoundOptions(fresh[0]!.options)
+    expect(options.rest).toStrictEqual(METADATA_OPTIONS)
+    expectRedactingLogger(options.logger)
+    expect(options.bound).toBe(controller.signal)
     expect([h.manager.provenance(h.a.key)!.connectionId, h.statuses.length, h.manager.status(h.a.key)?.state]).toEqual([connectionId, statuses, 'up'])
     expect(stubOf(h, h.b).callLog).toHaveLength(callsB)
   })

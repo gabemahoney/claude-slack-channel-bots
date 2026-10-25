@@ -3,12 +3,15 @@
  * and their retry spacing.
  *
  * Every root lookup (`conversations.replies`), `files.info` and
- * `conversations.info` attempt runs under one end-to-end deadline
- * (`ENROLLMENT_METADATA_DEADLINE_MS`). Its abort signal reaches the queued and
- * in-flight HTTP work through the connection manager's metadata client (no
- * SDK retries, rate limits rejected, request interceptor bound to the
- * signal), so an expired attempt leaves no SDK request behind while a fresh
- * one starts. A late fulfillment or rejection is consumed without effect.
+ * `conversations.info` attempt, and every granted-scope `auth.test` re-read,
+ * runs under one end-to-end deadline (`ENROLLMENT_METADATA_DEADLINE_MS`). Its
+ * abort signal reaches the queued and in-flight HTTP work through the
+ * connection manager's metadata client (`metadataWebClientOptions`: no SDK
+ * retries, rate limits rejected, request interceptor bound to the signal, and
+ * no SDK HTTP timeout), so the deadline is the only clock: a hung request
+ * fails as `deadline` at the deadline, and an expired attempt leaves no SDK
+ * request behind while a fresh one starts. A late fulfillment or rejection is
+ * consumed without effect.
  *
  * An attempt belongs to its persona, its authenticated connection and the
  * evidence it serves: `MetadataAttempts.run` re-checks the caller's `current`

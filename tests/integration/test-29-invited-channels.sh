@@ -77,7 +77,7 @@
 # on the same connection, never after a quiet period. Every push has its own
 # `ts`, but the two events of one mention and the one message pushed to both
 # personas.
-# Runtime: not yet measured after Phase R; expected roughly 6-10 min,
+# Runtime: about 5 min (284 s in the passing /ci run after Phase R),
 # dominated by R3's Retry-After window and the 60 s backoff after R4. It is
 # re-measured at the Epic /ci gate after Task 8k, and this header and
 # tests/ci-durations.tsv are refreshed from that run's duration-table block.

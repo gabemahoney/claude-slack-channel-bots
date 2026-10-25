@@ -199,6 +199,8 @@ interface Journal extends AppendRollback {
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
   threads: Map<string, ThreadParticipationRecord>; threadKeys: Map<string, ThreadParticipationRecord>; threadGap: boolean
   threadReplayPending?: boolean
+  /** A read of the journal failed; a journal merely not read yet is healthy. */
+  loadFailed?: boolean
 }
 function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0, threads: new Map(), threadKeys: new Map(), threadGap: false } }
 /** All file access is explicit; construction allocates only memory. */
@@ -346,11 +348,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const stored = journal(key)
     if (stored.loaded) return
     // Publish only a complete replay: a failed read or quarantine append must
-    // remain retryable without exposing partial rows or dedupe facts.
+    // remain retryable without exposing partial rows or dedupe facts. Any
+    // throw below leaves `loadFailed` set until a later load succeeds.
+    stored.loadFailed = true
     const j = emptyJournal()
     let bytes: Buffer
     try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { stored.loaded = true; return }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { stored.loaded = true; delete stored.loadFailed; return }
       event({ type: 'recovery-failed', key, error }); throw error
     }
     const lines: { bytes: Buffer; start: number; line: number; record?: QueueRecord; raw?: Record<string, unknown>; whole: boolean; torn: boolean }[] = []
@@ -416,7 +420,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const fd = fs.openSync(pathFor(key), 'r')
       try { fs.fsyncSync(fd); syncDir(dir) } finally { fs.closeSync(fd) }
     }
-    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
+    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true; delete stored.loadFailed
     stored.threads = j.threads; stored.threadKeys = j.threadKeys; stored.threadGap = j.threadGap
     // Remove a quarantined unfinished tail before any append can terminate it
     // into a complete damaged line, which a later reopen must treat as a gap.
@@ -717,7 +721,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     },
     threadRepairable: key => {
       const j = journals.get(key)
-      return !!j && started && !stopped && !j.threadGap && (!j.loaded || j.threadReplayPending === true || j.pendingRollback !== undefined)
+      // Not read yet is not a fault: its first use loads it.
+      return !!j && started && !stopped && !j.threadGap && (j.loadFailed === true || j.threadReplayPending === true || j.pendingRollback !== undefined)
     },
     async recordThreadObservation(key, observation, state = 'observed') {
       observation = structuredClone(observation)

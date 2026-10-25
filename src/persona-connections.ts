@@ -153,6 +153,7 @@ import {
   PRODUCTION_SLACK_CLIENT_FACTORY,
   longLivedWebClientOptions,
   membershipWebClientOptions,
+  metadataWebClientOptions,
   socketModeClientOptions,
   validationWebClientOptions,
   type PersonaSlackClientFactory,
@@ -388,9 +389,10 @@ export interface PersonaConnectionManager {
   membershipPage(key: string, connectionId: string, cursor: string | undefined, signal: AbortSignal): Promise<unknown>
   /**
    * One enrollment-metadata request on the persona's current authenticated
-   * connection, through the factory with the membership client options and
-   * the auth watch. Rejects with `MetadataCancelledError` when the connection
-   * is not current, not up, or `signal` already aborted.
+   * connection, through the factory with the metadata client options (no SDK
+   * HTTP timeout: `signal`, aborted by the caller's bounded attempt, ends
+   * it) and the auth watch. Rejects with `MetadataCancelledError` when the
+   * connection is not current, not up, or `signal` already aborted.
    */
   metadataCall(key: string, connectionId: string, method: EnrollmentMetadataMethod, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown>
   /**
@@ -401,7 +403,7 @@ export interface PersonaConnectionManager {
   /**
    * Read the held bot token's granted scopes again with one authenticated
    * `auth.test` on the persona's current connection, through the factory
-   * with the membership client options and the auth watch; not a root probe
+   * with the metadata client options and the auth watch; not a root probe
    * and no reconnect. A well-formed list from the same bot replaces what
    * `grantedScopes` reports. Rejects with `MetadataCancelledError` like
    * `metadataCall`.
@@ -1271,9 +1273,11 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     }
   }
 
-  /** Enrollment metadata uses the membership client options (no SDK retries,
-   * rate limits rejected, abort reaching queued HTTP work) and the same
-   * connection guard. A refusal marks the persona before the caller sees it. */
+  /** Enrollment metadata uses the metadata client options (no SDK retries,
+   * rate limits rejected, abort reaching queued HTTP work, and no SDK HTTP
+   * timeout, so the caller's metadata deadline alone ends a hung request) and
+   * the membership connection guard. A refusal marks the persona before the
+   * caller sees it. */
   async function metadataCall(key: string, connectionId: string, method: EnrollmentMetadataMethod,
     args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
     const entry = entries.get(key)
@@ -1283,7 +1287,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     const tokens = entry.tokens
     const applies = () => entries.get(key) === entry && entry.tokens === tokens && !entry.stopped && !signal.aborted &&
       entry.socket === binding && entry.status.state !== 'broken'
-    const raw = factory.createWebClient(tokens.botToken, membershipWebClientOptions(signal, slackApiUrl))
+    const raw = factory.createWebClient(tokens.botToken, metadataWebClientOptions(signal, slackApiUrl))
     const client = watchWebClientAuth(raw, outcome => { if (applies()) markRefusedWhileRunning(entry, outcome) })
     switch (method) {
       case 'conversations.replies': return client.conversations.replies(args as never)
@@ -1300,7 +1304,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     const tokens = entry.tokens
     const applies = () => entries.get(key) === entry && entry.tokens === tokens && !entry.stopped && !signal.aborted &&
       entry.socket === binding && entry.status.state !== 'broken'
-    const raw = factory.createWebClient(tokens.botToken, membershipWebClientOptions(signal, slackApiUrl))
+    const raw = factory.createWebClient(tokens.botToken, metadataWebClientOptions(signal, slackApiUrl))
     const client = watchWebClientAuth(raw, outcome => { if (applies()) markRefusedWhileRunning(entry, outcome) })
     const result: unknown = await client.auth.test()
     const scopes = grantedScopesFrom(result), answered = botIdentityFromAuthTest(result)

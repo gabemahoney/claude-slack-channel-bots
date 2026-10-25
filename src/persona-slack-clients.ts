@@ -28,6 +28,12 @@
  *   error text holding the WebSocket URL and its connection ticket.
  * - Validation: the same four Web API options, and a redacting `logger`
  *   (`redactingSlackLogger`).
+ * - Membership discovery (`users.conversations`): the validation options
+ *   (10 s timeout included) and a request interceptor that binds each request
+ *   to the caller's abort signal.
+ * - Enrollment metadata and the granted-scope re-read: the membership
+ *   options with no SDK HTTP timeout, since the caller's bounded attempt
+ *   aborts the signal at the metadata deadline.
  * - Long-lived Web API: `timeout: 30000`,
  *   `attachOriginalToWebAPIRequestError: false` and a redacting `logger`.
  *   `retryConfig` and `rejectRateLimitedCalls` stay unset, so the library's
@@ -206,6 +212,25 @@ export function membershipWebClientOptions(signal: AbortSignal, slackApiUrl?: st
     ...validationWebClientOptions(slackApiUrl),
     requestInterceptor: request => { request.signal = signal; return request },
   }
+}
+
+/**
+ * The SDK HTTP timeout of an enrollment-metadata client: none. `0` is the
+ * `@slack/web-api` default and makes axios set no timer in any adapter.
+ */
+export const PERSONA_METADATA_REQUEST_TIMEOUT_MS = 0
+
+/**
+ * Only enrollment-metadata requests (`conversations.replies`, `files.info`,
+ * `conversations.info`) and the granted-scope `auth.test` re-read: the
+ * membership options with no SDK HTTP timeout. `signal` is the only clock:
+ * every such request runs under `boundedMetadataCall`, which aborts it at
+ * `ENROLLMENT_METADATA_DEADLINE_MS`, on cancellation or on settlement, so the
+ * deadline, not a shorter SDK timeout, ends a hung request. A fresh object
+ * per call.
+ */
+export function metadataWebClientOptions(signal: AbortSignal, slackApiUrl?: string): WebClientOptions {
+  return { ...membershipWebClientOptions(signal, slackApiUrl), timeout: PERSONA_METADATA_REQUEST_TIMEOUT_MS }
 }
 
 // ---------------------------------------------------------------------------

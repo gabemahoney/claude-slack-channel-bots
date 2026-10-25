@@ -603,6 +603,7 @@ test.each(['EIO', 'EACCES'].flatMap(code => ['accept', 'compact'].map(operation 
     return (fs.readFileSync as Function)(path, ...args)
   } } as typeof fs
   const q = await open({ fs: seam })
+  if (operation === 'compact') expect([q.threadReadable('alpha'), q.threadRepairable!('alpha')]).toEqual([false, true])
   expect(q.items('alpha')).toEqual([])
   expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
   if (operation === 'accept') expect((await q.accept('alpha', injectedInput())).status).toBe('failed')
@@ -610,7 +611,10 @@ test.each(['EIO', 'EACCES'].flatMap(code => ['accept', 'compact'].map(operation 
   expect(q.items('alpha')).toEqual([])
   fail = false
   if (operation === 'accept') expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 2 })
-  else await q.compact('alpha')
+  else {
+    await q.compact('alpha')
+    expect([q.threadReadable('alpha'), q.threadRepairable!('alpha')]).toEqual([true, false])
+  }
   expect(q.items('alpha').map(i => i.accepted.seq)).toEqual(operation === 'accept' ? [1, 2] : [1])
   expect(q.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
 })
@@ -726,6 +730,18 @@ describe('a pending root lookup is rewritten only to re-issue it for a new ident
     await replay.recordThreadObservation('alpha', reissue(pending()), 'enrolled')
     await replay.recordThreadObservation('alpha', pending())
     expect(replay.threadRecord('alpha', pending().id)).toMatchObject({ state: 'enrolled', observation: reissue(pending()) })
+  })
+})
+
+describe('only a storage fault makes a journal repairable by idle recovery', () => {
+  // Rows: a read that creates the persona's in-memory journal without loading it.
+  test.each<[string, (q: DeliveryQueue) => unknown]>([
+    ['items', q => q.items('alpha')],
+    ['threadReadable', q => q.threadReadable('alpha')],
+  ])('a journal with no file, merely read by %s, is healthy: not repairable', async (_name, read) => {
+    const q = await open()
+    read(q)
+    expect(q.threadRepairable!('alpha')).toBe(false)
   })
 })
 
