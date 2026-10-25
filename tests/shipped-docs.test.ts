@@ -373,6 +373,8 @@ import {
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
 import { ONSET_TEMPLATES, tmuxServerChangedOnset } from '../src/outage-state.ts'
+import { DM_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, PUBLIC_HISTORY_SCOPE, requiredHistoryScopes } from '../src/participation-channel-evidence.ts'
+import { ENROLLMENT_METADATA_METHODS } from '../src/participation-metadata.ts'
 import { STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
@@ -642,6 +644,22 @@ describe('slack-app-manifest.yml', () => {
         'users:read',
       ].sort(),
     )
+  })
+
+  // Root, channel and file evidence use scopes the manifest already grants; this Task adds none.
+  test('every scope thread evidence needs is already a bot scope: the history scopes a DM persona checks, and each metadata method\'s read scope', () => {
+    const bot = manifest.oauth_config.scopes.bot
+    const METHOD_SCOPES: Record<typeof ENROLLMENT_METADATA_METHODS[number], readonly string[]> = {
+      'conversations.replies': requiredHistoryScopes({ dm: { enabled: true } }),
+      'conversations.info': ['channels:read', 'groups:read'],
+      'files.info': ['files:read'],
+    }
+    expect(Object.keys(METHOD_SCOPES).sort()).toEqual([...ENROLLMENT_METADATA_METHODS].sort())
+    expect(Object.values(METHOD_SCOPES).flat().filter((scope) => !bot.includes(scope))).toEqual([])
+    expect(requiredHistoryScopes({ dm: { enabled: true } })).toEqual(expect.arrayContaining([PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, DM_HISTORY_SCOPE]))
+    // Group DMs are never delivered, so their history is neither required nor granted.
+    expect(requiredHistoryScopes({ dm: { enabled: true } })).not.toContain('mpim:history')
+    expect(bot).not.toContain('mpim:history')
   })
 
   test('the bot events are exactly the pinned list (none dropped, none added)', () => {

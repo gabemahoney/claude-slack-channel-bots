@@ -21,7 +21,7 @@ import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 import type { PersonaConfig } from '../src/config.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
+import { createDeliveryReporting, MESSAGE_RECEIVED, type DeliveryReportingDeps } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
 import { configInEffect } from '../src/reload.ts'
@@ -59,6 +59,8 @@ import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
+import type { ParticipationRecoveryDeps } from '../src/participation-recovery.ts'
+import type { RootLookupCapabilityDeps } from '../src/participation-capability.ts'
 import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
 import type { ReloadControllerDeps } from '../src/reload.ts'
 import type * as RestartModule from '../src/restart.ts'
@@ -1664,7 +1666,7 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('dryRun')).toBe('isDryRun()')
     expect(props.get('onStatus')).toStartWith('composePersonaStatusListeners(')
     const listeners = onlyCallArgs('composePersonaStatusListeners')
-    expect(listeners).toHaveLength(4)
+    expect(listeners).toHaveLength(5)
     expect(listeners[0]).toBe('(key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) }')
     expect(listeners[1]).toBe(`createPersonaUpFlushListener(${notifier})`)
     // The controller is built after (and over) the manager, so the listener
@@ -1674,6 +1676,7 @@ describe('server.ts wires the persona connection seams', () => {
     expect(listeners[2]).not.toContain(constOf('createPersonaBringUpController'))
     // Resolve reporting on the up notification, when the current client is usable.
     expect(listeners[3]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
+    expect(listeners[4]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) \{ rootLookupCapability\.connected\(\1\); participationRecovery\?\.connected\(\1\) \} \}$/)
   })
 
   test('the Slack API base URL override (section 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
@@ -4278,7 +4281,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'getParticipation', 'currentProvenance', 'onParticipationFailure', 'onParticipationSettled', 'beginIntake',
+      'getParticipation', 'currentProvenance', 'onParticipationFailure', 'onParticipationSettled', 'onCandidateHeld', 'onChannelEvent', 'beginIntake',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5491,6 +5494,63 @@ describe('participation recovers before intake and shares the production owners'
     for (const [member, binding] of bindings) expect(props.get(member)).toBe(binding)
   })
 
+  test('idle participation recovery: never built in dry run, kicked once per restored key at startup, kicked per held candidate and per ended own-post episode, told of each new channel event, forgotten on teardown and stopped before the owner', () => {
+    expect(onlyCallProps('createPersonaRouting').get('onCandidateHeld')).toBe('candidate => participationRecovery?.kick(candidate.key, candidate.id)')
+    // A new event of a channel lets recovery look up that channel's lost-access gaps again.
+    expect(onlyCallProps('createPersonaRouting').get('onChannelEvent')).toBe('(key, channel) => participationRecovery?.channelEvent(key, channel)')
+    expect(indicesOf(/participationRecovery\?\.channelEvent\(/g, SERVER_CODE)).toHaveLength(1)
+    // An own-post episode's end asks recovery for its report through the same kick.
+    const owed: keyof DeliveryReportingDeps = 'recoveryOwed'
+    expect(onlyCallProps('createDeliveryReporting').get(owed)).toBe('(key, id) => participationRecovery?.kick(key, id)')
+    expect(indicesOf(/participationRecovery\?\.kick\(/g, SERVER_CODE)).toHaveLength(3)
+    const build = onlyCallOf('createParticipationRecovery')
+    expect(insideMain(build)).toBe(true)
+    const guard = SERVER_CODE.lastIndexOf('if (!isDryRun()) {', build)
+    expect(guard).toBeGreaterThan(-1)
+    expect(SERVER_CODE.slice(guard, build).replace(/\s+/g, ' ').trim()).toBe('if (!isDryRun()) { participationRecovery =')
+    const startup = SERVER_CODE.indexOf('for (const key of deliveryQueue?.keys() ?? []) participationRecovery.kick(key)')
+    expect(startup).toBeGreaterThan(build)
+    expect(indicesOf(/participationRecovery\.kick\(key\)/g, SERVER_CODE)).toHaveLength(1)
+    expect(onlyCallProps('createParticipationRecovery').get('report')?.replace(/\s+/g, ' ')).toBe(
+      '{ finding: (key, finding) => deliveryReporting?.recoveryFinding(key, finding), recovered: key => deliveryReporting?.participationRecovered(key), }')
+    expect(indicesOf(/participationRecovery\?\.forget\((\w+)\)/g, SERVER_CODE)).toHaveLength(1)
+    const stop = SERVER_CODE.indexOf('participationRecovery?.stop()')
+    expect(indicesOf(/participationRecovery\?\.stop\(\)/g, SERVER_CODE)).toHaveLength(1)
+    expect(SERVER_CODE.indexOf('personaRouting.stop()')).toBeLessThan(stop)
+    expect(stop).toBeLessThan(SERVER_CODE.indexOf('threadParticipation?.stop()'))
+  })
+
+  test('recovery reads the current owner, queue, candidates and authenticated connection, and shares the one capability the up listener and teardown use', () => {
+    const props = onlyCallProps('createParticipationRecovery')
+    const capability = constOf('createRootLookupCapability')
+    const bindings: Array<[keyof ParticipationRecoveryDeps, string]> = [
+      ['participation', `() => ${holder}`],
+      ['queue', '() => deliveryQueue'],
+      ['candidates', '() => personaRouting.pendingCandidates()'],
+      ['reevaluate', 'id => personaRouting.reevaluate(id)'],
+      ['provenance', 'key => manager.provenance(key)'],
+      ['isUp', 'isPersonaUp'],
+      ['metadataCall', '(key, connectionId, method, args, signal) => manager.metadataCall(key, connectionId, method, args, signal)'],
+      ['refreshScopes', '(key, connectionId, signal) => manager.refreshGrantedScopes(key, connectionId, signal)'],
+      ['capability', capability],
+      ['policy', 'ownPostLookupPolicy({ config: () => personaConfig, choices: () => channelDeliveryStore })'],
+      ['clock', 'RECOVERY_CLOCK'],
+    ]
+    for (const [member, binding] of bindings) expect([member, props.get(member)]).toEqual([member, binding])
+    expect([...props.keys()].sort()).toEqual([...bindings.map(([member]) => member), 'report'].sort())
+    // The capability is one module-level instance over the applied config and the live connection's scopes.
+    const cap = onlyCallProps('createRootLookupCapability')
+    const capBindings: Array<[keyof RootLookupCapabilityDeps, string]> = [
+      ['grantedScopes', 'key => connections?.grantedScopes(key)'],
+      ['persona', 'key => getAppliedPersona(key)'],
+    ]
+    for (const [member, binding] of capBindings) expect([member, cap.get(member)]).toEqual([member, binding])
+    expect(cap.get('report')?.replace(/\s+/g, ' ')).toBe('{ gap: (key, gap) => deliveryReporting?.capabilityGap(key, gap), cleared: key => deliveryReporting?.capabilityCleared(key), }')
+    expect(SERVER_CODE).toContain(`(key, status) => { if (status.state === 'up') { ${capability}.connected(key); participationRecovery?.connected(key) } }`)
+    expect(indicesOf(new RegExp(`\\b${capability}\\.connected\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+    expect(indicesOf(new RegExp(`\\b${capability}\\.forget\\(key\\); participationRecovery\\?\\.forget\\(key\\)`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+
   test('every posting surface shares one own-post observer over the current owner, and reporting replays restored findings before buffered outcomes', () => {
     const observer: keyof typeof ThreadParticipationModule = 'createOwnPostObserver'
     expect(importSource(SERVER_CODE, observer)).toBe('./thread-participation.ts')
@@ -5501,7 +5561,8 @@ describe('participation recovers before intake and shares the production owners'
     // Before reporting exists, outcomes are buffered (bounded); afterwards they go straight to it. Overflow counts only fresh outcomes.
     declaredOnce('reportOwnPost')
     const report = /\bfunction reportOwnPost\(outcome: OwnPostOutcome\): void \{([^}]*)\}/.exec(SERVER_CODE)
-    expect(report?.[1]?.replace(/\s+/g, ' ').trim()).toBe('if (deliveryReporting) deliveryReporting.ownPostObserved(outcome) ' +
+    expect(report?.[1]?.replace(/\s+/g, ' ').trim()).toBe("if (outcome.kind === 'pending' || outcome.kind === 'gap') participationRecovery?.kick(outcome.key, outcome.id) " +
+      'if (deliveryReporting) deliveryReporting.ownPostObserved(outcome) ' +
       'else if (bufferedOwnPostOutcomes.length < MAX_BUFFERED_OWN_POST_OUTCOMES) bufferedOwnPostOutcomes.push(outcome) ' +
       'else if (!outcome.duplicate) droppedOwnPostOutcomes.set(outcome.key, (droppedOwnPostOutcomes.get(outcome.key) ?? 0) + 1)')
     expect(onlyCallProps('createDeliveryReporting').get('ownPostFindings')).toBe(`key => ${holder}?.ownPostFindings(key) ?? []`)
@@ -5670,6 +5731,7 @@ describe('production bring-up reaction recovery', () => {
       composePersonaStatusListeners, createPersonaUpFlushListener, personaNotifier: n.h.notifier, bringUps: controller,
       deliveryPreparation: preparation, deliveryReporting: reporting, clientFor: conn.clientFor,
       personaConfig: config, appliedConfig: config, configInEffect,
+      rootLookupCapability: { connected() {} }, participationRecovery: undefined,
     }
     conn.onStatus = expression(onlyCallProps('createPersonaConnectionManager').get('onStatus')!, bindings)
     const onApplied = expression<(config: PersonaConfig) => void>(onlyCallProps('createReloadController').get('onApplied')!, bindings)

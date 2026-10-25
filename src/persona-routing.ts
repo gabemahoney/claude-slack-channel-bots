@@ -84,6 +84,18 @@ export interface PersonaRoutingDeps {
   currentProvenance?(key: string): PersonaEventProvenance | undefined
   onParticipationFailure?(key: string, id: string, event: Record<string, unknown>, error: unknown, unaccepted?: boolean): void
   onParticipationSettled?(key: string, id: string): void
+  /**
+   * An undecidable reply was held for re-evaluation. Called synchronously
+   * inside intake: it may only schedule work (`participation-recovery.ts`
+   * kicks a pass on its clock), never await or call Slack. Its throw is ignored.
+   */
+  onCandidateHeld?(candidate: ThreadCandidate): void
+  /**
+   * A new event of `channel` (neither retained already nor a held reply's
+   * redelivery) reached persona `key`. Called synchronously inside intake,
+   * like `onCandidateHeld`: it may only schedule work. Its throw is ignored.
+   */
+  onChannelEvent?(key: string, channel: string): void
   /** Reporting records faults during intake and posts only after its release. */
   beginIntake?(key: string): () => void
   /** Real-path interruption seams; registration always precedes the first one. */
@@ -398,6 +410,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       }
       const s = settlementFor(intake, r)
       if (duplicate && duplicate.status !== 'failed') { s.retained(duplicate); return }
+      if (slackKey && !(r.id && candidates.has(r.id))) {
+        try { deps.onChannelEvent?.(key, slackKey.chat_id) } catch { /* the event is handled as before */ }
+      }
       const selected = selectRecipient(intake, r, s, mode)
       if (!selected) return
       const { persona, decision } = selected
@@ -548,6 +563,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       flag: intake.flag, provenance: intake.provenance,
     })
     else previous.ack = intake.ack
+    try { deps.onCandidateHeld?.(structuredClone(candidates.get(id)!.candidate)) } catch { /* the reply stays held for redelivery */ }
   }
 
   /**

@@ -67,6 +67,54 @@
  *   `closed-port`, which mirrors Slack's real URL shape; `ws` otherwise).
  * - `user_id` / `bot_id`: `auth.test`'s identity; default `U`/`B` plus the
  *   token's hash, so two tokens get two identities.
+ * - `scopes`: the OAuth scopes `auth.test` reports in its `x-oauth-scopes`
+ *   header. Not given, no header is sent and the scopes are unknown.
+ * - `file_shares`: where an upload's share shows (see THREAD EVIDENCE):
+ *   `info` (default), `completion` or `none`.
+ * - `faults`: a list of `{ method, outcome, channel?, ts?, file?, skip?,
+ *   times?, retry_after_s?, delay_ms? }` for `conversations.replies`,
+ *   `conversations.info`, `files.info`, `files.getUploadURLExternal` and
+ *   `files.completeUploadExternal`. The first fault whose method and given
+ *   `channel` (a completion's `channel_id`) / `ts` / `file` match a request,
+ *   with uses left, answers it. `skip` is how many matching requests it lets
+ *   through first (default 0), so a scenario can fault one upload's second
+ *   completion. `times` is how many requests it answers in this stub
+ *   instance (default 1; 0 for all). Outcomes: `missing`
+ *   (`thread_not_found`, `channel_not_found`, `file_not_found`; for
+ *   `files.getUploadURLExternal` `invalid_arguments`), `deleted` (a
+ *   tombstone root; `file_deleted`; not for `conversations.info` or the
+ *   upload methods), `access` (`not_in_channel`; for `files.info` and
+ *   `files.getUploadURLExternal` `access_denied`), `capability`
+ *   (`missing_scope`), `transient` (`internal_error`), `ratelimited` (HTTP
+ *   429 with `Retry-After: retry_after_s`, default 1), `hung` (no answer
+ *   until the client aborts or `delay_ms`, default 60000, passes) and `late`
+ *   (the normal answer after `delay_ms`, default 5000). The `api` line
+ *   carries `fault` (and `aborted` and `held_ms`, how long the stub held the
+ *   request, for `hung` / `late`).
+ *
+ * A control's `channels` entry may also set the booleans `is_channel`,
+ * `is_group`, `is_im`, `is_mpim`, `is_private`, `is_ext_shared` and
+ * `is_pending_ext_shared` `conversations.info` returns.
+ *
+ * THREAD EVIDENCE
+ * ---------------
+ * The stub keeps every message it posted (`chat.postMessage`, authored by
+ * the label's `auth.test` user and bot) or pushed (a `message` event with no
+ * subtype, authored by its `user` / `bot_id`), by channel and ts.
+ * `conversations.replies { channel, ts }` for one of them returns it as the
+ * first message, with its `thread_ts` when it was a reply. A ts the stub never
+ * saw keeps the empty answer: inconclusive, not missing.
+ * `files.getUploadURLExternal` issues a unique `F0STUB####` file ID to the
+ * label (recorded as `file`). `files.completeUploadExternal` must name only
+ * files issued to that label and not yet completed (else
+ * `invalid_arguments`); with `channel_id` it posts one share message for all
+ * of them (authored like a post, with `thread_ts` when given, and listing the
+ * files), records one `file-share` line per file, and returns those IDs. With
+ * `file_shares: completion` each returned file carries its `shares`.
+ * `files.info { file }` returns the file and, unless `file_shares` is
+ * `none`, its `shares` (`private` for a `G`/`D` channel or one whose control
+ * says `is_private`, else `public`); a file it never issued is
+ * `file_not_found`.
  *
  * Other endpoints: `GET /_control` (the labels in force), `GET /_health`,
  * `POST /_push` (below), and `POST /upload/<id>` (the upload URL
@@ -148,6 +196,7 @@
  *   {"event":"ws-open"|"ws-close"|"ws-refused"|"ws-message", "label", "ticket", …}
  *   {"event":"control","source":"file"|"http","labels":[…]}  /  "control-error"
  *   {"event":"upload"} / {"event":"stop"}
+ *   {"event":"file-share","label","file_id","channel","share_ts","thread_ts","visibility"}
  *   {"event":"push","label","envelope_id","connection_id","sent_mono_ms","event_ts","event_type","channel","channel_type",
  *    "flag":"false"|"true"|"non-boolean"|"absent","flag_value"}
  *   {"event":"push-refused","label","reason"}
@@ -169,10 +218,17 @@
  * UUID independent of the ticket or credentials, shared by push and ACK.
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
- * them, and `args_token_like` (whether any argument held token-like text).
+ * them (`channel` from `channel_id` for a completion), `ts` for
+ * `conversations.replies` / `.history`, `file` for `files.info` and an issued
+ * upload, `files` for a completion, and `args_token_like` (whether any argument held token-like text).
+ * A line of a method `faults` can apply to also carries `arrived_mono_ms`:
+ * this process's monotonic clock, in whole milliseconds, when the request
+ * arrived, so a scenario can measure the spacing between two attempts.
  * Posts/updates with `blocks` additionally record their redacted structured
  * display/button fields (no arbitrary fields or URLs), and successful ones
  * carry `response_ts`, the returned message timestamp used for a click.
+ * Every successful `chat.postMessage` carries `response_ts` too: the root a
+ * persona's post created.
  * `text` always has token-like text replaced by `<token>`, before it is
  * written. A `chat.postMessage` text is then recorded whole, so a scenario
  * can compare a posted notice in full; every other method's `text` is cut to
@@ -207,6 +263,42 @@ export interface StubAnswers {
   memberships?: string[]
   /** Cursor-keyed raw pages allow empty nonterminal and malformed responses. */
   inventory_pages?: Record<string, Record<string, unknown>>
+  /** The OAuth scopes `auth.test` reports (its `x-oauth-scopes` header); absent, it reports none, so they are unknown. */
+  scopes?: string[]
+  /** Where an upload's own share is shown: `files.info` only (default), the completion too, or nowhere. */
+  file_shares?: StubFileShares
+  /** Metadata faults, each applied to the matching requests in order (see FAULTS). */
+  faults?: StubFault[]
+}
+
+/** Where an upload's share appears: `info` (`files.info` only), `completion` (also the completion response), `none`. */
+export type StubFileShares = 'info' | 'completion' | 'none'
+
+/** The metadata and upload methods a fault can apply to. */
+export const STUB_FAULT_METHODS = ['conversations.replies', 'conversations.info', 'files.info', 'files.getUploadURLExternal', 'files.completeUploadExternal'] as const
+
+/** The methods with no `deleted` outcome: nothing they name can be a tombstone. */
+const NO_DELETED_OUTCOME: readonly string[] = ['conversations.info', 'files.getUploadURLExternal', 'files.completeUploadExternal']
+
+/** How a faulted metadata request is answered. */
+export const STUB_FAULT_OUTCOMES = ['missing', 'deleted', 'access', 'capability', 'transient', 'ratelimited', 'hung', 'late'] as const
+
+/** One metadata fault: the requests it matches and how they are answered. */
+export interface StubFault {
+  method: typeof STUB_FAULT_METHODS[number]
+  outcome: typeof STUB_FAULT_OUTCOMES[number]
+  /** Only requests naming this channel, root `ts` or file. */
+  channel?: string
+  ts?: string
+  file?: string
+  /** How many matching requests it lets through before it answers any (default 0). */
+  skip?: number
+  /** How many matching requests it answers (default 1); 0 for every one. */
+  times?: number
+  /** `ratelimited`: the Retry-After seconds (default 1). */
+  retry_after_s?: number
+  /** `late`: the delay before the normal answer; `hung`: the longest wait before giving up (default 60000). */
+  delay_ms?: number
 }
 
 /** One control entry: the tokens ending in `suffix` are `label`'s. */
@@ -220,8 +312,24 @@ export interface StubControl {
   tokens?: StubTokenRule[]
   default?: StubAnswers
   users?: Record<string, { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } }>
-  channels?: Record<string, { name?: string; is_member?: boolean }>
+  channels?: Record<string, StubChannelInfo>
 }
+
+/** The `conversations.info` fields a control may set for a channel. */
+export interface StubChannelInfo {
+  name?: string
+  is_member?: boolean
+  is_channel?: boolean
+  is_group?: boolean
+  is_im?: boolean
+  is_mpim?: boolean
+  is_private?: boolean
+  is_ext_shared?: boolean
+  is_pending_ext_shared?: boolean
+}
+
+/** The boolean `conversations.info` fields a control may set. */
+const CHANNEL_INFO_FLAGS = ['is_member', 'is_channel', 'is_group', 'is_im', 'is_mpim', 'is_private', 'is_ext_shared', 'is_pending_ext_shared'] as const
 
 export interface SlackStubOptions {
   /** JSONL record file. */
@@ -354,7 +462,42 @@ function checkAnswers(value: unknown, where: string): StubAnswers {
     if (!isObject(value.inventory_pages) || Object.values(value.inventory_pages).some(page => !isObject(page))) throw new Error(`${where}.inventory_pages must contain pages`)
     answers.inventory_pages = structuredClone(value.inventory_pages) as Record<string, Record<string, unknown>>
   }
+  if (value.scopes !== undefined) {
+    if (!Array.isArray(value.scopes) || value.scopes.some(scope => typeof scope !== 'string' || !/^[a-z][a-z0-9_.:-]{0,63}$/.test(scope))) throw new Error(`${where}.scopes must contain OAuth scope names`)
+    answers.scopes = [...value.scopes] as string[]
+  }
+  if (value.file_shares !== undefined) {
+    if (value.file_shares !== 'info' && value.file_shares !== 'completion' && value.file_shares !== 'none') throw new Error(`${where}.file_shares must be info, completion or none`)
+    answers.file_shares = value.file_shares
+  }
+  if (value.faults !== undefined) {
+    if (!Array.isArray(value.faults)) throw new Error(`${where}.faults must be an array`)
+    answers.faults = value.faults.map((fault, i) => checkFault(fault, `${where}.faults[${i}]`))
+  }
   return answers
+}
+
+function checkFault(value: unknown, where: string): StubFault {
+  if (!isObject(value)) throw new Error(`${where} must be an object`)
+  const known = ['method', 'outcome', 'channel', 'ts', 'file', 'skip', 'times', 'retry_after_s', 'delay_ms']
+  if (Object.keys(value).some(key => !known.includes(key))) throw new Error(`${where} has an unknown field`)
+  if (!(STUB_FAULT_METHODS as readonly unknown[]).includes(value.method)) throw new Error(`${where}.method must be a metadata or upload method`)
+  if (!(STUB_FAULT_OUTCOMES as readonly unknown[]).includes(value.outcome)) throw new Error(`${where}.outcome is unknown`)
+  const fault: StubFault = { method: value.method as StubFault['method'], outcome: value.outcome as StubFault['outcome'] }
+  for (const key of ['channel', 'ts', 'file'] as const) {
+    const field = value[key]
+    if (field === undefined) continue
+    if (typeof field !== 'string' || !/^[A-Za-z0-9.]{1,40}$/.test(field)) throw new Error(`${where}.${key} must be a Slack ID or timestamp`)
+    fault[key] = field
+  }
+  for (const key of ['skip', 'times', 'retry_after_s', 'delay_ms'] as const) {
+    const field = value[key]
+    if (field === undefined) continue
+    if (typeof field !== 'number' || !Number.isInteger(field) || field < 0 || field > 600_000) throw new Error(`${where}.${key} must be a small whole number`)
+    fault[key] = field
+  }
+  if (fault.outcome === 'deleted' && NO_DELETED_OUTCOME.includes(fault.method)) throw new Error(`${where}: ${fault.method} has no deleted outcome`)
+  return fault
 }
 
 /** Validate a parsed control document; throws a message naming no value. */
@@ -384,8 +527,8 @@ export function parseControl(value: unknown): StubControl {
         if (field === 'name' || (kind === 'users' && field === 'real_name')) {
           if (typeof data !== 'string') throw new Error(`control.${kind} text must be a string`)
           entry[field] = data
-        } else if (kind === 'channels' && field === 'is_member') {
-          if (typeof data !== 'boolean') throw new Error('control.channels.is_member must be boolean')
+        } else if (kind === 'channels' && (CHANNEL_INFO_FLAGS as readonly string[]).includes(field)) {
+          if (typeof data !== 'boolean') throw new Error(`control.channels.${field} must be boolean`)
           entry[field] = data
         } else if (kind === 'users' && field === 'profile') {
           if (!isObject(data) || Object.keys(data).some(key => !['display_name', 'real_name'].includes(key)) || Object.values(data).some(text => typeof text !== 'string')) throw new Error('control.users.profile is invalid')
@@ -414,7 +557,7 @@ function slackTs(seq: number): string {
 }
 
 /** The `ok: true` body for a method other than `auth.test` / `apps.connections.open`. */
-function okBody(method: string, args: Record<string, string>, seq: number, uploadBase: string, control: StubControl): Record<string, unknown> {
+function okBody(method: string, args: Record<string, string>, seq: number, control: StubControl): Record<string, unknown> {
   const channel = args.channel ?? 'C0STUBCHAN'
   switch (method) {
     case 'chat.postMessage':
@@ -437,12 +580,6 @@ function okBody(method: string, args: Record<string, string>, seq: number, uploa
     }
     case 'bots.info':
       return { ok: true, bot: { id: args.bot ?? 'B0STUBBOT', app_id: APP_ID, name: 'stub-bot' } }
-    case 'files.getUploadURLExternal': {
-      const fileId = `F0STUB${String(seq).padStart(4, '0')}`
-      return { ok: true, file_id: fileId, upload_url: `${uploadBase}${fileId}` }
-    }
-    case 'files.completeUploadExternal':
-      return { ok: true, files: [{ id: 'F0STUBFILE', title: 'stub' }] }
     default:
       return { ok: true }
   }
@@ -609,6 +746,48 @@ async function readArgs(req: Request): Promise<Record<string, string>> {
 // The server
 // ---------------------------------------------------------------------------
 
+/** A message as `conversations.replies` returns it. */
+interface StubMessage {
+  ts: string
+  user?: string
+  bot_id?: string
+  thread_ts?: string
+  files?: { id: string }[]
+}
+
+/** One issued upload: its owner, and once completed, the share it created. */
+interface StubUpload {
+  label: string
+  share?: { channel: string; ts: string; thread_ts?: string; visibility: 'public' | 'private' }
+}
+
+/** The upload methods' answer to each fault outcome; they have no `deleted` outcome (`checkFault`). */
+const UPLOAD_FAULT_ERRORS: Record<Exclude<StubFault['outcome'], 'deleted' | 'ratelimited' | 'hung' | 'late'>, Record<'files.getUploadURLExternal' | 'files.completeUploadExternal', string>> = {
+  missing: { 'files.getUploadURLExternal': 'invalid_arguments', 'files.completeUploadExternal': 'file_not_found' },
+  access: { 'files.getUploadURLExternal': 'access_denied', 'files.completeUploadExternal': 'not_in_channel' },
+  capability: { 'files.getUploadURLExternal': 'missing_scope', 'files.completeUploadExternal': 'missing_scope' },
+  transient: { 'files.getUploadURLExternal': 'internal_error', 'files.completeUploadExternal': 'internal_error' },
+}
+
+/** The Slack error each fault outcome answers with, per method (`deleted` roots and 429s are answered specially). */
+const FAULT_ERRORS: Record<Exclude<StubFault['outcome'], 'ratelimited' | 'hung' | 'late'>, Record<StubFault['method'], string>> = {
+  missing: { 'conversations.replies': 'thread_not_found', 'conversations.info': 'channel_not_found', 'files.info': 'file_not_found', ...UPLOAD_FAULT_ERRORS.missing },
+  deleted: { 'conversations.replies': 'message_not_found', 'conversations.info': 'channel_not_found', 'files.info': 'file_deleted', ...UPLOAD_FAULT_ERRORS.missing },
+  access: { 'conversations.replies': 'not_in_channel', 'conversations.info': 'not_in_channel', 'files.info': 'access_denied', ...UPLOAD_FAULT_ERRORS.access },
+  capability: { 'conversations.replies': 'missing_scope', 'conversations.info': 'missing_scope', 'files.info': 'missing_scope', ...UPLOAD_FAULT_ERRORS.capability },
+  transient: { 'conversations.replies': 'internal_error', 'conversations.info': 'internal_error', 'files.info': 'internal_error', ...UPLOAD_FAULT_ERRORS.transient },
+}
+
+/** A file's `shares` object, as `files.info` and a completion carry it. */
+function sharesOf(share: NonNullable<StubUpload['share']>): Record<string, unknown> {
+  return { [share.visibility]: { [share.channel]: [{ ts: share.ts, ...(share.thread_ts ? { thread_ts: share.thread_ts } : {}), channel_name: `stub-${share.channel.toLowerCase()}`, team_id: TEAM_ID }] } }
+}
+
+/** How long a `hung` fault waits for the client to give up, unless it sets `delay_ms`. */
+const HUNG_MAX_MS = 60_000
+/** How long a `late` fault delays its answer, unless it sets `delay_ms`. */
+const LATE_DEFAULT_MS = 5_000
+
 /** A loopback port nothing listens on: bind port 0, note it, close it. */
 function reserveClosedPort(): number {
   const probe = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } })
@@ -630,6 +809,18 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   // Only this stub instance's successful posts/updates authorize a click.
   const messageActions = new Map<string, PushAction[]>()
   const messageKey = (label: string, channel: string, ts: string): string => JSON.stringify([label, channel, ts])
+  // Every message this stub posted or pushed, by channel then ts: the roots `conversations.replies` answers for.
+  const messages = new Map<string, Map<string, StubMessage>>()
+  const remember = (channel: string, message: StubMessage): void => {
+    const inChannel = messages.get(channel) ?? new Map<string, StubMessage>()
+    inChannel.set(message.ts, message)
+    messages.set(channel, inChannel)
+  }
+  // Every file `files.getUploadURLExternal` issued, and the share its completion created.
+  const uploads = new Map<string, StubUpload>()
+  // How many requests each fault has answered, and let through under its `skip`, by label, position and content.
+  const faultUses = new Map<string, number>()
+  const faultSkips = new Map<string, number>()
   const closedPort = reserveClosedPort()
 
   appendFileSync(recordPath, '')
@@ -648,6 +839,27 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       waiters.splice(waiters.indexOf(waiter), 1)
       waiter.resolve(line)
     }
+  }
+
+  /** The first of `faults` matching this request with uses left, past its `skip`; counts the use or the pass. */
+  function takeFault(label: string, faults: StubFault[], method: string, args: Record<string, string>): StubFault | undefined {
+    const channel = args.channel ?? args.channel_id
+    for (const [index, fault] of faults.entries()) {
+      if (fault.method !== method || (fault.channel !== undefined && fault.channel !== channel) ||
+          (fault.ts !== undefined && fault.ts !== args.ts) || (fault.file !== undefined && fault.file !== args.file)) continue
+      const key = JSON.stringify([label, index, fault])
+      const skipped = faultSkips.get(key) ?? 0
+      if (skipped < (fault.skip ?? 0)) {
+        faultSkips.set(key, skipped + 1)
+        continue
+      }
+      const used = faultUses.get(key) ?? 0
+      const times = fault.times ?? 1
+      if (times !== 0 && used >= times) continue
+      faultUses.set(key, used + 1)
+      return fault
+    }
+    return undefined
   }
 
   function labelsOf(c: StubControl): string[] {
@@ -777,6 +989,12 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       sendStatus = 0
     }
     if (sendStatus === 0) return refusePush(label, 'send-failed')
+    const str = (value: unknown): string | undefined => typeof value === 'string' && value !== '' ? value : undefined
+    const pushedChannel = str(event.channel), pushedTs = str(event.ts)
+    if (event.type === 'message' && event.subtype === undefined && pushedChannel !== undefined && pushedTs !== undefined) {
+      const user = str(event.user), botId = str(event.bot_id), thread = str(event.thread_ts)
+      remember(pushedChannel, { ts: pushedTs, ...(user ? { user } : {}), ...(botId ? { bot_id: botId } : {}), ...(thread ? { thread_ts: thread } : {}) })
+    }
     record('push', {
       label: pushFieldText(label),
       envelope_id: envelopeId,
@@ -834,6 +1052,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         return new Response('OK')
       }
 
+      const arrivedMonoMs = Math.round(performance.now())
       const method = path.startsWith('/api/') ? path.slice('/api/'.length) : path.slice(1)
       if (!METHOD_RE.test(method)) return new Response('not found', { status: 404 })
 
@@ -851,6 +1070,9 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         token_hash: token === undefined || token === '' ? null : tokenHash(token),
       }
       if (args.channel !== undefined) fields.channel = args.channel
+      else if (args.channel_id !== undefined && method === 'files.completeUploadExternal') fields.channel = recordedText(method, args.channel_id)
+      if (args.ts !== undefined && (method === 'conversations.replies' || method === 'conversations.history')) fields.ts = recordedText(method, args.ts)
+      if (args.file !== undefined && method === 'files.info') fields.file = recordedText(method, args.file)
       if (method === 'reactions.add' || method === 'reactions.remove') {
         if (args.name !== undefined) fields.name = recordedText(method, args.name)
         if (args.timestamp !== undefined) fields.timestamp = recordedText(method, args.timestamp)
@@ -861,8 +1083,10 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       if (args.text !== undefined) fields.text = recordedText(method, args.text)
       if (args.blocks !== undefined && (method === 'chat.postMessage' || method === 'chat.update')) fields.blocks = recordedBlocks(args.blocks)
       fields.args_token_like = Object.entries(args).some(([k, v]) => k !== 'token' && TOKEN_LIKE.test(v))
+      if ((STUB_FAULT_METHODS as readonly string[]).includes(method)) fields.arrived_mono_ms = arrivedMonoMs
 
-      const answer = (name: string, body: Record<string, unknown> | undefined, status = 200): Response => {
+      const answer = (name: string, body: Record<string, unknown> | undefined, status = 200, headers?: Record<string, string>): Response => {
+        if (body?.ok === true && typeof body.ts === 'string' && method === 'chat.postMessage') fields.response_ts = body.ts.replace(TOKEN_LIKE_ALL, '<token>')
         if (body?.ok === true && typeof body.ts === 'string' && typeof body.channel === 'string' &&
             (method === 'chat.postMessage' || method === 'chat.update') && args.blocks !== undefined) {
           fields.response_ts = body.ts.replace(TOKEN_LIKE_ALL, '<token>')
@@ -885,7 +1109,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
           messageActions.set(messageKey(label, body.channel, body.ts), actions)
         }
         record('api', { ...fields, answer: name, status })
-        return body === undefined ? new Response(null, { status }) : Response.json(body, { status })
+        return body === undefined ? new Response(null, { status, headers }) : Response.json(body, { status, headers })
       }
       const failWith = (code: string): Response => {
         const status = httpStatusOf(code)
@@ -923,7 +1147,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
           user_id: answers.user_id ?? `U${hash}`,
           bot_id: answers.bot_id ?? `B${hash}`,
           is_enterprise_install: false,
-        })
+        }, 200, answers.scopes === undefined ? undefined : { 'x-oauth-scopes': answers.scopes.join(',') })
       }
       if (method === 'bots.info') {
         const hash = tokenHash(token!).toUpperCase().slice(0, 10)
@@ -937,7 +1161,89 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
           id, is_channel: id.startsWith('C'), is_group: id.startsWith('G'), is_im: false, is_mpim: false, is_ext_shared: false,
         })), response_metadata: { next_cursor: '' } })
       }
-      return answer('ok', okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`, control))
+      const hash = tokenHash(token!).toUpperCase().slice(0, 10)
+      const author = { user: authenticatedInstallations.get(label)?.user_id ?? answers.user_id ?? `U${hash}`, bot_id: answers.bot_id ?? `B${hash}` }
+
+      if ((STUB_FAULT_METHODS as readonly string[]).includes(method)) {
+        const fault = takeFault(label, answers.faults ?? [], method, args)
+        if (fault !== undefined) {
+          fields.fault = fault.outcome
+          const faultMethod = fault.method
+          if (fault.outcome === 'ratelimited') {
+            const retryAfter = String(fault.retry_after_s ?? 1)
+            fields.retry_after_s = Number(retryAfter)
+            return answer('ratelimited', { ok: false, error: 'ratelimited' }, 429, { 'retry-after': retryAfter })
+          }
+          if (fault.outcome === 'hung') {
+            await new Promise<void>(done => {
+              const timer = setTimeout(done, fault.delay_ms ?? HUNG_MAX_MS)
+              req.signal.addEventListener('abort', () => { clearTimeout(timer); done() }, { once: true })
+            })
+            fields.aborted = req.signal.aborted
+            fields.held_ms = Math.round(performance.now()) - arrivedMonoMs
+            return answer('hung', { ok: false, error: 'internal_error' })
+          }
+          if (fault.outcome === 'late') {
+            await Bun.sleep(fault.delay_ms ?? LATE_DEFAULT_MS)
+            fields.aborted = req.signal.aborted
+            fields.held_ms = Math.round(performance.now()) - arrivedMonoMs
+          } else if (fault.outcome === 'deleted' && faultMethod === 'conversations.replies') {
+            return answer('ok', { ok: true, has_more: false, messages: [{ type: 'message', subtype: 'tombstone', ts: args.ts, user: 'USLACKBOT', text: 'This message was deleted.' }] })
+          } else {
+            return failWith(FAULT_ERRORS[fault.outcome][faultMethod])
+          }
+        }
+      }
+
+      if (method === 'conversations.replies' && args.channel !== undefined && args.ts !== undefined) {
+        const root = messages.get(args.channel)?.get(args.ts)
+        // A root this stub never saw keeps the old empty answer: inconclusive, not missing.
+        if (root !== undefined) return answer('ok', { ok: true, has_more: false, messages: [{ type: 'message', text: '', ...root }], response_metadata: { next_cursor: '' } })
+      }
+      if (method === 'files.info') {
+        const upload = args.file === undefined ? undefined : uploads.get(args.file)
+        if (upload === undefined) return failWith('file_not_found')
+        const mode = answers.file_shares ?? 'info'
+        return answer('ok', { ok: true, file: { id: args.file, name: 'stub-upload', ...(mode !== 'none' && upload.share ? { shares: sharesOf(upload.share) } : {}) } })
+      }
+      if (method === 'files.getUploadURLExternal') {
+        const fileId = `F0STUB${String(n).padStart(4, '0')}`
+        uploads.set(fileId, { label })
+        fields.file = fileId
+        return answer('ok', { ok: true, file_id: fileId, upload_url: `http://127.0.0.1:${srv.port}/upload/${fileId}` })
+      }
+      if (method === 'files.completeUploadExternal') {
+        let requested: unknown
+        try { requested = JSON.parse(args.files ?? '') } catch { requested = undefined }
+        const ids = Array.isArray(requested) ? requested.map(file => isObject(file) ? file.id : undefined) : []
+        if (ids.length === 0 || ids.some(id => typeof id !== 'string' || uploads.get(id)?.label !== label || uploads.get(id)?.share !== undefined)) {
+          return failWith('invalid_arguments')
+        }
+        fields.files = ids
+        const channel = args.channel_id
+        const mode = answers.file_shares ?? 'info'
+        const completed: Record<string, unknown>[] = []
+        // One completion posts one message sharing every file: one share ts for all of them.
+        const shareTs = slackTs(n)
+        const thread = args.thread_ts
+        if (channel !== undefined) remember(channel, { ts: shareTs, ...author, ...(thread ? { thread_ts: thread } : {}), files: (ids as string[]).map(id => ({ id })) })
+        for (const id of ids as string[]) {
+          const upload = uploads.get(id)!
+          if (channel !== undefined) {
+            const visibility = /^[GD]/.test(channel) || control.channels?.[channel]?.is_private === true ? 'private' : 'public'
+            upload.share = { channel, ts: shareTs, ...(thread ? { thread_ts: thread } : {}), visibility }
+            record('file-share', { label, file_id: id, channel, share_ts: shareTs, thread_ts: thread ?? null, visibility })
+          }
+          completed.push({ id, title: 'stub-upload', ...(mode === 'completion' && upload.share ? { shares: sharesOf(upload.share) } : {}) })
+        }
+        return answer('ok', { ok: true, files: completed })
+      }
+
+      const body = okBody(method, args, n, control)
+      if (method === 'chat.postMessage' && typeof body.ts === 'string' && typeof body.channel === 'string') {
+        remember(body.channel, { ts: body.ts, ...author, ...(args.thread_ts ? { thread_ts: args.thread_ts } : {}) })
+      }
+      return answer('ok', body)
     },
     websocket: {
       // Slack's pings would start the client's 30 s server-ping watch; the

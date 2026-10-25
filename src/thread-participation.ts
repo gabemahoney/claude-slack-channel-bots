@@ -8,6 +8,7 @@ import { isThreadTimestamp, personaListsChannel, type StoredChoices } from './de
 import type { MembershipReading } from './channel-membership.ts'
 import type { DeliveryQueue, QueueStoredResult, SlackKey } from './delivery-queue.ts'
 import type { SharedChannelAuthority, SharedChannelLifetime, SharedLifetimeStatus } from './shared-channels.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS } from './delivery-constants.ts'
 
 /** Surfaces that confirm an own post. `file` is reserved for upload completions. */
 export const OWN_POST_SURFACES = ['text', 'prompt', 'warning', 'notice', 'file'] as const
@@ -34,10 +35,27 @@ export interface OwnPostEvidence {
   parentUnresolved?: true
   /** A completed file's ID, without inventing its message root. */
   file?: string
+  /** Epoch milliseconds when the post was issued, before its await; bounds which root it can have created. */
+  issuedAt?: number
   issuer: OwnPostIssuer
   missing: OwnPostMissing[]
   /** The eligibility fault that left this evidence pending. */
   reason?: string
+}
+/**
+ * One thread's root-author lookup (`participation-root-evidence.ts`):
+ * `observed` while it is requested, `enrolled` once the root is an own root
+ * a confirmed post of this lifetime created, `cancelled` once the lookup
+ * settled the thread as not followed here: another author, or
+ * (`reason: 'outside-lifetime'`) an own root no confirmed post of this
+ * lifetime created.
+ */
+export interface RootLookupEvidence {
+  /** The receiving identity the root's author must match, captured at request. */
+  issuer: OwnPostIssuer
+  requestedAt: number
+  /** Only on a cancelled lookup of an own root from outside this lifetime; never a not-own fact. */
+  reason?: 'outside-lifetime'
 }
 
 export interface ThreadObservation {
@@ -51,6 +69,8 @@ export interface ThreadObservation {
   policy: { mode: ChannelMode; delivery?: DeliveryMode }
   /** Present only for a confirmed own post; never with `slackKey`. */
   post?: OwnPostEvidence
+  /** Present only for a root-author lookup; never with `slackKey` or `post`. */
+  lookup?: RootLookupEvidence
 }
 export interface ThreadParticipationRecord {
   v: 1
@@ -75,6 +95,7 @@ function isOwnPostEvidence(value: unknown, root: unknown): value is OwnPostEvide
   if (!object(value) || !OWN_POST_SURFACES.includes(value.surface as OwnPostSurface) || typeof value.operation !== 'string' ||
       !OWN_POST_ID_RE.test(value.operation) || !integer(value.part) || value.part < 1 || !object(value.issuer) ||
       !optionalId(value.issuer.botUserId) || !optionalId(value.issuer.botId) || !optionalId(value.file) || !optionalId(value.reason) ||
+      (value.issuedAt !== undefined && !integer(value.issuedAt)) ||
       !Array.isArray(value.missing) || !value.missing.every(m => OWN_POST_MISSING.includes(m as OwnPostMissing)) ||
       new Set(value.missing).size !== value.missing.length) return false
   if ((value.ts !== undefined && !isThreadTimestamp(value.ts)) || (value.parent !== undefined && !isThreadTimestamp(value.parent))) return false
@@ -88,8 +109,12 @@ function isOwnPostEvidence(value: unknown, root: unknown): value is OwnPostEvide
 export function isThreadObservation(value: unknown): value is ThreadObservation {
   if (!object(value) || typeof value.id !== 'string' || !/^[a-f0-9]{64}$/.test(value.id) ||
       !object(value.lifetime) || !object(value.policy) || !integer(value.observedAt)) return false
-  const l = value.lifetime, p = value.policy, key = value.slackKey, post = value.post
+  const l = value.lifetime, p = value.policy, key = value.slackKey, post = value.post, lookup = value.lookup
   if (post !== undefined && (key !== undefined || !isOwnPostEvidence(post, value.root))) return false
+  if (lookup !== undefined && (key !== undefined || post !== undefined || value.root === undefined || !object(lookup) ||
+      !object(lookup.issuer) || !optionalId(lookup.issuer.botUserId) || !optionalId(lookup.issuer.botId) ||
+      (!lookup.issuer.botUserId && !lookup.issuer.botId) || !integer(lookup.requestedAt) || p.delivery === undefined ||
+      (lookup.reason !== undefined && lookup.reason !== 'outside-lifetime'))) return false
   const delivery = p.delivery === undefined
     ? post !== undefined && (post as OwnPostEvidence).missing.includes('channel-eligibility')
     : DELIVERY_MODES.includes(p.delivery as DeliveryMode)
@@ -119,6 +144,30 @@ export function threadObservationId(lifetime: SharedChannelLifetime, key: SlackK
 export function ownPostObservationId(lifetime: SharedChannelLifetime, operation: string, part: number): string {
   return createHash('sha256').update(JSON.stringify(['own-post', lifetime.key, lifetime.channel, lifetime.incarnation,
     lifetime.resetOrder, lifetime.createdAt ?? null, lifetime.membershipBoundary, lifetime.leaveBoundary, operation, part])).digest('hex')
+}
+/** One thread's root-author lookup within its lifetime; repeated requests share it. */
+export function rootLookupObservationId(lifetime: SharedChannelLifetime, root: string): string {
+  return createHash('sha256').update(JSON.stringify(['root-lookup', lifetime.key, lifetime.channel, lifetime.incarnation,
+    lifetime.resetOrder, lifetime.createdAt ?? null, lifetime.membershipBoundary, lifetime.leaveBoundary, root])).digest('hex')
+}
+/** The observation a cancellation settles: a cancelled lookup's decided reason is not part of what was observed. Pure. */
+export function cancelledObservationBase(observation: ThreadObservation): ThreadObservation {
+  if (observation.lookup?.reason === undefined) return observation
+  const { reason: _reason, ...lookup } = observation.lookup
+  return { ...observation, lookup }
+}
+/** An identity a root lookup can be requested for: a valid bot user ID or bot ID. Pure. */
+export function isRootLookupIssuer(issuer: OwnPostIssuer): boolean {
+  return optionalId(issuer.botUserId) && optionalId(issuer.botId) && !!(issuer.botUserId || issuer.botId)
+}
+/** A root-level own post whose root is still unknown: only such a post can have created a looked-up root. */
+function rootless(post: OwnPostEvidence): boolean {
+  return post.parent === undefined && !post.parentUnresolved && post.ts === undefined
+}
+/** A valid Slack timestamp in epoch milliseconds. */
+function tsMillis(ts: string): number {
+  const [seconds, micros] = ts.split('.') as [string, string]
+  return Number(seconds) * 1000 + Math.floor(Number(micros) / 1000)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +230,16 @@ export function ownPostEligibility(sources: OwnPostEligibilitySources): (key: st
   }
 }
 
+/** The applied mode and readable stored choice a root lookup is requested under, read at each call. */
+export function ownPostLookupPolicy(sources: Pick<OwnPostEligibilitySources, 'config' | 'choices'>): (key: string, channel: string) => { mode: ChannelMode; delivery: DeliveryMode } | undefined {
+  return (key, channel) => {
+    const store = sources.choices()
+    if (store === undefined || !store.readableFor(key, channel)) return undefined
+    const delivery = store.storedChoice(key, channel)
+    return delivery === undefined ? undefined : { mode: channelModeOf(sources.config()), delivery }
+  }
+}
+
 /** Captured before the post's await, so a replacement identity or lifetime is never rebound. */
 export interface OwnPostIssue {
   key: string
@@ -194,7 +253,13 @@ export interface OwnPostIssue {
   /** That channel's whole lifetime at issue: a leave, rejoin or reset since supersedes the post. */
   lifetime?: SharedChannelLifetime
   issuer: OwnPostIssuer
+  /** Epoch milliseconds at issue, before the post's await. */
+  issuedAt?: number
 }
+/** A channel's authenticated type and external sharing (`participation-channel-evidence.ts`). */
+export interface OwnPostChannelEvidence { channel: string; channelType: 'public' | 'private'; externallyShared: boolean }
+/** Open mode's membership reason when only the channel's type or sharing is unknown. */
+export const ELIGIBILITY_MISSING = 'eligibility-missing'
 /** What Slack's success response showed: the actual channel and returned timestamp. */
 export interface OwnPostPosted {
   channel: string
@@ -202,6 +267,8 @@ export interface OwnPostPosted {
   parent?: string
   /** 1-based part within the operation; one when absent. */
   part?: number
+  /** A completed file's ID (`file` surface); `ts` then only when its own share named the root. */
+  file?: string
 }
 /**
  * `enrolled`: durable participation. `pending`: durable evidence awaiting
@@ -298,11 +365,83 @@ export interface ThreadParticipation {
    * rejects. Callers never await it before registering their own success.
    */
   confirmOwnPost(issue: OwnPostIssue, posted: OwnPostPosted): Promise<OwnPostOutcome>
-  /** Recovery: retry eligibility/enrollment of one pending own post. Never posts. */
-  retryOwnPost(key: string, id: string): Promise<OwnPostOutcome | undefined>
-  /** Unresolved own-post obligations, for startup reporting and recovery. */
+  /**
+   * Recovery: retry eligibility/enrollment of one pending own post. Never
+   * posts. `evidence` is authenticated `conversations.info` evidence for the
+   * post's channel, revalidated by the caller after its await; it settles only
+   * open mode's missing channel type and sharing (`eligibility-missing`).
+   */
+  retryOwnPost(key: string, id: string, evidence?: OwnPostChannelEvidence): Promise<OwnPostOutcome | undefined>
+  /**
+   * Recovery: settle a pending own post's missing root from correlated share
+   * metadata (`participation-file-evidence.ts`), then retry its enrollment.
+   * Never posts.
+   */
+  resolveOwnPostRoot(key: string, id: string, root: string): Promise<OwnPostOutcome | undefined>
+  /**
+   * Unresolved own-post obligations, for startup reporting and recovery. A
+   * post whose write is still in flight is not listed: its write settles it.
+   */
   ownPostFindings(key?: string): OwnPostOutcome[]
+  /** Whether own post `id` is still an obligation `ownPostFindings` lists; reads that one record. */
+  ownPostOpen(key: string, id: string): boolean
+  /**
+   * Whether an undecidable reply in `root` needs its root author looked up:
+   * only root-level own posts of the current lifetime whose roots are still
+   * unknown can have created that root, so with none (a reply post under an
+   * unresolved parent is not one), or once a lookup settled the root, no
+   * lookup is needed.
+   */
+  rootLookupNeeded(key: string, channel: string, root: string): boolean
+  /**
+   * Durably record a thread's lookup obligation, so a restart continues it.
+   * An open lookup requested for another identity of the same lifetime is
+   * recorded again for `issuer`, keeping its policy. Undefined when the
+   * lifetime is not current, the lookup was already settled, the request is
+   * invalid (an issuer `isRootLookupIssuer` rejects; callers check it first)
+   * or the write failed.
+   */
+  requestRootLookup(key: string, channel: string, root: string, issuer: OwnPostIssuer, policy: { mode: ChannelMode; delivery: DeliveryMode }): Promise<ThreadObservation | undefined>
+  /**
+   * Recorded lookup obligations still open, for recovery; not those an
+   * ineligible channel set aside until a new request, nor those whose thread
+   * is already durably followed (they need no request).
+   */
+  rootLookups(key: string): ThreadObservation[]
+  /** Whether lookup `id` is still open in a current lifetime; reads that one record. */
+  rootLookupOpen(key: string, id: string): boolean
+  /** Apply a lookup's verdict (`participation-root-evidence.ts`) after the caller revalidated its binding. */
+  resolveRootLookup(key: string, id: string, verdict: RootLookupVerdict, evidence?: OwnPostChannelEvidence): Promise<RootLookupOutcome>
   stop(): void
+}
+/**
+ * What one root lookup showed: the root's own author matched the request's
+ * identity (with the file IDs that root message itself shares), or it did not.
+ */
+export type RootLookupVerdict = { kind: 'own'; root: string; files?: string[] } | { kind: 'not-own' }
+/**
+ * `enrolled`: the thread is followed. `not-own`: another author started it.
+ * `outside-lifetime`: an own root no confirmed post of this lifetime created
+ * (from before an upgrade, a reset or a verified leave); the thread is not
+ * followed from it. `followed`: the thread was already durably followed, so
+ * the lookup is dropped unchanged. `ineligible`: a root of this lifetime
+ * whose channel cannot enroll now; nothing is written and the lookup stays
+ * observed, but until the channel is eligible the thread reads unfollowed,
+ * the lookup is not listed for recovery, and a reply once it is eligible
+ * requests it again (a restart looks it up again). Nothing is decided or
+ * written for: `deferred` (pending own-post evidence for that root settles
+ * it), `unmatched` (only a root-level text post Slack returned no timestamp
+ * for could have created it, and the root is outside that post's window)
+ * and `pending` (channel eligibility is unresolved, for `reason` in `mode`).
+ * `storage`: the write failed. `superseded` and `unresolved`: the lifetime is
+ * no longer, or not yet, current. `absent`: no open lookup has that id.
+ */
+export type RootLookupOutcome = {
+  kind: 'enrolled' | 'not-own' | 'outside-lifetime' | 'followed' | 'deferred' | 'unmatched' | 'ineligible' | 'pending' | 'storage' | 'superseded' | 'unresolved' | 'absent'
+  error?: unknown
+  /** `pending` only: the unresolved eligibility reason; open mode's `ELIGIBILITY_MISSING` alone can be settled by channel evidence. */
+  reason?: string
+  mode?: ChannelMode
 }
 export function createThreadParticipation(options: ThreadParticipationOptions): ThreadParticipation {
   const records = new Map<string, Map<string, ThreadParticipationRecord>>()
@@ -310,6 +449,15 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
   // population. Full enumeration is reserved for startup/recovery/compaction.
   const roots = new Map<string, Map<string, { followed: Set<string>; pending: Set<string> }>>()
   const unknown = new Map<string, Set<string>>()
+  /** Roots a lookup settled as not followed in that lifetime: another author's, or an own root from outside it. */
+  const decided = new Map<string, Set<string>>()
+  /**
+   * Own roots of a lifetime whose lookup met a channel that could not enroll.
+   * In memory only: the lookup stays observed, so a restart looks it up again.
+   */
+  const ineligibleRoots = new Map<string, Set<string>>()
+  /** Own posts whose save is in flight; their write, not recovery, settles them. */
+  const saving = new Set<string>()
   const initialized = new Set<string>()
   let started = false, stopped = false
   const scope = (l: SharedChannelLifetime) => JSON.stringify([l.key, l.channel, l.incarnation, l.resetOrder, l.createdAt ?? null, l.membershipBoundary, l.leaveBoundary])
@@ -339,6 +487,22 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
       if (!ids) { ids = new Set(); unknown.set(channel, ids) }
       ids.add(observation.id)
     }
+    if (record.state === 'cancelled' && observation.lookup && observation.root) {
+      let known = decided.get(channel)
+      if (!known) { known = new Set(); decided.set(channel, known) }
+      known.add(observation.root)
+    }
+  }
+  /** Forget an in-memory record that a durable fact made redundant. */
+  function drop(key: string, id: string): void {
+    const record = records.get(key)?.get(id)
+    if (!record) return
+    const old = record.observation, token = scope(old.lifetime)
+    if (old.root) {
+      const index = roots.get(token)?.get(old.root)
+      index?.followed.delete(id); index?.pending.delete(id)
+    } else unknown.get(token)?.delete(id)
+    records.get(key)!.delete(id)
   }
   function status(lifetime: SharedChannelLifetime): SharedLifetimeStatus {
     if (!started || stopped) return 'unresolved'
@@ -382,15 +546,19 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
   }
   /** Own-post writes use the queue's serialized fsync writer, like incoming observations. */
   async function saveOwnPost(observation: ThreadObservation, state: 'observed' | 'enrolled'): Promise<OwnPostOutcome> {
-    const key = observation.lifetime.key
+    const key = observation.lifetime.key, id = observation.id
+    saving.add(id)
     try { await options.queue.recordThreadObservation(key, observation, state) } catch (error) {
+      saving.delete(id)
       // A lifetime superseded during the write owes nothing, whether or not it saved.
       if (supersededNow(observation.lifetime)) return report(outcomeOf('superseded', observation))
       // The in-memory observation keeps protecting dependents for recovery. A
-      // failed enrollment of already durable evidence leaves that evidence pending.
-      const kept = durableCopy(key, observation.id) ? records.get(key)?.get(observation.id)?.observation : undefined
-      return report(kept?.post ? outcomeOf('pending', kept, { error }) : outcomeOf('gap', observation, { reason: 'storage', error }))
+      // failed write over already durable evidence leaves that evidence
+      // pending, and the failure is a storage fault, whatever it still lacks.
+      const kept = durableCopy(key, id) ? records.get(key)?.get(id)?.observation : undefined
+      return report(kept?.post ? outcomeOf('pending', kept, { reason: 'storage', error }) : outcomeOf('gap', observation, { reason: 'storage', error }))
     }
+    saving.delete(id)
     try {
       if (status(observation.lifetime) === 'superseded') return report(outcomeOf('superseded', observation))
       if (state === 'observed') return report(outcomeOf('pending', observation))
@@ -400,6 +568,89 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
     } catch (error) {
       return report(outcomeOf(durableCopy(key, observation.id) ? 'pending' : 'gap', observation, { reason: 'operation', error }))
     }
+  }
+  /**
+   * Current own-post eligibility. Open mode's missing channel type and
+   * sharing alone may be settled by authenticated `conversations.info`
+   * evidence for exactly this channel, revalidated by the caller.
+   */
+  function currentEligibility(key: string, channel: string, evidence?: OwnPostChannelEvidence): OwnPostEligibility | undefined {
+    let eligibility: OwnPostEligibility | undefined
+    try { eligibility = options.eligibility?.(key, channel) } catch { return undefined }
+    if (eligibility?.kind === 'unresolved' && eligibility.mode === 'open' && eligibility.reason === ELIGIBILITY_MISSING &&
+        eligibility.delivery !== undefined && evidence?.channel === channel) {
+      return evidence.externallyShared
+        ? { kind: 'ineligible', mode: 'open', reason: 'external-sharing' }
+        : { kind: 'eligible', mode: 'open', delivery: eligibility.delivery }
+    }
+    return eligibility
+  }
+  /**
+   * Whether `root`'s lookup met an ineligible channel that still reads
+   * ineligible: the thread is not followed now. An unresolved reading
+   * decides nothing either way.
+   */
+  function heldIneligible(key: string, lifetime: SharedChannelLifetime, root: string): boolean {
+    if (!ineligibleRoots.get(scope(lifetime))?.has(root)) return false
+    return currentEligibility(key, lifetime.channel)?.kind === 'ineligible'
+  }
+  /**
+   * Which confirmed own post of this lifetime created the own root `root`,
+   * among root-level own posts by the same identity whose roots are still
+   * unknown. A parentless upload matches exactly when the root message
+   * shares its file (`file`, naming the post); no clock is read. Only a
+   * root-level text post Slack returned no timestamp for falls back to its
+   * issue-to-confirmation window, within the clock-skew allowance and never
+   * before the lifetime's start (`window`, or `window-missed` outside it).
+   * `none`: no post of this lifetime can have created it, so the root is
+   * from before an upgrade, a reset or a verified leave.
+   */
+  function matchOwnRoot(lifetime: SharedChannelLifetime, root: string, issuer: OwnPostIssuer, files: readonly string[]):
+    { kind: 'file'; id: string } | { kind: 'window' | 'window-missed' | 'none' } {
+    const at = tsMillis(root), token = scope(lifetime)
+    let fallback: 'window' | 'window-missed' | 'none' = 'none'
+    for (const id of unknown.get(token) ?? []) {
+      const observation = records.get(lifetime.key)?.get(id)?.observation, post = observation?.post
+      if (!observation || !post || !rootless(post)) continue
+      if (post.issuer.botUserId !== issuer.botUserId || post.issuer.botId !== issuer.botId) continue
+      if (post.file !== undefined) {
+        if (files.includes(post.file)) return { kind: 'file', id }
+        continue
+      }
+      if (fallback === 'window') continue
+      const from = Math.max((post.issuedAt ?? observation.observedAt) - OWN_ROOT_CLOCK_SKEW_MS, lifetime.createdAt ?? 0)
+      fallback = at >= from && at <= observation.observedAt + OWN_ROOT_CLOCK_SKEW_MS ? 'window' : 'window-missed'
+    }
+    return { kind: fallback }
+  }
+  /**
+   * Whether the lifetime holds evidence whose unknown root could be any
+   * thread: a root-level own post with an unknown root (only such a post
+   * makes a root lookup decide anything), or other evidence published
+   * without a root. A reply post under an unresolved parent is neither: it
+   * holds no thread, and only its own finding reports it.
+   */
+  function rootlessPosts(lifetime: SharedChannelLifetime): boolean {
+    for (const id of unknown.get(scope(lifetime)) ?? []) {
+      const observation = records.get(lifetime.key)?.get(id)?.observation
+      if (observation && (!observation.post || rootless(observation.post))) return true
+    }
+    return false
+  }
+  /**
+   * The parentless upload a looked-up own root matched by file now has that
+   * root: save it enrolled with the thread, as eligible as the thread just
+   * was. Never posts. True when that write enrolled it (and settled the
+   * thread); otherwise its evidence stays pending for recovery.
+   */
+  async function settleMatchedUpload(key: string, id: string, root: string, eligibility: { mode: ChannelMode; delivery: DeliveryMode }): Promise<boolean> {
+    const record = records.get(key)?.get(id), observation = record?.observation, post = observation?.post
+    if (!record || record.state !== 'observed' || !observation || !post || observation.root !== undefined || saving.has(id) || !rootless(post)) return false
+    const { reason: _reason, ...rest } = post
+    const policy = observation.policy.delivery !== undefined ? observation.policy : { mode: eligibility.mode, delivery: eligibility.delivery }
+    const resolved: ThreadObservation = { ...observation, root, policy, post: { ...rest, missing: [] } }
+    if (!isThreadObservation(resolved)) return false
+    return (await saveOwnPost(resolved, 'enrolled')).kind === 'enrolled'
   }
   const api: ThreadParticipation = {
     start() {
@@ -469,7 +720,10 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
       const token = scope(lifetime), matching = roots.get(token)?.get(root)
       if (matching?.followed.size) return answer('followed')
       if (!options.queue.threadReadable(key)) return answer('unresolved', 'storage')
-      if (matching?.pending.size || unknown.get(token)?.size) return answer('unresolved')
+      // An own root on a channel that cannot enroll now is not followed; only other pending evidence there still decides.
+      if (heldIneligible(key, lifetime, root) && ![...matching?.pending ?? []].some(id => !records.get(key)?.get(id)?.observation.lookup)) return answer('unfollowed')
+      // Root-level own posts with unknown roots could be this root, unless a lookup settled it; the same test as `rootLookupNeeded`.
+      if (matching?.pending.size || (rootlessPosts(lifetime) && !decided.get(token)?.has(root))) return answer('unresolved')
       return answer('unfollowed')
     },
     pending(key) {
@@ -481,7 +735,7 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
       const lifetime = channel !== undefined ? options.authority.lifetime(key, channel) : undefined
       return { key, surface, operation: randomUUID(), incarnation: lifetime?.incarnation ?? options.authority.incarnation?.(key),
         ...(lifetime ? { resetOrder: lifetime.resetOrder, channel, lifetime: structuredClone(lifetime) } : {}),
-        issuer: identity ? { botUserId: identity.botUserId, botId: identity.botId } : {} }
+        issuer: identity ? { botUserId: identity.botUserId, botId: identity.botId } : {}, issuedAt: now() }
     },
     confirmOwnPost(issue, posted) {
       const part = posted.part ?? 1
@@ -490,8 +744,9 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
       // A malformed requested parent names no root, and the reply's own ts is not one.
       const parentUnresolved = posted.parent !== undefined && parent === undefined
       const root = posted.parent !== undefined ? parent : ts
+      const file = typeof posted.file === 'string' && OWN_POST_ID_RE.test(posted.file) ? posted.file : undefined
       const base = { key: issue.key, surface: issue.surface, operation: issue.operation, part, channel: posted.channel,
-        ...(ts ? { ts } : {}), ...(parent ? { parent } : {}), ...(root ? { root } : {}) }
+        ...(ts ? { ts } : {}), ...(parent ? { parent } : {}), ...(root ? { root } : {}), ...(file ? { file } : {}) }
       const done = (outcome: OwnPostOutcome, reported = true) => Promise.resolve(reported ? report(outcome) : outcome)
       try {
         if (!CHANNEL_ID_RE.test(posted.channel)) {
@@ -523,7 +778,10 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
         // episode an id-less gap left open; a pending one is already reported.
         if (existing?.observation.post) {
           if (existing.state === 'observed') return done(outcomeOf('pending', existing.observation), false)
-          return done(outcomeOf(existing.state === 'enrolled' ? 'enrolled' : 'ineligible', existing.observation, { duplicate: true }))
+          if (existing.state === 'enrolled') return done(outcomeOf('enrolled', existing.observation, { duplicate: true }))
+          // A decided ineligible post lacks nothing more; the reason it was pending no longer applies.
+          const { reason: _stale, ...decided } = outcomeOf('ineligible', existing.observation, { missing: [], duplicate: true })
+          return done(decided)
         }
         // A durably followed thread stays followed: duplicate confirmations and
         // later chunks of a reply add nothing, whatever eligibility reads now.
@@ -545,7 +803,9 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
           id, lifetime: structuredClone(lifetime), ...(root ? { root } : {}), observedAt: now(),
           policy: { mode: eligibility.mode, ...(eligibility.delivery ? { delivery: eligibility.delivery } : {}) },
           post: { surface: issue.surface, operation: issue.operation, part, ...(ts ? { ts } : {}), ...(parent ? { parent } : {}),
-            ...(parentUnresolved ? { parentUnresolved: true as const } : {}), issuer: { ...issue.issuer }, missing, ...(reason ? { reason } : {}) },
+            ...(parentUnresolved ? { parentUnresolved: true as const } : {}), ...(file ? { file } : {}),
+            ...(Number.isSafeInteger(issue.issuedAt) && issue.issuedAt! >= 0 ? { issuedAt: issue.issuedAt } : {}), issuer: { ...issue.issuer }, missing,
+            ...(reason ? { reason } : {}) },
         }
         if (!isThreadObservation(observation)) return done({ ...base, kind: 'gap', missing, reason: 'operation' })
         // Dependent selection sees this evidence before the first await.
@@ -560,14 +820,19 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
         return done({ ...base, kind: 'gap', missing: [], reason: 'operation', error })
       }
     },
-    async retryOwnPost(key, id) {
+    async retryOwnPost(key, id, evidence) {
       const record = records.get(key)?.get(id), observation = record?.observation
       if (!record || record.state !== 'observed' || !observation?.post) return undefined
+      if (saving.has(id)) return outcomeOf('pending', observation)
       const current = status(observation.lifetime), durable = durableCopy(key, id)
       if (current === 'superseded') return report(outcomeOf('superseded', observation))
       if (current !== 'current') return outcomeOf(durable ? 'pending' : 'gap', observation, durable ? {} : { reason: 'lifetime-unresolved' })
-      let eligibility: OwnPostEligibility | undefined
-      try { eligibility = observation.root ? options.eligibility?.(key, observation.lifetime.channel) : undefined } catch { /* stays unresolved */ }
+      // Another post already enrolled this thread durably: writing this one too would add nothing.
+      if (observation.root && followed(observation.lifetime, observation.root)) {
+        drop(key, id)
+        return report(outcomeOf('enrolled', observation, { missing: [], duplicate: true }))
+      }
+      const eligibility = observation.root ? currentEligibility(key, observation.lifetime.channel, evidence) : undefined
       if (!eligibility || eligibility.kind === 'unresolved') return durable ? outcomeOf('pending', observation) : saveOwnPost(observation, 'observed')
       if (eligibility.kind === 'ineligible') {
         try { await options.queue.cancelThreadObservation(key, observation) } catch (error) {
@@ -579,12 +844,126 @@ export function createThreadParticipation(options: ThreadParticipationOptions): 
         return report(outcomeOf('ineligible', observation, { missing: [], reason: eligibility.reason }))
       }
       const { reason: _reason, ...post } = observation.post
-      return saveOwnPost({ ...observation, policy: { mode: eligibility.mode, delivery: eligibility.delivery }, post: { ...post, missing: [] } }, 'enrolled')
+      // The policy applied at the post's first success stays its policy; a later change applies to arriving replies only.
+      const policy = observation.policy.delivery !== undefined ? observation.policy : { mode: eligibility.mode, delivery: eligibility.delivery }
+      return saveOwnPost({ ...observation, policy, post: { ...post, missing: [] } }, 'enrolled')
+    },
+    async resolveOwnPostRoot(key, id, root) {
+      const record = records.get(key)?.get(id), observation = record?.observation, post = observation?.post
+      if (!record || record.state !== 'observed' || !post || observation!.root !== undefined || saving.has(id) || !isThreadTimestamp(root)) return undefined
+      if (!rootless(post)) return undefined
+      const current = status(observation!.lifetime)
+      if (current === 'superseded') return report(outcomeOf('superseded', observation!))
+      if (current !== 'current') return undefined
+      const missing = post.missing.filter(m => m !== 'root')
+      const resolved: ThreadObservation = { ...observation!, root, post: { ...post, missing } }
+      if (!isThreadObservation(resolved)) return undefined
+      // The resolved root protects its thread at once; the write makes it durable.
+      install(key, { v: 1, kind: 'thread-participation', seq: 0, state: 'observed', observation: resolved })
+      const saved = await saveOwnPost(resolved, 'observed')
+      if (saved.kind !== 'pending') return saved
+      return await api.retryOwnPost(key, id) ?? saved
     },
     ownPostFindings(key) {
       return [...records].filter(([k]) => key === undefined || key === k).flatMap(([k, own]) => [...own.values()]
-        .filter(r => r.state === 'observed' && r.observation.post && status(r.observation.lifetime) !== 'superseded')
+        .filter(r => r.state === 'observed' && r.observation.post && !saving.has(r.observation.id) && status(r.observation.lifetime) !== 'superseded')
         .map(r => durableCopy(k, r.observation.id) ? outcomeOf('pending', r.observation) : outcomeOf('gap', r.observation, { reason: 'storage' })))
+    },
+    ownPostOpen(key, id) {
+      const record = records.get(key)?.get(id)
+      return record?.state === 'observed' && record.observation.post !== undefined && !saving.has(id) && status(record.observation.lifetime) !== 'superseded'
+    },
+    rootLookupNeeded(key, channel, root) {
+      const lifetime = options.authority.lifetime(key, channel)
+      if (!lifetime || status(lifetime) !== 'current' || !isThreadTimestamp(root) || !initialized.has(key)) return false
+      return !followed(lifetime, root) && !decided.get(scope(lifetime))?.has(root) && !heldIneligible(key, lifetime, root) && rootlessPosts(lifetime)
+    },
+    async requestRootLookup(key, channel, root, issuer, policy) {
+      const lifetime = options.authority.lifetime(key, channel)
+      if (!lifetime || status(lifetime) !== 'current' || !isThreadTimestamp(root) || !isRootLookupIssuer(issuer)) return undefined
+      const id = rootLookupObservationId(lifetime, root)
+      // A new request (the channel can enroll again) reopens a lookup an ineligible channel set aside.
+      ineligibleRoots.get(scope(lifetime))?.delete(root)
+      const existing = records.get(key)?.get(id)
+      if (existing && existing.state !== 'observed') return undefined
+      const previous = existing?.observation.lookup?.issuer
+      if (existing && previous?.botUserId === issuer.botUserId && previous?.botId === issuer.botId) return structuredClone(existing.observation)
+      // A lookup requested for an earlier identity of this lifetime is issued again for the current one: only its answer decides.
+      const observation: ThreadObservation = existing
+        ? { ...structuredClone(existing.observation), lookup: { issuer: { ...issuer }, requestedAt: now() } }
+        : { id, lifetime: structuredClone(lifetime), root, observedAt: now(),
+          policy: { mode: policy.mode, delivery: policy.delivery }, lookup: { issuer: { ...issuer }, requestedAt: now() } }
+      if (!isThreadObservation(observation)) return undefined
+      try { await options.queue.recordThreadObservation(key, observation) } catch { return undefined }
+      if (status(lifetime) !== 'current') return undefined
+      install(key, { v: 1, kind: 'thread-participation', seq: 0, state: 'observed', observation })
+      return structuredClone(observation)
+    },
+    rootLookups(key) {
+      return [...(records.get(key)?.values() ?? [])]
+        .filter(r => r.state === 'observed' && r.observation.lookup && status(r.observation.lifetime) === 'current' &&
+          !ineligibleRoots.get(scope(r.observation.lifetime))?.has(r.observation.root!) && !followed(r.observation.lifetime, r.observation.root!))
+        .map(r => structuredClone(r.observation))
+    },
+    rootLookupOpen(key, id) {
+      const record = records.get(key)?.get(id)
+      return record?.state === 'observed' && record.observation.lookup !== undefined && status(record.observation.lifetime) === 'current'
+    },
+    async resolveRootLookup(key, id, verdict, evidence) {
+      const record = records.get(key)?.get(id), observation = record?.observation
+      if (!record || record.state !== 'observed' || !observation?.lookup || !observation.root) return { kind: 'absent' }
+      const lifetime = observation.lifetime, root = observation.root, channel = lifetime.channel
+      const notCurrent = (): RootLookupOutcome | undefined => { const now = status(lifetime); return now === 'current' ? undefined : { kind: now } }
+      const before = notCurrent()
+      if (before) return before
+      // Another post or reply made the thread durably followed meanwhile: the lookup decides nothing more.
+      if (followed(lifetime, root)) { drop(key, id); return { kind: 'followed' } }
+      const ownRoot = verdict.kind === 'own' && verdict.root === root
+      let match: ReturnType<typeof matchOwnRoot> = { kind: 'none' }
+      if (ownRoot) {
+        // A pending own post of this lifetime in that very thread settles it by its own enrollment.
+        for (const other of roots.get(scope(lifetime))?.get(root)?.pending ?? []) {
+          if (other !== id && records.get(key)?.get(other)?.observation.post) return { kind: 'deferred' }
+        }
+        match = matchOwnRoot(lifetime, root, observation.lookup.issuer, verdict.files ?? [])
+        // A clock window is no authorship fact: an own root outside it stays undecided.
+        if (match.kind === 'window-missed') return { kind: 'unmatched' }
+      }
+      try {
+        if (match.kind === 'file' || match.kind === 'window') {
+          const eligibility = currentEligibility(key, channel, evidence)
+          if (!eligibility) return { kind: 'pending', reason: 'eligibility-unavailable' }
+          if (eligibility.kind === 'unresolved') return { kind: 'pending', reason: eligibility.reason, mode: eligibility.mode }
+          // The root is the persona's; only the channel cannot enroll now. Nothing is written: replies there are
+          // re-evaluated under current eligibility, and a reply once the channel can enroll asks again.
+          if (eligibility.kind === 'ineligible') {
+            let marked = ineligibleRoots.get(scope(lifetime))
+            if (!marked) { marked = new Set(); ineligibleRoots.set(scope(lifetime), marked) }
+            marked.add(root)
+            settled(key, channel, root)
+            return { kind: 'ineligible' }
+          }
+          const enrolled: ThreadObservation = { ...observation, policy: { mode: eligibility.mode, delivery: eligibility.delivery } }
+          await options.queue.recordThreadObservation(key, enrolled, 'enrolled')
+          const after = notCurrent()
+          if (after) return after
+          install(key, { v: 1, kind: 'thread-participation', seq: 0, state: 'enrolled', observation: enrolled })
+          if (!(match.kind === 'file' && await settleMatchedUpload(key, match.id, root, eligibility))) settled(key, channel, root)
+          return { kind: 'enrolled' }
+        }
+      } catch (error) {
+        return supersededNow(lifetime) ? { kind: 'superseded' } : { kind: 'storage', error }
+      }
+      // Another author's root, or an own root no post of this lifetime created: the thread is not followed from it.
+      const cancelled: ThreadObservation = ownRoot ? { ...observation, lookup: { ...observation.lookup, reason: 'outside-lifetime' } } : observation
+      try { await options.queue.cancelThreadObservation(key, cancelled) } catch (error) {
+        return supersededNow(lifetime) ? { kind: 'superseded' } : { kind: 'storage', error }
+      }
+      const after = notCurrent()
+      if (after) return after
+      install(key, { v: 1, kind: 'thread-participation', seq: 0, state: 'cancelled', observation: cancelled })
+      settled(key, channel, root)
+      return { kind: ownRoot ? 'outside-lifetime' : 'not-own' }
     },
     stop() { stopped = true },
   }

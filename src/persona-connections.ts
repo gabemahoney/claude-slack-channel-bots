@@ -176,6 +176,8 @@ import {
   type SlackValidationFailure,
 } from './persona-slack-validation.ts'
 import { watchWebClientAuth } from './persona-web-api-watch.ts'
+import { observeFileCompletions } from './file-upload-observation.ts'
+import { MetadataCancelledError, type EnrollmentMetadataMethod } from './participation-metadata.ts'
 import { MembershipCancelledError, MEMBERSHIP_PAGE_LIMIT } from './channel-membership-retry.ts'
 
 // ---------------------------------------------------------------------------
@@ -384,6 +386,27 @@ export interface PersonaConnectionManager {
   identity(key: string): SlackBotIdentity | undefined
   provenance(key: string): PersonaEventProvenance | undefined
   membershipPage(key: string, connectionId: string, cursor: string | undefined, signal: AbortSignal): Promise<unknown>
+  /**
+   * One enrollment-metadata request on the persona's current authenticated
+   * connection, through the factory with the membership client options and
+   * the auth watch. Rejects with `MetadataCancelledError` when the connection
+   * is not current, not up, or `signal` already aborted.
+   */
+  metadataCall(key: string, connectionId: string, method: EnrollmentMetadataMethod, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown>
+  /**
+   * The OAuth scopes Slack reported (`response_metadata.scopes`) when the
+   * persona's held bot token was last validated; `undefined` when unknown.
+   */
+  grantedScopes(key: string): readonly string[] | undefined
+  /**
+   * Read the held bot token's granted scopes again with one authenticated
+   * `auth.test` on the persona's current connection, through the factory
+   * with the membership client options and the auth watch; not a root probe
+   * and no reconnect. A well-formed list from the same bot replaces what
+   * `grantedScopes` reports. Rejects with `MetadataCancelledError` like
+   * `metadataCall`.
+   */
+  refreshGrantedScopes(key: string, connectionId: string, signal: AbortSignal): Promise<void>
   /** One bounded attempt with the held applied token pair; no internal retry. */
   revalidateMembership(key: string, signal: AbortSignal): Promise<MembershipRevalidation>
   /** The persona's long-lived Web API client once it has been up; always `undefined` in dry run. */
@@ -576,6 +599,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const serialize: PersonaSerialize = deps.serialize ?? (async (_key, operation) => operation())
   const entries = new Map<string, PersonaEntry>()
+  /** The OAuth scopes Slack reported for each validated token pair's bot token; absent means unknown. */
+  const grantedScopes = new WeakMap<PersonaSlackTokens, readonly string[] | undefined>()
 
   // -------------------------------------------------------------------------
   // Logging and callbacks (a throwing logger or listener never breaks supervision)
@@ -780,7 +805,9 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     let metadata = false
     try {
       const client = factory.createValidationClient(tokens.botToken, validationWebClientOptions(slackApiUrl))
-      const outcome = botIdentityFromAuthTest(await client.auth.test())
+      const authResult: unknown = await client.auth.test()
+      const outcome = botIdentityFromAuthTest(authResult)
+      if (!attempt.settled && outcome.kind === 'up') grantedScopes.set(tokens, grantedScopesFrom(authResult))
       if (attempt.settled || outcome.kind !== 'up' || !outcome.identity.teamId || outcome.identity.appId || !client.bots) return outcome
       // Existing users:read permission; the same end-to-end validation bound
       // covers this metadata request. Never inspect a token for identity.
@@ -1140,6 +1167,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   /** The persona's long-lived Web API client for `tokens`, wrapped by the auth-failure watch. */
   function createWatchedWebClient(entry: PersonaEntry, tokens: PersonaSlackTokens): WebClient {
     const raw = factory.createWebClient(tokens.botToken, longLivedWebClientOptions(slackApiUrl))
+    observeFileCompletions(raw)
     const watched: WebClient = watchWebClientAuth(raw, outcome => onWebApiRefused(entry, watched, outcome))
     return watched
   }
@@ -1241,6 +1269,44 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       if (applies() && classifySlackValidationError(error, 'web-api').kind === 'credentials-refused') entry.membershipNeedsValidation = true
       throw error
     }
+  }
+
+  /** Enrollment metadata uses the membership client options (no SDK retries,
+   * rate limits rejected, abort reaching queued HTTP work) and the same
+   * connection guard. A refusal marks the persona before the caller sees it. */
+  async function metadataCall(key: string, connectionId: string, method: EnrollmentMetadataMethod,
+    args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+    const entry = entries.get(key)
+    const binding = entry?.socket
+    if (dryRun || !entry?.tokens || !binding || binding.connectionId !== connectionId ||
+        !provenanceOf(entry, binding).isCurrent() || signal.aborted || entry.status.state !== 'up') throw new MetadataCancelledError()
+    const tokens = entry.tokens
+    const applies = () => entries.get(key) === entry && entry.tokens === tokens && !entry.stopped && !signal.aborted &&
+      entry.socket === binding && entry.status.state !== 'broken'
+    const raw = factory.createWebClient(tokens.botToken, membershipWebClientOptions(signal, slackApiUrl))
+    const client = watchWebClientAuth(raw, outcome => { if (applies()) markRefusedWhileRunning(entry, outcome) })
+    switch (method) {
+      case 'conversations.replies': return client.conversations.replies(args as never)
+      case 'conversations.info': return client.conversations.info(args as never)
+      case 'files.info': return client.files.info(args as never)
+    }
+  }
+
+  async function refreshGrantedScopes(key: string, connectionId: string, signal: AbortSignal): Promise<void> {
+    const entry = entries.get(key)
+    const binding = entry?.socket
+    if (dryRun || !entry?.tokens || !binding || binding.connectionId !== connectionId ||
+        !provenanceOf(entry, binding).isCurrent() || signal.aborted || entry.status.state !== 'up') throw new MetadataCancelledError()
+    const tokens = entry.tokens
+    const applies = () => entries.get(key) === entry && entry.tokens === tokens && !entry.stopped && !signal.aborted &&
+      entry.socket === binding && entry.status.state !== 'broken'
+    const raw = factory.createWebClient(tokens.botToken, membershipWebClientOptions(signal, slackApiUrl))
+    const client = watchWebClientAuth(raw, outcome => { if (applies()) markRefusedWhileRunning(entry, outcome) })
+    const result: unknown = await client.auth.test()
+    const scopes = grantedScopesFrom(result), answered = botIdentityFromAuthTest(result)
+    // Only the same bot's answer for the same held token replaces the scopes its validation read.
+    if (scopes && applies() && answered.kind === 'up' && answered.identity.botUserId === binding.identity.botUserId &&
+        answered.identity.botId === binding.identity.botId) grantedScopes.set(tokens, scopes)
   }
 
   async function revalidateMembership(key: string, signal: AbortSignal): Promise<MembershipRevalidation> {
@@ -1375,11 +1441,25 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     },
     reconnectCredentials,
     membershipPage,
+    metadataCall,
+    refreshGrantedScopes,
+    grantedScopes: key => {
+      const tokens = entries.get(key)?.tokens
+      return tokens ? grantedScopes.get(tokens) : undefined
+    },
     revalidateMembership,
     replaceRetryTokens,
     stop,
     stopAll,
   }
+}
+
+/** `auth.test`'s reported OAuth scopes, when it carried a well-formed list. */
+function grantedScopesFrom(result: unknown): readonly string[] | undefined {
+  const metadata = typeof result === 'object' && result !== null ? (result as { response_metadata?: unknown }).response_metadata : undefined
+  const scopes = typeof metadata === 'object' && metadata !== null ? (metadata as { scopes?: unknown }).scopes : undefined
+  if (!Array.isArray(scopes) || !scopes.every(s => typeof s === 'string' && /^[a-z][a-z0-9_.:-]{0,63}$/.test(s))) return undefined
+  return Object.freeze([...scopes])
 }
 
 /** Whether a value is a promise-like whose rejection must be handled. */

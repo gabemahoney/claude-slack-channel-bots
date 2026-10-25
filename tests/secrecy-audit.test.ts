@@ -98,7 +98,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 
 import { LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak } from './test-helpers/credentials.ts'
@@ -169,6 +169,12 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   // the stored-choice file holds the credentials file's path, never its content.
   [/^src\/channel-delivery-attempt\.ts$/, 'logical attempt validation and hashed caller identity evidence'],
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
+  // Thread participation's metadata repair: each makes or reads an authenticated Slack request on a persona's client.
+  [/^src\/participation-metadata\.ts$/, "the bounded metadata attempts, which run a persona's authenticated Slack requests and classify their raw failures (an error's message can hold a token) into safe codes"],
+  [/^src\/participation-recovery\.ts$/, "the participation recovery owner, which calls Slack on a persona's current connection and reports findings whose codes come from Slack failures"],
+  [/^src\/participation-capability\.ts$/, "the root-lookup capability, which reads the scopes Slack reported for a persona's validated bot token and records a refused lookup's Slack error"],
+  [/^src\/participation-(?:channel|root|file)-evidence\.ts$/, "the channel, root and file evidence readers, which parse authenticated Slack answers about a persona's channels, threads and uploads"],
+  [/^src\/file-upload-observation\.ts$/, "the file-completion observation, which wraps a persona's raw Web API client and hands each completion response, as Slack returned it, to its listener"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -191,6 +197,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/thread-participation.ts': { makeThreadHarness: 'builds durable persona configuration and sentinel-bearing routing clients' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
   'tests/test-helpers/slack-stub.ts': { makeStubSlackFactory: 'builds Slack clients from tokens' },
+  'tests/integration/fixtures/slack-stub-server.ts': { startSlackStub: "serves token-bearing Slack clients and records their requests, upload, file-share and root-lookup evidence" },
   'tests/test-helpers/ci-run.ts': {
     makeFakeCodexHome: 'writes fake Codex login and config files under the fixture root',
     makeFakeCodexLogin: 'builds injected Codex login dependencies with sentinel-bearing tokens',
@@ -693,6 +700,62 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
     expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes('src/channel-delivery.ts'))).toBe(true)
     expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+  })
+
+  // each makes, wraps or parses a persona's authenticated Slack requests, and its findings and
+  // classifications carry codes taken from Slack failures.
+  test.each([
+    ['src/participation-metadata.ts', 'classifyMetadataFailure', 'ENROLLMENT_METADATA_METHODS', 'MetadataFailure'],
+    ['src/participation-recovery.ts', 'createParticipationRecovery', 'PARTICIPATION_RECOVERY_CAUSES', 'ParticipationRecoveryFinding'],
+    ['src/participation-capability.ts', 'createRootLookupCapability', undefined, 'RootLookupCapability'],
+    ['src/participation-channel-evidence.ts', 'parseConversationInfo', 'PUBLIC_HISTORY_SCOPE', 'RootLookupCapabilityGap'],
+    ['src/participation-root-evidence.ts', 'parseRootReplies', undefined, 'RootAuthorEvidence'],
+    ['src/participation-file-evidence.ts', 'completionFiles', 'SLACK_FILE_ID_RE', 'CompletedFile'],
+    ['src/file-upload-observation.ts', 'observeFileCompletions', undefined, 'FileCompletionListener'],
+  ] as const)('%s is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', (module, fn, constant, type) => {
+    const suite = 'tests/thread-participation.test.ts'
+    expect(SOURCE_FILES).toContain(module)
+    expect(SOURCE_SURFACES.filter(([re]) => re.test(module))).toHaveLength(1)
+    expect(touchReasonsOf(suite, `import { ${fn} } from '../${module}'`)).toHaveLength(1)
+    expect(touchReasonsOf(suite, `import { ${fn} as used } from '../${module}'`)).toHaveLength(1)
+    if (constant !== undefined) expect(touchReasonsOf(suite, `import { ${constant} } from '../${module}'`)).toEqual([])
+    expect(touchReasonsOf(suite, `import type { ${type} } from '../${module}'`)).toEqual([])
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  test('the participation modules are touched by suites today, and a touching suite without its assertNoLeak calls fails the rule', () => {
+    const touched = (module: string) => SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
+    for (const module of ['src/participation-metadata.ts', 'src/participation-channel-evidence.ts', 'src/participation-root-evidence.ts', 'src/participation-file-evidence.ts', 'src/participation-capability.ts']) {
+      expect([module, touched(module).length > 0]).toEqual([module, true])
+    }
+    const suite = 'tests/notice-texts.test.ts'
+    expect(touchReasons(suite).some((r) => r.includes('src/participation-channel-evidence.ts'))).toBe(true)
+    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+    expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes('src/participation-channel-evidence.ts'))).toBe(true)
+    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+  })
+
+  test("the Slack stub server's startSlackStub touches, its control parser alone does not, and every suite that starts it leak-checks with no exemption", () => {
+    const helper = 'tests/integration/fixtures/slack-stub-server.ts', suite = 'tests/real-ai-classifier-stop.test.ts'
+    expect(touchReasonsOf(suite, "import { startSlackStub } from './integration/fixtures/slack-stub-server.ts'")).toEqual([
+      `imports startSlackStub from ${helper}: ${HELPER_SURFACES[helper]!.startSlackStub}`,
+    ])
+    expect(touchReasonsOf(suite, "import { parseControl } from './integration/fixtures/slack-stub-server.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { StubControl } from './integration/fixtures/slack-stub-server.ts'")).toEqual([])
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes(helper)))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  test('every helper surface names a module that exists and an export it has (none stale)', async () => {
+    const failures: string[] = []
+    for (const [module, names] of Object.entries(HELPER_SURFACES)) {
+      if (!existsSync(join(ROOT, module))) { failures.push(`${module}: stale helper surface: no such file`); continue }
+      const exported = await import(join(ROOT, module)) as Record<string, unknown>
+      for (const name of Object.keys(names)) if (!(name in exported)) failures.push(`${module} ${name}: stale helper surface: not exported`)
+    }
+    expect(checked(failures, 'stale helper surfaces')).toEqual([])
   })
 
   test('attempt evidence functions require leakage checks, including aliased imports and omission mutants, without exemptions', () => {

@@ -84,7 +84,11 @@
  *     agent-director's words in a quoted description would fail the checks
  *     if the own-lines helper stopped removing the description.
  * This file pins no notice text: each builder's exact text is asserted in
- * its own suite.
+ * its own suite. The exceptions are action texts the debugging skill quotes
+ * and no other suite pins: the storage gap action, which gives no backup
+ * advice (nor does its notice), and the backup sentence every other gap
+ * cause keeps; the `access-lost` recovery action; and both root-lookup
+ * capability actions.
  *
  * Pure: every builder here is a pure function of its arguments; nothing is
  * started, written or posted. The JSONL safeguard has no pure builder, so it
@@ -168,6 +172,11 @@ import {
   buildOwnPostNotEnrolledLine,
   buildOwnPostNotEnrolledNotice,
   buildOwnPostOutcomesDroppedLine,
+  buildParticipationRecoveredLine,
+  buildParticipationRecoveryCappedLine,
+  buildParticipationRecoveryLine,
+  buildRootLookupCapabilityLine,
+  buildRootLookupCapabilityNotice,
   MESSAGES_WAITING_STATES,
   OWN_POST_FINDING_CAUSES,
   OWN_POST_FINDINGS_LOGGED_PER_PERSONA,
@@ -175,10 +184,24 @@ import {
   ownPostFindingAction,
   ownPostFindingCause,
   ownPostMentionApplies,
+  PARTICIPATION_RECOVERY,
+  PARTICIPATION_RECOVERY_LOGGED_PER_PERSONA,
+  ROOT_LOOKUP_CAPABILITY_MISSING,
+  rootLookupCapabilityAction,
   type DeliveryStuckReason,
   type OwnPostFinding,
   type OwnPostFindingCause,
 } from '../src/delivery-notices.ts'
+import {
+  DM_HISTORY_SCOPE,
+  missingHistoryScopes,
+  PRIVATE_HISTORY_SCOPE,
+  PUBLIC_HISTORY_SCOPE,
+  requiredHistoryScopes,
+  type RootLookupCapabilityGap,
+} from '../src/participation-channel-evidence.ts'
+import { METADATA_CAPABILITY_ERRORS } from '../src/participation-metadata.ts'
+import { PARTICIPATION_RECOVERY_CAUSES, type ParticipationRecoveryFinding } from '../src/participation-recovery.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from '../src/jsonl-persistence-check.ts'
 import {
@@ -824,6 +847,15 @@ const OWN_POST_FINDING_VARIANTS: readonly (readonly [variant: string, finding: O
     kind: 'gap', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, delivery: 'off', missing: [], reason: 'storage',
     error: ownPostError('own-post-off-storage'),
   }],
+  // A failed save over durable pending evidence: still pending, its cause storage whatever the evidence lacks.
+  ['pending, storage: a root post whose enrollment could not be saved over its durable evidence', {
+    kind: 'pending', surface: 'text', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, ts: OWN_POST_TS, delivery: 'mentions',
+    missing: [], reason: 'storage', error: ownPostError('own-post-pending-storage'),
+  }],
+  ['pending, storage: a file completion still missing its root', {
+    kind: 'pending', surface: 'file', operation: OWN_POST_OPERATION, part: 1, channel: OWN_POST_CHANNEL, file: OWN_POST_FILE,
+    missing: ['root'], reason: 'storage', error: ownPostError('own-post-pending-file-storage'),
+  }],
 ]
 
 /**
@@ -848,6 +880,33 @@ function ownPostForm(finding: OwnPostFinding): 'ts' | 'file' | 'channel only' {
 function ownPostEntries(): NoticeEntry[] {
   return OWN_POST_FINDING_VARIANTS.map(([variant, finding]) =>
     entry("common", buildOwnPostNotEnrolledNotice.name, variant, () => buildOwnPostNotEnrolledNotice(PERSONA.name, finding)))
+}
+
+/** The refusal a lazily verified `conversations.replies` gets for its scope or token type. */
+const REFUSED_LOOKUP_ERROR = 'missing_scope'
+
+/**
+ * Every root-lookup capability gap the reporter can render, by kind (a new
+ * kind fails the type check): a missing private-history scope alone, every
+ * history scope a DM-enabled persona needs, DM history alone (the one gap
+ * that holds no lookup), and a refused method.
+ */
+const ROOT_LOOKUP_CAPABILITY_GAP_VARIANTS: Readonly<Record<RootLookupCapabilityGap['kind'], readonly (readonly [variant: string, gap: RootLookupCapabilityGap])[]>> = {
+  'missing-scope': [
+    ['missing scope: private-channel history only', { kind: 'missing-scope', scopes: missingHistoryScopes([PUBLIC_HISTORY_SCOPE], { dm: { enabled: false } })! }],
+    ['missing scope: every history scope of a DM-enabled persona', { kind: 'missing-scope', scopes: requiredHistoryScopes({ dm: { enabled: true } }) }],
+    ['missing scope: DM history only', { kind: 'missing-scope', scopes: missingHistoryScopes([PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE], { dm: { enabled: true } })! }],
+  ],
+  'method-refused': [
+    [`method refused: conversations.replies ${REFUSED_LOOKUP_ERROR}`, { kind: 'method-refused', method: 'conversations.replies', slackError: REFUSED_LOOKUP_ERROR }],
+  ],
+}
+const ROOT_LOOKUP_CAPABILITY_GAPS = Object.values(ROOT_LOOKUP_CAPABILITY_GAP_VARIANTS).flat()
+
+/** The capability notice delivery reporting posts once per episode, in every gap variant. */
+function rootLookupCapabilityEntries(): NoticeEntry[] {
+  return ROOT_LOOKUP_CAPABILITY_GAPS.map(([variant, gap]) =>
+    entry("common", buildRootLookupCapabilityNotice.name, variant, () => buildRootLookupCapabilityNotice(PERSONA.name, gap)))
 }
 
 /** The JSONL persistence safeguard's storage and AD-reference notices (keeps their text): one per variant. */
@@ -1040,6 +1099,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...notConnectedEntries(),
   ...deliveryEntries(),
   ...ownPostEntries(),
+  ...rootLookupCapabilityEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
   ...capEntries(),
@@ -1094,6 +1154,7 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildMessagesWaitingNotice.name,
   buildQueueRecordUnreadableNotice.name,
   buildOwnPostNotEnrolledNotice.name,
+  buildRootLookupCapabilityNotice.name,
   runPersonaStorageCheck.name,
   runJsonlPersistenceSafeguard.name,
   jsonlRowAbsentInconclusiveNoticeText.name,
@@ -1257,6 +1318,27 @@ describe('the notice catalogue is complete (to, and every named Slack notice)', 
     expect(variantsOf(buildMessagesWaitingNotice.name)).toEqual([...MESSAGES_WAITING_STATES])
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_ROTATED])
     expect(variantsOf(buildOwnPostNotEnrolledNotice.name)).toEqual(OWN_POST_FINDING_VARIANTS.map(([variant]) => variant))
+    expect(variantsOf(buildRootLookupCapabilityNotice.name)).toEqual(ROOT_LOOKUP_CAPABILITY_GAPS.map(([variant]) => variant))
+  })
+
+  test('the root-lookup capability variants cover each gap kind, every configured history scope and a capability refusal', () => {
+    const gaps = ROOT_LOOKUP_CAPABILITY_GAPS.map(([, gap]) => gap)
+    const scopes = gaps.flatMap((gap) => (gap.kind === 'missing-scope' ? gap.scopes : []))
+    const refusals = gaps.flatMap((gap) => (gap.kind === 'method-refused' ? [gap.slackError] : []))
+    expect({
+      kinds: [...new Set(gaps.map((gap) => gap.kind))].sort(),
+      scopes: [...new Set(scopes)].sort(),
+      scopesNonEmpty: gaps.every((gap) => gap.kind !== 'missing-scope' || gap.scopes.length > 0),
+      dmScopeOnlyWithDm: requiredHistoryScopes({ dm: { enabled: false } }).includes(DM_HISTORY_SCOPE),
+      refusalsAreCapabilityErrors: refusals.length > 0 && refusals.every((code) => METADATA_CAPABILITY_ERRORS.has(code)),
+    }).toEqual({
+      kinds: (Object.keys(ROOT_LOOKUP_CAPABILITY_GAP_VARIANTS) as RootLookupCapabilityGap['kind'][]).sort(),
+      scopes: [DM_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, PUBLIC_HISTORY_SCOPE].sort(),
+      scopesNonEmpty: true,
+      dmScopeOnlyWithDm: false,
+      refusalsAreCapabilityErrors: true,
+    })
+    expect([...new Set(scopes)].sort()).toEqual([...requiredHistoryScopes({ dm: { enabled: true } })].sort())
   })
 
   test('the own-post notice variants cover each state, cause, gap cause, missing-evidence set and identifier form', () => {
@@ -1266,10 +1348,18 @@ describe('the notice catalogue is complete (to, and every named Slack notice)', 
     expect([...new Set(findings.map(ownPostFindingCause))].sort()).toEqual([...OWN_POST_FINDING_CAUSES].sort())
     expect([...new Set(gaps.map((f) => f.reason))].sort()).toEqual([...OWN_POST_GAP_CAUSES].sort())
     expect(gaps.every((f) => f.missing.length === 0)).toBe(true)
-    // Every nonempty set of missing evidence a pending post can hold.
+    // Every nonempty set of missing evidence a pending post can hold; only a
+    // failed save over durable evidence is pending with none missing.
     const subsets = Array.from({ length: 2 ** OWN_POST_MISSING.length - 1 }, (_, i) =>
       OWN_POST_MISSING.filter((_m, bit) => ((i + 1) >> bit) & 1).join(','))
-    expect([...new Set(pending.map((f) => [...f.missing].sort().join(',')))].sort()).toEqual(subsets.map((s) => s.split(',').sort().join(',')).sort())
+    const awaiting = pending.filter((f) => f.reason !== 'storage'), storagePending = pending.filter((f) => f.reason === 'storage')
+    expect([...new Set(awaiting.map((f) => [...f.missing].sort().join(',')))].sort()).toEqual(subsets.map((s) => s.split(',').sort().join(',')).sort())
+    expect(pending.filter((f) => f.missing.length === 0).every((f) => f.reason === 'storage')).toBe(true)
+    expect({
+      causes: [...new Set(storagePending.map(ownPostFindingCause))],
+      noneMissing: storagePending.some((f) => f.missing.length === 0),
+      rootMissing: storagePending.some((f) => f.missing.includes('root')),
+    }).toEqual({ causes: ['storage'], noneMissing: true, rootMissing: true })
     const forms: ReturnType<typeof ownPostForm>[] = ['channel only', 'file', 'ts']
     expect({ pending: [...new Set(pending.map(ownPostForm))].sort(), gap: [...new Set(gaps.map(ownPostForm))].sort() }).toEqual({ pending: forms, gap: forms })
     // With and without the new-mention guidance: a known root under `mentions`,
@@ -1692,6 +1782,41 @@ describe('own-post findings: the notice tells pending from gap, and the line nam
     expect(ownPostMentionSentence('storage', false)).toBe(storage)
   })
 
+  // The debugging skill quotes these: a storage gap is saved again while the
+  // server runs, so it never sends the operator to a backup; every other gap
+  // kept no record, so its only remedies are a reviewed backup or letting go.
+  const STORAGE_GAP_ACTION = "Check the server's disk and state directory. CSCB saves the post's evidence again while the server runs, once it can save its state and the persona is up; a restart before then loses it."
+  const GAP_BACKUP_SENTENCE = "CSCB cannot rebuild a record it never saved: restore the server's state only from a reviewed, trustworthy backup, or accept that the persona does not follow the thread."
+  const NON_STORAGE_CAUSES = OWN_POST_FINDING_CAUSES.filter((cause) => cause !== 'storage')
+  const gapVariants = (storage: boolean) => OWN_POST_FINDING_VARIANTS.filter(([, f]) => f.kind === 'gap' && (ownPostFindingCause(f) === 'storage') === storage)
+
+  test('the storage gap action is its own text and gives no backup advice, with or without the new mention', () => {
+    const plain = ownPostFindingAction('storage', true, false), withMention = ownPostFindingAction('storage', true, true)
+    expect({ plain, withMention, backup: /backup/i.test(plain + withMention) })
+      .toEqual({ plain: STORAGE_GAP_ACTION, withMention: `${STORAGE_GAP_ACTION} ${ownPostMentionSentence('storage', true)}`, backup: false })
+  })
+
+  test.each(gapVariants(true))('%s: the *Thread participation not saved* notice and the line give no backup advice', (_variant, finding) => {
+    const text = buildOwnPostNotEnrolledNotice(PERSONA.name, finding), line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
+    expect({ title: text.includes('*Thread participation not saved*'), storageAction: text.includes(STORAGE_GAP_ACTION), backup: /backup/i.test(text + line) })
+      .toEqual({ title: true, storageAction: true, backup: false })
+  })
+
+  test.each(NON_STORAGE_CAUSES.map((cause) => [cause] as const))('%s gap: the action keeps the backup sentence, with or without the new mention', (cause) => {
+    expect({ plain: ownPostFindingAction(cause, true, false), withMention: ownPostFindingAction(cause, true, true).includes(GAP_BACKUP_SENTENCE) })
+      .toEqual({ plain: `Check that the persona is applied and up. ${GAP_BACKUP_SENTENCE}`, withMention: true })
+  })
+
+  test.each(gapVariants(false))('%s: the notice and the line keep the backup sentence', (_variant, finding) => {
+    const text = buildOwnPostNotEnrolledNotice(PERSONA.name, finding), line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
+    expect({ notice: text.includes(GAP_BACKUP_SENTENCE), line: line.includes(JSON.stringify(GAP_BACKUP_SENTENCE).slice(1, -1)) }).toEqual({ notice: true, line: true })
+  })
+
+  test('self-check: the variants hold storage gaps and a gap of every other cause the reporter renders', () => {
+    expect(gapVariants(true).length).toBeGreaterThan(0)
+    expect([...new Set(gapVariants(false).map(([, f]) => ownPostFindingCause(f)))].sort()).toEqual(['channel-eligibility', 'operation'])
+  })
+
   test.each(OWN_POST_FINDING_VARIANTS)('%s: the line is one line of identifiers, state, cause and an error code only', (_variant, finding) => {
     const line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
     const cause = ownPostFindingCause(finding)
@@ -1727,6 +1852,158 @@ describe('own-post findings: the notice tells pending from gap, and the line nam
     const [, finding] = OWN_POST_FINDING_VARIANTS.find(([, f]) => f.error !== undefined)!
     const line = buildOwnPostNotEnrolledLine(PERSONA.name, finding)
     expect(() => assertNoLeak(`${line} ${(finding.error as Error).message}`, 'own-post line with raw error')).toThrow()
+  })
+})
+
+describe('root-lookup capability: the notice and line name the scopes or refused method, and the persona stays up', () => {
+  test.each(ROOT_LOOKUP_CAPABILITY_GAPS)('%s: the line is one line of the cause, its identifiers and its action', (_variant, gap) => {
+    const line = buildRootLookupCapabilityLine(PERSONA.name, gap)
+    assertNoLeak(line, 'root-lookup capability line')
+    const identity = gap.kind === 'missing-scope'
+      ? ` cause=missing-scope scopes=${gap.scopes.join(',')} `
+      : ` cause=method-refused method=${gap.method} slack_error=${gap.slackError} `
+    expect({
+      prefix: line.startsWith(`[slack] ${ROOT_LOOKUP_CAPABILITY_MISSING}: persona=`),
+      oneLine: !/[\r\n]/.test(line),
+      identity: line.includes(identity),
+      staysUp: line.includes(' effect="the persona stays up;'),
+      action: line.endsWith(` action=${JSON.stringify(rootLookupCapabilityAction(gap))}`),
+    }).toEqual({ prefix: true, oneLine: true, identity: true, staysUp: true, action: true })
+  })
+
+  test.each(ROOT_LOOKUP_CAPABILITY_GAPS)('%s: the notice names each scope or the refused method and keeps the unaffected paths working', (_variant, gap) => {
+    const text = buildRootLookupCapabilityNotice(PERSONA.name, gap)
+    const named = gap.kind === 'missing-scope' ? gap.scopes.map((scope) => `\`${scope}\``) : [`\`${gap.method}\``, `\`${gap.slackError}\``]
+    expect({
+      named: named.every((part) => text.includes(part)),
+      action: text.endsWith(rootLookupCapabilityAction(gap)),
+      unaffected: text.includes('Mentions, all delivery, DMs and threads it already follows still work'),
+    }).toEqual({ named: true, action: true, unaffected: true })
+  })
+
+  test('each gap kind has its own action, and only the missing-scope action names scopes', () => {
+    const [[, scopeGap]] = ROOT_LOOKUP_CAPABILITY_GAP_VARIANTS['missing-scope'], [[, refusal]] = ROOT_LOOKUP_CAPABILITY_GAP_VARIANTS['method-refused']
+    expect(rootLookupCapabilityAction(scopeGap)).not.toBe(rootLookupCapabilityAction(refusal))
+    expect(rootLookupCapabilityAction(scopeGap)).toContain(PRIVATE_HISTORY_SCOPE)
+    expect(requiredHistoryScopes({ dm: { enabled: true } }).filter((scope) => rootLookupCapabilityAction(refusal).includes(scope))).toEqual([])
+  })
+
+  // The debugging skill quotes these: each says when CSCB checks again; a gap that holds replies needs no restart.
+  test.each(ROOT_LOOKUP_CAPABILITY_GAPS)('%s: the action is its exact text', (_variant, gap) => {
+    const fix = gap.kind === 'missing-scope'
+      ? `Add the missing bot scope(s) ${gap.scopes.join(', ')} to the persona's Slack app (the shipped manifest lists them), reinstall the app, and update the persona's bot token if Slack issued a new one.`
+      : ''
+    expect(rootLookupCapabilityAction(gap)).toBe(gap.kind === 'method-refused'
+      ? "Check that the persona's bot token is a bot token of an app installed with the manifest's history scopes, and reinstall the app if it is. While replies are waiting, CSCB tries one thread lookup again about once a minute, so no restart is needed after the reinstall."
+      : gap.scopes.join() === DM_HISTORY_SCOPE
+        ? `${fix} No reply waits on this scope, so CSCB checks it again only when the persona's token is next validated (for example at a server restart or a bot token update).`
+        : `${fix} While replies are waiting, CSCB re-checks the token's scopes about once a minute, so no restart is needed after the reinstall.`)
+  })
+
+  // Every root lookup is in a channel, so DM history alone holds no reply; every other gap holds those whose root must be looked up.
+  test.each(ROOT_LOOKUP_CAPABILITY_GAPS)("%s: the line's effect and the notice are their exact texts", (_variant, gap) => {
+    const dmOnly = gap.kind === 'missing-scope' && gap.scopes.join() === DM_HISTORY_SCOPE
+    const what = gap.kind === 'missing-scope'
+      ? `its bot token lacks the scope(s) ${gap.scopes.map((scope) => `\`${scope}\``).join(', ')}`
+      : `Slack refused its thread lookup (\`${gap.method}\`: \`${gap.slackError}\`)`
+    expect({
+      effect: /effect="([^"]+)"/.exec(buildRootLookupCapabilityLine(PERSONA.name, gap))?.[1],
+      notice: buildRootLookupCapabilityNotice(PERSONA.name, gap),
+    }).toEqual(dmOnly
+      ? {
+        effect: 'the persona stays up; no reply waits, because thread lookups in channels do not need this scope',
+        notice: `:warning: *DM history scope missing* — Alpha is up, but ${what}, which its configuration requires for DMs; no thread lookup CSCB makes needs it now. Mentions, all delivery, DMs and threads it already follows still work. ${rootLookupCapabilityAction(gap)}`,
+      }
+      : {
+        effect: 'the persona stays up; only thread replies whose root must be looked up wait',
+        notice: `:warning: *Thread lookups unavailable* — Alpha is up, but CSCB can't look up who started a thread: ${what}. Mentions, all delivery, DMs and threads it already follows still work; replies whose thread root must be looked up wait until this is fixed. ${rootLookupCapabilityAction(gap)}`,
+      })
+  })
+
+  test('the DM-history-only variant is exactly im:history, and its texts are verbatim', () => {
+    const [, gap] = ROOT_LOOKUP_CAPABILITY_GAPS.find(([variant]) => variant === 'missing scope: DM history only')!
+    const action = "Add the missing bot scope(s) im:history to the persona's Slack app (the shipped manifest lists them), reinstall the app, and update the persona's bot token if Slack issued a new one. No reply waits on this scope, so CSCB checks it again only when the persona's token is next validated (for example at a server restart or a bot token update)."
+    expect(gap).toEqual({ kind: 'missing-scope', scopes: ['im:history'] })
+    expect(rootLookupCapabilityAction(gap)).toBe(action)
+    expect(buildRootLookupCapabilityLine(PERSONA.name, gap)).toEndWith(
+      ` cause=missing-scope scopes=im:history effect="the persona stays up; no reply waits, because thread lookups in channels do not need this scope" action=${JSON.stringify(action)}`)
+    expect(buildRootLookupCapabilityNotice(PERSONA.name, gap)).toBe(
+      `:warning: *DM history scope missing* — Alpha is up, but its bot token lacks the scope(s) \`im:history\`, which its configuration requires for DMs; no thread lookup CSCB makes needs it now. Mentions, all delivery, DMs and threads it already follows still work. ${action}`)
+  })
+
+  test("a token-bearing refused method's Slack error is redacted, and the line stays one line", () => {
+    const slackError = `${sentinelInMessage('capability-line')}\nnext`
+    expect(() => assertNoLeak(slackError, 'the raw Slack error')).toThrow()
+    const line = buildRootLookupCapabilityLine(PERSONA.name, { kind: 'method-refused', method: 'conversations.replies', slackError })
+    assertNoLeak(line, 'root-lookup capability line with a token-bearing Slack error')
+    expect(/[\r\n]/.test(line)).toBe(false)
+  })
+})
+
+describe('participation recovery: each finding line names its state, cause and identifiers only', () => {
+  const GAP_CAUSES = ['access-lost', 'file-unavailable', 'root-deleted']
+  /** Settled: the thread is decided not followed, so nothing stays pending. */
+  const UNFOLLOWED_CAUSES = ['root-outside-lifetime']
+  const stateOf = (cause: string) => GAP_CAUSES.includes(cause) ? 'gap' : UNFOLLOWED_CAUSES.includes(cause) ? 'unfollowed' : 'pending'
+  /** One finding per cause, with every identifier its owner reports and a code where one is reported. */
+  const findingOf = (cause: ParticipationRecoveryFinding['cause']): ParticipationRecoveryFinding => ({
+    cause, channel: OWN_POST_CHANNEL,
+    ...(cause === 'file-unavailable' ? { file: OWN_POST_FILE } : cause === 'storage' ? {} : { root: OWN_POST_PARENT }),
+    ...(cause === 'metadata' ? { code: 'ratelimited' } : cause === 'capability' ? { code: REFUSED_LOOKUP_ERROR } : {}),
+  })
+  const actionOf = (line: string) => /action=("(?:\\.|[^"\\])*")$/.exec(line)?.[1]
+
+  test.each(PARTICIPATION_RECOVERY_CAUSES.map((cause) => [cause] as const))('%s: one line of state, cause, identifiers, code and action', (cause) => {
+    const finding = findingOf(cause)
+    const line = buildParticipationRecoveryLine(PERSONA.name, finding)
+    assertNoLeak(line, 'participation-recovery line')
+    expect({
+      prefix: line.startsWith(`[slack] ${PARTICIPATION_RECOVERY}: persona=`),
+      oneLine: !/[\r\n]/.test(line),
+      state: line.includes(` state=${stateOf(cause)} cause=${cause}`),
+      channel: line.includes(` chat_id=${JSON.stringify(OWN_POST_CHANNEL)}`),
+      root: finding.root === undefined ? !line.includes(' root=') : line.includes(` root=${JSON.stringify(finding.root)}`),
+      file: finding.file === undefined ? !line.includes(' file=') : line.includes(` file=${JSON.stringify(finding.file)}`),
+      code: finding.code === undefined ? !line.includes(' code=') : line.includes(` code=${finding.code} `),
+      action: actionOf(line) !== undefined,
+    }).toEqual({ prefix: true, oneLine: true, state: true, channel: true, root: true, file: true, code: true, action: true })
+  })
+
+  test('every cause has its own action; exactly root-deleted, access-lost and file-unavailable are gaps, root-outside-lifetime unfollowed, the rest pending', () => {
+    const lines = PARTICIPATION_RECOVERY_CAUSES.map((cause) => buildParticipationRecoveryLine(PERSONA.name, findingOf(cause)))
+    expect(new Set(lines.map(actionOf)).size).toBe(PARTICIPATION_RECOVERY_CAUSES.length)
+    const withState = (state: string): string[] => PARTICIPATION_RECOVERY_CAUSES.filter((cause, i) => lines[i]!.includes(` state=${state} `)).sort()
+    expect(withState('gap')).toEqual(GAP_CAUSES)
+    expect(withState('unfollowed')).toEqual(UNFOLLOWED_CAUSES)
+    expect(withState('pending')).toEqual(PARTICIPATION_RECOVERY_CAUSES.filter((cause) => stateOf(cause) === 'pending').sort())
+    expect(withState('gap').length + withState('unfollowed').length + withState('pending').length).toBe(PARTICIPATION_RECOVERY_CAUSES.length)
+  })
+
+  // The debugging skill quotes it: the operator re-adds the app, and the next message there or a reconnect clears the gap.
+  test('the access-lost action is its exact text', () => {
+    const action = actionOf(buildParticipationRecoveryLine(PERSONA.name, findingOf('access-lost')))
+    expect(action === undefined ? undefined : JSON.parse(action)).toBe(
+      'The persona can no longer read that channel; replies there wait. Add the app to the channel again: CSCB looks again when the persona next receives a new message in that channel or reconnects.')
+  })
+
+  test('a token-bearing code is redacted, and the line stays one line', () => {
+    const code = `${sentinelInMessage('recovery-code')}\nnext`
+    expect(() => assertNoLeak(code, 'the raw code')).toThrow()
+    const line = buildParticipationRecoveryLine(PERSONA.name, { cause: 'metadata', channel: OWN_POST_CHANNEL, code })
+    assertNoLeak(line, 'participation-recovery line with a token-bearing code')
+    expect(/[\r\n]/.test(line)).toBe(false)
+  })
+
+  test('the cap line names the per-persona limit, and the recovered line its state; neither leaks', () => {
+    const capped = buildParticipationRecoveryCappedLine(PERSONA.name), recovered = buildParticipationRecoveredLine(PERSONA.name)
+    assertNoLeak({ capped, recovered }, 'participation-recovery cap and recovered lines')
+    expect({
+      cappedPrefix: capped.startsWith(`[slack] ${PARTICIPATION_RECOVERY}: persona=`),
+      limit: capped.includes(` limit=${PARTICIPATION_RECOVERY_LOGGED_PER_PERSONA} `),
+      recoveredPrefix: recovered.startsWith(`[slack] ${PARTICIPATION_RECOVERY}: persona=`),
+      recoveredState: recovered.includes(' state=recovered '),
+      oneLine: !/[\r\n]/.test(capped + recovered),
+    }).toEqual({ cappedPrefix: true, limit: true, recoveredPrefix: true, recoveredState: true, oneLine: true })
   })
 })
 

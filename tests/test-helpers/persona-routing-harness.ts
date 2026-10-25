@@ -471,7 +471,7 @@ export interface RoutingHarnessOptions {
   /** Each own-post outcome after `h.ownPostOutcomes` records it (with `participation`), as server.ts's `reportOwnPost`. */
   onOwnPost?: (outcome: OwnPostOutcome) => void
   queueOptions?: Omit<DeliveryQueueOptions, 'stateDir' | 'now'>
-  routingHooks?: Pick<PersonaRoutingDeps, '_afterObservation' | '_afterAcceptance' | 'onReceived' | 'currentProvenance' | 'onParticipationFailure' | 'onParticipationSettled' | 'beginIntake'>
+  routingHooks?: Pick<PersonaRoutingDeps, '_afterObservation' | '_afterAcceptance' | 'onReceived' | 'currentProvenance' | 'onParticipationFailure' | 'onParticipationSettled' | 'onCandidateHeld' | 'onChannelEvent' | 'beginIntake'>
   /** Caller-supplied current observations, never inferred from configuration. */
   membership?: PersonaRoutingDeps['membership']
   /** Names with a registered session; default every persona. */

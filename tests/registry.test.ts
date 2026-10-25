@@ -99,6 +99,7 @@ import {
   MCP_INSTRUCTIONS_MAX_CHARS,
   SET_CHANNEL_DELIVERY_TOOL,
   slackRefusalToolErrorText,
+  replyPartialFailureText,
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
@@ -113,8 +114,12 @@ import {
   writeConfigFile,
   type PersonaSpec,
 } from './test-helpers/persona-config.ts'
+import { observeFileCompletions, withFileCompletions } from '../src/file-upload-observation.ts'
+import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
+import type { OwnPostIssue, OwnPostObserver } from '../src/thread-participation.ts'
 import {
   asWebClient,
+  makeDeferredWebApiCall,
   makeStubSlack,
   openedDm,
   stubOpenedDmId,
@@ -124,6 +129,7 @@ import {
   type StubWebCall,
   type StubWebMethod,
   type WebApiOutcome,
+  type SettledWebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import {
@@ -2592,6 +2598,175 @@ describe('reply files', () => {
     expect(stub.calls.postMessage).toHaveLength(1)
     expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file: plain }] as any)
     assertNoLeak({ result, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reply files: each nested upload completion observed on the persona's client
+// ---------------------------------------------------------------------------
+
+describe('reply files: nested upload completions observed on the real client', () => {
+  const TEXT_TS = '1700000000.000300'
+  const SHARE_TS = '1700000000.000301'
+  /** A `files.completeUploadExternal` answer for `id`, shared as a new root at `share` when given. */
+  const completion = (id: string, channel = A_ALL, share?: string): SettledWebApiOutcome =>
+    ({ kind: 'ok', result: { files: [{ id, ...(share ? { shares: { public: { [channel]: [{ ts: share }] } } } : {}) }] } })
+
+  /** A recording own-post adapter: each issue is its own operation; every file confirmation is kept with its issue. */
+  function recordingOwnPosts() {
+    const issued: OwnPostIssue[] = []
+    const files: Array<{ issue: OwnPostIssue; channel: string; file?: string; ts?: string; part?: number }> = []
+    const ownPosts: OwnPostObserver = {
+      issue: (key, surface, channel) => {
+        const issue: OwnPostIssue = { key, surface, operation: `op-${issued.length + 1}`, issuer: {}, ...(channel ? { channel } : {}) }
+        issued.push(issue)
+        return issue
+      },
+      confirm: (issue, posted) => {
+        if (issue?.surface === 'file') files.push({ issue, channel: posted.channel, file: posted.file, ts: posted.ts, part: posted.part })
+      },
+    }
+    return { files, ownPosts }
+  }
+
+  /** The session deps with `ownPosts`, each persona's client handed out as the connection manager does: observed on the raw client, then wrapped by the auth watch. */
+  function observedDeps(ownPosts: OwnPostObserver, observed = true): SessionToolDeps {
+    if (observed) for (const stub of h.clients.values()) observeFileCompletions(stub.web)
+    return {
+      ...h.deps, ownPosts,
+      clientFor: (key) => {
+        const stub = h.clients.get(key)
+        return stub ? asWebClient(watchWebClientAuth(stub.web, () => {})) : undefined
+      },
+    }
+  }
+  const openWith = (p: Persona, deps: SessionToolDeps) => openSession(registerSession(p.working_directory, p.key, makeTransport(), makeServer()), deps)
+  function inboxFile(name: string): string {
+    const file = join(h.inboxDir, name)
+    writeFileSync(file, name)
+    return file
+  }
+  async function settleMicrotasks(done: () => boolean): Promise<void> {
+    for (let i = 0; i < 50 && !done(); i++) await new Promise((resolve) => setImmediate(resolve))
+    expect(done()).toBe(true)
+  }
+
+  test('a group completed before its aggregate rejected keeps its one confirmation, counts as uploaded and clears the ack once; a later file that fails reports the partial post and nothing is posted or completed again', async () => {
+    const { files, ownPosts } = recordingOwnPosts()
+    const stub = stubOf(h.alpha)
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
+    stub.uploadGroups.push(2, 1)
+    stub.script.completeUpload.push(completion('F0DONE0001', A_ALL, SHARE_TS), { kind: 'platform', error: 'internal_error' }, { kind: 'platform', error: 'file_upload_failed' })
+    const session = await openWith(h.alpha, observedDeps(ownPosts))
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt'), inboxFile('two.txt')], message_id: MSG_TS })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: TEXT_TS, uploaded: 1, files: 2 }, 'file_upload_failed'))
+    expect(files.map(({ issue, ...posted }) => [issue.surface, issue.channel, posted])).toEqual([['file', A_ALL, { channel: A_ALL, file: 'F0DONE0001', ts: SHARE_TS, part: 1 }]])
+    expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 2, 3])
+    expect(stub.calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('a completion that resolves after its aggregate already rejected is still confirmed on its own operation, after the tool result', async () => {
+    const { files, ownPosts } = recordingOwnPosts()
+    const stub = stubOf(h.alpha), late = makeDeferredWebApiCall()
+    stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
+    stub.uploadGroups.push(2)
+    stub.script.completeUpload.push(late.outcome, { kind: 'platform', error: 'internal_error' })
+    const session = await openWith(h.alpha, observedDeps(ownPosts))
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
+
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: TEXT_TS, uploaded: 0, files: 1 }, 'internal_error'))
+    expect(files).toEqual([])
+    late.settle(completion('F0LATE0001'))
+    await settleMicrotasks(() => files.length > 0)
+    expect(files.map(({ issue, ...posted }) => [issue.surface, issue.channel, posted])).toEqual([['file', A_ALL, { channel: A_ALL, file: 'F0LATE0001', part: 1 }]])
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each([['observed on the client', true], ['a client built without the observation (the aggregate fallback)', false]] as const)(
+    'one completed upload is confirmed exactly once: %s', async (_name, observed) => {
+      const { files, ownPosts } = recordingOwnPosts()
+      const stub = stubOf(h.alpha)
+      stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
+      const session = await openWith(h.alpha, observedDeps(ownPosts, observed))
+
+      const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
+
+      expect(result.content[0]!.text).toBe(`Sent 1 message(s) + 1 file(s) to ${A_ALL} [ts: ${TEXT_TS}]`)
+      expect(files.map(({ issue, ...posted }) => [issue.surface, posted])).toEqual([['file', { channel: A_ALL, file: 'F0STUB0001', part: 1 }]])
+      expect(stub.calls.completeUploadExternal).toEqual([{ files: [{ id: 'F0STUB0001' }], channel_id: A_ALL }] as any)
+    })
+
+  test('concurrent uploads of one persona and of two personas each confirm only their own completion, settled in reverse order', async () => {
+    const { files, ownPosts } = recordingOwnPosts()
+    const deps = observedDeps(ownPosts)
+    const alpha = stubOf(h.alpha), beta = stubOf(h.beta)
+    const alphaDone = [makeDeferredWebApiCall(), makeDeferredWebApiCall()], betaDone = makeDeferredWebApiCall()
+    alpha.script.completeUpload.push(alphaDone[0]!.outcome, alphaDone[1]!.outcome)
+    beta.script.completeUpload.push(betaDone.outcome)
+    const alphaSession = await openWith(h.alpha, deps), betaSession = await openWith(h.beta, deps)
+    const fileFor: Record<string, string> = { [A_ALL]: 'F0ALLFILE1', [A_MENTIONS]: 'F0MENFILE1', [B_CHANNEL]: 'F0BETFILE1' }
+
+    const replies = [
+      alphaSession.call('reply', { chat_id: A_ALL, text: 'one', files: [inboxFile('one.txt')] }),
+      alphaSession.call('reply', { chat_id: A_MENTIONS, text: 'two', files: [inboxFile('two.txt')] }),
+      betaSession.call('reply', { chat_id: B_CHANNEL, text: 'three', files: [inboxFile('three.txt')] }),
+    ]
+    await settleMicrotasks(() => alpha.calls.completeUploadExternal.length === 2 && beta.calls.completeUploadExternal.length === 1)
+    const channelOf = (stub: StubSlack, i: number) => (stub.calls.completeUploadExternal[i] as { channel_id: string }).channel_id
+    betaDone.settle(completion(fileFor[B_CHANNEL]!, B_CHANNEL))
+    alphaDone[1]!.settle(completion(fileFor[channelOf(alpha, 1)]!, channelOf(alpha, 1)))
+    alphaDone[0]!.settle(completion(fileFor[channelOf(alpha, 0)]!, channelOf(alpha, 0)))
+    for (const result of await Promise.all(replies)) expect(result.isError).toBeUndefined()
+
+    expect(files.map(({ issue, channel, file }) => [issue.key, issue.channel, channel, file]).sort()).toEqual([
+      [h.alpha.key, A_ALL, A_ALL, fileFor[A_ALL]],
+      [h.alpha.key, A_MENTIONS, A_MENTIONS, fileFor[A_MENTIONS]],
+      [h.beta.key, B_CHANNEL, B_CHANNEL, fileFor[B_CHANNEL]],
+    ].sort())
+    expect(new Set(files.map((f) => f.issue.operation)).size).toBe(3)
+  })
+
+  test('a completion made outside any bound upload reaches no upload\'s listener, even while one is in flight', async () => {
+    const { files, ownPosts } = recordingOwnPosts()
+    const stub = stubOf(h.alpha), inside = makeDeferredWebApiCall()
+    stub.script.completeUpload.push(inside.outcome)
+    const session = await openWith(h.alpha, observedDeps(ownPosts))
+
+    const reply = session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
+    await settleMicrotasks(() => stub.calls.completeUploadExternal.length === 1)
+    expect(await stub.web.files.completeUploadExternal({ files: [{ id: 'F0OUTSIDE1' }], channel_id: A_ALL })).toMatchObject({ ok: true, files: [{ id: 'F0OUTSIDE1' }] })
+    inside.settle(completion('F0INSIDE01'))
+    expect((await reply).isError).toBeUndefined()
+
+    expect(files.map((f) => f.file)).toEqual(['F0INSIDE01'])
+  })
+
+  test('observing a client twice wraps its completion once; a bound upload hears each resolved completion once and a rejected one not at all, with the caller\'s results unchanged', async () => {
+    const stub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+    const client = stub.web
+    observeFileCompletions(client)
+    const wrapped = client.files.completeUploadExternal
+    observeFileCompletions(client)
+    expect(client.files.completeUploadExternal).toBe(wrapped)
+    const heard: unknown[] = []
+    const upload = () => client.filesUploadV2({ channel_id: A_ALL, file: Buffer.from('data'), filename: 'data.txt' })
+
+    const result = await withFileCompletions((response) => heard.push(response), upload)
+    expect(heard).toEqual([{ ok: true, files: [{ id: 'F0STUB0001' }] }])
+    expect(result).toEqual({ ok: true, files: heard } as any)
+
+    stub.script.completeUpload.push({ kind: 'platform', error: 'internal_error' })
+    const rejected = await withFileCompletions((response) => heard.push(response), upload).catch((err: unknown) => err)
+    expect(rejected).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'internal_error' } })
+    expect(heard).toHaveLength(1)
   })
 })
 

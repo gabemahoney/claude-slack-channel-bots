@@ -206,12 +206,15 @@ import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
-import { createOwnPostObserver, createThreadParticipation, ownPostEligibility, type OwnPostOutcome, type ThreadParticipation } from './thread-participation.ts'
+import { createOwnPostObserver, createThreadParticipation, ownPostEligibility, ownPostLookupPolicy, type OwnPostOutcome, type ThreadParticipation } from './thread-participation.ts'
+import { createRootLookupCapability } from './participation-capability.ts'
+import { createParticipationRecovery, type ParticipationRecovery } from './participation-recovery.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
   createPersonaConnectionManager,
   SYSTEM_PERSONA_CONNECTION_CLOCK,
+  type PersonaConnectionClock,
   type PersonaConnectionManager,
 } from './persona-connections.ts'
 import {
@@ -1152,6 +1155,23 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
   setDeliveryLifecycle(value)
 }
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
+/** Each persona's root-lookup capability: checked at connection, verified by real lookups. */
+const rootLookupCapability = createRootLookupCapability({
+  grantedScopes: key => connections?.grantedScopes(key),
+  persona: key => getAppliedPersona(key),
+  report: {
+    gap: (key, gap) => deliveryReporting?.capabilityGap(key, gap),
+    cleared: key => deliveryReporting?.capabilityCleared(key),
+  },
+})
+/** Startup and idle recovery of pending thread evidence; created in main(), never in dry run. */
+let participationRecovery: ParticipationRecovery | undefined
+/** The recovery clock: real timers that never keep the process alive. */
+const RECOVERY_CLOCK: PersonaConnectionClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, delayMs) => { const timer = setTimeout(callback, delayMs); timer.unref?.(); return timer },
+  clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+}
 const bufferedQueueEvents: QueueEvent[] = []
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
@@ -1163,6 +1183,7 @@ const MAX_BUFFERED_OWN_POST_OUTCOMES = 100
 /** Per persona, outcomes past the buffer; logged once when reporting starts. */
 const droppedOwnPostOutcomes = new Map<string, number>()
 function reportOwnPost(outcome: OwnPostOutcome): void {
+  if (outcome.kind === 'pending' || outcome.kind === 'gap') participationRecovery?.kick(outcome.key, outcome.id)
   if (deliveryReporting) deliveryReporting.ownPostObserved(outcome)
   else if (bufferedOwnPostOutcomes.length < MAX_BUFFERED_OWN_POST_OUTCOMES) bufferedOwnPostOutcomes.push(outcome)
   else if (!outcome.duplicate) droppedOwnPostOutcomes.set(outcome.key, (droppedOwnPostOutcomes.get(outcome.key) ?? 0) + 1)
@@ -1174,6 +1195,8 @@ const personaRouting = createPersonaRouting({
   currentProvenance: key => connections?.provenance(key),
   onParticipationFailure: (key, id, event, error, unaccepted) => deliveryReporting?.participationFailed(key, id, event, error, unaccepted),
   onParticipationSettled: (key, id) => deliveryReporting?.participationSettled(key, id),
+  onCandidateHeld: candidate => participationRecovery?.kick(candidate.key, candidate.id),
+  onChannelEvent: (key, channel) => participationRecovery?.channelEvent(key, channel),
   beginIntake: key => deliveryReporting?.beginIntake(key) ?? (() => {}),
   membership: {
     read: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
@@ -1459,6 +1482,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // finish fixation and drain the shared writers after every
   // synchronous stop above, before closing the transports and clients.
   personaRouting.stop()
+  participationRecovery?.stop()
   threadParticipation?.stop()
   const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
@@ -3485,6 +3509,7 @@ export async function main(): Promise<void> {
     queued: createQueuedAckCallback({ getReaction: () => getReplySettings().queued_ack_reaction, clientFor, queue: deliveryQueue! }),
     delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor, queue: deliveryQueue! }),
     ownPostFindings: key => threadParticipation?.ownPostFindings(key) ?? [],
+    recoveryOwed: (key, id) => participationRecovery?.kick(key, id),
   })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
@@ -3612,9 +3637,34 @@ export async function main(): Promise<void> {
       // Apply recovery precedes teardown/bring-up. Restore retained feedback
       // with the usable client, on initial success and background retry alike.
       (key, status) => { if (status.state === 'up') deliveryReporting?.reconcileQueued(key) },
+      // Configured history scopes, from the validated token's reported scopes; no lookup is probed.
+      // Then pending thread evidence resumes on the new connection.
+      (key, status) => { if (status.state === 'up') { rootLookupCapability.connected(key); participationRecovery?.connected(key) } },
     ),
   })
   connections = manager
+  // Protection was restored by the participation owner's start(); this only
+  // repairs afterwards, on its own timers, never from an intake handler.
+  if (!isDryRun()) {
+    participationRecovery = createParticipationRecovery({
+      participation: () => threadParticipation,
+      queue: () => deliveryQueue,
+      candidates: () => personaRouting.pendingCandidates(),
+      reevaluate: id => personaRouting.reevaluate(id),
+      provenance: key => manager.provenance(key),
+      isUp: isPersonaUp,
+      metadataCall: (key, connectionId, method, args, signal) => manager.metadataCall(key, connectionId, method, args, signal),
+      refreshScopes: (key, connectionId, signal) => manager.refreshGrantedScopes(key, connectionId, signal),
+      capability: rootLookupCapability,
+      policy: ownPostLookupPolicy({ config: () => personaConfig, choices: () => channelDeliveryStore }),
+      report: {
+        finding: (key, finding) => deliveryReporting?.recoveryFinding(key, finding),
+        recovered: key => deliveryReporting?.participationRecovered(key),
+      },
+      clock: RECOVERY_CLOCK,
+    })
+    for (const key of deliveryQueue?.keys() ?? []) participationRecovery.kick(key)
+  }
   membershipScanner = createMembershipScanner({
     authority: reload.sharedChannels()!, membership: channelMembership,
     connections: manager, dryRun: isDryRun(), log: line => console.error(line),
@@ -3663,7 +3713,7 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
+    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryReporting?.forget(key); rootLookupCapability.forget(key); participationRecovery?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,

@@ -241,7 +241,7 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { HUMAN_ONLY_SENTENCE } from './test-helpers/conflict-cases.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
-import { makeThreadHarness, threadReply, THREAD_CHANNEL, type ThreadHarness } from './test-helpers/thread-participation.ts'
+import { attachRecovery, hungMetadata, makeThreadHarness, threadReply, THREAD_CHANNEL, type ThreadHarness } from './test-helpers/thread-participation.ts'
 import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import {
   BOT_TOKEN_PREFIX,
@@ -5251,5 +5251,57 @@ describe('a permission prompt enrolls its own thread through the real participat
     expect(t.h.queue.items(key).map((i) => [i.accepted.ts, i.accepted.via])).toEqual([[HUMAN_TS, 'thread']])
     expect(t.h.ownPostOutcomes.filter((o) => o.kind !== 'enrolled')).toEqual([])
     assertNoLeak({ logCalls, trail: trail.events, outcomes: t.h.ownPostOutcomes }, 'prompt enrolled through the owner')
+  })
+
+  test('a root lookup hung in flight delays no prompt: it posts, registers and is decided by a click through the real handler with no timer advanced, the lookup still in flight', async () => {
+    th = await makeThreadHarness(stateDir)
+    const t = th
+    t.chooseDestination('alpha', THREAD_CHANNEL)
+    const alpha = t.h.p('alpha')
+    const key = alpha.persona.key
+    const instance = personaInstanceId(key)
+    const r = attachRecovery(t)
+    // A rootless own post makes a reply of an unknown thread wait on a root lookup, which hangs.
+    expect(await t.confirmPost({ channel: THREAD_CHANNEL }, key, 'text').outcome).toMatchObject({ kind: 'pending', missing: ['root'] })
+    const hung = hungMetadata()
+    r.respond(hung.respond)
+    let acks = 0
+    await t.h.routing.receive(threadReply(), () => { acks++ }, [key], false)
+    await r.settle()
+    expect([r.requests.length, r.attempts.inFlight(key), hung.aborted, acks]).toEqual([1, 1, [false], 0])
+
+    const started = t.clock.now()
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    const getThreadPersona = (k: string): Persona | undefined => t.h.config?.personas.find((p) => p.key === k)
+    alpha.stub.script.post.push({ kind: 'ok', result: { ts: PROMPT_TS } })
+    const ivl = startManualPoller({
+      getClient: () => ({
+        list: async () => ({ spawns: [cannedListRow({ instance_id: instance, state: 'check_permission' })] }),
+        get: async () => cannedGetResult({ instance_id: instance, state: 'check_permission', permission_requests: [requestA()] }),
+        getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+          cannedGetPermissionResponse({ request_token: params.request_token, decision: null, decision_reason: null }),
+      }),
+      clientFor: t.h.clients.clientFor,
+      getPersona: getThreadPersona,
+      destinations: createPersonaDestinations({ log: (line) => { logCalls.push([line]) }, getPersonaConfig: () => t.h.config, ownPosts: t.h.ownPosts }),
+      log: (...args) => { logCalls.push(args) },
+      emitTrail: trail.emit,
+    })
+    await ivl.tick()
+    expect(posts(alpha.stub).map((c) => c.channel)).toEqual([THREAD_CHANNEL])
+    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ personaKey: key, channelId: THREAD_CHANNEL, messageTs: PROMPT_TS, handled: false })
+
+    const decided: DecideParams[] = []
+    const decider = { decide: async (params: DecideParams) => { decided.push(params); return cannedDecideResult('delivered') } }
+    initOutageState({ getClient: () => decider as unknown as AgentDirectorClient, notify: () => {} })
+    expect(await handlePermissionClick(encodePermissionActionId('allow', instance, TOKEN_A), {
+      receivingPersonaKey: key, clientFor: t.h.clients.clientFor, getPersona: getThreadPersona, log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit,
+    })).toBe(true)
+    expect(decided).toEqual([{ instance_id: instance, request_token: TOKEN_A, decision: 'allow' }])
+    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ handled: true })
+    // No timer ran: the lookup is still the one hung attempt, and its reply still waits.
+    expect([t.clock.now(), r.requests.length, r.attempts.inFlight(key), hung.aborted, acks]).toEqual([started, 1, 1, [false], 0])
+    assertNoLeak({ logCalls, trail: trail.events }, 'prompt answered while a lookup hangs')
   })
 })

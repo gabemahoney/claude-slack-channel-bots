@@ -62,6 +62,7 @@ import * as config from '../src/config.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
 import * as deliveryDecision from '../src/delivery-decision.ts'
 import * as deliveryConstants from '../src/delivery-constants.ts'
+import * as deliveryNotices from '../src/delivery-notices.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
 import * as installCheck from '../src/install-check.ts'
 import * as installSkillPointer from '../src/install-skill-pointer.ts'
@@ -113,6 +114,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'conflict-latch.ts': conflictLatch,
   'delivery-decision.ts': deliveryDecision,
   'delivery-constants.ts': deliveryConstants,
+  'delivery-notices.ts': deliveryNotices,
   'install-check-labels.ts': installCheckLabels,
   'invalid-flags-hold.ts': invalidFlagsHold,
   'live-row-sequence.ts': liveRowSequence,

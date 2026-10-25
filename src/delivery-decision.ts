@@ -444,8 +444,11 @@ export function channelDeliveryFor(
   return { delivery: stored, heldByLoopGuard: false }
 }
 
-/** step 2: the author is P's bot user, or the event carries P's bot ID. */
-function isOwn(user: string | undefined, botId: string | undefined, persona: DeliveryPersona): boolean {
+/**
+ * step 2: the author is P's bot user, or the event carries P's bot ID. Also
+ * the author rule for a looked-up thread root (`participation-root-evidence.ts`).
+ */
+export function isOwn(user: string | undefined, botId: string | undefined, persona: Partial<Pick<DeliveryPersona, 'botUserId' | 'botId'>>): boolean {
   const ownUser = nonEmptyString(persona.botUserId)
   const ownBot = nonEmptyString(persona.botId)
   return (ownUser !== undefined && user === ownUser) || (ownBot !== undefined && botId === ownBot)

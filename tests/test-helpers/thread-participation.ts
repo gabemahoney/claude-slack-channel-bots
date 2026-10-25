@@ -13,7 +13,12 @@ import { createFakeClock } from './fake-clock.ts'
 import { makeChannelMessage, mentionText, type SlackEvent } from './slack-stub.ts'
 import { SHARED_CHANNEL_IDS } from './shared-channels.ts'
 import { queuePath, readQueue, slackInput } from './delivery-queue.ts'
-import { assertNoLeak, writtenFile } from './credentials.ts'
+import { assertNoLeak, writtenFile, sentinelInMessage, BOT_TOKEN_PREFIX } from './credentials.ts'
+import { createParticipationRecovery, type ParticipationRecovery, type ParticipationRecoveryFinding } from '../../src/participation-recovery.ts'
+import { createMetadataAttempts, type EnrollmentMetadataMethod, type MetadataAttempts } from '../../src/participation-metadata.ts'
+import { createRootLookupCapability } from '../../src/participation-capability.ts'
+import { requiredHistoryScopes } from '../../src/participation-channel-evidence.ts'
+import { ownPostLookupPolicy } from '../../src/thread-participation.ts'
 
 export const THREAD_CHANNEL = SHARED_CHANNEL_IDS.primary
 export const THREAD_OTHER_CHANNEL = SHARED_CHANNEL_IDS.secondary
@@ -88,6 +93,7 @@ export async function makeThreadHarness(stateDir: string, options: {
   const clock = options.clock ?? createFakeClock({ start: 1_700_000_000_000 })
   const disk = options.disk ?? threadDisk()
   const received: Array<{ key: string; item: QueueItem }> = [], failed: string[] = [], settled: string[] = []
+  const owed: Array<{ key: string; id: string | undefined }> = []
   const failures: Array<{ key: string; id: string; unaccepted: boolean }> = []
   const reactions: Promise<void>[] = []
   let reporting: ReturnType<typeof createDeliveryReporting> | undefined
@@ -99,7 +105,11 @@ export async function makeThreadHarness(stateDir: string, options: {
     dm: { enabled: true, contact: 'U0OPERATOR' }, permission_prompts: 'dm' })), stateDir, {
     mode: options.mode ?? 'strict',
     membership: { ...observed, read: (key, channel, mode) => membership.get(`${key}:${channel}`) ?? observed.read(key, channel, mode) },
-    onOwnPost: outcome => reporting?.ownPostObserved(outcome),
+    // As server.ts's reportOwnPost: new pending or gap evidence kicks an attached recovery first.
+    onOwnPost: outcome => {
+      if (outcome.kind === 'pending' || outcome.kind === 'gap') result.recovery?.kick(outcome.key, outcome.id)
+      reporting?.ownPostObserved(outcome)
+    },
     participation: true, upCheck: true, preparationClock: clock, dedupeClock: clock.now,
     restartDelayS: NEVER_FIRE_RESTART_DELAY_S, channelDelivery: { stateDir }, ...options.routing,
     queueOptions: { fs: disk.fs, ...options.queue, onEvent(event) { reporting?.queueEvent(event); options.queue?.onEvent?.(event) } },
@@ -114,6 +124,8 @@ export async function makeThreadHarness(stateDir: string, options: {
         reporting!.participationFailed(key, id, event, error, unaccepted); hooks?.onParticipationFailure?.(key, id, event, error, unaccepted)
       },
       onParticipationSettled(key, id) { settled.push(id); reporting!.participationSettled(key, id); hooks?.onParticipationSettled?.(key, id) },
+      onCandidateHeld(candidate) { result.recovery?.kick(candidate.key, candidate.id); hooks?.onCandidateHeld?.(candidate) },
+      onChannelEvent(key, channel) { result.recovery?.channelEvent(key, channel); hooks?.onChannelEvent?.(key, channel) },
     },
   })
   const queued = createQueuedAckCallback({ queue: h.queue, getReaction: () => h.config!.queued_ack_reaction, clientFor: key => h.p(key).stub.web })
@@ -122,6 +134,8 @@ export async function makeThreadHarness(stateDir: string, options: {
   reporting = createDeliveryReporting({ queue: h.queue, episodes: notices.rig.episodes, persona: key => h.config?.personas.find(p => p.key === key),
     state: key => ({ up: !h.notUp.has(key) }), now: clock.now, log: line => h.logs.push(line), notify: (key, text) => notices.h.notifier.notify(key, text), defer: notices.defer,
     ownPostFindings: key => h.participation?.ownPostFindings(key) ?? [],
+    // As server.ts: an own-post episode's end asks the attached recovery for its report.
+    recoveryOwed(key, id) { owed.push({ key, id }); result.recovery?.kick(key, id) },
     queued(key, item) { const promise = queued(key, item); reactions.push(promise); return promise },
     delivered(key, item) { const promise = delivered(key, item); reactions.push(promise); return promise },
   })
@@ -146,6 +160,10 @@ export async function makeThreadHarness(stateDir: string, options: {
   }
   const result = {
     h, clock, disk, stateDir, received, failed, failures, settled, reporting, notices, membership,
+    /** Each `recoveryOwed` call reporting made, in order. */
+    owed,
+    /** The production recovery `attachRecovery` bound to this harness, kicked as server.ts kicks it. */
+    recovery: undefined as ParticipationRecovery | undefined,
     get threads() { return h.participation! },
     get authority() { return h.channelDelivery!.authority },
     mention(overrides: Partial<SlackEvent> = {}, key = 'alpha') {
@@ -197,6 +215,8 @@ export async function makeThreadHarness(stateDir: string, options: {
       return { issue, outcome: h.participation!.confirmOwnPost(issue, posted) }
     },
     async close() {
+      // Shutdown order as server.ts: recovery stops before the participation owner.
+      result.recovery?.stop()
       reporting!.stop(); await result.drainReactions(); await h.close()
       assertNoLeak({ captured: h.captured(), notices: notices.h.allPosts(), noticeLogs: notices.logs, queue: writtenFile(join(stateDir, 'queue')), authority: writtenFile(result.authority.path) })
       await notices.cleanup()
@@ -243,3 +263,121 @@ export async function acceptObservation(h: ThreadHarness, observation: ThreadObs
   if (result.status === 'failed') throw result.error
   return result
 }
+
+/** One enrollment-metadata request recovery made, as `PersonaConnectionManager.metadataCall` receives it. */
+export interface MetadataRequest {
+  key: string; connectionId: string; method: EnrollmentMetadataMethod; args: Record<string, unknown>; signal: AbortSignal; at: number
+}
+export type MetadataResponder = (request: MetadataRequest) => unknown
+/** One granted-scope re-read recovery made, as `PersonaConnectionManager.refreshGrantedScopes` receives it. */
+export interface ScopeRefresh { key: string; connectionId: string; signal: AbortSignal; at: number }
+/** Rejection shapes of `@slack/web-api` 7.15.0, as the shared Slack stub builds them. With `leakMarker`, as the stub's
+ * scripted failures: the marker in the message through `sentinelInMessage`, and bare in the other properties. */
+export const slackPlatformError = (error: string, retryAfter?: number, leakMarker?: string) => Object.assign(
+  new Error(`An API error occurred: ${error}${leakMarker ? ` (${sentinelInMessage(leakMarker, BOT_TOKEN_PREFIX, leakMarker)})` : ''}`),
+  { code: 'slack_webapi_platform_error', data: { ok: false, error, ...(leakMarker ? { provided: leakMarker } : {}),
+    ...(retryAfter !== undefined || leakMarker ? { response_metadata: { ...(retryAfter !== undefined ? { retryAfter } : {}), ...(leakMarker ? { messages: [`[ERROR] ${leakMarker}`] } : {}) } } : {}) } })
+export const slackRateLimited = (retryAfter: number, leakMarker?: string) => Object.assign(
+  new Error(`A rate-limit has been reached${leakMarker ? ` (${sentinelInMessage(leakMarker, BOT_TOKEN_PREFIX, leakMarker)})` : ''}`),
+  { code: 'slack_webapi_rate_limited_error', retryAfter, ...(leakMarker ? { data: { provided: leakMarker } } : {}) })
+/** `@slack/web-api` 7.15.0's HTTP-status rejection (`httpErrorFromResponse`). */
+export const slackHttpError = (statusCode: number) => Object.assign(
+  new Error(`An HTTP protocol error occurred: statusCode = ${statusCode}`),
+  { code: 'slack_webapi_http_error', statusCode, statusMessage: 'stub status', headers: {}, body: {} })
+/** A `conversations.replies` answer whose first message is `root`; later messages are returned history that must confer nothing. */
+export const rootReplies = (root: string, author: { user?: string; bot_id?: string }, extra: Record<string, unknown> = {}, later: Array<Record<string, unknown>> = []) =>
+  ({ ok: true, messages: [{ type: 'message', ts: root, text: 'root text 4e1c', ...author, ...extra }, ...later] })
+/** A `files.info` answer whose shares in `channel` are `shares`. */
+export const fileInfo = (id: string, channel: string, shares: Array<{ ts: string; thread_ts?: string }>, visibility: 'public' | 'private' = 'public') =>
+  ({ ok: true, file: { id, created: 1_700_000_000, shares: { [visibility]: { [channel]: shares } } } })
+/** A `conversations.info` answer for a channel; `fields` override its type and sharing flags. */
+export const channelInfo = (id: string, fields: Record<string, unknown> = {}) =>
+  ({ ok: true, channel: { id, is_channel: true, is_group: false, is_private: false, is_im: false, is_mpim: false, is_ext_shared: false, ...fields } })
+/** A request that answers only when the test settles it; whether its own signal was aborted is observable. */
+export function hungMetadata() {
+  let settle!: (value: unknown) => void, fail!: (error: unknown) => void
+  const seen: MetadataRequest[] = []
+  const answer = new Promise<unknown>((resolve, reject) => { settle = resolve; fail = reject })
+  const respond: MetadataResponder = request => { seen.push(request); return answer }
+  return { respond, settle, fail, get aborted() { return seen.map(r => r.signal.aborted) } }
+}
+
+/**
+ * Production startup/idle recovery bound to the harness as server.ts binds
+ * it: the harness's owner, queue, routing candidates and re-evaluation, the
+ * production lookup policy and root-lookup capability (scopes default to
+ * every configured surface's), and delivery reporting. Network answers come
+ * from `respond`, one per request in order; an unscripted request rejects
+ * (a transient failure). Each persona's connection is `conn-<key>` with the
+ * stub identity, or `identities[key]` (a reopened harness's stub has a new
+ * one, while a real restart keeps the bot's); `stale`/`down` make it not
+ * current or not up. `scopes` is read at call time. With `refreshScopes`,
+ * recovery gets its re-read dep as server.ts binds `refreshGrantedScopes`:
+ * each call is recorded in `refreshes`, then answered by it (a throw
+ * rejects); changing `scopes` there is the manager replacing the scopes.
+ */
+export function attachRecovery(t: ThreadHarness, options: {
+  scopes?: Record<string, readonly string[] | undefined>; attempts?: MetadataAttempts; identities?: Record<string, ThreadHarness['h']['p'] extends (key: string) => { stub: { identity: infer I } } ? I : never>
+  refreshScopes?: (request: ScopeRefresh) => unknown
+} = {}) {
+  const requests: MetadataRequest[] = [], responders: MetadataResponder[] = [], refreshes: ScopeRefresh[] = []
+  const { refreshScopes } = options
+  const findings: Array<{ key: string; finding: ParticipationRecoveryFinding }> = [], recovered: string[] = []
+  const down = new Set<string>(), stale = new Set<string>()
+  const persona = (key: string) => t.h.config?.personas.find(p => p.key === key)
+  const capability = createRootLookupCapability({
+    grantedScopes: key => options.scopes && key in options.scopes ? options.scopes[key] : requiredHistoryScopes(persona(key)),
+    persona,
+    report: { gap: (key, gap) => t.reporting.capabilityGap(key, gap), cleared: key => t.reporting.capabilityCleared(key) },
+  })
+  const attempts = options.attempts ?? createMetadataAttempts(t.clock)
+  const recovery = createParticipationRecovery({
+    participation: () => t.h.participation,
+    queue: () => t.h.queue,
+    candidates: () => t.h.routing.pendingCandidates(),
+    reevaluate: id => t.h.routing.reevaluate(id),
+    provenance: key => persona(key) ? { key, connectionId: `conn-${key}`, incarnation: t.authority.incarnation(key), identity: options.identities?.[key] ?? t.h.p(key).stub.identity,
+      applied: true, candidate: false, isCurrent: () => !stale.has(key) } : undefined,
+    isUp: key => !down.has(key) && !t.h.notUp.has(key),
+    async metadataCall(key, connectionId, method, args, signal) {
+      const request: MetadataRequest = { key, connectionId, method, args: structuredClone(args), signal, at: t.clock.now() }
+      requests.push(request)
+      const respond = responders.shift()
+      if (!respond) throw new Error('unscripted enrollment metadata request')
+      return respond(request)
+    },
+    ...(refreshScopes ? {
+      async refreshScopes(key: string, connectionId: string, signal: AbortSignal) {
+        const request: ScopeRefresh = { key, connectionId, signal, at: t.clock.now() }
+        refreshes.push(request)
+        return refreshScopes(request)
+      },
+    } : {}),
+    capability,
+    policy: ownPostLookupPolicy({ config: () => t.h.config, choices: () => t.h.channelDelivery ?? undefined }),
+    report: {
+      finding(key, finding) { findings.push({ key, finding }); t.reporting.recoveryFinding(key, finding) },
+      recovered(key) { recovered.push(key); t.reporting.participationRecovered(key) },
+    },
+    clock: t.clock,
+    attempts,
+  })
+  t.recovery = recovery
+  return {
+    recovery, capability, attempts, requests, refreshes, findings, recovered, down, stale,
+    respond(...next: MetadataResponder[]) { responders.push(...next) },
+    /** Answers still scripted and unused. */
+    get unused() { return responders.length },
+    /** Fire due passes (a 0 ms timer fires on `advance(1)`) and let their effects, including detached re-evaluation, finish.
+     * A pass held by a hung request is not awaited past one macrotask. */
+    async settle(key = 'alpha', rounds = 6) {
+      for (let i = 0; i < rounds; i++) {
+        await t.clock.advance(1)
+        await Promise.race([recovery.idle(key), new Promise(resolve => setImmediate(resolve))])
+        await t.drainReactions()
+        await new Promise(resolve => setImmediate(resolve))
+      }
+    },
+  }
+}
+export type AttachedRecovery = ReturnType<typeof attachRecovery>

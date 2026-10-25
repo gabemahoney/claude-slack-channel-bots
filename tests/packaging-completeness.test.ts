@@ -183,12 +183,20 @@ import {
 import {
   buildOwnPostFindingsCappedLine,
   buildOwnPostOutcomesDroppedLine,
+  buildParticipationRecoveredLine,
+  buildParticipationRecoveryCappedLine,
+  buildParticipationRecoveryLine,
+  buildRootLookupCapabilityLine,
   OWN_POST_FINDING_CAUSES,
   OWN_POST_NOT_ENROLLED,
   ownPostFindingAction,
+  PARTICIPATION_RECOVERY,
+  ROOT_LOOKUP_CAPABILITY_MISSING,
   type OwnPostFindingCause,
 } from '../src/delivery-notices.ts'
 import { OWN_POST_MISSING } from '../src/thread-participation.ts'
+import { DM_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, PUBLIC_HISTORY_SCOPE, type RootLookupCapabilityGap } from '../src/participation-channel-evidence.ts'
+import { PARTICIPATION_RECOVERY_CAUSES } from '../src/participation-recovery.ts'
 import { DELIVERY_MODES, DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
@@ -423,7 +431,17 @@ describe('npm pack ships every runtime src file', () => {
     },
   )
 
-  test.each(['src/channel-delivery-attempt.ts', 'src/thread-participation.ts'])('%s is inventoried, included, and an explicit exclusion fails coverage', path => {
+  test.each([
+    'src/channel-delivery-attempt.ts',
+    'src/thread-participation.ts',
+    'src/file-upload-observation.ts',
+    'src/participation-capability.ts',
+    'src/participation-channel-evidence.ts',
+    'src/participation-file-evidence.ts',
+    'src/participation-metadata.ts',
+    'src/participation-recovery.ts',
+    'src/participation-root-evidence.ts',
+  ])('%s is inventoried, included, and an explicit exclusion fails coverage', path => {
     const files = readPkg().files ?? []
     expect(runtimeSrcFiles()).toContain(path)
     expect(filesCover(files, path)).toBe(true)
@@ -587,8 +605,9 @@ describe('the debugging skill covers every persona diagnostic class', () => {
  * What the `own-post-not-enrolled` entry must carry, each from the exported
  * builders: the line's state, missing, cause and action fields; each state,
  * missing-evidence and cause value as a whole word; the cap line from its
- * `limit=`; the dropped-outcomes line from its `dropped=`; the gap remedy
- * every gap cause shares (its repair limit), quoted; and the conditional
+ * `limit=`; the dropped-outcomes line from its `dropped=`; the storage gap's
+ * own remedy and the remedy every other gap cause shares (its repair limit),
+ * each quoted; and the conditional
  * new-mention sentence, quoted, with its storage condition and the `off`
  * choice it is never offered for.
  */
@@ -616,13 +635,20 @@ function ownPostDroppedTail(): string {
   return line.slice(line.indexOf('dropped=3') + 'dropped=3'.length).trim()
 }
 
+/** The gap actions' remedies after their first sentence: the storage cause's own, and the one every other cause shares. */
+function ownPostGapRemedies(): { storage: string; other: string } {
+  const remedy = (cause: OwnPostFindingCause) => { const action = ownPostFindingAction(cause, true, false); return action.slice(action.indexOf('. ') + 2) }
+  const others = OWN_POST_FINDING_CAUSES.filter((cause) => cause !== 'storage').map(remedy)
+  if (!others.every((text) => text === others[0])) throw new Error('the non-storage gap actions no longer share their remedy')
+  const storage = remedy('storage')
+  if (storage === others[0]) throw new Error('the storage gap action no longer has its own remedy')
+  return { storage, other: others[0] }
+}
+
 function ownPostEntryRequirements(): [label: string, found: (entry: string) => boolean][] {
   const word = (value: string) => (entry: string) => new RegExp(`(?<![\\w-])${escapeRegExp(value)}(?![\\w-])`).test(entry)
   const cap = buildOwnPostFindingsCappedLine('<key>')
-  const gapActions = OWN_POST_FINDING_CAUSES.map((cause) => ownPostFindingAction(cause, true, false))
-  // The gap actions differ only in their first sentence.
-  const gapRemedy = gapActions[0].slice(gapActions[0].indexOf('. ') + 2)
-  if (!gapActions.every((action) => action.endsWith(` ${gapRemedy}`))) throw new Error('the gap actions no longer share their remedy')
+  const gapRemedies = ownPostGapRemedies()
   const { mention, storageCondition } = ownPostMentionParts()
   const dropped = ownPostDroppedTail()
   return [
@@ -630,7 +656,8 @@ function ownPostEntryRequirements(): [label: string, found: (entry: string) => b
     ...OWN_POST_ENTRY_VALUES.map((value): [string, (entry: string) => boolean] => [`the value ${value}`, word(value)]),
     ['the cap line', (entry) => flat(entry).includes(flat(cap.slice(cap.indexOf('limit=')))) && entry.includes(`[slack] ${OWN_POST_NOT_ENROLLED}:`)],
     ['the dropped line', (entry) => entry.includes('dropped=') && flat(entry).includes(flat(dropped))],
-    ['the gap remedy', (entry) => flat(entry).includes(flat(gapRemedy))],
+    ['the storage gap remedy', (entry) => flat(entry).includes(flat(gapRemedies.storage))],
+    ['the gap remedy', (entry) => flat(entry).includes(flat(gapRemedies.other))],
     ['the new-mention sentence', (entry) => flat(entry).includes(flat(mention))],
     ['the storage condition on the new mention', (entry) => flat(entry).includes(flat(storageCondition))],
     ['the off choice the new mention skips', word('off')],
@@ -649,14 +676,15 @@ describe(`the debugging skill's ${OWN_POST_NOT_ENROLLED} entry names what its li
 
   // A synthetic entry holding each requirement once, so a cut shows that requirement alone.
   const cap = buildOwnPostFindingsCappedLine('<key>')
-  const gapAction = ownPostFindingAction('storage', true, false)
+  const gapRemedies = ownPostGapRemedies()
   const { mention, storageCondition } = ownPostMentionParts()
   const parts: [label: string, text: string][] = [
     ['fields', 'state= missing= cause= action='],
     ...OWN_POST_ENTRY_VALUES.map((value): [string, string] => [`the value ${value}`, value]),
     ['the cap line', cap],
     ['the dropped line', buildOwnPostOutcomesDroppedLine('<key>', 3)],
-    ['the gap remedy', gapAction.slice(gapAction.indexOf('. ') + 2)],
+    ['the storage gap remedy', gapRemedies.storage],
+    ['the gap remedy', gapRemedies.other],
     ['the new-mention sentence', mention],
     ['the storage condition on the new mention', storageCondition],
     ['the off choice the new mention skips', 'off'],
@@ -676,6 +704,79 @@ describe(`the debugging skill's ${OWN_POST_NOT_ENROLLED} entry names what its li
 
   test('self-check: the synthetic entry without its fields fails on each field', () => {
     expect(ownPostEntryGaps(synthetic('fields'))).toEqual(['state=', 'missing=', 'cause=', 'action='].map((field) => `the ${field} field`))
+  })
+})
+
+/** A requirement on a class's skill entry: its label, the text a synthetic entry holds for it, and whether `entry` has it. */
+type EntryRequirement = readonly [label: string, text: string, found: (entry: string) => boolean]
+
+const wholeWord = (value: string) => (entry: string) => new RegExp(`(?<![\\w-])${escapeRegExp(value)}(?![\\w-])`).test(entry)
+const fieldRequirement = (field: string): EntryRequirement => [`the ${field} field`, field, (entry) => entry.includes(field)]
+const wordRequirement = (value: string): EntryRequirement => [`the value ${value}`, value, wholeWord(value)]
+
+/** One gap of every `RootLookupCapabilityGap` kind, keyed by its kind: a kind added without one fails the type check. */
+const CAPABILITY_GAPS: Readonly<{ [K in RootLookupCapabilityGap['kind']]: Extract<RootLookupCapabilityGap, { kind: K }> }> = {
+  'missing-scope': { kind: 'missing-scope', scopes: [PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, DM_HISTORY_SCOPE] },
+  'method-refused': { kind: 'method-refused', method: 'conversations.replies', slackError: 'missing_scope' },
+}
+const unique = (values: readonly string[]): string[] => [...new Set(values)]
+
+/**
+ * What the `root-lookup-capability-missing` entry must carry, each from the
+ * exported builder or constants: the identity fields its line renders for
+ * every gap kind; every kind and every history scope a persona can lack as
+ * whole words; the refused method; and the line's stays-up effect, quoted.
+ */
+function capabilityEntryRequirements(): EntryRequirement[] {
+  const gaps = Object.values(CAPABILITY_GAPS)
+  const lines = gaps.map((gap) => buildRootLookupCapabilityLine('<persona>', gap))
+  const fields = unique(lines.flatMap((line) => [...line.slice(0, line.indexOf(' effect=')).matchAll(/ ([a-z_]+)=/g)].map(([, name]) => `${name}=`)))
+  const effect = /effect="([^"]+)"/.exec(lines[0]!)?.[1]
+  if (effect === undefined || fields.length === 0) throw new Error('the capability line no longer carries its identity fields and effect')
+  return [
+    ...fields.filter((field) => field !== 'persona=').map(fieldRequirement),
+    ...unique([...gaps.map((gap) => gap.kind), PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, DM_HISTORY_SCOPE,
+      ...gaps.flatMap((gap) => gap.kind === 'method-refused' ? [gap.method] : [])]).map(wordRequirement),
+    ['the stays-up effect', effect, (entry) => flat(entry).includes(flat(effect))],
+  ]
+}
+
+/**
+ * What the `participation-recovery` entry must carry, each from the exported
+ * builders or causes: every `state=` form its line renders over one finding
+ * per cause, its cause and action fields; every cause as a whole word; the
+ * cap line from its `limit=`; and the recovered line from its `state=recovered`.
+ */
+function recoveryEntryRequirements(): EntryRequirement[] {
+  const cap = buildParticipationRecoveryCappedLine('<persona>'), recovered = buildParticipationRecoveredLine('<persona>')
+  const capTail = cap.slice(cap.indexOf('limit=')), recoveredTail = recovered.slice(recovered.indexOf('state=recovered'))
+  const states = unique(PARTICIPATION_RECOVERY_CAUSES.map((cause) => /state=[a-z-]+/.exec(buildParticipationRecoveryLine('<persona>', { cause }))?.[0] ?? `no state for ${cause}`))
+  return [
+    ...[...states, 'cause=', 'action='].map(fieldRequirement),
+    ...PARTICIPATION_RECOVERY_CAUSES.map(wordRequirement),
+    ['the cap line', capTail, (entry) => flat(entry).includes(flat(capTail))],
+    ['the recovered line', recoveredTail, (entry) => flat(entry).includes(flat(recoveredTail))],
+  ]
+}
+
+describe.each([
+  [ROOT_LOOKUP_CAPABILITY_MISSING, capabilityEntryRequirements],
+  [PARTICIPATION_RECOVERY, recoveryEntryRequirements],
+] as const)("the debugging skill's %s entry names what its line carries", (label, requirements) => {
+  const gaps = (entry: string) => requirements().filter(([, , found]) => !found(entry)).map(([name]) => name)
+  // A synthetic entry holding each requirement once, so a cut shows that requirement alone.
+  const synthetic = (without?: string) => requirements().filter(([name]) => name !== without).map(([, text]) => `- ${text}`).join('\n')
+
+  test('the entry has every requirement', () => {
+    expect(gaps(requiredSection(debugSkill(), classHeading(label), SKILL_REL))).toEqual([])
+  })
+
+  test('self-check: the synthetic entry passes', () => {
+    expect(gaps(synthetic())).toEqual([])
+  })
+
+  test.each(requirements().map(([name]) => [name] as const))('self-check: the synthetic entry without %s fails on it alone', (name) => {
+    expect(gaps(synthetic(name))).toEqual([name])
   })
 })
 

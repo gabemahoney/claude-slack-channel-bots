@@ -5,8 +5,11 @@
  * - Web API stubs (`web`, `createWebClient`) with capture arrays for
  *   `chat.postMessage`, `chat.update`, `reactions.add`/`remove`,
  *   `conversations.open`, `auth.test`, `users.info`, `filesUploadV2`,
- *   `conversations.history`, `conversations.replies` and
- *   `conversations.info`. Each client carries the bot token it was built
+ *   `conversations.history`, `conversations.replies`,
+ *   `conversations.info`, `files.info` and `files.completeUploadExternal`. An
+ *   unscripted `filesUploadV2` completes each of its upload groups through
+ *   `this.files.completeUploadExternal` on the client itself and settles after
+ *   all of them, as the SDK does. Each client carries the bot token it was built
  *   with as a non-enumerable `token` (as `WebClient.token`), checked through
  *   `hasToken`, so printing or comparing a client never shows it;
  * - Socket Mode stubs (`createSocketClient`, `socket`, `sockets`) that register
@@ -19,7 +22,7 @@
  * carry the same envelope;
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
  *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
- *   `conversations.replies`, `conversations.info`, `conversations.open`,
+ *   `conversations.replies`, `conversations.info`, `files.info`, `conversations.open`,
  *   `reactions.add`, `reactions.remove`, `users.info` and `apiCall`
  *   (`script`), falling back to success when exhausted; a Web API call
  *   scripted with a deferred outcome (`makeDeferredWebApiCall`) answers only
@@ -294,14 +297,22 @@ export interface StubSlackScript {
   post: WebApiOutcome[]
   /** `chat.update`. */
   update: WebApiOutcome[]
-  /** `filesUploadV2`. */
+  /** `filesUploadV2`: a scripted outcome settles the whole call at once, with no nested completion. */
   upload: WebApiOutcome[]
+  /**
+   * `files.completeUploadExternal`, one per completion group; an `ok`
+   * `result` can set `files`. Starts empty (no `StubSlackOptions`
+   * counterpart); push onto `stub.script.completeUpload`.
+   */
+  completeUpload: WebApiOutcome[]
   /** `conversations.history`; an `ok` `result` can set `messages`. */
   history: WebApiOutcome[]
   /** `conversations.replies`; an `ok` `result` can set `messages`. */
   replies: WebApiOutcome[]
   /** `conversations.info`; an `ok` `result` can set `channel`. */
   info: WebApiOutcome[]
+  /** `files.info`; an `ok` `result` can set `file`. */
+  filesInfo: WebApiOutcome[]
   /**
    * `conversations.open`; an `ok` `result` can set `channel` (see `openedDm`).
    * Unscripted, a call succeeds with `stubOpenedDmId(users)`. Starts empty
@@ -339,6 +350,8 @@ export interface StubSlackOptions {
   replies?: readonly WebApiOutcome[]
   /** Initial `conversations.info` outcomes. */
   info?: readonly WebApiOutcome[]
+  /** Initial `files.info` outcomes. */
+  filesInfo?: readonly WebApiOutcome[]
   /** Initial `reactions.add` outcomes. */
   reactionsAdd?: readonly WebApiOutcome[]
   /** Initial `reactions.remove` outcomes. */
@@ -400,6 +413,7 @@ export type StubWebMethod =
   | 'conversations.history'
   | 'conversations.replies'
   | 'conversations.info'
+  | 'files.info'
   | 'users.info'
   | 'filesUploadV2'
   /** `apiCall(method, options)`: logged with `args` `{ method, options }`. */
@@ -437,6 +451,8 @@ export interface StubWebClient {
     replies: WebClient['conversations']['replies']
     info: WebClient['conversations']['info']
   }
+  /** `completeUploadExternal` is the SDK's inner call of `filesUploadV2`: captured, but not in `callLog`. */
+  files: { info: WebClient['files']['info']; completeUploadExternal: WebClient['files']['completeUploadExternal'] }
   bots?: { info: WebClient['bots']['info'] }
   users: { info: WebClient['users']['info']; conversations: WebClient['users']['conversations'] }
   /** As on the real `WebClient`, a prototype method that needs the client as `this` (a detached call throws). */
@@ -569,6 +585,8 @@ export interface StubSlackCalls {
   conversationsHistory: Parameters<WebClient['conversations']['history']>[0][]
   conversationsReplies: Parameters<WebClient['conversations']['replies']>[0][]
   conversationsInfo: Parameters<WebClient['conversations']['info']>[0][]
+  filesInfo: Parameters<WebClient['files']['info']>[0][]
+  completeUploadExternal: Parameters<WebClient['files']['completeUploadExternal']>[0][]
   /** `apiCall` calls: the method named and the options passed. */
   apiCall: StubApiCall[]
 }
@@ -584,6 +602,12 @@ export interface StubSlack {
   readonly identity: { botUserId: string; botId: string; teamId: string; appId?: string }
   /** Outcome queues; push onto them at any time. */
   readonly script: StubSlackScript
+  /**
+   * How many completion groups each unscripted `filesUploadV2` call
+   * completes, consumed front to back (default 1, one file per call); each
+   * group takes the next `script.completeUpload` outcome.
+   */
+  readonly uploadGroups: number[]
   /** Captured Web API call arguments, shared by every Web API client of this stub. */
   readonly calls: StubSlackCalls
   /**
@@ -775,7 +799,8 @@ const STUB_WEB_CLIENT_STATE = Symbol('stub web client state')
 /** The per-client implementations `apiCall` and `filesUploadV2` reach through `this`. */
 interface StubWebClientState {
   apiCall: WebClient['apiCall']
-  filesUploadV2: WebClient['filesUploadV2']
+  /** `self` is the call's `this`, whose `files.completeUploadExternal` completes each group. */
+  filesUploadV2: (self: unknown, args: Parameters<WebClient['filesUploadV2']>[0]) => ReturnType<WebClient['filesUploadV2']>
 }
 
 /** The client state `self` (a method's `this`) reaches, own or inherited; throws as a real client's method does without its `this`. */
@@ -798,7 +823,7 @@ const STUB_WEB_CLIENT_PROTOTYPE: Pick<StubWebClient, 'apiCall' | 'filesUploadV2'
     return stubWebClientState(this, 'apiCall').apiCall(method, apiOptions)
   },
   filesUploadV2(this: unknown, args) {
-    return stubWebClientState(this, 'filesUploadV2').filesUploadV2(args)
+    return stubWebClientState(this, 'filesUploadV2').filesUploadV2(this, args)
   },
 }
 
@@ -831,9 +856,11 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     post: [...(opts.post ?? [])],
     update: [...(opts.update ?? [])],
     upload: [...(opts.upload ?? [])],
+    completeUpload: [],
     history: [...(opts.history ?? [])],
     replies: [...(opts.replies ?? [])],
     info: [...(opts.info ?? [])],
+    filesInfo: [...(opts.filesInfo ?? [])],
     open: [],
     reactionsAdd: [...(opts.reactionsAdd ?? [])],
     reactionsRemove: [...(opts.reactionsRemove ?? [])],
@@ -854,8 +881,11 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     conversationsHistory: [],
     conversationsReplies: [],
     conversationsInfo: [],
+    filesInfo: [],
+    completeUploadExternal: [],
     apiCall: [],
   }
+  const uploadGroups: number[] = []
   const options: StubSlack['options'] = { web: [], socket: [] }
   const sockets: StubSocketClient[] = []
   const stubCallLog: StubWebCall[] = []
@@ -885,14 +915,23 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         mergeDroppingUndefined({ ok: true, messages: [], has_more: false }, overrides),
       )
     const state: StubWebClientState = {
-      filesUploadV2: (args) => {
+      filesUploadV2: (self, args) => {
         record('filesUploadV2', args)
         calls.filesUploadV2.push(args)
         const outcome = script.upload.shift()
-        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
-          const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
-          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
-        })
+        if (outcome !== undefined) {
+          return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
+            const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
+            return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
+          }) as ReturnType<WebClient['filesUploadV2']>
+        }
+        const { channel_id, thread_ts } = args as { channel_id?: string; thread_ts?: string }
+        const files = (self as { files: StubWebClient['files'] }).files
+        const groups = Array.from({ length: uploadGroups.shift() ?? 1 }, () => files.completeUploadExternal({
+          files: [{ id: `F0STUB${String(++fileSeq).padStart(4, '0')}` }],
+          ...(channel_id === undefined ? {} : { channel_id }), ...(thread_ts === undefined ? {} : { thread_ts }),
+        } as Parameters<StubWebClient['files']['completeUploadExternal']>[0]))
+        return Promise.all(groups).then(completed => ({ ok: true, files: completed })) as ReturnType<WebClient['filesUploadV2']>
       },
       apiCall: (method, apiOptions) => {
         const captured: StubApiCall = { method, options: apiOptions }
@@ -1010,6 +1049,23 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
               },
               overrides,
             ),
+          )
+        },
+      },
+      files: {
+        info: (args) => {
+          record('files.info', args)
+          calls.filesInfo.push(args)
+          // Unscripted: the file with no shares yet.
+          return runWebApiCall(script.filesInfo.shift(), ctx('files.info'), (overrides) =>
+            mergeDroppingUndefined({ ok: true, file: { id: args.file, shares: {} } }, overrides),
+          )
+        },
+        completeUploadExternal: (args) => {
+          calls.completeUploadExternal.push(args)
+          // Unscripted: the group's files, with no shares yet.
+          return runWebApiCall(script.completeUpload.shift(), ctx('files.completeUploadExternal'), (overrides) =>
+            mergeDroppingUndefined({ ok: true, files: args.files.map(({ id }) => ({ id })) }, overrides),
           )
         },
       },
@@ -1297,6 +1353,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
   return {
     identity,
     script,
+    uploadGroups,
     calls,
     callLog: stubCallLog,
     options,

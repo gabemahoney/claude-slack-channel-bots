@@ -86,6 +86,8 @@ import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
 import type { OwnPostObserver } from './thread-participation.ts'
+import { withFileCompletions } from './file-upload-observation.ts'
+import { completionFiles } from './participation-file-evidence.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
 // Peer-PID + sessions.json registry have been deleted. The
@@ -1491,6 +1493,8 @@ export function createSessionServer(
         }
         // Issued before the first post, so a later lifetime or identity change is visible at confirmation.
         const ownPost = deps.ownPosts?.issue(persona.key, 'text', chatId)
+        const fileOwnPost = files?.length ? deps.ownPosts?.issue(persona.key, 'file', chatId) : undefined
+        let filePart = 0
         // Confirmed parts survive any later failure; none is posted again.
         let sent = 0
         let uploaded = 0
@@ -1545,11 +1549,30 @@ export function createSessionServer(
             file: resolve(filePath),
           }
           if (threadTs) uploadArgs.thread_ts = threadTs
+          // Each nested completion is confirmed in its own reaction, so a
+          // group that succeeded stays a success when the aggregate rejects.
+          let completed = false
+          const onCompletion = (response: unknown) => {
+            for (const file of completionFiles(response, chatId, threadTs)) {
+              completed = true
+              if (!fileOwnPost) continue
+              try {
+                deps.ownPosts!.confirm(fileOwnPost, { channel: chatId, part: ++filePart, file: file.id,
+                  ...(threadTs ? { parent: threadTs } : file.root ? { ts: file.root } : {}) })
+              } catch { /* participation cannot stop the remaining authorized parts */ }
+            }
+            if (completed) succeeded()
+          }
           try {
-            await web.filesUploadV2(uploadArgs as any)
+            const result: unknown = await withFileCompletions(onCompletion, () => web.filesUploadV2(uploadArgs as any))
+            // A client built without the observation reports its completions only in the aggregate.
+            const responses = (result as { files?: unknown } | undefined)?.files
+            if (!completed && Array.isArray(responses)) for (const response of responses) onCompletion(response)
           } catch (err) {
-            if (sent === 0 && uploaded === 0) throw err
-            return partialFailure(err)
+            if (!completed) {
+              if (sent === 0 && uploaded === 0) throw err
+              return partialFailure(err)
+            }
           }
           uploaded++
           succeeded()

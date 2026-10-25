@@ -10,6 +10,7 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
+import { rootLookupObservationId, type ThreadObservation } from '../src/thread-participation.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
@@ -680,6 +681,52 @@ test('maintenance compacts at the exported interval once and stop cancels its ti
   expect(q.items('alpha')).toEqual([])
   expect(clock.pendingCount()).toBe(1)
   await q.stop(); expect(clock.pendingCount()).toBe(0)
+})
+
+describe('a pending root lookup is rewritten only to re-issue it for a new identity', () => {
+  const lifetime = { key: 'alpha', channel: 'C0ALPHA01', incarnation: 'life-1', resetOrder: 1, membershipBoundary: 0, leaveBoundary: 0 }
+  const ROOT = '1700000000.000100'
+  const old = { botUserId: 'U0OLDBOT1', botId: 'B0OLDBOT1' }, next = { botUserId: 'U0NEWBOT1', botId: 'B0NEWBOT1' }
+  const pending = (): ThreadObservation => ({ id: rootLookupObservationId(lifetime, ROOT), lifetime, root: ROOT, observedAt: 1000,
+    policy: { mode: 'strict', delivery: 'thread_hybrid' }, lookup: { issuer: old, requestedAt: 1000 } })
+  const reissue = (o: ThreadObservation): ThreadObservation => ({ ...o, lookup: { issuer: next, requestedAt: 2000 } })
+  async function recorded() {
+    const q = await open()
+    await q.recordThreadObservation('alpha', pending())
+    return { q, written: readQueue(dir).length }
+  }
+
+  test.each<[string, (o: ThreadObservation) => ThreadObservation]>([
+    ['its observation time', o => ({ ...o, observedAt: 1500 })],
+    ['its recorded policy', o => ({ ...o, policy: { mode: 'open', delivery: 'all' } })],
+    ['its root', o => ({ ...o, root: '1700000000.000200' })],
+    ['its lifetime', o => ({ ...o, lifetime: { ...lifetime, incarnation: 'life-2' } })],
+  ])('a re-issue that also changes %s is ignored: nothing is written', async (_name, change) => {
+    const { q, written } = await recorded()
+    await q.recordThreadObservation('alpha', reissue(change(pending())))
+    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([pending(), written])
+  })
+
+  test('a re-issue that adds a post is refused as invalid evidence and changes nothing', async () => {
+    const { q, written } = await recorded()
+    const post: NonNullable<ThreadObservation['post']> = { surface: 'text', operation: 'op-1', part: 1, issuer: old, missing: [] }
+    await expect(q.recordThreadObservation('alpha', { ...reissue(pending()), post })).rejects.toThrow('Invalid thread observation')
+    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([pending(), written])
+  })
+
+  test('a pure re-issue for a new identity is written and replays; the same identity with a new request time writes nothing; a settled lookup is never re-issued', async () => {
+    const { q, written } = await recorded()
+    await q.recordThreadObservation('alpha', { ...pending(), lookup: { issuer: old, requestedAt: 2000 } })
+    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([pending(), written])
+    await q.recordThreadObservation('alpha', reissue(pending()))
+    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([reissue(pending()), written + 1])
+    await q.stop()
+    const replay = await open()
+    expect(replay.threadRecord('alpha', pending().id)).toMatchObject({ state: 'observed', observation: reissue(pending()) })
+    await replay.recordThreadObservation('alpha', reissue(pending()), 'enrolled')
+    await replay.recordThreadObservation('alpha', pending())
+    expect(replay.threadRecord('alpha', pending().id)).toMatchObject({ state: 'enrolled', observation: reissue(pending()) })
+  })
 })
 
 test('startup findings remain available to a notifier installed after queue start and are safe copies', async () => {

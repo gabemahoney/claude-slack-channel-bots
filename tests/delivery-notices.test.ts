@@ -3,6 +3,9 @@ import { afterEach, expect, test } from 'bun:test'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
+import { buildParticipationRecoveredLine, createDeliveryReporting, OWN_POST_NOT_ENROLLED } from '../src/delivery-notices.ts'
+import { PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED } from '../src/persona-episodes.ts'
+import type { OwnPostOutcome } from '../src/thread-participation.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
@@ -287,6 +290,70 @@ test('the durable per-item not-taken-in notice survives server restart while ret
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.posts(r.beta)).toEqual([])
   } finally { await e.cleanup() }
+})
+
+/** Reporting over the harness's queue, episodes and notifier, with the owner's remaining findings and `recoveryOwed` scripted. */
+function owedReporting(r: DeliveryNoticeHarness, recoveryOwed: (key: string, id: string | undefined) => void) {
+  const remaining = new Map<string, OwnPostOutcome[]>()
+  const reporting = createDeliveryReporting({ queue: r.queue, episodes: r.rig.episodes, persona: key => r.config.personas.find(p => p.key === key),
+    state: () => ({ up: true }), log: line => r.logs.push(line), notify: (key, text) => r.h.notifier.notify(key, text), defer: r.defer,
+    ownPostFindings: key => remaining.get(key) ?? [], recoveryOwed })
+  const outcome = (kind: OwnPostOutcome['kind'], id: string, extra: Partial<OwnPostOutcome> = {}): OwnPostOutcome =>
+    ({ kind, key: r.alpha, surface: 'text', operation: `op-${id}`, part: 0, channel: 'C0ALPHA01', ts: '1700000000.000100', id,
+      missing: kind === 'pending' ? ['channel-eligibility'] : [], ...(kind === 'pending' ? { reason: 'history-unresolved' } : {}), ...extra })
+  // The recovered line is logged only over readable thread state, which needs the persona's journal loaded.
+  r.queue.threadRecords(r.alpha)
+  const episodeOpen = (key = r.alpha) => r.rig.episodes.isOpen(key, PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)
+  const recoveredLines = () => r.logs.filter(l => l === buildParticipationRecoveredLine(r.ref()))
+  return { reporting, remaining, outcome, episodeOpen, recoveredLines }
+}
+
+test('an own-post episode ending at a settling outcome asks recovery once with that id; recovery\'s next report logs one line', async () => {
+  const r = await run(), owed: Array<[string, string | undefined]> = []
+  const o = owedReporting(r, (key, id) => { owed.push([key, id]) })
+  o.remaining.set(r.alpha, [o.outcome('pending', 'obs-1')])
+  o.reporting.ownPostObserved(o.outcome('pending', 'obs-1'))
+  expect([owed, o.episodeOpen(), r.logs.filter(l => l.includes(OWN_POST_NOT_ENROLLED))]).toEqual([[], true, [expect.any(String)]])
+  o.remaining.set(r.alpha, [])
+  o.reporting.ownPostObserved(o.outcome('enrolled', 'obs-1'))
+  // Asked in that turn, but nothing is logged until recovery reports.
+  expect([owed, o.episodeOpen(), o.recoveredLines()]).toEqual([[[r.alpha, 'obs-1']], false, []])
+  o.reporting.participationRecovered(r.alpha); o.reporting.participationRecovered(r.alpha)
+  expect(o.recoveredLines()).toHaveLength(1)
+  // A later settled duplicate has no open finding: it asks for nothing.
+  o.reporting.ownPostObserved(o.outcome('enrolled', 'obs-1', { duplicate: true }))
+  expect(owed).toHaveLength(1)
+  o.reporting.stop()
+})
+
+test('recovery is not asked while a finding stays open or the owner still reports one, nor for a persona with nothing reported', async () => {
+  const r = await run(), owed: Array<[string, string | undefined]> = []
+  const o = owedReporting(r, (key, id) => { owed.push([key, id]) })
+  o.reporting.ownPostObserved(o.outcome('enrolled', 'obs-0', { key: r.beta }))
+  for (const id of ['obs-1', 'obs-2']) o.reporting.ownPostObserved(o.outcome('pending', id))
+  o.remaining.set(r.alpha, [o.outcome('pending', 'obs-2')])
+  o.reporting.ownPostObserved(o.outcome('enrolled', 'obs-1'))
+  expect([owed, o.episodeOpen()]).toEqual([[], true])
+  // The owner still reports a finding reporting never saw.
+  o.remaining.set(r.alpha, [o.outcome('pending', 'obs-3')])
+  o.reporting.ownPostObserved(o.outcome('ineligible', 'obs-2'))
+  expect([owed, o.episodeOpen()]).toEqual([[], true])
+  o.remaining.set(r.alpha, [])
+  o.reporting.ownPostObserved(o.outcome('enrolled', 'obs-4', { duplicate: true }))
+  expect([owed, o.episodeOpen()]).toEqual([[[r.alpha, 'obs-4']], false])
+  o.reporting.stop()
+})
+
+test('a throwing recoveryOwed cannot interrupt reporting: the episode still ends and recovery\'s report still logs', async () => {
+  const r = await run()
+  let calls = 0
+  const o = owedReporting(r, () => { calls++; throw new Error('recovery unavailable') })
+  o.reporting.ownPostObserved(o.outcome('pending', 'obs-1'))
+  expect(() => o.reporting.ownPostObserved(o.outcome('enrolled', 'obs-1'))).not.toThrow()
+  expect([calls, o.episodeOpen()]).toEqual([1, false])
+  o.reporting.participationRecovered(r.alpha)
+  expect(o.recoveredLines()).toHaveLength(1)
+  o.reporting.stop()
 })
 
 test('emptying the queue ends the waiting episode before new accepted work arrives', async () => {

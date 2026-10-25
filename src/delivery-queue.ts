@@ -4,7 +4,7 @@ import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
-import { isThreadObservation, isThreadParticipationRecord, type ThreadObservation, type ThreadParticipationRecord, type ThreadParticipationGap } from './thread-participation.ts'
+import { cancelledObservationBase, isThreadObservation, isThreadParticipationRecord, type ThreadObservation, type ThreadParticipationRecord, type ThreadParticipationGap } from './thread-participation.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
 export const REPLY_REMINDER_KEEP_MS = 24 * 60 * 60 * 1000
@@ -107,7 +107,12 @@ export interface DeliveryQueue {
   threadRecords(key: string): ThreadParticipationRecord[]
   threadRecord(key: string, id: string): ThreadParticipationRecord | undefined
   threadReadable(key: string): boolean
-  /** Only own-post evidence (no Slack key) may be written directly as enrolled. */
+  /** Thread participation is unreadable only for a storage fault a rewrite can repair (not a lasting gap). */
+  threadRepairable?(key: string): boolean
+  /**
+   * Only own-post and root-lookup evidence (no Slack key) may be written
+   * directly as enrolled. Pending evidence is rewritten only to add its root.
+   */
   recordThreadObservation(key: string, observation: ThreadObservation, state?: 'observed' | 'enrolled'): Promise<void>
   /** Serialize discard against acceptance; an already accepted Slack key wins. */
   cancelThreadObservation(key: string, observation: ThreadObservation): Promise<QueueStoredResult | undefined>
@@ -710,6 +715,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const j = journal(key)
       return started && !stopped && j.loaded && !j.threadGap && !j.threadReplayPending && j.pendingRollback === undefined
     },
+    threadRepairable: key => {
+      const j = journals.get(key)
+      return !!j && started && !stopped && !j.threadGap && (!j.loaded || j.threadReplayPending === true || j.pendingRollback !== undefined)
+    },
     async recordThreadObservation(key, observation, state = 'observed') {
       observation = structuredClone(observation)
       await serial(key, () => {
@@ -718,9 +727,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const j = journal(key)
         const record: ThreadParticipationRecord = { v: 1, kind: 'thread-participation', seq: 0, state, observation }
         if (!isThreadParticipationRecord(record) || observation.lifetime.key !== key) throw new Error('Invalid thread observation')
-        if (state === 'enrolled' && observation.post === undefined) throw new Error('Invalid thread observation')
+        if (state === 'enrolled' && observation.post === undefined && observation.lookup === undefined) throw new Error('Invalid thread observation')
         const previous = j.threads.get(observation.id)
-        if (previous && (previous.state !== 'observed' || state === 'observed')) return
+        // Pending evidence is rewritten only to add the root it lacked, or to re-issue its pending lookup (and nothing else) for a new identity.
+        const rootResolved = previous?.state === 'observed' && state === 'observed' && previous.observation.root === undefined && observation.root !== undefined
+        const withoutLookup = (o: ThreadObservation) => JSON.stringify({ ...o, lookup: undefined })
+        const reissued = previous?.state === 'observed' && state === 'observed' && previous.observation.lookup !== undefined &&
+          observation.lookup !== undefined && observation.post === undefined && withoutLookup(previous.observation) === withoutLookup(observation) &&
+          (previous.observation.lookup.issuer.botUserId !== observation.lookup.issuer.botUserId || previous.observation.lookup.issuer.botId !== observation.lookup.issuer.botId)
+        if (previous && (previous.state !== 'observed' || (state === 'observed' && !rootResolved && !reissued))) return
         durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
         update(j, record)
       })
@@ -738,7 +753,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         if (accepted?.enrollment?.id === observation.id) return accepted
         const previous = j.threads.get(observation.id)
         if (previous?.state === 'enrolled' || previous?.state === 'cancelled') return accepted
-        if (previous && JSON.stringify(previous.observation) !== JSON.stringify(observation)) throw new Error('Thread observation does not match')
+        if (previous && JSON.stringify(previous.observation) !== JSON.stringify(cancelledObservationBase(observation))) throw new Error('Thread observation does not match')
         durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
         update(j, record)
         return accepted

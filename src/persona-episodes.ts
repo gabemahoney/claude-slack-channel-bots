@@ -483,6 +483,19 @@ export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
  */
 export const PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED = 'own-post-not-enrolled'
 
+/**
+ * Root lookup capability missing: from the first check that finds a
+ * configured history scope missing from the persona's token, or the first
+ * real root lookup Slack refuses for its scope or token type, until a later
+ * connection or recovery's scope re-read reports every required scope, or,
+ * for a refused method, a lookup succeeds while no configured history scope
+ * is missing. Begun and
+ * posted by delivery reporting (`src/delivery-notices.ts`), once per
+ * episode; repeated recovery attempts post nothing more. Ended silently; a
+ * teardown's `forget` drops it.
+ */
+export const PERSONA_EPISODE_KIND_ROOT_LOOKUP_CAPABILITY = 'root-lookup-capability'
+
 /** Every notice kind with a latch here, one per row of the contract table. */
 export const PERSONA_EPISODE_KINDS = [
   'message-not-saved',
@@ -499,6 +512,7 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED,
+  PERSONA_EPISODE_KIND_ROOT_LOOKUP_CAPABILITY,
 ] as const
 
 /** A notice kind with a latch here. */
