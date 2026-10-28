@@ -246,9 +246,17 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary).
     Printed `could not stop persona` and exited 1? That persona could not
     be stopped. After `stop --stop-bots` the server stays stopped; after
-    `clean_restart` the server was started again if agent-director
-    answered, and otherwise not (`clean-restart-not-restarted`). See
+    `clean_restart --server` the server was started again if agent-director
+    answered, and otherwise not (`clean-restart-not-restarted`); after
+    `clean_restart <bot>…` the server kept running. See
     [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
+    `clean_restart` printed `Usage:` and exited 2, or `clean_restart <bot>…`
+    printed a line saying `nothing was stopped`, `not seen relaunched` or
+    `not seen launched`? See
+    [`clean_restart <bot>…`: the named bots](#clean_restart-bot-the-named-bots).
+    The server and every bot are down after `clean_restart --server` was run
+    from a bot? See
+    [The server and every bot are down after `clean_restart --server` run from a bot](#symptom-the-server-and-every-bot-are-down-after-clean_restart---server-run-from-a-bot).
 11. **The cause of a hold is fixed but the persona is still held, or
     `clear-latch` printed a line and exited non-zero?** See
     [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch).
@@ -357,7 +365,8 @@ ls -l "$STATE"/server.log*
   and the notices raised during a persona teardown
   (`persona-teardown-notice`). `stop --stop-bots` and `clean_restart` write
   `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor`
-  entries while the server is stopped, and `clean_restart` also
+  entries while the server is stopped (for `clean_restart <bot>…`, while
+  it runs), and `clean_restart --server` also
   `clean-restart-not-restarted` (see
   [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)).
   Each entry is also a line in `server.log`. The persona diagnostic classes
@@ -4352,7 +4361,7 @@ error class when refused, and `kill_sent` when agent-director reports it.
 | `[slack] teardownBots: persona "<name>" (key=<key>): status read before kill try <n> for <id>: failed: <failure> — the row was last read <state>, and this caller ends the tries on any CONFIG read: no further kill while agent-director's config is unreadable; the last try's outcome stands` | `stop --stop-bots` or `clean_restart` only: between force-kill tries agent-director refused its config file, so no further force-kill is made, whatever the instance was last read as. The persona fails as CONFIG. | See **agent-director refuses its config file** above, then see [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
 | `[slack] <site>: status read before kill try <n> for <id>: failed: <failure> — the row was last read <state>: the try goes ahead` | Between tries agent-director refused its config file; the instance was last read running (`<state>`), so the next try is made. | See **agent-director refuses its config file** above. |
 | `[slack] <site>: status read before kill try <n> for <id>: <answer> — the try goes ahead` | Between tries the instance still read running (`state=<state>`), or the read failed for another reason (`failed: <failure>`); the next try is made. | Nothing: wait for the tries' outcome. |
-| `[slack] <site>: kill tries for <id> stop before try <n>: <why> — no further kill; the last try's outcome stands` | The tries stopped early. `<why>`: `the caller's keep-going check answered false` (the persona was put on hold, removed or is no longer up, or the server is stopping) or `the wait between tries failed` (an internal error). | For a hold, see the *Held:* entry; for a removal or a stopping server, nothing. `the wait between tries failed`: report it as a bug, with the persona's lines. |
+| `[slack] <site>: kill tries for <id> stop before try <n>: <why> — no further kill; the last try's outcome stands` | The tries stopped early. `<why>`: `the caller's keep-going check answered false` (the persona was put on hold, removed or is no longer up, or the server is stopping; for `teardownBots`, a read showed the persona's next life (the next line says so)) or `the wait between tries failed` (an internal error). | For a hold, see the *Held:* entry; for a removal or a stopping server, nothing. `the wait between tries failed`: report it as a bug, with the persona's lines. |
 | `[slack] <site>: kill tries for <id> ended (<end>) after <n> kill(s) and <m> read(s): <outcome> — alert=<none\|survivor\|ordinary>` | The summary of a kill that took more than one call, or whose tries met agent-director's report that it couldn't stop the session. `<outcome>` is the result that stands. `alert=` records which kind of human alert the tries call for: `survivor` (the kill ended as a success, but an earlier try named a surviving process: a *Process outlived kill* notice) or `ordinary` (agent-director couldn't stop the session: a *Kill failed* notice), or `none`. The notice, or the entry or line that stands in for it, comes after this line. | Nothing for `none`. Otherwise see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice); the tries' lines above it for `<id>` quote agent-director's answer. |
 | `[slack] reconcileOrphans: the status read between kill tries for instanceId=<id> answered CONFIG; the row names no persona of the applied configuration, so no outage is raised — logged only` | At a start, agent-director refused its config file while the server was reading a leftover instance (a removed persona's, or one from before personas) between its kill's tries. No persona's notice is raised for it. | See **agent-director refuses its config file** above. |
 
@@ -4641,11 +4650,16 @@ agent-director get --instance-id <id>
 |---|---|
 | `[slack] teardownBots: no spawn row for persona "<name>" (key=<key>) — skipping`, `[slack] teardownBots: persona "<name>" (key=<key>) already terminal (state=<state>) — skipping` | `stop --stop-bots` or `clean_restart` found no instance for the persona, or a finished one: it counts as stopped. On the terminal for `stop --stop-bots`, in `clean_restart.log` for `clean_restart`. Nothing. |
 | `[slack] teardownBots: pause failed for persona "<name>" (key=<key>) — escalating to kill: <description>` | The pause was refused for a reason that leads on to the force-kill (the session already gone, the bot still launching, a pause timeout, agent-director not answering after 3 tries, or an answer the teardown gives no other meaning). Nothing: the force-kill's lines follow. |
-| `[slack] teardownBots: persona "<name>" (key=<key>) exited cleanly in <ms>ms`, `[slack] teardownBots: persona "<name>" (key=<key>) force-killed after <ms>ms` | The persona was stopped, after its pause or by the force-kill at `exit_timeout`. Nothing. |
-| `[slack] teardownBots: kill failed for persona "<name>" (key=<key>): <description>` | The force-kill at `exit_timeout` did not stop the persona; its `could not stop persona` line follows once every persona has finished. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
+| `[slack] teardownBots: persona "<name>" (key=<key>) exited cleanly in <ms>ms`, `[slack] teardownBots: persona "<name>" (key=<key>) force-killed after <ms>ms` | The persona was stopped, after its pause or by the force-kill (after a refused pause, or at `exit_timeout`; `clean_restart <bot>…` never force-kills after a successful pause). Nothing. |
+| `[slack] teardownBots: kill failed for persona "<name>" (key=<key>): <description>` | The force-kill did not stop the persona; its `could not stop persona` line follows once every persona has finished. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
 | `[slack] <command>: could not append a line to server.log: <error>` | `stop --stop-bots` or `clean_restart` could not append one of its report lines to `server.log` (for example, the state directory isn't writable). For `stop --stop-bots` the line is on the terminal; for `clean_restart` it is in `clean_restart.log` only. The print, `startup-errors.log` and the exit status are unchanged. Check the state directory's permissions and free space. |
-| `[slack] clean_restart: agent-director answer check: list try <n> of 3 failed: <CLASS>: <description>` (`clean_restart.log`) | `clean_restart` could not stop a persona and is checking that agent-director answers before it starts the server again; this try failed. After 3 failed tries the server is not started and `clean-restart-not-restarted` is recorded. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
-| `[slack] clean_restart: agent-director answers — starting server after the failed teardown` (`clean_restart.log`) | The check answered, so `clean_restart` starts the server even though a persona could not be stopped. Read `server.log` for the new start. |
+| `[slack] clean_restart: agent-director answer check: list try <n> of 3 failed: <CLASS>: <description>` (`clean_restart.log`) | `clean_restart --server` could not stop a persona and is checking that agent-director answers before it starts the server again; this try failed. After 3 failed tries the server is not started and `clean-restart-not-restarted` is recorded. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
+| `[slack] clean_restart: agent-director answers — starting server after the failed teardown` (`clean_restart.log`) | The check answered, so `clean_restart --server` starts the server even though a persona could not be stopped. Read `server.log` for the new start. |
+| `[slack] clean_restart: restarting the named bots; the server keeps running and relaunches them` (`clean_restart.log`) | `clean_restart <bot>…` passed its checks and precheck and is stopping the named bots. Nothing. See [`clean_restart <bot>…`: the named bots](#clean_restart-bot-the-named-bots). |
+| `[slack] teardownBots: persona "<name>" (key=<key>) reads live <ms>ms after a successful pause, which ended its old life — this is its next life; it is left running` (`clean_restart.log`) | `clean_restart <bot>…`: the pause ended the bot, and the running server has already relaunched it. The bot counts as stopped and is not killed. Nothing. |
+| `[slack] teardownBots: persona "<name>" (key=<key>) reads a new launch start <ms>ms after the pause — its old life ended; its next life is left running` | A poll after the pause shows a launch other than the one before it: the old life ended and a new one was launched. The persona counts as stopped and is not killed. On the terminal for `stop --stop-bots`, in `clean_restart.log` for `clean_restart`. Nothing. |
+| `[slack] teardownBots: persona "<name>" (key=<key>) reads a new launch start between kill tries — its old life ended; no further kill: its next life is left running` | Between force-kill tries, the persona's row shows a new launch: the old life ended, so no further kill is made. It follows the kill tries' own stop line ("the caller's keep-going check answered false…"). On the terminal for `stop --stop-bots`, in `clean_restart.log` for `clean_restart`. Nothing. |
+| `[slack] clean_restart: done` (`clean_restart.log`) | The run finished: for `--server`, the server started; for `<bot>…`, every named bot was seen live again. Nothing. |
 | `[slack] server.port: could not write <path>; clear-latch cannot reach this server until it restarts: <error>` | At start the server could not record its PID and port in `server.port` beside its PID file (for example, the state directory isn't writable or is full). The server runs normally, but a hold cannot be cleared by hand on it until it restarts. Check the state directory's permissions and free space; the record is written again at the next start. |
 | `[<time>] [startup-errors] WARNING: could not write to <path>: <error>` (terminal) | The command could not record one of its entries in `startup-errors.log` at `<path>`. The print, `server.log` and the exit status are unchanged. Check the state directory's permissions and free space. |
 | `[slack] cron-log: prune failed identity=<identity> outcome=<outcome> — the line is written, the log is not pruned: <description>` | With `cron_log_max_bytes` set, the server drops the cron log's oldest whole lines after each line that takes it past that many bytes. The newest line is always kept and nothing is rotated, so old lines missing from the cron log are expected. This line means one such prune failed. The cron-log line it names (`<identity>` is its schedule or `-`, `<outcome>` its outcome class or line kind) is in the log and nothing was lost, but the log stays over the cap until a later line prunes it. A prune writes a temporary file in the cron log's directory (the symlink target's, when `cron_log_path` is a symlink) and renames it over the log: check that directory's free space and that the server's user can create files in it. A changed `cron_log_max_bytes` takes effect at the next server start. |
@@ -4781,7 +4795,8 @@ agent-director get --instance-id <id>
 
 `stop --stop-bots` and `clean_restart` check agent-director before they stop
 anything: they connect to it, then, for each persona in the last-applied
-record (else `config.json`), read its instance `cscb_<key>` and, when it is
+record (else `config.json`), or each named bot for `clean_restart <bot>…`,
+read its instance `cscb_<key>` and, when it is
 running, one line of its screen. A persona with no instance or a finished
 one is skipped. When the check fails, the command stops nothing and exits 1.
 
@@ -4829,11 +4844,16 @@ persona's own launch.
 
 ## `stop --stop-bots` or `clean_restart` could not stop a persona
 
-After a passed precheck, `stop --stop-bots` and `clean_restart` stop the
-server, then tear every persona down in parallel: pause, wait up to
-`exit_timeout` for the bot to exit, then force-kill. Once every persona's
-teardown has finished, the command reports each persona in configuration
-order.
+After a passed precheck, `stop --stop-bots` and `clean_restart --server`
+stop the server, then tear every persona down in parallel: pause, wait up
+to `exit_timeout` for the bot to exit, then force-kill.
+`clean_restart <bot>…` leaves the server running and tears down only the
+named bots, with one difference: a bot whose pause succeeds is never
+force-killed; only a refused pause leads to the force-kill, so
+`exit_timeout` doesn't apply (see
+[`clean_restart <bot>…`: the named bots](#clean_restart-bot-the-named-bots)).
+Once every persona's teardown has finished, the command reports each
+persona in configuration order.
 
 - **Failure line:** one per persona it could not stop:
 
@@ -4858,11 +4878,12 @@ order.
   It gets no failure line and is not counted; the *Process outlived kill*
   text is printed instead, led the same way and ending `This persona's
   teardown has finished; nothing in CSCB checks this process again.` It
-  changes no exit status, and on `clean_restart` the server is started as
-  usual.
+  changes no exit status, and on `clean_restart --server` the server is
+  started as usual.
 - **Last line:** when at least one persona could not be stopped, after
-  every persona's lines (for `clean_restart`, after the restart's outcome,
-  below):
+  every persona's lines (for `clean_restart --server`, after the restart's
+  outcome, below; for `clean_restart <bot>…`, after each stopped bot's
+  relaunch line):
 
   ```text
   <command>: could not stop <N> persona(s); rows are never deleted, so running the command again is safe
@@ -4870,9 +4891,10 @@ order.
 - **Where:** every line is printed on the terminal (stderr) once;
   `clean_restart` also writes it to `clean_restart.log`. The failure lines
   and the two notice texts are also appended to `server.log` in the state
-  directory (the server is stopped, so the command writes it, timestamped and
-  rotated as the server does) and recorded in `startup-errors.log`, one entry
-  per persona: `cli-teardown-failed` for a failure line alone,
+  directory (the command writes it, timestamped and rotated as the server
+  does; the server is stopped, except under `clean_restart <bot>…`) and
+  recorded in `startup-errors.log`, one entry per persona:
+  `cli-teardown-failed` for a failure line alone,
   `persona-kill-failed` for a failure line and its *Kill failed* text (both
   on one line), `persona-kill-survivor` for a *Process outlived kill* text.
   The last line goes to neither file. A `server.log` write
@@ -4884,9 +4906,10 @@ order.
   [Other lines you may see](#other-lines-you-may-see)). Neither changes the
   print, the other file or the exit status.
 - **Effect:** both commands exit 1. `stop --stop-bots` never starts the
-  server: it stays stopped. `clean_restart` then decides whether to start
-  it (below). Every row is kept. Nothing is posted to Slack, and the
-  command itself holds or latches nothing.
+  server: it stays stopped. `clean_restart --server` then decides whether
+  to start it (below). Under `clean_restart <bot>…` the server keeps
+  running and relaunches the bots it can. Every row is kept. Nothing is
+  posted to Slack, and the command itself holds or latches nothing.
 - **Fix:** fix the cause the class names, below. When a *Kill failed* text
   follows the line, a human deals with the worker by following the
   "Operator actions" section of agent-director's README; this skill
@@ -4924,10 +4947,11 @@ bot teardown, and the other personas are still torn down when one fails.
   the server does that), tmux unavailable, an agent-director internal
   error, or a refused config file (the error names
   `~/.config/agent-director/config.toml`).
-- **The force-kill** (after the pause, or once `exit_timeout` passes) ends
-  the bot's session and keeps its row; no force-kill ever removes a row. The
-  persona counts as stopped when the force-kill succeeds (through an
-  agent-director older than Phase 1, which only `stop --stop-bots` reaches,
+- **The force-kill** (after a refused pause, or once `exit_timeout` passes
+  after a successful one; under `clean_restart <bot>…`, only after a refused
+  pause) ends the bot's session and keeps its row; no force-kill ever
+  removes a row. The persona counts as stopped when the force-kill
+  succeeds (through an agent-director older than Phase 1, which only `stop --stop-bots` reaches,
   that is a plain success), when agent-director finds no instance for it,
   or when the read before a further try finds the instance ended, missing
   or gone (no further force-kill is made). A force-kill whose answer names a
@@ -4968,9 +4992,9 @@ read, the pause or the poll, which print nothing of their own. These lines
 are on the terminal for `stop --stop-bots`, in `clean_restart.log` for
 `clean_restart`.
 
-**`clean_restart`'s restart after a failed teardown.** While agent-director
-answers, a persona it could not stop never leaves every bot down. Once every persona's lines are out,
-`clean_restart` checks that agent-director answers: one list of CSCB's
+**`clean_restart --server`'s restart after a failed teardown.** While
+agent-director answers, a persona it could not stop never leaves every bot down. Once every persona's lines are out,
+`clean_restart --server` checks that agent-director answers: one list of CSCB's
 instances, up to 3 tries, 2 s apart, any error a failed try. Each failed
 try writes one line to `clean_restart.log` only:
 
@@ -5023,11 +5047,78 @@ The classes only these commands write:
 | Class | Cause | Fix |
 |---|---|---|
 | `cli-teardown-failed` | `stop --stop-bots` or `clean_restart` could not stop a persona, and no *Kill failed* text follows its line. The entry is the failure line. | Fix the cause its class names, above, then run the command again. |
-| `clean-restart-not-restarted` | `clean_restart` could not stop at least one persona, and agent-director did not answer the check after the teardown, so the server was not started. One entry per run: `clean_restart: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>[; persona …]; agent-director did not answer, so the server was not started: start it once agent-director answers`, naming each persona it could not stop with its session and class. The server, and every bot the teardown did stop, stays down. | Confirm agent-director answers: `agent-director version`, and the list under [Listing instances](#listing-instances). Once it does, with the operator's say-so, start the server: `claude-slack-channel-bots start`. Each failed persona's own line says why it could not be stopped; fix that as above. |
+| `clean-restart-not-restarted` | `clean_restart --server` could not stop at least one persona, and agent-director did not answer the check after the teardown, so the server was not started. One entry per run: `clean_restart: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>[; persona …]; agent-director did not answer, so the server was not started: start it once agent-director answers`, naming each persona it could not stop with its session and class. The server, and every bot the teardown did stop, stays down. | Confirm agent-director answers: `agent-director version`, and the list under [Listing instances](#listing-instances). Once it does, with the operator's say-so, start the server: `claude-slack-channel-bots start`. Each failed persona's own line says why it could not be stopped; fix that as above. |
 
 The same commands' `persona-kill-failed` and `persona-kill-survivor` entries
 are described under
 [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice).
+
+## `clean_restart <bot>…`: the named bots
+
+`clean_restart` needs one of two forms: `clean_restart --server` (stop the
+server and every bot, then start the server) or
+`clean_restart <bot name or key> [<bot name or key>…]` (restart only those
+bots; the server keeps running and relaunches them). The list form, in
+order: loads the configuration as `--server` does and finds each name (a
+bot named twice counts once; configuration order); needs a running server
+and a `session_restart_delay` other than `0`; connects to agent-director
+and runs the precheck over the named bots only
+([A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped));
+tears the named bots down as under
+[`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona);
+then waits for each stopped bot to read live again. It never stops the
+server, starts nothing, checks no answer and raises no
+`clean-restart-not-restarted`.
+
+- **Next life:** once a bot's pause has ended it, a live row is the bot's
+  next life, launched by the server: it counts as stopped and is never
+  killed. A bot whose pause succeeds is never force-killed, whatever
+  `exit_timeout` is; only a refused pause leads to the force-kill. A row
+  with a launch start other than the one read before the
+  pause counts the same, at a poll or between force-kill tries (both under
+  [Other lines you may see](#other-lines-you-may-see)).
+- **The wait:** up to 90 s, or `session_restart_delay` plus 30 s if that
+  is longer. A bot that exits cleanly is relaunched about 3 s after its
+  row reads `ended`. A force-killed bot, one relaunched within
+  `session_restart_delay` of its last clean-exit relaunch, or one with
+  launch failures on record comes back only after the full (backed-off)
+  delay. A force-killed bot counts as relaunched only after a read of its
+  row as finished or absent, then a live one, or a live read with a new
+  launch start.
+- **Where:** every line below but the first is on the terminal (stderr)
+  and in `clean_restart.log`. The teardown's own lines go where they go
+  under `--server`.
+- **Exit:** `0` only when every named bot was seen live again; `2` for
+  the usage line; `1` otherwise. After a bot that could not be stopped,
+  the relaunch lines come first, then the `could not stop <N> persona(s)`
+  last line.
+- **Calling bot:** a list naming the bot it runs from ends the command with
+  that bot's session. The server still relaunches the bot; nothing is
+  printed about it. `--server` run from a bot is worse:
+  [The server and every bot are down after `clean_restart --server` run from a bot](#symptom-the-server-and-every-bot-are-down-after-clean_restart---server-run-from-a-bot).
+
+`<bot>` below is `persona "<name>" (key=<key>), session "slack_bot_<key>"`,
+and `<s>` is the wait in seconds.
+
+| Line | Meaning and cause | Fix |
+|---|---|---|
+| `Usage: claude-slack-channel-bots clean_restart --server, or claude-slack-channel-bots clean_restart <bot name or key> [<bot name or key>…]` (terminal only, exit 2) | No argument, `--server` with anything else, any other argument starting with `-`, or an empty argument. Nothing was loaded or stopped. | Run it again with one form. After an upgrade, from a terminal: `--server`. From a bot, name only other bots. |
+| `clean_restart: argument <n> names no persona in the running configuration (declared: <personas>); nothing was stopped` (exit 1) | The `<n>`th argument is no persona's name or key in the configuration the server runs (the last-applied record, else `config.json`). It is never repeated, in case a token was typed there; `<personas>` is `none` when none is declared. | Use a name or key from the list; quote a name with spaces. |
+| `clean_restart: no server is running, so nothing would relaunch the named bots; nothing was stopped. Run clean_restart --server from a terminal (not from a bot's session), or start, instead` (exit 1) | `STATE_DIR/server.pid` is absent or stale, read as `stop` reads it. | With the operator's say-so, `claude-slack-channel-bots start`, which brings up every bot, or `clean_restart --server` from a terminal. |
+| `clean_restart: session_restart_delay is 0, so the server would not relaunch the named bots; nothing was stopped. Run clean_restart --server from a terminal (not from a bot's session) instead` (exit 1) | Auto-restart is off in the applied configuration, so a stopped bot would stay down. | With the operator's say-so, `clean_restart --server` from a terminal. For the list form later, set a non-zero `session_restart_delay`, confirm the change, and restart the server: the running server keeps the value it started with. |
+| `clean_restart: <bot> was relaunched by the server` | The bot was stopped and its row reads live again. | Nothing. |
+| `clean_restart: <bot> was stopped but not seen relaunched within <s> s; the server relaunches it on its own schedule: see server.log` (exit 1) | The bot was stopped, but its row did not read live within the wait: its relaunch waits the full, possibly backed-off, delay, or something holds it. | Read its lines in `server.log` (`grep -F '(key=<key>)'`): a hold or *Cannot launch* notice, a bring-up retry, or a launch failure. Follow that entry. Otherwise wait for the server's relaunch; don't start the bot by hand. If `session_restart_delay` was changed from `0` since the server started, the server won't relaunch it: restart the server (`clean_restart --server` from a terminal). This is a known limitation: the command reads the last-applied record, while the running server keeps its start-time value. |
+| `clean_restart: <bot> was not running, so nothing was stopped; the server has launched it since` | The bot had no instance or a finished one, so the teardown stopped nothing, and it reads live now. | Nothing. |
+| `clean_restart: <bot> was not running, so nothing was stopped, and was not seen launched within <s> s; the server launches it on its own schedule: see server.log` (exit 1) | As above, but not live within the wait. | As for `not seen relaunched`. |
+
+Read-only checks:
+
+```sh
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
+grep -h -E 'teardownBots|clean_restart' "$STATE"/clean_restart.log | tail -n 60
+grep -h -F '(key=<key>)' "$STATE"/server.log | tail -n 40
+agent-director get --instance-id cscb_<key>
+```
 
 ## The server refuses the agent-director binary at start
 
@@ -5380,8 +5471,9 @@ read that configuration.
   `agent_director_call_timeout_ms` in `config.json` above the need and confirm
   the change (see [Confirming a pending change](#confirming-a-pending-change)).
   `stop --stop-bots` and `clean_restart` use it at once; the server uses it at
-  its next start or a `clean_restart`. For an unused `[pause] timeout_seconds`,
-  the operator gives it a positive whole number or removes it. This skill
+  its next start or a `clean_restart --server`. For an unused
+  `[pause] timeout_seconds`, the operator gives it a positive whole number
+  or removes it. This skill
   never edits `config.toml`.
 
 ---
@@ -5898,15 +5990,21 @@ for a server start.
 
 | Preview line | After the confirmation | To carry it out sooner |
 |---|---|---|
-| `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch: when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A changed `claude_config_dir` makes that launch start a new conversation on the same instance; nothing is deleted, and the old conversation stays in the old directory. | Relaunch the bots: `claude-slack-channel-bots clean_restart`, or `stop --stop-bots` then `start`. Both cut off the bots' current turns. A plain restart reconnects running bots, which is not a launch. |
+| `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch: when the bot dies (a crash or a failed health check), at `clean_restart --server`, or `clean_restart <bot>…` naming it, at `stop --stop-bots` then `start`, or after a host reboot. A changed `claude_config_dir` makes that launch start a new conversation on the same instance; nothing is deleted, and the old conversation stays in the old directory. | Relaunch the bots: `claude-slack-channel-bots clean_restart <bot> [<bot>…]` for the personas it names, `claude-slack-channel-bots clean_restart --server` from a terminal, or `stop --stop-bots` then `start`. Each cuts off the relaunched bots' current turns. A plain restart reconnects running bots, which is not a launch. |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | Recorded. The running server keeps the value it started with. | Restart. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`. The next `stop` or `clean_restart` uses it. | Nothing. |
-| `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`. The next `stop --stop-bots` or `clean_restart` uses it; the running server keeps the value it started with. | Restart, or `clean_restart`. |
+| `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`. The next `stop --stop-bots` or `clean_restart` uses it; the running server keeps the value it started with. | Restart, or `clean_restart --server` from a terminal. |
 
 Wait for `reload-applied`, then, with the operator's say-so, run
-`claude-slack-channel-bots clean_restart`. It covers every row above: the
+`claude-slack-channel-bots clean_restart --server` from a terminal, never
+from a bot's own session (it would end that session and leave the server
+down). It covers every row above: the
 server comes back on the record and every bot is relaunched, resuming its
-conversation except where a changed `claude_config_dir` starts it fresh. When
+conversation except where a changed `claude_config_dir` starts it fresh.
+When only next-launch settings of some personas changed,
+`claude-slack-channel-bots clean_restart <bot> [<bot>…]` relaunches just
+those, and the server keeps running; a bot running it names only other
+bots. When
 no next-launch setting changed,
 `claude-slack-channel-bots stop && claude-slack-channel-bots start` is
 enough, and bots keep running undisturbed. The record already holds the
@@ -6299,7 +6397,7 @@ or a filesystem that doesn't support syncing a directory).
     record, with no effect until the switch selects that section;
   - a kept persona's `stop_hook_bootstrap` change applies immediately;
   - a kept persona's `claude_config_dir` change takes effect at its next launch (a relaunch after the bot dies, a
-    `clean_restart`, `stop --stop-bots` then `start`, or a host reboot; a
+    `clean_restart --server`, or `clean_restart <bot>…` naming it, `stop --stop-bots` then `start`, or a host reboot; a
     plain `stop` and `start` only reconnects), which launches the new
     declaration; until then its instance runs as launched;
   - a kept persona whose `credentials_file` path or `working_directory`
@@ -6861,7 +6959,7 @@ Every class `startup-errors.log` can record, what it means and where its detail 
 
 CSCB writes startup errors to `~/.config/claude-slack-channel-bots/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
 
-The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (persona launch and conversation memory) are non-fatal: they are recorded, and the start continues. Four non-fatal classes, `persona-unclassified-error`, `persona-kill-failed`, `persona-teardown-notice` and `persona-kill-survivor`, are written while the server runs; of them only `persona-kill-survivor` can also be written at start (see "Written while the server runs" below). `stop --stop-bots` and `clean_restart` write `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor` entries while the server is stopped, and `clean_restart` also `clean-restart-not-restarted` (see "Written by `stop --stop-bots` and `clean_restart`" below).
+The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (persona launch and conversation memory) are non-fatal: they are recorded, and the start continues. Four non-fatal classes, `persona-unclassified-error`, `persona-kill-failed`, `persona-teardown-notice` and `persona-kill-survivor`, are written while the server runs; of them only `persona-kill-survivor` can also be written at start (see "Written while the server runs" below). `stop --stop-bots` and `clean_restart` write `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor` entries while the server is stopped (for `clean_restart <bot>…`, while it runs), and `clean_restart --server` also `clean-restart-not-restarted` (see "Written by `stop --stop-bots` and `clean_restart`" below).
 
 Fatal classes you may see:
 
@@ -6893,11 +6991,11 @@ The following classes are **non-fatal** failures while preparing or launching pe
 - `orphan-cleanup-list-failed` — the server couldn't list its agent-director instances to clean up stale ones (see "Bots come back with no memory" in [Symptom reference](#symptom-reference)). At this start the server ends no stale instance, records no persona as retired and holds no persona from the listing; the start goes on.
 - `orphan-cleanup` — at a start, the kill of an old instance did not succeed after its tries; the row is kept and its session may still run. See the `[orphan-cleanup]` row under [A server start's clean-up of old instances](#a-server-starts-clean-up-of-old-instances).
 
-**Written by `stop --stop-bots` and `clean_restart`,** while the server is stopped, one entry per persona the teardown could not stop or stopped with a *Process outlived kill* text, and for `clean_restart` one more when it did not start the server. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona):
+**Written by `stop --stop-bots` and `clean_restart`,** while the server is stopped (for `clean_restart <bot>…`, while it runs), one entry per persona the teardown could not stop or stopped with a *Process outlived kill* text, and for `clean_restart --server` one more when it did not start the server. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona):
 
 - `cli-teardown-failed` — a persona the command could not stop, with no *Kill failed* text after its line.
 - `persona-kill-failed` and `persona-kill-survivor` — with the context `CLI teardown, <command>`; see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice).
-- `clean-restart-not-restarted` — `clean_restart` could not stop a persona and agent-director did not answer, so the server was not started.
+- `clean-restart-not-restarted` — `clean_restart --server` could not stop a persona and agent-director did not answer, so the server was not started.
 
 **Written while the server runs.** Only `persona-kill-survivor` is also written at start:
 
@@ -7119,11 +7217,23 @@ agent-director has kept returning an error the server can't classify while launc
 
 ### Symptom: Session stuck during clean_restart
 
-A bot that does not exit within `exit_timeout` after its pause is force-killed, its row kept; a force-kill that still fails fails that persona, and `clean_restart` exits 1. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
+A bot that does not exit within `exit_timeout` after its pause is force-killed, its row kept; a force-kill that still fails fails that persona, and `clean_restart` exits 1. Under `clean_restart <bot>…`, a bot whose pause succeeds is never force-killed; only a refused pause leads to the force-kill, so `exit_timeout` doesn't apply. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
 
 ### Symptom: `clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`
 
-The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names, then re-run the command. See [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped).
+The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names, then re-run the command. See [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped). For `clean_restart <bot>…`, a line naming an argument, no running server or `session_restart_delay is 0` is one line saying `nothing was stopped`: see [`clean_restart <bot>…`: the named bots](#clean_restart-bot-the-named-bots).
+
+### Symptom: `clean_restart` exits 2 with `Usage:`
+
+`clean_restart` was run with no argument, `--server` beside anything else, another argument starting with `-`, or an empty argument. Nothing was loaded or stopped. Run it again as `clean_restart --server` (the server and every bot, from a terminal) or `clean_restart <bot name or key> [<bot name or key>…]` (only those bots; the server keeps running). See [`clean_restart <bot>…`: the named bots](#clean_restart-bot-the-named-bots).
+
+### Symptom: The server and every bot are down after `clean_restart --server` run from a bot
+
+`clean_restart --server` stops the server first, then ends every bot's session, the one it runs in included, and so the command itself, before it can start the server again. `clean_restart.log` ends with `[slack] clean_restart: stopping server` and `teardownBots` lines, with no `[slack] clean_restart: starting server`, and `server.pid` is absent or stale. Fix: with the operator's say-so, start the server from a terminal, `claude-slack-channel-bots start`; it brings every bot back, resuming its conversation. To restart from a bot, run `clean_restart <bot>…` naming only other bots; a bot that names itself is relaunched by the server, but the command can't report on it.
+
+### Symptom: `clean_restart <bot>…` says a bot was `not seen relaunched`
+
+The bot was stopped, but its row did not read live within the wait, and the command exits 1. The server relaunches it on its own schedule, after the full, possibly backed-off, `session_restart_delay`. Read the bot's lines in `server.log` (`grep -F '(key=<key>)'`) for a hold or *Cannot launch* notice, a bring-up retry or a launch failure, and follow that entry. Otherwise wait for the relaunch; don't start the bot by hand. If `session_restart_delay` was changed from `0` since the server started, the server won't relaunch it: restart the server (`clean_restart --server` from a terminal). This is a known limitation: the command reads the last-applied record, while the running server keeps its start-time value. See [`clean_restart <bot>…`: the named bots](#clean_restart-bot-the-named-bots).
 
 ### Symptom: `stop --stop-bots` exits non-zero with `only the server was stopped`
 

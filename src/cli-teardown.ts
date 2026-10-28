@@ -2,12 +2,14 @@
  * cli-teardown.ts — The pure pieces of the CLI's persona teardown commands,
  * `stop --stop-bots` and `clean_restart` (`src/cli.ts`): the precheck's
  * verdict over one answer, its tries and spacing, its two operator lines,
- * `stop --stop-bots`' too-old line and the config-file display name; the teardown's per-persona
- * outcome, its pause verdict, its state-read verdict, its kill's options
- * and mapping, and the bounds of its cost; the teardown's report: each persona's
- * failure line, kill-failure alert and startup-errors entry, and the last
- * line; `clean_restart`'s answer check line,
- * not-restarted alert and its class, and its restart lines; and both commands' initialization-failed line.
+ * `stop --stop-bots`' too-old line and the config-file display name; the
+ * teardown's per-persona outcome, its pause verdict, its state-read
+ * verdict, its kill's options and mapping, and the bounds of its cost; the
+ * teardown's report: each persona's failure line, kill-failure alert and
+ * startup-errors entry, and the last line; `clean_restart`'s answer check
+ * line, not-restarted alert and its class, and its restart lines;
+ * `clean_restart <bot>…`'s lines and relaunch wait; and both commands'
+ * initialization-failed line.
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -47,15 +49,17 @@
  * When the client refuses the binary as too old, `stop --stop-bots` stops
  * only the server and ends with {@link onlyServerStoppedLine}.
  *
- * The teardown. After a passed precheck and the server stop, each persona's
+ * The teardown. After a passed precheck and the server stop (for
+ * `clean_restart <bot>…`, with the server left running), each persona's
  * teardown (`teardownPersona`) answers one {@link PersonaTeardownOutcome}:
  * stopped, with its reason (no row, already finished, exited after the
- * pause, killed), or failed, with the step that failed (state read, pause,
- * poll or kill; or an unexpected rejection of the teardown itself, which the
- * CLI maps to a failed outcome), the classifier's class (never relabelled
- * UNCLASSIFIED, as the precheck's `get` relabels) and the redacted one-line
- * description `describeReportedAdFailure` renders, a CONFIG
- * failure's naming {@link AD_CONFIG_FILE_DISPLAY_NAME}.
+ * pause, its next life read after the pause, killed), or failed, with the
+ * step that failed (state read, pause, poll or kill; or an unexpected
+ * rejection of the teardown itself, which the CLI maps to a failed outcome),
+ * the classifier's class (never relabelled UNCLASSIFIED, as the precheck's
+ * `get` relabels) and the redacted one-line description
+ * `describeReportedAdFailure` renders, a CONFIG failure's naming
+ * {@link AD_CONFIG_FILE_DISPLAY_NAME}.
  *
  * {@link stateReadVerdictOf} decides each of the teardown's own `status`
  * reads (the read before the pause and every read of the poll): a finished
@@ -118,7 +122,7 @@
  * form names the command as the context. When any persona failed, the
  * command ends with {@link teardownNotStoppedLine}, printed only.
  *
- * The restart: when any persona of a `clean_restart` failed, the
+ * The restart: when any persona of a `clean_restart --server` failed, the
  * CLI checks that agent-director answers, one `list` of `service=cscb` rows
  * made at most {@link PRECHECK_TRIES} times {@link PRECHECK_TRY_SPACING_MS}
  * apart, any error being a failed try, and starts the server when it does.
@@ -130,10 +134,23 @@
  * {@link CLEAN_RESTART_NOT_RESTARTED_LABEL} entry. The last line follows the
  * restart's outcome.
  *
+ * The named bots: `clean_restart <bot>…` stops neither the server nor any
+ * other bot and spawns no `start`; the running server relaunches each bot it
+ * stopped. It then waits up to {@link cleanRestartRelaunchWaitMs} of the
+ * applied `session_restart_delay` for each one's row to read live again (for
+ * a bot stopped by the kill, only after a finished or absent read, or with a
+ * new launch start) and prints one line per bot
+ * ({@link cleanRestartRelaunchLineOf}). An argument naming no persona
+ * ({@link cleanRestartUnknownBotLine}), no running server
+ * ({@link cleanRestartNoServerLine}) or a `session_restart_delay` of 0
+ * ({@link cleanRestartRestartDisabledLine}) stops nothing.
+ *
  * The cost: {@link teardownBoundMs} bounds one persona's teardown
  * and {@link precheckBoundMs} its precheck, each call taking the call
  * timeout, from {@link PRECHECK_TRIES}, {@link PRECHECK_TRY_SPACING_MS},
- * `KILL_RETRY_TRIES`, `KILL_RETRY_SPACING_MS` and `exit_timeout`.
+ * `KILL_RETRY_TRIES`, `KILL_RETRY_SPACING_MS` and `exit_timeout`;
+ * {@link cleanRestartRelaunchWaitMs} bounds `clean_restart <bot>…`'s
+ * relaunch wait, from `session_restart_delay`.
  *
  * The precheck and the teardown have no side effects beyond the teardown's
  * own `pause` and `kill`: nothing
@@ -449,6 +466,14 @@ export const TEARDOWN_STOPPED_ALREADY_FINISHED = 'already finished'
 export const TEARDOWN_STOPPED_EXITED = 'exited after the pause'
 /** The kill ended the persona's teardown as a success. */
 export const TEARDOWN_STOPPED_KILLED = 'killed'
+/**
+ * The old life ended and the row is the persona's next life, which the
+ * teardown never kills: after a successful pause of `clean_restart <bot>…`,
+ * a poll read found the row live; or, after any pause, a poll read or a
+ * `status` read between the kill's tries showed a launch start other than
+ * the one read before the pause.
+ */
+export const TEARDOWN_STOPPED_NEXT_LIFE = 'next life read after the pause'
 
 /** Why a persona's teardown counts as stopped. */
 export type TeardownStoppedReason =
@@ -456,6 +481,7 @@ export type TeardownStoppedReason =
   | typeof TEARDOWN_STOPPED_ALREADY_FINISHED
   | typeof TEARDOWN_STOPPED_EXITED
   | typeof TEARDOWN_STOPPED_KILLED
+  | typeof TEARDOWN_STOPPED_NEXT_LIFE
 
 /** The persona was stopped. */
 export const TEARDOWN_OUTCOME_STOPPED = 'stopped'
@@ -554,9 +580,13 @@ function errorReportOfClass(errorClass: AdErrorClass, error: unknown): TeardownE
 // The teardown's state reads
 // ---------------------------------------------------------------------------
 
-/** What the teardown reads of a `status` row: its state. */
+/**
+ * What the teardown reads of a `status` row: its state, and its launch start,
+ * which agent-director gives only on a `pending` row.
+ */
 export interface TeardownStateRow {
   readonly state: string
+  readonly launch_started_at?: string | null
 }
 
 /** A `status` read that answered: the row, or null for no row (`ErrSpawnNotFound`). */
@@ -878,6 +908,35 @@ export function teardownBoundMs(exitTimeoutSeconds: number, callTimeoutMs: numbe
   return stateRead + pause + poll + kill
 }
 
+/**
+ * The shortest relaunch wait of `clean_restart <bot>…`: it covers the
+ * server's clean-exit relaunch and the default `session_restart_delay` (60 s),
+ * with time for the launch.
+ */
+export const CLEAN_RESTART_RELAUNCH_WAIT_MS = 90_000
+
+/**
+ * What `clean_restart <bot>…`'s relaunch wait allows past the applied
+ * `session_restart_delay` for the server's launch to read live.
+ */
+export const CLEAN_RESTART_RELAUNCH_MARGIN_MS = 30_000
+
+/**
+ * How long, in ms, `clean_restart <bot>…` waits on the CLI's injected clock,
+ * after the teardown, for agent-director to read each stopped bot's row live
+ * again: the larger of {@link CLEAN_RESTART_RELAUNCH_WAIT_MS} and the applied
+ * `session_restart_delay` (seconds) plus {@link CLEAN_RESTART_RELAUNCH_MARGIN_MS},
+ * since a bot that was killed, or relaunched under the server's loop guard or
+ * after launch failures, waits the full delay. A read that starts before the
+ * deadline may take one more call timeout. A negative or non-finite delay is
+ * 0. Pure; never throws.
+ */
+export function cleanRestartRelaunchWaitMs(sessionRestartDelaySeconds: number): number {
+  const delayMs =
+    Number.isFinite(sessionRestartDelaySeconds) && sessionRestartDelaySeconds > 0 ? sessionRestartDelaySeconds * MS_PER_SECOND : 0
+  return Math.max(CLEAN_RESTART_RELAUNCH_WAIT_MS, delayMs + CLEAN_RESTART_RELAUNCH_MARGIN_MS)
+}
+
 // ---------------------------------------------------------------------------
 // Lines
 // ---------------------------------------------------------------------------
@@ -1165,4 +1224,153 @@ export function cleanRestartStartingAfterFailedTeardownLine(): string {
  */
 export function cleanRestartStartFailedLine(status: number | null): string {
   return `[slack] ${CLI_COMMAND_CLEAN_RESTART}: start failed with exit code ${status}`
+}
+
+// ---------------------------------------------------------------------------
+// clean_restart <bot>…: the named bots, relaunched by the running server
+// ---------------------------------------------------------------------------
+
+/** The argument of `clean_restart`'s whole-fleet form, which stops the server and every bot and starts the server again. */
+export const CLEAN_RESTART_SERVER_FLAG = '--server'
+
+/**
+ * `clean_restart <bot>…`'s progress line in `clean_restart.log`, before its
+ * teardown of the named bots.
+ */
+export const CLEAN_RESTART_NAMED_BOTS_LINE =
+  `[slack] ${CLI_COMMAND_CLEAN_RESTART}: restarting the named bots; the server keeps running and relaunches them`
+
+/**
+ * `clean_restart <bot>…` when the argument at `position` (1-based) names no
+ * persona of the running configuration:
+ * `clean_restart: argument <n> names no persona in the running configuration (declared: <personas>); nothing was stopped`.
+ * It never repeats the argument, in case a token was typed there. Pure; never throws.
+ */
+export function cleanRestartUnknownBotLine(position: number, declared: readonly CliTeardownPersona[]): string {
+  const names = declared.map((p) => renderPersonaRef(p.name, p.key)).join(', ')
+  return (
+    `${CLI_COMMAND_CLEAN_RESTART}: argument ${position} names no persona in the running configuration ` +
+    `(declared: ${names === '' ? 'none' : names}); nothing was stopped`
+  )
+}
+
+/** `clean_restart <bot>…` with no server running, so nothing would relaunch the bots; nothing is stopped. Pure. */
+export function cleanRestartNoServerLine(): string {
+  return (
+    `${CLI_COMMAND_CLEAN_RESTART}: no server is running, so nothing would relaunch the named bots; nothing was stopped. ` +
+    `Run clean_restart ${CLEAN_RESTART_SERVER_FLAG} from a terminal (not from a bot's session), or start, instead`
+  )
+}
+
+/** `clean_restart <bot>…` when the applied `session_restart_delay` is 0, so the server relaunches no bot; nothing is stopped. Pure. */
+export function cleanRestartRestartDisabledLine(): string {
+  return (
+    `${CLI_COMMAND_CLEAN_RESTART}: session_restart_delay is 0, so the server would not relaunch the named bots; ` +
+    `nothing was stopped. Run clean_restart ${CLEAN_RESTART_SERVER_FLAG} from a terminal (not from a bot's session) instead`
+  )
+}
+
+/**
+ * A persona `clean_restart <bot>…` stopped whose relaunch the wait saw
+ * ({@link cleanRestartRelaunchWaitMs}):
+ * `clean_restart: persona "<name>" (key=<key>), session "slack_bot_<key>" was relaunched by the server`. Pure.
+ */
+export function cleanRestartRelaunchedLine(persona: CliTeardownPersona): string {
+  return `${CLI_COMMAND_CLEAN_RESTART}: ${personaWithSession(persona)} was relaunched by the server`
+}
+
+/**
+ * A persona `clean_restart <bot>…` stopped whose relaunch the wait of
+ * `waitMs` did not see ({@link cleanRestartRelaunchWaitMs}):
+ * `clean_restart: persona "<name>" (key=<key>), session "slack_bot_<key>" was stopped but not seen relaunched within <s> s; the server relaunches it on its own schedule: see server.log`.
+ * Pure.
+ */
+export function cleanRestartNotRelaunchedLine(persona: CliTeardownPersona, waitMs: number): string {
+  return (
+    `${CLI_COMMAND_CLEAN_RESTART}: ${personaWithSession(persona)} was stopped but not seen relaunched within ` +
+    `${waitMs / MS_PER_SECOND} s; the server relaunches it on its own schedule: see server.log`
+  )
+}
+
+/**
+ * A persona `clean_restart <bot>…` found not running (no row, or a finished
+ * row), so it stopped nothing, whose launch the wait then saw:
+ * `clean_restart: persona "<name>" (key=<key>), session "slack_bot_<key>" was not running, so nothing was stopped; the server has launched it since`.
+ * Pure.
+ */
+export function cleanRestartNotRunningLaunchedLine(persona: CliTeardownPersona): string {
+  return `${CLI_COMMAND_CLEAN_RESTART}: ${personaWithSession(persona)} was not running, so nothing was stopped; the server has launched it since`
+}
+
+/**
+ * A persona `clean_restart <bot>…` found not running (no row, or a finished
+ * row), so it stopped nothing, whose launch the wait of `waitMs` did not see:
+ * `clean_restart: persona "<name>" (key=<key>), session "slack_bot_<key>" was not running, so nothing was stopped, and was not seen launched within <s> s; the server launches it on its own schedule: see server.log`.
+ * Pure.
+ */
+export function cleanRestartNotRunningNotLaunchedLine(persona: CliTeardownPersona, waitMs: number): string {
+  return (
+    `${CLI_COMMAND_CLEAN_RESTART}: ${personaWithSession(persona)} was not running, so nothing was stopped, and was not seen ` +
+    `launched within ${waitMs / MS_PER_SECOND} s; the server launches it on its own schedule: see server.log`
+  )
+}
+
+/**
+ * The line `clean_restart <bot>…` prints for a persona its teardown stopped
+ * with `reason`, given whether the wait of `waitMs` saw it read live: for no
+ * row or a finished row, the not-running lines; otherwise the relaunched or
+ * the not-relaunched line. Pure.
+ */
+export function cleanRestartRelaunchLineOf(
+  persona: CliTeardownPersona,
+  reason: TeardownStoppedReason,
+  seenLive: boolean,
+  waitMs: number,
+): string {
+  if (reason === TEARDOWN_STOPPED_NO_ROW || reason === TEARDOWN_STOPPED_ALREADY_FINISHED) {
+    return seenLive ? cleanRestartNotRunningLaunchedLine(persona) : cleanRestartNotRunningNotLaunchedLine(persona, waitMs)
+  }
+  return seenLive ? cleanRestartRelaunchedLine(persona) : cleanRestartNotRelaunchedLine(persona, waitMs)
+}
+
+/**
+ * The teardown's line when a poll read after `clean_restart <bot>…`'s
+ * successful pause finds the row live, `elapsedMs` after the pause: `pause`
+ * answers only once the row reads `ended`, so this is the persona's next
+ * life, launched by the running server, and it is never killed:
+ * `[slack] teardownBots: persona <ref> reads live <ms>ms after a successful pause, which ended its old life — this is its next life; it is left running`.
+ * Pure.
+ */
+export function teardownNextLifeAfterPauseLine(persona: CliTeardownPersona, elapsedMs: number): string {
+  return (
+    `[slack] teardownBots: persona ${renderPersonaRef(persona.name, persona.key)} reads live ${elapsedMs}ms after a successful pause, ` +
+    'which ended its old life — this is its next life; it is left running'
+  )
+}
+
+/**
+ * The teardown's line when a poll read after the pause shows a launch start
+ * other than the one read before it, `elapsedMs` after the pause:
+ * `[slack] teardownBots: persona <ref> reads a new launch start <ms>ms after the pause — its old life ended; its next life is left running`.
+ * Pure.
+ */
+export function teardownNextLifeLaunchStartLine(persona: CliTeardownPersona, elapsedMs: number): string {
+  return (
+    `[slack] teardownBots: persona ${renderPersonaRef(persona.name, persona.key)} reads a new launch start ${elapsedMs}ms ` +
+    'after the pause — its old life ended; its next life is left running'
+  )
+}
+
+/**
+ * The teardown's line when a `status` read between the kill's tries shows a
+ * launch start other than the one read before the pause, so the tries end
+ * with no further kill:
+ * `[slack] teardownBots: persona <ref> reads a new launch start between kill tries — its old life ended; no further kill: its next life is left running`.
+ * Pure.
+ */
+export function teardownNextLifeBetweenKillTriesLine(persona: CliTeardownPersona): string {
+  return (
+    `[slack] teardownBots: persona ${renderPersonaRef(persona.name, persona.key)} reads a new launch start between kill tries ` +
+    '— its old life ended; no further kill: its next life is left running'
+  )
 }

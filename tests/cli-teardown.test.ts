@@ -85,7 +85,11 @@ import {
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
+  CLEAN_RESTART_NAMED_BOTS_LINE,
   CLEAN_RESTART_NOT_STARTED_SENTENCE,
+  CLEAN_RESTART_RELAUNCH_MARGIN_MS,
+  CLEAN_RESTART_RELAUNCH_WAIT_MS,
+  CLEAN_RESTART_SERVER_FLAG,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
   CLI_TEARDOWN_FAILED_LABEL,
@@ -118,12 +122,22 @@ import {
   TEARDOWN_STOPPED_ALREADY_FINISHED,
   TEARDOWN_STOPPED_EXITED,
   TEARDOWN_STOPPED_KILLED,
+  TEARDOWN_STOPPED_NEXT_LIFE,
   TEARDOWN_STOPPED_NO_ROW,
   agentDirectorInitFailedLine,
   answerCheckFailedTryLine,
+  cleanRestartNoServerLine,
+  cleanRestartNotRelaunchedLine,
   cleanRestartNotRestartedAlert,
+  cleanRestartNotRunningLaunchedLine,
+  cleanRestartNotRunningNotLaunchedLine,
+  cleanRestartRelaunchLineOf,
+  cleanRestartRelaunchWaitMs,
+  cleanRestartRelaunchedLine,
+  cleanRestartRestartDisabledLine,
   cleanRestartStartFailedLine,
   cleanRestartStartingAfterFailedTeardownLine,
+  cleanRestartUnknownBotLine,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
@@ -140,6 +154,9 @@ import {
   teardownFailureLine,
   teardownKillOutcomeOf,
   teardownKillReadOf,
+  teardownNextLifeAfterPauseLine,
+  teardownNextLifeBetweenKillTriesLine,
+  teardownNextLifeLaunchStartLine,
   teardownNotStoppedLine,
   teardownRejectedOutcomeOf,
   teardownStopped,
@@ -573,7 +590,7 @@ describe('stateReadVerdictOf: the teardown\'s own status reads, before the pause
 
 describe('the teardown\'s per-persona outcome and its error report', () => {
   test('teardownStopped carries its reason; teardownFailed its step and the report, field by field', () => {
-    for (const reason of [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED] as const) {
+    for (const reason of [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED, TEARDOWN_STOPPED_NEXT_LIFE] as const) {
       expect(teardownStopped(reason)).toEqual({ kind: TEARDOWN_OUTCOME_STOPPED, reason })
     }
     const report = teardownErrorReportOf(errConfigMalformed())
@@ -1061,7 +1078,7 @@ describe('teardownRejectedOutcomeOf: a persona\'s teardown that rejected fails i
 })
 
 describe('personaTeardownReportOf: each persona\'s report plan', () => {
-  const STOPPED_REASONS: readonly TeardownStoppedReason[] = [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED]
+  const STOPPED_REASONS: readonly TeardownStoppedReason[] = [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED, TEARDOWN_STOPPED_NEXT_LIFE]
 
   test.each(forEachReportCommand<[string, () => PersonaTeardownOutcome]>([
     ...STOPPED_REASONS.map((reason) => [`stopped (${reason})`, () => teardownStopped(reason)] as [string, () => PersonaTeardownOutcome]),
@@ -1282,6 +1299,122 @@ describe('the not-restarted alert and its class, the answer check\'s line and th
     }
     expect(alert).not.toContain(REDACTED_SENTINEL_TAIL)
     assertNoLeak(alert)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart <bot>…: its refusals, its relaunch wait and its per-bot lines
+// ---------------------------------------------------------------------------
+
+describe('clean_restart <bot>…: the server flag, the relaunch wait, the next-life reason and the per-bot lines', () => {
+  const OPS: CliTeardownPersona = { name: 'Ops Bot', key: 'ops_bot' }
+  const BETA: CliTeardownPersona = { name: 'Beta', key: 'beta' }
+
+  test('the flag, the wait, the reason and every line, exactly (pinned once)', () => {
+    expect(CLEAN_RESTART_SERVER_FLAG).toBe('--server')
+    expect(CLEAN_RESTART_RELAUNCH_WAIT_MS).toBe(90_000)
+    expect(CLEAN_RESTART_RELAUNCH_MARGIN_MS).toBe(30_000)
+    expect(TEARDOWN_STOPPED_NEXT_LIFE).toBe('next life read after the pause')
+    expect(CLEAN_RESTART_NAMED_BOTS_LINE).toBe('[slack] clean_restart: restarting the named bots; the server keeps running and relaunches them')
+    expect(cleanRestartNotRunningLaunchedLine(OPS)).toBe(
+      'clean_restart: persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot" was not running, so nothing was stopped; the server has launched it since',
+    )
+    expect(cleanRestartNotRunningNotLaunchedLine(OPS, 150_000)).toBe(
+      'clean_restart: persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot" was not running, so nothing was stopped, ' +
+        'and was not seen launched within 150 s; the server launches it on its own schedule: see server.log',
+    )
+    expect(teardownNextLifeAfterPauseLine(OPS, 100)).toBe(
+      '[slack] teardownBots: persona "Ops Bot" (key=ops_bot) reads live 100ms after a successful pause, which ended its old life — this is its next life; it is left running',
+    )
+    expect(teardownNextLifeLaunchStartLine(OPS, 300)).toBe(
+      '[slack] teardownBots: persona "Ops Bot" (key=ops_bot) reads a new launch start 300ms after the pause — its old life ended; its next life is left running',
+    )
+    expect(teardownNextLifeBetweenKillTriesLine(OPS)).toBe(
+      '[slack] teardownBots: persona "Ops Bot" (key=ops_bot) reads a new launch start between kill tries — its old life ended; no further kill: its next life is left running',
+    )
+    expect(cleanRestartUnknownBotLine(2, [OPS, BETA])).toBe(
+      'clean_restart: argument 2 names no persona in the running configuration ' +
+        '(declared: "Ops Bot" (key=ops_bot), "Beta" (key=beta)); nothing was stopped',
+    )
+    expect(cleanRestartUnknownBotLine(1, [])).toBe(
+      'clean_restart: argument 1 names no persona in the running configuration (declared: none); nothing was stopped',
+    )
+    expect(cleanRestartNoServerLine()).toBe(
+      'clean_restart: no server is running, so nothing would relaunch the named bots; nothing was stopped. ' +
+        "Run clean_restart --server from a terminal (not from a bot's session), or start, instead",
+    )
+    expect(cleanRestartRestartDisabledLine()).toBe(
+      'clean_restart: session_restart_delay is 0, so the server would not relaunch the named bots; nothing was stopped. ' +
+        "Run clean_restart --server from a terminal (not from a bot's session) instead",
+    )
+    expect(cleanRestartRelaunchedLine(OPS)).toBe('clean_restart: persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot" was relaunched by the server')
+    expect(cleanRestartNotRelaunchedLine(OPS, CLEAN_RESTART_RELAUNCH_WAIT_MS)).toBe(
+      'clean_restart: persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot" was stopped but not seen relaunched within 90 s; ' +
+        'the server relaunches it on its own schedule: see server.log',
+    )
+  })
+
+  test('each line starts with the command, sits on one line and leaks nothing; the per-bot ones name the persona and its session, and the not-relaunched one the wait in seconds', () => {
+    const waitMs = cleanRestartRelaunchWaitMs(CLEAN_RESTART_RELAUNCH_WAIT_MS / 1000)
+    const lines = [
+      cleanRestartUnknownBotLine(1, [REPORT_PERSONA]),
+      cleanRestartNoServerLine(),
+      cleanRestartRestartDisabledLine(),
+      cleanRestartRelaunchedLine(REPORT_PERSONA),
+      cleanRestartNotRunningLaunchedLine(REPORT_PERSONA),
+      cleanRestartNotRelaunchedLine(REPORT_PERSONA, waitMs),
+      cleanRestartNotRunningNotLaunchedLine(REPORT_PERSONA, waitMs),
+    ]
+    for (const line of lines) {
+      expect(line).toStartWith(`${CLI_COMMAND_CLEAN_RESTART}: `)
+      expect(line.includes('\n')).toBe(false)
+    }
+    for (const line of lines.slice(3)) {
+      expect(line).toContain(renderPersonaRef(REPORT_PERSONA.name, REPORT_PERSONA.key))
+      expect(line).toContain(JSON.stringify(personaTmuxSessionName(REPORT_PERSONA.key)))
+    }
+    for (const line of lines.slice(-2)) expect(line).toContain(`within ${waitMs / 1000} s`)
+    const teardownLines = [
+      teardownNextLifeAfterPauseLine(REPORT_PERSONA, 100),
+      teardownNextLifeLaunchStartLine(REPORT_PERSONA, 100),
+      teardownNextLifeBetweenKillTriesLine(REPORT_PERSONA),
+    ]
+    for (const line of teardownLines) {
+      expect(line).toStartWith(`[slack] teardownBots: persona ${renderPersonaRef(REPORT_PERSONA.name, REPORT_PERSONA.key)} `)
+      expect(line.includes('\n')).toBe(false)
+    }
+    assertNoLeak([...lines, ...teardownLines, CLEAN_RESTART_NAMED_BOTS_LINE])
+  })
+
+  test.each<[string, number, number]>([
+    ['the default delay (60 s): the floor', 60, CLEAN_RESTART_RELAUNCH_WAIT_MS],
+    ['no delay: the floor', 0, CLEAN_RESTART_RELAUNCH_WAIT_MS],
+    ['the delay whose margin just reaches the floor', (CLEAN_RESTART_RELAUNCH_WAIT_MS - CLEAN_RESTART_RELAUNCH_MARGIN_MS) / 1000, CLEAN_RESTART_RELAUNCH_WAIT_MS],
+    ['1 s past it: the delay plus the margin', (CLEAN_RESTART_RELAUNCH_WAIT_MS - CLEAN_RESTART_RELAUNCH_MARGIN_MS) / 1000 + 1, CLEAN_RESTART_RELAUNCH_WAIT_MS + 1000],
+    ['a long delay: the delay plus the margin', 600, 600_000 + CLEAN_RESTART_RELAUNCH_MARGIN_MS],
+    ['a fractional delay past the floor', 75.5, 75_500 + CLEAN_RESTART_RELAUNCH_MARGIN_MS],
+    ['a negative delay: as 0', -5, CLEAN_RESTART_RELAUNCH_WAIT_MS],
+    ['NaN: as 0', Number.NaN, CLEAN_RESTART_RELAUNCH_WAIT_MS],
+    ['Infinity: as 0', Number.POSITIVE_INFINITY, CLEAN_RESTART_RELAUNCH_WAIT_MS],
+  ])('cleanRestartRelaunchWaitMs, %s', (_label, delayS, expected) => {
+    expect(cleanRestartRelaunchWaitMs(delayS)).toBe(expected)
+  })
+
+  type LineRow = [TeardownStoppedReason, seenLive: boolean, (p: CliTeardownPersona, waitMs: number) => string]
+  const notRunning = (reason: TeardownStoppedReason): LineRow[] =>
+    [[reason, true, (p) => cleanRestartNotRunningLaunchedLine(p)], [reason, false, cleanRestartNotRunningNotLaunchedLine]]
+  const stoppedHere = (reason: TeardownStoppedReason): LineRow[] =>
+    [[reason, true, (p) => cleanRestartRelaunchedLine(p)], [reason, false, cleanRestartNotRelaunchedLine]]
+
+  test.each<LineRow>([
+    ...notRunning(TEARDOWN_STOPPED_NO_ROW),
+    ...notRunning(TEARDOWN_STOPPED_ALREADY_FINISHED),
+    ...stoppedHere(TEARDOWN_STOPPED_EXITED),
+    ...stoppedHere(TEARDOWN_STOPPED_KILLED),
+    ...stoppedHere(TEARDOWN_STOPPED_NEXT_LIFE),
+  ])('cleanRestartRelaunchLineOf, stopped %s, seen live %p: the line for that reason and sighting', (reason, seenLive, line) => {
+    const waitMs = cleanRestartRelaunchWaitMs(CLEAN_RESTART_RELAUNCH_WAIT_MS / 1000)
+    expect(cleanRestartRelaunchLineOf(OPS, reason, seenLive, waitMs)).toBe(line(OPS, waitMs))
   })
 })
 
