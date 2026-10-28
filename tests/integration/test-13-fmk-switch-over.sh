@@ -1494,9 +1494,10 @@ for cid in "${CHANNELS[@]}"; do
     CONNECTED_BEFORE["${name}"]="$(count_log "[slack] Session connected: persona $(persona_ref "${name}")")"
 done
 
-# The new CLI's clean_restart, through the install path, as a CSCB process
-# (the tmux shim first on its PATH), with start's environment. It runs in the
-# background so that the harness's status reads see each row through it.
+# The new CLI's clean_restart --server (the server and every bot), through
+# the install path, as a CSCB process (the tmux shim first on its PATH), with
+# start's environment. It runs in the background so that the harness's status
+# reads see each row through it.
 LEG_B_OUT="${SCENARIO_ROOT}/clean-restart.out"
 # Bound on clean_restart itself: the installed package's own bounds on its
 # precheck and its teardown (src/cli-teardown.ts precheckBoundMs and
@@ -1517,12 +1518,12 @@ restart_from_us="$(now_us)"
 (
     rc=0
     cscb_run env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA -u SLACK_DRY_RUN \
-        "${CSCB_CLI}" clean_restart < /dev/null > "${LEG_B_OUT}" 2>&1 || rc=$?
+        "${CSCB_CLI}" clean_restart --server < /dev/null > "${LEG_B_OUT}" 2>&1 || rc=$?
     exit "${rc}"
 ) &
 restart_pid=$!
 track_pid "${restart_pid}"
-echo "${TEST_NAME}: leg B: clean_restart started"
+echo "${TEST_NAME}: leg B: clean_restart --server started"
 
 # Harness status reads, from the scenario's shell, until each row reads
 # waiting after its resume. The resume is known from server.log (the bot

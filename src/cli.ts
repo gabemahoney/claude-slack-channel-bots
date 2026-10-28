@@ -9,10 +9,17 @@
  *   stop           — Send SIGTERM to a running server via its PID file.
  *                    `--stop-bots` first runs the precheck, then stops the
  *                    server and exits every configured persona's instance.
- *   clean_restart  — Run the precheck, then stop the server, exit every
- *                    configured persona's instance and start the server;
- *                    after a failed teardown, start it only once
- *                    agent-director answers.
+ *   clean_restart  — `clean_restart --server`: run the precheck, then stop
+ *                    the server, exit every configured persona's instance
+ *                    and start the server; after a failed teardown, start it
+ *                    only once agent-director answers.
+ *                    `clean_restart <bot> [<bot>…]`: run the precheck over
+ *                    the named personas, then exit only their instances,
+ *                    leaving the running server to relaunch them, and report
+ *                    each relaunch. With no argument it prints its usage line
+ *                    (`CLEAN_RESTART_USAGE`) and exits 2. It does not detect
+ *                    where it runs: `--server` run from a bot, or a list
+ *                    naming the calling bot, takes that bot down too.
  *   credentials    — `credentials <persona>`: write that persona's
  *                    credentials file from the operator's terminal, by
  *                    running the packaged `scripts/write-credentials.sh`
@@ -45,15 +52,29 @@
  *
  * Before either stops anything, `stop --stop-bots` and `clean_restart` run
  * the precheck: the client's initialization, then per persona
- * of that configuration one `get` of its row and, for a live row, one
+ * of that configuration (for `clean_restart <bot>…`, per named persona)
+ * one `get` of its row and, for a live row, one
  * one-line `read-pane`, decided by `precheckVerdictOf` (`src/cli-teardown.ts`).
  * A failed precheck stops neither the server nor any persona: the command
  * prints its lines, ending `<command>: nothing was stopped`, and exits 1.
  * The precheck latches nothing and writes no file. After a passed precheck
- * the server is stopped, then every persona torn down; `clean_restart` then
- * starts the server, or, after a failed teardown, checks that agent-director
- * answers first (below). `stop --stop-bots` with an unreadable configuration
- * has no per-persona step: it stops the server and skips the teardown.
+ * the server is stopped, then every persona torn down; `clean_restart --server`
+ * then starts the server, or, after a failed teardown, checks that
+ * agent-director answers first (below). `clean_restart <bot>…` never stops
+ * the server: it tears down the named personas alone, then waits for the
+ * server to relaunch them (below). `stop --stop-bots` with an unreadable
+ * configuration has no per-persona step: it stops the server and skips the
+ * teardown.
+ *
+ * A poll read after a persona's pause that shows its next life stops it:
+ * its old life counts as stopped, and the next life is never killed. For
+ * `clean_restart <bot>…`, whose server keeps running, that is any live read
+ * after a successful pause (`pause` answers only once the row reads
+ * `ended`), and a successful pause is never followed by the kill; for the
+ * other commands, a launch start (`parseLaunchStart`) other than the one read
+ * before the pause. A `status` read between the kill's tries that shows such
+ * a launch start ends the tries with no further kill, and the persona counts
+ * as stopped.
  *
  * Personas are torn down in parallel, and once every persona has settled
  * each persona's report is written in configuration order (
@@ -76,10 +97,10 @@
  *   - `stop --stop-bots` never starts the server: with a failed persona it
  *     exits 1 and the server stays stopped; otherwise it exits with the
  *     server stop's code;
- *   - `clean_restart` with every persona stopped (a persona stopped with the
+ *   - `clean_restart --server` with every persona stopped (a persona stopped with the
  *     survivor version included) starts the server, with no answer check,
  *     and exits as `start` does;
- *   - `clean_restart` with a failed persona checks that agent-director
+ *   - `clean_restart --server` with a failed persona checks that agent-director
  *     answers: one `list` of `service=cscb` rows (`directorList`) succeeds
  *     within PRECHECK_TRIES calls PRECHECK_TRY_SPACING_MS apart on the
  *     injected clock, any error a failed try (`callWithCliTries`, the CLI's
@@ -89,7 +110,18 @@
  *     (`cleanRestartNotRestartedAlert`) is printed, appended to `server.log`
  *     and recorded as one `clean-restart-not-restarted` entry. The last line
  *     follows that outcome, and the exit is 1 either way. Rows are never
- *     deleted.
+ *     deleted;
+ *   - `clean_restart <bot>…` spawns no `start`: for each persona it stopped
+ *     it reads the row (`status`) until agent-director reads its next life
+ *     (for a killed bot, only after a finished or absent read, or with a new
+ *     launch start), within `cleanRestartRelaunchWaitMs` of the applied
+ *     `session_restart_delay` on the injected clock, and prints one line per
+ *     persona, in configuration order; after a failed persona the last line
+ *     follows. Its teardown never kills a bot's next life. It exits 0 when
+ *     every named persona was seen live again, otherwise 1. It has no
+ *     answer check and no not-restarted alert. Before building the client
+ *     it exits 1 with nothing stopped when an argument names no persona,
+ *     no server is running, or `session_restart_delay` is 0.
  *
  * `clean_restart`'s initialization runs the whole startup gate, CSCB's
  * Phase 1 floor included, and any failure of it stops nothing. `stop --stop-bots`'s initialization leaves the floor out, so the
@@ -142,8 +174,13 @@ import { appendLogLine, initLogging, type AppendLogLineResult } from './logging.
 import { recordStartupError } from './startup-errors.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { isAdErrorInstance } from './ad-error-class.ts'
-import { checkedKill, type PlainKillParams } from './checked-kill.ts'
-import { killRetrySeedOfState, runKillRetry, type KillRetryRead } from './kill-retry.ts'
+import { checkedKill, KILL_OUTCOME_ROW_FINISHED, KILL_OUTCOME_ROW_GONE, type PlainKillParams } from './checked-kill.ts'
+import {
+  KILL_RETRY_END_STOPPED,
+  killRetrySeedOfState,
+  runKillRetry,
+  type KillRetryRead,
+} from './kill-retry.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import type { Client, GetResult, ListRow } from 'agent-director'
@@ -151,8 +188,11 @@ import { SERVICE_LABEL, personaInstanceId, personaKey, renderPersonaRef, resolve
 import { REFUSAL_KIND_CLIENT_TOO_OLD, runStartupGate } from './agent-director-startup.ts'
 import type { StartupGateDeps, StartupGateOptions, StartupGateRefusalKind } from './agent-director-startup.ts'
 import { PROBE_PANE_READ_LINES } from './pane-read.ts'
+import { parseLaunchStart } from './pending-row.ts'
 import {
+  CLEAN_RESTART_NAMED_BOTS_LINE,
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
+  CLEAN_RESTART_SERVER_FLAG,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
   PRECHECK_CALL_GET,
@@ -167,8 +207,10 @@ import {
   PAUSE_VERDICT_RETRY,
   STATE_READ_VERDICT_ABSENT,
   STATE_READ_VERDICT_FAIL,
+  STATE_READ_VERDICT_FINISHED,
   STATE_READ_VERDICT_LIVE,
   TEARDOWN_OUTCOME_FAILED,
+  TEARDOWN_OUTCOME_STOPPED,
   TEARDOWN_POLL_FIRST_WAIT_MS,
   TEARDOWN_POLL_MAX_WAIT_MS,
   TEARDOWN_STEP_PAUSE,
@@ -176,14 +218,21 @@ import {
   TEARDOWN_STEP_STATE_READ,
   TEARDOWN_STOPPED_ALREADY_FINISHED,
   TEARDOWN_STOPPED_EXITED,
+  TEARDOWN_STOPPED_KILLED,
+  TEARDOWN_STOPPED_NEXT_LIFE,
   TEARDOWN_STOPPED_NO_ROW,
   TEARDOWN_KILL_OPTIONS,
   TEARDOWN_KILL_RETRY_OPTIONS,
   agentDirectorInitFailedLine,
   answerCheckFailedTryLine,
+  cleanRestartNoServerLine,
   cleanRestartNotRestartedAlert,
+  cleanRestartRelaunchLineOf,
+  cleanRestartRelaunchWaitMs,
+  cleanRestartRestartDisabledLine,
   cleanRestartStartFailedLine,
   cleanRestartStartingAfterFailedTeardownLine,
+  cleanRestartUnknownBotLine,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
@@ -197,6 +246,9 @@ import {
   teardownFailed,
   teardownKillOutcomeOf,
   teardownKillReadOf,
+  teardownNextLifeAfterPauseLine,
+  teardownNextLifeBetweenKillTriesLine,
+  teardownNextLifeLaunchStartLine,
   teardownNotStoppedLine,
   teardownRejectedOutcomeOf,
   teardownStopped,
@@ -211,7 +263,8 @@ import {
   type PrecheckRow,
   type PrecheckVerdict,
   type StateReadAnswer,
-  type StateReadVerdict,
+  type TeardownStateRow,
+  type TeardownStoppedOutcome,
 } from './cli-teardown.ts'
 
 // ---------------------------------------------------------------------------
@@ -246,6 +299,16 @@ export const CREDENTIALS_SCRIPT_PATH = resolve(import.meta.dir, '..', 'scripts',
 /** `credentials`' usage line, printed with exit 2 when it is not given exactly one persona. */
 export const CREDENTIALS_USAGE = 'Usage: claude-slack-channel-bots credentials <persona name or key>'
 
+/**
+ * `clean_restart`'s usage line, naming both its forms: printed to stderr with
+ * exit 2, before anything is loaded, built or stopped, when it is given no
+ * argument, `--server` with any other argument, any other argument starting
+ * with `-`, or an empty argument.
+ */
+export const CLEAN_RESTART_USAGE =
+  `Usage: claude-slack-channel-bots clean_restart ${CLEAN_RESTART_SERVER_FLAG}, or ` +
+  'claude-slack-channel-bots clean_restart <bot name or key> [<bot name or key>…]'
+
 // ---------------------------------------------------------------------------
 // The usage text
 // ---------------------------------------------------------------------------
@@ -258,20 +321,26 @@ export const CLEAR_LATCH_USAGE_ENTRY =
 /**
  * The usage text, one line per entry: printed to stderr, line by line, when
  * the entry point gets no subcommand or one it does not accept, before it
- * exits 1. It lists every subcommand the entry point accepts and `stop`'s one
- * flag, and nothing else (no reload gesture is advertised).
+ * exits 1. It lists every subcommand the entry point accepts, `stop`'s one
+ * flag, `clean_restart`'s two forms and the warning that either can take the
+ * calling bot down, and nothing else (no reload gesture is advertised).
  */
 export const CLI_USAGE_LINES: readonly string[] = Object.freeze([
   `Usage: cli.ts <start|stop|clean_restart|credentials|${CLEAR_LATCH_COMMAND}> [flags]`,
   '',
   '  start          Validate prerequisites and start the server in the background',
   '  stop           Send SIGTERM to a running server',
-  '  clean_restart  Exit all managed sessions, then stop and start the server',
+  '  clean_restart  <bot name or key> [<bot name or key>…]: restart only the named bots; the running server relaunches them',
   "  credentials    <persona name or key>: write that persona's credentials file from this terminal",
   CLEAR_LATCH_USAGE_ENTRY,
   '',
   'stop flags:',
   '  --stop-bots    Gracefully exit all managed bots before stopping the server',
+  '',
+  'clean_restart flags:',
+  `  ${CLEAN_RESTART_SERVER_FLAG}       Instead of naming bots: exit all managed sessions, then stop and start the server`,
+  '',
+  `Warning: clean_restart ${CLEAN_RESTART_SERVER_FLAG} run from a bot, or clean_restart naming the calling bot, takes that bot down too`,
 ])
 
 // ---------------------------------------------------------------------------
@@ -386,9 +455,9 @@ export interface CliDeps {
   fileSize: (path: string) => number
   /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
   readFileFrom: (path: string, offset: number) => string
-  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, `clean_restart`'s answer check, and `clear-latch`'s `CLEAR_LATCH_WAIT_MS` wait for the server's answer). */
+  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, `clean_restart`'s answer check and relaunch wait, and `clear-latch`'s `CLEAR_LATCH_WAIT_MS` wait for the server's answer). */
   now: () => number
-  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, `clean_restart`'s answer check, and `clear-latch`'s `CLEAR_LATCH_WAIT_MS` wait for the server's answer). */
+  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, `clean_restart`'s answer check and relaunch wait, and `clear-latch`'s `CLEAR_LATCH_WAIT_MS` wait for the server's answer). */
   sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
@@ -472,11 +541,12 @@ export interface CliDeps {
   directorReadPane: (instanceId: string, nLines: number) => Promise<void>
   /**
    * Query the agent-director state of a persona's instance, addressed by its
-   * instance ID (`cscb_<key>`). Returns null only when the row is absent
+   * instance ID (`cscb_<key>`), answering its state and, on a `pending` row,
+   * its launch start. Returns null only when the row is absent
    * (ErrSpawnNotFound, by class); every other error propagates for the
    * teardown to classify.
    */
-  directorStatus: (instanceId: string) => Promise<{ state: string } | null>
+  directorStatus: (instanceId: string) => Promise<TeardownStateRow | null>
   /**
    * Politely shut down a persona's instance (`cscb_<key>`) via client.pause.
    * Every error propagates, ErrSpawnNotFound included, for the teardown to
@@ -717,7 +787,8 @@ function isSessionLeader(): boolean {
 export interface CliHandlers {
   start: () => Promise<void>
   stop: (opts?: { stopBots?: boolean }) => Promise<void>
-  clean_restart: () => Promise<void>
+  /** `clean_restart --server` or `clean_restart <bot>…`, given the arguments after the subcommand. */
+  clean_restart: (args: readonly string[]) => Promise<void>
   /** `credentials <persona>`, given the arguments after the subcommand. */
   credentials: (args: readonly string[]) => Promise<void>
   /** `clear-latch <persona>`, given the arguments after the subcommand. */
@@ -750,6 +821,43 @@ function clearLatchReportOf(outcome: ClearLatchOutcome): { readonly line: string
   }
 }
 
+/** `clean_restart`'s form: the server and every bot, or the bots its arguments name. */
+type CleanRestartForm =
+  | { readonly kind: 'server' }
+  | { readonly kind: 'bots'; readonly targets: readonly string[] }
+
+/**
+ * `clean_restart`'s form from its arguments: `--server` alone is the server
+ * form; one or more arguments, none empty or starting with `-`, name bots.
+ * Anything else, no argument included, is undefined: the usage error. Pure.
+ */
+function cleanRestartFormOf(args: readonly string[]): CleanRestartForm | undefined {
+  if (args.length === 1 && args[0] === CLEAN_RESTART_SERVER_FLAG) return { kind: 'server' }
+  if (args.length === 0 || args.some((arg) => arg === '' || arg.startsWith('-'))) return undefined
+  return { kind: 'bots', targets: args }
+}
+
+/** The launch start a `status` answer reads (`parseLaunchStart`); undefined for no row, a failed read or no valid start. */
+function launchStartOfAnswer(answer: StateReadAnswer): number | undefined {
+  return 'row' in answer && answer.row !== null ? parseLaunchStart(answer.row.launch_started_at) : undefined
+}
+
+/**
+ * True when a read after the pause shows the persona's next life: it reads a
+ * launch start, other than the one read before the pause. A read with none
+ * proves nothing, since agent-director gives a launch start only on a
+ * `pending` row. Pure.
+ */
+function isNextLifeLaunchStart(before: number | undefined, after: number | undefined): boolean {
+  return after !== undefined && after !== before
+}
+
+/** One persona's teardown: its outcome, and the launch start its state read showed before the pause (undefined for none). */
+interface PersonaTeardown {
+  readonly outcome: PersonaTeardownOutcome
+  readonly launchStartBefore: number | undefined
+}
+
 /** A persona the precheck could not reach, with its failure. */
 interface PrecheckPersonaFailure {
   readonly persona: Persona
@@ -777,13 +885,32 @@ export function createCli(deps: CliDeps): CliHandlers {
     personas: readonly Persona[],
     exit_timeout: number,
   ): Promise<readonly PersonaTeardownOutcome[]> {
+    return (await teardownEach(personas, exit_timeout, false)).map((teardown) => teardown.outcome)
+  }
+
+  /**
+   * `teardownBots`' teardown, answering each persona's launch start read
+   * before its pause beside its outcome. `serverRelaunches` is
+   * `clean_restart <bot>…`'s: the server keeps running and relaunches each
+   * bot, so a poll read live after a successful pause is the bot's next
+   * life (see `teardownPersona`).
+   */
+  async function teardownEach(
+    personas: readonly Persona[],
+    exit_timeout: number,
+    serverRelaunches: boolean,
+  ): Promise<readonly PersonaTeardown[]> {
     // Personas are torn down in parallel; each answers its outcome and never
     // throws for an agent-director answer. Every persona settles before any
     // is reported: a teardown that rejects all the same is a failed outcome
     // (a teardown is never a silent no-op), so no persona is left
     // un-awaited and none is reported stopped without proof.
-    const settled = await Promise.allSettled(personas.map((persona) => teardownPersona(persona, exit_timeout)))
-    return settled.map((result) => (result.status === 'fulfilled' ? result.value : teardownRejectedOutcomeOf(result.reason)))
+    const settled = await Promise.allSettled(personas.map((persona) => teardownPersona(persona, exit_timeout, serverRelaunches)))
+    return settled.map((result) =>
+      result.status === 'fulfilled'
+        ? result.value
+        : { outcome: teardownRejectedOutcomeOf(result.reason), launchStartBefore: undefined },
+    )
   }
 
   /**
@@ -846,8 +973,8 @@ export function createCli(deps: CliDeps): CliHandlers {
 
   /**
    * One persona's teardown, answering its outcome
-   * (`PersonaTeardownOutcome`, `src/cli-teardown.ts`); it never throws for
-   * an agent-director answer:
+   * (`PersonaTeardownOutcome`, `src/cli-teardown.ts`) and the launch start
+   * its state read showed; it never throws for an agent-director answer:
    *
    *   1. one `status` read of `cscb_<key>` (`stateReadVerdictOf`): no row or
    *      a finished row is stopped; any other error fails the persona;
@@ -859,9 +986,14 @@ export function createCli(deps: CliDeps): CliHandlers {
    *   3. after a successful pause, `status` reads with a doubling wait until
    *      the row is `ended`, `missing` or absent, or `exit_timeout` passes;
    *      the last wait is cut short at `exit_timeout`; a read error fails the
-   *      persona (`stateReadVerdictOf`);
+   *      persona (`stateReadVerdictOf`). A read that shows the persona's next
+   *      life stops it, with no kill: with `serverRelaunches`, any live read
+   *      (`pause` answers only once the row reads `ended`); otherwise a
+   *      launch start other than the one step 1 read;
    *   4. at `exit_timeout`, or after an escalated pause, the kill's bounded
-   * retry by class (`teardownKill`).
+   *      retry by class (`teardownKill`); with `serverRelaunches`, a
+   *      successful pause is never followed by the kill: with `exit_timeout`
+   *      0 there is no poll read, and the persona counts as exited.
    *
    * Every wait is on the CLI's injected clock (`deps.now`, `deps.sleep`), and
    * the whole teardown, with every call taking the call timeout, ends within
@@ -872,14 +1004,30 @@ export function createCli(deps: CliDeps): CliHandlers {
    * server's start recovers such a row. Log lines name the persona as its
    * JSON-quoted name with its key.
    */
-  async function teardownPersona(persona: Persona, exit_timeout: number): Promise<PersonaTeardownOutcome> {
+  async function teardownPersona(persona: Persona, exit_timeout: number, serverRelaunches: boolean): Promise<PersonaTeardown> {
+    const initialAnswer = await teardownStatusAnswer(personaInstanceId(persona.key))
+    const launchStartBefore = launchStartOfAnswer(initialAnswer)
+    return {
+      outcome: await teardownPersonaFrom(persona, exit_timeout, serverRelaunches, initialAnswer, launchStartBefore),
+      launchStartBefore,
+    }
+  }
+
+  /** `teardownPersona` after its state read, which answered `initialAnswer` with `launchStartBefore`. */
+  async function teardownPersonaFrom(
+    persona: Persona,
+    exit_timeout: number,
+    serverRelaunches: boolean,
+    initialAnswer: StateReadAnswer,
+    launchStartBefore: number | undefined,
+  ): Promise<PersonaTeardownOutcome> {
     const id = personaInstanceId(persona.key)
     const ref = renderPersonaRef(persona.name, persona.key)
 
     // State read. "No spawn row" is reported only for a row that is
     // genuinely absent (ErrSpawnNotFound, by class); any other error (
     // agent-director unreachable, no client installed) fails the persona.
-    const initial = await teardownStateRead(id)
+    const initial = stateReadVerdictOf(initialAnswer)
     if (initial.kind === STATE_READ_VERDICT_ABSENT) {
       console.error(`[slack] teardownBots: no spawn row for persona ${ref} — skipping`)
       return teardownStopped(TEARDOWN_STOPPED_NO_ROW)
@@ -904,13 +1052,15 @@ export function createCli(deps: CliDeps): CliHandlers {
     if (pause.kind === PAUSE_VERDICT_FAIL) return teardownFailed(TEARDOWN_STEP_PAUSE, pause)
     if (pause.kind !== PAUSE_VERDICT_DONE) {
       console.error(`[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: ${pause.description}`)
-      return teardownKill(id, ref, initial.state)
+      return teardownKill(persona, initial.state, launchStartBefore)
     }
 
     // Poll for `ended` or `missing`. Each read goes through the same verdict
     // as the state read; it latches nothing, reads and writes no record and
     // never clears a retired-key entry (an site; the
     // CLI never writes retired-keys.json and installs no store).
+    // A read showing the persona's next life stops it: the old life ended,
+    // and the next one must never be killed.
     const startTime = deps.now()
     const deadline = startTime + exitTimeoutMsOf(exit_timeout)
     let wait = TEARDOWN_POLL_FIRST_WAIT_MS
@@ -918,35 +1068,105 @@ export function createCli(deps: CliDeps): CliHandlers {
     while (deps.now() < deadline) {
       await deps.sleep(Math.min(wait, deadline - deps.now()))
       wait = Math.min(wait * 2, TEARDOWN_POLL_MAX_WAIT_MS)
-      const polled = await teardownStateRead(id)
+      const polledAnswer = await teardownStatusAnswer(id)
+      const polled = stateReadVerdictOf(polledAnswer)
       if (polled.kind === STATE_READ_VERDICT_FAIL) return teardownFailed(TEARDOWN_STEP_POLL, polled)
       if (polled.kind !== STATE_READ_VERDICT_LIVE) {
         console.error(`[slack] teardownBots: persona ${ref} exited cleanly in ${deps.now() - startTime}ms`)
         return teardownStopped(TEARDOWN_STOPPED_EXITED)
       }
+      if (serverRelaunches) {
+        console.error(teardownNextLifeAfterPauseLine(persona, deps.now() - startTime))
+        return teardownStopped(TEARDOWN_STOPPED_NEXT_LIFE)
+      }
+      if (isNextLifeLaunchStart(launchStartBefore, launchStartOfAnswer(polledAnswer))) {
+        console.error(teardownNextLifeLaunchStartLine(persona, deps.now() - startTime))
+        return teardownStopped(TEARDOWN_STOPPED_NEXT_LIFE)
+      }
       lastState = polled.state
+    }
+
+    // With `serverRelaunches` the loop returns at its first read, so it ends
+    // here only having made none (`exit_timeout` 0): the successful pause
+    // already ended the row, and a kill could reach the next life.
+    if (serverRelaunches) {
+      console.error(`[slack] teardownBots: persona ${ref} exited cleanly in ${deps.now() - startTime}ms`)
+      return teardownStopped(TEARDOWN_STOPPED_EXITED)
     }
 
     // exit_timeout passed: the kill.
     const elapsed = deps.now() - startTime
-    const killed = await teardownKill(id, ref, lastState)
+    const killed = await teardownKill(persona, lastState, launchStartBefore)
     if (killed.kind === TEARDOWN_OUTCOME_FAILED) {
       console.error(`[slack] teardownBots: kill failed for persona ${ref}: ${killed.description}`)
-    } else {
+    } else if (killed.reason === TEARDOWN_STOPPED_KILLED) {
       console.error(`[slack] teardownBots: persona ${ref} force-killed after ${elapsed}ms`)
     }
     return killed
   }
 
-  /** One of the teardown's own `status` reads of `id`, and its verdict (`stateReadVerdictOf`). */
-  async function teardownStateRead(id: string): Promise<StateReadVerdict> {
-    let answer: StateReadAnswer
+  /** One of the teardown's own `status` reads of `id`, as answered; its verdict is `stateReadVerdictOf`'s. */
+  async function teardownStatusAnswer(id: string): Promise<StateReadAnswer> {
     try {
-      answer = { row: await deps.directorStatus(id) }
+      return { row: await deps.directorStatus(id) }
     } catch (error) {
-      answer = { error }
+      return { error }
     }
-    return stateReadVerdictOf(answer)
+  }
+
+  /**
+   * `clean_restart <bot>…`'s wait for the running server to relaunch each of
+   * `stopped`, which the teardown stopped: answers, per persona in the
+   * order given, whether agent-director read its next life within `waitMs`
+   * on the injected clock (a failed read is no sighting):
+   *   - stopped by the kill: the kill leaves the row in the old life's last
+   *     live state, so only a live read after a read of `ended`, `missing` or
+   *     no row (a kill that stood `row-finished` or `row-gone`, a read
+   *     between its tries that ended them included), or a live read with a
+   *     launch start other than the one read before the pause;
+   *   - otherwise (it exited, its next life was read, it had no row or a
+   *     finished one): any live read.
+   * Personas are waited for in parallel, under one deadline. The first read
+   * comes at once, then one after each wait, doubling from
+   * TEARDOWN_POLL_FIRST_WAIT_MS up to TEARDOWN_POLL_MAX_WAIT_MS, the last cut
+   * short at the deadline. Only `status` reads: no pause, kill, latch or
+   * write. Never throws for an agent-director answer.
+   */
+  async function awaitRelaunch(
+    stopped: readonly { readonly persona: Persona; readonly outcome: TeardownStoppedOutcome; readonly launchStartBefore: number | undefined }[],
+    waitMs: number,
+  ): Promise<boolean[]> {
+    const deadline = deps.now() + waitMs
+    return Promise.all(
+      stopped.map(({ persona, outcome, launchStartBefore }) =>
+        awaitPersonaRelaunch(personaInstanceId(persona.key), outcome, launchStartBefore, deadline),
+      ),
+    )
+  }
+
+  /** One persona's relaunch wait (see `awaitRelaunch`). */
+  async function awaitPersonaRelaunch(
+    id: string,
+    outcome: TeardownStoppedOutcome,
+    launchStartBefore: number | undefined,
+    deadline: number,
+  ): Promise<boolean> {
+    const killKind = outcome.kill?.outcome.kind
+    let finishedRead =
+      outcome.reason !== TEARDOWN_STOPPED_KILLED || killKind === KILL_OUTCOME_ROW_FINISHED || killKind === KILL_OUTCOME_ROW_GONE
+    let wait = TEARDOWN_POLL_FIRST_WAIT_MS
+    for (;;) {
+      const answer = await teardownStatusAnswer(id)
+      const verdict = stateReadVerdictOf(answer)
+      if (verdict.kind === STATE_READ_VERDICT_LIVE) {
+        if (finishedRead || isNextLifeLaunchStart(launchStartBefore, launchStartOfAnswer(answer))) return true
+      } else if (verdict.kind === STATE_READ_VERDICT_ABSENT || verdict.kind === STATE_READ_VERDICT_FINISHED) {
+        finishedRead = true
+      }
+      if (deps.now() >= deadline) return false
+      await deps.sleep(Math.min(wait, deadline - deps.now()))
+      wait = Math.min(wait * 2, TEARDOWN_POLL_MAX_WAIT_MS)
+    }
   }
 
   /**
@@ -975,8 +1195,9 @@ export function createCli(deps: CliDeps): CliHandlers {
   }
 
   /**
-   * The teardown's kill of `id` (persona `ref`), after an escalated pause or
-   * at `exit_timeout`, whose path last read the row in `lastState`: one bounded retry (`runKillRetry`,
+   * The teardown's kill of `persona`'s `cscb_<key>`, after an escalated pause or
+   * at `exit_timeout`, whose path last read the row in `lastState`, and
+   * whose state read before the pause showed `launchStartBefore`: one bounded retry (`runKillRetry`,
    * `src/kill-retry.ts`), mapped to the persona's outcome by
    * `teardownKillOutcomeOf` (`src/cli-teardown.ts`).
    *
@@ -996,32 +1217,43 @@ export function createCli(deps: CliDeps): CliHandlers {
    *   - an UNUSABLE NAME answer at that read, or a `pending` row with no
    *     launch start, lets the try go ahead: nothing latches in the CLI, which
    * imports no latch and writes no retired-key record;
+   *   - a read showing a launch start other than `launchStartBefore` is the
+   *     persona's next life: the retry's keep-going check then ends the
+   *     tries with no further kill, and the persona is stopped
+   *     (`TEARDOWN_STOPPED_NEXT_LIFE`), with no kill-failure alert;
    *   - each try, read and end line goes through `console.error` with the
    *     teardown's prefix: stderr for `stop --stop-bots`, `clean_restart.log`
    *     for `clean_restart`, which has redirected it.
    * Raises no outage, arms no retry timer and starts no condition: the CLI
    * has none. Never throws for an agent-director answer.
    */
-  async function teardownKill(id: string, ref: string, lastState: string): Promise<PersonaTeardownOutcome> {
+  async function teardownKill(
+    persona: Persona,
+    lastState: string,
+    launchStartBefore: number | undefined,
+  ): Promise<PersonaTeardownOutcome> {
+    const id = personaInstanceId(persona.key)
     const kill = (params: PlainKillParams): Promise<unknown> => deps.directorKill(params.instance_id)
+    let nextLifeRead = false
     const result = await runKillRetry({
       ...TEARDOWN_KILL_RETRY_OPTIONS,
       instanceId: id,
       kill: () => checkedKill(id, kill, TEARDOWN_KILL_OPTIONS),
       read: async (): Promise<KillRetryRead> => {
-        let answer: StateReadAnswer
-        try {
-          answer = { row: await deps.directorStatus(id) }
-        } catch (error) {
-          answer = { error }
-        }
+        const answer = await teardownStatusAnswer(id)
+        if (isNextLifeLaunchStart(launchStartBefore, launchStartOfAnswer(answer))) nextLifeRead = true
         return teardownKillReadOf(answer)
       },
+      keepGoing: () => !nextLifeRead,
       wait: deps.sleep,
       lastRead: killRetrySeedOfState(lastState),
       log: (line) => console.error(line),
-      logPrefix: `[slack] teardownBots: persona ${ref}`,
+      logPrefix: `[slack] teardownBots: persona ${renderPersonaRef(persona.name, persona.key)}`,
     })
+    if (nextLifeRead && result.end === KILL_RETRY_END_STOPPED) {
+      console.error(teardownNextLifeBetweenKillTriesLine(persona))
+      return teardownStopped(TEARDOWN_STOPPED_NEXT_LIFE)
+    }
     return teardownKillOutcomeOf(result)
   }
 
@@ -1474,7 +1706,12 @@ export function createCli(deps: CliDeps): CliHandlers {
   }
 
   /**
-   * `clean_restart`, in this order: load the
+   * `clean_restart --server` or `clean_restart <bot>…`, given the arguments
+   * after the subcommand. Any other arguments (`cleanRestartFormOf`) print
+   * `CLEAN_RESTART_USAGE` to stderr and exit 2, with nothing loaded, built
+   * or stopped.
+   *
+   * `--server`, in this order: load the
    * configuration the server runs, initialize the client, run the precheck
    * (a failure stops nothing), spawn `stop`, tear down every persona and
    * report it, then:
@@ -1482,9 +1719,24 @@ export function createCli(deps: CliDeps): CliHandlers {
    *   - a persona failed: the answer check (`agentDirectorAnswers`), then
    *     spawn `start` if agent-director answers, or the not-restarted alert,
    *     with no `start`, if it does not; then the last line and exit 1.
+   *
+   * `<bot>…`, in this order: load the configuration the server runs and
+   * resolve each argument by name or key (`resolvePersonaTarget`; an
+   * argument naming no persona exits 1 with `cleanRestartUnknownBotLine`,
+   * duplicates count once); require a running server (`readServerPid`) and
+   * a non-zero `session_restart_delay`, since the server's relaunch is the
+   * restart; initialize the client and run the precheck over the named
+   * personas only; then `restartNamedBots`. The server is never stopped.
+   *
    * Nothing is stopped before the precheck has passed.
    */
-  async function clean_restart(): Promise<void> {
+  async function clean_restart(args: readonly string[]): Promise<void> {
+    const form = cleanRestartFormOf(args)
+    if (form === undefined) {
+      console.error(CLEAN_RESTART_USAGE)
+      return deps.exit(2)
+    }
+
     // Everything below goes to clean_restart.log. A fatal line is also written
     // to the stderr in place before the redirect, so a failed clean_restart
     // says why on the terminal instead of a bare exit 1. These lines name
@@ -1516,7 +1768,8 @@ export function createCli(deps: CliDeps): CliHandlers {
       fatal('[slack] clean_restart: failed to load config:', err)
       deps.exit(1)
     }
-    const { personas, exit_timeout } = config!
+    const { exit_timeout } = config!
+    const personas = form.kind === 'server' ? config!.personas : namedBotsOrExit(config!, form.targets, fatal)
 
     // Phase 2: initialize the AD Client singleton before the precheck.
     // This CLI process does NOT run the server startup gate, so without
@@ -1543,6 +1796,10 @@ export function createCli(deps: CliDeps): CliHandlers {
     if (failures.length > 0) {
       printPrecheckFailure(CLI_COMMAND_CLEAN_RESTART, failures, (line) => fatal(line))
       deps.exit(1)
+    }
+
+    if (form.kind === 'bots') {
+      return restartNamedBots(personas, exit_timeout, cleanRestartRelaunchWaitMs(config!.session_restart_delay), fatal)
     }
 
     // Phase 4: Stop the server daemon
@@ -1602,6 +1859,81 @@ export function createCli(deps: CliDeps): CliHandlers {
     recordEntry(CLI_COMMAND_CLEAN_RESTART, { classLabel: CLEAN_RESTART_NOT_RESTARTED_LABEL, message: alert })
     fatal(teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, failed))
     deps.exit(1)
+  }
+
+  /**
+   * `clean_restart <bot>…`'s checks before the client is built: the personas
+   * of `config` that `targets` name (`resolvePersonaTarget`), each once, in
+   * configuration order. Exits 1 through `fatal`, with nothing stopped, when
+   * an argument names no persona (`cleanRestartUnknownBotLine`, which never
+   * repeats it), when no server is running (`readServerPid`, as `stop` and
+   * `clear-latch` read it: `cleanRestartNoServerLine`), or when the applied
+   * `session_restart_delay` is 0 (`cleanRestartRestartDisabledLine`): in
+   * either of the last two, nothing would relaunch the bots.
+   */
+  function namedBotsOrExit(config: PersonaConfig, targets: readonly string[], fatal: (line: string) => void): Persona[] {
+    const named = new Set<string>()
+    for (const [i, target] of targets.entries()) {
+      const persona = resolvePersonaTarget(config, target)
+      if (persona === undefined) {
+        fatal(cleanRestartUnknownBotLine(i + 1, config.personas))
+        return deps.exit(1)
+      }
+      named.add(persona.key)
+    }
+    if (readServerPid(join(deps.resolveStateDir(), 'server.pid'), deps).kind !== SERVER_PID_RUNNING) {
+      fatal(cleanRestartNoServerLine())
+      return deps.exit(1)
+    }
+    if (config.session_restart_delay === 0) {
+      fatal(cleanRestartRestartDisabledLine())
+      return deps.exit(1)
+    }
+    return config.personas.filter((persona) => named.has(persona.key))
+  }
+
+  /**
+   * `clean_restart <bot>…` after its passed precheck: the teardown of
+   * `personas` alone, with the server left running, so a bot's graceful
+   * `/exit` closes its MCP session and the server relaunches it on its own
+   * (its clean-exit relaunch, or its ordinary restart). No `stop` or `start`
+   * spawn, no answer check and no not-restarted alert. In this order:
+   *   1. tear down `personas`, a poll read live after a successful pause
+   *      being the bot's next life (`teardownEach`), and report it as
+   *      `--server` does (`reportTeardown`);
+   *   2. wait up to `waitMs` (`cleanRestartRelaunchWaitMs`) for the relaunch
+   *      of every persona the teardown stopped (`awaitRelaunch`), then print
+   *      each one's line (`cleanRestartRelaunchLineOf`), in configuration order;
+   *   3. with a failed persona, the last line (`teardownNotStoppedLine`) and
+   *      exit 1; with a persona not seen live, exit 1; otherwise done.
+   * Every line goes through `fatal` but the progress lines, which reach only
+   * `clean_restart.log`. A list naming the calling bot ends this process
+   * with that bot's session; the server still relaunches it.
+   */
+  async function restartNamedBots(
+    personas: readonly Persona[],
+    exit_timeout: number,
+    waitMs: number,
+    fatal: (line: string) => void,
+  ): Promise<void> {
+    console.error(CLEAN_RESTART_NAMED_BOTS_LINE)
+    const teardowns = await teardownEach(personas, exit_timeout, true)
+    const outcomes = teardowns.map((teardown) => teardown.outcome)
+    const failed = reportTeardown(CLI_COMMAND_CLEAN_RESTART, personas, outcomes, fatal)
+
+    const stopped = personas.flatMap((persona, i) => {
+      const { outcome, launchStartBefore } = teardowns[i]
+      return outcome.kind === TEARDOWN_OUTCOME_STOPPED ? [{ persona, outcome, launchStartBefore }] : []
+    })
+    const relaunched = await awaitRelaunch(stopped, waitMs)
+    stopped.forEach(({ persona, outcome }, i) => fatal(cleanRestartRelaunchLineOf(persona, outcome.reason, relaunched[i], waitMs)))
+
+    if (failed > 0) {
+      fatal(teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, failed))
+      return deps.exit(1)
+    }
+    if (relaunched.includes(false)) return deps.exit(1)
+    console.error('[slack] clean_restart: done')
   }
 
   /**
@@ -1809,7 +2141,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
     directorStatus: async (id) => {
       try {
         const r = await getClient().status({ instance_id: id })
-        return { state: r.state }
+        return { state: r.state, launch_started_at: r.launch_started_at }
       } catch (err) {
         if (isAdErrorInstance(err, ErrSpawnNotFound)) return null
         throw err
@@ -1958,7 +2290,7 @@ if (import.meta.main) {
       process.exit(1)
     })
   } else {
-    cli.clean_restart().catch((err) => {
+    cli.clean_restart(process.argv.slice(3)).catch((err) => {
       console.error('[slack] Fatal:', err)
       process.exit(1)
     })

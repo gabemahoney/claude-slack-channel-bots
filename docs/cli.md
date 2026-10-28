@@ -60,7 +60,7 @@ Plain `stop` leaves the managed bots running — they are meant to survive a ser
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This follows `clean_restart`'s order. It runs the [precheck](#precheck-before-stopping-bots) first, and stops nothing if it fails. When it passes, the server is stopped first, so it can't relaunch a just-exited bot mid-teardown and lose that bot's `ended` row and history, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>`: pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `session_id` so the bots can resume their conversation history on the next start. Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
+This follows `clean_restart --server`'s order. It runs the [precheck](#precheck-before-stopping-bots) first, and stops nothing if it fails. When it passes, the server is stopped first, so it can't relaunch a just-exited bot mid-teardown and lose that bot's `ended` row and history, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>`: pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `session_id` so the bots can resume their conversation history on the next start. Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
 
 If a persona can't be stopped after a passed precheck, the command prints a line naming it, its session and why, ends with a line counting the personas it could not stop, and exits 1 rather than silently reporting a clean stop (see [What the command prints when a bot can't be stopped](#what-the-command-prints-when-a-bot-cant-be-stopped)). `stop --stop-bots` never starts the server: after a failure the server stays stopped, unlike [`clean_restart`](#when-clean_restart-cant-stop-a-bot). When every persona is stopped, one stopped with a *Process outlived kill* text included, it exits with the server stop's status.
 
@@ -70,11 +70,16 @@ A configuration that cannot be loaded, a bad record or a missing or pre-persona 
 
 ## `claude-slack-channel-bots clean_restart`
 
-Runs the [precheck](#precheck-before-stopping-bots), then stops the server, gracefully exits all managed Claude Code sessions, and starts the server again.
-
 ```sh
-claude-slack-channel-bots clean_restart
+claude-slack-channel-bots clean_restart --server
+claude-slack-channel-bots clean_restart <bot name or key> [<bot name or key>…]
 ```
+
+`--server` restarts the server and every bot, for example after an upgrade, and a list restarts only those bots while the server keeps running ([Restarting named bots](#restarting-named-bots)); any other arguments, none included, print `Usage: claude-slack-channel-bots clean_restart --server, or claude-slack-channel-bots clean_restart <bot name or key> [<bot name or key>…]`, stop nothing and exit 2. **Run from a bot, it ends that bot's session and itself with it:** with `--server` nothing starts the server again, so the server and every bot stay down (run it from a terminal), and with a list naming that bot the server relaunches it, but the command can't report on it.
+
+### `clean_restart --server`
+
+Runs the [precheck](#precheck-before-stopping-bots), then stops the server, gracefully exits all managed Claude Code sessions, and starts the server again.
 
 For each persona in the last-applied record (or in `config.json` when there is no record), it pauses the persona's instance, `cscb_<key>`, through agent-director and waits until the instance has ended or is missing, or its row is gone. A bot that has not exited within `exit_timeout` seconds (default 120s) is force-killed. Teardown kills but never deletes each row, preserving its `session_id` so bots resume their conversation history on the next start. All personas are processed in parallel. After the server restarts, it decides for each persona whether to resume its conversation or start a fresh one.
 
@@ -90,9 +95,6 @@ Behavior by case:
 - **A persona with no instance:** logs `[slack] teardownBots: no spawn row for persona "<name>" (key=<key>) — skipping` and continues. This message appears only when a persona genuinely has no instance, never when the command failed to reach agent-director.
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
 - **Server fails to start again:** `clean_restart` exits non-zero with `[slack] clean_restart: start failed with exit code <n>`; the reason is in `server.log`.
-- **agent-director unreachable, or a persona's instance can't be read:** the precheck fails and nothing is stopped: the old server and every bot keep running, and `clean_restart` exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)).
-- **An agent-director older than CSCB needs:** `clean_restart` runs the same version checks as the server's start, so on an agent-director below CSCB's Phase 1 floor, or below the client's own minimum, its precheck fails at the connection and nothing is stopped. Follow the docs/migration.md section "Switching over to agent-director Phase 1". To stop the bots before the switch-over, use `stop --stop-bots`, which works on any agent-director the client accepts (see [`stop`](#claude-slack-channel-bots-stop)).
-- **agent-director fails during the teardown:** that persona can't be stopped, so the command exits 1, as below.
 
 ### What the command prints when a bot can't be stopped
 
@@ -112,7 +114,7 @@ The lines go to the terminal and `server.log`, and each failed persona gets one 
 
 ### When `clean_restart` can't stop a bot
 
-While agent-director answers, a bot that can't be stopped never leaves the whole fleet down. Once every persona's line is printed, `clean_restart` checks that agent-director answers (up to 3 tries, 2 s apart).
+While agent-director answers, a bot that can't be stopped never leaves the whole fleet down. Once every persona's line is printed, `clean_restart --server` checks that agent-director answers (up to 3 tries, 2 s apart).
 
 - **agent-director answers:** the server is started, as at any start. Every row is kept, and the new server keeps each configured persona's own instance that is still running, one the command could not stop included.
 - **agent-director doesn't answer:** the server is not started, so nothing starts on top of bots the command could not reach. The command prints one alert naming every persona it could not stop, appends it to `server.log` and records it as one `clean-restart-not-restarted` entry in `startup-errors.log`:
@@ -125,12 +127,18 @@ While agent-director answers, a bot that can't be stopped never leaves the whole
 
 Either way the last line follows, and the command exits 1. Rows are never deleted, so running `clean_restart` again once the cause is fixed is safe.
 
+### Restarting named bots
+
+`clean_restart <bot>…` restarts only the bots it names, by name or key in the configuration the server runs (quote a name with spaces), each once, in configuration order. It never stops the server or another bot and starts nothing: the running server relaunches each bot it stops. It needs a running server (`STATE_DIR/server.pid`) and a `session_restart_delay` other than `0` (the recorded value: after changing it from `0`, restart the server first), then runs the [precheck](#precheck-before-stopping-bots) over the named bots only; nothing is stopped until every check has passed. It then runs the bot teardown over the named bots, never killing a bot's next life, and waits for each stopped bot to read live again, up to 90 s or `session_restart_delay` plus 30 s, whichever is longer.
+
+Each bot then gets one line, on the terminal and in `clean_restart.log`: relaunched, or not seen relaunched within the wait. It exits 0 when every named bot was seen live again, and 1 otherwise. A name matching no persona, no running server, or a `session_restart_delay` of `0` exits 1 with one line saying `nothing was stopped`; the name is never repeated. A failed precheck, or a bot that can't be stopped, prints the [same lines](#what-the-command-prints-when-a-bot-cant-be-stopped) as `--server`, but no alert, since the server keeps running. The debugging skill's ["`clean_restart <bot>…`: the named bots"](../skills/debug-slack-channel-bots/SKILL.md#clean_restart-bot-the-named-bots) has every line, its cause and its fix.
+
 ## Precheck before stopping bots
 
 Before `stop --stop-bots` or `clean_restart` stops anything, it checks that agent-director answers and that each persona's instance can be read:
 
 1. It connects to agent-director. `clean_restart` makes the same version checks as the server's start. `stop --stop-bots` makes no version check of its own: any agent-director the client accepts passes, including the unsupported development placeholder `0.0.0-dev`. Ordinary 0.10.0/0.11.0 releases and 0.12.0 release candidates are refused by the client before teardown.
-2. For each persona in the last-applied record (or in `config.json` when there is no record), it reads the persona's instance, `cscb_<key>`. A persona with no instance, or whose instance has finished, is skipped. A running instance has one line of its screen read.
+2. For each persona in the last-applied record (or in `config.json` when there is no record), or only each named bot for `clean_restart <bot>…`, it reads the persona's instance, `cscb_<key>`. A persona with no instance, or whose instance has finished, is skipped. A running instance has one line of its screen read.
 
 A failed precheck prints one line per persona it could not check, naming its class (such as `CONFLICT`, `UNAVAILABLE` or `CONFIG`), then a closing line, and exits 1:
 

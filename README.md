@@ -102,7 +102,8 @@ Replace the channel ID and paths with your own. [Configuration](docs/configurati
 | `claude-slack-channel-bots start` | Starts the server in the background. It brings up every persona's bot. |
 | `claude-slack-channel-bots stop` | Stops the server. The bots keep running and are picked up by the next start. |
 | `claude-slack-channel-bots stop --stop-bots` | Stops the server, then each bot, keeping its conversation for the next start. |
-| `claude-slack-channel-bots clean_restart` | Stops the server and every bot, then starts them again. Conversations resume. |
+| `claude-slack-channel-bots clean_restart --server` | Stops the server and every bot, then starts them again. Conversations resume. Run it from a terminal, not from a bot. |
+| `claude-slack-channel-bots clean_restart <bot> [<bot>…]` | Restarts only the named bots; the running server relaunches them. Naming the bot you run it from takes that bot down too, and the command with it; the server relaunches it. |
 | `claude-slack-channel-bots credentials <persona>` | Writes one persona's credentials file from your terminal. |
 | `claude-slack-channel-bots clear-latch <persona>` | Ends one persona's hold once a human has fixed its cause. |
 

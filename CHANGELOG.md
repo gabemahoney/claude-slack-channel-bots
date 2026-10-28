@@ -7,6 +7,11 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 ## Unreleased
 
 - **agent-director 0.16 and 0.17.0: Displayed States are read as their raw states.** A bot those releases show as `needs_intelligence` is read as `check_permission` and one shown as `idle_screen` as `working`. Its permission prompts are relayed to Slack, and reconnects, restarts and recovery at start-up go ahead as for the raw state. On other agent-director releases CSCB reads the state as given. agent-director's `[state]` timeouts need no change for CSCB. See [agent-director's timing settings](docs/agent-director.md#agent-directors-timing-settings).
+- **Breaking: `clean_restart` needs an argument.** A bare `claude-slack-channel-bots clean_restart` now stops nothing: it prints its usage line and exits 2. Update any script, alias or bot instruction that runs it:
+  - `clean_restart --server` does what `clean_restart` did: it stops the server and every bot, then starts the server again. Run it from a terminal. Run from a bot's own session, it ends that session and dies before starting the server, leaving the server and every bot down.
+  - New: `clean_restart <bot name or key> [<bot name or key>…]` restarts only the named bots. The server keeps running and relaunches each one. It needs a running server and a non-zero `session_restart_delay`, and prints one line per bot, relaunched or not seen relaunched. A bot can use it to restart other bots; a list naming the calling bot ends the command with that bot's session, and the server still relaunches it.
+
+  See [`clean_restart`](docs/cli.md#claude-slack-channel-bots-clean_restart).
 
 ---
 

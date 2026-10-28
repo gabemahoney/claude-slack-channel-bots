@@ -1935,6 +1935,7 @@ leg_stub_direct() {
 
     stub_direct_start_modes "${step}: startup modes"
     stub_direct_linger "${step}: linger on exit"
+    stub_direct_exit_on_pause "${step}: exit on pause"
     stub_direct_composer "${step}: composer"
 }
 
@@ -2106,6 +2107,36 @@ stub_direct_linger() {
         || fail "${step}: the linger-on-exit stub fired SessionEnd $(line_count "${mark}.end") times, not once"
     ! grep -qF 'unknown mode' "${SCENARIO_ROOT}/${name}.err" \
         || fail "${step}: the stub did not know the linger-on-exit mode: $(head -c 300 "${SCENARIO_ROOT}/${name}.err")"
+}
+
+# stub_direct_exit_on_pause <step>: the stub run on a FIFO (`fifo_stub`) with
+# hooks from `linger_settings`, in a directory selected for `exit-on-pause`.
+# After report-in (SessionStart once, from the stub's own process), a C-u and
+# `/exit` line, as `pause` types it, fires SessionEnd once from the stub's own
+# process and the stub exits 0 within STUB_RELEASE_WAIT_S, writing no
+# lingering marker.
+stub_direct_exit_on_pause() {
+    local step="$1" dir mark rc=0 name=stub-exit-on-pause marker
+    mark="${SCENARIO_ROOT}/${name}-mark"
+    dir="$(make_workdir "${name}")"
+    stub_mode "${dir}" "${STUB_MODE_EXIT_ON_PAUSE}"
+    fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
+    wait_until 10 "${step}: the exit-on-pause stub never fired SessionStart" test -s "${mark}.start"
+    [[ "$(cat -- "${mark}.start")" == "${FIFO_PID}" ]] \
+        || fail "${step}: the exit-on-pause stub's SessionStart record is '$(tr '\n' ' ' < "${mark}.start")', not once from its process ${FIFO_PID}"
+    [[ ! -e "${mark}.end" ]] || fail "${step}: the exit-on-pause stub fired SessionEnd before /exit"
+    marker="${SCENARIO_BIN}/${SCENARIO_STUB_LINGER_PREFIX}${FIFO_PID}"
+    printf '\x15/exit\r' >&"${FIFO_FD}"
+    wait_until "${STUB_RELEASE_WAIT_S}" "${step}: the exit-on-pause stub still runs ${STUB_RELEASE_WAIT_S}s after /exit" \
+        _scenario_pid_gone "${FIFO_PID}"
+    wait "${FIFO_PID}" || rc=$?
+    exec {FIFO_FD}>&-
+    (( rc == 0 )) || fail "${step}: the exit-on-pause stub exited ${rc} on /exit"
+    [[ "$(cat -- "${mark}.end")" == "${FIFO_PID}" ]] \
+        || fail "${step}: the exit-on-pause stub's SessionEnd record is '$(tr '\n' ' ' < "${mark}.end" 2> /dev/null)', not once from its process ${FIFO_PID}"
+    [[ ! -e "${marker}" ]] || fail "${step}: the exit-on-pause stub wrote a lingering marker ${marker}"
+    ! grep -qF 'unknown mode' "${SCENARIO_ROOT}/${name}.err" \
+        || fail "${step}: the stub did not know the exit-on-pause mode: $(head -c 300 "${SCENARIO_ROOT}/${name}.err")"
 }
 
 

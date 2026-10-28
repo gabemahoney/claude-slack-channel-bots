@@ -269,13 +269,13 @@ for ATTEMPT in $(seq 1 "${SR61_POLL_ATTEMPTS}"); do
 done
 
 if [ "${VERIFIED}" != "1" ]; then
-  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 10-minute polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute the install or restart itself): have the operator re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'; once visible, have the operator run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 10-minute polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute the install or restart itself): have the operator re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'; once visible, have the operator run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 60
 fi
 
 # SR-7.1 — sanitize the bun-1.3.13 empty-string-dependency-key poison from the global package.json
 if ! bash "${SCRIPT_DIR}/sanitize-global.sh"; then
-  echo "SR-7.1 (sanitize global): 'scripts/sanitize-global.sh' exited non-zero. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the local global package.json may contain bun-1.3.13 poison. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator inspect '\${BUN_INSTALL:-\$HOME/.bun}/install/global/package.json', remove any empty-string-key entry and any pre-existing claude-slack-channel-bots entry manually, then run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' and 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-7.1 (sanitize global): 'scripts/sanitize-global.sh' exited non-zero. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the local global package.json may contain bun-1.3.13 poison. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator inspect '\${BUN_INSTALL:-\$HOME/.bun}/install/global/package.json', remove any empty-string-key entry and any pre-existing claude-slack-channel-bots entry manually, then run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' and, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 70
 fi
 
@@ -448,19 +448,19 @@ rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots" || true
 
 # SR-7.3 — install the just-published version from npm (the exact command an end user would run)
 if ! (cd "$HOME" && bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"); then
-  echo "SR-7.3 (post-publish install): 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the dev box has NO global install at this point. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator rerun 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until it succeeds, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-7.3 (post-publish install): 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the dev box has NO global install at this point. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator rerun 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until it succeeds, then, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 71
 fi
 
 # SR-7.4 — verify the install: bin resolves under the global install prefix, and installed version matches
 INSTALLED_BIN_PATH="$(command -v claude-slack-channel-bots || true)"
 if [ -z "${INSTALLED_BIN_PATH}" ]; then
-  echo "SR-7.4 (post-publish verification): 'claude-slack-channel-bots' not found on PATH after install. State: the release IS published. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT mutate PATH or run clean_restart itself): have the operator confirm '${GLOBAL_DIR}/bin' is on PATH, then run 'claude-slack-channel-bots clean_restart' manually, then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-7.4 (post-publish verification): 'claude-slack-channel-bots' not found on PATH after install. State: the release IS published. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT mutate PATH or run clean_restart itself): have the operator confirm '${GLOBAL_DIR}/bin' is on PATH, then run, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server' manually, then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 72
 fi
 
 if ! RESOLVED_BIN="$(readlink -f "${INSTALLED_BIN_PATH}")"; then
-  echo "SR-7.4 (post-publish verification): 'readlink -f ${INSTALLED_BIN_PATH}' failed — the bin path on PATH does not resolve. State: the release IS published (v${NEXT_VERSION} is on npm + tag is on origin) but the local global install layout is broken. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-7.4 (post-publish verification): 'readlink -f ${INSTALLED_BIN_PATH}' failed — the bin path on PATH does not resolve. State: the release IS published (v${NEXT_VERSION} is on npm + tag is on origin) but the local global install layout is broken. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually, then, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 72
 fi
 case "${RESOLVED_BIN}" in
@@ -473,7 +473,7 @@ case "${RESOLVED_BIN}" in
     {
       echo "SR-7.4 (post-publish verification): the 'claude-slack-channel-bots' on PATH does not come from the prefix this release installed into. The install itself is fine — something else is shadowing it on PATH."
       cscb_shadow_report "${INSTALLED_BIN_PATH}" "${RESOLVED_BIN}"
-      echo "State: the release IS published (v${NEXT_VERSION} is on npm + tag is on origin) and installed at ${GLOBAL_DIR}/node_modules/claude-slack-channel-bots; only PATH resolution is wrong. ${MANIFEST} is preserved. After the remediation above resolves the command under ${GLOBAL_DIR}/, have the operator run 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote — rerunning reinstalls the same correct copy and changes nothing about the shadowing path."
+      echo "State: the release IS published (v${NEXT_VERSION} is on npm + tag is on origin) and installed at ${GLOBAL_DIR}/node_modules/claude-slack-channel-bots; only PATH resolution is wrong. ${MANIFEST} is preserved. After the remediation above resolves the command under ${GLOBAL_DIR}/, have the operator run, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote — rerunning reinstalls the same correct copy and changes nothing about the shadowing path."
     } >&2
     sr_exit 72
     ;;
@@ -486,11 +486,11 @@ if [ ! -f "${INSTALLED_PKG_JSON}" ]; then
 fi
 
 if ! INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG_JSON}")"; then
-  echo "SR-7.4 (post-publish verification): 'jq -r .version ${INSTALLED_PKG_JSON}' failed — installed package.json is malformed JSON. State: the release IS published but the local install is broken. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-7.4 (post-publish verification): 'jq -r .version ${INSTALLED_PKG_JSON}' failed — installed package.json is malformed JSON. State: the release IS published but the local install is broken. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually, then, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 72
 fi
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
-  echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then, from a terminal (not from a bot's session), 'claude-slack-channel-bots clean_restart --server', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 72
 fi
 
@@ -684,7 +684,10 @@ fi
 # not execute the bounce (clean_restart is operator-state-mutating; the
 # contract forbids the LLM from running such commands without explicit operator
 # confirmation). The orchestrator's job on seeing this message: ask the
-# operator, and run clean_restart only on confirmation.
+# operator and, only on confirmation, have the operator run
+# `clean_restart --server` from a terminal. The orchestrator may itself be a
+# bot; run from a bot's session, the command dies with that session after
+# stopping the server, leaving the server and every bot down.
 DAEMON_PID_FILE="$(resolve_state_dir)/server.pid"
 DAEMON_PID=""
 DAEMON_ALIVE=0
@@ -701,9 +704,9 @@ SR-8.1 (daemon-bounce handoff): /publish promote complete. Release v${NEXT_VERSI
 
 DAEMON STATE: the daemon at PID ${DAEMON_PID} is still running the previous version. It MUST be bounced to pick up v${NEXT_VERSION}.
 
-ORCHESTRATOR INSTRUCTION: confirm with the operator that they want the daemon bounced now. On confirmation, run:
+ORCHESTRATOR INSTRUCTION: confirm with the operator that they want the daemon bounced now. On confirmation, have the operator run, from a terminal (not from a bot's session):
 
-    claude-slack-channel-bots clean_restart
+    claude-slack-channel-bots clean_restart --server
 
 Side effects of clean_restart: per-channel bot Claude sessions are killed and respawned. If a slack conversation is mid-flight, the bot will restart fresh.
 
@@ -737,7 +740,7 @@ Release complete: claude-slack-channel-bots@${NEXT_VERSION}
   GitHub tag:        ${GITHUB_TAG_URL}
   Local install:     ${RESOLVED_BIN}
 
-Next: run \`claude-slack-channel-bots clean_restart\` to swap the running daemon over to v${NEXT_VERSION}.
+Next: have the operator run, from a terminal (not from a bot's session), \`claude-slack-channel-bots clean_restart --server\` to swap the running daemon over to v${NEXT_VERSION}.
 EOF
 
 # Success-only tarball cleanup. The smoke-tested tarball's job is done once

@@ -1578,6 +1578,7 @@ MODE='${mode}'
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_SILENT=silent
 MODE_LINGER_ON_EXIT=linger-on-exit
+MODE_EXIT_ON_PAUSE=exit-on-pause
 SENTINEL=__CSCB_TEST_EXIT__
 REPORTED=1
 AWAITING_ENTER=0
@@ -1621,6 +1622,7 @@ MODE=transcript-on-first-message
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_SILENT=silent
 MODE_LINGER_ON_EXIT=linger-on-exit
+MODE_EXIT_ON_PAUSE=exit-on-pause
 SENTINEL=__CSCB_TEST_EXIT__
 REPORTED=1
 AWAITING_ENTER=0
@@ -1634,6 +1636,38 @@ handle_line $'first\\nmessage'
 handle_line $'leftover\\n__CSCB_TEST_EXIT__'
 exit 9`)
     expect(output).toBe('reconnect\nreceipt:<first\nmessage>\nend')
+  })
+
+  // exit-on-pause ends on pause's `/exit` as Claude Code does: SessionEnd
+  // before the MCP session closes, then exit 0; at-once ignores the line and
+  // linger-on-exit lingers. Before report-in, every mode ignores it.
+  test.each([
+    ['exit-on-pause', 'end\nclose'],
+    ['at-once', 'continued'],
+    ['linger-on-exit', 'linger'],
+  ])('a reported-in %s stub answers the /exit line pause types', (mode, answer) => {
+    const output = shell(`${helper('handle_line', worker)}
+${helper('exit_on_pause', worker)}
+MODE='${mode}'
+MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
+MODE_SILENT=silent
+MODE_LINGER_ON_EXIT=linger-on-exit
+MODE_EXIT_ON_PAUSE=exit-on-pause
+PAUSE_EXIT_LINE=/exit
+SENTINEL=__CSCB_TEST_EXIT__
+AWAITING_ENTER=0
+append_user_receipt() { printf 'receipt:<%s>\\n' "$1"; }
+reconnect_mcp_session() { printf 'reconnect\\n'; }
+fire_session_end() { printf 'end\\n'; }
+close_mcp_session() { printf 'close\\n'; }
+linger_after_exit() { printf 'linger\\n'; exit 0; }
+REPORTED=0
+handle_line '/exit'
+printf 'ignored before report-in\\n'
+REPORTED=1
+handle_line '/exit'
+printf 'continued\\n'`)
+    expect(output).toBe(`ignored before report-in\n${answer}`)
   })
 
   test.each([

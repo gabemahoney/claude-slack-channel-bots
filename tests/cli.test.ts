@@ -180,6 +180,9 @@ import {
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
+  CLEAN_RESTART_NOT_STARTED_SENTENCE,
+  CLEAN_RESTART_RELAUNCH_WAIT_MS,
+  CLEAN_RESTART_SERVER_FLAG,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
   CLI_TEARDOWN_FAILED_LABEL,
@@ -195,9 +198,19 @@ import {
   TEARDOWN_POLL_MAX_WAIT_MS,
   agentDirectorInitFailedLine,
   answerCheckFailedTryLine,
+  cleanRestartNoServerLine,
+  cleanRestartNotRelaunchedLine,
   cleanRestartNotRestartedAlert,
+  cleanRestartNotRunningLaunchedLine,
+  cleanRestartNotRunningNotLaunchedLine,
+  cleanRestartRelaunchWaitMs,
+  cleanRestartRelaunchedLine,
+  cleanRestartRestartDisabledLine,
   cleanRestartStartFailedLine,
   cleanRestartStartingAfterFailedTeardownLine,
+  cleanRestartUnknownBotLine,
+  teardownNextLifeAfterPauseLine,
+  teardownNextLifeBetweenKillTriesLine,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   precheckBoundMs,
@@ -217,6 +230,7 @@ import {
   type PrecheckRow,
 } from '../src/cli-teardown.ts'
 import {
+  CLEAN_RESTART_USAGE,
   CLEAR_LATCH_USAGE,
   CLEAR_LATCH_USAGE_ENTRY,
   CLI_USAGE_LINES,
@@ -296,6 +310,7 @@ import {
   KILL_FAILED_DESCRIPTIONS,
   SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
   STUB_SURVIVOR_PIDS,
   STUB_TMUX_SOCKET_PATH,
   UNAVAILABLE_FORMS,
@@ -1202,7 +1217,7 @@ describe('shared config path', () => {
 
   test('clean_restart loads exactly <stateDir>/config.json', async () => {
     const b = makeDeps()
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(b.loadPaths).toEqual([configPath])
   })
 
@@ -1238,7 +1253,7 @@ describe('shared config path', () => {
     writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(BETA, root)] }, root))
     const b = makeDeps({ loadConfig: appliedLoader })
 
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
 
     const ids = [personaInstanceId(personaKey(ALPHA.name)), personaInstanceId(personaKey(BETA.name))]
     expectOnePrecheckEach(b, ids)
@@ -1251,7 +1266,7 @@ describe('shared config path', () => {
     writePrePersonaFile()
     const b = makeDeps({ loadConfig: appliedLoader })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     expect(b.exitCodes).toEqual([1])
     expect(stderr.join('\n')).toContain(prePersonaConversionMessage(PRE_PERSONA_KEY))
@@ -1491,7 +1506,7 @@ describe('last-applied record', () => {
 
   const runStopBots = (b: Bundle): Promise<void> =>
     createCli(b.deps).stop({ stopBots: true }).catch((e) => { if (!(e instanceof ExitError)) throw e })
-  const runCleanRestart = (b: Bundle): Promise<void> => createCli(b.deps).clean_restart()
+  const runCleanRestart = (b: Bundle): Promise<void> => createCli(b.deps).clean_restart(['--server'])
 
   const SOURCES = [
     ['record present: the record', 'record'],
@@ -1726,7 +1741,7 @@ describe('last-applied record', () => {
     writeMalformedRecord()
     const b = makeDeps({ loadConfig: appliedLoader, directorStatus: waitingThenEnded(), initClient: async () => { /* gate ok */ } })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     expect(b.exitCodes).toEqual([1])
     expect(stderr).toHaveLength(1)
@@ -1841,7 +1856,7 @@ describe('last-applied record', () => {
       const f = makeNonRegular(source, kind, code)
       const b = makeDeps({ loadConfig: f.loader, directorStatus: waitingThenEnded() })
 
-      await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+      await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
       expect(b.exitCodes).toEqual([1])
       expect(stderr).toHaveLength(1)
@@ -2202,7 +2217,7 @@ describe('persona-set teardown', () => {
   const betaId = (): string => personaInstanceId(personaKey(BETA.name))
 
   test.each([
-    ['clean_restart', (b: Bundle) => createCli(b.deps).clean_restart()],
+    ['clean_restart', (b: Bundle) => createCli(b.deps).clean_restart(['--server'])],
     ['stop --stop-bots', (b: Bundle) => createCli(b.deps).stop({ stopBots: true }).catch((e) => { if (!(e instanceof ExitError)) throw e })],
   ])('%s: two personas (two channels; zero channels with DMs) each get one get, one one-line read-pane, one status, pause and kill on cscb_<key>, none by channel', async (_name, run) => {
     const b = makeStopDeps({
@@ -2227,7 +2242,7 @@ describe('persona-set teardown', () => {
 
   test('the instance ID is cscb_<key>, never the persona name or its channel', async () => {
     const b = makeDeps({ directorStatus: async () => ({ state: 'ended' }) })
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(personaKey(OPS_NAME)).not.toBe(OPS_NAME) // precondition: name ≠ key
     expectOnePrecheckEach(b, [opsId()])
     expect(b.statusCalls).toEqual([opsId()])
@@ -2235,13 +2250,13 @@ describe('persona-set teardown', () => {
 
   test('an absent row logs the persona reference ("<name>" (key=<key>)) and skips', async () => {
     const b = makeDeps({ directorStatus: async () => null })
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(stderr).toContain(`[slack] teardownBots: no spawn row for persona ${renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))} — skipping`)
   })
 
   test('clean_restart with an empty personas array: no director call, still stops and starts', async () => {
     const b = makeDeps({ config: makeMultiPersonaConfig([], root), directorStatus: async () => ({ state: 'waiting' }) })
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop', 'start'])
     expect(b.exitCodes).toEqual([])
@@ -2264,7 +2279,7 @@ describe('persona-set teardown', () => {
       },
       directorPause: async () => { throw errTmuxSendKeys() }, // GONE: one pause, then the kill
     })
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
     expect(b.killCalls).toEqual([betaId()])
     expect(b.exitCodes).toEqual([1])
     expectReported(b, CLI_COMMAND_CLEAN_RESTART, [failedReport(CLI_COMMAND_CLEAN_RESTART, personaOf(ALPHA.name), alphaError, AD_ERROR_CLASS_UNAVAILABLE)])
@@ -2295,7 +2310,7 @@ describe('persona-set teardown', () => {
       directorKill: async () => { throw killError },
     })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     const ref = renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))
     const line = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment))
@@ -2320,7 +2335,7 @@ describe('persona-set teardown', () => {
       directorKill: async () => { throw killError },
     })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     const ref = renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))
     const line = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment))
@@ -2348,7 +2363,7 @@ describe('persona-set teardown', () => {
 describe('clean_restart', () => {
   test('genuinely-absent row (null) skips quietly and clean_restart still starts', async () => {
     const b = makeDeps({ directorStatus: async () => null })
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(b.statusCalls).toEqual([opsId()])
     expect(b.pauseCalls).toEqual([])
     expect(b.killCalls).toEqual([])
@@ -2359,8 +2374,548 @@ describe('clean_restart', () => {
 
   test('skips personas already in terminal state', async () => {
     const b = makeDeps({ directorStatus: async () => ({ state: 'ended' }) })
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(b.pauseCalls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart's two forms: `--server` restarts the server and every bot;
+// `<bot>…` pauses only the named bots and leaves the running server to
+// relaunch them. Anything else is the usage error, which stops nothing.
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — --server or the named bots', () => {
+  const OTHER_BOT = 'other_bot'
+  const CALLER_BOT = 'caller_bot'
+  const otherId = (): string => personaInstanceId(personaKey(OTHER_BOT))
+  const callerId = (): string => personaInstanceId(personaKey(CALLER_BOT))
+  const SERVER_PID = 4242
+  /** A name no persona has; no printed line may repeat it. */
+  const UNDECLARED = 'not_a_declared_bot'
+
+  type ListedRow = Awaited<ReturnType<CliDeps['directorList']>>[number]
+
+  /** The reproduction's two bots, other_bot first. */
+  const twoBots = (overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig =>
+    makeMultiPersonaConfig([{ name: OTHER_BOT }, { name: CALLER_BOT }], root, overrides)
+
+  /**
+   * agent-director's rows of the two bots, the same through `get`, `status`
+   * and `list`: live `waiting` (no launch start: agent-director gives one
+   * only on a `pending` row) until the bot's pause; then one `ended` read;
+   * then live `waiting` again, as the server's clean-exit relaunch brings it
+   * back. The pause of `hangingPause` never answers, as when the CLI ends
+   * with that bot's session. `relaunchedSeen` tells whether a read answered
+   * the relaunched row.
+   */
+  function relaunchingRows(o: { hangingPause?: string } = {}): {
+    overrides: Overrides
+    relaunchedSeen: () => boolean
+  } {
+    const phase = new Map<string, 'old' | 'paused' | 'relaunched'>()
+    let relaunchedSeen = false
+    const read = (id: string): PrecheckRow => {
+      const p = phase.get(id) ?? 'old'
+      if (p === 'old') return WAITING_ROW
+      if (p === 'paused') {
+        phase.set(id, 'relaunched')
+        return ENDED_ROW
+      }
+      relaunchedSeen = true
+      return WAITING_ROW
+    }
+    return {
+      overrides: {
+        directorGet: async (id) => read(id),
+        directorStatus: async (id) => read(id),
+        directorList: async () =>
+          [otherId(), callerId()].map((id) => cannedListRow({ instance_id: id, ...read(id) } as Partial<ListedRow> & { instance_id: string })),
+        directorPause: async (id) => {
+          if (id === o.hangingPause) return new Promise<void>(() => {})
+          phase.set(id, 'paused')
+        },
+      },
+      relaunchedSeen: () => relaunchedSeen,
+    }
+  }
+
+  /** {@link twoBots} under a running server, with a recorded client init. */
+  const bundle = (o: Overrides = relaunchingRows().overrides): Bundle =>
+    makeDeps({
+      config: twoBots(),
+      serverPid: SERVER_PID,
+      isProcessRunning: (pid) => pid === SERVER_PID,
+      initClient: async () => {},
+      ...o,
+    })
+
+  /** The subcommand of each `spawnSync` of the CLI (`stop`, `start`), in order. */
+  const spawned = (b: Bundle): string[] => b.spawnCalls.map((c) => c.args.at(-1)!)
+
+  /** Neither the server nor any bot was touched: nothing loaded, no client built, no agent-director call, no spawn or signal. */
+  function expectNothingDone(b: Bundle): void {
+    expect(spawned(b)).toEqual([])
+    expect(b.daemonSpawns).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
+    expect(b.initClientCalls).toEqual([])
+    expect(b.loadPaths).toEqual([])
+    expect(b.configFileLoads).toEqual([])
+  }
+
+  test.each([
+    ['no argument', []],
+    ['--server with a bot after it', ['--server', CALLER_BOT]],
+    ['--server after a bot', [CALLER_BOT, '--server']],
+    ['--server twice', ['--server', '--server']],
+    ['an unknown flag', ['--all']],
+    ['a bot and an unknown flag', [CALLER_BOT, '--all']],
+    ['an empty argument', ['']],
+  ])('%s: the usage line naming both forms on stderr and exit 2; nothing loaded, built or stopped', async (_label, args) => {
+    const b = bundle()
+
+    await settled(createCli(b.deps).clean_restart(args))
+
+    expect(b.exitCodes).toEqual([2])
+    expectNothingDone(b)
+    expect(stderr).toEqual([CLEAN_RESTART_USAGE])
+  })
+
+  test('the usage line naming both forms, exactly (pinned once)', () => {
+    expect(CLEAN_RESTART_USAGE).toBe(
+      'Usage: claude-slack-channel-bots clean_restart --server, or ' +
+        'claude-slack-channel-bots clean_restart <bot name or key> [<bot name or key>…]',
+    )
+  })
+
+  test('the real CLI: `clean_restart` alone is accepted and prints its own usage line (not the unknown-subcommand usage), exits 2 and leaves the tree as it was', () => {
+    const before = snapshotTree()
+
+    const result = runCli(['clean_restart'])
+
+    expect(result.status).toBe(2)
+    expect(result.stderr).toBe(`${CLEAN_RESTART_USAGE}\n`)
+    expect(result.stdout).toBe('')
+    expect(snapshotTree()).toEqual(before)
+  })
+
+  test('the real CLI: `clean_restart <declared> <undeclared>` gets every argument after the subcommand, exits 1 naming argument 2 before the client is built and leaves the tree as it was', () => {
+    const cleanRestartLog = relative(root, join(stateDir, 'clean_restart.log'))
+    const withoutCleanRestartLog = (tree: Record<string, string | null>) =>
+      Object.fromEntries(Object.entries(tree).filter(([rel]) => rel !== cleanRestartLog))
+    const before = withoutCleanRestartLog(snapshotTreeExceptTeardownLogs())
+    const line = cleanRestartUnknownBotLine(2, [OPS_PERSONA])
+
+    const result = runCli(['clean_restart', OPS_NAME, 'not_a_declared_bot'])
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toBe(`${line}\n`)
+    expect(result.stdout).toBe('')
+    const logged = readFileSync(join(root, cleanRestartLog), 'utf-8').split('\n').filter((l) => l !== '')
+    expect(logged).toHaveLength(1)
+    expect(logged[0]).toMatch(/^\[[^\]]+\] /)
+    expect(logged[0]!.endsWith(`] ${line}`)).toBe(true)
+    expect(existsSync(join(stateDir, 'server.log'))).toBe(false)
+    expect(existsSync(startupErrorsPath())).toBe(false)
+    expect(withoutCleanRestartLog(snapshotTreeExceptTeardownLogs())).toEqual(before)
+  })
+
+  test('the calling bot by name under a running server: no stop or start spawn, only cscb_caller_bot paused and nothing of other_bot touched; its row read live again, exit 0', async () => {
+    const rows = relaunchingRows()
+    const b = bundle(rows.overrides)
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    expect(spawned(b)).toEqual([])
+    expect(b.daemonSpawns).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.pauseCalls).toEqual([callerId()])
+    expect(b.killCalls).toEqual([])
+    expect(b.directorCallTimes.filter(([call]) => call.endsWith(`:${otherId()}`))).toEqual([])
+    expect(rows.relaunchedSeen()).toBe(true)
+    expect(b.exitCodes).toEqual([])
+  })
+
+  test('the CLI ending with the calling bot\'s session (its pause never answers): the server was never stopped', async () => {
+    const b = bundle(relaunchingRows({ hangingPause: callerId() }).overrides)
+
+    void settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+    for (let i = 0; i < 10 && !b.pauseCalls.includes(callerId()); i++) await b.clock.flush()
+
+    // Precondition: the run reached the calling bot's pause.
+    expect(b.pauseCalls).toContain(callerId())
+    expect(spawned(b)).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.pauseCalls).toEqual([callerId()])
+  })
+
+  test('--server keeps today\'s order: the stop spawn, then a pause of every bot, then the start spawn', async () => {
+    const b = bundle()
+
+    await settled(createCli(b.deps).clean_restart(['--server']))
+
+    const order = b.events.filter((e) => e.startsWith('spawnSync:') || e.startsWith('pause:'))
+    expect(order[0]).toBe('spawnSync:stop')
+    expect(order.at(-1)).toBe('spawnSync:start')
+    expect(order.slice(1, -1).sort()).toEqual([`pause:${callerId()}`, `pause:${otherId()}`].sort())
+    expectOnePrecheckEach(b, [otherId(), callerId()])
+    expect(b.exitCodes).toEqual([])
+    expect(stderr).toContain('[slack] clean_restart: done')
+  })
+
+  /** A status read error during the relaunch wait. */
+  const READ_ERROR = errCallTimeout('status')
+
+  /**
+   * Every bot's rows: `waiting` through `get` and `status` until its pause;
+   * then its `afterPause` answers to `status` in call order (the teardown's
+   * poll first), the last repeating, a {@link thrown} one thrown. A bot with
+   * none reads `ended` at the poll and then `waiting`, its relaunch.
+   */
+  function rowsAfterPause(afterPause: Readonly<Record<string, ReadonlyArray<PrecheckRow | null | Thrown>>> = {}): Overrides {
+    const readsSincePause = new Map<string, number>()
+    return {
+      directorGet: async () => WAITING_ROW,
+      directorStatus: async (id) => {
+        const reads = readsSincePause.get(id)
+        if (reads === undefined) return WAITING_ROW
+        readsSincePause.set(id, reads + 1)
+        const answers = afterPause[id] ?? [ENDED_ROW, WAITING_ROW]
+        const answer = answers[Math.min(reads, answers.length - 1)]!
+        if (isThrown(answer)) throw answer.thrown
+        return answer
+      },
+      directorPause: async (id) => { readsSincePause.set(id, 0) },
+    }
+  }
+
+  /** The command's own lines on the terminal (the report, the relaunch lines, the last line), in order; no `[slack]` progress line. */
+  const commandLines = (): string[] => stderr.filter((l) => l.startsWith(`${CLI_COMMAND_CLEAN_RESTART}: `))
+
+  test.each<[string, () => Overrides, () => string]>([
+    ['no PID file', () => ({ serverPid: undefined }), cleanRestartNoServerLine],
+    ['a stale PID file', () => ({ isProcessRunning: () => false }), cleanRestartNoServerLine],
+    ['session_restart_delay 0 under a running server', () => ({ config: twoBots({ session_restart_delay: 0 }) }), cleanRestartRestartDisabledLine],
+  ])('%s: the one line saying nothing would relaunch the bot, on the terminal and in clean_restart.log; exit 1, no client built and nothing stopped', async (_label, o, line) => {
+    const log: string[] = []
+    const b = bundle({ ...rowsAfterPause(), initLogging: redirectTo(log), ...o() })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toEqual([line()])
+    expect(log).toEqual([line()])
+    expect(spawned(b)).toEqual([])
+    expect(b.daemonSpawns).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.unlinked).toEqual([])
+    expect(b.initClientCalls).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
+  })
+
+  test.each<[string, (token: string) => string[], number]>([
+    ['an undeclared name alone', () => [UNDECLARED], 1],
+    ['a declared bot, then an undeclared name', () => [CALLER_BOT, UNDECLARED], 2],
+    ['a token-shaped argument first', (token) => [token, CALLER_BOT], 1],
+    ['a token-shaped argument third, after a bot named by name and by key', (token) => [CALLER_BOT, personaKey(CALLER_BOT), token], 3],
+  ])('an argument naming no persona (%s): the line names its position and the declared personas, never the argument, on the terminal and in clean_restart.log; exit 1, no client built and nothing stopped; nothing leaks', async (_label, argsWith, position) => {
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'clean-restart-argument')
+    const args = argsWith(token)
+    const log: string[] = []
+    const b = bundle({ ...rowsAfterPause(), initLogging: redirectTo(log) })
+
+    await settled(createCli(b.deps).clean_restart(args))
+
+    const line = cleanRestartUnknownBotLine(position, [personaOf(OTHER_BOT), personaOf(CALLER_BOT)])
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toEqual([line])
+    expect(log).toEqual([line])
+    expect(line).not.toContain(args[position - 1]!)
+    expect(b.initClientCalls).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
+    expect(spawned(b)).toEqual([])
+    expect(b.daemonSpawns).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    assertNoLeak({ stderr, log, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  /** An agent-director initialization failure, the per-bot form's first gate after its refusals. */
+  const INIT_ERROR = new Error('startup gate failed')
+  /** The named bot's precheck read-pane answer: CONFLICT, which fails with no retry. */
+  const PRECHECK_CONFLICT = errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'not-this-launch', personaTmuxSessionName(personaKey(CALLER_BOT)))
+
+  test.each<[string, () => Overrides, () => string]>([
+    [
+      'agent-director initialization fails',
+      () => ({ initClient: async () => { throw INIT_ERROR } }),
+      () => agentDirectorInitFailedLine(CLI_COMMAND_CLEAN_RESTART, describeThrownValue(INIT_ERROR)),
+    ],
+    [
+      'the named bot\'s precheck read-pane answers CONFLICT',
+      () => ({ directorReadPane: async (id) => { if (id === callerId()) throw PRECHECK_CONFLICT } }),
+      () => precheckFailureLine(CLI_COMMAND_CLEAN_RESTART, personaOf(CALLER_BOT), precheckVerdictOf({ call: PRECHECK_CALL_READ_PANE, error: PRECHECK_CONFLICT }) as PrecheckFailure),
+    ],
+  ])('%s under a running server: exactly its line, then the nothing-stopped line, on the terminal and in clean_restart.log; exit 1, no pause, kill, status read, spawn or signal', async (_label, o, line) => {
+    const log: string[] = []
+    const b = bundle({ ...rowsAfterPause(), initLogging: redirectTo(log), ...o() })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    const lines = [line(), precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART)]
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toEqual(lines)
+    expect(log).toEqual(lines)
+    expect([b.pauseCalls, b.killCalls, b.statusCalls]).toEqual([[], [], []])
+    expect(spawned(b)).toEqual([])
+    expect(b.daemonSpawns).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.directorCallTimes.filter(([call]) => call.endsWith(`:${otherId()}`))).toEqual([])
+    assertNoLeak({ stderr, log, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test('a bot named twice, once by name and once by key, and the bots named out of configuration order: one precheck and one pause each, the other bot untouched, the relaunch lines in configuration order, exit 0', async () => {
+    const config = makeMultiPersonaConfig([{ name: OPS_NAME }, { name: OTHER_BOT }, { name: CALLER_BOT }], root)
+    expect(personaKey(OPS_NAME)).not.toBe(OPS_NAME) // precondition: name ≠ key
+    const b = bundle({ ...rowsAfterPause(), config })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT, personaKey(OPS_NAME), OPS_NAME, CALLER_BOT]))
+
+    expectOnePrecheckEach(b, [opsId(), callerId()])
+    expect([...b.pauseCalls].sort()).toEqual([opsId(), callerId()].sort())
+    expect(b.directorCallTimes.filter(([call]) => call.endsWith(`:${otherId()}`))).toEqual([])
+    expect(commandLines()).toEqual([cleanRestartRelaunchedLine(OPS_PERSONA), cleanRestartRelaunchedLine(personaOf(CALLER_BOT))])
+    expect(spawned(b)).toEqual([])
+    expect(b.exitCodes).toEqual([])
+  })
+
+  test('two bots under one shared deadline, named out of configuration order: other_bot relaunches late, caller_bot never; every wait read of both within polledAt + the wait, not twice it; both lines in configuration order, exit 1 at the deadline', async () => {
+    const b = bundle(rowsAfterPause({
+      [otherId()]: [ENDED_ROW, ENDED_ROW, ENDED_ROW, ENDED_ROW, WAITING_ROW],
+      [callerId()]: [ENDED_ROW],
+    }))
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT, OTHER_BOT]))
+
+    const waitMs = cleanRestartRelaunchWaitMs(twoBots().session_restart_delay)
+    const [, otherPolledAt, ...otherWaitReads] = callTimesOf(b, 'status', otherId())
+    const [, callerPolledAt, ...callerWaitReads] = callTimesOf(b, 'status', callerId())
+    expect(callerPolledAt).toBe(otherPolledAt!) // precondition: the two teardowns ran side by side
+    const deadline = otherPolledAt! + waitMs
+    // other_bot's relaunch came late: after reads of ended, not at the wait's first read.
+    expect(otherWaitReads.length).toBeGreaterThan(1)
+    expect(otherWaitReads.at(-1)!).toBeGreaterThan(otherPolledAt!)
+    expect(otherWaitReads.at(-1)!).toBeLessThan(deadline)
+    expect(callerWaitReads[0]).toBe(callerPolledAt!)
+    expect(callerWaitReads.at(-1)).toBe(deadline)
+    expect(b.directorCallTimes.filter(([, at]) => at > deadline)).toEqual([])
+    expect([...b.pauseCalls].sort()).toEqual([otherId(), callerId()].sort())
+    expect(b.killCalls).toEqual([])
+    expect(commandLines()).toEqual([
+      cleanRestartRelaunchedLine(personaOf(OTHER_BOT)),
+      cleanRestartNotRelaunchedLine(personaOf(CALLER_BOT), waitMs),
+    ])
+    expect(spawned(b)).toEqual([])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.exitTimes).toEqual([deadline])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  /** A `session_restart_delay` (s) long enough that the wait outlasts CLEAN_RESTART_RELAUNCH_WAIT_MS. */
+  const LONG_DELAY_S = CLEAN_RESTART_RELAUNCH_WAIT_MS / 1000
+
+  test.each<[string, ReadonlyArray<PrecheckRow | null | Thrown>, relaunched: boolean, delayS: number | null]>([
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row reads ${state} until the wait runs out`, [{ state }], false, null] as [string, PrecheckRow[], boolean, null]),
+    ['the row reads ended until the wait runs out, under a session_restart_delay past the wait\'s floor', [ENDED_ROW], false, LONG_DELAY_S],
+    ['no row until the wait runs out', [null], false, null],
+    ['every read of the wait fails', [ENDED_ROW, thrown(READ_ERROR)], false, null],
+    ['a read of the wait fails, then the relaunched row', [ENDED_ROW, thrown(READ_ERROR), WAITING_ROW], true, null],
+    ['ended, then the relaunch first read pending with a new launch start', [ENDED_ROW, ENDED_ROW, NEXT_LIFE_PENDING_ROW], true, null],
+  ])('the relaunch wait after the bot exited, %s: status reads only, the first at once and none past cleanRestartRelaunchWaitMs on the injected clock; the relaunched line and exit 0, or the not-relaunched line naming the wait and exit 1', async (_label, afterPause, relaunched, delayS) => {
+    // null: the configuration's default session_restart_delay.
+    const config = delayS === null ? twoBots() : twoBots({ session_restart_delay: delayS })
+    const waitMs = cleanRestartRelaunchWaitMs(config.session_restart_delay)
+    if (delayS !== null) expect(waitMs).toBeGreaterThan(CLEAN_RESTART_RELAUNCH_WAIT_MS) // precondition
+    const b = bundle({ ...rowsAfterPause({ [callerId()]: afterPause }), config })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    const caller = personaOf(CALLER_BOT)
+    const [, polledAt, ...waitReads] = callTimesOf(b, 'status', callerId())
+    expect(waitReads[0]).toBe(polledAt!)
+    expect(b.pauseCalls).toEqual([callerId()])
+    expect(b.killCalls).toEqual([])
+    expect(spawned(b)).toEqual([])
+    expect(listTimesOf(b)).toEqual([])
+    if (relaunched) {
+      expect(commandLines()).toEqual([cleanRestartRelaunchedLine(caller)])
+      expect(waitReads.at(-1)! - polledAt!).toBeLessThan(waitMs)
+      expect(b.exitCodes).toEqual([])
+    } else {
+      expect(commandLines()).toEqual([cleanRestartNotRelaunchedLine(caller, waitMs)])
+      expect(waitReads.at(-1)).toBe(polledAt! + waitMs)
+      expect(b.exitCodes).toEqual([1])
+      expect(b.exitTimes).toEqual([waitReads.at(-1)!])
+    }
+    expect(b.directorCallTimes.filter(([, at]) => at > polledAt! + waitMs)).toEqual([])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  /** Every next-life line the teardown logged (after the pause, at a new launch start, between kill tries). */
+  const nextLifeLines = (): string[] => stderr.filter((l) => l.startsWith('[slack] teardownBots: ') && l.includes('next life'))
+
+  test.each<[string, PrecheckRow]>([
+    ['waiting, with no launch start', WAITING_ROW],
+    ['working, with no launch start', { state: 'working' }],
+    ['pending, with no launch start yet', { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }],
+    ['pending, with a new launch start', NEXT_LIFE_PENDING_ROW],
+  ])('a poll read after a successful pause finds the row live (%s): its next life, stopped at that read with one next-life line and never killed; the wait sees it at once; the relaunched line, exit 0', async (_label, polled) => {
+    const b = bundle(rowsAfterPause({ [callerId()]: [polled] }))
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    const caller = personaOf(CALLER_BOT)
+    const [pausedAt] = callTimesOf(b, 'pause', callerId())
+    const polledAt = pausedAt! + TEARDOWN_POLL_FIRST_WAIT_MS
+    expect(callTimesOf(b, 'status', callerId())).toEqual([pausedAt!, polledAt, polledAt])
+    expect(b.killCalls).toEqual([])
+    expect(nextLifeLines()).toEqual([teardownNextLifeAfterPauseLine(caller, TEARDOWN_POLL_FIRST_WAIT_MS)])
+    expect(commandLines()).toEqual([cleanRestartRelaunchedLine(caller)])
+    expect(spawned(b)).toEqual([])
+    expect(b.exitCodes).toEqual([])
+  })
+
+  test('exit_timeout 0 after a successful pause: no poll and never the kill, the bot counts as exited; the wait reads it ended, then live; the relaunched line, exit 0', async () => {
+    const b = bundle({ ...rowsAfterPause(), config: twoBots({ exit_timeout: 0 }) })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    const [pausedAt] = callTimesOf(b, 'pause', callerId())
+    expect(callTimesOf(b, 'status', callerId()).slice(0, 2)).toEqual([pausedAt!, pausedAt!])
+    expect(b.killCalls).toEqual([])
+    expect(nextLifeLines()).toEqual([])
+    expect(commandLines()).toEqual([cleanRestartRelaunchedLine(personaOf(CALLER_BOT))])
+    expect(spawned(b)).toEqual([])
+    expect(b.exitCodes).toEqual([])
+  })
+
+  /** Two escalated pauses, the bots form's ways to its kill: a pause answering GONE, and one timing out. */
+  const BOTS_KILL_PATHS: ReadonlyArray<readonly [string, () => Overrides]> = [
+    ['a pause answering GONE', () => ({ directorPause: async () => { throw errTmuxSendKeys() } })],
+    ['a pause timing out (ErrPauseTimeout)', () => ({ directorPause: async () => { throw errPauseTimeout() } })],
+  ]
+  /** The old life's `pending` row with its launch start, as read before the pause. */
+  const OLD_PENDING_ROW: PrecheckRow = Object.freeze({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_DEFAULT })
+  const KILL_SENT = (): KillCase['kills'] => [cannedKillResult(true)]
+
+  test.each(BOTS_KILL_PATHS.flatMap(([path, overrides]) => ([
+    ['the old life\'s live state, unchanged after the kill, until the wait runs out', () => stops(KILL_SENT(), [1, 0], [WAITING_ROW]), WAITING_ROW, false],
+    ['the old life\'s pending row and launch start, unchanged after the kill, until the wait runs out', () => stops(KILL_SENT(), [1, 0], [OLD_PENDING_ROW]), OLD_PENDING_ROW, false],
+    ['ended, then live', () => stops(KILL_SENT(), [1, 0], [ENDED_ROW, WAITING_ROW]), WAITING_ROW, true],
+    ['no row, then live', () => stops(KILL_SENT(), [1, 0], [null, WAITING_ROW]), WAITING_ROW, true],
+    ['the relaunch read pending with a new launch start, with no finished read before it', () => stops(KILL_SENT(), [1, 0], [NEXT_LIFE_PENDING_ROW]), WAITING_ROW, true],
+    ['a kill try answering UNAVAILABLE whose read between tries finds ended (no further kill), then live', () => stops([thrown(errTmuxUnresponsive(KILL_VERB))], [1, 1], [ENDED_ROW, WAITING_ROW]), WAITING_ROW, true],
+    ['a kill answering ErrSpawnNotFound (the row already gone), then live', () => stops([thrown(errSpawnNotFound())], [1, 0], [WAITING_ROW]), WAITING_ROW, true],
+  ] as const).map(([label, kc, before, relaunched]) => [`${path}, ${label}`, overrides, kc, before, relaunched] as const)))(
+    'the bots form killing the bot (%s): the wait counts a live read only after a finished or absent one, or with a new launch start; the relaunched line and exit 0, or the not-relaunched line and exit 1 at the wait\'s end',
+    async (_label, path, kc, before, relaunched) => {
+      const b = bundle(killCaseOverrides(path(), { ...kc(), row: before }))
+
+      await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+      const caller = personaOf(CALLER_BOT)
+      expect(b.pauseCalls).toEqual([callerId()])
+      expect(b.killCalls).toEqual([callerId()])
+      expect(nextLifeLines()).toEqual([])
+      expect(spawned(b)).toEqual([])
+      expect(listTimesOf(b)).toEqual([])
+      if (relaunched) {
+        expect(commandLines()).toEqual([cleanRestartRelaunchedLine(caller)])
+        expect(b.exitCodes).toEqual([])
+      } else {
+        const waitMs = cleanRestartRelaunchWaitMs(twoBots().session_restart_delay)
+        expect(commandLines()).toEqual([cleanRestartNotRelaunchedLine(caller, waitMs)])
+        expect(b.exitCodes).toEqual([1])
+        expect(b.exitTimes).toEqual([callTimesOf(b, 'kill', callerId())[0]! + waitMs])
+      }
+      assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+    },
+  )
+
+  test.each(BOTS_KILL_PATHS)('the bots form, %s, a first kill try answering UNAVAILABLE and the read between tries showing a new launch start: its next life, so no further kill, no alert and no force-killed line, one next-life line; the relaunched line, exit 0', async (_label, path) => {
+    const b = bundle(killCaseOverrides(path(), stops([thrown(errTmuxUnresponsive(KILL_VERB))], [1, 1], [NEXT_LIFE_PENDING_ROW])))
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    const caller = personaOf(CALLER_BOT)
+    const [killedAt] = callTimesOf(b, 'kill', callerId())
+    expect(b.killCalls).toEqual([callerId()])
+    expect(callTimesOf(b, 'status', callerId()).filter((at) => at > killedAt!)).toEqual([killedAt! + KILL_RETRY_SPACING_MS, killedAt! + KILL_RETRY_SPACING_MS])
+    expect(nextLifeLines()).toEqual([teardownNextLifeBetweenKillTriesLine(caller)])
+    expect(stderr.filter((l) => l.includes('force-killed'))).toEqual([])
+    expect(commandLines()).toEqual([cleanRestartRelaunchedLine(caller)])
+    expect([existsSync(logPath), existsSync(startupErrorsPath())]).toEqual([false, false])
+    expect(spawned(b)).toEqual([])
+    expect(b.exitCodes).toEqual([])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test.each<[string, ReadonlyArray<PrecheckRow | null>, launched: boolean]>([
+    ['no row, then launched by the server', [null, null, WAITING_ROW], true],
+    ['no row until the wait runs out', [null], false],
+    ...[...AGENT_DIRECTOR_DEAD_STATES].flatMap((state): Array<[string, PrecheckRow[], boolean]> => [
+      [`a ${state} row, then launched by the server`, [{ state }, { state }, WAITING_ROW], true],
+      [`a ${state} row until the wait runs out`, [{ state }], false],
+    ]),
+  ])('a named bot that was not running (%s): no pause or kill; the not-running line, launched since or not seen launched within the wait; exit 0, or exit 1 at the wait\'s end', async (_label, reads, launched) => {
+    const b = bundle({ directorGet: async () => reads[0]!, directorStatus: scripted<PrecheckRow | null>(...reads) })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT]))
+
+    const caller = personaOf(CALLER_BOT)
+    const [readAt, waitReadAt] = callTimesOf(b, 'status', callerId())
+    expect(waitReadAt).toBe(readAt!)
+    expect(b.pauseCalls).toEqual([])
+    expect(b.killCalls).toEqual([])
+    expect(spawned(b)).toEqual([])
+    if (launched) {
+      expect(commandLines()).toEqual([cleanRestartNotRunningLaunchedLine(caller)])
+      expect(b.exitCodes).toEqual([])
+    } else {
+      const waitMs = cleanRestartRelaunchWaitMs(twoBots().session_restart_delay)
+      expect(commandLines()).toEqual([cleanRestartNotRunningNotLaunchedLine(caller, waitMs)])
+      expect(b.exitCodes).toEqual([1])
+      expect(b.exitTimes).toEqual([readAt! + waitMs])
+    }
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test('a named bot the teardown could not stop, beside one it stopped: its failure line, server.log line and startup-errors entry, the other\'s relaunched line, then the last line; exit 1 with no answer check, no not-restarted alert and no start', async () => {
+    const error = errCallTimeout('status')
+    const rows = rowsAfterPause()
+    const b = bundle({
+      ...rows,
+      directorStatus: async (id) => {
+        if (id === callerId()) throw error
+        return rows.directorStatus!(id)
+      },
+    })
+
+    await settled(createCli(b.deps).clean_restart([CALLER_BOT, OTHER_BOT]))
+
+    const failed = failedReport(CLI_COMMAND_CLEAN_RESTART, personaOf(CALLER_BOT), error, AD_ERROR_CLASS_UNAVAILABLE)
+    const last = teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, 1)
+    expect(commandLines()).toEqual([...failed.lines, cleanRestartRelaunchedLine(personaOf(OTHER_BOT)), last])
+    expect(stderr.at(-1)).toBe(last)
+    expect(serverLogTexts(b.clock.now())).toEqual([...failed.lines])
+    expect(startupErrorEntries()).toEqual([failed.entry])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.pauseCalls).toEqual([otherId()])
+    expect(b.killCalls).toEqual([])
+    expect(listTimesOf(b)).toEqual([])
+    expect(spawned(b)).toEqual([])
+    expect(stderr.filter((l) => l.includes(CLEAN_RESTART_NOT_STARTED_SENTENCE))).toEqual([])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, files: writtenTeardownLogs() })
   })
 })
 
@@ -2425,7 +2980,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
     const log: string[] = []
     const b = makeDeps({ ...o, initLogging: redirectTo(log) })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     expect(b.logInits).toEqual([join(stateDir, 'clean_restart.log')])
     const expected = lines()
@@ -2441,7 +2996,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
     const log: string[] = []
     const b = makeDeps({ initLogging: redirectTo(log) })
 
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
 
     expect(b.logInits).toEqual([join(stateDir, 'clean_restart.log')])
     expect(b.events.indexOf('initLogging')).toBeLessThan(b.events.indexOf('loadConfig'))
@@ -2453,7 +3008,7 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
   test('initLogging throwing: clean_restart still runs, its lines stay on the terminal and the fatal line appears once', async () => {
     const b = makeDeps({ spawnSyncStatus: 3, initLogging: () => { throw new Error('EACCES') } })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     expect(b.exitCodes).toEqual([3])
     expect(stderr).toContain('[slack] clean_restart: stopping server')
@@ -2473,6 +3028,8 @@ describe('createDirectorOps', () => {
 
   /** The `get` row the fake Client answers: a live row carrying a note and a launch start, so each field read shows. */
   const GET_ROW: PrecheckRow = { state: 'pending', liveness_note: provenanceNote, launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
+  /** The `status` row the fake Client answers: a `pending` row with its launch start, which the teardown's next-life rule reads. */
+  const STATUS_ROW = { state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
 
   /**
    * A fake Client whose verbs record [verb, request] and throw `fail` when
@@ -2488,7 +3045,7 @@ describe('createDirectorOps', () => {
     const client = {
       get: verb('get', { ...GET_ROW, instance_id: opsId() }),
       readPane: verb('readPane', cannedReadPaneResult(FAKE_PANE)),
-      status: verb('status', { state: 'working' }),
+      status: verb('status', STATUS_ROW),
       pause: verb('pause', {}),
       kill: verb('kill', killResult),
       list: verb('list', { spawns: [LIST_ROW] }),
@@ -2582,7 +3139,7 @@ describe('createDirectorOps', () => {
 
     expect(await ops.directorGet(opsId())).toEqual(GET_ROW)
     expect(await ops.directorReadPane(opsId(), PROBE_PANE_READ_LINES)).toBeUndefined()
-    expect(await ops.directorStatus(opsId())).toEqual({ state: 'working' })
+    expect(await ops.directorStatus(opsId())).toEqual(STATUS_ROW)
     await ops.directorPause(opsId())
     expect(await ops.directorKill(opsId())).toEqual(cannedKillResult(true))
     expect(await ops.directorList()).toEqual([LIST_ROW])
@@ -2679,7 +3236,7 @@ describe('teardown fails loudly when agent-director is unreachable', () => {
     ['ErrCallTimeout', () => new ErrCallTimeout('status', 35000, 30000)],
   ])('clean_restart exits 1 with no start when directorStatus and the answer check\'s list throw %s — never "no spawn row"', async (_name, makeErr) => {
     const b = makeDeps({ directorStatus: async () => { throw makeErr() }, directorList: async () => { throw makeErr() } })
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
     expect(b.exitCodes).toEqual([1])
     expect(listTimesOf(b)).toHaveLength(PRECHECK_TRIES)
     expect(startedServer(b)).toBe(false)
@@ -2703,7 +3260,7 @@ describe('initClient startup gate', () => {
       initClient: async () => { /* gate ok */ },
       directorStatus: async () => (++n === 1 ? { state: 'waiting' } : { state: 'ended' }),
     })
-    await createCli(b.deps).clean_restart()
+    await createCli(b.deps).clean_restart(['--server'])
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     // init, get, read-pane, the stop spawn, then the teardown's status and pause, then start.
     expect(b.events.filter((e) => e !== 'loadConfig' && e !== 'initLogging' && e !== 'sleep')).toEqual([
@@ -2775,7 +3332,7 @@ const settled = (p: Promise<void>): Promise<void> => p.catch((e) => { if (!(e in
 type Command = readonly [command: CliTeardownCommand, make: (o?: Overrides) => Bundle, run: (b: Bundle) => Promise<void>]
 const COMMANDS: readonly Command[] = [
   [CLI_COMMAND_STOP_BOTS, makeLiveStopDeps, (b) => settled(createCli(b.deps).stop({ stopBots: true }))],
-  [CLI_COMMAND_CLEAN_RESTART, makeDeps, (b) => settled(createCli(b.deps).clean_restart())],
+  [CLI_COMMAND_CLEAN_RESTART, makeDeps, (b) => settled(createCli(b.deps).clean_restart(['--server']))],
 ]
 
 /** Each row of `rows` for each command: `[command, label, spec, Command]`. */
@@ -3136,6 +3693,10 @@ describe('precheck before anything is stopped', () => {
 type StatusRow = { readonly state: string }
 const WAITING_ROW: StatusRow = Object.freeze({ state: 'waiting' })
 const ENDED_ROW: StatusRow = Object.freeze({ state: 'ended' })
+/** A launch start other than {@link SAMPLE_LAUNCH_START_DEFAULT}: the life a relaunch starts. */
+const NEXT_LAUNCH_START = '2026-05-24T12:05:00Z'
+/** A relaunch first read `pending` with its own launch start (agent-director gives one only on a `pending` row). */
+const NEXT_LIFE_PENDING_ROW: PrecheckRow = Object.freeze({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: NEXT_LAUNCH_START })
 
 /**
  * Every persona was stopped: `stop --stop-bots` stopped the server and exits
@@ -3376,6 +3937,38 @@ describe('the teardown\'s state read and poll on the injected clock (hatch note 
     const [pausedAt] = callTimesOf(b, 'pause')
     expect(callTimesOf(b, 'status')).toEqual([pausedAt!, pausedAt! + TEARDOWN_POLL_FIRST_WAIT_MS])
     expect(b.killCalls).toEqual([])
+    expectTeardownStopped(b, command)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  const pendingRow = (launchStartedAt: PrecheckRow['launch_started_at']): PrecheckRow => ({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStartedAt })
+  /** The persona's line when a poll read shows its next life. */
+  const nextLifeLines = (): string[] =>
+    stderr.filter((l) => l.startsWith(`[slack] teardownBots: persona ${renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))} reads a new launch start `))
+
+  test.each(forEachCommand<readonly [before: PrecheckRow, polled: PrecheckRow, nextLife: boolean]>([
+    ['a launch start other than the one read before the pause', [pendingRow(SAMPLE_LAUNCH_START_DEFAULT), pendingRow(NEXT_LAUNCH_START), true]],
+    ['a launch start where none was read before the pause', [WAITING_ROW, pendingRow(NEXT_LAUNCH_START), true]],
+    ['the launch start read before the pause', [pendingRow(SAMPLE_LAUNCH_START_DEFAULT), pendingRow(SAMPLE_LAUNCH_START_DEFAULT), false]],
+    ['the same launch start spelled otherwise', [pendingRow(SAMPLE_LAUNCH_START_WHOLE), pendingRow('2026-05-24T12:00:00.000Z'), false]],
+    ['no launch start, after one was read before the pause', [pendingRow(SAMPLE_LAUNCH_START_DEFAULT), WAITING_ROW, false]],
+    ['no launch start, before the pause or at any poll (every read waiting)', [WAITING_ROW, WAITING_ROW, false]],
+    ['an unreadable launch start', [pendingRow(SAMPLE_LAUNCH_START_DEFAULT), pendingRow('not a time'), false]],
+  ]))('%s: every poll read live with %s: a new one is the persona\'s next life, stopped at that read with no kill; any other is the old life, killed at exit_timeout', async (command, _label, [before, polled, nextLife], [, make, run]) => {
+    const exitTimeoutS = 1
+    const b = make({ config: opsConfig({ exit_timeout: exitTimeoutS }), directorStatus: scripted<PrecheckRow>(before, polled) })
+
+    await run(b)
+
+    const [pausedAt] = callTimesOf(b, 'pause')
+    if (nextLife) {
+      expect(callTimesOf(b, 'status')).toEqual([pausedAt!, pausedAt! + TEARDOWN_POLL_FIRST_WAIT_MS])
+      expect(b.killCalls).toEqual([])
+      expect(nextLifeLines()).toHaveLength(1)
+    } else {
+      expect(callTimesOf(b, 'kill')).toEqual([pausedAt! + exitTimeoutMsOf(exitTimeoutS)])
+      expect(nextLifeLines()).toEqual([])
+    }
     expectTeardownStopped(b, command)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
@@ -3634,6 +4227,8 @@ const KILL_READ_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`a read of ${state}`, () => stops([thrown(errTmuxUnresponsive(KILL_VERB))], [1, 1], [{ state }])] as const),
   ['a read finding no row (null)', () => stops([thrown(errTmuxUnresponsive(KILL_VERB))], [1, 1], [null])],
   ['a read answering ErrSpawnNotFound', () => stops([thrown(errTmuxUnresponsive(KILL_VERB))], [1, 1], [thrown(errSpawnNotFound())])],
+  // A launch start other than the one read before the pause: the next life, stopped with no further kill and no alert.
+  ['a read of a pending row with a new launch start (the next life: no further kill)', () => stops([thrown(errTmuxUnresponsive(KILL_VERB))], [1, 1], [NEXT_LIFE_PENDING_ROW])],
   // Any other read lets the next try go ahead and latches nothing.
   ...([
     ['a read answering UNAVAILABLE (ErrCallTimeout)', () => thrown(errCallTimeout(STATUS_VERB))],
@@ -4512,7 +5107,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
       directorList: scripted<readonly never[]>(...Array.from({ length: tries - 1 }, () => thrown(listError)), []),
     })
 
-    await settled(createCli(b.deps).clean_restart())
+    await settled(createCli(b.deps).clean_restart(['--server']))
 
     const times = listTimesOf(b)
     expect(times).toEqual(Array.from({ length: tries }, (_, i) => callTimesOf(b, PAUSE_VERB, idOf(alphaP))[0]! + i * PRECHECK_TRY_SPACING_MS))
@@ -4534,7 +5129,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     const b = makeDeps({ ...teardownOverrides([[alphaP, failure]]), spawnSyncStatus: START_STATUS })
     const atStart = printedAtStart(b)
 
-    await settled(createCli(b.deps).clean_restart())
+    await settled(createCli(b.deps).clean_restart(['--server']))
 
     const [report] = reportsOf(CLI_COMMAND_CLEAN_RESTART, [[alphaP, failure]])
     expectRestarted(b)
@@ -4559,7 +5154,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     const failures = [[alphaP, sentinelConflictAtPause()]] as const
     const b = makeDeps({ ...teardownOverrides(failures), directorList: async () => { throw listError }, initLogging: redirectTo(log) })
 
-    await settled(createCli(b.deps).clean_restart())
+    await settled(createCli(b.deps).clean_restart(['--server']))
 
     const times = listTimesOf(b)
     expect(times).toEqual(Array.from({ length: PRECHECK_TRIES }, (_, i) => times[0]! + i * PRECHECK_TRY_SPACING_MS))
@@ -4586,7 +5181,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
       ...failure.overrides,
     })
 
-    await settled(createCli(b.deps).clean_restart())
+    await settled(createCli(b.deps).clean_restart(['--server']))
 
     const reports = reportsOf(CLI_COMMAND_CLEAN_RESTART, failures)
     const lines = reports.flatMap((r) => r.lines)
@@ -4610,7 +5205,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     const failures = [[alphaP, conflictAtPause(alphaP)], [betaP, unavailableAtKill(betaP)]] as const
     const b = makeDeps({ ...teardownOverrides(failures), directorList: async () => { throw errCallTimeout(LIST_CALL) }, initLogging: redirectTo(log) })
 
-    await settled(createCli(b.deps).clean_restart())
+    await settled(createCli(b.deps).clean_restart(['--server']))
 
     expect(listTimesOf(b)).toHaveLength(PRECHECK_TRIES)
     const alert = expectNotRestarted(b, failures, log)
@@ -4623,7 +5218,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
     const callMs = DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
     const b = makeDeps({ ...teardownOverrides([[alphaP, conflictAtPause(alphaP)]]), callMs, directorList: async () => { throw errCallTimeout(LIST_CALL) } })
 
-    await settled(createCli(b.deps).clean_restart())
+    await settled(createCli(b.deps).clean_restart(['--server']))
 
     const times = listTimesOf(b)
     expect(times).toEqual(Array.from({ length: PRECHECK_TRIES }, (_, i) => times[0]! + i * (callMs + PRECHECK_TRY_SPACING_MS)))
@@ -5015,7 +5610,7 @@ describe('stop --stop-bots on the development sentinel below Phase 1', () => {
     const client = makeStubClient({ ...log, binaryVersion: DEV_PLACEHOLDER_VERSION })
     const b = productionWired(makeDeps, { client, calls: created })
 
-    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
     expect(b.initClientGates).toEqual([undefined])
     expect(created.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
@@ -5146,7 +5741,7 @@ describe('stop --stop-bots on the development sentinel below Phase 1', () => {
       const refusal = await wholeGateRefusal(kind)
       const b = makeLiveStopDeps({ initClient: async () => { throw refusal } })
 
-      await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+      await expect(createCli(b.deps).clean_restart(['--server'])).rejects.toBeInstanceOf(ExitError)
 
       expect(b.initClientGates).toEqual([undefined])
       expect(b.exitCodes).toEqual([1])
@@ -5502,7 +6097,7 @@ const ACTING_COMMANDS: ReadonlyArray<readonly [string, () => Overrides, (b: Bund
   ['start (pre-flight and daemon start)', () => ({}), (b) => createCli(b.deps).start(), false],
   ['stop', upOnce, (b) => createCli(b.deps).stop(), false],
   ['stop --stop-bots', upOnce, (b) => createCli(b.deps).stop({ stopBots: true }), true],
-  ['clean_restart', () => ({}), (b) => createCli(b.deps).clean_restart(), true],
+  ['clean_restart', () => ({}), (b) => createCli(b.deps).clean_restart(['--server']), true],
   ['credentials <persona>', () => ({}), (b) => createCli(b.deps).credentials([OPS_NAME]), false],
   ['clear-latch <persona> (a running server clears the latch)', clearsOnRunningServer, (b) => createCli(b.deps).clearLatch([OPS_NAME]), false],
 ]
@@ -5728,7 +6323,7 @@ describe('unknown subcommand', () => {
     expect(reloadTermsIn(output)).toEqual([])
   })
 
-  test('no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials and clear-latch (with line), and only --stop-bots, under stop, with no reload wording', () => {
+  test('no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials and clear-latch (with line), and only --stop-bots under stop and --server under clean_restart, with no reload wording', () => {
     const result = runCli([])
 
     expect(result.status).not.toBe(0)
@@ -5738,10 +6333,20 @@ describe('unknown subcommand', () => {
     const usage = usageEntries(result.output)
     expect(usage.synopsis.sort()).toEqual(['clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
     expect(usage.listed.sort()).toEqual(['clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
-    expect(usage.flags).toEqual({ stop: ['--stop-bots'] })
+    expect(usage.flags).toEqual({ stop: ['--stop-bots'], clean_restart: [CLEAN_RESTART_SERVER_FLAG] })
     expect(usage.unexpected).toEqual([])
-    expect(usage.allFlags).toEqual(['--stop-bots'])
+    // The second --server is the warning line's.
+    expect(usage.allFlags).toEqual(['--stop-bots', CLEAN_RESTART_SERVER_FLAG, CLEAN_RESTART_SERVER_FLAG])
     expect(reloadTermsIn(result.output)).toEqual([])
+    // clean_restart's two forms: the named bots in its entry, --server under its flags, then the warning naming both, last.
+    expect(CLI_USAGE_LINES.filter((line) => /^\s+clean_restart\s+<bot name or key> \[<bot name or key>…\]: /.test(line))).toHaveLength(1)
+    const flagsAt = CLI_USAGE_LINES.indexOf('clean_restart flags:')
+    expect(CLI_USAGE_LINES[flagsAt + 1]).toStartWith(`  ${CLEAN_RESTART_SERVER_FLAG} `)
+    const warning = CLI_USAGE_LINES.at(-1)!
+    expect(warning).toStartWith('Warning: ')
+    expect(warning).toContain(`clean_restart ${CLEAN_RESTART_SERVER_FLAG} run from a bot`)
+    expect(warning).toContain('clean_restart naming the calling bot')
+    expect(warning).toEndWith('takes that bot down too')
     // clear-latch's one entry is the exported one (its wording is
     // pinned against line in tests/clear-latch.test.ts's pin table).
     expect(result.stderr.split('\n').filter((line) => /^\s+clear-latch\b/.test(line))).toEqual([CLEAR_LATCH_USAGE_ENTRY])

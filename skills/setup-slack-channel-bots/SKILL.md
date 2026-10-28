@@ -606,11 +606,12 @@ on a running server, the operator waits for the `reload-applied` line, then
 runs:
 
 ```bash
-claude-slack-channel-bots clean_restart
+claude-slack-channel-bots clean_restart --server
 ```
 
 It restarts the server and relaunches every persona; conversations resume.
-The operator runs it; you never do.
+The operator runs it from a terminal; you never do. Run from a bot's own
+session, it ends that session and leaves the server down.
 
 After the change is applied (a confirmation or a first start), confirm each
 new persona came up: `server.log` has its `persona-start` line
@@ -655,7 +656,8 @@ Report:
 - The next action from Step 10: start the server, or read and confirm
   `config.json.pending`. On a running server where Step 7 changed
   `append_system_prompt_file`, the system-prompt file or `system_prompt_mode`,
-  add: after `reload-applied`, run `claude-slack-channel-bots clean_restart`.
+  add: after `reload-applied`, run `claude-slack-channel-bots clean_restart --server`
+  from a terminal.
 - How to confirm each new persona came up (Step 10).
 
 If a persona doesn't come up or doesn't answer, point the operator to

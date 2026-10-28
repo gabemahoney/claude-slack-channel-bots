@@ -111,16 +111,25 @@ A human fixes `~/.config/agent-director/config.toml` following agent-director's 
 agent-director returned an error the server can't classify; the server keeps retrying. A human checks the host's agent-director and the persona's lines in `server.log`; the next retry recovers the persona once agent-director answers normally. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-an-unclassified-agent-director-error-notice).
 
 **Session stuck during clean_restart**
-A bot that doesn't exit within `exit_timeout` is force-killed; one that still can't be stopped fails the command (see "`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`" below). Rows are never deleted, so running `clean_restart` again is safe. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-stuck-during-clean_restart).
+A bot that doesn't exit within `exit_timeout` is force-killed (under `clean_restart <bot>…`, a bot whose pause succeeds is never force-killed, and only a refused pause leads to the force-kill); one that still can't be stopped fails the command (see "`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`" below). Rows are never deleted, so running `clean_restart` again is safe. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-stuck-during-clean_restart).
+
+**`clean_restart` exits 2 with `Usage:`**
+It needs `--server` (the server and every bot) or the names of the bots to restart; a bare `clean_restart` stops nothing. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-exits-2-with-usage).
+
+**The server and every bot are down after `clean_restart --server` run from a bot**
+The command ended with the bot's session before it started the server. Start it from a terminal with `claude-slack-channel-bots start`; from a bot, name only other bots. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-and-every-bot-are-down-after-clean_restart---server-run-from-a-bot).
+
+**`clean_restart <bot>…` says a bot was `not seen relaunched`**
+The bot was stopped, and the server relaunches it on its own schedule; its `server.log` lines say when or why not. If `session_restart_delay` was changed from `0` since the server started, the server won't relaunch it: restart the server (`clean_restart --server` from a terminal). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-bot-says-a-bot-was-not-seen-relaunched).
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`**
-The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names (see [Precheck before stopping bots](cli.md#precheck-before-stopping-bots)), then run the command again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-nothing-was-stopped).
+The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names (see [Precheck before stopping bots](cli.md#precheck-before-stopping-bots)), then run the command again. For `clean_restart <bot>…`, a line naming an argument, no running server or `session_restart_delay is 0` is a refusal, not a precheck failure; it says what to run instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-nothing-was-stopped).
 
 **`stop --stop-bots` exits non-zero with `only the server was stopped`**
 The installed agent-director is below the client's own minimum, so only the server was stopped. Follow the docs/migration.md section "Switching over to agent-director Phase 1". [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-stop---stop-bots-exits-non-zero-with-only-the-server-was-stopped).
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`**
-Each `could not stop persona` line names a persona, its session and the class of the failure. Fix the cause and run the command again; rows are never deleted. If `clean_restart` says the server was not started, start it with `claude-slack-channel-bots start` once `agent-director version` answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-could-not-stop).
+Each `could not stop persona` line names a persona, its session and the class of the failure. Fix the cause and run the command again; rows are never deleted. If `clean_restart --server` says the server was not started, start it with `claude-slack-channel-bots start` once `agent-director version` answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-could-not-stop).
 
 **Bots come back with no memory of the prior conversation after a reboot**
 A bot starts a new conversation when its session no longer matches the applied configuration, when it was retired by a confirmed change, once after an upgrade, or after 2 resumes in a row that failed. Search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row`, `key is retired` or `not resuming its transcript again` to see which. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bots-come-back-with-no-memory-of-the-prior-conversation-after-a-reboot).
@@ -134,7 +143,7 @@ A regression in some Claude Code releases (for example v2.1.120). Set `resume_en
 
 The server daemon writes runtime output to `~/.config/claude-slack-channel-bots/server.log` (and `clean_restart.log` for the `clean_restart` subcommand). Rotation is built into CSCB, so it applies on every machine with no per-host logrotate config: when the active file crosses `CSCB_LOG_MAX_BYTES` it is rolled to `server.log.1`, the previous `.1` → `.2`, and so on up to `CSCB_LOG_KEEP` generations; the oldest is discarded. Rotated generations are not compressed. See the environment variables in [Configuration](server-settings.md#environment-variables) for the size, retention, and verbosity settings that tune this behavior.
 
-`stop --stop-bots` and `clean_restart` append their bot-teardown lines to `server.log` while the server is stopped (see [What the command prints when a bot can't be stopped](cli.md#what-the-command-prints-when-a-bot-cant-be-stopped)); those lines take the same timestamped form and are rotated the same way.
+`stop --stop-bots` and `clean_restart` append their bot-teardown lines to `server.log`, while the server is stopped or, for `clean_restart <bot>…`, while it runs (see [What the command prints when a bot can't be stopped](cli.md#what-the-command-prints-when-a-bot-cant-be-stopped)); those lines take the same timestamped form and are rotated the same way.
 
 Note this covers only `server.log` / `clean_restart.log`. `startup-errors.log` and `permission-trail.jsonl` are separate append-only files with their own retention (see below). The cron log is never rotated; `cron_log_max_bytes` caps it instead (see [The cron log](scheduled-prompts.md#the-cron-log)).
 

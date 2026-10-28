@@ -780,6 +780,36 @@
  *                                    (`adGraceMs` of
  *                                    DEFAULT_AD_SETTINGS_IN_EFFECT,
  *                                    src/ad-settings.ts)
+ *   CLEAN_RESTART_SERVER_FLAG        `clean_restart`'s whole-fleet flag
+ *                                    (src/cli-teardown.ts; b.ku8)
+ *   CLEAN_RESTART_USAGE              `clean_restart`'s usage line, printed
+ *                                    with exit 2 (src/cli.ts)
+ *   cleanRestartRelaunchWaitMs <delay>
+ *                                    how long, in ms, `clean_restart <bot>…`
+ *                                    waits for each stopped bot's relaunch
+ *                                    under `session_restart_delay` <delay>
+ *                                    seconds (src/cli-teardown.ts)
+ *   CLEAN_EXIT_RELAUNCH_DELAY        the server's clean-exit check's delay in
+ *                                    seconds (src/restart.ts)
+ *   cleanExitRelaunchLine <key> <delay>
+ *                                    the server's line when the clean-exit
+ *                                    check relaunches persona <key> at once
+ *                                    instead of after <delay> seconds
+ *                                    (src/restart.ts)
+ *   CLEAN_RESTART_NAMED_BOTS_LINE    `clean_restart <bot>…`'s progress line
+ *                                    (src/cli-teardown.ts)
+ *   cleanRestartRelaunchedLine <name>
+ *                                    `clean_restart <bot>…`'s line for a bot
+ *                                    the server was seen relaunching
+ *   cleanRestartNotRelaunchedLine <name> <wait-ms>
+ *                                    its line for a bot it stopped but did
+ *                                    not see relaunched within <wait-ms>
+ *   teardownNextLifeAfterPauseLine.head <name>
+ *   teardownNextLifeAfterPauseLine.tail <name>
+ *                                    the parts of the teardown's line for a
+ *                                    poll read live after a successful pause
+ *                                    (the bot's next life) before and after
+ *                                    its elapsed milliseconds
  * Scenario 7, reuse replaces delete (test-19; b.jg5 SRJ-1409, SRJ-413,
  * SRJ-707, SRJ-712):
  *   personaPreTrustLogLine <name> <verb> <value>
@@ -2768,6 +2798,16 @@ async function cliPersona(name: string): Promise<{ readonly name: string; readon
 }
 
 /**
+ * The teardown's next-life line after a successful pause
+ * (`teardownNextLifeAfterPauseLine`, src/cli-teardown.ts) for the persona
+ * named `name`, cut around its elapsed milliseconds.
+ */
+async function teardownNextLifeAfterPauseParts(name: string): Promise<{ readonly head: string; readonly tail: string }> {
+  const line = (await fn<(p: object, ms: number) => string>('cli-teardown.ts', 'teardownNextLifeAfterPauseLine'))(await cliPersona(name), COUNT_STAND_IN)
+  return around(line, String(COUNT_STAND_IN), 'teardownNextLifeAfterPauseLine')
+}
+
+/**
  * The report (`personaTeardownReportOf`) of the persona named `name` under
  * the `CLI_COMMAND_*` export `commandName`, whose teardown kill's tries
  * ended exhausted after `KILL_RETRY_TRIES` kills on an `ErrTmuxKillFailed`
@@ -3068,6 +3108,36 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
       const defaults = await value('ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
       return String((await fn<(values: unknown) => number>('ad-settings.ts', 'adGraceMs'))(defaults))
     },
+  },
+  // Scenario 9's clean_restart forms (test-21; b.ku8).
+  CLEAN_RESTART_SERVER_FLAG: { args: [], print: () => text('cli-teardown.ts', 'CLEAN_RESTART_SERVER_FLAG') },
+  CLEAN_RESTART_USAGE: { args: [], print: () => text('cli.ts', 'CLEAN_RESTART_USAGE') },
+  cleanRestartRelaunchWaitMs: {
+    args: ['delay'],
+    print: async ([raw]) => String((await fn<(s: number) => number>('cli-teardown.ts', 'cleanRestartRelaunchWaitMs'))(count(raw))),
+  },
+  CLEAN_EXIT_RELAUNCH_DELAY: { args: [], print: () => text('restart.ts', 'CLEAN_EXIT_RELAUNCH_DELAY') },
+  cleanExitRelaunchLine: {
+    args: ['key', 'delay'],
+    print: async ([key, raw]) => (await fn<(k: string, d: number) => string>('restart.ts', 'cleanExitRelaunchLine'))(key, count(raw)),
+  },
+  CLEAN_RESTART_NAMED_BOTS_LINE: { args: [], print: () => text('cli-teardown.ts', 'CLEAN_RESTART_NAMED_BOTS_LINE') },
+  cleanRestartRelaunchedLine: {
+    args: ['name'],
+    print: async ([name]) => (await fn<(p: object) => string>('cli-teardown.ts', 'cleanRestartRelaunchedLine'))(await cliPersona(name)),
+  },
+  cleanRestartNotRelaunchedLine: {
+    args: ['name', 'wait-ms'],
+    print: async ([name, raw]) =>
+      (await fn<(p: object, w: number) => string>('cli-teardown.ts', 'cleanRestartNotRelaunchedLine'))(await cliPersona(name), count(raw)),
+  },
+  'teardownNextLifeAfterPauseLine.head': {
+    args: ['name'],
+    print: async ([name]) => (await teardownNextLifeAfterPauseParts(name)).head,
+  },
+  'teardownNextLifeAfterPauseLine.tail': {
+    args: ['name'],
+    print: async ([name]) => (await teardownNextLifeAfterPauseParts(name)).tail,
   },
   // Scenario 7 (test-19; b.jg5 SRJ-1409).
   personaPreTrustLogLine: {
