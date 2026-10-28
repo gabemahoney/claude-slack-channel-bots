@@ -257,6 +257,15 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
   }
   const boundMs = adLaunchBoundMs(settings, input('OVR_DIALOG_READY_MS'))
   const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
+  /** The time limit of each probe's child shell. */
+  const PROBE_LIMIT_MS = 10_000
+  /**
+   * The verbatim oracle launches about 120 processes in sequence for one
+   * recoveryProbe. Where a launch costs about 30 ms that takes 3.4 to 4.3 s,
+   * too close to bun's default 5 s. Above the probe's limit, so the limit,
+   * not the test runner, ends a stuck probe.
+   */
+  const RECOVERY_PROBE_TEST_TIMEOUT_MS = 12_000
   function probe(completed: number, command: string, options: { boundMs?: number; base?: number; ceiling?: number; launchAt?: number } = {}) {
     const root = mkdtempSync('/tmp/timing-bound-control-')
     const base = options.base ?? input('OVR_RETRY_BASE_S'), ceiling = options.ceiling ?? input('OVR_RETRY_CEILING_S')
@@ -288,7 +297,7 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
     ].join('\n')
     try {
       const result = spawnSync('bash', ['-c', script], {
-        env: hostSafeChildEnv(root, { tools: ['bash', 'awk', 'jq', 'wc', 'grep', 'cat'] }), encoding: 'utf8', timeout: 10_000,
+        env: hostSafeChildEnv(root, { tools: ['bash', 'awk', 'jq', 'wc', 'grep'] }), encoding: 'utf8', timeout: PROBE_LIMIT_MS,
       })
       expect(result.error).toBeUndefined()
       expect(result.signal).toBeNull()
@@ -359,17 +368,21 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
       // These are the production retry builders. The printer itself is a
       // Docker-only entry point; execute the extracted audit, not the scenario.
       `printed() { case "$1" in unavailableRetryDueS) case "$2" in ${dueCases} esac;; unavailableRetryRetryLine) case "$3" in ${Array.from({length: 11}, (_, i) => `${i + 1}) echo ${quote(unavailableRetryRetryLine('fixture', i + 1, false))};;`).join('\n')} esac;; unavailableRetryReArmedLine) case "$3" in ${Array.from({length: 10}, (_, i) => `${i + 1}) echo ${quote(unavailableRetryReArmedLine('fixture', i + 1, false, 'fixture-marker', undefined, 0))};;`).join('\n')} esac;; pendingRowRuleRoundLineHead) echo fixture-round;; *) exit 9;; esac; }`,
+      // The modeled server.log and CSCB's AD calls, one tab-separated line per element.
+      `LOG=(${[...logs.map(([line, at]) => `${at}\t${line}`), ...records.filter(r => r.beforeB).map(r => `${r.end! - 0.001}\tfixture-round before B: nothing more this round`)].map(quote).join(' ')})`,
+      `GETS=(${calls.get.map(quote).join(' ')}) KILLS=(${calls.kill.map(quote).join(' ')})`,
+      // The stand-ins below launch no process: each launch costs tens of
+      // milliseconds on a slow host, and the oracle calls them in a loop.
+      // at_or_after <a> <b>: a >= b, for the fixture's non-negative decimal times only.
+      `at_or_after() { [[ "$1" =~ ^([0-9]+)([.]([0-9]+))?$ ]] || exit 9; local ai="\${BASH_REMATCH[1]}" af="\${BASH_REMATCH[3]}"; [[ "$2" =~ ^([0-9]+)([.]([0-9]+))?$ ]] || exit 9; local bi="\${BASH_REMATCH[1]}" bf="\${BASH_REMATCH[3]}"; (( 10#$ai == 10#$bi )) || return $(( 10#$ai > 10#$bi ? 0 : 1 )); while (( \${#af} < \${#bf} )); do af+=0; done; while (( \${#bf} < \${#af} )); do bf+=0; done; [[ ! "$af" < "$bf" ]]; }`,
       // log_lines uses substring matching, as the scenario's log reader does.
-      `log_lines() { while IFS=$'\t' read -r at line; do [[ "$line" == *"$1"* ]] && printf '%s\t%s\n' "$at" "$line"; done < "$fixture/retries.tsv"; return 0; }`,
+      `log_lines() { local l; for l in "\${LOG[@]}"; do [[ "\${l#*$'\t'}" == *"$1"* ]] && printf '%s\n' "$l"; done; return 0; }`,
       `log_time() { echo "\${1%%$'\t'*}"; }`,
-      `cscb_ad_calls() { [[ "$2 $3" == '--instance-id cscb_fixture' ]] || exit 9; case "$1" in get) cat "$fixture/gets.tsv";; kill) cat "$fixture/kills.tsv";; *) exit 9;; esac; }`,
-      `first_cscb_call_at_or_after() { local a="$1"; shift; cscb_ad_calls "$@" | awk -F'\t' -v a="$a" '$2 >= a { print; exit }'; }`,
-      `call_fields() { CALL_T="$(awk -F'\t' '{print $2}' <<< "$2")"; }`,
-      `log_lines_from() { local a="$1" b="$2"; log_lines "$3" | awk -F'\t' -v a="$a" -v b="$b" '$1 >= a && $1 < b'; }`,
-      `printf '%s\n' ${quote(logs.map(([line, at]) => `${at}\t${line}`).join('\n'))} > "$fixture/retries.tsv"`,
-      `printf '%s\n' ${quote(calls.get.join('\n'))} > "$fixture/gets.tsv"`,
-      `printf '%s\n' ${quote(calls.kill.join('\n'))} > "$fixture/kills.tsv"`,
-      ...records.filter(r => r.beforeB).map(r => `printf '%s\n' ${quote(`${r.end! - 0.001}\tfixture-round before B: nothing more this round`)} >> "$fixture/retries.tsv"`),
+      `ad_calls_of() { [[ "$2 $3" == '--instance-id cscb_fixture' ]] || exit 9; case "$1" in get) CALLS=("\${GETS[@]}");; kill) CALLS=("\${KILLS[@]}");; *) exit 9;; esac; }`,
+      `cscb_ad_calls() { ad_calls_of "$@"; printf '%s\n' "\${CALLS[@]}"; }`,
+      `first_cscb_call_at_or_after() { local a="$1" l t; shift; ad_calls_of "$@"; for l in "\${CALLS[@]}"; do t="\${l#*$'\t'}"; t="\${t%%$'\t'*}"; at_or_after "$t" "$a" && { printf '%s\n' "$l"; return 0; }; done; return 0; }`,
+      `call_fields() { local f="\${2#*$'\t'}"; CALL_T="\${f%%$'\t'*}"; }`,
+      `log_lines_from() { local l; for l in "\${LOG[@]}"; do [[ "\${l#*$'\t'}" == *"$3"* ]] && at_or_after "\${l%%$'\t'*}" "$1" && ! at_or_after "\${l%%$'\t'*}" "$2" && printf '%s\n' "$l"; done; return 0; }`,
       'for ((i=0; i<10; i++)); do if call_timeout_recovery_started control t2; then echo "recovered $CT_RECOVERY_RETRY $CT_RECOVERY_AT"; exit 0; fi; done; fail "no recovery"',
     ].join('\n')
     return probe(completed, commands, options)
@@ -383,27 +396,36 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
     })
   }
 
-  test.each([30, 40.059])('actual retry audit accepts retry five at error +%s, rejects a one-retry delay still inside the global deadline', completed => {
+  test.each([30, 40.059])('actual retry audit accepts retry five at error +%s', completed => {
     const positive = recoveryProbe(completed, retries(completed, 5))
     expect(positive.status).toBe(0)
     expect(positive.stdout).toContain('recovered 5')
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
+
+  test.each([30, 40.059])('actual retry audit at error +%s rejects a one-retry delay still inside the global deadline', completed => {
     const delayed = retries(completed, 6)
     expect(delayed.at(-1)!.kill!).toBeLessThan(completed + 135 + input('LOG_WAIT_S') + input('LAUNCH_WAIT_S') + input('REPORT_WAIT_S'))
     const negative = recoveryProbe(completed, delayed)
     expect(negative.status).toBe(1)
     expect(negative.stderr).toContain('first eligible retry 5 ended without a CSCB checked kill')
-  })
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
 
   test('AD launch start +1 moves B from +121 to +122 and eligibility from retry four to five', () => {
     const noOffset = probe(46, 'echo "$CT_ELIGIBLE_RETRY $CT_BOUND_AT"')
     const offset = probe(46, 'echo "$CT_ELIGIBLE_RETRY $CT_BOUND_AT"', { launchAt: 1 })
     expect(noOffset.stdout.trim()).toBe('4 121.000000')
     expect(offset.stdout.trim()).toBe('5 122.000000')
+  })
+
+  test('with AD launch start +1 the actual retry audit accepts retry five', () => {
     expect(recoveryProbe(46, retries(46, 5), { launchAt: 1 }).status).toBe(0)
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
+
+  test('with AD launch start +1 the actual retry audit rejects retry four\'s kill before B', () => {
     const early = recoveryProbe(46, retries(46, 4), { launchAt: 1 })
     expect(early.status).toBe(1)
     expect(early.stderr).toContain('CSCB kill before B')
-  })
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
 
   test.each(['read-crossing', 'return-crossing', 'before-B-answer'])('a retry beginning before B uses actual AD observations across B: %s', mode => {
     const records = retries(45.99, mode === 'before-B-answer' ? 5 : 4)
@@ -413,7 +435,7 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
     const result = recoveryProbe(45.99, records)
     expect(result.status).toBe(0)
     expect(result.stdout).toContain(`recovered ${mode === 'before-B-answer' ? 5 : 4}`)
-  })
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
 
   test('a retry crossing B cannot silently defer recovery without a production before-B answer', () => {
     const records = retries(45.99, 5)
@@ -421,7 +443,7 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
     const result = recoveryProbe(45.99, records)
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('crossed B without recovery or a production before-B answer')
-  })
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
 
   test.each(['pending', 'late-kill'])('an eligible retry has its own row-check phase bound: %s', mode => {
     const records = retries(40.059, 5)
@@ -429,7 +451,7 @@ describe('CI round 3: test-26 recovery observation deadline', () => {
     const result = recoveryProbe(40.059, records, { now: 205.06 })
     expect(result.status).toBe(1)
     expect(result.stderr).toContain(mode === 'pending' ? 'retry 5 exceeded its bounded recovery phase' : 'retry 5 kill exceeded its bounded recovery phase')
-  })
+  }, RECOVERY_PROBE_TEST_TIMEOUT_MS)
 
   test('the low leg additionally bounds the following retry that stops its timer', () => {
     const result = probe(30, 'first="$CT_DEADLINE"; call_timeout_observation_deadline 0 30 "$OVR_RETRY_CEILING_S"; seconds_between "$first" "$CT_DEADLINE"')
