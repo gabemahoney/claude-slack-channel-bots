@@ -415,6 +415,11 @@
 #                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and, before
 #                                      any signal, unless that process is a stub lingering in
 #                                      `linger-on-exit` (its marker `$SCENARIO_BIN/stub-claude-lingering.<pid>`)
+#   STUB_MODE_EXIT_ON_PAUSE            harness addition (test-21): the mode `exit-on-pause`, selected
+#                                      with `stub_mode` like the others: the stub reports in at once
+#                                      and, on the `/exit` line agent-director's `pause` types, ends
+#                                      as Claude Code does: fires SessionEnd (the row reads `ended`),
+#                                      closes its MCP session and exits 0
 #   STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE
 #                                      (a harness addition) the mode
 #                                      `transcript-on-first-message`, a known mode of `stub_mode`:
@@ -1209,6 +1214,11 @@ STUB_MODE_LINGER_ON_EXIT=linger-on-exit
 SCENARIO_STUB_MODES+=("${STUB_MODE_LINGER_ON_EXIT}")
 SCENARIO_STUB_LINGER_PREFIX=stub-claude-lingering.
 SCENARIO_STUB_RELEASE_S=10
+
+# Harness addition (test-21): the stub mode that answers `pause`'s `/exit`
+# as Claude Code does, with SessionEnd, its MCP session closed and exit 0.
+STUB_MODE_EXIT_ON_PAUSE=exit-on-pause
+SCENARIO_STUB_MODES+=("${STUB_MODE_EXIT_ON_PAUSE}")
 
 # The MCP server name the package's install writes into slack-mcp.json
 # (src/config.ts MCP_SERVER_NAME).

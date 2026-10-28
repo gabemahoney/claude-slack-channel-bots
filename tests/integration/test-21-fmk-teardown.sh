@@ -916,6 +916,10 @@ t21_named_restart_leg() {
     local step="named restart" out pid n p ref_var line mark connected ended ended_t launches launch_t gap
     local r_before k_before r_ids k_ids exited next_life next_head next_tail
     stop_server
+    # R's stub ends on the pause's `/exit` as Claude Code does, so its row
+    # reads `ended` and the CLI sees a clean exit; the mode also reports in
+    # at once, so R's relaunched life reports in too. K's stays at-once.
+    stub_mode "${R_WORK}" "${STUB_MODE_EXIT_ON_PAUSE}"
     T21_RESTART_DELAY_S="${NAMED_RESTART_DELAY_S}"
     t21_up "${step}: setup" R K
     T21_RESTART_DELAY_S=0

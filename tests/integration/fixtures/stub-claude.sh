@@ -3,7 +3,8 @@
 # Modes are selected by resolved cwd in stub-claude-modes (last selection wins):
 # at-once reports SessionStart immediately; manual-start waits for harness Enter;
 # silent fires no hooks; transcript-on-first-message delays its transcript until
-# message receipt; linger-on-exit fires SessionEnd but waits for harness SIGUSR1.
+# message receipt; linger-on-exit fires SessionEnd but waits for harness SIGUSR1;
+# exit-on-pause fires SessionEnd, closes its MCP session and exits 0, as Claude Code does.
 # Optional stub-claude-report-delays postpones at-once SessionStart in seconds.
 # Hooks execute as direct children, preserving AD's process identity checks.
 # SessionStart re-fires every two seconds while AD says pending, until its grace
@@ -80,6 +81,7 @@ MODE_MANUAL_START=manual-start
 # A harness addition.
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_LINGER_ON_EXIT=linger-on-exit
+MODE_EXIT_ON_PAUSE=exit-on-pause
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -107,7 +109,7 @@ fi
 case "${MODE}" in
     "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_MANUAL_START}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
-    "${MODE_LINGER_ON_EXIT}") ;;
+    "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_AT_ONCE}" >&2
@@ -486,7 +488,7 @@ case "${MODE}" in
         print_manual_start
         AWAITING_ENTER=1
         ;;
-    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}")
+    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}")
         if (( REPORT_DELAY_S > 0 )); then
             printf 'Starting worker\n'
             now_ms
@@ -528,6 +530,15 @@ linger_after_exit() {
     exit 0
 }
 
+# `exit-on-pause`: end the session as Claude Code does on `/exit`: SessionEnd
+# (the row reads `ended`) before the MCP session closes, then exit 0. Never
+# returns.
+exit_on_pause() {
+    fire_session_end
+    close_mcp_session
+    exit 0
+}
+
 # handle_line <line>: the complete submitted composer (literal LFs retained).
 handle_line() {
     local line="$1"
@@ -537,6 +548,9 @@ handle_line() {
     fi
     if [[ "${MODE}" == "${MODE_LINGER_ON_EXIT}" && "${line}" == "${PAUSE_EXIT_LINE}" ]] && (( REPORTED )); then
         linger_after_exit
+    fi
+    if [[ "${MODE}" == "${MODE_EXIT_ON_PAUSE}" && "${line}" == "${PAUSE_EXIT_LINE}" ]] && (( REPORTED )); then
+        exit_on_pause
     fi
     # transcript-on-first-message: the first message after reporting in
     # writes the transcript; a slash command (a line starting with `/`, such
