@@ -58,11 +58,25 @@ export function channelPopulation(count: number, offset = 0) {
     delivery: (['off', 'mentions', 'all', 'thread_hybrid'] as const)[i % 4]!,
   }))
 }
-export function initialSharedState(stateDir: string, input: PersonaConfigInput = makePersonaConfigInput({}, stateDir)): SharedChannelState {
+export const FIXTURE_THREAD_HYBRID_SINCE_PREFIX = 'fixture-thread-hybrid-since-'
+/** A deterministic Thread Hybrid Since mint: `fixture-thread-hybrid-since-N`,
+ * continuing after the highest fixture value already in `after`, so a mint
+ * over a reopened state never repeats one of its values. */
+export function fixtureThreadHybridSince(after?: SharedChannelState): () => string {
+  let n = 0
+  for (const life of Object.values(after?.personas ?? {})) {
+    for (const { threadHybridSince } of Object.values(life.assignments)) {
+      if (threadHybridSince?.startsWith(FIXTURE_THREAD_HYBRID_SINCE_PREFIX)) n = Math.max(n, Number(threadHybridSince.slice(FIXTURE_THREAD_HYBRID_SINCE_PREFIX.length)) || 0)
+    }
+  }
+  return () => `${FIXTURE_THREAD_HYBRID_SINCE_PREFIX}${++n}`
+}
+export function initialSharedState(stateDir: string, input: PersonaConfigInput = makePersonaConfigInput({}, stateDir),
+  threadHybridSince: () => string = fixtureThreadHybridSince()): SharedChannelState {
   const bytes = configBytes(input)
   const config = parsePersonaConfigBytes(bytes, join(stateDir, 'config.json'), stateDir)
   let life = 0
-  return initialSharedChannelState(bytes, config, () => `fixture-incarnation-${++life}`)
+  return initialSharedChannelState(bytes, config, () => `fixture-incarnation-${++life}`, threadHybridSince)
 }
 export function writeSharedState(stateDir: string, state: SharedChannelState): string {
   const dir = resolve(stateDir)
@@ -82,10 +96,43 @@ export function readSharedState(stateDir: string): SharedChannelState | null {
   if (!state) throw new Error('readSharedState: expected a shared authority envelope')
   return state
 }
+/** The initial state and later writes share one mint: `deps.threadHybridSince`,
+ * else the fixture counter, so the first build's values come first. */
 export function makeSharedAuthority(stateDir: string, input = makePersonaConfigInput({}, stateDir), deps: SharedChannelDeps = {}) {
-  const state = initialSharedState(stateDir, input)
+  const threadHybridSince = deps.threadHybridSince ?? fixtureThreadHybridSince()
+  const state = initialSharedState(stateDir, input, threadHybridSince)
   writeSharedState(stateDir, state)
-  return createSharedChannelAuthority(sharedChannelPath(stateDir), state, deps)
+  return createSharedChannelAuthority(sharedChannelPath(stateDir), state, { ...deps, threadHybridSince })
+}
+
+/** A production-format state with a Thread Memory created marker for each of
+ * `keys` (current or removed), validated by the production parser. */
+export function withThreadMemoryCreated(state: SharedChannelState, keys: string[], path = 'fixture-authority'): SharedChannelState {
+  const next = structuredClone(state)
+  if (keys.length) next.threadMemoryCreated = Object.fromEntries(keys.map(key => [key, true as const]))
+  else delete next.threadMemoryCreated
+  const parsed = parseSharedChannelState(serializeSharedChannelState(next), path)
+  if (!parsed) throw new Error('withThreadMemoryCreated: expected a shared authority')
+  return parsed
+}
+/** Invalid marker shapes, each a change to a valid marked production state. */
+export function malformedThreadMemoryMarkers(state: SharedChannelState): Array<{ label: string; state: SharedChannelState }> {
+  const marked = state.threadMemoryCreated && Object.keys(state.threadMemoryCreated).length
+  if (!marked) throw new Error('malformedThreadMemoryMarkers needs a marked production state')
+  const changes: Array<[string, (markers: Record<string, unknown>, copy: Record<string, unknown>) => void]> = [
+    ['key not a persona key', markers => { markers['Not-A-Key'] = true }],
+    ['empty key', markers => { markers[''] = true }],
+    ['false value', (markers, copy) => { markers[Object.keys(copy['threadMemoryCreated'] as object)[0]!] = false }],
+    ['string value', (markers, copy) => { markers[Object.keys(copy['threadMemoryCreated'] as object)[0]!] = 'true' }],
+    ['array', (_markers, copy) => { copy['threadMemoryCreated'] = Object.keys(state.threadMemoryCreated!) }],
+    ['null', (_markers, copy) => { copy['threadMemoryCreated'] = null }],
+    ['boolean', (_markers, copy) => { copy['threadMemoryCreated'] = true }],
+  ]
+  return changes.map(([label, mutate]) => {
+    const copy = structuredClone(state) as unknown as Record<string, unknown>
+    mutate(copy['threadMemoryCreated'] as Record<string, unknown>, copy)
+    return { label, state: copy as unknown as SharedChannelState }
+  })
 }
 
 // Production membership composition over the shared connection/Slack fixtures.
@@ -110,20 +157,23 @@ export function makeMembershipHarness(stateDir: string, options: {
   realBringUp?: boolean; queuedAckReaction?: string; mode?: ChannelMode; dryRun?: boolean; reopen?: boolean; names?: string[];
   startTime?: number;
   channels?: Array<{ id: string; delivery: DeliveryMode }>;
+  /** Defaults to the fixture counter, continuing past a reopened state's values. */
+  threadHybridSince?: () => string;
 } = {}) {
   const names = options.names ?? ['alpha']
   const input = makePersonaConfigInput({ ...(options.queuedAckReaction ? { queued_ack_reaction: options.queuedAckReaction } : {}), channel_mode: options.mode ?? 'open', personas: names.map(name =>
     makePersona({ name, channels: options.channels ?? [], permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' } }, stateDir)) }, stateDir)
   let refuseWrite: (state: SharedChannelState) => boolean = () => false
   const writes: SharedChannelState[] = []
-  const deps: SharedChannelDeps = { now: () => h.clock.now(), write(path, bytes) {
+  const reopened = options.reopen ? readSharedState(stateDir)! : undefined
+  const deps: SharedChannelDeps = { now: () => h.clock.now(), threadHybridSince: options.threadHybridSince ?? fixtureThreadHybridSince(reopened), write(path, bytes) {
     const state = parseSharedChannelState(bytes, path)!
     writes.push(state)
     if (refuseWrite(state)) throw Object.assign(new Error('fixture disk full'), { code: 'ENOSPC' })
     durableWriteFileSync(path, bytes)
   } }
   const authority = options.reopen
-    ? createSharedChannelAuthority(sharedChannelPath(stateDir), readSharedState(stateDir)!, deps)
+    ? createSharedChannelAuthority(sharedChannelPath(stateDir), reopened!, deps)
     : makeSharedAuthority(stateDir, input, deps)
   let admission = true
   const h = makeConnectionHarness(names.map(name => ({ name })), stateDir, {

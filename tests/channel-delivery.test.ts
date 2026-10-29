@@ -8,7 +8,10 @@ import { createChannelDeliveryStore, channelDeliveryDeclarationOf } from '../src
 import { createSharedChannelAuthority, parseSharedChannelState, serializeSharedChannelState, type SharedChannelState } from '../src/shared-channels.ts'
 import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
-import { configBytes, initialSharedState, makeSharedAuthority, readSharedState, sharedChannelPath, writeSharedState } from './test-helpers/shared-channels.ts'
+import {
+  configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState, makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState,
+  sharedChannelPath, withThreadMemoryCreated, writeSharedState,
+} from './test-helpers/shared-channels.ts'
 import { osTempDir } from './test-helpers/host-safe-env.ts'
 
 let root: string
@@ -234,6 +237,63 @@ test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
   expect(() => createSharedChannelAuthority(authority.path, seed)).toThrow()
   expect(readFileSync(authority.path)).toEqual(before)
   check(authority.snapshot())
+})
+
+describe('thread fields in the production format', () => {
+  const ORDERED = 'The shared channel authority has an invalid ordered assignment.'
+  const MARKER = 'The shared channel authority has an invalid Thread Memory marker.'
+  function refused(state: SharedChannelState, path: string, message: string) {
+    expect(() => parseSharedChannelState(serializeSharedChannelState(state), path)).toThrow(message)
+    expect(() => createSharedChannelAuthority(path, state)).toThrow(message)
+  }
+  /** alpha's C0TEST001 is `thread_hybrid` by an operator write; beta's stays `all`. */
+  function hybridSeed() {
+    const authority = makeSharedAuthority(root, input())
+    expect(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'thread_hybrid', authority.revision).kind).toBe('applied')
+    return { authority, seed: readSharedState(root)! }
+  }
+
+  test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
+    { label: 'thread_hybrid entry without Thread Hybrid Since', alter: s => { delete s.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince } },
+    { label: 'thread_hybrid entry with an empty one', alter: s => { s.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince = '' } },
+    { label: 'thread_hybrid entry with a non-string one', alter: s => { Object.assign(s.personas['alpha']!.assignments['C0TEST001']!, { threadHybridSince: 7 }) } },
+    { label: 'all entry with one', alter: s => { s.personas['beta']!.assignments['C0TEST001']!.threadHybridSince = s.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince } },
+  ])('$label is refused as an invalid ordered assignment', ({ alter }) => {
+    const { authority, seed } = hybridSeed()
+    expect(seed.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince).toStartWith(FIXTURE_THREAD_HYBRID_SINCE_PREFIX)
+    const before = readFileSync(authority.path)
+    alter(seed)
+    refused(seed, authority.path, ORDERED)
+    expect(readFileSync(authority.path)).toEqual(before)
+    check(seed)
+  })
+
+  test('markers for current and removed keys parse and round-trip through the fixture writer and reader', () => {
+    const { authority, seed } = hybridSeed()
+    expect(seed.personas['gone_key']).toBeUndefined()
+    const seeded = withThreadMemoryCreated(seed, ['alpha', 'gone_key'])
+    writeSharedState(root, seeded)
+    expect(readSharedState(root)).toEqual(seeded)
+    expect(createSharedChannelAuthority(authority.path, readSharedState(root)!).threadMemoryCreatedKeys()).toEqual(['alpha', 'gone_key'])
+    const cleared = withThreadMemoryCreated(seeded, [])
+    expect(Object.hasOwn(cleared, 'threadMemoryCreated')).toBe(false)
+    writeSharedState(root, cleared)
+    expect(readSharedState(root)).toEqual(cleared)
+    check(readSharedState(root))
+  })
+
+  test('each malformed marker shape is refused', () => {
+    const { authority } = hybridSeed()
+    expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+    const before = readFileSync(authority.path)
+    const variants = malformedThreadMemoryMarkers(readSharedState(root)!)
+    for (const { state } of variants) {
+      refused(state, authority.path, MARKER)
+      expect(() => writeSharedState(root, state)).toThrow(MARKER)
+    }
+    expect(readFileSync(authority.path)).toEqual(before)
+    check(variants)
+  })
 })
 
  describe('identity and provenance foundations', () => {

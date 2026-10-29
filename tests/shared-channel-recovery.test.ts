@@ -4,8 +4,11 @@ import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import * as nodeFs from 'node:fs'
 import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { DEFAULT_PERSONA_CONFIG_FS, type PersonaConfigFs } from '../src/config.ts'
-import { parseSharedChannelState, serializeSharedChannelState } from '../src/shared-channels.ts'
+import { DEFAULT_PERSONA_CONFIG_FS, type DeliveryMode, type PersonaConfigFs } from '../src/config.ts'
+import {
+  createSharedChannelAuthority, parseSharedChannelState, sameChannelStamp, serializeSharedChannelState,
+  type ChannelStamp, type SharedChannelStampState, type SharedChannelState, type SharedThreadView, type ThreadMemoryMarkerResult,
+} from '../src/shared-channels.ts'
 import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
 import { errnoSuffix } from '../src/persona-credentials.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -24,6 +27,17 @@ beforeEach(() => { h = makeReloadHarness(); runs = []; engines = []; repairBodie
 afterEach(async () => { for (const reminder of reminders) await reminder.stop(); for (const e of engines) { assertNoLeak({ errors: e.errors, events: e.events }); await e.cleanup() }; for (const run of runs) { expect(run.slackPosts()).toEqual([]); assertNoLeak(run.captured()); await run.stop() }; await h.cleanup() })
 async function start(opts: ReloadRunOptions = {}) { const run = await h.startDetecting({ dryRun: true, ...opts }); runs.push(run); expect(run.outcome.kind).toBe('applied'); return run }
 function disk() { return parseSharedChannelState(readFileSync(h.paths.lastApplied), h.paths.lastApplied)! }
+const THREAD = 'C0THREAD1'
+/** `h.persona(name)` with a `thread_hybrid` entry beside its default channel. */
+function threaded(name: string) {
+  const persona = h.persona(name)
+  return { ...persona, channels: [...persona.channels!, { id: THREAD, delivery: 'thread_hybrid' as const }] }
+}
+function sinceOf(state: SharedChannelState, key = 'alpha', channel = THREAD) { return state.personas[key]?.assignments[channel]?.threadHybridSince }
+function assignmentsOf(state: SharedChannelState) {
+  return Object.fromEntries(Object.entries(state.personas).map(([key, life]) => [key, life.assignments]))
+}
+function lastAppliedWrites(run: ReloadRun) { return run.writes.filter(write => write.path === h.paths.lastApplied).length }
 
 test('shared transaction order reservations reject invalid spans before callbacks or writes and preserve ordinary one-order commits', async () => {
   const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
@@ -118,8 +132,8 @@ test.each(['removal', 'replacement'] as const)('%s write failure after retiremen
   for (const item of accepted[0]!) expect((await reopened.queue.accept('alpha', item)).status).toBe('duplicate')
 })
 
-test.each(['retirement', 'publication'] as const)('shutdown during %s preserves the correct authority and prepared input on reopen', async phase => {
-  const alpha = h.persona('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta)
+test.each(['retirement', 'publication'] as const)('shutdown during %s preserves the correct authority, prepared input and Thread Hybrid Since on reopen', async phase => {
+  const alpha = h.persona('alpha'); const beta = threaded('beta'); h.materialize(alpha, beta)
   h.writeConfig({ personas: [alpha, beta] })
   let armed = false
   const stopped: string[] = []
@@ -130,6 +144,11 @@ test.each(['retirement', 'publication'] as const)('shutdown during %s preserves 
   expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'retained' } }).kind).toBe('applied')
   const notificationsBefore = run.appliedConfigs.length
   const before = authority.snapshot()
+  const views: SharedThreadView[] = []
+  authority.subscribeThreadView(view => views.push(view))
+  // A Channel Mode switch keeps the untouched persona's Thread Hybrid Since.
+  const kept: SharedChannelStampState = { kind: 'decided', incarnation: before.personas.beta!.incarnation, threadHybridSince: sinceOf(before, 'beta') }
+  expect(sinceOf(before, 'beta')).toEqual(expect.any(String))
   const bytes = h.writeConfig({ channel_mode: 'open', personas: [beta] })
   await run.ticks.tick(); h.confirm(); const confirmation = h.readApply()
   authority.subscribe(() => { if (armed && phase === 'publication') run.controller.stopDetection() })
@@ -147,11 +166,23 @@ test.each(['retirement', 'publication'] as const)('shutdown during %s preserves 
     expect(applicationState(authority.snapshot())).toEqual(applicationState(before))
     expect(h.readApply()).toEqual(confirmation)
   }
+  // The retirement journal holds only the retiring persona's stamps and is
+  // delivered as such; its rejection or the removal then delivers again.
+  const released: SharedChannelStampState | undefined = phase === 'retirement' ? { kind: 'decided', incarnation: before.personas.alpha!.incarnation } : undefined
+  expect(views).toHaveLength(2)
+  expect(views[0]!.stamp('alpha', alpha.permission_prompts)).toEqual({ kind: 'undecided' })
+  expect(views[1]!.stamp('alpha', alpha.permission_prompts)).toEqual(released)
+  expect(authority.channelStamp('alpha', alpha.permission_prompts)).toEqual(released)
+  for (const view of views) expect(view.stamp('beta', THREAD)).toEqual(kept)
+  expect(authority.channelStamp('beta', THREAD)).toEqual(kept)
   assertNoLeak(run.captured())
   await run.stop()
   const reopened = await start()
+  const reopenedAuthority = reopened.controller.sharedChannels()!
   expect(reopened.controller.applied()!.config.channel_mode).toBe(phase === 'retirement' ? 'strict' : 'open')
-  expect(applicationState(reopened.controller.sharedChannels()!.snapshot())).toEqual(applicationState(authority.snapshot()))
+  expect(applicationState(reopenedAuthority.snapshot())).toEqual(applicationState(authority.snapshot()))
+  expect(reopenedAuthority.channelStamp('beta', THREAD)).toEqual(kept)
+  expect(reopenedAuthority.channelStamp('alpha', alpha.permission_prompts)).toEqual(released)
   expect(h.readConfig()).toEqual(bytes)
 })
 
@@ -316,13 +347,15 @@ test('post-read stat failure safely refuses startup and a later reload without l
   expect(h.readPending()).toBeUndefined()
  })
 
- test.each(['before', 'after'] as const)('interruption %s durable activation retains trustworthy state and prepared input', async when => {
-  const alpha = h.persona('alpha'); h.materialize(alpha)
-  h.writeConfig({ personas: [alpha] })
+ test.each(['before', 'after'] as const)('interruption %s durable activation retains trustworthy state, prepared input and each value with its Thread Hybrid Since', async when => {
+  const alpha = threaded('alpha'), beta = threaded('beta'); h.materialize(alpha, beta)
+  h.writeConfig({ personas: [alpha, beta] })
   let armed = false
+  let attempted: SharedChannelState | undefined
   const run = await start({ beforeWrite: (path, bytes) => {
     if (armed && path === h.paths.lastApplied && activationRecord(bytes, path)) {
       armed = false
+      attempted = parseSharedChannelState(bytes, path)
       h.failWrites(when === 'before' ? { step: 'writeSync', code: 'ENOSPC', call: 1 } : { step: 'fsyncSync', call: 2, code: 'EIO' })
     }
   } })
@@ -330,7 +363,15 @@ test('post-read stat failure safely refuses startup and a later reload without l
   const incarnation = authority.incarnation(h.key('alpha'))!
   expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'review' }; next.outcomes = { prior: 'retained' } }).kind).toBe('applied')
   const before = disk()
-  h.writeConfig({ channel_mode: 'open', personas: [alpha] })
+  // One confirmation changes mode, list and identity: alpha keeps THREAD, turns
+  // its default channel thread_hybrid and adds another; beta's new life resets
+  // its copied THREAD entry and declares C0THREAD3.
+  const movedBeta = { ...beta, working_directory: h.persona('beta_moved').working_directory,
+    channels: [...beta.channels, { id: 'C0THREAD3', delivery: 'thread_hybrid' as const }] }
+  h.materialize(movedBeta)
+  h.writeConfig({ channel_mode: 'open', personas: [{ ...alpha, channels: [
+    { id: alpha.permission_prompts, delivery: 'thread_hybrid' }, { id: THREAD, delivery: 'thread_hybrid' }, { id: 'C0THREAD2', delivery: 'thread_hybrid' },
+  ] }, movedBeta] })
   await run.ticks.tick()
   h.confirm()
   const confirmation = h.readApply()!
@@ -350,7 +391,179 @@ test('post-read stat failure safely refuses startup and a later reload without l
   expect(disk().pendingIntent).toEqual(before.pendingIntent)
   expect(disk().outcomes.prior).toEqual(before.outcomes.prior)
   expect(Object.values(reviewLedger(disk())!.outcomes).some(outcome => outcome.status === (when === 'before' ? 'rejected' : 'consumed'))).toBe(true)
+  // Each reopened value carries exactly the Thread Hybrid Since of the one
+  // durable write that installed it: the old state's, or the activation's.
+  const reopenedState = reopened.controller.sharedChannels()!.snapshot()
+  expect(assignmentsOf(reopenedState)).toEqual(assignmentsOf(when === 'before' ? before : attempted!))
+  if (when === 'after') {
+    const previous = [sinceOf(before, 'alpha'), sinceOf(before, 'beta')]
+    expect(sinceOf(reopenedState, 'alpha')).toBe(previous[0])
+    const minted = [sinceOf(reopenedState, 'alpha', alpha.permission_prompts), sinceOf(reopenedState, 'alpha', 'C0THREAD2'), sinceOf(reopenedState, 'beta', 'C0THREAD3')]
+    for (const id of minted) { expect(id).toEqual(expect.any(String)); expect(previous).not.toContain(id) }
+    expect(new Set(minted).size).toBe(3)
+    expect(reopenedState.personas.beta!.assignments[THREAD]).toBeUndefined()
+    expect(reopenedState.personas.beta!.incarnation).not.toBe(before.personas.beta!.incarnation)
+  }
  })
+
+test.each(['before-rename', 'installed-unsynced'] as const)('operator thread_hybrid assignment interrupted %s keeps value and Thread Hybrid Since together; only its channel reads undecided until recovered', async fault => {
+  const alpha = threaded('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+  const run = await start(); const authority = run.controller.sharedChannels()!
+  const channel = alpha.permission_prompts, life = authority.incarnation('alpha')!
+  const kept: SharedChannelStampState = { kind: 'decided', incarnation: life, threadHybridSince: sinceOf(authority.snapshot()) }
+  const keptSince = sinceOf(authority.snapshot())
+  expect(authority.channelStamp('alpha', THREAD)).toEqual(kept)
+  expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'decided', incarnation: life })
+  const views: SharedThreadView[] = []
+  authority.subscribeThreadView(view => views.push(view))
+  const before = disk()
+  h.failWrites(fault === 'before-rename' ? { step: 'writeSync', code: 'ENOSPC' } : { step: 'fsyncSync', call: 2, code: 'EIO' })
+  const result = authority.assign('alpha', life, channel, 'thread_hybrid', authority.revision)
+  h.clearWriteFailure()
+  let installed = before.personas.alpha!.assignments[channel]
+  if (fault === 'before-rename') {
+    // A definite failure changes nothing and delivers no view.
+    expect(result.kind).toBe('failed')
+    expect(disk()).toEqual(before)
+    expect(views).toEqual([])
+    expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'decided', incarnation: life })
+  } else {
+    expect(result.kind).toBe('unresolved')
+    installed = disk().personas.alpha!.assignments[channel]
+    expect(installed).toEqual({ delivery: 'thread_hybrid', order: before.revision + 1, threadHybridSince: expect.any(String) })
+    expect(installed!.threadHybridSince).not.toBe(keptSince)
+    expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'undecided' })
+    expect(authority.channelStamp('alpha', THREAD)).toEqual(kept)
+    // An undecided or absent stamp never counts as current, even for the installed value.
+    const joined: ChannelStamp = { incarnation: life, threadHybridSince: installed!.threadHybridSince! }
+    expect(sameChannelStamp(joined, authority.channelStamp('alpha', channel))).toBe(false)
+    expect(sameChannelStamp(kept as ChannelStamp, undefined)).toBe(false)
+    expect(views).toHaveLength(1)
+    expect(views[0]!.stamp('alpha', channel)).toEqual({ kind: 'undecided' })
+    expect(views[0]!.stamp('alpha', THREAD)).toEqual(kept)
+    expect(views[0]!.threadHybridChannels('alpha')).toEqual([THREAD])
+    expect(authority.recoverDurability().kind).toBe('applied')
+    const recovered: SharedChannelStampState = { kind: 'decided', incarnation: life, threadHybridSince: installed!.threadHybridSince }
+    expect(authority.channelStamp('alpha', channel)).toEqual(recovered)
+    expect(sameChannelStamp(joined, authority.channelStamp('alpha', channel))).toBe(true)
+    expect(views).toHaveLength(2)
+    expect(views[1]!.stamp('alpha', channel)).toEqual(recovered)
+    expect(views[1]!.threadHybridChannels('alpha')).toEqual([channel, THREAD].sort())
+    expect(views[0]!.stamp('alpha', channel)).toEqual({ kind: 'undecided' })
+  }
+  await run.stop()
+  const reopened = (await start()).controller.sharedChannels()!
+  expect(reopened.snapshot().personas.alpha!.assignments[channel]).toEqual(installed)
+  expect(reopened.channelStamp('alpha', THREAD)).toEqual(kept)
+  // A same-value write takes a new order but keeps its Thread Hybrid Since.
+  const revision = reopened.revision
+  expect(reopened.assign('alpha', life, THREAD, 'thread_hybrid', revision).kind).toBe('applied')
+  expect(disk().personas.alpha!.assignments[THREAD]).toEqual({ delivery: 'thread_hybrid', order: revision + 1, threadHybridSince: keptSince })
+  expect(reopened.channelStamp('alpha', THREAD)).toEqual(kept)
+})
+
+test('Thread Memory marker set and clear are durable whole-file writes, readable at start and kept for a removed persona', async () => {
+  const alpha = threaded('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta); h.writeConfig({ personas: [alpha, beta] })
+  const run = await start(); const authority = run.controller.sharedChannels()!
+  const writes = lastAppliedWrites(run)
+  expect(authority.setThreadMemoryCreated('beta')).toEqual({ kind: 'saved' })
+  expect(lastAppliedWrites(run)).toBe(writes + 1)
+  expect(authority.setThreadMemoryCreated('beta')).toEqual({ kind: 'saved' })
+  expect(lastAppliedWrites(run)).toBe(writes + 1)
+  expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+  expect(disk().threadMemoryCreated).toEqual({ alpha: true, beta: true })
+  h.writeConfig({ personas: [alpha] }); await run.ticks.tick()
+  h.confirm(); await run.ticks.tick()
+  expect(authority.config().personas.map(persona => persona.key)).toEqual(['alpha'])
+  expect(authority.threadMemoryCreatedKeys()).toEqual(['alpha', 'beta'])
+  await run.stop()
+  // The start read answers before any persona starts.
+  const reopened = h.build({ dryRun: true }); runs.push(reopened)
+  expect(reopened.resolveStart().kind).toBe('applied')
+  expect(reopened.lifecycle.records).toEqual([]); expect(reopened.lifecycle.startPasses).toEqual([])
+  const read = reopened.controller.sharedChannels()!
+  expect(read.threadMemoryCreated('beta')).toBe(true)
+  expect(read.threadMemoryCreatedKeys()).toEqual(['alpha', 'beta'])
+  expect(read.clearThreadMemoryCreated('beta')).toEqual({ kind: 'saved' })
+  const cleared = lastAppliedWrites(reopened)
+  expect(read.clearThreadMemoryCreated('beta')).toEqual({ kind: 'saved' })
+  expect(lastAppliedWrites(reopened)).toBe(cleared)
+  expect(read.threadMemoryCreated('beta')).toBe(false)
+  expect(read.clearThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+  expect(Object.hasOwn(disk(), 'threadMemoryCreated')).toBe(false)
+})
+
+test.each([
+  ['failed', { step: 'writeSync', code: 'ENOSPC' }],
+  ['written-but-unsynced', { step: 'fsyncSync', call: 2, code: 'EIO' }],
+] as const)('a %s marker write reports failed, keeps the in-memory marker and readability, and a retry writes again', async (kind, failure) => {
+  const alpha = threaded('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+  const run = await start(); const authority = run.controller.sharedChannels()!
+  const life = authority.incarnation('alpha')!, revision = authority.revision
+  const views: SharedThreadView[] = []
+  authority.subscribeThreadView(view => views.push(view))
+  const stamp = authority.channelStamp('alpha', THREAD)
+  for (const created of [true, false]) {
+    const write = () => created ? authority.setThreadMemoryCreated('alpha') : authority.clearThreadMemoryCreated('alpha')
+    h.failWrites(failure)
+    expect(write()).toEqual({ kind: 'failed' })
+    h.clearWriteFailure()
+    expect(authority.threadMemoryCreated('alpha')).toBe(!created)
+    expect(authority.readable).toBe(true); expect(authority.readableFor('alpha', THREAD)).toBe(true)
+    expect(authority.channelStamp('alpha', THREAD)).toEqual(stamp)
+    expect(Object.hasOwn(disk(), 'threadMemoryCreated')).toBe(kind === 'failed' ? !created : created)
+    const writes = lastAppliedWrites(run)
+    expect(write()).toEqual({ kind: 'saved' })
+    expect(lastAppliedWrites(run)).toBe(writes + 1)
+    expect(authority.threadMemoryCreated('alpha')).toBe(created)
+    expect(Object.hasOwn(disk(), 'threadMemoryCreated')).toBe(created)
+  }
+  expect(views).toEqual([])
+  // A revision captured before the marker writes is still current.
+  expect(authority.revision).toBe(revision)
+  expect(authority.assign('alpha', life, alpha.permission_prompts, 'mentions', revision).kind).toBe('applied')
+})
+
+test('marker writes refuse with no write for a key that is not a current persona, inside a publication, while unreadable and while a restoration is staged', async () => {
+  const alpha = threaded('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+  const run = await start(); const authority = run.controller.sharedChannels()!
+  const life = authority.incarnation('alpha')!, channel = alpha.permission_prompts
+  let writes = lastAppliedWrites(run)
+  expect(authority.setThreadMemoryCreated('ghost')).toEqual({ kind: 'failed' })
+  expect(lastAppliedWrites(run)).toBe(writes)
+  const inside: ThreadMemoryMarkerResult[] = []
+  const stopView = authority.subscribeThreadView(() => { inside.push(authority.setThreadMemoryCreated('alpha')) })
+  const stopConfig = authority.subscribe(() => { inside.push(authority.setThreadMemoryCreated('alpha')) })
+  expect(authority.assign('alpha', life, channel, 'mentions', authority.revision).kind).toBe('applied')
+  stopView(); stopConfig()
+  expect(inside).toEqual([{ kind: 'failed' }, { kind: 'failed' }])
+  expect(lastAppliedWrites(run)).toBe(writes + 1)
+  expect(authority.threadMemoryCreated('alpha')).toBe(false)
+  h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
+  expect(authority.assign('alpha', life, channel, 'all', authority.revision).kind).toBe('unresolved')
+  h.clearWriteFailure(); writes = lastAppliedWrites(run)
+  expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'failed' })
+  expect(lastAppliedWrites(run)).toBe(writes)
+  expect(authority.recoverDurability().kind).toBe('applied')
+  expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+  // A staged restoration decides no stamp, live or delivered, and takes no marker write.
+  const views: SharedThreadView[] = []
+  authority.subscribeThreadView(view => views.push(view))
+  const damage = h.writeRecordBytes('damaged while the owner holds its validated state')
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('marker-staged', damage)))
+  await run.ticks.tick()
+  expect(authority.readable).toBe(false); expect(authority.readableFor('alpha', THREAD)).toBe(true)
+  expect(authority.channelStamp('alpha', THREAD)).toEqual({ kind: 'undecided' })
+  expect(views).toHaveLength(1)
+  expect(views[0]!.stamp('alpha', THREAD)).toEqual({ kind: 'undecided' })
+  expect(views[0]!.threadHybridChannels('alpha')).toEqual([])
+  writes = lastAppliedWrites(run)
+  expect(authority.clearThreadMemoryCreated('alpha')).toEqual({ kind: 'failed' })
+  expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'failed' })
+  expect(lastAppliedWrites(run)).toBe(writes)
+  expect(authority.threadMemoryCreated('alpha')).toBe(true)
+  expect(disk().threadMemoryCreated).toEqual({ alpha: true })
+})
 
  test('a same-value assignment invalidates an older confirmation and never replays a copied source preference', async () => {
   const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
@@ -617,7 +830,7 @@ test('recording/refusing filesystem sees zero legacy access through startup, rel
 import { sharedRecoveryRequest, membershipPage, deliveryAttempt, retryAttempt } from './test-helpers/shared-channels.ts'
 import { recoveryBytes, recoveryHash } from '../src/shared-recovery.ts'
 import { renderSharedRecovery, sharedRecoveryLine } from '../src/reload-recovery.ts'
-import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE } from '../src/reload-preview-clauses.ts'
+import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE, RECOVERY_THREADS_FORGOTTEN } from '../src/reload-preview-clauses.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { buildReviewRequest, REVIEW_REQUEST_SUFFIX } from '../src/reload-request.ts'
 
@@ -650,6 +863,15 @@ async function recoveryStart(opts: ReloadRunOptions = {}) {
     ])
   }
   return run
+}
+/** The pending recovery preview's choice lines for alpha: only a
+ * `thread_hybrid` line carries the forgotten-threads clause. */
+function expectRecoveryChoiceLines(choice: 'restored' | 'new', entries: Array<[string, DeliveryMode]>) {
+  const lines = h.pendingLines()!
+  for (const [channel, delivery] of entries) {
+    expect(lines).toContain(`persona=alpha; channel=${channel}; ${choice} choice=${delivery}` + (delivery === 'thread_hybrid' ? `; ${RECOVERY_THREADS_FORGOTTEN}` : '.'))
+  }
+  expect(lines.filter(line => line.includes(RECOVERY_THREADS_FORGOTTEN))).toHaveLength(entries.filter(([, delivery]) => delivery === 'thread_hybrid').length)
 }
 function acceptedContents(run: ReloadRun, key = 'alpha') {
   return run.queue.items(key).map(({ accepted: { attempt_high_watermark, ...content } }) => content)
@@ -748,21 +970,32 @@ test.each(['request', 'prepared-input', 'credentials', 'working-directory'] as c
   expect(Object.values(reviewLedger(disk())!.outcomes).filter(o => o.status === 'consumed')).toHaveLength(1)
 })
 
-test.each(['before-rename', 'installed-unsynced'] as const)('repair interruption %s recovers exactly one activation and preserves accepted work', async boundary => {
-  const alpha = h.persona('alpha'); h.materialize(alpha)
+test.each(['before-rename', 'installed-unsynced'] as const)('repair interruption %s recovers exactly one activation with one Thread Hybrid Since and preserves accepted work', async boundary => {
+  const alpha = threaded('alpha'); h.materialize(alpha)
   const input = h.writeConfig({ personas: [alpha] }), damage = h.writeRecordBytes('damaged input')
   h.writeRequestBytes(configBytes(sharedRecoveryRequest('interrupted-repair', damage, input)))
   let run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
+  expectRecoveryChoiceLines('new', [[alpha.permission_prompts, 'all'], [THREAD, 'thread_hybrid']])
+  // A stage in review decides no stamp, whatever Thread Hybrid Since it holds.
+  const stageStamp = () => createSharedChannelAuthority(h.paths.lastApplied, disk(), { write: () => { throw new Error('read only') } }).channelStamp('alpha', THREAD)
+  const staged = sinceOf(disk())
+  expect(staged).toEqual(expect.any(String)); expect(stageStamp()).toEqual({ kind: 'undecided' })
   await run.queue.start()
   expect((await run.queue.accept('alpha', slackInput({ text: '  original\r\n😀 ', queued_ack_reaction: 'hourglass' }))).status).toBe('accepted')
   const original = acceptedContents(run)
   expectRepairSecrecy(run, original[0]!.text)
   await run.stop(); h.confirm(); const confirmation = h.readApply()!; let armed = true
+  let attempted: string | undefined
   run = await recoveryStart({ beforeWrite: (path, bytes) => {
-    if (path !== h.paths.lastApplied || !armed || parseSharedChannelState(bytes, path)?.recovery?.phase !== 'active') return
+    const state = path === h.paths.lastApplied ? parseSharedChannelState(bytes, path) : undefined
+    if (!armed || state?.recovery?.phase !== 'active') return
     armed = false
+    attempted = sinceOf(state)
     h.failWrites(boundary === 'before-rename' ? { step: 'writeSync', call: 1, code: 'ENOSPC' } : { step: 'fsyncSync', call: 2, code: 'EIO' })
   } })
+  expect(attempted).toEqual(expect.any(String)); expect(attempted).not.toBe(staged)
+  expect(sinceOf(disk())).toBe(boundary === 'before-rename' ? staged : attempted)
+  if (boundary === 'before-rename') expect(stageStamp()).toEqual({ kind: 'undecided' })
   expect(armed).toBe(false); expect(run.outcome.kind).toBe('refused')
   expect(run.controller.sharedChannels()).toBeUndefined(); expect(run.appliedConfigs).toEqual([])
   expect(h.readConfig()).toEqual(input)
@@ -779,9 +1012,19 @@ test.each(['before-rename', 'installed-unsynced'] as const)('repair interruption
   }
   await run.stop(); h.clearWriteFailure()
   run = await recoveryStart(); expect(run.outcome.kind).toBe(boundary === 'before-rename' ? 'refused' : 'applied')
+  if (boundary === 'before-rename') {
+    expect(sinceOf(disk())).toBe(staged); expect(stageStamp()).toEqual({ kind: 'undecided' })
+  } else {
+    expect(run.controller.sharedChannels()!.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: disk().personas.alpha!.incarnation, threadHybridSince: attempted })
+  }
   await run.queue.start(); expect(acceptedContents(run)).toEqual(original)
   await run.stop(); if (boundary === 'before-rename') h.confirm()
   run = await recoveryStart(); expect(run.outcome.kind).toBe('applied')
+  // The retained activation is not applied again, so its Thread Hybrid Since stays.
+  const final = sinceOf(disk())
+  if (boundary === 'installed-unsynced') expect(final).toBe(attempted)
+  else { expect(final).toEqual(expect.any(String)); expect(final).not.toBe(staged) }
+  expect(run.controller.sharedChannels()!.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: disk().personas.alpha!.incarnation, threadHybridSince: final })
   const retained = run.logs.filter(line => line.startsWith(sharedRecoveryLine('retained repair activation')))
   expect(retained).toHaveLength(1)
   expect(retained[0]).toContain(`order=${disk().recovery!.activation!.order}; it is not applied again`)
@@ -800,11 +1043,54 @@ test.each(['before-rename', 'installed-unsynced'] as const)('repair interruption
   expect(run.membership.read('alpha', alpha.permission_prompts, 'strict').kind).toBe('unresolved')
 })
 
-test('owned restoration retains actual MCP history and separately pending intent; known-not-applied retries stay nonwriting after repair', async () => {
-  const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: 'open' })
+test.each(['readable', 'invalid', 'absent', 'unparsable'] as const)('explicit replacement from unreadable evidence whose marker is %s keeps only a marker the evidence proves, through revision, minting Thread Hybrid Since at activation', async marker => {
+  const alpha = threaded('alpha'); h.materialize(alpha)
+  const input = h.writeConfig({ personas: [alpha] })
+  const first = await start(); const authority = first.controller.sharedChannels()!
+  if (marker !== 'absent') expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+  const prior = authority.snapshot()
+  await first.stop()
+  // Damage the envelope; the marker field stays as production wrote it, or is
+  // made invalid, or the whole file stops being JSON.
+  const raw = JSON.parse(readFileSync(h.paths.lastApplied, 'utf8'))
+  raw.revision = 0
+  if (marker === 'invalid') raw.threadMemoryCreated = { alpha: false }
+  const damage = h.writeRecordBytes(marker === 'unparsable' ? 'plain-text damage over a marked shared state' : configBytes(raw))
+  expect(() => parseSharedChannelState(damage, h.paths.lastApplied)).toThrow()
+  const kept: Record<string, true> | undefined = marker === 'readable' ? { alpha: true } : undefined
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('marker-replacement', damage, input)))
+  let run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
+  expect(disk().threadMemoryCreated).toEqual(kept)
+  await run.stop()
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('marker-revised', damage, configBytes({ personas: [alpha], channel_mode: 'open' }))))
+  run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
+  const stage = disk()
+  expect(stage.recovery!.request.request_id).toBe('marker-revised')
+  expect(stage.threadMemoryCreated).toEqual(kept)
+  expectRecoveryChoiceLines('new', [[alpha.permission_prompts, 'all'], [THREAD, 'thread_hybrid']])
+  await run.stop(); h.confirm()
+  let activation: SharedChannelState | undefined
+  run = await recoveryStart({ beforeWrite: (path, bytes) => {
+    const state = path === h.paths.lastApplied ? parseSharedChannelState(bytes, path) : undefined
+    if (state?.recovery?.phase === 'active') activation ??= state
+  } })
+  expect(run.outcome.kind).toBe('applied')
+  const active = run.controller.sharedChannels()!, state = active.snapshot()
+  expect(active.threadMemoryCreated('alpha')).toBe(marker === 'readable')
+  expect(state.threadMemoryCreated).toEqual(kept)
+  expect(state.personas.alpha!.incarnation).not.toBe(prior.personas.alpha!.incarnation)
+  const minted = sinceOf(state)
+  expect(minted).toEqual(expect.any(String))
+  expect([sinceOf(prior), sinceOf(stage)]).not.toContain(minted)
+  expect(sinceOf(activation!)).toBe(minted)
+  expect(active.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: state.personas.alpha!.incarnation, threadHybridSince: minted })
+})
+
+test('owned restoration retains actual MCP history, separately pending intent and the marker, starting a new Thread Hybrid Since; known-not-applied retries stay nonwriting after repair', async () => {
+  const alpha = threaded('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: 'open' })
   let run = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK })
   const channel = alpha.permission_prompts
-  run.stub('alpha').script.inventory.push(membershipPage([channel])); await run.membershipClock.runNext()
+  run.stub('alpha').script.inventory.push(membershipPage([channel, THREAD])); await run.membershipClock.runNext()
   run.registerSession('alpha')
   const attempt = deliveryAttempt('retained-success', channel, 'all')
   expect((await run.callTool('alpha', 'set_channel_delivery', attempt)).isError).toBe(false)
@@ -834,7 +1120,10 @@ test('owned restoration retains actual MCP history and separately pending intent
   const detection = snapshot()
   run.request('request', [], 'separate-pending-intent'); await run.ticks.tick()
   expectRepairSecrecy(run); expectNoLiveEffects(detection)
-  const authority = run.controller.sharedChannels()!, prior = authority.snapshot(), input = h.readConfig()!
+  const authority = run.controller.sharedChannels()!
+  expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+  const prior = authority.snapshot(), input = h.readConfig()!, anchorSince = sinceOf(prior)
+  expect(anchorSince).toEqual(expect.any(String))
   const damage = h.writeRecordBytes('damaged while owner retains its validated state')
   h.writeRequestBytes(configBytes(sharedRecoveryRequest('owned-restoration', damage)))
   const staging = snapshot()
@@ -845,11 +1134,25 @@ test('owned restoration retains actual MCP history and separately pending intent
   expect(recoveryBytes(disk().recovery!.anchorBase64)).toEqual(Buffer.from(serializeSharedChannelState(prior)))
   await run.stop(); run = await recoveryStart({ dryRun: false, slack: REPAIR_SLACK }); expect(run.outcome.kind).toBe('refused')
   expect(h.readPendingText()).toContain(RECOVERY_RESTORE)
+  expectRecoveryChoiceLines('restored', [[channel, 'all'], [THREAD, 'thread_hybrid']])
+  expect(sinceOf(disk())).toBe(anchorSince)
   await run.stop(); h.confirm()
-  run = await recoveryStart({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK })
+  let activation: SharedChannelState | undefined
+  run = await recoveryStart({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK, beforeWrite: (path, bytes) => {
+    const state = path === h.paths.lastApplied ? parseSharedChannelState(bytes, path) : undefined
+    if (state?.recovery?.phase === 'active') activation ??= state
+  } })
   expect(run.outcome.kind).toBe('applied')
   const restored = run.controller.sharedChannels()!
-  expect(restored.snapshot().personas).toEqual(prior.personas)
+  // Only the thread_hybrid entry's Thread Hybrid Since differs from the
+  // anchor, minted in the activation's own write; the marker is kept.
+  const restoredSince = sinceOf(restored.snapshot())
+  expect(restoredSince).toEqual(expect.any(String)); expect(restoredSince).not.toBe(anchorSince)
+  expect(sinceOf(activation!)).toBe(restoredSince)
+  const expected = structuredClone(prior.personas)
+  expected.alpha!.assignments[THREAD]!.threadHybridSince = restoredSince
+  expect(restored.snapshot().personas).toEqual(expected)
+  expect(restored.snapshot().threadMemoryCreated).toEqual({ alpha: true })
   expect(restored.snapshot().outcomes.botAttempts).toEqual(prior.outcomes.botAttempts)
   expect(restored.operatorIntent()).toEqual(authority.operatorIntent()); expect(h.readConfig()).toEqual(input)
   expect(run.membership.read('alpha', channel, 'open').kind).toBe('unresolved')
@@ -905,8 +1208,10 @@ test('real staged recovery renders bounded facts and rejects derived malformed d
 })
 
 test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename', 'installed-unsynced'] as const).map(fault => [mode, fault] as const)))(
-  '%s durable later leave supersedes held obligations through %s and rejects delayed old consumers after reopen/rejoin', async (mode, fault) => {
-  const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: mode })
+  '%s durable later leave supersedes held obligations and clears Thread Hybrid Since through %s and rejects delayed old consumers after reopen/rejoin', async (mode, fault) => {
+  const base = h.persona('alpha')
+  const alpha = { ...base, channels: [{ id: base.permission_prompts, delivery: 'thread_hybrid' as const }] }
+  h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: mode })
   const opts = { dryRun: false, realLifecycle: true, slack: REPAIR_SLACK }
   let run = await start(opts), authority = run.controller.sharedChannels()!
   const channel = alpha.permission_prompts, sibling = 'C0SIBLING'
@@ -928,6 +1233,8 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
     expect(conflict.state).toBe('conflict')
     expect(run.membership.read('alpha', channel, mode).kind).toBe('unresolved')
     expect(run.membership.read('alpha', sibling, mode).kind).toBe('eligible')
+    const entry = authority.snapshot().personas.alpha!.assignments[channel]!, incarnation = authority.incarnation('alpha')!
+    expect(entry.threadHybridSince).toEqual(expect.any(String))
     if (fault !== 'none') h.failWrites(fault === 'before-rename' ? { step: 'writeSync', code: 'ENOSPC' } : { step: 'fsyncSync', call: 2, code: 'EIO' })
     const acks = run.stub('alpha').socket.acks.length
     await send('channel_left', 'EvPROVENLATER', 20)
@@ -936,11 +1243,20 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
       expect(run.membership.read('alpha', channel, mode).kind).toBe('unresolved')
       expect(authority.lifetimeStatus(unaffected)).toBe('current')
       expect(authority.lifetimeStatus(old)).toBe(fault === 'installed-unsynced' ? 'unresolved' : 'current')
+      // The removal's own write carries the cleared field: the disk keeps the
+      // old entry with its Thread Hybrid Since, or has neither.
+      const onDisk = disk().personas.alpha!.assignments
+      expect(Object.hasOwn(onDisk, channel)).toBe(fault === 'before-rename')
+      if (fault === 'before-rename') expect(onDisk[channel]).toEqual(entry)
+      expect(authority.channelStamp('alpha', channel)).toEqual(fault === 'before-rename'
+        ? { kind: 'decided', incarnation, threadHybridSince: entry.threadHybridSince } : { kind: 'undecided' })
       h.clearWriteFailure()
       if (fault === 'before-rename') await send('channel_left', 'EvPROVENLATER', 20)
       else { expect(authority.recoverDurability().kind).toBe('applied'); expect(run.membership.recover('alpha')).toBe(true) }
     }
     expect(authority.choice('alpha', channel)).toBeUndefined()
+    expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'decided', incarnation })
+    expect(disk().personas.alpha!.assignments[channel]).toBeUndefined()
     expect(authority.lifetimeStatus(old)).toBe('superseded'); expect(authority.isCurrentLifetime(old)).toBe(false)
     expect(authority.lifetimeStatus(unaffected)).toBe('current')
     expect(authority.snapshot().personas.alpha!.membershipEvidence![conflict.event]!.state).toBe('superseded')
@@ -953,6 +1269,7 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
     await send('member_joined_channel', 'EvFRESHJOIN', 30)
     const fresh = authority.lifetime('alpha', channel)!
     expect(authority.choice('alpha', channel)).toBe(mode === 'open' ? 'mentions' : 'off')
+    expect(disk().personas.alpha!.assignments[channel]).not.toHaveProperty('threadHybridSince')
     expect(authority.lifetimeStatus(removed)).toBe('superseded')
     release(); expect(await delayed).toBe(false)
     expect(authority.lifetimeStatus(fresh)).toBe('current')

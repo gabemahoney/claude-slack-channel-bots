@@ -1779,7 +1779,7 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
 
   test('the shipped-text audit includes each actual recovery clause and strict unreadable-state refusal', () => {
     const names = Object.keys(recoveryClauses).filter(name => /^(RECOVERY_|REVIEW_ABSENCE_REPLACEMENT$)/.test(name))
-    expect(names.sort()).toEqual(['RECOVERY_CURRENT_MEMBERSHIP', 'RECOVERY_LOSS', 'RECOVERY_PRESERVATION', 'RECOVERY_RESTORE', 'REVIEW_ABSENCE_REPLACEMENT'])
+    expect(names.sort()).toEqual(['RECOVERY_CURRENT_MEMBERSHIP', 'RECOVERY_LOSS', 'RECOVERY_PRESERVATION', 'RECOVERY_RESTORE', 'RECOVERY_THREADS_FORGOTTEN', 'REVIEW_ABSENCE_REPLACEMENT'])
     for (const name of [...names.map(name => `${name} (src/reload-preview-clauses.ts)`), 'CHANNEL_TARGET_STATE_UNRESOLVED (src/registry.ts)']) {
       const entry = SHIPPED_TEXTS.find(([label]) => label === name)
       expect(entry).toBeDefined(); expect(entry![1]().trim().length).toBeGreaterThan(30)

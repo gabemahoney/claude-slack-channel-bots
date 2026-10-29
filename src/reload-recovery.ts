@@ -4,16 +4,16 @@
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
-import { parsePersonaConfigBytes, readPersonaConfigBytes, referencedCredentialsPaths, resolveRealPath, type PersonaConfigFs } from './config.ts'
+import { parseConfigJsonBytes, parsePersonaConfigBytes, readPersonaConfigBytes, referencedCredentialsPaths, resolveRealPath, type PersonaConfigFs } from './config.ts'
 import { errnoSuffix, readCredentialsFile, type CredentialsFs } from './persona-credentials.ts'
 import { composePendingFile, parsePendingFingerprint, reloadFingerprint, reloadReviewBinding } from './reload-fingerprint.ts'
 import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, REVIEW_ID_RE, type OperatorIntent } from './reload-request.ts'
 import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, sharedReviewDependency, supersedeReview } from './reload-review.ts'
-import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
+import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, restartThreadHybridSince, serializeSharedChannelState, validThreadMemoryMarker, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
 import { readSharedRecoveryRequest, recoveryBytes, recoveryHash, type SharedRecoveryRequest } from './shared-recovery.ts'
 import { RETIRED_KEYS_WRITE_FAILED, RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, retiredReviewRecovery, restoreReviewedRetirement, type RetiredKeyStore } from './retired-keys.ts'
 import { DurableWriteUnsyncedError } from './atomic-write.ts'
-import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE } from './reload-preview-clauses.ts'
+import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE, RECOVERY_THREADS_FORGOTTEN } from './reload-preview-clauses.ts'
 
 export const RELOAD_SHARED_RECOVERY = 'reload-shared-recovery'
 export interface ReloadRecoveryDeps {
@@ -24,6 +24,7 @@ export interface ReloadRecoveryDeps {
   dryRun?: boolean
   now?: () => number
   boundary?: () => string
+  threadHybridSince?: () => string
   write(path: string, bytes: Uint8Array): void
   remove(path: string): unknown
   retiredKeys: RetiredKeyStore
@@ -43,7 +44,10 @@ export function renderSharedRecovery(state: SharedChannelState): string {
   ]
   for (const [key, life] of Object.entries(state.personas)) {
     lines.push(`persona=${key}; ${recovery.request.action === 'replace' ? 'new' : 'retained'} incarnation=${REVIEW_ID_RE.test(life.incarnation) ? life.incarnation : '(not renderable)'}; choices=${Object.keys(life.assignments).length}.`)
-    for (const [channel, assignment] of Object.entries(life.assignments)) lines.push(`persona=${key}; channel=${channel}; ${recovery.request.action === 'replace' ? 'new choice' : 'restored choice'}=${assignment.delivery}.`)
+    for (const [channel, assignment] of Object.entries(life.assignments)) {
+      lines.push(`persona=${key}; channel=${channel}; ${recovery.request.action === 'replace' ? 'new choice' : 'restored choice'}=${assignment.delivery}` +
+        (assignment.delivery === 'thread_hybrid' ? `; ${RECOVERY_THREADS_FORGOTTEN}` : '.'))
+    }
   }
   lines.push('Rename this reviewed pending file to the apply name, then start again. Prepared config input is retained separately for ordinary review.')
   return lines.join('\n')
@@ -63,12 +67,23 @@ function fingerprint(deps: ReloadRecoveryDeps, authority: SharedChannelAuthority
     authority.snapshot().recovery!.boundary, authority.operatorIntent().generation, [recoveryHash(request),
       authority.config().personas.map(p => [p.key, resolveRealPath(p.credentials_file), resolveRealPath(p.working_directory), p.permission_prompts])])
 }
+/** A marker readable from unreadable evidence is kept: losing it would hide a
+ * `threads/` directory deleted at the same time. Otherwise there is none. */
+function evidenceThreadMemoryMarker(evidence: Buffer): Record<string, true> | undefined {
+  let value: unknown
+  try { value = parseConfigJsonBytes(evidence, 'recovery evidence') } catch { return undefined }
+  const marker = typeof value === 'object' && value !== null && !Array.isArray(value) && Object.hasOwn(value, 'threadMemoryCreated')
+    ? (value as Record<string, unknown>)['threadMemoryCreated'] : undefined
+  return validThreadMemoryMarker(marker) && Object.keys(marker).length ? marker : undefined
+}
 function prepareReplacement(request: SharedRecoveryRequest, evidence: Buffer, input: Buffer, deps: ReloadRecoveryDeps): SharedChannelState {
   if (request.action !== 'replace') throw new Error('Restoration requires a retained owner anchor.')
   const bytes = recoveryBytes(request.replacement_source_base64)!
   const config = parsePersonaConfigBytes(bytes, deps.paths.config, dirname(deps.paths.config), { home: deps.home })
   const boundary = (deps.boundary ?? randomUUID)()
-  const state = initialSharedChannelState(bytes, config, () => boundary + '-' + randomUUID())
+  const state = initialSharedChannelState(bytes, config, () => boundary + '-' + randomUUID(), deps.threadHybridSince)
+  const marker = evidenceThreadMemoryMarker(evidence)
+  if (marker) state.threadMemoryCreated = marker
   state.recovery = { boundary, phase: 'review', request, evidenceBase64: evidence.toString('base64'), preparedBase64: input.toString('base64') }
   // This position records only the stage. Choices become applied on confirmation.
   state.revision++
@@ -136,6 +151,7 @@ function activate(authority: SharedChannelAuthority, deps: ReloadRecoveryDeps, b
       life.createdAt = (deps.now ?? Date.now)()
       for (const choice of Object.values(life.assignments)) choice.order = order
     }
+    restartThreadHybridSince(next, deps.threadHybridSince)
     const ledger = reviewLedger(next)!
     ledger.outcomes[review.fingerprint] = { generation: review.generation, revision: order, status: 'consumed' }
     delete ledger.active
@@ -251,7 +267,7 @@ export function runStartupRecovery(deps: ReloadRecoveryDeps): 'pending' | 'activ
     deps.write(path, bytes)
     expected = Buffer.from(bytes)
   }
-  const authority = createSharedChannelAuthority(paths.lastApplied, state, { write, home: deps.home, readFs: deps.configFs, sourcePath: paths.config, now: deps.now })
+  const authority = createSharedChannelAuthority(paths.lastApplied, state, { write, home: deps.home, readFs: deps.configFs, sourcePath: paths.config, now: deps.now, threadHybridSince: deps.threadHybridSince })
   const observe = createReviewObserver()
   try {
     const processed = processRecoveryRequest(authority, deps, input, requestBytes, observe)

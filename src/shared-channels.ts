@@ -11,7 +11,7 @@ import { emptyOperatorIntent, parseReviewRequest, validateOperatorIntent, type O
 import { consumeReview, reviewLedger, reviewMatches, sharedReviewDependency, supersedeReview, validateReviewLedger, type DurableReview, type ReviewLedger } from './reload-review.ts'
 import { reloadFingerprint } from './reload-fingerprint.ts'
 import { recoveryHash, validateSharedRecovery, type SharedRecoveryRecord, type SharedRecoveryRequest } from './shared-recovery.ts'
-import { expandTilde, personaKey } from './persona-identity.ts'
+import { expandTilde, PERSONA_KEY_RE, personaKey } from './persona-identity.ts'
 import { dirname } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
@@ -26,7 +26,13 @@ import {
 
 export const SHARED_CHANNEL_FORMAT = 'cscb-shared-channels-v1'
 export type PersonaDeclaration = Pick<Persona, 'name' | 'credentials_file' | 'working_directory'>
-export interface SharedAssignment { delivery: DeliveryMode; order: number }
+export interface SharedAssignment {
+  delivery: DeliveryMode
+  order: number
+  /** Present exactly on a `thread_hybrid` entry. A random ID compared only
+   * for equality; never a delivery value, membership evidence or authorization. */
+  threadHybridSince?: string
+}
 export interface SharedMembership {
   member: boolean
   boundary: number
@@ -135,11 +141,15 @@ export interface SharedChannelState {
   /** Metadata is durable, but does not publish configuration activation. */
   pendingIntent: Record<string, unknown>
   outcomes: SharedChannelOutcomes
+  /** Thread Memory created marker per persona key, current or not. Outside
+   * `revision`, the review dependency and every delivery assignment. */
+  threadMemoryCreated?: Record<string, true>
 }
 export interface SharedChannelOutcomes extends Record<string, unknown> {
   operatorReviews?: ReviewLedger
   botAttempts?: Record<string, SharedBotAttempt>
 }
+export type ThreadMemoryMarkerResult = { kind: 'saved' } | { kind: 'failed' }
 export type SharedMutationResult =
   | { kind: 'applied'; revision: number }
   | { kind: 'stale'; revision: number }
@@ -154,6 +164,7 @@ export interface SharedChannelDeps {
   /** Submitted input label, separate from the durable authority's path. */
   sourcePath?: string
   now?: () => number
+  threadHybridSince?: () => string
 }
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -164,6 +175,23 @@ function own<T>(record: Record<string, T>, key: string): T | undefined {
 }
 function put<T>(record: Record<string, T>, key: string, value: T): void {
   Object.defineProperty(record, key, { value, enumerable: true, configurable: true, writable: true })
+}
+/** Every value write: a `thread_hybrid` entry keeps its Thread Hybrid Since
+ * only over a previous `thread_hybrid` entry of the same life, else mints. */
+function putAssignment(assignments: Record<string, SharedAssignment>, channel: string, delivery: DeliveryMode, order: number, mint: () => string = randomUUID): void {
+  const previous = own(assignments, channel)
+  const since = delivery !== 'thread_hybrid' ? undefined
+    : previous?.delivery === 'thread_hybrid' && previous.threadHybridSince ? previous.threadHybridSince : mint()
+  put(assignments, channel, { delivery, order, ...(since === undefined ? {} : { threadHybridSince: since }) })
+}
+/** Reviewed restoration and replacement: every `thread_hybrid` entry starts a
+ * new Thread Hybrid Since. Changes nothing else and performs no I/O. */
+export function restartThreadHybridSince(state: SharedChannelState, mint: () => string = randomUUID): void {
+  for (const life of Object.values(state.personas)) {
+    for (const assignment of Object.values(life.assignments)) {
+      if (assignment.delivery === 'thread_hybrid') assignment.threadHybridSince = mint()
+    }
+  }
 }
 function declaration(persona: PersonaDeclaration): PersonaDeclaration {
   return { name: persona.name, credentials_file: persona.credentials_file, working_directory: persona.working_directory }
@@ -250,7 +278,10 @@ export function absenceReplacementBinding(state: SharedChannelState, key: string
   const life = own(state.personas, key)
   const conflict = life && own(life.membershipAbsenceConflicts ?? {}, channel)
   if (!life || !conflict || Object.values(life.membershipEvidence ?? {}).some(e => e.channel === channel && (e.state === 'pending' || e.state === 'conflict'))) return undefined
-  return createHash('sha256').update(JSON.stringify([life.incarnation, channel, conflict, life.membership[channel], life.leaves[channel], life.assignments[channel]])).digest('hex')
+  // Thread Hybrid Since authorizes nothing, so it never enters this binding.
+  const assignment = own(life.assignments, channel)
+  const choice = assignment && { delivery: assignment.delivery, order: assignment.order }
+  return createHash('sha256').update(JSON.stringify([life.incarnation, channel, conflict, life.membership[channel], life.leaves[channel], choice])).digest('hex')
 }
 function checkReplacedAbsences(life: SharedPersona, revision: number): void {
   if (life.replacedAbsences === undefined) return
@@ -301,6 +332,10 @@ export function sharedAppliedConfig(state: SharedChannelState, path: string, dep
     resetDestination: persona => resetDestination(state, persona, deps.realpath),
   })
 }
+/** The marker field's only valid shape; absence is checked by the caller. */
+export function validThreadMemoryMarker(value: unknown): value is Record<string, true> {
+  return object(value) && Object.entries(value).every(([key, created]) => PERSONA_KEY_RE.test(key) && created === true)
+}
 /** Strict envelope reader. A raw baseline still obeys the new schema; this
  * never reads or imports the removed delivery store or old configuration. */
 export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: SharedChannelDeps = {}): SharedChannelState | undefined {
@@ -309,6 +344,7 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
   if (!Number.isSafeInteger(value['revision']) || (value['revision'] as number) < 1 ||
       !object(value['source']) || typeof value['sourceBytesBase64'] !== 'string' || !object(value['applied']) || !object(value['personas']) ||
       !object(value['pendingIntent']) || !object(value['outcomes']) || !object(value['retiredIdentities'])) throw new Error('The shared channel authority has an invalid envelope.')
+  if (Object.hasOwn(value, 'threadMemoryCreated') && !validThreadMemoryMarker(value['threadMemoryCreated'])) throw new Error('The shared channel authority has an invalid Thread Memory marker.')
   const state = value as unknown as SharedChannelState
   if (state.recovery !== undefined) validateSharedRecovery(state.recovery)
   if (Object.hasOwn(state.pendingIntent, 'operator')) validateOperatorIntent(state.pendingIntent['operator'])
@@ -395,7 +431,10 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
     }
     for (const [id, assignment] of Object.entries(life.assignments)) {
       if (!CHANNEL_ID_RE.test(id) || !object(assignment) || !DELIVERY_MODES.includes(assignment.delivery) ||
-          !Number.isSafeInteger(assignment.order) || assignment.order < 1 || assignment.order > state.revision) throw new Error('The shared channel authority has an invalid ordered assignment.')
+          !Number.isSafeInteger(assignment.order) || assignment.order < 1 || assignment.order > state.revision ||
+          (assignment.delivery === 'thread_hybrid'
+            ? typeof assignment.threadHybridSince !== 'string' || !assignment.threadHybridSince
+            : Object.hasOwn(assignment, 'threadHybridSince'))) throw new Error('The shared channel authority has an invalid ordered assignment.')
     }
     for (const [id, membership] of Object.entries(life.membership)) {
       if (!CHANNEL_ID_RE.test(id) || !object(membership) || typeof membership.member !== 'boolean' ||
@@ -472,11 +511,12 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
 export function serializeSharedChannelState(state: SharedChannelState): Uint8Array {
   return Buffer.from(JSON.stringify(state, null, 2) + '\n')
 }
-export function initialSharedChannelState(bytes: Uint8Array, config: PersonaConfig, incarnation: () => string = randomUUID): SharedChannelState {
+export function initialSharedChannelState(bytes: Uint8Array, config: PersonaConfig, incarnation: () => string = randomUUID, threadHybridSince: () => string = randomUUID): SharedChannelState {
   const raw = parseConfigJsonBytes(bytes, 'prepared configuration') as Record<string, unknown>
   const personas: Record<string, SharedPersona> = {}
   for (const persona of config.personas) {
-    const assignments = Object.fromEntries(persona.channels.map(channel => [channel.id, { delivery: channel.delivery, order: 1 }]))
+    const assignments: Record<string, SharedAssignment> = {}
+    for (const channel of persona.channels) putAssignment(assignments, channel.id, channel.delivery, 1, threadHybridSince)
     put(personas, persona.key, { incarnation: incarnation(), resetOrder: 1, declaration: declaration(persona), assignments, membership: {}, membershipEvents: {}, leaves: {}, removedDestinations: {} })
   }
   return { format: SHARED_CHANNEL_FORMAT, revision: 1, source: clone(raw), sourceBytesBase64: Buffer.from(bytes).toString('base64'), applied: clone(raw), personas, retiredIdentities: {}, pendingIntent: {}, outcomes: {} }
@@ -492,6 +532,7 @@ function rawPersona(state: SharedChannelState, key: string): Record<string, unkn
  * publishes nothing; live effects and complete-inventory batches share it. */
 export function applySharedMembership(
   next: SharedChannelState, order: number, key: string, incarnation: string, observation: VerifiedSharedMembership,
+  mint: () => string = randomUUID,
 ): void {
   const life = own(next.personas, key)
   if (!life || life.incarnation !== incarnation) throw new Error('Obsolete membership incarnation.')
@@ -524,7 +565,7 @@ export function applySharedMembership(
     put(life.leaves, observation.channel, leave)
     if (raw['permission_prompts'] === observation.channel) put(life.removedDestinations, observation.channel, leave)
   } else if (observation.member && !own(life.assignments, observation.channel)) {
-    put(life.assignments, observation.channel, { delivery: next.applied['channel_mode'] === 'open' ? 'mentions' : 'off', order })
+    putAssignment(life.assignments, observation.channel, next.applied['channel_mode'] === 'open' ? 'mentions' : 'off', order, mint)
   }
   raw['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
 }
@@ -577,6 +618,87 @@ export function reviewedReplacementIncarnation(state: SharedChannelState, path: 
 }
 export type OperatorRequestResult = { kind: 'recorded' | 'duplicate' | 'invalid' | 'stale' | 'failed' | 'unresolved'; generation: number }
 
+// --- Channel Stamps: thread facts only, never selection or authorization ---
+
+/** The stamp a join records; only a `thread_hybrid` entry has one. */
+export interface ChannelStamp { incarnation: string; threadHybridSince: string }
+export type SharedChannelStampState =
+  | { kind: 'decided'; incarnation: string; threadHybridSince?: string }
+  | { kind: 'undecided' }
+/** Thread facts captured at one moment; a later application never changes it.
+ * An `undecided` stamp may coexist with readable intake for that channel;
+ * consumers hold its joins rather than forget or drop them. */
+export interface SharedThreadView {
+  readonly revision: number
+  /** `undefined` for a key with no current persona. */
+  stamp(key: string, channel: string): SharedChannelStampState | undefined
+  /** Sorted decided channels whose entry is `thread_hybrid`. */
+  threadHybridChannels(key: string): string[]
+  personaKeys(): string[]
+}
+export function sameChannelStamp(a: ChannelStamp, b: SharedChannelStampState | undefined): boolean {
+  return b?.kind === 'decided' && b.incarnation === a.incarnation && b.threadHybridSince === a.threadHybridSince
+}
+/** The authority's readability facts; committed states are never mutated in place. */
+interface SharedReadability {
+  current: SharedChannelState
+  uncertain: SharedChannelState | undefined
+  readable: boolean
+  recoveryStaged: boolean
+}
+function heldByReview(state: SharedChannelState, key: string): boolean {
+  return state.recovery?.phase === 'review' || reviewLedger(state)?.retirement?.recovery.keys.includes(key) === true
+}
+function readableIn(facts: SharedReadability, key: string, channel?: string): boolean {
+  const { current, uncertain } = facts
+  if (heldByReview(current, key)) return false
+  if (facts.readable) return true
+  if (!uncertain) return false
+  const before = own(current.personas, key)
+  const after = own(uncertain.personas, key)
+  if (!before || !after || before.incarnation !== after.incarnation) return false
+  const oldRaw = rawPersona(current, key)
+  const newRaw = rawPersona(uncertain, key)
+  if (!channel) return isDeepStrictEqual(oldRaw, newRaw)
+  if (channel.startsWith('D')) return isDeepStrictEqual(oldRaw['dm'], newRaw['dm'])
+  if (current.applied['channel_mode'] !== uncertain.applied['channel_mode']) return false
+  const destinations = (state: SharedChannelState) => (state.applied['personas'] as Record<string, unknown>[])
+    .filter(persona => persona['permission_prompts'] === channel).map(persona => persona['name']).sort()
+  return isDeepStrictEqual(destinations(current), destinations(uncertain)) &&
+    isDeepStrictEqual(own(before.assignments, channel), own(after.assignments, channel)) &&
+    isDeepStrictEqual(own(before.membership, channel), own(after.membership, channel)) &&
+    isDeepStrictEqual(own(before.leaves, channel), own(after.leaves, channel)) &&
+    isDeepStrictEqual(own(before.membershipAbsenceConflicts ?? {}, channel), own(after.membershipAbsenceConflicts ?? {}, channel))
+}
+/** A staged recovery leaves unchanged projections readable, yet no stamp under
+ * it can be decided: the restart reviews the stage before any join counts. */
+function stampIn(facts: SharedReadability, key: string, channel: string): SharedChannelStampState | undefined {
+  const life = own(facts.current.personas, key)
+  if (!life) return undefined
+  if (facts.recoveryStaged || !readableIn(facts, key, channel)) return { kind: 'undecided' }
+  const since = own(life.assignments, channel)?.threadHybridSince
+  return { kind: 'decided', incarnation: life.incarnation, ...(since === undefined ? {} : { threadHybridSince: since }) }
+}
+function captureThreadView(facts: SharedReadability): SharedThreadView {
+  return {
+    revision: facts.current.revision,
+    stamp: (key, channel) => stampIn(facts, key, channel),
+    threadHybridChannels: key => Object.entries(own(facts.current.personas, key)?.assignments ?? {})
+      .filter(([channel, assignment]) => assignment.delivery === 'thread_hybrid' && stampIn(facts, key, channel)?.kind === 'decided')
+      .map(([channel]) => channel).sort(),
+    personaKeys: () => Object.keys(facts.current.personas).sort(),
+  }
+}
+/** Compares views by derived stamps only, so marker writes and unrelated
+ * metadata never count as a change. */
+function threadViewSignature(facts: SharedReadability): string {
+  return JSON.stringify(Object.keys(facts.current.personas).sort().map(key => {
+    const channels = new Set([...Object.keys(facts.current.personas[key]!.assignments),
+      ...Object.keys(own(facts.uncertain?.personas ?? {}, key)?.assignments ?? {})])
+    return [key, [...channels].sort().map(channel => [channel, stampIn(facts, key, channel)])]
+  }))
+}
+
 export interface SharedChannelAuthority {
   readonly path: string
   readonly readable: boolean
@@ -607,6 +729,16 @@ export interface SharedChannelAuthority {
   channels(key: string): string[]
   validatesRemovedDestination(persona: Pick<Persona, 'key' | 'name' | 'credentials_file' | 'working_directory' | 'permission_prompts'>): boolean
   subscribe(listener: (config: PersonaConfig) => void): () => void
+  /** A stamp can read `undecided` while `readableFor` is true (a staged
+   * recovery), so intake may continue. Undecided means hold: a consumer never
+   * forgets under it, never treats it as selecting nothing, and never
+   * acknowledges then drops a reply that depends on a join. */
+  channelStamp(key: string, channel: string): SharedChannelStampState | undefined
+  threadView(): SharedThreadView
+  /** Delivered at every config publication, before `subscribe` listeners, and
+   * after any other durable or readability change to the derived stamps. A
+   * listener may run under the mutation lock and must not mutate synchronously. */
+  subscribeThreadView(listener: (view: SharedThreadView) => void): () => void
   operatorIntent(): OperatorIntent
   requestReview(request: ReviewRequest, bytes: Uint8Array): OperatorRequestResult
   declaredAssignments(bytes: Uint8Array): ReviewedAssignment[]
@@ -624,6 +756,16 @@ export interface SharedChannelAuthority {
   lookupBotAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest): BotAttemptResult | undefined
   botAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest,
     authorize: () => BotAttemptAuthorization, applied?: (outcome: Extract<SharedBotAttempt, { status: 'applied' }>) => void): BotAttemptResult
+  /** The last durably committed marker; readable at start and while unreadable. */
+  threadMemoryCreated(key: string): boolean
+  threadMemoryCreatedKeys(): string[]
+  /** One whole-file write with `revision` unchanged: no application order, no
+   * stale confirmation and no publication. `saved` only after the write returns.
+   * `failed` after an unsynced write means the new marker may be on disk while
+   * memory keeps the old one, and a later whole-file write may undo it: retry
+   * until `saved`. A success leaves `failure` describing the last failed write. */
+  setThreadMemoryCreated(key: string): ThreadMemoryMarkerResult
+  clearThreadMemoryCreated(key: string): ThreadMemoryMarkerResult
 }
 export function createSharedChannelAuthority(path: string, initial: SharedChannelState, deps: SharedChannelDeps = {}): SharedChannelAuthority {
   const validated = parseSharedChannelState(serializeSharedChannelState(initial), path, deps)
@@ -636,7 +778,21 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   let mutating = false
   let failure = ''
   const write = deps.write ?? durableWriteFileSync
+  const mint = deps.threadHybridSince ?? randomUUID
   const listeners = new Set<(config: PersonaConfig) => void>()
+  const threadViewListeners = new Set<(view: SharedThreadView) => void>()
+  const readability = (): SharedReadability => ({ current, uncertain, readable, recoveryStaged })
+  let deliveredThreadView = threadViewSignature(readability())
+  function deliverThreadView(always: boolean): void {
+    const facts = readability()
+    const signature = threadViewSignature(facts)
+    if (!always && signature === deliveredThreadView) return
+    deliveredThreadView = signature
+    const view = captureThreadView(facts)
+    for (const listener of [...threadViewListeners]) {
+      try { listener(view) } catch { /* an observer cannot undo durability */ }
+    }
+  }
   // Only closes synchronous reentrancy and undurable binding failures. Durable
   // evidence always wins; this map is never recovery authority after restart.
   const attemptsInFlight = new Map<string, { binding: BotAttemptBinding; kind: 'pending' | 'unresolved' }>()
@@ -649,7 +805,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       next.outcomes.botAttempts ??= {}
       put(next.outcomes.botAttempts, botAttemptKey(record), record)
       if (activate && record.status === 'applied') {
-        put(life.assignments, record.channel, { delivery: record.delivery, order })
+        putAssignment(life.assignments, record.channel, record.delivery, order, mint)
         rawPersona(next, record.key)['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
       }
     }, 1, publish)
@@ -699,11 +855,38 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       if (own(current.outcomes.botAttempts ?? {}, id)) attemptsInFlight.delete(id)
     }
   }
+  function writeThreadMemoryMarker(key: string, created: boolean): ThreadMemoryMarkerResult {
+    if (!readable || recoveryStaged || heldByReview(current, key) || mutating || (created && !own(current.personas, key))) return { kind: 'failed' }
+    if ((own(current.threadMemoryCreated ?? {}, key) === true) === created) return { kind: 'saved' }
+    const next = clone(current)
+    const markers = next.threadMemoryCreated ?? {}
+    if (created) put(markers, key, true)
+    else delete markers[key]
+    if (Object.keys(markers).length) next.threadMemoryCreated = markers
+    else delete next.threadMemoryCreated
+    mutating = true
+    try {
+      const bytes = serializeSharedChannelState(next)
+      const saved = parseSharedChannelState(bytes, path, deps)
+      if (!saved) throw new Error('Invalid shared authority format.')
+      write(path, bytes)
+      current = saved
+      return { kind: 'saved' }
+    } catch (err) {
+      // Only the marker can differ from memory, so even an unsynced write
+      // leaves the authority readable; the next whole-file write agrees.
+      failure = errnoSuffix(err)
+      return { kind: 'failed' }
+    } finally { mutating = false }
+  }
   function publishChange(before: SharedChannelState, publish?: (config: PersonaConfig) => void): void {
     // Runtime publication precedes observers while the mutation lock is held.
     try { publish?.(authority.config()) } catch { /* durability cannot be undone by a publisher */ }
-    if (!isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
-        !isDeepStrictEqual(before.retiredIdentities, current.retiredIdentities)) {
+    const changed = !isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
+      !isDeepStrictEqual(before.retiredIdentities, current.retiredIdentities)
+    // Thread Memory forgets before any other observer reacts.
+    deliverThreadView(publish !== undefined || changed)
+    if (changed) {
       for (const listener of [...listeners]) {
         try { listener(authority.config()) } catch { /* an observer cannot undo durability */ }
       }
@@ -785,7 +968,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         // replacement cannot inherit a preference from the old life.
         const changed = !previousChoices.has(channel.id) || previousChoices.get(channel.id) !== channel.delivery
         if (!previous || changed) {
-          put(life.assignments, channel.id, { delivery: channel.delivery, order })
+          putAssignment(life.assignments, channel.id, channel.delivery, order, mint)
           edited.add(channel.id)
         }
       }
@@ -806,8 +989,10 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
           put(life.membershipEvents, event, { channel: assignment.channel, member: false, identity: conflict.identity, order: removedOrder, boundary: removedOrder })
           put(life.leaves, assignment.channel, leave)
           if (persona.permission_prompts === assignment.channel) put(life.removedDestinations, assignment.channel, leave)
+          // The removal ends the old entry, so the new choice cannot keep its Thread Hybrid Since.
+          delete life.assignments[assignment.channel]
         }
-        put(life.assignments, assignment.channel, { delivery: assignment.delivery, order })
+        putAssignment(life.assignments, assignment.channel, assignment.delivery, order, mint)
       }
       const inputChannels = new Set(persona.channels.map(c => c.id))
       if (!same && previous && inputChannels.has(persona.permission_prompts) && !own(life.assignments, persona.permission_prompts)) {
@@ -842,26 +1027,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   const authority: SharedChannelAuthority = {
     path,
     get readable() { return readable },
-    readableFor(key, channel) {
-      if (authority.reviewHeld(key)) return false
-      if (readable) return true
-      if (!uncertain) return false
-      const before = own(current.personas, key)
-      const after = own(uncertain.personas, key)
-      if (!before || !after || before.incarnation !== after.incarnation) return false
-      const oldRaw = rawPersona(current, key)
-      const newRaw = rawPersona(uncertain, key)
-      if (!channel) return isDeepStrictEqual(oldRaw, newRaw)
-      if (channel.startsWith('D')) return isDeepStrictEqual(oldRaw['dm'], newRaw['dm'])
-      if (current.applied['channel_mode'] !== uncertain.applied['channel_mode']) return false
-      const destinations = (state: SharedChannelState) => (state.applied['personas'] as Record<string, unknown>[])
-        .filter(persona => persona['permission_prompts'] === channel).map(persona => persona['name']).sort()
-      return isDeepStrictEqual(destinations(current), destinations(uncertain)) &&
-        isDeepStrictEqual(own(before.assignments, channel), own(after.assignments, channel)) &&
-        isDeepStrictEqual(own(before.membership, channel), own(after.membership, channel)) &&
-        isDeepStrictEqual(own(before.leaves, channel), own(after.leaves, channel)) &&
-        isDeepStrictEqual(own(before.membershipAbsenceConflicts ?? {}, channel), own(after.membershipAbsenceConflicts ?? {}, channel))
-    },
+    readableFor: (key, channel) => readableIn(readability(), key, channel),
     get revision() { return current.revision },
     get failure() { return failure },
     recoverDurability() {
@@ -923,6 +1089,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       readable = false
       uncertain = staged
       mutating = false
+      deliverThreadView(false)
       return { kind: 'unresolved', revision: current.revision }
     },
     snapshot: () => clone(current),
@@ -945,15 +1112,22 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       return undefined
     },
     botAttempt: performBotAttempt,
+    threadMemoryCreated: key => own(current.threadMemoryCreated ?? {}, key) === true,
+    threadMemoryCreatedKeys: () => Object.keys(current.threadMemoryCreated ?? {}).sort(),
+    setThreadMemoryCreated: key => writeThreadMemoryMarker(key, true),
+    clearThreadMemoryCreated: key => writeThreadMemoryMarker(key, false),
     sourceBytes: () => Buffer.from(current.sourceBytesBase64, 'base64'),
     incarnation: key => own(current.personas, key)?.incarnation,
-    reviewHeld: key => current.recovery?.phase === 'review' || reviewLedger(current)?.retirement?.recovery.keys.includes(key) === true,
+    reviewHeld: key => heldByReview(current, key),
     lifetime: (key, channel) => sharedChannelLifetime(current, key, channel),
     lifetimeStatus: token => !authority.readableFor(token.key, token.channel) ? 'unresolved' :
       isDeepStrictEqual(sharedChannelLifetime(current, token.key, token.channel), token) ? 'current' : 'superseded',
     isCurrentLifetime: token => authority.lifetimeStatus(token) === 'current',
     validatesRemovedDestination: persona => removedDestination(current, persona, deps.realpath),
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+    channelStamp: (key, channel) => stampIn(readability(), key, channel),
+    threadView: () => captureThreadView(readability()),
+    subscribeThreadView(listener) { threadViewListeners.add(listener); return () => threadViewListeners.delete(listener) },
     operatorIntent: () => clone((own(current.pendingIntent, 'operator') as OperatorIntent | undefined) ?? emptyOperatorIntent()),
     declaredAssignments: bytes => validateDeclarations(authority.operatorIntent(), bytes),
     requestReview(input, bytes) {
@@ -1008,6 +1182,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
           readable = false
           uncertain = prepared
           uncertainPublish = publish
+          deliverThreadView(false)
           return { kind: 'unresolved', revision: current.revision }
         }
         return { kind: 'failed', revision: current.revision }
@@ -1034,7 +1209,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         return { kind: samePayload && recorded.channel === observation.channel && recorded.member === observation.member && recorded.identity === observation.identity ? 'applied' : 'failed', revision: recorded.order }
       }
       return authority.transact(expectedRevision, (next, order) => {
-        applySharedMembership(next, order, key, incarnation, observation)
+        applySharedMembership(next, order, key, incarnation, observation, mint)
       })
     },
     assign(key, incarnation, channel, delivery, expectedRevision) {
@@ -1044,7 +1219,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       return authority.transact(expectedRevision, (next, order) => {
         const life = own(next.personas, key)
         if (!life || life.incarnation !== incarnation || !CHANNEL_ID_RE.test(channel) || !DELIVERY_MODES.includes(delivery)) throw new Error('Obsolete or invalid assignment.')
-        put(life.assignments, channel, { delivery, order })
+        putAssignment(life.assignments, channel, delivery, order, mint)
         const raw = rawPersona(next, key)
         raw['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
       })
