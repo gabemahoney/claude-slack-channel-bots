@@ -157,6 +157,11 @@ export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
  */
 export const PERSONA_CHANNEL_DELIVERY_SET = 'persona-channel-delivery-set'
 
+export const PERSONA_THREAD_STAMP_UNDECIDED = 'persona-thread-stamp-undecided'
+export function threadStampUndecidedCause(channel: string): string {
+  return `channel=${safe(channel)}: thread-dependent replies remain unacknowledged until the shared-state restoration is reviewed and applied; finite Slack retries do not guarantee recovery of never-accepted events. Check the app's event subscriptions and resend missing replies after recovery.`
+}
+
 export const MESSAGE_NOT_SAVED = 'message-not-saved'
 export const MESSAGE_RECEIVED = 'message-received'
 export const MESSAGE_DELIVERED = 'message-delivered'
@@ -187,6 +192,7 @@ export function queueErrorCode(error: unknown): string {
 
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
+  PERSONA_THREAD_STAMP_UNDECIDED,
   ...DELIVERY_DIAGNOSTIC_CLASSES,
   PERSONA_START,
   PERSONA_CREDENTIALS_MISSING,

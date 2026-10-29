@@ -22,6 +22,8 @@ import { fungibleDestinationsOf } from './persona-destination.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
+  PERSONA_THREAD_STAMP_UNDECIDED,
+  threadStampUndecidedCause,
   fungibleUnclaimedChannelCause,
   invitedChannelCause,
   PERSONA_DM_DROPPED,
@@ -43,6 +45,7 @@ import {
 import { getOutageFlags } from './outage-state.ts'
 import { LIVENESS_PENDING, livenessKindOf, type LivenessReading } from './liveness-reading.ts'
 import { describeAgentDirectorFailure } from './ad-error-class.ts'
+import type { ThreadStampUndecidedEpisodes } from './persona-episodes.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,6 +76,10 @@ export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_res
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
+  /** Pure stamp observation; independent selection never depends on it. */
+  threadStampUndecided?(key: string, channel: string): boolean
+  /** Shared log-only episode owner. Absent fixtures still hold intake, without the diagnostic. */
+  threadStampEpisodes?: ThreadStampUndecidedEpisodes
   membership?: Pick<ChannelMembership, 'read' | 'hasUnresolved' | 'request'>
   /** The applied persona config, read at call time; null or undefined when there is none. */
   getPersonaConfig(): PersonaRoutingConfig | null | undefined
@@ -307,9 +314,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             return
           }
           if (!config || !persona) return
+          if (slackKey && deps.threadStampUndecided?.(key, slackKey.chat_id) !== true) deps.threadStampEpisodes?.end(key, slackKey.chat_id)
           const identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
           const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel, slackKey?.chat_id))
           if (decision.action === 'unresolved') {
+            if (decision.reason === 'thread-stamp-undecided' && slackKey && deps.threadStampEpisodes?.begin(key, slackKey.chat_id)) {
+              deps.log(formatPersonaDiagnostic({ class: PERSONA_THREAD_STAMP_UNDECIDED, name: persona.name, key, index: persona.index, cause: threadStampUndecidedCause(slackKey.chat_id) }))
+            }
             storeFailed = true
             deps.membership?.request(key)
             return
@@ -392,6 +403,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       isExtSharedChannel,
       channelIdPattern: CHANNEL_ID_RE,
       storedChoices: deps.getChannelDelivery?.() ?? undefined,
+      threadStampUndecided: deps.threadStampUndecided,
       fungibleDestinations: fungibleDestinationsOf(config, config.personas),
       memberships,
     }

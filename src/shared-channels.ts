@@ -876,7 +876,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     try { publish?.(authority.config()) } catch { /* durability cannot be undone by a publisher */ }
     const changed = !isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
       !isDeepStrictEqual(before.retiredIdentities, current.retiredIdentities)
-    // Thread Memory forgets before any other observer reacts.
+    // Thread Memory forgets before `subscribe` listeners; the runtime publisher ran above.
     deliverThreadView(publish !== undefined || changed)
     if (changed) {
       for (const listener of [...listeners]) {

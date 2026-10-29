@@ -1,6 +1,6 @@
 /**
- * persona-episodes.ts — The once-per-episode latch of every per-persona
- * notice kind adds.
+ * persona-episodes.ts — Shared once-per-episode latches for per-persona
+ * notices and log-only diagnostics.
  *
  * An episode is the span in which one notice kind posts at most once for one
  * persona. Each persona key has at most one open episode per kind, and every
@@ -36,6 +36,11 @@
  *   the episode (the `tmux-unresponsive` alert check) is cancelled with it.
  * - `openKeys(kind)` lists the keys with an open episode of the kind; `clock`
  *   is the clock the start times come from.
+ * - `threadStampUndecided` is routing's log-only adapter. Its `begin`
+ *   claims one channel mark in the persona's thread-stamp-undecided episode;
+ *   `end` clears only that channel's mark when its stamp reads decided, and
+ *   closes the episode when no marks remain. Neither calls the notice sink.
+ *   The shared `forget`, `forgetAll` and `close` clear these marks too.
  * - `teardownWindowState(key)` reads the injected teardown query (
  * ; production: the persona notifier's `teardownWindowState`).
  *
@@ -474,7 +479,10 @@ export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-sessio
  */
 export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
-/** Every notice kind with a latch here, one per row of the contract table. */
+/** Log-only intake diagnostic, with a separate mark for each undecided channel. */
+export const PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED = 'thread-stamp-undecided'
+
+/** Every notice or log-only diagnostic kind with a latch here. */
 export const PERSONA_EPISODE_KINDS = [
   'message-not-saved',
   'delivery-stuck',
@@ -489,9 +497,10 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
+  PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED,
 ] as const
 
-/** A notice kind with a latch here. */
+/** A notice or log-only diagnostic kind with a latch here. */
 export type PersonaEpisodeKind = (typeof PERSONA_EPISODE_KINDS)[number]
 
 /** The mark a post uses when none is given: a kind with one text posts it at most once per episode. */
@@ -552,14 +561,24 @@ export interface PersonaEpisodeView {
   readonly startedAt: number
   /** The case it began with, when one was given. */
   readonly caseLabel?: string
-  /** The marks posted in it, in the order posted. */
+  /** The notice or log-only marks claimed in it, in claim order. */
   readonly posted: readonly string[]
+}
+
+/** Routing's log-only adapter; neither method sends a notice to the sink. */
+export interface ThreadStampUndecidedEpisodes {
+  /** Claim this channel's diagnostic once until end or central episode cleanup. False after close. */
+  begin(key: string, channel: string): boolean
+  /** A decided observation ends only this channel's diagnostic episode. */
+  end(key: string, channel: string): void
 }
 
 /** The latches of one server. */
 export interface PersonaEpisodes {
   /** The clock the episodes' start times come from; a poster's timers for an episode run on it too. */
   readonly clock: PersonaEpisodesClock
+  /** Channel-scoped log marks owned here, cleared by forget, forgetAll and close. */
+  readonly threadStampUndecided: ThreadStampUndecidedEpisodes
   /**
    * Open the persona's episode of this kind, or keep the open one. A case
    * that differs from the open episode's begins a new episode; no case, or
@@ -726,8 +745,26 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     }
   }
 
-  return {
+  const episodes: PersonaEpisodes = {
     clock,
+
+    threadStampUndecided: {
+      begin(key, channel) {
+        const kind = PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED
+        if (episodes.begin(key, kind) === 'closed') return false
+        const current = open(key, kind)!
+        if (current.posted.has(channel)) return false
+        // Claim before routing logs, without calling the Slack notice sink.
+        current.posted.add(channel)
+        return true
+      },
+      end(key, channel) {
+        const kind = PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED
+        const current = open(key, kind)
+        if (!current?.posted.delete(channel)) return
+        if (current.posted.size === 0) episodes.end(key, kind)
+      },
+    },
 
     begin(key, kind, caseLabel) {
       if (closed) return 'closed'
@@ -830,6 +867,7 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       closeAll()
     },
   }
+  return episodes
 }
 
 /** Hand `line` to `log`; a throwing log is swallowed, so no caller throws or rejects because of it. */

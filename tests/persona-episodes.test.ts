@@ -206,6 +206,7 @@ import {
   PERSONA_EPISODE_KIND_KILL_FAILURE,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
+  PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
@@ -425,6 +426,105 @@ describe('once per episode, for every declared kind', () => {
 // ---------------------------------------------------------------------------
 // Cases and marks
 // ---------------------------------------------------------------------------
+
+describe('Thread Stamp diagnostic episode adapter', () => {
+  const kind = PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED
+
+  afterEach(() => {
+    // Routing owns the diagnostic line; this adapter only claims marks.
+    expect(posts).toEqual([])
+    expect(lines).toEqual([])
+    episodes.close()
+  })
+
+  test('interleaved channels and personas each claim once without posting or arming a timer', () => {
+    const stamps = episodes.threadStampUndecided
+    expect(stamps.begin('alpha', 'C123')).toBe(true)
+    expect(stamps.begin('alpha', 'C456')).toBe(true)
+    expect(stamps.begin('beta', 'C123')).toBe(true)
+    expect(stamps.begin('alpha', 'C123')).toBe(false)
+    expect(stamps.begin('beta', 'C456')).toBe(true)
+    expect(stamps.begin('alpha', 'C456')).toBe(false)
+    expect(stamps.begin('beta', 'C123')).toBe(false)
+    expect(stamps.begin('beta', 'C456')).toBe(false)
+    expect(episodes.openKeys(kind).sort()).toEqual(['alpha', 'beta'])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('resolving one channel re-arms only that channel; the last resolution closes the central episode', () => {
+    const stamps = episodes.threadStampUndecided
+    expect(stamps.begin('alpha', 'C123')).toBe(true)
+    expect(stamps.begin('alpha', 'C456')).toBe(true)
+    expect(stamps.begin('beta', 'C123')).toBe(true)
+    const closed: string[] = []
+    expect(episodes.whenClosed('alpha', kind, () => { closed.push('alpha') })).toBe(true)
+    stamps.end('missing', 'C123')
+    stamps.end('alpha', 'C999')
+    expect(stamps.begin('alpha', 'C123')).toBe(false)
+    stamps.end('alpha', 'C123')
+    expect(closed).toEqual([])
+    expect(episodes.isOpen('alpha', kind)).toBe(true)
+    expect(stamps.begin('alpha', 'C456')).toBe(false)
+    expect(stamps.begin('beta', 'C123')).toBe(false)
+    expect(stamps.begin('alpha', 'C123')).toBe(true)
+    stamps.end('alpha', 'C123')
+    stamps.end('alpha', 'C456')
+    stamps.end('alpha', 'C456')
+    expect(closed).toEqual(['alpha'])
+    expect(episodes.isOpen('alpha', kind)).toBe(false)
+    expect(stamps.begin('beta', 'C123')).toBe(false)
+    expect(stamps.begin('alpha', 'C456')).toBe(true)
+  })
+
+  test.each(['end', 'new case', 'forget'] as const)('central %s clears the persona marks and leaves another persona and kind intact', action => {
+    const stamps = episodes.threadStampUndecided
+    expect(stamps.begin('alpha', 'C123')).toBe(true)
+    expect(stamps.begin('alpha', 'C456')).toBe(true)
+    expect(stamps.begin('beta', 'C123')).toBe(true)
+    episodes.begin('beta', PERSONA_EPISODE_KIND_CONFLICT)
+    const closed: string[] = []
+    expect(episodes.whenClosed('alpha', kind, () => { closed.push('alpha') })).toBe(true)
+    if (action === 'end') expect(episodes.end('alpha', kind)).toBe(true)
+    else if (action === 'new case') expect(episodes.begin('alpha', kind, 'replacement')).toBe('new-case')
+    else episodes.forget('alpha')
+    expect(closed).toEqual(['alpha'])
+    expect(stamps.begin('alpha', 'C123')).toBe(true)
+    expect(stamps.begin('alpha', 'C456')).toBe(true)
+    expect(stamps.begin('beta', 'C123')).toBe(false)
+    expect(episodes.isOpen('beta', PERSONA_EPISODE_KIND_CONFLICT)).toBe(true)
+  })
+
+  test('forgetAll resets every persona and leaves the adapter usable', () => {
+    const stamps = episodes.threadStampUndecided
+    for (const key of ['alpha', 'beta']) {
+      expect(stamps.begin(key, 'C123')).toBe(true)
+      expect(stamps.begin(key, 'C456')).toBe(true)
+    }
+    episodes.forgetAll()
+    expect(episodes.openKeys(kind)).toEqual([])
+    for (const key of ['alpha', 'beta']) {
+      expect(stamps.begin(key, 'C123')).toBe(true)
+      expect(stamps.begin(key, 'C456')).toBe(true)
+      expect(stamps.begin(key, 'C123')).toBe(false)
+    }
+  })
+
+  test('close clears every mark and permanently refuses old and new claims, even after reset or end', () => {
+    const stamps = episodes.threadStampUndecided
+    expect(stamps.begin('alpha', 'C123')).toBe(true)
+    expect(stamps.begin('beta', 'C456')).toBe(true)
+    episodes.close()
+    expect(episodes.openKeys(kind)).toEqual([])
+    expect(stamps.begin('alpha', 'C123')).toBe(false)
+    expect(stamps.begin('new', 'C999')).toBe(false)
+    stamps.end('alpha', 'C123')
+    episodes.forget('alpha')
+    episodes.forgetAll()
+    expect(stamps.begin('alpha', 'C123')).toBe(false)
+    expect(stamps.begin('beta', 'C456')).toBe(false)
+    expect(episodes.openKeys(kind)).toEqual([])
+  })
+})
 
 describe('cases and marks', () => {
   const kind = PERSONA_EPISODE_KIND_CONFLICT

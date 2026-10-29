@@ -6,6 +6,7 @@ import { createChannelMembership, type ChannelMembership } from '../../src/chann
 import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from '../../src/channel-membership-scan.ts'
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
+import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
 
 import {
   accessSync,
@@ -119,7 +120,7 @@ import {
 } from '../../src/unavailable-retry.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
-import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
+import { createPersonaLifecycle, forgetPersonaState, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
 import { createPersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer } from '../../src/persona-serializer.ts'
 import {
@@ -195,6 +196,7 @@ import {
   type WrittenFile,
 } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { makeManualInterval } from './permission-relay-harness.ts'
 import { makeFifo as makeFifoAt, mkfifoAvailable } from './fifo.ts'
 import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
@@ -951,6 +953,9 @@ export interface PreparedPersonaState {
 // ---------------------------------------------------------------------------
 
 export interface ReloadRunOptions {
+  /** Opt in to the production Thread Memory and real lifecycle composition.
+   * Journals live in stateDir; optional fs overrides inject storage failures. */
+  threadMemory?: { fs?: ThreadMemoryOptions['fs'] }
   /** Actual MCP callbacks, held independently of the reload transaction. */
   onReplyCall?: SessionToolDeps['onReplyCall']
   consumeAck?: SessionToolDeps['consumeAck']
@@ -1082,6 +1087,8 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
+  readonly threadMemory: ThreadMemory | undefined
+  readonly threadMemoryEvents: ThreadMemoryEvent[]
   /** Write a real operator request; a later tick records it. */
   request(action: ReviewRequest['action'], assignments?: OperatorAssignment[], requestId?: string): ReviewRequest
   queue: ReturnType<typeof createDeliveryQueue>
@@ -1905,7 +1912,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     if (dryRun) process.env['SLACK_DRY_RUN'] = '1'
     else delete process.env['SLACK_DRY_RUN']
     const realLaunch = runOpts.realLaunch === true
-    const realLifecycle = runOpts.realLifecycle === true || realLaunch
+    const realLifecycle = runOpts.realLifecycle === true || realLaunch || runOpts.threadMemory !== undefined
     // With the real composition, one serializer shared by the manager, the
     // bring-up controller and the lifecycle, as server.ts shares its one.
     const serializer = realLifecycle ? createPersonaSerializer() : undefined
@@ -2067,7 +2074,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const getReplySettings = (): ReplySettings => replySettingsOf(serverConfig())
     const queueEvents: QueueEvent[] = []
     const queue = createDeliveryQueue({stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event)})
+    const threadMaintenance = makeManualInterval()
+    const threadMemoryEvents: ThreadMemoryEvent[] = []
+    const threadMemory = runOpts.threadMemory === undefined ? undefined : createThreadMemory({
+      stateDir, dryRun, fs: runOpts.threadMemory.fs, now: connections.clock.now,
+      onEvent: event => threadMemoryEvents.push(event),
+      setInterval: threadMaintenance.setInterval as typeof globalThis.setInterval,
+      clearInterval: threadMaintenance.clearInterval as typeof globalThis.clearInterval,
+      appliedKeys: () => serverConfig()?.personas.map(p => p.key) ?? [],
+      stamp: (key, channel) => controller?.sharedChannels()?.channelStamp(key, channel),
+      threadHybridChannels: key => controller?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
+      markerKeys: () => controller?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
+      canRemove: key => controller?.sharedChannels()?.reviewHeld(key) === false,
+      setCreated: key => controller?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' },
+      clearCreated: key => controller?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
+    })
+    threadMemory?.readAtStart()
     const queueReady = queue.start()
+    let threadMemoryReady = Promise.resolve()
+    let unsubscribeThreadMemory: (() => void) | undefined
     const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName})
     const membershipClock = createFakeClock()
     let membership: ChannelMembership | undefined
@@ -2093,6 +2118,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // the start loads the store, and after a refused start, it is
       // undefined, so no stored choice applies and nothing throws.
       getChannelDelivery: () => channelDeliveryStore,
+      threadStampUndecided: (key, channel) => controller.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
+      threadStampEpisodes: episodes.threadStampUndecided,
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
       isPersonaUp,
     })
@@ -2351,7 +2378,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         // The run's routing's per-key forget, as server.ts binds it, so a
         // torn-down key's dedupe store and heard set are dropped.
-        routing: { forget: rec('routing.forget', (key) => routing.forget(key)) },
+        routing: { forget: rec('routing.forget', (key) => threadMemory === undefined ? routing.forget(key) :
+          forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => threadMemory.forget(k)])) },
+        ...(threadMemory === undefined ? {} : { loadThreadMemory: (key: string) => threadMemory.loadKey(key) }),
         // The real tracker's per-key forget, as server.ts binds it, so a key
         // added again starts with no ack-reaction entry.
         forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
@@ -2563,6 +2592,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     const ops: Required<ReloadLifecycleOps> = {
       async startBringUp(applied) {
+        if (threadMemory) await threadMemoryReady
         startPasses.push(applied)
         connections.config = applied
         await Promise.all(applied.personas.map((persona) => bringUpAndLaunch(persona, applied, 'start')))
@@ -2583,7 +2613,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       },
       async teardown(persona) {
         record('teardown', persona.key, 'apply')
-        await gated('teardown', persona.key, async () => {
+        try { await gated('teardown', persona.key, async () => {
           if (composition !== undefined) {
             await composition.lifecycle.teardown(persona)
             return
@@ -2597,7 +2627,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           }
           bringUps.cancel(persona.key)
           await connections.manager.stop(persona.key)
-        })
+        }) } finally {
+          if (!serverConfig()?.personas.some(p => p.key === persona.key)) await threadMemory?.remove(persona.key)
+        }
       },
       async refreshTemplate(applied) {
         const entry = record('template-refresh', TEMPLATE_REFRESH_KEY, 'apply')
@@ -2757,11 +2789,20 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     function loadChannelDeliveryForStart(start: PersonaConfig): void {
       const authority = controller.sharedChannels()
       if (!authority) throw new Error('reload-harness: resolved start has no shared authority')
-      membership = createChannelMembership({ authority, dryRun, log, requestReconciliation: key => membershipScanner?.request(key) })
-      membershipScanner = createMembershipScanner({ authority, membership, connections: connections.manager, clock: membershipClock, dryRun, log })
-      membershipStatus = membershipConnectionListener(membership, membershipScanner, connections.manager, dryRun)
       channelDeliveryStore = createChannelDeliveryStore(authority, (key, channel) =>
         !dryRun && !stopped && isPersonaUp(key) && membership?.read(key, channel, 'open').kind === 'eligible')
+      const wireMembership = () => {
+        membership = createChannelMembership({ authority, dryRun, log, requestReconciliation: key => membershipScanner?.request(key) })
+        membershipScanner = createMembershipScanner({ authority, membership, connections: connections.manager, clock: membershipClock, dryRun, log })
+        membershipStatus = membershipConnectionListener(membership, membershipScanner, connections.manager, dryRun)
+      }
+      if (threadMemory) {
+        unsubscribeThreadMemory = authority.subscribeThreadView(() => threadMemory.published())
+        threadMemoryReady = queueReady.then(() => {
+          threadMemory.startMaintenance()
+          return threadMemory.activate()
+        }).then(wireMembership)
+      } else wireMembership()
     }
     controller = createReloadController({
       now: () => connections.clock.now(),
@@ -3001,6 +3042,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     let stopped = false
     const run: ReloadRun = {
+      threadMemory,
+      threadMemoryEvents,
       async prepareQueued() { await preparation.recover(serverConfig()?.personas.map(p => p.key) ?? []) },
       queue,
       queueEvents,
@@ -3123,6 +3166,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       slackCalls,
       slackPosts: () => Object.values(slackCalls()).flat().filter((c) => c.method === 'chat.postMessage'),
       captured: (extra = {}) => ({
+        ...(threadMemory === undefined ? {} : { threadMemoryEvents }),
         logs,
         statuses: connections.statuses,
         lifecycle: records,
@@ -3260,6 +3304,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         membership?.close()
         await preparation.stop()
         await queue.stop()
+        if (threadMemory) await threadMemoryReady
+        unsubscribeThreadMemory?.()
+        await threadMemory?.stop()
         // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.
         if (stopImage !== undefined && !stopImagePutBack) {
           stopImagePutBack = true

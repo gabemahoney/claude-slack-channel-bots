@@ -1,0 +1,200 @@
+/** Thread Memory fixtures over production records, real files and the shared authority. */
+import * as fs from 'node:fs'
+import { join } from 'node:path'
+import { durableWriteFileSync, DurableWriteUnsyncedError } from '../../src/atomic-write.ts'
+import type { DeliveryMode, PersonaConfigInput } from '../../src/config.ts'
+import { createSharedChannelAuthority, type SharedChannelAuthority, type SharedChannelDeps } from '../../src/shared-channels.ts'
+import {
+  createThreadMemory, isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords,
+  THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
+  type ThreadJoin, type ThreadJoinRecord, type ThreadMemoryHeader, type ThreadMemoryRecord,
+  type ThreadPostIntent, type ThreadPostOutcome, type ThreadMemoryOptions, type ThreadMemoryEvent,
+} from '../../src/thread-memory.ts'
+import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { makePersona, makePersonaConfigInput } from './persona-config.ts'
+import {
+  SHARED_CHANNEL_IDS, configBytes, makeSharedAuthority, readSharedState,
+  sharedChannelPath, sharedRecoveryRequest, makeMembershipHarness, membershipPage,
+} from './shared-channels.ts'
+
+export const THREAD_PERSONAS = { primary: 'alpha', secondary: 'beta' } as const
+export const THREAD_CHANNELS = SHARED_CHANNEL_IDS
+export const THREAD_ROOTS = { primary: '1700000000.000001', secondary: '1700000000.000002', third: '1700000000.000003' } as const
+export const THREAD_TIME = 1_700_000_000_000
+export const THREAD_STAMP = { incarnation: 'fixture-life', threadHybridSince: 'fixture-since' }
+export const threadPath = (dir: string, key: string = THREAD_PERSONAS.primary): string => join(dir, 'threads', `${key}.jsonl`)
+/** A removed assignment no longer carries the old fixture counter. Include the
+ * durable revision on restart so it cannot mint that forgotten stamp again. */
+function restartMint(revision: number) {
+  let n = 0
+  return () => `thread-memory-restart-${revision}-${++n}`
+}
+export const threadHeader = (overrides: Partial<ThreadMemoryHeader> = {}): ThreadMemoryHeader =>
+  ({ v: 1, kind: 'header', seq: 1, storeId: 'fixture-store', digestKey: 'ab'.repeat(32), highWater: 1, ...overrides })
+export const threadJoin = (overrides: Partial<ThreadJoin> = {}): ThreadJoin =>
+  ({ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary, stamp: { ...THREAD_STAMP }, source: 'mention', at: THREAD_TIME, ...overrides })
+export const joinRecord = (fact: ThreadJoin, seq = 2): ThreadJoinRecord => ({ ...fact, v: 1, kind: 'join', seq })
+export const postIntent = (fact: ThreadJoin, overrides: Partial<ThreadPostIntent> = {}): ThreadPostIntent =>
+  ({ v: 1, kind: 'post-intent', seq: 3, operationId: 'fixture-post', channel: fact.channel, root: fact.root, stamp: fact.stamp, at: fact.at, digest: 'cd'.repeat(32), ...overrides })
+export const postOutcome = (intent: ThreadPostIntent, outcome: ThreadPostOutcome['outcome'] = 'joined', seq = intent.seq + 1): ThreadPostOutcome =>
+  ({ v: 1, kind: 'post-outcome', operationId: intent.operationId, seq, outcome })
+
+/** All damage starts with a production-serialized record. UTF-8 damage is exact bytes. */
+export function damagedThreadLine(record: ThreadMemoryRecord, kind: 'json' | 'utf8' | 'torn' | 'torn-utf8' | 'invalid-header'): Buffer {
+  if (kind === 'invalid-header') return serializeThreadMemoryRecords([{ ...record, digestKey: 'invalid' } as ThreadMemoryRecord])
+  const bytes = serializeThreadMemoryRecords([record])
+  if (kind === 'json') return Buffer.concat([bytes.subarray(0, -2), Buffer.from(',\n')])
+  if (kind === 'utf8') return Buffer.concat([bytes.subarray(0, -2), Buffer.from([0xff, 0x7d, 0x0a])])
+  if (kind === 'torn-utf8') return Buffer.concat([bytes.subarray(0, -2), Buffer.from([0xf0, 0x9f])])
+  return bytes.subarray(0, -2)
+}
+export function seedThreads(dir: string, records: readonly (ThreadMemoryRecord | Buffer)[], key: string = THREAD_PERSONAS.primary): Buffer {
+  const bytes = Buffer.concat(records.map(record => {
+    if (Buffer.isBuffer(record)) return record
+    if (!isThreadMemoryRecord(record)) throw new Error('seedThreads: invalid production record')
+    return serializeThreadMemoryRecords([record])
+  }))
+  fs.mkdirSync(join(dir, 'threads'), { recursive: true, mode: THREAD_MEMORY_DIRECTORY_MODE })
+  fs.writeFileSync(threadPath(dir, key), bytes, { mode: THREAD_MEMORY_FILE_MODE })
+  return bytes
+}
+export function readThreads(dir: string, key: string = THREAD_PERSONAS.primary): ThreadMemoryRecord[] {
+  return fs.readFileSync(threadPath(dir, key), 'utf8').split('\n').filter(Boolean).map(line => {
+    const record = parseThreadMemoryRecord(line)
+    if (!record) throw new Error('readThreads: invalid production record')
+    return record
+  })
+}
+
+export type ThreadFsOperation = 'openSync' | 'readFileSync' | 'readdirSync' | 'writeSync' | 'fsyncSync' | 'renameSync' | 'unlinkSync' | 'ftruncateSync'
+export interface ThreadFsCall { op: string; path: string; flags?: string | number }
+export function threadFsControls(dir: string) {
+  const calls: ThreadFsCall[] = [], descriptors = new Map<number, string>()
+  const faults: Array<{ op: ThreadFsOperation; path: (path: string) => boolean; error: Error; left: number }> = []
+  const invoke = (op: string, args: unknown[]) => {
+    const path = typeof args[0] === 'number' ? descriptors.get(args[0]) ?? '<unknown-fd>' : String(args[0])
+    calls.push({ op, path, ...(op === 'openSync' ? { flags: args[1] as string | number } : {}) })
+    const fault = faults.find(f => f.op === op && f.left > 0 && f.path(path))
+    if (fault) { fault.left--; throw fault.error }
+    const value = Reflect.apply(Reflect.get(fs, op), fs, args)
+    if (op === 'openSync') descriptors.set(value as number, path)
+    if (op === 'closeSync') descriptors.delete(args[0] as number)
+    return value
+  }
+  const seam = new Proxy({ ...fs }, { get(target, property) {
+    const value = Reflect.get(target, property)
+    return typeof property === 'string' && property.endsWith('Sync') && typeof value === 'function'
+      ? (...args: unknown[]) => invoke(property, args) : value
+  } }) as typeof fs
+  return {
+    fs: seam, calls,
+    fail(op: ThreadFsOperation, key: string = THREAD_PERSONAS.primary, options: { times?: number; code?: string; match?: (path: string) => boolean } = {}) {
+      const path = threadPath(dir, key)
+      const error = Object.assign(new Error(`fixture ${op} refused`), { code: options.code ?? 'EIO' })
+      faults.push({ op, path: options.match ?? (p => p === path || p.startsWith(`${path}.`) || p.startsWith(join(dir, 'threads', `${key}.unreadable-`))), error, left: options.times ?? Infinity })
+      return error
+    },
+    heal() { faults.length = 0 },
+    reset() { calls.length = 0 },
+    writes() { return calls.filter(c => ['writeSync', 'ftruncateSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'chmodSync', 'fchmodSync'].includes(c.op) || (c.op === 'openSync' && c.flags !== 'r')) },
+  }
+}
+
+function intervalTimers(clock: FakeClock) {
+  type Handle = { timer: unknown; stopped: boolean; unref(): void }
+  return {
+    setInterval: ((callback: () => void, ms: number) => {
+      const handle: Handle = { timer: undefined, stopped: false, unref() {} }
+      const tick = () => { if (handle.stopped) return; callback(); handle.timer = clock.setTimeout(tick, ms) }
+      handle.timer = clock.setTimeout(tick, ms)
+      return handle
+    }) as unknown as typeof globalThis.setInterval,
+    clearInterval: ((handle: Handle) => { handle.stopped = true; clock.clearTimeout(handle.timer) }) as unknown as typeof globalThis.clearInterval,
+  }
+}
+export function threadConfig(dir: string, delivery: DeliveryMode = 'thread_hybrid', names: readonly string[] = [THREAD_PERSONAS.primary], channels: readonly string[] = [THREAD_CHANNELS.primary]): PersonaConfigInput {
+  return makePersonaConfigInput({ channel_mode: 'strict', personas: names.map(name => makePersona({ name,
+    channels: channels.map(id => ({ id, delivery })), permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' },
+  }, dir)) }, dir)
+}
+export interface ThreadHarnessOptions {
+  authority?: SharedChannelAuthority; input?: PersonaConfigInput; reopen?: boolean; dryRun?: boolean; clock?: FakeClock
+  now?: () => number; appliedKeys?: () => readonly string[]; canRemove?: (key: string) => boolean
+  fs?: ReturnType<typeof threadFsControls>
+  setCreated?: ThreadMemoryOptions['setCreated']; clearCreated?: ThreadMemoryOptions['clearCreated']
+}
+export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
+  const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
+  let sharedFault: ((bytes: Uint8Array) => 'before' | 'unsynced' | undefined) | undefined
+  const deps: SharedChannelDeps = { now: clock.now, write(path, bytes) {
+    const failure = sharedFault?.(bytes)
+    if (failure === 'before') throw Object.assign(new Error('fixture shared write refused'), { code: 'EIO' })
+    durableWriteFileSync(path, bytes)
+    if (failure === 'unsynced') throw new DurableWriteUnsyncedError(path, Object.assign(new Error('fixture directory sync refused'), { code: 'EIO' }))
+  } }
+  const saved = options.reopen ? readSharedState(stateDir)! : undefined
+  const authority = options.authority ?? (saved
+    ? createSharedChannelAuthority(sharedChannelPath(stateDir), saved, { ...deps, threadHybridSince: restartMint(saved.revision) })
+    : makeSharedAuthority(stateDir, options.input ?? threadConfig(stateDir), deps))
+  const events: ThreadMemoryEvent[] = [], markerCalls: Array<{ action: 'set' | 'clear'; key: string; fileExists: boolean; synced: boolean }> = []
+  const memory = createThreadMemory({
+    stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun,
+    appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
+    stamp: (key, channel) => authority.channelStamp(key, channel),
+    threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
+    markerKeys: () => authority.threadMemoryCreatedKeys(), canRemove: options.canRemove ?? (key => !authority.reviewHeld(key)),
+    setCreated: key => {
+      const syncs = io.calls.filter(c => c.op === 'fsyncSync').map(c => c.path), journalSync = syncs.lastIndexOf(threadPath(stateDir, key))
+      const synced = journalSync >= 0 && syncs.slice(journalSync + 1).includes(join(stateDir, 'threads'))
+      markerCalls.push({ action: 'set', key, fileExists: fs.existsSync(threadPath(stateDir, key)), synced })
+      return options.setCreated?.(key) ?? authority.setThreadMemoryCreated(key)
+    },
+    clearCreated: key => {
+      markerCalls.push({ action: 'clear', key, fileExists: fs.existsSync(threadPath(stateDir, key)), synced: false })
+      return options.clearCreated?.(key) ?? authority.clearThreadMemoryCreated(key)
+    },
+    onEvent: event => events.push(event),
+  })
+  const unsubscribe = authority.subscribeThreadView(() => memory.published())
+  const apply = (input: PersonaConfigInput) => authority.applyReviewed(configBytes(input), authority.revision)
+  return {
+    stateDir, clock, io, authority, memory, events, markerCalls, unsubscribe,
+    async start() { memory.readAtStart(); await memory.activate() },
+    async close() { unsubscribe(); await memory.stop() },
+    fact(overrides: Partial<ThreadJoin> = {}, key: string = THREAD_PERSONAS.primary): ThreadJoin {
+      const channel = overrides.channel ?? THREAD_CHANNELS.primary, stamp = authority.channelStamp(key, channel)
+      if (stamp?.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('fixture needs a decided thread_hybrid stamp')
+      return threadJoin({ at: memory.clock(key), channel, stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, ...overrides })
+    },
+    apply,
+    choose(delivery: DeliveryMode, key: string = THREAD_PERSONAS.primary, channel: string = THREAD_CHANNELS.primary) {
+      return authority.applyReviewed(authority.sourceBytes(), authority.revision, [{ key, channel, delivery }])
+    },
+    mode(channel_mode: 'open' | 'strict') { return apply({ ...authority.snapshot().source, channel_mode } as unknown as PersonaConfigInput) },
+    failShared(write?: typeof sharedFault) { sharedFault = write },
+    stageRestoration() {
+      fs.writeFileSync(authority.path, Buffer.from('fixture unreadable shared evidence'))
+      const bytes = fs.readFileSync(authority.path)
+      return authority.stageRestoration(sharedRecoveryRequest('thread-memory-restore', bytes), bytes, authority.sourceBytes())
+    },
+    reopen(overrides: ThreadHarnessOptions = {}) { return makeThreadMemoryHarness(stateDir, { reopen: true, ...overrides }) },
+  }
+}
+export type ThreadMemoryHarness = ReturnType<typeof makeThreadMemoryHarness>
+
+/** Real event router and inventory scanner; every positive/absence is scripted explicitly. */
+export function makeThreadMembershipHarness(stateDir: string, options: Parameters<typeof makeMembershipHarness>[1] = {}) {
+  const membership = makeMembershipHarness(stateDir, { channels: [{ id: THREAD_CHANNELS.primary, delivery: 'thread_hybrid' }],
+    ...(options.reopen ? { threadHybridSince: restartMint(readSharedState(stateDir)!.revision) } : {}), ...options })
+  const threads = makeThreadMemoryHarness(stateDir, { authority: membership.authority, clock: membership.h.clock })
+  const stub = (key: string = THREAD_PERSONAS.primary) => membership.h.stub(membership.h.p(key))
+  return {
+    ...threads, membership, stub,
+    async start(channels: string[] = options.channels?.map(c => c.id) ?? [THREAD_CHANNELS.primary]) {
+      await threads.start()
+      for (const persona of membership.h.config!.personas) stub(persona.key).script.inventory.push(membershipPage(channels))
+      await membership.start(); await membership.scan()
+    },
+    async close() { await threads.close(); await membership.close() },
+  }
+}

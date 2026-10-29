@@ -168,7 +168,7 @@ export type DropDecision =
 /** Outcome of `decideDelivery` for one receiving persona. */
 export type DeliveryDecision = DeliverDecision | DropDecision | {
   action: 'unresolved'
-  reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing'
+  reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing' | 'thread-stamp-undecided'
 }
 
 /**
@@ -210,6 +210,8 @@ export interface ChannelDeliveryInputs {
  * cannot authorize channel selection.
  */
 export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
+  /** Shared-state restoration may hold a stamp while choices remain readable. */
+  threadStampUndecided?(key: string, channel: string): boolean
   /** Current, synchronous observations for this event's channel, by persona.
    * Missing evidence is unresolved; configured entries are never membership. */
   memberships?: ReadonlyMap<string, MembershipReading>
@@ -307,6 +309,7 @@ export function decideDelivery(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention' }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast' }
+  if (saved === 'thread_hybrid' && dependentReplyUndecided(ev, persona.key, channel, fungible)) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
   if (saved !== 'all') return { action: 'drop', reason: 'not-mentioned' }
   const shared = applied.some((p) =>
     p.key !== persona.key && !channelAvailability(p.key, channel, fungible) &&
@@ -341,11 +344,17 @@ function decideFungibleChannel(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention', fungible: path }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast', fungible: path }
+  if (path.channelDelivery === 'thread_hybrid' && dependentReplyUndecided(ev, persona.key, channel, inputs)) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
   if (path.channelDelivery !== DELIVERY_ALL) return { action: 'drop', reason: 'not-mentioned', fungible: path }
   const shared = inputs.fungibleDestinations.some((other) =>
     other.key !== persona.key && !channelAvailability(other.key, channel, inputs) &&
       channelDeliveryFor(other.key, channel, inputs).delivery === DELIVERY_ALL)
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all', fungible: path }
+}
+
+/** Called after independent mentions and broadcasts have already selected. */
+function dependentReplyUndecided(ev: Record<string, unknown>, key: string, channel: string, inputs?: FungibleDecisionInputs): boolean {
+  return isThreadTimestamp(ev['thread_ts']) && ev['thread_ts'] !== ev['ts'] && inputs?.threadStampUndecided?.(key, channel) === true
 }
 
 /** Whether a persona's configured channel entries name `channel`. Pure. */

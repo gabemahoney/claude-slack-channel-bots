@@ -1,6 +1,6 @@
 /** Durable Slack intake: decision wiring, persona isolation, ack boundary and immutable preparation. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
@@ -10,16 +10,19 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
+import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { readQueue, seedQueue, slackInput, queuePath } from './test-helpers/delivery-queue.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
-import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { configBytes, makeSharedAuthority, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
+import { makeReloadHarness } from './test-helpers/reload-harness.ts'
+import { PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
-import { isRestartPendingOrActive } from '../src/restart.ts'
+import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
@@ -35,6 +38,185 @@ function selectionInputs(config: ReturnType<typeof makeMultiPersonaConfig>, chan
   return { getChannelDelivery: () => store, membership: observedMembership(Object.fromEntries(config.personas.map(p => [p.key, channels]))) }
 }
 const facts = (h: RoutingHarness, name: string) => h.queued(name).map(i => ({ channel: i.accepted.channel, ts: i.accepted.ts, via: i.accepted.via, text: i.accepted.text }))
+
+test.each(['strict', 'open'] as const)('%s staged restoration holds thread-dependent replies despite readableFor=true while independent and accepted work continues, even when not-up', async channel_mode => {
+  const h = makeReloadHarness()
+  let preparation: ReturnType<typeof createDeliveryPreparation> | undefined
+  try {
+    const alpha = h.persona('alpha', { channels: [{ id: CA, delivery: 'thread_hybrid' }, { id: CB, delivery: 'mentions' }, { id: CX, delivery: 'all' }], permission_prompts: CB, dm: { enabled: true } })
+    const beta = h.persona('beta', { channels: [{ id: CA, delivery: 'all' }, { id: CB, delivery: 'mentions' }], permission_prompts: CB })
+    h.materialize(alpha, beta)
+    h.writeRecord({ channel_mode, personas: [alpha, beta] })
+    h.writeConfig({ channel_mode, personas: [alpha, beta] })
+    const slack = {
+      alpha: { inventory: [membershipPage([CA, CB, CX])] }, beta: { inventory: [membershipPage([CA, CB])] },
+    }
+    let run = await h.startDetecting({ threadMemory: {}, slack })
+    const restart = makeRestartDeps({ restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
+    initRestart(restart)
+    await run.membershipClock.runNext()
+    // A failed local bring-up beside a still-serving connection must remain
+    // not-up. Use the real controller's directory failure and the harness's
+    // production predicate, retaining current membership for intake.
+    const establishNotUp = async () => {
+      h.deleteWorkingDirectory(alpha)
+      run.bringUps.cancel('alpha')
+      const applied = run.controller.applied()!.config.personas
+      await run.bringUps.bringUp(applied.find(p => p.key === 'alpha')!, applied)
+      h.makeWorkingDirectory(alpha)
+      expect(run.connections.manager.status('alpha')?.state).toBe('up')
+      expect(run.bringUps.state('alpha')?.outcome).toBe('retrying')
+      expect(run.isUp('alpha')).toBe(false)
+      expect(run.isUp('beta')).toBe(true)
+      run.registerSession('beta')
+    }
+    await establishNotUp()
+    const lifecycleBefore = run.checkpoint()
+    let authority = run.controller.sharedChannels()!
+    expect(run.membership.read('alpha', CA, channel_mode).kind).toBe('eligible')
+    const stamp = authority.channelStamp('alpha', CA)!
+    if (stamp.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('expected a thread stamp')
+    const root = '1700000000.000001'
+    expect(await run.threadMemory!.saveJoins('alpha', [{ channel: CA, root, source: 'mention', at: run.threadMemory!.clock('alpha'),
+      stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince } }])).toEqual({ kind: 'saved' })
+    expect(run.threadMemory!.view('alpha', CA, root)).toBe('joined')
+    const prepare = () => createDeliveryPreparation({ queue: run.queue, clientFor: () => undefined, resolveUserName: async (_key, user) => user })
+    preparation = prepare()
+    const logs: string[] = []
+    const notices: string[] = []
+    const episodes = createPersonaEpisodes({ sink: (_key, text) => { notices.push(text) }, log: line => logs.push(line), clock: run.clock })
+    const rowReads: string[] = []
+    const makeRouter = () => createPersonaRouting({
+      getPersonaConfig: () => run.controller.applied()?.config,
+      getChannelDelivery: () => run.channelDelivery,
+      threadStampUndecided: (key, channel) => authority.channelStamp(key, channel)?.kind === 'undecided',
+      threadStampEpisodes: episodes.threadStampUndecided,
+      membership: run.membership,
+      getBotIdentity: key => run.stub(key).identity,
+      queue: run.queue, prepare: preparation!.prepare, archive: () => {}, log: line => logs.push(line),
+      isPersonaUp: key => run.isUp(key),
+      readRowLiveness: async key => { rowReads.push(key); return { kind: 'dead', cause: 'ended' } },
+    })
+    let routing = makeRouter()
+    const mention = makeChannelMessage({ channel: CA, ts: '1700000000.000002', thread_ts: root, text: mentionText(run.stub('alpha').identity.botUserId) })
+    const project = (event: SlackEvent, via: string) => ({ channel: event.channel as string, ts: event.ts as string, via, text: event.text as string })
+    const queued = () => Object.fromEntries(['alpha', 'beta'].map(key => [key, run.queue.items(key).map(({ accepted }) => ({
+      channel: accepted.channel, ts: accepted.ts, via: accepted.via, text: accepted.text,
+    }))]))
+    const durableQueues = () => Object.fromEntries(['alpha', 'beta'].map(key => [key,
+      (existsSync(queuePath(h.stateDir, key)) ? readQueue(h.stateDir, key) : []).filter((record): record is AcceptedRecord => record.kind === 'accepted')
+        .map(record => ({ channel: record.channel, ts: record.ts, via: record.via, text: record.text })),
+    ]))
+    const expected = { alpha: [project(mention, 'mention')], beta: [] as ReturnType<typeof project>[] }
+    let acks = 0
+    const acceptedAtAck: ReturnType<typeof durableQueues>[] = []
+    const ack = () => { acks++ }
+    await routing.receive(mention, () => {
+      ack()
+      acceptedAtAck.push(durableQueues())
+    }, 'alpha', false)
+    expect(acks).toBe(1)
+    expect(acceptedAtAck).toEqual([expected])
+    expect(queued()).toEqual(expected)
+    const acceptedBefore = readFileSync(queuePath(h.stateDir, 'alpha'))
+    const joins = run.threadMemory!.joins('alpha')
+    const damage = h.writeRecordBytes('damaged authority with a retained owner snapshot')
+    h.writeRequestBytes(configBytes(sharedRecoveryRequest('routing-restoration', damage)))
+    await run.ticks.tick()
+    expect(authority.readable).toBe(false)
+    expect(authority.readableFor('alpha', CA)).toBe(true)
+    expect(authority.channelStamp('alpha', CA)).toEqual({ kind: 'undecided' })
+    expect(run.threadMemory!.joins('alpha')).toEqual(joins)
+    expect(run.threadMemory!.view('alpha', CA, root)).toBe('not-joined')
+    const dependent = makeChannelMessage({ channel: CA, ts: '1700000000.000003', thread_ts: root, text: 'dependent reply' })
+    acks = 0
+    await routing.receive(dependent, ack, 'alpha', false)
+    await routing.receive(dependent, ack, 'alpha', false)
+    expect(acks).toBe(0)
+    expect(run.queue.items('alpha').map(i => i.accepted.ts)).toEqual([mention.ts as string])
+    expect(readFileSync(queuePath(h.stateDir, 'alpha'))).toEqual(acceptedBefore)
+    const warnings = () => logs.filter(line => line.includes(PERSONA_THREAD_STAMP_UNDECIDED))
+    expect(warnings()).toHaveLength(1)
+    // The diagnostic module pins this exported cause's finite-retry warning.
+    expect(warnings()[0]).toContain(threadStampUndecidedCause(CA))
+    await routing.receive(mention, ack, 'alpha', false)
+    expect(acks).toBe(1)
+    expect(readFileSync(queuePath(h.stateDir, 'alpha'))).toEqual(acceptedBefore)
+
+    const independent = [
+      { key: 'alpha', via: 'mention', event: makeChannelMessage({ channel: CA, thread_ts: root, ts: '1700000000.000004', text: mentionText(run.stub('alpha').identity.botUserId) }) },
+      { key: 'alpha', via: 'broadcast', event: makeChannelMessage({ channel: CA, thread_ts: root, ts: '1700000000.000005', text: broadcastText('channel') }) },
+      { key: 'alpha', via: 'dm', event: makeDm({ ts: '1700000000.000006', text: 'direct' }) },
+      { key: 'alpha', via: 'receive_all', event: makeChannelMessage({ channel: CX, ts: '1700000000.000007', text: 'another channel' }) },
+      { key: 'beta', via: 'receive_all', event: makeChannelMessage({ channel: CA, thread_ts: root, ts: '1700000000.000008', text: 'another persona' }) },
+    ]
+    for (const { key, via, event } of independent) {
+      let ackCount = 0
+      acceptedAtAck.length = 0
+      await routing.receive(event, () => {
+        ackCount++
+        acceptedAtAck.push(durableQueues())
+      }, key, false)
+      expect(ackCount).toBe(1)
+      expected[key as keyof typeof expected].push(project(event, via))
+      expect(acceptedAtAck).toEqual([expected])
+      expect(queued()).toEqual(expected)
+    }
+    // A held recipient cannot make the aggregate ack lie about partial fanout.
+    acks = 0
+    await routing.receive(dependent, ack, ['alpha', 'beta'], false)
+    await routing.receive(dependent, ack, ['alpha', 'beta'], false)
+    expect(acks).toBe(0)
+    expect(run.queue.items('alpha').some(i => i.accepted.ts === dependent.ts)).toBe(false)
+    expect(run.queue.items('beta').filter(i => i.accepted.ts === dependent.ts)).toHaveLength(1)
+    expected.beta.push(project(dependent, 'receive_all'))
+    expect(queued()).toEqual(expected)
+    expect(warnings()).toHaveLength(1)
+    expect(rowReads).toEqual([])
+    expect(restart.restartAsks).toEqual([])
+    expect(restart.launches).toEqual([])
+    expect(['alpha', 'beta'].map(isRestartPendingOrActive)).toEqual([false, false])
+    expect(run.since(lifecycleBefore).lifecycle).toEqual([])
+    expect(run.isUp('alpha')).toBe(false)
+    expect(run.isUp('beta')).toBe(true)
+    expect(notices).toEqual([])
+    expect(run.slackPosts()).toEqual([])
+
+    assertNoLeak({ logs, captured: run.captured() })
+    // Owned restoration is reviewed on the next start; it is never activated
+    // by the running owner's ordinary detection tick.
+    await preparation.stop(); await run.stop()
+    const review = await h.start({ threadMemory: {} })
+    expect(review.outcome.kind).toBe('refused')
+    expect(h.pendingExists()).toBe(true)
+    expect(review.slackPosts()).toEqual([])
+    assertNoLeak(review.captured())
+    await review.stop(); h.confirm()
+    run = await h.start({ threadMemory: {}, slack })
+    initRestart(restart)
+    expect(run.outcome.kind).toBe('applied')
+    await run.membershipClock.runNext()
+    await establishNotUp()
+    authority = run.controller.sharedChannels()!
+    preparation = prepare(); routing = makeRouter()
+    expect(authority.channelStamp('alpha', CA)?.kind).toBe('decided')
+    expect(authority.channelStamp('alpha', CA)).not.toEqual(stamp)
+    expect(run.threadMemory!.view('alpha', CA, root)).toBe('not-joined')
+    await routing.receive(dependent, ack, ['alpha', 'beta'], false)
+    expect(acks).toBe(1)
+    expect(run.queue.items('alpha').some(i => i.accepted.ts === dependent.ts)).toBe(false)
+    expect(run.queue.items('beta').filter(i => i.accepted.ts === dependent.ts)).toHaveLength(1)
+    expect(queued()).toEqual(expected)
+    expect(rowReads).toEqual([])
+    expect(restart.restartAsks).toEqual([])
+    expect(restart.launches).toEqual([])
+    expect(['alpha', 'beta'].map(isRestartPendingOrActive)).toEqual([false, false])
+    expect(notices).toEqual([])
+    expect(run.slackPosts()).toEqual([])
+    assertNoLeak({ logs, captured: run.captured() })
+  } finally { await preparation?.stop(); await h.cleanup() }
+})
+
 async function each(h: RoutingHarness, event: unknown) { await h.receive(event, ['alpha']); await h.receive(event, ['beta']) }
 describe('persona routing and durable dedupe', () => {
   test('home, shared mention and DM retain exact target, source and via with empty bystander queues', async () => {

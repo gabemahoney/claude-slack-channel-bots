@@ -335,6 +335,20 @@ import type { PersonaTeardownKillRefusal, PersonaTeardownKillResult } from './se
 // Types
 // ---------------------------------------------------------------------------
 
+/** Start every forget even if another throws; report the first failed step
+ * only after all asynchronous releases settle. */
+export async function forgetPersonaState(key: string, forgetters: readonly ((key: string) => void | Promise<void>)[]): Promise<void> {
+  const results = await Promise.allSettled(forgetters.map(forget => {
+    try { return Promise.resolve(forget(key)) } catch (error) { return Promise.reject(error) }
+  }))
+  for (const result of results) if (result.status === 'rejected') throw result.reason
+}
+
+/** Apply-time load failures are non-fatal and never expose the raw thrown value. */
+export function threadMemoryLoadAtApplyFailedLine(persona: Pick<Persona, 'name' | 'key'>, error: unknown): string {
+  return `[slack] persona ${renderPersonaRef(persona.name, persona.key)}: Thread Memory load at apply failed: ${describeThrownValue(error)}`
+}
+
 /** Dependencies of `createPersonaLifecycle`. */
 export interface PersonaLifecycleDeps {
   /** The per-persona lifecycle serializer's `run` (the server's one shared instance). */
@@ -354,6 +368,8 @@ export interface PersonaLifecycleDeps {
   connections: Pick<PersonaConnectionManager, 'stop' | 'reconnectCredentials' | 'replaceRetryTokens'>
   /** The inbound routing: a removed persona's dedupe store is dropped. */
   routing: Pick<PersonaRouting, 'forget'>
+  /** Load before opening this persona's Socket Mode connection. */
+  loadThreadMemory?(key: string): void | Promise<void>
   /**
    * The shared destination resolver: a removed persona's cached DM is
    * forgotten, an in-place updated one's when its DM destination settings
@@ -1131,6 +1147,10 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     } catch (err) {
       log(`[slack] persona ${ref}: storage check at apply failed: ${describeThrownValue(err)}`)
     }
+    try { await deps.loadThreadMemory?.(persona.key) } catch (err) {
+      log(threadMemoryLoadAtApplyFailedLine(persona, err))
+    }
+    if (deps.isShuttingDown()) { log(skipLine); return { outcome: 'broken', failures: [] } }
     const result = await deps.bringUps.bringUp(persona, applied.personas)
     if (result.outcome !== 'up') return result
     // Shutdown may have begun during the bring-up: no instance is launched.

@@ -288,15 +288,22 @@ function forwardingHolder(lifecycle: Map<string, string>, member: string, arity:
  */
 function lifecycleHolder(): string {
   const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
-  const teardown = forwardingHolder(lifecycle, 'teardown', 1)
+  const holder = forwardingHolder(lifecycle, 'updateInPlace', 1)
+  // Teardown still forwards the same persona to this holder and waits for
+  // it, even on failure, before removing only an unapplied key's Thread Memory.
+  // Pin the whole wrapper: an arbitrary async body must not pass the audit.
+  const teardown = lifecycle.get('teardown') ?? ''
+  const parameter = teardown.match(/^async \((\w+)\) => /)
+  expect(parameter).not.toBeNull()
+  const persona = parameter![1]!
+  expect(teardown).toBe(`async (${persona}) => { try { await ${holder}.teardown(${persona}) } finally { if (!${loadedConfigName(SERVER_CODE)}?.personas.some(applied => applied.key === ${persona}.key)) await threadMemory?.remove(${persona}.key) } }`)
   // All five on the same holder. bringUp forwards its third parameter, the
   // options carrying `recovery` (step 6): a binding that drops
   // it typechecks, but would bring a credentials-broken persona up as new.
-  expect(forwardingHolder(lifecycle, 'updateInPlace', 1)).toBe(teardown)
-  expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(teardown)
-  expect(forwardingHolder(lifecycle, 'refreshTemplate', 1)).toBe(teardown)
-  expect(forwardingHolder(lifecycle, 'bringUp', 3)).toBe(teardown)
-  return teardown
+  expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(holder)
+  expect(forwardingHolder(lifecycle, 'refreshTemplate', 1)).toBe(holder)
+  expect(forwardingHolder(lifecycle, 'bringUp', 3)).toBe(holder)
+  return holder
 }
 
 describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change, template refresh and bring-up (steps 3 to 6)', () => {
@@ -400,7 +407,9 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } }`],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => threadMemory?.forget(k), ]) }`],
+      // A later bring-up reads this key's Thread Memory before connecting.
+      ['loadThreadMemory', 'key => threadMemory?.loadKey(key)'],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],
@@ -450,6 +459,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // The imported production functions, each from its own module and not
     // shadowed by a local declaration of the same name.
     const imports: Record<string, string> = {
+      forgetPersonaState: './persona-lifecycle.ts',
       whenLaunchSettled: './session-manager.ts',
       cancelWorkingRowWait: './session-manager.ts',
       killPersonaInstanceForTeardown: './session-manager.ts',

@@ -4,6 +4,7 @@ import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
+import { createDurableJournal, splitJournalLines, type AppendRollback } from './durable-journal.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
 export const REPLY_REMINDER_KEEP_MS = 24 * 60 * 60 * 1000
@@ -167,7 +168,6 @@ export function slackKeyString(key: SlackKey): string { return JSON.stringify([k
 function isAccepted(r: QueueRecord): r is AcceptedRecord { return r.kind === 'accepted' && !('compact' in r) }
 function microseconds(ts: string): bigint { const [s, f = ''] = ts.split('.'); return BigInt(s!) * 1000000n + BigInt(f.padEnd(6, '0').slice(0, 6)) }
 function formatMicros(us: bigint): string { return `${us / 1000000n}.${String(us % 1000000n).padStart(6, '0')}` }
-interface AppendRollback { pendingRollback?: number }
 interface Journal extends AppendRollback {
   records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
@@ -178,12 +178,12 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   const fs = options.fs ?? nodeFs
   const now = options.now ?? Date.now
   const dir = join(options.stateDir, 'queue')
+  const { ensureDir, durableAppend, reconcileRollback, rewrite } = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: QUEUE_DIRECTORY_MODE, fileMode: QUEUE_FILE_MODE, fs })
   const journals = new Map<string, Journal>()
   const writers = new Map<string, Promise<unknown>>()
   const appendBlocked = new Set<string>()
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
-  let durableDirectory: { dev: number; ino: number } | undefined
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
   const findings: QueueEvent[] = []
   function event(e: QueueEvent): void { if (e.type === 'record-unreadable') findings.push({ ...e }); try { void Promise.resolve(options.onEvent?.(e)).catch(() => {}) } catch { /* observers cannot change durable outcomes */ } }
@@ -201,49 +201,6 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const next = (writers.get(key) ?? Promise.resolve()).catch(() => {}).then(work)
     writers.set(key, next)
     return next
-  }
-  function syncDir(path: string): void { const fd = fs.openSync(path, 'r'); try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) } }
-  function ensureDir(): void {
-    // A recreated directory may reuse the cached device/inode identity.
-    if (fs.mkdirSync(dir, { recursive: true, mode: QUEUE_DIRECTORY_MODE }) !== undefined) durableDirectory = undefined
-    const stat = fs.statSync(dir)
-    if (durableDirectory?.dev === stat.dev && durableDirectory.ino === stat.ino && (stat.mode & 0o7777) === QUEUE_DIRECTORY_MODE) return
-    durableDirectory = undefined
-    fs.chmodSync(dir, QUEUE_DIRECTORY_MODE)
-    // Persist a new/replaced queue directory before any acceptance.
-    // Publish this identity only after success; a failed sync remains retryable.
-    syncDir(options.stateDir)
-    durableDirectory = { dev: stat.dev, ino: stat.ino }
-  }
-  function writeAll(fd: number, bytes: Uint8Array): void {
-    let offset = 0
-    while (offset < bytes.length) { const n = fs.writeSync(fd, bytes, offset, bytes.length - offset); if (n <= 0) throw new Error('Short queue write'); offset += n }
-  }
-  function durableAppend(path: string, bytes: Uint8Array, rollback?: AppendRollback): void {
-    ensureDir()
-    const fd = fs.openSync(path, 'a+', QUEUE_FILE_MODE)
-    let original: number | undefined
-    try {
-      // A failed reconciliation still owes the original rollback, not the
-      // current file length, which may contain an unaccepted append.
-      original = rollback?.pendingRollback ?? fs.fstatSync(fd).size
-      fs.fchmodSync(fd, QUEUE_FILE_MODE)
-      if (rollback?.pendingRollback !== undefined) {
-        fs.ftruncateSync(fd, rollback.pendingRollback); fs.fsyncSync(fd)
-        original = rollback.pendingRollback; delete rollback.pendingRollback
-      }
-      if (original > 0) { const last = Buffer.alloc(1); fs.readSync(fd, last, 0, 1, original - 1); if (last[0] !== 10) writeAll(fd, Buffer.from('\n')) }
-      writeAll(fd, bytes)
-      fs.fsyncSync(fd)
-      // Always sync: a previous failed first append may have left an unsynced directory entry.
-      syncDir(dir)
-    } catch (error) {
-      if (rollback && original !== undefined) {
-        rollback.pendingRollback ??= original
-        try { fs.ftruncateSync(fd, rollback.pendingRollback); fs.fsyncSync(fd); delete rollback.pendingRollback } catch { /* next append must reconcile before writing */ }
-      }
-      throw error
-    } finally { try { fs.closeSync(fd) } catch { /* fsync is the durability boundary */ } }
   }
   function update(j: Journal, record: QueueRecord, replay = false): void {
     j.records.push(record); j.nextSeq = Math.max(j.nextSeq, record.seq + 1)
@@ -314,10 +271,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       event({ type: 'recovery-failed', key, error }); throw error
     }
     const lines: { bytes: Buffer; line: number; record?: QueueRecord; raw?: Record<string, unknown>; whole: boolean }[] = []
-    let offset = 0, line = 0
-    while (offset < bytes.length) {
-      const nl = bytes.indexOf(10, offset), end = nl < 0 ? bytes.length : nl + 1
-      const chunk = bytes.subarray(offset, end); const text = chunk.toString('utf8').replace(/\n$/, '')
+    for (const split of splitJournalLines(bytes)) {
+      const { text, whole } = split
       let raw: Record<string, unknown> | undefined
       try { const parsed: unknown = JSON.parse(text); if (object(parsed)) raw = parsed } catch {
         // A torn or syntactically damaged send can still identify its item. Retain
@@ -327,10 +282,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const attemptText = /(?:^|[,{])\s*"attempt"\s*:\s*(\d+)(?=\s*[,}])/.exec(text)?.[1]
         if (kind !== undefined || seqText !== undefined) raw = { kind, seq: seqText === undefined ? undefined : Number(seqText), attempt: attemptText === undefined ? undefined : Number(attemptText) }
       }
-      // Buffer roundtrip rejects invalid UTF-8 rather than silently fixing stored text.
-      const whole = nl >= 0 && Buffer.from(text).equals(chunk.subarray(0, chunk.length - 1))
-      lines.push({ bytes: chunk, line: ++line, record: whole ? parseQueueRecord(text) : undefined, raw, whole })
-      offset = end
+      lines.push({ bytes: split.bytes, line: split.line, record: whole ? parseQueueRecord(text) : undefined, raw, whole })
     }
     const accepted = new Set(lines.flatMap(l => l.record && isAccepted(l.record) ? [l.record.seq] : []))
     const quarantinePath = join(dir, `${key}.unreadable-${startId}`)
@@ -362,15 +314,6 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       }
     }
     stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
-  }
-  function rewrite(key: string, records: QueueRecord[]): void {
-    const path = pathFor(key), temp = `${path}.${randomUUID()}.tmp`
-    ensureDir()
-    try {
-      const fd = fs.openSync(temp, 'wx', QUEUE_FILE_MODE)
-      try { writeAll(fd, Buffer.from(records.map(r => JSON.stringify(r) + '\n').join(''))); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
-      fs.renameSync(temp, path); syncDir(dir)
-    } finally { try { fs.unlinkSync(temp) } catch { /* rename consumed temp */ } }
   }
   function lastSend(item: QueueItem): SentRecord | undefined {
     const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
@@ -422,16 +365,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     return [...targets.values()]
   }
-  function reconcileRollback(key: string, j: Journal): void {
-    if (j.pendingRollback !== undefined) {
-      const fd = fs.openSync(pathFor(key), 'r+')
-      try { fs.ftruncateSync(fd, j.pendingRollback); fs.fsyncSync(fd); delete j.pendingRollback } finally { fs.closeSync(fd) }
-    }
-  }
   function compactOne(key: string): void {
     load(key)
     const j = journal(key)
-    reconcileRollback(key, j)
+    reconcileRollback(pathFor(key), j)
     const at = now(), retained: QueueRecord[] = []
     const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
     for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
@@ -455,7 +392,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     // Preserve both sequence allocation and the injected microsecond watermark forever.
     retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
-    rewrite(key, retained)
+    rewrite(pathFor(key), Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')))
     j.records = retained
     rebuild(j)
   }
@@ -609,9 +546,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         if (item.delivered) return undefined
         const accepted = { ...item.accepted, queued_ack_reaction: name }
         if (!isQueueRecord(accepted)) throw new Error('Invalid queued reaction')
-        reconcileRollback(key, j)
+        reconcileRollback(pathFor(key), j)
         const records = j.records.map(r => isAccepted(r) && r.seq === seq ? accepted : r)
-        rewrite(key, records)
+        rewrite(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')))
         j.records = records
         rebuild(j)
         return name

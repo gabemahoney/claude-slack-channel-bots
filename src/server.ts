@@ -52,6 +52,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createThreadMemory, type ThreadMemory } from './thread-memory.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
 import type { Client } from 'agent-director'
@@ -243,7 +244,7 @@ import {
   type PersonaBringUpController,
 } from './persona-bringup-controller.ts'
 import { createPersonaSerializer } from './persona-serializer.ts'
-import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
+import { forgetPersonaState, createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { describeKillOutcome, killOutcomeStopsServer } from './checked-kill.ts'
 import { KILL_RETRY_SEED_NOT_LIVE_VALUE, KILL_RETRY_SYSTEM_CLOCK, killRetryStopped, type KillRetryWait } from './kill-retry.ts'
 import { resolveSystemBinary } from 'agent-director'
@@ -1141,6 +1142,8 @@ async function handleInitialized(
  */
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
+let threadMemory: ThreadMemory | undefined
+let unsubscribeThreadMemory: (() => void) | undefined
 let replyReminders: ReplyReminders | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
 let deliveryEngines: DeliveryEngines | undefined
@@ -1182,6 +1185,11 @@ const personaRouting = createPersonaRouting({
   // sets, which the session tools and the reload controller read too. Before
   // main() loads the store it is undefined, so no stored choice applies.
   getChannelDelivery: () => channelDeliveryStore,
+  threadStampUndecided: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
+  threadStampEpisodes: {
+    begin: (key, channel) => personaEpisodes?.threadStampUndecided.begin(key, channel) ?? false,
+    end: (key, channel) => personaEpisodes?.threadStampUndecided.end(key, channel),
+  },
   // Asked for a lost message only: one lost for a persona that is not up
   // restarts nothing.
   isPersonaUp,
@@ -1448,6 +1456,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await remindersStopping
   await deliveryClients?.close()
   await deliveryQueue?.stop()
+  unsubscribeThreadMemory?.()
+  await threadMemory?.stop()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -2739,8 +2749,20 @@ export async function main(): Promise<void> {
 
   // replay and compact every journal before Slack/HTTP admission.
   deliveryQueue = createDeliveryQueue({ stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event) })
+  threadMemory = createThreadMemory({
+    stateDir: STATE_DIR, dryRun: isDryRun(),
+    appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
+    stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
+    threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
+    markerKeys: () => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
+    canRemove: key => reloadController?.sharedChannels()?.reviewHeld(key) === false,
+    setCreated: key => reloadController?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' },
+    clearCreated: key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
+  })
+  threadMemory.readAtStart()
   await deliveryQueue.start()
   deliveryQueue.startMaintenance()
+  threadMemory.startMaintenance()
   deliveryPreparation = createDeliveryPreparation({
     queue: deliveryQueue,
     onReceived: (key, item) => deliveryReporting?.received(key, item),
@@ -2854,7 +2876,11 @@ export async function main(): Promise<void> {
         if (appliedConfig === undefined) throw new Error('the start bring-up ran before the start resolved its configuration')
         return startupSessionManager(configInEffect(appliedConfig, applied), { bringUp: personaBringUps, isShuttingDown: () => shuttingDown })
       },
-      teardown: (persona) => personaLifecycleOps.teardown(persona),
+      teardown: async (persona) => {
+        try { await personaLifecycleOps.teardown(persona) } finally {
+          if (!personaConfig?.personas.some(applied => applied.key === persona.key)) await threadMemory?.remove(persona.key)
+        }
+      },
       updateInPlace: (change) => personaLifecycleOps.updateInPlace(change),
       bringUp: (persona, applied, options) => personaLifecycleOps.bringUp(persona, applied, options),
       reconnectCredentials: (persona, applied) => personaLifecycleOps.reconnectCredentials(persona, applied),
@@ -2924,12 +2950,18 @@ export async function main(): Promise<void> {
   // Every consumer shares the authority already recovered by the reload controller.
   // This adapter creates no store and performs no I/O.
 
+  channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>
+    !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
+  // Thread-view notifications include undecided stamps during restoration,
+  // and run before the authority's ordinary subscribe listeners.
+  unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => threadMemory?.published())
+  await threadMemory.activate()
+  if (shuttingDown) return
+
   channelMembership = createChannelMembership({
     authority: reload.sharedChannels()!, dryRun: isDryRun(),
     log: line => console.error(line), requestReconciliation: key => membershipScanner?.request(key),
   })
-  channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>
-    !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
 
   // agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,
@@ -3619,7 +3651,11 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
+    routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
+      k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k),
+      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => threadMemory?.forget(k),
+    ]) },
+    loadThreadMemory: key => threadMemory?.loadKey(key),
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,

@@ -510,6 +510,13 @@ retain their existing text excerpts; receipt confirmation has its own line.
 - **Cause:** The state directory or its disk cannot be written.
 - **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
 
+### `persona-thread-stamp-undecided`
+
+- **Line:** `[slack] persona-thread-stamp-undecided: personas[<i>] "<name>" (key=<key>): channel=<channel>: <cause>`
+- **Meaning:** Thread-dependent replies in this channel remain unacknowledged. Existing Joined Threads are retained but select nothing while the Channel Stamp is undecided; independent @mentions, Broadcasts, DMs and unaffected channels/personas can continue. The diagnostic goes to the server log only, once per persona/channel episode.
+- **Cause:** The channel's shared state has an undecided Channel Stamp, including during a staged restoration whose other settings remain readable.
+- **Fix:** Follow [reload-shared-recovery](#reload-shared-recovery) to review and apply the restoration. Finite Slack retries do not guarantee recovery of never-accepted events; check the app's event subscriptions and resend missing replies after recovery.
+
 ### `persona-start`
 
 - **Line:** `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting`

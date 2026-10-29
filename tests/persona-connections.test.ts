@@ -1387,6 +1387,7 @@ describe('diagnostic lines', () => {
       'persona-invited-channel',
       'persona-slack-unreachable',
       'persona-start',
+      'persona-thread-stamp-undecided',
       'queue-kept',
       'queue-record-unreadable',
       'queue-unwritable',

@@ -1,9 +1,11 @@
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
+import * as nodeFs from 'node:fs'
 import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
 import { queuePath, readQueue, slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
@@ -185,6 +187,393 @@ afterEach(async () => {
 function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }
+
+describe('Thread Memory at confirmed apply', () => {
+  const channel = 'C0THREAD1', root = '1700000000.000001'
+  const pathFor = (key: string) => join(h.stateDir, 'threads', `${key}.jsonl`)
+  async function seeded(opts: ReloadRunOptions = {}) {
+    const started = await running([
+      ['alpha', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
+      ['bravo', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
+    ], { ...opts, threadMemory: opts.threadMemory ?? {} })
+    const { run } = started
+    const authority = run.controller.sharedChannels()!
+    for (const key of ['alpha', 'bravo']) {
+      const stamp = authority.channelStamp(key, channel)!
+      if (stamp.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('expected a decided thread stamp')
+      expect(await run.threadMemory!.saveJoins(key, [{ channel, root,
+        stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, source: 'mention', at: run.threadMemory!.clock(key) }])).toEqual({ kind: 'saved' })
+      expect(run.threadMemory!.view(key, channel, root)).toBe('joined')
+      expect(authority.threadMemoryCreated(key)).toBe(true)
+      const accepted = await run.queue.accept(key, slackInput({ channel, text: `accepted before apply: ${key}` }))
+      expect(accepted.status).toBe('accepted')
+    }
+    await run.prepareQueued()
+    return started
+  }
+
+  test.each((['off', 'mentions', 'all'] as const).flatMap(delivery =>
+    (['addition', 'destructive modify'] as const).map(action => ({ delivery, action })),
+  ))('$action with $delivery and no prior store skips journal reads and creates on the first hybrid apply after storage heals', async ({ delivery, action }) => {
+    const destructive = action === 'destructive modify'
+    if (destructive) await useConfigDirs()
+    const reads: string[] = []
+    let failRead = false
+    const threadFs = { ...nodeFs, readFileSync: ((...args: Parameters<typeof nodeFs.readFileSync>) => {
+      if (String(args[0]) === pathFor('bravo')) {
+        reads.push(String(args[0]))
+        if (failRead) throw Object.assign(new Error('fixture journal read refused'), { code: 'EACCES' })
+      }
+      return Reflect.apply(nodeFs.readFileSync, nodeFs, args)
+    }) as typeof nodeFs.readFileSync }
+    const bravoOptions = { channels: [{ id: channel, delivery }], permission_prompts: channel }
+    const { run, personas: [alpha, oldBravo] } = await running([
+      ['alpha', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
+      ...(destructive ? [['bravo', bravoOptions] as PersonaSpec] : []),
+    ], { ...(destructive ? REAL_LAUNCH : {}), threadMemory: { fs: threadFs } })
+    const authority = run.controller.sharedChannels()!
+    const stamp = authority.channelStamp('alpha', channel)!
+    if (stamp.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('expected a decided thread stamp')
+    expect(await run.threadMemory!.saveJoins('alpha', [{ channel, root,
+      stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, source: 'mention', at: run.threadMemory!.clock('alpha') }])).toEqual({ kind: 'saved' })
+    expect((await run.queue.accept('alpha', slackInput({ channel, text: 'accepted neighbor before apply' }))).status).toBe('accepted')
+    await run.prepareQueued()
+    const neighborJournal = readFileSync(pathFor('alpha'))
+    const neighborQueue = readFileSync(queuePath(h.stateDir, 'alpha'))
+    const untouched = watchUntouched(run, 'alpha')
+    const callsFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const bravo = destructive
+      ? { ...oldBravo!, working_directory: join(h.root, 'replacement-work') }
+      : h.persona('bravo', bravoOptions)
+    if (destructive) h.makeWorkingDirectory(bravo)
+    else h.materialize(bravo)
+    const noStore = () => {
+      expect(existsSync(pathFor('bravo'))).toBe(false)
+      expect(authority.threadMemoryCreated('bravo')).toBe(false)
+      expect(run.threadMemoryEvents.filter(event => event.key === 'bravo')).toEqual([])
+      expect(reads).toEqual([])
+    }
+    noStore()
+    failRead = true
+    const cp = run.checkpoint()
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+    const activityFrom = run.socketActivity('bravo').length
+    const label = h.credentialsLabel('bravo')
+    await previewConfig(run, [alpha!, bravo])
+    noStore()
+    expectNoPostNoLeak(run)
+    const gate = run.lifecycle.hold('bring-up', 'bravo')
+    h.confirm()
+    const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      noStore()
+      if (destructive) {
+        expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: oldBravo!.working_directory })
+        expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+        expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([`discarded ${label}`, `disconnected ${label}`])
+        expect(await run.relaunch('bravo')).toBe('skipped')
+        expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+      }
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      ...(destructive ? [{ op: 'teardown', key: 'bravo', via: 'apply' } as const] : []),
+      { op: 'bring-up', key: 'bravo', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      ...(destructive ? [{ op: 'launch', key: 'bravo', via: 'restart', restart: 'skipped' } as const] : []),
+      { op: 'launch', key: 'bravo', via: 'apply', ...(destructive ? { action: SPAWN_ACTION_FRESH_RETIRED } : {}) },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      ...(destructive ? [
+        { op: 'teardown', key: 'bravo', phase: 'start' },
+        { op: 'teardown', key: 'bravo', phase: 'settled' },
+      ] satisfies ApplyTimelineEntry[] : []),
+      { op: 'bring-up', key: 'bravo', phase: 'start' },
+      { op: 'bring-up', key: 'bravo', phase: 'settled' },
+    ])
+    expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+      ...(destructive ? [`discarded ${label}`, `disconnected ${label}`] : []),
+      `built ${label}`, `started ${label}`, `connected ${label}`,
+    ])
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(destructive ? ['kill ok', 'reuse-spawn ok'] : [])
+    if (destructive) {
+      expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: personaInstanceId('bravo'), reuse: true, cwd: bravo.working_directory, claudeConfigDir: ownConfigDir('bravo') })
+      expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo.working_directory })
+    }
+    expect(run.appliedKeys()).toEqual(['alpha', 'bravo'])
+    expect(run.isUp('bravo')).toBe(true)
+    noStore()
+    await expectNothingPendingAfter(run)
+    noStore()
+    expectNoPostNoLeak(run)
+
+    // Heal before the first hybrid choice. Only the real apply publication
+    // drives creation: no direct loadKey/flush can rescue a poisoned store.
+    failRead = false
+    const hybrid = { ...bravo, channels: [{ id: channel, delivery: 'thread_hybrid' as const }] }
+    const hybridCp = run.checkpoint()
+    const hybridCallsFrom = run.composition!.agentDirectorCalls.length
+    const bravoSlack = slackSideOf(run, 'bravo')
+    await previewConfig(run, [alpha!, hybrid])
+    noStore()
+    expectNoPostNoLeak(run)
+    h.confirm()
+    await run.ticks.tick()
+    await until(() => authority.threadMemoryCreated('bravo'))
+    expect(run.since(hybridCp).lifecycle).toEqual([
+      // The identity reset retired the previous channel assignment.
+      { op: 'update-in-place', key: 'bravo', via: 'apply', settings: [destructive ? 'channels' : 'delivery'] },
+    ])
+    expect(run.lifecycle.applyTimeline.slice(-2)).toEqual([
+      { op: 'update-in-place', key: 'bravo', phase: 'start' },
+      { op: 'update-in-place', key: 'bravo', phase: 'settled' },
+    ])
+    expect(authority.threadView().threadHybridChannels('bravo')).toEqual([channel])
+    expect(authority.channelStamp('bravo', channel)).toMatchObject({ kind: 'decided', threadHybridSince: expect.any(String) })
+    expect(existsSync(pathFor('bravo'))).toBe(true)
+    expect(run.threadMemory!.store('bravo')).toMatchObject({ readable: true, created: true })
+    expect(run.threadMemory!.view('bravo', channel, root)).toBe('not-joined')
+    expect(run.threadMemoryEvents.filter(event => event.key === 'bravo')).toEqual([{ type: 'created', key: 'bravo', path: pathFor('bravo') }])
+    expect(reads).toEqual([])
+    expect(slackSideOf(run, 'bravo')).toEqual(bravoSlack)
+    expect(adCallsSince(run, hybridCallsFrom)).toEqual([])
+    await expectNothingPendingAfter(run)
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(adCallsSince(run, adFrom).filter(call => call.id !== personaInstanceId('bravo'))).toEqual([])
+    expect(readFileSync(pathFor('alpha'))).toEqual(neighborJournal)
+    expect(readFileSync(queuePath(h.stateDir, 'alpha'))).toEqual(neighborQueue)
+    expect(run.queue.openCount('alpha')).toBe(1)
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(run.lifecycle.startPasses).toHaveLength(1)
+    expect(h.runs).toHaveLength(1)
+    const captures = () => ({ files: h.serverSideFiles(h.paths.config, alpha!.credentials_file, bravo.credentials_file),
+      agentDirectorCalls: run.composition!.agentDirectorCalls, makeTemplateCalls: run.composition!.agentDirector.makeTemplateCalls })
+    for (const capturedRun of h.runs) expectNoPostNoLeak(capturedRun, captures())
+    await run.stop()
+    for (const capturedRun of h.runs) expectNoPostNoLeak(capturedRun, captures())
+  })
+
+  test.each(['remove', 'rename'] as const)('%s unlinks only the old key after teardown, clears its marker afterward and preserves accepted queues', async action => {
+    let run!: ReloadRun
+    const unlinkObservations: unknown[] = []
+    const started = await seeded({ threadMemory: { fs: { ...nodeFs, unlinkSync(path) {
+      if (String(path) === pathFor('bravo')) unlinkObservations.push({
+        settled: run.lifecycle.timeline.some(e => e.op === 'teardown' && e.key === 'bravo' && e.phase === 'settled'),
+        marker: run.controller.sharedChannels()!.threadMemoryCreated('bravo'),
+      })
+      nodeFs.unlinkSync(path)
+    } } } })
+    run = started.run
+    const [alpha, bravo] = started.personas
+    const before = ['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))
+    const siblingBytes = readFileSync(pathFor('alpha'))
+    const renamed = h.persona('charlie', { channels: bravo!.channels, permission_prompts: channel })
+    if (action === 'rename') h.materialize(renamed)
+    const untouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+    const callsFrom = run.composition!.calls.length
+    await previewConfig(run, action === 'remove' ? [alpha!] : [alpha!, renamed])
+    expectNoPostNoLeak(run)
+    const gate = run.lifecycle.hold('teardown', 'bravo')
+    h.confirm()
+    const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      expect(existsSync(pathFor('bravo'))).toBe(true)
+      expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
+      expect(unlinkObservations).toEqual([])
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'bravo', via: 'apply' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+        { op: 'launch', key: 'charlie', via: 'apply' },
+      ] satisfies ReloadLifecycleRecord[]),
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', phase: 'start' },
+        { op: 'bring-up', key: 'charlie', phase: 'settled' },
+      ] satisfies ApplyTimelineEntry[]),
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(unlinkObservations).toEqual([{ settled: true, marker: true }])
+    expect(existsSync(pathFor('bravo'))).toBe(false)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    expect(readFileSync(pathFor('alpha'))).toEqual(siblingBytes)
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))).toEqual(before)
+    for (const key of ['alpha', 'bravo']) {
+      expect(run.queue.openCount(key)).toBe(1)
+      expect(run.queue.items(key)[0]!.fixed!.parts.join('')).toContain(`accepted before apply: ${key}`)
+    }
+    if (action === 'rename') {
+      expect(existsSync(pathFor('charlie'))).toBe(true)
+      expect(run.controller.sharedChannels()!.threadMemoryCreated('charlie')).toBe(true)
+      expect(run.threadMemory!.view('charlie', channel, root)).toBe('not-joined')
+    }
+    expectNoPostNoLeak(run)
+  })
+
+  test('a destructive modify keeps its store identity, forgets the old incarnation and leaves accepted work deliverable', async () => {
+    await useConfigDirs()
+    const { run, personas: [alpha, bravo] } = await seeded(REAL_LAUNCH)
+    const authority = run.controller.sharedChannels()!
+    const oldStamp = authority.channelStamp('bravo', channel)
+    const storeId = run.threadMemory!.store('bravo')!.storeId
+    const sibling = readFileSync(pathFor('alpha'))
+    const queues = ['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))
+    const changed = { ...bravo!, working_directory: join(h.root, 'replacement-work') }
+    h.makeWorkingDirectory(changed)
+    const untouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+    const callsFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+    const activityFrom = run.socketActivity('bravo').length
+    const label = h.credentialsLabel('bravo')
+    const bravoId = personaInstanceId('bravo')
+    expect(h.rowOf('bravo')?.state).toBe('waiting')
+    await previewConfig(run, [alpha!, changed])
+    expectNoPostNoLeak(run)
+    const gate = run.lifecycle.hold('bring-up', 'bravo')
+    h.confirm()
+    const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
+      expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+      expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([`discarded ${label}`, `disconnected ${label}`])
+      expect(await run.relaunch('bravo')).toBe('skipped')
+      expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'bravo', via: 'apply' },
+      { op: 'bring-up', key: 'bravo', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: 'bravo', via: 'restart', restart: 'skipped' },
+      { op: 'launch', key: 'bravo', via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+      { op: 'bring-up', key: 'bravo', phase: 'start' },
+      { op: 'bring-up', key: 'bravo', phase: 'settled' },
+    ])
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok', 'reuse-spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, reuse: true, cwd: changed.working_directory, claudeConfigDir: ownConfigDir('bravo') })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: changed.working_directory })
+    expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+      `discarded ${label}`, `disconnected ${label}`, `built ${label}`, `started ${label}`, `connected ${label}`,
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(adCallsSince(run, adFrom).filter(call => call.id !== bravoId)).toEqual([])
+    expect(authority.channelStamp('bravo', channel)).not.toEqual(oldStamp)
+    expect(existsSync(pathFor('bravo'))).toBe(true)
+    expect(authority.threadMemoryCreated('bravo')).toBe(true)
+    expect(run.threadMemory!.store('bravo')!.storeId).toBe(storeId)
+    expect(run.threadMemory!.view('bravo', channel, root)).toBe('not-joined')
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(readFileSync(pathFor('alpha'))).toEqual(sibling)
+    expect(['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))).toEqual(queues)
+    const item = run.queue.items('bravo')[0]!
+    // The production executor sends the unchanged pre-reset item and observes
+    // a transcript receipt through the established fake-AD delivery driver.
+    expect(item.fixed!.parts.join('')).toContain('accepted before apply: bravo')
+    const delivery = await makeEngineHarness({ queue: run.queue, stateDir: h.stateDir, keys: ['bravo'] })
+    try {
+      await delivery.tick('bravo')
+      await delivery.until(() => run.queue.openCount('bravo') === 0)
+      expect(delivery.textCalls('bravo').map(call => call.params.text)).toEqual(item.fixed!.parts)
+      expect(run.queue.items('bravo')[0]!.delivered).toBe(true)
+      expect(delivery.errors).toEqual([])
+      expect(delivery.restarts).toEqual([])
+      expect(readFileSync(queuePath(h.stateDir, 'alpha'))).toEqual(queues[0]!)
+      expect(run.queue.openCount('alpha')).toBe(1)
+      assertNoLeak({ calls: delivery.calls, events: delivery.events, errors: delivery.errors })
+    } finally { await delivery.cleanup() }
+    expectNoPostNoLeak(run)
+  })
+
+  test('a failed unlink preserves the marker, does not fail apply and is retried on the next start', async () => {
+    let failures = 0
+    const { run, personas: [alpha] } = await seeded({ threadMemory: { fs: { ...nodeFs, unlinkSync(path) {
+      if (String(path) === pathFor('bravo')) { failures++; throw Object.assign(new Error('unlink failed'), { code: 'EACCES' }) }
+      nodeFs.unlinkSync(path)
+    } } } })
+    const bytes = readFileSync(pathFor('bravo'))
+    const queues = ['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))
+    const untouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+    const callsFrom = run.composition!.calls.length
+    await previewConfig(run, [alpha!])
+    expectNoPostNoLeak(run)
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'teardown', key: 'bravo', via: 'apply' }])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(run.appliedKeys()).toEqual(['alpha'])
+    expect(failures).toBe(1)
+    expect(readFileSync(pathFor('bravo'))).toEqual(bytes)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
+    expect(['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))).toEqual(queues)
+    expectNoPostNoLeak(run)
+    await run.stop()
+    const reopened = await h.start({ threadMemory: {} })
+    expect(reopened.outcome.kind).toBe('applied')
+    expect(existsSync(pathFor('bravo'))).toBe(false)
+    expect(reopened.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    expect(reopened.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(reopened.queue.items('bravo')[0]!.fixed!.parts.join('')).toContain('accepted before apply: bravo')
+    expectNoPostNoLeak(run)
+    expectNoPostNoLeak(reopened)
+  })
+
+  test('dry-run activation and removing apply leave existing Thread Memory bytes and marker intact', async () => {
+    const { run, personas: [alpha] } = await seeded()
+    expectNoPostNoLeak(run)
+    await run.stop()
+    expectNoPostNoLeak(run)
+    const before = ['alpha', 'bravo'].map(key => readFileSync(pathFor(key)))
+    const writes: string[] = []
+    const dry = await h.startDetecting({ dryRun: true, threadMemory: { fs: { ...nodeFs,
+      openSync: ((path: nodeFs.PathLike, flags: nodeFs.OpenMode, mode?: nodeFs.Mode) => {
+        if (flags !== 'r') writes.push(String(path))
+        return nodeFs.openSync(path, flags, mode)
+      }) as typeof nodeFs.openSync,
+      unlinkSync(path) { writes.push(String(path)); nodeFs.unlinkSync(path) },
+    } } })
+    const cp = dry.checkpoint()
+    const callsFrom = dry.composition!.calls.length
+    await previewConfig(dry, [alpha!])
+    expectNoPostNoLeak(dry)
+    h.confirm()
+    await dry.ticks.tick()
+    expect(dry.since(cp).lifecycle).toEqual([{ op: 'teardown', key: 'bravo', via: 'apply' }])
+    expect(dry.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+    ])
+    expect(dry.slack.builds).toEqual([])
+    expect(dry.socketActivity('alpha')).toEqual([])
+    expect(Object.values(dry.slackCalls()).flat()).toEqual([])
+    expect(dry.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(dry.appliedKeys()).toEqual(['alpha'])
+    expect(writes).toEqual([])
+    expect(['alpha', 'bravo'].map(key => readFileSync(pathFor(key)))).toEqual(before)
+    expect(dry.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
+    expectNoPostNoLeak(dry)
+  })
+})
 
 /** Top-level (server-wide) settings in file form. */
 type TopLevel = Partial<Omit<PersonaConfigInput, 'personas'>>
