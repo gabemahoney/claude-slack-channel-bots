@@ -34,6 +34,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from './delivery-queue.ts'
 import { durableUnlinkSync, DurableUnlinkUnsyncedError } from './atomic-write.ts'
+import type { ThreadMemoryJournalFact, ThreadMemoryJournalFacts, ThreadMemorySealPort, ThreadMemoryStoreIdentity } from './thread-memory-seal.ts'
 import { createDurableJournal, splitJournalLines, removeTornTail, type AppendRollback } from './durable-journal.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from './delivery-constants.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
@@ -241,6 +242,7 @@ export type ThreadMemoryEvent =
 export type ThreadMemoryWriteResult = { kind: 'saved' | 'kept' | 'cancelled' } | { kind: 'failed'; error?: unknown }
 export interface ThreadMemoryOptions {
   stateDir: string; fs?: typeof nodeFs; now?: () => number; dryRun?: boolean
+  seal?: ThreadMemorySealPort
   setInterval?: typeof globalThis.setInterval; clearInterval?: typeof globalThis.clearInterval
   appliedKeys(): readonly string[]
   stamp(key: string, channel: string): ThreadMemoryStampState | undefined
@@ -254,6 +256,8 @@ export interface ThreadMemoryOptions {
 }
 export interface ThreadMemory {
   readAtStart(): void
+  journalFacts(): ThreadMemoryJournalFacts
+  completedStores(): ReadonlyMap<string, ThreadMemoryStoreIdentity>
   activate(): Promise<void>
   loadKey(key: string): Promise<void>
   published(): void
@@ -274,6 +278,7 @@ export interface ThreadMemory {
   remove(key: string): Promise<ThreadMemoryWriteResult>
   removeUnappliedAtStart(): Promise<void>
   startMaintenance(): void
+  quiesce(): Promise<void>
   stop(): Promise<void>
 }
 const memoryObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -328,6 +333,7 @@ interface JoinedThread { join: ThreadJoin; saved?: ThreadJoinRecord }
 interface MemoryJournal extends AppendRollback {
   readable: boolean; exists: boolean; hasRecords: boolean; live: boolean; created: boolean; failed: boolean
   header?: ThreadMemoryHeader; highWater: number; records?: ThreadMemoryRecord[]
+  creationHeader?: ThreadMemoryHeader; sealSaved?: boolean
   joinedByChannel: Map<string, Map<string, Map<string, JoinedThread>>>
   kept: ThreadJoin[]; intents: Map<string, ThreadPostIntent>
   error?: unknown; quarantined: ThreadMemoryQuarantineFact[]; quarantineRollback: AppendRollback
@@ -343,7 +349,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const io = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: THREAD_MEMORY_DIRECTORY_MODE, fileMode: THREAD_MEMORY_FILE_MODE, fs })
   const journals = new Map<string, MemoryJournal>(), writers = new Map<string, Promise<unknown>>()
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
-  let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false
+  let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false, quiesced = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
   function pathFor(key: string): string {
     if (!PERSONA_KEY_RE.test(key)) throw new Error('Invalid Thread Memory persona key')
@@ -364,7 +370,16 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     return next
   }
   function current(key: string, j: MemoryJournal): boolean {
-    return !stopped && !forgotten.has(key) && journals.get(key) === j && j.live && options.appliedKeys().includes(key)
+    return !stopped && !quiesced && !forgotten.has(key) && journals.get(key) === j && j.live && options.appliedKeys().includes(key)
+  }
+  function journalFact(j: MemoryJournal): ThreadMemoryJournalFact {
+    if (!j.readable) return { kind: 'unreadable' }
+    if (!j.exists) return { kind: 'absent' }
+    if (!j.header && !j.hasRecords) return { kind: 'not-created' }
+    return { kind: 'read', storeId: j.header?.storeId, lastRecordNumber: j.highWater }
+  }
+  function journalFacts(): ThreadMemoryJournalFacts {
+    return new Map([...journals].map(([key, j]) => [key, journalFact(j)]))
   }
   function entry(j: MemoryJournal, fact: ThreadJoin): JoinedThread | undefined {
     return j.joinedByChannel.get(fact.channel)?.get(fact.root)?.get(stampKey(fact.stamp))
@@ -467,18 +482,23 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function newHeader(j: MemoryJournal): ThreadMemoryHeader {
     return { v: 1, kind: 'header', seq: 0, storeId: randomUUID(), digestKey: randomBytes(32).toString('hex'), highWater: j.highWater }
   }
-  function compactOne(key: string, j: MemoryJournal): void {
+  function compactOne(key: string, j: MemoryJournal, creationHeader?: ThreadMemoryHeader): void {
     if (!current(key, j) || !j.readable || !j.exists || options.dryRun || (!j.hasRecords && !options.threadHybridChannels(key).length)) return
+    // Creating a missing header creates a store, so its seal step must run
+    // first. Without a seal, retain the original standalone store behavior.
+    if (options.seal && !j.header && !creationHeader) return
     try {
       judge(key, j)
       io.reconcileRollback(pathFor(key), j)
-      const header = { ...(j.header ?? newHeader(j)), highWater: j.highWater }
+      const header = { ...(j.header ?? creationHeader ?? newHeader(j)), highWater: j.highWater }
       const records: ThreadMemoryRecord[] = []
       for (const roots of j.joinedByChannel.values()) for (const entries of roots.values()) for (const value of entries.values()) if (value.saved) records.push(value.saved)
       records.push(...j.intents.values())
       records.sort((a, b) => a.seq - b.seq)
       io.rewrite(pathFor(key), serializeThreadMemoryRecords([header, ...records]))
       j.header = header; j.hasRecords = true
+      // The shared seal writer must never hold a persona's compaction turn.
+      void options.seal?.entryCompacted(key, header.storeId, j.highWater)
     } catch (error) { event({ type: 'compaction-failed', key, path: pathFor(key), error }); throw error }
   }
   async function createStore(key: string, j: MemoryJournal): Promise<ThreadMemoryWriteResult> {
@@ -487,16 +507,27 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     if (j.created) return { kind: 'saved' }
     if (!j.hasRecords && !options.threadHybridChannels(key).length) return { kind: 'kept' }
     try {
-      // The seal's creation step belongs immediately before the journal step.
+      // Keep the identity across failures at any creation step. An existing
+      // header is already saved; an unsaved header is private to creation.
+      const header = j.header ?? (j.creationHeader ??= j.exists
+        ? newHeader(j) : { ...newHeader(j), seq: j.highWater + 1, highWater: j.highWater + 1 })
+      if (options.seal && !j.sealSaved) {
+        const result = await options.seal.entryCreated(key, header.storeId, j.header ? j.highWater : header.highWater)
+        if (!current(key, j)) return { kind: 'cancelled' }
+        if (result.kind !== 'written') throw result.kind === 'failed' ? result.error : new Error('Thread Memory seal entry was not saved')
+        j.sealSaved = true
+      }
       if (!j.header) {
-        if (j.exists) compactOne(key, j)
+        if (j.exists) compactOne(key, j, header)
         else {
-          const header = { ...newHeader(j), seq: j.highWater + 1, highWater: j.highWater + 1 }
           io.durableAppend(pathFor(key), serializeThreadMemoryRecords([header]), j)
           j.header = header; j.highWater = header.highWater; j.exists = true; j.hasRecords = true
         }
       }
       if (!current(key, j)) return { kind: 'cancelled' }
+      // Repair can skip an empty journal if the last hybrid entry vanished
+      // during the seal await. Keep creation pending until its header is saved.
+      if (!j.header) return { kind: 'kept' }
       const result = await options.setCreated(key)
       if (!current(key, j)) return { kind: 'cancelled' }
       if (result.kind !== 'saved') throw new Error('Thread Memory created marker was not saved')
@@ -546,7 +577,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     }
   }
   async function activateKey(key: string): Promise<void> {
-    if (stopped || forgotten.has(key)) return
+    if (stopped || quiesced || forgotten.has(key)) return
     const j = journal(key)
     j.live = true
     j.created = j.header !== undefined && options.markerKeys().includes(key)
@@ -562,11 +593,17 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     if (options.canRemove?.(key) === false) return { kind: 'kept' }
     forgotten.add(key); journals.delete(key)
     return serial(key, async () => {
-      if (options.dryRun || stopped) return { kind: 'cancelled' }
+      if (options.dryRun || stopped || quiesced) return { kind: 'cancelled' }
       if (options.canRemove?.(key) === false) return { kind: 'kept' }
       try {
         try { durableUnlinkSync(pathFor(key), fs) } catch (error) { if (!(error instanceof DurableUnlinkUnsyncedError)) throw error }
-        // The seal entry is removed here, before clearing the shared marker.
+        if (options.seal) {
+          const sealed = await options.seal.removeEntry(key)
+          if (sealed.kind !== 'written' && sealed.kind !== 'skipped') {
+            throw sealed.kind === 'failed' ? sealed.error : new Error('Thread Memory seal entry was not removed')
+          }
+          if (stopped || quiesced) return { kind: 'cancelled' }
+        }
         const result = await options.clearCreated(key)
         if (result.kind !== 'saved') throw new Error('Thread Memory created marker was not cleared')
         event({ type: 'removed', key, path: pathFor(key) })
@@ -576,7 +613,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   }
   async function removeUnappliedAtStart(): Promise<void> {
     const applied = new Set(options.appliedKeys())
-    const keys = new Set([...journals.keys(), ...options.markerKeys()])
+    const keys = new Set([...journals.keys(), ...options.markerKeys(), ...options.seal?.entryKeys() ?? []])
     await Promise.all([...keys].filter(key => !applied.has(key)).map(remove))
   }
   async function compact(key?: string): Promise<void> {
@@ -587,34 +624,46 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   }
   const api: ThreadMemory = {
     readAtStart() {
-      if (readStarted || stopped) return
+      if (readStarted || stopped || quiesced) return
       readStarted = true
       let names: string[]
       try { names = fs.readdirSync(dir) } catch (error) { listingFailed = (error as NodeJS.ErrnoException).code !== 'ENOENT'; return }
       for (const name of names) if (name.endsWith('.jsonl') && PERSONA_KEY_RE.test(name.slice(0, -6))) readKey(name.slice(0, -6))
     },
+    journalFacts,
+    completedStores() {
+      return new Map([...journals].filter(([, j]) => j.created && j.readable && j.header !== undefined).map(([key, j]) =>
+        [key, { storeId: j.header!.storeId, lastRecordNumber: j.highWater }]))
+    },
     async activate() {
+      if (stopped || quiesced) return
       api.readAtStart()
       if (listingFailed) for (const key of options.appliedKeys()) if (!journals.has(key)) readKey(key)
+      // Keep startup evidence ahead of stamp filtering, repair and removal.
+      options.seal?.judgeAtStart(journalFacts())
+      if (listingFailed) await options.seal?.refreshAtStart(journalFacts())
+      if (stopped || quiesced) return
       await Promise.all([removeUnappliedAtStart(), ...options.appliedKeys().map(key => activateKey(key))])
     },
     async loadKey(key) {
       pathFor(key)
-      if (stopped) return
+      if (stopped || quiesced) return
       const previous = journals.get(key)
       if (previous?.live && previous.readable) return
       forgotten.delete(key)
       // A never-created, non-hybrid store needs no journal read. Only a
       // confirmed absence can skip it; existing/unknown stores still retry.
       let absent = false
-      if (!previous?.exists && previous?.readable !== false && !options.markerKeys().includes(key) && !options.threadHybridChannels(key).length) {
+      if (!previous?.exists && previous?.readable !== false && !options.markerKeys().includes(key) && !options.threadHybridChannels(key).length && !options.seal?.entryKeys().includes(key)) {
         try { fs.lstatSync(pathFor(key)) } catch (error) { absent = (error as NodeJS.ErrnoException).code === 'ENOENT' }
       }
       if (!absent) readKey(key)
+      const loaded = journals.get(key)
+      if (loaded) options.seal?.judgeFirstRead(key, journalFact(loaded))
       await activateKey(key)
     },
     published() {
-      if (stopped) return
+      if (stopped || quiesced) return
       for (const [key, j] of journals) if (j.live) judge(key, j)
       // Promise-chain turns run after the synchronous publisher releases its
       // mutation lock; a marker setter must never run inside that publisher.
@@ -623,7 +672,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         const j = journal(key)
         if (!j.live) {
           if (options.threadHybridChannels(key).length) void Promise.resolve().then(() => {
-            if (!stopped && !forgotten.has(key) && journals.get(key) === j) return api.loadKey(key)
+            if (!stopped && !quiesced && !forgotten.has(key) && journals.get(key) === j) return api.loadKey(key)
           }).catch(() => {})
           continue
         }
@@ -665,15 +714,19 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     forget(key) { forgotten.add(key); journals.delete(key) },
     remove, removeUnappliedAtStart,
     startMaintenance() {
-      if (stopped || timer !== undefined) return
+      if (stopped || quiesced || timer !== undefined) return
       timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, QUEUE_COMPACT_INTERVAL_MS)
       timer.unref?.()
     },
+    async quiesce() {
+      quiesced = true
+      await Promise.allSettled([...writers.values()])
+    },
     async stop() {
+      await api.quiesce()
       stopped = true
       if (timer !== undefined) (options.clearInterval ?? globalThis.clearInterval)(timer)
       timer = undefined
-      await Promise.allSettled([...writers.values()])
     },
   }
   return api

@@ -6,7 +6,8 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
@@ -18,13 +19,17 @@ import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN
 import { PersonaSlackTokens } from '../src/persona-credentials.ts'
 import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE, type ThreadJoin } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
+import { isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
+  type JudgeSealInput, type ThreadMemorySealCase, type ThreadMemorySealEntry } from '../src/thread-memory-seal.ts'
 import {
   makeThreadMemoryHarness, makeThreadMembershipHarness, threadConfig, threadPath, threadHeader,
   threadJoin, joinRecord, postIntent, postOutcome, seedThreads, readThreads, damagedThreadLine,
   THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_TIME, type ThreadMemoryHarness,
+  runningSealEntry, cleanSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
 } from './test-helpers/thread-memory.ts'
 import { membershipPage, readSharedState } from './test-helpers/shared-channels.ts'
-import { makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeDeferredWebApiCall } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
@@ -74,7 +79,8 @@ afterEach(async () => {
   for (const h of threadRuns.splice(0)) {
     await h.close()
     if ('membership' in h) assertNoLeak(h.membership.captured())
-    assertNoLeak({ events: h.events, state: readSharedState(h.stateDir),
+    assertNoLeak({ events: h.events, sealEvents: h.sealEvents, state: readSharedState(h.stateDir),
+      ...(existsSync(threadSealPath(h.stateDir)) ? { seal: writtenFile(threadSealPath(h.stateDir)) } : {}),
       ...(existsSync(join(h.stateDir, 'threads')) ? { threads: writtenFile(join(h.stateDir, 'threads')) } : {}) })
   }
   _resetAckTracker(); _resetRegistry()
@@ -554,6 +560,666 @@ describe('Thread Memory store', () => {
     expect(h.memory.clock('alpha')).toBe(fact.at + 1)
     h.memory.advancePast('alpha', fact.at + 200); expect(h.memory.clock('alpha')).toBe(fact.at + 201)
     h.memory.advancePast('alpha', 0); expect(h.memory.clock('alpha')).toBe(fact.at + 202)
+  })
+})
+
+function sealFixture(options: Parameters<typeof fixture>[0] = {}, dir?: string) {
+  const h = fixture({ seal: true, ...options }, dir)
+  return { ...h, seal: h.seal!, queue: h.queue! }
+}
+const sealEntry = (h: ThreadMemoryHarness, key = 'alpha') => readThreadSeal(h.stateDir).entries[key]!
+function expectSealFinding(h: ThreadMemoryHarness, reason?: ThreadMemorySealCase, wording: 'changed' | 'unclean' = 'changed') {
+  const expected = reason ? [{ key: 'alpha', case: reason, wording }] : []
+  expect(h.seal!.startupFindings()).toEqual(expected)
+  expect(h.sealEvents.filter(e => e.type === 'changed-while-stopped')).toEqual(expected.map(e => ({ type: 'changed-while-stopped', ...e })))
+}
+async function queueTraffic(h: ReturnType<typeof sealFixture>, key = 'alpha') {
+  const accepted = await h.queue.accept(key, slackInput())
+  expect(accepted.status).toBe('accepted')
+  if (accepted.status === 'failed') throw accepted.error
+  await h.queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: ['fixture delivery'] })
+  await h.queue.append(key, deliveredRecord(accepted.seq))
+  expect(h.queue.item(key, accepted.seq)?.delivered).toBe(true)
+  expect(h.queue.openCount(key)).toBe(0)
+}
+
+describe('Thread Memory seal judgments and closed metadata', () => {
+  test('production schema accepts running, clean and empty files and rejects extra content at every level', () => {
+    const h = sealFixture(), running = runningSealEntry(), clean = cleanSealEntry(h.stateDir)
+    const validEntries: Array<Record<string, ThreadMemorySealEntry>> = [{}, { alpha: running }, { alpha: clean, beta: running }]
+    for (const entries of validEntries) {
+      const file = { v: 1 as const, entries }
+      expect(isThreadMemorySealFile(file)).toBe(true)
+      expect(JSON.parse(serializeThreadMemorySeal(file).toString())).toEqual(file)
+    }
+    const file = { v: 1, entries: { alpha: clean } }
+    for (const invalid of [null, [], { ...file, v: 2 }, { ...file, text: LEAK_SENTINEL },
+      { ...file, entries: { '../alpha': clean } }, { ...file, entries: [] },
+      { ...file, entries: { alpha: { ...clean, token: fakeToken(BOT_TOKEN_PREFIX) } } }]) {
+      expect(isThreadMemorySealFile(invalid)).toBe(false)
+      let rejection: unknown
+      try { serializeThreadMemorySeal(invalid as never) } catch (error) { rejection = error }
+      expect(rejection).toBeInstanceOf(Error)
+      expect((rejection as Error).message).toStartWith('Invalid Thread Memory seal')
+      assertNoLeak(rejection)
+    }
+    for (const invalid of [
+      { ...running, storeId: '' }, { ...running, storeId: '../store' },
+      ...[-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '1'].map(lastRecordNumber => ({ ...running, lastRecordNumber })),
+      { ...running, clean: 'false' }, { ...running, queue: clean.queue }, { ...clean, queue: undefined },
+      ...[{ ...clean.queue, text: LEAK_SENTINEL }, { ...clean.queue, size: '01' }, { ...clean.queue, sha256: 'invalid' },
+        { ...clean.queue, inode: '1' }, { ...clean.queue, mtimeNs: '1' }, { ...clean.queue, size: '1' },
+        { ...clean.queue, sha256: 'a'.repeat(64) }].map(queue => ({ ...clean, queue })),
+    ]) expect(isThreadMemorySealEntry(invalid)).toBe(false)
+  })
+
+  test('judgment precedence uses original evidence, with unclean wording only for the stated cases', () => {
+    const h = sealFixture(), previous = cleanSealEntry(h.stateDir), queue = { ...previous.queue!, inode: '3', mtimeNs: '4' }
+    const input: JudgeSealInput = { key: 'alpha', previous, queue, journal: { kind: 'read', storeId: previous.storeId, lastRecordNumber: previous.lastRecordNumber },
+      threadHybrid: true, created: true, sealExisted: true, anyUnclean: false }
+    const rows: Array<[Partial<JudgeSealInput>, ThreadMemorySealCase | undefined, 'changed' | 'unclean']> = [
+      [{ previous: runningSealEntry(), journal: { kind: 'absent' } }, 'unclean-stop', 'unclean'],
+      [{ previous: runningSealEntry(), journal: { kind: 'read', storeId: 'other', lastRecordNumber: 0 } }, 'unclean-stop', 'unclean'],
+      [{ journal: { kind: 'absent' } }, 'journal-missing', 'changed'],
+      [{ journal: { kind: 'not-created' } }, 'journal-missing', 'changed'],
+      [{ journal: { kind: 'read', storeId: 'other', lastRecordNumber: 0 } }, 'journal-changed', 'changed'],
+      [{ previous: undefined }, 'entry-missing', 'changed'],
+      [{ previous: undefined, journal: { kind: 'absent' } }, 'hybrid-without-store', 'changed'],
+      [{ previous: undefined, journal: { kind: 'absent' }, anyUnclean: true }, 'hybrid-without-store', 'unclean'],
+      [{ previous: undefined, journal: { kind: 'absent' }, threadHybrid: false, anyUnclean: true }, 'marker-without-store', 'changed'],
+      [{ anyUnclean: true }, 'queue-changed', 'changed'],
+      [{ queue: undefined }, undefined, 'changed'],
+      [{ previous: undefined, journal: { kind: 'absent' }, sealExisted: false, created: false }, undefined, 'changed'],
+    ]
+    for (const [change, reason, wording] of rows) expect(judgeSeal({ ...input, ...change })).toEqual(reason ? { key: 'alpha', case: reason, wording } : undefined)
+  })
+
+  test.each(['inode', 'size', 'mtimeNs', 'sha256'] as const)('a change of queue %s alone is detected', field => {
+    const h = sealFixture(), base = cleanSealEntry(h.stateDir)
+    const queue = { inode: '9007199254740993', size: '42', mtimeNs: '1700000000000000001', sha256: base.queue!.sha256 }
+    const changed = { ...queue, [field]: field === 'sha256' ? 'b'.repeat(64) : (BigInt(queue[field]) + 1n).toString() }
+    expect(queueIdentitiesMatch(queue, queue)).toBe(true)
+    expect(queueIdentitiesMatch(queue, changed)).toBe(false)
+    expect(judgeSeal({ key: 'alpha', previous: { ...base, clean: true, queue }, queue: changed,
+      journal: { kind: 'read', storeId: base.storeId, lastRecordNumber: base.lastRecordNumber + 1 },
+      threadHybrid: false, created: false, sealExisted: true, anyUnclean: false })).toEqual({ key: 'alpha', case: 'queue-changed', wording: 'changed' })
+  })
+
+  test('queue hashing uses descriptor metadata and bounded reads, distinguishes absent from empty, and closes failed reads', async () => {
+    const h = sealFixture(), absent = h.seal.queueIdentity('alpha')
+    expect(absent).toEqual({ size: '0', sha256: createHash('sha256').digest('hex') })
+    await h.queue.start(); await h.queue.accept('alpha', slackInput({ text: 'x'.repeat(200_000) }))
+    h.sealIo.reset()
+    const identity = h.seal.queueIdentity('alpha'), stat = statSync(queuePath(h.stateDir), { bigint: true })
+    expect(identity).toEqual({ inode: stat.ino.toString(), size: stat.size.toString(), mtimeNs: stat.mtimeNs.toString(),
+      sha256: createHash('sha256').update(readFileSync(queuePath(h.stateDir))).digest('hex') })
+    const reads = h.sealIo.queueReads().filter(c => c.op === 'readSync')
+    expect(reads.length).toBeGreaterThan(3)
+    expect(reads.every(c => c.length! < Number(identity.size))).toBe(true)
+    expect(h.sealIo.calls.some(c => c.op === 'readFileSync' && c.path === queuePath(h.stateDir))).toBe(false)
+    const failure = h.sealIo.fail('readSync', 'alpha', { match: p => p === queuePath(h.stateDir) })
+    expect(() => h.seal.queueIdentity('alpha')).toThrow(failure)
+    expect(h.sealIo.calls.at(-1)).toEqual({ op: 'closeSync', path: queuePath(h.stateDir) })
+    h.sealIo.heal(); writeFileSync(queuePath(h.stateDir), Buffer.alloc(0))
+    expect(queueIdentitiesMatch(absent, h.seal.queueIdentity('alpha'))).toBe(false)
+  })
+})
+
+describe('Thread Memory seal startup and restart', () => {
+  test.each([
+    ['missing journal', 'journal-missing'], ['different store', 'journal-changed'], ['older journal', 'journal-changed'],
+    ['missing entry', 'entry-missing'], ['missing entry and journal', 'hybrid-without-store'],
+    ['marker only', 'marker-without-store'], ['other release queue rewrite', 'queue-changed'],
+  ] as const)('%s produces one typed finding without changing the other persona', async (change, reason) => {
+    const h = sealFixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); await h.start()
+    await h.memory.saveJoins('alpha', [h.fact()]); const earlier = journalBytes(h)
+    await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })]); await queueTraffic(h)
+    await h.close()
+    if (change === 'missing journal') rmSync(threadPath(h.stateDir))
+    if (change === 'different store') seedThreads(h.stateDir, [threadHeader({ storeId: 'other-store' })])
+    if (change === 'older journal') writeFileSync(threadPath(h.stateDir), earlier)
+    if (change === 'missing entry') {
+      // Preserve beta's evidence to isolate the missing-entry case to alpha.
+      seedThreadSeal(h.stateDir, { beta: sealEntry(h, 'beta') })
+    }
+    if (change === 'missing entry and journal') { seedThreadSeal(h.stateDir, { beta: sealEntry(h, 'beta') }); rmSync(threadPath(h.stateDir)) }
+    if (change === 'marker only') {
+      // The seal is still present for beta, but alpha has no hybrid entry.
+      seedThreadSeal(h.stateDir, { beta: sealEntry(h, 'beta') }); rmSync(threadPath(h.stateDir)); h.choose('mentions')
+    }
+    if (change === 'other release queue rewrite') { const queue = await makeQueue(h.stateDir); await queue.stop() }
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expectSealFinding(next, reason)
+    next.seal.judgeAtStart(next.memory.journalFacts()); await next.memory.loadKey('alpha')
+    expectSealFinding(next, reason)
+    const snapshot = next.seal.startupFindings(); snapshot[0]!.key = 'mutated-snapshot'
+    expect(next.seal.startupFindings()[0]!.key).toBe('alpha')
+  })
+
+  test.each(['threads', 'seal', 'both'] as const)('deleting the complete %s path after a clean stop is detected', async removed => {
+    const h = sealFixture(); await h.start(); await h.close()
+    if (removed !== 'seal') rmSync(join(h.stateDir, 'threads'), { recursive: true })
+    if (removed !== 'threads') rmSync(threadSealPath(h.stateDir))
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expectSealFinding(next, removed === 'both' ? 'marker-without-store' : removed === 'threads' ? 'journal-missing' : 'entry-missing')
+  })
+
+  test('abandoning a run leaves running entries, and unclean wins over a missing journal and changed queue', async () => {
+    const h = sealFixture(); await h.start(); await queueTraffic(h); await h.crash()
+    expect(sealEntry(h).clean).toBe(false)
+    rmSync(threadPath(h.stateDir)); const queue = await makeQueue(h.stateDir); await queue.stop()
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expectSealFinding(next, 'unclean-stop', 'unclean')
+  })
+
+  test('a new hybrid entry after an unclean stop uses unclean wording from another running entry', async () => {
+    const h = sealFixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); h.choose('mentions')
+    await h.start(); await h.crash(); h.choose('thread_hybrid')
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expect(next.seal.startupFindings()).toEqual([
+      { key: 'alpha', case: 'hybrid-without-store', wording: 'unclean' },
+      { key: 'beta', case: 'unclean-stop', wording: 'unclean' },
+    ])
+  })
+
+  test('first start, missing queue, and consecutive clean restarts with real queue traffic give no finding', async () => {
+    let h = sealFixture(); await h.start(); expectSealFinding(h)
+    await h.close(); expect(sealEntry(h)).toMatchObject({ clean: true, queue: { size: '0' } })
+    expect(existsSync(queuePath(h.stateDir))).toBe(false)
+    for (let round = 0; round < 3; round++) {
+      h = sealFixture({ reopen: true }, h.stateDir); await h.start(); expectSealFinding(h)
+      const input = slackInput({ key: { chat_id: C.primary, ts: `1700000000.00000${round + 1}` } })
+      expect((await h.queue.accept('alpha', input)).status).toBe('accepted')
+      await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })]); await h.close()
+      const entry = sealEntry(h)
+      expect(entry).toEqual({ ...h.memory.completedStores().get('alpha')!, clean: true, queue: h.seal.queueIdentity('alpha') })
+    }
+  })
+
+  test.each(['move', 'copy'] as const)('whole-directory %s preserves joins and judges the queue inode', async mode => {
+    const h = sealFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()]); await queueTraffic(h); await h.close()
+    const before = h.seal.queueIdentity('alpha'), aside = `${h.stateDir}-aside`; threadDirs.push(aside)
+    renameSync(h.stateDir, aside)
+    if (mode === 'move') renameSync(aside, h.stateDir)
+    else cpSync(aside, h.stateDir, { recursive: true, preserveTimestamps: true })
+    const next = sealFixture({ reopen: true }, h.stateDir)
+    expect(next.seal.queueIdentity('alpha').inode === before.inode).toBe(mode === 'move')
+    await next.start(); expect(view(next)).toBe('joined'); expectSealFinding(next, mode === 'move' ? undefined : 'queue-changed')
+  })
+
+  test('start writes running entries and captures only previous clean queues before replay rewrites them', async () => {
+    const h = sealFixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); await h.start()
+    await queueTraffic(h); await queueTraffic(h, 'beta'); await h.close()
+    const old = sealEntry(h), beta = runningSealEntry(sealEntry(h, 'beta'))
+    seedThreadSeal(h.stateDir, { alpha: old, beta })
+    const next = sealFixture({ reopen: true }, h.stateDir)
+    next.memory.readAtStart(); await next.seal.loadAtStart(next.memory.journalFacts())
+    expect(readThreadSeal(h.stateDir).entries).toEqual({ alpha: runningSealEntry(old), beta })
+    expect(next.sealIo.queueReads().filter(c => c.op === 'openSync').map(c => c.path)).toEqual([queuePath(h.stateDir)])
+    expect(next.seal.queueIdentity('alpha')).toEqual(old.queue!)
+    await next.queue.start()
+    expect(next.seal.queueIdentity('alpha')).not.toEqual(old.queue!)
+    await next.memory.activate()
+    expect(next.seal.startupFindings()).toEqual([{ key: 'beta', case: 'unclean-stop', wording: 'unclean' }])
+  })
+
+  test.each(['json', 'version', 'persona-key', 'missing-queue', 'read-failure'] as const)('%s seal is reported, treated as empty and replaced with valid running entries', async damage => {
+    const h = sealFixture(); await h.start(); await h.close()
+    const next = sealFixture({ reopen: true }, h.stateDir)
+    const cause = damage === 'read-failure' ? next.sealIo.failRead() : undefined
+    if (damage !== 'read-failure') writeFileSync(threadSealPath(h.stateDir), damagedThreadSeal(h.stateDir, damage))
+    await next.start()
+    const failure = next.sealEvents.find(e => e.type === (cause ? 'seal-read-failed' : 'seal-invalid'))
+    expect(failure).toMatchObject({ path: threadSealPath(h.stateDir), error: cause ?? expect.any(Error) })
+    expectSealFinding(next, 'entry-missing')
+    expect(sealEntry(next)).toEqual(runningSealEntry(next.memory.completedStores().get('alpha')))
+  })
+
+  test('an unreadable seal path retains its cause and retries after the path is repaired', async () => {
+    const h = sealFixture(); await h.start(); await h.close()
+    rmSync(threadSealPath(h.stateDir)); mkdirSync(threadSealPath(h.stateDir))
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expect(next.sealEvents).toContainEqual({ type: 'seal-read-failed', path: threadSealPath(h.stateDir), error: expect.objectContaining({ code: 'EISDIR' }) })
+    expectSealFinding(next, 'entry-missing')
+    rmSync(threadSealPath(h.stateDir), { recursive: true }); expect(await next.seal.flush()).toEqual({ kind: 'written' })
+    expect(sealEntry(next).clean).toBe(false)
+  })
+
+  test.each(['older', 'other-store', 'matching'] as const)('unreadable startup journal defers %s identity judgment until its first successful read', async kind => {
+    const h = sealFixture(); await h.start(); const older = journalBytes(h)
+    await h.memory.saveJoins('alpha', [h.fact()]); await h.close(); const previous = sealEntry(h)
+    if (kind === 'older') writeFileSync(threadPath(h.stateDir), older)
+    if (kind === 'other-store') seedThreads(h.stateDir, [threadHeader({ storeId: 'other-store' })])
+    const next = sealFixture({ reopen: true }, h.stateDir); next.io.fail('readFileSync'); await next.start()
+    expectSealFinding(next); expect(sealEntry(next)).toEqual(runningSealEntry(previous))
+    expect(view(next)).toBe('unknown')
+    next.io.heal(); await next.memory.loadKey('alpha')
+    expectSealFinding(next, kind === 'matching' ? undefined : 'journal-changed')
+    await next.memory.loadKey('alpha'); expect(next.seal.startupFindings()).toHaveLength(kind === 'matching' ? 0 : 1)
+  })
+
+  test.each([false, true])('empty sealed journal is reported once before recreation (delayed first read=%s)', async delayedRead => {
+    const h = sealFixture(); await h.start(); const fact = h.fact()
+    await h.memory.saveJoins('alpha', [fact]); expectOnlySavedJoin(h, fact)
+    await h.close(); const previous = sealEntry(h)
+    expect(previous.clean).toBe(true)
+    seedThreads(h.stateDir, [])
+    const sizesAtFinding: number[] = []
+    const next = sealFixture({ reopen: true, seal: { onEvent(event) {
+      if (event.type === 'changed-while-stopped') sizesAtFinding.push(journalBytes(h).length)
+    } } }, h.stateDir)
+    if (delayedRead) next.io.fail('readFileSync')
+    await next.start()
+    if (delayedRead) {
+      expect(view(next)).toBe('unknown'); expectSealFinding(next)
+      expect(sealEntry(next)).toEqual(runningSealEntry(previous))
+      expect(next.markerCalls).toEqual([])
+      next.io.heal(); await next.memory.loadKey('alpha')
+    }
+    expectSealFinding(next, 'journal-missing')
+    expect(sizesAtFinding).toEqual([0])
+    const records = readThreads(h.stateDir), store = next.memory.store('alpha')!
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({ kind: 'header', storeId: store.storeId })
+    expect(store.storeId).not.toBe(previous.storeId)
+    expect(next.memory.completedStores().get('alpha')?.storeId).toBe(store.storeId)
+    expect(view(next)).toBe('not-joined')
+    expect(next.memory.isJoinSaved('alpha', fact)).toBe(false)
+    await next.memory.loadKey('alpha')
+    next.memory.forget('alpha'); await next.memory.loadKey('alpha')
+    expectSealFinding(next, 'journal-missing'); expect(sizesAtFinding).toEqual([0])
+  })
+
+  test('unreadable startup journal keeps missing-file retries unknown until an empty file returns', async () => {
+    const h = sealFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()]); await h.close()
+    const previous = sealEntry(h), next = sealFixture({ reopen: true }, h.stateDir)
+    const cause = next.io.fail('readFileSync'); await next.start(); next.io.reset()
+    await next.memory.loadKey('alpha')
+    expect(next.memory.readFacts('alpha').error).toBe(cause)
+    expect(view(next)).toBe('unknown'); expectSealFinding(next)
+    next.io.heal(); rmSync(threadPath(h.stateDir))
+    for (let retry = 0; retry < 2; retry++) {
+      await next.memory.loadKey('alpha')
+      expect(next.memory.readFacts('alpha').error).toMatchObject({ code: 'ENOENT' })
+      expect(view(next)).toBe('unknown'); expectSealFinding(next)
+      expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    }
+    expect(next.io.writes()).toEqual([]); expect(next.markerCalls).toEqual([])
+    expect(sealEntry(next)).toEqual(runningSealEntry(previous))
+    seedThreads(h.stateDir, []); await next.memory.loadKey('alpha')
+    expectSealFinding(next, 'journal-missing')
+    expect(view(next)).toBe('not-joined')
+    expect(readThreads(h.stateDir)[0]).toMatchObject({ kind: 'header', storeId: next.memory.store('alpha')!.storeId })
+    expect(next.memory.store('alpha')!.storeId).not.toBe(previous.storeId)
+  })
+
+  test('delayed empty read keeps the sole unclean-stop finding while recreating the journal', async () => {
+    const h = sealFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()]); await h.crash()
+    const previous = sealEntry(h); expect(previous.clean).toBe(false)
+    seedThreads(h.stateDir, [])
+    const next = sealFixture({ reopen: true }, h.stateDir); next.io.fail('readFileSync'); await next.start()
+    expect(view(next)).toBe('unknown'); expectSealFinding(next, 'unclean-stop', 'unclean')
+    next.io.heal(); await next.memory.loadKey('alpha')
+    expect(view(next)).toBe('not-joined')
+    expect(next.memory.store('alpha')!.storeId).not.toBe(previous.storeId)
+    expectSealFinding(next, 'unclean-stop', 'unclean')
+    next.memory.forget('alpha'); await next.memory.loadKey('alpha')
+    expectSealFinding(next, 'unclean-stop', 'unclean')
+  })
+
+  test('failed directory listing still judges by-path facts before repairs and never recaptures the replayed queue', async () => {
+    const h = sealFixture(); await h.start(); await queueTraffic(h); await h.close()
+    const next = sealFixture({ reopen: true }, h.stateDir)
+    next.io.fail('readdirSync', 'alpha', { match: p => p === join(h.stateDir, 'threads') })
+    await next.start(); expectSealFinding(next)
+    expect(next.sealIo.queueReads().filter(c => c.op === 'openSync').map(c => c.path)).toEqual([queuePath(h.stateDir)])
+    expect(sealEntry(next)).toEqual(runningSealEntry(next.memory.completedStores().get('alpha')))
+  })
+})
+
+describe('Thread Memory seal creation and durable writer', () => {
+  async function loseLastHybridDuringEmptyJournalCreation() {
+    let armed = false, switched = false, choice: string | undefined
+    const markerProofs: Array<{ header: boolean; runningSealMatches: boolean; fileSynced: boolean; directorySynced: boolean }> = []
+    let h!: ReturnType<typeof sealFixture>
+    h = sealFixture({ seal: { onEvent(event) {
+      // The real seal has landed, but entryCreated's promise has not returned
+      // to creation. Change the real authority before header repair resumes.
+      if (armed && !switched && event.type === 'seal-written') {
+        switched = true; choice = h.choose('off').kind
+      }
+    } }, setCreated(key) {
+      const header = readThreads(h.stateDir, key)[0], entry = sealEntry(h, key)
+      const renameAt = h.io.calls.map(call => call.op).lastIndexOf('renameSync')
+      const temporary = h.io.calls[renameAt]?.path
+      markerProofs.push({
+        header: header?.kind === 'header',
+        runningSealMatches: header?.kind === 'header' && entry.storeId === header.storeId && !entry.clean,
+        fileSynced: renameAt >= 0 && h.io.calls.slice(0, renameAt).some(call => call.op === 'fsyncSync' && call.path === temporary),
+        directorySynced: renameAt >= 0 && h.io.calls.slice(renameAt + 1).some(call => call.op === 'fsyncSync' && call.path === join(h.stateDir, 'threads')),
+      })
+      return h.authority.setThreadMemoryCreated(key)
+    } })
+    seedThreads(h.stateDir, [])
+    h.memory.readAtStart(); await h.seal.loadAtStart(h.memory.journalFacts())
+    expect(h.authority.threadView().threadHybridChannels('alpha')).toEqual([C.primary])
+    armed = true; await h.start()
+    expect(choice).toBe('applied')
+    expect(h.authority.threadView().threadHybridChannels('alpha')).toEqual([])
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(false)
+    expect(h.markerCalls).toEqual([]); expect(markerProofs).toEqual([])
+    expect(journalBytes(h)).toHaveLength(0)
+    expect(h.memory.store('alpha')).toMatchObject({ created: false, readable: true })
+    expect(h.memory.store('alpha')?.storeId).toBeUndefined()
+    expect(h.memory.store('alpha')?.digestKey).toBeUndefined()
+    expect(h.memory.completedStores().size).toBe(0)
+    expect(sealEntry(h).clean).toBe(false)
+    return { h, markerProofs, pending: sealEntry(h) }
+  }
+
+  test('CR1: losing the last hybrid during seal await keeps an empty journal incomplete until flush saves its header and join, then restarts cleanly', async () => {
+    const { h, markerProofs, pending } = await loseLastHybridDuringEmptyJournalCreation()
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'kept' })
+    expect(h.markerCalls).toEqual([]); expect(journalBytes(h)).toHaveLength(0)
+    // Isolate the explicit flush retry; the next case keeps publication wired.
+    h.unsubscribe(); expect(h.choose('thread_hybrid').kind).toBe('applied')
+    const fact = h.fact()
+    expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'kept' })
+    expect(view(h)).toBe('joined'); expect(h.memory.isJoinSaved('alpha', fact)).toBe(false)
+    expect(h.memory.completedStores().size).toBe(0); expect(journalBytes(h)).toHaveLength(0)
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(markerProofs).toEqual([{ header: true, runningSealMatches: true, fileSynced: true, directorySynced: true }])
+    expect(h.markerCalls.map(c => c.action)).toEqual(['set'])
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
+    const records = readThreads(h.stateDir), digestKey = h.memory.store('alpha')?.digestKey
+    expect(records.map(record => record.kind)).toEqual(['header', 'join'])
+    expect(records[0]).toMatchObject({ kind: 'header', storeId: pending.storeId, digestKey })
+    expect(digestKey).toMatch(/^[a-f0-9]{64}$/)
+    expectOnlySavedJoin(h, fact)
+    expect(h.memory.store('alpha')?.created).toBe(true)
+    expect(h.memory.completedStores().get('alpha')).toEqual({ storeId: pending.storeId, lastRecordNumber: records[1]!.seq })
+    await h.close()
+    expect(sealEntry(h)).toMatchObject({ storeId: pending.storeId, clean: true, lastRecordNumber: records[1]!.seq })
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expectSealFinding(next); expectOnlySavedJoin(next, joinRecord(fact, records[1]!.seq))
+    expect(next.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(next.memory.store('alpha')).toMatchObject({ storeId: pending.storeId, digestKey, created: true })
+    expect(next.memory.completedStores().get('alpha')?.storeId).toBe(pending.storeId)
+  })
+
+  test('CR1: graceful shutdown keeps skipped empty-journal creation running; real hybrid publication after restart completes it', async () => {
+    const { h, pending } = await loseLastHybridDuringEmptyJournalCreation()
+    await h.close()
+    expect(sealEntry(h)).toEqual(pending)
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expectSealFinding(next, 'unclean-stop', 'unclean')
+    expect(next.authority.threadMemoryCreated('alpha')).toBe(false)
+    expect(next.memory.completedStores().size).toBe(0)
+    expect(journalBytes(next)).toHaveLength(0)
+    expect(next.choose('thread_hybrid').kind).toBe('applied')
+    // Drain the publication's writer turn without explicitly retrying creation.
+    await next.memory.compact('alpha')
+    expect(next.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(next.memory.store('alpha')?.created).toBe(true)
+    const header = readThreads(next.stateDir)[0]!
+    expect(header.kind).toBe('header')
+    expect(header).toMatchObject({ storeId: next.memory.completedStores().get('alpha')?.storeId })
+    expect(next.memory.completedStores().has('alpha')).toBe(true)
+    await next.close(); expect(sealEntry(next).clean).toBe(true)
+    const clean = sealFixture({ reopen: true }, h.stateDir); await clean.start()
+    expectSealFinding(clean); expect(clean.memory.completedStores().has('alpha')).toBe(true)
+  })
+
+  test('CR1: a renamed but unsynced header on empty-journal retry cannot save the marker or complete the store', async () => {
+    const { h, markerProofs, pending } = await loseLastHybridDuringEmptyJournalCreation()
+    h.unsubscribe(); expect(h.choose('thread_hybrid').kind).toBe('applied')
+    const fact = h.fact()
+    expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'kept' })
+    const cause = h.io.fail('fsyncSync', 'alpha', { match: path => path === join(h.stateDir, 'threads') })
+    const result = await h.memory.flush('alpha')
+    expect(result).toEqual({ kind: 'failed', error: cause })
+    expect(h.events).toContainEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), error: cause })
+    expect(readThreads(h.stateDir)).toEqual([expect.objectContaining({ kind: 'header', storeId: pending.storeId })])
+    expect(h.memory.store('alpha')?.storeId).toBeUndefined()
+    expect(h.memory.store('alpha')?.created).toBe(false)
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(false)
+    expect(h.markerCalls).toEqual([]); expect(markerProofs).toEqual([])
+    expect(h.memory.completedStores().size).toBe(0)
+    expect(view(h)).toBe('joined'); expect(h.memory.isJoinSaved('alpha', fact)).toBe(false)
+    h.io.heal(); h.io.reset()
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(markerProofs).toEqual([{ header: true, runningSealMatches: true, fileSynced: true, directorySynced: true }])
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(h.memory.completedStores().get('alpha')?.storeId).toBe(pending.storeId)
+    expect(readThreads(h.stateDir).map(record => record.kind)).toEqual(['header', 'join'])
+    expectOnlySavedJoin(h, fact)
+  })
+
+  test.each(['activation', 'publication'] as const)('%s creates the running seal before the journal and the durable journal before the marker', async when => {
+    const observed: Array<{ step: string; journal: boolean; marker: boolean; entry: ThreadMemorySealEntry }> = []
+    const h = sealFixture({ seal: { onEvent(event) {
+      if (event.type === 'seal-written') observed.push({ step: 'seal', journal: existsSync(threadPath(h.stateDir)),
+        marker: h.authority.threadMemoryCreated('alpha'), entry: sealEntry(h) })
+    } }, setCreated(key) {
+      observed.push({ step: 'marker', journal: existsSync(threadPath(h.stateDir)), marker: h.authority.threadMemoryCreated(key), entry: sealEntry(h) })
+      return h.authority.setThreadMemoryCreated(key)
+    } })
+    if (when === 'publication') h.choose('mentions')
+    await h.start()
+    if (when === 'publication') { h.choose('thread_hybrid'); await h.memory.flush('alpha') }
+    const header = readThreads(h.stateDir)[0]!
+    expect(observed).toEqual([
+      { step: 'seal', journal: false, marker: false, entry: runningSealEntry({ storeId: 'storeId' in header ? header.storeId : '', lastRecordNumber: header.seq }) },
+      { step: 'marker', journal: true, marker: false, entry: sealEntry(h) },
+    ])
+    expect(h.markerCalls).toEqual([{ action: 'set', key: 'alpha', fileExists: true, synced: true }])
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
+  })
+
+  test.each([false, true])('failed creation seal (unsynced=%s) keeps joins, permits another persona and queue delivery, then resumes in order', async unsynced => {
+    const h = sealFixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); h.choose('mentions')
+    await h.start(); h.sealIo.failWrite(unsynced)
+    h.choose('thread_hybrid'); await h.memory.flush('alpha')
+    const fact = h.fact(); expect(h.memory.addJoin('alpha', fact)).toBe(true)
+    expect(view(h)).toBe('joined'); expect(h.memory.isJoinSaved('alpha', fact)).toBe(false)
+    expect(existsSync(threadPath(h.stateDir))).toBe(false); expect(h.authority.threadMemoryCreated('alpha')).toBe(false)
+    expect(h.markerCalls.map(c => c.key)).toEqual(['beta'])
+    expect(h.sealEvents).toContainEqual({ type: 'seal-write-failed', path: threadSealPath(h.stateDir), error: expect.any(Error), unsynced })
+    const firstId = unsynced ? sealEntry(h).storeId : undefined
+    await h.memory.saveJoins('beta', [h.fact({}, 'beta')]); await h.memory.compact('beta')
+    expect(view(h, R.primary, 'beta')).toBe('joined'); expect(savedJoins(h, 'beta')).toHaveLength(1)
+    await queueTraffic(h); await queueTraffic(h, 'beta')
+    expect(h.memory.store('alpha')?.created).toBe(false)
+    h.sealIo.heal(); h.io.reset()
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expectOnlySavedJoin(h, fact)
+    expect(h.markerCalls.at(-1)).toEqual({ action: 'set', key: 'alpha', fileExists: true, synced: true })
+    expect(sealEntry(h).storeId).toBe(h.memory.store('alpha')!.storeId!)
+    if (firstId) expect(sealEntry(h).storeId).toBe(firstId)
+  })
+
+  test.each((['seal', 'journal'] as const).flatMap(step => (['crash', 'graceful'] as const).map(stop => [step, stop] as const)))('%s boundary followed by %s keeps incomplete creation running and reports unclean on restart', async (step, stop) => {
+    let interrupt = false, interrupted: Promise<void> | undefined
+    const h = sealFixture({ seal: { onEvent(event) {
+      if (interrupt && step === 'seal' && event.type === 'seal-written') interrupted ??= h.memory.quiesce()
+    } }, setCreated(key) {
+      if (interrupt && step === 'journal' && key === 'alpha') {
+        interrupted ??= h.memory.quiesce()
+        return { kind: 'failed', error: new Error('fixture stopped before marker') }
+      }
+      return h.authority.setThreadMemoryCreated(key)
+    } })
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); h.choose('mentions'); await h.start()
+    expect(h.memory.store('beta')?.created).toBe(true)
+    interrupt = true; h.choose('thread_hybrid'); await h.clock.flush(); await interrupted
+    expect(interrupted).toBeDefined()
+    expect(existsSync(threadPath(h.stateDir))).toBe(step === 'journal')
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(false)
+    if (stop === 'crash') await h.crash(); else await h.close()
+    expect(sealEntry(h).clean).toBe(false); expect(sealEntry(h, 'beta').clean).toBe(stop === 'graceful')
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expect(next.seal.startupFindings()).toEqual([
+      { key: 'alpha', case: 'unclean-stop', wording: 'unclean' },
+      ...(stop === 'crash' ? [{ key: 'beta', case: 'unclean-stop', wording: 'unclean' } as const] : []),
+    ])
+  })
+
+  test('startup compaction and the hourly interval update record numbers; failed compaction does not, and failed sealing cannot fail compaction', async () => {
+    const h = sealFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()]); await h.crash()
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    expect(sealEntry(next).lastRecordNumber).toBe(next.memory.store('alpha')!.lastRecordNumber)
+    await next.memory.saveJoins('alpha', [next.fact({ root: R.secondary })]); const previous = readFileSync(threadSealPath(h.stateDir))
+    next.io.fail('renameSync'); await next.memory.compact('alpha')
+    expect(readFileSync(threadSealPath(h.stateDir))).toEqual(previous)
+    next.io.heal(); next.sealIo.failWrite()
+    await next.memory.compact('alpha')
+    expect(readThreads(h.stateDir)[0]).toMatchObject({ highWater: next.memory.store('alpha')!.lastRecordNumber })
+    expect(readFileSync(threadSealPath(h.stateDir))).toEqual(previous)
+    expect(next.sealEvents.at(-1)).toMatchObject({ type: 'seal-write-failed', unsynced: false })
+    next.sealIo.heal(); await next.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    expect(sealEntry(next).lastRecordNumber).toBe(next.memory.store('alpha')!.lastRecordNumber)
+    expect(savedJoins(next)).toHaveLength(2)
+  })
+
+  test('shutdown waits for the queue last write and seals only completed stores at their final record numbers', async () => {
+    let acceptanceDuringSeal: Promise<{ status: string }> | undefined
+    const h = sealFixture({ seal: { onEvent(event) {
+      if (event.type === 'seal-written' && sealEntry(h).clean) {
+        acceptanceDuringSeal = h.queue.accept('alpha', slackInput({ key: { chat_id: C.primary, ts: R.secondary } }))
+      }
+    } } })
+    await h.start(); await queueTraffic(h)
+    await h.memory.saveJoins('alpha', [h.fact()]); const before = h.seal.queueIdentity('alpha')
+    // Queue an admitted compaction without awaiting it. stop() must drain it
+    // before the seal samples the identity; the rewrite changes the inode.
+    const lastWrite = h.queue.compact('alpha'), stopping = h.close()
+    await Promise.all([lastWrite, stopping])
+    expect(acceptanceDuringSeal).toBeDefined()
+    expect(await acceptanceDuringSeal).toMatchObject({ status: 'failed' })
+    const after = h.seal.queueIdentity('alpha')
+    expect(after).not.toEqual(before)
+    expect(sealEntry(h)).toEqual({ ...h.memory.completedStores().get('alpha')!, clean: true, queue: after })
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'cancelled' })
+    expect(h.clock.pendingCount()).toBe(0)
+    const next = sealFixture({ reopen: true }, h.stateDir); await next.start(); expectSealFinding(next)
+  })
+
+  test.each([false, true])('shared writer coalesces, rewrites the whole file, retains a failed write (unsynced=%s) and refuses writes after stop', async unsynced => {
+    const snapshots: Array<Record<string, ThreadMemorySealEntry>> = []
+    let later: Promise<unknown> | undefined, reenter = true
+    const h = sealFixture({ seal: { onEvent(event) {
+      if (event.type !== 'seal-written') return
+      snapshots.push(readThreadSeal(h.stateDir).entries)
+      if (reenter) { reenter = false; later = h.seal.entryCompacted('alpha', 'alpha-store', 4) }
+    } } })
+    const a = h.seal.entryCreated('alpha', 'alpha-store', 1), b = h.seal.entryCreated('beta', 'beta-store', 2)
+    expect(a).toBe(b)
+    await a; await later
+    expect(snapshots).toEqual([
+      { alpha: runningSealEntry({ storeId: 'alpha-store', lastRecordNumber: 1 }), beta: runningSealEntry({ storeId: 'beta-store', lastRecordNumber: 2 }) },
+      { alpha: runningSealEntry({ storeId: 'alpha-store', lastRecordNumber: 4 }), beta: runningSealEntry({ storeId: 'beta-store', lastRecordNumber: 2 }) },
+    ])
+    // Each durable writer must close/sync its directory before the next temp opens.
+    const boundaries = h.sealIo.calls.filter(c => c.op === 'openSync' && c.flags === 'wx' || c.op === 'closeSync' && c.path === h.stateDir)
+    expect(boundaries.map(c => c.op)).toEqual(['openSync', 'closeSync', 'openSync', 'closeSync'])
+    const before = readFileSync(threadSealPath(h.stateDir)), cause = h.sealIo.failWrite(unsynced)
+    const result = await h.seal.entryCompacted('beta', 'beta-store', 7)
+    expect(result).toMatchObject({ kind: 'failed', unsynced })
+    if (result.kind === 'failed') {
+      if (unsynced) { expect(result.error).toBeInstanceOf(DurableWriteUnsyncedError); expect((result.error as DurableWriteUnsyncedError).syncError).toBe(cause) }
+      else expect(result.error).toBe(cause)
+    }
+    expect(readFileSync(threadSealPath(h.stateDir)).equals(before)).toBe(!unsynced)
+    h.sealIo.heal(); await h.seal.entryCompacted('alpha', 'alpha-store', 8)
+    expect(readThreadSeal(h.stateDir).entries).toEqual({
+      alpha: runningSealEntry({ storeId: 'alpha-store', lastRecordNumber: 8 }), beta: runningSealEntry({ storeId: 'beta-store', lastRecordNumber: 7 }),
+    })
+    await h.seal.stop(); h.sealIo.reset()
+    expect(await h.seal.entryCreated('gamma', 'gamma-store', 1)).toEqual({ kind: 'stopped' })
+    expect(await h.seal.removeEntry('alpha')).toEqual({ kind: 'stopped' })
+    expect(await h.seal.flush()).toEqual({ kind: 'stopped' }); expect(h.sealIo.writes()).toEqual([])
+  })
+
+  test('queue identity failures are retained as typed facts, never guessed as changes or sealed clean', async () => {
+    const h = sealFixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); await h.start()
+    await queueTraffic(h); await h.close()
+    const next = sealFixture({ reopen: true }, h.stateDir)
+    const cause = next.sealIo.fail('openSync', 'alpha', { match: p => p === queuePath(h.stateDir) })
+    await next.start(); expectSealFinding(next)
+    expect(next.sealEvents).toContainEqual({ type: 'queue-identity-failed', key: 'alpha', phase: 'start', error: cause })
+    await next.close()
+    expect(sealEntry(next).clean).toBe(false); expect(sealEntry(next, 'beta').clean).toBe(true)
+    expect(next.sealEvents).toContainEqual({ type: 'queue-identity-failed', key: 'alpha', phase: 'shutdown', error: cause })
+    expect(next.sealEvents.at(-1)).toMatchObject({ type: 'seal-write-failed', error: cause, unsynced: false })
+  })
+})
+
+describe('Thread Memory seal removal and dry run', () => {
+  test('removal unlinks the journal, saves an empty seal, then clears the marker', async () => {
+    const observations: Array<{ journal: boolean; entries: unknown; marker: boolean }> = []
+    const h = sealFixture({ clearCreated(key) {
+      observations.push({ journal: existsSync(threadPath(h.stateDir, key)), entries: readThreadSeal(h.stateDir).entries,
+        marker: h.authority.threadMemoryCreated(key) })
+      return h.authority.clearThreadMemoryCreated(key)
+    } })
+    await h.start(); await h.memory.remove('alpha')
+    expect(observations).toEqual([{ journal: false, entries: {}, marker: true }])
+    expect(readThreadSeal(h.stateDir).entries).toEqual({}); expect(h.authority.threadMemoryCreated('alpha')).toBe(false)
+  })
+
+  test.each(['journal-and-marker', 'seal-only'] as const)('unapplied %s evidence is removed without judgment after failed seal removal', async evidence => {
+    const h = sealFixture(); await h.start(); h.sealIo.failWrite()
+    expect((await h.memory.remove('alpha')).kind).toBe('failed')
+    expect(existsSync(threadPath(h.stateDir))).toBe(false); expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(h.markerCalls.filter(c => c.action === 'clear')).toEqual([])
+    await h.crash()
+    if (evidence === 'seal-only') h.authority.clearThreadMemoryCreated('alpha')
+    const next = sealFixture({ reopen: true, appliedKeys: () => [] }, h.stateDir); await next.start()
+    expectSealFinding(next); expect(readThreadSeal(h.stateDir).entries).toEqual({})
+    expect(next.authority.threadMemoryCreated('alpha')).toBe(false)
+    expect(next.markerCalls).toEqual([{ action: 'clear', key: 'alpha', fileExists: false, synced: false }])
+  })
+
+  test('unapplied journals and entries are removed without judging them, and missing-journal evidence is dropped at start', async () => {
+    const h = sealFixture(); await h.start(); await h.crash()
+    const next = sealFixture({ reopen: true, appliedKeys: () => [] }, h.stateDir); await next.start()
+    expectSealFinding(next); expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    expect(readThreadSeal(h.stateDir).entries).toEqual({})
+    await next.close()
+    seedThreadSeal(h.stateDir, { alpha: cleanSealEntry(h.stateDir) })
+    const last = sealFixture({ reopen: true }, h.stateDir); last.choose('mentions')
+    last.memory.readAtStart(); await last.seal.loadAtStart(last.memory.journalFacts()); await last.queue.start(); await last.memory.activate()
+    expectSealFinding(last, 'journal-missing'); expect(readThreadSeal(h.stateDir).entries).toEqual({})
+    await last.close()
+    const again = sealFixture({ reopen: true }, h.stateDir); await again.start(); expectSealFinding(again)
+  })
+
+  test.each(['off', 'mentions', 'all'] as const)('%s with no Thread Memory writes no seal and reads no queue, even with traffic and shutdown', async delivery => {
+    const h = sealFixture(); h.choose(delivery); await h.start(); await queueTraffic(h)
+    await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS); await h.close()
+    expect(existsSync(threadSealPath(h.stateDir))).toBe(false)
+    expect(h.sealIo.writes()).toEqual([]); expect(h.sealIo.queueReads()).toEqual([]); expectSealFinding(h)
+  })
+
+  test('dry run only seals existing journals at start and shutdown; a new hybrid persona is reported on the next ordinary start', async () => {
+    const h = sealFixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); h.choose('mentions', 'beta')
+    await h.start(); await h.memory.saveJoins('alpha', [h.fact()]); await queueTraffic(h); await h.close()
+    const original = journalBytes(h), next = sealFixture({ reopen: true, dryRun: true }, h.stateDir)
+    await next.start(); expectSealFinding(next)
+    expect(next.sealEvents.filter(e => e.type === 'seal-written')).toHaveLength(1)
+    next.sealIo.reset(); next.io.reset()
+    next.choose('thread_hybrid', 'beta'); await next.memory.flush('beta')
+    await next.memory.compact(); await next.clock.advance(QUEUE_COMPACT_INTERVAL_MS); await next.memory.remove('beta')
+    expect(next.sealIo.writes()).toEqual([]); expect(next.io.writes()).toEqual([])
+    expect(journalBytes(next)).toEqual(original); expect(existsSync(threadPath(h.stateDir, 'beta'))).toBe(false)
+    expect(next.events.filter(e => e.type === 'creation-failed')).toEqual([])
+    await next.close()
+    expect(next.sealEvents.filter(e => e.type === 'seal-written')).toHaveLength(2)
+    expect(Object.keys(readThreadSeal(h.stateDir).entries)).toEqual(['alpha'])
+    expect(sealEntry(next).clean).toBe(true)
+    const ordinary = sealFixture({ reopen: true }, h.stateDir); await ordinary.start()
+    expect(ordinary.seal.startupFindings()).toEqual([{ key: 'beta', case: 'hybrid-without-store', wording: 'changed' }])
+    expect(ordinary.memory.store('beta')?.created).toBe(true)
   })
 })
 

@@ -216,7 +216,7 @@ Reject the removed `allow_invited_channels` and `invited` keys in every configur
 ## Async Patterns
 
 - Use async/await; raw Promises are for explicitly held connections. SSE resolves on request abort and writes through the response; clean up every held connection on abort. Use a settled flag where races could resolve twice.
-- Bound potentially non-settling Slack operations on the injected clock and catch/disconnect late results. Keep locks, queues, promise chains and timers per persona so one cannot block another.
+- Bound potentially non-settling Slack operations on the injected clock and catch/disconnect late results. Keep locks, queues, promise chains and timers per persona so one cannot block another, except the Thread Memory seal (`src/thread-memory-seal.ts`): one file with one serialized writer for all personas. A persona's Thread Memory creation waits for its seal entry and keeps joins in memory meanwhile; a seal write failure never stops any persona's intake or delivery, and per-persona compaction does not wait on the seal writer.
 - Multi-item ticks catch per item, log a repeating failure once and continue. Intervals call `tick().catch(...)` with a last-resort once-until-success logger, never unhandled `void tick()`.
 - Startup AD/file-changing passes and queued launches check a live shutdown query before acting and after awaits; throws mean stop. Never capture a stale flag. No queued launch starts after shutdown; record its explicit not-launched outcome without failure counts.
 

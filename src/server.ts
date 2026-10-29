@@ -53,6 +53,7 @@
  */
 
 import { createThreadMemory, type ThreadMemory } from './thread-memory.ts'
+import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
 import type { Client } from 'agent-director'
@@ -1143,6 +1144,7 @@ async function handleInitialized(
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
 let threadMemory: ThreadMemory | undefined
+let threadMemorySeal: ThreadMemorySeal | undefined
 let unsubscribeThreadMemory: (() => void) | undefined
 let replyReminders: ReplyReminders | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
@@ -1155,6 +1157,8 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
 }
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
+/** Observer port for Thread Memory reporting; the seal retains startup findings. */
+export const threadMemorySealEvents = { emit: (_event: ThreadMemorySealEvent): void => {} }
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
 /** binds event handling here; supplies facts without notices or wording. */
@@ -1457,7 +1461,12 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await deliveryClients?.close()
   await deliveryQueue?.stop()
   unsubscribeThreadMemory?.()
+  await threadMemory?.quiesce()
+  if (threadMemorySeal?.loadedAtStart() && threadMemory) {
+    await threadMemorySeal.writeShutdown(threadMemory.completedStores())
+  }
   await threadMemory?.stop()
+  await threadMemorySeal?.stop()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -2749,8 +2758,16 @@ export async function main(): Promise<void> {
 
   // replay and compact every journal before Slack/HTTP admission.
   deliveryQueue = createDeliveryQueue({ stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event) })
+  threadMemorySeal = createThreadMemorySeal({
+    stateDir: STATE_DIR,
+    queueJournalPath: key => join(STATE_DIR, 'queue', `${key}.jsonl`),
+    appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
+    threadHybrid: key => (reloadController?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0,
+    created: key => reloadController?.sharedChannels()?.threadMemoryCreated(key) ?? false,
+    onEvent: event => threadMemorySealEvents.emit(event),
+  })
   threadMemory = createThreadMemory({
-    stateDir: STATE_DIR, dryRun: isDryRun(),
+    stateDir: STATE_DIR, dryRun: isDryRun(), seal: threadMemorySeal,
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
     threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
@@ -2760,7 +2777,10 @@ export async function main(): Promise<void> {
     clearCreated: key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
   })
   threadMemory.readAtStart()
+  await threadMemorySeal.loadAtStart(threadMemory.journalFacts())
+  if (shuttingDown) return
   await deliveryQueue.start()
+  if (shuttingDown) return
   deliveryQueue.startMaintenance()
   threadMemory.startMaintenance()
   deliveryPreparation = createDeliveryPreparation({

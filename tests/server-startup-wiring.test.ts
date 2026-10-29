@@ -43,6 +43,7 @@ import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type * as OwnPostModule from '../src/own-post.ts'
 import type * as ThreadMemoryModule from '../src/thread-memory.ts'
+import type * as ThreadMemorySealModule from '../src/thread-memory-seal.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
 import type * as PendingRowModule from '../src/pending-row.ts'
 import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
@@ -5477,12 +5478,34 @@ describe('the own-post observer is ownerless and server.ts builds no participati
 
 describe('Thread Memory server lifecycle wiring', () => {
   const factory: keyof typeof ThreadMemoryModule = 'createThreadMemory'
+  const sealFactory: keyof typeof ThreadMemorySealModule = 'createThreadMemorySeal'
 
-  test('one store reads immediately before queue replay, and maintenance starts beside the queue', () => {
+  test('one seal uses the queue state directory, real filesystem and live shared-state readers, and publishes its events', () => {
+    expect(importSource(SERVER_CODE, sealFactory)).toBe('./thread-memory-seal.ts')
+    const seal = onlyCallOf(sealFactory)
+    expect(atMainTopLevel(SERVER_CODE, seal)).toBe(true)
+    declaredOnce('threadMemorySeal')
+    expect(assignmentsTo('threadMemorySeal').map(({ value }) => value)).toEqual([`${sealFactory}({`])
+    const props = onlyCallProps(sealFactory)
+    // No fs override: the seal factory supplies node:fs in production.
+    expect(Object.fromEntries(props)).toEqual({
+      stateDir: onlyCallProps('createDeliveryQueue').get('stateDir')!,
+      queueJournalPath: 'key => join(STATE_DIR, \'queue\', `${key}.jsonl`)',
+      appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
+      threadHybrid: 'key => (reloadController?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0',
+      created: 'key => reloadController?.sharedChannels()?.threadMemoryCreated(key) ?? false',
+      onEvent: 'event => threadMemorySealEvents.emit(event)',
+    })
+    expect(props.get('stateDir')).toBe('STATE_DIR')
+    expect(seal).toBeGreaterThan(onlyCallOf('createDeliveryQueue'))
+    expect(seal).toBeLessThan(onlyCallOf(factory))
+  })
+
+  test('one store reads, then awaits the seal before queue replay even in dry run, and maintenance starts beside the queue', () => {
     expect(importSource(SERVER_CODE, factory)).toBe('./thread-memory.ts')
     const props = onlyCallProps(factory)
     expect(Object.fromEntries(props)).toEqual({
-      stateDir: 'STATE_DIR', dryRun: 'isDryRun()',
+      stateDir: 'STATE_DIR', dryRun: 'isDryRun()', seal: 'threadMemorySeal',
       appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
       stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
       threadHybridChannels: 'key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
@@ -5492,10 +5515,16 @@ describe('Thread Memory server lifecycle wiring', () => {
       clearCreated: "key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' }",
     })
     const read = onlyCallOf('threadMemory\\.readAtStart')
-    expect(atMainTopLevel(SERVER_CODE, read)).toBe(true)
+    const load = onlyCallOf('threadMemorySeal\\.loadAtStart')
+    expect(onlyCallArgs('threadMemorySeal\\.loadAtStart')).toEqual(['threadMemory.journalFacts()'])
+    expect(SERVER_CODE.slice(load - 6, load)).toBe('await ')
+    for (const at of [onlyCallOf(factory), read, load - 6, onlyCallOf('threadMemory\\.startMaintenance')]) {
+      expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    }
     expect(onlyCallOf(factory)).toBeLessThan(read)
+    // A failed seal result never gates replay; only a shutdown interrupts it.
     expect(SERVER_CODE.slice(read, onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim())
-      .toBe('threadMemory.readAtStart() await deliveryQueue.start() deliveryQueue.startMaintenance()')
+      .toBe('threadMemory.readAtStart() await threadMemorySeal.loadAtStart(threadMemory.journalFacts()) if (shuttingDown) return await deliveryQueue.start() if (shuttingDown) return deliveryQueue.startMaintenance()')
     expect(onlyCallArgs('threadMemory\\.startMaintenance')).toEqual([])
   })
 
@@ -5531,10 +5560,28 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(lifecycle.get('teardown')).toBe('async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) await threadMemory?.remove(persona.key) } }')
   })
 
-  test('shutdown drains the queue before unsubscribing and stopping Thread Memory', () => {
+  test('shutdown awaits queue drain and quiescence, seals completed stores only after load, then stops memory and seal even in dry run', () => {
     const [start, end] = shutdownBody(SERVER_CODE)
-    const code = SERVER_CODE.slice(start, end).replace(/\s+/g, ' ')
-    expect(code).toContain('await deliveryQueue?.stop() unsubscribeThreadMemory?.() await threadMemory?.stop()')
+    const code = SERVER_CODE.slice(start, end)
+    const tree = ts.createSourceFile('shutdown-body.ts', code, ts.ScriptTarget.Latest, true)
+    // These must be shutdown's own statements: wrapping the whole sequence in
+    // a dry-run branch must fail just as wrapping either seal write does.
+    const statements = tree.statements.map(node => node.getText(tree).replace(/\s+/g, ' ').trim())
+    const drain = statements.indexOf('await deliveryQueue?.stop()')
+    expect(drain).toBeGreaterThanOrEqual(0)
+    expect(statements.slice(drain, drain + 6)).toEqual([
+      'await deliveryQueue?.stop()',
+      'unsubscribeThreadMemory?.()',
+      'await threadMemory?.quiesce()',
+      'if (threadMemorySeal?.loadedAtStart() && threadMemory) { await threadMemorySeal.writeShutdown(threadMemory.completedStores()) }',
+      'await threadMemory?.stop()',
+      'await threadMemorySeal?.stop()',
+    ])
+    for (const call of ['threadMemorySeal\\.writeShutdown', 'threadMemorySeal\\?\\.stop']) {
+      const at = onlyCallOf(call)
+      expect(at).toBeGreaterThan(start)
+      expect(at).toBeLessThan(end)
+    }
   })
 })
 

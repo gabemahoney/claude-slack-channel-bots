@@ -2,6 +2,12 @@
 import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../../src/atomic-write.ts'
+import { createDeliveryQueue, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
+import {
+  createThreadMemorySeal, isThreadMemorySealFile, serializeThreadMemorySeal, THREAD_MEMORY_SEAL_FILE,
+  type ThreadMemorySealEntry, type ThreadMemorySealFile, type ThreadMemorySealEvent,
+} from '../../src/thread-memory-seal.ts'
+import { queuePath } from './delivery-queue.ts'
 import type { DeliveryMode, PersonaConfigInput } from '../../src/config.ts'
 import { createSharedChannelAuthority, type SharedChannelAuthority, type SharedChannelDeps } from '../../src/shared-channels.ts'
 import {
@@ -66,14 +72,15 @@ export function readThreads(dir: string, key: string = THREAD_PERSONAS.primary):
   })
 }
 
-export type ThreadFsOperation = 'openSync' | 'readFileSync' | 'readdirSync' | 'writeSync' | 'fsyncSync' | 'renameSync' | 'unlinkSync' | 'ftruncateSync'
-export interface ThreadFsCall { op: string; path: string; flags?: string | number }
+export type ThreadFsOperation = 'openSync' | 'readFileSync' | 'readdirSync' | 'writeSync' | 'fsyncSync' | 'renameSync' | 'unlinkSync' | 'ftruncateSync' | 'readSync' | 'fstatSync' | 'closeSync'
+export interface ThreadFsCall { op: string; path: string; flags?: string | number; length?: number }
 export function threadFsControls(dir: string) {
   const calls: ThreadFsCall[] = [], descriptors = new Map<number, string>()
   const faults: Array<{ op: ThreadFsOperation; path: (path: string) => boolean; error: Error; left: number }> = []
   const invoke = (op: string, args: unknown[]) => {
     const path = typeof args[0] === 'number' ? descriptors.get(args[0]) ?? '<unknown-fd>' : String(args[0])
-    calls.push({ op, path, ...(op === 'openSync' ? { flags: args[1] as string | number } : {}) })
+    calls.push({ op, path, ...(op === 'openSync' ? { flags: args[1] as string | number } : {}),
+      ...(op === 'readSync' ? { length: args[3] as number } : {}) })
     const fault = faults.find(f => f.op === op && f.left > 0 && f.path(path))
     if (fault) { fault.left--; throw fault.error }
     const value = Reflect.apply(Reflect.get(fs, op), fs, args)
@@ -100,6 +107,49 @@ export function threadFsControls(dir: string) {
   }
 }
 
+export const threadSealPath = (dir: string) => join(dir, THREAD_MEMORY_SEAL_FILE)
+export const runningSealEntry = (overrides: Partial<Pick<ThreadMemorySealEntry, 'storeId' | 'lastRecordNumber'>> = {}): ThreadMemorySealEntry =>
+  ({ storeId: overrides.storeId ?? threadHeader().storeId, lastRecordNumber: overrides.lastRecordNumber ?? threadHeader().highWater, clean: false })
+export function cleanSealEntry(dir: string, key = THREAD_PERSONAS.primary as string, overrides: Parameters<typeof runningSealEntry>[0] = {}): ThreadMemorySealEntry {
+  const seal = createThreadMemorySeal({ stateDir: dir, queueJournalPath: k => queuePath(dir, k),
+    appliedKeys: () => [], threadHybrid: () => false, created: () => false })
+  return { ...runningSealEntry(overrides), clean: true, queue: seal.queueIdentity(key) }
+}
+export function seedThreadSeal(dir: string, entries: ThreadMemorySealFile['entries'] = {}): Buffer {
+  const bytes = serializeThreadMemorySeal({ v: 1, entries })
+  fs.writeFileSync(threadSealPath(dir), bytes)
+  return bytes
+}
+export function readThreadSeal(dir: string): ThreadMemorySealFile {
+  const value: unknown = JSON.parse(fs.readFileSync(threadSealPath(dir), 'utf8'))
+  if (!isThreadMemorySealFile(value)) throw new Error('readThreadSeal: invalid production seal')
+  return value
+}
+export type ThreadSealDamage = 'json' | 'version' | 'persona-key' | 'missing-queue'
+/** Corrupt exactly one property of a valid production-serialized seed. */
+export function damagedThreadSeal(dir: string, kind: ThreadSealDamage): Buffer {
+  const bytes = serializeThreadMemorySeal({ v: 1, entries: { alpha: cleanSealEntry(dir) } })
+  if (kind === 'json') return bytes.subarray(0, -2)
+  const value = JSON.parse(bytes.toString())
+  if (kind === 'version') value.v++
+  if (kind === 'persona-key') { value.entries['../invalid'] = value.entries.alpha; delete value.entries.alpha }
+  if (kind === 'missing-queue') delete value.entries.alpha.queue
+  return Buffer.from(JSON.stringify(value) + '\n')
+}
+export function threadSealFsControls(dir: string) {
+  const io = threadFsControls(dir), path = threadSealPath(dir)
+  return {
+    ...io,
+    failWrite(unsynced = false, times = Infinity) {
+      return io.fail(unsynced ? 'fsyncSync' : 'writeSync', 'alpha', {
+        times, match: p => unsynced ? p === dir : p.startsWith(`${path}.`),
+      })
+    },
+    failRead() { return io.fail('readFileSync', 'alpha', { match: p => p === path }) },
+    queueReads() { return io.calls.filter(c => c.path.startsWith(join(dir, 'queue') + '/') && ['openSync', 'fstatSync', 'readSync'].includes(c.op)) },
+  }
+}
+
 function intervalTimers(clock: FakeClock) {
   type Handle = { timer: unknown; stopped: boolean; unref(): void }
   return {
@@ -121,6 +171,8 @@ export interface ThreadHarnessOptions {
   authority?: SharedChannelAuthority; input?: PersonaConfigInput; reopen?: boolean; dryRun?: boolean; clock?: FakeClock
   now?: () => number; appliedKeys?: () => readonly string[]; canRemove?: (key: string) => boolean
   fs?: ReturnType<typeof threadFsControls>
+  seal?: boolean | { fs?: ReturnType<typeof threadSealFsControls>; onEvent?: (event: ThreadMemorySealEvent) => void }
+  queueOptions?: Omit<DeliveryQueueOptions, 'stateDir'>
   setCreated?: ThreadMemoryOptions['setCreated']; clearCreated?: ThreadMemoryOptions['clearCreated']
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
@@ -137,8 +189,18 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     ? createSharedChannelAuthority(sharedChannelPath(stateDir), saved, { ...deps, threadHybridSince: restartMint(saved.revision) })
     : makeSharedAuthority(stateDir, options.input ?? threadConfig(stateDir), deps))
   const events: ThreadMemoryEvent[] = [], markerCalls: Array<{ action: 'set' | 'clear'; key: string; fileExists: boolean; synced: boolean }> = []
+  const sealOptions = typeof options.seal === 'object' ? options.seal : {}
+  const sealIo = sealOptions.fs ?? threadSealFsControls(stateDir), sealEvents: ThreadMemorySealEvent[] = []
+  const seal = options.seal ? createThreadMemorySeal({ stateDir, fs: sealIo.fs,
+    queueJournalPath: key => queuePath(stateDir, key),
+    appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
+    threadHybrid: key => authority.threadView().threadHybridChannels(key).length > 0,
+    created: key => authority.threadMemoryCreated(key),
+    onEvent(event) { sealEvents.push(event); sealOptions.onEvent?.(event) },
+  }) : undefined
+  const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions }) : undefined
   const memory = createThreadMemory({
-    stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun,
+    stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
     threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
@@ -157,10 +219,30 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   })
   const unsubscribe = authority.subscribeThreadView(() => memory.published())
   const apply = (input: PersonaConfigInput) => authority.applyReviewed(configBytes(input), authority.revision)
+  let closing: Promise<void> | undefined
+  function close(clean: boolean) {
+    return closing ??= (async () => {
+      if (!seal) { unsubscribe(); await memory.stop(); return }
+      await queue?.stop()
+      await memory.quiesce()
+      if (clean && seal.loadedAtStart()) await seal.writeShutdown(memory.completedStores())
+      unsubscribe(); await memory.stop(); await seal?.stop()
+    })()
+  }
   return {
-    stateDir, clock, io, authority, memory, events, markerCalls, unsubscribe,
-    async start() { memory.readAtStart(); await memory.activate() },
-    async close() { unsubscribe(); await memory.stop() },
+    stateDir, clock, io, authority, memory, events, markerCalls, unsubscribe, seal, sealIo, sealEvents, queue,
+    async start() {
+      memory.readAtStart()
+      if (seal) {
+        await seal.loadAtStart(memory.journalFacts())
+        await queue?.start()
+      }
+      await memory.activate()
+      if (seal) memory.startMaintenance()
+    },
+    close: () => close(true),
+    // Retire in-process timers/writers without the graceful shutdown seal.
+    crash: () => close(false),
     fact(overrides: Partial<ThreadJoin> = {}, key: string = THREAD_PERSONAS.primary): ThreadJoin {
       const channel = overrides.channel ?? THREAD_CHANNELS.primary, stamp = authority.channelStamp(key, channel)
       if (stamp?.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('fixture needs a decided thread_hybrid stamp')
@@ -177,7 +259,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
       const bytes = fs.readFileSync(authority.path)
       return authority.stageRestoration(sharedRecoveryRequest('thread-memory-restore', bytes), bytes, authority.sourceBytes())
     },
-    reopen(overrides: ThreadHarnessOptions = {}) { return makeThreadMemoryHarness(stateDir, { reopen: true, ...overrides }) },
+    reopen(overrides: ThreadHarnessOptions = {}) { return makeThreadMemoryHarness(stateDir, { reopen: true, seal: !!seal, ...overrides }) },
   }
 }
 export type ThreadMemoryHarness = ReturnType<typeof makeThreadMemoryHarness>
