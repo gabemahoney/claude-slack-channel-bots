@@ -10,8 +10,8 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { deliveredRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
-import { THREAD_ROOT } from './test-helpers/thread-participation.ts'
 
+const THREAD_ROOT = '1700000000.000100'
 let dir: string
 let queues: ReplyReminderQueue[]
 let monitors: ReplyReminders[]

@@ -22,8 +22,6 @@ HUMAN="U0${SCENARIO_TAG^^}HUMAN"
 PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
 RECEIVED="$(bun "${PRINTER}" MESSAGE_RECEIVED)" || fail "cannot print received label"
 DELIVERED="$(bun "${PRINTER}" MESSAGE_DELIVERED)" || fail "cannot print delivered label"
-ROOT_LOOKUP_CAPABILITY="$(bun "${PRINTER}" ROOT_LOOKUP_CAPABILITY_MISSING)" || fail "cannot print root-lookup capability label"
-PARTICIPATION_RECOVERY="$(bun "${PRINTER}" PARTICIPATION_RECOVERY)" || fail "cannot print participation recovery label"
 QUEUED_REACTION="$(bun "${PRINTER}" DEFAULT_QUEUED_ACK_REACTION)" || fail "cannot print queued reaction"
 DELIVERED_REACTION="$(bun "${PRINTER}" DEFAULT_ACK_REACTION)" || fail "cannot print delivered reaction"
 SESSION="$(bun "${PRINTER}" personaTmuxSessionName "${KEY}")" || fail "cannot print session name"
@@ -163,22 +161,6 @@ assert len(reactions) == 1000, "missing or duplicate queued reactions"
 assert all(r.get("name") == queued and r.get("label") == label and r.get("answer") == "ok" for r in reactions), "failed, foreign or premature delivered reaction"
 assert collections.Counter((r.get("channel"), r.get("timestamp")) for r in reactions) == collections.Counter(intended), "queued reaction set differs"
 assert not any(r["event"] == "api" and r.get("method") == "reactions.remove" for r in stub), "queued reaction removed before reply/delivery"
-# Root messages of an `all` channel need no thread evidence: no enrollment
-# metadata call (src/thread-memory.ts ENROLLMENT_METADATA_METHODS).
-# The one permitted conversations.info is delivery preparation's cached
-# channel-name lookup (src/delivery-intake.ts channelName), not enrollment:
-# strict mode makes no open-mode channel-evidence lookup. Both lookups send
-# only `channel`, so the count, not the arguments, rules out enrollment.
-# Not `== 1`: this block reads the stub record before the script waits for the
-# 1,000 received lines, so the channel-name request may not have reached the stub yet.
-metadata = ("conversations.replies", "conversations.info", "files.info")
-calls = {m: [r for r in stub if r["event"] == "api" and r.get("method") == m] for m in metadata}
-counts = " ".join(f"{m}={len(calls[m])}" for m in metadata)
-assert not calls["conversations.replies"] and not calls["files.info"], f"a thread-evidence metadata call during the burst: {counts}"
-assert len(calls["conversations.info"]) <= 1, f"conversations.info beyond the one channel-name lookup: {counts}"
-assert all(r.get("label") == label and r.get("token_kind") == "bot" and r.get("channel") == channel
-           and r.get("args_token_like") is False and not any(k in r for k in ("user", "thread_ts", "text"))
-           for r in calls["conversations.info"]), f"conversations.info is not a bot call on the burst channel with only `channel` set: {counts}"
 print(f"ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms={maximum:.3f} p95_ms={p95:.3f} over_limit={over_limit}")
 EOF
 
@@ -190,9 +172,6 @@ RECEIVED_MATCH="$(matcher "[slack] ${RECEIVED}: persona=\"${PERSONA}\" (key=${KE
 wait_for_count "${RECEIVED_MATCH}" 1000 30 "missing received diagnostics"
 [[ "$(count_log "${RECEIVED_MATCH}")" == 1000 ]] || fail "unexpected received diagnostic count"
 [[ "$(count_log "$(matcher "[slack] ${DELIVERED}:")")" == 0 ]] || fail "a message was delivered"
-for class in "${ROOT_LOOKUP_CAPABILITY}" "${PARTICIPATION_RECOVERY}"; do
-    [[ "$(count_log "$(matcher "[slack] ${class}:")")" == 0 ]] || fail "a ${class} line during the burst"
-done
 
 stop_server --stop-bots
 port_closed "${SCENARIO_PORT}" || fail "server port remains open"

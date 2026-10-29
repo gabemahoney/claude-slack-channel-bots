@@ -33,14 +33,7 @@
  * PERSONA_DIAGNOSTIC_CLASSES (imported, side-effect free) names a `##`–`####`
  * heading in the skill (the skill gives each class a `###` heading naming it),
  * so a class added without a skill entry, or an entry cut down to a passing
- * mention, fails here. The `own-post-not-enrolled` entry also names its
- * line's state, missing, cause and action fields and every state,
- * missing-evidence and cause value (`OWN_POST_MISSING`,
- * `OWN_POST_FINDING_CAUSES`), and quotes the cap line from its `limit=`, the
- * dropped-outcomes line from its `dropped=`, the remedy every gap action
- * shares and the conditional new-mention sentence with its storage condition,
- * and names the `off` choice the mention is never offered for, each from the
- * exported builders, with a self-check per requirement. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
+ * mention, fails here. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
  * side-effect free) gets the same heading check in its own `test.each`, plus
  * a non-empty, duplicate-free check on the list. The stored-choice store's
  * own closed list, CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES (src/channel-delivery.ts,
@@ -180,23 +173,6 @@ import {
   stateDirRepointedLine,
   stateDirRepointFailedLine,
 } from '../src/state-dir-migration.ts'
-import {
-  buildOwnPostFindingsCappedLine,
-  buildOwnPostOutcomesDroppedLine,
-  buildParticipationRecoveredLine,
-  buildParticipationRecoveryCappedLine,
-  buildParticipationRecoveryLine,
-  buildRootLookupCapabilityLine,
-  OWN_POST_FINDING_CAUSES,
-  OWN_POST_NOT_ENROLLED,
-  ownPostFindingAction,
-  PARTICIPATION_RECOVERY,
-  ROOT_LOOKUP_CAPABILITY_MISSING,
-  type OwnPostFindingCause,
-} from '../src/delivery-notices.ts'
-import { OWN_POST_MISSING } from '../src/thread-participation.ts'
-import { DM_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, PUBLIC_HISTORY_SCOPE, type RootLookupCapabilityGap } from '../src/participation-channel-evidence.ts'
-import { PARTICIPATION_RECOVERY_CAUSES } from '../src/participation-recovery.ts'
 import { DELIVERY_MODES, DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
@@ -433,14 +409,7 @@ describe('npm pack ships every runtime src file', () => {
 
   test.each([
     'src/channel-delivery-attempt.ts',
-    'src/thread-participation.ts',
     'src/file-upload-observation.ts',
-    'src/participation-capability.ts',
-    'src/participation-channel-evidence.ts',
-    'src/participation-file-evidence.ts',
-    'src/participation-metadata.ts',
-    'src/participation-recovery.ts',
-    'src/participation-root-evidence.ts',
     'src/thread-memory.ts',
     'src/own-post.ts',
   ])('%s is inventoried, included, and an explicit exclusion fails coverage', path => {
@@ -601,185 +570,6 @@ describe('the debugging skill covers every persona diagnostic class', () => {
       }
     },
   )
-})
-
-/**
- * What the `own-post-not-enrolled` entry must carry, each from the exported
- * builders: the line's state, missing, cause and action fields; each state,
- * missing-evidence and cause value as a whole word; the cap line from its
- * `limit=`; the dropped-outcomes line from its `dropped=`; the storage gap's
- * own remedy and the remedy every other gap cause shares (its repair limit),
- * each quoted; and the conditional
- * new-mention sentence, quoted, with its storage condition and the `off`
- * choice it is never offered for.
- */
-const OWN_POST_ENTRY_VALUES: readonly string[] = [...new Set(['pending', 'gap', ...OWN_POST_MISSING, ...OWN_POST_FINDING_CAUSES])]
-
-/** The sentence `ownPostFindingAction` adds when the new mention applies, for `cause`. */
-function ownPostMentionSentence(cause: OwnPostFindingCause): string {
-  const without = ownPostFindingAction(cause, false, false), withMention = ownPostFindingAction(cause, false, true)
-  if (!withMention.startsWith(without) || withMention === without) throw new Error(`the ${cause} action no longer appends its new-mention sentence`)
-  return withMention.slice(without.length).trim()
-}
-
-/** The general new-mention sentence, and the condition the storage cause adds to it. */
-function ownPostMentionParts(): { mention: string; storageCondition: string } {
-  const mention = ownPostMentionSentence('root-metadata')
-  const storage = ownPostMentionSentence('storage')
-  const stem = mention.replace(/\.$/, '')
-  if (!storage.startsWith(stem) || storage === mention) throw new Error('the storage new-mention sentence no longer adds a condition')
-  return { mention, storageCondition: storage.slice(stem.length).replace(/^[,\s]+/, '').replace(/\.$/, '') }
-}
-
-/** The dropped-outcomes line from its `dropped=` field, with the count left out. */
-function ownPostDroppedTail(): string {
-  const line = buildOwnPostOutcomesDroppedLine('<key>', 3)
-  return line.slice(line.indexOf('dropped=3') + 'dropped=3'.length).trim()
-}
-
-/** The gap actions' remedies after their first sentence: the storage cause's own, and the one every other cause shares. */
-function ownPostGapRemedies(): { storage: string; other: string } {
-  const remedy = (cause: OwnPostFindingCause) => { const action = ownPostFindingAction(cause, true, false); return action.slice(action.indexOf('. ') + 2) }
-  const others = OWN_POST_FINDING_CAUSES.filter((cause) => cause !== 'storage').map(remedy)
-  if (!others.every((text) => text === others[0])) throw new Error('the non-storage gap actions no longer share their remedy')
-  const storage = remedy('storage')
-  if (storage === others[0]) throw new Error('the storage gap action no longer has its own remedy')
-  return { storage, other: others[0] }
-}
-
-function ownPostEntryRequirements(): [label: string, found: (entry: string) => boolean][] {
-  const word = (value: string) => (entry: string) => new RegExp(`(?<![\\w-])${escapeRegExp(value)}(?![\\w-])`).test(entry)
-  const cap = buildOwnPostFindingsCappedLine('<key>')
-  const gapRemedies = ownPostGapRemedies()
-  const { mention, storageCondition } = ownPostMentionParts()
-  const dropped = ownPostDroppedTail()
-  return [
-    ...['state=', 'missing=', 'cause=', 'action='].map((field): [string, (entry: string) => boolean] => [`the ${field} field`, (entry) => entry.includes(field)]),
-    ...OWN_POST_ENTRY_VALUES.map((value): [string, (entry: string) => boolean] => [`the value ${value}`, word(value)]),
-    ['the cap line', (entry) => flat(entry).includes(flat(cap.slice(cap.indexOf('limit=')))) && entry.includes(`[slack] ${OWN_POST_NOT_ENROLLED}:`)],
-    ['the dropped line', (entry) => entry.includes('dropped=') && flat(entry).includes(flat(dropped))],
-    ['the storage gap remedy', (entry) => flat(entry).includes(flat(gapRemedies.storage))],
-    ['the gap remedy', (entry) => flat(entry).includes(flat(gapRemedies.other))],
-    ['the new-mention sentence', (entry) => flat(entry).includes(flat(mention))],
-    ['the storage condition on the new mention', (entry) => flat(entry).includes(flat(storageCondition))],
-    ['the off choice the new mention skips', word('off')],
-  ]
-}
-
-/** The labels of the requirements `entry` misses. */
-function ownPostEntryGaps(entry: string): string[] {
-  return ownPostEntryRequirements().filter(([, found]) => !found(entry)).map(([label]) => label)
-}
-
-describe(`the debugging skill's ${OWN_POST_NOT_ENROLLED} entry names what its line carries and the gap's repair limit`, () => {
-  test('the entry has every requirement', () => {
-    expect(ownPostEntryGaps(requiredSection(debugSkill(), classHeading(OWN_POST_NOT_ENROLLED), SKILL_REL))).toEqual([])
-  })
-
-  // A synthetic entry holding each requirement once, so a cut shows that requirement alone.
-  const cap = buildOwnPostFindingsCappedLine('<key>')
-  const gapRemedies = ownPostGapRemedies()
-  const { mention, storageCondition } = ownPostMentionParts()
-  const parts: [label: string, text: string][] = [
-    ['fields', 'state= missing= cause= action='],
-    ...OWN_POST_ENTRY_VALUES.map((value): [string, string] => [`the value ${value}`, value]),
-    ['the cap line', cap],
-    ['the dropped line', buildOwnPostOutcomesDroppedLine('<key>', 3)],
-    ['the storage gap remedy', gapRemedies.storage],
-    ['the gap remedy', gapRemedies.other],
-    ['the new-mention sentence', mention],
-    ['the storage condition on the new mention', storageCondition],
-    ['the off choice the new mention skips', 'off'],
-  ]
-  const synthetic = (without?: string) => parts.filter(([label]) => label !== without).map(([, text]) => `- ${text}`).join('\n')
-
-  test('self-check: the synthetic entry passes', () => {
-    expect(ownPostEntryGaps(synthetic())).toEqual([])
-  })
-
-  test.each(parts.filter(([label]) => label !== 'fields').map(([label]) => [label] as const))(
-    'self-check: the synthetic entry without %s fails on it alone',
-    (label) => {
-      expect(ownPostEntryGaps(synthetic(label))).toEqual([label])
-    },
-  )
-
-  test('self-check: the synthetic entry without its fields fails on each field', () => {
-    expect(ownPostEntryGaps(synthetic('fields'))).toEqual(['state=', 'missing=', 'cause=', 'action='].map((field) => `the ${field} field`))
-  })
-})
-
-/** A requirement on a class's skill entry: its label, the text a synthetic entry holds for it, and whether `entry` has it. */
-type EntryRequirement = readonly [label: string, text: string, found: (entry: string) => boolean]
-
-const wholeWord = (value: string) => (entry: string) => new RegExp(`(?<![\\w-])${escapeRegExp(value)}(?![\\w-])`).test(entry)
-const fieldRequirement = (field: string): EntryRequirement => [`the ${field} field`, field, (entry) => entry.includes(field)]
-const wordRequirement = (value: string): EntryRequirement => [`the value ${value}`, value, wholeWord(value)]
-
-/** One gap of every `RootLookupCapabilityGap` kind, keyed by its kind: a kind added without one fails the type check. */
-const CAPABILITY_GAPS: Readonly<{ [K in RootLookupCapabilityGap['kind']]: Extract<RootLookupCapabilityGap, { kind: K }> }> = {
-  'missing-scope': { kind: 'missing-scope', scopes: [PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, DM_HISTORY_SCOPE] },
-  'method-refused': { kind: 'method-refused', method: 'conversations.replies', slackError: 'missing_scope' },
-}
-const unique = (values: readonly string[]): string[] => [...new Set(values)]
-
-/**
- * What the `root-lookup-capability-missing` entry must carry, each from the
- * exported builder or constants: the identity fields its line renders for
- * every gap kind; every kind and every history scope a persona can lack as
- * whole words; the refused method; and the line's stays-up effect, quoted.
- */
-function capabilityEntryRequirements(): EntryRequirement[] {
-  const gaps = Object.values(CAPABILITY_GAPS)
-  const lines = gaps.map((gap) => buildRootLookupCapabilityLine('<persona>', gap))
-  const fields = unique(lines.flatMap((line) => [...line.slice(0, line.indexOf(' effect=')).matchAll(/ ([a-z_]+)=/g)].map(([, name]) => `${name}=`)))
-  const effect = /effect="([^"]+)"/.exec(lines[0]!)?.[1]
-  if (effect === undefined || fields.length === 0) throw new Error('the capability line no longer carries its identity fields and effect')
-  return [
-    ...fields.filter((field) => field !== 'persona=').map(fieldRequirement),
-    ...unique([...gaps.map((gap) => gap.kind), PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, DM_HISTORY_SCOPE,
-      ...gaps.flatMap((gap) => gap.kind === 'method-refused' ? [gap.method] : [])]).map(wordRequirement),
-    ['the stays-up effect', effect, (entry) => flat(entry).includes(flat(effect))],
-  ]
-}
-
-/**
- * What the `participation-recovery` entry must carry, each from the exported
- * builders or causes: every `state=` form its line renders over one finding
- * per cause, its cause and action fields; every cause as a whole word; the
- * cap line from its `limit=`; and the recovered line from its `state=recovered`.
- */
-function recoveryEntryRequirements(): EntryRequirement[] {
-  const cap = buildParticipationRecoveryCappedLine('<persona>'), recovered = buildParticipationRecoveredLine('<persona>')
-  const capTail = cap.slice(cap.indexOf('limit=')), recoveredTail = recovered.slice(recovered.indexOf('state=recovered'))
-  const states = unique(PARTICIPATION_RECOVERY_CAUSES.map((cause) => /state=[a-z-]+/.exec(buildParticipationRecoveryLine('<persona>', { cause }))?.[0] ?? `no state for ${cause}`))
-  return [
-    ...[...states, 'cause=', 'action='].map(fieldRequirement),
-    ...PARTICIPATION_RECOVERY_CAUSES.map(wordRequirement),
-    ['the cap line', capTail, (entry) => flat(entry).includes(flat(capTail))],
-    ['the recovered line', recoveredTail, (entry) => flat(entry).includes(flat(recoveredTail))],
-  ]
-}
-
-describe.each([
-  [ROOT_LOOKUP_CAPABILITY_MISSING, capabilityEntryRequirements],
-  [PARTICIPATION_RECOVERY, recoveryEntryRequirements],
-] as const)("the debugging skill's %s entry names what its line carries", (label, requirements) => {
-  const gaps = (entry: string) => requirements().filter(([, , found]) => !found(entry)).map(([name]) => name)
-  // A synthetic entry holding each requirement once, so a cut shows that requirement alone.
-  const synthetic = (without?: string) => requirements().filter(([name]) => name !== without).map(([, text]) => `- ${text}`).join('\n')
-
-  test('the entry has every requirement', () => {
-    expect(gaps(requiredSection(debugSkill(), classHeading(label), SKILL_REL))).toEqual([])
-  })
-
-  test('self-check: the synthetic entry passes', () => {
-    expect(gaps(synthetic())).toEqual([])
-  })
-
-  test.each(requirements().map(([name]) => [name] as const))('self-check: the synthetic entry without %s fails on it alone', (name) => {
-    expect(gaps(synthetic(name))).toEqual([name])
-  })
 })
 
 describe('the debugging skill covers every reload diagnostic class', () => {

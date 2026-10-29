@@ -162,12 +162,12 @@
  *     literal texts one `pin:` case holds.
  * - Confirmed own posts: a prompt is registered at its success and a wedge
  *     warning latched, each confirmed once (`prompt`, `warning`) with Slack's
- *     channel and ts, through enrollment, hold-settle and trail faults; an
- *     enrollment-faulted prompt stays at its channel and ts after a
+ *     channel and ts, through own-post confirmation, hold-settle and trail
+ *     faults; a prompt whose own-post confirmation faults stays at its channel and ts after a
  *     destination change and is decided by a click on its own persona's
  *     connection only; a prompt without a ts is never reposted until a
- *     teardown forgets it. Through the real participation owner, a
- *     prompt's ts becomes a followed root, once, with no echo.
+ *     teardown forgets it. Through the ownerless observer `src/server.ts`
+ *     wires, a prompt posts once and is registered.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -214,7 +214,7 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../src/persona-destination-hold.ts'
-import type { OwnPostObserver } from '../src/own-post.ts'
+import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
@@ -240,9 +240,7 @@ import {
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { HUMAN_ONLY_SENTENCE } from './test-helpers/conflict-cases.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
-import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
-import { attachRecovery, hungMetadata, makeThreadHarness, threadReply, THREAD_CHANNEL, type ThreadHarness } from './test-helpers/thread-participation.ts'
-import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
+import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
 import {
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
@@ -5033,7 +5031,7 @@ describe('poller tick — a throw on one row, request or closed entry is caught 
 /**
  * A recording own-post adapter: each confirmation the resolver hands it, by
  * surface, channel and ts. With `fails`, each confirmation throws once
- * recorded (an enrollment failure right after the success).
+ * recorded (an own-post confirmation fault right after the success).
  */
 function recordingOwnPosts(fails = false) {
   const confirmed: Array<{ surface: string; channel: string; ts?: string }> = []
@@ -5041,18 +5039,19 @@ function recordingOwnPosts(fails = false) {
     issue: (key, surface) => ({ key, surface, operation: `op-${confirmed.length}`, issuer: {} }),
     confirm: (issue, posted) => {
       confirmed.push({ surface: issue!.surface, channel: posted.channel, ...(posted.ts ? { ts: posted.ts } : {}) })
-      if (fails) throw new Error('injected enrollment failure')
+      if (fails) throw new Error('injected own-post confirmation failure')
     },
   }
   return { confirmed, ownPosts }
 }
 
 describe('a confirmed prompt or warning stays registered and latched through post-success faults', () => {
-  type Fault = 'enrollment' | 'hold settle' | 'trail'
-  /** Persona A's poller over the real resolver and hold, its own-post adapter recording every confirmation. */
-  function confirmedScenario(fault?: Fault) {
+  type Fault = 'own-post confirmation' | 'hold settle' | 'trail'
+  /** Persona A's poller over the real resolver and hold, its own-post adapter recording every confirmation unless `observer` replaces it. */
+  function confirmedScenario(fault?: Fault, observer?: OwnPostObserver) {
     const logCalls: unknown[][] = []
-    const { confirmed, ownPosts } = recordingOwnPosts(fault === 'enrollment')
+    const recording = recordingOwnPosts(fault === 'own-post confirmation')
+    const { confirmed } = recording, ownPosts = observer ?? recording.ownPosts
     const log = (line: string): void => {
       logCalls.push([line])
       if (fault === 'hold settle' && line.includes(': cleared: ')) throw new Error('injected settle failure')
@@ -5078,8 +5077,8 @@ describe('a confirmed prompt or warning stays registered and latched through pos
   }
 
   test.each<[Fault, 'full' | 'short']>([
-    ['enrollment', 'full'], ['enrollment', 'short'], ['trail', 'full'], ['trail', 'short'], ['hold settle', 'full'],
-  ])('a %s fault after a %s prompt posts: registered with its returned channel and ts, never posted again or replaced by a fallback', async (fault, form) => {
+    ['own-post confirmation', 'full'], ['own-post confirmation', 'short'], ['trail', 'full'], ['trail', 'short'], ['hold settle', 'full'],
+  ])('%s fault after a %s prompt posts: registered with its returned channel and ts, never posted again or replaced by a fallback', async (fault, form) => {
     const s = confirmedScenario(fault)
     if (fault === 'hold settle') stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
     if (form === 'short') stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
@@ -5101,6 +5100,16 @@ describe('a confirmed prompt or warning stays registered and latched through pos
     expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
     expect(s.confirmed).toHaveLength(1)
     assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, `${fault} after ${form} prompt`)
+  })
+
+  test('through the ownerless observer src/server.ts wires, a prompt posts once and is registered with its channel and ts', async () => {
+    const s = confirmedScenario(undefined, createOwnPostObserver(() => undefined))
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < 4; n++) await s.ivl.tick()
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+    expect(chatPosts(s.trail).filter((e) => e['ok'] === true)).toHaveLength(1)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'prompt through the ownerless observer')
   })
 
   test('a prompt Slack confirms without a ts is posted but not answerable: never registered, never posted again, its line says so', async () => {
@@ -5127,8 +5136,8 @@ describe('a confirmed prompt or warning stays registered and latched through pos
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ messageTs: POST_TS })
   })
 
-  test('an enrollment-faulted prompt stays answerable: a destination change leaves it at its original channel and ts, a click through the real handler decides it there, and another persona\'s connection cannot', async () => {
-    const s = confirmedScenario('enrollment')
+  test('a prompt whose own-post confirmation faults stays answerable: a destination change leaves it at its original channel and ts, a click through the real handler decides it there, and another persona\'s connection cannot', async () => {
+    const s = confirmedScenario('own-post confirmation')
     scriptPostTs(stubA, POST_TS)
     await s.ivl.tick()
     reconfigure(KEY_A, { permission_prompts: A_WORK })
@@ -5151,13 +5160,13 @@ describe('a confirmed prompt or warning stays registered and latched through pos
     expect(slackCalls(stubB, stubD)).toBe(0)
     expect(posts(stubA)).toHaveLength(1)
     expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
-    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'enrollment-faulted prompt answered')
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'own-post confirmation faulted prompt answered')
   })
 
-  test.each<['none' | 'enrollment' | 'trail']>([['none'], ['enrollment'], ['trail']])(
-    'a wedge warning is confirmed once as a warning own post at its destination and, with a %s fault after it posts, stays latched: one warning however many empty ticks follow',
+  test.each<['none' | 'own-post confirmation' | 'trail']>([['none'], ['own-post confirmation'], ['trail']])(
+    'a wedge warning is confirmed once as a warning own post at its destination and, with fault %s after it posts, stays latched: one warning however many empty ticks follow',
     async (fault) => {
-      const own = recordingOwnPosts(fault === 'enrollment')
+      const own = recordingOwnPosts(fault === 'own-post confirmation')
       const log = (line: string): void => { s.logCalls.push([line]) }
       const s = makeNotUpScenario(
         (e) => fault === 'trail' && e.event === 'cscb.poller.wedge_detected' && e['ok'] === true ? new Error('injected trail failure') : undefined,
@@ -5174,134 +5183,4 @@ describe('a confirmed prompt or warning stays registered and latched through pos
       assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, `wedge warning, ${fault} fault`)
     },
   )
-})
-
-describe('a permission prompt enrolls its own thread through the real participation owner', () => {
-  const PROMPT_TS = '1700000000.000400'
-  let stateDir: string
-  let th: ThreadHarness | undefined
-  beforeEach(() => { stateDir = mkdtempSync(join(tmpdir(), 'poller-own-post-')) })
-  afterEach(async () => {
-    await th?.close()
-    th = undefined
-    resetRoutingState()
-    rmSync(stateDir, { recursive: true, force: true })
-  })
-
-  test('the prompt\'s returned ts becomes a followed root with one durable record and no echo; a repeated confirmation or an own echo adds nothing, and a human reply in it is delivered', async () => {
-    th = await makeThreadHarness(stateDir)
-    const t = th
-    t.chooseDestination('alpha', THREAD_CHANNEL)
-    const alpha = t.h.p('alpha')
-    const key = alpha.persona.key
-    const instance = personaInstanceId(key)
-    const ownRecords = () => t.h.queue.threadRecords(key).filter((r) => r.observation.post)
-    const fresh = () => t.h.ownPostOutcomes.filter((o) => !o.duplicate)
-    async function settleUntil(done: () => boolean): Promise<void> {
-      for (let i = 0; i < 50 && !done(); i++) { await t.clock.flush(); await new Promise((resolve) => setImmediate(resolve)) }
-      expect(done()).toBe(true)
-    }
-    const logCalls: unknown[][] = []
-    const trail = makeTrailCapture()
-    const getThreadPersona = (k: string): Persona | undefined => t.h.config?.personas.find((p) => p.key === k)
-    alpha.stub.script.post.push({ kind: 'ok', result: { ts: PROMPT_TS } })
-    const ivl = startManualPoller({
-      getClient: () => ({
-        list: async () => ({ spawns: [cannedListRow({ instance_id: instance, state: 'check_permission' })] }),
-        get: async () => cannedGetResult({ instance_id: instance, state: 'check_permission', permission_requests: [requestA()] }),
-        getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
-          cannedGetPermissionResponse({ request_token: params.request_token, decision: null, decision_reason: null }),
-      }),
-      clientFor: t.h.clients.clientFor,
-      getPersona: getThreadPersona,
-      destinations: createPersonaDestinations({ log: (line) => { logCalls.push([line]) }, getPersonaConfig: () => t.h.config, ownPosts: t.h.ownPosts }),
-      log: (...args) => { logCalls.push(args) },
-      emitTrail: trail.emit,
-    })
-
-    await ivl.tick()
-    expect(posts(alpha.stub).map((c) => c.channel)).toEqual([THREAD_CHANNEL])
-    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ personaKey: key, channelId: THREAD_CHANNEL, messageTs: PROMPT_TS })
-    await settleUntil(() => fresh().length > 0)
-    expect(fresh()).toEqual([expect.objectContaining({
-      kind: 'enrolled', key, surface: 'prompt', channel: THREAD_CHANNEL, ts: PROMPT_TS, root: PROMPT_TS, missing: [],
-    })])
-    expect(t.read(PROMPT_TS)).toBe('followed')
-    expect(ownRecords().map((r) => [r.observation.lifetime.channel, r.observation.root, r.state])).toEqual([[THREAD_CHANNEL, PROMPT_TS, 'enrolled']])
-
-    // Later ticks neither repost nor confirm again.
-    await ivl.tick()
-    await ivl.tick()
-    expect(posts(alpha.stub)).toHaveLength(1)
-    expect(fresh()).toHaveLength(1)
-
-    // A repeated confirmation of the same post settles as a duplicate.
-    t.h.ownPosts.confirm(t.h.ownPosts.issue(key, 'prompt', THREAD_CHANNEL), { channel: THREAD_CHANNEL, ts: PROMPT_TS })
-    await settleUntil(() => t.h.ownPostOutcomes.some((o) => o.duplicate))
-    expect(fresh()).toHaveLength(1)
-    expect(ownRecords()).toHaveLength(1)
-
-    // The prompt's own echo delivers nothing to alpha and adds no participation.
-    const identity = alpha.stub.identity
-    await t.receive(makeChannelMessage({ channel: THREAD_CHANNEL, ts: PROMPT_TS, user: identity.botUserId, bot_id: identity.botId, text: 'own prompt echo' }))
-    expect(t.h.queue.items(key)).toEqual([])
-    expect(ownRecords()).toHaveLength(1)
-    const HUMAN_TS = '1700000000.000401'
-    expect((await t.receive(threadReply({ thread_ts: PROMPT_TS, ts: HUMAN_TS }))).acknowledged).toBe(1)
-    expect(t.h.queue.items(key).map((i) => [i.accepted.ts, i.accepted.via])).toEqual([[HUMAN_TS, 'thread']])
-    expect(t.h.ownPostOutcomes.filter((o) => o.kind !== 'enrolled')).toEqual([])
-    assertNoLeak({ logCalls, trail: trail.events, outcomes: t.h.ownPostOutcomes }, 'prompt enrolled through the owner')
-  })
-
-  test('a root lookup hung in flight delays no prompt: it posts, registers and is decided by a click through the real handler with no timer advanced, the lookup still in flight', async () => {
-    th = await makeThreadHarness(stateDir)
-    const t = th
-    t.chooseDestination('alpha', THREAD_CHANNEL)
-    const alpha = t.h.p('alpha')
-    const key = alpha.persona.key
-    const instance = personaInstanceId(key)
-    const r = attachRecovery(t)
-    // A rootless own post makes a reply of an unknown thread wait on a root lookup, which hangs.
-    expect(await t.confirmPost({ channel: THREAD_CHANNEL }, key, 'text').outcome).toMatchObject({ kind: 'pending', missing: ['root'] })
-    const hung = hungMetadata()
-    r.respond(hung.respond)
-    let acks = 0
-    await t.h.routing.receive(threadReply(), () => { acks++ }, [key], false)
-    await r.settle()
-    expect([r.requests.length, r.attempts.inFlight(key), hung.aborted, acks]).toEqual([1, 1, [false], 0])
-
-    const started = t.clock.now()
-    const logCalls: unknown[][] = []
-    const trail = makeTrailCapture()
-    const getThreadPersona = (k: string): Persona | undefined => t.h.config?.personas.find((p) => p.key === k)
-    alpha.stub.script.post.push({ kind: 'ok', result: { ts: PROMPT_TS } })
-    const ivl = startManualPoller({
-      getClient: () => ({
-        list: async () => ({ spawns: [cannedListRow({ instance_id: instance, state: 'check_permission' })] }),
-        get: async () => cannedGetResult({ instance_id: instance, state: 'check_permission', permission_requests: [requestA()] }),
-        getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
-          cannedGetPermissionResponse({ request_token: params.request_token, decision: null, decision_reason: null }),
-      }),
-      clientFor: t.h.clients.clientFor,
-      getPersona: getThreadPersona,
-      destinations: createPersonaDestinations({ log: (line) => { logCalls.push([line]) }, getPersonaConfig: () => t.h.config, ownPosts: t.h.ownPosts }),
-      log: (...args) => { logCalls.push(args) },
-      emitTrail: trail.emit,
-    })
-    await ivl.tick()
-    expect(posts(alpha.stub).map((c) => c.channel)).toEqual([THREAD_CHANNEL])
-    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ personaKey: key, channelId: THREAD_CHANNEL, messageTs: PROMPT_TS, handled: false })
-
-    const decided: DecideParams[] = []
-    const decider = { decide: async (params: DecideParams) => { decided.push(params); return cannedDecideResult('delivered') } }
-    initOutageState({ getClient: () => decider as unknown as AgentDirectorClient, notify: () => {} })
-    expect(await handlePermissionClick(encodePermissionActionId('allow', instance, TOKEN_A), {
-      receivingPersonaKey: key, clientFor: t.h.clients.clientFor, getPersona: getThreadPersona, log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit,
-    })).toBe(true)
-    expect(decided).toEqual([{ instance_id: instance, request_token: TOKEN_A, decision: 'allow' }])
-    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ handled: true })
-    // No timer ran: the lookup is still the one hung attempt, and its reply still waits.
-    expect([t.clock.now(), r.requests.length, r.attempts.inFlight(key), hung.aborted, acks]).toEqual([started, 1, 1, [false], 0])
-    assertNoLeak({ logCalls, trail: trail.events }, 'prompt answered while a lookup hangs')
-  })
 })

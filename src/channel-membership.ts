@@ -21,9 +21,9 @@ export function membershipDiagnostic(key: string, channel: string | undefined, f
   return `[slack] ${fault === 'event-not-durable' ? MEMBERSHIP_STORAGE_FAILED : MEMBERSHIP_UNRESOLVED} persona=${key}${scope}: ${fault}. ${repair}`
 }
 
-/** c9 binds its durable clearing/enrollment obligations to this token.
- * Superseded tokens cannot hold a new lifetime or authorize late callbacks.
- * Queued work never acquires enrollment authority merely by replaying it. */
+/** Proves one durable membership lifetime, nothing more.
+ * A later leave or reset supersedes it; a superseded lifetime authorizes
+ * no late callback, and replaying queued work never revives it. */
 export interface MembershipLifetime {
   incarnation: string
   boundary: number

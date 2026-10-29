@@ -153,8 +153,6 @@ export interface FungibleDecisionRow {
   readonly readable?: boolean
   /** Independent current observations. Empty explicitly means no evidence. */
   readonly memberships?: ReadonlyMap<string, MembershipReading>
-  readonly participation?: FungibleDecisionInputs['participation']
-  readonly enrollment?: string
   readonly readableFor?: StoredChoices['readableFor']
   /**
    * Declarative sections the decision's views carry instead of the
@@ -261,7 +259,6 @@ export function decisionArgsOf(row: FungibleDecisionRow): Parameters<typeof deci
     isExtSharedChannel: row.flag,
     channelIdPattern: CHANNEL_ID_RE,
     memberships: row.memberships ?? new Map([P_KEY, Q_KEY, R_KEY].map(key => [key, eligibleMembership(key)])),
-    participation: row.participation,
     ...channelDeliveryInputsOf(row),
   }
   return [row.event, persona, applied, inputs]
@@ -950,13 +947,15 @@ const currentAuthorityRows: FungibleDecisionRow[] = (['strict', 'open'] as const
   ]
 })
 
-/** Participation changes only dependent reply selection; the older matrices
- * retain ownership of exhaustive message-shape/sharing combinations. */
+/** Until Thread Memory, `thread_hybrid` selects like `mentions`: only an
+ * @mention or a `here`/`channel` Broadcast, never an unmentioned reply. The
+ * older matrices retain ownership of exhaustive message-shape/sharing
+ * combinations. */
 const threadRows: FungibleDecisionRow[] = (['strict', 'open'] as const).flatMap(mode => {
   const root = '1700000000.000100', ts = '1700000000.000101'
   const config = { ...FUNGIBLE_CAST, channel_mode: mode }
-  const reading = { key: P_KEY, channel: PUBLIC_CHANNEL, root, kind: 'followed' as const }
-  const base = { config, flag: false, participation: new Map([[P_KEY, reading]]) }
+  const guardedConfig = { ...config, personas: config.personas.map(p => p.key === Q_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) }
+  const base = { config, flag: false }
   const event = (extra: Record<string, unknown> = {}) => makeChannelMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, ...extra })
   const path = (value: DeliveryMode) => mode === 'open' ? { fungible: onPath('public', value) } : {}
   const selected = (via: Via, value: DeliveryMode = 'thread_hybrid'): DeliveryDecision => ({ action: 'deliver', via, ...path(value) })
@@ -965,33 +964,31 @@ const threadRows: FungibleDecisionRow[] = (['strict', 'open'] as const).flatMap(
     ...base, label: `${mode} thread: ${label}`, event: event(), stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'thread_hybrid' } }, ...extra, expected,
   })
   const values = (['off', 'mentions', 'all', 'thread_hybrid'] as const).flatMap(value => [
-    row(`${value} followed reply`, { stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } } }, value === 'all' ? selected('receive_all', value) : value === 'thread_hybrid' ? selected('thread') : dropped(value === 'off' ? 'channel-off' : 'not-mentioned', value)),
-    ...[false, true].map(reply => row(`${value} ${reply ? 'reply' : 'root'} labelled mention enrolls its parent`, {
+    row(`${value} unmentioned reply`, { stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } } }, value === 'all' ? selected('receive_all', value) : dropped(value === 'off' ? 'channel-off' : 'not-mentioned', value)),
+    ...[false, true].map(reply => row(`${value} ${reply ? 'reply' : 'root'} labelled mention before a broadcast`, {
       stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, event: event({ thread_ts: reply ? root : undefined, text: `${mentionText(P_USER, 'alpha')} ${broadcastText('here')}` }),
-      enrollment: value === 'off' ? undefined : reply ? root : ts,
     }, value === 'off' ? dropped('channel-off', value) : selected('mention', value))),
   ])
-  const unresolvedReading = (extra: Record<string, unknown>) => new Map([[P_KEY, { ...reading, ...extra }]]) as FungibleDecisionInputs['participation']
   return [...values,
-    row('known unfollowed', { participation: unresolvedReading({ kind: 'unfollowed' }) }, dropped('not-mentioned')),
-    ...[undefined, unresolvedReading({ kind: 'unresolved' }), unresolvedReading({ key: Q_KEY }), unresolvedReading({ channel: PRIVATE_CHANNEL }), unresolvedReading({ root: '1700000000.000999' })].map((participation, i) =>
-      row(`unresolved or foreign fact ${i}`, { participation }, { action: 'unresolved', reason: 'participation-unresolved' })),
     ...[undefined, '', null, 'bad', 1700000000, '1700000000.1', ts].map(parent => row(`root or malformed parent ${String(parent)}`, { event: event({ thread_ts: parent }) }, dropped('not-mentioned'))),
-    ...['here', 'channel'].map(kind => row(`${kind} retains broadcast precedence`, { event: event({ text: broadcastText(kind as 'here' | 'channel') }), participation: undefined }, selected('broadcast'))),
-    row('everyone does not enroll', { event: event({ text: broadcastText('everyone') }) }, selected('thread')),
-    row('group mention does not enroll', { event: event({ text: userGroupMentionText('S0GROUP') }) }, selected('thread')),
-    row('DM does not consult participation', { event: makeDm({ text: mentionText(P_USER), thread_ts: root }), participation: undefined }, deliver('dm')),
+    ...(['here', 'channel'] as const).map(kind => row(`${kind} reply keeps broadcast`, { event: event({ text: broadcastText(kind) }) }, selected('broadcast'))),
+    ...(['here', 'channel'] as const).map(kind => row(`${kind} root keeps broadcast`, { event: event({ thread_ts: undefined, text: broadcastText(kind) }) }, selected('broadcast'))),
+    row('everyone is not a broadcast', { event: event({ text: broadcastText('everyone') }) }, dropped('not-mentioned')),
+    row('user-group mention is not P\'s mention', { event: event({ text: userGroupMentionText('S0GROUP') }) }, dropped('not-mentioned')),
+    row('DM in a thread is decided by dm.enabled', { event: makeDm({ text: mentionText(P_USER), thread_ts: root }) }, deliver('dm')),
     row('own user is excluded', { event: event({ user: P_USER }) }, drop('own')),
     row('own bot is excluded', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: P_BOT }) }, drop('own')),
-    row('other bot remains eligible', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: Q_BOT }) }, selected('thread')),
-    row('unresolved membership wins over followed', { memberships: new Map([[P_KEY, { kind: 'unresolved', reason: 'current-membership-missing' }]]) }, { action: 'unresolved', reason: 'membership-unresolved' }),
-    row('absence wins over followed', { memberships: new Map([[P_KEY, { kind: 'ineligible', reason: 'absent' }]]) }, { action: 'drop', reason: 'channel-ineligible' }),
+    row('other persona\'s bot reply is not mentioned', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: Q_BOT }) }, dropped('not-mentioned')),
+    row('other persona\'s bot reply mentioning P', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: Q_BOT, text: P_MENTION }) }, selected('mention')),
+    row('unresolved membership wins over a mention', { event: event({ text: P_MENTION }), memberships: new Map([[P_KEY, { kind: 'unresolved', reason: 'current-membership-missing' }]]) }, { action: 'unresolved', reason: 'membership-unresolved' }),
+    row('absence wins over a mention', { event: event({ text: P_MENTION }), memberships: new Map([[P_KEY, { kind: 'ineligible', reason: 'absent' }]]) }, { action: 'drop', reason: 'channel-ineligible' }),
     row('all retains shared precedence', { stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' }, [Q_KEY]: { [PUBLIC_CHANNEL]: 'all' } } }, selected('receive_all_shared', 'all')),
-    row('loop guard changes effective value only in open mode', {
-      config: { ...config, personas: config.personas.map(p => p.key === Q_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) },
-    }, mode === 'open' ? dropped('not-mentioned', 'mentions') : selected('thread')),
-    row('malformed mention parent creates no enrollment', { event: event({ text: mentionText(P_USER), thread_ts: 'invalid-parent' }) }, selected('mention')),
-    row('missing mention timestamp creates no enrollment', { event: event({ text: mentionText(P_USER), thread_ts: undefined, ts: undefined }) }, selected('mention')),
+    row('loop guard changes effective value only in open mode', { config: guardedConfig },
+      mode === 'open' ? dropped('not-mentioned', 'mentions') : dropped('not-mentioned')),
+    row('loop guard keeps a mention', { config: guardedConfig, event: event({ text: P_MENTION }) },
+      mode === 'open' ? selected('mention', 'mentions') : selected('mention')),
+    row('mention with a malformed parent keeps mention', { event: event({ text: mentionText(P_USER), thread_ts: 'invalid-parent' }) }, selected('mention')),
+    row('mention with no timestamps keeps mention', { event: event({ text: mentionText(P_USER), thread_ts: undefined, ts: undefined }) }, selected('mention')),
   ]
 })
 

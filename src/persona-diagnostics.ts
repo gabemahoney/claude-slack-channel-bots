@@ -168,13 +168,7 @@ export const QUEUE_RECORD_UNREADABLE = 'queue-record-unreadable'
 export const QUEUE_UNWRITABLE = 'queue-unwritable'
 export const QUEUE_KEPT = 'queue-kept'
 export const SYSTEM_PROMPT_UNWRITABLE = 'system-prompt-unwritable'
-/** A confirmed own post whose thread participation is pending or could not be saved. */
-export const OWN_POST_NOT_ENROLLED = 'own-post-not-enrolled'
-/** A persona's token lacks a configured history scope, or Slack refused its root lookup method. */
-export const ROOT_LOOKUP_CAPABILITY_MISSING = 'root-lookup-capability-missing'
-/** Pending thread evidence recovery could not settle yet (or a gap), and its full recovery. */
-export const PARTICIPATION_RECOVERY = 'participation-recovery'
-export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, OWN_POST_NOT_ENROLLED, ROOT_LOOKUP_CAPABILITY_MISSING, PARTICIPATION_RECOVERY] as const
+export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
 export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 /** Explicit metadata allowlist: redaction alone is not message-body exclusion. */

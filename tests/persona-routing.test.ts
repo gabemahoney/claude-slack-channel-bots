@@ -11,7 +11,8 @@ import type { AcceptedRecord } from '../src/delivery-queue.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
-import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
+import type { ChannelMode } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { readQueue, seedQueue, slackInput, queuePath } from './test-helpers/delivery-queue.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
@@ -139,6 +140,46 @@ describe('fungible mode', () => {
     expect(h.queued('alpha')).toHaveLength(form === 'false' ? 1 : 0); expect(facts(h, 'beta')).toEqual([])
   })
 })
+describe('thread_hybrid selects only @mentions and Broadcasts', () => {
+  const CT = 'C0THREAD1', ROOT = '1700000000.000100'
+  function threadHarness(mode: ChannelMode) {
+    const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CT, delivery: 'thread_hybrid' }] }], dir, { mode, membership: observedMembership({ alpha: [CT] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
+    harnesses.push(h)
+    const alpha = h.p('alpha').persona
+    if (mode === 'open') h.channelDelivery!.set(alpha.key, CT, 'thread_hybrid', alpha)
+    return h
+  }
+  /** The persona's root @mention is delivered; returns the stub's Web API call count once its preparation settled. */
+  async function mentionedRoot(h: RoutingHarness): Promise<number> {
+    await h.receive(makeChannelMessage({ channel: CT, ts: ROOT, text: `${mentionText(h.p('alpha').stub.identity.botUserId)} root` }))
+    expect(facts(h, 'alpha')).toEqual([{ channel: CT, ts: ROOT, via: 'mention', text: expect.stringContaining('root') }])
+    return h.p('alpha').stub.callLog.length
+  }
+  test.each(['strict', 'open'] as const)('%s: an unmentioned reply under a mentioning root is dropped as not-mentioned, acknowledged once, with no store or Slack call', async mode => {
+    const h = threadHarness(mode)
+    const calls = await mentionedRoot(h)
+    await h.receive(makeChannelMessage({ channel: CT, ts: '1700000000.000101', thread_ts: ROOT, text: 'unmentioned reply' }))
+    expect(h.order.filter(s => s === 'ack')).toEqual(['ack', 'ack'])
+    expect(facts(h, 'alpha').map(f => f.ts)).toEqual([ROOT])
+    expect(readQueue(dir, h.p('alpha').persona.key).flatMap(r => r.kind === 'accepted' && 'ts' in r ? [r.ts] : [])).toEqual([ROOT])
+    expect(h.p('alpha').stub.callLog.slice(calls)).toEqual([])
+    expect(h.p('alpha').stub.calls.conversationsReplies).toEqual([])
+    expect(h.p('alpha').stub.calls.conversationsHistory).toEqual([])
+    expect(h.logs.filter(l => l.includes('not-mentioned'))).toHaveLength(1)
+  })
+  test.each([
+    ['strict', 'mention'], ['strict', 'broadcast'], ['open', 'mention'], ['open', 'broadcast'],
+  ] as const)('%s: a %s reply there is delivered with its via and acknowledged once', async (mode, via) => {
+    const h = threadHarness(mode)
+    await mentionedRoot(h)
+    const text = via === 'mention' ? `${mentionText(h.p('alpha').stub.identity.botUserId)} reply` : `${broadcastText('here')} reply`
+    await h.receive(makeChannelMessage({ channel: CT, ts: '1700000000.000102', thread_ts: ROOT, text }))
+    expect(h.order.filter(s => s === 'ack')).toEqual(['ack', 'ack'])
+    expect(h.queued('alpha').map(i => ({ ts: i.accepted.ts, thread_ts: i.accepted.thread_ts, via: i.accepted.via }))).toEqual([
+      { ts: ROOT, thread_ts: undefined, via: 'mention' }, { ts: '1700000000.000102', thread_ts: ROOT, via },
+    ])
+  })
+})
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {
   const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
   let failing = true; const order: string[] = []
@@ -166,7 +207,7 @@ test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack
   try {
     expect(queue.items('alpha')[0]!.delivered).toBe(false)
     await routing.receive(event, () => { calls.push('ack') }, 'alpha')
-    expect(calls).toEqual(['ack', 'received'])
+    expect(calls).toEqual(['ack'])
     expect(queue.items('alpha')).toHaveLength(1)
     expect(queue.items('alpha')[0]!.fixed!.parts).toEqual(['preexisting fixed bytes'])
     expect(readQueue(dir)).toEqual(before)

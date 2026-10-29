@@ -2,9 +2,8 @@
  * thread-memory.ts — Thread Memory's home. For now it holds the bounded,
  * revocable metadata call its lookups use, and their retry spacing.
  *
- * Every metadata attempt (`conversations.replies`, `files.info`,
- * `conversations.info`), and every granted-scope `auth.test` re-read, runs
- * under one end-to-end deadline (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`). Its
+ * Every lookup attempt (`conversations.replies`, `conversations.history`)
+ * runs under one end-to-end deadline (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`). Its
  * abort signal reaches the queued and in-flight HTTP work through the
  * connection manager's metadata client (`metadataWebClientOptions`: no SDK
  * retries, rate limits rejected, request interceptor bound to the signal, and
@@ -22,8 +21,7 @@
  * Failures are classified apart: an expired deadline, a transient failure
  * of the dependency (with any Retry-After), a request Slack rejected for a
  * reason specific to it, a missing capability, refused credentials, lost
- * access, a not-found answer, an unavailable file (`files.info`'s denials of
- * one file), malformed data and cancellation. None of them
+ * access, a not-found answer, malformed data and cancellation. None of them
  * is a deleted root, a negative authorship or a recovery; deciding that is the
  * callers' job, from a successful response only.
  *
@@ -34,18 +32,18 @@ import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_ME
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { SLACK_ERROR_CODE_RE, WEB_API_AUTH_FAILURE_ERRORS, slackRetryAfterSeconds } from './persona-slack-validation.ts'
 
-/** The metadata methods enrollment may call; nothing else. */
-export const ENROLLMENT_METADATA_METHODS = ['conversations.replies', 'conversations.info', 'files.info'] as const
-export type EnrollmentMetadataMethod = typeof ENROLLMENT_METADATA_METHODS[number]
+/** The metadata methods Thread Memory's lookups may call; nothing else. */
+export const THREAD_MEMORY_LOOKUP_METHODS = ['conversations.replies', 'conversations.history'] as const
+export type ThreadMemoryLookupMethod = typeof THREAD_MEMORY_LOOKUP_METHODS[number]
 
-export const METADATA_DEADLINE_CODE = 'participation-metadata-deadline'
+export const METADATA_DEADLINE_CODE = 'thread-memory-lookup-deadline'
 
 export class MetadataDeadlineError extends Error {
   readonly code = METADATA_DEADLINE_CODE
-  constructor() { super('Enrollment metadata request deadline expired.') }
+  constructor() { super('Thread Memory lookup request deadline expired.') }
 }
 export class MetadataCancelledError extends Error {
-  constructor() { super('Enrollment metadata request was superseded or cancelled.') }
+  constructor() { super('Thread Memory lookup request was superseded or cancelled.') }
 }
 
 /** Slack errors that mean the token lacks the method, scope or permission. */
@@ -53,16 +51,10 @@ export const METADATA_CAPABILITY_ERRORS: ReadonlySet<string> = new Set([
   'missing_scope', 'not_allowed_token_type', 'no_permission', 'access_denied', 'method_deprecated',
   'ekm_access_denied', 'team_access_not_granted', 'not_authorized', 'restricted_action',
 ])
-/**
- * For `files.info`, Slack errors that deny only this file (a private or
- * restricted file): unavailable file evidence that stays pending, not a
- * missing capability of the token.
- */
-export const FILE_UNAVAILABLE_ERRORS: ReadonlySet<string> = new Set(['access_denied', 'no_permission', 'not_authorized'])
 /** Slack errors that mean the persona cannot see the conversation any more. */
 export const METADATA_ACCESS_ERRORS: ReadonlySet<string> = new Set(['channel_not_found', 'not_in_channel', 'is_archived'])
-/** Slack errors that mean the named message or file does not exist (or no longer does). */
-export const METADATA_NOT_FOUND_ERRORS: ReadonlySet<string> = new Set(['thread_not_found', 'message_not_found', 'file_not_found', 'file_deleted'])
+/** Slack errors that mean the named message or thread does not exist (or no longer does). */
+export const METADATA_NOT_FOUND_ERRORS: ReadonlySet<string> = new Set(['thread_not_found', 'message_not_found'])
 /** Slack errors that mean Slack itself is failing or limiting: the dependency is down, not this item. */
 const TRANSIENT_ERRORS: ReadonlySet<string> = new Set(['internal_error', 'fatal_error', 'service_unavailable', 'request_timeout', 'ratelimited'])
 
@@ -78,8 +70,6 @@ export type MetadataFailure =
   | { kind: 'credentials'; slackError: string }
   | { kind: 'access-lost'; slackError: string }
   | { kind: 'not-found'; slackError: string }
-  /** `files.info` only: the file itself is not shown to the persona. */
-  | { kind: 'file-unavailable'; slackError: string }
   | { kind: 'malformed' }
 export type MetadataResult = { kind: 'ok'; value: unknown } | MetadataFailure
 
@@ -87,13 +77,13 @@ const read = (value: unknown, key: string): unknown =>
   typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[key] : undefined
 
 /**
- * Classify a value a metadata attempt of `method` rejected with. Copies only
- * a safe Slack error code and Retry-After. Only a server, rate-limit or
- * transport failure is `transient`; an unrecognised Slack error or an HTTP
- * 4xx is `rejected`, specific to that request. Either leaves the evidence
+ * Classify a value a metadata attempt rejected with. Copies only a safe
+ * Slack error code and Retry-After. Only a server, rate-limit or transport
+ * failure is `transient`; an unrecognised Slack error or an HTTP 4xx is
+ * `rejected`, specific to that request. Either leaves the evidence
  * unresolved and retried. Never throws.
  */
-export function classifyMetadataFailure(error: unknown, method?: EnrollmentMetadataMethod): MetadataFailure {
+export function classifyMetadataFailure(error: unknown): MetadataFailure {
   if (error instanceof MetadataCancelledError) return { kind: 'cancelled' }
   const code = read(error, 'code')
   if (code === METADATA_DEADLINE_CODE) return { kind: 'deadline' }
@@ -101,7 +91,6 @@ export function classifyMetadataFailure(error: unknown, method?: EnrollmentMetad
     const slackError = read(read(error, 'data'), 'error')
     if (typeof slackError !== 'string' || !SLACK_ERROR_CODE_RE.test(slackError)) return { kind: 'malformed' }
     if (WEB_API_AUTH_FAILURE_ERRORS.has(slackError)) return { kind: 'credentials', slackError }
-    if (method === 'files.info' && FILE_UNAVAILABLE_ERRORS.has(slackError)) return { kind: 'file-unavailable', slackError }
     if (METADATA_CAPABILITY_ERRORS.has(slackError)) return { kind: 'capability', slackError }
     if (METADATA_ACCESS_ERRORS.has(slackError)) return { kind: 'access-lost', slackError }
     if (METADATA_NOT_FOUND_ERRORS.has(slackError)) return { kind: 'not-found', slackError }
@@ -168,9 +157,9 @@ export interface MetadataAttempts {
    * Run one bounded attempt owned by persona `key`. `current` is the
    * caller's guard (connection, lifetime, observation still the same); a
    * result after it turns false, after `revoke(key)` or after `stop()` is
-   * `cancelled`. `method` selects its failure classification. Never rejects.
+   * `cancelled`. Never rejects.
    */
-  run(key: string, current: () => boolean, operation: (signal: AbortSignal) => Promise<unknown>, method?: EnrollmentMetadataMethod): Promise<MetadataResult>
+  run(key: string, current: () => boolean, operation: (signal: AbortSignal) => Promise<unknown>): Promise<MetadataResult>
   /** Abort and invalidate every attempt of `key` (its connection, identity or lifetime changed). */
   revoke(key: string): void
   /** Number of attempts in flight for `key`, for tests and bounded scheduling. */
@@ -183,7 +172,7 @@ export function createMetadataAttempts(clock: PersonaConnectionClock, timeoutMs 
   const owned = new Map<string, Set<AbortController>>()
   let stopped = false
   return {
-    async run(key, current, operation, method) {
+    async run(key, current, operation) {
       if (stopped || !current()) return { kind: 'cancelled' }
       const controller = new AbortController()
       let mine = owned.get(key)
@@ -193,7 +182,7 @@ export function createMetadataAttempts(clock: PersonaConnectionClock, timeoutMs 
         const value = await boundedMetadataCall(clock, controller.signal, operation, timeoutMs)
         return stopped || controller.signal.aborted || !current() ? { kind: 'cancelled' } : { kind: 'ok', value }
       } catch (error) {
-        return stopped || controller.signal.aborted || !current() ? { kind: 'cancelled' } : classifyMetadataFailure(error, method)
+        return stopped || controller.signal.aborted || !current() ? { kind: 'cancelled' } : classifyMetadataFailure(error)
       } finally {
         mine.delete(controller)
         if (!mine.size && owned.get(key) === mine) owned.delete(key)

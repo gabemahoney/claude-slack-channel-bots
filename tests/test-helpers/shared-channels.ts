@@ -1,11 +1,13 @@
 /** Shared-authority fixtures: production schema, serializer and durable writer only. */
+import { expect } from 'bun:test'
 import { existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { resolve, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { parsePersonaConfigBytes, type PersonaConfigInput } from '../../src/config.ts'
 import {
   createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState,
-  serializeSharedChannelState, type SharedChannelDeps, type SharedChannelState,
+  serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelDeps, type SharedChannelLifetime, type SharedChannelState,
 } from '../../src/shared-channels.ts'
 import { isRealHome, isUnder, osTempDir } from './host-safe-env.ts'
 import { makePersonaConfigInput } from './persona-config.ts'
@@ -103,6 +105,22 @@ export function makeSharedAuthority(stateDir: string, input = makePersonaConfigI
   const state = initialSharedState(stateDir, input, threadHybridSince)
   writeSharedState(stateDir, state)
   return createSharedChannelAuthority(sharedChannelPath(stateDir), state, { ...deps, threadHybridSince })
+}
+
+/** What the lifetime checks read of an authority. */
+type LifetimeReader = Pick<SharedChannelAuthority, 'readableFor' | 'lifetime'>
+/** `token` is still its channel's lifetime on a readable authority. */
+export function holdsLifetime(authority: LifetimeReader, token: SharedChannelLifetime): boolean {
+  return authority.readableFor(token.key, token.channel) && isDeepStrictEqual(authority.lifetime(token.key, token.channel), token)
+}
+/** The authority is readable for `token`'s channel and `token` is its current lifetime. */
+export function expectCurrent(authority: LifetimeReader, token: SharedChannelLifetime): void {
+  expect([authority.readableFor(token.key, token.channel), authority.lifetime(token.key, token.channel)]).toEqual([true, token])
+}
+/** The authority is readable for `token`'s channel and a durable change has replaced its lifetime. */
+export function expectSuperseded(authority: LifetimeReader, token: SharedChannelLifetime): void {
+  expect(authority.readableFor(token.key, token.channel)).toBe(true)
+  expect(authority.lifetime(token.key, token.channel)).not.toEqual(token)
 }
 
 /** A production-format state with a Thread Memory created marker for each of

@@ -10,7 +10,6 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
-import { rootLookupObservationId, type ThreadObservation } from '../src/thread-participation.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
@@ -603,7 +602,6 @@ test.each(['EIO', 'EACCES'].flatMap(code => ['accept', 'compact'].map(operation 
     return (fs.readFileSync as Function)(path, ...args)
   } } as typeof fs
   const q = await open({ fs: seam })
-  if (operation === 'compact') expect([q.threadReadable('alpha'), q.threadRepairable!('alpha')]).toEqual([false, true])
   expect(q.items('alpha')).toEqual([])
   expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
   if (operation === 'accept') expect((await q.accept('alpha', injectedInput())).status).toBe('failed')
@@ -611,10 +609,7 @@ test.each(['EIO', 'EACCES'].flatMap(code => ['accept', 'compact'].map(operation 
   expect(q.items('alpha')).toEqual([])
   fail = false
   if (operation === 'accept') expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 2 })
-  else {
-    await q.compact('alpha')
-    expect([q.threadReadable('alpha'), q.threadRepairable!('alpha')]).toEqual([true, false])
-  }
+  else await q.compact('alpha')
   expect(q.items('alpha').map(i => i.accepted.seq)).toEqual(operation === 'accept' ? [1, 2] : [1])
   expect(q.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
 })
@@ -687,61 +682,62 @@ test('maintenance compacts at the exported interval once and stop cancels its ti
   await q.stop(); expect(clock.pendingCount()).toBe(0)
 })
 
-describe('a pending root lookup is rewritten only to re-issue it for a new identity', () => {
-  const lifetime = { key: 'alpha', channel: 'C0ALPHA01', incarnation: 'life-1', resetOrder: 1, membershipBoundary: 0, leaveBoundary: 0 }
-  const ROOT = '1700000000.000100'
-  const old = { botUserId: 'U0OLDBOT1', botId: 'B0OLDBOT1' }, next = { botUserId: 'U0NEWBOT1', botId: 'B0NEWBOT1' }
-  const pending = (): ThreadObservation => ({ id: rootLookupObservationId(lifetime, ROOT), lifetime, root: ROOT, observedAt: 1000,
-    policy: { mode: 'strict', delivery: 'thread_hybrid' }, lookup: { issuer: old, requestedAt: 1000 } })
-  const reissue = (o: ThreadObservation): ThreadObservation => ({ ...o, lookup: { issuer: next, requestedAt: 2000 } })
-  async function recorded() {
-    const q = await open()
-    await q.recordThreadObservation('alpha', pending())
-    return { q, written: readQueue(dir).length }
-  }
+describe('the journal holds only the record kinds and fields main reads', () => {
+  const KINDS = ['accepted', 'fixed', 'sent', 'delivered', 'refused', 'noticed', 'reply-reminder']
+  const rawLines = () => fs.readFileSync(queuePath(dir), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
 
-  test.each<[string, (o: ThreadObservation) => ThreadObservation]>([
-    ['its observation time', o => ({ ...o, observedAt: 1500 })],
-    ['its recorded policy', o => ({ ...o, policy: { mode: 'open', delivery: 'all' } })],
-    ['its root', o => ({ ...o, root: '1700000000.000200' })],
-    ['its lifetime', o => ({ ...o, lifetime: { ...lifetime, incarnation: 'life-2' } })],
-  ])('a re-issue that also changes %s is ignored: nothing is written', async (_name, change) => {
-    const { q, written } = await recorded()
-    await q.recordThreadObservation('alpha', reissue(change(pending())))
-    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([pending(), written])
-  })
-
-  test('a re-issue that adds a post is refused as invalid evidence and changes nothing', async () => {
-    const { q, written } = await recorded()
-    const post: NonNullable<ThreadObservation['post']> = { surface: 'text', operation: 'op-1', part: 1, issuer: old, missing: [] }
-    await expect(q.recordThreadObservation('alpha', { ...reissue(pending()), post })).rejects.toThrow('Invalid thread observation')
-    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([pending(), written])
-  })
-
-  test('a pure re-issue for a new identity is written and replays; the same identity with a new request time writes nothing; a settled lookup is never re-issued', async () => {
-    const { q, written } = await recorded()
-    await q.recordThreadObservation('alpha', { ...pending(), lookup: { issuer: old, requestedAt: 2000 } })
-    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([pending(), written])
-    await q.recordThreadObservation('alpha', reissue(pending()))
-    expect([q.threadRecord('alpha', pending().id)?.observation, readQueue(dir).length]).toEqual([reissue(pending()), written + 1])
+  test('compaction writes a delivered key record with exactly v, kind, seq, compact, key, received_at and delivered_at, an allocation record with exactly v, kind, seq, compact and injected_ts, and only records isQueueRecord accepts; an open via thread item replays whole', async () => {
+    const clock = createFakeClock({ start: 1000 })
+    const q = await open({ now: clock.now })
+    const threaded = slackInput({ via: 'thread', thread_ts: '1700000000.000000' })
+    await q.accept('alpha', threaded)
+    await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['delivered'] })
+    await q.append('alpha', sentRecord())
+    await q.append('alpha', deliveredRecord())
+    const openThreaded = slackInput({ ts: '1700000000.000002', key: { chat_id: 'C0TEST001', ts: '1700000000.000002' }, via: 'thread', thread_ts: '1700000000.000000' })
+    await q.accept('alpha', openThreaded)
+    await q.accept('alpha', injectedInput())
+    await q.compact('alpha')
+    const lines = rawLines()
+    const keys = lines.filter(r => r.compact === 'key')
+    expect(keys.map(r => Object.keys(r).sort())).toEqual([['compact', 'delivered_at', 'key', 'kind', 'received_at', 'seq', 'v']])
+    expect(keys[0]).toEqual({ v: 1, kind: 'accepted', seq: 1, compact: 'key', key: threaded.key, received_at: 1000, delivered_at: 1000 })
+    expect(lines.filter(r => r.compact === 'allocation').map(r => Object.keys(r).sort())).toEqual([['compact', 'injected_ts', 'kind', 'seq', 'v']])
+    expect(lines.map(r => r.kind)).toEqual(['accepted', 'accepted', 'accepted', 'reply-reminder', 'accepted'])
+    for (const r of lines) {
+      expect(KINDS).toContain(String(r.kind))
+      expect(isQueueRecord(r)).toBe(true)
+    }
     await q.stop()
-    const replay = await open()
-    expect(replay.threadRecord('alpha', pending().id)).toMatchObject({ state: 'observed', observation: reissue(pending()) })
-    await replay.recordThreadObservation('alpha', reissue(pending()), 'enrolled')
-    await replay.recordThreadObservation('alpha', pending())
-    expect(replay.threadRecord('alpha', pending().id)).toMatchObject({ state: 'enrolled', observation: reissue(pending()) })
+    const replay = await open({ now: clock.now })
+    expect(replay.lookupSlackKey('alpha', threaded.key!)).toEqual({ status: 'duplicate', seq: 1 })
+    expect(replay.items('alpha').map(i => i.accepted.seq)).toEqual([2, 3])
+    expect(replay.items('alpha')[0]!.accepted).toMatchObject({ via: 'thread', thread_ts: '1700000000.000000', key: openThreaded.key })
   })
-})
 
-describe('only a storage fault makes a journal repairable by idle recovery', () => {
-  // Rows: a read that creates the persona's in-memory journal without loading it.
-  test.each<[string, (q: DeliveryQueue) => unknown]>([
-    ['items', q => q.items('alpha')],
-    ['threadReadable', q => q.threadReadable('alpha')],
-  ])('a journal with no file, merely read by %s, is healthy: not repairable', async (_name, read) => {
-    const q = await open()
-    read(q)
-    expect(q.threadRepairable!('alpha')).toBe(false)
+  test('participation lines from an unreleased build are quarantined as unknown records and never replayed', async () => {
+    // The shapes an unreleased build wrote; this build has no reader for them.
+    const participation = JSON.stringify({ v: 1, kind: 'thread-participation', seq: 0, state: 'enrolled', observation: { id: 'obs-1', root: '1700000000.000100' } }) + '\n'
+    const gap = JSON.stringify({ v: 1, kind: 'thread-gap', seq: 0 }) + '\n'
+    const enrolledKey = { chat_id: 'C0TEST001', ts: '1700000000.000002' }
+    const keyWithEnrollment = JSON.stringify({ v: 1, kind: 'accepted', seq: 2, compact: 'key', key: enrolledKey, received_at: 1000, delivered_at: 1000, thread_enrollment: { id: 'obs-2', slackKey: enrolledKey } }) + '\n'
+    for (const line of [participation, gap, keyWithEnrollment]) expect(parseQueueRecord(line.trimEnd())).toBeUndefined()
+    seedQueue(dir, [accepted(), participation, gap, keyWithEnrollment, { ...accepted(), seq: 3, source: 'interject', sender: 'interject', key: undefined, channel: undefined, via: undefined }])
+    const events: QueueEvent[] = []
+    const q = await open({ onEvent: e => events.push(e) })
+    const unreadable = events.filter((e): e is Extract<QueueEvent, { type: 'record-unreadable' }> => e.type === 'record-unreadable')
+    expect(unreadable.map(e => [e.line, e.alert])).toEqual([[2, true], [3, true], [4, true]])
+    expect(fs.readFileSync(unreadable[0]!.quarantinePath, 'utf8')).toBe(participation + gap + keyWithEnrollment)
+    expect(q.items('alpha').map(i => i.accepted.seq)).toEqual([1, 3])
+    expect(q.lookupSlackKey('alpha', enrolledKey)).toBeUndefined()
+    expect(rawLines().every(r => KINDS.includes(String(r.kind)) && !('thread_enrollment' in r))).toBe(true)
+    await q.stop()
+    const replayEvents: QueueEvent[] = []
+    const replay = await open({ onEvent: e => replayEvents.push(e) })
+    expect(replayEvents.filter(e => e.type === 'record-unreadable')).toEqual([])
+    expect(replay.items('alpha').map(i => i.accepted.seq)).toEqual([1, 3])
+    expect(replay.lookupSlackKey('alpha', enrolledKey)).toBeUndefined()
+    expect(await replay.accept('alpha', slackInput({ ts: enrolledKey.ts, key: enrolledKey }))).toMatchObject({ status: 'accepted', seq: 4 })
   })
 })
 

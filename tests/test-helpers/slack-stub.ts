@@ -6,7 +6,7 @@
  *   `chat.postMessage`, `chat.update`, `reactions.add`/`remove`,
  *   `conversations.open`, `auth.test`, `users.info`, `filesUploadV2`,
  *   `conversations.history`, `conversations.replies`,
- *   `conversations.info`, `files.info` and `files.completeUploadExternal`. An
+ *   `conversations.info` and `files.completeUploadExternal`. An
  *   unscripted `filesUploadV2` completes each of its upload groups through
  *   `this.files.completeUploadExternal` on the client itself and settles after
  *   all of them, as the SDK does. Each client carries the bot token it was built
@@ -22,7 +22,7 @@
  * carry the same envelope;
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
  *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
- *   `conversations.replies`, `conversations.info`, `files.info`, `conversations.open`,
+ *   `conversations.replies`, `conversations.info`, `conversations.open`,
  *   `reactions.add`, `reactions.remove`, `users.info` and `apiCall`
  *   (`script`), falling back to success when exhausted; a Web API call
  *   scripted with a deferred outcome (`makeDeferredWebApiCall`) answers only
@@ -311,8 +311,6 @@ export interface StubSlackScript {
   replies: WebApiOutcome[]
   /** `conversations.info`; an `ok` `result` can set `channel`. */
   info: WebApiOutcome[]
-  /** `files.info`; an `ok` `result` can set `file`. */
-  filesInfo: WebApiOutcome[]
   /**
    * `conversations.open`; an `ok` `result` can set `channel` (see `openedDm`).
    * Unscripted, a call succeeds with `stubOpenedDmId(users)`. Starts empty
@@ -350,8 +348,6 @@ export interface StubSlackOptions {
   replies?: readonly WebApiOutcome[]
   /** Initial `conversations.info` outcomes. */
   info?: readonly WebApiOutcome[]
-  /** Initial `files.info` outcomes. */
-  filesInfo?: readonly WebApiOutcome[]
   /** Initial `reactions.add` outcomes. */
   reactionsAdd?: readonly WebApiOutcome[]
   /** Initial `reactions.remove` outcomes. */
@@ -413,7 +409,6 @@ export type StubWebMethod =
   | 'conversations.history'
   | 'conversations.replies'
   | 'conversations.info'
-  | 'files.info'
   | 'users.info'
   | 'filesUploadV2'
   /** `apiCall(method, options)`: logged with `args` `{ method, options }`. */
@@ -452,7 +447,7 @@ export interface StubWebClient {
     info: WebClient['conversations']['info']
   }
   /** `completeUploadExternal` is the SDK's inner call of `filesUploadV2`: captured, but not in `callLog`. */
-  files: { info: WebClient['files']['info']; completeUploadExternal: WebClient['files']['completeUploadExternal'] }
+  files: { completeUploadExternal: WebClient['files']['completeUploadExternal'] }
   bots?: { info: WebClient['bots']['info'] }
   users: { info: WebClient['users']['info']; conversations: WebClient['users']['conversations'] }
   /** As on the real `WebClient`, a prototype method that needs the client as `this` (a detached call throws). */
@@ -585,7 +580,6 @@ export interface StubSlackCalls {
   conversationsHistory: Parameters<WebClient['conversations']['history']>[0][]
   conversationsReplies: Parameters<WebClient['conversations']['replies']>[0][]
   conversationsInfo: Parameters<WebClient['conversations']['info']>[0][]
-  filesInfo: Parameters<WebClient['files']['info']>[0][]
   completeUploadExternal: Parameters<WebClient['files']['completeUploadExternal']>[0][]
   /** `apiCall` calls: the method named and the options passed. */
   apiCall: StubApiCall[]
@@ -882,7 +876,6 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     history: [...(opts.history ?? [])],
     replies: [...(opts.replies ?? [])],
     info: [...(opts.info ?? [])],
-    filesInfo: [...(opts.filesInfo ?? [])],
     open: [],
     reactionsAdd: [...(opts.reactionsAdd ?? [])],
     reactionsRemove: [...(opts.reactionsRemove ?? [])],
@@ -903,7 +896,6 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     conversationsHistory: [],
     conversationsReplies: [],
     conversationsInfo: [],
-    filesInfo: [],
     completeUploadExternal: [],
     apiCall: [],
   }
@@ -1075,14 +1067,6 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         },
       },
       files: {
-        info: (args) => {
-          record('files.info', args)
-          calls.filesInfo.push(args)
-          // Unscripted: the file with no shares yet.
-          return runWebApiCall(script.filesInfo.shift(), ctx('files.info'), (overrides) =>
-            mergeDroppingUndefined({ ok: true, file: { id: args.file, shares: {} } }, overrides),
-          )
-        },
         completeUploadExternal: (args) => {
           calls.completeUploadExternal.push(args)
           // Unscripted: the group's files, with no shares yet.

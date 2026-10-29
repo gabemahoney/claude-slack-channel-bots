@@ -13,7 +13,7 @@ import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
 import { errnoSuffix } from '../src/persona-credentials.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { activationRecord, applicationState, channelPopulation, configBytes } from './test-helpers/shared-channels.ts'
+import { activationRecord, applicationState, channelPopulation, configBytes, expectCurrent, expectSuperseded, holdsLifetime } from './test-helpers/shared-channels.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
 import { cannedGetResult, stubCallCount } from './test-helpers/agent-director-stub.ts'
@@ -1220,12 +1220,11 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
   const send = (type: string, id: string, offset: number) => run.stub('alpha').socket.deliver({ type, channel,
     user: run.stub('alpha').identity.botUserId, event_ts: ((origin + offset) / 1000).toFixed(3) }, { event_id: id })
   const old = authority.lifetime('alpha', channel)!, unaffected = authority.lifetime('alpha', sibling)!
-  expect(authority.lifetimeStatus(old)).toBe('current')
+  expectCurrent(authority, old)
   // A delayed consumer uses the real durable token, and rechecks AFTER await.
-  // It owns no pretend participation store or completion protocol.
   let release!: () => void
   const wait = new Promise<void>(resolve => { release = resolve })
-  const delayed = (async () => { await wait; return authority.lifetimeStatus(old) === 'current' })()
+  const delayed = (async () => { await wait; return holdsLifetime(authority, old) })()
   try {
     await send('member_joined_channel', 'EvCONTRADICTORY', 10)
     await send('channel_left', 'EvCONTRADICTORY', 10)
@@ -1241,8 +1240,10 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
     if (fault !== 'none') {
       expect(run.stub('alpha').socket.acks).toHaveLength(acks)
       expect(run.membership.read('alpha', channel, mode).kind).toBe('unresolved')
-      expect(authority.lifetimeStatus(unaffected)).toBe('current')
-      expect(authority.lifetimeStatus(old)).toBe(fault === 'installed-unsynced' ? 'unresolved' : 'current')
+      expectCurrent(authority, unaffected)
+      // An unsynced removal leaves the channel unreadable, so its old lifetime is not current.
+      if (fault === 'installed-unsynced') expect(authority.readableFor('alpha', channel)).toBe(false)
+      else expectCurrent(authority, old)
       // The removal's own write carries the cleared field: the disk keeps the
       // old entry with its Thread Hybrid Since, or has neither.
       const onDisk = disk().personas.alpha!.assignments
@@ -1257,12 +1258,12 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
     expect(authority.choice('alpha', channel)).toBeUndefined()
     expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'decided', incarnation })
     expect(disk().personas.alpha!.assignments[channel]).toBeUndefined()
-    expect(authority.lifetimeStatus(old)).toBe('superseded'); expect(authority.isCurrentLifetime(old)).toBe(false)
-    expect(authority.lifetimeStatus(unaffected)).toBe('current')
+    expectSuperseded(authority, old)
+    expectCurrent(authority, unaffected)
     expect(authority.snapshot().personas.alpha!.membershipEvidence![conflict.event]!.state).toBe('superseded')
     const removed = authority.lifetime('alpha', channel)!
     await run.stop(); run = await start(opts); authority = run.controller.sharedChannels()!
-    expect(authority.lifetimeStatus(old)).toBe('superseded'); expect(authority.lifetimeStatus(removed)).toBe('current')
+    expectSuperseded(authority, old); expectCurrent(authority, removed)
     expect(run.membership.read('alpha', channel, mode).kind).toBe('unresolved')
     await send('channel_left', 'EvCONTRADICTORY', 10)
     expect(run.membership.hasUnresolved('alpha', channel)).toBe(false)
@@ -1270,9 +1271,9 @@ test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename
     const fresh = authority.lifetime('alpha', channel)!
     expect(authority.choice('alpha', channel)).toBe(mode === 'open' ? 'mentions' : 'off')
     expect(disk().personas.alpha!.assignments[channel]).not.toHaveProperty('threadHybridSince')
-    expect(authority.lifetimeStatus(removed)).toBe('superseded')
+    expectSuperseded(authority, removed)
     release(); expect(await delayed).toBe(false)
-    expect(authority.lifetimeStatus(fresh)).toBe('current')
+    expectCurrent(authority, fresh)
     for (const [id, offset] of [['EvCONTRADICTORY', 10], ['EvPROVENLATER', 20]] as const) await send('channel_left', id, offset)
     expect(authority.lifetime('alpha', channel)).toEqual(fresh)
     expect(authority.choice('alpha', channel)).toBe(mode === 'open' ? 'mentions' : 'off')

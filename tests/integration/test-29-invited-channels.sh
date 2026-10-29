@@ -44,17 +44,6 @@
 #   shared, missing and non-boolean flags, a group DM, alpha's own fungible
 #   destination, then set_channel_delivery: stored, refused, held by the loop
 #   guard, and shared delivery, exactly once to each persona.
-# - R, thread evidence on alpha's thread_hybrid T1 (fungible mode): an
-#   incoming mention's thread (R0); alpha's own root post, no root lookup
-#   (R1); an upload's root from files.info for its actual file ID, then
-#   recovered (R2); a held reply released by a root lookup through a refused
-#   method (the capability line; tried again only after its re-check window)
-#   and an HTTP 429, acked once and only after
-#   the lookup's answer (R3); a deleted root, a gap line and no delivery or
-#   ack (R4); a foreign root's reply dropped, acked after its lookup (R5);
-#   no post or upload repeated. The stub's control switches alpha's file
-#   shares and metadata faults per step; alpha's auth.test reports its
-#   history scopes.
 # - Restart: a plain stop (the bots keep running) and a live start;
 #   shared choices, identities and reviewed bytes survive fresh discovery;
 #   the reconnect's new MCP clients
@@ -77,10 +66,8 @@
 # on the same connection, never after a quiet period. Every push has its own
 # `ts`, but the two events of one mention and the one message pushed to both
 # personas.
-# Runtime: about 5 min (284 s in the passing /ci run after Phase R),
-# dominated by R3's Retry-After window and the 60 s backoff after R4. It is
-# re-measured at the Epic /ci gate after Task 8k, and this header and
-# tests/ci-durations.tsv are refreshed from that run's duration-table block.
+# Measured runtime: 87 s on the cscb-ci image (the PASS line's elapsed time);
+# the target is under about 4 minutes.
 #
 # Texts. Every text src/ exports comes from fixtures/fmk-texts.ts (the one
 # value printer), run in this shell. Texts src/ does not export are fragments,
@@ -107,10 +94,6 @@ TICK_WAIT_S=20      # an edit showing up in config.json.pending (the 5 s reload 
 APPLY_WAIT_S=20     # a confirmation applied (the 5 s reload tick)
 EVENT_WAIT_S=15     # a pushed event's decision line or delivery
 RECORD_WAIT_S=10    # a line reaching the stub's record
-RECOVERY_WAIT_S=120 # participation recovery's retries: 5 to 60 s apart (src/thread-memory.ts metadataRetryDelay); R3 derives its own (R3_WAIT_S)
-# R4's share-less upload keeps every later pass failed, so R5-R7 and the
-# restart lookups wait at the 60 s cap, which is why RECOVERY_WAIT_S keeps its
-# margin over one repair bound (2 x DEADLINE + RETRY_MAX, checked in phase R).
 
 # --- Prerequisites ---------------------------------------------------------
 for tool in bun tmux agent-director jq sha256sum realpath python3 cmp; do
@@ -162,7 +145,6 @@ B1="C0${CH_TAG}B1"          # bravo: listed `mentions`
 F1="C0${CH_TAG}F1"          # public, discovered off in strict; explicitly mentions in open
 F2="G0${CH_TAG}F2"          # private (`group`), discovered off; bravo explicitly mentions in open
 U1="C0${CH_TAG}U1"          # public, discovered off; explicitly shared all after phase A
-T1="C0${CH_TAG}T1"          # alpha: public, discovered off; explicitly thread_hybrid in open (phase R)
 U0="C0${CH_TAG}U0"          # genuinely unlisted: neither inventory nor configuration
 X1="C0${CH_TAG}X1"          # externally shared (flag true)
 X2="C0${CH_TAG}X2"          # no flag
@@ -175,7 +157,7 @@ BRAVO_BOT_USER="U0${CH_TAG}BRAVO"
 BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
 HUMAN="U0${CH_TAG}HUMAN"    # every event's author
 CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
-for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${T1}" "${U0}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
+for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${U0}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
     "${ALPHA_BOT_USER}" "${BRAVO_BOT_USER}" "${HUMAN}" "${CONTACT}"; do
     [[ "${id}" =~ ^[A-Z0-9]{1,24}$ ]] || fail "ID ${id} is not 1 to 24 characters from A-Z0-9"
 done
@@ -240,24 +222,6 @@ VIA_MENTION='mention'
 VIA_BROADCAST='broadcast'
 VIA_RECEIVE_ALL='receive_all'
 VIA_RECEIVE_ALL_SHARED='receive_all_shared'
-VIA_THREAD='thread'
-# src/registry.ts ListTools: the MCP tool a persona posts with.
-REPLY_TOOL='reply'
-# Phase R's thread-evidence lines come whole from the printer
-# (src/delivery-notices.ts builders, below). The recovery causes and
-# capability kinds passed to it are src/participation-recovery.ts
-# PARTICIPATION_RECOVERY_CAUSES and src/participation-channel-evidence.ts
-# RootLookupCapabilityGap words; the printer fails a cause it names no action for.
-CAUSE_ROOT_DELETED='root-deleted'
-CAUSE_METADATA='metadata'
-GAP_METHOD_REFUSED='method-refused'
-# src/thread-memory.ts MetadataFailure kind: an attempt's expired deadline.
-FAILURE_DEADLINE='deadline'
-# fixtures/slack-stub-server.ts: the method a root lookup calls, the Slack
-# error its `capability` fault answers and the one its `transient` fault answers.
-ROOT_LOOKUP_METHOD='conversations.replies'
-STUB_CAPABILITY_ERROR='missing_scope'
-STUB_TRANSIENT_ERROR='internal_error'
 # src/server.ts handleInitialized: an MCP session registered for a persona.
 session_connected() {
     matcher "[slack] Session connected: persona $1"
@@ -346,30 +310,12 @@ count_server_log() {
 }
 
 # The stub's record lines whose fields match every <field>=<value> (string
-# compare; a JSON true/false reads True/False) and every <field>><number>
-# (a numeric field greater than it, such as `seq>` a mark).
-RECORD_SPECS="${SCENARIO_ROOT}/record_specs.py"
-cat > "${RECORD_SPECS}" << 'EOF'
-def parse(specs):
-    return [(*spec.split("=", 1), "=") if "=" in spec else (*spec.split(">", 1), ">") for spec in specs]
-
-def matches(rec, checks):
-    for k, v, op in checks:
-        got = rec.get(k)
-        if got is None:
-            return False
-        if op == "=" and str(got) != v:
-            return False
-        if op == ">" and not (isinstance(got, (int, float)) and not isinstance(got, bool) and got > float(v)):
-            return False
-    return True
-EOF
+# compare; a JSON true/false reads True/False).
 RECORD_QUERY="${SCENARIO_ROOT}/record-query.py"
 cat > "${RECORD_QUERY}" << 'EOF'
 import json, sys
-from record_specs import parse, matches
 path, *specs = sys.argv[1:]
-checks = parse(specs)
+checks = [spec.split("=", 1) for spec in specs]
 count = 0
 try:
     with open(path) as f:
@@ -378,7 +324,7 @@ try:
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if matches(rec, checks):
+            if all(rec.get(k) is not None and str(rec.get(k)) == v for k, v in checks):
                 count += 1
 except FileNotFoundError:
     pass
@@ -390,33 +336,6 @@ rec_count() {
 rec_at_least() {
     local min="$1"; shift
     (( $(rec_count "$@") >= min ))
-}
-# rec_field <field> <first|last|all> <field>=<value>...: that field of the
-# first or last matching record line, or of every one in order (space-joined);
-# empty when none matches.
-RECORD_FIELD="${SCENARIO_ROOT}/record-field.py"
-cat > "${RECORD_FIELD}" << 'EOF'
-import json, sys
-from record_specs import parse, matches
-path, field, which, *specs = sys.argv[1:]
-checks = parse(specs)
-found = []
-try:
-    with open(path) as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if matches(rec, checks) and rec.get(field) is not None:
-                found.append(str(rec[field]))
-except FileNotFoundError:
-    pass
-if found:
-    print(found[0] if which == "first" else found[-1] if which == "last" else " ".join(found))
-EOF
-rec_field() {
-    python3 "${RECORD_FIELD}" "${STUB_RECORD}" "$@"
 }
 
 # The delivery-record query: lines of a stub MCP session's accepted queue record
@@ -591,14 +510,11 @@ app_mention_event() {
 }
 
 # push_event <label> <event-json> [<flag>]: one push; fails on a refusal.
-# PUSH_ENVELOPE is its envelope ID, the one its socket ack (the stub's
-# `ws-message` line) carries.
 push_event() {
     local label="$1" ts
     ts="$(jq -r '.ts' <<< "$2")"
     PUSHED_TS["${label} ${ts} $(jq -r '.type' <<< "$2")"]=1
-    PUSH_ENVELOPE="$(slack_stub_push "${label}" "$2" "${3:-}")"
-    [[ -n "${PUSH_ENVELOPE}" ]] || fail "push_event: no envelope ID for the push to ${label}"
+    slack_stub_push "${label}" "$2" "${3:-}" > /dev/null
 }
 
 # push_message <label> <channel> <channel_type|""> <text> [<flag>]: a message
@@ -632,13 +548,6 @@ push_both() {
     new_ts
     push_event "${ALPHA_LABEL}" "$(message_event "$1" "$2" "$3" "${PUSH_TS}")"
     push_event "${BRAVO_LABEL}" "$(message_event "$1" "$2" "$3" "${PUSH_TS}")"
-}
-
-# push_reply <label> <channel> <root-ts> <text>: a plain thread reply under
-# <root-ts>, with a ts of its own.
-push_reply() {
-    new_ts
-    push_event "$1" "$(message_event "$2" channel "$4" "${PUSH_TS}" | jq -c --arg r "$3" '. + {thread_ts: $r}')" false
 }
 
 plain_text() {
@@ -767,21 +676,15 @@ write_credentials "${ALPHA_CREDS}" "${ALPHA_SUFFIX}"
 write_credentials "${BRAVO_CREDS}" "${BRAVO_SUFFIX}"
 
 # One label per persona, with the bot identity auth.test answers (so a
-# mention names it); any other token is refused. alpha's auth.test reports
-# the history scopes its root lookups need (DMs off), so its capability is
-# `scopes-present` and logs nothing; bravo's reports none (unknown, no line).
-# T1's channel metadata is explicit, as conversations.info's parser requires.
-# Phase R derives each later control from this one (set_alpha_evidence).
+# mention names it); any other token is refused.
 jq -n --arg asuf "${ALPHA_SUFFIX}" --arg al "${ALPHA_LABEL}" --arg au "${ALPHA_BOT_USER}" --arg ab "${ALPHA_BOT_ID}" \
     --arg bsuf "${BRAVO_SUFFIX}" --arg bl "${BRAVO_LABEL}" --arg bu "${BRAVO_BOT_USER}" --arg bb "${BRAVO_BOT_ID}" \
-    --arg a1 "${A1}" --arg a2 "${A2}" --arg b1 "${B1}" --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" --arg t1 "${T1}" \
+    --arg a1 "${A1}" --arg a2 "${A2}" --arg b1 "${B1}" --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" \
     '{tokens: [
-        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: [$a1,$a2,$f1,$f2,$u1,$t1],
-         scopes: ["channels:history", "groups:history", "channels:read", "groups:read", "chat:write", "files:read", "files:write"]},
+        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: [$a1,$a2,$f1,$f2,$u1]},
         {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb, memberships: [$b1,$a1,$f1,$f2,$u1]}],
-      default: {auth: "invalid_auth", connections: "invalid_auth"},
-      channels: {($t1): {is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_ext_shared: false}}}' \
-    | write_file "${STUB_CONTROL}" || fail "could not write the stub's control file ${STUB_CONTROL}"
+      default: {auth: "invalid_auth", connections: "invalid_auth"}}' | write_file "${STUB_CONTROL}" \
+    || fail "could not write the stub's control file ${STUB_CONTROL}"
 
 # The MCP config each persona's stub reads (config.json's mcp_config_path),
 # naming this scenario's port, as the package's install writes slack-mcp.json.
@@ -820,7 +723,7 @@ write_persona_config() {
             local mode='open'
             [[ "$1" == 'switch-off' ]] && mode='strict'
             switch=$'\n  "'"${SWITCH_KEY}"'": "'"${mode}"'",'
-            extra_alpha=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${U1}"'", "delivery": "all" }, { "id": "'"${T1}"'", "delivery": "thread_hybrid" }'
+            extra_alpha=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${U1}"'", "delivery": "all" }'
             extra_bravo=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${F2}"'", "delivery": "mentions" }, { "id": "'"${A1}"'", "delivery": "mentions" }, { "id": "'"${U1}"'", "delivery": "all" }'
             ;;
         *) fail "write_persona_config: unknown shape '$1'" ;;
@@ -870,8 +773,6 @@ wait_membership_complete "${BRAVO}"
 UNCLAIMED_CHANNEL="$(printed UNCLAIMED_CHANNEL)"
 PERSONA_INVITED_CHANNEL="$(printed PERSONA_INVITED_CHANNEL)"
 PERSONA_CHANNEL_DELIVERY_SET="$(printed PERSONA_CHANNEL_DELIVERY_SET)"
-ROOT_LOOKUP_CAPABILITY_MISSING="$(printed ROOT_LOOKUP_CAPABILITY_MISSING)"
-PARTICIPATION_RECOVERY="$(printed PARTICIPATION_RECOVERY)"
 SWITCH_KEY="$(printed MODE_SWITCH_SETTING)"
 FUNGIBLE="$(printed channelModeOf open)"
 DECLARATIVE="$(printed channelModeOf strict)"
@@ -977,7 +878,7 @@ wait_until "${RECORD_WAIT_S}" "start: the stub's record holds no push-refused li
 check_upgrade_log() {
     local term
     for term in "${SWITCH_KEY}" "${FUNGIBLE}" "${PERSONA_INVITED_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
-        "[slack] ${ROOT_LOOKUP_CAPABILITY_MISSING}:" "[slack] ${PARTICIPATION_RECOVERY}:"; do
+        ; do
         [[ -n "${term}" ]] || fail "$1: an empty term from the printer"
         [[ "$(count_server_log "${term}")" == 0 ]] || fail "$1: server.log names '${term}' in declarative mode"
     done
@@ -991,9 +892,9 @@ configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "phase A: re
 check_phase_a_inventory() {
     jq -ne --slurpfile input "${CONFIG}" --slurpfile record "${LAST}" \
         --arg alpha "${ALPHA}" --arg bravo "${BRAVO}" --arg a1 "${A1}" \
-        --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" --arg t1 "${T1}" '
+        --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" '
         ($input[0] | .personas |= map(.channels = ((.channels +
-          (if .name == $alpha then [$f1,$f2,$u1,$t1]
+          (if .name == $alpha then [$f1,$f2,$u1]
            elif .name == $bravo then [$a1,$f1,$f2,$u1]
            else error("unexpected persona") end | map({id: ., delivery: "off"}))) | sort_by(.id)))) as $expected |
         ($record[0].applied | .personas |= map(.channels |= sort_by(.id))) == $expected' > /dev/null
@@ -1075,7 +976,7 @@ confirm_switch() {
     cp -- "${LAST}" "${authority_before}"
     write_persona_config "${shape}"
     if [[ "${shape}" == fungible ]]; then
-        configuration_request "mode-${shape}" request "${ALPHA}/${F1}/mentions" "${ALPHA}/${U1}/all" "${ALPHA}/${T1}/thread_hybrid" \
+        configuration_request "mode-${shape}" request "${ALPHA}/${F1}/mentions" "${ALPHA}/${U1}/all" \
             "${BRAVO}/${F1}/mentions" "${BRAVO}/${F2}/mentions" "${BRAVO}/${A1}/mentions" "${BRAVO}/${U1}/all"
     else
         configuration_request "mode-${shape}" request
@@ -1248,323 +1149,6 @@ wait_queued "step 11: bravo F1 mention, after the shared message" "${BRAVO_DIR}"
 expect_queued "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11_TS}"
 expect_queued "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
 
-# --- Phase R: thread evidence on alpha's thread_hybrid T1 ------------------
-# Each reply below is a plain thread reply (no mention), so only thread
-# participation can deliver it (`thread`). Its socket ack is read by its
-# envelope ID, apart from its delivery.
-# expect_acked <step> <envelope-id>: exactly one ack of that envelope.
-expect_acked() {
-    wait_until "${RECORD_WAIT_S}" "$1: no socket ack of envelope $2" rec_at_least 1 event=ws-message envelope_id="$2"
-    [[ "$(rec_count event=ws-message envelope_id="$2")" == 1 ]] || fail "$1: envelope $2 was acked more than once"
-}
-# wait_queued_within <seconds> <step> <dir> <chat-id> <ts> <via>: wait_queued
-# with its own bound, for a delivery only recovery releases.
-wait_queued_within() {
-    local bound="$1" step="$2"; shift 2
-    wait_until "${bound}" "${step}: no delivery with via $4 in the accepted queue record of $1" queued "$@"
-    wait_queued "${step}" "$@"
-}
-# reply_tool <step> <dir> <json-args>: alpha's reply tool call, which must succeed.
-reply_tool() {
-    local line
-    line="$(stub_session_call "$2" "${REPLY_TOOL}" "$3")"
-    jq -e '(has("error") | not) and .isError == false' <<< "${line}" > /dev/null \
-        || fail "$1: the reply tool did not succeed: $(jq -r '.error // .text' <<< "${line}")"
-}
-# stub_control_loaded <n>: the stub re-read its control file at least <n>
-# times (a request makes it look; /_health is one).
-stub_control_loaded() {
-    curl -s --max-time 5 -o /dev/null "${SCENARIO_SLACK_STUB_URL}/_health" || true
-    rec_at_least "$1" event=control source=file
-}
-# set_alpha_evidence <step> <alpha-extra-json>: the start's control with
-# alpha's thread-evidence fields (file_shares, faults) merged in, once the
-# stub has loaded it.
-STUB_CONTROL_BASE="${STUB_DIR}/control-start.json"
-set_alpha_evidence() {
-    local loaded
-    loaded="$(rec_count event=control source=file)"
-    [[ -f "${STUB_CONTROL_BASE}" ]] || cp -- "${STUB_CONTROL}" "${STUB_CONTROL_BASE}"
-    jq --arg al "${ALPHA_LABEL}" --argjson extra "$2" '.tokens |= map(if .label == $al then . + $extra else . end)' \
-        "${STUB_CONTROL_BASE}" | write_file "${STUB_CONTROL}" || fail "$1: could not write the stub's control file"
-    wait_until "${RECORD_WAIT_S}" "$1: the stub never loaded the new control" stub_control_loaded $(( loaded + 1 ))
-}
-# upload_reply <step> <file-name>: alpha replies at T1's root with one file;
-# R_FILE and R_SHARE are its upload's file ID and the share the stub posted.
-upload_reply() {
-    local step="$1" path="${ALPHA_DIR}/$2" shares
-    printf '%s %s upload\n' "${TEST_NAME}" "$2" | write_file "${path}"
-    shares="$(rec_count event=file-share label="${ALPHA_LABEL}" channel="${T1}")"
-    reply_tool "${step}" "${ALPHA_DIR}" "$(jq -cn --arg c "${T1}" --arg t "${TEST_NAME} ${step}" --arg f "${path}" '{chat_id: $c, text: $t, files: [$f]}')"
-    wait_until "${RECORD_WAIT_S}" "${step}: the upload made no share" \
-        rec_at_least $(( shares + 1 )) event=file-share label="${ALPHA_LABEL}" channel="${T1}"
-    R_FILE="$(rec_field file_id last event=file-share label="${ALPHA_LABEL}" channel="${T1}")"
-    R_SHARE="$(rec_field share_ts last event=file-share label="${ALPHA_LABEL}" channel="${T1}")"
-    [[ -n "${R_FILE}" && -n "${R_SHARE}" ]] || fail "${step}: the share line names no file or ts"
-    [[ "$(rec_count event=api method=files.completeUploadExternal label="${ALPHA_LABEL}" channel="${T1}" answer=ok)" -ge 1 ]] \
-        || fail "${step}: no successful completion of the upload"
-}
-# reply_tool_result <dir> <json-args>: the reply tool's result line, as
-# REPLY_IS_ERROR (`true` or `false`) and REPLY_TEXT; a call that ended
-# without a tool result fails.
-reply_tool_result() {
-    local line
-    line="$(stub_session_call "$1" "${REPLY_TOOL}" "$2")"
-    jq -e 'has("error") | not' <<< "${line}" > /dev/null \
-        || fail "reply_tool_result: the reply tool ended without a result: $(jq -r '.error' <<< "${line}")"
-    REPLY_IS_ERROR="$(jq -r '.isError' <<< "${line}")"
-    REPLY_TEXT="$(jq -r '.text' <<< "${line}")"
-}
-RECOVERED_TEXT="$(printed participationRecoveredLine "${ALPHA}" "${ALPHA_KEY}")"
-RECOVERED_LINE="$(matcher "${RECOVERED_TEXT}")"
-CAPABILITY_REFUSED_TEXT="$(printed rootLookupCapabilityLine "${ALPHA}" "${ALPHA_KEY}" "${GAP_METHOD_REFUSED}" "${ROOT_LOOKUP_METHOD}" "${STUB_CAPABILITY_ERROR}")"
-DEADLINE_MS="$(printed THREAD_MEMORY_LOOKUP_DEADLINE_MS)"
-RETRY_MIN_MS="$(printed THREAD_MEMORY_RETRY_MIN_MS)"
-RETRY_MAX_MS="$(printed THREAD_MEMORY_RETRY_MAX_MS)"
-QUEUED_REACTION="$(printed DEFAULT_QUEUED_ACK_REACTION)"
-# Every recovery release but R3's: one in-flight deadline, the longest local
-# retry wait, then one answered attempt (src/delivery-constants.ts
-# enrollmentRepairBoundMs).
-(( RECOVERY_WAIT_S * 1000 >= 2 * DEADLINE_MS + RETRY_MAX_MS )) \
-    || fail "phase R: RECOVERY_WAIT_S (${RECOVERY_WAIT_S}s) cannot cover one repair bound"
-# R3's Retry-After: longer than any local retry spacing and than the refused
-# method's re-check window (both THREAD_MEMORY_RETRY_MAX_MS at most), so only
-# Slack's header, carried through the real SDK's rate-limit error, explains
-# the wait.
-R3_RETRY_AFTER_S=$(( RETRY_MAX_MS / 1000 + 5 ))
-# R3's release: the re-check window after the refusal, which one local retry
-# wait may overrun (R3's upload never shows a share, so its passes fail),
-# then the Retry-After, then one answered attempt.
-R3_WAIT_S=$(( 2 * RETRY_MAX_MS / 1000 + R3_RETRY_AFTER_S + DEADLINE_MS / 1000 ))
-
-# R0. Incoming enrollment: a mention at T1's root is delivered `mention`,
-#     and a reply in its thread `thread`.
-push_message "${ALPHA_LABEL}" "${T1}" channel "$(mention_text "${ALPHA_BOT_USER}")" false
-R0_TS="${PUSH_TS}"
-wait_queued "phase R0: alpha T1 mention" "${ALPHA_DIR}" "${T1}" "${R0_TS}" "${VIA_MENTION}"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R0_TS}" "$(plain_text)"
-wait_queued "phase R0: a reply in the mentioned thread" "${ALPHA_DIR}" "${T1}" "${PUSH_TS}" "${VIA_THREAD}"
-expect_acked "phase R0: the reply" "${PUSH_ENVELOPE}"
-
-# R1. An own root post: alpha's reply tool posts at T1's root, and a reply
-#     in that thread is delivered `thread` with no root lookup: the post's
-#     own ts enrolled it.
-reply_tool "phase R1" "${ALPHA_DIR}" "$(jq -cn --arg c "${T1}" --arg t "${TEST_NAME} phase R1 root" '{chat_id: $c, text: $t}')"
-R1_ROOT="$(rec_field response_ts last event=api method=chat.postMessage label="${ALPHA_LABEL}" channel="${T1}" answer=ok)"
-[[ -n "${R1_ROOT}" ]] || fail "phase R1: the stub recorded no root ts for alpha's post"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R1_ROOT}" "$(plain_text)"
-wait_queued "phase R1: a reply in alpha's own thread" "${ALPHA_DIR}" "${T1}" "${PUSH_TS}" "${VIA_THREAD}"
-expect_acked "phase R1: the reply" "${PUSH_ENVELOPE}"
-[[ "$(rec_count event=api method=conversations.replies ts="${R1_ROOT}")" == 0 ]] \
-    || fail "phase R1: a root lookup for alpha's own post"
-
-# R2. A file upload's root from its share: the completion names no share,
-#     so recovery reads files.info for the actual upload ID, enrolls the
-#     share's ts and reports recovered; a reply there is then delivered
-#     `thread` with no root lookup.
-R2_MARK="$(log_mark)"
-upload_reply "phase R2" phase-r2.txt
-R2_SHARE="${R_SHARE}"
-wait_until "${RECOVERY_WAIT_S}" "phase R2: no successful files.info for upload ${R_FILE}" \
-    rec_at_least 1 event=api method=files.info label="${ALPHA_LABEL}" file="${R_FILE}" answer=ok
-wait_since "${R2_MARK}" "${RECOVERED_LINE}" "${RECOVERY_WAIT_S}" "phase R2: alpha's recovery never reported recovered"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R2_SHARE}" "$(plain_text)"
-wait_queued "phase R2: a reply in the upload's thread" "${ALPHA_DIR}" "${T1}" "${PUSH_TS}" "${VIA_THREAD}"
-expect_acked "phase R2: the reply" "${PUSH_ENVELOPE}"
-[[ "$(rec_count event=api method=conversations.replies ts="${R2_SHARE}")" == 0 ]] \
-    || fail "phase R2: a root lookup for the upload's share"
-
-# R3. A root lookup through a refused method and a rate limit: no share
-#     anywhere, so a reply in the upload's thread is held (no ack) until
-#     conversations.replies for that root answers. Slack refuses it
-#     (missing_scope: the capability line); the refused method is tried
-#     again only once its re-check window (THREAD_MEMORY_RETRY_MAX_MS) has
-#     passed, and Slack rate-limits that attempt (429, Retry-After
-#     R3_RETRY_AFTER_S, waited out in full), then answers with alpha's own
-#     root naming the upload: the reply is delivered `thread`, acked once,
-#     after that answer.
-set_alpha_evidence "phase R3" "$(jq -cn --arg c "${T1}" --argjson ra "${R3_RETRY_AFTER_S}" '{file_shares: "none", faults: [
-    {method: "conversations.replies", outcome: "capability", channel: $c, times: 1},
-    {method: "conversations.replies", outcome: "ratelimited", channel: $c, retry_after_s: $ra, times: 1}]}')"
-R3_MARK="$(log_mark)"
-upload_reply "phase R3" phase-r3.txt
-R3_SHARE="${R_SHARE}"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R3_SHARE}" "$(plain_text)"
-R3_TS="${PUSH_TS}"
-R3_ENVELOPE="${PUSH_ENVELOPE}"
-wait_since "${R3_MARK}" "$(matcher "${CAPABILITY_REFUSED_TEXT}")" \
-    "${RECOVERY_WAIT_S}" "phase R3: no root-lookup capability line for the refused method"
-wait_queued_within "${R3_WAIT_S}" "phase R3: the held reply" "${ALPHA_DIR}" "${T1}" "${R3_TS}" "${VIA_THREAD}"
-expect_acked "phase R3: the held reply" "${R3_ENVELOPE}"
-R3_ANSWERS="$(rec_field answer all event=api method=conversations.replies channel="${T1}" ts="${R3_SHARE}")"
-[[ "${R3_ANSWERS}" == "missing_scope ratelimited ok"* ]] \
-    || fail "phase R3: conversations.replies for root ${R3_SHARE} answered '${R3_ANSWERS}', expected missing_scope, ratelimited, then ok"
-[[ "$(rec_count event=api method=conversations.replies channel="${T1}" ts="${R3_SHARE}" status=429)" == 1 ]] \
-    || fail "phase R3: the rate-limited lookup was not one HTTP 429"
-R3_OK_SEQ="$(rec_field seq first event=api method=conversations.replies channel="${T1}" ts="${R3_SHARE}" answer=ok)"
-R3_ACK_SEQ="$(rec_field seq first event=ws-message envelope_id="${R3_ENVELOPE}")"
-(( R3_ACK_SEQ > R3_OK_SEQ )) || fail "phase R3: the held reply was acked (record ${R3_ACK_SEQ}) before its root lookup answered (record ${R3_OK_SEQ})"
-R3_REFUSED_AT="$(rec_field arrived_mono_ms first event=api method=conversations.replies channel="${T1}" ts="${R3_SHARE}" fault=capability)"
-R3_LIMITED_AT="$(rec_field arrived_mono_ms first event=api method=conversations.replies channel="${T1}" ts="${R3_SHARE}" status=429)"
-R3_RETRIED_AT="$(rec_field arrived_mono_ms first event=api method=conversations.replies channel="${T1}" ts="${R3_SHARE}" answer=ok)"
-[[ -n "${R3_REFUSED_AT}" && -n "${R3_LIMITED_AT}" && -n "${R3_RETRIED_AT}" ]] \
-    || fail "phase R3: the stub recorded no arrival time for the refused lookup, the rate-limited one or its retry"
-(( R3_LIMITED_AT - R3_REFUSED_AT >= RETRY_MAX_MS )) \
-    || fail "phase R3: the refused method was tried again $(( R3_LIMITED_AT - R3_REFUSED_AT )) ms after the refusal, within its ${RETRY_MAX_MS} ms re-check window"
-(( R3_RETRIED_AT - R3_LIMITED_AT >= R3_RETRY_AFTER_S * 1000 )) \
-    || fail "phase R3: the lookup was retried $(( R3_RETRIED_AT - R3_LIMITED_AT )) ms after the 429, before its Retry-After of ${R3_RETRY_AFTER_S}s"
-expect_since "${R3_MARK}" "$(matcher "[slack] ${ROOT_LOOKUP_CAPABILITY_MISSING}: persona=${ALPHA_REF} ")" 1 \
-    "phase R3: root-lookup capability lines (a repeat refusal reports nothing)"
-wait_since "${R3_MARK}" "${RECOVERED_LINE}" "${RECOVERY_WAIT_S}" "phase R3: alpha's recovery never reported recovered"
-
-# R4. A deleted root is a gap, reported and not delivered (no restoration or
-#     replacement is exercised): no share, and conversations.replies shows a
-#     tombstone root. The reply is never acked; read after the gap line and
-#     a later delivery on alpha's connection (a T1 mention).
-set_alpha_evidence "phase R4" '{"file_shares": "none"}'
-R4_MARK="$(log_mark)"
-upload_reply "phase R4" phase-r4.txt
-R4_SHARE="${R_SHARE}"
-R4_FILE="${R_FILE}"
-# R4's tombstone stays in every later control, so the gap stands through the restart.
-R4_FAULTS="$(jq -cn --arg c "${T1}" --arg r "${R4_SHARE}" '[{method: "conversations.replies", outcome: "deleted", channel: $c, ts: $r, times: 0}]')"
-set_alpha_evidence "phase R4" "$(jq -cn --argjson f "${R4_FAULTS}" '{file_shares: "none", faults: $f}')"
-R4_TEXT="$(plain_text)"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R4_SHARE}" "${R4_TEXT}"
-R4_TS="${PUSH_TS}"
-R4_ENVELOPE="${PUSH_ENVELOPE}"
-R4_GAP_TEXT="$(printed participationRecoveryLine "${ALPHA}" "${ALPHA_KEY}" "${CAUSE_ROOT_DELETED}" "${T1}" "${R4_SHARE}" - -)"
-wait_since "${R4_MARK}" "$(matcher "${R4_GAP_TEXT}")" "${RECOVERY_WAIT_S}" "phase R4: no root-deleted gap line"
-push_message "${ALPHA_LABEL}" "${T1}" channel "$(mention_text "${ALPHA_BOT_USER}")" false
-wait_queued "phase R4: alpha T1 mention, after the gap" "${ALPHA_DIR}" "${T1}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_queued "phase R4: the reply under a deleted root" 0 "${ALPHA_DIR}" "${T1}" "${R4_TS}"
-[[ "$(rec_count event=ws-message envelope_id="${R4_ENVELOPE}")" == 0 ]] || fail "phase R4: the reply under a deleted root was acked"
-expect_since "${R4_MARK}" "${RECOVERED_LINE}" 0 "phase R4: recovered lines while the gap stands"
-
-# R5. A foreign root decides nothing for alpha: a human's plain T1 root (a
-#     not-mentioned drop), then a reply under it, held while R4's upload root
-#     is unknown. Its lookup shows the human's root: the reply is dropped
-#     not-mentioned, never delivered, and acked once after that answer.
-R5_ROOT_MARK="$(log_mark)"
-push_message "${ALPHA_LABEL}" "${T1}" channel "$(plain_text)" false
-R5_ROOT="${PUSH_TS}"
-wait_since "${R5_ROOT_MARK}" "$(plain_drop "${ALPHA_REF}" "${T1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
-    "phase R5: the foreign root did not drop as not-mentioned"
-R5_MARK="$(log_mark)"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R5_ROOT}" "$(plain_text)"
-R5_TS="${PUSH_TS}"
-R5_ENVELOPE="${PUSH_ENVELOPE}"
-wait_since "${R5_MARK}" "$(plain_drop "${ALPHA_REF}" "${T1}" "${DROP_NOT_MENTIONED}")" "${RECOVERY_WAIT_S}" \
-    "phase R5: the reply under a foreign root was never decided"
-expect_acked "phase R5: the reply under a foreign root" "${R5_ENVELOPE}"
-R5_OK_SEQ="$(rec_field seq first event=api method=conversations.replies channel="${T1}" ts="${R5_ROOT}" answer=ok)"
-R5_ACK_SEQ="$(rec_field seq first event=ws-message envelope_id="${R5_ENVELOPE}")"
-[[ -n "${R5_OK_SEQ}" ]] || fail "phase R5: no answered root lookup for the foreign root ${R5_ROOT}"
-(( R5_ACK_SEQ > R5_OK_SEQ )) || fail "phase R5: the reply was acked (record ${R5_ACK_SEQ}) before its root lookup answered (record ${R5_OK_SEQ})"
-push_message "${ALPHA_LABEL}" "${T1}" channel "$(mention_text "${ALPHA_BOT_USER}")" false
-wait_queued "phase R5: alpha T1 mention, after the foreign root" "${ALPHA_DIR}" "${T1}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_queued "phase R5: the reply under a foreign root" 0 "${ALPHA_DIR}" "${T1}" "${R5_TS}"
-expect_queued "phase R5: the foreign root" 0 "${ALPHA_DIR}" "${T1}" "${R5_ROOT}"
-
-# R6. A later part's upload fails after an earlier one succeeded, through
-#     the real SDK upload path: alpha replies at T1's root to a delivered
-#     mention, with its text and two files, one upload each; Slack completes
-#     the first and refuses the second's completion (transient). The tool
-#     reports the partial post; the queued reaction on the mention is removed
-#     once; the first file's share is alpha's own root, which a held reply
-#     under it shows by file ID; nothing is posted or completed again.
-push_message "${ALPHA_LABEL}" "${T1}" channel "$(mention_text "${ALPHA_BOT_USER}")" false
-R6_MESSAGE="${PUSH_TS}"
-wait_queued "phase R6: alpha T1 mention, the message replied to" "${ALPHA_DIR}" "${T1}" "${R6_MESSAGE}" "${VIA_MENTION}"
-wait_until "${RECORD_WAIT_S}" "phase R6: no queued reaction on the mention" \
-    rec_at_least 1 event=api method=reactions.add label="${ALPHA_LABEL}" timestamp="${R6_MESSAGE}" name="${QUEUED_REACTION}" answer=ok
-set_alpha_evidence "phase R6" "$(jq -cn --arg c "${T1}" --argjson f "${R4_FAULTS}" '{file_shares: "none", faults: ($f + [
-    {method: "files.completeUploadExternal", outcome: "transient", channel: $c, skip: 1, times: 1}])}')"
-R6_SHARES_BEFORE="$(rec_count event=file-share label="${ALPHA_LABEL}" channel="${T1}")"
-R6_FILES=()
-for part in a b; do
-    printf '%s phase-r6-%s upload\n' "${TEST_NAME}" "${part}" | write_file "${ALPHA_DIR}/phase-r6-${part}.txt"
-    R6_FILES+=("${ALPHA_DIR}/phase-r6-${part}.txt")
-done
-reply_tool_result "${ALPHA_DIR}" "$(jq -cn --arg c "${T1}" --arg t "${TEST_NAME} phase R6" --arg m "${R6_MESSAGE}" \
-    --arg a "${R6_FILES[0]}" --arg b "${R6_FILES[1]}" '{chat_id: $c, text: $t, message_id: $m, files: [$a, $b]}')"
-R6_POST="$(rec_field response_ts last event=api method=chat.postMessage label="${ALPHA_LABEL}" channel="${T1}" answer=ok)"
-[[ -n "${R6_POST}" ]] || fail "phase R6: the stub recorded no ts for the reply's text"
-R6_PARTIAL_TEXT="$(printed replyPartialFailureText "${T1}" 1 1 "${R6_POST}" 1 2 "${STUB_TRANSIENT_ERROR}")"
-[[ "${REPLY_IS_ERROR}" == true && "${REPLY_TEXT}" == "${R6_PARTIAL_TEXT}" ]] \
-    || fail "phase R6: the reply tool answered (isError ${REPLY_IS_ERROR}) '${REPLY_TEXT}', expected the partial-post error '${R6_PARTIAL_TEXT}'"
-[[ "$(rec_count event=api method=files.completeUploadExternal label="${ALPHA_LABEL}" channel="${T1}" fault=transient)" == 1 ]] \
-    || fail "phase R6: the second file's completion was not refused exactly once"
-[[ "$(rec_count event=file-share label="${ALPHA_LABEL}" channel="${T1}")" == $(( R6_SHARES_BEFORE + 1 )) ]] \
-    || fail "phase R6: the upload made other than exactly one share"
-R6_FILE="$(rec_field file_id last event=file-share label="${ALPHA_LABEL}" channel="${T1}")"
-R6_SHARE="$(rec_field share_ts last event=file-share label="${ALPHA_LABEL}" channel="${T1}")"
-[[ -n "${R6_FILE}" && -n "${R6_SHARE}" ]] || fail "phase R6: the share line names no file or ts"
-wait_until "${RECORD_WAIT_S}" "phase R6: the queued reaction on the mention was never removed" \
-    rec_at_least 1 event=api method=reactions.remove label="${ALPHA_LABEL}" timestamp="${R6_MESSAGE}" name="${QUEUED_REACTION}"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R6_SHARE}" "$(plain_text)"
-R6_TS="${PUSH_TS}"
-R6_ENVELOPE="${PUSH_ENVELOPE}"
-wait_queued_within "${RECOVERY_WAIT_S}" "phase R6: the reply under the first file's share" "${ALPHA_DIR}" "${T1}" "${R6_TS}" "${VIA_THREAD}"
-expect_acked "phase R6: the reply under the first file's share" "${R6_ENVELOPE}"
-R6_OK_SEQ="$(rec_field seq first event=api method=conversations.replies channel="${T1}" ts="${R6_SHARE}" answer=ok)"
-R6_ACK_SEQ="$(rec_field seq first event=ws-message envelope_id="${R6_ENVELOPE}")"
-[[ -n "${R6_OK_SEQ}" ]] || fail "phase R6: no answered root lookup for the first file's share ${R6_SHARE}"
-(( R6_ACK_SEQ > R6_OK_SEQ )) || fail "phase R6: the reply was acked (record ${R6_ACK_SEQ}) before its root lookup answered (record ${R6_OK_SEQ})"
-[[ "$(rec_count event=api method=reactions.remove label="${ALPHA_LABEL}" timestamp="${R6_MESSAGE}")" == 1 ]] \
-    || fail "phase R6: the queued reaction on the mention was removed other than once"
-
-# R7. A hung root lookup ends at its deadline: no share, and alpha's own root
-#     lookup for an upload's share hangs once. The client aborts it at
-#     THREAD_MEMORY_LOOKUP_DEADLINE_MS (the stub sees the abort, long before
-#     it would give up), recovery reports the deadline, and the next attempt,
-#     after the retry spacing, is answered: the held reply is delivered
-#     `thread` and acked once, after that answer. A late answer to an
-#     abandoned attempt is not exercised here (a recorded gap).
-R7_MARK="$(log_mark)"
-upload_reply "phase R7" phase-r7.txt
-R7_SHARE="${R_SHARE}"
-set_alpha_evidence "phase R7" "$(jq -cn --arg c "${T1}" --arg r "${R7_SHARE}" --argjson f "${R4_FAULTS}" '{file_shares: "none", faults: ($f + [
-    {method: "conversations.replies", outcome: "hung", channel: $c, ts: $r, times: 1}])}')"
-push_reply "${ALPHA_LABEL}" "${T1}" "${R7_SHARE}" "$(plain_text)"
-R7_TS="${PUSH_TS}"
-R7_ENVELOPE="${PUSH_ENVELOPE}"
-wait_until $(( RECOVERY_WAIT_S + DEADLINE_MS / 1000 )) "phase R7: the hung root lookup never ended" \
-    rec_at_least 1 event=api method=conversations.replies channel="${T1}" ts="${R7_SHARE}" fault=hung
-[[ "$(rec_field aborted first event=api method=conversations.replies ts="${R7_SHARE}" fault=hung)" == True ]] \
-    || fail "phase R7: the hung root lookup ended without the client aborting it"
-R7_HELD_MS="$(rec_field held_ms first event=api method=conversations.replies ts="${R7_SHARE}" fault=hung)"
-(( R7_HELD_MS >= DEADLINE_MS - 3000 && R7_HELD_MS <= DEADLINE_MS + 5000 )) \
-    || fail "phase R7: the hung root lookup was aborted after ${R7_HELD_MS} ms, not at its ${DEADLINE_MS} ms deadline"
-R7_DEADLINE_TEXT="$(printed participationRecoveryLine "${ALPHA}" "${ALPHA_KEY}" "${CAUSE_METADATA}" "${T1}" "${R7_SHARE}" - "${FAILURE_DEADLINE}")"
-wait_since "${R7_MARK}" "$(matcher "${R7_DEADLINE_TEXT}")" "${RECORD_WAIT_S}" "phase R7: no deadline line for the hung root lookup"
-wait_queued_within "${RECOVERY_WAIT_S}" "phase R7: the held reply" "${ALPHA_DIR}" "${T1}" "${R7_TS}" "${VIA_THREAD}"
-expect_acked "phase R7: the held reply" "${R7_ENVELOPE}"
-R7_ANSWERS="$(rec_field answer all event=api method=conversations.replies channel="${T1}" ts="${R7_SHARE}")"
-[[ "${R7_ANSWERS}" == "hung ok"* ]] \
-    || fail "phase R7: conversations.replies for root ${R7_SHARE} answered '${R7_ANSWERS}', expected hung, then ok"
-R7_HUNG_AT="$(rec_field arrived_mono_ms first event=api method=conversations.replies ts="${R7_SHARE}" fault=hung)"
-R7_RETRIED_AT="$(rec_field arrived_mono_ms first event=api method=conversations.replies ts="${R7_SHARE}" answer=ok)"
-# The abort's own trip to the stub may land a few milliseconds after the
-# client set its next permitted attempt: 1 s of slack.
-(( R7_RETRIED_AT - R7_HUNG_AT >= R7_HELD_MS + RETRY_MIN_MS - 1000 )) \
-    || fail "phase R7: the lookup was retried $(( R7_RETRIED_AT - R7_HUNG_AT - R7_HELD_MS )) ms after the hung attempt was aborted, within the ${RETRY_MIN_MS} ms retry spacing"
-R7_OK_SEQ="$(rec_field seq first event=api method=conversations.replies ts="${R7_SHARE}" answer=ok)"
-R7_ACK_SEQ="$(rec_field seq first event=ws-message envelope_id="${R7_ENVELOPE}")"
-(( R7_ACK_SEQ > R7_OK_SEQ )) || fail "phase R7: the held reply was acked (record ${R7_ACK_SEQ}) before its root lookup answered (record ${R7_OK_SEQ})"
-
-# Metadata repair repeats no post: alpha's T1 posts are its six reply
-# texts (R1 to R4, R6, R7) and its uploads one completion each (R2 to R4,
-# R6's first file, R7), with R6's second completion refused once and never
-# tried again. R4's gap still stands, so no recovery is reported after it.
-[[ "$(rec_count event=api method=chat.postMessage label="${ALPHA_LABEL}" channel="${T1}" answer=ok)" == 6 ]] \
-    || fail "phase R: alpha's T1 posts were repeated or lost"
-[[ "$(rec_count event=api method=files.completeUploadExternal label="${ALPHA_LABEL}" channel="${T1}" answer=ok)" == 5 ]] \
-    || fail "phase R: alpha's T1 uploads were repeated or lost"
-[[ "$(rec_count event=api method=files.completeUploadExternal label="${ALPHA_LABEL}" channel="${T1}")" == 6 ]] \
-    || fail "phase R: alpha's refused T1 completion was tried again"
-expect_since "${R4_MARK}" "${RECOVERED_LINE}" 0 "phase R: recovered lines while R4's gap stands"
-
 # --- Persistence across a restart ----------------------
 # Queue acceptance above can precede typing and its receipt. Settle both
 # personas before checking an immediate idle-session reconnect on restart.
@@ -1584,8 +1168,6 @@ bravo_connected_before="$(count_log "$(session_connected "${BRAVO_REF}")")"
 alpha_sockets_before="$(rec_count event=ws-open label="${ALPHA_LABEL}")"
 bravo_sockets_before="$(rec_count event=ws-open label="${BRAVO_LABEL}")"
 RESTART_MARK="$(log_mark)"
-STUB_RESTART_SEQ="$(rec_field seq last)"
-[[ -n "${STUB_RESTART_SEQ}" ]] || fail "restart: the stub's record has no line"
 IDS_BEFORE_RESTART="${SCENARIO_ROOT}/request-ids-before-restart"
 python3 "${STUB_RECORDS}" ids "${REQUESTS_FILE[${ALPHA_DIR}]}" "${REQUESTS_FILE[${BRAVO_DIR}]}" \
     > "${IDS_BEFORE_RESTART}" || fail "restart: could not read the request files"
@@ -1626,24 +1208,6 @@ for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     [[ ! -s "${SCENARIO_ROOT}/accepted-after-restart" ]] \
         || fail "restart: receipted message content of ${dir} survived startup compaction"
 done
-
-# Phase R's unresolved evidence survives the restart: R4's upload is still
-# pending its root (files.info is asked again for its file), R4's root
-# lookup is asked again and is still a tombstone (its gap line again, in
-# this server run), Slack's redelivery of R4's held reply is neither acked
-# nor queued, and no recovery is reported.
-wait_until "${RECOVERY_WAIT_S}" "restart: R4's pending upload ${R4_FILE} was not looked up again" \
-    rec_at_least 1 event=api method=files.info label="${ALPHA_LABEL}" file="${R4_FILE}" "seq>${STUB_RESTART_SEQ}"
-wait_until "${RECOVERY_WAIT_S}" "restart: R4's root lookup was not asked again" \
-    rec_at_least 1 event=api method=conversations.replies label="${ALPHA_LABEL}" channel="${T1}" ts="${R4_SHARE}" fault=deleted "seq>${STUB_RESTART_SEQ}"
-wait_since "${RESTART_MARK}" "$(matcher "${R4_GAP_TEXT}")" "${RECOVERY_WAIT_S}" "restart: no root-deleted gap line for R4 in this run"
-push_event "${ALPHA_LABEL}" "$(message_event "${T1}" channel "${R4_TEXT}" "${R4_TS}" | jq -c --arg r "${R4_SHARE}" '. + {thread_ts: $r}')" false
-R4_REDELIVERY="${PUSH_ENVELOPE}"
-push_message "${ALPHA_LABEL}" "${T1}" channel "$(mention_text "${ALPHA_BOT_USER}")" false
-wait_queued "restart: alpha T1 mention, after R4's redelivery" "${ALPHA_DIR}" "${T1}" "${PUSH_TS}" "${VIA_MENTION}"
-[[ "$(rec_count event=ws-message envelope_id="${R4_REDELIVERY}")" == 0 ]] || fail "restart: Slack's redelivery of R4's held reply was acked"
-expect_queued "restart: R4's held reply" 0 "${ALPHA_DIR}" "${T1}" "${R4_TS}"
-expect_since "${RESTART_MARK}" "${RECOVERED_LINE}" 0 "restart: recovered lines while R4's gap stands"
 
 # alpha calls the tool for F1 with `all` before any F1 event: accepted as a
 # stored channel, `all` before and after. Its result also shows the new

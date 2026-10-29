@@ -442,8 +442,8 @@ retain their existing text excerpts; receipt confirmation has its own line.
 
 ### `message-not-saved`
 
-- **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`, or, when saving a message together with its thread participation fails, `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" participation=unresolved code=<errno>`
-- **Meaning:** The incoming message could not be durably stored; it has not been accepted. The `count=` form counts every failure, including Slack retries. The `participation=unresolved` form is logged once per unsaved message, not per retry, and its Slack acknowledgement stays withheld.
+- **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
+- **Meaning:** The incoming message could not be durably stored; it has not been accepted. Every failure is counted, including Slack retries.
 - **Cause:** The queue directory or disk cannot be written.
 - **Fix:** Check free space, mount availability and permissions on the named path. For Slack, follow **Message not saved** below; retry a failed injected message once storage works.
 
@@ -491,10 +491,10 @@ retain their existing text excerpts; receipt confirmation has its own line.
 
 ### `queue-unwritable`
 
-- **Line:** `[slack] queue-unwritable: persona="<name>" (key=<key>) path="<path>" code=<errno>`, or, for a thread participation fault, `[slack] queue-unwritable: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" participation=unresolved code=<errno>`
-- **Meaning:** The `path=` form: an append failed after acceptance. CSCB retains the item and types nothing further for this persona until the write succeeds. The `participation=unresolved` form: the thread participation that this Slack message depends on could not be read, synced or reconciled. It does not mean a message was lost: retained items stay queued, this message's acknowledgement and the thread selections that depend on it stay unresolved, and other work can continue. No Slack notice is posted for it.
-- **Cause:** The `path=` form: the queue file cannot be written or synced; one line reports each unwritable episode. The `participation=unresolved` form: the persona's queue file cannot be read, written or synced; one line reports each unresolved message.
-- **Fix:** Check the server disk and the named path permissions or mount. Restore reading, writing and syncing; the queued work resumes without resending it. Don't ask senders to resend because of a `participation=unresolved` line alone.
+- **Line:** `[slack] queue-unwritable: persona="<name>" (key=<key>) path="<path>" code=<errno>`
+- **Meaning:** An append failed after acceptance. CSCB retains the item and types nothing further for this persona until the write succeeds.
+- **Cause:** The queue file cannot be written or synced; one line reports each unwritable episode.
+- **Fix:** Check the server disk and the named path permissions or mount. Restore writing; the queued work resumes without resending it.
 
 ### `queue-kept`
 
@@ -509,79 +509,6 @@ retain their existing text excerpts; receipt confirmation has its own line.
 - **Meaning:** CSCB cannot write the shared bot system prompt, so this persona is not launched.
 - **Cause:** The state directory or its disk cannot be written.
 - **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
-
-### `own-post-not-enrolled`
-
-- **Line:** `[slack] own-post-not-enrolled: persona="<name>" (key=<key>) surface=<text|prompt|warning|notice> chat_id="<channel>" ts="<ts>" parent="<ts>" operation=<id> part=<n> state=<pending|gap> missing=<root|channel-eligibility|root,channel-eligibility|none> cause=<cause> reason=<reason> code=<errno> action="<action>"`. `ts=`, `parent=`, `reason=` and `code=` appear only when known. After a persona's 20th finding line: `[slack] own-post-not-enrolled: persona="<name>" (key=<key>) limit=20 further findings are not logged until this persona has none`. Once at start, when posts made before reporting began overflowed its buffer: `[slack] own-post-not-enrolled: persona="<name>" (key=<key>) dropped=<n> outcomes seen before reporting started were not kept; recorded evidence is still reported and recovered`.
-- **Meaning:** The persona's post succeeded in Slack, but CSCB has not recorded that the persona follows the thread, so replies in that thread may not reach it until this resolves. A reply post whose requested parent wasn't a valid thread root is reported by its own finding only; other replies in its channel don't wait on it.
-
-  `state=pending`: CSCB keeps a durable copy of the evidence, and idle recovery follows the thread once what `cause=` names is resolved, as the line's `action=` says. `state=gap`: no durable copy was saved.
-
-  A `storage` gap is retried while the server runs: idle recovery saves the post's evidence again once the server can save its state and the persona is up, and the finding closes. A gap of any other cause, or a `storage` gap after a restart, has nothing to resolve later.
-
-  The first finding in an episode posts one notice, *Thread not followed yet* (pending) or *Thread participation not saved* (gap); a finding about a notice, or one restored at start, is only logged. Resolving one thread settles that thread only, and elapsed time or a working queue alone settles nothing.
-
-  The episode and its 20-line cap end, with no Slack notice, once none of the persona's findings is still open: at its next settled own post, or when idle recovery settles or saves the last one. A later finding then posts a new notice. Recovery's next clean pass logs one [`participation-recovery`](#participation-recovery) `state=recovered` line for the ended episode, and that pass starts promptly once the episode ends, no sooner than the retry spacing after a failed pass.
-- **Cause:** `cause=` names one of four:
-  - `storage`: the server could not save its state; `code=` names the error.
-  - `root-metadata`: the thread's root message is not known, as for a prompt Slack returned without a `ts`.
-  - `channel-eligibility`: the persona's current channel membership, the channel's sharing or its delivery choice is not verified.
-  - `operation`: the post could not be bound to the persona's current life (the persona or channel is not applied, the server was starting or stopping, or the persona's identity was not yet known) or a bookkeeping step failed.
-
-  `missing=` lists the evidence the thread still needs, or `none`, whatever the cause; `reason=` gives the detail. A post whose persona was removed or destructively modified by a confirmed change, or left the channel, before CSCB saved its record belongs to the old life and is dropped silently, with no line or notice.
-- **Fix:** Don't post it again: the post succeeded, and fixing the evidence never reposts it or posts a fallback prompt. Follow the line's `action=`.
-
-  For a `storage` gap it says: "Check the server's disk and state directory. CSCB saves the post's evidence again while the server runs, once it can save its state and the persona is up; a restart before then loses it." For a gap of any other cause it says to check that the persona is applied and up, then: "CSCB cannot rebuild a record it never saved: restore the server's state only from a reviewed, trustworthy backup, or accept that the persona does not follow the thread."
-
-  The action adds "A new mention of the persona in that thread can also make it follow the thread." only when the finding names its thread and the channel's choice is known and not `off` (never for `reason=choice-missing`, `reason=state-unavailable` or a gap found before the choice was read). For `storage` the sentence ends "…follow the thread, once the server can save its state again."
-
-  Never delete state files to clear a finding, and don't count on Slack's finite retries to bring back replies that were not accepted.
-
-### `root-lookup-capability-missing`
-
-- **Line:** `[slack] root-lookup-capability-missing: persona="<name>" (key=<key>) cause=missing-scope scopes=<scope>[,<scope>…] effect="the persona stays up; only thread replies whose root must be looked up wait" action="<action>"`, or, when Slack refused a real lookup, `[slack] root-lookup-capability-missing: persona="<name>" (key=<key>) cause=method-refused method=conversations.replies slack_error=<error> effect="the persona stays up; only thread replies whose root must be looked up wait" action="<action>"`.
-- **Meaning:** CSCB can't look up who started a thread, so a reply in a thread the persona isn't known to follow can't be decided yet. The persona stays up: its mentions, `all` delivery, DMs and the threads it already follows keep working, and other personas are unaffected.
-
-  Only those undecided replies wait, unacknowledged, and only while the server runs: don't count on Slack's finite retries to bring back replies that were not accepted. They are never treated as a deleted root, a thread someone else started, or a recovery.
-
-  `cause=missing-scope`: when the persona's connection comes up, CSCB checks the bot scopes Slack reported for its token, without making a lookup: `channels:history` (public channels), `groups:history` (private channels) and, when the persona's `dm` is enabled, `im:history`. `scopes=` names the ones missing. `cause=method-refused`: the scopes looked present, but Slack refused the first real lookup (`conversations.replies`) with `slack_error=`.
-
-  Every thread lookup is in a channel, so a gap of only `im:history` holds no reply. Its line reads `effect="the persona stays up; no reply waits, because thread lookups in channels do not need this scope"`, and its notice, titled *DM history scope missing*, says no thread lookup CSCB makes needs the scope. A known limit: a missing `channels:history` or `groups:history` holds every channel reply that needs a lookup, in public and private channels alike.
-
-  The line is logged when the gap begins, and the persona's notice destination gets one notice per episode: *Thread lookups unavailable*, or *DM history scope missing* for a gap of only `im:history`. Repeated lookups and the same gap again add nothing; a different gap in the same episode is logged only.
-- **Cause:** the persona's Slack app was created, or last installed, from a manifest without those history scopes, or its bot token isn't a bot token of an app installed with them. For `method-refused`, the workspace may also restrict the method (see `slack_error=`). The shipped `slack-app-manifest.yml` already lists the scopes; nothing new is needed.
-- **Fix:** follow the line's `action=`. Once lookups work, recovery looks up the waiting replies' threads with no new traffic; see [`participation-recovery`](#participation-recovery).
-  - `missing-scope`: add the named bot scopes in the app's settings and re-install it, as [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite) does for `im:write` (don't paste the shipped manifest over the app's own), then check **The bot token after the re-install** there. For a missing channel scope, no restart is needed.
-  - While a reply waits on a gap that holds replies, CSCB re-reads the token's granted scopes with one `auth.test` at most once a minute; that is not a thread lookup and doesn't change the connection unless Slack refuses the token itself. Once the channel scopes are granted, the waiting replies go ahead and the re-reads stop; the gap ends silently, with no new notice, or, if `im:history` is still missing, is logged once more as that narrower gap. A re-read that keeps failing shows as a [`participation-recovery`](#participation-recovery) `metadata` or `capability` finding.
-  - `method-refused`: while a reply waits, CSCB tries one real lookup at most once a minute, and once Slack answers one, lookups the gap held back run in a follow-up pass. That answer ends the gap only while no configured history scope is missing; otherwise the gap returns to that scope in the same episode, logged with no new notice. A reconnect doesn't end it, and one that finds only `im:history` missing keeps the refusal open.
-  - With no reply waiting, nothing is re-checked until a reply waits again, or, for missing scopes, until the persona's token is next validated (for example at a server restart or a bot token update). A gap of only `im:history` starts no re-read, even while replies wait for other reasons, so it is checked again only then.
-
-### `participation-recovery`
-
-- **Line:** `[slack] participation-recovery: persona="<name>" (key=<key>) state=<pending|gap|unfollowed> cause=<cause> chat_id="<channel>" root="<ts>" file="<file>" code=<code> action="<action>"`. `chat_id=`, `root=`, `file=` and `code=` appear only when known. After a persona's 20th finding line: `[slack] participation-recovery: persona="<name>" (key=<key>) limit=20 further findings are not logged until this persona recovers`. When everything is resolved: `[slack] participation-recovery: persona="<name>" (key=<key>) state=recovered effect="pending thread evidence is resolved and saved; the persona follows the threads it should"`.
-- **Meaning:** CSCB's thread recovery could not yet settle evidence the persona's thread participation needs: who started a thread an undecided reply arrived in, which thread an own upload started, the channel's sharing for an own post, or a record that wasn't saved. Each distinct finding is logged once; nothing is posted to Slack.
-
-  Recovery runs at start and while the server is idle, with no new traffic, post, reconnect or restart. It runs separately for each persona, and its lookups run only while that persona is up; it never posts, reposts or acknowledges anything itself.
-
-  - `state=pending`: still open. Lookups and saves are retried on their own, no faster than the retry spacing or any Retry-After Slack asks for; a lookup that times out stays pending and never counts as a deleted root, a thread someone else started, or a recovery. Two pending findings wait for an event instead: a `root-unmatched` finding is not looked up again and settles when CSCB records the matching post or at a new mention in the thread, and `code=identity-unresolved` settles once CSCB learns the persona's identity when its connection next comes up.
-  - `state=gap`: Slack showed the root deleted, the channel no longer readable, or the file deleted or no longer shown to the persona. Recovery doesn't retry it on a timer, discard it or report it recovered, but looks again after the persona's connection comes up again; after a leave or reset, the thread's replies are looked up afresh in the channel's new lifetime. An `access-lost` gap is also looked at again after the persona receives a new message in that channel (not a redelivery), though no sooner than the retry spacing after the gap was found; a `root-deleted` or `file-unavailable` gap is not.
-  - `state=unfollowed`: decided; the thread is not followed and replies there are not delivered.
-  - `state=recovered`: logged once, for a persona that had a finding here or in [`own-post-not-enrolled`](#own-post-not-enrolled), after a pass that finds the persona's thread state readable, every lookup and held reply settled, and every recoverable enrollment saved. It also follows promptly once an own-post episode ends, no sooner than the retry spacing after a failed pass. A single resolved thread or a saved message is not recovery.
-
-  Only the replies that depend on a finding wait. A reply whose root turns out to be the persona's own post is followed and delivered once with `via=thread`, even while file bookkeeping for other posts is still pending. A reply in a channel the persona can't currently take replies from is decided by the channel's current eligibility; a reply arriving once it is eligible asks again.
-- **Cause:** `cause=` names one of eight:
-  - `storage`: the server could not save or read its thread state.
-  - `metadata`: a lookup or scope re-read timed out, was rate limited, or got a Slack, network or malformed answer; `code=` names it (`identity-unresolved` while the persona's identity is not yet known). A timeout, Slack server error, rate limit or network failure ends the pass. A Slack error CSCB doesn't recognise is reported with that error as `code=` and holds back only its own item: recovery still tries the other pending items in the same pass.
-  - `capability`: Slack refused a channel or file lookup, or a scope re-read, for its scope, token type or credentials; `code=` is the Slack error. A thread lookup refused for its scope or token type is reported as [`root-lookup-capability-missing`](#root-lookup-capability-missing) instead; one refused for the token's credentials is reported here.
-  - `root-deleted` and `access-lost`: the thread's root message was deleted, or the persona can no longer read the channel. These are the only reasons the thread's starter stays unknown.
-  - `file-unavailable`: Slack shows the persona's uploaded file as deleted, or no longer lets it see the file's share; `code=` names the Slack error when Slack denied the file. The upload itself succeeded.
-  - `root-outside-lifetime` (`state=unfollowed`): the persona started the thread, but with no post CSCB recorded in the channel's current lifetime: the root predates an upgrade, a reset or a leave.
-  - `root-unmatched` (`state=pending`): the persona started the thread, but CSCB can't match it to a post it recorded. CSCB matches an own root to an upload by the uploaded file's ID. A text post whose timestamp it never recorded is matched by time instead, close to when it was posted and never before the channel's current lifetime began.
-- **Fix:** follow the line's `action=`. A `pending` line that recovery retries needs nothing unless it persists; `root-unmatched` and `identity-unresolved` wait for the events `state=pending` names. For `storage`, check the server's disk and state directory; for `capability`, check the app's scopes and bot token.
-
-  For `access-lost`, add the app to the channel again; CSCB looks again at the persona's next new message in that channel or its next reconnect. For `root-deleted`, `file-unavailable`, `root-outside-lifetime` and `root-unmatched`, a new mention of the persona in that thread makes it follow the thread.
-
-  Don't post again: the posts succeeded, and recovery never repeats them. Never delete state files to clear a finding. A gap is only reported: CSCB does not rebuild lost participation records.
 
 ### `persona-start`
 

@@ -9,7 +9,6 @@ import { renderPersonaRef } from '../../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './persona-config.ts'
 import { makeNoticeAlertsRig, makeNotifierHarness } from './persona-notifier.ts'
 import { makeQueue, slackInput, deliveredRecord } from './delivery-queue.ts'
-import { createFakeClock } from './fake-clock.ts'
 
 export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue; leakMarker?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'delivery-notices-'))
@@ -18,19 +17,13 @@ export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue
     { name: 'beta', channels: [{ id: 'C0BETA001', delivery: 'all' }, { id: 'C0ALPHA01', delivery: 'all' }], permission_prompts: 'C0BETA001' },
   ], root)
   const h = makeNotifierHarness(config, { leakMarker: options.leakMarker })
-  // Separate post-intake scheduling from microtask settling and episode time.
-  const deferredClock = createFakeClock()
-  const defer = (run: () => void) => {
-    const timer = deferredClock.setTimeout(run, 0)
-    return () => deferredClock.clearTimeout(timer)
-  }
   const rig = makeNoticeAlertsRig(h, { logDir: root, omitStderr: true })
   const logs: string[] = [], blocked: { key: string; rule: 'menu' | 'input' }[] = [], delivered: { key: string; item: QueueItem }[] = []
   const states = new Map(config.personas.map(p => [p.key, { up: true } as DeliveryReportState]))
   const queue = options.queue ?? await makeQueue(root, { now: h.clock.now, onEvent: event => reporting?.queueEvent(event) })
   const reporting = createDeliveryReporting({ queue, episodes: rig.episodes, persona: key => config.personas.find(p => p.key === key), state: key => states.get(key)!,
     log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text),
-    delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now, defer,
+    delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now,
   })
   const [alpha, beta] = config.personas.map(p => p.key) as [string, string]
   const ref = (key = alpha) => { const p = config.personas.find(p => p.key === key)!; return renderPersonaRef(p.name, key) }
@@ -48,15 +41,14 @@ export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue
     const facts = status(item, patch, key)
     reporting.engineEvent({ type: 'waiting', key, seq: item.accepted.seq, reason, ageMs: facts.ageMs, status: facts })
   }
-  return { root, config, h, rig, queue, reporting, logs, blocked, delivered, states, alpha, beta, ref, accept, status, waiting, defer, deferredClock,
+  return { root, config, h, rig, queue, reporting, logs, blocked, delivered, states, alpha, beta, ref, accept, status, waiting,
     async complete(item: QueueItem, key = alpha) {
       if (!item.fixed) await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] })
       await queue.append(key, { ...deliveredRecord(item.accepted.seq, h.clock.now()), seq: item.accepted.seq })
       reporting.engineEvent({ type: 'item-delivered', key, seq: item.accepted.seq, at: h.clock.now(), waitMs: 0 })
     },
     async flush() { await h.clock.flush(); await Promise.resolve(); await Promise.resolve() },
-    async runDeferred() { await deferredClock.runNext(); await h.clock.flush() },
-    async cleanup() { reporting.stop(); await queue.stop(); rig.episodes.close(); h.cleanup(); rmSync(root, { recursive: true, force: true }) },
+    async cleanup() { await queue.stop(); rig.episodes.close(); h.cleanup(); rmSync(root, { recursive: true, force: true }) },
   }
 }
 export type DeliveryNoticeHarness = Awaited<ReturnType<typeof makeDeliveryNoticeHarness>>

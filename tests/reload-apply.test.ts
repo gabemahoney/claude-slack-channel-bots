@@ -1,5 +1,5 @@
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
-import { membershipPage, deliveryAttempt } from './test-helpers/shared-channels.ts'
+import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
@@ -6048,7 +6048,7 @@ describe('durable queues across confirmed persona changes', () => {
     const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const key = h.key('bravo')
     const authority = run.controller.sharedChannels()!, token = authority.lifetime(key, bravo!.channels![0]!.id)!
-    expect(authority.lifetimeStatus(token)).toBe('current')
+    expectCurrent(authority, token)
     for (const source of ['slack', 'interject', 'cron'] as const) {
       const input = source === 'slack'
         ? { source, text: 'slack', channel: bravo!.channels![0]!.id, via: 'receive_all', key: { chat_id: bravo!.channels![0]!.id, ts: '1700000000.000001' }, ts: '1700000000.000001' }
@@ -6061,7 +6061,7 @@ describe('durable queues across confirmed persona changes', () => {
     const preview = await previewConfig(run, [alpha!])
     expect(preview.find(line => line.startsWith('DESTRUCTIVE:'))).toContain('3 open queued items kept, delivered only if a persona with the same key is added again')
     h.confirm(); await run.ticks.tick()
-    expect(authority.lifetimeStatus(token)).toBe('superseded')
+    expectSuperseded(authority, token)
     expect(run.queueEvents).toContainEqual({ type: 'retained', key, count: 3 })
     expect(existsSync(queuePath(h.stateDir, key))).toBe(true)
     expect(readQueue(h.stateDir, key)).toEqual(durableBefore)
@@ -6069,12 +6069,12 @@ describe('durable queues across confirmed persona changes', () => {
     await applyConfig(run, [alpha!, withIndependentDestination(bravo!)])
     const replacement = authority.lifetime(key, bravo!.channels![0]!.id)!
     expect(replacement.incarnation).not.toBe(token.incarnation)
-    expect(authority.lifetimeStatus(replacement)).toBe('current')
-    expect(authority.lifetimeStatus(token)).toBe('superseded')
+    expectCurrent(authority, replacement)
+    expectSuperseded(authority, token)
     expect(run.queued('bravo').map(i => i.accepted.seq)).toEqual([1, 2, 3]); expect(run.queued('bravo').every(i => i.delivered === false)).toBe(true)
     const renamed = h.persona('bravo_two'); h.materialize(renamed); await applyConfig(run, [alpha!, renamed])
     expect(run.queued('bravo_two')).toEqual([]); expect(run.queue.openCount(key)).toBe(3); assertNoLeak(run.captured())
-    expect(authority.lifetimeStatus(replacement)).toBe('superseded')
+    expectSuperseded(authority, replacement)
     const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
     const alphaUntouched = watchUntouched(run, 'alpha'), alphaSession = run.session('alpha')!
     const alphaClient = run.connections.clientFor(h.key('alpha')), alphaSocket = run.stub('alpha').socket
@@ -6131,9 +6131,9 @@ describe('durable queues across confirmed persona changes', () => {
     const current = authority.lifetime(key, bravo!.channels![0]!.id)!
     expect(current.incarnation).not.toBe(token.incarnation)
     expect(current.incarnation).not.toBe(replacement.incarnation)
-    expect(authority.lifetimeStatus(current)).toBe('current')
-    expect(authority.lifetimeStatus(token)).toBe('superseded')
-    expect(authority.lifetimeStatus(replacement)).toBe('superseded')
+    expectCurrent(authority, current)
+    expectSuperseded(authority, token)
+    expectSuperseded(authority, replacement)
     expect(run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))).toEqual(before)
     expect(run.queued('bravo').map(i => i.accepted)).toEqual(acceptedBefore)
     expect(readQueue(h.stateDir, key)).toEqual(retainedBeforeBack)
@@ -6159,7 +6159,7 @@ test.each(['credentials_file', 'working_directory'] as const)('a destructive %s 
   const authority = run.controller.sharedChannels()!, token = authority.lifetime(key, alpha!.channels![0]!.id)!
   let release!: () => void
   const blocked = new Promise<void>(resolve => { release = resolve })
-  const completion = (async () => { await blocked; return authority.isCurrentLifetime(token) })()
+  const completion = (async () => { await blocked; return holdsLifetime(authority, token) })()
   expect((await run.queue.accept(key, { source: 'interject', sender: 'ops', text: 'pending' })).status).toBe('accepted')
   await run.queue.append(key, { v: 1, kind: 'fixed', seq: 1, parts: ['immutable fixed input'] })
   const oldLabel = h.credentialsLabel('alpha')
@@ -6203,9 +6203,8 @@ test.each(['credentials_file', 'working_directory'] as const)('a destructive %s 
   expect(run.connections.clientFor(h.key('bravo'))).toBe(siblingClient); expect(run.stub('bravo').socket).toBe(siblingSocket)
   expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo')); expect(run.isUp('alpha')).toBe(true)
   expect(await completion).toBe(false)
-  expect(authority.lifetimeStatus(token)).toBe('superseded')
+  expectSuperseded(authority, token)
   expect(authority.lifetime(key, alpha!.channels![0]!.id)!.incarnation).not.toBe(token.incarnation)
-  expect(authority.lifetimeStatus(authority.lifetime(key, alpha!.channels![0]!.id)!)).toBe('current')
   expect(run.queued('alpha')).toHaveLength(1); expect(run.queued('alpha')[0]!.fixed!.parts).toEqual(['immutable fixed input']); expect(run.queue.openCount(key)).toBe(1)
   expect(readQueue(h.stateDir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1)
   expect(run.queued('bravo')).toEqual([]); assertNoLeak(run.captured())

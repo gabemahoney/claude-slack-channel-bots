@@ -56,7 +56,7 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import type { OwnPostObserver } from '../src/own-post.ts'
+import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import {
@@ -578,6 +578,21 @@ describe('confirmed own posts', () => {
     expect(events.slice(2).map(([name, value]) => name === 'confirm' ? (value as { posted: { channel: string } }).posted.channel : name)).toEqual(['issue', 'D0ALPHADM', 'onPosted'])
     // A DM destination has no channel lifetime to capture at issue.
     expect(events[2]).toEqual(['issue', { key: A.key, surface: 'notice', channel: undefined }])
+  })
+
+  test('a surfaced notice through the ownerless observer server.ts builds posts once, hands Slack\'s channel and ts to onPosted and logs nothing', async () => {
+    const ownPosts = createOwnPostObserver(() => undefined)
+    const resolver = createPersonaDestinations({ log: (line) => logs.push(line), getPersonaConfig: () => ({ channel_mode: 'strict' as const }), ownPosts })
+    const called: DestinationPosted[] = []
+    stub(C).script.post.push({ kind: 'ok', result: { ts: '1700000000.000901' } })
+
+    const result = record(await resolver.post(C, client(C), { text: 'notice' }, { surface: 'notice', onPosted: (posted) => void called.push(posted) }))
+
+    const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000901' }
+    expect(result).toEqual(posted)
+    expect(called).toEqual([posted])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'notice' }])
+    expect(logs).toEqual([])
   })
 })
 

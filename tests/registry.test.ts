@@ -116,7 +116,7 @@ import {
 } from './test-helpers/persona-config.ts'
 import { observeFileCompletions, withFileCompletions } from '../src/file-upload-observation.ts'
 import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
-import type { OwnPostIssue, OwnPostObserver } from '../src/own-post.ts'
+import { createOwnPostObserver, type OwnPostIssue, type OwnPostObserver } from '../src/own-post.ts'
 import {
   asWebClient,
   makeDeferredWebApiCall,
@@ -2767,6 +2767,73 @@ describe('reply files: nested upload completions observed on the real client', (
     const rejected = await withFileCompletions((response) => heard.push(response), upload).catch((err: unknown) => err)
     expect(rejected).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'internal_error' } })
     expect(heard).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reply through the ownerless observer server.ts builds until Epic 5c
+// ---------------------------------------------------------------------------
+
+describe('reply through the ownerless own-post observer', () => {
+  /** Exactly the observer `src/server.ts` builds. */
+  const ownerlessOwnPosts = () => createOwnPostObserver(() => undefined)
+  const PARTS = ['QZPART01', 'QZPART02', 'QZPART03']
+  const partTs = (n: number) => `1700000000.${String(n).padStart(6, '0')}`
+
+  test.each([2, 3])('a failure at text chunk %i of 3 reports the confirmed prefix, posts no part twice and logs one operator line without the reply\'s text', async (failing) => {
+    const ownPosts = ownerlessOwnPosts()
+    const logged: string[] = []
+    const stub = stubOf(h.alpha)
+    for (let i = 1; i < failing; i++) stub.script.post.push({ kind: 'ok' })
+    stub.script.post.push({ kind: 'platform', error: 'channel_not_found' })
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 8 }), ownPosts, log: (line) => void logged.push(line),
+    })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: PARTS.join('') })
+
+    const sent = failing - 1
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent, total: 3, lastTs: partTs(sent), uploaded: 0, files: 0 }, 'channel_not_found'))
+    expect(stub.calls.postMessage.map((c) => ('text' in c ? c.text : undefined))).toEqual(PARTS.slice(0, failing))
+    expect(logged).toHaveLength(1)
+    expect(logged[0]!.startsWith(`[slack] Tool "reply" stopped after a partial post for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}: sent=${sent}/3 uploaded=0/0: `)).toBe(true)
+    expect(logged[0]).toContain('channel_not_found')
+    for (const part of PARTS) expect(logged[0]).not.toContain(part)
+    expect(h.lines.filter((l) => l.includes('partial post'))).toEqual([])
+    assertNoLeak({ result, lines: logged })
+  })
+
+  test('a reply with text and a file posts each part once, reports success, clears its ack and logs nothing', async () => {
+    const ownPosts = ownerlessOwnPosts()
+    const stub = stubOf(h.alpha)
+    observeFileCompletions(stub.web)
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const file = join(h.inboxDir, 'one.txt')
+    writeFileSync(file, 'one')
+    const consumedAt: Array<{ posts: number; uploads: number }> = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, ownPosts,
+      consumeAck: (key, channel, ts, remove) => {
+        consumedAt.push({ posts: stub.calls.postMessage.length, uploads: stub.calls.filesUploadV2.length })
+        return remove ? consumeAck(key, channel, ts, remove) : consumeAck(key, channel, ts)
+      },
+      clientFor: (key) => {
+        const s = h.clients.get(key)
+        return s ? asWebClient(watchWebClientAuth(s.web, () => {})) : undefined
+      },
+    })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [file], message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Sent 1 message(s) + 1 file(s) to ${A_ALL} [ts: ${partTs(1)}]`)
+    expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 1, 1])
+    expect(stub.calls.reactionsRemove).toEqual([REMOVE_EYES])
+    // The text's own success clears the ack, before the upload starts.
+    expect(consumedAt).toEqual([{ posts: 1, uploads: 0 }])
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    expect(h.lines).toEqual([])
   })
 })
 

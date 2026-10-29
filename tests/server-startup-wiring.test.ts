@@ -21,7 +21,7 @@ import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 import type { PersonaConfig } from '../src/config.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { createDeliveryReporting, MESSAGE_RECEIVED, type DeliveryReportingDeps } from '../src/delivery-notices.ts'
+import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
 import { configInEffect } from '../src/reload.ts'
@@ -60,8 +60,6 @@ import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
-import type { ParticipationRecoveryDeps } from '../src/participation-recovery.ts'
-import type { RootLookupCapabilityDeps } from '../src/participation-capability.ts'
 import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
 import type { ReloadControllerDeps } from '../src/reload.ts'
 import type * as RestartModule from '../src/restart.ts'
@@ -75,7 +73,6 @@ import type * as SessionManagerModule from '../src/session-manager.ts'
 import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
 import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
 import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
-import type * as ThreadParticipationModule from '../src/thread-participation.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
@@ -1667,7 +1664,7 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('dryRun')).toBe('isDryRun()')
     expect(props.get('onStatus')).toStartWith('composePersonaStatusListeners(')
     const listeners = onlyCallArgs('composePersonaStatusListeners')
-    expect(listeners).toHaveLength(5)
+    expect(listeners).toHaveLength(4)
     expect(listeners[0]).toBe('(key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) }')
     expect(listeners[1]).toBe(`createPersonaUpFlushListener(${notifier})`)
     // The controller is built after (and over) the manager, so the listener
@@ -1677,7 +1674,6 @@ describe('server.ts wires the persona connection seams', () => {
     expect(listeners[2]).not.toContain(constOf('createPersonaBringUpController'))
     // Resolve reporting on the up notification, when the current client is usable.
     expect(listeners[3]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
-    expect(listeners[4]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) \{ rootLookupCapability\.connected\(\1\); participationRecovery\?\.connected\(\1\) \} \}$/)
   })
 
   test('the Slack API base URL override (section 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
@@ -4282,7 +4278,6 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'getParticipation', 'currentProvenance', 'onParticipationFailure', 'onParticipationSettled', 'onCandidateHeld', 'onChannelEvent', 'beginIntake',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5437,169 +5432,37 @@ describe('delivery ownership wiring', () => {
   })
 })
 
-describe('participation recovers before intake and shares the production owners', () => {
-  const factory: keyof typeof ThreadParticipationModule = 'createThreadParticipation'
-  const holder = 'threadParticipation'
+describe('the own-post observer is ownerless and server.ts builds no participation', () => {
+  const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
 
-  test('queue replay completes before authority recovery and participation starts before any admission', () => {
-    const queueStart = onlyCallOf('deliveryQueue.start')
-    const built = onlyCallOf(factory)
-    const started = onlyCallOf(`${holder}.start`)
-    const resolution = startResolution(SERVER_CODE)
-    expect(importSource(SERVER_CODE, factory)).toBe('./thread-participation.ts')
-    declaredOnce(holder)
-    expect(assignmentsTo(holder).map(({ value }) => value)).toEqual([`${factory}({`])
-    const props = onlyCallProps(factory)
-    expect([...props.keys()]).toEqual(['queue', 'authority', 'eligibility', 'identity', 'onOwnPost', 'onSettled'])
-    expect(props.get('queue')).toBe('deliveryQueue')
-    expect(props.get('authority')).toBe(`${resolution.controller}.sharedChannels()!`)
-    // Eligibility reads the applied config, the one stored-choice store and current membership at each confirmation.
-    const eligibility: keyof typeof OwnPostModule = 'ownPostEligibility'
-    expect(importSource(SERVER_CODE, eligibility)).toBe('./own-post.ts')
-    expect(props.get('eligibility')).toBe(`${eligibility}({ config: () => personaConfig, persona: getAppliedPersona, ` +
-      'choices: () => channelDeliveryStore, membership: (key, channel, mode) => channelMembership?.read(key, channel, mode), })')
-    expect(props.get('identity')).toBe('identityFor')
-    expect(props.get('onOwnPost')).toBe('reportOwnPost')
-    // A settled thread (or rootless channel) re-evaluates only that persona's held replies there; a failure leaves them unacknowledged.
-    expect(props.get('onSettled')).toBe('(key, channel, root) => { for (const held of personaRouting.pendingCandidates()) { ' +
-      'if (held.key === key && held.channel === channel && (root === undefined || held.root === root)) { ' +
-      'void personaRouting.reevaluate(held.id).catch(() => { }) } } }')
-    expect(onlyCallArgs(`${holder}.start`)).toEqual([])
-    expect(SERVER_CODE.slice(queueStart - 'await '.length, queueStart)).toBe('await ')
-    const ordered = [onlyCallOf('checkPidConflict'), onlyCallOf('createDeliveryQueue'), queueStart,
-      resolution.resolveAt, resolution.assignAt, onlyCallOf('createChannelMembership'), built, started,
-      onlyCallOf('createPersonaConnectionManager'), onlyCallOf('Bun.serve'), resolution.bringUpAt]
-    expect(ordered).toEqual([...ordered].sort((a, b) => a - b))
-    for (const at of [queueStart, resolution.resolveAt, built, started]) expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  test('server.ts builds none of the removed participation pieces and defers no intake notice', () => {
+    expect(SERVER_CODE.match(/participation|rootLookup|grantedScope|RECOVERY_CLOCK|reportOwnPost|beginIntake/gi)).toBeNull()
   })
 
-  test('the routing harness re-evaluates settled threads with server.ts\'s own onSettled, its routing in place of personaRouting', () => {
+  test('the routing harness builds its own-post observer with server.ts\'s own arguments', () => {
     const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
-    const decls = indicesOf(/\bconst\s+ownPostOptions\b/g, harness)
-    expect(decls).toHaveLength(1)
-    const options = objectProperties(harness.slice(harness.indexOf('{', harness.indexOf('=', decls[0]!))))
-    const production = onlyCallProps(factory).get('onSettled')!
-    expect(production).toContain('personaRouting.')
-    expect(options.get('onSettled')?.replace(/\brouting\./g, 'personaRouting.')).toBe(production)
-  })
-
-  test('the routing harness builds its own-post observer with server.ts\'s own arguments, h.participation in place of threadParticipation', () => {
-    const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
-    const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
     const production = onlyCallArgs(observer)
-    expect(production[0]).toBe(`() => ${holder}`)
-    const mirrored = splitTopLevel(onlyCallArguments(harness, observer))
-    expect(mirrored.map(arg => arg.replace(/\bh\.participation\b/g, holder))).toEqual(production)
+    expect(production).toEqual(['() => undefined'])
+    expect(splitTopLevel(onlyCallArguments(harness, observer))).toEqual(production)
   })
 
-  test('routing reads the current owner and authenticated connection provenance, and reports unresolved obligations separately', () => {
-    const props = onlyCallProps('createPersonaRouting')
-    const bindings: Array<[keyof PersonaRoutingDeps, string]> = [
-      ['getParticipation', `() => ${holder}`],
-      ['currentProvenance', 'key => connections?.provenance(key)'],
-      ['onParticipationFailure', '(key, id, event, error, unaccepted) => deliveryReporting?.participationFailed(key, id, event, error, unaccepted)'],
-      ['onParticipationSettled', '(key, id) => deliveryReporting?.participationSettled(key, id)'],
-      ['beginIntake', 'key => deliveryReporting?.beginIntake(key) ?? (() => {})'],
-    ]
-    for (const [member, binding] of bindings) expect(props.get(member)).toBe(binding)
-  })
-
-  test('idle participation recovery: never built in dry run, kicked once per restored key at startup, kicked per held candidate and per ended own-post episode, told of each new channel event, forgotten on teardown and stopped before the owner', () => {
-    expect(onlyCallProps('createPersonaRouting').get('onCandidateHeld')).toBe('candidate => participationRecovery?.kick(candidate.key, candidate.id)')
-    // A new event of a channel lets recovery look up that channel's lost-access gaps again.
-    expect(onlyCallProps('createPersonaRouting').get('onChannelEvent')).toBe('(key, channel) => participationRecovery?.channelEvent(key, channel)')
-    expect(indicesOf(/participationRecovery\?\.channelEvent\(/g, SERVER_CODE)).toHaveLength(1)
-    // An own-post episode's end asks recovery for its report through the same kick.
-    const owed: keyof DeliveryReportingDeps = 'recoveryOwed'
-    expect(onlyCallProps('createDeliveryReporting').get(owed)).toBe('(key, id) => participationRecovery?.kick(key, id)')
-    expect(indicesOf(/participationRecovery\?\.kick\(/g, SERVER_CODE)).toHaveLength(3)
-    const build = onlyCallOf('createParticipationRecovery')
-    expect(insideMain(build)).toBe(true)
-    const guard = SERVER_CODE.lastIndexOf('if (!isDryRun()) {', build)
-    expect(guard).toBeGreaterThan(-1)
-    expect(SERVER_CODE.slice(guard, build).replace(/\s+/g, ' ').trim()).toBe('if (!isDryRun()) { participationRecovery =')
-    const startup = SERVER_CODE.indexOf('for (const key of deliveryQueue?.keys() ?? []) participationRecovery.kick(key)')
-    expect(startup).toBeGreaterThan(build)
-    expect(indicesOf(/participationRecovery\.kick\(key\)/g, SERVER_CODE)).toHaveLength(1)
-    expect(onlyCallProps('createParticipationRecovery').get('report')?.replace(/\s+/g, ' ')).toBe(
-      '{ finding: (key, finding) => deliveryReporting?.recoveryFinding(key, finding), recovered: key => deliveryReporting?.participationRecovered(key), }')
-    expect(indicesOf(/participationRecovery\?\.forget\((\w+)\)/g, SERVER_CODE)).toHaveLength(1)
-    const stop = SERVER_CODE.indexOf('participationRecovery?.stop()')
-    expect(indicesOf(/participationRecovery\?\.stop\(\)/g, SERVER_CODE)).toHaveLength(1)
-    expect(SERVER_CODE.indexOf('personaRouting.stop()')).toBeLessThan(stop)
-    expect(stop).toBeLessThan(SERVER_CODE.indexOf('threadParticipation?.stop()'))
-  })
-
-  test('recovery reads the current owner, queue, candidates and authenticated connection, and shares the one capability the up listener and teardown use', () => {
-    const props = onlyCallProps('createParticipationRecovery')
-    const capability = constOf('createRootLookupCapability')
-    const bindings: Array<[keyof ParticipationRecoveryDeps, string]> = [
-      ['participation', `() => ${holder}`],
-      ['queue', '() => deliveryQueue'],
-      ['candidates', '() => personaRouting.pendingCandidates()'],
-      ['reevaluate', 'id => personaRouting.reevaluate(id)'],
-      ['provenance', 'key => manager.provenance(key)'],
-      ['isUp', 'isPersonaUp'],
-      ['metadataCall', '(key, connectionId, method, args, signal) => manager.metadataCall(key, connectionId, method, args, signal)'],
-      ['refreshScopes', '(key, connectionId, signal) => manager.refreshGrantedScopes(key, connectionId, signal)'],
-      ['capability', capability],
-      ['policy', 'ownPostLookupPolicy({ config: () => personaConfig, choices: () => channelDeliveryStore })'],
-      ['clock', 'RECOVERY_CLOCK'],
-    ]
-    for (const [member, binding] of bindings) expect([member, props.get(member)]).toEqual([member, binding])
-    expect([...props.keys()].sort()).toEqual([...bindings.map(([member]) => member), 'report'].sort())
-    // The capability is one module-level instance over the applied config and the live connection's scopes.
-    const cap = onlyCallProps('createRootLookupCapability')
-    const capBindings: Array<[keyof RootLookupCapabilityDeps, string]> = [
-      ['grantedScopes', 'key => connections?.grantedScopes(key)'],
-      ['persona', 'key => getAppliedPersona(key)'],
-    ]
-    for (const [member, binding] of capBindings) expect([member, cap.get(member)]).toEqual([member, binding])
-    expect(cap.get('report')?.replace(/\s+/g, ' ')).toBe('{ gap: (key, gap) => deliveryReporting?.capabilityGap(key, gap), cleared: key => deliveryReporting?.capabilityCleared(key), }')
-    expect(SERVER_CODE).toContain(`(key, status) => { if (status.state === 'up') { ${capability}.connected(key); participationRecovery?.connected(key) } }`)
-    expect(indicesOf(new RegExp(`\\b${capability}\\.connected\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
-    expect(indicesOf(new RegExp(`\\b${capability}\\.forget\\(key\\); participationRecovery\\?\\.forget\\(key\\)`, 'g'), SERVER_CODE)).toHaveLength(1)
-  })
-
-  test('every posting surface shares one own-post observer over the current owner, and reporting replays restored findings before buffered outcomes', () => {
-    const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
+  test('every posting surface shares the one ownerless own-post observer, built at module load', () => {
     expect(importSource(SERVER_CODE, observer)).toBe('./own-post.ts')
+    expect(callsOf(observer)).toHaveLength(1)
     declaredOnce('ownPosts')
-    // A confirmation fault reaches reporting as the operation gap ownPostFaultOutcome builds.
-    const fault: keyof typeof ThreadParticipationModule = 'ownPostFaultOutcome'
-    expect(importSource(SERVER_CODE, fault)).toBe('./thread-participation.ts')
-    expect(onlyCallArgs(observer)).toEqual([`() => ${holder}`, `(issue, posted, error) => reportOwnPost(${fault}(issue, posted, error))`])
-    expect(callsOf(fault)).toHaveLength(1)
+    expect(constOf(observer)).toBe('ownPosts')
+    expect(onlyCallArgs(observer)).toEqual(['() => undefined'])
+    expect(assignmentsTo('ownPosts')).toEqual([])
+    expect(insideMain(onlyCallOf(observer))).toBe(false)
     expect(objectProperties(spreadConstObject('sessionToolDeps')).get('ownPosts')).toBe('ownPosts')
     expect(onlyCallProps('createPersonaDestinations').get('ownPosts')).toBe('ownPosts')
-    // Before reporting exists, outcomes are buffered (bounded); afterwards they go straight to it. Overflow counts only fresh outcomes.
-    declaredOnce('reportOwnPost')
-    const report = /\bfunction reportOwnPost\(outcome: OwnPostOutcome\): void \{([^}]*)\}/.exec(SERVER_CODE)
-    expect(report?.[1]?.replace(/\s+/g, ' ').trim()).toBe("if (outcome.kind === 'pending' || outcome.kind === 'gap') participationRecovery?.kick(outcome.key, outcome.id) " +
-      'if (deliveryReporting) deliveryReporting.ownPostObserved(outcome) ' +
-      'else if (bufferedOwnPostOutcomes.length < MAX_BUFFERED_OWN_POST_OUTCOMES) bufferedOwnPostOutcomes.push(outcome) ' +
-      'else if (!outcome.duplicate) droppedOwnPostOutcomes.set(outcome.key, (droppedOwnPostOutcomes.get(outcome.key) ?? 0) + 1)')
-    expect(onlyCallProps('createDeliveryReporting').get('ownPostFindings')).toBe(`key => ${holder}?.ownPostFindings(key) ?? []`)
-    const reporting = onlyCallOf('createDeliveryReporting')
-    const startup = onlyCallOf('deliveryReporting.ownPostStartup')
-    expect(onlyCallArgs('deliveryReporting.ownPostStartup')).toEqual([`${holder}?.ownPostFindings() ?? []`])
-    const replay = SERVER_CODE.indexOf('for (const outcome of bufferedOwnPostOutcomes.splice(0)) deliveryReporting.ownPostObserved(outcome)')
-    // The notifier is built at module load, before main(); restored protection exists (owner started) before findings are reported.
-    expect(insideMain(onlyCallOf('createPersonaNotifier'))).toBe(false)
-    expect(onlyCallProps('createDeliveryReporting').get('notify')).toBe('(key, text) => personaNotifier.notify(key, text)')
-    // Overflow beyond the buffer is counted per persona and logged once after the replay, then forgotten.
-    const dropped = onlyCallOf('deliveryReporting.ownPostDropped')
-    expect(onlyCallArgs('deliveryReporting.ownPostDropped')).toEqual(['droppedOwnPostOutcomes'])
-    const cleared = SERVER_CODE.indexOf('droppedOwnPostOutcomes.clear()')
-    const ordered = [onlyCallOf(`${holder}.start`), reporting, startup, replay, dropped, cleared]
-    expect(ordered).toEqual([...ordered].sort((a, b) => a - b))
-    for (const at of [reporting, startup, replay, dropped, cleared]) expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
   })
 
-  test('shutdown stops intake and participation before draining preparation and closing the journal', () => {
+  test('shutdown drains preparation before closing the journal, with no routing or owner stop', () => {
     const [start, end] = shutdownBody(SERVER_CODE)
     const code = SERVER_CODE.slice(start, end)
-    const calls = ['personaRouting.stop', `${holder}?.stop`, 'deliveryPreparation?.stop', 'deliveryQueue?.stop']
+    expect(code).not.toMatch(/personaRouting\.stop\s*\(/)
+    const calls = ['deliveryPreparation?.stop', 'deliveryQueue?.stop']
     const offsets = calls.map(name => {
       const at = indicesOf(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(', 'g'), code)
       expect(at).toHaveLength(1)
@@ -5745,7 +5608,6 @@ describe('production bring-up reaction recovery', () => {
       composePersonaStatusListeners, createPersonaUpFlushListener, personaNotifier: n.h.notifier, bringUps: controller,
       deliveryPreparation: preparation, deliveryReporting: reporting, clientFor: conn.clientFor,
       personaConfig: config, appliedConfig: config, configInEffect,
-      rootLookupCapability: { connected() {} }, participationRecovery: undefined,
     }
     conn.onStatus = expression(onlyCallProps('createPersonaConnectionManager').get('onStatus')!, bindings)
     const onApplied = expression<(config: PersonaConfig) => void>(onlyCallProps('createReloadController').get('onApplied')!, bindings)

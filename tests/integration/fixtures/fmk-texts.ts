@@ -317,22 +317,6 @@
  *                                                src/persona-diagnostics.ts: its cause
  *   PERSONA_CHANNEL_DELIVERY_SET                 src/persona-diagnostics.ts, the class label
  *   MESSAGE_RECEIVED, MESSAGE_DELIVERED          src/persona-diagnostics.ts, delivery evidence labels
- *   ROOT_LOOKUP_CAPABILITY_MISSING, PARTICIPATION_RECOVERY
- *                                                src/persona-diagnostics.ts, the thread-evidence
- *                                                class labels (test-29 phase R, test-31)
- *   rootLookupCapabilityLine <name> <key> missing-scope <scopes>
- *   rootLookupCapabilityLine <name> <key> method-refused <method> <slack-error>
- *                                                src/delivery-notices.ts: the whole
- *                                                root-lookup-capability-missing line, the
- *                                                persona ref rendered by the package
- *   participationRecoveryLine <name> <key> <cause> <channel|-> <root|-> <file|-> <code|->
- *                                                src/delivery-notices.ts: one whole
- *                                                participation-recovery finding line, `-`
- *                                                for a field the finding lacks
- *   participationRecoveredLine <name> <key>      src/delivery-notices.ts: the recovered line
- *   replyPartialFailureText <where> <sent> <total> <last-ts> <uploaded> <files> <reason>
- *                                                src/registry.ts: the reply tool's error after
- *                                                a later part failed
  *   THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS
  *                                                src/delivery-constants.ts: one metadata
  *                                                attempt's deadline and the local retry
@@ -3901,85 +3885,6 @@ const personaDiagnosticLine: Entry = {
   },
 }
 
-/** The persona ref the package renders for <name> and <key> (persona-identity.ts renderPersonaRef). */
-async function personaRefOf(context: EntryContext, name: string, key: string): Promise<string> {
-  const render = await packageFunction<(name: string, key: string) => unknown>(context, 'persona-identity.ts', 'renderPersonaRef')
-  return builtString('renderPersonaRef', render(name, key))
-}
-
-/**
- * `buildRootLookupCapabilityLine(<ref>, <gap>)` (delivery-notices.ts): a
- * `missing-scope` gap naming <scopes> (comma-separated), or a
- * `method-refused` gap naming <method> and <slack-error>.
- */
-const rootLookupCapabilityLine: Entry = {
-  synopsis: '<name> <key> missing-scope <scopes> | <name> <key> method-refused <method> <slack-error>',
-  async print(args, context) {
-    const entry = 'buildRootLookupCapabilityLine'
-    const [name, key, kind] = args
-    if (kind === 'missing-scope') expectArguments(entry, args, ['name', 'key', 'kind', 'scopes'])
-    else if (kind === 'method-refused') expectArguments(entry, args, ['name', 'key', 'kind', 'method', 'slack-error'])
-    else usageFail(`${entry}: <kind> must be missing-scope or method-refused (got '${kind ?? ''}')`)
-    const gap = kind === 'missing-scope'
-      ? { kind, scopes: args[3]!.split(',') }
-      : { kind, method: args[3]!, slackError: args[4]! }
-    const build = await packageFunction<(persona: string, gap: object) => unknown>(context, 'delivery-notices.ts', entry)
-    return builtString(entry, build(await personaRefOf(context, name!, key!), gap))
-  },
-}
-
-/**
- * `buildParticipationRecoveryLine(<ref>, <finding>)` (delivery-notices.ts):
- * one recovery finding, each of <channel>, <root>, <file> and <code> `-`
- * when the finding has none. A <cause> the package names no action for fails.
- */
-const participationRecoveryLine: Entry = {
-  synopsis: '<name> <key> <cause> <channel|-> <root|-> <file|-> <code|->',
-  async print(args, context) {
-    const entry = 'buildParticipationRecoveryLine'
-    expectArguments(entry, args, ['name', 'key', 'cause', 'channel', 'root', 'file', 'code'])
-    const [name, key, cause, ...where] = args
-    const finding: Record<string, string> = { cause: cause! }
-    for (const [field, value] of [['channel', where[0]], ['root', where[1]], ['file', where[2]], ['code', where[3]]] as const) {
-      if (value !== '-') finding[field] = value!
-    }
-    const build = await packageFunction<(persona: string, finding: object) => unknown>(context, 'delivery-notices.ts', entry)
-    const line = builtString(entry, build(await personaRefOf(context, name!, key!), finding))
-    if (!line.includes(' action="')) usageFail(`${entry}: the installed package names no action for the cause '${cause}'`)
-    return line
-  },
-}
-
-/** `buildParticipationRecoveredLine(<ref>)` (delivery-notices.ts): the persona's recovery report. */
-const participationRecoveredLine: Entry = {
-  synopsis: '<name> <key>',
-  async print(args, context) {
-    const entry = 'buildParticipationRecoveredLine'
-    expectArguments(entry, args, ['name', 'key'])
-    const build = await packageFunction<(persona: string) => unknown>(context, 'delivery-notices.ts', entry)
-    return builtString(entry, build(await personaRefOf(context, args[0]!, args[1]!)))
-  },
-}
-
-/**
- * `replyPartialFailureText(<prefix>, <reason>)` (registry.ts): the `reply`
- * tool's error after a later part failed, <sent> of <total> messages and
- * <uploaded> of <files> files posted, the last message <last-ts>.
- */
-const replyPartialFailure: Entry = {
-  synopsis: '<where> <sent> <total> <last-ts> <uploaded> <files> <reason>',
-  async print(args, context) {
-    const entry = 'replyPartialFailureText'
-    expectArguments(entry, args, ['where', 'sent', 'total', 'last-ts', 'uploaded', 'files', 'reason'])
-    const [where, sent, total, lastTs, uploaded, files, reason] = args
-    for (const [label, value] of [['sent', sent], ['total', total], ['uploaded', uploaded], ['files', files]] as const) {
-      if (!/^(0|[1-9][0-9]{0,8})$/.test(value!)) usageFail(`${entry}: <${label}> '${value}' is not a whole number in decimal`)
-    }
-    const build = await packageFunction<(prefix: object, reason?: string) => unknown>(context, 'registry.ts', entry)
-    return builtString(entry, build({ where, sent: Number(sent), total: Number(total), lastTs, uploaded: Number(uploaded), files: Number(files) }, reason))
-  },
-}
-
 /**
  * `modeSwitchLine(<mode>, <personas>)` (reload-plan.ts): the switch's preview
  * line turning <mode> on, for the personas named, in the order given, each
@@ -4434,12 +4339,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   PERSONA_CHANNEL_DELIVERY_SET: constantEntry('persona-diagnostics.ts', 'PERSONA_CHANNEL_DELIVERY_SET'),
   MESSAGE_RECEIVED: constantEntry('persona-diagnostics.ts', 'MESSAGE_RECEIVED'),
   MESSAGE_DELIVERED: constantEntry('persona-diagnostics.ts', 'MESSAGE_DELIVERED'),
-  ROOT_LOOKUP_CAPABILITY_MISSING: constantEntry('persona-diagnostics.ts', 'ROOT_LOOKUP_CAPABILITY_MISSING'),
-  PARTICIPATION_RECOVERY: constantEntry('persona-diagnostics.ts', 'PARTICIPATION_RECOVERY'),
-  rootLookupCapabilityLine,
-  participationRecoveryLine,
-  participationRecoveredLine,
-  replyPartialFailureText: replyPartialFailure,
   THREAD_MEMORY_LOOKUP_DEADLINE_MS: constantEntry('delivery-constants.ts', 'THREAD_MEMORY_LOOKUP_DEADLINE_MS'),
   THREAD_MEMORY_RETRY_MIN_MS: constantEntry('delivery-constants.ts', 'THREAD_MEMORY_RETRY_MIN_MS'),
   THREAD_MEMORY_RETRY_MAX_MS: constantEntry('delivery-constants.ts', 'THREAD_MEMORY_RETRY_MAX_MS'),

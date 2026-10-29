@@ -7,15 +7,14 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { ENROLLMENT_METADATA_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
-  type EnrollmentMetadataMethod, type MetadataFailure } from '../src/thread-memory.ts'
+import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
+  type MetadataFailure } from '../src/thread-memory.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { slackHttpError, slackPlatformError, slackRateLimited } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
 const T0 = 1_700_000_000_000
-const METHODS: EnrollmentMetadataMethod[] = [...ENROLLMENT_METADATA_METHODS]
 
 /** Operations answered in call order, each recording the signal its attempt gave it. */
 function scripted() {
@@ -31,9 +30,13 @@ function scripted() {
 }
 
 describe('the bounded metadata call', () => {
-  test.each(METHODS)('%s: a hung first and a hung later attempt each end at the lookup deadline, abort their request and leave nothing in flight; late answers change nothing', async method => {
+  test('Thread Memory\'s lookups may call exactly conversations.replies and conversations.history (SR-3.4.2)', () => {
+    expect(THREAD_MEMORY_LOOKUP_METHODS).toEqual(['conversations.replies', 'conversations.history'])
+  })
+
+  test('a hung first and a hung later attempt each end at the lookup deadline, abort their request and leave nothing in flight; late answers change nothing', async () => {
     const clock = createFakeClock({ start: T0 }), attempts = createMetadataAttempts(clock), s = scripted()
-    const run = () => attempts.run('alpha', () => true, s.operation, method)
+    const run = () => attempts.run('alpha', () => true, s.operation)
     const first = s.hang()
     const one = run()
     await clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS - 1)
@@ -43,7 +46,7 @@ describe('the bounded metadata call', () => {
     expect([attempts.inFlight('alpha'), s.signals[0]!.aborted]).toEqual([0, true])
     // The abandoned attempt's late answer is consumed; a fresh attempt starts at once and decides from its own answer.
     first.settle({ ok: true, late: true })
-    const fresh = { ok: true, method }
+    const fresh = { ok: true, fresh: true }
     s.answers.push(async () => fresh)
     expect(await run()).toEqual({ kind: 'ok', value: fresh })
     const later = s.hang()
@@ -55,14 +58,14 @@ describe('the bounded metadata call', () => {
     expect([s.signals.length, s.signals[2]!.aborted, attempts.inFlight('alpha'), clock.pendingCount()]).toEqual([3, true, 0, 0])
   })
 
-  test.each(METHODS)('%s: a guard turning false, revocation or shutdown cancels the attempt; another persona\'s attempt is untouched', async method => {
+  test('a guard turning false, revocation or shutdown cancels the attempt; another persona\'s attempt is untouched', async () => {
     const clock = createFakeClock({ start: T0 }), attempts = createMetadataAttempts(clock), s = scripted()
-    const answer = { ok: true, method }
+    const answer = { ok: true }
     let current = true
     const guarded = s.hang(), revoked = s.hang(), other = s.hang()
-    const a = attempts.run('alpha', () => current, s.operation, method)
-    const b = attempts.run('alpha', () => true, s.operation, method)
-    const c = attempts.run('beta', () => true, s.operation, method)
+    const a = attempts.run('alpha', () => current, s.operation)
+    const b = attempts.run('alpha', () => true, s.operation)
+    const c = attempts.run('beta', () => true, s.operation)
     current = false; guarded.settle(answer)
     expect(await a).toEqual({ kind: 'cancelled' })
     attempts.revoke('alpha')
@@ -71,13 +74,16 @@ describe('the bounded metadata call', () => {
     revoked.settle(answer); other.settle(answer)
     expect(await c).toEqual({ kind: 'ok', value: answer })
     attempts.stop()
-    expect(await attempts.run('beta', () => true, s.operation, method)).toEqual({ kind: 'cancelled' })
+    expect(await attempts.run('beta', () => true, s.operation)).toEqual({ kind: 'cancelled' })
     expect(s.signals).toHaveLength(3)
   })
 
   test.each<[string, unknown, MetadataFailure]>([
     ['a missing scope', slackPlatformError('missing_scope'), { kind: 'capability', slackError: 'missing_scope' }],
     ['a refused token type', slackPlatformError('not_allowed_token_type'), { kind: 'capability', slackError: 'not_allowed_token_type' }],
+    ['a denied access', slackPlatformError('access_denied'), { kind: 'capability', slackError: 'access_denied' }],
+    ['a missing permission', slackPlatformError('no_permission'), { kind: 'capability', slackError: 'no_permission' }],
+    ['an unauthorized call', slackPlatformError('not_authorized'), { kind: 'capability', slackError: 'not_authorized' }],
     ['a revoked token', slackPlatformError('token_revoked'), { kind: 'credentials', slackError: 'token_revoked' }],
     ['lost access', slackPlatformError('channel_not_found'), { kind: 'access-lost', slackError: 'channel_not_found' }],
     ['a deleted message', slackPlatformError('thread_not_found'), { kind: 'not-found', slackError: 'thread_not_found' }],
@@ -98,21 +104,12 @@ describe('the bounded metadata call', () => {
     expect(classifyMetadataFailure(error)).toEqual(expected)
   })
 
-  // Every listed method has a row: a method added to or removed from the list fails to compile here until it is given one.
-  const FILE_DENIAL_READING: Record<EnrollmentMetadataMethod, 'file-unavailable' | 'capability'> = {
-    'conversations.replies': 'capability', 'conversations.info': 'capability', 'files.info': 'file-unavailable',
-  }
-  test.each(METHODS.flatMap(method => ['access_denied', 'no_permission', 'not_authorized'].map(code => [method, code] as const)))(
-    '%s answering %s: only a file lookup reads it as that file being unavailable', (method, code) => {
-      expect(classifyMetadataFailure(slackPlatformError(code), method)).toEqual({ kind: FILE_DENIAL_READING[method], slackError: code })
-    })
-
-  test.each(METHODS)('%s: a sentinel-bearing failure keeps only its safe Slack code and Retry-After', async method => {
+  test('a sentinel-bearing failure keeps only its safe Slack code and Retry-After', async () => {
     const clock = createFakeClock({ start: T0 }), attempts = createMetadataAttempts(clock)
     const results = [
-      await attempts.run('alpha', () => true, async () => { throw slackPlatformError('something_new', undefined, LEAK_SENTINEL) }, method),
-      await attempts.run('alpha', () => true, async () => { throw slackPlatformError('ratelimited', 30, LEAK_SENTINEL) }, method),
-      await attempts.run('alpha', () => true, async () => { throw slackRateLimited(120, LEAK_SENTINEL) }, method),
+      await attempts.run('alpha', () => true, async () => { throw slackPlatformError('something_new', undefined, LEAK_SENTINEL) }),
+      await attempts.run('alpha', () => true, async () => { throw slackPlatformError('ratelimited', 30, LEAK_SENTINEL) }),
+      await attempts.run('alpha', () => true, async () => { throw slackRateLimited(120, LEAK_SENTINEL) }),
     ]
     expect(results).toEqual([{ kind: 'rejected', slackError: 'something_new' }, { kind: 'transient', retryAfter: 30 }, { kind: 'transient', retryAfter: 120 }])
     assertNoLeak({ results })

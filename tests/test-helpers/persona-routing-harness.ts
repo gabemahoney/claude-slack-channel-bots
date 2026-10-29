@@ -1,11 +1,7 @@
 import { mkdtempSync } from 'node:fs'
 
-import { createDeliveryQueue, type DeliveryQueueOptions, type QueueItem } from '../../src/delivery-queue.ts'
-import {
-  createThreadParticipation, ownPostFaultOutcome,
-  type OwnPostOutcome, type ThreadParticipation, type ThreadParticipationOptions,
-} from '../../src/thread-participation.ts'
-import { createOwnPostObserver, ownPostEligibility, type OwnPostObserver } from '../../src/own-post.ts'
+import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
+import { createOwnPostObserver } from '../../src/own-post.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -28,7 +24,7 @@ import {
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { createChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
 import { createSharedChannelAuthority } from '../../src/shared-channels.ts'
-import { configBytes, initialSharedState, readSharedState, sharedChannelPath, writeSharedState } from './shared-channels.ts'
+import { configBytes, initialSharedState, readSharedState, sharedChannelPath } from './shared-channels.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
@@ -467,12 +463,6 @@ export interface PersonaHandle {
 }
 
 export interface RoutingHarnessOptions {
-  onReplyCall?: SessionToolDeps['onReplyCall']
-  participation?: boolean
-  /** Each own-post outcome after `h.ownPostOutcomes` records it (with `participation`), as server.ts's `reportOwnPost`. */
-  onOwnPost?: (outcome: OwnPostOutcome) => void
-  queueOptions?: Omit<DeliveryQueueOptions, 'stateDir' | 'now'>
-  routingHooks?: Pick<PersonaRoutingDeps, '_afterObservation' | '_afterAcceptance' | 'onReceived' | 'currentProvenance' | 'onParticipationFailure' | 'onParticipationSettled' | 'onCandidateHeld' | 'onChannelEvent' | 'beginIntake'>
   /** Caller-supplied current observations, never inferred from configuration. */
   membership?: PersonaRoutingDeps['membership']
   /** Names with a registered session; default every persona. */
@@ -489,8 +479,6 @@ export interface RoutingHarnessOptions {
   stubOptions?: Readonly<Record<string, StubSlackOptions>>
   /** The `ack_reaction` the reply settings source (`getReplySettings`) returns to the routing and `h.reply`; default none. */
   ackReaction?: string
-  /** The `reply_chunk_limit` (in `length` mode) the reply settings source returns; default the server default. */
-  replyChunkLimit?: number
   /** The archive DB the archive seam writes to; the seam is a no-op without one. */
   archiveDb?: Database
   /** Replaces the user-name lookup (default: `users.info` on P's client from `clientFor`, the user ID when it has none). */
@@ -626,12 +614,6 @@ export interface RaisedNotice {
   text: string
 }
 
-/** A `reply` tool call's MCP result: its text content and whether it reported an error. */
-export interface ReplyToolResult {
-  isError?: boolean
-  content: Array<{ type: string; text?: string }>
-}
-
 /** One captured `chat.postMessage`, tagged with the key of the persona whose stub made it. */
 export interface HarnessPost {
   key: string
@@ -640,24 +622,6 @@ export interface HarnessPost {
 }
 
 export interface RoutingHarness {
-  ready: Promise<void>
-  routing: ReturnType<typeof createPersonaRouting>
-  participation?: ThreadParticipation
-  /**
-   * The owner's own-post composition as main() builds it (with `participation`):
-   * production eligibility over `h.config`, the stored choices and `membership`,
-   * each persona stub's identity (read at call time, `ownPostIdentity` replaces
-   * it), outcomes into `h.ownPostOutcomes`, and settled threads re-evaluating
-   * the routing's held candidates. A rebuilt owner reuses it.
-   */
-  ownPostOptions: Omit<ThreadParticipationOptions, 'queue' | 'authority'>
-  /** The one own-post adapter over the current `h.participation`, shared by `h.reply` and the notifier's resolver, as server.ts's `ownPosts`. */
-  ownPosts: OwnPostObserver
-  /** Every own-post outcome the owner (or adapter) reported, in order. */
-  ownPostOutcomes: OwnPostOutcome[]
-  /** The persona identity confirmations compare to; absent for a key, the stub's own identity. */
-  ownPostIdentity: Map<string, { botUserId?: string; botId?: string } | undefined>
-  close(): Promise<void>
   queue: ReturnType<typeof createDeliveryQueue>
   queued(name: string): QueueItem[]
   /** The applied config the routing reads at call time; set to null for none, or edit it. */
@@ -776,8 +740,6 @@ export interface RoutingHarness {
    * returned; rejects when the tool reports an error.
    */
   reply(name: string, args: Record<string, unknown>): Promise<void>
-  /** The same `reply` call, resolving with the tool's result whether or not it reports an error. */
-  replyResult(name: string, args: Record<string, unknown>): Promise<ReplyToolResult>
   /** Everything the harness captured, for `assertNoLeak`. */
   captured(): Record<string, unknown>
 }
@@ -906,29 +868,8 @@ export function makeRoutingHarness(
   const log = (line: string): void => { h.logs.push(line) }
   const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
   const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
-  // As server.ts: one adapter over the owner current at each call (none without `participation`).
-  const ownPostOutcomes: OwnPostOutcome[] = []
-  const reportOwnPost = (outcome: OwnPostOutcome): void => { ownPostOutcomes.push(outcome); opts.onOwnPost?.(outcome) }
-  const ownPosts = createOwnPostObserver(() => h.participation, (issue, posted, error) => reportOwnPost(ownPostFaultOutcome(issue, posted, error)))
-  const ownPostIdentity = new Map<string, { botUserId?: string; botId?: string } | undefined>()
-  const ownPostOptions: RoutingHarness['ownPostOptions'] = {
-    now: opts.dedupeClock,
-    eligibility: ownPostEligibility({
-      config: () => h.config,
-      persona: getPersona,
-      choices: () => h.channelDelivery ?? undefined,
-      membership: (key, channel, mode) => opts.membership?.read(key, channel, mode),
-    }),
-    identity: key => ownPostIdentity.has(key) ? ownPostIdentity.get(key) : byKey(key)?.stub.identity,
-    onOwnPost: reportOwnPost,
-    onSettled: (key, channel, root) => {
-      for (const held of routing.pendingCandidates()) {
-        if (held.key === key && held.channel === channel && (root === undefined || held.root === root)) {
-          void routing.reevaluate(held.id).catch(() => { /* the held reply stays unacknowledged for redelivery */ })
-        }
-      }
-    },
-  }
+  // As server.ts: the one adapter, with no owner.
+  const ownPosts = createOwnPostObserver(() => undefined)
   const { notifier, hold, clock: holdClock } = makeNotifierStack({
     getPersona,
     clientFor: webClientFor,
@@ -937,20 +878,11 @@ export function makeRoutingHarness(
     ownPosts,
   })
   // The one reply settings source for the inbound ack step and `h.reply`, as server.ts.
-  const getReplySettings = (): ReplySettings => ({
-    ...replySettingsOf(null), ack_reaction: opts.ackReaction,
-    ...(opts.replyChunkLimit !== undefined ? { reply_chunk_limit: opts.replyChunkLimit, reply_chunk_mode: 'length' as const } : {}),
-  })
+  const getReplySettings = (): ReplySettings => ({ ...replySettingsOf(null), ack_reaction: opts.ackReaction })
 
   async function reply(name: string, args: Record<string, unknown>): Promise<void> {
-    const result = await replyResult(name, args)
-    if (result.isError) throw new Error(`reply as ${name} reported an error`)
-  }
-
-  async function replyResult(name: string, args: Record<string, unknown>): Promise<ReplyToolResult> {
     const { persona } = byName(name)
     const deps: SessionToolDeps = {
-      onReplyCall: opts.onReplyCall,
       log: line => h.logs.push(line),
       assertSendable: () => {},
       getReplySettings,
@@ -979,22 +911,16 @@ export function makeRoutingHarness(
     const client = new Client({ name: 'routing-harness-reply', version: '1.0.0' }, { capabilities: {} })
     await client.connect(clientTransport)
     try {
-      return (await client.callTool({ name: 'reply', arguments: args })) as ReplyToolResult
+      const result = await client.callTool({ name: 'reply', arguments: args })
+      if (result.isError) throw new Error(`reply as ${name} reported an error`)
     } finally {
       await client.close()
     }
   }
 
-  const queue = createDeliveryQueue({ ...opts.queueOptions, stateDir: baseDir, now: opts.dedupeClock })
+  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock })
   const queueReady = queue.start()
   const h: RoutingHarness = {
-    ready: queueReady,
-    get routing() { return routing },
-    async close() { routing.stop(); h.participation?.stop(); await preparation.stop(); h.hold.cancelAll(); h.releaseLaunches(); await queue.stop() },
-    ownPostOptions,
-    ownPosts,
-    ownPostOutcomes,
-    ownPostIdentity,
     queue,
     queued: name => queue.items(byName(name).persona.key),
     config,
@@ -1031,13 +957,13 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: async (event, names, ack, envelope) => { await h.ready; return routing.receive(
+    receive: async (event, names, ack, envelope) => { await queueReady; return routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
       envelopeFlagOf(envelope),
     ) },
-    receiveKeys: async (event, keys, envelope) => { await h.ready; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
+    receiveKeys: async (event, keys, envelope) => { await queueReady; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
     setMode: (mode) => {
       h.config = configIn(mode)
     },
@@ -1061,7 +987,6 @@ export function makeRoutingHarness(
     notices: [],
     noticeText: (name, body) => formatPersonaNotice(byName(name).persona, body),
     reply,
-    replyResult,
     captured: () => ({
       logs: h.logs,
       calls: Object.fromEntries(handles.map((x) => [x.persona.name, x.stub.calls])),
@@ -1070,7 +995,6 @@ export function makeRoutingHarness(
       notices: h.notices,
       episodeNotices: h.episodeNotices,
       outageNotices: h.outageNotices,
-      ownPostOutcomes: h.ownPostOutcomes,
     }),
   }
 
@@ -1100,7 +1024,6 @@ export function makeRoutingHarness(
     const stateDir = opts.channelDelivery?.stateDir ?? mkdtempSync(join(baseDir, 'routing-authority-'))
     const raw = { ...config, personas: config.personas.map(({ index, key, sections, ...persona }) => persona) }
     const state = readSharedState(stateDir) ?? initialSharedState(stateDir, raw)
-    if (opts.participation && !readSharedState(stateDir)) writeSharedState(stateDir, state)
     h.channelDelivery = createChannelDeliveryStore(createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
       write(path, bytes) { h.channelDeliveryWrites.push(path); durableWriteFileSync(path, bytes) },
     }))
@@ -1108,13 +1031,7 @@ export function makeRoutingHarness(
   }
 
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
-  if (opts.participation) {
-    h.participation = createThreadParticipation({ queue, authority: h.channelDelivery!.authority, ...ownPostOptions })
-    h.ready = queueReady.then(() => { h.participation!.start() })
-  }
   const routing = createPersonaRouting({
-    ...opts.routingHooks,
-    getParticipation: () => h.participation,
     membership: opts.membership,
     queue,
     prepare: preparation.prepare,

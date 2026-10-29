@@ -582,11 +582,9 @@ export interface ReviewedChannelEffect {
   absenceReplacement?: string
 }
 export interface ReviewedChannelPlan { config: PersonaConfig; channels: ReviewedChannelEffect[] }
-/** Provenance for later participation clearing. This token proves only a
- * durable lifetime, never current membership or permission to enroll. A
- * consumer holds only obligations for its current token. A durable leave or
- * reset supersedes old obligations; late completions cannot acknowledge or
- * enroll under a new token. Accepted queues do not consume this authority. */
+/** A persona's durable lifetime in one channel. This token proves only a
+ * durable lifetime, never current membership or eligibility. A durable leave
+ * or reset supersedes it. Accepted queues do not consume this authority. */
 export interface SharedChannelLifetime {
   key: string
   channel: string
@@ -596,7 +594,6 @@ export interface SharedChannelLifetime {
   membershipBoundary: number
   leaveBoundary: number
 }
-export type SharedLifetimeStatus = 'current' | 'superseded' | 'unresolved'
 export function sharedChannelLifetime(state: SharedChannelState, key: string, channel: string): SharedChannelLifetime | undefined {
   const life = own(state.personas, key)
   if (!life || !CHANNEL_ID_RE.test(channel)) return undefined
@@ -720,11 +717,6 @@ export interface SharedChannelAuthority {
   incarnation(key: string): string | undefined
   reviewHeld(key: string): boolean
   lifetime(key: string, channel: string): SharedChannelLifetime | undefined
-  /** Uncertainty holds the affected consumer. Supersession invalidates old
-   * callbacks and releases their hold on the new lifetime; neither status
-   * supplies current membership or confirms clearing of the new token. */
-  lifetimeStatus(token: SharedChannelLifetime): SharedLifetimeStatus
-  isCurrentLifetime(token: SharedChannelLifetime): boolean
   choice(key: string, channel: string): DeliveryMode | undefined
   channels(key: string): string[]
   validatesRemovedDestination(persona: Pick<Persona, 'key' | 'name' | 'credentials_file' | 'working_directory' | 'permission_prompts'>): boolean
@@ -1120,9 +1112,6 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     incarnation: key => own(current.personas, key)?.incarnation,
     reviewHeld: key => heldByReview(current, key),
     lifetime: (key, channel) => sharedChannelLifetime(current, key, channel),
-    lifetimeStatus: token => !authority.readableFor(token.key, token.channel) ? 'unresolved' :
-      isDeepStrictEqual(sharedChannelLifetime(current, token.key, token.channel), token) ? 'current' : 'superseded',
-    isCurrentLifetime: token => authority.lifetimeStatus(token) === 'current',
     validatesRemovedDestination: persona => removedDestination(current, persona, deps.realpath),
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
     channelStamp: (key, channel) => stampIn(readability(), key, channel),
