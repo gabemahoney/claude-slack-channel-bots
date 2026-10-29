@@ -6,7 +6,7 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 
 The server-wide switch `allow_invited_channels` picks one channel mode for every persona (docs/configuration.md [Channel modes](channel-modes.md#channel-modes)). In declarative mode (the switch absent or `false`) a persona serves the channels its `channels` lists, at each entry's `delivery`, and its destination is `permission_prompts`. In fungible mode (`true`) it serves every public or private channel its Slack app is a member of that is not externally shared, at the channel delivery its agent stores with `set_channel_delivery` (`channel-delivery.json`; `mentions` when nothing is stored), and its destination is `invited.permission_prompts` (`"dm"` when absent).
 
-**Layering.** CSCB never touches tmux, and never replicates agent-director: sessions, liveness, spawn and resume are agent-director's, and the server reaches a session only through it. There is one Claude session per persona, however many channels it serves, in either mode: fungible mode adds no session, no tmux, no agent-director call and no channel-membership lookup.
+**Layering.** CSCB never touches tmux, and never replicates agent-director: sessions, liveness, spawn and resume are agent-director's, and the server reaches a session only through it. There is one Claude session per persona, however many channels it serves, in either mode: open mode adds no session, no tmux and no agent-director call, and both modes take membership from live events and background `users.conversations` reconciliation.
 
 ## Module Map
 
