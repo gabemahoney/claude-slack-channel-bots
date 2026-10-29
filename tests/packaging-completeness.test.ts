@@ -441,6 +441,8 @@ describe('npm pack ships every runtime src file', () => {
     'src/participation-metadata.ts',
     'src/participation-recovery.ts',
     'src/participation-root-evidence.ts',
+    'src/thread-memory.ts',
+    'src/own-post.ts',
   ])('%s is inventoried, included, and an explicit exclusion fails coverage', path => {
     const files = readPkg().files ?? []
     expect(runtimeSrcFiles()).toContain(path)

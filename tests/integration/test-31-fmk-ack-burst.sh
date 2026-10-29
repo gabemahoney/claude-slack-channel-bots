@@ -164,7 +164,7 @@ assert all(r.get("name") == queued and r.get("label") == label and r.get("answer
 assert collections.Counter((r.get("channel"), r.get("timestamp")) for r in reactions) == collections.Counter(intended), "queued reaction set differs"
 assert not any(r["event"] == "api" and r.get("method") == "reactions.remove" for r in stub), "queued reaction removed before reply/delivery"
 # Root messages of an `all` channel need no thread evidence: no enrollment
-# metadata call (src/participation-metadata.ts ENROLLMENT_METADATA_METHODS).
+# metadata call (src/thread-memory.ts ENROLLMENT_METADATA_METHODS).
 # The one permitted conversations.info is delivery preparation's cached
 # channel-name lookup (src/delivery-intake.ts channelName), not enrollment:
 # strict mode makes no open-mode channel-evidence lookup. Both lookups send

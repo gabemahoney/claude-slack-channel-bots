@@ -206,7 +206,8 @@ import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
-import { createOwnPostObserver, createThreadParticipation, ownPostEligibility, ownPostLookupPolicy, type OwnPostOutcome, type ThreadParticipation } from './thread-participation.ts'
+import { createThreadParticipation, ownPostFaultOutcome, ownPostLookupPolicy, type OwnPostOutcome, type ThreadParticipation } from './thread-participation.ts'
+import { createOwnPostObserver, ownPostEligibility } from './own-post.ts'
 import { createRootLookupCapability } from './participation-capability.ts'
 import { createParticipationRecovery, type ParticipationRecovery } from './participation-recovery.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
@@ -708,7 +709,7 @@ function resolvePersonaUserName(personaKey: string, userId: string): Promise<str
  * The one confirmed-own-post adapter, shared by replies, prompts, warnings and
  * notices. It reads the participation owner and reporting holders at each call.
  */
-const ownPosts = createOwnPostObserver(() => threadParticipation, reportOwnPost)
+const ownPosts = createOwnPostObserver(() => threadParticipation, (issue, posted, error) => reportOwnPost(ownPostFaultOutcome(issue, posted, error)))
 
 const sessionToolDeps: SessionToolDeps = {
   ownPosts,

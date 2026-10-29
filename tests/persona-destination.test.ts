@@ -56,7 +56,7 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import type { OwnPostObserver } from '../src/thread-participation.ts'
+import type { OwnPostObserver } from '../src/own-post.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import {

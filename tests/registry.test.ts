@@ -116,7 +116,7 @@ import {
 } from './test-helpers/persona-config.ts'
 import { observeFileCompletions, withFileCompletions } from '../src/file-upload-observation.ts'
 import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
-import type { OwnPostIssue, OwnPostObserver } from '../src/thread-participation.ts'
+import type { OwnPostIssue, OwnPostObserver } from '../src/own-post.ts'
 import {
   asWebClient,
   makeDeferredWebApiCall,

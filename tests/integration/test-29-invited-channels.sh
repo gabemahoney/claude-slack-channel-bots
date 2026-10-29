@@ -107,7 +107,7 @@ TICK_WAIT_S=20      # an edit showing up in config.json.pending (the 5 s reload 
 APPLY_WAIT_S=20     # a confirmation applied (the 5 s reload tick)
 EVENT_WAIT_S=15     # a pushed event's decision line or delivery
 RECORD_WAIT_S=10    # a line reaching the stub's record
-RECOVERY_WAIT_S=120 # participation recovery's retries: 5 to 60 s apart (src/participation-metadata.ts metadataRetryDelay); R3 derives its own (R3_WAIT_S)
+RECOVERY_WAIT_S=120 # participation recovery's retries: 5 to 60 s apart (src/thread-memory.ts metadataRetryDelay); R3 derives its own (R3_WAIT_S)
 # R4's share-less upload keeps every later pass failed, so R5-R7 and the
 # restart lookups wait at the 60 s cap, which is why RECOVERY_WAIT_S keeps its
 # margin over one repair bound (2 x DEADLINE + RETRY_MAX, checked in phase R).
@@ -251,7 +251,7 @@ REPLY_TOOL='reply'
 CAUSE_ROOT_DELETED='root-deleted'
 CAUSE_METADATA='metadata'
 GAP_METHOD_REFUSED='method-refused'
-# src/participation-metadata.ts MetadataFailure kind: an attempt's expired deadline.
+# src/thread-memory.ts MetadataFailure kind: an attempt's expired deadline.
 FAILURE_DEADLINE='deadline'
 # fixtures/slack-stub-server.ts: the method a root lookup calls, the Slack
 # error its `capability` fault answers and the one its `transient` fault answers.
@@ -1318,9 +1318,9 @@ reply_tool_result() {
 RECOVERED_TEXT="$(printed participationRecoveredLine "${ALPHA}" "${ALPHA_KEY}")"
 RECOVERED_LINE="$(matcher "${RECOVERED_TEXT}")"
 CAPABILITY_REFUSED_TEXT="$(printed rootLookupCapabilityLine "${ALPHA}" "${ALPHA_KEY}" "${GAP_METHOD_REFUSED}" "${ROOT_LOOKUP_METHOD}" "${STUB_CAPABILITY_ERROR}")"
-DEADLINE_MS="$(printed ENROLLMENT_METADATA_DEADLINE_MS)"
-RETRY_MIN_MS="$(printed ENROLLMENT_RETRY_MIN_MS)"
-RETRY_MAX_MS="$(printed ENROLLMENT_RETRY_MAX_MS)"
+DEADLINE_MS="$(printed THREAD_MEMORY_LOOKUP_DEADLINE_MS)"
+RETRY_MIN_MS="$(printed THREAD_MEMORY_RETRY_MIN_MS)"
+RETRY_MAX_MS="$(printed THREAD_MEMORY_RETRY_MAX_MS)"
 QUEUED_REACTION="$(printed DEFAULT_QUEUED_ACK_REACTION)"
 # Every recovery release but R3's: one in-flight deadline, the longest local
 # retry wait, then one answered attempt (src/delivery-constants.ts
@@ -1328,7 +1328,7 @@ QUEUED_REACTION="$(printed DEFAULT_QUEUED_ACK_REACTION)"
 (( RECOVERY_WAIT_S * 1000 >= 2 * DEADLINE_MS + RETRY_MAX_MS )) \
     || fail "phase R: RECOVERY_WAIT_S (${RECOVERY_WAIT_S}s) cannot cover one repair bound"
 # R3's Retry-After: longer than any local retry spacing and than the refused
-# method's re-check window (both ENROLLMENT_RETRY_MAX_MS at most), so only
+# method's re-check window (both THREAD_MEMORY_RETRY_MAX_MS at most), so only
 # Slack's header, carried through the real SDK's rate-limit error, explains
 # the wait.
 R3_RETRY_AFTER_S=$(( RETRY_MAX_MS / 1000 + 5 ))
@@ -1378,7 +1378,7 @@ expect_acked "phase R2: the reply" "${PUSH_ENVELOPE}"
 #     anywhere, so a reply in the upload's thread is held (no ack) until
 #     conversations.replies for that root answers. Slack refuses it
 #     (missing_scope: the capability line); the refused method is tried
-#     again only once its re-check window (ENROLLMENT_RETRY_MAX_MS) has
+#     again only once its re-check window (THREAD_MEMORY_RETRY_MAX_MS) has
 #     passed, and Slack rate-limits that attempt (429, Retry-After
 #     R3_RETRY_AFTER_S, waited out in full), then answers with alpha's own
 #     root naming the upload: the reply is delivered `thread`, acked once,
@@ -1516,7 +1516,7 @@ R6_ACK_SEQ="$(rec_field seq first event=ws-message envelope_id="${R6_ENVELOPE}")
 
 # R7. A hung root lookup ends at its deadline: no share, and alpha's own root
 #     lookup for an upload's share hangs once. The client aborts it at
-#     ENROLLMENT_METADATA_DEADLINE_MS (the stub sees the abort, long before
+#     THREAD_MEMORY_LOOKUP_DEADLINE_MS (the stub sees the abort, long before
 #     it would give up), recovery reports the deadline, and the next attempt,
 #     after the retry spacing, is answered: the held reply is delivered
 #     `thread` and acked once, after that answer. A late answer to an

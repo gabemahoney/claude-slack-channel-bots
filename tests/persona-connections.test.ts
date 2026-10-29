@@ -318,7 +318,7 @@ import {
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { classifyMetadataFailure, MetadataCancelledError, type EnrollmentMetadataMethod } from '../src/participation-metadata.ts'
+import { classifyMetadataFailure, MetadataCancelledError, type EnrollmentMetadataMethod } from '../src/thread-memory.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'

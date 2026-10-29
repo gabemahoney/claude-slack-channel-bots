@@ -333,7 +333,7 @@
  *   replyPartialFailureText <where> <sent> <total> <last-ts> <uploaded> <files> <reason>
  *                                                src/registry.ts: the reply tool's error after
  *                                                a later part failed
- *   ENROLLMENT_METADATA_DEADLINE_MS, ENROLLMENT_RETRY_MIN_MS, ENROLLMENT_RETRY_MAX_MS
+ *   THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS
  *                                                src/delivery-constants.ts: one metadata
  *                                                attempt's deadline and the local retry
  *                                                spacing's minimum and maximum, in
@@ -4440,9 +4440,9 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   participationRecoveryLine,
   participationRecoveredLine,
   replyPartialFailureText: replyPartialFailure,
-  ENROLLMENT_METADATA_DEADLINE_MS: constantEntry('delivery-constants.ts', 'ENROLLMENT_METADATA_DEADLINE_MS'),
-  ENROLLMENT_RETRY_MIN_MS: constantEntry('delivery-constants.ts', 'ENROLLMENT_RETRY_MIN_MS'),
-  ENROLLMENT_RETRY_MAX_MS: constantEntry('delivery-constants.ts', 'ENROLLMENT_RETRY_MAX_MS'),
+  THREAD_MEMORY_LOOKUP_DEADLINE_MS: constantEntry('delivery-constants.ts', 'THREAD_MEMORY_LOOKUP_DEADLINE_MS'),
+  THREAD_MEMORY_RETRY_MIN_MS: constantEntry('delivery-constants.ts', 'THREAD_MEMORY_RETRY_MIN_MS'),
+  THREAD_MEMORY_RETRY_MAX_MS: constantEntry('delivery-constants.ts', 'THREAD_MEMORY_RETRY_MAX_MS'),
   DEFAULT_QUEUED_ACK_REACTION: constantEntry('config.ts', 'DEFAULT_QUEUED_ACK_REACTION'),
   DEFAULT_ACK_REACTION: constantEntry('config.ts', 'DEFAULT_ACK_REACTION'),
   channelDeliverySetCause: deliverySetCause,

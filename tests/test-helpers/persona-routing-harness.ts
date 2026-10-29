@@ -2,9 +2,10 @@ import { mkdtempSync } from 'node:fs'
 
 import { createDeliveryQueue, type DeliveryQueueOptions, type QueueItem } from '../../src/delivery-queue.ts'
 import {
-  createOwnPostObserver, createThreadParticipation, ownPostEligibility,
-  type OwnPostObserver, type OwnPostOutcome, type ThreadParticipation, type ThreadParticipationOptions,
+  createThreadParticipation, ownPostFaultOutcome,
+  type OwnPostOutcome, type ThreadParticipation, type ThreadParticipationOptions,
 } from '../../src/thread-participation.ts'
+import { createOwnPostObserver, ownPostEligibility, type OwnPostObserver } from '../../src/own-post.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -908,7 +909,7 @@ export function makeRoutingHarness(
   // As server.ts: one adapter over the owner current at each call (none without `participation`).
   const ownPostOutcomes: OwnPostOutcome[] = []
   const reportOwnPost = (outcome: OwnPostOutcome): void => { ownPostOutcomes.push(outcome); opts.onOwnPost?.(outcome) }
-  const ownPosts = createOwnPostObserver(() => h.participation, reportOwnPost)
+  const ownPosts = createOwnPostObserver(() => h.participation, (issue, posted, error) => reportOwnPost(ownPostFaultOutcome(issue, posted, error)))
   const ownPostIdentity = new Map<string, { botUserId?: string; botId?: string } | undefined>()
   const ownPostOptions: RoutingHarness['ownPostOptions'] = {
     now: opts.dedupeClock,

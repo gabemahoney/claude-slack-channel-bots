@@ -178,7 +178,7 @@ import {
 } from './persona-slack-validation.ts'
 import { watchWebClientAuth } from './persona-web-api-watch.ts'
 import { observeFileCompletions } from './file-upload-observation.ts'
-import { MetadataCancelledError, type EnrollmentMetadataMethod } from './participation-metadata.ts'
+import { MetadataCancelledError, type EnrollmentMetadataMethod } from './thread-memory.ts'
 import { MembershipCancelledError, MEMBERSHIP_PAGE_LIMIT } from './channel-membership-retry.ts'
 
 // ---------------------------------------------------------------------------

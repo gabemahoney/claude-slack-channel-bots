@@ -52,7 +52,8 @@
  *    config-file writer, the agent-director settings-file writer, the
  *    stored-choice file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
- *    stub), or sets a stub's `leakMarker`. A suite that matches but has no
+ *    stub and its marker-planting rejection factories), or sets a stub's
+ *    `leakMarker`. A suite that matches but has no
  *    secret-bearing surface is listed in `EXEMPT` with its reason; an
  *    exemption that no longer matches
  *    such a suite (missing file, no longer touching, or now calling
@@ -120,7 +121,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
   [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
-  [/^src\/thread-participation\.ts$/, "durable persona policy and lifetime observations, including the shared-authority identity and queue persistence failure surface, and confirmed own-post evidence: the issuing persona's bot identity and outcomes that keep a persistence or observer fault raw"],
+  [/^src\/thread-participation\.ts$/, "durable persona policy and lifetime observations, including the shared-authority identity and queue persistence failure surface, and the confirmed own-post evidence it records: the issuing persona's bot identity and outcomes that keep a persistence or observer fault raw"],
   [/^src\/shared-recovery\.ts$/, 'damaged authority evidence, prepared input and recovery request parsing'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
@@ -170,10 +171,11 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/channel-delivery-attempt\.ts$/, 'logical attempt validation and hashed caller identity evidence'],
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
   // Thread participation's metadata repair: each makes or reads an authenticated Slack request on a persona's client.
-  [/^src\/participation-metadata\.ts$/, "the bounded metadata attempts, which run a persona's authenticated Slack requests and classify their raw failures (an error's message can hold a token) into safe codes"],
+  [/^src\/thread-memory\.ts$/, "the bounded metadata attempts, which run a persona's authenticated Slack requests and classify their raw failures (an error's message can hold a token) into safe codes"],
+  [/^src\/own-post\.ts$/, "the own-post observer, whose issues carry the issuing persona's bot identity and whose fault callback receives an owner's raw fault, own-post eligibility over the applied config and current membership, and the reading of upload completions as Slack returned them"],
   [/^src\/participation-recovery\.ts$/, "the participation recovery owner, which calls Slack on a persona's current connection and reports findings whose codes come from Slack failures"],
   [/^src\/participation-capability\.ts$/, "the root-lookup capability, which reads the scopes Slack reported for a persona's validated bot token and records a refused lookup's Slack error"],
-  [/^src\/participation-(?:channel|root|file)-evidence\.ts$/, "the channel, root and file evidence readers, which parse authenticated Slack answers about a persona's channels, threads and uploads"],
+  [/^src\/participation-(?:channel|root|file)-evidence\.ts$/, "the channel, root and file evidence readers, which parse authenticated Slack answers about a persona's channels, threads and uploads' files.info metadata"],
   [/^src\/file-upload-observation\.ts$/, "the file-completion observation, which wraps a persona's raw Web API client and hands each completion response, as Slack returned it, to its listener"],
 ]
 
@@ -196,7 +198,11 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
   'tests/test-helpers/thread-participation.ts': { makeThreadHarness: 'builds durable persona configuration and sentinel-bearing routing clients' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
-  'tests/test-helpers/slack-stub.ts': { makeStubSlackFactory: 'builds Slack clients from tokens' },
+  'tests/test-helpers/slack-stub.ts': {
+    makeStubSlackFactory: 'builds Slack clients from tokens',
+    slackPlatformError: 'builds a Slack platform rejection that, given a leak marker, plants it in a fake bot token in its message',
+    slackRateLimited: 'builds a Slack rate-limited rejection that, given a leak marker, plants it in a fake bot token in its message',
+  },
   'tests/integration/fixtures/slack-stub-server.ts': { startSlackStub: "serves token-bearing Slack clients and records their requests, upload, file-share and root-lookup evidence" },
   'tests/test-helpers/ci-run.ts': {
     makeFakeCodexHome: 'writes fake Codex login and config files under the fixture root',
@@ -458,24 +464,40 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     }
   })
 
-  test('participation and own-post functions and the composition helper require leak checks without exemptions', () => {
+  test('participation functions and the composition helper require leak checks without exemptions', () => {
     const suite = 'tests/thread-participation.test.ts'
     for (const code of [
       "import { createThreadParticipation as create } from '../src/thread-participation.ts'",
       "import * as participation from '../src/thread-participation.ts'",
       "const participation = await import('../src/thread-participation.ts')",
       "import { makeThreadHarness as create } from './test-helpers/thread-participation.ts'",
-      "import { createOwnPostObserver as observer } from '../src/thread-participation.ts'",
-      "import { ownPostEligibility } from '../src/thread-participation.ts'",
-      "import { decideOwnPostEligibility as decide } from '../src/thread-participation.ts'",
+      "import { ownPostFaultOutcome as outcome } from '../src/thread-participation.ts'",
     ]) expect(touchReasonsOf(suite, code)).toHaveLength(1)
     for (const code of [
       "import type { ThreadObservation } from '../src/thread-participation.ts'",
       "import type * as Participation from '../src/thread-participation.ts'",
       "import { threadReply, threadHold, THREAD_ROOT } from './test-helpers/thread-participation.ts'",
-      "import { OWN_POST_SURFACES, OWN_POST_MISSING, OWN_POST_GAP_CAUSES } from '../src/thread-participation.ts'",
-      "import type { OwnPostOutcome, OwnPostIssue } from '../src/thread-participation.ts'",
-      "import { type OwnPostObserver } from '../src/thread-participation.ts'",
+      "import { OWN_POST_MISSING, OWN_POST_GAP_CAUSES } from '../src/thread-participation.ts'",
+      "import type { OwnPostOutcome } from '../src/thread-participation.ts'",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([])
+    expect(callsAssertNoLeak(suite)).toBe(true)
+    expect(suite in EXEMPT).toBe(false)
+  })
+
+  test('own-post functions require leak checks, while its constants and types do not, without exemptions', () => {
+    const suite = 'tests/own-post.test.ts'
+    for (const code of [
+      "import { createOwnPostObserver as observer } from '../src/own-post.ts'",
+      "import { ownPostEligibility } from '../src/own-post.ts'",
+      "import { decideOwnPostEligibility as decide } from '../src/own-post.ts'",
+      "import * as ownPost from '../src/own-post.ts'",
+      "const ownPost = await import('../src/own-post.ts')",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([expect.stringContaining('from src/own-post.ts: the own-post observer')])
+    for (const code of [
+      "import { OWN_POST_SURFACES } from '../src/own-post.ts'",
+      "import type { OwnPostIssue, OwnPostObserver } from '../src/own-post.ts'",
+      "import { type OwnPostObserver } from '../src/own-post.ts'",
+      "import type * as OwnPost from '../src/own-post.ts'",
     ]) expect(touchReasonsOf(suite, code)).toEqual([])
     expect(callsAssertNoLeak(suite)).toBe(true)
     expect(suite in EXEMPT).toBe(false)
@@ -705,15 +727,15 @@ describe('every suite that touches config, credentials or reload calls assertNoL
   // each makes, wraps or parses a persona's authenticated Slack requests, and its findings and
   // classifications carry codes taken from Slack failures.
   test.each([
-    ['src/participation-metadata.ts', 'classifyMetadataFailure', 'ENROLLMENT_METADATA_METHODS', 'MetadataFailure'],
-    ['src/participation-recovery.ts', 'createParticipationRecovery', 'PARTICIPATION_RECOVERY_CAUSES', 'ParticipationRecoveryFinding'],
-    ['src/participation-capability.ts', 'createRootLookupCapability', undefined, 'RootLookupCapability'],
-    ['src/participation-channel-evidence.ts', 'parseConversationInfo', 'PUBLIC_HISTORY_SCOPE', 'RootLookupCapabilityGap'],
-    ['src/participation-root-evidence.ts', 'parseRootReplies', undefined, 'RootAuthorEvidence'],
-    ['src/participation-file-evidence.ts', 'completionFiles', 'SLACK_FILE_ID_RE', 'CompletedFile'],
-    ['src/file-upload-observation.ts', 'observeFileCompletions', undefined, 'FileCompletionListener'],
-  ] as const)('%s is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', (module, fn, constant, type) => {
-    const suite = 'tests/thread-participation.test.ts'
+    ['src/thread-memory.ts', 'classifyMetadataFailure', 'ENROLLMENT_METADATA_METHODS', 'MetadataFailure', 'tests/thread-memory.test.ts'],
+    ['src/own-post.ts', 'completionFiles', 'SLACK_FILE_ID_RE', 'CompletedFile', 'tests/own-post.test.ts'],
+    ['src/participation-recovery.ts', 'createParticipationRecovery', 'PARTICIPATION_RECOVERY_CAUSES', 'ParticipationRecoveryFinding', 'tests/thread-participation.test.ts'],
+    ['src/participation-capability.ts', 'createRootLookupCapability', undefined, 'RootLookupCapability', 'tests/thread-participation.test.ts'],
+    ['src/participation-channel-evidence.ts', 'parseConversationInfo', 'PUBLIC_HISTORY_SCOPE', 'RootLookupCapabilityGap', 'tests/thread-participation.test.ts'],
+    ['src/participation-root-evidence.ts', 'parseRootReplies', undefined, 'RootAuthorEvidence', 'tests/thread-participation.test.ts'],
+    ['src/participation-file-evidence.ts', 'resolveFileRoot', undefined, 'FileRootEvidence', 'tests/thread-participation.test.ts'],
+    ['src/file-upload-observation.ts', 'observeFileCompletions', undefined, 'FileCompletionListener', 'tests/thread-participation.test.ts'],
+  ] as const)('%s is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', (module, fn, constant, type, suite) => {
     expect(SOURCE_FILES).toContain(module)
     expect(SOURCE_SURFACES.filter(([re]) => re.test(module))).toHaveLength(1)
     expect(touchReasonsOf(suite, `import { ${fn} } from '../${module}'`)).toHaveLength(1)
@@ -724,16 +746,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  test('the participation modules are touched by suites today, and a touching suite without its assertNoLeak calls fails the rule', () => {
+  test('the participation, Thread Memory and own-post modules are touched by suites today, and a touching suite without its assertNoLeak calls fails the rule', () => {
     const touched = (module: string) => SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
-    for (const module of ['src/participation-metadata.ts', 'src/participation-channel-evidence.ts', 'src/participation-root-evidence.ts', 'src/participation-file-evidence.ts', 'src/participation-capability.ts']) {
+    for (const module of ['src/participation-channel-evidence.ts', 'src/participation-root-evidence.ts', 'src/participation-file-evidence.ts', 'src/participation-capability.ts']) {
       expect([module, touched(module).length > 0]).toEqual([module, true])
     }
-    const suite = 'tests/notice-texts.test.ts'
-    expect(touchReasons(suite).some((r) => r.includes('src/participation-channel-evidence.ts'))).toBe(true)
-    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
-    expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes('src/participation-channel-evidence.ts'))).toBe(true)
-    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    for (const [suite, module] of [
+      ['tests/notice-texts.test.ts', 'src/participation-channel-evidence.ts'],
+      ['tests/thread-memory.test.ts', 'src/thread-memory.ts'],
+      ['tests/own-post.test.ts', 'src/own-post.ts'],
+    ] as const) {
+      expect([module, touched(module)]).toEqual([module, expect.arrayContaining([suite])])
+      const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+      expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes(module))).toBe(true)
+      expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    }
   })
 
   test("the Slack stub server's startSlackStub touches, its control parser alone does not, and every suite that starts it leak-checks with no exemption", () => {
@@ -746,6 +773,17 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes(helper)))
     expect(touching).toContain(suite)
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  test("the Slack stub's marker-planting rejection factories touch, its HTTP rejection alone does not, and every suite that imports them leak-checks with no exemption", () => {
+    const helper = 'tests/test-helpers/slack-stub.ts', suite = 'tests/thread-memory.test.ts'
+    for (const factory of ['slackPlatformError', 'slackRateLimited']) {
+      expect(touchReasonsOf(suite, `import { ${factory} as reject } from './test-helpers/slack-stub.ts'`)).toEqual([`imports ${factory} from ${helper}: ${HELPER_SURFACES[helper]![factory]}`])
+    }
+    expect(touchReasonsOf(suite, "import { slackHttpError } from './test-helpers/slack-stub.ts'")).toEqual([])
+    const importing = SUITES.filter((file) => touchReasons(file).some((r) => /^imports slack(?:PlatformError|RateLimited) from tests\/test-helpers\/slack-stub\.ts:/.test(r)))
+    expect(importing).toContain(suite)
+    expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
   })
 
   test('every helper surface names a module that exists and an export it has (none stale)', async () => {

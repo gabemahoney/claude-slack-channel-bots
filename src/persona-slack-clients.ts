@@ -225,7 +225,7 @@ export const PERSONA_METADATA_REQUEST_TIMEOUT_MS = 0
  * `conversations.info`) and the granted-scope `auth.test` re-read: the
  * membership options with no SDK HTTP timeout. `signal` is the only clock:
  * every such request runs under `boundedMetadataCall`, which aborts it at
- * `ENROLLMENT_METADATA_DEADLINE_MS`, on cancellation or on settlement, so the
+ * `THREAD_MEMORY_LOOKUP_DEADLINE_MS`, on cancellation or on settlement, so the
  * deadline, not a shorter SDK timeout, ends a hung request. A fresh object
  * per call.
  */

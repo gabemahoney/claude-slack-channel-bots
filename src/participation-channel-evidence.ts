@@ -27,7 +27,7 @@
  */
 
 import { CHANNEL_ID_RE, type Persona } from './config.ts'
-import type { EnrollmentMetadataMethod, MetadataAttempts, MetadataFailure } from './participation-metadata.ts'
+import type { EnrollmentMetadataMethod, MetadataAttempts, MetadataFailure } from './thread-memory.ts'
 
 /** One authenticated metadata request on the persona's current connection (`PersonaConnectionManager.metadataCall`, bound). */
 export type MetadataCaller = (method: EnrollmentMetadataMethod, args: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>

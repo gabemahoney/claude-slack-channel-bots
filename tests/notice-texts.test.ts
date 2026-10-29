@@ -200,7 +200,7 @@ import {
   requiredHistoryScopes,
   type RootLookupCapabilityGap,
 } from '../src/participation-channel-evidence.ts'
-import { METADATA_CAPABILITY_ERRORS } from '../src/participation-metadata.ts'
+import { METADATA_CAPABILITY_ERRORS } from '../src/thread-memory.ts'
 import { PARTICIPATION_RECOVERY_CAUSES, type ParticipationRecoveryFinding } from '../src/participation-recovery.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from '../src/jsonl-persistence-check.ts'

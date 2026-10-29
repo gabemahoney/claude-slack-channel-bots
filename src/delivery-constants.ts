@@ -10,15 +10,15 @@ export const DELIVERY_ROW_POLL_MS = 1000
 export const DELIVERY_STUCK_AFTER_MS = 300000
 
 /**
- * Enrollment metadata (root lookup, `files.info`, `conversations.info`): one
+ * A Thread Memory lookup (and any other bounded metadata call): one
  * end-to-end deadline per attempt, covering SDK queueing, retries and
- * rate-limit waits as well as the HTTP request. Root lookup gets no longer
- * bound than any other metadata.
+ * rate-limit waits as well as the HTTP request. No lookup gets a longer
+ * bound than another.
  */
-export const ENROLLMENT_METADATA_DEADLINE_MS = 15_000
-/** Retry spacing after a failed or expired attempt: bounded exponential from the minimum. */
-export const ENROLLMENT_RETRY_MIN_MS = 5_000
-export const ENROLLMENT_RETRY_MAX_MS = 60_000
+export const THREAD_MEMORY_LOOKUP_DEADLINE_MS = 15_000
+/** Retry spacing after a failed or expired lookup attempt: bounded exponential from the minimum. */
+export const THREAD_MEMORY_RETRY_MIN_MS = 5_000
+export const THREAD_MEMORY_RETRY_MAX_MS = 60_000
 /** Longest single timer; a longer wait (a large Retry-After) is re-armed in chunks. */
 export const ENROLLMENT_TIMER_MAX_MS = 2_147_483_647
 /**
@@ -48,7 +48,7 @@ export const OWN_ROOT_CLOCK_SKEW_MS = 120_000
  * serialized fsync write and is not included. Expiry alone proves no missing
  * fact and reports no recovery.
  */
-export function enrollmentRepairBoundMs(remainingDeadlineMs = ENROLLMENT_METADATA_DEADLINE_MS, retryAfterSeconds?: number): number {
+export function enrollmentRepairBoundMs(remainingDeadlineMs = THREAD_MEMORY_LOOKUP_DEADLINE_MS, retryAfterSeconds?: number): number {
   const retryAfter = typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0 ? retryAfterSeconds * 1000 : 0
-  return Math.max(0, remainingDeadlineMs) + Math.max(ENROLLMENT_RETRY_MAX_MS, retryAfter) + ENROLLMENT_METADATA_DEADLINE_MS
+  return Math.max(0, remainingDeadlineMs) + Math.max(THREAD_MEMORY_RETRY_MAX_MS, retryAfter) + THREAD_MEMORY_LOOKUP_DEADLINE_MS
 }

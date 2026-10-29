@@ -2,17 +2,17 @@
  * queue's injected, serialized fsync writer; construction performs no I/O. */
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { CHANNEL_ID_RE, DELIVERY_MODES, channelModeOf, type ChannelMode, type DeliveryMode, type Persona, type ServerSettings } from './config.ts'
+import { CHANNEL_ID_RE, DELIVERY_MODES, channelModeOf, type ChannelMode, type DeliveryMode } from './config.ts'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
-import { isThreadTimestamp, personaListsChannel, type StoredChoices } from './delivery-decision.ts'
-import type { MembershipReading } from './channel-membership.ts'
+import { isThreadTimestamp } from './delivery-decision.ts'
 import type { DeliveryQueue, QueueStoredResult, SlackKey } from './delivery-queue.ts'
 import type { SharedChannelAuthority, SharedChannelLifetime, SharedLifetimeStatus } from './shared-channels.ts'
 import { OWN_ROOT_CLOCK_SKEW_MS } from './delivery-constants.ts'
+import {
+  OWN_POST_SURFACES,
+  type OwnPostEligibility, type OwnPostEligibilitySources, type OwnPostIssue, type OwnPostIssuer, type OwnPostPosted, type OwnPostSurface,
+} from './own-post.ts'
 
-/** Surfaces that confirm an own post. `file` is reserved for upload completions. */
-export const OWN_POST_SURFACES = ['text', 'prompt', 'warning', 'notice', 'file'] as const
-export type OwnPostSurface = typeof OWN_POST_SURFACES[number]
 /** Evidence a confirmed own post still needs before it can enroll. */
 export const OWN_POST_MISSING = ['root', 'channel-eligibility'] as const
 export type OwnPostMissing = typeof OWN_POST_MISSING[number]
@@ -20,8 +20,6 @@ export type OwnPostMissing = typeof OWN_POST_MISSING[number]
 export const OWN_POST_GAP_CAUSES = ['storage', 'lifetime-unresolved', 'identity-unresolved', 'eligibility-unavailable', 'operation'] as const
 export type OwnPostGapCause = typeof OWN_POST_GAP_CAUSES[number]
 const OWN_POST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
-/** The authenticated identity that issued a post, captured before its await. */
-export interface OwnPostIssuer { botUserId?: string; botId?: string }
 /** A confirmed own post's facts, bound when its success is first observed. */
 export interface OwnPostEvidence {
   surface: OwnPostSurface
@@ -174,62 +172,6 @@ function tsMillis(ts: string): number {
 // Confirmed own posts
 // ---------------------------------------------------------------------------
 
-/** Whether a confirmed own post may enroll, from current applied evidence. */
-export type OwnPostEligibility =
-  | { kind: 'eligible'; mode: ChannelMode; delivery: DeliveryMode }
-  | { kind: 'ineligible'; mode: ChannelMode; reason: 'dm' | 'unlisted' | 'absent' | 'external-sharing' | 'invalid-channel' }
-  | { kind: 'unresolved'; mode: ChannelMode; delivery?: DeliveryMode; reason: string }
-export interface OwnPostEligibilityInputs {
-  channel: string
-  mode: ChannelMode
-  /** The persona's configured channel entries name this channel; read in strict mode only. */
-  listed: boolean
-  /** The shared choice projection is trustworthy for this persona/channel. */
-  choiceReadable: boolean
-  choice: DeliveryMode | undefined
-  membership: MembershipReading | undefined
-}
-/**
- * SR-1.4 for an own post. Strict inclusion is the applied shared choice;
- * open mode relies on membership's public/private and non-external evidence.
- * Posting success, a destination, a listed entry or an ID prefix alone proves
- * neither membership nor sharing. An off choice may enroll without intake.
- * Pure.
- */
-export function decideOwnPostEligibility(inputs: OwnPostEligibilityInputs): OwnPostEligibility {
-  const { channel, mode, choice, membership } = inputs
-  if (!CHANNEL_ID_RE.test(channel)) return { kind: 'ineligible', mode, reason: channel.startsWith('D') ? 'dm' : 'invalid-channel' }
-  if (!inputs.choiceReadable) return { kind: 'unresolved', mode, reason: 'state-unavailable' }
-  if (choice === undefined) {
-    return mode === 'strict' && !inputs.listed ? { kind: 'ineligible', mode, reason: 'unlisted' } : { kind: 'unresolved', mode, reason: 'choice-missing' }
-  }
-  if (!membership) return { kind: 'unresolved', mode, delivery: choice, reason: 'current-membership-missing' }
-  if (membership.kind === 'ineligible') return { kind: 'ineligible', mode, reason: membership.reason }
-  if (membership.kind === 'unresolved') return { kind: 'unresolved', mode, delivery: choice, reason: membership.reason }
-  return { kind: 'eligible', mode, delivery: choice }
-}
-
-/** The current facts `ownPostEligibility` reads at each confirmation. */
-export interface OwnPostEligibilitySources {
-  config(): Pick<ServerSettings, 'channel_mode'> | null | undefined
-  persona(key: string): Pick<Persona, 'channels'> | undefined
-  choices(): Pick<StoredChoices, 'storedChoice'> & { readableFor(key: string, channel?: string): boolean } | undefined
-  membership(key: string, channel: string, mode: ChannelMode): MembershipReading | undefined
-}
-/** The owner's `eligibility` over the applied config, stored choices and current membership. */
-export function ownPostEligibility(sources: OwnPostEligibilitySources): (key: string, channel: string) => OwnPostEligibility {
-  return (key, channel) => {
-    const mode = channelModeOf(sources.config()), store = sources.choices()
-    const readable = store !== undefined && store.readableFor(key, channel)
-    return decideOwnPostEligibility({
-      // Open mode reads no persona's channel entries.
-      channel, mode, listed: mode === 'strict' && personaListsChannel(sources.persona(key), channel),
-      choiceReadable: readable, choice: readable ? store.storedChoice(key, channel) : undefined,
-      membership: sources.membership(key, channel, mode),
-    })
-  }
-}
-
 /** The applied mode and readable stored choice a root lookup is requested under, read at each call. */
 export function ownPostLookupPolicy(sources: Pick<OwnPostEligibilitySources, 'config' | 'choices'>): (key: string, channel: string) => { mode: ChannelMode; delivery: DeliveryMode } | undefined {
   return (key, channel) => {
@@ -240,36 +182,10 @@ export function ownPostLookupPolicy(sources: Pick<OwnPostEligibilitySources, 'co
   }
 }
 
-/** Captured before the post's await, so a replacement identity or lifetime is never rebound. */
-export interface OwnPostIssue {
-  key: string
-  surface: OwnPostSurface
-  operation: string
-  incarnation?: string
-  /** The persona's reset order, when the channel was known at issue. */
-  resetOrder?: number
-  /** The channel the post was issued for, when known before the post. */
-  channel?: string
-  /** That channel's whole lifetime at issue: a leave, rejoin or reset since supersedes the post. */
-  lifetime?: SharedChannelLifetime
-  issuer: OwnPostIssuer
-  /** Epoch milliseconds at issue, before the post's await. */
-  issuedAt?: number
-}
 /** A channel's authenticated type and external sharing (`participation-channel-evidence.ts`). */
 export interface OwnPostChannelEvidence { channel: string; channelType: 'public' | 'private'; externallyShared: boolean }
 /** Open mode's membership reason when only the channel's type or sharing is unknown. */
 export const ELIGIBILITY_MISSING = 'eligibility-missing'
-/** What Slack's success response showed: the actual channel and returned timestamp. */
-export interface OwnPostPosted {
-  channel: string
-  ts?: string
-  parent?: string
-  /** 1-based part within the operation; one when absent. */
-  part?: number
-  /** A completed file's ID (`file` surface); `ts` then only when its own share named the root. */
-  file?: string
-}
 /**
  * `enrolled`: durable participation. `pending`: durable evidence awaiting
  * root/eligibility. `gap`: no durable copy could be written. `ineligible`
@@ -300,31 +216,11 @@ export interface OwnPostOutcome {
   /** A settled duplicate (already enrolled or decided): it changes nothing, but lets reporting see the persona settle. */
   duplicate?: true
 }
-/** The posting adapters' view: never throws, never delays or fails the post. */
-export interface OwnPostObserver {
-  /** `channel` is the post's channel when known before the post, so a lifetime change during it is seen. */
-  issue(key: string, surface: OwnPostSurface, channel?: string): OwnPostIssue | undefined
-  /** Call synchronously at the success response, before any awaited bookkeeping. */
-  confirm(issue: OwnPostIssue | undefined, posted: OwnPostPosted): void
-}
-/** The shared adapter over the current owner; a fault, sync or async, becomes an operation gap. */
-export function createOwnPostObserver(owner: () => ThreadParticipation | undefined, report?: (outcome: OwnPostOutcome) => void): OwnPostObserver {
-  return {
-    issue(key, surface, channel) {
-      try { return owner()?.issueOwnPost(key, surface, channel) } catch { return undefined }
-    },
-    confirm(issue, posted) {
-      if (!issue) return
-      const fault = (error: unknown) => {
-        try {
-          report?.({ kind: 'gap', key: issue.key, surface: issue.surface, operation: issue.operation, part: posted.part ?? 1,
-            channel: posted.channel, ...(isThreadTimestamp(posted.ts) ? { ts: posted.ts } : {}),
-            ...(isThreadTimestamp(posted.parent) ? { parent: posted.parent } : {}), missing: [], reason: 'operation', error })
-        } catch { /* reporting cannot fail a successful post */ }
-      }
-      try { void Promise.resolve(owner()?.confirmOwnPost(issue, posted)).catch(fault) } catch (error) { fault(error) }
-    },
-  }
+/** The operation gap an own-post observer fault (`createOwnPostObserver`'s `onFault`) reports. Pure. */
+export function ownPostFaultOutcome(issue: OwnPostIssue, posted: OwnPostPosted, error: unknown): OwnPostOutcome {
+  return { kind: 'gap', key: issue.key, surface: issue.surface, operation: issue.operation, part: posted.part ?? 1,
+    channel: posted.channel, ...(isThreadTimestamp(posted.ts) ? { ts: posted.ts } : {}),
+    ...(isThreadTimestamp(posted.parent) ? { parent: posted.parent } : {}), missing: [], reason: 'operation', error }
 }
 
 export type ThreadParticipationQueue = Pick<DeliveryQueue,

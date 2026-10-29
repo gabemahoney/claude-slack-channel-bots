@@ -793,6 +793,28 @@ function randomIdTail(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 9).toUpperCase()
 }
 
+// ---------------------------------------------------------------------------
+// Standalone rejections (for code that takes a Slack call's rejection directly)
+// ---------------------------------------------------------------------------
+
+/**
+ * A platform error as the stub's scripted failures build it, for a bot-token
+ * call. With `leakMarker`, the marker is in the message through
+ * `sentinelInMessage`, and bare in `data.provided` and the response messages.
+ */
+export const slackPlatformError = (error: string, retryAfter?: number, leakMarker?: string): Error => codedError(
+  `An API error occurred: ${error}${markerSuffix(leakMarker, BOT_TOKEN_PREFIX)}`, WebApiErrorCode.PlatformError,
+  { data: { ok: false, error, ...(leakMarker ? { provided: leakMarker } : {}),
+    ...(retryAfter !== undefined || leakMarker ? { response_metadata: { ...(retryAfter !== undefined ? { retryAfter } : {}), ...(leakMarker ? { messages: [`[ERROR] ${leakMarker}`] } : {}) } } : {}) } })
+/** A rate-limited error with `retryAfter` seconds; with `leakMarker`, as `slackPlatformError`, bare in `data.provided`. */
+export const slackRateLimited = (retryAfter: number, leakMarker?: string): Error => codedError(
+  `A rate-limit has been reached${markerSuffix(leakMarker, BOT_TOKEN_PREFIX)}`, WebApiErrorCode.RateLimitedError,
+  { retryAfter, ...(leakMarker ? { data: { provided: leakMarker } } : {}) })
+/** The HTTP-status rejection (`httpErrorFromResponse`). */
+export const slackHttpError = (statusCode: number): Error => codedError(
+  `An HTTP protocol error occurred: statusCode = ${statusCode}`, WebApiErrorCode.HTTPError,
+  { statusCode, statusMessage: 'stub status', headers: {}, body: {} })
+
 /** Where a stub Web API client keeps what its prototype methods read through `this`. */
 const STUB_WEB_CLIENT_STATE = Symbol('stub web client state')
 

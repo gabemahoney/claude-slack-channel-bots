@@ -374,7 +374,7 @@ import {
 } from '../src/kill-failure-alert.ts'
 import { ONSET_TEMPLATES, tmuxServerChangedOnset } from '../src/outage-state.ts'
 import { DM_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, PUBLIC_HISTORY_SCOPE, requiredHistoryScopes } from '../src/participation-channel-evidence.ts'
-import { ENROLLMENT_METADATA_METHODS } from '../src/participation-metadata.ts'
+import { ENROLLMENT_METADATA_METHODS } from '../src/thread-memory.ts'
 import { STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {

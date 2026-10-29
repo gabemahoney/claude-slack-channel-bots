@@ -85,9 +85,8 @@ import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, sl
 import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
-import type { OwnPostObserver } from './thread-participation.ts'
+import { completionFiles, type OwnPostObserver } from './own-post.ts'
 import { withFileCompletions } from './file-upload-observation.ts'
-import { completionFiles } from './participation-file-evidence.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
 // Peer-PID + sessions.json registry have been deleted. The

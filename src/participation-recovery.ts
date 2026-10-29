@@ -11,8 +11,8 @@
  * to that connection, its identity, the evidence's lifetime and the evidence
  * still being pending (`MetadataAttempts.run`'s guard, re-checked after each
  * await). Each request goes through the bounded metadata facility
- * (`participation-metadata.ts`), so a hung request ends by
- * `ENROLLMENT_METADATA_DEADLINE_MS`.
+ * (`thread-memory.ts`), so a hung request ends by
+ * `THREAD_MEMORY_LOOKUP_DEADLINE_MS`.
  *
  * Spacing: one pass runs at a time per persona. A pass ends early at its
  * first expired deadline or transient failure (the dependency looks down);
@@ -29,14 +29,14 @@
  * locally) block the recovery report but arm no timer: gaps are looked up
  * again only after the connection comes up again (`connected`) or a new
  * lifetime (`revoke`), and lost access also after a new event of that
- * channel (`channelEvent`), no sooner than `ENROLLMENT_RETRY_MIN_MS` after
+ * channel (`channelEvent`), no sooner than `THREAD_MEMORY_RETRY_MIN_MS` after
  * the gap was found.
  *
  * Capability: only a gap that holds root lookups (`capabilityGapHoldsLookups`)
  * holds or re-checks anything; a missing `im:history` alone holds none and
  * ends at the next connection. While a holding gap is open and a held reply
  * waits on a lookup, the gap is re-checked at most once per
- * `ENROLLMENT_RETRY_MAX_MS`: a missing scope by re-reading the token's
+ * `THREAD_MEMORY_RETRY_MAX_MS`: a missing scope by re-reading the token's
  * granted scopes (`refreshScopes`, an authenticated `auth.test`), a refused
  * method by one real lookup for a held reply. Either clears the gap through
  * the capability owner when it shows the gap is gone; lookups the gap held
@@ -67,7 +67,7 @@
 import type { ChannelMode, DeliveryMode } from './config.ts'
 import type { DeliveryQueue } from './delivery-queue.ts'
 import type { PersonaConnectionClock, PersonaEventProvenance } from './persona-connections.ts'
-import { createMetadataAttempts, metadataRetryDelay, type EnrollmentMetadataMethod, type MetadataAttempts, type MetadataFailure } from './participation-metadata.ts'
+import { createMetadataAttempts, metadataRetryDelay, type EnrollmentMetadataMethod, type MetadataAttempts, type MetadataFailure } from './thread-memory.ts'
 import { capabilityGapHoldsLookups, resolveChannelEvidence, type MetadataCaller } from './participation-channel-evidence.ts'
 import { resolveRootAuthor, rootLookupVerdict } from './participation-root-evidence.ts'
 import { resolveFileRoot } from './participation-file-evidence.ts'
@@ -77,7 +77,7 @@ import {
   type OwnPostChannelEvidence, type OwnPostOutcome, type RootLookupVerdict, type ThreadObservation, type ThreadParticipation,
 } from './thread-participation.ts'
 import type { ThreadCandidate } from './persona-routing.ts'
-import { ENROLLMENT_RETRY_MAX_MS, ENROLLMENT_RETRY_MIN_MS, ENROLLMENT_TIMER_MAX_MS } from './delivery-constants.ts'
+import { ENROLLMENT_TIMER_MAX_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from './delivery-constants.ts'
 
 /**
  * Why recovery could not settle something yet, or (`root-outside-lifetime`)
@@ -141,7 +141,7 @@ export interface ParticipationRecovery {
   /**
    * A new event (not a redelivery) of `channel` reached the persona: it can
    * read that channel again, so forget its lost-access gaps (one found less
-   * than `ENROLLMENT_RETRY_MIN_MS` ago, once that long has passed) and kick.
+   * than `THREAD_MEMORY_RETRY_MIN_MS` ago, once that long has passed) and kick.
    * Never awaits.
    */
   channelEvent(key: string, channel: string): void
@@ -167,7 +167,7 @@ interface PersonaState {
    * Evidence whose lookup ended in a gap, with its channel and when it was
    * found: looked up again only after `connected` or `revoke`, or (lost
    * access) `channelEvent`, which releases it at `retryAt` when it was found
-   * less than `ENROLLMENT_RETRY_MIN_MS` before.
+   * less than `THREAD_MEMORY_RETRY_MIN_MS` before.
    */
   gaps: Map<string, { channel: string; accessLost: boolean; at: number; retryAt?: number }>
   /** Own-root verdicts of lookups that decided nothing yet: applied again locally, never fetched again. */
@@ -348,7 +348,7 @@ export function createParticipationRecovery(deps: ParticipationRecoveryDeps): Pa
   /**
    * While a capability gap that holds lookups is open, which lookups may make a request this
    * pass. Only a held reply waiting on a lookup makes a re-check worth a
-   * request, at most once per `ENROLLMENT_RETRY_MAX_MS` from when the gap
+   * request, at most once per `THREAD_MEMORY_RETRY_MAX_MS` from when the gap
    * was found: a missing scope re-reads the token's granted scopes, which
    * clears the gap when they now include every required scope; a refused
    * method lets one held reply's lookup be tried again for real.
@@ -364,7 +364,7 @@ export function createParticipationRecovery(deps: ParticipationRecoveryDeps): Pa
     if (!waiting.size || (gap.kind === 'missing-scope' && !deps.refreshScopes)) return closed
     const now = deps.clock.now()
     state.capabilityCheckedAt ??= now
-    const due = state.capabilityCheckedAt + ENROLLMENT_RETRY_MAX_MS
+    const due = state.capabilityCheckedAt + THREAD_MEMORY_RETRY_MAX_MS
     if (now < due) { tally.recheckAt = Math.min(tally.recheckAt ?? Infinity, due); return closed }
     state.capabilityCheckedAt = now
     if (gap.kind === 'method-refused') return { remaining: 1, held: waiting, skipped: false }
@@ -372,7 +372,7 @@ export function createParticipationRecovery(deps: ParticipationRecoveryDeps): Pa
     if (!live()) return closed
     if (result.kind === 'ok') protect(() => deps.capability.recheckScopes(key))
     else { reportFailure(key, result, {}); noteFailure(tally, result) }
-    if (holdingGap(key)) { tally.recheckAt = Math.min(tally.recheckAt ?? Infinity, now + ENROLLMENT_RETRY_MAX_MS); return closed }
+    if (holdingGap(key)) { tally.recheckAt = Math.min(tally.recheckAt ?? Infinity, now + THREAD_MEMORY_RETRY_MAX_MS); return closed }
     return { remaining: Infinity, held: waiting, skipped: false }
   }
 
@@ -626,10 +626,10 @@ export function createParticipationRecovery(deps: ParticipationRecoveryDeps): Pa
       if (!gaps) return
       let cleared = false
       const now = deps.clock.now()
-      // A gap is looked up again no sooner than ENROLLMENT_RETRY_MIN_MS after it was found, however many events arrive.
+      // A gap is looked up again no sooner than THREAD_MEMORY_RETRY_MIN_MS after it was found, however many events arrive.
       for (const [id, gap] of gaps) {
         if (!gap.accessLost || gap.channel !== channel) continue
-        const due = gap.at + ENROLLMENT_RETRY_MIN_MS
+        const due = gap.at + THREAD_MEMORY_RETRY_MIN_MS
         if (due <= now) gaps.delete(id)
         else gap.retryAt ??= due
         cleared = true

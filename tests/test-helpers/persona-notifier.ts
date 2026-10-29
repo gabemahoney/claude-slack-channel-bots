@@ -109,7 +109,7 @@ import {
   type UnclassifiedErrorEpisodes,
 } from '../../src/persona-episodes.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
-import type { OwnPostObserver } from '../../src/thread-participation.ts'
+import type { OwnPostObserver } from '../../src/own-post.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.ts'
 

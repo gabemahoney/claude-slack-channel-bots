@@ -41,6 +41,7 @@ import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '..
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
+import type * as OwnPostModule from '../src/own-post.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
 import type * as PendingRowModule from '../src/pending-row.ts'
 import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
@@ -5453,8 +5454,8 @@ describe('participation recovers before intake and shares the production owners'
     expect(props.get('queue')).toBe('deliveryQueue')
     expect(props.get('authority')).toBe(`${resolution.controller}.sharedChannels()!`)
     // Eligibility reads the applied config, the one stored-choice store and current membership at each confirmation.
-    const eligibility: keyof typeof ThreadParticipationModule = 'ownPostEligibility'
-    expect(importSource(SERVER_CODE, eligibility)).toBe('./thread-participation.ts')
+    const eligibility: keyof typeof OwnPostModule = 'ownPostEligibility'
+    expect(importSource(SERVER_CODE, eligibility)).toBe('./own-post.ts')
     expect(props.get('eligibility')).toBe(`${eligibility}({ config: () => personaConfig, persona: getAppliedPersona, ` +
       'choices: () => channelDeliveryStore, membership: (key, channel, mode) => channelMembership?.read(key, channel, mode), })')
     expect(props.get('identity')).toBe('identityFor')
@@ -5480,6 +5481,15 @@ describe('participation recovers before intake and shares the production owners'
     const production = onlyCallProps(factory).get('onSettled')!
     expect(production).toContain('personaRouting.')
     expect(options.get('onSettled')?.replace(/\brouting\./g, 'personaRouting.')).toBe(production)
+  })
+
+  test('the routing harness builds its own-post observer with server.ts\'s own arguments, h.participation in place of threadParticipation', () => {
+    const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
+    const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
+    const production = onlyCallArgs(observer)
+    expect(production[0]).toBe(`() => ${holder}`)
+    const mirrored = splitTopLevel(onlyCallArguments(harness, observer))
+    expect(mirrored.map(arg => arg.replace(/\bh\.participation\b/g, holder))).toEqual(production)
   })
 
   test('routing reads the current owner and authenticated connection provenance, and reports unresolved obligations separately', () => {
@@ -5552,10 +5562,14 @@ describe('participation recovers before intake and shares the production owners'
   })
 
   test('every posting surface shares one own-post observer over the current owner, and reporting replays restored findings before buffered outcomes', () => {
-    const observer: keyof typeof ThreadParticipationModule = 'createOwnPostObserver'
-    expect(importSource(SERVER_CODE, observer)).toBe('./thread-participation.ts')
+    const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
+    expect(importSource(SERVER_CODE, observer)).toBe('./own-post.ts')
     declaredOnce('ownPosts')
-    expect(onlyCallArgs(observer)).toEqual([`() => ${holder}`, 'reportOwnPost'])
+    // A confirmation fault reaches reporting as the operation gap ownPostFaultOutcome builds.
+    const fault: keyof typeof ThreadParticipationModule = 'ownPostFaultOutcome'
+    expect(importSource(SERVER_CODE, fault)).toBe('./thread-participation.ts')
+    expect(onlyCallArgs(observer)).toEqual([`() => ${holder}`, `(issue, posted, error) => reportOwnPost(${fault}(issue, posted, error))`])
+    expect(callsOf(fault)).toHaveLength(1)
     expect(objectProperties(spreadConstObject('sessionToolDeps')).get('ownPosts')).toBe('ownPosts')
     expect(onlyCallProps('createPersonaDestinations').get('ownPosts')).toBe('ownPosts')
     // Before reporting exists, outcomes are buffered (bounded); afterwards they go straight to it. Overflow counts only fresh outcomes.

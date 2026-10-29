@@ -214,7 +214,7 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../src/persona-destination-hold.ts'
-import type { OwnPostObserver } from '../src/thread-participation.ts'
+import type { OwnPostObserver } from '../src/own-post.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'

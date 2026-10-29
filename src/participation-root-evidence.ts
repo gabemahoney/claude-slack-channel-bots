@@ -16,7 +16,7 @@
  * Only a deleted root (a tombstone, or Slack's not-found answer) and lost
  * channel access are root-author gaps. A mismatched, non-root, authorless or
  * otherwise malformed answer is unresolved and retried; a failed attempt is
- * returned classified (`participation-metadata.ts`), never as authorship.
+ * returned classified (`thread-memory.ts`), never as authorship.
  * Whether an own root may enroll (it must belong to this lifetime) is the
  * participation owner's decision (`ThreadParticipation.resolveRootLookup`).
  *
@@ -25,10 +25,10 @@
 
 import { CHANNEL_ID_RE } from './config.ts'
 import { isOwn, isThreadTimestamp } from './delivery-decision.ts'
-import type { MetadataAttempts, MetadataFailure } from './participation-metadata.ts'
+import type { MetadataAttempts, MetadataFailure } from './thread-memory.ts'
 import type { MetadataCaller } from './participation-channel-evidence.ts'
-import { SLACK_FILE_ID_RE } from './participation-file-evidence.ts'
-import type { OwnPostIssuer, RootLookupVerdict } from './thread-participation.ts'
+import { SLACK_FILE_ID_RE, type OwnPostIssuer } from './own-post.ts'
+import type { RootLookupVerdict } from './thread-participation.ts'
 
 /** What one lookup proves about a thread's root. `files`: the root message's own shared file IDs. */
 export type RootAuthorEvidence =

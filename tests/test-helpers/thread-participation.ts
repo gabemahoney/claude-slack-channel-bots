@@ -1,7 +1,8 @@
 /** Production participation, queue and routing composition in caller-owned scratch state. */
 import * as fs from 'node:fs'
 import { basename, join } from 'node:path'
-import { createThreadParticipation, type OwnPostPosted, type OwnPostSurface, type ThreadObservation, type ThreadParticipation } from '../../src/thread-participation.ts'
+import { createThreadParticipation, type ThreadObservation, type ThreadParticipation } from '../../src/thread-participation.ts'
+import type { OwnPostPosted, OwnPostSurface } from '../../src/own-post.ts'
 import type { MembershipReading } from '../../src/channel-membership.ts'
 import { parseQueueRecord, type DeliveryQueueOptions, type QueueItem, type QueueRecord } from '../../src/delivery-queue.ts'
 import { createQueuedAckCallback, createDeliveryAckCallback } from '../../src/ack-tracker.ts'
@@ -13,9 +14,9 @@ import { createFakeClock } from './fake-clock.ts'
 import { makeChannelMessage, mentionText, type SlackEvent } from './slack-stub.ts'
 import { SHARED_CHANNEL_IDS } from './shared-channels.ts'
 import { queuePath, readQueue, slackInput } from './delivery-queue.ts'
-import { assertNoLeak, writtenFile, sentinelInMessage, BOT_TOKEN_PREFIX } from './credentials.ts'
+import { assertNoLeak, writtenFile } from './credentials.ts'
 import { createParticipationRecovery, type ParticipationRecovery, type ParticipationRecoveryFinding } from '../../src/participation-recovery.ts'
-import { createMetadataAttempts, type EnrollmentMetadataMethod, type MetadataAttempts } from '../../src/participation-metadata.ts'
+import { createMetadataAttempts, type EnrollmentMetadataMethod, type MetadataAttempts } from '../../src/thread-memory.ts'
 import { createRootLookupCapability } from '../../src/participation-capability.ts'
 import { requiredHistoryScopes } from '../../src/participation-channel-evidence.ts'
 import { ownPostLookupPolicy } from '../../src/thread-participation.ts'
@@ -271,19 +272,6 @@ export interface MetadataRequest {
 export type MetadataResponder = (request: MetadataRequest) => unknown
 /** One granted-scope re-read recovery made, as `PersonaConnectionManager.refreshGrantedScopes` receives it. */
 export interface ScopeRefresh { key: string; connectionId: string; signal: AbortSignal; at: number }
-/** Rejection shapes of `@slack/web-api` 7.15.0, as the shared Slack stub builds them. With `leakMarker`, as the stub's
- * scripted failures: the marker in the message through `sentinelInMessage`, and bare in the other properties. */
-export const slackPlatformError = (error: string, retryAfter?: number, leakMarker?: string) => Object.assign(
-  new Error(`An API error occurred: ${error}${leakMarker ? ` (${sentinelInMessage(leakMarker, BOT_TOKEN_PREFIX, leakMarker)})` : ''}`),
-  { code: 'slack_webapi_platform_error', data: { ok: false, error, ...(leakMarker ? { provided: leakMarker } : {}),
-    ...(retryAfter !== undefined || leakMarker ? { response_metadata: { ...(retryAfter !== undefined ? { retryAfter } : {}), ...(leakMarker ? { messages: [`[ERROR] ${leakMarker}`] } : {}) } } : {}) } })
-export const slackRateLimited = (retryAfter: number, leakMarker?: string) => Object.assign(
-  new Error(`A rate-limit has been reached${leakMarker ? ` (${sentinelInMessage(leakMarker, BOT_TOKEN_PREFIX, leakMarker)})` : ''}`),
-  { code: 'slack_webapi_rate_limited_error', retryAfter, ...(leakMarker ? { data: { provided: leakMarker } } : {}) })
-/** `@slack/web-api` 7.15.0's HTTP-status rejection (`httpErrorFromResponse`). */
-export const slackHttpError = (statusCode: number) => Object.assign(
-  new Error(`An HTTP protocol error occurred: statusCode = ${statusCode}`),
-  { code: 'slack_webapi_http_error', statusCode, statusMessage: 'stub status', headers: {}, body: {} })
 /** A `conversations.replies` answer whose first message is `root`; later messages are returned history that must confer nothing. */
 export const rootReplies = (root: string, author: { user?: string; bot_id?: string }, extra: Record<string, unknown> = {}, later: Array<Record<string, unknown>> = []) =>
   ({ ok: true, messages: [{ type: 'message', ts: root, text: 'root text 4e1c', ...author, ...extra }, ...later] })

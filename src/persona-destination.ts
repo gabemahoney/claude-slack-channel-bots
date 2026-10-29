@@ -63,7 +63,7 @@ import { DM_DESTINATION, type Persona, type ServerSettings } from './config.ts'
 import type { PersonaFungibleDestination } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
-import type { OwnPostObserver, OwnPostSurface } from './thread-participation.ts'
+import type { OwnPostObserver, OwnPostSurface } from './own-post.ts'
 
 // ---------------------------------------------------------------------------
 // Constants

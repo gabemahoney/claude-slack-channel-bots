@@ -76,7 +76,7 @@ import {
   type PersonaDestinationHold,
 } from '../src/persona-destination-hold.ts'
 import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
-import type { OwnPostObserver } from '../src/thread-participation.ts'
+import type { OwnPostObserver } from '../src/own-post.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'

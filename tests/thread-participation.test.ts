@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createThreadParticipation, decideOwnPostEligibility, ownPostEligibility, ELIGIBILITY_MISSING } from '../src/thread-participation.ts'
+import { createThreadParticipation, ownPostFaultOutcome, ELIGIBILITY_MISSING } from '../src/thread-participation.ts'
+import type { OwnPostIssue } from '../src/own-post.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { createSharedChannelAuthority } from '../src/shared-channels.ts'
 import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
-import { RETYPE_BACKOFF_MS, RECEIPT_WAIT_MS, ENROLLMENT_METADATA_DEADLINE_MS, ENROLLMENT_RETRY_MIN_MS, ENROLLMENT_RETRY_MAX_MS, ENROLLMENT_TIMER_MAX_MS,
+import { RETYPE_BACKOFF_MS, RECEIPT_WAIT_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS, ENROLLMENT_TIMER_MAX_MS,
   OWN_ROOT_CLOCK_SKEW_MS, enrollmentRepairBoundMs } from '../src/delivery-constants.ts'
 import { buildMessageNotSavedNotice, MESSAGE_NOT_SAVED, QUEUE_UNWRITABLE, OWN_POST_NOT_ENROLLED, OWN_POST_FINDINGS_LOGGED_PER_PERSONA,
   buildOwnPostNotEnrolledLine, buildOwnPostNotEnrolledNotice, buildOwnPostFindingsCappedLine, buildOwnPostOutcomesDroppedLine } from '../src/delivery-notices.ts'
@@ -24,17 +25,19 @@ import { resetRoutingState, observedMembership } from './test-helpers/persona-ro
 import { makeQueue, readQueue, queuePath, seedQueue, slackInput, deliveredRecord, sentRecord } from './test-helpers/delivery-queue.ts'
 import { readSharedState, sharedChannelPath } from './test-helpers/shared-channels.ts'
 import { assertNoLeak, writtenFile, LEAK_SENTINEL } from './test-helpers/credentials.ts'
-import { asWebClient, broadcastText, mentionText, makeDm, makeGroupDmMessage, makeDeferredWebApiCall } from './test-helpers/slack-stub.ts'
+import { asWebClient, broadcastText, mentionText, makeDm, makeGroupDmMessage, makeDeferredWebApiCall,
+  slackPlatformError, slackRateLimited, slackHttpError } from './test-helpers/slack-stub.ts'
 import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { makeThreadHarness, threadHold, threadDisk, threadReply, observeThread, acceptObservation, tearJournal,
   THREAD_CHANNEL as C, THREAD_OTHER_CHANNEL as C2, THREAD_ROOT as ROOT, THREAD_OTHER_ROOT as ROOT2,
-  attachRecovery, hungMetadata, slackPlatformError, slackRateLimited, slackHttpError, rootReplies, fileInfo, channelInfo,
+  attachRecovery, hungMetadata, rootReplies, fileInfo, channelInfo,
   type ThreadHarness, type MetadataResponder, type AttachedRecovery } from './test-helpers/thread-participation.ts'
 import { parseRootReplies, resolveRootAuthor, rootLookupVerdict } from '../src/participation-root-evidence.ts'
-import { completionFiles, fileShareRoot, resolveFileRoot } from '../src/participation-file-evidence.ts'
+import { resolveFileRoot } from '../src/participation-file-evidence.ts'
 import { parseConversationInfo, resolveChannelEvidence, requiredHistoryScopes, missingHistoryScopes, capabilityGapHoldsLookups, PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE, DM_HISTORY_SCOPE,
   type RootLookupCapabilityGap } from '../src/participation-channel-evidence.ts'
-import { createMetadataAttempts, classifyMetadataFailure, metadataRetryDelay, waitFor, MetadataCancelledError, type MetadataAttempts, type EnrollmentMetadataMethod } from '../src/participation-metadata.ts'
+import { createMetadataAttempts, metadataRetryDelay, type MetadataAttempts } from '../src/thread-memory.ts'
+import { waitFor } from '../src/participation-metadata.ts'
 import { createRootLookupCapability } from '../src/participation-capability.ts'
 import { buildParticipationRecoveryLine, buildParticipationRecoveredLine, buildParticipationRecoveryCappedLine, PARTICIPATION_RECOVERY_LOGGED_PER_PERSONA,
   buildRootLookupCapabilityLine, buildRootLookupCapabilityNotice, ownPostFindingCause } from '../src/delivery-notices.ts'
@@ -339,7 +342,7 @@ describe('permanent participation and joint queue recovery', () => {
     expect(r.recovered).toEqual([])
     reading(h, ROOT3, 'unresolved', 'storage')
     disk.repair()
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect([h.h.queue.threadReadable('alpha'), h.h.queue.threadRepairable!('alpha'), r.recovered]).toEqual([true, false, ['alpha']])
     expect(h.h.logs.filter(l => l === buildParticipationRecoveredLine(renderPersonaRef('alpha', 'alpha')))).toHaveLength(1)
     reading(h, ROOT, 'followed'); reading(h, ROOT3, 'unfollowed')
@@ -1409,29 +1412,16 @@ describe('confirmed own posts through the participation owner', () => {
     if (reading) expect(h.read(ROOT, 'alpha', channel)).toBe(reading)
   })
 
-  test.each([
-    ['unreadable choices, even over a negative membership reading', { listed: true, choiceReadable: false, choice: undefined, membership: { kind: 'ineligible', reason: 'absent' } },
-      { kind: 'unresolved', mode: 'strict', reason: 'state-unavailable' }],
-    ['a listed strict channel with a stored choice but no membership reading', { listed: true, choiceReadable: true, choice: 'thread_hybrid', membership: undefined },
-      { kind: 'unresolved', mode: 'strict', delivery: 'thread_hybrid', reason: 'current-membership-missing' }],
-  ] as const)('%s leaves own-post eligibility unresolved, never eligible or ineligible', (_name, inputs, expected) => {
-    expect(decideOwnPostEligibility({ channel: C, mode: 'strict', ...inputs })).toEqual(expected)
-  })
-
-  test('open mode reads no persona channel entries for own-post eligibility; strict mode reads the posting persona\'s', () => {
-    const personaReads: string[] = [], membershipModes: string[] = []
-    const eligibility = (mode: 'strict' | 'open', stored?: 'mentions') => ownPostEligibility({
-      config: () => ({ channel_mode: mode }),
-      persona: key => { personaReads.push(key); return { channels: [] } },
-      choices: () => ({ readableFor: () => true, storedChoice: () => stored }),
-      membership: (_key, _channel, m) => { membershipModes.push(m); return { kind: 'ineligible', reason: 'external-sharing' } },
-    })
-    expect(eligibility('open')('alpha', C)).toMatchObject({ kind: 'unresolved', mode: 'open', reason: 'choice-missing' })
-    expect(eligibility('open', 'mentions')('alpha', C)).toMatchObject({ kind: 'ineligible', mode: 'open', reason: 'external-sharing' })
-    expect(personaReads).toEqual([])
-    expect(eligibility('strict')('alpha', C)).toMatchObject({ kind: 'ineligible', mode: 'strict', reason: 'unlisted' })
-    expect(personaReads).toEqual(['alpha'])
-    expect(membershipModes).toEqual(['open', 'open', 'strict'])
+  test('an own-post observer fault is an operation gap: the issue\'s key, surface and operation, part 1 by default, the channel, and only valid thread timestamps', () => {
+    const issue: OwnPostIssue = { key: 'alpha', surface: 'prompt', operation: 'op-fault', incarnation: 'inc-1', channel: C2, issuer: { botUserId: 'U0ALPHABOT' }, issuedAt: 1 }
+    const error = new Error('injected confirmation fault')
+    const gap = { kind: 'gap', key: 'alpha', surface: 'prompt', operation: 'op-fault', channel: C, missing: [], reason: 'operation', error }
+    const full = ownPostFaultOutcome(issue, { channel: C, ts: '1700000000.000101', parent: ROOT, part: 3 }, error)
+    expect(full).toEqual({ ...gap, part: 3, ts: '1700000000.000101', parent: ROOT } as typeof full)
+    const bare = ownPostFaultOutcome(issue, { channel: C, ts: 'not-a-ts', parent: 'not-a-thread' }, error)
+    expect(bare).toEqual({ ...gap, part: 1 } as typeof bare)
+    expect([Object.keys(bare).sort(), bare.error]).toEqual([['channel', 'error', 'key', 'kind', 'missing', 'operation', 'part', 'reason', 'surface'], error])
+    expect(Object.keys(ownPostFaultOutcome(issue, { channel: C }, error)).sort()).toEqual(Object.keys(bare).sort())
   })
 
   test('an eligible listed off channel enrolls without changing intake; the post alone selects nothing', async () => {
@@ -2183,22 +2173,6 @@ describe('root, file and channel evidence read from one exact authenticated answ
       { kind: 'deadline' }, { kind: 'capability', slackError: 'missing_scope' }, { kind: 'transient' }] as const) expect(rootLookupVerdict(evidence)).toBeUndefined()
   })
 
-  test('a new upload root is its file\'s earliest share in the exact channel; IDs, creation times, other channels and re-shares name nothing', () => {
-    const F = 'F0UPLOAD1', file = (shares: Array<{ ts: string; thread_ts?: string }>, channel: string = C, visibility: 'public' | 'private' = 'public') =>
-      fileInfo(F, channel, shares, visibility).file
-    expect(fileShareRoot(file([{ ts: ROOT2 }, { ts: ROOT }]), C)).toEqual({ kind: 'root', root: ROOT })
-    expect(fileShareRoot(file([{ ts: ROOT }], C, 'private'), C)).toEqual({ kind: 'root', root: ROOT })
-    expect(fileShareRoot(file([{ ts: ROOT }], C2), C)).toEqual({ kind: 'unresolved', reason: 'no-share' })
-    expect(fileShareRoot(file([{ ts: ROOT2, thread_ts: ROOT }]), C)).toEqual({ kind: 'unresolved', reason: 'ambiguous' })
-    expect(fileShareRoot({ id: F, created: 1_700_000_000, timestamp: 1_700_000_000 }, C)).toEqual({ kind: 'unresolved', reason: 'no-share' })
-    expect(fileShareRoot({ id: F, shares: { public: { [C]: 'not-a-list' } } }, C)).toEqual({ kind: 'unresolved', reason: 'malformed' })
-    expect(completionFiles({ ok: true, files: [file([{ ts: ROOT }]), { id: 'not-a-file-id' }] }, C)).toEqual([{ id: F, root: ROOT }])
-    // A parent upload needs no share; an aggregate that is not ok confirms nothing.
-    expect(completionFiles({ ok: true, files: [file([{ ts: ROOT }])] }, C, ROOT2)).toEqual([{ id: F }])
-    expect(completionFiles({ ok: false, files: [file([{ ts: ROOT }])] }, C)).toEqual([])
-    expect(completionFiles({ ok: true, files: [{ id: F, created: 1_700_000_000 }] }, C)).toEqual([{ id: F }])
-  })
-
   const sharing = (externallyShared: boolean, channelType: 'public' | 'private' = 'public') => ({ kind: 'evidence', channel: C, channelType, externallyShared }) as const
   test.each<[string, Record<string, unknown>, ReturnType<typeof parseConversationInfo>]>([
     ['explicit is_ext_shared false', {}, sharing(false)],
@@ -2328,7 +2302,7 @@ describe('root, file and channel evidence read from one exact authenticated answ
   })
 })
 
-describe('bounded, revocable enrollment metadata attempts', () => {
+describe('enrollment metadata resolvers, the repair bound and long waits', () => {
   const me = { botUserId: 'U0ALPHABOT', botId: 'B0ALPHABOT' }, F = 'F0UPLOAD1'
   type Call = (method: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>
   const sources: Array<[string, (a: MetadataAttempts, key: string, current: () => boolean, call: Call) => Promise<unknown>, Record<string, unknown>, unknown, unknown]> = [
@@ -2341,81 +2315,14 @@ describe('bounded, revocable enrollment metadata attempts', () => {
   function scripted() {
     const calls: Array<{ method: string; args: Record<string, unknown>; signal: AbortSignal }> = [], answers: Array<() => Promise<unknown>> = []
     const call: Call = (method, args, signal) => { calls.push({ method, args, signal }); return answers.shift()!() }
-    const hang = () => { let settle!: (v: unknown) => void, fail!: (e: unknown) => void; const p = new Promise((a, b) => { settle = a; fail = b }); answers.push(() => p); return { settle, fail } }
-    return { calls, answers, call, hang }
+    return { calls, answers, call }
   }
 
-  test.each(sources)('%s: a hung first and a hung later attempt each end at the same end-to-end deadline, abort their request and leave nothing in flight', async (method, resolve, args, answer, decided) => {
-    const clock = createFakeClock({ start: T0 }), attempts = createMetadataAttempts(clock), s = scripted()
-    const first = s.hang()
-    const one = resolve(attempts, 'alpha', () => true, s.call)
-    await clock.advance(ENROLLMENT_METADATA_DEADLINE_MS - 1)
-    expect([attempts.inFlight('alpha'), s.calls[0]!.signal.aborted]).toEqual([1, false])
-    await clock.advance(1)
-    expect(await one).toEqual({ kind: 'deadline' })
-    expect([attempts.inFlight('alpha'), s.calls[0]!.signal.aborted]).toEqual([0, true])
-    // The abandoned attempt's late answer is consumed; a fresh attempt starts at once and decides.
-    first.settle(answer)
+  test.each(sources)('%s: the resolver asks for exactly its evidence, once, and decides from the answer', async (method, resolve, args, answer, decided) => {
+    const attempts = createMetadataAttempts(createFakeClock({ start: T0 })), s = scripted()
     s.answers.push(async () => answer)
     expect(await resolve(attempts, 'alpha', () => true, s.call)).toEqual(decided)
-    const later = s.hang()
-    const three = resolve(attempts, 'alpha', () => true, s.call)
-    await clock.advance(ENROLLMENT_METADATA_DEADLINE_MS)
-    expect(await three).toEqual({ kind: 'deadline' })
-    later.fail(slackPlatformError('internal_error'))
-    await clock.flush()
-    expect(s.calls.map(c => [c.method, c.args])).toEqual([[method, args], [method, args], [method, args]])
-    expect([s.calls[2]!.signal.aborted, attempts.inFlight('alpha'), clock.pendingCount()]).toEqual([true, 0, 0])
-  })
-
-  test.each(sources)('%s: a guard turning false, revocation or shutdown cancels the attempt; another persona\'s attempt is untouched', async (_method, resolve, _args, answer, decided) => {
-    const clock = createFakeClock({ start: T0 }), attempts = createMetadataAttempts(clock), s = scripted()
-    let current = true
-    const guarded = s.hang(), revoked = s.hang(), other = s.hang()
-    const a = resolve(attempts, 'alpha', () => current, s.call)
-    const b = resolve(attempts, 'alpha', () => true, s.call)
-    const c = resolve(attempts, 'beta', () => true, s.call)
-    current = false; guarded.settle(answer)
-    expect(await a).toEqual({ kind: 'cancelled' })
-    attempts.revoke('alpha')
-    expect(await b).toEqual({ kind: 'cancelled' })
-    expect([s.calls[1]!.signal.aborted, s.calls[2]!.signal.aborted, attempts.inFlight('beta')]).toEqual([true, false, 1])
-    revoked.settle(answer); other.settle(answer)
-    expect(await c).toEqual(decided)
-    attempts.stop()
-    expect(await resolve(attempts, 'beta', () => true, s.call)).toEqual({ kind: 'cancelled' })
-    expect(s.calls).toHaveLength(3)
-  })
-
-  test.each<[string, unknown, unknown]>([
-    ['a missing scope', slackPlatformError('missing_scope'), { kind: 'capability', slackError: 'missing_scope' }],
-    ['a refused token type', slackPlatformError('not_allowed_token_type'), { kind: 'capability', slackError: 'not_allowed_token_type' }],
-    ['a revoked token', slackPlatformError('token_revoked'), { kind: 'credentials', slackError: 'token_revoked' }],
-    ['lost access', slackPlatformError('channel_not_found'), { kind: 'access-lost', slackError: 'channel_not_found' }],
-    ['a deleted message', slackPlatformError('thread_not_found'), { kind: 'not-found', slackError: 'thread_not_found' }],
-    ['ratelimited with Retry-After', slackPlatformError('ratelimited', 30), { kind: 'transient', retryAfter: 30 }],
-    ['a rate-limited rejection', slackRateLimited(120), { kind: 'transient', retryAfter: 120 }],
-    ['a server error', slackPlatformError('internal_error'), { kind: 'transient' }],
-    ['an unknown Slack error', slackPlatformError('something_new'), { kind: 'rejected', slackError: 'something_new' }],
-    ['a service outage', slackPlatformError('service_unavailable'), { kind: 'transient' }],
-    ['an HTTP 400', slackHttpError(400), { kind: 'rejected' }],
-    ['an HTTP 404', slackHttpError(404), { kind: 'rejected' }],
-    ['an HTTP 408', slackHttpError(408), { kind: 'transient' }],
-    ['an HTTP 429', slackHttpError(429), { kind: 'transient' }],
-    ['an HTTP 503', slackHttpError(503), { kind: 'transient' }],
-    ['a malformed Slack error code', slackPlatformError('Not A Code!'), { kind: 'malformed' }],
-    ['a transport error', Object.assign(new Error('socket hang up'), { code: 'slack_webapi_request_error' }), { kind: 'transient' }],
-    ['a cancellation', new MetadataCancelledError(), { kind: 'cancelled' }],
-  ])('%s is classified apart, never as authorship, deletion or recovery', (_name, error, expected) => {
-    expect(classifyMetadataFailure(error) as unknown).toEqual(expected)
-  })
-
-  test.each(['access_denied', 'no_permission', 'not_authorized'].flatMap(code => [
-    ['files.info', code, { kind: 'file-unavailable', slackError: code }],
-    ['conversations.replies', code, { kind: 'capability', slackError: code }],
-    ['conversations.info', code, { kind: 'capability', slackError: code }],
-  ] as Array<[EnrollmentMetadataMethod, string, unknown]>))('%s answering %s: only a file lookup reads it as that file being unavailable', (method, code, expected) => {
-    expect(classifyMetadataFailure(slackPlatformError(code), method) as unknown).toEqual(expected)
+    expect(s.calls.map(c => [c.method, c.args])).toEqual([[method, args]])
   })
 
   test('only Slack\'s not-found and lost-access answers become root and file gaps', async () => {
@@ -2432,18 +2339,9 @@ describe('bounded, revocable enrollment metadata attempts', () => {
     expect(await file()).toEqual({ kind: 'unresolved', reason: 'malformed' })
   })
 
-  test('retry spacing: a positive minimum doubling to the local maximum; Retry-After below the cap changes nothing, above it is honored, and huge waits stay safe', () => {
-    expect(ENROLLMENT_RETRY_MIN_MS).toBeGreaterThan(0)
-    expect([1, 2, 3, 4, 5, 6, 50].map(n => metadataRetryDelay(n))).toEqual([1, 2, 4, 8, 16, 32, 32].map(m => Math.min(ENROLLMENT_RETRY_MAX_MS, ENROLLMENT_RETRY_MIN_MS * m)))
-    expect(metadataRetryDelay(50)).toBe(ENROLLMENT_RETRY_MAX_MS)
-    expect(metadataRetryDelay(1, 1)).toBe(ENROLLMENT_RETRY_MIN_MS)
-    expect(metadataRetryDelay(50, ENROLLMENT_RETRY_MAX_MS / 1000 - 1)).toBe(ENROLLMENT_RETRY_MAX_MS)
-    expect(metadataRetryDelay(1, ENROLLMENT_RETRY_MAX_MS / 1000 * 3)).toBe(ENROLLMENT_RETRY_MAX_MS * 3)
-    expect(metadataRetryDelay(1, 1e300)).toBe(Number.MAX_SAFE_INTEGER)
-    for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY]) expect(metadataRetryDelay(1, bad)).toBe(ENROLLMENT_RETRY_MIN_MS)
-    // The repair bound: remaining deadline + the next permitted wait (the local maximum or a greater Retry-After) + one attempt.
-    expect(enrollmentRepairBoundMs()).toBe(ENROLLMENT_METADATA_DEADLINE_MS + ENROLLMENT_RETRY_MAX_MS + ENROLLMENT_METADATA_DEADLINE_MS)
-    expect(enrollmentRepairBoundMs(1000, ENROLLMENT_RETRY_MAX_MS / 1000 * 2)).toBe(1000 + ENROLLMENT_RETRY_MAX_MS * 2 + ENROLLMENT_METADATA_DEADLINE_MS)
+  test('the repair bound: the remaining deadline, the next permitted wait (the local maximum or a greater Retry-After), then one attempt', () => {
+    expect(enrollmentRepairBoundMs()).toBe(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS + THREAD_MEMORY_LOOKUP_DEADLINE_MS)
+    expect(enrollmentRepairBoundMs(1000, THREAD_MEMORY_RETRY_MAX_MS / 1000 * 2)).toBe(1000 + THREAD_MEMORY_RETRY_MAX_MS * 2 + THREAD_MEMORY_LOOKUP_DEADLINE_MS)
   })
 
   test('a wait longer than one timer re-arms in chunks and never fires early; aborting it resolves false', async () => {
@@ -2665,16 +2563,16 @@ describe('startup and idle recovery through the production owner, routing and re
     r.respond(first.respond, second.respond)
     await r.settle()
     const started = r.requests[0]!.at
-    await h.clock.advanceTo(started + ENROLLMENT_METADATA_DEADLINE_MS - 1)
+    await h.clock.advanceTo(started + THREAD_MEMORY_LOOKUP_DEADLINE_MS - 1)
     expect([first.aborted, r.attempts.inFlight('alpha'), r.findings]).toEqual([[false], 1, []])
-    await h.clock.advanceTo(started + ENROLLMENT_METADATA_DEADLINE_MS); await r.recovery.idle('alpha')
+    await h.clock.advanceTo(started + THREAD_MEMORY_LOOKUP_DEADLINE_MS); await r.recovery.idle('alpha')
     const deadline = { cause: 'metadata', channel: C, root: ROOT, code: 'deadline' } as const
     expect([first.aborted, r.attempts.inFlight('alpha'), r.findings.map(f => f.finding)]).toEqual([[true], 0, [deadline]])
     first.settle(rootReplies(ROOT, { user: h.h.p('alpha').stub.identity.botUserId }))
     await h.clock.flush()
     expect([h.read(), acks.count, r.requests.length]).toEqual(['unresolved', 0, 1])
     const expired = h.clock.now()
-    await h.clock.advanceTo(expired + ENROLLMENT_RETRY_MIN_MS - 1)
+    await h.clock.advanceTo(expired + THREAD_MEMORY_RETRY_MIN_MS - 1)
     expect(r.requests).toHaveLength(1)
     // The retry hangs too, so its pass is not awaited here.
     await h.clock.advanceTo(expired + metadataRetryDelay(1)); await new Promise(resolve => setImmediate(resolve))
@@ -2682,7 +2580,7 @@ describe('startup and idle recovery through the production owner, routing and re
     // Slack is healthy from this attempt on; the hung attempt expires, and the next permitted one repairs.
     const healthy = r.requests[1]!.at
     r.respond(ownAnswer(h))
-    await h.clock.advanceTo(healthy + ENROLLMENT_METADATA_DEADLINE_MS); await r.recovery.idle('alpha')
+    await h.clock.advanceTo(healthy + THREAD_MEMORY_LOOKUP_DEADLINE_MS); await r.recovery.idle('alpha')
     second.fail(slackPlatformError('internal_error'))
     const again = h.clock.now()
     await h.clock.advanceTo(again + metadataRetryDelay(2) - 1)
@@ -2691,19 +2589,19 @@ describe('startup and idle recovery through the production owner, routing and re
     expect([h.read(), acks.count, r.requests.length]).toEqual(['followed', 1, 3])
     // The bound covers resolution and durability: the acknowledgement follows durable acceptance.
     expect(accepted(h).map(a => [a.ts, a.via])).toEqual([[reply.ts, 'thread']])
-    expect(ackedAt[0]! - healthy).toBeLessThanOrEqual(enrollmentRepairBoundMs(ENROLLMENT_METADATA_DEADLINE_MS))
+    expect(ackedAt[0]! - healthy).toBeLessThanOrEqual(enrollmentRepairBoundMs(THREAD_MEMORY_LOOKUP_DEADLINE_MS))
     // One deadline finding line however often it recurs; no recovery while the rootless post still waits.
     expect(recoveryLines(h)).toEqual([buildParticipationRecoveryLine(personaRef(), deadline)])
     expect([r.recovered, postCount(h)]).toEqual([[], 0])
   })
 
-  test.each([['below', 1], ['above', ENROLLMENT_RETRY_MAX_MS / 1000 * 2]] as const)('Retry-After %s the local maximum: the next lookup waits the greater of it and the local spacing, whatever new evidence kicks recovery meanwhile', async (_where, retryAfter) => {
+  test.each([['below', 1], ['above', THREAD_MEMORY_RETRY_MAX_MS / 1000 * 2]] as const)('Retry-After %s the local maximum: the next lookup waits the greater of it and the local spacing, whatever new evidence kicks recovery meanwhile', async (_where, retryAfter) => {
     const { h, r } = await rootless()
     const { acks } = await holdReply(h)
     r.respond(fails(slackRateLimited(retryAfter, LEAK_SENTINEL)))
     await r.settle()
     const failed = r.requests[0]!.at, wait = metadataRetryDelay(1, retryAfter)
-    expect(wait).toBe(Math.max(ENROLLMENT_RETRY_MIN_MS, retryAfter * 1000))
+    expect(wait).toBe(Math.max(THREAD_MEMORY_RETRY_MIN_MS, retryAfter * 1000))
     expect(r.findings.map(f => f.finding)).toEqual([{ cause: 'metadata', channel: C, root: ROOT, code: 'transient' }])
     assertNoLeak(r.findings)
     // A second held reply and a new pending own post each kick recovery inside the wait; neither cuts it short.
@@ -2870,7 +2768,7 @@ describe('startup and idle recovery through the production owner, routing and re
     const written = records()
     expect(h.h.queue.threadRecords('alpha').filter(x => x.observation.lookup).map(x => x.state)).toEqual(['observed'])
     r.recovery.kick('alpha'); await r.settle()
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); r.recovery.kick('alpha'); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); r.recovery.kick('alpha'); await r.settle()
     const finding = { cause: 'root-unmatched', channel: C, root: far } as const
     expect([r.requests.length, records()]).toEqual([1, written])
     expect(r.findings.map(f => f.finding)).toEqual(r.findings.map(() => finding))
@@ -2906,7 +2804,7 @@ describe('startup and idle recovery through the production owner, routing and re
     r.respond(hung.respond)
     await r.settle()
     const started = r.requests[0]!.at
-    await h.clock.advanceTo(started + ENROLLMENT_METADATA_DEADLINE_MS); await r.recovery.idle('alpha')
+    await h.clock.advanceTo(started + THREAD_MEMORY_LOOKUP_DEADLINE_MS); await r.recovery.idle('alpha')
     expect([r.requests.map(q => q.args.ts), r.findings.map(f => f.finding.code)]).toEqual([[ROOT], ['deadline']])
     const expired = h.clock.now()
     r.respond(ownAnswer(h), ownAnswer(h, ROOT2))
@@ -2960,7 +2858,7 @@ describe('startup and idle recovery through the production owner, routing and re
     expect(h.disk.failures).toContain('write')
     expect([h.read(), acceptedAtAck, accepted(h), r.recovered]).toEqual(['followed', [], [], []])
     h.disk.repair()
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect(accepted(h).map(a => [a.ts, a.via])).toEqual([[reply.ts, 'thread']])
     expect([acceptedAtAck, r.recovered, recoveredLines(h).length, r.requests.length]).toEqual([[1], ['alpha'], 1, 1])
   })
@@ -3063,7 +2961,7 @@ describe('startup and idle recovery through the production owner, routing and re
     r.respond(() => rootReplies(ROOT2, { user: 'U0HUMAN' }))
     const other = await holdReply(h, { thread_ts: ROOT2, ts: '1700000000.000201' })
     await r.settle()
-    for (let i = 0; i < 3; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+    for (let i = 0; i < 3; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
     expect([r.requests.map(q => q.args.ts), r.refreshes, other.acks.count, h.read(ROOT2), r.capability.gap('alpha')]).toEqual([[ROOT, ROOT2], [], 1, 'unfollowed', gap])
     await h.notices.flush()
     expect([capabilityLines(h).length, capabilityNotices(h).length]).toEqual([1, 1])
@@ -3088,8 +2986,8 @@ describe('startup and idle recovery through the production owner, routing and re
     test('the re-check lookup succeeding returns to the im:history gap in the same episode: one notice, a third line, no clearing; the held reply resolves and a later connection adds no notice', async () => {
       const { h, r, held, refusedAt } = await refusedUnderImGap({ alpha: [PUBLIC_HISTORY_SCOPE, PRIVATE_HISTORY_SCOPE] })
       r.respond(ownAnswer(h))
-      await h.clock.advanceTo(refusedAt + ENROLLMENT_RETRY_MAX_MS); await r.settle()
-      expect(r.requests.map(q => q.at - refusedAt)).toEqual([0, ENROLLMENT_RETRY_MAX_MS])
+      await h.clock.advanceTo(refusedAt + THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
+      expect(r.requests.map(q => q.at - refusedAt)).toEqual([0, THREAD_MEMORY_RETRY_MAX_MS])
       expect([r.capability.gap('alpha'), r.capability.state('alpha'), h.read(), held.acks.count, r.refreshes]).toEqual([IM_GAP, 'missing', 'followed', 1, []])
       expect(accepted(h).map(a => [a.ts, a.via])).toEqual([[held.reply.ts, 'thread']])
       await h.notices.flush()
@@ -3111,7 +3009,7 @@ describe('startup and idle recovery through the production owner, routing and re
       expect(capabilityLines(h)).toEqual(lines)
       // As server.ts does when the persona's connection comes up again.
       r.capability.connected('alpha'); r.recovery.connected('alpha'); await r.settle()
-      await h.clock.advanceTo(refusedAt + ENROLLMENT_RETRY_MAX_MS - 1); await r.recovery.idle('alpha')
+      await h.clock.advanceTo(refusedAt + THREAD_MEMORY_RETRY_MAX_MS - 1); await r.recovery.idle('alpha')
       await h.notices.flush()
       expect([r.capability.gap('alpha'), r.requests.length, held.acks.count, h.read(), h.threads.rootLookupNeeded('alpha', C, ROOT)]).toEqual([REFUSED_GAP, 1, 0, 'unresolved', true])
       expect([capabilityLines(h), capabilityNotices(h).length, r.refreshes]).toEqual([lines, 1, []])
@@ -3140,7 +3038,7 @@ describe('startup and idle recovery through the production owner, routing and re
     } else expect(r.findings.map(f => f.finding)).toEqual([{ cause: 'capability', channel: C, root: ROOT, code }])
     // A later successful lookup settles it (refused credentials at the backoff; a refused method at its re-check, a full spacing later) and clears a method refusal.
     r.respond(ownAnswer(h))
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect([h.read(), acks.count, r.capability.gap('alpha')]).toEqual(['followed', 1, undefined])
     await h.notices.flush()
     assertNoLeak([h.h.logs, h.notices.h.allPosts()])
@@ -3156,7 +3054,7 @@ describe('startup and idle recovery through the production owner, routing and re
     r.recovery.revoke('alpha'); await h.clock.flush()
     expect([hung.aborted, r.attempts.inFlight('alpha')]).toEqual([[true], 0])
     hung.settle(rootReplies(ROOT, { user: h.h.p('alpha').stub.identity.botUserId }))
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS * 2); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2); await r.settle()
     expect([h.read(), acks.count, r.requests.length, r.findings]).toEqual(['unresolved', 0, 1, []])
     expect(h.threads.rootLookups('alpha')).toHaveLength(1)
     r.respond(ownAnswer(h))
@@ -3190,7 +3088,7 @@ describe('startup and idle recovery through the production owner, routing and re
     await h.close()
     expect(hung.aborted).toEqual([true])
     r.recovery.kick('alpha')
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS)
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
     expect(r.requests).toHaveLength(1)
     const reopened = await open({ clock: h.clock })
     expect(reopened.threads.rootLookups('alpha').map(o => o.root)).toEqual([ROOT])
@@ -3288,7 +3186,7 @@ describe('startup and idle recovery through the production owner, routing and re
     expect([h.read(), r.recovered, h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)]).toEqual(['unresolved', [], true])
     h.disk.repair()
     await r.settle()
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect([h.read(), h.threads.ownPostFindings('alpha'), r.recovered]).toEqual(['followed', [], ['alpha']])
     expect(h.notices.rig.episodes.isOpen('alpha', PERSONA_EPISODE_KIND_OWN_POST_NOT_ENROLLED)).toBe(false)
     expect(recoveredLines(h)).toHaveLength(1)
@@ -3336,7 +3234,7 @@ describe('startup and idle recovery through the production owner, routing and re
     await r.settle()
     expect([passes.count, recoveredLines(h).length, r.recovered, r.requests]).toEqual([2, 1, ['alpha'], []])
     expect(h.clock.now() - settledAt).toBeLessThan(metadataRetryDelay(1))
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS * 2); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2); await r.settle()
     expect([passes.count, recoveredLines(h).length]).toEqual([2, 1])
   })
 
@@ -3373,7 +3271,7 @@ describe('startup and idle recovery through the production owner, routing and re
     expect([h.owed, passes.count, recoveredLines(h).length, h.read()]).toEqual([[{ key: 'alpha', id: pending.id }], 1, 1, 'followed'])
     const duplicate = await h.confirmPost({ channel: C, ts: '1700000000.000102', parent: ROOT }).outcome
     expect(duplicate).toMatchObject({ kind: 'enrolled', duplicate: true })
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect([h.owed.length, passes.count, recoveredLines(h).length]).toEqual([1, 1, 1])
   })
 
@@ -3385,7 +3283,7 @@ describe('startup and idle recovery through the production owner, routing and re
     const { acks } = await holdReply(h)
     await r.settle()
     expect([h.read(), acks.count, accepted(h), h.h.routing.pendingCandidates(), r.requests, h.threads.rootLookups('alpha')]).toEqual(['unfollowed', 1, [], [], [], []])
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS * 2); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2); await r.settle()
     expect([acks.count, r.requests.length, h.clock.pendingCount()]).toEqual([1, 0, 0])
     expect(h.threads.ownPostFindings('alpha')).toEqual([expect.objectContaining({ kind: 'pending', id: post.id, missing: ['root'] })])
   })
@@ -3416,20 +3314,20 @@ describe('startup and idle recovery through the production owner, routing and re
     await r.settle()
     expect(r.requests.map(q => q.method)).toEqual(['conversations.replies', 'files.info'])
     expect(r.findings.map(f => f.finding)).toEqual([{ cause: 'access-lost', channel: C, root: ROOT }, { cause: 'access-lost', channel: C, file: F }])
-    // A gap found less than ENROLLMENT_RETRY_MIN_MS before an event is released only then; these gaps are older.
-    await h.clock.advance(ENROLLMENT_RETRY_MIN_MS); await r.settle()
+    // A gap found less than THREAD_MEMORY_RETRY_MIN_MS before an event is released only then; these gaps are older.
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS); await r.settle()
     for (const [key, channel] of [['alpha', C2], ['beta', C]] as const) { r.recovery.channelEvent(key, channel); await r.settle(); await r.settle(key) }
     r.recovery.kick('alpha'); await r.settle()
     expect(r.requests).toHaveLength(2)
     r.respond(lost, lost)
     const eventAt = h.clock.now()
     r.recovery.channelEvent('alpha', C); await r.settle()
-    // A gap older than ENROLLMENT_RETRY_MIN_MS is looked up at once.
-    expect(r.requests.slice(2).map(q => [q.method, q.at - eventAt < ENROLLMENT_RETRY_MIN_MS])).toEqual([['conversations.replies', true], ['files.info', true]])
+    // A gap older than THREAD_MEMORY_RETRY_MIN_MS is looked up at once.
+    expect(r.requests.slice(2).map(q => [q.method, q.at - eventAt < THREAD_MEMORY_RETRY_MIN_MS])).toEqual([['conversations.replies', true], ['files.info', true]])
     expect(r.recovered).toEqual([])
   })
 
-  test('new events right after a lost-access gap release it only ENROLLMENT_RETRY_MIN_MS after it was found, with one request each however many arrive', async () => {
+  test('new events right after a lost-access gap release it only THREAD_MEMORY_RETRY_MIN_MS after it was found, with one request each however many arrive', async () => {
     const { h, r } = await rootless()
     const F = 'F0UPLOAD9'
     await h.confirmPost({ channel: C, file: F }, 'alpha', 'file').outcome
@@ -3441,16 +3339,16 @@ describe('startup and idle recovery through the production owner, routing and re
     const foundAt = r.requests[0]!.at
     expect(r.requests[1]!.at).toBe(foundAt)
     for (let i = 0; i < 5; i++) { r.recovery.channelEvent('alpha', C); await r.settle() }
-    await h.clock.advanceTo(foundAt + ENROLLMENT_RETRY_MIN_MS / 2)
+    await h.clock.advanceTo(foundAt + THREAD_MEMORY_RETRY_MIN_MS / 2)
     r.recovery.channelEvent('alpha', C)
-    await h.clock.advanceTo(foundAt + ENROLLMENT_RETRY_MIN_MS - 1); await r.recovery.idle('alpha')
+    await h.clock.advanceTo(foundAt + THREAD_MEMORY_RETRY_MIN_MS - 1); await r.recovery.idle('alpha')
     expect(r.requests).toHaveLength(2)
     r.respond(() => rootReplies(ROOT, { user: 'U0HUMAN01' }), () => fileInfo(F, C, [{ ts: ROOT2 }]))
-    await h.clock.advanceTo(foundAt + ENROLLMENT_RETRY_MIN_MS); await r.settle()
-    expect(r.requests.slice(2).map(q => [q.method, q.at - foundAt])).toEqual([['conversations.replies', ENROLLMENT_RETRY_MIN_MS], ['files.info', ENROLLMENT_RETRY_MIN_MS]])
+    await h.clock.advanceTo(foundAt + THREAD_MEMORY_RETRY_MIN_MS); await r.settle()
+    expect(r.requests.slice(2).map(q => [q.method, q.at - foundAt])).toEqual([['conversations.replies', THREAD_MEMORY_RETRY_MIN_MS], ['files.info', THREAD_MEMORY_RETRY_MIN_MS]])
     expect([h.read(), h.read(ROOT2), acks.count]).toEqual(['unfollowed', 'followed', 1])
     // Settled: later events ask nothing more.
-    r.recovery.channelEvent('alpha', C); await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    r.recovery.channelEvent('alpha', C); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect(r.requests).toHaveLength(4)
   })
 
@@ -3465,10 +3363,10 @@ describe('startup and idle recovery through the production owner, routing and re
     r.respond(ownAnswer(h))
     await r.settle()
     expect(r.requests.map(q => q.method)).toEqual(['conversations.replies'])
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); r.recovery.kick('alpha'); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); r.recovery.kick('alpha'); await r.settle()
     expect([r.requests.length, h.read(), acks.count, r.findings, r.recovered]).toEqual([1, 'unresolved', 0, [], []])
     h.membership.delete(`alpha:${C}`)
-    await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
     expect([r.requests.length, h.read(), acks.count]).toEqual([1, 'followed', 1])
     expect(accepted(h).map(a => [a.ts, a.via])).toEqual([[threadReply().ts as string, 'thread']])
   })
@@ -3527,7 +3425,7 @@ describe('startup and idle recovery through the production owner, routing and re
     hung.settle(rootReplies(ROOT, { user: h.h.p('alpha').stub.identity.botUserId }))
     await r.settle()
     expect(r.requests.map(q => q.args.ts)).toEqual([ROOT, ROOT2])
-    expect(r.requests[1]!.at - ended).toBeLessThan(ENROLLMENT_RETRY_MIN_MS)
+    expect(r.requests[1]!.at - ended).toBeLessThan(THREAD_MEMORY_RETRY_MIN_MS)
     expect([h.read(), h.read(ROOT2), mine.acks.count, other.acks.count]).toEqual(['followed', 'followed', 1, 1])
   })
 
@@ -3549,7 +3447,7 @@ describe('startup and idle recovery through the production owner, routing and re
     const start = h.clock.now()
     await r.settle()
     expect([posted, r.requests.map(q => q.args.ts), r.findings]).toEqual([true, [ROOT], []])
-    expect(r.requests[0]!.at - start).toBeLessThan(ENROLLMENT_RETRY_MIN_MS)
+    expect(r.requests[0]!.at - start).toBeLessThan(THREAD_MEMORY_RETRY_MIN_MS)
     expect([h.read(), held.acks.count]).toEqual(['followed', 1])
   })
 
@@ -3608,7 +3506,7 @@ describe('startup and idle recovery through the production owner, routing and re
       const { h, r } = await rootless({}, { scopes: { alpha: PARTIAL } })
       r.capability.connected('alpha')
       const { acks } = await holdReply(h)
-      for (let i = 0; i < 3; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+      for (let i = 0; i < 3; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
       expect([r.requests, acks.count, r.capability.gap('alpha')?.kind]).toEqual([[], 0, 'missing-scope'])
     })
 
@@ -3618,10 +3516,10 @@ describe('startup and idle recovery through the production owner, routing and re
       const { acks } = await holdReply(h)
       await r.settle()
       const since = requestedAt(h)
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS - 1); await r.recovery.idle('alpha')
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS - 1); await r.recovery.idle('alpha')
       expect(r.refreshes).toEqual([])
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS * 3); await r.settle()
-      expect(r.refreshes.map(q => [q.key, q.connectionId, q.at - since])).toEqual([1, 2, 3].map(n => ['alpha', 'conn-alpha', ENROLLMENT_RETRY_MAX_MS * n]))
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS * 3); await r.settle()
+      expect(r.refreshes.map(q => [q.key, q.connectionId, q.at - since])).toEqual([1, 2, 3].map(n => ['alpha', 'conn-alpha', THREAD_MEMORY_RETRY_MAX_MS * n]))
       expect([r.requests, acks.count, r.capability.gap('alpha')?.kind]).toEqual([[], 0, 'missing-scope'])
       await h.notices.flush()
       expect([capabilityLines(h).length, capabilityNotices(h).length]).toEqual([1, 1])
@@ -3632,7 +3530,7 @@ describe('startup and idle recovery through the production owner, routing and re
       r.capability.connected('alpha')
       await h.threads.requestRootLookup('alpha', C, ROOT, issuerOf(h), STRICT_POLICY)
       r.recovery.kick('alpha'); await r.settle()
-      for (let i = 0; i < 3; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+      for (let i = 0; i < 3; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
       expect([r.refreshes, r.requests]).toEqual([[], []])
     })
 
@@ -3646,8 +3544,8 @@ describe('startup and idle recovery through the production owner, routing and re
       await r.settle()
       const since = requestedAt(h)
       r.respond(ownAnswer(h))
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS); await r.settle()
-      expect([r.refreshes.map(q => q.at - since), r.requests.map(q => q.at - since)]).toEqual([[ENROLLMENT_RETRY_MAX_MS], [ENROLLMENT_RETRY_MAX_MS]])
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
+      expect([r.refreshes.map(q => q.at - since), r.requests.map(q => q.at - since)]).toEqual([[THREAD_MEMORY_RETRY_MAX_MS], [THREAD_MEMORY_RETRY_MAX_MS]])
       expect([r.capability.gap('alpha'), h.read(), acks.count]).toEqual([undefined, 'followed', 1])
       expect(accepted(h).map(a => [a.ts, a.via])).toEqual([[reply.ts, 'thread']])
       await h.notices.flush()
@@ -3665,11 +3563,11 @@ describe('startup and idle recovery through the production owner, routing and re
       expect([r.requests, acks.count]).toEqual([[], 0])
       const since = requestedAt(h)
       r.respond(ownAnswer(h))
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS); await r.settle()
-      expect([r.refreshes.map(q => q.at - since), r.requests.map(q => q.at - since)]).toEqual([[ENROLLMENT_RETRY_MAX_MS], [ENROLLMENT_RETRY_MAX_MS]])
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
+      expect([r.refreshes.map(q => q.at - since), r.requests.map(q => q.at - since)]).toEqual([[THREAD_MEMORY_RETRY_MAX_MS], [THREAD_MEMORY_RETRY_MAX_MS]])
       expect([r.capability.gap('alpha'), h.read(), acks.count]).toEqual([{ kind: 'missing-scope', scopes: [DM_HISTORY_SCOPE] }, 'followed', 1])
       expect(accepted(h).map(a => [a.ts, a.via])).toEqual([[reply.ts, 'thread']])
-      for (let i = 0; i < 3; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+      for (let i = 0; i < 3; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
       expect(r.refreshes).toHaveLength(1)
       await h.notices.flush()
       // One line per distinct gap, one notice for the episode, which stays open.
@@ -3685,7 +3583,7 @@ describe('startup and idle recovery through the production owner, routing and re
       r.respond(fails(slackPlatformError('internal_error')))
       await r.settle()
       // Later lookups are unscripted, so each is a transient failure retried at its spacing.
-      for (let i = 0; i < 3; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+      for (let i = 0; i < 3; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
       expect(r.requests.length).toBeGreaterThan(1)
       expect([...new Set(r.findings.map(f => f.finding.cause))]).toEqual(['metadata'])
       expect([r.refreshes, acks.count, h.read(), r.capability.gap('alpha')]).toEqual([[], 0, 'unresolved', im])
@@ -3702,8 +3600,8 @@ describe('startup and idle recovery through the production owner, routing and re
       const { acks } = await holdReply(h)
       await r.settle()
       const since = requestedAt(h)
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS * 3); await r.settle()
-      expect(r.refreshes.map(q => q.at - since)).toEqual([1, 2, 3].map(n => ENROLLMENT_RETRY_MAX_MS * n))
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS * 3); await r.settle()
+      expect(r.refreshes.map(q => q.at - since)).toEqual([1, 2, 3].map(n => THREAD_MEMORY_RETRY_MAX_MS * n))
       expect(r.findings.map(f => f.finding)).toEqual([finding, finding, finding])
       expect(recoveryLines(h)).toEqual([buildParticipationRecoveryLine(personaRef(), finding)])
       expect([r.requests, acks.count, r.capability.gap('alpha')?.kind, r.recovered]).toEqual([[], 0, 'missing-scope', []])
@@ -3728,15 +3626,15 @@ describe('startup and idle recovery through the production owner, routing and re
     /** A hung re-read started at `startedAt` is aborted exactly at the deadline, with one deadline finding and nothing left in flight. */
     async function expectRereadDeadline(h: ThreadHarness, r: AttachedRecovery, rereads: ReturnType<typeof scopeRereads>, startedAt: number) {
       const findings = r.findings.length
-      await h.clock.advanceTo(startedAt + ENROLLMENT_METADATA_DEADLINE_MS - 1); await turn(r)
+      await h.clock.advanceTo(startedAt + THREAD_MEMORY_LOOKUP_DEADLINE_MS - 1); await turn(r)
       expect([rereads.aborted.at(-1), r.attempts.inFlight('alpha'), r.findings.length]).toEqual([false, 1, findings])
-      await h.clock.advanceTo(startedAt + ENROLLMENT_METADATA_DEADLINE_MS); await r.recovery.idle('alpha')
+      await h.clock.advanceTo(startedAt + THREAD_MEMORY_LOOKUP_DEADLINE_MS); await r.recovery.idle('alpha')
       expect([rereads.aborted.at(-1), r.attempts.inFlight('alpha'), r.findings.slice(findings).map(f => f.finding)]).toEqual([true, 0, [DEADLINE_FINDING]])
     }
     /** The re-read after one that hung from `startedAt`: never before the re-check spacing or the deadline plus the least retry wait, always by the deadline plus the most. */
     async function expectNextReread(h: ThreadHarness, r: AttachedRecovery, startedAt: number) {
-      const earliest = Math.max(ENROLLMENT_RETRY_MAX_MS, ENROLLMENT_METADATA_DEADLINE_MS + metadataRetryDelay(1))
-      const latest = ENROLLMENT_METADATA_DEADLINE_MS + ENROLLMENT_RETRY_MAX_MS
+      const earliest = Math.max(THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS + metadataRetryDelay(1))
+      const latest = THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS
       const before = r.refreshes.length
       await h.clock.advanceTo(startedAt + earliest - 1); await turn(r)
       expect(r.refreshes).toHaveLength(before)
@@ -3752,7 +3650,7 @@ describe('startup and idle recovery through the production owner, routing and re
       r.capability.connected('alpha')
       const { acks } = await holdReply(h)
       await r.settle()
-      await h.clock.advanceTo(requestedAt(h) + ENROLLMENT_RETRY_MAX_MS); await r.settle()
+      await h.clock.advanceTo(requestedAt(h) + THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
       expect([r.refreshes.length, r.attempts.inFlight('alpha')]).toEqual([1, 1])
       const startedAt = r.refreshes[0]!.at
       await expectRereadDeadline(h, r, rereads, startedAt)
@@ -3768,10 +3666,10 @@ describe('startup and idle recovery through the production owner, routing and re
       const { acks } = await holdReply(h)
       await r.settle()
       const since = requestedAt(h)
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS); await r.settle()
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
       expect([r.refreshes.length, r.attempts.inFlight('alpha'), r.findings, r.capability.gap('alpha')?.kind]).toEqual([1, 0, [], 'missing-scope'])
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS * 2); await r.settle()
-      expect([r.refreshes.map(q => q.at - since), r.attempts.inFlight('alpha')]).toEqual([[ENROLLMENT_RETRY_MAX_MS, ENROLLMENT_RETRY_MAX_MS * 2], 1])
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS * 2); await r.settle()
+      expect([r.refreshes.map(q => q.at - since), r.attempts.inFlight('alpha')]).toEqual([[THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MAX_MS * 2], 1])
       const startedAt = r.refreshes[1]!.at
       await expectRereadDeadline(h, r, rereads, startedAt)
       await expectNextReread(h, r, startedAt)
@@ -3787,7 +3685,7 @@ describe('startup and idle recovery through the production owner, routing and re
       await r.settle()
       const since = requestedAt(h)
       r.respond(fails(slackPlatformError('not_allowed_token_type')), ownAnswer(h, ROOT2))
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS); await r.settle()
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS); await r.settle()
       expect([r.refreshes.length, r.requests.map(q => q.args.ts), r.capability.gap('alpha')?.kind]).toEqual([1, [ROOT], 'method-refused'])
       expect([h.read(), h.read(ROOT2), mine.acks.count, other.acks.count, r.unused]).toEqual(['unresolved', 'unresolved', 0, 0, 1])
     })
@@ -3800,14 +3698,14 @@ describe('startup and idle recovery through the production owner, routing and re
       await r.settle()
       const refusedAt = r.requests[0]!.at
       expect([r.requests.map(q => q.args.ts), r.capability.gap('alpha')?.kind]).toEqual([[ROOT], 'method-refused'])
-      await h.clock.advanceTo(refusedAt + ENROLLMENT_RETRY_MAX_MS - 1); await r.recovery.idle('alpha')
+      await h.clock.advanceTo(refusedAt + THREAD_MEMORY_RETRY_MAX_MS - 1); await r.recovery.idle('alpha')
       expect(r.requests).toHaveLength(1)
       r.respond(refused)
-      await h.clock.advanceTo(refusedAt + ENROLLMENT_RETRY_MAX_MS * 2 - 1); await r.recovery.idle('alpha')
-      expect(r.requests.map(q => [q.args.ts, q.at - refusedAt])).toEqual([[ROOT, 0], [ROOT, ENROLLMENT_RETRY_MAX_MS]])
+      await h.clock.advanceTo(refusedAt + THREAD_MEMORY_RETRY_MAX_MS * 2 - 1); await r.recovery.idle('alpha')
+      expect(r.requests.map(q => [q.args.ts, q.at - refusedAt])).toEqual([[ROOT, 0], [ROOT, THREAD_MEMORY_RETRY_MAX_MS]])
       r.respond(ownAnswer(h), ownAnswer(h, ROOT2))
-      await h.clock.advanceTo(refusedAt + ENROLLMENT_RETRY_MAX_MS * 2); await r.settle()
-      expect(r.requests.slice(2).map(q => [q.args.ts, q.at - refusedAt])).toEqual([[ROOT, ENROLLMENT_RETRY_MAX_MS * 2], [ROOT2, ENROLLMENT_RETRY_MAX_MS * 2]])
+      await h.clock.advanceTo(refusedAt + THREAD_MEMORY_RETRY_MAX_MS * 2); await r.settle()
+      expect(r.requests.slice(2).map(q => [q.args.ts, q.at - refusedAt])).toEqual([[ROOT, THREAD_MEMORY_RETRY_MAX_MS * 2], [ROOT2, THREAD_MEMORY_RETRY_MAX_MS * 2]])
       expect([r.capability.gap('alpha'), h.read(), h.read(ROOT2), mine.acks.count, other.acks.count]).toEqual([undefined, 'followed', 'followed', 1, 1])
       await h.notices.flush()
       expect(capabilityNotices(h)).toHaveLength(1)
@@ -3823,12 +3721,12 @@ describe('startup and idle recovery through the production owner, routing and re
       expect([r.requests, h.threads.rootLookups('alpha').map(o => o.root)]).toEqual([[], [ROOT2, ROOT]])
       const since = h.threads.rootLookups('alpha').find(o => o.root === ROOT)!.lookup!.requestedAt
       r.respond(foreign, foreign)
-      await h.clock.advanceTo(since + ENROLLMENT_RETRY_MAX_MS); await r.recovery.idle('alpha')
+      await h.clock.advanceTo(since + THREAD_MEMORY_RETRY_MAX_MS); await r.recovery.idle('alpha')
       // The re-check pass: the gate lets only the held reply's lookup through, and its answer clears the gap.
       expect([r.requests.map(q => q.args.ts), r.capability.gap('alpha'), h.threads.rootLookups('alpha').map(o => o.root)]).toEqual([[ROOT], undefined, [ROOT2]])
       await h.clock.advance(1); await r.recovery.idle('alpha')
-      expect(r.requests.map(q => [q.args.ts, q.at - since])).toEqual([[ROOT, ENROLLMENT_RETRY_MAX_MS], [ROOT2, ENROLLMENT_RETRY_MAX_MS + 1]])
-      for (let i = 0; i < 5; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+      expect(r.requests.map(q => [q.args.ts, q.at - since])).toEqual([[ROOT, THREAD_MEMORY_RETRY_MAX_MS], [ROOT2, THREAD_MEMORY_RETRY_MAX_MS + 1]])
+      for (let i = 0; i < 5; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
       expect([r.requests.length, r.unused, h.threads.rootLookups('alpha'), h.read(), h.read(ROOT2), acks.count, h.owed]).toEqual([2, 0, [], 'unfollowed', 'unfollowed', 1, []])
     })
 
@@ -3842,7 +3740,7 @@ describe('startup and idle recovery through the production owner, routing and re
       await h.threads.requestRootLookup('alpha', C, ROOT2, issuerOf(h), STRICT_POLICY)
       await h.clock.advance(metadataRetryDelay(1)); await r.settle()
       expect([acks.count, h.h.routing.pendingCandidates()]).toEqual([1, []])
-      for (let i = 0; i < 3; i++) { await h.clock.advance(ENROLLMENT_RETRY_MAX_MS); await r.settle() }
+      for (let i = 0; i < 3; i++) { await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); await r.settle() }
       expect([r.requests.length, r.capability.gap('alpha')?.kind, h.threads.rootLookups('alpha').map(o => o.root)]).toEqual([1, 'method-refused', [ROOT2]])
     })
   })
