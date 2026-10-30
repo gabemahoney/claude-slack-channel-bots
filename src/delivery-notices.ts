@@ -1,5 +1,6 @@
 /** Delivery reporting consumes durable facts and never authorizes keys. */
 import type { QueueEvent, QueueItem, DeliveryQueue, AcceptedRecord } from './delivery-queue.ts'
+import { isOpenItem } from './delivery-queue.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from './conflict-latch.ts'
@@ -86,6 +87,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   const pendingFindings: QueueEvent[] = []
   let findingFlushPending = false
   const received = new Set<string>(), completed = new Set<string>(), failures = new Map<string, number>(), unwritable = new Set<string>(), heads = new Map<string, number>()
+  const recoveredQueued = new Set<string>()
   const ref = (key: string) => { const p = deps.persona(key); return p ? renderPersonaRef(p.name, key) : `key=${key}` }
   const protect = (run: () => unknown) => { try { const result = run(); if (result && typeof (result as Promise<unknown>).catch === 'function') void (result as Promise<unknown>).catch(() => {}) } catch { /* reporting cannot interrupt durability */ } }
   function log(kind: DeliveryDiagnosticClass, key: string, identity: string, detail = '') { protect(() => deps.log(buildDeliveryDiagnostic(kind, ref(key), identity, detail))) }
@@ -94,21 +96,26 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     heads.delete(key); if (seq !== undefined) heads.set(key, seq)
     deps.episodes.end(key, 'delivery-stuck'); deps.episodes.end(key, 'messages-waiting')
   }
-  function receivedItem(key: string, item: QueueItem): void {
+  function receivedItem(key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live'): void {
+    if (item.hold && item.hold.state !== 'released') return
     const id = `${key}:${item.accepted.seq}`
+    if (mode === 'recovered') recoveredQueued.add(id)
     if (!received.has(id)) {
       received.add(id); log(MESSAGE_RECEIVED, key, deliveryIdentity(item.accepted))
     }
     // Log lifetime is the server run; reaction lifetime is one persona life.
     // The tracker deduplicates successful stages and permits restoration/retry.
-    if (item.accepted.source === 'slack' && !item.delivered) protect(() => deps.queued?.(key, item))
+    if (recoveredQueued.has(id) && !deps.state(key).up) return
+    recoveredQueued.delete(id)
+    if (item.accepted.source === 'slack' && isOpenItem(item)) protect(() => deps.queued?.(key, item))
   }
   function reconcileQueued(key: string): void {
     if (!deps.persona(key) || !deps.state(key).up) return
     // One pass when the current life becomes usable, detached from Slack and
     // delivery. Unreported intake still belongs to its normal post-ack path.
     for (const item of deps.queue.items(key)) {
-      if (received.has(`${key}:${item.accepted.seq}`) && item.accepted.source === 'slack' && !item.delivered) {
+      if (received.has(`${key}:${item.accepted.seq}`) && item.accepted.source === 'slack' && isOpenItem(item)) {
+        recoveredQueued.delete(`${key}:${item.accepted.seq}`)
         protect(() => deps.queued?.(key, item))
       }
     }
@@ -165,7 +172,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       completed.add(id)
       receivedItem(key, item)
       log(MESSAGE_DELIVERED, key, identity, `at=${event.at} wait_ms=${event.waitMs}`)
-      move(key, deps.queue.items(key).find(i => !i.delivered)?.accepted.seq)
+      move(key, deps.queue.items(key).find(isOpenItem)?.accepted.seq)
       protect(() => deps.delivered?.(key, item)); return
     }
     if (event.type === 'first-typed') {
@@ -177,7 +184,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       log(MESSAGE_NOT_TAKEN_IN, key, identity)
       protect(() => deps.notify(key, buildMessageNotTakenInNotice(ref(key), item.accepted.user ?? item.accepted.bot_id ?? item.accepted.sender ?? 'unknown'))); return
     }
-    if (event.type !== 'waiting' || !event.status) return
+    if (event.type !== 'waiting' || !event.status || !isOpenItem(item)) return
     const status = event.status, state = deps.state(key)
     move(key, event.seq)
     if (!state.up) return
@@ -190,5 +197,5 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (begun === 'begun') log(DELIVERY_STUCK, key, identity, `reason=${reason} age_ms=${status.ageMs}`)
     deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1))
   }
-  return { received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) { failures.delete(key); unwritable.delete(key); heads.delete(key) } }
+  return { received: (key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live') => protect(() => receivedItem(key, item, mode)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) { failures.delete(key); unwritable.delete(key); heads.delete(key) } }
 }

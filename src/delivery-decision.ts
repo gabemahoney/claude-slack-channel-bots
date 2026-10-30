@@ -158,6 +158,8 @@ export type DropDecision =
 
 /** Outcome of `decideDelivery` for one receiving persona. */
 export type DeliveryDecision = DeliverDecision | DropDecision | {
+  action: 'hold'; hold: 'memory'; via: 'thread'; threadRoot: string; fungible?: FungiblePath
+} | {
   action: 'unresolved'
   reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing' | 'thread-stamp-undecided'
 }
@@ -338,9 +340,9 @@ function decideThreadReply(
   const root = replyThreadRoot(ev)
   if (root === undefined) return notMentioned
   if (inputs?.threadStampUndecided?.(key, channel) === true) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
-  const view = inputs?.threadMemory?.(key, channel, root) ?? 'unknown'
-  // Unknown Thread Memory currently excludes the reply, pending durable Memory Holds.
-  if (view === 'unknown') return notMentioned
+  if (!inputs?.threadMemory) return notMentioned
+  const view = inputs.threadMemory(key, channel, root)
+  if (view === 'unknown') return { action: 'hold', hold: 'memory', via: 'thread', threadRoot: root, ...context }
   return view === 'joined' ? { action: 'deliver', via: 'thread', ...context } : notMentioned
 }
 

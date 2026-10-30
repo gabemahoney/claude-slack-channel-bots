@@ -1010,10 +1010,36 @@ function threadGroups(mode: 'strict' | 'open') {
       row('malformed channel', { event: event({ channel: MALFORMED_CHANNEL }) }, refused('channel-id-malformed')),
     ] : []),
   ]
-  // Only these expected outcomes change when unknown Memory Holds are built.
+  // SR-1.2.5 holds only dependent replies. Missing input keeps Task Decision 3's
+  // drop; every earlier selection/exclusion keeps its whole outcome and no read.
+  const unknown = { [P_KEY]: { [PUBLIC_CHANNEL]: { [THREAD_ROOT]: 'unknown' as const } } }
   const unknownView = [
-    row('unknown view', { threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [THREAD_ROOT]: 'unknown' } } }, threadReads: [THREAD_READ] }, dropped()),
+    ...[THREAD_ROOT, OTHER_ROOT].map(root => row(`unknown view holds reply in ${root}`, {
+      event: event({ thread_ts: root }),
+      threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [root]: 'unknown' } } },
+      threadReads: [[P_KEY, PUBLIC_CHANNEL, root]],
+    }, {
+      action: 'hold', hold: 'memory', via: 'thread', threadRoot: root,
+      ...(mode === 'open' ? { fungible: onPath('public', 'thread_hybrid') } : {}),
+    })),
     row('missing view input', { omitThreadMemory: true }, dropped()),
+    ...[undefined, REPLY_TS].map(parent => row(`unknown view channel message ${String(parent)}`, {
+      event: event({ thread_ts: parent }), threadViews: unknown,
+    }, dropped())),
+    row('unknown view mention precedes Broadcast and hold', {
+      event: event({ text: `${P_MENTION} ${broadcastText('here')}` }), threadViews: unknown,
+    }, selected('mention')),
+    ...(['here', 'channel'] as const).map(kind => row(`unknown view ${kind} precedes hold`, {
+      event: event({ text: broadcastText(kind) }), threadViews: unknown,
+    }, selected('broadcast'))),
+    ...(['off', 'mentions', 'all'] as const).map(value => row(`unknown view ${value} reply`, {
+      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, threadViews: unknown,
+    }, value === 'off' ? dropped('channel-off', value)
+      : value === 'all' ? selected('receive_all', value) : dropped('not-mentioned', value))),
+    ...noLookup.map(original => ({
+      ...original, label: `${original.label}; unknown view`,
+      threadViews: { [P_KEY]: { [String(original.event.channel)]: { [THREAD_ROOT]: 'unknown' as const } } },
+    })),
   ]
   // The same matrix at Q's notice destination, plus prompt/notice bot posts.
   // Moving/removing Q's destination and moving P's own destination preserve it.

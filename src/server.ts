@@ -53,6 +53,7 @@
  */
 
 import { createThreadMemory, type ThreadMemory } from './thread-memory.ts'
+import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent } from './memory-holds.ts'
 import { recoverQueuedJoins } from './thread-join-recovery.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
@@ -208,7 +209,7 @@ import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
-import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
+import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
 import { createOwnPostObserver } from './own-post.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
@@ -1142,6 +1143,7 @@ async function handleInitialized(
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
 let threadMemory: ThreadMemory | undefined
+let memoryHolds: MemoryHoldResolver | undefined
 let threadMemorySeal: ThreadMemorySeal | undefined
 let unsubscribeThreadMemory: (() => void) | undefined
 let replyReminders: ReplyReminders | undefined
@@ -1155,6 +1157,13 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
 }
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
+const bufferedHeldReleases = new Map<string, { key: string; item: QueueItem }>()
+/** Task 4b binds reporting here and calls resolveMemoryHolds after its first
+ * successful read and queued-join recovery. No read retry belongs here. */
+export const memoryHoldEvents = { emit: (_event: MemoryHoldEvent): void => {} }
+export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> {
+  return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve()
+}
 /** Observer port for Thread Memory reporting; the seal retains startup findings. */
 export const threadMemorySealEvents = { emit: (_event: ThreadMemorySealEvent): void => {} }
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
@@ -1187,7 +1196,11 @@ const personaRouting = createPersonaRouting({
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
   },
   prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
-  onReceived: (key, item) => deliveryReporting?.received(key, item),
+  onReceived: (key, item, mode) => {
+    if (deliveryReporting) deliveryReporting.received(key, item, mode)
+    else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item })
+  },
+  onHoldStored: key => resolveMemoryHolds(key),
   archive: (key, event) => archiveWrite?.(key, event),
   log: (line) => console.error(line),
   // beside the stored choices and their
@@ -1469,6 +1482,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // synchronous stop above, before closing the transports and clients.
   const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
+  memoryHolds?.stop()
   await deliveryPreparation?.stop()
   await deliveryStopping
   await remindersStopping
@@ -2793,6 +2807,7 @@ export async function main(): Promise<void> {
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
     authorityReady: () => reloadController?.sharedChannels() !== undefined,
+    heldStamps: key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? [],
     threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
     markerKeys: () => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
     canRemove: key => reloadController?.sharedChannels()?.reviewHeld(key) === false,
@@ -2804,6 +2819,14 @@ export async function main(): Promise<void> {
   if (shuttingDown) return
   await deliveryQueue.start()
   if (shuttingDown) return
+  for (const key of deliveryQueue.keys()) for (const hold of deliveryQueue.unresolvedHolds(key)) threadMemory.advancePast(key, hold.arrived_at)
+  memoryHolds = createMemoryHoldResolver({
+    queue: deliveryQueue, memory: threadMemory,
+    release: (key, item, mode) => personaRouting.releaseHeld(key, item, mode),
+    now: Date.now,
+    clock: { setTimeout: (callback, ms) => setTimeout(callback, ms), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) },
+    onEvent: event => memoryHoldEvents.emit(event),
+  })
   deliveryQueue.startMaintenance()
   threadMemory.startMaintenance()
   deliveryPreparation = createDeliveryPreparation({
@@ -2921,7 +2944,11 @@ export async function main(): Promise<void> {
       },
       teardown: async (persona) => {
         try { await personaLifecycleOps.teardown(persona) } finally {
-          if (!personaConfig?.personas.some(applied => applied.key === persona.key)) await threadMemory?.remove(persona.key)
+          if (!personaConfig?.personas.some(applied => applied.key === persona.key)) {
+            try { memoryHolds?.forget(persona.key) } finally {
+              await threadMemory?.remove(persona.key)
+            }
+          }
         }
       },
       updateInPlace: (change) => personaLifecycleOps.updateInPlace(change),
@@ -2997,13 +3024,24 @@ export async function main(): Promise<void> {
     !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
   // Thread-view notifications include undecided stamps during restoration,
   // and run before the authority's ordinary subscribe listeners.
-  unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => threadMemory?.published())
+  unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => {
+    if (shuttingDown) return
+    threadMemory?.published()
+    // published() synchronously recovers deferred queue joins before these
+    // per-key resolver turns run. A forgotten life is never recreated here.
+    for (const key of deliveryQueue?.keys() ?? []) {
+      if (getAppliedPersona(key)) void memoryHolds?.retryPending(key).catch(() => {})
+    }
+  })
   await threadMemory.activate()
   if (shuttingDown) return
   for (const key of deliveryQueue.keys()) {
-    try { recoverQueuedJoins(key, deliveryQueue, threadMemory) } catch { /* a retained queue copy retries at this key's bring-up */ }
+    try {
+      recoverQueuedJoins(key, deliveryQueue, threadMemory)
+      void memoryHolds.resolve(key, 'recovered', true).catch(() => {})
+    } catch { /* a retained queue copy retries at this key's bring-up */ }
   }
-  // Memory Hold resolution follows start join recovery, before intake admission.
+  // Resolution and its second compaction are detached; intake never waits.
 
   channelMembership = createChannelMembership({
     authority: reload.sharedChannels()!, dryRun: isDryRun(),
@@ -3527,6 +3565,8 @@ export async function main(): Promise<void> {
     delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor, queue: deliveryQueue! }),
   })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
+  for (const { key, item } of bufferedHeldReleases.values()) deliveryReporting.received(key, deliveryQueue.item(key, item.accepted.seq) ?? item, 'recovered')
+  bufferedHeldReleases.clear()
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
   deliveryLifecycle = createDeliveryLifecycle({
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
@@ -3605,7 +3645,7 @@ export async function main(): Promise<void> {
   deliveryQueueWake.wake = key => deliveryEngines?.wake(key)
   // Retained in-flight items need recovery before launch reconnects; an
   // accepted-only head has no keys to recover and is fixed after bring-up.
-  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => !i.delivered && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
+  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => isOpenItem(i) && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
   setSessionNotifier(personaNotifier.notify)
 
   // one Slack connection per persona. Each connection's
@@ -3700,12 +3740,14 @@ export async function main(): Promise<void> {
     connections: manager,
     routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
       k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k),
-      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => threadMemory?.forget(k),
+      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemory?.forget(k),
     ]) },
     loadThreadMemory: async key => {
       await threadMemory?.loadKey(key)
-      if (!shuttingDown && deliveryQueue && threadMemory) recoverQueuedJoins(key, deliveryQueue, threadMemory)
-      // Memory Hold resolution follows bring-up recovery before intake opens.
+      if (!shuttingDown && deliveryQueue && threadMemory) {
+        recoverQueuedJoins(key, deliveryQueue, threadMemory)
+        void memoryHolds?.resolve(key, 'recovered').catch(() => {})
+      }
     },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,

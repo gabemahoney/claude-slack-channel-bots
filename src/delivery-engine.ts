@@ -2,6 +2,7 @@
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
+import { isOpenItem, itemOpenedAt } from './delivery-queue.ts'
 import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
@@ -112,10 +113,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
   function timers(s: State): void { for (const name of Object.keys(s.e.timers) as DeliveryTimer[]) s.e.timers[name] = Math.max(0, (s.deadlines[name] ?? 0) - clock.now()) }
   function status(key: string, s: State): DeliveryStatus | undefined {
-    const items = deps.queue.items(key).filter(i => !i.delivered), head = items[0]
+    const items = deps.queue.items(key).filter(isOpenItem), head = items[0]
     if (!head) return undefined
     const deferred = life.deferred(key)
-    return { key, seq: head.accepted.seq, count: items.length, ageMs: Math.max(0, clock.now() - head.accepted.received_at), retypeCount: head.retypeCount,
+    return { key, seq: head.accepted.seq, count: items.length, ageMs: Math.max(0, clock.now() - itemOpenedAt(head)), retypeCount: head.retypeCount,
       row: s.restarted === true ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
       latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred }
   }
@@ -222,7 +223,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function build(key: string, s: State): DeliveryPolicyKnowledge {
     timers(s)
     s.e.appendBlocked = !!s.pending && s.e.appendBlocked || deps.queue.isWritable?.(key) === false
-    const items = deps.queue.items(key)
+    const items = deps.queue.items(key).filter(i => i.hold?.state !== 'withdrawn')
     s.e.noticed = [...new Set([...s.e.noticed, ...items.filter(i => i.records.some(r => r.kind === 'noticed')).map(i => i.accepted.seq)])]
     const sends: DeliveryPolicyKnowledge['p']['sent'][number][] = [], refused: number[] = [], delivered: DeliveryPair[] = [], parts: Record<number, number> = {}
     for (const item of items) {
@@ -245,6 +246,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
     const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
+    k.holds = items.flatMap(i => i.hold?.state === 'unresolved' ? [{ item: i.accepted.seq, kind: i.hold.field.on }] : [])
+    if (s.pending) k.writer.item = s.pending.record.seq
     s.snapshot = k; return k
   }
   async function observe(key: string, s: State, head: QueueItem, part: number, force = false): Promise<boolean> {
@@ -350,13 +353,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       // Finish our own append/call continuations without replacing the key
       // reading. Every new operation obtains a fresh row and gate grant.
       for (let turns = 0; turns < 40 && !stopped && !s.stopped; turns++) {
-        const items = deps.queue.items(key), head = items.find(i => !i.delivered)
+        let k = build(key, s), pair = selectDeliveryTarget(k), part = pair[1]
+        const head = deps.queue.items(key).find(i => isOpenItem(i) && i.accepted.seq === pair[0])
         if (!head && !s.pending) {
           release(s); states.delete(key); life.engineRunning(key, false); return
         }
         if (!s.pending && (!deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key))) { release(s); wait(key, s, 'held'); break }
         if (!s.pending && deps.queue.isWritable?.(key) === false) { release(s); wait(key, s, 'queue-unwritable'); nextDelay = RETYPE_BACKOFF_MS[0]; break }
-        let k = build(key, s), pair = selectDeliveryTarget(k), part = pair[1]
         const observedItem = head
         const observedPart = part
         if (head && (s.lastSeq !== head.accepted.seq || s.lastPart !== part)) {
@@ -373,6 +376,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           // replace the engine reading again after that independent grant.
           observedPair = [observedItem.accepted.seq, observedPart]; readyObserved = true
           k = build(key, s)
+          if (selectDeliveryTarget(k).some((value, i) => value !== pair[i])) { release(s); continue }
         }
         const action = decideEngine(k)
         if (action === 'commitAppend') {
@@ -409,7 +413,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
             s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; release(s)
             emit({ type: 'delivered', key, seq: pair[0], part })
             const item = deps.queue.items(key).find(i => i.accepted.seq === pair[0])
-            if (item?.delivered) emit({ type: 'item-delivered', key, seq: pair[0], at: clock.now(), waitMs: Math.max(0, clock.now() - item.accepted.received_at) })
+            if (item?.delivered) emit({ type: 'item-delivered', key, seq: pair[0], at: clock.now(), waitMs: Math.max(0, clock.now() - itemOpenedAt(item)) })
           }); continue
         }
         if (action === 'fixText') {
@@ -424,6 +428,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const saved = s.reading
           if (!await observe(key, s, observedItem!, observedPart, true)) { s.e.request = 'none'; s.reading = saved; break }
           const gateKnowledge = build(key, s), choice = decideGate(gateKnowledge)
+          if (selectDeliveryTarget(gateKnowledge).some((value, i) => value !== pair[i])) { release(s); continue }
           // A writer failure may have released an already-recorded attempt's
           // lease for a long time. Recover that durable unknown attempt if
           // fresh guards changed; never turn its old intention into keys in
@@ -540,7 +545,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       await s.busy
     },
     async recoverBeforeReconnect(key) {
-      const head = deps.queue.items(key).find(i => !i.delivered)
+      const open = deps.queue.items(key).filter(isOpenItem)
+      const head = open.find(i => i.unknownSend || i.records.some(r => r.kind === 'sent' && !i.records.some(refusal => refusal.kind === 'refused' && refusal.attempt === r.attempt))) ?? open[0]
       if (!head || (!head.unknownSend && !head.records.some(r => r.kind === 'sent'))) return true
       api.wake(key)
       const s = states.get(key)!

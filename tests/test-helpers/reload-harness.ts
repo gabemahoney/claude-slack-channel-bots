@@ -4,8 +4,11 @@ import { reviewIntentLine } from '../../src/reload-request.ts'
 import { buildReviewRequest, composeReviewRequest, REVIEW_REQUEST_SUFFIX, type ReviewRequest, type OperatorAssignment } from '../../src/reload-request.ts'
 import { createChannelMembership, type ChannelMembership } from '../../src/channel-membership.ts'
 import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from '../../src/channel-membership-scan.ts'
-import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, type QueueItem, type QueueEvent, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
+import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent, type MemoryHoldMode } from '../../src/memory-holds.ts'
+import { createDeliveryReporting } from '../../src/delivery-notices.ts'
+import { setDeliveryLifecycle } from '../../src/session-manager.ts'
 import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
 import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
 import { threadJoin } from './thread-memory.ts'
@@ -86,7 +89,7 @@ import type { JSONRPCResponse, JSONRPCError } from '@modelcontextprotocol/sdk/ty
 import type { MakeTemplateParams } from 'agent-director'
 import type { SpawnParams } from 'agent-director'
 
-import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-tracker.ts'
+import { _resetAckTracker, consumeAck, forgetPersonaAcks, createQueuedAckCallback } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
@@ -957,7 +960,7 @@ export interface PreparedPersonaState {
 export interface ReloadRunOptions {
   /** Opt in to the production Thread Memory and real lifecycle composition.
    * Journals live in stateDir; optional fs overrides inject storage failures. */
-  threadMemory?: { fs?: ThreadMemoryOptions['fs'] }
+  threadMemory?: { fs?: ThreadMemoryOptions['fs']; queueFs?: DeliveryQueueOptions['fs'] }
   /** Observe the first admission boundary, before any start bring-up. */
   beforeStartBringUp?: (run: ReloadRun) => void | Promise<void>
   /** Actual MCP callbacks, held independently of the reload transaction. */
@@ -1093,6 +1096,9 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 export interface ReloadRun {
   readonly threadMemory: ThreadMemory | undefined
   readonly threadMemoryEvents: ThreadMemoryEvent[]
+  readonly memoryHolds: MemoryHoldResolver | undefined
+  readonly memoryHoldEvents: MemoryHoldEvent[]
+  readonly heldReleases: Array<{ key: string; seq: number; mode: MemoryHoldMode }>
   /** Seed through the real store under the authority's current Channel Stamp. */
   joinThread(name: string, channel: string, root: string): Promise<void>
   /** Write a real operator request; a later tick records it. */
@@ -2089,6 +2095,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const queue = createDeliveryQueue({
       stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event),
       ...(runOpts.threadMemory === undefined ? {} : {
+        fs: runOpts.threadMemory.queueFs,
         threadJoinSaved: (key: string, channel: string, fact: NonNullable<QueueItem['accepted']['thread_join']>) => {
           threadMemory?.advancePast(key, fact.at)
           return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false
@@ -2119,6 +2126,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       appliedKeys: () => serverConfig()?.personas.map(p => p.key) ?? [],
       stamp: (key, channel) => controller?.sharedChannels()?.channelStamp(key, channel),
       authorityReady: () => controller?.sharedChannels() !== undefined,
+      heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
       threadHybridChannels: key => controller?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
       markerKeys: () => controller?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
       canRemove: key => controller?.sharedChannels()?.reviewHeld(key) === false,
@@ -2129,7 +2137,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const queueReady = queue.start()
     let threadMemoryReady = Promise.resolve()
     let unsubscribeThreadMemory: (() => void) | undefined
-    const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName})
+    const reporting = threadMemory === undefined ? undefined : createDeliveryReporting({
+      queue, episodes, persona: getAppliedPersona,
+      state: key => ({ up: !stopped && isPersonaUp(key) }), log,
+      notify: (key, text) => noticeStack.notifier.notify(key, text), now: connections.clock.now,
+      queued: createQueuedAckCallback({ queue, clientFor, getReaction: () => getReplySettings().queued_ack_reaction }),
+    })
+    const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName,
+      ...(threadMemory === undefined ? {} : { clock: connections.clock }),
+    })
+    const memoryHoldEvents: MemoryHoldEvent[] = []
+    const heldReleases: Array<{ key: string; seq: number; mode: MemoryHoldMode }> = []
+    const memoryHolds = threadMemory === undefined ? undefined : createMemoryHoldResolver({
+      queue, memory: threadMemory, clock: connections.clock, now: connections.clock.now,
+      release(key, item, mode) {
+        heldReleases.push({ key, seq: item.accepted.seq, mode })
+        return routing.releaseHeld(key, item, mode)
+      },
+      onEvent: event => memoryHoldEvents.push(event),
+    })
     const membershipClock = createFakeClock()
     let membership: ChannelMembership | undefined
     let membershipScanner: MembershipScanner | undefined
@@ -2144,6 +2170,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       getBotIdentity: identityFor,
       queue,
       prepare: preparation.prepare,
+      ...(threadMemory === undefined ? {} : {
+        onReceived: (key: string, item: QueueItem, mode?: MemoryHoldMode) => reporting!.received(key, item, mode),
+        onHoldStored: (key: string) => !stopped && getAppliedPersona(key) ? memoryHolds!.resolve(key, 'live') : Promise.resolve(),
+      }),
       archive: () => undefined,
       log,
       now: connections.clock.now,
@@ -2423,10 +2453,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // The run's routing's per-key forget, as server.ts binds it, so a
         // torn-down key's dedupe store and heard set are dropped.
         routing: { forget: rec('routing.forget', (key) => threadMemory === undefined ? routing.forget(key) :
-          forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => threadMemory.forget(k)])) },
+          forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemory.forget(k)])) },
         ...(threadMemory === undefined ? {} : { loadThreadMemory: async (key: string) => {
           await threadMemory.loadKey(key)
-          if (!stopped) recoverQueuedJoins(key, queue, threadMemory)
+          if (!stopped) {
+            recoverQueuedJoins(key, queue, threadMemory)
+            void memoryHolds!.resolve(key, 'recovered')
+          }
         } }),
         // The real tracker's per-key forget, as server.ts binds it, so a key
         // added again starts with no ack-reaction entry.
@@ -2845,13 +2878,21 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         membershipStatus = membershipConnectionListener(membership, membershipScanner, connections.manager, dryRun)
       }
       if (threadMemory) {
-        unsubscribeThreadMemory = authority.subscribeThreadView(() => threadMemory.published())
+        unsubscribeThreadMemory = authority.subscribeThreadView(() => {
+          if (stopped) return
+          threadMemory.published()
+          for (const key of queue.keys()) if (getAppliedPersona(key)) void memoryHolds!.retryPending(key)
+        })
         threadMemoryReady = queueReady.then(() => {
+          for (const key of queue.keys()) for (const hold of queue.unresolvedHolds(key)) threadMemory.advancePast(key, hold.arrived_at)
           threadMemory.startMaintenance()
           return threadMemory.activate()
         }).then(() => {
           for (const key of queue.keys()) {
-            try { recoverQueuedJoins(key, queue, threadMemory) } catch { /* retry this key at bring-up */ }
+            try {
+              recoverQueuedJoins(key, queue, threadMemory)
+              void memoryHolds!.resolve(key, 'recovered', true)
+            } catch { /* retry this key at bring-up */ }
           }
           queue.startMaintenance()
           wireMembership()
@@ -3034,7 +3075,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         notificationsByKey.set(key, captured)
       }
       const cwd = getAppliedPersona(key)?.working_directory ?? join(root, 'sessions', key)
-      return registerSession(cwd, key, makeTransport(`mcp-${key}-${++sessionSeq}`), makeSessionServer(captured), controller.sharedChannels()?.incarnation(key))
+      const session = registerSession(cwd, key, makeTransport(`mcp-${key}-${++sessionSeq}`), makeSessionServer(captured), controller.sharedChannels()?.incarnation(key))
+      reporting?.reconcileQueued(key)
+      return session
     }
 
     /**
@@ -3097,6 +3140,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const run: ReloadRun = {
       threadMemory,
       threadMemoryEvents,
+      memoryHolds, memoryHoldEvents, heldReleases,
       async joinThread(name, channel, root) {
         const key = personaKey(name), stamp = controller.sharedChannels()?.channelStamp(key, channel)
         if (!threadMemory || stamp?.kind !== 'decided' || !stamp.threadHybridSince) {
@@ -3228,7 +3272,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       slackCalls,
       slackPosts: () => Object.values(slackCalls()).flat().filter((c) => c.method === 'chat.postMessage'),
       captured: (extra = {}) => ({
-        ...(threadMemory === undefined ? {} : { threadMemoryEvents }),
+        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases }),
         logs,
         statuses: connections.statuses,
         lifecycle: records,
@@ -3366,6 +3410,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     async function finishRun(graceful: boolean): Promise<void> {
       if (stopped) return
       stopped = true
+      memoryHolds?.stop()
       membershipScanner?.close()
       membership?.close()
       if (graceful) {
@@ -3432,6 +3477,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
      */
     function installLaunchSeams(): void {
       launchSeamsInstalled = true
+      // This simulated process uses standalone reconnects. A stopped engine
+      // installed by an earlier suite must not supply its closed gate here.
+      setDeliveryLifecycle(undefined)
       captureConsole({ lines: logs, live: () => !stopped })
       setClientForTests(composition!.client as Parameters<typeof setClientForTests>[0])
       _setSpawnHomeDir(home)
@@ -3852,7 +3900,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         else process.env['SLACK_DRY_RUN'] = savedDryRun
         if (consoleCaptured) console.error = originalConsoleError
         if (launchSeamsInstalled) {
-
+          setDeliveryLifecycle(undefined)
           _resetInFlightLaunches()
           resetClientForTests()
           _resetSpawnHomeDir()

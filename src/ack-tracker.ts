@@ -7,7 +7,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
-import type { DeliveryQueue, QueueItem } from './delivery-queue.ts'
+import { isOpenItem, type DeliveryQueue, type QueueItem } from './delivery-queue.ts'
 
 export const EARLY_REPLY_EXPIRY_MS = 24 * 60 * 60 * 1000
 const ACK_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000
@@ -169,7 +169,7 @@ function createAckCallback(deps: DeliveryAckDeps, stage: Stage): (key: string, i
     const accepted = item.accepted
     const queuedName = accepted.queued_ack_reaction
     const name = stage === 'queued' ? queuedName ?? deps.getReaction() : deps.getReaction()
-    if (accepted.source !== 'slack' || !accepted.channel || !name || (stage === 'delivered' ? !item.delivered : item.delivered)) return
+    if (accepted.source !== 'slack' || !accepted.channel || !name || (stage === 'delivered' ? !item.delivered : !isOpenItem(item))) return
     const web = deps.clientFor(key)
     const prior: Reaction | undefined = queuedName ? {
       name: queuedName,

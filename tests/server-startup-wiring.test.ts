@@ -21,7 +21,7 @@ import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 import type { PersonaConfig } from '../src/config.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import type { DeliveryQueueOptions, QueueThreadJoin } from '../src/delivery-queue.ts'
+import type { DeliveryQueueOptions, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -43,6 +43,9 @@ import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type * as OwnPostModule from '../src/own-post.ts'
+import type { MemoryHoldResolver } from '../src/memory-holds.ts'
+import { forgetPersonaState } from '../src/persona-lifecycle.ts'
+import * as fs from 'node:fs'
 import type * as ThreadMemoryModule from '../src/thread-memory.ts'
 import type * as ThreadJoinRecoveryModule from '../src/thread-join-recovery.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
@@ -85,7 +88,7 @@ import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { deliveredRecord, makeQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, heldSlackInput, memoryHold, makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
 import { threadJoin, THREAD_PERSONAS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
@@ -113,6 +116,25 @@ const SERVER_PATH = join(SRC_DIR, 'server.ts')
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(SERVER_PATH, 'utf-8'))
+
+/** Run only an actual dependency expression, with isolated bindings, never server main. */
+function expression<T>(code: string, bindings: Record<string, unknown>): T {
+  const js = ts.transpileModule(`const callback = (${code});`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  return new Function(...Object.keys(bindings), `${js}\nreturn callback;`)(...Object.values(bindings)) as T
+}
+
+/** Locate the recovery loop by its call, not by the other queue-key loops. */
+function startJoinRecoveryLoop(): string {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const loops: string[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isForOfStatement(node) && node.statement.getText(tree).includes('recoverQueuedJoins(')) loops.push(node.getText(tree))
+    ts.forEachChild(node, visit)
+  }
+  visit(tree)
+  expect(loops).toHaveLength(1)
+  return loops[0]!
+}
 
 /** The production kill-retry clock; renaming it fails the typecheck. */
 const KILL_RETRY_PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
@@ -4285,7 +4307,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'threadMemory', 'joins', 'threadStampUndecided', 'threadStampEpisodes',
+      'threadMemory', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5615,6 +5637,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
       stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
       authorityReady: '() => reloadController?.sharedChannels() !== undefined',
+      heldStamps: 'key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? []',
       threadHybridChannels: 'key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
       markerKeys: '() => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? []',
       canRemove: 'key => reloadController?.sharedChannels()?.reviewHeld(key) === false',
@@ -5630,14 +5653,15 @@ describe('Thread Memory server lifecycle wiring', () => {
     }
     expect(onlyCallOf(factory)).toBeLessThan(read)
     // A failed seal result never gates replay; only a shutdown interrupts it.
-    expect(SERVER_CODE.slice(read, onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim())
-      .toBe('threadMemory.readAtStart() await threadMemorySeal.loadAtStart(threadMemory.journalFacts()) if (shuttingDown) return await deliveryQueue.start() if (shuttingDown) return deliveryQueue.startMaintenance()')
+    expect(SERVER_CODE.slice(read, onlyCallOf('deliveryQueue\\.start') + 'deliveryQueue.start()'.length).replace(/\s+/g, ' ').trim())
+      .toBe('threadMemory.readAtStart() await threadMemorySeal.loadAtStart(threadMemory.journalFacts()) if (shuttingDown) return await deliveryQueue.start()')
+    expect(SERVER_CODE.slice(onlyCallOf('deliveryQueue\\.startMaintenance'), onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim()).toBe('deliveryQueue.startMaintenance()')
     expect(onlyCallArgs('threadMemory\\.startMaintenance')).toEqual([])
   })
 
   test('thread-view subscription and awaited activation follow the recovered choice adapter and precede membership, connections and bring-up', () => {
     const subscription = onlyCallOf('subscribeThreadView')
-    expect(splitTopLevel(callArguments(SERVER_CODE, subscription))).toEqual(['() => threadMemory?.published()'])
+    expect(splitTopLevel(callArguments(SERVER_CODE, subscription))).toEqual(['() => { if (shuttingDown) return threadMemory?.published() for (const key of deliveryQueue?.keys() ?? []) { if (getAppliedPersona(key)) void memoryHolds?.retryPending(key).catch(() => {}) } }'])
     expect(SERVER_CODE.slice(0, subscription).endsWith('reload.sharedChannels()!.')).toBe(true)
     const activation = onlyCallOf('threadMemory\\.activate')
     expect(atMainTopLevel(SERVER_CODE, activation)).toBe(true)
@@ -5654,17 +5678,17 @@ describe('Thread Memory server lifecycle wiring', () => {
 
   test('later bring-up loads the key and every teardown forget runs through the isolation helper', () => {
     const props = onlyCallProps('createPersonaLifecycle')
-    expect(props.get('loadThreadMemory')).toBe(`async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) ${recovery}(key, deliveryQueue, threadMemory) }`)
+    expect(props.get('loadThreadMemory')).toBe(`async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { ${recovery}(key, deliveryQueue, threadMemory) void memoryHolds?.resolve(key, 'recovered').catch(() => {}) } }`)
     expect(importSource(SERVER_CODE, 'forgetPersonaState')).toBe('./persona-lifecycle.ts')
     const args = onlyCallArgs('forgetPersonaState')
     expect(args[0]).toBe('key')
     expect(splitTopLevel(args[1]!.slice(1, -1))).toEqual([
       'k => personaRouting.forget(k)', 'k => deliveryReporting?.forget(k)', 'k => deliveryPreparation?.forget(k)',
-      'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => threadMemory?.forget(k)',
+      'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => memoryHolds?.forget(k)', 'k => threadMemory?.forget(k)',
     ])
     expect(props.get('routing')).toContain('forget: key => forgetPersonaState(key, [')
     const lifecycle = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!)
-    expect(lifecycle.get('teardown')).toBe('async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) await threadMemory?.remove(persona.key) } }')
+    expect(lifecycle.get('teardown')).toBe('async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) { try { memoryHolds?.forget(persona.key) } finally { await threadMemory?.remove(persona.key) } } } }')
   })
 
   test('start recovers every queue key immediately after activation, isolates each failure, and precedes all intake wiring', () => {
@@ -5676,7 +5700,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     const activation = onlyCallOf('threadMemory\\.activate')
     const membership = onlyCallOf('createChannelMembership')
     expect(SERVER_CODE.slice(activation, membership).replace(/\s+/g, ' ').trim()).toBe(
-      `threadMemory.activate() if (shuttingDown) return for (const key of deliveryQueue.keys()) { try { ${recovery}(key, deliveryQueue, threadMemory) } catch { } } channelMembership =`,
+      `threadMemory.activate() if (shuttingDown) return for (const key of deliveryQueue.keys()) { try { ${recovery}(key, deliveryQueue, threadMemory) void memoryHolds.resolve(key, 'recovered', true).catch(() => {}) } catch { } } channelMembership =`,
     )
     expect(insideMain(startRecovery)).toBe(true)
     expect(startRecovery).toBeLessThan(onlyCallOf('createPersonaConnectionManager'))
@@ -5704,17 +5728,20 @@ describe('Thread Memory server lifecycle wiring', () => {
         await queue.append(key, deliveredRecord(1))
         expect(queue.items(key).map(item => item.delivered)).toEqual([true, false])
       }
-      const starts = indicesOf(/for \(const key of deliveryQueue\.keys\(\)\)/g, SERVER_CODE)
-      expect(starts).toHaveLength(1)
-      const [, end] = balancedAfter(SERVER_CODE, starts[0]!, '{', '}')
-      const loop = new Function('deliveryQueue', 'threadMemory', recovery, SERVER_CODE.slice(starts[0]!, end + 1))
+      const loop = new Function('deliveryQueue', 'threadMemory', recovery, 'memoryHolds', startJoinRecoveryLoop())
+      const resolutions: unknown[][] = []
+      const pending = Promise.withResolvers<void>()
       const reads: string[] = [], recovered: Array<[string, readonly ThreadMemoryModule.ThreadJoin[]]> = []
       loop({ keys: () => queue.keys(), items: (key: string) => { reads.push(key); return queue.items(key) } }, {
         recoverJoins(key: string, candidates: readonly ThreadMemoryModule.ThreadJoin[]) {
           recovered.push([key, candidates])
           if (key === THREAD_PERSONAS.primary) throw new Error('fixture recovery failed')
         },
-      }, recoverQueuedJoins)
+      }, recoverQueuedJoins, { resolve: (...args: unknown[]) => { resolutions.push(args); return pending.promise } })
+      // A failed key does not stop later recovery, and a pending resolution
+      // does not keep the loop open or gate intake.
+      expect(resolutions).toEqual([[THREAD_PERSONAS.secondary, 'recovered', true]])
+      pending.resolve()
       expect(reads).toEqual([THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary])
       expect(recovered).toEqual([[THREAD_PERSONAS.primary, facts], [THREAD_PERSONAS.secondary, facts]])
     } finally {
@@ -5746,6 +5773,223 @@ describe('Thread Memory server lifecycle wiring', () => {
       expect(at).toBeGreaterThan(start)
       expect(at).toBeLessThan(end)
     }
+  })
+})
+
+describe('Memory Hold server wiring', () => {
+  test('one resolver shares the queue, memory, release callback, clock and event port', () => {
+    expect(importSource(SERVER_CODE, 'createMemoryHoldResolver')).toBe('./memory-holds.ts')
+    declaredOnce('memoryHolds')
+    expect(assignmentsTo('memoryHolds').map(({ value }) => value)).toEqual(['createMemoryHoldResolver({'])
+    const created = onlyCallOf('createMemoryHoldResolver')
+    expect(atMainTopLevel(SERVER_CODE, created)).toBe(true)
+    expect(Object.fromEntries(onlyCallProps('createMemoryHoldResolver'))).toEqual({
+      queue: 'deliveryQueue', memory: 'threadMemory',
+      release: '(key, item, mode) => personaRouting.releaseHeld(key, item, mode)',
+      now: 'Date.now',
+      clock: '{ setTimeout: (callback, ms) => setTimeout(callback, ms), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) }',
+      onEvent: 'event => memoryHoldEvents.emit(event)',
+    })
+    // compactAfter=true in the start loop delegates the detached second
+    // compaction and its hourly retry to this resolver over the real queue.
+    expect(startJoinRecoveryLoop().replace(/\s+/g, ' ')).toContain("void memoryHolds.resolve(key, 'recovered', true).catch(() => {})")
+    expect(created).toBeLessThan(onlyCallOf('threadMemory\\.activate'))
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stop = onlyCallOf('memoryHolds\\?\\.stop')
+    expect(stop).toBeGreaterThan(start)
+    expect(stop).toBeLessThan(end)
+    expect(stop).toBeLessThan(onlyCallOf('deliveryQueue\\?\\.stop'))
+  })
+
+  test('held-stamp and stored-hold inputs are bound only in their construction', () => {
+    for (const [member, factory] of [['heldStamps', 'createThreadMemory'], ['onHoldStored', 'createPersonaRouting']]) {
+      const bindings = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
+      expect(bindings).toHaveLength(1)
+      expect(withinCall(bindings, onlyCallOf(factory!))).toBe(1)
+      expect(indicesOf(new RegExp(`(?:\\.\\s*${member}\\b|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+    }
+    expect(onlyCallProps('createPersonaRouting').get('onHoldStored')).toBe('key => resolveMemoryHolds(key)')
+  })
+
+  test.each([false, true])('actual held-stamp adapter sees the decision during store and its outcome; failed=%s', async fail => {
+    const adapter = expression<() => {
+      held: NonNullable<ThreadMemoryModule.ThreadMemoryOptions['heldStamps']>
+      set(queue?: Pick<DeliveryQueue, 'unresolvedHolds'>): void
+    }>(`() => { let deliveryQueue;
+      const held = (${onlyCallProps('createThreadMemory').get('heldStamps')});
+      return { held, set: value => { deliveryQueue = value } };
+    }`, {})()
+    const key = THREAD_PERSONAS.primary, fact = threadJoin()
+    expect(adapter.held(key)).toEqual([])
+    const root = mkdtempSync(join(tmpdir(), 'cscb-held-stamp-wiring-'))
+    const observed: unknown[] = [], paths = new Map<number, string>()
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) {
+        const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd
+      },
+      fsyncSync(fd: number) {
+        if (paths.get(fd) === queuePath(root, key)) {
+          observed.push(adapter.held(key))
+          if (fail) throw new Error('fixture hold store failed')
+        }
+        fs.fsyncSync(fd)
+      },
+    } as typeof fs
+    const queue = await makeQueue(root, { fs: seam })
+    try {
+      adapter.set(queue)
+      const input = heldSlackInput(memoryHold(fact.at, { stamp: fact.stamp }), { channel: fact.channel })
+      const stored = await queue.acceptDecided(key, input.key, () => ({ store: input }))
+      const stamps = [{ channel: fact.channel, stamp: fact.stamp }]
+      // A failed fsync also attempts rollback. Every store-time observation,
+      // including that rollback, must still protect the decided hold.
+      expect(observed.length).toBeGreaterThan(0)
+      for (const value of observed) expect(value).toEqual(stamps)
+      expect(stored.status).toBe(fail ? 'failed' : 'accepted')
+      expect(adapter.held(key)).toEqual(fail ? [] : stamps)
+      expect(adapter.held(THREAD_PERSONAS.secondary)).toEqual([])
+      // A replacement holder is read on the next call; non-dependent holds
+      // must not retain a stamp in Thread Memory.
+      const holds = queue.unresolvedHolds(key)
+      adapter.set({ unresolvedHolds: () => holds.map(hold => ({ ...hold, memoryDependent: false })) })
+      expect(adapter.held(key)).toEqual([])
+      adapter.set(queue)
+      expect(adapter.held(key)).toEqual(fail ? [] : stamps)
+      adapter.set()
+      expect(adapter.held(key)).toEqual([])
+    } finally {
+      await queue.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('stored-hold callback resolves live through the current holder, guarded by shutdown and applied key', async () => {
+    const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+    const fn = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'resolveMemoryHolds')!
+    expect(fn.getText(tree).replace(/\s+/g, ' ')).toBe("export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> { return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve() }")
+    const adapter = expression<() => {
+      stored: NonNullable<PersonaRoutingDeps['onHoldStored']>
+      resolve: typeof ServerModule.resolveMemoryHolds
+      set(value?: Pick<MemoryHoldResolver, 'resolve'>, stopping?: boolean, applied?: boolean): void
+    }>(`() => {
+      let memoryHolds, shuttingDown = false, applied = true;
+      const getAppliedPersona = () => applied;
+      ${fn.getText(tree).replace(/^export /, '')}
+      const stored = (${onlyCallProps('createPersonaRouting').get('onHoldStored')});
+      return { stored, resolve: resolveMemoryHolds, set(value, stopping = false, present = true) {
+        memoryHolds = value; shuttingDown = stopping; applied = present;
+      } };
+    }`, {})()
+    const key = THREAD_PERSONAS.primary, calls: unknown[][] = []
+    await adapter.stored(key)
+    for (const marker of ['first', 'replacement']) {
+      const resolver = { resolve: async (...args: Parameters<MemoryHoldResolver['resolve']>) => {
+        calls.push([marker, ...args]); return 'resolved' as const
+      } }
+      adapter.set(resolver)
+      await adapter.stored(key)
+      await adapter.resolve(key, 'recovered')
+      adapter.set(resolver, true)
+      await adapter.stored(key)
+      adapter.set(resolver, false, false)
+      await adapter.stored(key)
+    }
+    expect(calls).toEqual(['first', 'replacement'].flatMap(marker => [[marker, key, 'live'], [marker, key, 'recovered']]))
+  })
+
+  test('hold clock advancement follows queue replay and precedes resolution, maintenance and intake', () => {
+    const started = onlyCallOf('deliveryQueue\\.start'), created = onlyCallOf('createMemoryHoldResolver')
+    expect(SERVER_CODE.slice(started, created).replace(/\s+/g, ' ').trim()).toBe(
+      'deliveryQueue.start() if (shuttingDown) return for (const key of deliveryQueue.keys()) for (const hold of deliveryQueue.unresolvedHolds(key)) threadMemory.advancePast(key, hold.arrived_at) memoryHolds =',
+    )
+    expect(created).toBeLessThan(onlyCallOf('deliveryQueue\\.startMaintenance'))
+    expect(created).toBeLessThan(onlyCallOf('createPersonaConnectionManager'))
+    expect(created).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    expect(mainExecutionAwaits().map(at => SERVER_CODE.slice(at, at + 70)).some(code => /memoryHolds\.(resolve|retryPending)/.test(code))).toBe(false)
+  })
+
+  test('publication recovers joins before detached retries, visits applied keys only, and stops during shutdown', async () => {
+    const subscription = callArguments(SERVER_CODE, onlyCallOf('subscribeThreadView'))
+    const keys = Object.values(THREAD_PERSONAS), calls: unknown[][] = []
+    const pending = Promise.withResolvers<void>()
+    for (const shuttingDown of [false, true]) {
+      const publish = expression<() => void>(subscription, {
+        shuttingDown, threadMemory: { published: () => calls.push(['published']) },
+        deliveryQueue: { keys: () => keys }, getAppliedPersona: (key: string) => key === keys[1],
+        memoryHolds: { retryPending: (key: string) => { calls.push(['retry', key]); return pending.promise } },
+      })
+      expect(publish()).toBeUndefined()
+    }
+    expect(calls).toEqual([['published'], ['retry', keys[1]]])
+    pending.reject(new Error('fixture resolution failed'))
+    await createFakeClock().flush()
+  })
+
+  test('start resolution does not wait for a previous key and requests second compaction for every recovered key', () => {
+    const keys = Object.values(THREAD_PERSONAS), calls: unknown[][] = []
+    const pending = Promise.withResolvers<void>()
+    const loop = new Function('deliveryQueue', 'threadMemory', 'recoverQueuedJoins', 'memoryHolds', startJoinRecoveryLoop())
+    loop({ keys: () => keys }, {}, (key: string) => calls.push(['recover', key]), {
+      resolve: (...args: unknown[]) => { calls.push(['resolve', ...args]); return pending.promise },
+    })
+    expect(calls).toEqual(keys.flatMap(key => [['recover', key], ['resolve', key, 'recovered', true]]))
+    pending.resolve()
+  })
+
+  test('teardown isolates resolver forget from the remaining per-key cleanup', async () => {
+    const calls: string[] = [], key = THREAD_PERSONAS.primary
+    const error = new Error('fixture forget failed')
+    const routing = expression<{ forget(key: string): Promise<void> }>(onlyCallProps('createPersonaLifecycle').get('routing')!, {
+      forgetPersonaState,
+      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemory'].map(name => [name, {
+        forget: (received: string) => { expect(received).toBe(key); calls.push(name); if (name === 'memoryHolds') throw error },
+      }])),
+    })
+    await expect(routing.forget(key)).rejects.toBe(error)
+    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemory'])
+  })
+
+  test('removed-key cleanup forgets the resolver before removing memory even after lifecycle teardown fails', async () => {
+    const key = THREAD_PERSONAS.primary, calls: unknown[][] = []
+    const teardown = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!).get('teardown')!
+    for (const present of [true, false]) {
+      const error = new Error('fixture teardown failed')
+      const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
+        personaLifecycleOps: { teardown: async () => { throw error } },
+        personaConfig: { personas: present ? [{ key }] : [] },
+        memoryHolds: { forget: (key: string) => calls.push(['forget', key]) },
+        threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
+      })
+      await expect(run({ key })).rejects.toBe(error)
+    }
+    expect(calls).toEqual([['forget', key], ['remove', key]])
+  })
+
+  test('removed-key cleanup still removes Thread Memory when resolver forget throws', async () => {
+    const key = THREAD_PERSONAS.primary, calls: unknown[][] = [], error = new Error('fixture forget failed')
+    const teardown = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!).get('teardown')!
+    const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
+      personaLifecycleOps: { teardown: async () => {} }, personaConfig: { personas: [] },
+      memoryHolds: { forget: (key: string) => { calls.push(['forget', key]); throw error } },
+      threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
+    })
+    await run({ key }).catch(caught => { expect(caught).toBe(error) })
+    expect(calls).toEqual([['forget', key], ['remove', key]])
+  })
+
+  test('start wake and reload count read open queue work through the shared predicates', () => {
+    expect(importSource(SERVER_CODE, 'isOpenItem')).toBe('./delivery-queue.ts')
+    expect(SERVER_CODE).toContain("for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => isOpenItem(i) && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)")
+    expect(onlyCallProps('createReloadController').get('queueOpenCount')).toBe('key => deliveryQueue?.openCount(key) ?? 0')
+  })
+
+  test('recovered releases buffered before reporting are replayed from the current queue then cleared', () => {
+    const created = onlyCallOf('createDeliveryReporting')
+    const replay = SERVER_CODE.indexOf('for (const { key, item } of bufferedHeldReleases.values())')
+    expect(replay).toBeGreaterThan(created)
+    const end = SERVER_CODE.indexOf('bufferedHeldReleases.clear()', replay) + 'bufferedHeldReleases.clear()'.length
+    expect(SERVER_CODE.slice(replay, end).replace(/\s+/g, ' ').trim()).toBe("for (const { key, item } of bufferedHeldReleases.values()) deliveryReporting.received(key, deliveryQueue.item(key, item.accepted.seq) ?? item, 'recovered') bufferedHeldReleases.clear()")
+    expect(replay).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
   })
 })
 
@@ -5808,7 +6052,8 @@ describe('typed delivery reporting production wiring', () => {
     expect(SERVER_CODE.indexOf('deliveryReporting.startupFindings')).toBeGreaterThan(created)
   })
   test('intake and engine report through the one consumer; upgrade inspection retains the per-persona scope', () => {
-    for (const factory of ['createPersonaRouting', 'createDeliveryPreparation']) expect(onlyCallProps(factory).get('onReceived')).toMatch(/deliveryReporting\?\.received\(key, item\)/)
+    expect(onlyCallProps('createDeliveryPreparation').get('onReceived')).toBe('(key, item) => deliveryReporting?.received(key, item)')
+    expect(onlyCallProps('createPersonaRouting').get('onReceived')).toBe("(key, item, mode) => { if (deliveryReporting) deliveryReporting.received(key, item, mode) else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item }) }")
     const engine = onlyCallProps('createDeliveryEngines')
     expect(engine.get('onEvent')).toBe('event => deliveryEngineEvents.emit(event)')
     expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
@@ -5836,13 +6081,6 @@ describe('typed delivery reporting production wiring', () => {
 })
 
 describe('production bring-up reaction recovery', () => {
-  /** Run only the actual dependency expression, never server main or a copy of
-   * its listeners. Bind all effects to the in-process fixtures below. */
-  function expression<T>(code: string, bindings: Record<string, unknown>): T {
-    const js = ts.transpileModule(`const callback = (${code});`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
-    return new Function(...Object.keys(bindings), `${js}\nreturn callback;`)(...Object.values(bindings)) as T
-  }
-
   test.each(['remove/re-add', 'destructive modification', 'startup retry'] as const)('%s restores retained queued feedback on actual client bring-up, without an extra manual recovery', async path => {
     _resetAckTracker()
     const e = await makeEngineHarness()

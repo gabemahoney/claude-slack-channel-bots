@@ -2,16 +2,16 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDeliveryQueue, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type AcceptedInput, type HoldResolution, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
-import { deliveredRecord, fixedRecord, injectedInput, makeQueue, noticedRecord, queuePath, readQueue, refusedRecord, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, heldSlackInput, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, withdrawnRecord } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
-import { THREAD_ROOTS, THREAD_STAMP, THREAD_TIME } from './test-helpers/thread-memory.ts'
-import { createDeliveryQueue as createMainDeliveryQueue } from './fixtures/main-delivery-queue/delivery-queue.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, THREAD_TIME } from './test-helpers/thread-memory.ts'
+import { createDeliveryQueue as createMainDeliveryQueue, isQueueRecord as isMainQueueRecord } from './fixtures/main-delivery-queue/delivery-queue.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
@@ -897,7 +897,9 @@ describe('thread_join acceptance and main-reader compatibility', () => {
     expect(q.replyReminderItems('alpha')).toEqual(reminders)
     expect(q.item('alpha', 3)!.accepted.thread_join).toEqual(joinFact())
     const old = await readWithMain('main-retained')
-    expect(old.items).toEqual(q.items('alpha'))
+    // The current record union includes hold resolutions; main's is a subset.
+    // Compare the complete values without narrowing either snapshot or reader.
+    expect(q.items('alpha')).toEqual(old.items)
     expect(old.open).toBe(1)
     expect(old.keys.map(k => k?.status)).toEqual(['duplicate', 'duplicate', 'duplicate'])
     await q.stop()
@@ -912,7 +914,7 @@ describe('thread_join acceptance and main-reader compatibility', () => {
     for (const record of readQueue(dir).filter(r => 'compact' in r)) expect(record).not.toHaveProperty('thread_join')
     expect(replay.replyReminderItems('alpha')).toEqual(reminders)
     const confirmed = await readWithMain('main-confirmed')
-    expect(confirmed.items).toEqual(replay.items('alpha'))
+    expect(replay.items('alpha')).toEqual(confirmed.items)
     expect(confirmed.open).toBe(1)
     expect(confirmed.keys[0]).toEqual({ status: 'duplicate', seq: 1 })
   })
@@ -1013,5 +1015,398 @@ describe('decided acceptance owns the persona writer turn', () => {
     expect(order.indexOf('gamma')).toBeLessThan(order.indexOf('alpha:19'))
     expect(q.openCount('alpha')).toBe(0)
     expect(q.openCount('beta')).toBe(1); expect(q.openCount('gamma')).toBe(1)
+  })
+})
+
+describe('Memory Hold queue records', () => {
+  const heldRecord = (): AcceptedRecord => ({ ...accepted(), ...heldSlackInput(memoryHold(THREAD_TIME)), received_at: THREAD_TIME })
+  async function storeHold(q: DeliveryQueue, at: number, overrides: Partial<AcceptedInput> = {}, key = 'alpha') {
+    const input = heldSlackInput(memoryHold(at), overrides)
+    const result = await q.acceptDecided(key, input.key, () => ({ store: input }))
+    expect(result.status).toBe('accepted')
+    if (result.status !== 'accepted' || !result.item) throw new Error('hold was not stored')
+    return result.item
+  }
+  // Both readers compact at start. Reject only writes to inspect their loaded
+  // state before compaction removes delivered items or rewrites released holds.
+  const readOnlyFs = { ...fs,
+    openSync(path: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) {
+      if (typeof flags !== 'string' || /[wa+]/.test(flags)) throw new Error('read-only replay')
+      return fs.openSync(path, flags, mode)
+    },
+  } as typeof fs
+
+  test.each([false, true])('one accepting append protects an in-flight hold; store failure=%s', async fail => {
+    const clock = createFakeClock({ start: THREAD_TIME }), writes: Buffer[] = [], events: QueueEvent[] = []
+    const paths = new Map<number, string>(), observations: ReturnType<DeliveryQueue['unresolvedHolds']>[] = []
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number | null) {
+        if (paths.get(fd) === queuePath(dir)) {
+          observations.push(q.unresolvedHolds('alpha'))
+          writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
+        }
+        return fs.writeSync(fd, bytes, offset, length, position)
+      },
+      fsyncSync(fd: number) {
+        if (paths.get(fd) === queuePath(dir)) {
+          observations.push(q.unresolvedHolds('alpha'))
+          if (fail) throw new Error('EIO hold store')
+        }
+        fs.fsyncSync(fd)
+      },
+    } as typeof fs
+    const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
+    const input = heldSlackInput(memoryHold(clock.now()), { text: 'held exact\nbytes🙂', queued_ack_reaction: 'original_queue' })
+    const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }))
+    const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: 1, received_at: clock.now(), ts: input.ts! }
+    const expected = [{ ...input.hold!, seq: 1, channel: input.channel!, memoryDependent: true }]
+    expect(writes).toEqual([Buffer.from(JSON.stringify(record) + '\n')])
+    expect(observations.length).toBeGreaterThanOrEqual(2)
+    for (const observed of observations) expect(observed).toEqual(expected)
+    expect(result.status).toBe(fail ? 'failed' : 'accepted')
+    expect(q.unresolvedHolds('alpha')).toEqual(fail ? [] : expected)
+    expect(q.openCount('alpha')).toBe(0)
+    expect(readQueue(dir)).toEqual(fail ? [] : [record])
+    if (!fail) {
+      await q.stop()
+      const replay = await open({ now: clock.now })
+      expect(replay.item('alpha', 1)!.accepted).toMatchObject(record)
+      expect(replay.item('alpha', 1)!.hold).toEqual({ field: input.hold!, state: 'unresolved' })
+      expect(replay.unresolvedHolds('alpha')).toEqual(expected)
+      expect(replay.openCount('alpha')).toBe(0)
+    }
+    assertNoLeak(events)
+    expect(JSON.stringify(events)).not.toContain(input.text)
+  })
+
+  const badHolds: [string, unknown][] = [
+    ['missing on', { ...memoryHold(THREAD_TIME), on: undefined }],
+    ['missing root', { ...memoryHold(THREAD_TIME), thread_ts: undefined }],
+    ['missing stamp', { ...memoryHold(THREAD_TIME), stamp: undefined }],
+    ['missing arrival', { ...memoryHold(THREAD_TIME), arrived_at: undefined }],
+    ['extra hold key', { ...memoryHold(THREAD_TIME), extra: true }],
+    ['unknown on', { ...memoryHold(THREAD_TIME), on: 'future' }],
+    ['bad root', { ...memoryHold(THREAD_TIME), thread_ts: '1.1' }],
+    ['empty incarnation', memoryHold(THREAD_TIME, { stamp: { ...THREAD_STAMP, incarnation: '' } })],
+    ['empty since', memoryHold(THREAD_TIME, { stamp: { ...THREAD_STAMP, threadHybridSince: '' } })],
+    ['extra stamp key', { ...memoryHold(THREAD_TIME), stamp: { ...THREAD_STAMP, extra: true } }],
+    ['non-finite arrival', memoryHold(Infinity)],
+    ['null hold', null],
+  ]
+  const invalid: [string, () => unknown][] = [
+    ...badHolds.map(([label, hold]): [string, () => unknown] => [label, () => ({ ...heldRecord(), hold })]),
+    ...['interject', 'cron'].map(source => [`hold on ${source}`, () => ({ ...heldRecord(), source, sender: source, key: undefined })] as [string, () => unknown]),
+    ...['mention', 'broadcast', 'all', 'dm', ''].map(via => [`hold via ${via}`, () => ({ ...heldRecord(), via })] as [string, () => unknown]),
+    ['hold beside thread_join', () => ({ ...heldRecord(), thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP, at: THREAD_TIME } })],
+    ['non-finite released_at', () => ({ ...accepted(), released_at: Infinity })],
+    ...[fixedRecord, sentRecord, deliveredRecord, refusedRecord, noticedRecord].flatMap(build => [
+      [`hold on ${build().kind}`, () => ({ ...build(), hold: memoryHold(THREAD_TIME) })],
+      [`released_at on ${build().kind}`, () => ({ ...build(), released_at: THREAD_TIME })],
+    ] as [string, () => unknown][]),
+    ...[releasedRecord, withdrawnRecord, parkedRecord].flatMap(build => [
+      [`${build().kind} missing at`, () => ({ ...build(), at: undefined })],
+      [`${build().kind} non-finite at`, () => ({ ...build(), at: NaN })],
+      [`${build().kind} extra field`, () => ({ ...build(), extra: true })],
+      [`${build().kind} invalid sequence`, () => ({ ...build(), seq: -1 })],
+      [`${build().kind} invalid version`, () => ({ ...build(), v: 2 })],
+    ] as [string, () => unknown][]),
+  ]
+  test.each(invalid)('rejects %s', (_, build) => {
+    const record = build()
+    expect(isQueueRecord(record)).toBe(false)
+    expect(parseQueueRecord(JSON.stringify(record))).toBeUndefined()
+  })
+
+  test('compacted key and allocation records reject hold, join and release fields', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    await storeHold(q, clock.now())
+    await q.resolveHolds('alpha', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])
+    await q.compact('alpha')
+    const records = readQueue(dir)
+    expect(records).toHaveLength(2)
+    for (const record of records) {
+      expect(isMainQueueRecord(record)).toBe(true)
+      for (const field of [{ hold: memoryHold(clock.now()) }, { released_at: clock.now() }, { thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP, at: clock.now() } }]) {
+        expect(isQueueRecord({ ...record, ...field })).toBe(false)
+      }
+    }
+  })
+
+  test.each([releasedRecord, withdrawnRecord, parkedRecord])('%p roundtrips; damaged resolution is quarantined without alerting for a loaded sequence', async build => {
+    const record = build(1, THREAD_TIME)
+    expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
+    const damaged = JSON.stringify({ ...record, at: null }) + '\n'
+    // Not the final line: the loaded-sequence rule, not torn-tail suppression.
+    seedQueue(dir, [heldRecord(), damaged, { ...accepted(), seq: 2 }])
+    const q = await open({ now: createFakeClock({ start: THREAD_TIME }).now })
+    expect(q.startupFindings()).toMatchObject([{ type: 'record-unreadable', line: 2, alert: false }])
+    const finding = q.startupFindings()[0]!
+    if (finding.type !== 'record-unreadable') throw new Error('expected damaged resolution')
+    expect(fs.readFileSync(finding.quarantinePath, 'utf8')).toBe(damaged)
+    expect(q.item('alpha', 1)!.hold?.state).toBe('unresolved')
+    expect(q.openCount('alpha')).toBe(1)
+    assertNoLeak(q.startupFindings())
+  })
+
+  test.each([
+    ['plain', undefined, true, THREAD_TIME],
+    ['unresolved', undefined, false, THREAD_TIME],
+    ['released', 'released', true, THREAD_TIME + 50],
+    ['withdrawn', 'withdrawn', false, THREAD_TIME],
+    ['parked', 'parked', false, THREAD_TIME],
+    ['compacted released', 'released', true, THREAD_TIME + 50],
+  ] as const)('%s has the correct open-work count and age', async (state, outcome, isOpen, openedAt) => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    if (state === 'plain') await q.accept('alpha', slackInput())
+    else await storeHold(q, clock.now())
+    await clock.advance(50)
+    if (outcome) await q.resolveHolds('alpha', [{ seq: 1, outcome, at: clock.now() }])
+    if (state === 'compacted released') await q.compact('alpha')
+    const item = q.item('alpha', 1)!
+    expect(isOpenItem(item)).toBe(isOpen)
+    expect(itemOpenedAt(item)).toBe(openedAt)
+    expect(q.openCount('alpha')).toBe(Number(isOpen))
+    expect(q.unresolvedHolds('alpha').map(h => h.seq)).toEqual(state === 'unresolved' || state === 'parked' ? [1] : [])
+    if (state === 'plain' || state === 'compacted released') expect(item.hold).toBeUndefined()
+    if (state === 'compacted released') expect(item.accepted.released_at).toBe(openedAt)
+    if (isOpen) {
+      await q.append('alpha', fixedRecord())
+      await q.append('alpha', deliveredRecord(1, clock.now()))
+      expect(isOpenItem(q.item('alpha', 1)!)).toBe(false)
+      expect(q.openCount('alpha')).toBe(0)
+    }
+  })
+
+  test.each([
+    ['release first', [parkedRecord(1, THREAD_TIME), releasedRecord(1, THREAD_TIME + 50), withdrawnRecord(1, THREAD_TIME + 10)], 'released', THREAD_TIME + 50],
+    ['withdraw first', [withdrawnRecord(1, THREAD_TIME + 50), releasedRecord(1, THREAD_TIME + 10), parkedRecord(1, THREAD_TIME + 60)], 'withdrawn', THREAD_TIME + 50],
+    ['fixed only', [fixedRecord()], 'released', THREAD_TIME],
+    ['sent only', [{ ...sentRecord(), at: THREAD_TIME + 40 }], 'released', THREAD_TIME + 40],
+    ['delivered only', [deliveredRecord(1, THREAD_TIME + 30)], 'released', THREAD_TIME + 30],
+    ['earliest send or receipt', [fixedRecord(1, ['one', 'two']), { ...sentRecord(), at: THREAD_TIME + 40 }, deliveredRecord(1, THREAD_TIME + 30), { ...sentRecord(1, 2), at: THREAD_TIME + 20 }], 'released', THREAD_TIME + 20],
+  ] as const)('replay uses %s and preserves its decision time', async (_, records, state, at) => {
+    seedQueue(dir, [heldRecord(), ...records])
+    const q = await open({ fs: readOnlyFs, now: createFakeClock({ start: THREAD_TIME }).now })
+    expect(q.item('alpha', 1)!.hold).toEqual({ field: heldRecord().hold!, state, at })
+    expect(q.unresolvedHolds('alpha')).toEqual([])
+    expect(q.openCount('alpha')).toBe(Number(state === 'released'))
+    expect(itemOpenedAt(q.item('alpha', 1)!)).toBe(state === 'released' ? at : THREAD_TIME)
+  })
+
+  test('a resolution on a hold-less item has no effect during replay', async () => {
+    seedQueue(dir, [accepted(), withdrawnRecord()])
+    const q = await open({ fs: readOnlyFs })
+    expect(q.item('alpha', 1)!.hold).toBeUndefined()
+    expect(q.openCount('alpha')).toBe(1)
+    expect(itemOpenedAt(q.item('alpha', 1)!)).toBe(accepted().received_at)
+  })
+
+  test('resolution batches save once, filter resolved/absent holds and publish only after durable sync', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), events: QueueEvent[] = [], writes: Buffer[] = []
+    let resolving = false
+    const seam = { ...fs,
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number | null) {
+        if (resolving) writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
+        return fs.writeSync(fd, bytes, offset, length, position)
+      },
+      fsyncSync(fd: number) {
+        if (resolving) {
+          expect(q.unresolvedHolds('alpha').map(h => h.seq)).toEqual([1, 2])
+          expect(q.openCount('alpha')).toBe(2)
+          expect(events).toEqual([])
+        }
+        fs.fsyncSync(fd)
+      },
+    } as typeof fs
+    const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
+    await storeHold(q, clock.now())
+    await storeHold(q, clock.now(), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } })
+    await q.accept('alpha', injectedInput())
+    await storeHold(q, clock.now(), { ts: THREAD_ROOTS.primary, key: { ...slackInput().key!, ts: THREAD_ROOTS.primary } })
+    await storeHold(q, clock.now(), { channel: THREAD_CHANNELS.secondary, key: { chat_id: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary } })
+    const earlier = [{ seq: 4, outcome: 'withdrawn', at: clock.now() }, { seq: 5, outcome: 'released', at: clock.now() }] satisfies HoldResolution[]
+    await q.resolveHolds('alpha', earlier)
+    await clock.advance(50)
+    const saved: HoldResolution[] = [{ seq: 2, outcome: 'withdrawn', at: clock.now() }, { seq: 1, outcome: 'released', at: clock.now() }]
+    const candidates: HoldResolution[] = [
+      { seq: 4, outcome: 'released', at: clock.now() }, saved[0]!,
+      { seq: 5, outcome: 'withdrawn', at: clock.now() }, saved[1]!,
+      { seq: 1, outcome: 'withdrawn', at: clock.now() + 1 }, { seq: 2, outcome: 'released', at: clock.now() + 1 },
+      { seq: 3, outcome: 'withdrawn', at: clock.now() }, { seq: 99, outcome: 'released', at: clock.now() },
+    ]
+    events.length = 0; resolving = true
+    expect(await q.resolveHolds('alpha', candidates)).toEqual(saved)
+    resolving = false
+    expect(writes).toEqual([Buffer.from([withdrawnRecord(2, clock.now()), releasedRecord(1, clock.now())].map(r => JSON.stringify(r) + '\n').join(''))])
+    expect(events).toEqual([{ type: 'holds-resolved', key: 'alpha', resolutions: saved }])
+    expect(q.unresolvedHolds('alpha')).toEqual([])
+    expect(q.openCount('alpha')).toBe(3)
+    expect(earlier.map(r => q.item('alpha', r.seq)!.hold)).toEqual(earlier.map(r => ({ field: memoryHold(THREAD_TIME), state: r.outcome, at: r.at })))
+    const before = fs.readFileSync(queuePath(dir))
+    expect(await q.resolveHolds('alpha', candidates)).toHaveLength(0)
+    expect(await q.resolveHolds('alpha', [])).toHaveLength(0)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(before)
+    expect(events).toHaveLength(1)
+    for (const build of [releasedRecord, withdrawnRecord, parkedRecord]) await expect(q.append('alpha', build())).rejects.toThrow('Invalid append record')
+    assertNoLeak(events)
+  })
+
+  test('failed resolution sync saves none; an append restores writability and one retry resolves the batch', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), events: QueueEvent[] = []
+    let fail = false
+    const seam = { ...fs, fsyncSync(fd: number) {
+      if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO hold resolution')
+      fs.fsyncSync(fd)
+    } } as typeof fs
+    const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
+    await storeHold(q, clock.now())
+    await storeHold(q, clock.now(), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } })
+    const bytes = fs.readFileSync(queuePath(dir)), holds = q.unresolvedHolds('alpha')
+    const resolutions: HoldResolution[] = [{ seq: 1, outcome: 'released', at: clock.now() + 50 }, { seq: 2, outcome: 'withdrawn', at: clock.now() + 60 }]
+    events.length = 0; fail = true
+    await expect(q.resolveHolds('alpha', resolutions)).rejects.toThrow('EIO hold resolution')
+    expect(q.isWritable!('alpha')).toBe(false)
+    expect(q.unresolvedHolds('alpha')).toEqual(holds)
+    expect(q.openCount('alpha')).toBe(0)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect(events).toMatchObject([{ type: 'append-failed', key: 'alpha' }])
+    fail = false
+    await q.append('alpha', noticedRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(q.unresolvedHolds('alpha')).toEqual(holds)
+    await q.resolveHolds('alpha', resolutions)
+    await q.resolveHolds('alpha', resolutions)
+    expect(events.map(e => e.type)).toEqual(['append-failed', 'writable', 'holds-resolved'])
+    expect(readQueue(dir).filter(r => r.kind === 'released' || r.kind === 'withdrawn')).toEqual([releasedRecord(1, resolutions[0]!.at), withdrawnRecord(2, resolutions[1]!.at)])
+    expect(q.openCount('alpha')).toBe(1)
+    await q.stop()
+    const replay = await open({ now: clock.now })
+    expect(replay.unresolvedHolds('alpha')).toEqual([])
+    expect(replay.openCount('alpha')).toBe(1)
+    expect(itemOpenedAt(replay.item('alpha', 1)!)).toBe(resolutions[0]!.at)
+    assertNoLeak(events)
+  })
+
+  test('one persona resolves while another has queued writer turns', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now }), order: string[] = []
+    await storeHold(q, clock.now())
+    await storeHold(q, clock.now(), {}, 'beta')
+    const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
+    const alpha = q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: clock.now() }]).then(() => order.push('alpha:resolved'))
+    await q.resolveHolds('beta', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])
+    expect(order).not.toContain('alpha:19')
+    expect(q.unresolvedHolds('alpha')).toHaveLength(1)
+    expect(q.unresolvedHolds('beta')).toEqual([])
+    await Promise.all([...backlog, alpha])
+    expect(q.openCount('alpha')).toBe(1)
+  })
+
+  test.each(['unresolved', 'released', 'withdrawn'] as const)('%s keeps its Slack key across reopen, compaction and the retention boundary', async state => {
+    const clock = createFakeClock({ start: THREAD_TIME })
+    let q = await open({ now: clock.now })
+    const item = await storeHold(q, clock.now()), input = heldSlackInput(item.accepted.hold!)
+    await clock.advance(100)
+    if (state !== 'unresolved') await q.resolveHolds('alpha', [{ seq: 1, outcome: state, at: clock.now() }])
+    const duplicate = async () => {
+      const bytes = fs.readFileSync(queuePath(dir))
+      expect(await q.acceptDecided('alpha', input.key, () => { throw new Error('duplicate must not decide') })).toMatchObject({ status: 'duplicate', seq: 1 })
+      expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    }
+    await duplicate()
+    await q.stop(); q = await open({ now: clock.now })
+    await duplicate()
+    await clock.advanceTo(THREAD_TIME + QUEUE_KEY_KEEP_MS - 1)
+    await q.compact('alpha'); await duplicate()
+    await clock.advance(1); await q.compact('alpha')
+    if (state === 'withdrawn') {
+      expect(q.lookupSlackKey('alpha', input.key!)).toBeUndefined()
+      expect(await q.acceptDecided('alpha', input.key, () => ({ store: input }))).toMatchObject({ status: 'accepted', seq: 2 })
+    } else await duplicate() // Open accepted work and unresolved holds never expire.
+  })
+
+  test('late withdrawal expires from receipt on its first compaction', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    const item = await storeHold(q, clock.now())
+    await clock.advance(QUEUE_KEY_KEEP_MS)
+    await q.resolveHolds('alpha', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])
+    await q.compact('alpha')
+    expect(q.lookupSlackKey('alpha', item.accepted.key!)).toBeUndefined()
+    expect(q.items('alpha')).toEqual([])
+    expect(readQueue(dir).map(r => 'compact' in r ? r.compact : r.kind)).toEqual(['allocation'])
+  })
+
+  test('compaction preserves unresolved/parked holds and rewrites resolved work for the frozen main reader', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    const inputs = [
+      heldSlackInput(memoryHold(clock.now())),
+      heldSlackInput(memoryHold(clock.now()), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } }),
+      heldSlackInput(memoryHold(clock.now()), { ts: THREAD_ROOTS.primary, key: { ...slackInput().key!, ts: THREAD_ROOTS.primary } }),
+      heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.secondary, key: { chat_id: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary } }),
+      heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.private, key: { chat_id: THREAD_CHANNELS.private, ts: THREAD_ROOTS.secondary } }),
+    ]
+    for (const input of inputs) expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+    await clock.advance(50)
+    await q.resolveHolds('alpha', [
+      { seq: 1, outcome: 'released', at: clock.now() }, { seq: 2, outcome: 'withdrawn', at: clock.now() },
+      { seq: 3, outcome: 'released', at: clock.now() }, { seq: 5, outcome: 'parked', at: clock.now() },
+    ])
+    const otherRecords = [fixedRecord(1, ['one', 'two']), { ...sentRecord(), at: clock.now() }, deliveredRecord(1, clock.now()), noticedRecord(1, clock.now())]
+    for (const record of [...otherRecords, fixedRecord(3), deliveredRecord(3, clock.now() + 10)]) await q.append('alpha', record)
+    const before = q.items('alpha')
+    await q.compact('alpha')
+    const records = readQueue(dir)
+    for (const record of records) {
+      expect(isMainQueueRecord(record)).toBe(true)
+      expect(['released', 'withdrawn', 'parked']).not.toContain(record.kind)
+      if ('compact' in record) { expect(record).not.toHaveProperty('hold'); expect(record).not.toHaveProperty('thread_join') }
+    }
+    const released = q.item('alpha', 1)!
+    expect(released.accepted).toEqual({ ...inputs[0]!, hold: undefined, v: 1, kind: 'accepted', seq: 1, received_at: THREAD_TIME, ts: inputs[0]!.ts!, attempt_high_watermark: 1, released_at: clock.now() })
+    expect(released.accepted).not.toHaveProperty('hold')
+    expect(released.records.filter(r => r.kind !== 'accepted')).toEqual(otherRecords)
+    expect(q.openCount('alpha')).toBe(1)
+    for (const seq of [4, 5]) {
+      expect(q.item('alpha', seq)!.accepted).toMatchObject(before[seq - 1]!.accepted)
+      expect(q.item('alpha', seq)!.hold?.state).toBe('unresolved')
+    }
+    expect(records.filter(r => 'compact' in r && r.compact === 'key').map(r => 'delivered_at' in r ? [r.seq, r.delivered_at] : [])).toEqual([[2, clock.now()], [3, clock.now() + 10]])
+    const copy = join(dir, 'main-holds')
+    seedQueue(copy, records)
+    const old = createMainDeliveryQueue({ stateDir: copy, now: clock.now })
+    await old.start()
+    try {
+      expect(old.startupFindings()).toEqual([])
+      expect(old.items('alpha').map(i => [i.accepted.seq, i.delivered])).toEqual([[1, false], [4, false], [5, false]])
+      expect(released.records).toEqual(old.item('alpha', 1)!.records)
+      for (let i = 0; i < inputs.length; i++) expect(old.lookupSlackKey('alpha', inputs[i]!.key!)).toMatchObject({ status: 'duplicate', seq: i + 1 })
+      expect(old.item('alpha', 2)).toBeUndefined() // Withdrawn is a delivered key, never open work.
+    } finally { await old.stop() }
+    await q.stop()
+    const replay = await open({ now: clock.now })
+    expect(replay.openCount('alpha')).toBe(1)
+    expect(itemOpenedAt(replay.item('alpha', 1)!)).toBe(clock.now())
+    expect(replay.unresolvedHolds('alpha').map(h => h.seq)).toEqual([4, 5])
+  })
+
+  test('main can deliver an unresolved hold and current replay recognizes its release at delivery time', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    await storeHold(q, clock.now()); await q.stop()
+    const old = createMainDeliveryQueue({ stateDir: dir, now: clock.now })
+    await old.start()
+    try {
+      expect(old.startupFindings()).toEqual([])
+      expect(old.openCount('alpha')).toBe(1)
+      await clock.advance(50)
+      await old.append('alpha', fixedRecord())
+      await old.append('alpha', deliveredRecord(1, clock.now()))
+      expect(old.item('alpha', 1)!.delivered).toBe(true)
+    } finally { await old.stop() }
+    const replay = await open({ fs: readOnlyFs, now: clock.now }), item = replay.item('alpha', 1)!
+    expect(item.hold).toEqual({ field: memoryHold(THREAD_TIME), state: 'released', at: clock.now() })
+    expect(item.delivered).toBe(true)
+    expect(itemOpenedAt(item)).toBe(clock.now())
+    expect(replay.openCount('alpha')).toBe(0)
+    expect(replay.unresolvedHolds('alpha')).toEqual([])
   })
 })

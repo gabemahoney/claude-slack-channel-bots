@@ -15,7 +15,9 @@ import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { injectedInput, makeQueue, readQueue } from './test-helpers/delivery-queue.ts'
+import { heldSlackInput, memoryHold, injectedInput, makeQueue, readQueue } from './test-helpers/delivery-queue.ts'
+import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeRecoveryHarness, personaOf, personaRow, retryNow } from './test-helpers/recovery-harness.ts'
 import { balancedAfter, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
@@ -26,6 +28,94 @@ afterEach(async () => { for (const h of harnesses.splice(0).reverse()) await h.c
 async function harness(options: Parameters<typeof makeEngineHarness>[0] = {}) { const h = await makeEngineHarness(options); harnesses.push(h); return h }
 async function start(h: EngineHarness, key = 'alpha') { await h.tick(key) }
 async function delivered(h: EngineHarness, key = 'alpha') { await h.until(() => h.queue.openCount(key) === 0) }
+
+async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key = 'alpha') {
+  const input = heldSlackInput(memoryHold(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
+  const result = await h.queue.acceptDecided(key, input.key, () => ({ store: input }))
+  if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
+  return result.item!
+}
+
+describe('Memory Hold delivery', () => {
+  test('passes unresolved and withdrawn work, preserves later FIFO and isolates personas', async () => {
+    const h = await harness({ keys: ['alpha', 'beta'] })
+    const held = await hold(h), withdrawn = await hold(h, THREAD_ROOTS.third)
+    await h.queue.resolveHolds('alpha', [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: h.clock.now() }])
+    for (const text of ['first later', 'second later']) {
+      expect((await h.queue.accept('alpha', injectedInput({ text }))).status).toBe('accepted')
+    }
+    await h.preparation.recover()
+    await h.accept('independent beta', 'beta')
+    await h.tick('alpha'); await h.tick('beta')
+    await h.until(() => h.queue.openCount('alpha') === 0 && h.queue.openCount('beta') === 0)
+    expect(h.records().filter(r => r.kind === 'fixed').map(r => r.seq)).toEqual([3, 4])
+    expect(h.records().filter(r => r.kind === 'sent').map(r => r.seq)).toEqual([3, 4])
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual([3, 4])
+    expect(h.textCalls().map(c => c.params.text)).toEqual(h.queue.items('alpha').slice(2).flatMap(i => i.fixed!.parts))
+    expect(h.events.flatMap(e => e.type === 'item-delivered' && e.key === 'beta' ? [e.seq] : [])).toEqual([1])
+    expect(h.textCalls('beta').map(c => c.params.text)).toEqual(['independent beta'])
+    expect(h.queue.item('alpha', held.accepted.seq)?.fixed).toBeUndefined()
+    expect(h.queue.item('alpha', withdrawn.accepted.seq)?.fixed).toBeUndefined()
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records(), h.records('beta')])
+  })
+
+  test.each([false, true])('release opens at its original position and ages from release (compacted=%s)', async compacted => {
+    const h = await harness(), held = await hold(h), withdrawn = await hold(h, THREAD_ROOTS.third)
+    await h.queue.resolveHolds('alpha', [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: h.clock.now() }])
+    await h.tick()
+    await h.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.events.filter(e => e.type === 'waiting')).toEqual([])
+    expect(h.keyCalls()).toEqual([])
+    const releasedAt = h.clock.now()
+    await h.queue.resolveHolds('alpha', [{ seq: held.accepted.seq, outcome: 'released', at: releasedAt }])
+    if (compacted) await h.queue.compact('alpha')
+    h.p().held = true
+    await h.preparation.recover()
+    await h.accept('after release')
+    await h.tick()
+    expect(h.engine.status('alpha')).toMatchObject({ seq: held.accepted.seq, count: 2, ageMs: 0 })
+    await h.advance(DELIVERY_STUCK_AFTER_MS)
+    expect(h.engine.status('alpha')).toMatchObject({ seq: held.accepted.seq, count: 2, ageMs: DELIVERY_STUCK_AFTER_MS })
+    expect(h.events.filter(e => e.type === 'waiting').every(e => e.ageMs <= DELIVERY_STUCK_AFTER_MS)).toBe(true)
+    h.p().held = false
+    await h.tick(); await delivered(h)
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual([held.accepted.seq, 3])
+    const completion = h.events.find(e => e.type === 'item-delivered' && e.seq === held.accepted.seq)
+    if (completion?.type !== 'item-delivered') throw new Error('released item was not delivered')
+    expect(completion.waitMs).toBe(completion.at - releasedAt)
+    expect(completion.waitMs).toBeLessThan(completion.at - held.accepted.received_at)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records()])
+  })
+
+  test('a release during text submission finishes the whole in-flight item before returning to the older hold', async () => {
+    const h = await harness(), held = await hold(h)
+    const parts = ['later part one', 'later part two', 'later part three']
+    await h.accept('multipart', 'alpha', parts)
+    await h.accept('last')
+    let released = false
+    h.p().keyHook = async params => {
+      if (!released && params.no_enter) {
+        released = true
+        expect(h.records().filter(r => r.kind === 'delivered')).toEqual([])
+        await h.queue.resolveHolds('alpha', [{ seq: held.accepted.seq, outcome: 'released', at: h.clock.now() }])
+        await h.preparation.prepare('alpha', h.queue.item('alpha', held.accepted.seq)!)
+      }
+      return undefined
+    }
+    await h.tick(); await delivered(h)
+    expect(released).toBe(true)
+    expect(h.textCalls().map(c => c.params.text)).toEqual([...parts, ...h.queue.item('alpha', held.accepted.seq)!.fixed!.parts, 'last'])
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => [r.seq, r.part])).toEqual([[2, 1], [2, 2], [2, 3], [1, 1], [3, 1]])
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual([2, 1, 3])
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records()])
+  })
+})
 async function drainTimers(h: EngineHarness) {
   for (let turns = 0; h.engine.running('alpha') && turns < 1000; turns++) {
     await new Promise<void>(resolve => setImmediate(resolve))

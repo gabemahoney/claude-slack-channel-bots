@@ -1,5 +1,6 @@
 /** Durable Slack intake and existing message-triggered recovery. Hybrid-channel
- * decisions and joins share the queue's writer turn; other intake stays plain. */
+ * decisions, joins and Memory Holds share the queue's writer turn. Holds are
+ * acknowledged on storage and enter reporting/preparation only on release. */
 import {
   CHANNEL_ID_RE,
   DEFAULT_QUEUED_ACK_REACTION,
@@ -35,6 +36,7 @@ import {
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
 import type { DeliveryQueue, QueueItem, AcceptedInput, SlackKey } from './delivery-queue.ts'
+import { isOpenItem } from './delivery-queue.ts'
 import type { ThreadMemory, ThreadJoin, ThreadMemoryStampState } from './thread-memory.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
@@ -112,7 +114,8 @@ export interface PersonaRoutingDeps {
   prepare(key: string, item: QueueItem): Promise<void>
   /** Durable retained acceptance: after envelope ack, or after partial-fanout
    * failure suppresses it. Reporting must not await Slack or authorize delivery. */
-  onReceived?(key: string, item: QueueItem): void
+  onReceived?(key: string, item: QueueItem, mode?: 'live' | 'recovered'): void
+  onHoldStored?(key: string): void | Promise<unknown>
   /** Fire-and-forget archive, before the decision, with no pre-ack await. */
   archive(key: string, event: unknown): void
   /** Writes one log line. */
@@ -236,7 +239,8 @@ export interface PersonaRouting {
    * targets, add any in-memory join, ack only after every store succeeds, then
    * save joins, report, recover and fix text. Hybrid-channel key checks,
    * decisions, stores and joins share each persona's serial queue turn;
-   * other events retain their outside key check and decision.
+   * other events retain their outside key check and decision. Stored Memory
+   * Holds get the ack, but no reporting or preparation until release.
    * Each target is isolated; a failed store suppresses the aggregate ack.
    *
    * `isExtSharedChannel` is the envelope flag: the Events API
@@ -252,6 +256,7 @@ export interface PersonaRouting {
     isExtSharedChannel?: unknown,
     provenance?: PersonaEventProvenance,
   ): Promise<void>
+  releaseHeld(key: string, item: QueueItem, mode: 'live' | 'recovered'): Promise<void>
   /**
    * Forget ephemeral heard-channel state on teardown. Durable queue records
    * and Slack keys remain under their original persona key.
@@ -274,6 +279,20 @@ export interface PersonaRouting {
 export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   const heardSets = new Map<string, Set<string>>()
   const postAcked = new Map<string, Set<number>>()
+  function reportReceived(key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live'): void {
+    try { void Promise.resolve(deps.onReceived?.(key, item, mode)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
+  }
+  async function postAccepted(key: string, item: QueueItem, mode: 'live' | 'recovered'): Promise<void> {
+    if (!isOpenItem(item)) return
+    const posted = postAcked.get(key) ?? new Set<number>()
+    if (posted.has(item.accepted.seq)) return
+    posted.add(item.accepted.seq); postAcked.set(key, posted)
+    const config = deps.getPersonaConfig(), persona = config?.personas.find(p => p.key === key)
+    const session = getSessionByPersona(key)
+    if (mode === 'live' && persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
+    if (postAcked.get(key) !== posted) return
+    await deps.prepare(key, item)
+  }
   /** The persona reference for a key: its rendered name when applied, else the bare key. */
   function refForKey(key: string): string {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
@@ -293,6 +312,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const afterAck: Array<() => Promise<void>> = []
     const accepted: Array<() => void> = []
     const saveJoins: Array<() => void> = []
+    const heldKeys = new Set<string>()
     let storeFailed = false
     if (typeof event === 'object' && event !== null) {
       const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
@@ -308,20 +328,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           const slackKey = typeof ev['channel'] === 'string' && typeof ev['ts'] === 'string'
             ? { chat_id: ev['channel'], ts: ev['ts'], ...(typeof editedTs(ev) === 'string' ? { edited_ts: editedTs(ev) as string } : {}) } : undefined
           const persona = config?.personas.find(p => p.key === key)
-          const report = (item: QueueItem) => accepted.push(() => {
-            try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
-          })
-          const post = (item: QueueItem) => async () => {
-            const posted = postAcked.get(key) ?? new Set<number>()
-            if (posted.has(item.accepted.seq)) return
-            // Claim only after the aggregate ack: retained partial fanout can
-            // retry here, but concurrent/redelivered copies recover just once.
-            posted.add(item.accepted.seq)
-            postAcked.set(key, posted)
-            const session = getSessionByPersona(key)
-            if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
-            await deps.prepare(key, item)
-          }
+          const report = (item: QueueItem) => accepted.push(() => reportReceived(key, item))
+          const post = (item: QueueItem) => () => postAccepted(key, item, 'live')
           if (usesSerialIntake(key, ev, mode, isExtSharedChannel)) {
             let selection: SerialSelection | undefined
             const result = await deps.queue.acceptDecided<SerialSelection>(key, slackKey, () => {
@@ -339,7 +347,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
                 try { void deps.joins?.saveJoins(key, [fact]).catch(() => {}) } catch { /* kept join is recovered independently */ }
               })
             }
-            if (result.item && !result.item.delivered && (result.status !== 'duplicate' || !result.item.fixed)) {
+            if (result.item?.hold?.state === 'unresolved') heldKeys.add(key)
+            if (result.item && isOpenItem(result.item) && (result.status !== 'duplicate' || !result.item.fixed)) {
               report(result.item); afterAck.push(post(result.item))
             }
             if (result.status === 'duplicate' && slackKey && deps.membership?.hasUnresolved(key, slackKey.chat_id)) {
@@ -351,7 +360,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           // A retry after partial fanout must prepare the already retained, unfixed target too.
           const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
           if (duplicate && duplicate.status !== 'failed') {
-            if (duplicate.item && !duplicate.item.fixed && !duplicate.item.delivered) {
+            if (duplicate.item?.hold?.state === 'unresolved') heldKeys.add(key)
+            if (duplicate.item && !duplicate.item.fixed && isOpenItem(duplicate.item)) {
               report(duplicate.item)
               afterAck.push(post(duplicate.item))
             }
@@ -376,6 +386,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           const path = fungiblePathOf(decision)
           if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
           if (decision.action === 'drop') { logDrop(persona, ev, decision); return }
+          // A plain-path choice raced into thread_hybrid. Re-enter on Slack's
+          // retry so a dependent reply is always decided in the writer turn.
+          if (decision.action === 'hold') { storeFailed = true; return }
           if (!slackKey) return
           if (decision.via !== 'dm' && deps.membership) {
             const membership = deps.membership.read(key, slackKey.chat_id, mode)
@@ -390,7 +403,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           try {
             const result = await deps.queue.accept(key, input)
             if (result.status === 'failed') { storeFailed = true; return }
-            if (result.item && !result.item.delivered) { report(result.item); afterAck.push(post(result.item)) }
+            if (result.item && isOpenItem(result.item)) { report(result.item); afterAck.push(post(result.item)) }
           } catch { storeFailed = true }
         } catch (err) {
           // A failed selection is undecidable, never permission to discard.
@@ -405,6 +418,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     try { await ack() } catch (err) { deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
     for (const save of saveJoins) save()
     for (const report of accepted) report()
+    for (const key of heldKeys) {
+      try { void Promise.resolve(deps.onHoldStored?.(key)).catch(() => {}) } catch { /* durable holds recover independently */ }
+    }
     await Promise.all(afterAck.map(async work => {
       try { await work() } catch (err) { deps.log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
     }))
@@ -437,6 +453,15 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (membership?.kind === 'unresolved' || (provenance && !provenance.isCurrent())) return { ...selection, requestMembership: true }
     selection.input = acceptedInput(ev, slackKey, config, decision.via)
     const joins = deps.joins, root = ev['thread_ts'] === undefined ? ev['ts'] : ev['thread_ts']
+    if (decision.action === 'hold') {
+      const stamp = joins?.stamp(key, slackKey.chat_id)
+      if (!joins || stamp?.kind !== 'decided' || !stamp.threadHybridSince) {
+        delete selection.input
+        return { ...selection, requestMembership: true }
+      }
+      selection.input.hold = { on: 'memory', thread_ts: decision.threadRoot, stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, arrived_at: joins.clock(key) }
+      return selection
+    }
     if (!joins || (decision.via !== 'mention' && decision.via !== 'broadcast') || 'edited' in ev || ev['subtype'] === 'message_changed' ||
       !isThreadTimestamp(root) || channelDeliveryFor(key, slackKey.chat_id, inputs ?? {}).delivery !== 'thread_hybrid') return selection
     const stamp = joins.stamp(key, slackKey.chat_id)
@@ -715,8 +740,14 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
 
   return {
     receive,
+    async releaseHeld(key, item, mode) {
+      if (!isOpenItem(item) || (item.hold?.state !== 'released' && item.accepted.released_at === undefined)) return
+      reportReceived(key, item, mode)
+      await postAccepted(key, item, mode)
+    },
     forget: (key) => {
       heardSets.delete(key)
+      postAcked.delete(key)
     },
     heardChannels: (key) => new Set(heardSets.get(key)),
   }

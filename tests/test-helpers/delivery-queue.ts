@@ -1,12 +1,23 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type NoticedRecord, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP } from './thread-memory.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
   source: 'slack', text: 'message', channel: 'C0TEST001', channel_type: 'channel', user: 'U0TEST001',
   key: { chat_id: 'C0TEST001', ts: '1700000000.000001' }, ts: '1700000000.000001', via: 'all', ...overrides,
 })
+/** Supply the decision's time explicitly, usually from the caller's fake clock. */
+export const memoryHold = (arrived_at: number, overrides: Partial<Omit<HoldField, 'on' | 'arrived_at'>> = {}): HoldField => ({
+  on: 'memory', thread_ts: THREAD_ROOTS.primary, stamp: { ...THREAD_STAMP }, ...overrides, arrived_at,
+})
+export function heldSlackInput(hold: HoldField, overrides: Partial<Omit<AcceptedInput, 'source' | 'via' | 'hold' | 'thread_join'>> = {}): AcceptedInput {
+  const input = slackInput({ ts: THREAD_ROOTS.secondary, key: { chat_id: THREAD_CHANNELS.primary, ts: THREAD_ROOTS.secondary },
+    ...overrides, source: 'slack', via: 'thread', thread_ts: hold.thread_ts, hold })
+  delete input.thread_join
+  return input
+}
 export const injectedInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({ source: 'interject', sender: 'interject', text: 'prompt', ...overrides })
 export const queuePath = (stateDir: string, key = 'alpha'): string => join(stateDir, 'queue', `${key}.jsonl`)
 export function seedQueue(stateDir: string, records: readonly (QueueRecord | string)[], key = 'alpha'): void {
@@ -28,5 +39,9 @@ export async function makeQueue(stateDir: string, options: Omit<DeliveryQueueOpt
 export const fixedRecord = (seq = 1, parts = ['message']): FixedRecord => ({ v: 1, kind: 'fixed', seq, parts })
 export const sentRecord = (seq = 1, attempt = 1, send_kind: 'text' | 'enter' | 'retype' = 'text'): Extract<QueueRecord, { kind: 'sent' }> => ({ v: 1, kind: 'sent', seq, attempt, part: 1, send_kind, at: 1000, session_id: 'session', transcript_path: '/scratch/transcript.jsonl', transcript_size: 0 })
 export const deliveredRecord = (seq = 1, at = 1000): DeliveredRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' } })
+/** Seed resolutions only for replay/validation; behavioral tests use queue.resolveHolds. */
+export const releasedRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'released', seq, at })
+export const withdrawnRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'withdrawn', seq, at })
+export const parkedRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'parked', seq, at })
 export const refusedRecord = (seq = 1, attempt = 1, at = 1000): RefusedRecord => ({ v: 1, kind: 'refused', seq, attempt, at })
 export const noticedRecord = (seq = 1, at = 1000): NoticedRecord => ({ v: 1, kind: 'noticed', seq, at })

@@ -12,14 +12,101 @@ import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
 import { MESSAGE_DELIVERED } from '../src/persona-diagnostics.ts'
-import { slackInput } from './test-helpers/delivery-queue.ts'
+import { heldSlackInput, memoryHold, slackInput } from './test-helpers/delivery-queue.ts'
 import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 const runs: DeliveryNoticeHarness[] = []
-async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
+async function run(options: Parameters<typeof makeDeliveryNoticeHarness>[0] = {}) { const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try {
   const path = join(r.root, 'queue')
   assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines, queue: existsSync(path) ? writtenFile(path) : undefined })
 } finally { await r.cleanup() } } })
+
+async function noticeHold(r: DeliveryNoticeHarness, ts: string = THREAD_ROOTS.secondary) {
+  const input = heldSlackInput(memoryHold(r.h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts }, text: 'private held reply' })
+  const result = await r.queue.acceptDecided(r.alpha, input.key, () => ({ store: input }))
+  if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
+  return result.item!
+}
+
+test('Memory Holds and withdrawals stay quiet through queued reconciliation and late waiting events', async () => {
+  const r = await run({ holds: true }), held = await noticeHold(r), withdrawn = await noticeHold(r, THREAD_ROOTS.third)
+  await r.queue.resolveHolds(r.alpha, [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() }])
+  await r.h.clock.advance(DELIVERY_STUCK_AFTER_MS * 2)
+  for (const item of r.queue.items(r.alpha)) {
+    r.reporting.received(r.alpha, item)
+    r.waiting(item, 'not-now')
+    r.waiting(item, 'state', { row: 'ended' })
+  }
+  r.reporting.reconcileQueued(r.alpha)
+  await r.flush()
+  expect(r.queued).toEqual([])
+  expect(r.logs).toEqual([])
+  expect(r.h.totalPosts()).toBe(0)
+  expect(r.delivered).toEqual([])
+
+  await r.queue.resolveHolds(r.alpha, [{ seq: held.accepted.seq, outcome: 'released', at: r.h.clock.now() }])
+  const released = r.queue.item(r.alpha, held.accepted.seq)!
+  r.reporting.received(r.alpha, released)
+  r.reporting.reconcileQueued(r.alpha)
+  expect(r.queued.map(q => [q.key, q.item.accepted.seq])).toEqual([[r.alpha, held.accepted.seq], [r.alpha, held.accepted.seq]])
+  r.waiting(released, 'state', { row: 'ended' }); await r.flush()
+  expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildMessagesWaitingNotice(r.ref(), 1, 0, 'down'))])
+  expect(r.h.posts(r.beta)).toEqual([])
+  expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+  assertNoLeak(r.queued)
+})
+
+test('Memory Hold release starts the real engine stuck clock at release', async () => {
+  let r: DeliveryNoticeHarness | undefined
+  const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+  r = await run({ queue: e.queue, holds: true })
+  try {
+    const held = await noticeHold(r), withdrawn = await noticeHold(r, THREAD_ROOTS.third)
+    await e.queue.resolveHolds(r.alpha, [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: e.clock.now() }])
+    e.p().row.relay_mode = 'off'
+    await e.tick()
+    await e.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    expect(r.h.totalPosts()).toBe(0)
+    const releasedAt = e.clock.now()
+    await e.queue.resolveHolds(r.alpha, [{ seq: held.accepted.seq, outcome: 'released', at: releasedAt }])
+    await e.preparation.recover()
+    await e.tick()
+    await e.advance(DELIVERY_STUCK_AFTER_MS)
+    expect(e.engine.status(r.alpha)).toMatchObject({ count: 1, ageMs: DELIVERY_STUCK_AFTER_MS })
+    await r.flush()
+    expect(r.h.totalPosts()).toBe(0)
+    await e.advance(1); await e.tick(); await r.flush()
+    expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, DELIVERY_STUCK_AFTER_MS + 1, 'relay-off', 1))])
+    expect(e.keyCalls()).toEqual([])
+    expect(e.errors).toEqual([])
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+    assertNoLeak([e.events, e.calls, e.errors])
+  } finally { await e.cleanup() }
+})
+
+test('later in-flight completion does not move a released head back to an unresolved or withdrawn hold', async () => {
+  const r = await run({ holds: true })
+  const unresolved = await noticeHold(r), withdrawn = await noticeHold(r, THREAD_ROOTS.third)
+  const released = await noticeHold(r, THREAD_ROOTS.primary)
+  const later = await r.accept({ key: { chat_id: 'C0TEST001', ts: 'later' } })
+  await r.queue.resolveHolds(r.alpha, [
+    { seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() },
+    { seq: released.accepted.seq, outcome: 'released', at: r.h.clock.now() },
+  ])
+  const head = r.queue.item(r.alpha, released.accepted.seq)!
+  r.waiting(head, 'state', { row: 'ended' }); await r.flush()
+  expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
+  // Completion of an item already in flight can follow release of this older head.
+  await r.complete(later)
+  expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
+  r.waiting(head, 'state', { row: 'ended' }); await r.flush()
+  expect(r.h.posts(r.alpha)).toHaveLength(1)
+  expect(r.delivered.map(d => d.item.accepted.seq)).toEqual([later.accepted.seq])
+  expect(r.queue.item(r.alpha, unresolved.accepted.seq)?.fixed).toBeUndefined()
+  expect(r.queue.item(r.alpha, withdrawn.accepted.seq)?.fixed).toBeUndefined()
+  expect(r.queued).toEqual([])
+})
 
 test('launch timing diagnostics preserve structured engine evidence without posting a notice or requiring queued work', async () => {
   // the real-agent timing assertion consumes these JSON facts.

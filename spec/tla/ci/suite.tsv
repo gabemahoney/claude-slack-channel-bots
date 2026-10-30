@@ -75,3 +75,7 @@ traces	PersonaDelivery	trace_storage	1800	pass	fast	simulate num=8 depth=256 see
 traces	PersonaDelivery	trace_screen	1800	pass	fast	simulate num=8 depth=256 seed=108765; structured executed-transition coverage; screen	-
 traces	PersonaDelivery	trace_flapping	1800	pass	fast	simulate num=8 depth=256 seed=109774; structured executed-transition coverage; flapping	-
 traces	PersonaDelivery	trace_identical	1800	pass	fast	simulate num=8 depth=256 seed=110783; structured executed-transition coverage; identical	-
+memory-holds	PersonaDelivery	safety_memory_holds	1800	pass	fast	constrained exhaustive Memory Hold release and withdrawal; full safety including no held delivery	-
+memory-holds	PersonaDelivery	restart_memory_holds	1800	pass	fast	constrained exhaustive Memory Hold resolution across server restart; full safety	-
+memory-holds	PersonaDelivery	control_memory_hold	1800	violation	fast	control: select an unresolved Memory Hold; target NoHeldDelivery	NoHeldDelivery
+memory-holds	PersonaDelivery	trace_memory_holds	1800	pass	fast	simulate num=8 depth=256 seed=112801; Memory Holds, resolution and storage recovery	-

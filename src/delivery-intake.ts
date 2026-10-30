@@ -1,6 +1,7 @@
 /** Post-accept immutable fixation shared by fresh and recovered work. */
 import type { WebClient } from '@slack/web-api'
 import type { DeliveryQueue, QueueAccept, QueueItem, QueueEvent } from './delivery-queue.ts'
+import { isOpenItem } from './delivery-queue.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, type TagMessage } from './tag-wrapper.ts'
 import { sanitizeFilename } from './lib.ts'
 import { RETYPE_BACKOFF_MS } from './delivery-constants.ts'
@@ -71,7 +72,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     // post-ack fixation must not clone every queued item
     // while a burst's remaining events still await durable acceptance.
     item = deps.queue.item(key, item.accepted.seq) ?? item
-    if (stopped || item.delivered) return
+    if (stopped || !isOpenItem(item)) return
     if (!item.fixed) {
       const a = item.accepted, id = `${key}:${a.seq}`
       let parts = fixedParts.get(id)
@@ -100,6 +101,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     if (!stopped) await deps.wake?.(key)
   }
   function prepare(key: string, item: QueueItem): Promise<void> {
+    if (stopped || !isOpenItem(item)) return Promise.resolve()
     try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting never owns acceptance */ }
     const id = `${key}:${item.accepted.seq}`
     const existing = inFlight.get(id)
@@ -128,7 +130,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     owns: (key, seq) => inFlight.has(`${key}:${seq}`) || retries.has(`${key}:${seq}`),
     prepare,
     async recover(keys = deps.queue.keys()) {
-      await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(item => !item.delivered).map(item => prepare(key, item))))
+      await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(isOpenItem).map(item => prepare(key, item))))
     },
     async accept(key, input) {
       const result = await deps.queue.accept(key, input)

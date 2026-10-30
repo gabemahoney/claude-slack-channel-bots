@@ -49,6 +49,7 @@ TRACE_SIMULATIONS = {"trace_" + name: {"num": 8, "depth": 256, "seed": 104729 + 
                      for i, name in enumerate(("calls", "agent", "lifecycle", "storage", "screen", "flapping", "identical"))}
 # Stable cfg inventory makes omission of a control a preflight error.
 CONTROLS = {
+    "control_memory_hold": "NoHeldDelivery",
     "control_next_item": "OneInFlight", "control_next_part": "OneInFlight",
     "control_send_is_delivery": "ReceiptBacked", "control_queue_is_receipt": "TranscriptFIFO",
     "control_start_drop": "NoDrop", "control_compact_open": "NoDrop",
@@ -131,7 +132,7 @@ def reduced_cfg(cfg: str | dict) -> bool:
         if cfg.get("cfg") == VIEW_ONLY_CONTROL:
             return cfg.get("state_reduction") == VIEW_ONLY_REDUCTION
         return cfg.get("state_reduction") == RESTART_REDUCTION
-    return (cfg in RESTART_CASES or cfg in RESTART_MUTATIONS
+    return (cfg in RESTART_CASES or cfg in RESTART_MUTATIONS or cfg == "restart_memory_holds"
             or cfg.startswith(("safety_", "live_", "core_"))
             or (cfg in CONTROLS and CONTROLS[cfg] in LIVENESS)
             or cfg in {"probe_premise", "witness_duplicates", VIEW_ONLY_CONTROL})
@@ -139,12 +140,16 @@ def reduced_cfg(cfg: str | dict) -> bool:
 
 def validate_shared_cfg(cfg: str, content: str, mode: str = "check") -> None:
     tokens = cfg_tokens(content)
+    hold_bounds = re.findall(r'^\s*MaxMemoryHolds\s*=\s*(\d+)\s*$', content, re.M)
+    hold_cases = {"safety_memory_holds", "restart_memory_holds", "trace_memory_holds", "control_memory_hold"}
+    require(hold_bounds == (["1"] if cfg in hold_cases else ["0"]),
+            "Memory Holds must be enabled only in their dedicated configurations")
     if cfg == "core_head_taken_in":
         expected = {"MaxItems": "1", "MaxParts": "1", "MaxLaunches": "1",
                     "MaxServerStarts": "2", "MaxRetypes": "1", "EnterRetries": "4",
                     "MaxAgentQueue": "2", "Faults": "{}", "PromptFlapping": "TRUE",
                     "Flapping": "FALSE", "Bug": '"none"', "Scenario": '"probe"',
-                    "IdenticalTexts": "FALSE"}
+                    "IdenticalTexts": "FALSE", "MaxMemoryHolds": "0"}
         require(mode == "check" and tokens.count("CONSTANTS") == 1,
                 "core must retain its exact exhaustive bound contract")
         start = tokens.index("CONSTANTS") + 1
@@ -175,6 +180,7 @@ CONSTANTS
   Bug = "retype_without_guards"
   Scenario = "control"
   IdenticalTexts = FALSE
+  MaxMemoryHolds = 0
 INVARIANT TypingGuards
 VIEW RestartSafetyView
 ALIAS TraceView
@@ -235,7 +241,7 @@ def validate_restart_cfg(cfg: str, content: str, mode: str = "check") -> None:
                 "the larger restart simulation must retain the raw state space")
     expected = {"MaxItems": "2", "MaxParts": "2", "MaxServerStarts": "2",
                 "EnterRetries": "4", "PromptFlapping": "TRUE", "Flapping": "FALSE",
-                "Bug": '"none"', "IdenticalTexts": "FALSE"}
+                "Bug": '"none"', "IdenticalTexts": "FALSE", "MaxMemoryHolds": "0"}
     if cfg == RESTART_SIMULATION:
         expected.update(MaxItems="3", MaxLaunches="2", MaxRetypes="3", MaxAgentQueue="11",
                         Faults='{"botRestart", "busyWaiting", "lostEnter", "serverCrash"}',
@@ -489,8 +495,18 @@ def load_manifest(root: Path, proof: bool) -> list[dict]:
 def validate_suite(rows: list[dict]) -> None:
     indexed = {row["cfg"]: row for row in rows}
     mandatory = ORIGINAL_POSITIVES | set(TRACE_SIMULATIONS) | set(RESTART_CASES) | {RESTART_SIMULATION}
+    mandatory |= {"safety_memory_holds", "restart_memory_holds", "trace_memory_holds"}
     require(mandatory <= indexed.keys(), f"missing original positive rows: {sorted(mandatory-indexed.keys())}")
     require(all(indexed[cfg]["expect"] == "pass" for cfg in mandatory), "positive row converted to a control")
+    for cfg in ("safety_memory_holds", "restart_memory_holds", "trace_memory_holds"):
+        row = indexed[cfg]
+        expected_checks = SAFETY | {"TypeOK", "NoHeldDelivery"}
+        if cfg == "trace_memory_holds":
+            expected_checks |= {"EmitSimulationTrace"}
+            require(row["simulation"] == {"num": 8, "depth": 256, "seed": 112801},
+                    "Memory Hold trace sampling changed")
+        require(set(row["checks"]) == expected_checks and not row["properties"],
+                "Memory Hold cases must check the full safety inventory")
     for cfg, parameters in TRACE_SIMULATIONS.items():
         require(indexed[cfg]["mode"] == "simulate" and indexed[cfg]["simulation"] == parameters,
                 f"original simulation parameters changed: {cfg}")

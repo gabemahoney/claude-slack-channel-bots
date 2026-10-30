@@ -291,12 +291,13 @@ function lifecycleHolder(): string {
   const holder = forwardingHolder(lifecycle, 'updateInPlace', 1)
   // Teardown still forwards the same persona to this holder and waits for
   // it, even on failure, before removing only an unapplied key's Thread Memory.
+  // Resolver cleanup cannot prevent that removal, even if forget throws.
   // Pin the whole wrapper: an arbitrary async body must not pass the audit.
   const teardown = lifecycle.get('teardown') ?? ''
   const parameter = teardown.match(/^async \((\w+)\) => /)
   expect(parameter).not.toBeNull()
   const persona = parameter![1]!
-  expect(teardown).toBe(`async (${persona}) => { try { await ${holder}.teardown(${persona}) } finally { if (!${loadedConfigName(SERVER_CODE)}?.personas.some(applied => applied.key === ${persona}.key)) await threadMemory?.remove(${persona}.key) } }`)
+  expect(teardown).toBe(`async (${persona}) => { try { await ${holder}.teardown(${persona}) } finally { if (!${loadedConfigName(SERVER_CODE)}?.personas.some(applied => applied.key === ${persona}.key)) { try { memoryHolds?.forget(${persona}.key) } finally { await threadMemory?.remove(${persona}.key) } } } }`)
   // All five on the same holder. bringUp forwards its third parameter, the
   // options carrying `recovery` (step 6): a binding that drops
   // it typechecks, but would bring a credentials-broken persona up as new.
@@ -407,10 +408,11 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => threadMemory?.forget(k), ]) }`],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemory?.forget(k), ]) }`],
       // A later bring-up awaits this key's Thread Memory load, then recovers
-      // queued joins before connecting, only while running with both holders.
-      ['loadThreadMemory', 'async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) recoverQueuedJoins(key, deliveryQueue, threadMemory) }'],
+      // queued joins and starts detached hold resolution before connecting,
+      // only while running with both holders.
+      ['loadThreadMemory', "async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { recoverQueuedJoins(key, deliveryQueue, threadMemory) void memoryHolds?.resolve(key, 'recovered').catch(() => {}) } }"],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],

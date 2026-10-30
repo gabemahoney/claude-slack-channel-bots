@@ -25,7 +25,7 @@ import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { createChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
 import { createSharedChannelAuthority, type SharedChannelAuthority } from '../../src/shared-channels.ts'
 import { configBytes, initialSharedState, readSharedState, sharedChannelPath } from './shared-channels.ts'
-import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
+import { createPersonaRouting, type PersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { LOST_MESSAGE_STATES, type LostMessageState } from '../../src/lost-message.ts'
@@ -73,7 +73,7 @@ import { makeNotifierStack } from './persona-notifier.ts'
 import { errTmuxUnresponsive } from './agent-director-stub.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { conflictForPersona } from './conflict-cases.ts'
-import { makeThreadMemoryHarness, type ThreadMemoryHarness } from './thread-memory.ts'
+import { makeThreadMemoryHarness, type ThreadMemoryHarness, type ThreadHarnessOptions } from './thread-memory.ts'
 import { eligibleMembership } from './fungible-decision.ts'
 
 /** Explicit observations for tests of queue/recovery behavior. This projection
@@ -557,7 +557,12 @@ export interface RoutingHarnessOptions {
    */
   mode?: ChannelMode
   /** Opt in to real Thread Memory over the same shared authority as routing. */
-  threadMemory?: Record<string, never>
+  threadMemory?: {
+    fs?: ThreadHarnessOptions['fs']
+    /** Exercise the unresolved-store boundary when the joins dependency is absent. */
+    joins?: false
+    onHoldStored?: PersonaRoutingDeps['onHoldStored']
+  }
   /** Queue I/O and event seams; all paths remain under baseDir. */
   queueOptions?: Pick<DeliveryQueueOptions, 'fs' | 'onEvent'>
   onReceived?: PersonaRoutingDeps['onReceived']
@@ -624,6 +629,11 @@ export interface HarnessPost {
 export interface RoutingHarness {
   threads?: ThreadMemoryHarness
   threadMemoryReads: Array<[string, string, string]>
+  /** Resolver notifications, recorded only by the opt-in Thread Memory wiring. */
+  holdStored: string[]
+  releaseHeld: PersonaRouting['releaseHeld']
+  /** Preparation requests made by opt-in routing, including requests the preparer refuses. */
+  preparationCalls: Array<{ key: string; seq: number }>
   /** Hold the routing's detached saves for one persona; release before cleanup. */
   holdJoinSaves(key: string): () => void
   settleJoinSaves(): Promise<void>
@@ -921,6 +931,9 @@ export function makeRoutingHarness(
   const h: RoutingHarness = {
     queue,
     threadMemoryReads: [],
+    holdStored: [],
+    releaseHeld: (key, item, mode) => routing.releaseHeld(key, item, mode),
+    preparationCalls: [],
     holdJoinSaves(key) {
       if (joinSaveHolds.has(key)) throw new Error('join saves already held')
       let release!: () => void
@@ -1037,7 +1050,13 @@ export function makeRoutingHarness(
     h.channelDelivery.authority.subscribe(next => { h.config = next })
   }
 
-  if (opts.threadMemory !== undefined) h.threads = makeThreadMemoryHarness(baseDir, { authority: h.channelDelivery!.authority })
+  if (opts.threadMemory !== undefined) h.threads = makeThreadMemoryHarness(baseDir, {
+    authority: h.channelDelivery!.authority,
+    fs: opts.threadMemory.fs,
+    // Query at use time: unresolvedHolds includes a decided hold whose store
+    // is still in flight, not just the accepted items visible in the queue.
+    heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
+  })
   const threadReady = h.threads?.start()
 
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
@@ -1047,7 +1066,9 @@ export function makeRoutingHarness(
       h.threadMemoryReads.push([key, channel, root])
       return h.threads!.memory.view(key, channel, root)
     },
-    joins: opts.threadMemory === undefined ? undefined : {
+    threadStampUndecided: opts.threadMemory === undefined ? undefined :
+      (key, channel) => h.channelDelivery?.authority.channelStamp(key, channel)?.kind === 'undecided',
+    joins: opts.threadMemory === undefined || opts.threadMemory.joins === false ? undefined : {
       stamp: (key, channel) => h.channelDelivery?.authority.channelStamp(key, channel),
       hasSavedJoin: (key, channel, root, stamp) => h.threads!.memory.hasSavedJoin(key, channel, root, stamp),
       clock: key => h.threads!.memory.clock(key),
@@ -1060,9 +1081,17 @@ export function makeRoutingHarness(
         return saved
       },
     },
+    onHoldStored: opts.threadMemory === undefined ? undefined : key => {
+      h.holdStored.push(key)
+      h.order.push(`hold-stored:${key}`)
+      return opts.threadMemory?.onHoldStored?.(key)
+    },
     onReceived: opts.onReceived,
     queue,
-    prepare: preparation.prepare,
+    prepare: opts.threadMemory === undefined ? preparation.prepare : (key, item) => {
+      h.preparationCalls.push({ key, seq: item.accepted.seq })
+      return preparation.prepare(key, item)
+    },
     getPersonaConfig: () => {
       h.order.push('config')
       return h.config

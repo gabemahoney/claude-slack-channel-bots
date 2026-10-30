@@ -64,6 +64,7 @@ function outcomeText(outcome: DeliveryDecision): string {
   const path = pathOf(outcome)
   const onPath = path === undefined ? '' : ` [fungible path: ${path.channelType}, at ${path.channelDelivery}]`
   if (outcome.action === 'deliver') return `delivered via ${outcome.via}${onPath}`
+  if (outcome.action === 'hold') return `held for ${outcome.hold} via ${outcome.via} in ${outcome.threadRoot}${onPath}`
   if ('refusal' in outcome) return `not delivered: ${outcome.reason} (${outcome.refusal})`
   if ('unclaimed' in outcome) return `not delivered: ${outcome.reason} (${outcome.unclaimed ? 'unclaimed' : 'claimed'})`
   return `not delivered: ${outcome.reason}${onPath}`

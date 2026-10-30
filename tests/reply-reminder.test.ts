@@ -9,9 +9,11 @@ import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { deliveredRecord, fixedRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, heldSlackInput, memoryHold, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 import { THREAD_ROOTS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { appendTranscript, promptEntry } from './test-helpers/working-row-panes.ts'
 
 const THREAD_ROOT = THREAD_ROOTS.primary
 let dir: string
@@ -57,6 +59,52 @@ const joinedMention = (overrides: Partial<AcceptedInput> = {}) => slackInput({
   via: 'mention', ts: THREAD_ROOT, thread_ts: THREAD_ROOT,
   key: { chat_id: slackInput().channel!, ts: THREAD_ROOT },
   thread_join: { thread_ts: THREAD_ROOT, stamp: { ...THREAD_STAMP }, at: 1000 }, ...overrides,
+})
+
+test('Memory Holds never get reminders until release and durable delivery; withdrawal stays ineligible', async () => {
+  const clock = createFakeClock(), q = await open({ now: clock.now }), h = harness(q)
+  for (const ts of [THREAD_ROOTS.secondary, THREAD_ROOTS.third]) {
+    const input = heldSlackInput(memoryHold(clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
+    expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+  }
+  await q.resolveHolds('alpha', [{ seq: 2, outcome: 'withdrawn', at: clock.now() }])
+  await clock.advance(REPLY_REMINDER_KEEP_MS)
+  await h.monitor.observe('alpha', h.row('working'))
+  await h.monitor.observe('alpha', h.row('waiting'))
+  expect(q.replyReminderItems('alpha')).toEqual([])
+  expect(nudges(q)).toEqual([])
+  expect(h.prepared).toEqual([])
+
+  await q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: clock.now() }])
+  await h.monitor.observe('alpha', h.row('working'))
+  await h.monitor.observe('alpha', h.row('waiting'))
+  expect(q.replyReminderItems('alpha')).toEqual([])
+  expect(nudges(q)).toEqual([])
+  const engine = await makeEngineHarness({ queue: q, stateDir: dir })
+  try {
+    await engine.clock.advanceTo(clock.now())
+    await engine.preparation.recover()
+    engine.p().autoReceipt = false
+    await engine.tick()
+    await engine.until(() => engine.keyCalls().some(c => c.params.key === 'Enter'))
+    expect(q.replyReminderItems('alpha')).toEqual([])
+    await h.monitor.observe('alpha', h.row('working'))
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect(nudges(q)).toEqual([])
+    // Take in the real engine's exact fixed text; no test-authored delivery record.
+    appendTranscript(engine.p().path, [promptEntry(q.item('alpha', 1)!.fixed!.parts[0]!)])
+    await engine.until(() => q.item('alpha', 1)?.delivered === true)
+    expect(q.replyReminderItems('alpha').map(r => r.seq)).toEqual([1])
+    await h.monitor.observe('alpha', h.row('working', { session_id: engine.p().row.session_id }))
+    await h.monitor.observe('alpha', h.row('waiting', { session_id: engine.p().row.session_id }))
+    expect(nudges(q).map(i => [i.accepted.reminder_for, i.accepted.text])).toEqual([[1, REPLY_REMINDER_TEXT]])
+    expect(h.prepared.map(p => p.item.accepted.reminder_for)).toEqual([1])
+    expect(q.item('alpha', 2)?.hold?.state).toBe('withdrawn')
+    expect(q.item('alpha', 2)?.fixed).toBeUndefined()
+    expect(h.errors).toEqual([])
+    expect(engine.errors).toEqual([])
+    assertNoLeak([h.prepared, h.errors, engine.events, engine.calls, engine.errors, readQueue(dir)])
+  } finally { await engine.cleanup() }
 })
 
 describe('join retention preserves reply reminders', () => {

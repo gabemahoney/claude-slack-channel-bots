@@ -82,7 +82,11 @@ def write_bytes(path, data):
 
 SET_FIELDS = {"accepted", "fixed", "refused", "delivered", "everSent",
               "everDelivered", "acked", "credited", "expired", "noticed", "receipts",
-              "Faults", "engineActions", "controlActions", "expiredTimers"}
+              "Faults", "engineActions", "controlActions", "expiredTimers",
+              "held", "withdrawn", "bypassed", "holds"}
+# JSON arrays erase the model's set/sequence distinction. This applies only
+# to lists: AD reading fields also named "held" remain scalar booleans, and
+# members of bypassed remain ordered pairs rather than nested sets.
 FAIR_ACTIONS = {"observe": "EngineObserve /\\ EnvTypable", "engine": "EngineStep",
                 "gate": "GateStep", "reconnect": "ReconnectStep",
                 "takeIn": "AgentTakeIn", "turnEnd": "AgentTurnEnd",
@@ -682,7 +686,72 @@ NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~
                     "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
 
 
+def weak_observation_candidate_inputs(cfg_text):
+    """Search for observation starvation, not a fair gate-cancellation cycle.
+
+    Own turns may cancel every delivery request even with strong observation
+    fairness in the raw spec. Such a lasso must still fail validate_evidence.
+    This existential guide instead reads only during busy turns after accepting
+    work. Original Next, all fairness/target checks and the same-environment
+    correct contrast remain the independent proof obligations.
+    """
+    spec, target, bug, constants = cfg_context(cfg_text)
+    require(bug == "weak_observe", "unsupported weak observation candidate")
+    assumption = " /\\ TypableHeadTakeInAssumption" if spec == "Spec" else ""
+    module = r'''---------------- MODULE ConcreteCandidate ----------------
+EXTENDS PersonaDelivery
+TargetedMutationWitnessGuide ==
+ CASE st.w.kind # "none" -> EngineStep
+ [] st.h.accepted = {} /\ st.observation = "none" -> Accept
+ [] st.observation = "ready" \/ InternalContinuation -> EngineStep
+ [] st.a.actual = "idle" -> AgentOwnTurnStart
+ [] st.transition = "EngineStep" /\ st.action = "wait" -> AgentTurnEnd
+ [] OTHER -> EngineObserve
+CandidateNext == Next /\ TargetedMutationWitnessGuide
+CandidateSpec == Init /\ [][CandidateNext]_vars
+NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~" + target + " )\n" + "=" * 56 + "\n"
+    return module, ("SPECIFICATION CandidateSpec\n" + constants + "PROPERTY NotConcrete\n"
+                    "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
+
+
+def permission_starvation_candidate_inputs(cfg_text):
+    """Select the no-assumption control's intended permission-starvation case.
+
+    The projected search can also select own-turn cancellation or a prefix
+    with an earlier take-in. Neither establishes this control's original
+    permission context. Guide only existential selection through original
+    Next; the full Init/edge/record/fairness/target replay and the unchanged
+    no-take-in, recurring-permission and zero-fault guards still decide it.
+    """
+    spec, target, bug, constants = cfg_context(cfg_text)
+    require((spec, target, bug) == ("SpecWithoutHeadTakeInAssumption", "HeadTakenIn", "none")
+            and '  Scenario = "control-no-assumption"' in constants.splitlines(),
+            "unsupported permission-starvation candidate")
+    module = r'''---------------- MODULE ConcreteCandidate ----------------
+EXTENDS PersonaDelivery
+PermissionStarvationGuide ==
+ CASE st.w.kind # "none" -> EngineStep
+ [] st.h.accepted = {} /\ st.observation = "none" -> Accept
+ [] st.observation = "ready" /\ st.a.row = "waiting" /\
+    EngineChoice(StepKnowledge) = "requestGate" -> PermissionOpen
+ [] st.e.request = "delivery" /\ st.g.owner = "free" -> GateStep
+ [] st.observation = "ready" \/ InternalContinuation -> EngineStep
+ [] st.a.permission -> PermissionAnswer
+ [] OTHER -> EngineObserve
+CandidateNext == Next /\ PermissionStarvationGuide
+CandidateSpec == Init /\ [][CandidateNext]_vars
+NotConcrete == ~(Fairness /\ []RestartStateConstraint /\ ~HeadTakenIn)
+========================================================
+'''
+    return module, ("SPECIFICATION CandidateSpec\n" + constants + "PROPERTY NotConcrete\n"
+                    "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
+
+
 def candidate_search_inputs(cfg_text, raw):
+    if cfg_context(cfg_text)[:3] == ("SpecWithoutHeadTakeInAssumption", "HeadTakenIn", "none"):
+        return "independent-targeted-guide", permission_starvation_candidate_inputs(cfg_text)
+    if cfg_context(cfg_text)[2] == "weak_observe":
+        return "independent-targeted-guide", weak_observation_candidate_inputs(cfg_text)
     if cfg_context(cfg_text)[2] == "replace_observation":
         return "independent-targeted-guide", observation_replacement_candidate_inputs(cfg_text)
     if cfg_context(cfg_text)[2] in {"park_retype", "unreadable_park", "hold_gate_mcp"}:

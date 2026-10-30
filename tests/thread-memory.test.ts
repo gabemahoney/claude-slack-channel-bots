@@ -892,6 +892,213 @@ describe('Thread Memory queued join recovery', () => {
   })
 })
 
+describe('Thread Memory held-stamp retention', () => {
+  test.each(['publication', 'load', 'recovery'] as const)('%s keeps named stale joins apart, with their earliest saved time through compaction and reopen', async origin => {
+    let held: ThreadJoin[] = []
+    const heldStamps = (key: string) => key === 'alpha' ? held : []
+    const h = fixture({ heldStamps })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary])).kind).toBe('applied')
+    const early = h.fact({ at: THREAD_TIME + 10 }), late = { ...early, at: early.at + 10 }
+    const unnamed = h.fact({ channel: C.secondary, at: late.at + 10 })
+    held = [early]
+    if (origin === 'load') {
+      h.unsubscribe() // Judge the seeded records only at startup, after the authority has changed.
+      seedThreads(h.stateDir, [threadHeader(), joinRecord(late), joinRecord(early, 3), joinRecord(unnamed, 4)])
+    } else {
+      await h.start()
+      if (origin === 'publication') await h.memory.saveJoins('alpha', [late, early, unnamed])
+    }
+    h.io.reset()
+    expect(h.choose('mentions').kind).toBe('applied')
+    expect(h.choose('mentions', 'alpha', C.secondary).kind).toBe('applied')
+    expect(h.io.writes()).toEqual([])
+    if (origin === 'load') await h.start()
+    if (origin === 'recovery') {
+      expect(h.memory.threadJoinSaved('alpha', early.channel, early.root, early.stamp, early.at)).toBe(false)
+      h.memory.recoverJoins('alpha', [late, early, unnamed, { ...early, at: unnamed.at }])
+      expect(h.memory.joins('alpha')).toEqual([])
+      await h.clock.flush()
+    }
+    expect(h.memory.joins('alpha')).toEqual([])
+    expect(view(h)).toBe('not-joined')
+    expect(h.memory.hasSavedJoin('alpha', early.channel, early.root, early.stamp)).toBe(false)
+    expect(h.memory.isJoinSaved('alpha', early)).toBe(false)
+    expect(h.memory.joinedBy('alpha', early.channel, early.root, { ...early.stamp }, early.at)).toBe(true)
+    expect(h.memory.joinedBy('alpha', early.channel, early.root, early.stamp, early.at - 1)).toBe(false)
+    expect(h.memory.joinedBy('alpha', unnamed.channel, unnamed.root, unnamed.stamp, unnamed.at)).toBe(false)
+    expect(h.memory.threadJoinSaved('alpha', early.channel, early.root, early.stamp, early.at)).toBe(true)
+    expect(h.memory.threadJoinSaved('alpha', early.channel, early.root, early.stamp, early.at - 1)).toBe(false)
+    await h.memory.compact('alpha')
+    const records = savedJoins(h)
+    expect(records).toHaveLength(1); expect(records[0]).toMatchObject(early)
+    await h.close()
+    const reopened = fixture({ reopen: true, heldStamps }, h.stateDir); await reopened.start()
+    expect(savedJoins(reopened)).toEqual(records)
+    expect(reopened.memory.joins('alpha')).toEqual([])
+    expect(reopened.memory.joinedBy('alpha', early.channel, early.root, early.stamp, early.at)).toBe(true)
+    expect(reopened.memory.hasSavedJoin('alpha', early.channel, early.root, early.stamp)).toBe(false)
+    held = []
+    reopened.memory.pruneHeldJoins('alpha')
+    expect(reopened.memory.joinedBy('alpha', early.channel, early.root, early.stamp, early.at)).toBe(false)
+    await reopened.memory.compact('alpha')
+    expect(savedJoins(reopened)).toEqual([])
+  })
+
+  test.each(['unread', 'unreadable', 'read', 'kept', 'recovered', 'held'] as const)('joinedBy answers from %s evidence without I/O and respects stamp, root and arrival', async origin => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held }), fact = h.fact()
+    held = [fact]
+    if (origin === 'unread' || origin === 'unreadable' || origin === 'read') seedThreads(h.stateDir, [threadHeader(), joinRecord(fact)])
+    if (origin === 'unreadable') h.io.fail('readFileSync')
+    if (origin !== 'unread') await h.start()
+    if (origin === 'kept') expect(h.memory.addJoin('alpha', fact)).toBe(true)
+    if (origin === 'recovered') h.memory.recoverJoins('alpha', [fact])
+    if (origin === 'held') {
+      await h.memory.saveJoins('alpha', [fact])
+      expect(h.choose('mentions').kind).toBe('applied')
+    }
+    const unknown = origin === 'unread' || origin === 'unreadable'
+    h.io.reset()
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, { ...fact.stamp }, fact.at)).toBe(unknown ? 'unknown' : true)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at + 1)).toBe(unknown ? 'unknown' : true)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at - 1)).toBe(unknown ? 'unknown' : false)
+    expect(h.memory.joinedBy('alpha', C.secondary, fact.root, fact.stamp, fact.at)).toBe(unknown ? 'unknown' : false)
+    expect(h.memory.joinedBy('alpha', fact.channel, R.secondary, fact.stamp, fact.at)).toBe(unknown ? 'unknown' : false)
+    expect(h.io.calls).toEqual([])
+    if (unknown) return
+    expect(h.choose('mentions').kind).toBe('applied')
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    const current = h.fact()
+    expect(current.stamp).not.toEqual(fact.stamp)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, current.stamp, current.at)).toBe(false)
+    expect(h.memory.hasSavedJoin('alpha', fact.channel, fact.root, current.stamp)).toBe(false)
+    expect(view(h)).toBe('not-joined')
+    // A new join in the same root cannot hide the old stamp's earlier evidence.
+    expect(h.memory.addJoin('alpha', current)).toBe(true)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at)).toBe(true)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, current.stamp, fact.at)).toBe(false)
+    expect(view(h)).toBe('joined')
+    h.failShared(() => 'unsynced'); expect(h.mode('open').kind).toBe('unresolved')
+    const undecided = h.authority.channelStamp('alpha', fact.channel)
+    expect(undecided).toEqual({ kind: 'undecided' })
+    // The public query must reject an undecided authority value even across a loose caller boundary.
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, undecided as never, current.at)).toBe(false)
+  })
+
+  test('stale held recovery batches with current joins, skips covered candidates, and confirms only saved times', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held }); await h.start()
+    const early = h.fact({ at: THREAD_TIME + 10 }), late = { ...early, at: early.at + 10 }
+    held = [early]
+    await h.memory.saveJoins('alpha', [late])
+    expect(h.choose('mentions').kind).toBe('applied'); expect(h.choose('thread_hybrid').kind).toBe('applied')
+    const current = h.fact({ root: R.secondary })
+    h.io.fail('writeSync'); h.io.reset()
+    h.memory.recoverJoins('alpha', [early, { ...early, at: late.at }, current])
+    expect(h.memory.keptFacts('alpha')).toEqual([early, current])
+    expect(h.memory.joins('alpha')).toEqual([{ join: current }])
+    expect(h.io.calls).toEqual([])
+    expect(h.memory.joinedBy('alpha', early.channel, early.root, early.stamp, early.at)).toBe(true)
+    expect(h.memory.threadJoinSaved('alpha', early.channel, early.root, early.stamp, early.at)).toBe(false)
+    expect(h.memory.threadJoinSaved('alpha', early.channel, early.root, early.stamp, late.at)).toBe(true)
+    expect(view(h)).toBe('not-joined'); expect(view(h, current.root)).toBe('joined')
+    await h.clock.flush()
+    expect(h.events.filter(e => e.type === 'append-failed')).toHaveLength(1)
+    h.io.heal()
+    await h.memory.compact('alpha')
+    expect(savedJoins(h)).toEqual([joinRecord(late)]) // Never serialize the earlier, unsaved time as saved.
+    h.io.reset()
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(savedJoins(h)).toEqual([joinRecord(late), joinRecord(early, 3), joinRecord(current, 4)])
+    expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
+    expect(h.memory.threadJoinSaved('alpha', early.channel, early.root, early.stamp, early.at)).toBe(true)
+    const bytes = journalBytes(h)
+    h.memory.recoverJoins('alpha', [early, current]); await h.clock.flush()
+    expect(journalBytes(h)).toEqual(bytes)
+  })
+
+  test('the call-time provider cannot revive dropped joins, and pruning prevents a kept stale join from being appended', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held }); await h.start()
+    const dropped = h.fact()
+    await h.memory.saveJoins('alpha', [dropped])
+    expect(h.choose('mentions').kind).toBe('applied') // Empty provider: drop at this publication.
+    held = [dropped]
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    expect(h.memory.joinedBy('alpha', dropped.channel, dropped.root, dropped.stamp, dropped.at)).toBe(false)
+    const kept = h.fact({ root: R.secondary })
+    held = [kept]; expect(h.memory.addJoin('alpha', kept)).toBe(true)
+    expect(h.choose('mentions').kind).toBe('applied')
+    expect(h.memory.joinedBy('alpha', kept.channel, kept.root, kept.stamp, kept.at)).toBe(true)
+    expect(h.memory.threadJoinSaved('alpha', kept.channel, kept.root, kept.stamp, kept.at)).toBe(false)
+    held = []
+    h.memory.pruneHeldJoins('alpha')
+    expect(h.memory.joinedBy('alpha', kept.channel, kept.root, kept.stamp, kept.at)).toBe(false)
+    h.io.reset(); expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(h.io.calls.filter(c => c.op === 'writeSync')).toEqual([])
+    expect(h.memory.keptFacts('alpha')).toEqual([])
+    h.memory.recoverJoins('alpha', [kept]); await h.clock.flush()
+    await h.memory.compact('alpha'); expect(savedJoins(h)).toEqual([])
+    await h.close()
+    const reopened = fixture({ reopen: true, heldStamps: () => [] }, h.stateDir); await reopened.start()
+    expect(reopened.memory.joins('alpha')).toEqual([])
+    expect(reopened.memory.joinedBy('alpha', kept.channel, kept.root, kept.stamp, kept.at)).toBe(false)
+  })
+
+  test.each(['current', 'stale-held'] as const)('B1: qualifying pending joins stay unknown until the %s publication recovers them', async outcome => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'], [C.primary, C.secondary])).kind).toBe('applied')
+    await h.start()
+    const fact = h.fact({ at: THREAD_TIME + 1000 }), other = h.fact({ channel: C.secondary })
+    held = [fact]
+    h.failShared(() => 'unsynced')
+    expect((outcome === 'current' ? h.mode('open') : h.choose('mentions')).kind).toBe('unresolved')
+    expect(h.authority.channelStamp('alpha', fact.channel)).toEqual({ kind: 'undecided' })
+    h.memory.recoverJoins('alpha', [fact]); await h.clock.flush()
+    expect(h.memory.store('alpha')?.readable).toBe(true)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at)).toBe('unknown')
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, { ...fact.stamp }, fact.at + 1)).toBe('unknown')
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at - 1)).toBe(false)
+    expect(h.memory.joinedBy('alpha', fact.channel, R.secondary, fact.stamp, fact.at)).toBe(false)
+    expect(h.memory.joinedBy('alpha', C.secondary, fact.root, fact.stamp, fact.at)).toBe(false)
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, other.stamp, fact.at)).toBe(false)
+    expect(h.memory.joinedBy('beta', fact.channel, fact.root, fact.stamp, fact.at)).toBe(false)
+    expect(savedJoins(h)).toEqual([])
+    h.failShared(); expect(h.authority.recoverDurability().kind).toBe('applied')
+    // Recovery is synchronous with publication; its append follows separately.
+    expect(h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at)).toBe(true)
+    expect(h.memory.threadJoinSaved('alpha', fact.channel, fact.root, fact.stamp, fact.at)).toBe(false)
+    expect(view(h)).toBe(outcome === 'current' ? 'joined' : 'not-joined')
+    await h.clock.flush()
+    expect(savedJoins(h)).toEqual([joinRecord(fact)])
+    expect(h.memory.threadJoinSaved('alpha', fact.channel, fact.root, fact.stamp, fact.at)).toBe(true)
+  })
+
+  test.each(['forget', 'remove'] as const)('%s discards a held store without affecting another key or reviving unsaved work', async action => {
+    const held = new Map<string, ThreadJoin[]>()
+    const h = fixture({ heldStamps: key => held.get(key) ?? [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    await h.start()
+    const a = h.fact(), b = h.fact({}, 'beta')
+    for (const [key, fact] of [['alpha', a], ['beta', b]] as const) {
+      held.set(key, [fact]); expect(h.memory.addJoin(key, fact)).toBe(true)
+      expect(h.choose('mentions', key).kind).toBe('applied')
+      expect(h.memory.joinedBy(key, fact.channel, fact.root, fact.stamp, fact.at)).toBe(true)
+    }
+    await h.memory.flush('beta'); const betaBytes = journalBytes(h, 'beta')
+    const saving = h.memory.flush('alpha'), removing = h.memory[action]('alpha')
+    expect(await saving).toEqual({ kind: 'cancelled' }); await removing
+    expect(h.memory.joinedBy('alpha', a.channel, a.root, a.stamp, a.at)).toBe('unknown')
+    expect(h.memory.joinedBy('beta', b.channel, b.root, b.stamp, b.at)).toBe(true)
+    held.delete('alpha'); await h.memory.loadKey('alpha'); await h.memory.flush('alpha')
+    expect(h.memory.joinedBy('alpha', a.channel, a.root, a.stamp, a.at)).toBe(false)
+    expect(h.memory.hasSavedJoin('beta', b.channel, b.root, b.stamp)).toBe(false)
+    expect(h.memory.threadJoinSaved('beta', b.channel, b.root, b.stamp, b.at)).toBe(true)
+    expect(journalBytes(h, 'beta')).toEqual(betaBytes)
+  })
+})
+
 describe('Thread Memory seal judgments and closed metadata', () => {
   test('production schema accepts running, clean and empty files and rejects extra content at every level', () => {
     const h = sealFixture(), running = runningSealEntry(), clean = cleanSealEntry(h.stateDir)

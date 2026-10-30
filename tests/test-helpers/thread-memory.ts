@@ -174,6 +174,7 @@ export interface ThreadHarnessOptions {
   seal?: boolean | { fs?: ReturnType<typeof threadSealFsControls>; onEvent?: (event: ThreadMemorySealEvent) => void }
   queueOptions?: Omit<DeliveryQueueOptions, 'stateDir'>
   setCreated?: ThreadMemoryOptions['setCreated']; clearCreated?: ThreadMemoryOptions['clearCreated']
+  heldStamps?: ThreadMemoryOptions['heldStamps']
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
@@ -203,6 +204,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
+    heldStamps: options.heldStamps,
     threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
     markerKeys: () => authority.threadMemoryCreatedKeys(), canRemove: options.canRemove ?? (key => !authority.reviewHeld(key)),
     setCreated: key => {
