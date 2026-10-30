@@ -408,8 +408,9 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
       ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => threadMemory?.forget(k), ]) }`],
-      // A later bring-up reads this key's Thread Memory before connecting.
-      ['loadThreadMemory', 'key => threadMemory?.loadKey(key)'],
+      // A later bring-up awaits this key's Thread Memory load, then recovers
+      // queued joins before connecting, only while running with both holders.
+      ['loadThreadMemory', 'async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) recoverQueuedJoins(key, deliveryQueue, threadMemory) }'],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],

@@ -9,9 +9,11 @@ import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { deliveredRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { THREAD_ROOTS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 
-const THREAD_ROOT = '1700000000.000100'
+const THREAD_ROOT = THREAD_ROOTS.primary
 let dir: string
 let queues: ReplyReminderQueue[]
 let monitors: ReplyReminders[]
@@ -45,12 +47,165 @@ async function send(queue: ReplyReminderQueue, key = 'alpha', input: AcceptedInp
   const accepted = await queue.accept(key, input)
   if (accepted.status !== 'accepted') throw new Error('fixture acceptance failed')
   const seq = accepted.seq
-  await queue.append(key, { v: 1, kind: 'fixed', seq, parts: ['delivered body'] })
+  await queue.append(key, fixedRecord(seq, ['delivered body']))
   await queue.append(key, sentRecord(seq))
   if (complete) await queue.append(key, deliveredRecord(seq))
   return seq
 }
 const nudges = (q: ReplyReminderQueue, key = 'alpha') => q.items(key).filter(item => item.accepted.reminder_for !== undefined)
+const joinedMention = (overrides: Partial<AcceptedInput> = {}) => slackInput({
+  via: 'mention', ts: THREAD_ROOT, thread_ts: THREAD_ROOT,
+  key: { chat_id: slackInput().channel!, ts: THREAD_ROOT },
+  thread_join: { thread_ts: THREAD_ROOT, stamp: { ...THREAD_STAMP }, at: 1000 }, ...overrides,
+})
+
+describe('join retention preserves reply reminders', () => {
+  test('a joined mention, its thread reply and a plain mention each retain one eligible reminder when the join becomes saved', async () => {
+    let saved = false
+    const options = { threadJoinSaved: () => saved }
+    const q = await open(options)
+    const joined = await send(q, 'alpha', joinedMention())
+    const reply = await send(q, 'alpha', slackInput({ via: 'thread', thread_ts: THREAD_ROOT,
+      ts: THREAD_ROOTS.secondary, key: { chat_id: slackInput().channel!, ts: THREAD_ROOTS.secondary } }))
+    const plain = await send(q, 'alpha', slackInput({ via: 'mention',
+      ts: THREAD_ROOTS.third, key: { chat_id: slackInput().channel!, ts: THREAD_ROOTS.third } }))
+    await q.compact(); await q.stop()
+    const replay = await open(options), h = harness(replay)
+    expect(replay.items('alpha').map(item => [item.accepted.seq, item.delivered])).toEqual([[joined, true]])
+    expect(replay.openCount('alpha')).toBe(0)
+    expect(replay.replyReminderItems('alpha').map(record => record.seq).sort((a, b) => a - b)).toEqual([joined, reply, plain])
+    await h.monitor.observe('alpha', h.row('working'))
+    saved = true
+    await replay.compact()
+    expect(replay.items('alpha')).toEqual([])
+    await h.monitor.observe('alpha', h.row('waiting'))
+    await h.monitor.observe('alpha', h.row('working'))
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect(nudges(replay).map(item => [item.accepted.reminder_for, item.accepted.text])).toEqual(
+      [joined, reply, plain].map(seq => [seq, REPLY_REMINDER_TEXT]))
+    expect(h.prepared.map(p => p.item.accepted.reminder_for)).toEqual([joined, reply, plain])
+    expect(replay.openCount('alpha')).toBe(3)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['replied', 'cancelled', 'nudged'] as const)('an unsaved join cannot re-arm a %s reminder after compaction and reopen', async state => {
+    let saved = false
+    const options = { threadJoinSaved: () => saved }
+    const q = await open(options), h = harness(q)
+    const seq = await send(q, 'alpha', joinedMention())
+    if (state === 'replied') await h.monitor.noteReplyCall('alpha')
+    else if (state === 'cancelled') await h.monitor.forget('alpha')
+    else {
+      await h.monitor.observe('alpha', h.row('working'))
+      await h.monitor.observe('alpha', h.row('waiting'))
+      const reminder = nudges(q)[0]!
+      await q.append('alpha', fixedRecord(reminder.accepted.seq, [REPLY_REMINDER_TEXT]))
+      await q.append('alpha', sentRecord(reminder.accepted.seq))
+      await q.append('alpha', deliveredRecord(reminder.accepted.seq))
+    }
+    expect(q.replyReminderItems('alpha')).toEqual([])
+    expect(readQueue(dir).filter(record => record.kind === 'reply-reminder').at(-1)).toEqual(expect.objectContaining({ seq, state }))
+    await h.monitor.stop(); await q.compact(); await q.stop()
+    const replay = await open(options), resumed = harness(replay)
+    expect(replay.item('alpha', seq)?.delivered).toBe(true)
+    expect(replay.openCount('alpha')).toBe(0)
+    expect(replay.replyReminderItems('alpha')).toEqual([])
+    expect(readQueue(dir).filter(record => record.kind === 'reply-reminder')).toEqual([expect.objectContaining({ seq, state })])
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect(nudges(replay)).toEqual([])
+    expect(resumed.prepared).toEqual([])
+    saved = true
+    await resumed.monitor.stop(); await replay.compact(); await replay.stop()
+    const final = await open(options), last = harness(final)
+    await last.monitor.observe('alpha', last.row('working'))
+    await last.monitor.observe('alpha', last.row('waiting'))
+    expect(final.items('alpha')).toEqual([])
+    expect(final.replyReminderItems('alpha')).toEqual([])
+    expect(last.prepared).toEqual([])
+  })
+
+  test.each([false, true])('a torn terminal append stays suppressed after the reminder compacts away (delivered before reopen: %s)', async deliveredBeforeReopen => {
+    let saved = false
+    const options = { threadJoinSaved: () => saved }
+    const q = await open(options), h = harness(q)
+    const seq = await send(q, 'alpha', joinedMention())
+    await h.monitor.observe('alpha', h.row('working'))
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect(h.prepared.map(p => p.item.accepted.reminder_for)).toEqual([seq])
+    const reminderSeq = nudges(q)[0]!.accepted.seq
+    const deliverReminder = async (queue: ReplyReminderQueue) => {
+      await queue.append('alpha', fixedRecord(reminderSeq, [REPLY_REMINDER_TEXT]))
+      await queue.append('alpha', sentRecord(reminderSeq))
+      await queue.append('alpha', deliveredRecord(reminderSeq))
+    }
+    if (deliveredBeforeReopen) await deliverReminder(q)
+    await h.monitor.stop(); await q.stop()
+    // Keep the accepted reminder, but simulate losing its terminal append.
+    seedQueue(dir, readQueue(dir).filter(r => !(r.kind === 'reply-reminder' && r.seq === seq && r.state === 'nudged')))
+    let replay = await open(options)
+    if (!deliveredBeforeReopen) await deliverReminder(replay)
+    // No AD observation repairs suppression before the reminder disappears.
+    for (let cycle = 0; cycle < 2; cycle++) {
+      await replay.compact(); await replay.stop()
+      replay = await open(options)
+      expect(replay.items('alpha').map(item => [item.accepted.seq, item.delivered])).toEqual([[seq, true]])
+      expect(replay.openCount('alpha')).toBe(0)
+      expect(replay.replyReminderItems('alpha')).toEqual([])
+    }
+    const resumed = harness(replay)
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect(nudges(replay)).toEqual([])
+    expect(resumed.prepared).toEqual([])
+    saved = true
+    await resumed.monitor.stop(); await replay.compact(); await replay.stop()
+    const released = await open(options), last = harness(released)
+    await last.monitor.observe('alpha', last.row('working'))
+    await last.monitor.observe('alpha', last.row('waiting'))
+    expect(released.items('alpha')).toEqual([])
+    expect(released.replyReminderItems('alpha')).toEqual([])
+    expect(readQueue(dir).filter(r => r.kind === 'reply-reminder')).toEqual([])
+    expect(last.prepared).toEqual([])
+    expect([...h.errors, ...resumed.errors, ...last.errors]).toEqual([])
+  })
+
+  test('retaining a delivered join neither extends reminder eligibility nor offers the item for delivery again', async () => {
+    const clock = createFakeClock({ start: 1000 })
+    let saved = false
+    const options = { now: clock.now, threadJoinSaved: () => saved }
+    const q = await open(options)
+    // A different join time proves that eligibility is measured from delivery.
+    const seq = await send(q, 'alpha', joinedMention({ thread_join: { thread_ts: THREAD_ROOT, stamp: { ...THREAD_STAMP }, at: 0 } }))
+    await clock.advance(REPLY_REMINDER_KEEP_MS - 1)
+    await q.compact(); await q.stop()
+    const replay = await open(options), h = harness(replay)
+    expect(replay.replyReminderItems('alpha').map(record => [record.seq, record.delivered_at ?? record.at])).toEqual([[seq, 1000]])
+    await clock.advance(1)
+    await replay.compact()
+    expect(replay.item('alpha', seq)?.delivered).toBe(true)
+    expect(replay.openCount('alpha')).toBe(0)
+    expect(replay.replyReminderItems('alpha')).toEqual([])
+    h.monitor.start(); await h.clock.flush()
+    expect(h.reads()).toBe(0)
+    expect(h.clock.pendingCount()).toBe(0)
+    const engine = await makeEngineHarness({ queue: replay, stateDir: dir })
+    try {
+      await engine.tick()
+      expect(engine.keyCalls()).toEqual([])
+      expect(engine.errors).toEqual([])
+    } finally { await engine.cleanup() }
+    await h.monitor.observe('alpha', h.row('working'))
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect(h.prepared).toEqual([])
+    saved = true
+    await h.monitor.stop(); await replay.compact(); await replay.stop()
+    const final = await open(options)
+    expect(final.items('alpha')).toEqual([])
+    expect(final.replyReminderItems('alpha')).toEqual([])
+    expect(final.openCount('alpha')).toBe(0)
+  })
+})
 
 describe('AD row reply reminders', () => {
   test.each([undefined, '0'])('a legacy Claude row with reply preallow marker %s gets no reminder, including after resume', async marker => {

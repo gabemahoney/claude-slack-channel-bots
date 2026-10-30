@@ -7,16 +7,19 @@ import type { WebClient } from '@slack/web-api'
 import { createPersonaRouting } from '../src/persona-routing.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import type { AcceptedRecord } from '../src/delivery-queue.ts'
+import type { AcceptedRecord, QueueEvent } from '../src/delivery-queue.ts'
+import { createDeliveryReporting, MESSAGE_NOT_SAVED, buildMessageNotSavedNotice } from '../src/delivery-notices.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
+import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
-import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { readQueue, seedQueue, slackInput, queuePath } from './test-helpers/delivery-queue.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
-import { configBytes, makeSharedAuthority, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
+import { configBytes, makeSharedAuthority, makeMembershipHarness, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
 import { makeReloadHarness } from './test-helpers/reload-harness.ts'
 import { PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
 import { createPersonaEpisodes } from '../src/persona-episodes.ts'
@@ -25,7 +28,7 @@ import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
 import { createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
-import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
+import { THREAD_ROOTS, readThreads, threadPath, threadFsControls } from './test-helpers/thread-memory.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
@@ -41,6 +44,371 @@ function selectionInputs(config: ReturnType<typeof makeMultiPersonaConfig>, chan
   return { getChannelDelivery: () => store, membership: observedMembership(Object.fromEntries(config.personas.map(p => [p.key, channels]))) }
 }
 const facts = (h: RoutingHarness, name: string) => h.queued(name).map(i => ({ channel: i.accepted.channel, ts: i.accepted.ts, via: i.accepted.via, text: i.accepted.text }))
+
+describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
+  async function joined(options: Parameters<typeof makeRoutingHarness>[2] = {}, choice: 'off' | 'mentions' | 'all' | 'thread_hybrid' = 'thread_hybrid', baseDir = dir) {
+    const h = makeRoutingHarness(['alpha', 'beta'].map(name => ({ name, channels: [{ id: CA, delivery: choice }], dm: { enabled: true } })), baseDir,
+      { mode, threadMemory: {}, membership: observedMembership({ alpha: [CA], beta: [CA] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...options })
+    harnesses.push(h)
+    await h.ready()
+    return h
+  }
+  const reply = (root: string = THREAD_ROOTS.primary) => makeChannelMessage({ channel: CA, thread_ts: root, text: 'the next reply' })
+  const mention = (h: RoutingHarness, root: string = THREAD_ROOTS.primary) => makeChannelMessage({ channel: CA, ts: root, text: mentionText(h.p('alpha').stub.identity.botUserId) })
+  const expected = (event: SlackEvent, via: string) => ({ channel: event.channel as string, ts: event.ts as string, text: event.text as string, via })
+  const savedJoins = (key = 'alpha') => readThreads(dir, key).filter(r => r.kind === 'join')
+  function observeIntake(h: RoutingHarness) {
+    const calls: string[] = []
+    const decided = h.queue.acceptDecided, plain = h.queue.accept, lookup = h.queue.lookupSlackKey
+    h.queue.acceptDecided = (key, slackKey, decide) => {
+      calls.push(`serial:${key}`)
+      return decided(key, slackKey, facts => { calls.push(`decide:${key}`); return decide(facts) })
+    }
+    h.queue.accept = (key, input) => { calls.push(`plain:${key}`); return plain(key, input) }
+    h.queue.lookupSlackKey = (key, slackKey) => { calls.push(`lookup:${key}`); return lookup(key, slackKey) }
+    return calls
+  }
+
+  test.each(['mention', 'broadcast'] as const)('%s joins before the next concurrent decision and ack while its save is held', async source => {
+    const h = await joined(), t = h.threads!, paths = observeIntake(h)
+    const event = source === 'mention' ? mention(h) : makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: broadcastText() })
+    const next = reply(), priorTime = t.memory.clock('alpha'), stamp = t.fact({ channel: CA }).stamp
+    // fact() takes a clock reading too. The decision must take the next one.
+    const beforeDecision = t.memory.clock('alpha')
+    expect(beforeDecision).toBeGreaterThan(priorTime)
+    const release = h.holdJoinSaves('alpha'), atAck: unknown[] = []
+    let finished = false
+    const work = Promise.all([h.receive(event, ['alpha'], () => {
+      atAck.push({ joined: t.memory.view('alpha', CA, THREAD_ROOTS.primary), accepted: readQueue(dir).filter(r => r.kind === 'accepted'), saved: savedJoins(), calls: [...h.p('alpha').stub.callLog] })
+      h.order.push('ack:join')
+    }), h.receive(next, ['alpha'])]).then(() => { finished = true })
+    try {
+      await t.clock.flush()
+      expect(finished).toBe(true)
+      expect(facts(h, 'alpha')).toEqual([expected(event, source), expected(next, 'thread')])
+      expect(facts(h, 'beta')).toEqual([])
+      const fact = { channel: CA, root: THREAD_ROOTS.primary, stamp, at: beforeDecision + 1, source }
+      expect(h.queued('alpha').map(i => i.accepted.thread_join)).toEqual([{ thread_ts: fact.root, stamp, at: fact.at }, undefined])
+      expect(t.memory.joins('alpha')).toEqual([{ join: fact }])
+      expect(savedJoins()).toEqual([])
+      expect(atAck).toHaveLength(1)
+      // The first ack needs its own durable store and join; the reply may store later.
+      expect(atAck[0]).toMatchObject({ joined: 'joined', saved: [], calls: [], accepted: expect.arrayContaining([
+        expect.objectContaining({ ...expected(event, source), thread_join: { thread_ts: fact.root, stamp, at: fact.at } }),
+      ]) })
+      expect(paths).toEqual(['serial:alpha', 'serial:alpha', 'decide:alpha', 'decide:alpha'])
+      expect(h.order.indexOf('save-join:alpha')).toBeGreaterThan(h.order.indexOf('ack:join'))
+      release(); await h.settleJoinSaves()
+      expect(savedJoins()).toEqual([expect.objectContaining(fact)])
+    } finally { release(); await work; await h.settleJoinSaves() }
+  })
+
+  test('two recipients join independently with one ack after both durable stores', async () => {
+    const stores: string[] = [], h = await joined({ queueOptions: { onEvent: e => { if (e.type === 'stored') stores.push(e.key) } } })
+    const event = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: ['alpha', 'beta'].map(k => mentionText(h.p(k).stub.identity.botUserId)).join(' ') })
+    const atAck: unknown[] = []
+    await h.receive(event, ['alpha', 'beta'], () => {
+      atAck.push({ stores: [...stores], joins: ['alpha', 'beta'].map(k => h.threads!.memory.view(k, CA, THREAD_ROOTS.primary)), saved: ['alpha', 'beta'].map(savedJoins) })
+    })
+    expect(atAck).toEqual([{ stores: ['alpha', 'beta'], joins: ['joined', 'joined'], saved: [[], []] }])
+    await h.settleJoinSaves()
+    const next = reply(); await h.receive(next)
+    for (const key of ['alpha', 'beta']) {
+      expect(facts(h, key)).toEqual([expected(event, 'mention'), expected(next, 'thread')])
+      expect(savedJoins(key)).toHaveLength(1)
+      expect(h.queued(key)[0]!.accepted.thread_join?.stamp).toEqual(h.threads!.fact({ channel: CA }, key).stamp)
+    }
+  })
+
+  test('a pending ack defers saves and Slack work; later hung queued feedback cannot delay acceptance', async () => {
+    let releaseAck!: () => void
+    const ack = new Promise<void>(resolve => { releaseAck = resolve }), reaction = makeDeferredWebApiCall(), feedback: Promise<void>[] = []
+    let queued: ReturnType<typeof createQueuedAckCallback> | undefined
+    const h = await joined({ stubOptions: { alpha: { reactionsAdd: [reaction.outcome] } }, onReceived: (key, item) => {
+      const work = queued!(key, item); feedback.push(work); return work
+    } })
+    queued = createQueuedAckCallback({ queue: h.queue, getReaction: () => h.config!.queued_ack_reaction, clientFor: key => h.p(key).stub.web })
+    let acked = false, finished = false
+    const work = h.receive(mention(h), ['alpha'], async () => { await ack; acked = true }).then(() => { finished = true })
+    try {
+      await h.threads!.clock.flush()
+      expect(h.queued('alpha')).toHaveLength(1)
+      expect(h.threads!.memory.view('alpha', CA, THREAD_ROOTS.primary)).toBe('joined')
+      expect(h.order.filter(x => x === 'save-join:alpha')).toEqual([])
+      expect(h.p('alpha').stub.callLog).toEqual([])
+      expect(acked).toBe(false)
+      releaseAck(); await h.threads!.clock.flush()
+      expect(acked).toBe(true); expect(finished).toBe(true)
+      expect(reaction.settled).toBe(false)
+      expect(h.p('alpha').stub.calls.reactionsAdd).toHaveLength(1)
+      expect(h.queued('alpha')[0]!.fixed).toBeDefined()
+      expect(h.order.filter(x => x === 'save-join:alpha')).toHaveLength(1)
+    } finally { releaseAck(); if (!reaction.settled) reaction.settle(); await work; await Promise.all(feedback); await h.settleJoinSaves() }
+  })
+
+  test('a reply before the mention stays dropped; edits, deletions and reactions neither join nor remove joins', async () => {
+    const h = await joined(), t = h.threads!, early = reply()
+    await h.receive(early, ['alpha'])
+    expect(h.queued('alpha')).toEqual([])
+    expect(h.logs.some(line => line.includes('not-mentioned'))).toBe(true)
+    const edits = [
+      makeChannelMessage({ ...mention(h, THREAD_ROOTS.secondary), edited: { ts: THREAD_ROOTS.third } }),
+      makeChannelMessage({ ...mention(h, THREAD_ROOTS.third), subtype: 'message_changed' }),
+    ]
+    for (const event of edits) await h.receive(event, ['alpha'])
+    expect(h.queued('alpha').map(i => i.accepted.thread_join)).toEqual([undefined])
+    expect(t.memory.joins('alpha')).toEqual([])
+    const joinedEvent = mention(h); await h.receive(joinedEvent, ['alpha']); await h.settleJoinSaves()
+    const joins = t.memory.joins('alpha'), before = readFileSync(threadPath(dir))
+    for (const root of [THREAD_ROOTS.primary, THREAD_ROOTS.secondary]) {
+      await h.receive(makeChannelMessage({ channel: CA, ts: root, subtype: 'message_deleted', deleted_ts: root, text: undefined }), ['alpha'])
+      await h.receive(makeChannelMessage({ type: 'reaction_added', channel: undefined, ts: undefined, text: undefined, item: { type: 'message', channel: CA, ts: root }, reaction: 'eyes' }), ['alpha'])
+    }
+    expect(t.memory.joins('alpha')).toEqual(joins)
+    expect(readFileSync(threadPath(dir))).toEqual(before)
+    const next = reply(); await h.receive(next, ['alpha'])
+    expect(facts(h, 'alpha')).toEqual([expected(edits[0]!, 'mention'), expected(joinedEvent, 'mention'), expected(next, 'thread')])
+    expect(h.queued('alpha').some(i => i.accepted.ts === early.ts)).toBe(false)
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(9)
+  })
+
+  test('kept joins carry another queue copy; saved joins and paired Slack events add none', async () => {
+    const h = await joined(), t = h.threads!, release = h.holdJoinSaves('alpha'), paths = observeIntake(h)
+    try {
+      const message = mention(h), app = makeAppMention({ ...message, type: 'app_mention' })
+      await h.receive(app, ['alpha']); await h.receive(message, ['alpha']); await h.receive(message, ['alpha'])
+      expect(h.queued('alpha')).toHaveLength(1)
+      expect(h.queued('alpha')[0]!.accepted.thread_join).toBeDefined()
+      expect(paths.filter(x => x === 'decide:alpha')).toHaveLength(1)
+      expect(paths.filter(x => x === 'serial:alpha')).toHaveLength(mode === 'open' ? 2 : 3)
+      const kept = makeChannelMessage({ channel: CA, thread_ts: message.ts, text: broadcastText() })
+      await h.receive(kept, ['alpha'])
+      expect(h.queued('alpha')[1]!.accepted.thread_join).toBeDefined()
+      expect(t.memory.joins('alpha')).toHaveLength(1)
+      expect(savedJoins()).toEqual([])
+      release(); await h.settleJoinSaves()
+      const saved = makeChannelMessage({ channel: CA, thread_ts: message.ts, text: mentionText(h.p('alpha').stub.identity.botUserId) })
+      await h.receive(saved, ['alpha']); await h.settleJoinSaves()
+      expect(facts(h, 'alpha')).toEqual([expected(message, 'mention'), expected(kept, 'broadcast'), expected(saved, 'mention')])
+      expect(h.queued('alpha')[2]!.accepted.thread_join).toBeUndefined()
+      expect(savedJoins()).toHaveLength(1)
+      expect(h.order.filter(x => x === 'ack')).toHaveLength(5)
+    } finally { release(); await h.settleJoinSaves() }
+  })
+
+  test.each(['off', 'mentions', 'all'] as const)('%s preserves plain intake, exact records and ack observations with or without joins', async choice => {
+    const without = await joined({ threadMemory: undefined, dedupeClock: () => 0 }, choice, mkdtempSync(join(dir, 'without-')))
+    const h = await joined({ dedupeClock: () => 0, stubOptions: Object.fromEntries(without.all.map(p => [p.persona.key, p.stub.identity])) }, choice), paths = observeIntake(h)
+    const events = [mention(h), makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.secondary, text: broadcastText() })]
+    const snapshots: unknown[][] = [[], []]
+    for (const [index, run] of [without, h].entries()) for (const event of events) await run.receive(event, ['alpha'], () => {
+      snapshots[index]!.push({ items: run.queued('alpha'), calls: [...run.p('alpha').stub.callLog] })
+    })
+    expect(snapshots[1]).toEqual(snapshots[0])
+    expect(h.queued('alpha')).toEqual(without.queued('alpha'))
+    expect(h.queued('alpha').map(i => i.accepted.thread_join)).toEqual(choice === 'off' ? [] : [undefined, undefined])
+    expect(paths.some(x => x.startsWith('serial:'))).toBe(false)
+    expect(h.threadMemoryReads).toEqual([])
+    expect(h.threads!.memory.joins('alpha')).toEqual([])
+    expect(existsSync(threadPath(dir))).toBe(false)
+    expect(h.threads!.choose('thread_hybrid', 'alpha', CA).kind).toBe('applied')
+    await h.threads!.memory.activate()
+    const count = h.queued('alpha').length
+    for (const event of events) await h.receive(reply(event.ts as string), ['alpha'])
+    expect(h.queued('alpha')).toHaveLength(count)
+    const fresh = makeChannelMessage({ channel: CA, thread_ts: THREAD_ROOTS.primary, text: mentionText(h.p('alpha').stub.identity.botUserId) })
+    await h.receive(fresh, ['alpha']); const next = reply(); await h.receive(next, ['alpha'])
+    expect(facts(h, 'alpha').slice(count)).toEqual([expected(fresh, 'mention'), expected(next, 'thread')])
+  })
+
+  test('DMs and group DMs never enter serial intake or create Thread Memory', async () => {
+    const h = await joined({}, 'mentions'), paths = observeIntake(h)
+    for (const factory of [makeDm, makeGroupDmMessage]) for (const text of [mentionText(h.p('alpha').stub.identity.botUserId), broadcastText()]) {
+      await h.receive(factory({ text }), ['alpha'])
+    }
+    expect(h.queued('alpha').map(i => [i.accepted.via, i.accepted.thread_join])).toEqual([['dm', undefined], ['dm', undefined]])
+    expect(paths.some(x => x.startsWith('serial:'))).toBe(false)
+    expect(h.threadMemoryReads).toEqual([])
+    expect(h.threads!.memory.joins('alpha')).toEqual([])
+    expect(existsSync(threadPath(dir))).toBe(false)
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(4)
+  })
+
+  test('temporary ineligibility preserves the stamp and join, selects nothing, then selects without another mention', async () => {
+    const channels = { alpha: [CA], beta: [CA] }, h = await joined({ membership: observedMembership(channels) }), t = h.threads!
+    await h.receive(mention(h), ['alpha']); await h.settleJoinSaves()
+    const stamp = t.authority.channelStamp('alpha', CA), joins = t.memory.joins('alpha'), bytes = readFileSync(threadPath(dir)), count = h.queued('alpha').length
+    const paths = observeIntake(h)
+    // A transient membership projection can refuse intake without publishing a
+    // verified leave. Only the latter removes the shared entry and stamp.
+    channels.alpha = []
+    for (const event of [reply(), makeChannelMessage({ ...mention(h, THREAD_ROOTS.secondary) }), makeChannelMessage({ channel: CA, text: broadcastText() })]) await h.receive(event, ['alpha'])
+    expect(h.queued('alpha')).toHaveLength(count)
+    expect(paths.some(x => x.startsWith('serial:'))).toBe(false)
+    expect(t.authority.channelStamp('alpha', CA)).toEqual(stamp)
+    expect(t.memory.joins('alpha')).toEqual(joins)
+    expect(readFileSync(threadPath(dir))).toEqual(bytes)
+    channels.alpha = [CA]
+    const next = reply(); await h.receive(next, ['alpha'])
+    expect(facts(h, 'alpha').slice(count)).toEqual([expected(next, 'thread')])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(5)
+  })
+
+  test('unresolved membership withholds ack and requests verification even for a retained duplicate', async () => {
+    let unresolved = false
+    const requests: string[] = [], observed = observedMembership({ alpha: [CA], beta: [CA] })
+    const h = await joined({ membership: {
+      read: (key, channel, mode) => unresolved ? { kind: 'unresolved', reason: 'current-membership-missing' } : observed.read(key, channel, mode),
+      hasUnresolved: () => unresolved, request: key => { requests.push(key) },
+    } })
+    const paths = observeIntake(h), event = mention(h)
+    unresolved = true
+    await h.receive(event, ['alpha'])
+    expect(h.order.filter(x => x === 'ack')).toEqual([])
+    expect(h.queued('alpha')).toEqual([])
+    expect(h.threads!.memory.joins('alpha')).toEqual([])
+    expect(requests).toEqual(['alpha'])
+    unresolved = false; await h.receive(event, ['alpha']); await h.settleJoinSaves()
+    const before = readFileSync(queuePath(dir))
+    unresolved = true; await h.receive(event, ['alpha'])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(1)
+    expect(requests).toEqual(['alpha', 'alpha'])
+    expect(readFileSync(queuePath(dir))).toEqual(before)
+    expect(paths.filter(x => x === 'decide:alpha')).toHaveLength(2)
+    expect(paths.filter(x => x === 'serial:alpha')).toHaveLength(3)
+  })
+
+  test('partial fanout saves the retained join, reports store failure and retries only the failed recipient', async () => {
+    const io = threadFsControls(dir), events: QueueEvent[] = [], reports: string[] = []
+    let reporting: ReturnType<typeof createDeliveryReporting> | undefined
+    const h = await joined({ queueOptions: { fs: io.fs, onEvent: event => { events.push(event); reporting?.queueEvent(event) } }, onReceived: key => { reports.push(key) } })
+    reporting = createDeliveryReporting({ queue: h.queue, episodes: h.episodes, persona: key => h.p(key).persona,
+      state: () => ({ up: true }), log: line => h.logs.push(line), notify: () => {} })
+    io.fail('writeSync', 'beta', { match: path => path === queuePath(dir, 'beta') })
+    const event = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: ['alpha', 'beta'].map(k => mentionText(h.p(k).stub.identity.botUserId)).join(' ') })
+    await h.receive(event); await h.settleJoinSaves()
+    expect(h.order.filter(x => x === 'ack')).toEqual([])
+    expect(facts(h, 'alpha')).toEqual([expected(event, 'mention')]); expect(facts(h, 'beta')).toEqual([])
+    expect(h.queued('alpha')[0]!.fixed).toBeUndefined()
+    expect(savedJoins('alpha')).toHaveLength(1)
+    expect(h.threads!.memory.joins('beta')).toEqual([])
+    expect(reports).toEqual(['alpha'])
+    expect(h.logs.filter(line => line.includes(MESSAGE_NOT_SAVED))).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([{ key: 'beta', text: buildMessageNotSavedNotice(renderPersonaRef(h.p('beta').persona.name, 'beta'), event.user as string) }])
+    io.heal(); await h.receive(event); await h.settleJoinSaves(); await h.receive(event)
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(2)
+    expect(events.filter(e => e.type === 'stored').map(e => e.key)).toEqual(['alpha', 'beta'])
+    expect(events.filter(e => e.type === 'store-failed').map(e => e.key)).toEqual(['beta'])
+    for (const key of ['alpha', 'beta']) {
+      expect(facts(h, key)).toEqual([expected(event, 'mention')])
+      expect(h.queued(key)[0]!.fixed).toBeDefined()
+      expect(savedJoins(key)).toHaveLength(1)
+    }
+  })
+
+  test('an unloadable queue acknowledges drops but withholds deliveries until the same event can store', async () => {
+    const io = threadFsControls(dir), events: QueueEvent[] = []
+    const h = await joined({ queueOptions: { fs: io.fs, onEvent: e => events.push(e) } })
+    io.fail('readFileSync', 'alpha', { match: path => path === queuePath(dir) })
+    const paths = observeIntake(h), event = mention(h)
+    await h.receive(reply(), ['alpha']); await h.receive(event, ['alpha'])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(1)
+    expect(h.queued('alpha')).toEqual([])
+    expect(events.filter(e => e.type === 'store-failed')).toHaveLength(1)
+    expect(h.threads!.memory.joins('alpha')).toEqual([])
+    expect(paths).toEqual(['serial:alpha', 'decide:alpha', 'serial:alpha', 'decide:alpha'])
+    io.heal(); await h.receive(event, ['alpha']); await h.settleJoinSaves()
+    expect(facts(h, 'alpha')).toEqual([expected(event, 'mention')])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(2)
+    expect(savedJoins()).toHaveLength(1)
+  })
+
+  test('failed join saves keep selection, queued feedback, preparation and reminder eligibility, including not-up intake', async () => {
+    const feedback: Promise<void>[] = []
+    let queued: ReturnType<typeof createQueuedAckCallback> | undefined
+    const h = await joined({ notUp: ['alpha'], rowRead: { alpha: LIVENESS_READING_DEAD_ENDED }, dedupeClock: () => 0,
+      onReceived: (key, item) => { feedback.push(queued!(key, item)) } })
+    queued = createQueuedAckCallback({ queue: h.queue, getReaction: () => h.config!.queued_ack_reaction, clientFor: key => h.p(key).stub.web })
+    const t = h.threads!, original = mention(h)
+    t.io.fail('writeSync')
+    await h.receive(original, ['alpha']); await h.settleJoinSaves()
+    const next = reply(); await h.receive(next, ['alpha']); await Promise.all(feedback)
+    expect(facts(h, 'alpha')).toEqual([expected(original, 'mention'), expected(next, 'thread')])
+    expect(h.queued('beta')).toEqual([])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(2)
+    expect(t.events.filter(e => e.type === 'append-failed')).toHaveLength(1)
+    expect(savedJoins()).toEqual([])
+    expect(t.memory.joins('alpha')).toHaveLength(1)
+    expect(h.rowReads).toEqual([]); expect(h.restartAsks).toEqual([]); expect(h.launches).toEqual([])
+    const reaction = h.config!.queued_ack_reaction!
+    expect(h.p('alpha').stub.calls.reactionsAdd).toEqual([original, next].map(e => ({ channel: CA, timestamp: e.ts as string, name: reaction })))
+    expect(h.queued('alpha').map(i => i.accepted.queued_ack_reaction)).toEqual([reaction, reaction])
+    expect(h.queued('alpha').every(i => i.fixed?.parts.every(part => part.includes(`via="${i.accepted.via}"`)))).toBe(true)
+    const engine = await makeEngineHarness({ queue: h.queue, stateDir: dir })
+    try {
+      await engine.tick(); await engine.until(() => h.queue.openCount('alpha') === 0)
+      expect(engine.textCalls().map(call => call.params.text)).toEqual(h.queued('alpha').flatMap(i => i.fixed!.parts))
+      expect(h.queue.replyReminderItems('alpha').map(i => i.seq)).toEqual(h.queued('alpha').map(i => i.accepted.seq))
+      expect(engine.errors).toEqual([])
+      expect(t.events.filter(e => e.type === 'append-failed')).toHaveLength(1)
+    } finally { await engine.cleanup() }
+  })
+
+  test('a blocked persona admission or save never blocks another persona, and ack precedes all network preparation', async () => {
+    let enter!: () => void, release!: () => void
+    const entered = new Promise<void>(resolve => { enter = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const h = await joined(), real = h.queue.acceptDecided, releaseSave = h.holdJoinSaves('beta')
+    h.queue.acceptDecided = async (key, slackKey, decide) => { if (key === 'alpha') { enter(); await gate }; return real(key, slackKey, decide) }
+    const pending = h.receive(mention(h), ['alpha'])
+    await entered
+    let finished = false
+    const beforeAck: unknown[] = []
+    const other = makeChannelMessage({ channel: CA, text: mentionText(h.p('beta').stub.identity.botUserId) })
+    const work = h.receive(other, ['beta'], () => { beforeAck.push([...h.p('beta').stub.callLog]) }).then(() => { finished = true })
+    try {
+      await h.threads!.clock.flush()
+      expect(finished).toBe(true)
+      expect(beforeAck).toEqual([[]])
+      expect(facts(h, 'alpha')).toEqual([])
+      expect(facts(h, 'beta')).toEqual([expected(other, 'mention')])
+      expect(savedJoins('beta')).toEqual([])
+    } finally { release(); releaseSave(); await Promise.all([pending, work]); await h.settleJoinSaves() }
+  })
+})
+
+test('open hybrid join survives a real inventory becoming external and eligible again under the same stamp', async () => {
+  const membership = makeMembershipHarness(dir, { mode: 'open', names: ['alpha', 'beta'], channels: [{ id: CA, delivery: 'thread_hybrid' }] })
+  const stub = (key: string) => membership.h.stub(membership.h.p(key))
+  let h: RoutingHarness | undefined
+  try {
+    for (const key of ['alpha', 'beta']) stub(key).script.inventory.push(membershipPage([CA]))
+    await membership.start(); await membership.scan()
+    h = makeRoutingHarness(['alpha', 'beta'].map(name => ({ name, channels: [{ id: CA, delivery: 'thread_hybrid' }] })), dir, {
+      mode: 'open', threadMemory: {}, membership: membership.membership,
+      channelDelivery: { stateDir: dir, authority: membership.authority },
+      stubOptions: Object.fromEntries(['alpha', 'beta'].map(key => [key, stub(key).identity])), restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+    })
+    harnesses.push(h); await h.ready()
+    const event = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: mentionText(stub('alpha').identity.botUserId) })
+    await h.receive(event, ['alpha']); await h.settleJoinSaves()
+    const stamp = membership.authority.channelStamp('alpha', CA), joins = h.threads!.memory.joins('alpha')
+    stub('alpha').script.inventory.push(membershipPage([{ id: CA, is_channel: true, is_im: false, is_mpim: false, is_ext_shared: true }]))
+    membership.scanner.request('alpha'); await membership.scan()
+    expect(membership.membership.read('alpha', CA, 'open')).toEqual({ kind: 'ineligible', reason: 'external-sharing' })
+    expect(membership.authority.channelStamp('alpha', CA)).toEqual(stamp)
+    await h.receive(makeChannelMessage({ channel: CA, thread_ts: event.ts }), ['alpha'])
+    expect(h.queued('alpha').map(i => i.accepted.ts)).toEqual([event.ts as string])
+    expect(h.threads!.memory.joins('alpha')).toEqual(joins)
+    stub('alpha').script.inventory.push(membershipPage([CA]))
+    membership.scanner.request('alpha'); await membership.scan()
+    expect(membership.membership.read('alpha', CA, 'open').kind).toBe('eligible')
+    const next = makeChannelMessage({ channel: CA, thread_ts: event.ts })
+    await h.receive(next, ['alpha'])
+    expect(facts(h, 'alpha')).toEqual([event, next].map((e, i) => ({ channel: CA, ts: e.ts as string, text: e.text as string, via: i ? 'thread' : 'mention' })))
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(3)
+    expect(membership.authority.channelStamp('alpha', CA)).toEqual(stamp)
+  } finally { await h?.settleJoinSaves(); await h?.threads?.close(); assertNoLeak(membership.captured()); await membership.close() }
+})
 
 test.each(['strict', 'open'] as const)('%s staged restoration holds thread-dependent replies despite readableFor=true while independent and accepted work continues, even when not-up', async channel_mode => {
   const h = makeReloadHarness()
@@ -528,7 +896,7 @@ describe.each(['strict', 'open'] as const)('%s routing through Thread Memory', m
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {
   const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
   let failing = true; const order: string[] = []
-  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, acceptDecided: queue.acceptDecided, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
   const event = makeChannelMessage({ channel: CS }); await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:alpha', 'store:beta', 'received:alpha']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])

@@ -63,6 +63,8 @@
  *       Print only the named safe applied setting, never pending input.
  *   sharedAuthorityPreserved <config-path> <before-record> <after-record>
  *       Validate preserved choices, identity and reviewed input across fresh discovery.
+ *   sharedThreadStamp <config-path> <record-path> <persona-key> <channel>
+ *       Print a current hybrid channel's stamp from the validated authority.
  *   sharedApplicationPreserved <config-path> <before-record> <after-record>
  *       Preserve the same applied/source/lifetime facts while operator intent changes.
  *   operatorReviewRequest <config-path> <record-path> <id> <request|revise|refresh|cancel> [name/channel/delivery...]
@@ -4017,7 +4019,9 @@ async function readSharedConfiguration(context: EntryContext, configPath: string
   const read = await packageFunction<(path: string) => Uint8Array>(context, 'config.ts', 'readPersonaConfigBytes')
   const parse = await packageFunction<(bytes: Uint8Array, path: string, deps: { sourcePath: string }) =>
     { sourceBytesBase64: string; revision: number; personas: Record<string, {
-      incarnation: string; declaration: unknown; assignments: unknown; leaves: unknown; removedDestinations: unknown;
+      incarnation: string; declaration: unknown;
+      assignments: Record<string, { delivery: string; threadHybridSince?: string }>;
+      leaves: unknown; removedDestinations: unknown;
       createdAt?: number; resetOrder?: number; resetDestination?: unknown;
       membership: Record<string, { member: boolean; boundary: number; identity: string; isExtSharedChannel?: boolean; channelType?: string }>;
       membershipInventory?: { incarnation: string; identity: string };
@@ -4087,6 +4091,21 @@ function preservedAuthorityEntry(includeIntent: boolean): Entry { return {
 }
 const sharedAuthorityPreserved = preservedAuthorityEntry(true)
 const sharedApplicationPreserved = preservedAuthorityEntry(false)
+
+const sharedThreadStamp: Entry = {
+  synopsis: '<config-path> <record-path> <persona-key> <channel>',
+  async print(args, context) {
+    expectArguments('sharedThreadStamp', args, ['config-path', 'record-path', 'persona-key', 'channel'])
+    const [configPath, recordPath, key, channel] = args
+    const { state } = await readSharedConfiguration(context, configPath, recordPath)
+    const life = Object.hasOwn(state.personas, key) ? state.personas[key] : undefined
+    const assignment = life && Object.hasOwn(life.assignments, channel) ? life.assignments[channel] : undefined
+    if (!life || assignment?.delivery !== 'thread_hybrid' || !assignment.threadHybridSince) {
+      throw new PrinterFailure('expected a current thread_hybrid Channel Stamp', PRINTER_FAIL_EXIT)
+    }
+    return JSON.stringify({ incarnation: life.incarnation, threadHybridSince: assignment.threadHybridSince })
+  },
+}
 
 // sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>:
 // the applied view only, never the pending input or an arbitrary JSON path.
@@ -4200,6 +4219,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   sharedReviewConsumed,
   sharedConfigurationMatches,
   sharedAuthorityPreserved,
+  sharedThreadStamp,
   sharedApplicationPreserved,
   reviewOutcomeLine: builderEntry('reload-review.ts', 'reviewOutcomeLine', ['status']),
   sharedConfigurationValue,

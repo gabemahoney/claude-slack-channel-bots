@@ -39,6 +39,7 @@ import { createDurableJournal, splitJournalLines, removeTornTail, type AppendRol
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from './delivery-constants.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { SLACK_ERROR_CODE_RE, WEB_API_AUTH_FAILURE_ERRORS, slackRetryAfterSeconds } from './persona-slack-validation.ts'
+import { sameChannelStamp, type ChannelStamp } from './shared-channels.ts'
 
 /** The metadata methods Thread Memory's lookups may call; nothing else. */
 export const THREAD_MEMORY_LOOKUP_METHODS = ['conversations.replies', 'conversations.history'] as const
@@ -210,7 +211,7 @@ export function createMetadataAttempts(clock: PersonaConnectionClock, timeoutMs 
 // --- Journal format and in-memory views ---
 export const THREAD_MEMORY_DIRECTORY_MODE = 0o700
 export const THREAD_MEMORY_FILE_MODE = 0o600
-export interface ThreadMemoryStamp { incarnation: string; threadHybridSince: string }
+export type ThreadMemoryStamp = ChannelStamp
 export type ThreadMemoryStampState =
   | { kind: 'decided'; incarnation: string; threadHybridSince?: string }
   | { kind: 'undecided' }
@@ -246,6 +247,9 @@ export interface ThreadMemoryOptions {
   setInterval?: typeof globalThis.setInterval; clearInterval?: typeof globalThis.clearInterval
   appliedKeys(): readonly string[]
   stamp(key: string, channel: string): ThreadMemoryStampState | undefined
+  /** Distinguish pre-authority startup from an authority reporting no persona.
+   * Without this adapter, activation or loadKey establishes the authority. */
+  authorityReady?(): boolean
   threadHybridChannels(key: string): readonly string[]
   markerKeys(): readonly string[]
   /** Staged replacement is not an applied removal; preserve its old evidence. */
@@ -265,6 +269,13 @@ export interface ThreadMemory {
   addJoin(key: string, fact: ThreadJoin): boolean
   saveJoins(key: string, facts: readonly ThreadJoin[]): Promise<ThreadMemoryWriteResult>
   isJoinSaved(key: string, fact: ThreadJoin): boolean
+  hasSavedJoin(key: string, channel: string, root: string, stamp: ChannelStamp): boolean
+  threadJoinSaved(key: string, channel: string, root: string, stamp: ChannelStamp, at: number): boolean
+  /** Judge queue joins in order, add them synchronously, then schedule one save. */
+  recoverJoins(key: string, candidates: readonly ThreadJoin[]): void
+  /** Rejudge after the first successful read of an unknown journal, before
+   * Memory Hold resolution. The read-retry owner also calls this entry. */
+  retryPendingJoins(key: string): void
   keptFacts(key: string): ThreadJoin[]
   joins(key: string): { join: ThreadJoin; savedAt?: number }[]
   unresolvedIntents(key: string): ThreadPostIntent[]
@@ -326,7 +337,7 @@ export function serializeThreadMemoryRecords(records: readonly ThreadMemoryRecor
   return Buffer.from(records.map(r => JSON.stringify(r) + '\n').join(''))
 }
 function memoryStampMatches(a: ThreadMemoryStamp, b: ThreadMemoryStampState | undefined): boolean {
-  return b?.kind === 'decided' && a.incarnation === b.incarnation && a.threadHybridSince === b.threadHybridSince
+  return sameChannelStamp(a, b)
 }
 function stampKey(stamp: ThreadMemoryStamp): string { return JSON.stringify([stamp.incarnation, stamp.threadHybridSince]) }
 interface JoinedThread { join: ThreadJoin; saved?: ThreadJoinRecord }
@@ -349,6 +360,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const io = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: THREAD_MEMORY_DIRECTORY_MODE, fileMode: THREAD_MEMORY_FILE_MODE, fs })
   const journals = new Map<string, MemoryJournal>(), writers = new Map<string, Promise<unknown>>()
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
+  const pendingJoins = new Map<string, ThreadJoin[]>()
+  let activationStarted = false
   let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false, quiesced = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
   function pathFor(key: string): string {
@@ -472,6 +485,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         event({ type: 'lines-quarantined', key, path: pathFor(key), quarantinePath, facts })
       }
       j.records = records; j.hasRecords = records.length > 0; j.header = header; j.highWater = highWater; j.readable = true; delete j.error
+      // Expose saved times before activation: the queue compacts after this
+      // read and before a shared authority is available. Replay later judges
+      // these stamps; no pre-activation join can select intake.
+      j.joinedByChannel.clear()
+      for (const fact of j.kept) retain(j, fact)
+      for (const record of records) if (record.kind === 'join') retain(j, record, record)
       j.created = header !== undefined && options.markerKeys().includes(key)
       event({ type: 'read', key, path: pathFor(key) })
     } catch (error) {
@@ -543,6 +562,44 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     const saved = entry(j, fact)?.saved
     return j.readable && saved !== undefined && saved.at <= fact.at
   }
+  function savedAt(key: string, channel: string, root: string, stamp: ChannelStamp): number | undefined {
+    const j = journals.get(key)
+    if (!j?.readable) return undefined
+    const saved = j.joinedByChannel.get(channel)?.get(root)?.get(stampKey(stamp))?.saved
+    return saved && sameChannelStamp(saved.stamp, { kind: 'decided', ...stamp }) ? saved.at : undefined
+  }
+  function recoveryStamp(key: string, fact: ThreadJoin): 'current' | 'stale' | 'undecided' {
+    if (!(options.authorityReady?.() ?? activationStarted)) return 'undecided'
+    const stamp = options.stamp(key, fact.channel)
+    if (stamp?.kind === 'undecided') return 'undecided'
+    // Memory Holds will keep named stale stamps in their separate join store.
+    return sameChannelStamp(fact.stamp, stamp) ? 'current' : 'stale'
+  }
+  function recoverJoins(key: string, candidates: readonly ThreadJoin[]): void {
+    if (stopped || quiesced || forgotten.has(key)) return
+    const all = [...pendingJoins.get(key) ?? [], ...candidates.map(copyThreadJoin)]
+    for (const fact of all) advancePast(key, fact.at)
+    pendingJoins.delete(key)
+    const j = journals.get(key), pending = new Map<string, ThreadJoin>(), added: ThreadJoin[] = []
+    for (const fact of all) {
+      const state = recoveryStamp(key, fact)
+      if (state === 'stale') continue
+      if (state === 'undecided' || !j?.readable || !current(key, j)) {
+        const id = JSON.stringify([fact.channel, fact.root, stampKey(fact.stamp)])
+        const old = pending.get(id)
+        if (!old || old.at > fact.at) pending.set(id, fact)
+        continue
+      }
+      const known = entry(j, fact)
+      if (known && known.join.at <= fact.at) continue
+      if (addJoin(key, fact)) added.push(fact)
+    }
+    if (pending.size) pendingJoins.set(key, [...pending.values()])
+    // saveJoins only schedules this key's writer: publication and intake
+    // never await its append or run a shared-state write synchronously.
+    if (added.length) void api.saveJoins(key, added).catch(() => {})
+    // Memory Hold resolution follows join recovery here when introduced.
+  }
   function addJoin(key: string, input: ThreadJoin): boolean {
     const fact = copyThreadJoin(input)
     const j = journals.get(key)
@@ -591,7 +648,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   async function remove(key: string): Promise<ThreadMemoryWriteResult> {
     pathFor(key)
     if (options.canRemove?.(key) === false) return { kind: 'kept' }
-    forgotten.add(key); journals.delete(key)
+    forgotten.add(key); journals.delete(key); pendingJoins.delete(key)
     return serial(key, async () => {
       if (options.dryRun || stopped || quiesced) return { kind: 'cancelled' }
       if (options.canRemove?.(key) === false) return { kind: 'kept' }
@@ -637,6 +694,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     },
     async activate() {
       if (stopped || quiesced) return
+      activationStarted = true
       api.readAtStart()
       if (listingFailed) for (const key of options.appliedKeys()) if (!journals.has(key)) readKey(key)
       // Keep startup evidence ahead of stamp filtering, repair and removal.
@@ -648,6 +706,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     async loadKey(key) {
       pathFor(key)
       if (stopped || quiesced) return
+      activationStarted = true
       const previous = journals.get(key)
       if (previous?.live && previous.readable) return
       forgotten.delete(key)
@@ -661,10 +720,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       const loaded = journals.get(key)
       if (loaded) options.seal?.judgeFirstRead(key, journalFact(loaded))
       await activateKey(key)
+      api.retryPendingJoins(key)
     },
     published() {
       if (stopped || quiesced) return
       for (const [key, j] of journals) if (j.live) judge(key, j)
+      for (const key of [...pendingJoins.keys()]) api.retryPendingJoins(key)
       // Promise-chain turns run after the synchronous publisher releases its
       // mutation lock; a marker setter must never run inside that publisher.
       for (const key of options.appliedKeys()) {
@@ -694,6 +755,18 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       return j ? serial(key, () => saveKept(key, j, copy)) : Promise.resolve({ kind: 'cancelled' })
     },
     isJoinSaved(key, fact) { const j = journals.get(key); return !!j?.live && memoryStampMatches(fact.stamp, options.stamp(key, fact.channel)) && savedJoin(j, fact) },
+    // Intake requires a current stamp; retention below can use saved evidence
+    // before the shared authority exists.
+    hasSavedJoin: (key, channel, root, stamp) => sameChannelStamp(stamp, options.stamp(key, channel)) && savedAt(key, channel, root, stamp) !== undefined,
+    threadJoinSaved(key, channel, root, stamp, at) {
+      if (journals.get(key)?.readable === false) return false
+      const saved = savedAt(key, channel, root, stamp)
+      if (saved !== undefined && saved <= at) return true
+      // A stale stamp named by an unresolved Memory Hold must be kept here.
+      return recoveryStamp(key, { channel, root, stamp, at, source: 'mention' }) === 'stale'
+    },
+    recoverJoins,
+    retryPendingJoins: key => recoverJoins(key, []),
     keptFacts: key => structuredClone(journals.get(key)?.kept ?? []),
     joins(key) {
       const j = journals.get(key)
@@ -711,7 +784,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     advancePast,
     flush(key) { const j = journals.get(key); return j ? serial(key, () => saveKept(key, j)) : Promise.resolve({ kind: 'cancelled' }) },
     compact,
-    forget(key) { forgotten.add(key); journals.delete(key) },
+    forget(key) { forgotten.add(key); journals.delete(key); pendingJoins.delete(key) },
     remove, removeUnappliedAtStart,
     startMaintenance() {
       if (stopped || quiesced || timer !== undefined) return

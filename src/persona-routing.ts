@@ -1,4 +1,5 @@
-/** Durable Slack intake and existing message-triggered recovery. */
+/** Durable Slack intake and existing message-triggered recovery. Hybrid-channel
+ * decisions and joins share the queue's writer turn; other intake stays plain. */
 import {
   CHANNEL_ID_RE,
   DEFAULT_QUEUED_ACK_REACTION,
@@ -12,6 +13,8 @@ import type { ChannelMembership, MembershipReading } from './channel-membership.
 import type { PersonaEventProvenance } from './persona-connections.ts'
 import {
   decideDelivery,
+  channelDeliveryFor,
+  isThreadTimestamp,
   type DeliveryDecision,
   type DropDecision,
   type FungibleDecisionInputs,
@@ -31,7 +34,8 @@ import {
   unclaimedChannelCause,
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
-import type { DeliveryQueue, QueueItem, AcceptedInput } from './delivery-queue.ts'
+import type { DeliveryQueue, QueueItem, AcceptedInput, SlackKey } from './delivery-queue.ts'
+import type { ThreadMemory, ThreadJoin, ThreadMemoryStampState } from './thread-memory.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
@@ -72,11 +76,24 @@ export type SlackAck = () => Promise<void> | void
  * `channelModeOf` at each event.
  */
 export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'channel_mode'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
+export interface RoutingThreadJoins extends Pick<ThreadMemory, 'hasSavedJoin' | 'clock' | 'addJoin' | 'saveJoins'> {
+  stamp(key: string, channel: string): ThreadMemoryStampState | undefined
+}
+interface SerialSelection {
+  persona?: Persona
+  decision?: DeliveryDecision
+  stampDecided?: boolean
+  requestMembership?: boolean
+  input?: AcceptedInput
+  join?: ThreadJoin
+}
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
   /** Read the live Thread Memory view only when the decision needs a reply's membership. */
   threadMemory?: FungibleDecisionInputs['threadMemory']
+  /** Join reads/additions are synchronous; saves run only after the ack attempt. */
+  joins?: RoutingThreadJoins
   /** Pure stamp observation; independent selection never depends on it. */
   threadStampUndecided?(key: string, channel: string): boolean
   /** Shared log-only episode owner. Absent fixtures still hold intake, without the diagnostic. */
@@ -90,7 +107,7 @@ export interface PersonaRoutingDeps {
    */
   getBotIdentity(key: string): SlackBotIdentity | undefined
   /** Shared queue; acceptance does no network I/O. */
-  queue: Pick<DeliveryQueue, 'accept' | 'lookupSlackKey'>
+  queue: Pick<DeliveryQueue, 'accept' | 'acceptDecided' | 'lookupSlackKey'>
   /** Fix stored text after the envelope ack; wake follows durable fixation. */
   prepare(key: string, item: QueueItem): Promise<void>
   /** Durable retained acceptance: after envelope ack, or after partial-fanout
@@ -216,7 +233,10 @@ export interface PersonaRouting {
   /**
    * Take one `message` or `app_mention` event received for the persona(s)
    * `personaKeys`: archive without awaiting, decide and store all accepted
-   * targets, ack only after every store succeeds, then recover and fix text.
+   * targets, add any in-memory join, ack only after every store succeeds, then
+   * save joins, report, recover and fix text. Hybrid-channel key checks,
+   * decisions, stores and joins share each persona's serial queue turn;
+   * other events retain their outside key check and decision.
    * Each target is isolated; a failed store suppresses the aggregate ack.
    *
    * `isExtSharedChannel` is the envelope flag: the Events API
@@ -272,6 +292,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (provenance && !provenance.applied) return
     const afterAck: Array<() => Promise<void>> = []
     const accepted: Array<() => void> = []
+    const saveJoins: Array<() => void> = []
     let storeFailed = false
     if (typeof event === 'object' && event !== null) {
       const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
@@ -286,8 +307,6 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
           const slackKey = typeof ev['channel'] === 'string' && typeof ev['ts'] === 'string'
             ? { chat_id: ev['channel'], ts: ev['ts'], ...(typeof editedTs(ev) === 'string' ? { edited_ts: editedTs(ev) as string } : {}) } : undefined
-          // A retry after partial fanout must prepare the already retained, unfixed target too.
-          const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
           const persona = config?.personas.find(p => p.key === key)
           const report = (item: QueueItem) => accepted.push(() => {
             try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
@@ -303,6 +322,34 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
             await deps.prepare(key, item)
           }
+          if (usesSerialIntake(key, ev, mode, isExtSharedChannel)) {
+            let selection: SerialSelection | undefined
+            const result = await deps.queue.acceptDecided<SerialSelection>(key, slackKey, () => {
+              selection = decideSerialIntake(key, ev, slackKey, isExtSharedChannel, provenance)
+              if (!selection.input) return { skip: selection }
+              const fact = selection.join
+              return { store: selection.input, ...(fact ? { afterStore: () => { deps.joins?.addJoin(key, fact) } } : {}) }
+            })
+            if (selection) reportSerialSelection(key, ev, slackKey, selection)
+            if (selection?.requestMembership || result.status === 'failed') storeFailed = true
+            if (result.status === 'skipped' || result.status === 'failed') return
+            if (result.status === 'accepted' && selection?.join) {
+              const fact = selection.join
+              saveJoins.push(() => {
+                try { void deps.joins?.saveJoins(key, [fact]).catch(() => {}) } catch { /* kept join is recovered independently */ }
+              })
+            }
+            if (result.item && !result.item.delivered && (result.status !== 'duplicate' || !result.item.fixed)) {
+              report(result.item); afterAck.push(post(result.item))
+            }
+            if (result.status === 'duplicate' && slackKey && deps.membership?.hasUnresolved(key, slackKey.chat_id)) {
+              storeFailed = true
+              deps.membership.request(key)
+            }
+            return
+          }
+          // A retry after partial fanout must prepare the already retained, unfixed target too.
+          const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
           if (duplicate && duplicate.status !== 'failed') {
             if (duplicate.item && !duplicate.item.fixed && !duplicate.item.delivered) {
               report(duplicate.item)
@@ -339,21 +386,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
               return
             }
           }
-          const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
-          const profile = ev['bot_profile']
-          const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
-            name: typeof f.name === 'string' ? f.name : 'unnamed',
-            mimetype: typeof f.mimetype === 'string' ? f.mimetype : undefined,
-            size: typeof f.size === 'number' ? f.size : undefined,
-          })) : undefined
-          const input: AcceptedInput = {
-            source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
-            queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
-            channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
-            user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
-            bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
-            text: stringField('text') ?? '', files, via: decision.via, received_at: (deps.now ?? Date.now)(),
-          }
+          const input = acceptedInput(ev, slackKey, config, decision.via)
           try {
             const result = await deps.queue.accept(key, input)
             if (result.status === 'failed') { storeFailed = true; return }
@@ -368,12 +401,87 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
     // A failed sibling suppresses the aggregate ack, but retained targets still
     // deserve queued feedback. Preparation/recovery continue only after ack.
-    if (storeFailed) { for (const report of accepted) report(); return }
+    if (storeFailed) { for (const save of saveJoins) save(); for (const report of accepted) report(); return }
     try { await ack() } catch (err) { deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
+    for (const save of saveJoins) save()
     for (const report of accepted) report()
     await Promise.all(afterAck.map(async work => {
       try { await work() } catch (err) { deps.log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
     }))
+  }
+
+  /** Path choice only; selection re-reads these facts in the writer turn. */
+  function usesSerialIntake(key: string, ev: Record<string, unknown>, mode: ChannelMode, extShared: unknown): boolean {
+    const channel = ev['channel'], kind = ev['channel_type']
+    if (typeof channel !== 'string' || !CHANNEL_ID_RE.test(channel) || kind === 'im' || kind === 'mpim') return false
+    if (mode === FUNGIBLE_MODE && (extShared !== false || (kind !== 'channel' && kind !== 'group'))) return false
+    if (channelDeliveryFor(key, channel, { storedChoices: deps.getChannelDelivery?.() ?? undefined }).delivery !== 'thread_hybrid') return false
+    return deps.membership?.read(key, channel, mode).kind !== 'ineligible'
+  }
+
+  /** No effects: the queue can run this even when its journal cannot load. */
+  function decideSerialIntake(
+    key: string, ev: Record<string, unknown>, slackKey: SlackKey | undefined,
+    extShared: unknown, provenance: PersonaEventProvenance | undefined,
+  ): SerialSelection {
+    const config = deps.getPersonaConfig(), persona = config?.personas.find(p => p.key === key)
+    if (!config || !persona) return {}
+    const mode = channelModeOf(config), identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
+    const inputs = fungibleInputs(config, mode, extShared, slackKey?.chat_id)
+    const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, inputs)
+    const selection: SerialSelection = { persona, decision, stampDecided: !!slackKey && deps.threadStampUndecided?.(key, slackKey.chat_id) !== true }
+    if (decision.action === 'unresolved') return { ...selection, requestMembership: true }
+    if (decision.action === 'drop' || !slackKey) return selection
+    const membership = deps.membership?.read(key, slackKey.chat_id, mode)
+    if (membership?.kind === 'ineligible') return selection
+    if (membership?.kind === 'unresolved' || (provenance && !provenance.isCurrent())) return { ...selection, requestMembership: true }
+    selection.input = acceptedInput(ev, slackKey, config, decision.via)
+    const joins = deps.joins, root = ev['thread_ts'] === undefined ? ev['ts'] : ev['thread_ts']
+    if (!joins || (decision.via !== 'mention' && decision.via !== 'broadcast') || 'edited' in ev || ev['subtype'] === 'message_changed' ||
+      !isThreadTimestamp(root) || channelDeliveryFor(key, slackKey.chat_id, inputs ?? {}).delivery !== 'thread_hybrid') return selection
+    const stamp = joins.stamp(key, slackKey.chat_id)
+    if (stamp?.kind !== 'decided' || !stamp.threadHybridSince) return selection
+    const channelStamp = { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }
+    if (joins.hasSavedJoin(key, slackKey.chat_id, root, channelStamp)) return selection
+    const at = joins.clock(key)
+    selection.input.thread_join = { thread_ts: root, stamp: channelStamp, at }
+    selection.join = { channel: slackKey.chat_id, root, stamp: channelStamp, at, source: decision.via }
+    return selection
+  }
+
+  /** Delayed effects from the serial decision; never run inside the queue turn. */
+  function reportSerialSelection(key: string, ev: Record<string, unknown>, slackKey: SlackKey | undefined, selection: SerialSelection): void {
+    const { persona, decision } = selection
+    if (!persona || !decision) return
+    if (slackKey && selection.stampDecided) deps.threadStampEpisodes?.end(key, slackKey.chat_id)
+    if (decision.action === 'unresolved') {
+      if (decision.reason === 'thread-stamp-undecided' && slackKey && deps.threadStampEpisodes?.begin(key, slackKey.chat_id)) {
+        deps.log(formatPersonaDiagnostic({ class: PERSONA_THREAD_STAMP_UNDECIDED, name: persona.name, key, index: persona.index, cause: threadStampUndecidedCause(slackKey.chat_id) }))
+      }
+    } else {
+      const path = fungiblePathOf(decision)
+      if (path) logFirstHeard(persona, String(ev['channel']), path)
+      if (decision.action === 'drop') logDrop(persona, ev, decision)
+    }
+    if (selection.requestMembership) deps.membership?.request(key)
+  }
+
+  function acceptedInput(ev: Record<string, unknown>, slackKey: SlackKey, config: PersonaRoutingConfig, via: string): AcceptedInput {
+    const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
+    const profile = ev['bot_profile']
+    const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
+      name: typeof f.name === 'string' ? f.name : 'unnamed',
+      mimetype: typeof f.mimetype === 'string' ? f.mimetype : undefined,
+      size: typeof f.size === 'number' ? f.size : undefined,
+    })) : undefined
+    return {
+      source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
+      queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
+      channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
+      user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
+      bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
+      text: stringField('text') ?? '', files, via, received_at: (deps.now ?? Date.now)(),
+    }
   }
 
   /** Applied choices and current membership, read for each event in both modes. */

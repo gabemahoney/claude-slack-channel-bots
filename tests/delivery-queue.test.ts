@@ -8,8 +8,10 @@ import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
-import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, injectedInput, makeQueue, noticedRecord, queuePath, readQueue, refusedRecord, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
+import { THREAD_ROOTS, THREAD_STAMP, THREAD_TIME } from './test-helpers/thread-memory.ts'
+import { createDeliveryQueue as createMainDeliveryQueue } from './fixtures/main-delivery-queue/delivery-queue.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
@@ -756,4 +758,260 @@ test('startup findings remain available to a notifier installed after queue star
   expect(q.startupFindings()).toMatchObject([{ alert: true }])
   expect(fs.readFileSync(path, 'utf8')).toBe(damaged)
   expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 3])
+})
+
+describe('thread_join acceptance and main-reader compatibility', () => {
+  const joinFact = () => ({ thread_ts: THREAD_ROOTS.primary, stamp: { ...THREAD_STAMP }, at: THREAD_TIME })
+  const joiningInput = (via = 'mention') => slackInput({ via, thread_join: joinFact() })
+  const joinedRecord = (): AcceptedRecord => ({ ...accepted(), ...joiningInput() })
+
+  test.each(['mention', 'broadcast'])('%s joins share the accepting append/fsync and survive reaction adoption and replay', async via => {
+    const writes: Buffer[] = [], syncs: string[] = []
+    const paths = new Map<number, string>()
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number | null) {
+        if (paths.get(fd) === queuePath(dir)) writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
+        return fs.writeSync(fd, bytes, offset, length, position)
+      },
+      fsyncSync(fd: number) { if (fs.fstatSync(fd).isFile()) syncs.push(paths.get(fd)!); fs.fsyncSync(fd) },
+    } as typeof fs
+    const clock = createFakeClock({ start: THREAD_TIME })
+    const q = await open({ fs: seam, now: clock.now }), input = joiningInput(via)
+    const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }))
+    expect(result).toMatchObject({ status: 'accepted', seq: 1 })
+    expect(readQueue(dir)).toEqual([{ ...input, v: 1, kind: 'accepted', seq: 1, received_at: THREAD_TIME, ts: input.ts! }])
+    expect(writes).toEqual([fs.readFileSync(queuePath(dir))])
+    expect(syncs).toEqual([queuePath(dir)])
+    expect(await q.rememberQueuedReaction('alpha', 1, 'original_queue')).toBe('original_queue')
+    await q.compact('alpha')
+    await q.stop()
+    const replay = await open({ now: clock.now })
+    expect(replay.item('alpha', 1)!.accepted).toMatchObject({ ...input, queued_ack_reaction: 'original_queue' })
+    expect(replay.openCount('alpha')).toBe(1)
+    expect(readQueue(dir).filter(r => r.kind === 'accepted' && !('compact' in r))).toMatchObject([{ thread_join: joinFact() }])
+    for (const record of readQueue(dir).filter(r => 'compact' in r)) expect(record).not.toHaveProperty('thread_join')
+  })
+
+  const badJoins: [string, unknown][] = [
+    ['null', null], ['array', []],
+    ['missing root', { stamp: THREAD_STAMP, at: THREAD_TIME }],
+    ['missing stamp', { thread_ts: THREAD_ROOTS.primary, at: THREAD_TIME }],
+    ['missing at', { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP }],
+    ['extra join key', { ...joinFact(), source: 'mention' }],
+    ['invalid timestamp', { ...joinFact(), thread_ts: 'not-a-timestamp' }],
+    ['short timestamp', { ...joinFact(), thread_ts: '1.1' }],
+    ['numeric timestamp', { ...joinFact(), thread_ts: 1 }],
+    ['empty incarnation', { ...joinFact(), stamp: { ...THREAD_STAMP, incarnation: '' } }],
+    ['empty since', { ...joinFact(), stamp: { ...THREAD_STAMP, threadHybridSince: '' } }],
+    ['missing incarnation', { ...joinFact(), stamp: { threadHybridSince: THREAD_STAMP.threadHybridSince } }],
+    ['missing since', { ...joinFact(), stamp: { incarnation: THREAD_STAMP.incarnation } }],
+    ['extra stamp key', { ...joinFact(), stamp: { ...THREAD_STAMP, extra: true } }],
+    ['string at', { ...joinFact(), at: String(THREAD_TIME) }],
+    ['NaN', { ...joinFact(), at: NaN }], ['infinite at', { ...joinFact(), at: Infinity }],
+  ]
+  const badRecords: [string, unknown][] = [
+    ...badJoins.map(([name, thread_join]): [string, unknown] => [name, { ...joinedRecord(), thread_join }]),
+    ...['interject', 'cron'].map(source => [source, { ...joinedRecord(), source, sender: source, key: undefined }] as [string, unknown]),
+    ...['thread', 'receive_all', 'all', 'dm', ''].map(via => [`via ${via}`, { ...joinedRecord(), via }] as [string, unknown]),
+    ['compacted key', { v: 1, kind: 'accepted', seq: 1, compact: 'key', key: slackInput().key, received_at: 1000, delivered_at: 1000, thread_join: joinFact() }],
+    ['allocation', { v: 1, kind: 'accepted', seq: 1, compact: 'allocation', thread_join: joinFact() }],
+  ]
+  test.each(badRecords)('quarantines %s instead of replaying a bad join', async (_, record) => {
+    expect(isQueueRecord(record)).toBe(false)
+    const line = JSON.stringify(record) + '\n'
+    expect(parseQueueRecord(line)).toBeUndefined()
+    seedQueue(dir, [line, { ...accepted(), seq: 2 }])
+    const q = await open(), findings = q.startupFindings()
+    expect(findings).toMatchObject([{ type: 'record-unreadable', key: 'alpha', line: 1, alert: true }])
+    const finding = findings[0]!
+    if (finding.type !== 'record-unreadable') throw new Error('expected invalid-join quarantine')
+    expect(fs.readFileSync(finding.quarantinePath, 'utf8')).toBe(line)
+    expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([2])
+    expect(q.openCount('alpha')).toBe(1)
+  })
+
+  test.each(['mention', 'broadcast', 'thread', 'receive_all', 'all', 'interject', 'cron'])('plain accept %s writes main-identical bytes and duplicate keys write nothing', async kind => {
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    const oldDir = join(dir, 'main'), old = createMainDeliveryQueue({ stateDir: oldDir, now: clock.now })
+    fs.mkdirSync(oldDir)
+    await old.start()
+    try {
+      const input = kind === 'interject' || kind === 'cron' ? injectedInput({ source: kind }) : slackInput({ via: kind })
+      for (let i = 0; i < 2; i++) {
+        expect(await q.accept('alpha', input)).toEqual(await old.accept('alpha', input))
+        expect(fs.readFileSync(queuePath(dir))).toEqual(fs.readFileSync(queuePath(oldDir)))
+      }
+      expect(q.items('alpha')).toHaveLength(input.source === 'slack' ? 1 : 2)
+    } finally { await old.stop() }
+  })
+
+  // main.start() compacts after loading. Refusing its writes keeps the loaded
+  // snapshot available, so we check delivered status before old compaction
+  // intentionally discards delivered content. Its reader code is unmodified.
+  async function readWithMain(label: string) {
+    const copy = join(dir, label)
+    seedQueue(copy, [])
+    fs.copyFileSync(queuePath(dir), queuePath(copy))
+    const before = fs.readFileSync(queuePath(copy))
+    const old = createMainDeliveryQueue({ stateDir: copy, now: () => 1000, fs: { ...fs,
+      openSync(path: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) {
+        if (typeof flags !== 'string' || /[wa+]/.test(flags)) throw new Error('read-only compatibility reader')
+        return fs.openSync(path, flags, mode)
+      },
+    } as typeof fs })
+    await old.start()
+    try {
+      expect(old.startupFindings()).toEqual([])
+      expect(fs.readFileSync(queuePath(copy))).toEqual(before)
+      return { items: old.items('alpha'), open: old.openCount('alpha'), keys: [THREAD_ROOTS.primary, THREAD_ROOTS.secondary, THREAD_ROOTS.third].map(ts => old.lookupSlackKey('alpha', { chat_id: slackInput().channel!, ts })) }
+    } finally { await old.stop() }
+  }
+
+  test.each(['absent', 'false'] as const)('delivered unsaved joins retain every item byte with predicate %s, then main reads delivered', async option => {
+    let saved = false
+    const calls: unknown[] = [], clock = createFakeClock({ start: 1000 })
+    const predicate = (key: string, channel: string, fact: ReturnType<typeof joinFact>) => { calls.push({ key, channel, fact }); return saved }
+    const q = await open({ now: clock.now, ...(option === 'false' ? { threadJoinSaved: predicate } : {}) })
+    await q.accept('alpha', joiningInput())
+    const itemRecords: QueueRecord[] = [
+      fixedRecord(1, ['exact\nbytes🙂']), sentRecord(),
+      refusedRecord(), sentRecord(1, 2), deliveredRecord(),
+      noticedRecord(),
+    ]
+    for (const record of itemRecords) await q.append('alpha', record)
+    // The unjoined delivered sibling still compacts; the open joined sibling
+    // still delivers in FIFO order. Pending reply reminders keep their facts.
+    for (const [seq, ts] of [[2, THREAD_ROOTS.secondary], [3, THREAD_ROOTS.third]] as const) {
+      await q.accept('alpha', slackInput({ via: 'mention', ts, key: { ...slackInput().key!, ts }, ...(seq === 3 ? { thread_join: joinFact() } : {}) }))
+      if (seq === 2) { await q.append('alpha', fixedRecord(seq, ['plain delivered'])); await q.append('alpha', deliveredRecord(seq)) }
+    }
+    const before = q.item('alpha', 1)!, reminders = q.replyReminderItems('alpha')
+    const itemBytes = fs.readFileSync(queuePath(dir), 'utf8').split('\n').filter(line => line && JSON.parse(line).seq === 1 && JSON.parse(line).kind !== 'reply-reminder')
+    await q.compact('alpha')
+    expect(fs.readFileSync(queuePath(dir), 'utf8').split('\n').filter(line => line && JSON.parse(line).seq === 1 && JSON.parse(line).kind !== 'reply-reminder')).toEqual(itemBytes)
+    expect(q.item('alpha', 1)).toEqual(before)
+    expect(q.item('alpha', 1)!.delivered).toBe(true)
+    expect(q.items('alpha').map(i => [i.accepted.seq, i.delivered])).toEqual([[1, true], [3, false]])
+    expect(q.openCount('alpha')).toBe(1)
+    expect(q.replyReminderItems('alpha')).toEqual(reminders)
+    expect(q.item('alpha', 3)!.accepted.thread_join).toEqual(joinFact())
+    const old = await readWithMain('main-retained')
+    expect(old.items).toEqual(q.items('alpha'))
+    expect(old.open).toBe(1)
+    expect(old.keys.map(k => k?.status)).toEqual(['duplicate', 'duplicate', 'duplicate'])
+    await q.stop()
+    const replay = await open({ now: clock.now, threadJoinSaved: predicate })
+    expect(replay.item('alpha', 1)).toEqual(before)
+    saved = true
+    await replay.compact('alpha')
+    expect(calls).toContainEqual({ key: 'alpha', channel: slackInput().channel, fact: joinFact() })
+    expect(replay.item('alpha', 1)).toBeUndefined()
+    expect(replay.lookupSlackKey('alpha', slackInput().key!)).toEqual({ status: 'duplicate', seq: 1 })
+    expect(readQueue(dir)).toContainEqual({ v: 1, kind: 'accepted', seq: 1, compact: 'key', key: slackInput().key!, received_at: 1000, delivered_at: 1000 })
+    for (const record of readQueue(dir).filter(r => 'compact' in r)) expect(record).not.toHaveProperty('thread_join')
+    expect(replay.replyReminderItems('alpha')).toEqual(reminders)
+    const confirmed = await readWithMain('main-confirmed')
+    expect(confirmed.items).toEqual(replay.items('alpha'))
+    expect(confirmed.open).toBe(1)
+    expect(confirmed.keys[0]).toEqual({ status: 'duplicate', seq: 1 })
+  })
+})
+
+describe('decided acceptance owns the persona writer turn', () => {
+  test('the next decision sees afterStore before it runs, and a concurrent duplicate never decides', async () => {
+    const q = await open(), order: string[] = []
+    const first = slackInput({ via: 'mention' }), second = slackInput({ ts: THREAD_ROOTS.secondary, key: { ...first.key!, ts: THREAD_ROOTS.secondary } })
+    let joined = false
+    let joinedBeforeYield: boolean | undefined
+    const a = q.acceptDecided('alpha', first.key, ({ keyChecked }) => {
+      expect(keyChecked).toBe(true); order.push('mention')
+      queueMicrotask(() => { joinedBeforeYield = joined })
+      return { store: first, afterStore: () => { joined = true; order.push('join') } }
+    })
+    const b = q.acceptDecided('alpha', second.key, ({ keyChecked }) => {
+      expect(keyChecked).toBe(true); expect(joined).toBe(true); order.push('reply')
+      return { store: { ...second, via: joined ? 'thread' : 'mention' } }
+    })
+    const duplicate = q.acceptDecided('alpha', first.key, () => { throw new Error('duplicate must not decide') })
+    expect((await Promise.all([a, b, duplicate])).map(r => r.status)).toEqual(['accepted', 'accepted', 'duplicate'])
+    expect(order).toEqual(['mention', 'join', 'reply'])
+    expect(joinedBeforeYield).toBe(true)
+    expect(q.items('alpha').map(i => [i.accepted.seq, i.accepted.via])).toEqual([[1, 'mention'], [2, 'thread']])
+    expect(readQueue(dir)).toHaveLength(2)
+  })
+
+  test.each(['skip', 'store', 'afterStore throws', 'decide throws', 'append fails'] as const)('%s preserves durable outcomes and callback order', async outcome => {
+    let fail = outcome === 'append fails'
+    const order: string[] = [], skipped = { reason: 'drop', detail: { identity: true } }, error = new Error('decision failed')
+    const q = await open({ onEvent: e => order.push(e.type), fs: { ...fs,
+      fsyncSync(fd: number) { if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO acceptance'); fs.fsyncSync(fd) },
+    } as typeof fs })
+    const result = await q.acceptDecided('alpha', slackInput().key, ({ keyChecked }) => {
+      expect(keyChecked).toBe(true); order.push('decide')
+      if (outcome === 'skip') return { skip: skipped }
+      if (outcome === 'decide throws') throw error
+      return { store: slackInput(), afterStore: () => { order.push('afterStore'); if (outcome === 'afterStore throws') throw new Error('observer failed') } }
+    })
+    if (outcome === 'skip') {
+      expect(result).toEqual({ status: 'skipped', outcome: skipped })
+      if (result.status === 'skipped') expect(result.outcome).toBe(skipped)
+      expect(order).toEqual(['decide']); expect(fs.existsSync(queuePath(dir))).toBe(false)
+      expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'accepted', seq: 1 })
+      expect(readQueue(dir)).toHaveLength(1)
+    } else if (outcome === 'decide throws' || outcome === 'append fails') {
+      expect(result.status).toBe('failed'); expect(order).toEqual(['decide', 'store-failed'])
+      expect(q.items('alpha')).toEqual([]); expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
+      if (outcome === 'decide throws') expect(result).toEqual({ status: 'failed', error })
+      fail = false
+      expect(await q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }))).toMatchObject({ status: 'accepted', seq: 1 })
+      expect(readQueue(dir)).toHaveLength(1)
+    } else {
+      expect(result).toMatchObject({ status: 'accepted', seq: 1 })
+      expect(order).toEqual(['decide', 'stored', 'afterStore'])
+      expect(readQueue(dir)).toHaveLength(1)
+      await q.stop()
+      expect((await open()).items('alpha')).toHaveLength(1)
+    }
+  })
+
+  test.each(['not started', 'stopped', 'unloadable'] as const)('%s still decides skips but refuses stores without a key check', async state => {
+    const events: QueueEvent[] = [], q = createDeliveryQueue({ stateDir: dir, onEvent: e => events.push(e), fs: { ...fs,
+      readFileSync(path: fs.PathOrFileDescriptor, ...args: unknown[]) {
+        if (state === 'unloadable' && String(path) === queuePath(dir)) throw new Error('EIO journal read')
+        return (fs.readFileSync as Function)(path, ...args)
+      },
+    } as typeof fs })
+    queues.push(q)
+    if (state === 'unloadable') seedQueue(dir, [accepted()])
+    const bytes = fs.existsSync(queuePath(dir)) ? fs.readFileSync(queuePath(dir)) : undefined
+    if (state !== 'not started') await q.start()
+    if (state === 'stopped') await q.stop()
+    const skipped = { reason: 'drop' }
+    expect(await q.acceptDecided('alpha', slackInput().key, facts => { expect(facts).toEqual({ keyChecked: false }); return { skip: skipped } })).toEqual({ status: 'skipped', outcome: skipped })
+    expect(events.filter(e => e.type === 'store-failed' || e.type === 'stored')).toEqual([])
+    let after = false
+    expect((await q.acceptDecided('alpha', slackInput().key, facts => {
+      expect(facts).toEqual({ keyChecked: false }); return { store: slackInput(), afterStore: () => { after = true } }
+    })).status).toBe('failed')
+    expect(after).toBe(false)
+    expect(events.filter(e => e.type === 'store-failed' || e.type === 'stored').map(e => e.type)).toEqual(['store-failed'])
+    expect(fs.existsSync(queuePath(dir)) ? fs.readFileSync(queuePath(dir)) : undefined).toEqual(bytes)
+  })
+
+  test('other personas accept while one persona has earlier queued turns', async () => {
+    const q = await open(), order: string[] = []
+    // A backlog makes the observation deterministic without timers or an async
+    // decide (the public callback contract is synchronous).
+    const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
+    const decided = q.acceptDecided('beta', slackInput().key, () => { order.push('beta'); return { store: slackInput() } })
+    const plain = q.accept('gamma', injectedInput()).then(r => { order.push('gamma'); return r })
+    expect((await Promise.all([decided, plain])).map(r => r.status)).toEqual(['accepted', 'accepted'])
+    expect(order).not.toContain('alpha:19')
+    await Promise.all(backlog)
+    expect(order.indexOf('beta')).toBeLessThan(order.indexOf('alpha:19'))
+    expect(order.indexOf('gamma')).toBeLessThan(order.indexOf('alpha:19'))
+    expect(q.openCount('alpha')).toBe(0)
+    expect(q.openCount('beta')).toBe(1); expect(q.openCount('gamma')).toBe(1)
+  })
 })

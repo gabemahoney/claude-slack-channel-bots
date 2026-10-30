@@ -1711,6 +1711,25 @@ function makeEvent(defaults: SlackEvent, overrides: EventOverrides): SlackEvent 
   return mergeDroppingUndefined({ ...defaults, ts, event_ts: ts }, overrides)
 }
 
+/**
+ * A bot's authenticated membership event and envelope for `deliver`.
+ * `at` is milliseconds on the caller's clock. Rebuilding the same observation
+ * keeps its event ID, so replay does not become a later membership change.
+ */
+export function makeMembershipEvent(
+  identity: StubSlack['identity'], kind: 'leave' | 'join', channel: string, at: number,
+): [SlackEvent, EnvelopeOverrides] {
+  const timestamp = (at / 1000).toFixed(3)
+  return [
+    { type: kind === 'leave' ? 'channel_left' : 'member_joined_channel',
+      channel, user: identity.botUserId, event_ts: timestamp },
+    { team_id: identity.teamId, api_app_id: identity.appId ?? 'A0STUB0001',
+      authorizations: [{ team_id: identity.teamId, user_id: identity.botUserId, is_bot: true }],
+      event_id: `EvMEMBERSHIP${identity.teamId}${identity.botUserId}${kind}${channel}${at}`,
+      event_time: Math.floor(at / 1000) },
+  ]
+}
+
 /** Default user-group ID for `userGroupMentionText`. User-group IDs start `S`. */
 const DEFAULT_USER_GROUP = 'S0STUBGRP1'
 

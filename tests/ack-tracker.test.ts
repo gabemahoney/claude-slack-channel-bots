@@ -9,9 +9,69 @@
  */
 
 import { describe, test, expect, beforeEach, jest, spyOn } from 'bun:test'
-import { trackAck, consumeAck, forgetPersonaAcks, _resetAckTracker, addDeliveryAck, EARLY_REPLY_EXPIRY_MS } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, forgetPersonaAcks, _resetAckTracker, addDeliveryAck, EARLY_REPLY_EXPIRY_MS, createQueuedAckCallback, createDeliveryAckCallback } from '../src/ack-tracker.ts'
+import { DEFAULT_ACK_REACTION, DEFAULT_QUEUED_ACK_REACTION } from '../src/config.ts'
+import type { AcceptedInput, QueueItem } from '../src/delivery-queue.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
+import { THREAD_ROOTS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
+import { makeStubSlack } from './test-helpers/slack-stub.ts'
 
 type Triple = [personaKey: string, channelId: string, messageTs: string]
+
+function threadAckItem(ts: string, overrides: Partial<AcceptedInput> = {}): QueueItem {
+  return {
+    accepted: { ...slackInput({ via: 'thread', thread_ts: THREAD_ROOTS.primary,
+      key: { chat_id: slackInput().channel!, ts }, queued_ack_reaction: DEFAULT_QUEUED_ACK_REACTION, ...overrides }),
+      v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts },
+    records: [], delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: 1,
+  }
+}
+
+describe('joined thread reaction identity', () => {
+  test('a root mention and its thread-selected reply keep separate queued and delivered reactions', async () => {
+    const slack = makeStubSlack()
+    const queued = createQueuedAckCallback({ getReaction: () => DEFAULT_QUEUED_ACK_REACTION, clientFor: () => slack.web })
+    const delivered = createDeliveryAckCallback({ getReaction: () => DEFAULT_ACK_REACTION, clientFor: () => slack.web })
+    const root = threadAckItem(THREAD_ROOTS.primary, { via: 'mention',
+      thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: { ...THREAD_STAMP }, at: 1000 } })
+    const reply = threadAckItem(THREAD_ROOTS.secondary)
+    const args = (timestamp: string, name: string) => ({ channel: root.accepted.channel!, timestamp, name })
+    for (const item of [root, reply]) await queued('alpha', item)
+    for (const item of [root, reply]) await delivered('alpha', { ...item, delivered: true })
+    expect(slack.calls.reactionsAdd).toEqual([
+      args(root.accepted.ts, DEFAULT_QUEUED_ACK_REACTION), args(reply.accepted.ts, DEFAULT_QUEUED_ACK_REACTION),
+      args(root.accepted.ts, DEFAULT_ACK_REACTION), args(reply.accepted.ts, DEFAULT_ACK_REACTION),
+    ])
+    await consumeAck('alpha', reply.accepted.channel!, reply.accepted.ts, async () => {})
+    expect(consumeAck('alpha', reply.accepted.channel!, reply.accepted.ts)).toBe(false)
+    expect(slack.calls.reactionsRemove).toEqual([
+      args(root.accepted.ts, DEFAULT_QUEUED_ACK_REACTION), args(reply.accepted.ts, DEFAULT_QUEUED_ACK_REACTION),
+      args(reply.accepted.ts, DEFAULT_ACK_REACTION),
+    ])
+    await consumeAck('alpha', root.accepted.channel!, root.accepted.ts, async () => {})
+    expect(slack.calls.reactionsRemove.at(-1)).toEqual(args(root.accepted.ts, DEFAULT_ACK_REACTION))
+    expect(slack.calls.reactionsRemove).toHaveLength(4)
+  })
+
+  test('the same thread-selected reply is consumed independently for two joined personas', async () => {
+    const stubs = { alpha: makeStubSlack(), beta: makeStubSlack() }
+    const queued = createQueuedAckCallback({ getReaction: () => DEFAULT_QUEUED_ACK_REACTION, clientFor: key => stubs[key as keyof typeof stubs].web })
+    const delivered = createDeliveryAckCallback({ getReaction: () => DEFAULT_ACK_REACTION, clientFor: key => stubs[key as keyof typeof stubs].web })
+    const reply = threadAckItem(THREAD_ROOTS.secondary)
+    const args = (name: string) => ({ channel: reply.accepted.channel!, timestamp: reply.accepted.ts, name })
+    for (const key of ['alpha', 'beta']) {
+      await queued(key, reply)
+      await delivered(key, { ...reply, delivered: true })
+    }
+    await consumeAck('alpha', reply.accepted.channel!, reply.accepted.ts, async () => {})
+    expect(consumeAck('alpha', reply.accepted.channel!, reply.accepted.ts)).toBe(false)
+    expect(stubs.alpha.calls.reactionsRemove).toEqual([args(DEFAULT_QUEUED_ACK_REACTION), args(DEFAULT_ACK_REACTION)])
+    expect(stubs.beta.calls.reactionsRemove).toEqual([args(DEFAULT_QUEUED_ACK_REACTION)])
+    await consumeAck('beta', reply.accepted.channel!, reply.accepted.ts, async () => {})
+    expect(stubs.beta.calls.reactionsRemove).toEqual([args(DEFAULT_QUEUED_ACK_REACTION), args(DEFAULT_ACK_REACTION)])
+    for (const stub of Object.values(stubs)) expect(stub.calls.reactionsAdd).toEqual([args(DEFAULT_QUEUED_ACK_REACTION), args(DEFAULT_ACK_REACTION)])
+  })
+})
 
 // ---------------------------------------------------------------------------
 // Reset state before each test

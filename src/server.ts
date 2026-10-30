@@ -53,6 +53,7 @@
  */
 
 import { createThreadMemory, type ThreadMemory } from './thread-memory.ts'
+import { recoverQueuedJoins } from './thread-join-recovery.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
@@ -1175,6 +1176,14 @@ const personaRouting = createPersonaRouting({
       if (!deliveryQueue) return Promise.resolve({ status: 'failed' as const, error: new Error('Queue not started') })
       return deliveryQueue.accept(key, input)
     },
+    acceptDecided: (key, slackKey, decide) => {
+      if (!deliveryQueue) {
+        const decision = decide({ keyChecked: false })
+        return Promise.resolve('skip' in decision ? { status: 'skipped' as const, outcome: decision.skip }
+          : { status: 'failed' as const, error: new Error('Queue not started') })
+      }
+      return deliveryQueue.acceptDecided(key, slackKey, decide)
+    },
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
   },
   prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
@@ -1187,6 +1196,13 @@ const personaRouting = createPersonaRouting({
   // main() loads the store it is undefined, so no stored choice applies.
   getChannelDelivery: () => channelDeliveryStore,
   threadMemory: (key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown',
+  joins: {
+    stamp: (key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined,
+    hasSavedJoin: (key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false,
+    clock: key => threadMemory!.clock(key),
+    addJoin: (key, fact) => threadMemory?.addJoin(key, fact) ?? false,
+    saveJoins: (key, facts) => threadMemory?.saveJoins(key, facts) ?? Promise.resolve({ kind: 'cancelled' }),
+  },
   threadStampUndecided: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
   threadStampEpisodes: {
     begin: (key, channel) => personaEpisodes?.threadStampUndecided.begin(key, channel) ?? false,
@@ -2755,7 +2771,15 @@ export async function main(): Promise<void> {
   checkPidConflict(PID_FILE)
 
   // replay and compact every journal before Slack/HTTP admission.
-  deliveryQueue = createDeliveryQueue({ stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event) })
+  deliveryQueue = createDeliveryQueue({
+    stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event),
+    threadJoinSaved: (key, channel, fact) => {
+      // A covered delivered join can disappear in start compaction before
+      // recovery reads items(). Its decision time still advances this clock.
+      threadMemory?.advancePast(key, fact.at)
+      return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+    },
+  })
   threadMemorySeal = createThreadMemorySeal({
     stateDir: STATE_DIR,
     queueJournalPath: key => join(STATE_DIR, 'queue', `${key}.jsonl`),
@@ -2768,6 +2792,7 @@ export async function main(): Promise<void> {
     stateDir: STATE_DIR, dryRun: isDryRun(), seal: threadMemorySeal,
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
+    authorityReady: () => reloadController?.sharedChannels() !== undefined,
     threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
     markerKeys: () => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
     canRemove: key => reloadController?.sharedChannels()?.reviewHeld(key) === false,
@@ -2975,6 +3000,10 @@ export async function main(): Promise<void> {
   unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => threadMemory?.published())
   await threadMemory.activate()
   if (shuttingDown) return
+  for (const key of deliveryQueue.keys()) {
+    try { recoverQueuedJoins(key, deliveryQueue, threadMemory) } catch { /* a retained queue copy retries at this key's bring-up */ }
+  }
+  // Memory Hold resolution follows start join recovery, before intake admission.
 
   channelMembership = createChannelMembership({
     authority: reload.sharedChannels()!, dryRun: isDryRun(),
@@ -3673,7 +3702,11 @@ export async function main(): Promise<void> {
       k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k),
       k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => threadMemory?.forget(k),
     ]) },
-    loadThreadMemory: key => threadMemory?.loadKey(key),
+    loadThreadMemory: async key => {
+      await threadMemory?.loadKey(key)
+      if (!shuttingDown && deliveryQueue && threadMemory) recoverQueuedJoins(key, deliveryQueue, threadMemory)
+      // Memory Hold resolution follows bring-up recovery before intake opens.
+    },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,

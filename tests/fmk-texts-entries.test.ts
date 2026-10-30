@@ -48,6 +48,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import ts from 'typescript'
 
@@ -91,10 +92,72 @@ import * as sharedChannels from '../src/shared-channels.ts'
 import * as testTimerOverrides from '../src/test-timer-overrides.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
+import { initialSharedState } from './test-helpers/shared-channels.ts'
 
 const REPO_ROOT = join(import.meta.dir, '..')
 const SRC_DIR = join(REPO_ROOT, 'src')
 const PRINTER_PATH = join(REPO_ROOT, 'tests', 'integration', 'fixtures', 'fmk-texts.ts')
+
+describe('test-29 Channel Stamp printer', () => {
+  // Execute only these declarations, never the image-only printer entry
+  // point. Read bytes from memory; use the real authority parser and the
+  // established helper's minted stamps, without a handwritten state record.
+  const source = ts.createSourceFile('fmk-texts.ts', readFileSync(PRINTER_PATH, 'utf8'), ts.ScriptTarget.Latest, true)
+  const names = ['readSharedConfiguration', 'sharedThreadStamp', 'expectArguments']
+  const declarations = source.statements.filter(statement =>
+    ts.isFunctionDeclaration(statement) ? names.includes(statement.name?.text ?? '') :
+      ts.isVariableStatement(statement) && statement.declarationList.declarations.some(d => names.includes(d.name.getText(source))))
+  const js = ts.transpileModule(declarations.map(d => d.getText(source)).join('\n'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const base = join(tmpdir(), 'stamp-printer-in-memory')
+  const configPath = join(base, 'config.json'), recordPath = `${configPath}.last-applied`
+  const input = makePersonaConfigInput({ personas: [makePersona({ name: 'alpha', channels: [
+    { id: 'CHYBRID', delivery: 'thread_hybrid' }, { id: 'COTHER', delivery: 'mentions' },
+  ], permission_prompts: 'CHYBRID' }, base)] }, base)
+  const state = initialSharedState(base, input)
+  const key = personaIdentity.personaKey('alpha')
+
+  function reader(bytes = sharedChannels.serializeSharedChannelState(state)) {
+    const reads: string[] = []
+    const packageFunction = async (_context: unknown, file: string, name: string) => {
+      if (file === 'config.ts' && name === 'readPersonaConfigBytes') return (path: string) => {
+        reads.push(path)
+        if (path !== recordPath) throw new Error('unexpected read')
+        return bytes
+      }
+      if (file === 'shared-channels.ts') return (sharedChannels as Record<string, unknown>)[name]
+      throw new Error('unexpected package export')
+    }
+    const entry = new Function('packageFunction', 'PrinterFailure', 'PRINTER_FAIL_EXIT', 'usageFail',
+      `${js}\nreturn sharedThreadStamp;`)(packageFunction, Error, 1, () => { throw new Error('invalid arguments') }) as {
+        print(args: string[], context: object): Promise<string>
+      }
+    return { reads, print: (persona = key, channel = 'CHYBRID') => entry.print([configPath, recordPath, persona, channel], {}) }
+  }
+
+  test('prints only the selected current stamp, obtained through the production reader', async () => {
+    expect(declarations).toHaveLength(names.length)
+    const r = reader(), output = await r.print()
+    expect(JSON.parse(output)).toEqual({ incarnation: state.personas[key]!.incarnation,
+      threadHybridSince: state.personas[key]!.assignments.CHYBRID!.threadHybridSince })
+    expect(r.reads).toEqual([recordPath])
+    assertNoLeak(output)
+  })
+
+  test('refuses absent, non-hybrid and inherited-property lookups', async () => {
+    for (const [persona, channel] of [[key, 'COTHER'], [key, 'CMISSING'], ['missing', 'CHYBRID'],
+      ['constructor', 'CHYBRID'], [key, 'constructor']]) {
+      await expect(reader().print(persona, channel)).rejects.toThrow('expected a current thread_hybrid Channel Stamp')
+    }
+  })
+
+  test('an invalid authority fails closed without echoing its bytes', async () => {
+    await expect(reader(Buffer.from('private-invalid-authority')).print()).rejects
+      .toThrow('shared configuration authority could not be read or validated')
+  })
+})
 
 /** The `src/` modules the printer reads, by the file name it passes. */
 const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {

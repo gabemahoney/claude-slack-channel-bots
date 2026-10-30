@@ -21,6 +21,7 @@ import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 import type { PersonaConfig } from '../src/config.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import type { DeliveryQueueOptions, QueueThreadJoin } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -43,6 +44,8 @@ import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type * as OwnPostModule from '../src/own-post.ts'
 import type * as ThreadMemoryModule from '../src/thread-memory.ts'
+import type * as ThreadJoinRecoveryModule from '../src/thread-join-recovery.ts'
+import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import type * as ThreadMemorySealModule from '../src/thread-memory-seal.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
 import type * as PendingRowModule from '../src/pending-row.ts'
@@ -82,9 +85,11 @@ import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, makeQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { threadJoin, THREAD_PERSONAS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -4280,7 +4285,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'threadMemory', 'threadStampUndecided', 'threadStampEpisodes',
+      'threadMemory', 'joins', 'threadStampUndecided', 'threadStampEpisodes',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5477,6 +5482,9 @@ describe('Thread Memory server lifecycle wiring', () => {
   const factory: keyof typeof ThreadMemoryModule = 'createThreadMemory'
   const sealFactory: keyof typeof ThreadMemorySealModule = 'createThreadMemorySeal'
   const routingMember: keyof PersonaRoutingDeps = 'threadMemory'
+  const joinsMember: keyof PersonaRoutingDeps = 'joins'
+  const retentionMember: keyof DeliveryQueueOptions = 'threadJoinSaved'
+  const recovery: keyof typeof ThreadJoinRecoveryModule = 'recoverQueuedJoins'
 
   test('routing reads the one Thread Memory holder at call time, with unknown before main creates it', () => {
     const routing = onlyCallOf('createPersonaRouting')
@@ -5518,6 +5526,66 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(indicesOf(new RegExp(`(?:\\.\\s*${routingMember}\\b|\\[\\s*['"]${routingMember}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
   })
 
+  test('queue retention and routing joins read the live holder, preserve the decision clock and bind every argument', () => {
+    const queue = onlyCallOf('createDeliveryQueue')
+    expect(queue).toBeLessThan(onlyCallOf(factory))
+    expect(onlyCallProps('createDeliveryQueue').get(retentionMember)).toBe(
+      '(key, channel, fact) => { threadMemory?.advancePast(key, fact.at) return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false }',
+    )
+    expect(Object.fromEntries(objectProperties(onlyCallProps('createPersonaRouting').get(joinsMember)!))).toEqual({
+      stamp: '(key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined',
+      hasSavedJoin: '(key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false',
+      clock: 'key => threadMemory!.clock(key)',
+      addJoin: '(key, fact) => threadMemory?.addJoin(key, fact) ?? false',
+      saveJoins: "(key, facts) => threadMemory?.saveJoins(key, facts) ?? Promise.resolve({ kind: 'cancelled' })",
+    })
+    for (const [member, call] of [[retentionMember, queue], [joinsMember, onlyCallOf('createPersonaRouting')]] as const) {
+      const bindings = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
+      expect(bindings).toHaveLength(1)
+      expect(withinCall(bindings, call)).toBe(1)
+      // No later assignment, Object.assign target or alternate options object.
+      const accesses = indicesOf(new RegExp(`(?:\\.\\s*${member}\\b|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)
+      expect(accesses).toHaveLength(member === retentionMember ? 1 : 0)
+      expect(withinCall(accesses, call)).toBe(accesses.length)
+    }
+  })
+
+  test('the actual join adapters safely answer before creation and observe replacement holders at each call', async () => {
+    // Evaluate only the private adapters, with isolated holders. No server
+    // import/start, storage or reproduction of the adapters' implementations.
+    const js = ts.transpileModule(`let threadMemory; let reloadController;
+      const retained = (${onlyCallProps('createDeliveryQueue').get(retentionMember)});
+      const joins = (${onlyCallProps('createPersonaRouting').get(joinsMember)});
+      return { retained, joins, set: value => { threadMemory = value } };`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+    const adapters = new Function(js)() as {
+      retained: NonNullable<DeliveryQueueOptions['threadJoinSaved']>
+      joins: NonNullable<PersonaRoutingDeps['joins']>
+      set(value: Pick<ThreadMemoryModule.ThreadMemory, 'advancePast' | 'threadJoinSaved' | 'hasSavedJoin'>): void
+    }
+    const fact = threadJoin(), key = THREAD_PERSONAS.primary
+    const queued: QueueThreadJoin = { thread_ts: fact.root, stamp: fact.stamp, at: fact.at }
+    expect(adapters.retained(key, fact.channel, queued)).toBe(false)
+    expect(adapters.joins.stamp(key, fact.channel)).toBeUndefined()
+    expect(adapters.joins.hasSavedJoin(key, fact.channel, fact.root, fact.stamp)).toBe(false)
+    expect(adapters.joins.addJoin(key, fact)).toBe(false)
+    expect(await adapters.joins.saveJoins(key, [fact])).toEqual({ kind: 'cancelled' })
+    for (const saved of [true, false]) {
+      const calls: unknown[][] = []
+      adapters.set({
+        advancePast: (...args) => { calls.push(['advance', ...args]) },
+        threadJoinSaved: (...args) => { calls.push(['retention', ...args]); return saved },
+        hasSavedJoin: (...args) => { calls.push(['saved', ...args]); return saved },
+      })
+      expect(adapters.retained(key, fact.channel, queued)).toBe(saved)
+      expect(adapters.joins.hasSavedJoin(key, fact.channel, fact.root, fact.stamp)).toBe(saved)
+      expect(calls).toEqual([
+        ['advance', key, fact.at], ['retention', key, fact.channel, fact.root, fact.stamp, fact.at],
+        ['saved', key, fact.channel, fact.root, fact.stamp],
+      ])
+    }
+  })
+
   test('one seal uses the queue state directory, real filesystem and live shared-state readers, and publishes its events', () => {
     expect(importSource(SERVER_CODE, sealFactory)).toBe('./thread-memory-seal.ts')
     const seal = onlyCallOf(sealFactory)
@@ -5546,6 +5614,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       stateDir: 'STATE_DIR', dryRun: 'isDryRun()', seal: 'threadMemorySeal',
       appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
       stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
+      authorityReady: '() => reloadController?.sharedChannels() !== undefined',
       threadHybridChannels: 'key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
       markerKeys: '() => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? []',
       canRemove: 'key => reloadController?.sharedChannels()?.reviewHeld(key) === false',
@@ -5585,7 +5654,7 @@ describe('Thread Memory server lifecycle wiring', () => {
 
   test('later bring-up loads the key and every teardown forget runs through the isolation helper', () => {
     const props = onlyCallProps('createPersonaLifecycle')
-    expect(props.get('loadThreadMemory')).toBe('key => threadMemory?.loadKey(key)')
+    expect(props.get('loadThreadMemory')).toBe(`async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) ${recovery}(key, deliveryQueue, threadMemory) }`)
     expect(importSource(SERVER_CODE, 'forgetPersonaState')).toBe('./persona-lifecycle.ts')
     const args = onlyCallArgs('forgetPersonaState')
     expect(args[0]).toBe('key')
@@ -5596,6 +5665,63 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(props.get('routing')).toContain('forget: key => forgetPersonaState(key, [')
     const lifecycle = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!)
     expect(lifecycle.get('teardown')).toBe('async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) await threadMemory?.remove(persona.key) } }')
+  })
+
+  test('start recovers every queue key immediately after activation, isolates each failure, and precedes all intake wiring', () => {
+    expect(importSource(SERVER_CODE, recovery)).toBe('./thread-join-recovery.ts')
+    const recoveries = callsOf(recovery)
+    expect(recoveries).toHaveLength(2)
+    expect(withinCall(recoveries, onlyCallOf('createPersonaLifecycle'))).toBe(1)
+    const startRecovery = recoveries.find(at => withinCall([at], onlyCallOf('createPersonaLifecycle')) === 0)!
+    const activation = onlyCallOf('threadMemory\\.activate')
+    const membership = onlyCallOf('createChannelMembership')
+    expect(SERVER_CODE.slice(activation, membership).replace(/\s+/g, ' ').trim()).toBe(
+      `threadMemory.activate() if (shuttingDown) return for (const key of deliveryQueue.keys()) { try { ${recovery}(key, deliveryQueue, threadMemory) } catch { } } channelMembership =`,
+    )
+    expect(insideMain(startRecovery)).toBe(true)
+    expect(startRecovery).toBeLessThan(onlyCallOf('createPersonaConnectionManager'))
+    expect(startRecovery).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    for (const at of recoveries) expect(splitTopLevel(callArguments(SERVER_CODE, at))).toEqual(['key', 'deliveryQueue', 'threadMemory'])
+  })
+
+  test('the actual start loop uses the shared recovery step for every key and preserves retained item order after one key throws', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-join-wiring-'))
+    const queue = await makeQueue(root)
+    const preparation = createDeliveryPreparation({ queue, clientFor: () => undefined,
+      resolveUserName: async (_key, user) => user, clock: createFakeClock(),
+    })
+    try {
+      const facts = [threadJoin({ root: THREAD_ROOTS.secondary, source: 'broadcast' }), threadJoin()]
+      for (const key of Object.values(THREAD_PERSONAS)) {
+        for (const fact of facts) {
+          const stored = await queue.accept(key, slackInput({ channel: fact.channel, ts: fact.root,
+            key: { chat_id: fact.channel, ts: fact.root }, via: fact.source as 'mention' | 'broadcast',
+            thread_join: { thread_ts: fact.root, stamp: fact.stamp, at: fact.at },
+          }))
+          expect(stored.status).toBe('accepted')
+        }
+        await preparation.prepare(key, queue.items(key)[0]!)
+        await queue.append(key, deliveredRecord(1))
+        expect(queue.items(key).map(item => item.delivered)).toEqual([true, false])
+      }
+      const starts = indicesOf(/for \(const key of deliveryQueue\.keys\(\)\)/g, SERVER_CODE)
+      expect(starts).toHaveLength(1)
+      const [, end] = balancedAfter(SERVER_CODE, starts[0]!, '{', '}')
+      const loop = new Function('deliveryQueue', 'threadMemory', recovery, SERVER_CODE.slice(starts[0]!, end + 1))
+      const reads: string[] = [], recovered: Array<[string, readonly ThreadMemoryModule.ThreadJoin[]]> = []
+      loop({ keys: () => queue.keys(), items: (key: string) => { reads.push(key); return queue.items(key) } }, {
+        recoverJoins(key: string, candidates: readonly ThreadMemoryModule.ThreadJoin[]) {
+          recovered.push([key, candidates])
+          if (key === THREAD_PERSONAS.primary) throw new Error('fixture recovery failed')
+        },
+      }, recoverQueuedJoins)
+      expect(reads).toEqual([THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary])
+      expect(recovered).toEqual([[THREAD_PERSONAS.primary, facts], [THREAD_PERSONAS.secondary, facts]])
+    } finally {
+      await preparation.stop()
+      await queue.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('shutdown awaits queue drain and quiescence, seals completed stores only after load, then stops memory and seal even in dry run', () => {

@@ -2055,7 +2055,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} },
       getPersonaConfig: appliedConfig,
       getBotIdentity: key => slackStubs.get(key)?.identity,
-      queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { await ready; return queue.accept(key, input) } },
+      queue: {
+        lookupSlackKey: queue.lookupSlackKey,
+        accept: async (key, input) => { await ready; return queue.accept(key, input) },
+        acceptDecided: async (key, slackKey, decide) => { await ready; return queue.acceptDecided(key, slackKey, decide) },
+      },
       prepare: preparation.prepare,
       archive: () => {},
       log,

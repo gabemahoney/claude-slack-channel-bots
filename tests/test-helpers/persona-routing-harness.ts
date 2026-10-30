@@ -1,6 +1,6 @@
 import { mkdtempSync } from 'node:fs'
 
-import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, type QueueItem, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
 import { createOwnPostObserver } from '../../src/own-post.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
@@ -23,7 +23,7 @@ import {
 } from '../../src/config.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { createChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
-import { createSharedChannelAuthority } from '../../src/shared-channels.ts'
+import { createSharedChannelAuthority, type SharedChannelAuthority } from '../../src/shared-channels.ts'
 import { configBytes, initialSharedState, readSharedState, sharedChannelPath } from './shared-channels.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
@@ -558,6 +558,8 @@ export interface RoutingHarnessOptions {
   mode?: ChannelMode
   /** Opt in to real Thread Memory over the same shared authority as routing. */
   threadMemory?: Record<string, never>
+  /** Queue I/O and event seams; all paths remain under baseDir. */
+  queueOptions?: Pick<DeliveryQueueOptions, 'fs' | 'onEvent'>
   onReceived?: PersonaRoutingDeps['onReceived']
   /**
    * Load the stored-choice store the routing reads (`h.channelDelivery`
@@ -570,6 +572,8 @@ export interface RoutingHarnessOptions {
 
 /** The stored-choice store a routing harness loads. */
 export interface RoutingChannelDeliveryOptions {
+  /** Reuse a membership fixture's live authority, including its publications. */
+  authority?: SharedChannelAuthority
   /**
    * The caller's own `mkdtempSync` state directory, under the OS temp
    * directory, holding the stored-choice file (seeded beforehand with
@@ -620,6 +624,9 @@ export interface HarnessPost {
 export interface RoutingHarness {
   threads?: ThreadMemoryHarness
   threadMemoryReads: Array<[string, string, string]>
+  /** Hold the routing's detached saves for one persona; release before cleanup. */
+  holdJoinSaves(key: string): () => void
+  settleJoinSaves(): Promise<void>
   ready(): Promise<void>
   queue: ReturnType<typeof createDeliveryQueue>
   queued(name: string): QueueItem[]
@@ -907,11 +914,20 @@ export function makeRoutingHarness(
     }
   }
 
-  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock })
+  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, ...opts.queueOptions })
+  const joinSaveHolds = new Map<string, Promise<void>>()
+  const joinSaves: Promise<unknown>[] = []
   const queueReady = queue.start()
   const h: RoutingHarness = {
     queue,
     threadMemoryReads: [],
+    holdJoinSaves(key) {
+      if (joinSaveHolds.has(key)) throw new Error('join saves already held')
+      let release!: () => void
+      joinSaveHolds.set(key, new Promise<void>(resolve => { release = resolve }))
+      return () => { joinSaveHolds.delete(key); release() }
+    },
+    settleJoinSaves: async () => { await Promise.all(joinSaves) },
     ready: async () => { await queueReady; await threadReady },
     queued: name => queue.items(byName(name).persona.key),
     config,
@@ -1015,7 +1031,7 @@ export function makeRoutingHarness(
     const stateDir = opts.channelDelivery?.stateDir ?? mkdtempSync(join(baseDir, 'routing-authority-'))
     const raw = { ...config, personas: config.personas.map(({ index, key, sections, ...persona }) => persona) }
     const state = readSharedState(stateDir) ?? initialSharedState(stateDir, raw)
-    h.channelDelivery = createChannelDeliveryStore(createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
+    h.channelDelivery = createChannelDeliveryStore(opts.channelDelivery?.authority ?? createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
       write(path, bytes) { h.channelDeliveryWrites.push(path); durableWriteFileSync(path, bytes) },
     }))
     h.channelDelivery.authority.subscribe(next => { h.config = next })
@@ -1030,6 +1046,19 @@ export function makeRoutingHarness(
     threadMemory: opts.threadMemory === undefined ? undefined : (key, channel, root) => {
       h.threadMemoryReads.push([key, channel, root])
       return h.threads!.memory.view(key, channel, root)
+    },
+    joins: opts.threadMemory === undefined ? undefined : {
+      stamp: (key, channel) => h.channelDelivery?.authority.channelStamp(key, channel),
+      hasSavedJoin: (key, channel, root, stamp) => h.threads!.memory.hasSavedJoin(key, channel, root, stamp),
+      clock: key => h.threads!.memory.clock(key),
+      addJoin: (key, fact) => h.threads!.memory.addJoin(key, fact),
+      saveJoins: (key, facts) => {
+        h.order.push(`save-join:${key}`)
+        const hold = joinSaveHolds.get(key)
+        const saved = hold ? hold.then(() => h.threads!.memory.saveJoins(key, facts)) : h.threads!.memory.saveJoins(key, facts)
+        joinSaves.push(saved)
+        return saved
+      },
     },
     onReceived: opts.onReceived,
     queue,

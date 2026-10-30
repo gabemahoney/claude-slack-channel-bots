@@ -7,6 +7,7 @@ import { createMembershipScanner, membershipConnectionListener, type MembershipS
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
+import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
 import { threadJoin } from './thread-memory.ts'
 
 import {
@@ -957,6 +958,8 @@ export interface ReloadRunOptions {
   /** Opt in to the production Thread Memory and real lifecycle composition.
    * Journals live in stateDir; optional fs overrides inject storage failures. */
   threadMemory?: { fs?: ThreadMemoryOptions['fs'] }
+  /** Observe the first admission boundary, before any start bring-up. */
+  beforeStartBringUp?: (run: ReloadRun) => void | Promise<void>
   /** Actual MCP callbacks, held independently of the reload transaction. */
   onReplyCall?: SessionToolDeps['onReplyCall']
   consumeAck?: SessionToolDeps['consumeAck']
@@ -1436,6 +1439,9 @@ export interface ReloadRun {
    * first. Idempotent.
    */
   stop(): Promise<void>
+  /** Discard an idle run without queue/Thread Memory stop, compaction or seal
+   * work. Finish issued intake before calling; no old-run driver is usable afterwards. */
+  crash(): Promise<void>
 }
 
 /** A run whose start was resolved (and brought up when applied) by `h.start`. */
@@ -2076,7 +2082,33 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // (configInEffect). No ack reaction unless the start's config sets one.
     const getReplySettings = (): ReplySettings => replySettingsOf(serverConfig())
     const queueEvents: QueueEvent[] = []
-    const queue = createDeliveryQueue({stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event)})
+    // Only opted-in runs arm queue maintenance. Its real interval callback is
+    // driven by the run's fake clock, never a wall-clock timer.
+    let queueTimer: unknown
+    let queueIntervalLive = false
+    const queue = createDeliveryQueue({
+      stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event),
+      ...(runOpts.threadMemory === undefined ? {} : {
+        threadJoinSaved: (key: string, channel: string, fact: NonNullable<QueueItem['accepted']['thread_join']>) => {
+          threadMemory?.advancePast(key, fact.at)
+          return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+        },
+        setInterval: ((callback: () => void, ms: number) => {
+          queueIntervalLive = true
+          const tick = () => {
+            if (!queueIntervalLive) return
+            callback()
+            queueTimer = connections.clock.setTimeout(tick, ms)
+          }
+          queueTimer = connections.clock.setTimeout(tick, ms)
+          return { unref() {} }
+        }) as unknown as typeof globalThis.setInterval,
+        clearInterval: (() => {
+          queueIntervalLive = false
+          connections.clock.clearTimeout(queueTimer)
+        }) as typeof globalThis.clearInterval,
+      }),
+    })
     const threadMaintenance = makeManualInterval()
     const threadMemoryEvents: ThreadMemoryEvent[] = []
     const threadMemory = runOpts.threadMemory === undefined ? undefined : createThreadMemory({
@@ -2086,6 +2118,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       clearInterval: threadMaintenance.clearInterval as typeof globalThis.clearInterval,
       appliedKeys: () => serverConfig()?.personas.map(p => p.key) ?? [],
       stamp: (key, channel) => controller?.sharedChannels()?.channelStamp(key, channel),
+      authorityReady: () => controller?.sharedChannels() !== undefined,
       threadHybridChannels: key => controller?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
       markerKeys: () => controller?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
       canRemove: key => controller?.sharedChannels()?.reviewHeld(key) === false,
@@ -2122,6 +2155,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // undefined, so no stored choice applies and nothing throws.
       getChannelDelivery: () => channelDeliveryStore,
       threadMemory: (key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown',
+      ...(threadMemory === undefined ? {} : { joins: {
+        stamp: (key: string, channel: string) => controller?.sharedChannels()?.channelStamp(key, channel),
+        hasSavedJoin: threadMemory.hasSavedJoin,
+        clock: threadMemory.clock,
+        addJoin: threadMemory.addJoin,
+        saveJoins: threadMemory.saveJoins,
+      } }),
       threadStampUndecided: (key, channel) => controller.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
       threadStampEpisodes: episodes.threadStampUndecided,
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
@@ -2384,7 +2424,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // torn-down key's dedupe store and heard set are dropped.
         routing: { forget: rec('routing.forget', (key) => threadMemory === undefined ? routing.forget(key) :
           forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => threadMemory.forget(k)])) },
-        ...(threadMemory === undefined ? {} : { loadThreadMemory: (key: string) => threadMemory.loadKey(key) }),
+        ...(threadMemory === undefined ? {} : { loadThreadMemory: async (key: string) => {
+          await threadMemory.loadKey(key)
+          if (!stopped) recoverQueuedJoins(key, queue, threadMemory)
+        } }),
         // The real tracker's per-key forget, as server.ts binds it, so a key
         // added again starts with no ack-reaction entry.
         forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
@@ -2597,6 +2640,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const ops: Required<ReloadLifecycleOps> = {
       async startBringUp(applied) {
         if (threadMemory) await threadMemoryReady
+        if (runOpts.beforeStartBringUp) await runOpts.beforeStartBringUp(run)
         startPasses.push(applied)
         connections.config = applied
         await Promise.all(applied.personas.map((persona) => bringUpAndLaunch(persona, applied, 'start')))
@@ -2805,7 +2849,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         threadMemoryReady = queueReady.then(() => {
           threadMemory.startMaintenance()
           return threadMemory.activate()
-        }).then(wireMembership)
+        }).then(() => {
+          for (const key of queue.keys()) {
+            try { recoverQueuedJoins(key, queue, threadMemory) } catch { /* retry this key at bring-up */ }
+          }
+          queue.startMaintenance()
+          wireMembership()
+        })
       } else wireMembership()
     }
     controller = createReloadController({
@@ -3309,55 +3359,67 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         beganUnder: (key: string) => invalidFlagsHold.beganUnder(key),
       }),
       episodeNotices,
-      async stop() {
-        if (stopped) return
-        stopped = true
-        membershipScanner?.close()
-        membership?.close()
+      stop: () => finishRun(true),
+      crash: () => finishRun(false),
+    }
+
+    async function finishRun(graceful: boolean): Promise<void> {
+      if (stopped) return
+      stopped = true
+      membershipScanner?.close()
+      membership?.close()
+      if (graceful) {
         await preparation.stop()
         await queue.stop()
         if (threadMemory) await threadMemoryReady
         unsubscribeThreadMemory?.()
         await threadMemory?.stop()
-        // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.
-        if (stopImage !== undefined && !stopImagePutBack) {
-          stopImagePutBack = true
-          putDiskImageBack(stopImage)
-          runsStoppedBeforeWrite.delete(run)
-        }
-        // As the server process ends: its store is no longer the session
-        // manager's (only when this run's is the one installed).
-        if (installedRetiredKeys === retiredKeys) {
-          _resetRetiredKeyStore()
-          installedRetiredKeys = undefined
-        }
-        // Likewise its old-life hold set, which the process's end drops.
-        if (installedOldLifeHolds === oldLifeHolds) {
-          _resetOldLifeHolds()
-          installedOldLifeHolds = undefined
-        }
-        // Its end-retry observer leaves its set, and its old-life wait bindings
-        // the session manager, when they are the installed ones.
-        removeOldLifeEndRetry?.()
-        removeOldLifeEndRetry = undefined
-        if (installedWaitBindingsOwner === run) {
-          _resetOldLifeWaitBindings()
-          installedWaitBindingsOwner = undefined
-        }
-        controller.stopDetection()
-        bringUps.cancelAll()
-        noticeStack.hold.cancelAll()
-        // As main()'s shutdown closes them: nothing opens or posts after it.
-        episodes.close()
-        // As main's shutdown: every live-row sequence is
-        // stopped, none starts after it.
-        void sequences?.close()
-        // As main's shutdown: every retry timer is stopped,
-        // and no later arm is taken.
-        retryTimers?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
-        for (const client of toolClients.values()) await client.close()
-        await connections.manager.stopAll()
-      },
+      } else {
+        // Drop old-run memory and timers; no durable shutdown API runs.
+        unsubscribeThreadMemory?.()
+        queueIntervalLive = false
+        connections.clock.clearTimeout(queueTimer)
+        for (const key of queue.keys()) threadMemory?.forget(key)
+        for (const persona of serverConfig()?.personas ?? []) dropPersonaSession(persona.key)
+      }
+      // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.
+      if (stopImage !== undefined && !stopImagePutBack) {
+        stopImagePutBack = true
+        putDiskImageBack(stopImage)
+        runsStoppedBeforeWrite.delete(run)
+      }
+      // As the server process ends: its store is no longer the session
+      // manager's (only when this run's is the one installed).
+      if (installedRetiredKeys === retiredKeys) {
+        _resetRetiredKeyStore()
+        installedRetiredKeys = undefined
+      }
+      // Likewise its old-life hold set, which the process's end drops.
+      if (installedOldLifeHolds === oldLifeHolds) {
+        _resetOldLifeHolds()
+        installedOldLifeHolds = undefined
+      }
+      // Its end-retry observer leaves its set, and its old-life wait bindings
+      // the session manager, when they are the installed ones.
+      removeOldLifeEndRetry?.()
+      removeOldLifeEndRetry = undefined
+      if (installedWaitBindingsOwner === run) {
+        _resetOldLifeWaitBindings()
+        installedWaitBindingsOwner = undefined
+      }
+      controller.stopDetection()
+      bringUps.cancelAll()
+      noticeStack.hold.cancelAll()
+      // As main()'s shutdown closes them: nothing opens or posts after it.
+      episodes.close()
+      // As main's shutdown: every live-row sequence is
+      // stopped, none starts after it.
+      void sequences?.close()
+      // As main's shutdown: every retry timer is stopped,
+      // and no later arm is taken.
+      retryTimers?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      for (const client of toolClients.values()) await client.close()
+      await connections.manager.stopAll()
     }
     if (realLaunch) installLaunchSeams()
     runs.push(run)

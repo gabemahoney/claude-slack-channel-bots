@@ -35,6 +35,10 @@
 #   `not-mentioned` drop; A2 and B1 mentions are delivered `mention`; the
 #   tool is refused with the declarative text (the first-tool-result control),
 #   and nothing is written.
+# - Threads in strict mode: off/mentions/all leave no Thread Memory; a
+#   reviewed configuration enables alpha's T1 and the three value controls.
+#   Mentions and Broadcasts join before a following reply; unrelated replies
+#   and plain messages stay out. Earlier roots need a fresh mention.
 # - Switch on : open mode and explicit F1/F2/U1 choices;
 #   the pending file carries the switch's line; its confirmation applies it
 #   with both sessions kept (no registration or launch line, read after a
@@ -44,13 +48,18 @@
 #   shared, missing and non-boolean flags, a group DM, alpha's own fungible
 #   destination, then set_channel_delivery: stored, refused, applied as written
 #   in another persona's destination, and shared delivery, exactly once to each persona.
+# - Threads in open mode: alpha's strict join and stamp survive the switch;
+#   bravo still has no Thread Memory under off/mentions/all. Tool assignments
+#   enable bravo's threads; both mentioned personas join on their connections.
 # - Restart: a plain stop (the bots keep running) and a live start;
 #   shared choices, identities and reviewed bytes survive fresh discovery;
 #   the reconnect's new MCP clients
 # repeat no call; the stored choice applies again.
+#   Both personas' joined threads and Channel Stamps survive too.
 # - Switch off: declarative mode again, sessions kept (read after
 #   a delivery on each persona's connection), shared choices still applied
 #   and new tool assignments refused.
+#   Joined replies still arrive; a fresh two-persona mention joins in strict.
 # - Closing: `stop --stop-bots`; the port closed; the Slack stub
 #   stopped; no token-like text anywhere; the elapsed time on the PASS line.
 #
@@ -66,8 +75,8 @@
 # on the same connection, never after a quiet period. Every push has its own
 # `ts`, but the two events of one mention and the one message pushed to both
 # personas.
-# Measured runtime: 87 s on the cscb-ci image (the PASS line's elapsed time);
-# the target is under about 4 minutes.
+# Earlier phases measured 87 s on cscb-ci; the added thread phases' runtime
+# remains to be measured by the Epic's full /ci gate (target about 4 minutes).
 #
 # Texts. Every text src/ exports comes from fixtures/fmk-texts.ts (the one
 # value printer), run in this shell. Texts src/ does not export are fragments,
@@ -151,6 +160,10 @@ X2="C0${CH_TAG}X2"          # no flag
 X3="C0${CH_TAG}X3"          # a flag that is not a boolean
 GDM="G0${CH_TAG}GD"         # a group DM (`mpim`)
 DM="D0${CH_TAG}DM"          # bravo's direct DM for the E5 delivery evidence
+T1="C0${CH_TAG}T1"          # both modes: dedicated thread_hybrid channel
+N1="C0${CH_TAG}N1"          # starts off, then thread_hybrid
+N2="C0${CH_TAG}N2"          # starts mentions, then thread_hybrid
+N3="C0${CH_TAG}N3"          # starts all, then thread_hybrid
 ALPHA_BOT_USER="U0${CH_TAG}ALPHA"
 ALPHA_BOT_ID="B0${CH_TAG}ALPHA"
 BRAVO_BOT_USER="U0${CH_TAG}BRAVO"
@@ -158,6 +171,7 @@ BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
 HUMAN="U0${CH_TAG}HUMAN"    # every event's author
 CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
 for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${U0}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
+    "${T1}" "${N1}" "${N2}" "${N3}" \
     "${ALPHA_BOT_USER}" "${BRAVO_BOT_USER}" "${HUMAN}" "${CONTACT}"; do
     [[ "${id}" =~ ^[A-Z0-9]{1,24}$ ]] || fail "ID ${id} is not 1 to 24 characters from A-Z0-9"
 done
@@ -222,6 +236,7 @@ VIA_MENTION='mention'
 VIA_BROADCAST='broadcast'
 VIA_RECEIVE_ALL='receive_all'
 VIA_RECEIVE_ALL_SHARED='receive_all_shared'
+VIA_THREAD='thread'
 # src/server.ts handleInitialized: an MCP session registered for a persona.
 session_connected() {
     matcher "[slack] Session connected: persona $1"
@@ -598,6 +613,146 @@ expect_attempt() {
     [[ "${CALL_TEXT}" == "${expected}" ]] || fail "${step}: result differs from retained outcome/current facts"
 }
 
+# Thread phases use real Slack events and the same acceptance/receipt ledger
+# as the earlier phases. The stub never answers these messages with reply.
+declare -A OLD_THREAD_ROOTS=() THREAD_STAMPS=() JOINED_ROOTS=()
+thread_persona() {
+    case "$1" in
+        alpha) THREAD_DIR="${ALPHA_DIR}" THREAD_KEY="${ALPHA_KEY}" THREAD_BOT="${ALPHA_BOT_USER}" THREAD_REF="${ALPHA_REF}" ;;
+        bravo) THREAD_DIR="${BRAVO_DIR}" THREAD_KEY="${BRAVO_KEY}" THREAD_BOT="${BRAVO_BOT_USER}" THREAD_REF="${BRAVO_REF}" ;;
+        *) fail "thread_persona: unknown label $1" ;;
+    esac
+}
+
+# push_thread_reply <label> <channel> <root> <text>
+push_thread_reply() {
+    new_ts
+    push_event "$1" "$(message_event "$2" channel "$4" "${PUSH_TS}" | jq -c --arg root "$3" '. + {thread_ts: $root}')"
+}
+
+# A fresh drop line is a decision witness, not a quiet-period assertion.
+expect_unjoined_reply() {
+    local step="$1" who="$2" channel="$3" root="$4" mark ts
+    thread_persona "${who}"
+    mark="$(log_mark)"
+    push_thread_reply "${who}" "${channel}" "${root}" "$(plain_text)"
+    ts="${PUSH_TS}"
+    wait_since "${mark}" "$(plain_drop "${THREAD_REF}" "${channel}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" "${step}: no unjoined-thread decision"
+    expect_queued "${step}" 0 "${THREAD_DIR}" "${channel}" "${ts}"
+}
+
+# other_value_threads <step> <label> <all-via>: before this persona has any
+# hybrid entry. Keep one root per value for the later transition check.
+other_value_threads() {
+    local step="$1" who="$2" all_via="$3" channel root reply mark
+    thread_persona "${who}"
+    for channel in "${N1}" "${N2}" "${N3}"; do
+        mark="$(log_mark)"
+        push_message "${who}" "${channel}" channel "$(mention_text "${THREAD_BOT}")"
+        root="${PUSH_TS}"
+        OLD_THREAD_ROOTS["${who}|${channel}"]="${root}"
+        push_thread_reply "${who}" "${channel}" "${root}" "$(plain_text)"
+        reply="${PUSH_TS}"
+        if [[ "${channel}" == "${N1}" ]]; then
+            wait_until "${EVENT_WAIT_S}" "${step}: off did not drop both events" count_since_at_least \
+                "${mark}" "$(plain_drop "${THREAD_REF}" "${channel}" "${DROP_CHANNEL_OFF}")" 2
+            expect_queued "${step}: off mention" 0 "${THREAD_DIR}" "${channel}" "${root}"
+            expect_queued "${step}: off reply" 0 "${THREAD_DIR}" "${channel}" "${reply}"
+        else
+            wait_queued "${step}: mention" "${THREAD_DIR}" "${channel}" "${root}" "${VIA_MENTION}"
+            if [[ "${channel}" == "${N2}" ]]; then
+                wait_since "${mark}" "$(plain_drop "${THREAD_REF}" "${channel}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" "${step}: mentions selected an unmentioned reply"
+                expect_queued "${step}: mentions reply" 0 "${THREAD_DIR}" "${channel}" "${reply}"
+            else
+                wait_queued "${step}: all reply" "${THREAD_DIR}" "${channel}" "${reply}" "${all_via}"
+            fi
+        fi
+        [[ ! -e "${SLACK_STATE_DIR}/threads/${THREAD_KEY}.jsonl" ]] || fail "${step}: a persona with no hybrid entry acquired Thread Memory"
+    done
+}
+
+# After the value changes, each earlier root stays unjoined until a new
+# mention in that same thread; no earlier event is replayed by the join.
+check_new_hybrid_choices() {
+    local step="$1" who="$2" channel root mention reply
+    thread_persona "${who}"
+    for channel in "${N1}" "${N2}" "${N3}"; do
+        root="${OLD_THREAD_ROOTS[${who}|${channel}]}"
+        expect_unjoined_reply "${step}: earlier root" "${who}" "${channel}" "${root}"
+        push_thread_reply "${who}" "${channel}" "${root}" "$(mention_text "${THREAD_BOT}")"
+        mention="${PUSH_TS}"
+        push_thread_reply "${who}" "${channel}" "${root}" "$(plain_text)"
+        reply="${PUSH_TS}"
+        wait_queued "${step}: fresh mention" "${THREAD_DIR}" "${channel}" "${mention}" "${VIA_MENTION}"
+        wait_queued "${step}: reply after fresh mention" "${THREAD_DIR}" "${channel}" "${reply}" "${VIA_THREAD}"
+    done
+}
+
+# Run in each mode. There is deliberately no wait between the joining root
+# and its reply: neither receipt completion nor a bot answer gates selection.
+join_thread_phase() {
+    local mode="$1" root reply broadcast broadcast_reply unrelated mark plain
+    push_message "${ALPHA_LABEL}" "${T1}" channel "$(mention_text "${ALPHA_BOT_USER}")"
+    root="${PUSH_TS}"
+    JOINED_ROOTS["${mode}"]="${root}"
+    push_thread_reply "${ALPHA_LABEL}" "${T1}" "${root}" "$(plain_text)"
+    reply="${PUSH_TS}"
+    wait_queued "${mode}: joining mention" "${ALPHA_DIR}" "${T1}" "${root}" "${VIA_MENTION}"
+    wait_queued "${mode}: immediate reply" "${ALPHA_DIR}" "${T1}" "${reply}" "${VIA_THREAD}"
+    new_ts
+    unrelated="${PUSH_TS}"
+    expect_unjoined_reply "${mode}: unrelated root" "${ALPHA_LABEL}" "${T1}" "${unrelated}"
+    mark="$(log_mark)"
+    push_message "${ALPHA_LABEL}" "${T1}" channel "$(plain_text)"
+    plain="${PUSH_TS}"
+    wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${T1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" "${mode}: plain channel message did not drop"
+    expect_queued "${mode}: plain channel message" 0 "${ALPHA_DIR}" "${T1}" "${plain}"
+    push_message "${ALPHA_LABEL}" "${T1}" channel "<!here> ${TEST_NAME} ${mode} thread broadcast"
+    broadcast="${PUSH_TS}"
+    push_thread_reply "${ALPHA_LABEL}" "${T1}" "${broadcast}" "$(plain_text)"
+    broadcast_reply="${PUSH_TS}"
+    wait_queued "${mode}: joining Broadcast" "${ALPHA_DIR}" "${T1}" "${broadcast}" "${VIA_BROADCAST}"
+    wait_queued "${mode}: Broadcast's reply" "${ALPHA_DIR}" "${T1}" "${broadcast_reply}" "${VIA_THREAD}"
+}
+
+two_persona_threads() {
+    local mode="$1" root reply event dir
+    push_both "${T1}" channel "<@${ALPHA_BOT_USER}> <@${BRAVO_BOT_USER}> ${TEST_NAME} ${mode} shared thread"
+    root="${PUSH_TS}"
+    JOINED_ROOTS["${mode}-both"]="${root}"
+    new_ts
+    reply="${PUSH_TS}"
+    event="$(message_event "${T1}" channel "$(plain_text)" "${reply}" | jq -c --arg root "${root}" '. + {thread_ts: $root}')"
+    push_event "${ALPHA_LABEL}" "${event}"
+    push_event "${BRAVO_LABEL}" "${event}"
+    for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+        wait_queued "${mode}: both mentioned" "${dir}" "${T1}" "${root}" "${VIA_MENTION}"
+        wait_queued "${mode}: both joined" "${dir}" "${T1}" "${reply}" "${VIA_THREAD}"
+    done
+}
+
+check_thread_persistence() {
+    local step="$1" who="$2" root="$3" stamp
+    thread_persona "${who}"
+    stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${THREAD_KEY}" "${T1}")"
+    [[ "${stamp}" == "${THREAD_STAMPS[${who}]}" ]] || fail "${step}: ${who}'s Channel Stamp changed"
+    push_thread_reply "${who}" "${T1}" "${root}" "$(plain_text)"
+    wait_queued "${step}: persisted join" "${THREAD_DIR}" "${T1}" "${PUSH_TS}" "${VIA_THREAD}"
+}
+
+# Read only metadata from the actual journal. Waiting for every queued join
+# to be saved makes startup's removal of delivered content deterministic.
+# No fixture writes a Thread Memory journal or invents a Channel Stamp.
+thread_joins_saved() {
+    local key="${QUEUE_KEY[$1]}"
+    jq -ne --slurpfile queue "${DELIVERIES_FILE[$1]}" --slurpfile memory "${SLACK_STATE_DIR}/threads/${key}.jsonl" '
+      [$queue[] | select(.kind == "accepted" and .thread_join != null)] as $joined |
+      ($joined | length) > 0 and all($joined[]; . as $item |
+        any($memory[]; .kind == "join" and .channel == $item.channel and
+          .root == $item.thread_join.thread_ts and .stamp == $item.thread_join.stamp and
+          .at <= $item.thread_join.at))' > /dev/null 2>&1
+}
+
 # A persona's registration and launch lines, as one comparable word: Session
 # connected, persona-start, spawnForPersona and relaunch lines.
 # launch_counts <ref> <persona-start matcher> <relaunch head>
@@ -680,9 +835,10 @@ write_credentials "${BRAVO_CREDS}" "${BRAVO_SUFFIX}"
 jq -n --arg asuf "${ALPHA_SUFFIX}" --arg al "${ALPHA_LABEL}" --arg au "${ALPHA_BOT_USER}" --arg ab "${ALPHA_BOT_ID}" \
     --arg bsuf "${BRAVO_SUFFIX}" --arg bl "${BRAVO_LABEL}" --arg bu "${BRAVO_BOT_USER}" --arg bb "${BRAVO_BOT_ID}" \
     --arg a1 "${A1}" --arg a2 "${A2}" --arg b1 "${B1}" --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" \
+    --arg t1 "${T1}" --arg n1 "${N1}" --arg n2 "${N2}" --arg n3 "${N3}" \
     '{tokens: [
-        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: [$a1,$a2,$f1,$f2,$u1]},
-        {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb, memberships: [$b1,$a1,$f1,$f2,$u1]}],
+        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: [$a1,$a2,$f1,$f2,$u1,$t1,$n1,$n2,$n3]},
+        {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb, memberships: [$b1,$a1,$f1,$f2,$u1,$t1,$n1,$n2,$n3]}],
       default: {auth: "invalid_auth", connections: "invalid_auth"}}' | write_file "${STUB_CONTROL}" \
     || fail "could not write the stub's control file ${STUB_CONTROL}"
 
@@ -717,6 +873,10 @@ wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" 
 # - switch-off: the same reviewed choices with strict mode.
 write_persona_config() {
     local switch='' extra_alpha='' extra_bravo=''
+    local at=off an1=off an2=mentions an3=all bt=off bn1=off bn2=mentions bn3=all
+    if [[ "${ALPHA_THREADS:-false}" == true ]]; then
+        at=thread_hybrid an1=thread_hybrid an2=thread_hybrid an3=thread_hybrid
+    fi
     case "$1" in
         declarative) ;;
         fungible|switch-off)
@@ -737,7 +897,11 @@ write_persona_config() {
       "working_directory": "${ALPHA_DIR}",
       "channels": [
         { "id": "${A1}", "delivery": "all" },
-        { "id": "${A2}", "delivery": "mentions" }${extra_alpha}
+        { "id": "${A2}", "delivery": "mentions" },
+        { "id": "${T1}", "delivery": "${at}" },
+        { "id": "${N1}", "delivery": "${an1}" },
+        { "id": "${N2}", "delivery": "${an2}" },
+        { "id": "${N3}", "delivery": "${an3}" }${extra_alpha}
       ],
       "dm": { "enabled": false },
       "permission_prompts": "${A1}"
@@ -746,7 +910,11 @@ write_persona_config() {
       "name": "${BRAVO}",
       "credentials_file": "${BRAVO_CREDS}",
       "working_directory": "${BRAVO_DIR}",
-      "channels": [{ "id": "${B1}", "delivery": "mentions" }${extra_bravo}],
+      "channels": [{ "id": "${B1}", "delivery": "mentions" },
+        { "id": "${T1}", "delivery": "${bt}" },
+        { "id": "${N1}", "delivery": "${bn1}" },
+        { "id": "${N2}", "delivery": "${bn2}" },
+        { "id": "${N3}", "delivery": "${bn3}" }${extra_bravo}],
       "dm": { "enabled": true, "contact": "${CONTACT}" },
       "permission_prompts": "dm"
     }
@@ -761,6 +929,7 @@ EOF
 }
 
 # --- Start --------------------------------------------
+ALPHA_THREADS=false
 write_persona_config declarative
 CONFIG_A_COPY="${SCENARIO_ROOT}/config-phase-a.json"
 cp -- "${CONFIG}" "${CONFIG_A_COPY}"
@@ -1005,8 +1174,29 @@ expect_sessions_kept() {
         || fail "${step}: a session registration or launch line for ${BRAVO} after the confirmation"
 }
 
+# --- Thread phases: strict ---------------------------------------
+other_value_threads "strict: other values" "${ALPHA_LABEL}" "${VIA_RECEIVE_ALL_SHARED}"
+[[ ! -e "${SLACK_STATE_DIR}/threads/${BRAVO_KEY}.jsonl" ]] || fail "strict: bravo acquired Thread Memory without a hybrid entry"
+
+# Explicitly review alpha's four new hybrid choices. Bravo keeps its
+# ordinary entries until the open-mode no-file control below.
+ALPHA_THREADS=true
+threads_applied_before="$(count_log "${APPLIED_CLASS}")"
+write_persona_config declarative
+configuration_request threads-strict request "${ALPHA}/${T1}/thread_hybrid" \
+    "${ALPHA}/${N1}/thread_hybrid" "${ALPHA}/${N2}/thread_hybrid" "${ALPHA}/${N3}/thread_hybrid"
+wait_for_file "${PENDING}" "${TICK_WAIT_S}" "strict threads: no pending review"
+check_pending_layout "strict threads"
+mv -f -- "${PENDING}" "${APPLY}"
+wait_for_count "${APPLIED_CLASS}" $(( threads_applied_before + 1 )) "${APPLY_WAIT_S}" "strict threads: confirmation was not applied"
+configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "strict threads: reviewed configuration differs"
+THREAD_STAMPS[alpha]="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${T1}")"
+check_new_hybrid_choices "strict: changed value" "${ALPHA_LABEL}"
+join_thread_phase strict
+
 # --- Switch on ---------------------------------------------------
 confirm_switch fungible "${SWITCH_ON_LINE}" "switch on"
+check_thread_persistence "strict to open" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"
 
 # --- Phase B: fungible mode --------------------------------------
 # 1. alpha, public F1 (flag false), plain: no delivery, a not-mentioned line,
@@ -1147,11 +1337,25 @@ wait_queued "step 11: bravo F1 mention, after the shared message" "${BRAVO_DIR}"
 expect_queued "step 11: alpha F1 plain (shared)" 1 "${ALPHA_DIR}" "${F1}" "${B11_TS}"
 expect_queued "step 11: bravo F1 plain (shared)" 1 "${BRAVO_DIR}" "${F1}" "${B11_TS}"
 
+# --- Thread phases: open -----------------------------------------
+other_value_threads "open: other values" "${BRAVO_LABEL}" "${VIA_RECEIVE_ALL}"
+for channel in "${T1}" "${N1}" "${N2}" "${N3}"; do
+    expect_attempt "open: enable bravo thread channel" "${BRAVO_DIR}" \
+        "$(attempt_args "${TEST_NAME}-bravo-thread-${channel}" "${channel}" thread_hybrid)" "${BRAVO_KEY}" thread_hybrid
+done
+THREAD_STAMPS[bravo]="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${BRAVO_KEY}" "${T1}")"
+check_new_hybrid_choices "open: changed value" "${BRAVO_LABEL}"
+join_thread_phase open
+# A thread joined only by alpha stays outside bravo's own Thread Memory.
+expect_unjoined_reply "open: independent persona joins" "${BRAVO_LABEL}" "${T1}" "${JOINED_ROOTS[open]}"
+two_persona_threads open
+
 # --- Persistence across a restart ----------------------
 # Queue acceptance above can precede typing and its receipt. Settle both
 # personas before checking an immediate idle-session reconnect on restart.
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     wait_until "${SESSION_WAIT_S}" "restart: accepted deliveries of ${dir} never received all their receipts" queue_drained "${dir}"
+    wait_until "${EVENT_WAIT_S}" "restart: queued joins of ${dir} were not saved" thread_joins_saved "${dir}"
 done
 STORE_BEFORE_RESTART="${SCENARIO_ROOT}/store-before-restart.json"
 cp -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"
@@ -1214,6 +1418,11 @@ expect_attempt "restart: alpha retries its retained ID" "${ALPHA_DIR}" "${F1_RET
 expect_since "${RESTART_MARK}" "${ALPHA_SET_F1_AGAIN}" 0 "restart: history creates no assignment diagnostic"
 expect_attempt "restart: alpha deliberately writes all again" "${ALPHA_DIR}" "${F1_FRESH_ARGS}" "${ALPHA_KEY}" all
 expect_since "${RESTART_MARK}" "${ALPHA_SET_F1_AGAIN}" 1 "restart: alpha's persona-channel-delivery-set lines (all to all)"
+check_thread_persistence "restart: strict join" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"
+check_thread_persistence "restart: open join" "${ALPHA_LABEL}" "${JOINED_ROOTS[open]}"
+for who in "${ALPHA_LABEL}" "${BRAVO_LABEL}"; do
+    check_thread_persistence "restart: shared join" "${who}" "${JOINED_ROOTS[open-both]}"
+done
 
 # the reconnect's new clients read each request file from its
 # start and skip every request ID already answered, each with its own stderr
@@ -1263,6 +1472,11 @@ expect_attempt "switch off: retained history remains readable" "${ALPHA_DIR}" "$
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${STRICT_FRESH_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
 jq -ne --slurpfile before "${STORE_BEFORE_OFF}" --slurpfile after "${STORE_FILE}" '$before[0].personas == $after[0].personas' > /dev/null \
     || fail "switch off: applied persona choices changed"
+check_thread_persistence "open to strict: original strict join" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"
+for who in "${ALPHA_LABEL}" "${BRAVO_LABEL}"; do
+    check_thread_persistence "open to strict: shared join" "${who}" "${JOINED_ROOTS[open-both]}"
+done
+two_persona_threads strict
 
 # demo: retain one real stub DM's log and transcript
 # metadata before the successful scenario's EXIT trap deletes both. The
@@ -1307,6 +1521,8 @@ EOF
 # Every persona's complete accepted set, including absence of all other inputs.
 # Multiple journal records per item never count as additional acceptances.
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    wait_until "${SESSION_WAIT_S}" "closing: ${dir} has accepted work without receipts" queue_drained "${dir}"
+    wait_until "${EVENT_WAIT_S}" "closing: ${dir} has unsaved queued joins" thread_joins_saved "${dir}"
     key="${QUEUE_KEY[${dir}]}"
     expected_rows="${SCENARIO_ROOT}/expected-queue-${key}.jsonl"
     : > "${expected_rows}"
@@ -1372,6 +1588,7 @@ EOF
 leak_files=("${SLACK_STATE_DIR}"/server.log* "${STUB_RECORD}" "${STORE_FILE}")
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     leak_files+=("${DELIVERIES_FILE[${dir}]}" "${RESULTS_FILE[${dir}]}" "${REQUESTS_FILE[${dir}]}")
+    leak_files+=("${SLACK_STATE_DIR}/threads/${QUEUE_KEY[${dir}]}.jsonl")
 done
 for file in "${leak_files[@]}"; do
     [[ -f "${file}" ]] || fail "closing: ${file} is missing"
