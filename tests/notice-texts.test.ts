@@ -148,7 +148,7 @@ import {
   type LatchKind,
   type LatchRecoveryReason,
 } from '../src/conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
 import {
   buildDeliveryStuckNotice,
   buildMessageNotSavedNotice,
@@ -204,7 +204,7 @@ import {
   tmuxUnresponsiveRecoveryText,
   unclassifiedErrorAlertText,
 } from '../src/persona-episodes.ts'
-import { personaInstanceId, personaTmuxSessionName, tmuxExactSessionTarget } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, tmuxExactSessionTarget } from '../src/persona-identity.ts'
 import {
   formatPersonaNotice,
   PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER,
@@ -227,6 +227,20 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
+import {
+  THREAD_MEMORY_SLACK_RETRY_WARNING,
+  buildThreadMemoryNotSavedNotice, buildThreadMemoryUnreadableNotice,
+  buildThreadMemoryJoinsLostNotice, buildThreadMemoryChangedWhileStoppedNotice,
+  buildThreadMemoryRecoveredNotice,
+  buildThreadMemoryNotSavedLine, buildThreadMemoryUnreadableLine,
+  buildThreadMemoryJoinsLostLine, buildThreadMemoryChangedWhileStoppedLine,
+  buildThreadMemoryRecoveredLine, buildThreadMemoryQuarantinedLine,
+  buildThreadMemoryCompactionFailedLine, buildThreadMemoryRemovalFailedLine,
+  buildThreadMemorySealUnreadableLine, buildThreadMemorySealNotSavedLine,
+  buildThreadMemoryHoldsNotResolvedLine,
+  type ThreadMemoryLoss,
+} from '../src/thread-memory-reports.ts'
+import { THREAD_MEMORY_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
 
 import {
   cannedGetResult,
@@ -259,8 +273,9 @@ import {
   humanOnlySentencesIn,
   sessionEndingCommandsIn,
 } from './test-helpers/conflict-cases.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { assertNoLeak, APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
 
 // ---------------------------------------------------------------------------
 // The catalogue
@@ -276,6 +291,8 @@ interface NoticeEntry {
   readonly variant: string
   /** Renders the text; a builder that throws fails its own case. */
   readonly render: () => string
+  /** Exact configured fields, one occurrence each; all other output is leak-checked. */
+  readonly configuredSpans?: readonly string[]
 }
 
 /** The persona the notices concern. */
@@ -289,8 +306,19 @@ function withToken(text: string, label: string): string {
   return `${text} (${sentinelInMessage(label)})`
 }
 
-function entry(group: NoticeGroup, builder: string, variant: string, render: () => string): NoticeEntry {
-  return Object.freeze({ group, builder, variant, render })
+function entry(group: NoticeGroup, builder: string, variant: string, render: () => string, configuredSpans?: readonly string[]): NoticeEntry {
+  return Object.freeze({ group, builder, variant, render, configuredSpans })
+}
+
+/** Mask only an explicitly preserved field, once. A second copy in an error
+ * or an unrelated credential still fails assertNoLeak, even with the same value. */
+function withoutConfiguredSpans(text: string, spans: readonly string[] = []): string {
+  for (const span of spans) {
+    expect(span.length).toBeGreaterThan(0)
+    expect(text).toContain(span)
+    text = text.replace(span, '[configured field]')
+  }
+  return text
 }
 
 /**
@@ -738,6 +766,99 @@ function deliveryEntries(): NoticeEntry[] {
   ]
 }
 
+// Metadata only: these shared fixture identifiers are never read from disk.
+const MEMORY_CHANNELS = [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary]
+const MEMORY_PATH = threadPath('/scratch/notice-texts', KEY)
+const MEMORY_BODY = 'THREAD-MEMORY-MESSAGE-BODY-MUST-NOT-BE-RENDERED'
+const MEMORY_USER = 'THREAD-MEMORY-USER-NAME-MUST-NOT-BE-RENDERED'
+const memoryRef = () => renderPersonaRef(PERSONA.name, KEY)
+function memoryError(path = memoryTokenPath()) {
+  return Object.assign(new Error(`cannot write <journal> & ${sentinelInMessage('memory-error')}; path=${JSON.stringify(path)}`), {
+    code: 'EACCES', data: { text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL },
+  })
+}
+const memoryTokenPath = () => threadPath(`/scratch/${fakeToken(BOT_TOKEN_PREFIX, 'memory-path')}/<journal>&`, KEY)
+const MEMORY_CONFIGURED_PATHS = [
+  { label: 'ordinary path', path: MEMORY_PATH },
+  { label: 'bot-token segment and Slack controls', path: memoryTokenPath() },
+  { label: 'app-token segment', path: threadPath(`/scratch/${fakeToken(APP_TOKEN_PREFIX, 'memory-path')}`, KEY) },
+  { label: 'quotes, backslash and line separators', path: threadPath('/scratch/"quoted"\\\r\n\t\u2028\u2029/<journal>&', KEY) },
+]
+/** JSON is the oracle for preserving a path; Unicode line separators must
+ * also be escaped so a diagnostic stays on one physical line. */
+const quotedMemoryPath = (path: string) => JSON.stringify(path).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+const MEMORY_CONFIGURED_NAMES = [
+  { label: 'bot-token name', name: fakeToken(BOT_TOKEN_PREFIX, 'configured-name') },
+  { label: 'app-token name', name: fakeToken(APP_TOKEN_PREFIX, 'configured-name') },
+  { label: 'embedded token', name: `Ops ${fakeToken(BOT_TOKEN_PREFIX, 'embedded-name')} bot` },
+  { label: 'quoted name with Slack controls', name: `Ops "<&>" \\ ${fakeToken(APP_TOKEN_PREFIX, 'quoted-name')}` },
+  { label: 'long name has no non-loss excerpt', name: 'Ops 🚀 <&> '.repeat(300) },
+]
+const MEMORY_NON_LOSS_NOTICES = [
+  { builder: buildThreadMemoryNotSavedNotice.name, variant: 'not saved', build: (ref: string) => buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, MEMORY_PATH, 'journal-append', memoryError()) },
+  { builder: buildThreadMemoryUnreadableNotice.name, variant: 'unreadable', build: (ref: string) => buildThreadMemoryUnreadableNotice(ref, MEMORY_CHANNELS, MEMORY_PATH) },
+  ...(['changed', 'unclean'] as const).map(wording => ({ builder: buildThreadMemoryChangedWhileStoppedNotice.name, variant: wording, build: (ref: string) => buildThreadMemoryChangedWhileStoppedNotice(ref, MEMORY_CHANNELS, wording) })),
+  { builder: buildThreadMemoryRecoveredNotice.name, variant: 'recovered', build: (ref: string) => buildThreadMemoryRecoveredNotice(ref, MEMORY_CHANNELS) },
+]
+const MEMORY_LOSSES: readonly (readonly [string, () => ThreadMemoryLoss])[] = [
+  ['threads only', () => ({ threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [] })],
+  ['messages only', () => ({ threads: [], messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }] })],
+  ['unreadable identities only', () => ({ threads: [], messages: [], unreadableLines: 3 })],
+  ['mixed losses', () => ({
+    threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }],
+    messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }], unreadableLines: 3,
+  })],
+  ['identifier overflow', () => ({
+    threads: Array.from({ length: 120 }, (_, i) => ({ channel: THREAD_CHANNELS.primary, root: `1700000000.${String(i).padStart(6, '0')}` })),
+    messages: Array.from({ length: 120 }, (_, i) => ({ channel: THREAD_CHANNELS.secondary, ts: `1700000001.${String(i).padStart(6, '0')}` })),
+    unreadableLines: 3,
+  })],
+]
+function renderMemoryLoss(persona: { name: string; key: string }, loss: ThreadMemoryLoss): string {
+  const notice = buildThreadMemoryJoinsLostNotice(persona, loss)
+  return formatPersonaNotice(persona, notice.text, notice.options)
+}
+const oneThreadLoss = (): ThreadMemoryLoss => ({ threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [] })
+/** A full-name oracle from the small pinned notice, with no budgeting logic. */
+function fullLossForName(name: string): string {
+  const ref = escapeSlackControlCharacters(renderPersonaRef(name, KEY))
+  const small = buildThreadMemoryJoinsLostNotice(PERSONA, oneThreadLoss())
+  return formatPersonaNotice({ name, key: KEY }, small.text.replaceAll(memoryRef(), ref), { personaRef: ref })
+}
+const lastFittingNameLength = () => Math.floor((THREAD_MEMORY_NOTICE_MAX_CHARS - fullLossForName('').length) / 2)
+const MEMORY_NAMES = [
+  { label: 'ordinary name longer than excerpt', name: () => 'Alpha <&> '.repeat(8), excerpt: false },
+  { label: 'just below full-name threshold', name: () => 'N'.repeat(lastFittingNameLength()), excerpt: false },
+  { label: 'just above full-name threshold', name: () => 'N'.repeat(lastFittingNameLength() + 1), excerpt: true },
+  { label: '2100-character name', name: () => 'N'.repeat(2100), excerpt: true },
+  { label: 'Slack escaping alone crosses threshold', name: () => 'N'.repeat(lastFittingNameLength() - 2) + '&', excerpt: true },
+  { label: 'surrogate pair at excerpt boundary', name: () => 'N'.repeat(63) + '🚀' + 'tail'.repeat(600), excerpt: true },
+  { label: 'entity at excerpt boundary', name: () => 'N'.repeat(63) + '&' + '<tail>'.repeat(600), excerpt: true },
+  { label: 'JSON quoting at excerpt boundary', name: () => 'N'.repeat(63) + '"\\' + 'tail'.repeat(600), excerpt: true },
+]
+function threadMemoryEntries(): NoticeEntry[] {
+  const row = (builder: string, variant: string, render: () => string, configuredSpans?: readonly string[]) => entry('thread-memory', builder, variant, render, configuredSpans)
+  const path = escapeSlackControlCharacters(quotedMemoryPath(memoryTokenPath()))
+  return [
+    row(buildThreadMemoryNotSavedNotice.name, 'all channels; token-bearing path and error', () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryNotSavedNotice(memoryRef(), MEMORY_CHANNELS, memoryTokenPath(), 'journal-append', memoryError())), [`Could not save ${path} (`]),
+    row(buildThreadMemoryUnreadableNotice.name, 'all channels; token-bearing path', () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryUnreadableNotice(memoryRef(), MEMORY_CHANNELS, memoryTokenPath())), [`Cannot read ${path}.`]),
+    ...(['changed', 'unclean'] as const).map(wording => row(buildThreadMemoryChangedWhileStoppedNotice.name, wording, () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryChangedWhileStoppedNotice(memoryRef(), MEMORY_CHANNELS, wording)))),
+    row(buildThreadMemoryRecoveredNotice.name, 'all channels', () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryRecoveredNotice(memoryRef(), MEMORY_CHANNELS))),
+    ...MEMORY_LOSSES.map(([variant, loss]) => row(buildThreadMemoryJoinsLostNotice.name, variant, () => renderMemoryLoss(PERSONA, loss()))),
+    ...MEMORY_NAMES.map(({ label, name }) => row(buildThreadMemoryJoinsLostNotice.name, label, () => renderMemoryLoss({ name: name(), key: KEY }, oneThreadLoss()))),
+    ...MEMORY_CONFIGURED_NAMES.flatMap(({ label, name }) => MEMORY_NON_LOSS_NOTICES.map(({ builder, variant, build }) => {
+      const ref = renderPersonaRef(name, KEY)
+      return row(builder, `${variant}; ${label}`, () => formatPersonaNotice({ name, key: KEY }, build(ref)), [
+        `Persona ${ref}: `, ` — ${escapeSlackControlCharacters(ref)}; channels:`,
+      ])
+    })),
+  ]
+}
+
 /** The JSONL persistence safeguard's storage and AD-reference notices (keeps their text): one per variant. */
 const JSONL_NON_PERSISTENT = 'non-persistent storage'
 const JSONL_ROTATED = 'AD rotated transcript reference'
@@ -927,6 +1048,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...spawnFailureEntries(),
   ...notConnectedEntries(),
   ...deliveryEntries(),
+  ...threadMemoryEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
   ...capEntries(),
@@ -957,7 +1079,7 @@ const NOT_APPLICABLE: Readonly<Partial<Record<NoticeGroup, string>>> = Object.fr
 })
 
 /** Every id the completeness guard covers: to. */
-const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed'] as const
+const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed', 'thread-memory'] as const
 
 /**
  * The server notices posted to Slack that names beyond the catalogued
@@ -980,6 +1102,11 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildMessageNotTakenInNotice.name,
   buildMessagesWaitingNotice.name,
   buildQueueRecordUnreadableNotice.name,
+  buildThreadMemoryNotSavedNotice.name,
+  buildThreadMemoryUnreadableNotice.name,
+  buildThreadMemoryJoinsLostNotice.name,
+  buildThreadMemoryChangedWhileStoppedNotice.name,
+  buildThreadMemoryRecoveredNotice.name,
   runPersonaStorageCheck.name,
   runJsonlPersistenceSafeguard.name,
   jsonlRowAbsentInconclusiveNoticeText.name,
@@ -1063,7 +1190,11 @@ describe('no catalogued notice names clear-latch', () => {
 
   test('every rendered text leaks no token: quoted descriptions are redacted', () => {
     const texts = NOTICE_CATALOGUE.map((e) => [e, e.render()] as const)
-    assertNoLeak(Object.fromEntries(texts.map(([e, text]) => [titleOf(e), text])), 'notices')
+    assertNoLeak(Object.fromEntries(texts.map(([e, text]) => [titleOf(e), withoutConfiguredSpans(text, e.configuredSpans)])), 'notices')
+    for (const [, text] of texts) {
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    }
     // Not vacuous: the fake tokens reach every builder that quotes agent-director, as its redaction placeholder.
     const redacted = [REDACTED_TOKEN_PLACEHOLDER, escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER)]
     expect([...new Set(texts.filter(([, text]) => redacted.some((r) => text.includes(r))).map(([e]) => e.group))].sort()).toEqual(([
@@ -1075,6 +1206,7 @@ describe('no catalogued notice names clear-latch', () => {
       "startup-errors",
       "ad-config-malformed",
       "unusable-name",
+      "thread-memory",
     ] as NoticeGroup[]).sort())
   })
 })
@@ -1286,6 +1418,255 @@ const CASES = NOTICE_CATALOGUE.map((e) => [titleOf(e), e] as const)
 /** The entries posted to Slack: every entry outside `LOG_ONLY_GROUPS`. */
 const SLACK_CASES = CASES.filter(([, e]) => !LOG_ONLY_GROUPS.includes(e.group))
 
+describe('Thread Memory catalogue content and loss budget', () => {
+  test('the catalogue retains every loss variant and name boundary', () => {
+    expect(NOTICE_CATALOGUE.filter(e => e.builder === buildThreadMemoryJoinsLostNotice.name).map(e => e.variant)).toEqual([
+      ...MEMORY_LOSSES.map(([label]) => label), ...MEMORY_NAMES.map(row => row.label),
+    ])
+    expect(NOTICE_CATALOGUE.filter(e => e.builder === buildThreadMemoryChangedWhileStoppedNotice.name).map(e => e.variant)).toEqual([
+      'changed', 'unclean', ...MEMORY_CONFIGURED_NAMES.flatMap(({ label }) => [`changed; ${label}`, `unclean; ${label}`]),
+    ])
+  })
+
+  test('notice texts and the final Slack-message bound (one literal pin)', () => {
+    expect(THREAD_MEMORY_NOTICE_MAX_CHARS).toBe(4000)
+    expect(THREAD_MEMORY_SLACK_RETRY_WARNING).toBe("If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.")
+    const ref = memoryRef(), channels = MEMORY_CHANNELS.join(', ')
+    const error = Object.assign(new Error('storage unavailable'), { code: 'EIO' })
+    const warning = THREAD_MEMORY_SLACK_RETRY_WARNING
+    expect(buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, MEMORY_PATH, 'journal-append', error)).toBe(
+      `:warning: *Thread Memory not saved* — ${ref}; channels: ${channels}. Could not save ${JSON.stringify(MEMORY_PATH)} (journal-append): Error code=EIO message="storage unavailable". Joins are kept and will be saved once storage works. Check the file's permissions and storage. ${warning}`,
+    )
+    expect(buildThreadMemoryUnreadableNotice(ref, MEMORY_CHANNELS, MEMORY_PATH)).toBe(
+      `:warning: *Thread Memory unreadable* — ${ref}; channels: ${channels}. Cannot read ${JSON.stringify(MEMORY_PATH)}. Replies in this bot's threads are saved and wait until Thread Memory can be read. ${warning} Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.`,
+    )
+    for (const [wording, sentence] of [
+      ['changed', 'Some Joined Threads may be missing, or may be ones the bot should have forgotten.'],
+      ['unclean', "CSCB didn't shut down cleanly, so it can't tell whether Thread Memory changed."],
+    ] as const) {
+      expect(buildThreadMemoryChangedWhileStoppedNotice(ref, MEMORY_CHANNELS, wording)).toBe(
+        `:warning: *Thread Memory changed while stopped* — ${ref}; channels: ${channels}. ${sentence} CSCB uses the Thread Memory it found. Check the threads the bot should be in; a new @mention puts it back in a thread.`,
+      )
+    }
+    expect(buildThreadMemoryRecoveredNotice(ref, MEMORY_CHANNELS)).toBe(
+      `:white_check_mark: *Thread Memory recovered* — ${ref}; channels: ${channels}. Thread Memory can be read and every kept join is saved.`,
+    )
+    const loss = MEMORY_LOSSES.find(([label]) => label === 'mixed losses')![1]()
+    expect(buildThreadMemoryJoinsLostNotice(PERSONA, loss)).toEqual({
+      text: `:warning: *Joins lost* — ${ref} is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 3 quarantined line(s) have no readable thread identity.\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.primary}.\nSend again: ${THREAD_CHANNELS.secondary} / ${THREAD_ROOTS.secondary}.`,
+      options: { personaRef: ref },
+    })
+  })
+
+  test.each(MEMORY_LOSSES)('%s retains complete ordered identifiers or an exact count, and logs every loss', (_label, makeLoss) => {
+    const loss = makeLoss()
+    const notice = buildThreadMemoryJoinsLostNotice(PERSONA, loss)
+    const text = renderMemoryLoss(PERSONA, loss)
+    const line = buildThreadMemoryJoinsLostLine(PERSONA, loss)
+    assertNoLeak({ text, line })
+    const identifiers = [
+      ...loss.threads.map(t => `Thread: ${t.channel} / ${t.root}.`),
+      ...loss.messages.map(m => `Send again: ${m.channel} / ${m.ts}.`),
+    ]
+    const [, ...bodyLines] = notice.text.split('\n')
+    const hasCount = bodyLines.at(-1)?.includes('more thread/message entry(s)') ?? false
+    const kept = hasCount ? bodyLines.slice(0, -1) : bodyLines
+    expect(kept).toEqual(identifiers.slice(0, kept.length))
+    expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    const omitted = identifiers.length - kept.length
+    if (omitted) {
+      expect(kept.length).toBeGreaterThan(0)
+      expect(bodyLines.at(-1)).toBe(`${omitted} more thread/message entry(s); see the server log for all identifiers.`)
+      expect(line.length).toBeGreaterThan(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    } else {
+      expect(hasCount).toBe(false)
+      expect(kept).toEqual(identifiers)
+    }
+    // The full heading is a fitting builder result, pinned above; overflow
+    // may change the display reference but must not truncate operator advice.
+    const heading = buildThreadMemoryJoinsLostNotice(PERSONA, { threads: [], messages: [], unreadableLines: loss.unreadableLines }).text
+    expect(notice.text.split('\n')[0]).toBe(heading.replaceAll(memoryRef(), notice.options.personaRef))
+    if (loss.unreadableLines) expect(line).toContain(`unreadable_lines=${loss.unreadableLines}`)
+    for (const t of loss.threads) expect(line).toContain(`channel=${t.channel} root=${t.root}`)
+    for (const m of loss.messages) expect(line).toContain(`channel=${m.channel} ts=${m.ts}`)
+    expect(line).toContain(`bot=${memoryRef()}`)
+    expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+  })
+
+  test.each(MEMORY_NAMES)('$label budgets the escaped prefix and body together; the log retains the full name', ({ label, name, excerpt }) => {
+    const persona = Object.freeze({ name: name(), key: KEY })
+    const before = { ...persona }, full = fullLossForName(persona.name)
+    const notice = buildThreadMemoryJoinsLostNotice(persona, oneThreadLoss())
+    const text = formatPersonaNotice(persona, notice.text, notice.options)
+    const line = buildThreadMemoryJoinsLostLine(persona, oneThreadLoss())
+    expect(full.length > THREAD_MEMORY_NOTICE_MAX_CHARS).toBe(excerpt)
+    if (label.startsWith('just ')) expect(Math.abs(full.length - THREAD_MEMORY_NOTICE_MAX_CHARS)).toBeLessThanOrEqual(2)
+    if (label === 'Slack escaping alone crosses threshold') {
+      expect(full.replaceAll('&amp;', '&').length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    }
+    const displayName = excerpt ? Array.from(persona.name).slice(0, 64).join('') + '…' : persona.name
+    const ref = escapeSlackControlCharacters(renderPersonaRef(displayName, KEY))
+    expect(notice.options).toEqual({ personaRef: ref })
+    expect(text).toBe(fullLossForName(displayName))
+    expect(text.split(ref)).toHaveLength(3) // exactly the prefix and body
+    expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    expect(text).not.toContain('&amp;lt;')
+    expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u)
+    expect(line).toContain(`bot=${renderPersonaRef(persona.name, KEY)}`)
+    expect(line).toContain(`channel=${THREAD_CHANNELS.primary} root=${THREAD_ROOTS.primary}`)
+    expect(persona).toEqual(before)
+    assertNoLeak({ text, line })
+  })
+
+  test.each(MEMORY_CONFIGURED_NAMES)('$label is preserved in all five non-loss wordings', ({ name, label }) => {
+    const ref = renderPersonaRef(name, KEY), escaped = escapeSlackControlCharacters(ref)
+    const persona = Object.freeze({ name, key: KEY })
+    for (const { variant, build } of MEMORY_NON_LOSS_NOTICES) {
+      const body = build(ref), text = formatPersonaNotice(persona, body)
+      // Reuse the pinned ordinary notice as the content oracle: only the
+      // configured reference changes, never its channels, advice or error.
+      expect({ variant, body }).toEqual({ variant, body: build(memoryRef()).replace(memoryRef(), escaped) })
+      expect(text).toStartWith(`Persona ${ref}: `)
+      expect(body).toContain(` — ${escaped}; channels:`)
+      expect(body).not.toContain('&amp;lt;')
+      if (label.startsWith('long name')) expect(text.length).toBeGreaterThan(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      assertNoLeak(withoutConfiguredSpans(text, [`Persona ${ref}: `, ` — ${escaped}; channels:`]))
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    }
+    expect(persona).toEqual({ name, key: KEY })
+  })
+
+  test.each(MEMORY_CONFIGURED_PATHS)('$label is preserved and quoted in both path-bearing notices', ({ path }) => {
+    const quoted = escapeSlackControlCharacters(quotedMemoryPath(path))
+    const error = memoryError(path)
+    const rendered = [
+      [buildThreadMemoryNotSavedNotice(memoryRef(), MEMORY_CHANNELS, path, 'journal-append', error), `Could not save ${quoted} (`],
+      [buildThreadMemoryUnreadableNotice(memoryRef(), MEMORY_CHANNELS, path), `Cannot read ${quoted}.`],
+    ] as const
+    for (const [body, field] of rendered) {
+      const text = formatPersonaNotice(PERSONA, body)
+      expect(text).toContain(field)
+      expect(text).not.toContain('<journal>')
+      expect(text).not.toContain('&amp;lt;')
+      expect(text).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+      assertNoLeak(withoutConfiguredSpans(text, [field]))
+    }
+    expect(rendered[0][0]).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+  })
+
+  test('metadata projection ignores extra message and user fields; only configured fields bypass error redaction', () => {
+    const contaminated = {
+      threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary, text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL }],
+      messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary, text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL }],
+      text: MEMORY_BODY, user: MEMORY_USER,
+    }
+    const captured = [
+      renderMemoryLoss(PERSONA, contaminated), buildThreadMemoryJoinsLostLine(PERSONA, contaminated),
+      ...threadMemoryEntries().map(e => withoutConfiguredSpans(e.render(), e.configuredSpans)),
+    ]
+    assertNoLeak(captured)
+    for (const text of captured) {
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    }
+    for (const e of threadMemoryEntries().filter(e => e.variant.includes('token-bearing'))) {
+      const text = e.render()
+      if (e.builder === buildThreadMemoryNotSavedNotice.name) expect(text).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+      expect(text).toContain(escapeSlackControlCharacters(quotedMemoryPath(memoryTokenPath())))
+      expect(text).toContain('&lt;journal&gt;&amp;')
+      expect(text).not.toContain('<journal>')
+      expect(text).not.toContain('&amp;lt;')
+    }
+  })
+
+  test('configured-field masking still rejects the same path, name or a different credential outside those fields', () => {
+    const path = memoryTokenPath(), name = MEMORY_CONFIGURED_NAMES[0]!.name
+    const ref = renderPersonaRef(name, KEY)
+    const body = buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, path, 'journal-append', memoryError(path))
+    const text = formatPersonaNotice({ name, key: KEY }, body)
+    const fields = [`Persona ${ref}: `, ` — ${escapeSlackControlCharacters(ref)}; channels:`, `Could not save ${escapeSlackControlCharacters(quotedMemoryPath(path))} (`]
+    assertNoLeak(withoutConfiguredSpans(text, fields))
+    for (const leak of [path, ref, fakeToken(APP_TOKEN_PREFIX, 'unrelated-credential')]) {
+      expect(() => assertNoLeak(withoutConfiguredSpans(`${text} error=${leak}`, fields))).toThrow('assertNoLeak')
+    }
+  })
+})
+
+describe('Thread Memory diagnostic builders', () => {
+  function rows(path: string, error: Error) {
+    const channels = MEMORY_CHANNELS
+    const loss = MEMORY_LOSSES.find(([label]) => label === 'mixed losses')![1]()
+    return [
+      ['thread-memory-not-saved', KEY, buildThreadMemoryNotSavedLine(KEY, channels, path, 'journal-append', error), path],
+      ['thread-memory-unreadable', KEY, buildThreadMemoryUnreadableLine(KEY, channels, path, error), path],
+      ['thread-memory-unreadable', KEY, buildThreadMemoryUnreadableLine(KEY, channels, path, undefined, true), path],
+      ['thread-memory-joins-lost', KEY, buildThreadMemoryJoinsLostLine(PERSONA, loss)],
+      ['thread-memory-changed-while-stopped', KEY, buildThreadMemoryChangedWhileStoppedLine(KEY, channels, 'journal-changed', 'changed')],
+      ['thread-memory-changed-while-stopped', KEY, buildThreadMemoryChangedWhileStoppedLine(KEY, channels, 'unclean-stop', 'unclean')],
+      ['thread-memory-recovered', KEY, buildThreadMemoryRecoveredLine(KEY, channels)],
+      ['thread-memory-quarantined', KEY, buildThreadMemoryQuarantinedLine(KEY, path, 4, 1), path],
+      ['thread-memory-compaction-failed', KEY, buildThreadMemoryCompactionFailedLine(KEY, path, 'journal-rewrite', error), path],
+      ['thread-memory-removal-failed', KEY, buildThreadMemoryRemovalFailedLine(KEY, path, 'unlink', error), path],
+      ['thread-memory-seal-unreadable', 'all', buildThreadMemorySealUnreadableLine(path, error), path],
+      ...[false, true].map(unsynced => ['thread-memory-seal-not-saved', 'all', buildThreadMemorySealNotSavedLine(path, error, unsynced), path]),
+      ['thread-memory-holds-not-resolved', KEY, buildThreadMemoryHoldsNotResolvedLine(KEY, error)],
+    ]
+  }
+
+  test.each(MEMORY_CONFIGURED_PATHS)('$label: all eleven classes retain configured fields, redact errors and render one log line', ({ path }) => {
+    const rendered = rows(path, memoryError(path))
+    expect([...new Set(rendered.map(([kind]) => kind))].sort()).toEqual([...THREAD_MEMORY_DIAGNOSTIC_CLASSES].sort())
+    for (const [kind, key, line, configuredPath] of rendered) {
+      expect(line!).toStartWith(`[slack] ${kind}: persona=${key} `)
+      expect(line!).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(line!).not.toContain(MEMORY_BODY)
+      expect(line!).not.toContain(MEMORY_USER)
+      const fields = configuredPath === undefined ? [] : [` path=${quotedMemoryPath(configuredPath)} `]
+      assertNoLeak(withoutConfiguredSpans(line!, fields))
+      if (configuredPath !== undefined) {
+        expect(line!).toContain(fields[0]!)
+        // Decode the actual field, not a re-rendered value: quotes, newlines,
+        // backslashes, token-shaped segments and Slack markup all round-trip.
+        const actual = line!.match(/ path=("(?:[^"\\]|\\.)*") /)![1]!
+        expect(JSON.parse(actual)).toBe(path)
+        expect(line!).not.toContain('&lt;journal&gt;')
+      }
+    }
+    expect(rendered.filter(([, , , configuredPath]) => configuredPath !== undefined)).toHaveLength(9)
+    for (const [, , line] of rendered.filter(([, , line]) => line!.includes('code='))) {
+      expect(line!).toContain('code=EACCES')
+      expect(line!).toContain(`cannot write <journal> & ${REDACTED_TOKEN_PLACEHOLDER}`)
+    }
+  })
+
+  test('diagnostic identities and operator actions (one literal pin)', () => {
+    const c = `channels=${JSON.stringify(MEMORY_CHANNELS)}`, p = `path=${JSON.stringify(MEMORY_PATH)}`
+    const error = new Error('storage unavailable'), cause = 'Error message="storage unavailable"'
+    const expected = [
+      `${c} step=journal-append ${p} ${cause}; joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
+      `${c} ${p} ${cause}; replies saved and waiting; fix permissions/storage, or stop CSCB, move the journal aside and start again. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
+      `${c} ${p} journal missing on retry; Thread Memory stays unknown until the next start; waiting replies remain saved`,
+      `threads=[channel=${THREAD_CHANNELS.primary} root=${THREAD_ROOTS.primary}] messages=[channel=${THREAD_CHANNELS.secondary} ts=${THREAD_ROOTS.secondary}] unreadable_lines=3 bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot=${memoryRef()}`,
+      `${c} case=journal-changed wording=changed Joined Threads may be missing or ones the bot should have forgotten; check threads, a new @mention puts the bot back`,
+      `${c} case=unclean-stop wording=unclean CSCB didn't shut down cleanly; cannot tell whether Thread Memory changed; check threads, a new @mention puts the bot back`,
+      `${c} Thread Memory readable; every kept join saved`,
+      `lines=4 invalid_final_lines=1 ${p} invalid lines quarantined; an invalid final line has no Joins lost report`,
+      `step=journal-rewrite ${p} ${cause}; compaction not confirmed; journal retained, retried at maintenance`,
+      `step=unlink ${p} ${cause}; removal retried at next start`,
+      `${p} ${cause}; seal treated as having no entries`,
+      `written_but_not_synced=false ${p} ${cause}; seal write retried`,
+      `written_but_not_synced=true ${p} ${cause}; seal write retried`,
+      `step=resolution-append ${cause}; Memory Hold resolution not saved, retried`,
+    ]
+    const rendered = rows(MEMORY_PATH, error)
+    expect(rendered.map(([kind, key, line]) => line)).toEqual(rendered.map(([kind, key], i) => `[slack] ${kind}: persona=${key} ${expected[i]}`))
+    assertNoLeak(rendered)
+  })
+})
+
 describe('no notice names a forbidden term in CSCB\'s own text', () => {
   test.each(CASES)('%s', (_title, e) => {
     expect(forbiddenTermsIn(ownTextOf(e.render()))).toEqual([])
@@ -1494,7 +1875,9 @@ describe('a description quoted from agent-director is redacted and capped at MAX
   })
 
   test('every builder that quotes agent-director has a redaction-and-cap row', () => {
-    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
+    // Thread Memory quotes storage errors, not agent-director descriptions;
+    // its loss notice has its own final-message budget below.
+    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => e.group !== 'thread-memory' && redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
     const capped = new Set(capRows.map(([, e]) => e.builder))
     expect([...quoting].filter((builder) => !capped.has(builder)).sort()).toEqual([])
   })

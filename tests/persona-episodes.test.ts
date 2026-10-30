@@ -207,6 +207,7 @@ import {
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
@@ -252,6 +253,8 @@ import {
   personaTeardownNoticeEntryText,
   type PersonaTeardownWindowState,
 } from '../src/persona-notifier.ts'
+import { buildThreadMemoryJoinsLostNotice } from '../src/thread-memory-reports.ts'
+import { THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   _resetNotConnectedEpisodes,
@@ -286,6 +289,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   BOT_TOKEN_PREFIX,
@@ -368,7 +372,11 @@ describe('once per episode, for every declared kind', () => {
   test('every kind label is distinct, so no two kinds share a latch', () => {
     expect(new Set(PERSONA_EPISODE_KINDS).size).toBe(PERSONA_EPISODE_KINDS.length)
     // these kinds participate in every shared lifecycle row below.
-    expect(PERSONA_EPISODE_KINDS).toEqual(expect.arrayContaining(['message-not-saved', 'delivery-stuck', 'messages-waiting']))
+    expect(PERSONA_EPISODE_KINDS).toEqual(expect.arrayContaining([
+      'message-not-saved', 'delivery-stuck', 'messages-waiting',
+      'thread-memory-not-saved', 'thread-memory-unreadable',
+      'thread-memory-joins-lost', 'thread-memory-changed-while-stopped',
+    ]))
   })
 
   test.each(eachKind)('%s posts once per episode however often asked, and once more after end and begin', (kind) => {
@@ -407,6 +415,16 @@ describe('once per episode, for every declared kind', () => {
     expect(episodes.view('K', kind)?.posted).toEqual([PERSONA_EPISODE_DEFAULT_MARK])
   })
 
+  test('post forwards its options once per mark, and an option does not leak into a later plain post', () => {
+    const kind = PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST
+    const options = { personaRef: escapeSlackControlCharacters(renderPersonaRef('A <&>…', 'K')) }
+    episodes.begin('K', kind)
+    expect(episodes.post('K', kind, textOf(kind, 1), undefined, options)).toBe(true)
+    expect(episodes.post('K', kind, textOf(kind, 2), undefined, options)).toBe(false)
+    expect(episodes.post('K', kind, textOf(kind, 3), 'next')).toBe(true)
+    expect(posts).toEqual([{ key: 'K', text: textOf(kind, 1), options }, { key: 'K', text: textOf(kind, 3) }])
+  })
+
   test('a sink that posts again for the same episode from inside its call posts nothing twice', () => {
     const kind = PERSONA_EPISODE_KINDS[0]
     const inner: boolean[] = []
@@ -426,6 +444,54 @@ describe('once per episode, for every declared kind', () => {
 // ---------------------------------------------------------------------------
 // Cases and marks
 // ---------------------------------------------------------------------------
+
+describe('budgeted loss reference through episodes and the real notifier', () => {
+  test.each([true, false])('validated=%s preserves the escaped prefix at immediate or held delivery', async (validated) => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'cscb-loss-reference-'))
+    const name = 'N'.repeat(63) + '🚀<&>' + 'long name '.repeat(220)
+    const config = makeMultiPersonaConfig([{ name }], baseDir)
+    const persona = config.personas[0]!
+    const h = makeNotifierHarness(config, { validated, clock, leakMarker: LEAK_SENTINEL })
+    const pending: Promise<void>[] = []
+    episodes = createPersonaEpisodes({
+      sink: (key, text, options) => {
+        const delivery = h.notifier.notify(key, text, options)
+        pending.push(delivery)
+        return delivery
+      },
+      log: line => lines.push(line), clock,
+    })
+    try {
+      const kind = PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST
+      const notice = buildThreadMemoryJoinsLostNotice(persona, {
+        threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [],
+      })
+      episodes.begin(persona.key, kind)
+      expect(episodes.post(persona.key, kind, notice.text, undefined, notice.options)).toBe(true)
+      expect(episodes.post(persona.key, kind, notice.text, undefined, notice.options)).toBe(false)
+      await Promise.all(pending)
+      if (!validated) {
+        expect(h.totalPosts()).toBe(0)
+        h.validate(persona.key)
+        await h.notifier.flush(persona.key)
+      }
+      const text = formatPersonaNotice(persona, notice.text, notice.options)
+      expect(h.posts(persona.key)).toEqual([{ channel: persona.permission_prompts!, text }])
+      const ref = escapeSlackControlCharacters(renderPersonaRef(Array.from(name).slice(0, 64).join('') + '…', persona.key))
+      expect(text.split(ref)).toHaveLength(3)
+      expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      expect(text).not.toContain(name)
+      expect(persona.name).toBe(name)
+      expect(lines).toEqual([])
+      assertNoLeak({ posts: h.allPosts(), logs: h.logs, entries: h.startupEntries() })
+    } finally {
+      episodes.close()
+      h.hold.cancelAll()
+      h.cleanup()
+      rmSync(baseDir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('Thread Stamp diagnostic episode adapter', () => {
   const kind = PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED
@@ -933,6 +999,7 @@ describe('close steps (whenClosed), openKeys and close()', () => {
   })
 
   test('after close(), begin answers closed for every kind, opens nothing and posts nothing', () => {
+    expect(episodes.isClosed()).toBe(false)
     for (const k of PERSONA_EPISODE_KINDS) {
       episodes.begin('K', k)
       episodes.post('K', k, textOf(k, 1))
@@ -940,6 +1007,7 @@ describe('close steps (whenClosed), openKeys and close()', () => {
     const before = posts.length
 
     episodes.close()
+    expect(episodes.isClosed()).toBe(true)
 
     for (const k of PERSONA_EPISODE_KINDS) {
       expect({ k, begin: episodes.begin('K', k), newCase: episodes.begin('Q', k, 'case-a') }).toEqual({

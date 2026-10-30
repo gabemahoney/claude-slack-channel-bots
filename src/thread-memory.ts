@@ -237,15 +237,24 @@ export interface ThreadMemoryQuarantineFact {
   line: number; invalidFinalLine: boolean; channel?: string; root?: string
 }
 export type ThreadMemoryEvent =
-  | { type: 'append-failed' | 'read-failed' | 'compaction-failed' | 'creation-failed' | 'removal-failed'; key: string; path: string; error: unknown }
-  | { type: 'saved-after-failure' | 'read' | 'created' | 'removed'; key: string; path: string }
+  | { type: 'append-failed' | 'creation-failed'; key: string; path: string; step: 'seal-entry' | 'journal-header' | 'journal-append' | 'marker'; error: unknown }
+  | { type: 'compaction-failed'; key: string; path: string; step: 'journal-rewrite'; error: unknown }
+  | { type: 'removal-failed'; key: string; path: string; step: 'journal-unlink' | 'seal-entry' | 'marker'; error: unknown }
+  | { type: 'read-failed'; key: string; path: string; error: unknown }
+  | { type: 'read'; key: string; path: string; firstSuccessfulRead: boolean }
+  | { type: 'saved-after-failure' | 'outage-settled' | 'created' | 'removed'; key: string; path: string }
   | { type: 'lines-quarantined'; key: string; path: string; quarantinePath: string; facts: ThreadMemoryQuarantineFact[] }
 export type ThreadMemoryWriteResult = { kind: 'saved' | 'kept' | 'cancelled' } | { kind: 'failed'; error?: unknown }
+export type ThreadMemoryReadResult = 'read' | 'unreadable' | 'missing'
+export interface ThreadMemoryOutage { unknown: boolean; unsaved: number; missing: boolean }
 export interface ThreadMemoryOptions {
   stateDir: string; fs?: typeof nodeFs; now?: () => number; dryRun?: boolean
   seal?: ThreadMemorySealPort
   setInterval?: typeof globalThis.setInterval; clearInterval?: typeof globalThis.clearInterval
   appliedKeys(): readonly string[]
+  /** Lifecycle admission, rechecked by queued work and after awaits. The
+   * teardown window closes it before the later forget invalidates the journal. */
+  canRun?(key: string): boolean
   stamp(key: string, channel: string): ThreadMemoryStampState | undefined
   /** Distinguish pre-authority startup from an authority reporting no persona.
    * Without this adapter, activation or loadKey establishes the authority. */
@@ -266,6 +275,10 @@ export interface ThreadMemory {
   completedStores(): ReadonlyMap<string, ThreadMemoryStoreIdentity>
   activate(): Promise<void>
   loadKey(key: string): Promise<void>
+  /** Retry only an unknown, current journal. A missing retry stays unknown
+   * until a later lifecycle load; it must never create an empty replacement. */
+  retryRead(key: string): Promise<ThreadMemoryReadResult>
+  outage(key: string): ThreadMemoryOutage
   published(): void
   view(key: string, channel: string, root: string): ThreadMemoryView
   addJoin(key: string, fact: ThreadJoin): boolean
@@ -350,6 +363,7 @@ interface MemoryJournal extends AppendRollback {
   readable: boolean; exists: boolean; hasRecords: boolean; live: boolean; created: boolean; failed: boolean
   header?: ThreadMemoryHeader; highWater: number; records?: ThreadMemoryRecord[]
   creationHeader?: ThreadMemoryHeader; sealSaved?: boolean
+  missing?: boolean
   joinedByChannel: JoinIndex
   heldJoins: JoinIndex
   kept: ThreadJoin[]; intents: Map<string, ThreadPostIntent>
@@ -388,8 +402,19 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     writers.set(key, next)
     return next
   }
+  function workAllowed(key: string): boolean {
+    return !stopped && !quiesced && (options.canRun?.(key) ?? true)
+  }
   function current(key: string, j: MemoryJournal): boolean {
-    return !stopped && !quiesced && !forgotten.has(key) && journals.get(key) === j && j.live && options.appliedKeys().includes(key)
+    return workAllowed(key) && !forgotten.has(key) && journals.get(key) === j && j.live && options.appliedKeys().includes(key)
+  }
+  /** A readiness observation, not an episode: the reporter owns recovery.
+   * Read outages need this even when no append ever failed, or publication
+   * discards the last stale candidate without needing a write. */
+  function observeSettled(key: string, j: MemoryJournal): void {
+    if (!current(key, j)) return
+    const outage = api.outage(key)
+    if (!outage.unknown && !outage.unsaved && !outage.missing) event({ type: 'outage-settled', key, path: pathFor(key) })
   }
   function journalFact(j: MemoryJournal): ThreadMemoryJournalFact {
     if (!j.readable) return { kind: 'unreadable' }
@@ -474,13 +499,16 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     }
     return { line, invalidFinalLine: final, ...(memoryChannel(raw.channel) ? { channel: raw.channel } : {}), ...(memoryRoot(raw.root) ? { root: raw.root } : {}) }
   }
-  function readKey(key: string): void {
+  function readKey(key: string, retry = false, emitRead = true): ThreadMemoryReadResult {
     const j = journal(key), wasUnknown = !j.readable
     let bytes: Buffer
     try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !wasUnknown) { j.exists = false; j.readable = true; return }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        if (retry) { j.missing = true; j.readable = false; return 'missing' }
+        if (!wasUnknown) { j.exists = false; j.readable = true; return 'read' }
+      }
       j.readable = false; j.error = error
-      event({ type: 'read-failed', key, path: pathFor(key), error }); return
+      event({ type: 'read-failed', key, path: pathFor(key), error }); return 'unreadable'
     }
     j.exists = true
     const records: ThreadMemoryRecord[] = [], damaged: ReturnType<typeof splitJournalLines> = []
@@ -517,10 +545,13 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       for (const fact of j.kept) retain(j, fact)
       for (const record of records) if (record.kind === 'join') retain(j, record, record)
       j.created = header !== undefined && options.markerKeys().includes(key)
-      event({ type: 'read', key, path: pathFor(key) })
+      j.missing = false
+      if (emitRead) event({ type: 'read', key, path: pathFor(key), firstSuccessfulRead: wasUnknown })
+      return 'read'
     } catch (error) {
       j.readable = false; j.error = error
       event({ type: 'read-failed', key, path: pathFor(key), error })
+      return 'unreadable'
     }
   }
   function newHeader(j: MemoryJournal): ThreadMemoryHeader {
@@ -544,13 +575,14 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       j.header = header; j.hasRecords = true
       // The shared seal writer must never hold a persona's compaction turn.
       void options.seal?.entryCompacted(key, header.storeId, j.highWater)
-    } catch (error) { event({ type: 'compaction-failed', key, path: pathFor(key), error }); throw error }
+    } catch (error) { event({ type: 'compaction-failed', key, path: pathFor(key), step: 'journal-rewrite', error }); throw error }
   }
   async function createStore(key: string, j: MemoryJournal): Promise<ThreadMemoryWriteResult> {
     if (!current(key, j)) return { kind: 'cancelled' }
     if (options.dryRun || !j.readable) return { kind: 'kept' }
     if (j.created) return { kind: 'saved' }
     if (!j.hasRecords && !options.threadHybridChannels(key).length) return { kind: 'kept' }
+    let step: 'seal-entry' | 'journal-header' | 'marker' = 'seal-entry'
     try {
       // Keep the identity across failures at any creation step. An existing
       // header is already saved; an unsaved header is private to creation.
@@ -563,6 +595,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         j.sealSaved = true
       }
       if (!j.header) {
+        step = 'journal-header'
         if (j.exists) compactOne(key, j, header)
         else {
           io.durableAppend(pathFor(key), serializeThreadMemoryRecords([header]), j)
@@ -573,6 +606,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       // Repair can skip an empty journal if the last hybrid entry vanished
       // during the seal await. Keep creation pending until its header is saved.
       if (!j.header) return { kind: 'kept' }
+      step = 'marker'
       const result = await options.setCreated(key)
       if (!current(key, j)) return { kind: 'cancelled' }
       if (result.kind !== 'saved') throw new Error('Thread Memory created marker was not saved')
@@ -580,7 +614,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       event({ type: 'created', key, path: pathFor(key) })
       return { kind: 'saved' }
     } catch (error) {
-      j.failed = true; event({ type: 'creation-failed', key, path: pathFor(key), error })
+      if (!current(key, j)) return { kind: 'cancelled' }
+      j.failed = true; event({ type: 'creation-failed', key, path: pathFor(key), step, error })
       return { kind: 'failed', error }
     }
   }
@@ -601,7 +636,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     return sameChannelStamp(fact.stamp, stamp) ? 'current' : 'stale'
   }
   function recoverJoins(key: string, candidates: readonly ThreadJoin[]): void {
-    if (stopped || quiesced || forgotten.has(key)) return
+    if (!workAllowed(key) || forgotten.has(key)) return
     const all = [...pendingJoins.get(key) ?? [], ...candidates.map(copyThreadJoin)]
     for (const fact of all) advancePast(key, fact.at)
     pendingJoins.delete(key)
@@ -644,6 +679,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     const creation = await createStore(key, j)
     if (creation.kind !== 'saved') return creation
     if (!current(key, j)) return { kind: 'cancelled' }
+    const hadKept = j.kept.length > 0
     judge(key, j)
     const facts = j.kept.filter(fact => (memoryStampMatches(fact.stamp, options.stamp(key, fact.channel)) || (recoveryStamp(key, fact) === 'stale' && named(key, fact.channel, fact.stamp))) && (!requested || requested.some(r =>
       r.channel === fact.channel && r.root === fact.root && stampKey(r.stamp) === stampKey(fact.stamp) && fact.at <= r.at)))
@@ -657,14 +693,15 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         j.kept = j.kept.filter(fact => !saved.has(fact))
       }
       if (j.failed && !j.kept.length) { j.failed = false; event({ type: 'saved-after-failure', key, path: pathFor(key) }) }
+      else if (hadKept) observeSettled(key, j)
       return { kind: j.kept.length ? 'kept' : 'saved' }
     } catch (error) {
-      j.failed = true; event({ type: 'append-failed', key, path: pathFor(key), error })
+      j.failed = true; event({ type: 'append-failed', key, path: pathFor(key), step: 'journal-append', error })
       return { kind: 'failed', error }
     }
   }
   async function activateKey(key: string): Promise<void> {
-    if (stopped || quiesced || forgotten.has(key)) return
+    if (!workAllowed(key) || forgotten.has(key)) return
     const j = journal(key)
     j.live = true
     j.created = j.header !== undefined && options.markerKeys().includes(key)
@@ -682,20 +719,23 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     return serial(key, async () => {
       if (options.dryRun || stopped || quiesced) return { kind: 'cancelled' }
       if (options.canRemove?.(key) === false) return { kind: 'kept' }
+      let step: 'journal-unlink' | 'seal-entry' | 'marker' = 'journal-unlink'
       try {
         try { durableUnlinkSync(pathFor(key), fs) } catch (error) { if (!(error instanceof DurableUnlinkUnsyncedError)) throw error }
         if (options.seal) {
+          step = 'seal-entry'
           const sealed = await options.seal.removeEntry(key)
           if (sealed.kind !== 'written' && sealed.kind !== 'skipped') {
             throw sealed.kind === 'failed' ? sealed.error : new Error('Thread Memory seal entry was not removed')
           }
           if (stopped || quiesced) return { kind: 'cancelled' }
         }
+        step = 'marker'
         const result = await options.clearCreated(key)
         if (result.kind !== 'saved') throw new Error('Thread Memory created marker was not cleared')
         event({ type: 'removed', key, path: pathFor(key) })
         return { kind: 'saved' }
-      } catch (error) { event({ type: 'removal-failed', key, path: pathFor(key), error }); return { kind: 'failed', error } }
+      } catch (error) { event({ type: 'removal-failed', key, path: pathFor(key), step, error }); return { kind: 'failed', error } }
     })
   }
   async function removeUnappliedAtStart(): Promise<void> {
@@ -735,10 +775,10 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     },
     async loadKey(key) {
       pathFor(key)
-      if (stopped || quiesced) return
+      if (!workAllowed(key)) return
       activationStarted = true
       const previous = journals.get(key)
-      if (previous?.live && previous.readable) return
+      if (previous?.live && (previous.readable || previous.missing)) return
       forgotten.delete(key)
       // A never-created, non-hybrid store needs no journal read. Only a
       // confirmed absence can skip it; existing/unknown stores still retry.
@@ -752,18 +792,48 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       await activateKey(key)
       api.retryPendingJoins(key)
     },
+    retryRead(key) {
+      const j = journals.get(key)
+      // Startup loads precede the shared authority and activation. Keep the
+      // retry alive without I/O until activation can judge the loaded facts.
+      if (j && !j.readable && !activationStarted && workAllowed(key) && !forgotten.has(key)) return Promise.resolve('unreadable')
+      if (!j || !current(key, j) || j.readable) return Promise.resolve('read')
+      return serial(key, () => {
+        if (!current(key, j) || j.readable) return 'read'
+        if (j.missing) return 'missing'
+        const result = readKey(key, true, false)
+        if (result !== 'read') return result
+        options.seal?.judgeFirstRead(key, journalFact(j))
+        replay(key, j)
+        event({ type: 'read', key, path: pathFor(key), firstSuccessfulRead: true })
+        return 'read'
+      })
+    },
+    outage(key) {
+      const j = journals.get(key)
+      if (!j) return { unknown: false, unsaved: 0, missing: false }
+      const kept = j.kept.filter(fact => recoveryStamp(key, fact) !== 'stale' || named(key, fact.channel, fact.stamp))
+      const pending = (pendingJoins.get(key) ?? []).filter(fact => !savedJoin(j, fact) &&
+        (recoveryStamp(key, fact) !== 'stale' || named(key, fact.channel, fact.stamp)))
+      const creation = !j.created && (j.creationHeader !== undefined || (j.readable && (j.hasRecords || options.threadHybridChannels(key).length > 0)))
+      return { unknown: !j.readable, unsaved: kept.length + pending.length + Number(creation), missing: j.missing === true }
+    },
     published() {
       if (stopped || quiesced) return
-      for (const [key, j] of journals) if (j.live) judge(key, j)
+      const settling = [...journals].filter(([key, j]) => j.kept.length > 0 || pendingJoins.has(key))
+      for (const [key, j] of journals) if (workAllowed(key) && j.live) judge(key, j)
       for (const key of [...pendingJoins.keys()]) api.retryPendingJoins(key)
+      // Recovery has added any needed joins before observing stale removals.
+      // A queued append stays unsaved until saveKept observes its durable end.
+      for (const [key, j] of settling) observeSettled(key, j)
       // Promise-chain turns run after the synchronous publisher releases its
       // mutation lock; a marker setter must never run inside that publisher.
       for (const key of options.appliedKeys()) {
-        if (forgotten.has(key)) continue
+        if (!workAllowed(key) || forgotten.has(key)) continue
         const j = journal(key)
         if (!j.live) {
           if (options.threadHybridChannels(key).length) void Promise.resolve().then(() => {
-            if (!stopped && !quiesced && !forgotten.has(key) && journals.get(key) === j) return api.loadKey(key)
+            if (workAllowed(key) && !forgotten.has(key) && journals.get(key) === j) return api.loadKey(key)
           }).catch(() => {})
           continue
         }

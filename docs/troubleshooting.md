@@ -79,6 +79,9 @@ Each start logs one `[slack] startupSessionManager: complete — …` line count
 **Delivery notices or delivery diagnostic lines**
 For *Message not saved*, check the server disk; a [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable) line with `participation=unresolved` posts no notice and does not mean a message was lost; fix the disk rather than asking for a resend. For *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
 
+**A persona posts a Thread Memory notice**
+Read the persona's Thread Memory report and follow its entry. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-notice).
+
 **A persona posts a *Waiting on a prompt* or *Not connected* notice**
 The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
 

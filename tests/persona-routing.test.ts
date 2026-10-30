@@ -11,6 +11,8 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { AcceptedRecord, QueueEvent } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_NOT_SAVED, buildMessageNotSavedNotice } from '../src/delivery-notices.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { buildThreadMemoryChangedWhileStoppedNotice } from '../src/thread-memory-reports.ts'
 import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -898,7 +900,11 @@ test.each(['strict', 'open'] as const)('%s staged restoration holds thread-depen
     expect(restart.launches).toEqual([])
     expect(['alpha', 'beta'].map(isRestartPendingOrActive)).toEqual([false, false])
     expect(notices).toEqual([])
-    expect(run.slackPosts()).toEqual([])
+    expect(run.slackPosts()).toEqual([{ method: 'chat.postMessage', args: {
+      channel: CB,
+      text: formatPersonaNotice({ name: 'alpha', key: 'alpha' },
+        buildThreadMemoryChangedWhileStoppedNotice(renderPersonaRef('alpha', 'alpha'), [CA], 'unclean')),
+    } }])
     assertNoLeak({ logs, captured: run.captured() })
   } finally { await preparation?.stop(); await h.cleanup() }
 })

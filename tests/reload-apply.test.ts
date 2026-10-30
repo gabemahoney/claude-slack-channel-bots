@@ -1,5 +1,6 @@
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
-import { THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
+import { THREAD_ROOTS, threadPath, threadFsControls, readThreads } from './test-helpers/thread-memory.ts'
+import { THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
 import * as nodeFs from 'node:fs'
 import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
@@ -189,6 +190,183 @@ afterEach(async () => {
 function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }
+
+describe.each(['strict', 'open'] as const)('%s Thread Memory retries at confirmed apply', mode => {
+  const channel = 'C0THREAD1'
+  const options = { channels: [{ id: channel, delivery: 'thread_hybrid' as const }], permission_prompts: 'dm' as const, dm: { enabled: true, contact: 'U0OPERATOR' } }
+  const reportPosts = (run: ReloadRun, key: string, title: string) => run.stub(key).calls.postMessage.filter(p => 'text' in p && String(p.text).includes(`*${title}*`))
+  async function mention(run: ReloadRun, key: string, ts: string) {
+    await run.deliver(key, makeChannelMessage({ channel, ts, thread_ts: THREAD_ROOTS.third,
+      text: `${mentionText(run.stub(key).identity.botUserId)} memory retry fixture` }))
+    await run.clock.flush()
+  }
+  async function checkedRuns(body: () => Promise<void>) {
+    try { await body() } finally {
+      // Check every run even if setup, an assertion, stop or another leak
+      // check failed. The outer afterEach removes files only after this.
+      const failures: unknown[] = []
+      for (const run of h.runs) {
+        try { assertNoLeak(run.captured()) } catch (error) { failures.push(error) }
+        try { await run.stop() } catch (error) { failures.push(error) }
+        try { assertNoLeak(run.captured()) } catch (error) { failures.push(error) }
+      }
+      if (failures.length) throw new AggregateError(failures, 'Thread Memory apply run cleanup checks failed')
+    }
+  }
+
+  test.each(['remove', 'rename'] as const)('%s cancels the old append retry without recreating its journal or disturbing its sibling', async action => checkedRuns(async () => {
+    const io = threadFsControls(h.stateDir)
+    const { run, personas: [alpha, bravo] } = await running([['alpha', options], ['bravo', options]],
+      { sessions: true, top: { channel_mode: mode }, threadMemory: { fs: io.fs } })
+    io.fail('writeSync', 'alpha'); io.fail('writeSync', 'bravo')
+    await mention(run, 'alpha', '1700000500.000001'); await mention(run, 'bravo', '1700000500.000002')
+    expect(reportPosts(run, 'alpha', 'Thread Memory not saved')).toHaveLength(1)
+    expect(reportPosts(run, 'bravo', 'Thread Memory not saved')).toHaveLength(1)
+    const renamed = h.persona('charlie', options)
+    if (action === 'rename') h.materialize(renamed)
+    const untouched = watchUntouched(run, 'alpha')
+    const callsFrom = run.composition!.calls.length
+    const instanceFrom = run.composition!.instanceCallsOf('alpha').length
+    await previewConfig(run, action === 'remove' ? [alpha!] : [alpha!, renamed], { channel_mode: mode })
+    untouched()
+    const cp = run.checkpoint()
+    h.confirm(); await run.ticks.tick()
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'bravo', via: 'apply' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+        { op: 'launch', key: 'charlie', via: 'apply' },
+      ] satisfies ReloadLifecycleRecord[]),
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', phase: 'start' },
+        { op: 'bring-up', key: 'charlie', phase: 'settled' },
+      ] satisfies ApplyTimelineEntry[]),
+    ])
+    // Apply must leave alpha alone. Its later background recovery is a
+    // separate, permitted report, so check isolation before moving time.
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual([])
+    expect(run.appliedKeys()).toEqual(action === 'remove' ? ['alpha'] : ['alpha', 'charlie'])
+    expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    const oldCalls = io.calls.filter(c => c.path === threadPath(h.stateDir, 'bravo')).length
+    const oldReports = reportPosts(run, 'bravo', 'Thread Memory not saved').length
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(io.calls.filter(c => c.path === threadPath(h.stateDir, 'bravo'))).toHaveLength(oldCalls)
+    expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    expect(reportPosts(run, 'bravo', 'Thread Memory not saved')).toHaveLength(oldReports)
+    expect(reportPosts(run, 'bravo', 'Thread Memory recovered')).toEqual([])
+    expect(readThreads(h.stateDir, 'alpha').filter(r => r.kind === 'join')).toHaveLength(1)
+    expect(reportPosts(run, 'alpha', 'Thread Memory recovered')).toHaveLength(1)
+    expect(run.threadMemoryRetryEvents.filter(e => e.type === 'retry-cancelled' && 'key' in e && e.key === 'alpha')).toEqual([])
+    await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
+    assertNoLeak(run.captured())
+  }))
+
+  test.each(['submitted', 'open'] as const)('destructive modify fences the still-applied key across a read deadline in its %s teardown window', async window => checkedRuns(async () => {
+    await useConfigDirs()
+    const { run: first, personas: [alpha, bravo] } = await running([['alpha', options], ['bravo', options]],
+      { ...REAL_LAUNCH, sessions: true, top: { channel_mode: mode }, threadMemory: {} })
+    await mention(first, 'alpha', '1700000501.000001'); await first.stop()
+    assertNoLeak(first.captured())
+    const io = threadFsControls(h.stateDir); io.fail('readFileSync', 'alpha')
+    const reached = Promise.withResolvers<void>(), stop = Promise.withResolvers<void>()
+    let stops = 0
+    const run = await h.startDetecting({ ...REAL_LAUNCH, threadMemory: { fs: io.fs, stopSequence: key => {
+      if (key !== 'alpha') return Promise.resolve()
+      if (window === 'submitted' || ++stops !== 2) return Promise.resolve()
+      reached.resolve(); return stop.promise
+    } } })
+    for (const key of ['alpha', 'bravo']) {
+      run.registerSession(key); run.stub(key).script.inventory.push(membershipPage([channel]))
+    }
+    await run.membershipClock.runNext(); await run.ticks.tick()
+    const reply = makeChannelMessage({ channel, thread_ts: THREAD_ROOTS.primary, ts: '1700000501.000002', text: 'held reply body' })
+    await run.deliver('alpha', reply); await run.clock.flush()
+    expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+    expect(run.threadMemoryRetryEvents).toContainEqual({ type: 'read-retry-started', key: 'alpha' })
+    const changed = { ...alpha!, working_directory: join(h.root, 'memory-replacement-work') }
+    h.makeWorkingDirectory(changed)
+    const untouched = watchUntouched(run, 'bravo')
+    const callsFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const instanceFrom = run.composition!.instanceCallsOf('alpha').length
+    const activityFrom = run.socketActivity('alpha').length
+    const label = h.credentialsLabel('alpha'), id = personaInstanceId('alpha')
+    expect(h.rowOf('alpha')).toMatchObject({ state: 'waiting', cwd: alpha!.working_directory })
+    await previewConfig(run, [changed, bravo!], { channel_mode: mode })
+    untouched()
+    const cp = run.checkpoint()
+    const previousTurn = window === 'submitted' ? run.inPersonaTurn('alpha', async () => { reached.resolve(); await stop.promise }) : Promise.resolve()
+    const bringUp = run.lifecycle.hold('bring-up', 'alpha')
+    let applying: Promise<void> | undefined
+    try {
+      h.confirm(); applying = run.ticks.tick()
+      await reached.promise
+      await run.clock.flush()
+      expect(run.appliedKeys()).toContain('alpha')
+      expect(run.threadMemoryWindow('alpha')).toBe(window)
+      const attempts = io.calls.length
+      io.heal()
+      run.observeThreadMemoryEvent(run.threadMemoryEvents.find(e => e.type === 'read-failed' && e.key === 'alpha')!)
+      run.threadMemoryRetries!.appendFailed('alpha')
+      expect(await run.memoryHolds!.resolve('alpha', 'live')).toBe('cancelled')
+      await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+      expect(io.calls).toHaveLength(attempts)
+      expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+      expect(run.memoryHoldEvents).toEqual([])
+      expect(reportPosts(run, 'alpha', 'Joins lost')).toEqual([])
+      expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toEqual([])
+      untouched()
+      stop.resolve(); await previousTurn
+      await bringUp.entered
+      // The old life is ended but its row still exists while step 6 waits.
+      expect(h.rowOf('alpha')).toMatchObject({ state: 'ended', cwd: alpha!.working_directory })
+      expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual(['kill ok'])
+      expect(run.socketActivity('alpha').slice(activityFrom)).toEqual([`discarded ${label}`, `disconnected ${label}`])
+      untouched()
+    } finally { stop.resolve(); bringUp.release(); await previousTurn; await applying }
+    await run.clock.flush()
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'alpha', via: 'apply' },
+      { op: 'bring-up', key: 'alpha', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: 'alpha', via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'alpha', phase: 'start' },
+      { op: 'teardown', key: 'alpha', phase: 'settled' },
+      { op: 'bring-up', key: 'alpha', phase: 'start' },
+      { op: 'bring-up', key: 'alpha', phase: 'settled' },
+    ])
+    expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual(['kill ok', 'reuse-spawn ok'])
+    expect(lastSpawnOf(run, 'alpha')).toMatchObject({ id, reuse: true, cwd: changed.working_directory, claudeConfigDir: ownConfigDir('alpha') })
+    expect(h.rowOf('alpha')).toMatchObject({ state: 'waiting', cwd: changed.working_directory })
+    expect(run.socketActivity('alpha').slice(activityFrom)).toEqual([
+      `discarded ${label}`, `disconnected ${label}`, `built ${label}`, `started ${label}`, `connected ${label}`,
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'bravo')).toEqual([])
+    expect(adCallsSince(run, adFrom).filter(call => call.id !== id)).toEqual([])
+    expect(run.threadMemoryWindow('alpha')).toBe('none')
+    expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+    expect(run.memoryHoldEvents).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [expect.objectContaining({ thread_ts: THREAD_ROOTS.primary, ts: reply.ts })] }])
+    expect(reportPosts(run, 'alpha', 'Joins lost')).toHaveLength(1)
+    expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toHaveLength(1)
+    await run.memoryHolds!.resolve('alpha', 'live'); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(reportPosts(run, 'alpha', 'Joins lost')).toHaveLength(1)
+    expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toHaveLength(1)
+    expect(run.threadMemoryRetryEvents.filter(e => e.type === 'read-retry-started')).toHaveLength(1)
+    expect(reportPosts(run, 'bravo', 'Joins lost')).toEqual([])
+    assertNoLeak(run.captured())
+  }))
+})
 
 describe('Thread Memory at confirmed apply', () => {
   const channel = 'C0THREAD1', root = '1700000000.000001'

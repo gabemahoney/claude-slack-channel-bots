@@ -154,6 +154,9 @@ export { MAX_HELD_NOTICES_PER_PERSONA }
 
 /** Per-notice options. */
 export interface PersonaNoticeOptions {
+  /** Joins lost only: the builder's escaped full reference or approved name
+   * excerpt, budgeted together with the body. Retained with a held notice. */
+  personaRef?: string
   /**
    * Called with the failure (the step, the error class and, when one was
    * thrown, the rejection) when the notice's Slack post fails (or, for a `dm`
@@ -340,8 +343,8 @@ export function firstNoticeLine(text: string): string {
  * persona's stored key (never one derived again from the name), then the
  * body. Pure; shared by `notify` and the permission poller.
  */
-export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text: string): string {
-  return `Persona ${renderPersonaRef(persona.name, persona.key)}: ${text}`
+export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text: string, options?: Pick<PersonaNoticeOptions, 'personaRef'>): string {
+  return `Persona ${options?.personaRef ?? renderPersonaRef(persona.name, persona.key)}: ${text}`
 }
 
 /**
@@ -476,7 +479,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
     const holdNotice: HoldNotice = {
-      message: { text: formatPersonaNotice(persona, notice.text) },
+      message: { text: formatPersonaNotice(persona, notice.text, notice.options) },
       summary: firstNoticeLine(notice.text),
       onAttemptFailed: (failure, info) => {
         if (!info.held) logDroppedFailure(ref, failure)

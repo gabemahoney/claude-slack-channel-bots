@@ -175,6 +175,24 @@ export const QUEUE_KEPT = 'queue-kept'
 export const SYSTEM_PROMPT_UNWRITABLE = 'system-prompt-unwritable'
 export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
 export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
+export const THREAD_MEMORY_NOT_SAVED = 'thread-memory-not-saved'
+export const THREAD_MEMORY_UNREADABLE = 'thread-memory-unreadable'
+export const THREAD_MEMORY_JOINS_LOST = 'thread-memory-joins-lost'
+export const THREAD_MEMORY_CHANGED_WHILE_STOPPED = 'thread-memory-changed-while-stopped'
+export const THREAD_MEMORY_RECOVERED = 'thread-memory-recovered'
+export const THREAD_MEMORY_QUARANTINED = 'thread-memory-quarantined'
+export const THREAD_MEMORY_COMPACTION_FAILED = 'thread-memory-compaction-failed'
+export const THREAD_MEMORY_REMOVAL_FAILED = 'thread-memory-removal-failed'
+export const THREAD_MEMORY_SEAL_UNREADABLE = 'thread-memory-seal-unreadable'
+export const THREAD_MEMORY_SEAL_NOT_SAVED = 'thread-memory-seal-not-saved'
+export const THREAD_MEMORY_HOLDS_NOT_RESOLVED = 'thread-memory-holds-not-resolved'
+export const THREAD_MEMORY_DIAGNOSTIC_CLASSES = [
+  THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE, THREAD_MEMORY_JOINS_LOST,
+  THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_RECOVERED, THREAD_MEMORY_QUARANTINED,
+  THREAD_MEMORY_COMPACTION_FAILED, THREAD_MEMORY_REMOVAL_FAILED, THREAD_MEMORY_SEAL_UNREADABLE,
+  THREAD_MEMORY_SEAL_NOT_SAVED, THREAD_MEMORY_HOLDS_NOT_RESOLVED,
+] as const
+export type ThreadMemoryDiagnosticClass = typeof THREAD_MEMORY_DIAGNOSTIC_CLASSES[number]
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 /** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
 export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id' | 'via'>): string {
@@ -183,6 +201,12 @@ export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 
 }
 export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: string, identity: string, detail = ''): string {
   return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
+}
+/** Configured paths have their own field: quote them without treating a
+ * token-shaped directory as a credential. All untrusted text stays redacted. */
+export function buildThreadMemoryDiagnostic(kind: ThreadMemoryDiagnosticClass, persona: string, identity: string, detail = '', configuredPath?: string): string {
+  const path = configuredPath === undefined ? '' : ` path=${JSON.stringify(configuredPath).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')}`
+  return `[slack] ${kind}: persona=${safe(persona)}${identity ? ` ${safe(identity)}` : ''}${path}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
 }
 export function buildQueuedMessageRetryLine(key: string): string {
   return `[slack] Queued message: persona=${safe(key)} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one`
@@ -195,6 +219,7 @@ export function queueErrorCode(error: unknown): string {
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_THREAD_STAMP_UNDECIDED,
   ...DELIVERY_DIAGNOSTIC_CLASSES,
+  ...THREAD_MEMORY_DIAGNOSTIC_CLASSES,
   PERSONA_START,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_UNREADABLE,

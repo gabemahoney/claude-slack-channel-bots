@@ -18,6 +18,10 @@ import {
 } from '../../src/thread-memory.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makePersona, makePersonaConfigInput } from './persona-config.ts'
+import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from '../../src/thread-memory-retry.ts'
+import { createThreadMemoryReporting } from '../../src/thread-memory-reports.ts'
+import { createPersonaEpisodes } from '../../src/persona-episodes.ts'
+import { formatPersonaNotice } from '../../src/persona-notifier.ts'
 import {
   SHARED_CHANNEL_IDS, configBytes, makeSharedAuthority, readSharedState,
   sharedChannelPath, sharedRecoveryRequest, makeMembershipHarness, membershipPage,
@@ -102,6 +106,7 @@ export function threadFsControls(dir: string) {
       return error
     },
     heal() { faults.length = 0 },
+    removeJournal(key: string = THREAD_PERSONAS.primary) { fs.unlinkSync(threadPath(dir, key)) },
     reset() { calls.length = 0 },
     writes() { return calls.filter(c => ['writeSync', 'ftruncateSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'chmodSync', 'fchmodSync'].includes(c.op) || (c.op === 'openSync' && c.flags !== 'r')) },
   }
@@ -175,6 +180,10 @@ export interface ThreadHarnessOptions {
   queueOptions?: Omit<DeliveryQueueOptions, 'stateDir'>
   setCreated?: ThreadMemoryOptions['setCreated']; clearCreated?: ThreadMemoryOptions['clearCreated']
   heldStamps?: ThreadMemoryOptions['heldStamps']
+  /** The same live work gate is shared by the store and its retry owner. */
+  canRun?: ThreadMemoryOptions['canRun']
+  /** Opt in to production retries/reporting; old store-only callers stay unchanged. */
+  failureHandling?: boolean
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
@@ -190,6 +199,15 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     ? createSharedChannelAuthority(sharedChannelPath(stateDir), saved, { ...deps, threadHybridSince: restartMint(saved.revision) })
     : makeSharedAuthority(stateDir, options.input ?? threadConfig(stateDir), deps))
   const events: ThreadMemoryEvent[] = [], markerCalls: Array<{ action: 'set' | 'clear'; key: string; fileExists: boolean; synced: boolean }> = []
+  const posts: Array<{ key: string; text: string }> = [], logs: string[] = [], retryEvents: ThreadMemoryRetryEvent[] = []
+  let retries: ThreadMemoryRetries | undefined, reporting: ReturnType<typeof createThreadMemoryReporting> | undefined
+  const episodes = options.failureHandling ? createPersonaEpisodes({ clock, log: line => logs.push(line),
+    sink(key, text, noticeOptions) {
+      const persona = authority.config().personas.find(p => p.key === key)
+      if (!persona) throw new Error('fixture notice needs an applied persona')
+      posts.push({ key, text: formatPersonaNotice(persona, text, noticeOptions) })
+    },
+  }) : undefined
   const sealOptions = typeof options.seal === 'object' ? options.seal : {}
   const sealIo = sealOptions.fs ?? threadSealFsControls(stateDir), sealEvents: ThreadMemorySealEvent[] = []
   const seal = options.seal ? createThreadMemorySeal({ stateDir, fs: sealIo.fs,
@@ -197,7 +215,11 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     threadHybrid: key => authority.threadView().threadHybridChannels(key).length > 0,
     created: key => authority.threadMemoryCreated(key),
-    onEvent(event) { sealEvents.push(event); sealOptions.onEvent?.(event) },
+    onEvent(event) {
+      sealEvents.push(event)
+      if (event.type === 'seal-write-failed') retries?.sealWriteFailed()
+      reporting?.sealEvent(event); sealOptions.onEvent?.(event)
+    },
   }) : undefined
   const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions }) : undefined
   const memory = createThreadMemory({
@@ -205,6 +227,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
     heldStamps: options.heldStamps,
+    canRun: options.canRun,
     threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
     markerKeys: () => authority.threadMemoryCreatedKeys(), canRemove: options.canRemove ?? (key => !authority.reviewHeld(key)),
     setCreated: key => {
@@ -217,22 +240,49 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
       markerCalls.push({ action: 'clear', key, fileExists: fs.existsSync(threadPath(stateDir, key)), synced: false })
       return options.clearCreated?.(key) ?? authority.clearThreadMemoryCreated(key)
     },
-    onEvent: event => events.push(event),
+    onEvent(event) {
+      events.push(event)
+      if (event.type === 'append-failed' || event.type === 'creation-failed') retries?.appendFailed(event.key)
+      else if (event.type === 'read-failed') retries?.readFailed(event.key)
+      reporting?.threadMemoryEvent(event)
+    },
   })
+  if (episodes) {
+    reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line),
+      persona: key => authority.config().personas.find(p => p.key === key),
+      threadHybridChannels: key => authority.threadView().threadHybridChannels(key), outage: key => memory.outage(key),
+    })
+    retries = createThreadMemoryRetries({ clock, canRun: options.canRun, flush: key => memory.flush(key), retryRead: key => memory.retryRead(key),
+      sealFlush: () => seal?.flush() ?? Promise.resolve({ kind: 'skipped' }),
+      async firstRead(key, current) {
+        if (!current()) return
+        memory.retryPendingJoins(key)
+        if (!current()) return
+        const result = await memory.flush(key)
+        if (current() && (result.kind === 'failed' || (result.kind === 'kept' && memory.outage(key).unsaved > 0))) retries?.appendFailed(key)
+      },
+      onEvent(event) { retryEvents.push(event); reporting?.retryEvent(event) },
+    })
+  }
   const unsubscribe = authority.subscribeThreadView(() => memory.published())
   const apply = (input: PersonaConfigInput) => authority.applyReviewed(configBytes(input), authority.revision)
   let closing: Promise<void> | undefined
   function close(clean: boolean) {
     return closing ??= (async () => {
-      if (!seal) { unsubscribe(); await memory.stop(); return }
+      if (!seal) {
+        retries?.stopKeys(); unsubscribe(); await memory.stop(); retries?.stopSeal(); episodes?.close(); return
+      }
       await queue?.stop()
+      retries?.stopKeys()
       await memory.quiesce()
-      if (clean && seal.loadedAtStart()) await seal.writeShutdown(memory.completedStores())
+      if (clean && seal?.loadedAtStart()) await seal.writeShutdown(memory.completedStores())
       unsubscribe(); await memory.stop(); await seal?.stop()
+      retries?.stopSeal(); episodes?.close()
     })()
   }
   return {
     stateDir, clock, io, authority, memory, events, markerCalls, unsubscribe, seal, sealIo, sealEvents, queue,
+    retries, reporting, episodes, posts, logs, retryEvents,
     async start() {
       memory.readAtStart()
       if (seal) {
@@ -240,6 +290,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
         await queue?.start()
       }
       await memory.activate()
+      if (seal) reporting?.startupFindings(seal.startupFindings())
       if (seal) memory.startMaintenance()
     },
     close: () => close(true),

@@ -2,7 +2,9 @@ import { createChannelMembership } from '../src/channel-membership.ts'
 import { createMembershipScanner, membershipConnectionListener } from '../src/channel-membership-scan.ts'
 import { createMembershipReadiness } from '../src/channel-membership-readiness.ts'
 import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
-import { makePersonaConfigInput, makePersona } from './test-helpers/persona-config.ts'
+import { makePersonaConfigInput, makePersona, makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 
 
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -43,10 +45,18 @@ import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type * as OwnPostModule from '../src/own-post.ts'
-import type { MemoryHoldResolver } from '../src/memory-holds.ts'
-import { forgetPersonaState } from '../src/persona-lifecycle.ts'
+import { createMemoryHoldResolver, type MemoryHoldResolver } from '../src/memory-holds.ts'
+import { createPersonaLifecycle, forgetPersonaState } from '../src/persona-lifecycle.ts'
+import { createPersonaSerializer } from '../src/persona-serializer.ts'
 import * as fs from 'node:fs'
 import type * as ThreadMemoryModule from '../src/thread-memory.ts'
+import { createThreadMemory } from '../src/thread-memory.ts'
+import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetriesDeps, type ThreadMemoryRetryEvent } from '../src/thread-memory-retry.ts'
+import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine, buildThreadMemoryJoinsLostNotice, buildThreadMemoryUnreadableNotice, buildThreadMemoryNotSavedNotice, buildThreadMemoryRecoveredNotice } from '../src/thread-memory-reports.ts'
+import { createThreadMemorySeal } from '../src/thread-memory-seal.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
 import type * as ThreadJoinRecoveryModule from '../src/thread-join-recovery.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import type * as ThreadMemorySealModule from '../src/thread-memory-seal.ts'
@@ -89,7 +99,7 @@ import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { deliveredRecord, heldSlackInput, memoryHold, makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
-import { threadJoin, THREAD_PERSONAS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
+import { threadJoin, threadHeader, seedThreads, threadFsControls, threadSealFsControls, threadConfig, threadPath, THREAD_PERSONAS, THREAD_ROOTS, THREAD_CHANNELS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -134,6 +144,96 @@ function startJoinRecoveryLoop(): string {
   visit(tree)
   expect(loops).toHaveLength(1)
   return loops[0]!
+}
+
+/** Extract the actual module-scope adapter, without importing or starting main. */
+function serverFunction(name: string, code = SERVER_CODE): string {
+  const tree = ts.createSourceFile('adapter.ts', code, ts.ScriptTarget.Latest, true)
+  const functions = tree.statements.filter(node => ts.isFunctionDeclaration(node) && node.name?.text === name)
+  expect(functions).toHaveLength(1)
+  return functions[0]!.getText(tree).replace(/^export /, '')
+}
+
+function serverInitializer(name: string): string {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const declarations = tree.statements.filter(ts.isVariableStatement).flatMap(node => [...node.declarationList.declarations])
+    .filter(node => node.name.getText(tree) === name)
+  expect(declarations).toHaveLength(1)
+  return declarations[0]!.initializer!.getText(tree)
+}
+
+function threadMemoryReplay(): string {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const main = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'main') as ts.FunctionDeclaration
+  const statements = [...main.body!.statements]
+  const replay = statements.findIndex(node => ts.isForOfStatement(node) && node.expression.getText(tree).includes('bufferedThreadMemoryEvents'))
+  expect(replay).toBeGreaterThanOrEqual(0)
+  expect(statements[replay + 1]!.getText(tree)).toBe('threadMemoryReporting.startupFindings(threadMemorySeal.startupFindings())')
+  return statements.slice(replay, replay + 2).map(node => node.getText(tree)).join('\n')
+}
+
+type MemoryReporter = ReturnType<typeof createThreadMemoryReporting>
+interface MemoryWiringHolders {
+  threadMemory?: Pick<ThreadMemoryModule.ThreadMemory, 'outage'> & Partial<Pick<ThreadMemoryModule.ThreadMemory, 'retryRead' | 'flush' | 'retryPendingJoins'>>
+  threadMemorySeal?: Pick<ThreadMemorySealModule.ThreadMemorySeal, 'flush' | 'startupFindings'>
+  threadMemoryRetries?: ThreadMemoryRetries
+  memoryHolds?: Pick<MemoryHoldResolver, 'resolve' | 'forget'>
+  threadMemoryReporting?: MemoryReporter
+  personaEpisodes?: Pick<PersonaEpisodes, 'isClosed' | 'teardownWindowState'>
+  shuttingDown?: boolean
+  getAppliedPersona?: (key: string) => unknown
+}
+
+/** Production ports, call-time holders and replay; no copies of dispatch logic. */
+function threadMemoryWiring() {
+  const names = ['threadMemory', 'threadMemorySeal', 'threadMemoryRetries', 'memoryHolds', 'threadMemoryReporting', 'personaEpisodes', 'shuttingDown', 'getAppliedPersona']
+  const retryProps = onlyCallProps('createThreadMemoryRetries')
+  return expression<() => {
+    memory: (event: ThreadMemoryModule.ThreadMemoryEvent) => void
+    seal: (event: ThreadMemorySealModule.ThreadMemorySealEvent) => void
+    holds: MemoryReporter['holdsEvent']
+    retry: (event: ThreadMemoryRetryEvent) => void
+    firstRead: ThreadMemoryRetriesDeps['firstRead']
+    canRun(key: string): boolean
+    cancel(key: string): void | Promise<void>
+    retryDeps(clock: ReturnType<typeof createFakeClock>): ThreadMemoryRetriesDeps
+    set(next: MemoryWiringHolders): void
+    start(reporting: MemoryReporter, seal: Pick<ThreadMemorySealModule.ThreadMemorySeal, 'startupFindings'>): void
+    buffered(): Array<{ source: string; event: { type: string }; outage?: ThreadMemoryModule.ThreadMemoryOutage }>
+  }>(`() => {
+    let ${names.join(', ')};
+    const bufferedThreadMemoryEvents = [];
+    ${serverFunction('dispatchThreadMemoryReport')}
+    ${serverFunction('threadMemoryWorkAllowed')}
+    return {
+      memory: (${serverInitializer('threadMemoryEvents')}).emit,
+      seal: (${serverInitializer('threadMemorySealEvents')}).emit,
+      holds: (${serverInitializer('memoryHoldEvents')}).emit,
+      retry: (${retryProps.get('onEvent')}),
+      firstRead: (${retryProps.get('firstRead')}),
+      canRun: threadMemoryWorkAllowed,
+      cancel: (${onlyCallProps('createPersonaLifecycle').get('cancelThreadMemory')}),
+      retryDeps(SYSTEM_PERSONA_CONNECTION_CLOCK) { return { ${callArguments(SERVER_CODE, onlyCallOf('createThreadMemoryRetries')).trim().slice(1, -1)} } },
+      set(next) { ${names.map(name => `if ('${name}' in next) ${name} = next.${name};`).join('\n')} },
+      start(reporting, seal) { threadMemoryReporting = reporting; threadMemorySeal = seal; ${threadMemoryReplay()} },
+      buffered: () => bufferedThreadMemoryEvents,
+    };
+  }`, { forgetPersonaState })()
+}
+
+/** Preserve shutdown's own awaited statements, including the final result handler. */
+function threadMemoryShutdown(bindings: Record<string, unknown>): () => Promise<void> {
+  const [start, end] = shutdownBody(SERVER_CODE)
+  const tree = ts.createSourceFile('shutdown.ts', SERVER_CODE.slice(start, end), ts.ScriptTarget.Latest, true)
+  const statements = tree.statements.map(node => node.getText(tree))
+  const first = statements.findIndex(code => code === 'memoryHolds?.stop()')
+  const last = statements.findIndex(code => code === 'threadMemoryRetries?.stopSeal()')
+  expect(first).toBeGreaterThanOrEqual(0)
+  expect(last).toBeGreaterThan(first)
+  return expression(`async () => { ${statements.slice(first, last + 1).join('\n')} }`, {
+    deliveryPreparation: undefined, deliveryStopping: undefined, remindersStopping: undefined, deliveryClients: undefined,
+    buildThreadMemorySealNotSavedLine, ...bindings,
+  })
 }
 
 /** The production kill-retry clock; renaming it fails the typecheck. */
@@ -2617,8 +2717,9 @@ describe('main() builds the one set of per-persona notice episodes before the st
     expect(onlyCallProps(FACTORY).get(TEARDOWN_WINDOW)).toMatch(
       new RegExp(`^(?:${notifier}\\.${WINDOW_STATE}|\\(?(\\w+)\\)? => ${notifier}\\.${WINDOW_STATE}\\(\\1\\))$`),
     )
-    // The notifier's query is read nowhere else in server.ts.
-    expect(indicesOf(new RegExp(`\\b${WINDOW_STATE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    // This remains the notifier's only reader; Thread Memory asks the central
+    // episodes for the same window through its shared work gate.
+    expect(indicesOf(new RegExp(`\\b${notifier}\\.${WINDOW_STATE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 
   test('shutdown closes the episodes exactly once, through the handle, before it first yields, and nothing forgets them all', () => {
@@ -5634,6 +5735,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     const props = onlyCallProps(factory)
     expect(Object.fromEntries(props)).toEqual({
       stateDir: 'STATE_DIR', dryRun: 'isDryRun()', seal: 'threadMemorySeal',
+      canRun: 'threadMemoryWorkAllowed',
       appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
       stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
       authorityReady: '() => reloadController?.sharedChannels() !== undefined',
@@ -5643,6 +5745,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       canRemove: 'key => reloadController?.sharedChannels()?.reviewHeld(key) === false',
       setCreated: "key => reloadController?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' }",
       clearCreated: "key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' }",
+      onEvent: 'event => threadMemoryEvents.emit(event)',
     })
     const read = onlyCallOf('threadMemory\\.readAtStart')
     const load = onlyCallOf('threadMemorySeal\\.loadAtStart')
@@ -5680,15 +5783,16 @@ describe('Thread Memory server lifecycle wiring', () => {
     const props = onlyCallProps('createPersonaLifecycle')
     expect(props.get('loadThreadMemory')).toBe(`async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { ${recovery}(key, deliveryQueue, threadMemory) void memoryHolds?.resolve(key, 'recovered').catch(() => {}) } }`)
     expect(importSource(SERVER_CODE, 'forgetPersonaState')).toBe('./persona-lifecycle.ts')
-    const args = onlyCallArgs('forgetPersonaState')
+    const args = splitTopLevel(onlyCallArguments(props.get('routing')!, 'forgetPersonaState'))
     expect(args[0]).toBe('key')
     expect(splitTopLevel(args[1]!.slice(1, -1))).toEqual([
       'k => personaRouting.forget(k)', 'k => deliveryReporting?.forget(k)', 'k => deliveryPreparation?.forget(k)',
-      'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => memoryHolds?.forget(k)', 'k => threadMemory?.forget(k)',
+      'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => memoryHolds?.forget(k)',
+      'k => threadMemoryRetries?.forget(k)', 'k => threadMemory?.forget(k)',
     ])
     expect(props.get('routing')).toContain('forget: key => forgetPersonaState(key, [')
     const lifecycle = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!)
-    expect(lifecycle.get('teardown')).toBe('async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) { try { memoryHolds?.forget(persona.key) } finally { await threadMemory?.remove(persona.key) } } } }')
+    expect(lifecycle.get('teardown')).toBe("async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) { try { memoryHolds?.forget(persona.key) } finally { try { threadMemoryRetries?.forget(persona.key, 'removal') } finally { await threadMemory?.remove(persona.key) } } } } }")
   })
 
   test('start recovers every queue key immediately after activation, isolates each failure, and precedes all intake wiring', () => {
@@ -5760,19 +5864,483 @@ describe('Thread Memory server lifecycle wiring', () => {
     const statements = tree.statements.map(node => node.getText(tree).replace(/\s+/g, ' ').trim())
     const drain = statements.indexOf('await deliveryQueue?.stop()')
     expect(drain).toBeGreaterThanOrEqual(0)
-    expect(statements.slice(drain, drain + 6)).toEqual([
+    expect(statements.slice(drain, drain + 8)).toEqual([
       'await deliveryQueue?.stop()',
+      'threadMemoryRetries?.stopKeys()',
       'unsubscribeThreadMemory?.()',
       'await threadMemory?.quiesce()',
-      'if (threadMemorySeal?.loadedAtStart() && threadMemory) { await threadMemorySeal.writeShutdown(threadMemory.completedStores()) }',
+      "if (threadMemorySeal?.loadedAtStart() && threadMemory) { const result = await threadMemorySeal.writeShutdown(threadMemory.completedStores()) try { if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced)) } catch { } }",
       'await threadMemory?.stop()',
       'await threadMemorySeal?.stop()',
+      'threadMemoryRetries?.stopSeal()',
     ])
     for (const call of ['threadMemorySeal\\.writeShutdown', 'threadMemorySeal\\?\\.stop']) {
       const at = onlyCallOf(call)
       expect(at).toBeGreaterThan(start)
       expect(at).toBeLessThan(end)
     }
+  })
+})
+
+describe('Thread Memory failure wiring', () => {
+  const key = THREAD_PERSONAS.primary
+
+  test('one retry owner precedes reads; one reporter follows delivery reporting and precedes replay and bring-up', () => {
+    for (const [factory, path, holder] of [
+      ['createThreadMemoryRetries', './thread-memory-retry.ts', 'threadMemoryRetries'],
+      ['createThreadMemoryReporting', './thread-memory-reports.ts', 'threadMemoryReporting'],
+    ]) {
+      expect(importSource(SERVER_CODE, factory!)).toBe(path!)
+      declaredOnce(holder!)
+      expect(assignmentsTo(holder!).map(({ value }) => value)).toEqual([`${factory}({`])
+      expect(atMainTopLevel(SERVER_CODE, onlyCallOf(factory!))).toBe(true)
+    }
+    const retryAt = onlyCallOf('createThreadMemoryRetries'), reportAt = onlyCallOf('createThreadMemoryReporting')
+    expect(retryAt).toBeGreaterThan(onlyCallOf('createThreadMemory'))
+    expect(retryAt).toBeLessThan(onlyCallOf('threadMemory\\.readAtStart'))
+    expect(reportAt).toBeGreaterThan(onlyCallOf('createDeliveryReporting'))
+    expect(reportAt).toBeLessThan(SERVER_CODE.indexOf(threadMemoryReplay().split('\n')[0]!))
+    expect(reportAt).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    const retries = onlyCallProps('createThreadMemoryRetries')
+    expect([...retries.keys()].sort()).toEqual(['canRun', 'clock', 'flush', 'retryRead', 'sealFlush', 'firstRead', 'onEvent'].sort())
+    expect(retries.get('canRun')).toBe('threadMemoryWorkAllowed')
+    expect(retries.get('clock')).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
+    expect(retries.get('flush')).toBe('key => threadMemory!.flush(key)')
+    expect(retries.get('retryRead')).toBe('key => threadMemory!.retryRead(key)')
+    expect(retries.get('sealFlush')).toBe('() => threadMemorySeal!.flush()')
+    expect(Object.fromEntries(onlyCallProps('createThreadMemoryReporting'))).toEqual({
+      episodes: constOf('createPersonaEpisodes'), persona: 'getAppliedPersona', log: 'line => console.error(line)',
+      threadHybridChannels: 'key => reload.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
+      outage: 'key => threadMemory!.outage(key)',
+    })
+  })
+
+  test.each(['none', 'reporter', 'retry'] as const)('dispatcher routes isolate consumers, throwing=%s', throwing => {
+    const wiring = threadMemoryWiring(), reported: unknown[][] = [], retried: unknown[][] = []
+    const report = (source: string) => (...args: unknown[]) => {
+      reported.push([source, ...args]); if (throwing === 'reporter') throw new Error('fixture report refused')
+    }
+    const retry = (series: string) => (...args: unknown[]) => {
+      retried.push([series, ...args]); if (throwing === 'retry') throw new Error('fixture retry refused')
+    }
+    const outage = { unknown: true, unsaved: 1, missing: false }
+    wiring.set({ threadMemory: { outage: () => outage },
+      threadMemoryReporting: { threadMemoryEvent: report('memory'), sealEvent: report('seal'), retryEvent: report('retry'), holdsEvent: report('holds'), startupFindings: report('findings') },
+      threadMemoryRetries: { appendFailed: retry('append'), readFailed: retry('read'), sealWriteFailed: retry('seal'), forget() {}, stopKeys() {}, stopSeal() {} },
+    })
+    const error = new Error('fixture unavailable'), path = 'fixture-journal'
+    const memoryEvents: ThreadMemoryModule.ThreadMemoryEvent[] = [
+      { type: 'append-failed', key, path, step: 'journal-append', error },
+      { type: 'creation-failed', key, path, step: 'journal-header', error },
+      { type: 'read-failed', key, path, error }, { type: 'saved-after-failure', key, path },
+      { type: 'outage-settled', key, path },
+    ]
+    const seal: ThreadMemorySealModule.ThreadMemorySealEvent = { type: 'seal-write-failed', path, error, unsynced: false }
+    const retryEvent: ThreadMemoryRetryEvent = { type: 'read-after-retries', key, attempts: 1 }
+    const holds: Parameters<MemoryReporter['holdsEvent']>[0] = { type: 'resolution-failed', key, error }
+    memoryEvents.forEach(wiring.memory); wiring.seal(seal); wiring.retry(retryEvent); wiring.holds(holds)
+    expect(reported).toEqual([...memoryEvents.map(event => ['memory', event, outage]), ['seal', seal], ['retry', retryEvent, outage], ['holds', holds]])
+    expect(retried).toEqual([['append', key], ['append', key], ['read', key], ['seal']])
+    assertNoLeak([reported, retried])
+  })
+
+  test('startup replays all four sources in observation order, once, before retained seal findings', () => {
+    const wiring = threadMemoryWiring(), seen: unknown[][] = []
+    let outage = { unknown: true, unsaved: 2, missing: false }
+    wiring.set({ threadMemory: { outage: () => outage } })
+    const memory: ThreadMemoryModule.ThreadMemoryEvent = { type: 'read', key, path: 'fixture', firstSuccessfulRead: true }
+    const retry: ThreadMemoryRetryEvent = { type: 'read-after-retries', key, attempts: 1 }
+    const seal: ThreadMemorySealModule.ThreadMemorySealEvent = { type: 'seal-write-failed', path: 'fixture', error: new Error('fixture failure'), unsynced: true }
+    const holds: Parameters<MemoryReporter['holdsEvent']>[0] = { type: 'resolution-failed', key, error: new Error('fixture failure') }
+    const finding: ThreadMemorySealModule.ThreadMemorySealFinding = { key, case: 'unclean-stop', wording: 'unclean' }
+    wiring.memory(memory); wiring.seal({ type: 'changed-while-stopped', ...finding }); wiring.retry(retry); wiring.seal(seal); wiring.holds(holds)
+    const observed = outage
+    outage = { unknown: false, unsaved: 0, missing: false }
+    const record = (source: string) => (...args: unknown[]) => { seen.push([source, ...args]) }
+    const reporting: MemoryReporter = { threadMemoryEvent: record('memory'), retryEvent: record('retry'), sealEvent: record('seal'), holdsEvent: record('holds'), startupFindings: record('findings') }
+    wiring.start(reporting, { startupFindings: () => [finding] })
+    expect(seen).toEqual([['memory', memory, observed], ['retry', retry, observed], ['seal', seal], ['holds', holds], ['findings', [finding]]])
+    expect(wiring.buffered()).toEqual([])
+    seen.length = 0
+    wiring.start(reporting, { startupFindings: () => [] })
+    expect(seen).toEqual([['findings', []]])
+    // A finding from a later first read still reaches the live reporter.
+    wiring.seal({ type: 'changed-while-stopped', ...finding })
+    expect(seen.at(-1)).toEqual(['seal', { type: 'changed-while-stopped', ...finding }])
+    assertNoLeak(seen)
+  })
+
+  test.each([false, true])('overlapping real read/write outage reports one recovery; buffered=%s', async buffered => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-replay-wiring-')), io = threadFsControls(root), wiring = threadMemoryWiring()
+    const clock = createFakeClock(), posts: string[] = [], logs: string[] = [], events: ThreadMemoryModule.ThreadMemoryEvent[] = []
+    seedThreads(root, [threadHeader()])
+    const episodes = createPersonaEpisodes({ clock, sink: (_key, text) => { posts.push(text) }, log: line => logs.push(line) })
+    const memory = createThreadMemory({ stateDir: root, fs: io.fs, canRun: wiring.canRun, appliedKeys: () => [key], markerKeys: () => [key],
+      stamp: () => ({ kind: 'decided', ...THREAD_STAMP }), threadHybridChannels: () => [THREAD_CHANNELS.primary],
+      setCreated: () => ({ kind: 'saved' }), clearCreated: () => ({ kind: 'saved' }),
+      onEvent(event) { events.push(event); wiring.memory(event) },
+    })
+    const persona = { name: key, key }, channels = [THREAD_CHANNELS.primary], ref = renderPersonaRef(persona.name, key)
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: () => persona, threadHybridChannels: () => channels, outage: k => memory.outage(k) })
+    wiring.set({ threadMemory: memory })
+    try {
+      if (!buffered) wiring.start(reporting, { startupFindings: () => [] })
+      io.fail('readFileSync'); memory.readAtStart(); await memory.activate()
+      memory.recoverJoins(key, [threadJoin()])
+      io.heal(); expect(await memory.retryRead(key)).toBe('read')
+      expect(memory.outage(key).unsaved).toBeGreaterThan(0)
+      io.fail('writeSync'); memory.retryPendingJoins(key); await clock.flush()
+      const failed = events.find((event): event is Extract<ThreadMemoryModule.ThreadMemoryEvent, { type: 'append-failed' | 'creation-failed' }> => event.type === 'append-failed')!
+      expect(failed).toBeDefined()
+      io.heal(); expect(await memory.flush(key)).toEqual({ kind: 'saved' })
+      expect(memory.outage(key)).toEqual({ unknown: false, unsaved: 0, missing: false })
+      if (buffered) {
+        expect(posts).toEqual([])
+        expect(wiring.buffered().find(value => value.event.type === 'read')!.outage!.unsaved).toBeGreaterThan(0)
+        wiring.start(reporting, { startupFindings: () => [] })
+      }
+      expect(posts).toEqual([
+        buildThreadMemoryUnreadableNotice(ref, channels, failed.path),
+        buildThreadMemoryNotSavedNotice(ref, channels, failed.path, failed.step, failed.error),
+        buildThreadMemoryRecoveredNotice(ref, channels),
+      ])
+      expect(logs).toHaveLength(3)
+      assertNoLeak([posts, logs, events])
+    } finally { episodes.close(); await memory.stop(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['none', 'judge', 'resolve', 'flush-failed', 'flush-throws', 'kept-unsaved', 'kept-empty'] as const)('firstRead uses current holders and isolates ordered steps: %s', async failure => {
+    const wiring = threadMemoryWiring(), calls: unknown[][] = [], clock = createFakeClock()
+    const deps = wiring.retryDeps(clock)
+    expect(deps.clock).toBe(clock)
+    wiring.set({ getAppliedPersona: () => ({ key }), shuttingDown: false })
+    await wiring.firstRead(key, () => true) // before the memory/resolver holders exist
+    for (const life of ['first', 'replacement']) {
+      wiring.set({ threadMemory: {
+        outage: () => ({ unknown: false, unsaved: failure === 'kept-unsaved' ? 1 : 0, missing: false }),
+        retryPendingJoins(k) { calls.push([life, 'judge', k]); if (failure === 'judge') throw new Error('fixture judge refused') },
+        async retryRead(k) { calls.push([life, 'read', k]); return 'read' },
+        async flush(k) { calls.push([life, 'flush', k]); if (failure === 'flush-throws') throw new Error('fixture flush refused'); return { kind: failure === 'flush-failed' ? 'failed' : failure.startsWith('kept-') ? 'kept' : 'saved' } },
+      }, memoryHolds: { forget() {}, async resolve(...args) { calls.push([life, 'resolve', ...args]); if (failure === 'resolve') throw new Error('fixture resolution refused'); return 'resolved' } },
+      threadMemoryRetries: { appendFailed(k) { calls.push([life, 'retry', k]) }, readFailed() {}, sealWriteFailed() {}, forget() {}, stopKeys() {}, stopSeal() {} },
+      threadMemorySeal: { startupFindings: () => [], async flush() { calls.push([life, 'seal']); return { kind: 'written' } } } })
+      await deps.firstRead(key, () => true)
+      expect(calls.splice(0)).toEqual([[life, 'judge', key], [life, 'resolve', key, 'live'], [life, 'flush', key],
+        ...(['flush-failed', 'flush-throws', 'kept-unsaved'].includes(failure) ? [[life, 'retry', key]] : [])])
+      await deps.retryRead(key); await deps.sealFlush()
+      expect(calls.splice(0)).toEqual([[life, 'read', key], [life, 'seal']])
+    }
+  })
+
+  test.each(['cancelled', 'shutdown', 'removed'] as const)('firstRead refuses initially and after awaited resolution: %s', async stop => {
+    const wiring = threadMemoryWiring(), calls: string[] = [], pending = Promise.withResolvers<'resolved'>()
+    let current = true
+    const halt = () => {
+      if (stop === 'cancelled') current = false
+      if (stop === 'shutdown') wiring.set({ shuttingDown: true })
+      if (stop === 'removed') wiring.set({ getAppliedPersona: () => undefined })
+    }
+    wiring.set({ shuttingDown: false, getAppliedPersona: () => ({ key }), threadMemory: {
+      outage: () => ({ unknown: false, unsaved: 0, missing: false }), retryPendingJoins() { calls.push('judge') },
+      retryRead: async () => 'read', async flush() { calls.push('flush'); return { kind: 'failed' } },
+    }, memoryHolds: { forget() {}, resolve() { calls.push('resolve'); return pending.promise } } })
+    const work = wiring.firstRead(key, () => current)
+    expect(calls).toEqual(['judge', 'resolve'])
+    halt(); pending.resolve('resolved'); await work
+    await wiring.firstRead(key, () => current)
+    expect(calls).toEqual(['judge', 'resolve'])
+  })
+
+  test.each(['cancelled', 'shutdown', 'removed'] as const)('firstRead cannot start saving from a late kept flush after %s', async stop => {
+    const wiring = threadMemoryWiring(), pending = Promise.withResolvers<ThreadMemoryModule.ThreadMemoryWriteResult>()
+    const calls: string[] = []
+    let current = true
+    wiring.set({ getAppliedPersona: () => ({ key }), threadMemory: {
+      outage: () => ({ unknown: false, unsaved: 1, missing: false }),
+      retryPendingJoins() {}, flush() { calls.push('flush'); return pending.promise },
+    }, threadMemoryRetries: { appendFailed() { calls.push('append') }, readFailed() {}, sealWriteFailed() {}, forget() {}, stopKeys() {}, stopSeal() {} } })
+    const work = wiring.firstRead(key, () => current)
+    await createFakeClock().flush()
+    expect(calls).toEqual(['flush'])
+    if (stop === 'cancelled') current = false
+    if (stop === 'shutdown') wiring.set({ shuttingDown: true })
+    if (stop === 'removed') wiring.set({ getAppliedPersona: () => undefined })
+    pending.resolve({ kind: 'kept' }); await work
+    expect(calls).toEqual(['flush'])
+  })
+
+  test.each([false, true])('kept first-read hands off to one spaced save owner through publication; buffered=%s', async buffered => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-kept-wiring-')), io = threadFsControls(root), wiring = threadMemoryWiring()
+    const clock = createFakeClock(), authority = makeSharedAuthority(root, threadConfig(root))
+    const posts: string[] = [], logs: string[] = [], events: ThreadMemoryModule.ThreadMemoryEvent[] = []
+    const retriesSeen: ThreadMemoryRetryEvent[] = []
+    seedThreads(root, [threadHeader()]); expect(authority.setThreadMemoryCreated(key).kind).toBe('saved')
+    let undecided = false
+    const episodes = createPersonaEpisodes({ clock, sink: (_key, text) => { posts.push(text) }, log: line => logs.push(line) })
+    const memory = createThreadMemory({ stateDir: root, fs: io.fs, canRun: wiring.canRun,
+      appliedKeys: () => authority.config().personas.map(p => p.key), markerKeys: () => authority.threadMemoryCreatedKeys(),
+      stamp: (k, channel) => undecided ? { kind: 'undecided' } : authority.channelStamp(k, channel),
+      threadHybridChannels: k => authority.threadView().threadHybridChannels(k),
+      setCreated: k => authority.setThreadMemoryCreated(k), clearCreated: k => authority.clearThreadMemoryCreated(k),
+      onEvent(event) { events.push(event); wiring.memory(event) },
+    })
+    wiring.set({ threadMemory: memory, personaEpisodes: episodes, getAppliedPersona: k => authority.config().personas.find(p => p.key === k) })
+    const deps = wiring.retryDeps(clock), retries = createThreadMemoryRetries({ ...deps, onEvent(event) { retriesSeen.push(event); deps.onEvent?.(event) } })
+    wiring.set({ threadMemoryRetries: retries })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: k => authority.config().personas.find(p => p.key === k),
+      threadHybridChannels: k => authority.threadView().threadHybridChannels(k), outage: k => memory.outage(k) })
+    try {
+      if (!buffered) wiring.start(reporting, { startupFindings: () => [] })
+      io.fail('readFileSync'); memory.readAtStart(); await memory.activate()
+      const stamp = authority.channelStamp(key, THREAD_CHANNELS.primary)
+      if (stamp?.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('fixture requires a decided stamp')
+      const fact = threadJoin({ stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince } })
+      expect(memory.addJoin(key, fact)).toBe(true)
+      expect(await memory.saveJoins(key, [fact])).toEqual({ kind: 'kept' })
+      undecided = true; io.heal()
+      await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(memory.outage(key)).toEqual({ unknown: false, unsaved: 1, missing: false })
+      expect(retriesSeen.filter(e => e.type === 'append-retry-started')).toHaveLength(1)
+      expect(clock.pending().map(t => t.delayMs)).toEqual([THREAD_MEMORY_RETRY_MIN_MS])
+      io.reset()
+      await clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1); expect(io.writes()).toEqual([])
+      await clock.advance(1); expect(io.writes()).toEqual([])
+      expect(clock.pending().map(t => t.delayMs)).toEqual([2 * THREAD_MEMORY_RETRY_MIN_MS])
+      const due = clock.pending()[0]!.dueAt
+      undecided = false; memory.published(); memory.published(); await clock.flush()
+      expect(clock.pending().map(t => t.dueAt)).toEqual([due])
+      expect(memory.isJoinSaved(key, fact)).toBe(false)
+      await clock.advance(2 * THREAD_MEMORY_RETRY_MIN_MS - 1); expect(io.writes()).toEqual([])
+      await clock.advance(1)
+      expect(memory.isJoinSaved(key, fact)).toBe(true)
+      expect(io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(root))).toHaveLength(1)
+      expect(clock.pendingCount()).toBe(0)
+      expect(retriesSeen.filter(e => e.type === 'saved-after-retries')).toEqual([{ type: 'saved-after-retries', key, attempts: 2 }])
+      const settled = events.find(e => e.type === 'outage-settled')
+      expect(settled).toBeDefined()
+      if (buffered) {
+        expect(posts).toEqual([])
+        expect(wiring.buffered().find(v => v.event.type === 'read')!.outage!.unsaved).toBe(1)
+        expect(wiring.buffered().find(v => v.event.type === 'outage-settled')!.outage).toEqual({ unknown: false, unsaved: 0, missing: false })
+        // Replay must use the stored settled observation, even if today's view has changed again.
+        wiring.set({ threadMemory: { ...memory, outage: () => ({ unknown: true, unsaved: 9, missing: false }) } })
+        wiring.start(reporting, { startupFindings: () => [] })
+      }
+      const persona = authority.config().personas[0]!, ref = renderPersonaRef(persona.name, key), channels = [THREAD_CHANNELS.primary]
+      expect(posts).toEqual([buildThreadMemoryUnreadableNotice(ref, channels, threadPath(root)), buildThreadMemoryRecoveredNotice(ref, channels)])
+      expect(logs).toHaveLength(2)
+      assertNoLeak([posts, logs, retriesSeen, events, writtenFile(root)])
+    } finally { retries.stopKeys(); retries.stopSeal(); episodes.close(); await memory.stop(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['none', 'retry', 'resolver'] as const)('submit cancellation calls both owners synchronously and isolates %s failure', async failure => {
+    const wiring = threadMemoryWiring(), calls: string[] = [], pending = Promise.withResolvers<void>()
+    wiring.set({ threadMemoryRetries: {
+      appendFailed() {}, readFailed() {}, sealWriteFailed() {}, stopKeys() {}, stopSeal() {},
+      forget(k) { calls.push(`retry:${k}`); if (failure === 'retry') throw new Error('fixture retry forget failed') },
+    }, memoryHolds: {
+      resolve: async () => 'resolved',
+      forget(k) { calls.push(`resolver:${k}`); if (failure === 'resolver') throw new Error('fixture resolver forget failed'); return pending.promise },
+    } })
+    const done = wiring.cancel(key)
+    // No await: neither owner's completion can defer invoking the other.
+    expect(calls).toEqual([`retry:${key}`, `resolver:${key}`])
+    pending.resolve()
+    if (failure === 'none') await done
+    else await expect(done).rejects.toThrow(`fixture ${failure} forget failed`)
+  })
+
+  test('production gate fences submitted/open windows, cancels late reads, and rearms only the next life', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-cancel-wiring-'))
+    const config = makeMultiPersonaConfig([{ name: key }, { name: THREAD_PERSONAS.secondary }], root)
+    const notifier = makeNotifierHarness(config), clock = notifier.clock, wiring = threadMemoryWiring(), calls: string[] = [], logs: string[] = []
+    const persona = config.personas[0]!, sibling = config.personas[1]!.key
+    const late = Promise.withResolvers<ThreadMemoryModule.ThreadMemoryReadResult>()
+    let first = true
+    const episodes = createPersonaEpisodes({ clock, log: line => logs.push(line),
+      teardownWindow: k => notifier.notifier.teardownWindowState(k), sink: notifier.notifier.notify })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: k => config.personas.find(p => p.key === k),
+      threadHybridChannels: () => [], outage: () => ({ unknown: true, unsaved: 1, missing: false }) })
+    wiring.set({ personaEpisodes: episodes, getAppliedPersona: k => config.personas.find(p => p.key === k), threadMemory: {
+      outage: () => ({ unknown: true, unsaved: 1, missing: false }),
+      retryPendingJoins(k) { calls.push(`judge:${k}`) },
+      async flush(k) { calls.push(`flush:${k}`); return { kind: 'saved' } },
+      retryRead(k) { calls.push(`read:${k}`); if (first) { first = false; return late.promise }; return Promise.resolve('read') },
+    }, memoryHolds: { forget(k) { calls.push(`forget:${k}`) }, async resolve(k) { calls.push(`resolve:${k}`); return 'resolved' } } })
+    const retries = createThreadMemoryRetries(wiring.retryDeps(clock))
+    wiring.set({ threadMemoryRetries: retries }); wiring.start(reporting, { startupFindings: () => [] })
+    const serializer = createPersonaSerializer(), turn = Promise.withResolvers<void>(), delivery = Promise.withResolvers<void>()
+    const lifecycleLogs: string[] = [], noop = () => {}, unexpected = (): never => { throw new Error('unexpected lifecycle operation') }
+    // Only the unrelated lifecycle edges are inert. Submission, serialization,
+    // notice windows and the production server cancel callback all run for real.
+    const lifecycle = createPersonaLifecycle({ serialize: serializer.run, cancelThreadMemory: wiring.cancel,
+      bringUps: { cancel: noop, state: () => undefined, bringUp: unexpected, changeCredentials: unexpected },
+      connections: { stop: async () => {}, reconnectCredentials: unexpected, replaceRetryTokens: unexpected },
+      routing: { forget: noop }, destinations: notifier.destinations, destinationHold: notifier.hold, notifier: notifier.notifier,
+      appliedPersonas: () => config.personas, dryRun: true, isShuttingDown: () => false, log: line => lifecycleLogs.push(line),
+      stopDelivery: () => delivery.promise, whenLaunchSettled: async () => {}, cancelRestartTimer: noop, stopRetryTimer: noop,
+      forgetFailures: noop, forgetDisconnectedStreak: noop, forgetNoticeEpisodes: k => episodes.forget(k),
+      forgetConflictLatch: noop, forgetInvalidFlagsHold: noop, resetOutageState: noop, forgetPersonaPrompts: noop,
+      forgetAcks: noop, dropSession: async () => {}, killInstance: unexpected, raiseKillFailureAlert: unexpected,
+      storageCheck: unexpected, launch: unexpected, templateRefresh: { get installed(): never { return unexpected() }, getClient: unexpected },
+    })
+    const prior = serializer.run(key, () => turn.promise)
+    let teardown: Promise<void> | undefined
+    try {
+      retries.readFailed(key); await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(calls).toEqual([`read:${key}`])
+      teardown = lifecycle.teardown(persona)
+      expect(wiring.canRun(key)).toBe(false); expect(wiring.canRun(sibling)).toBe(true)
+      expect(notifier.notifier.teardownWindowState(key)).toBe('submitted')
+      expect(calls).toEqual([`read:${key}`, `forget:${key}`])
+      const error = new Error('old life unavailable'), path = threadPath(root)
+      const oldEvents = () => { wiring.memory({ type: 'append-failed', key, path, step: 'journal-append', error }); wiring.memory({ type: 'read-failed', key, path, error }) }
+      oldEvents(); expect(clock.pendingCount()).toBe(0)
+      turn.resolve(); await prior; await clock.flush()
+      expect(notifier.notifier.teardownWindowState(key)).toBe('open')
+      expect(wiring.canRun(key)).toBe(false)
+      expect(calls.filter(c => c === `forget:${key}`)).toHaveLength(2)
+      oldEvents(); expect(clock.pendingCount()).toBe(0)
+      retries.appendFailed(sibling); await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(calls).toContain(`flush:${sibling}`)
+      delivery.resolve(); await teardown
+      expect(notifier.notifier.teardownWindowState(key)).toBe('none')
+      expect(wiring.canRun(key)).toBe(true)
+      late.resolve('read'); await clock.flush()
+      expect(calls).not.toContain(`judge:${key}`)
+      expect(calls).not.toContain(`resolve:${key}`)
+      retries.readFailed(key); await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(calls.slice(-4)).toEqual([`read:${key}`, `judge:${key}`, `resolve:${key}`, `flush:${key}`])
+      expect(clock.pendingCount()).toBe(0)
+      expect(notifier.totalPosts()).toBe(0); expect(logs).toEqual([])
+      wiring.set({ shuttingDown: true }); expect(wiring.canRun(sibling)).toBe(false)
+      wiring.set({ shuttingDown: false }); episodes.close(); expect(wiring.canRun(sibling)).toBe(false)
+      assertNoLeak([calls, logs, lifecycleLogs, notifier.allPosts(), notifier.logs])
+    } finally { turn.resolve(); delivery.resolve(); await prior; await teardown; retries.stopKeys(); retries.stopSeal(); episodes.close(); notifier.cleanup(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each([
+    { loaded: true, failure: 'failed', throwLog: false },
+    { loaded: true, failure: 'unsynced', throwLog: false },
+    { loaded: true, failure: 'failed', throwLog: true },
+    { loaded: true, failure: 'none', throwLog: false },
+    { loaded: false, failure: 'failed', throwLog: false },
+  ] as const)('final shutdown seal owns its log and cancels all work: %j', async ({ loaded, failure, throwLog }) => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-shutdown-wiring-')), io = threadSealFsControls(root), wiring = threadMemoryWiring(), clock = createFakeClock()
+    const order: string[] = [], logs: string[] = [], posts: string[] = [], keyCalls: string[] = [], events: ThreadMemorySealModule.ThreadMemorySealEvent[] = []
+    const drain = Promise.withResolvers<void>(), quiesce = Promise.withResolvers<void>()
+    const episodes = createPersonaEpisodes({ clock, log: line => logs.push(line), sink: (_key, text) => { posts.push(text) } })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: () => ({ name: key, key }),
+      threadHybridChannels: () => [], outage: () => ({ unknown: false, unsaved: 0, missing: false }) })
+    const seal = createThreadMemorySeal({ stateDir: root, fs: io.fs, queueJournalPath: k => queuePath(root, k), appliedKeys: () => [key],
+      threadHybrid: () => true, created: () => true, onEvent(event) { events.push(event); wiring.seal(event) } })
+    wiring.set({ personaEpisodes: episodes, threadMemorySeal: seal, threadMemory: {
+      outage: () => ({ unknown: true, unsaved: 1, missing: false }),
+      async flush(k) { keyCalls.push(`flush:${k}`); return { kind: 'failed' } },
+      async retryRead(k) { keyCalls.push(`read:${k}`); return 'unreadable' },
+    } })
+    const retries = createThreadMemoryRetries(wiring.retryDeps(clock))
+    wiring.set({ threadMemoryRetries: retries }); wiring.start(reporting, seal)
+    const header = threadHeader(), completed = new Map([[key, { storeId: header.storeId, lastRecordNumber: header.highWater }]])
+    try {
+      if (loaded) {
+        await seal.loadAtStart(new Map()); expect((await seal.entryCreated(key, header.storeId, header.highWater)).kind).toBe('written')
+      }
+      retries.appendFailed(key); retries.readFailed(key)
+      expect(clock.pendingCount()).toBe(2)
+      // shutdown() closes episodes before this drain/final-write segment.
+      episodes.close(); wiring.set({ shuttingDown: true })
+      io.reset(); if (failure !== 'none') io.failWrite(failure === 'unsynced')
+      const run = threadMemoryShutdown({ memoryHolds: { stop() { order.push('holds') } },
+        deliveryQueue: { stop() { order.push('queue'); return drain.promise } },
+        unsubscribeThreadMemory: () => order.push('unsubscribe'),
+        threadMemory: {
+          quiesce() { order.push('quiesce'); expect(clock.pendingCount()).toBe(0); return quiesce.promise },
+          completedStores() { order.push('stores'); return completed }, async stop() { order.push('memory-stop') },
+        },
+        threadMemorySeal: { ...seal,
+          async writeShutdown(stores: typeof completed) { order.push('write'); expect(stores).toBe(completed); return seal.writeShutdown(stores) },
+          async stop() { order.push('seal-stop'); await seal.stop() },
+        },
+        threadMemoryRetries: { ...retries,
+          stopKeys() { order.push('keys-stop'); retries.stopKeys() },
+          stopSeal() { order.push('seal-retries-stop'); retries.stopSeal() },
+        },
+        console: { error(line: string) { order.push('log'); logs.push(line); if (throwLog) throw new Error('fixture diagnostic failed') } },
+      })
+      const stopping = run(); await clock.flush()
+      expect(order).toEqual(['holds', 'queue']); expect(io.calls).toEqual([])
+      drain.resolve(); await clock.flush()
+      expect(order).toEqual(['holds', 'queue', 'keys-stop', 'unsubscribe', 'quiesce']); expect(io.calls).toEqual([])
+      quiesce.resolve(); await stopping
+      const failed = loaded && failure !== 'none'
+      expect(order).toEqual(['holds', 'queue', 'keys-stop', 'unsubscribe', 'quiesce', ...(loaded ? ['stores', 'write'] : []),
+        ...(failed ? ['log'] : []), 'memory-stop', 'seal-stop', 'seal-retries-stop'])
+      const failureEvents = events.filter((e): e is Extract<ThreadMemorySealModule.ThreadMemorySealEvent, { type: 'seal-write-failed' }> => e.type === 'seal-write-failed')
+      expect(failureEvents).toHaveLength(failed ? 1 : 0)
+      expect(logs).toEqual(failed ? [buildThreadMemorySealNotSavedLine(seal.path, failureEvents[0]!.error, failure === 'unsynced')] : [])
+      if (failed) expect(failureEvents[0]!.unsynced).toBe(failure === 'unsynced')
+      expect(posts).toEqual([]); expect(keyCalls).toEqual([]); expect(clock.pendingCount()).toBe(0)
+      const count = io.calls.length, oldLogs = [...logs]
+      wiring.memory({ type: 'read-failed', key, path: threadPath(root), error: new Error('late closed event') })
+      wiring.seal({ type: 'seal-write-failed', path: seal.path, error: new Error('late closed event'), unsynced: false })
+      await clock.advance(2 * THREAD_MEMORY_RETRY_MAX_MS)
+      expect(io.calls).toHaveLength(count); expect(keyCalls).toEqual([]); expect(posts).toEqual([]); expect(logs).toEqual(oldLogs)
+      expect(clock.pendingCount()).toBe(0)
+      assertNoLeak([logs, posts, keyCalls, order, writtenFile(root)])
+    } finally { drain.resolve(); quiesce.resolve(); retries.stopKeys(); await seal.stop(); retries.stopSeal(); episodes.close(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('reporter adapters read the replacement memory and shared authority at call time', () => {
+    const props = onlyCallProps('createThreadMemoryReporting'), clock = createFakeClock()
+    const episodes = createPersonaEpisodes({ clock, sink() {}, log() {} }), calls: unknown[][] = []
+    const adapters = expression<() => { deps: Parameters<typeof createThreadMemoryReporting>[0]; replace(n: number): void }>(`() => {
+      let current = 0;
+      let threadMemory;
+      const reload = { sharedChannels: () => current ? { threadView: () => ({ threadHybridChannels: key => [String(current), key] }) } : undefined };
+      const deps = { ${[...props].map(([name, value]) => `${name}: ${value}`).join(',')} };
+      return { deps, replace(n) { current = n; threadMemory = { outage: key => ({ unknown: false, unsaved: n, missing: false }) } } };
+    }`, { noticeEpisodes: episodes, getAppliedPersona: (key: string) => ({ key, name: key }), console: { error: (...args: unknown[]) => calls.push(args) } })()
+    expect(adapters.deps.episodes).toBe(episodes)
+    expect(adapters.deps.threadHybridChannels(key)).toEqual([])
+    for (const n of [1, 2]) {
+      adapters.replace(n)
+      expect(adapters.deps.outage(key).unsaved).toBe(n)
+      expect(adapters.deps.threadHybridChannels(key)).toEqual([String(n), key])
+      expect(adapters.deps.persona(key)).toEqual({ key, name: key })
+    }
+    adapters.deps.log('fixture diagnostic')
+    expect(calls).toEqual([['fixture diagnostic']])
+    episodes.close(); assertNoLeak(calls)
+  })
+
+  test('committed withdrawals reach the production dispatcher and episode sink with the budgeted notifier prefix', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-loss-wiring-'))
+    const config = makeMultiPersonaConfig([{ name: 'a'.repeat(2100), channels: [{ id: THREAD_CHANNELS.primary, delivery: 'thread_hybrid' }] }], root)
+    const notifier = makeNotifierHarness(config), wiring = threadMemoryWiring(), logs: string[] = []
+    const persona = config.personas[0]!, clock = notifier.clock, queue = await makeQueue(root, { now: clock.now })
+    const episodes = createPersonaEpisodes({ clock, sink: expression(onlyCallProps('createPersonaEpisodes').get('sink')!, { personaNotifier: notifier.notifier }), log: line => logs.push(line) })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: () => persona,
+      threadHybridChannels: () => [THREAD_CHANNELS.primary], outage: () => ({ unknown: false, unsaved: 0, missing: false }) })
+    const resolver = createMemoryHoldResolver({ queue, memory: { joinedBy: () => false, pruneHeldJoins: () => {} }, now: clock.now, clock,
+      release() { throw new Error('withdrawn item must not release') }, onEvent: expression(onlyCallProps('createMemoryHoldResolver').get('onEvent')!, { memoryHoldEvents: { emit: wiring.holds } }) })
+    try {
+      wiring.start(reporting, { startupFindings: () => [] })
+      const input = heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.primary })
+      expect((await queue.acceptDecided(persona.key, input.key, () => ({ store: input }))).status).toBe('accepted')
+      expect(await resolver.resolve(persona.key, 'live')).toBe('resolved')
+      await clock.flush()
+      expect(input.channel).toBeDefined(); expect(input.ts).toBeDefined(); expect(input.thread_ts).toBeDefined()
+      const loss = { threads: [{ channel: input.channel!, root: input.thread_ts! }], messages: [{ channel: input.channel!, ts: input.ts! }] }
+      const notice = buildThreadMemoryJoinsLostNotice(persona, loss)
+      expect(notifier.posts(persona.key).map(post => post.text)).toEqual([formatPersonaNotice(persona, notice.text, notice.options)])
+      expect(notifier.posts(persona.key)[0]!.text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toContain(persona.name)
+      expect(await resolver.resolve(persona.key, 'live')).toBe('resolved')
+      await clock.flush(); expect(notifier.totalPosts()).toBe(1)
+      assertNoLeak([notifier.allPosts(), logs, queue.items(persona.key)])
+    } finally { resolver.stop(); episodes.close(); await queue.stop(); notifier.cleanup(); rmSync(root, { recursive: true, force: true }) }
   })
 })
 
@@ -5784,6 +6352,7 @@ describe('Memory Hold server wiring', () => {
     const created = onlyCallOf('createMemoryHoldResolver')
     expect(atMainTopLevel(SERVER_CODE, created)).toBe(true)
     expect(Object.fromEntries(onlyCallProps('createMemoryHoldResolver'))).toEqual({
+      canRun: 'threadMemoryWorkAllowed',
       queue: 'deliveryQueue', memory: 'threadMemory',
       release: '(key, item, mode) => personaRouting.releaseHeld(key, item, mode)',
       now: 'Date.now',
@@ -5941,12 +6510,12 @@ describe('Memory Hold server wiring', () => {
     const error = new Error('fixture forget failed')
     const routing = expression<{ forget(key: string): Promise<void> }>(onlyCallProps('createPersonaLifecycle').get('routing')!, {
       forgetPersonaState,
-      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemory'].map(name => [name, {
+      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'].map(name => [name, {
         forget: (received: string) => { expect(received).toBe(key); calls.push(name); if (name === 'memoryHolds') throw error },
       }])),
     })
     await expect(routing.forget(key)).rejects.toBe(error)
-    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemory'])
+    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'])
   })
 
   test('removed-key cleanup forgets the resolver before removing memory even after lifecycle teardown fails', async () => {
@@ -5958,11 +6527,12 @@ describe('Memory Hold server wiring', () => {
         personaLifecycleOps: { teardown: async () => { throw error } },
         personaConfig: { personas: present ? [{ key }] : [] },
         memoryHolds: { forget: (key: string) => calls.push(['forget', key]) },
+        threadMemoryRetries: { forget: (...args: unknown[]) => calls.push(['retries', ...args]) },
         threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
       })
       await expect(run({ key })).rejects.toBe(error)
     }
-    expect(calls).toEqual([['forget', key], ['remove', key]])
+    expect(calls).toEqual([['forget', key], ['retries', key, 'removal'], ['remove', key]])
   })
 
   test('removed-key cleanup still removes Thread Memory when resolver forget throws', async () => {
@@ -5971,10 +6541,11 @@ describe('Memory Hold server wiring', () => {
     const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
       personaLifecycleOps: { teardown: async () => {} }, personaConfig: { personas: [] },
       memoryHolds: { forget: (key: string) => { calls.push(['forget', key]); throw error } },
+      threadMemoryRetries: { forget: (...args: unknown[]) => calls.push(['retries', ...args]) },
       threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
     })
     await run({ key }).catch(caught => { expect(caught).toBe(error) })
-    expect(calls).toEqual([['forget', key], ['remove', key]])
+    expect(calls).toEqual([['forget', key], ['retries', key, 'removal'], ['remove', key]])
   })
 
   test('start wake and reload count read open queue work through the shared predicates', () => {

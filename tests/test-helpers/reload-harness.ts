@@ -10,6 +10,9 @@ import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent
 import { createDeliveryReporting } from '../../src/delivery-notices.ts'
 import { setDeliveryLifecycle } from '../../src/session-manager.ts'
 import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
+import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent, type ThreadMemorySealOptions } from '../../src/thread-memory-seal.ts'
+import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from '../../src/thread-memory-retry.ts'
+import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from '../../src/thread-memory-reports.ts'
 import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
 import { threadJoin } from './thread-memory.ts'
 
@@ -960,7 +963,13 @@ export interface PreparedPersonaState {
 export interface ReloadRunOptions {
   /** Opt in to the production Thread Memory and real lifecycle composition.
    * Journals live in stateDir; optional fs overrides inject storage failures. */
-  threadMemory?: { fs?: ThreadMemoryOptions['fs']; queueFs?: DeliveryQueueOptions['fs'] }
+  threadMemory?: {
+    fs?: ThreadMemoryOptions['fs']; queueFs?: DeliveryQueueOptions['fs']; sealFs?: ThreadMemorySealOptions['fs']
+    onQueueEvent?: (event: QueueEvent) => void
+    /** Await the real lifecycle's sequence stop, or routing's release feedback. */
+    stopSequence?: (key: string) => Promise<void>
+    beforeRelease?: (key: string) => Promise<void>
+  }
   /** Observe the first admission boundary, before any start bring-up. */
   beforeStartBringUp?: (run: ReloadRun) => void | Promise<void>
   /** Actual MCP callbacks, held independently of the reload transaction. */
@@ -1094,6 +1103,16 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
+  readonly threadMemorySeal: ThreadMemorySeal | undefined
+  readonly threadMemoryRetries: ThreadMemoryRetries | undefined
+  readonly threadMemoryRetryEvents: ThreadMemoryRetryEvent[]
+  readonly threadMemorySealEvents: ThreadMemorySealEvent[]
+  readonly threadMemoryReporting: ReturnType<typeof createThreadMemoryReporting> | undefined
+  /** Replay a captured old-life observation through the same store observer port. */
+  observeThreadMemoryEvent(event: ThreadMemoryEvent): void
+  threadMemoryWindow(key: string): 'none' | 'submitted' | 'open'
+  /** Run injected pending work on the production serializer before teardown submission. */
+  inPersonaTurn<T>(key: string, body: () => Promise<T>): Promise<T>
   readonly threadMemory: ThreadMemory | undefined
   readonly threadMemoryEvents: ThreadMemoryEvent[]
   readonly memoryHolds: MemoryHoldResolver | undefined
@@ -1920,6 +1939,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   }
 
   function build(runOpts: ReloadRunOptions = {}): ReloadRun {
+    let stopped = false
     if (runsStoppedBeforeWrite.size > 0) {
       throw new Error('reload-harness: a run reached its stopBeforeWrite stop point; await run.stop() before building the next run')
     }
@@ -2057,6 +2077,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       log,
       isDryRun: () => dryRun,
       getPersonaConfig: appliedConfig,
+      ...(runOpts.threadMemory === undefined ? {} : { clock: connections.clock }),
     })
     // As main builds them: the run's one
     // set of notice episodes, on the run's fake clock, posting through the
@@ -2068,10 +2089,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // unclassified-error episode for them to stop or end.
     const episodeNotices: Array<{ key: string; text: string }> = []
     const episodes = createPersonaEpisodes({
-      sink: (key, text) => {
+      sink: (key, text, options) => {
         episodeNotices.push({ key, text })
-        void noticeStack.notifier.notify(key, text)
+        void noticeStack.notifier.notify(key, text, options)
       },
+      ...(runOpts.threadMemory === undefined ? {} : { teardownWindow: noticeStack.notifier.teardownWindowState }),
       log,
       clock: connections.clock,
     })
@@ -2093,7 +2115,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     let queueTimer: unknown
     let queueIntervalLive = false
     const queue = createDeliveryQueue({
-      stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event),
+      stateDir, now: connections.clock.now, onEvent: event => {
+        queueEvents.push(event)
+        runOpts.threadMemory?.onQueueEvent?.(event)
+      },
       ...(runOpts.threadMemory === undefined ? {} : {
         fs: runOpts.threadMemory.queueFs,
         threadJoinSaved: (key: string, channel: string, fact: NonNullable<QueueItem['accepted']['thread_join']>) => {
@@ -2118,9 +2143,40 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     })
     const threadMaintenance = makeManualInterval()
     const threadMemoryEvents: ThreadMemoryEvent[] = []
+    const threadMemoryRetryEvents: ThreadMemoryRetryEvent[] = [], threadMemorySealEvents: ThreadMemorySealEvent[] = []
+    let threadMemoryRetries: ThreadMemoryRetries | undefined
+    let threadMemoryReporting: ReturnType<typeof createThreadMemoryReporting> | undefined
+    // Same observation-time snapshot as main: replay never asks a healed store
+    // what an earlier read/append failure looked like.
+    const bufferedReports: Array<() => void> = []
+    function dispatchReport(report: () => void): void {
+      if (!threadMemoryReporting) bufferedReports.push(report)
+      else { try { report() } catch { /* observer isolation */ } }
+    }
+    const memoryWorkAllowed = (key: string) => !stopped && !episodes.isClosed() && episodes.teardownWindowState(key) === 'none'
+    const threadMemorySeal = runOpts.threadMemory === undefined ? undefined : createThreadMemorySeal({
+      stateDir, fs: runOpts.threadMemory.sealFs,
+      queueJournalPath: key => join(stateDir, 'queue', `${key}.jsonl`),
+      appliedKeys: () => serverConfig()?.personas.map(p => p.key) ?? [],
+      threadHybrid: key => (controller?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0,
+      created: key => controller?.sharedChannels()?.threadMemoryCreated(key) ?? false,
+      onEvent(event) {
+        threadMemorySealEvents.push(event)
+        if (threadMemoryReporting || event.type !== 'changed-while-stopped') dispatchReport(() => threadMemoryReporting?.sealEvent(event))
+        if (event.type === 'seal-write-failed') threadMemoryRetries?.sealWriteFailed()
+      },
+    })
+    function observeThreadMemoryEvent(event: ThreadMemoryEvent): void {
+        threadMemoryEvents.push(event)
+        const outage = threadMemory?.outage(event.key)
+        dispatchReport(() => threadMemoryReporting?.threadMemoryEvent(event, outage))
+        if (event.type === 'append-failed' || event.type === 'creation-failed') threadMemoryRetries?.appendFailed(event.key)
+        else if (event.type === 'read-failed') threadMemoryRetries?.readFailed(event.key)
+    }
     const threadMemory = runOpts.threadMemory === undefined ? undefined : createThreadMemory({
-      stateDir, dryRun, fs: runOpts.threadMemory.fs, now: connections.clock.now,
-      onEvent: event => threadMemoryEvents.push(event),
+      stateDir, dryRun, seal: threadMemorySeal, fs: runOpts.threadMemory.fs, now: connections.clock.now,
+      canRun: memoryWorkAllowed,
+      onEvent: observeThreadMemoryEvent,
       setInterval: threadMaintenance.setInterval as typeof globalThis.setInterval,
       clearInterval: threadMaintenance.clearInterval as typeof globalThis.clearInterval,
       appliedKeys: () => serverConfig()?.personas.map(p => p.key) ?? [],
@@ -2133,8 +2189,30 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       setCreated: key => controller?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' },
       clearCreated: key => controller?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
     })
+    if (threadMemory) threadMemoryRetries = createThreadMemoryRetries({
+      canRun: memoryWorkAllowed, clock: connections.clock,
+      flush: key => threadMemory.flush(key), retryRead: key => threadMemory.retryRead(key),
+      sealFlush: () => threadMemorySeal!.flush(),
+      firstRead: async (key, current) => {
+        const live = () => current() && !stopped && getAppliedPersona(key) !== undefined
+        if (!live()) return
+        try { threadMemory.retryPendingJoins(key) } catch { /* independent steps */ }
+        if (!live()) return
+        try { await memoryHolds?.resolve(key, 'live') } catch { /* saving is independent */ }
+        if (!live()) return
+        try {
+          const result = await threadMemory.flush(key)
+          if (live() && (result.kind === 'failed' || (result.kind === 'kept' && threadMemory.outage(key).unsaved > 0))) threadMemoryRetries?.appendFailed(key)
+        } catch { if (live()) threadMemoryRetries?.appendFailed(key) }
+      },
+      onEvent(event) {
+        threadMemoryRetryEvents.push(event)
+        const outage = 'key' in event ? threadMemory.outage(event.key) : undefined
+        dispatchReport(() => threadMemoryReporting?.retryEvent(event, outage))
+      },
+    })
     threadMemory?.readAtStart()
-    const queueReady = queue.start()
+    const queueReady = threadMemory ? threadMemorySeal!.loadAtStart(threadMemory.journalFacts()).then(() => queue.start()) : queue.start()
     let threadMemoryReady = Promise.resolve()
     let unsubscribeThreadMemory: (() => void) | undefined
     const reporting = threadMemory === undefined ? undefined : createDeliveryReporting({
@@ -2149,12 +2227,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const memoryHoldEvents: MemoryHoldEvent[] = []
     const heldReleases: Array<{ key: string; seq: number; mode: MemoryHoldMode }> = []
     const memoryHolds = threadMemory === undefined ? undefined : createMemoryHoldResolver({
+      canRun: memoryWorkAllowed,
       queue, memory: threadMemory, clock: connections.clock, now: connections.clock.now,
-      release(key, item, mode) {
+      async release(key, item, mode) {
         heldReleases.push({ key, seq: item.accepted.seq, mode })
+        await runOpts.threadMemory?.beforeRelease?.(key)
         return routing.releaseHeld(key, item, mode)
       },
-      onEvent: event => memoryHoldEvents.push(event),
+      onEvent(event) {
+        memoryHoldEvents.push(event)
+        dispatchReport(() => threadMemoryReporting?.holdsEvent(event))
+      },
     })
     const membershipClock = createFakeClock()
     let membership: ChannelMembership | undefined
@@ -2453,8 +2536,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // The run's routing's per-key forget, as server.ts binds it, so a
         // torn-down key's dedupe store and heard set are dropped.
         routing: { forget: rec('routing.forget', (key) => threadMemory === undefined ? routing.forget(key) :
-          forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemory.forget(k)])) },
-        ...(threadMemory === undefined ? {} : { loadThreadMemory: async (key: string) => {
+          forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemoryRetries!.forget(k), k => threadMemory.forget(k)])) },
+        ...(threadMemory === undefined ? {} : { cancelThreadMemory: (key: string) => forgetPersonaState(key, [
+          k => threadMemoryRetries!.forget(k), k => memoryHolds!.forget(k),
+        ]), loadThreadMemory: async (key: string) => {
           await threadMemory.loadKey(key)
           if (!stopped) {
             recoverQueuedJoins(key, queue, threadMemory)
@@ -2466,8 +2551,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
         // The run's one destination resolver, which the notices post through.
         destinations: { forget: rec('destinations.forget', (key) => noticeStack.destinations.forget(key)) },
-        destinationHold: { cancel: rec('destinationHold.cancel') },
-        notifier: { forget: rec('notifier.forget', () => 0) },
+        destinationHold: { cancel: rec('destinationHold.cancel', key => { if (threadMemory) noticeStack.hold.cancel(key) }) },
+        notifier: threadMemory ? noticeStack.notifier : { forget: rec('notifier.forget', () => 0) },
         appliedPersonas: () => controller.applied()?.config.personas ?? [],
         dryRun,
         // An apply here never runs during shutdown.
@@ -2479,7 +2564,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
         // manager's stop entry (with a realLaunch run's registry installed;
         // with none it stops nothing).
-        stopLiveRowSequence: rec('stopLiveRowSequence', (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)),
+        stopLiveRowSequence: rec('stopLiveRowSequence', (key) => runOpts.threadMemory?.stopSequence?.(key) ?? stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)),
         whenLaunchSettled: rec('whenLaunchSettled', (key) => whenLaunchSettled(key)),
         cancelRestartTimer: rec('cancelRestartTimer', () => false),
         // With the real launch path, as main() binds it: the run's retry
@@ -2709,7 +2794,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           bringUps.cancel(persona.key)
           await connections.manager.stop(persona.key)
         }) } finally {
-          if (!serverConfig()?.personas.some(p => p.key === persona.key)) await threadMemory?.remove(persona.key)
+          if (!serverConfig()?.personas.some(p => p.key === persona.key)) {
+            threadMemoryRetries?.forget(persona.key, 'removal')
+            await threadMemory?.remove(persona.key)
+          }
         }
       },
       async refreshTemplate(applied) {
@@ -2895,6 +2983,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             } catch { /* retry this key at bring-up */ }
           }
           queue.startMaintenance()
+          threadMemoryReporting = createThreadMemoryReporting({
+            episodes, persona: getAppliedPersona, log,
+            threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
+            outage: key => threadMemory.outage(key),
+          })
+          for (const report of bufferedReports.splice(0)) dispatchReport(report)
+          threadMemoryReporting.startupFindings(threadMemorySeal!.startupFindings())
           wireMembership()
         })
       } else wireMembership()
@@ -3136,9 +3231,16 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return client
     }
 
-    let stopped = false
     const run: ReloadRun = {
       threadMemory,
+      threadMemorySeal, threadMemoryRetries, threadMemoryRetryEvents, threadMemorySealEvents,
+      observeThreadMemoryEvent,
+      get threadMemoryReporting() { return threadMemoryReporting },
+      threadMemoryWindow: noticeStack.notifier.teardownWindowState,
+      inPersonaTurn: (key, body) => {
+        if (!serializer) throw new Error('inPersonaTurn requires the real lifecycle')
+        return serializer.run(key, body)
+      },
       threadMemoryEvents,
       memoryHolds, memoryHoldEvents, heldReleases,
       async joinThread(name, channel, root) {
@@ -3272,7 +3374,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       slackCalls,
       slackPosts: () => Object.values(slackCalls()).flat().filter((c) => c.method === 'chat.postMessage'),
       captured: (extra = {}) => ({
-        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases }),
+        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases, threadMemoryRetryEvents, threadMemorySealEvents }),
         logs,
         statuses: connections.statuses,
         lifecycle: records,
@@ -3410,16 +3512,26 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     async function finishRun(graceful: boolean): Promise<void> {
       if (stopped) return
       stopped = true
+      if (threadMemory) episodes.close()
       memoryHolds?.stop()
       membershipScanner?.close()
       membership?.close()
       if (graceful) {
         await preparation.stop()
         await queue.stop()
+        threadMemoryRetries?.stopKeys()
         if (threadMemory) await threadMemoryReady
         unsubscribeThreadMemory?.()
+        await threadMemory?.quiesce()
+        if (threadMemorySeal?.loadedAtStart() && threadMemory) {
+          const result = await threadMemorySeal.writeShutdown(threadMemory.completedStores())
+          if (result.kind === 'failed') log(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced))
+        }
         await threadMemory?.stop()
+        await threadMemorySeal?.stop()
+        threadMemoryRetries?.stopSeal()
       } else {
+        threadMemoryRetries?.stopKeys(); threadMemoryRetries?.stopSeal()
         // Drop old-run memory and timers; no durable shutdown API runs.
         unsubscribeThreadMemory?.()
         queueIntervalLive = false

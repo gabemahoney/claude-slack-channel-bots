@@ -1,23 +1,37 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ChannelMode, PersonaInput } from '../src/config.ts'
-import { RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'
+import type { Via } from '../src/delivery-decision.ts'
+import { buildTagParts } from '../src/tag-wrapper.ts'
+import { RETYPE_BACKOFF_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
 import { isOpenItem, itemOpenedAt, QUEUE_COMPACT_INTERVAL_MS, type HoldResolution } from '../src/delivery-queue.ts'
 import { createMemoryHoldResolver, judgeMemoryHolds, type MemoryHoldEvent, type MemoryHoldMode } from '../src/memory-holds.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { heldSlackInput, makeQueue, memoryHold, queuePath, readQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
-import { makeChannelMessage, makeDm, mentionText } from './test-helpers/slack-stub.ts'
-import { makeThreadMemoryHarness, readThreads, THREAD_ROOTS, THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
+import { broadcastText, makeChannelMessage, makeDm, mentionText, stubOpenedDmId, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { damagedThreadLine, makeThreadMemoryHarness, readThreads, seedThreads, THREAD_ROOTS, THREAD_TIME, threadFsControls, threadPath, threadSealFsControls, readThreadSeal } from './test-helpers/thread-memory.ts'
 
 const channel = SHARED_CHANNEL_IDS.primary, neighbor = SHARED_CHANNEL_IDS.secondary
 const root = THREAD_ROOTS.primary
+const MESSAGE_BODY = 'private reply body must never enter memory diagnostics'
+const notices = (run: ReloadRun, title: string, key = 'alpha') => run.stub(key).calls.postMessage.map(p => ({ channel: p.channel, text: 'text' in p ? String(p.text) : '' })).filter(p => p.text.includes(`*${title}*`))
+const memoryLines = (run: ReloadRun, kind: string, key = 'alpha') => run.logs.filter(l => l.includes(`thread-memory-${kind}`) && l.includes(`persona=${key}`))
+function expectMemoryReportsSafe(run: ReloadRun) {
+  const reports = { logs: run.logs.filter(l => l.includes('thread-memory-')), posts: run.stub('alpha').calls.postMessage,
+    memory: run.threadMemoryEvents, holds: run.memoryHoldEvents, retries: run.threadMemoryRetryEvents, seal: run.threadMemorySealEvents }
+  assertNoLeak(reports)
+  expect(JSON.stringify(reports)).not.toContain(MESSAGE_BODY)
+  for (const post of run.stub('alpha').calls.postMessage.filter(p => ('text' in p && (String(p.text).includes('Thread Memory') || String(p.text).includes('*Joins lost*'))))) {
+    expect(post.channel).toBe(stubOpenedDmId('U0OPERATOR'))
+  }
+}
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close() })
 
@@ -29,9 +43,9 @@ async function resolverFixture(releaseFeedback?: () => Promise<void>) {
   const saves: Array<{ key: string; decisions: readonly HoldResolution[] }> = []
   let beforeSave: (key: string) => Promise<void> = async () => {}, nowReads = 0
   const resolver = createMemoryHoldResolver({
-    queue: { ...queue, async resolveHolds(key, decisions, current) {
+    queue: { ...queue, async resolveHolds(key, decisions, current, onCommitted) {
       saves.push({ key, decisions }); await beforeSave(key)
-      const saved = await queue.resolveHolds(key, decisions, current)
+      const saved = await queue.resolveHolds(key, decisions, current, onCommitted)
       order.push(`saved:${key}`)
       return saved
     } },
@@ -98,7 +112,7 @@ describe('Memory Hold resolver', () => {
     expect(f.releases).toEqual([1, 3].map(seq => ({ key: 'alpha', seq, mode })))
     expect(f.events).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [{ seq: 2, channel,
       thread_ts: THREAD_ROOTS.secondary, ts: f.queue.item('alpha', 2)!.accepted.ts }] }])
-    expect(f.order).toEqual(['saved:alpha', 'released:alpha:1', 'released:alpha:3', 'withdrawn', 'pruned:alpha'])
+    expect(f.order).toEqual(['withdrawn', 'saved:alpha', 'released:alpha:1', 'released:alpha:3', 'pruned:alpha'])
     await f.resolver.resolve('alpha', mode); await f.resolver.retryPending('alpha')
     expect(f.releases).toHaveLength(2); expect(f.events).toHaveLength(1); expect(f.saves).toHaveLength(1)
   })
@@ -179,7 +193,7 @@ describe('Memory Hold resolver', () => {
         ] as const : []),
       ])
       if (compacted) {
-        expect(f.releases).toEqual(expectedReleases.slice(0, 1)); expect(f.events).toEqual([])
+        expect(f.releases).toEqual(expectedReleases.slice(0, 1)); expect(f.events).toEqual(expectedEvents)
         expect(f.queue.item('alpha', 4)!.hold!.state).toBe('withdrawn')
         // Remove the full withdrawal while the first release's feedback waits.
         await f.queue.compact('alpha')
@@ -189,8 +203,8 @@ describe('Memory Hold resolver', () => {
       }
       expect(await pending).toBe('resolved')
       expect(f.releases).toEqual(expectedReleases); expect(f.events).toEqual(expectedEvents)
-      expect(f.order).toEqual(['saved:alpha',
-        ...(outcome === 'mixed' ? ['released:alpha:3', 'released:alpha:5', 'withdrawn'] : []), 'pruned:alpha'])
+      expect(f.order).toEqual([...(outcome === 'mixed' ? ['withdrawn'] : []), 'saved:alpha',
+        ...(outcome === 'mixed' ? ['released:alpha:3', 'released:alpha:5'] : []), 'pruned:alpha'])
       expect(f.queue.unresolvedHolds('alpha')).toEqual([])
       const records = readQueue(f.dir)
       expect(await f.resolver.resolve('alpha', mode === 'live' ? 'recovered' : 'live')).toBe('resolved')
@@ -338,20 +352,20 @@ function outageFixture(mode: ChannelMode) {
     await run.clock.flush()
     return run
   }
-  async function intake(run: ReloadRun, kind: 'mention' | 'reply' | 'dm' | 'other' = 'reply', thread: string = root, key = 'alpha') {
+  async function intake(run: ReloadRun, kind: 'mention' | 'reply' | 'dm' | 'other' = 'reply', thread: string = root, key = 'alpha'): Promise<SlackEvent & { ts: string }> {
     const ts = `1700000300.${String(++sequence).padStart(6, '0')}`
     const event = kind === 'dm' ? makeDm({ ts, text: `dm ${sequence}` }) : makeChannelMessage({ ts,
       channel: kind === 'other' ? neighbor : channel, thread_ts: thread,
-      text: kind === 'mention' ? `${mentionText(run.stub(key).identity.botUserId)} join ${sequence}` : `reply ${sequence}` })
+      text: kind === 'mention' ? `${mentionText(run.stub(key).identity.botUserId)} ${MESSAGE_BODY} join ${sequence}` : `${MESSAGE_BODY} ${sequence}` })
     await run.deliver(key, event); await run.clock.flush(); return { ...event, ts }
   }
-  async function drain(run: ReloadRun, key = 'alpha') {
+  async function drain(run: ReloadRun, key = 'alpha', expectedParts?: readonly string[]) {
     await run.prepareQueued()
-    const expected = run.queued(key).filter(isOpenItem).flatMap(i => i.fixed!.parts)
+    const expected = expectedParts ?? run.queued(key).filter(isOpenItem).flatMap(i => i.fixed!.parts)
     const engine = await makeEngineHarness({ queue: run.queue, stateDir: h.stateDir, keys: [key] })
     try {
       await engine.tick(key); await engine.until(() => run.queue.openCount(key) === 0)
-      expect(engine.textCalls(key).map(c => c.params.text)).toEqual(expected)
+      expect(engine.textCalls(key).map(c => c.params.text)).toEqual([...expected])
       expect(engine.errors).toHaveLength(0); assertNoLeak({ calls: engine.calls, events: engine.events, errors: engine.errors })
     } finally { await engine.cleanup() }
   }
@@ -359,13 +373,437 @@ function outageFixture(mode: ChannelMode) {
     return run.stub(key).calls.reactionsAdd
   }
   cleanups.push(async () => {
-    for (const run of runs) { assertNoLeak(run.captured()); await run.stop() }
-    await h.cleanup()
+    try {
+      for (const run of runs) { assertNoLeak(run.captured()); await run.stop() }
+      const directory = join(h.stateDir, 'threads')
+      if (existsSync(directory)) {
+        assertNoLeak(writtenFile(directory))
+        for (const name of readdirSync(directory)) expect(readFileSync(join(directory, name), 'utf8')).not.toContain(MESSAGE_BODY)
+      }
+    } finally { await h.cleanup() }
   })
-  return { h, start, intake, drain, reactions }
+  return { h, personas, start, intake, drain, reactions }
 }
 
 describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
+  test('append retry saves kept joins without new traffic and reports one recovery', async () => {
+    const f = outageFixture(mode), io = threadFsControls(f.h.stateDir)
+    const run = await f.start({ threadMemory: { fs: io.fs } })
+    io.fail('writeSync', 'alpha')
+    await f.intake(run, 'mention')
+    const reply = await f.intake(run)
+    expect(run.queued('alpha').find(i => i.accepted.ts === reply.ts)!.accepted.via).toBe('thread')
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toEqual([])
+    await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(notices(run, 'Thread Memory not saved')).toHaveLength(1)
+    expect(memoryLines(run, 'not-saved')).toHaveLength(1)
+    await f.drain(run)
+    io.heal(); await run.clock.advance(2 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toHaveLength(1)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(1)
+    await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(notices(run, 'Thread Memory not saved', 'bravo')).toEqual([])
+    expectMemoryReportsSafe(run)
+  })
+
+  test('first successful retry releases live at its queue position and recovers only after kept joins save', async () => {
+    const f = outageFixture(mode), first = await f.start()
+    await f.intake(first, 'mention'); await f.drain(first); await first.stop()
+    const io = threadFsControls(f.h.stateDir); io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs } })
+    const reply = await f.intake(run), held = run.queue.unresolvedHolds('alpha')[0]!
+    await f.intake(run, 'mention', THREAD_ROOTS.third)
+    expect(run.stub('alpha').socket.acks).toHaveLength(2)
+    expect(f.reactions(run).some(a => a.timestamp === reply.ts)).toBe(false)
+    expect(notices(run, 'Thread Memory unreadable')).toHaveLength(1)
+    io.heal(); io.fail('writeSync', 'alpha')
+    await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(run.heldReleases).toEqual([{ key: 'alpha', seq: held.seq, mode: 'live' }])
+    expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+    expect(run.queued('alpha').filter(isOpenItem).map(i => i.accepted.ts)[0]).toBe(reply.ts)
+    expect(f.reactions(run).filter(a => a.timestamp === reply.ts)).toHaveLength(1)
+    expect(run.logs.filter(l => l.includes('received') && l.includes(reply.ts))).toHaveLength(1)
+    expect(notices(run, 'Thread Memory recovered')).toEqual([])
+    expect(notices(run, 'Thread Memory not saved')).toHaveLength(1)
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(1)
+    await f.drain(run)
+    expectMemoryReportsSafe(run)
+  })
+
+  test('quarantine and the hold it withdraws are each named once after a successful read retry', async () => {
+    const f = outageFixture(mode), first = await f.start()
+    await f.intake(first, 'mention'); await f.intake(first, 'mention', THREAD_ROOTS.third)
+    await f.drain(first); await first.queue.compact('alpha'); await first.stop()
+    const records = readThreads(f.h.stateDir)
+    const damaged = records.find(r => r.kind === 'join' && r.root === root)!
+    seedThreads(f.h.stateDir, records.map(r => r === damaged ? damagedThreadLine(r, 'json') : r))
+    const io = threadFsControls(f.h.stateDir); io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs } }), reply = await f.intake(run)
+    expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(run.memoryHoldEvents).toEqual([expect.objectContaining({ type: 'withdrawn', holds: [expect.objectContaining({ thread_ts: root, ts: reply.ts })] })])
+    const losses = notices(run, 'Joins lost')
+    expect(losses).toHaveLength(2)
+    expect(losses.every(p => String(p.text).includes(root))).toBe(true)
+    expect(losses.filter(p => String(p.text).includes(reply.ts))).toHaveLength(1)
+    expect(memoryLines(run, 'joins-lost')).toHaveLength(2)
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('not-joined')
+    expect(f.reactions(run).some(a => a.timestamp === reply.ts)).toBe(false)
+    await run.memoryHolds!.resolve('alpha', 'live'); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(notices(run, 'Joins lost')).toHaveLength(2)
+    expectMemoryReportsSafe(run)
+  })
+
+  test('changed-while-stopped startup finding waits for notifier wiring and posts once', async () => {
+    const f = outageFixture(mode), first = await f.start()
+    await f.intake(first, 'mention'); await f.drain(first); await first.stop()
+    const io = threadFsControls(f.h.stateDir); io.removeJournal()
+    const run = await f.start({}, pending => {
+      expect(pending.threadMemoryReporting).toBeUndefined()
+      expect(pending.episodeNotices).toEqual([])
+    })
+    expect(notices(run, 'Thread Memory changed while stopped')).toHaveLength(1)
+    expect(memoryLines(run, 'changed-while-stopped')).toHaveLength(1)
+    run.threadMemoryReporting!.startupFindings(run.threadMemorySeal!.startupFindings())
+    await run.clock.flush()
+    expect(notices(run, 'Thread Memory changed while stopped')).toHaveLength(1)
+    expectMemoryReportsSafe(run)
+  })
+
+  test.each(['append', 'read'] as const)('%s outage does not block unrelated traffic or its own explicit mentions and broadcasts', async failure => {
+    type ExpectedDelivery = { event: SlackEvent; chat_id: string; via: Via }
+    const partsFor = ({ event, chat_id, via }: ExpectedDelivery) => buildTagParts({
+      chat_id, channel_name: via === 'dm' ? 'dm' : `stub-${chat_id.toLowerCase()}`,
+      message_id: String(event.ts), ts: String(event.ts), thread_ts: event.thread_ts as string | undefined,
+      user: 'stub-user', user_id: String(event.user), via, text: String(event.text),
+    })
+    const f = outageFixture(mode), io = threadFsControls(f.h.stateDir), first = await f.start()
+    const seedAlpha = await f.intake(first, 'mention'), seedBravo = await f.intake(first, 'mention', root, 'bravo')
+    await f.drain(first, 'alpha', partsFor({ event: seedAlpha, chat_id: channel, via: 'mention' }))
+    await f.drain(first, 'bravo', partsFor({ event: seedBravo, chat_id: channel, via: 'mention' }))
+    await first.stop()
+    if (failure === 'read') io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs } })
+    const keys = ['alpha', 'bravo'] as const
+    const previous = Object.fromEntries(keys.map(key => [key, Math.max(0, ...run.queue.items(key).map(i => i.accepted.seq))]))
+    const newItems = (key: string) => run.queue.items(key).filter(i => i.accepted.seq > previous[key]!)
+    const population = (items: ReturnType<typeof newItems>) => items.map(i => ({ ts: i.accepted.ts, chat_id: i.accepted.channel, via: i.accepted.via }))
+    if (failure === 'append') io.fail('writeSync', 'alpha')
+    const hybridMention = await f.intake(run, 'mention', THREAD_ROOTS.third)
+    const reply = await f.intake(run), other = await f.intake(run, 'other'), dm = await f.intake(run, 'dm')
+    const sibling = await f.intake(run, 'reply', root, 'bravo')
+    const broadcast = makeChannelMessage({ channel, ts: '1700000400.000001', thread_ts: THREAD_ROOTS.secondary, text: broadcastText() })
+    await run.deliver('alpha', broadcast)
+    const before = run.queue.items('alpha').length
+    const authority = run.controller.sharedChannels()!
+    const suppressed: SlackEvent[] = []
+    for (const delivery of ['off', 'mentions'] as const) {
+      expect(authority.assign('alpha', authority.incarnation('alpha')!, neighbor, delivery, authority.revision).kind).toBe('applied')
+      const plain = makeChannelMessage({ channel: neighbor, ts: delivery === 'off' ? '1700000400.000002' : '1700000400.000003' })
+      suppressed.push(plain)
+      await run.deliver('alpha', plain)
+      expect(run.queue.items('alpha')).toHaveLength(before)
+    }
+    const mentioned = makeChannelMessage({ channel: neighbor, ts: '1700000400.000004', text: mentionText(run.stub('alpha').identity.botUserId) })
+    await run.deliver('alpha', mentioned); await run.clock.flush()
+    // The scenario, never the queue's contents, defines both admission and
+    // the exact messages the real engine must deliver during the outage.
+    const expected: Record<typeof keys[number], ExpectedDelivery[]> = {
+      alpha: [
+        { event: hybridMention, chat_id: channel, via: 'mention' },
+        ...(failure === 'append' ? [{ event: reply, chat_id: channel, via: 'thread' as const }] : []),
+        { event: other, chat_id: neighbor, via: 'receive_all_shared' },
+        { event: dm, chat_id: String(dm.channel), via: 'dm' },
+        { event: broadcast, chat_id: channel, via: 'broadcast' },
+        { event: mentioned, chat_id: neighbor, via: 'mention' },
+      ],
+      bravo: [{ event: sibling, chat_id: channel, via: 'thread' }],
+    }
+    for (const key of keys) {
+      const wanted = expected[key].map(({ event, chat_id, via }) => ({ ts: String(event.ts), chat_id, via }))
+      expect(population(newItems(key).filter(isOpenItem))).toEqual(wanted)
+      const held = key === 'alpha' && failure === 'read'
+        ? [{ ts: reply.ts, channel, thread_ts: root }] : []
+      expect(population(newItems(key))).toEqual(held.length
+        ? [wanted[0]!, { ts: reply.ts, chat_id: channel, via: 'thread' }, ...wanted.slice(1)] : wanted)
+      const heldPopulation = () => run.queue.unresolvedHolds(key).map(h => ({
+        ts: run.queue.item(key, h.seq)!.accepted.ts, channel: h.channel, thread_ts: h.thread_ts,
+      }))
+      expect(heldPopulation()).toEqual(held)
+      expect(newItems(key).filter(i => suppressed.some(event => event.ts === i.accepted.ts))).toEqual([])
+      expect(f.reactions(run, key).filter(a => suppressed.some(event => event.ts === a.timestamp))).toEqual([])
+      await f.drain(run, key, expected[key].flatMap(partsFor))
+      expect(population(newItems(key).filter(i => i.delivered))).toEqual(wanted)
+      expect(heldPopulation()).toEqual(held)
+    }
+    if (failure === 'read') expect(f.reactions(run).filter(a => a.timestamp === reply.ts)).toEqual([])
+    expectMemoryReportsSafe(run)
+  })
+
+  test.each(['append', 'read'] as const)('teardown cancels %s retries and bring-up starts a fresh episode', async failure => {
+    const f = outageFixture(mode), io = threadFsControls(f.h.stateDir), first = await f.start()
+    await f.intake(first, 'mention'); await first.stop()
+    if (failure === 'read') io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs } })
+    if (failure === 'append') { io.fail('writeSync', 'alpha'); await f.intake(run, 'mention', THREAD_ROOTS.third) }
+    const title = failure === 'append' ? 'Thread Memory not saved' : 'Thread Memory unreadable'
+    expect(notices(run, title)).toHaveLength(1)
+    const persona = run.serverConfig()!.personas.find(p => p.key === 'alpha')!
+    await run.composition!.lifecycle.teardown(persona)
+    const attempts = io.calls.length
+    await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(io.calls).toHaveLength(attempts)
+    expect(run.threadMemoryRetryEvents).toContainEqual({ type: 'retry-cancelled', series: failure, key: 'alpha', why: 'teardown' })
+    await run.composition!.lifecycle.bringUp(persona, run.serverConfig()!)
+    run.registerSession('alpha'); await run.clock.flush()
+    if (failure === 'append') await f.intake(run, 'mention', THREAD_ROOTS.third)
+    expect(notices(run, title)).toHaveLength(2)
+    expectMemoryReportsSafe(run)
+  })
+
+  test.each(['append', 'read'] as const)('shutdown cancels %s retries and stops seal retry only after the final write', async failure => {
+    const f = outageFixture(mode), first = await f.start()
+    await f.intake(first, 'mention'); await first.stop()
+    const io = threadFsControls(f.h.stateDir), sealIo = threadSealFsControls(f.h.stateDir)
+    if (failure === 'read') io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs, sealFs: sealIo.fs } })
+    if (failure === 'append') { io.fail('writeSync', 'alpha'); await f.intake(run, 'mention', THREAD_ROOTS.third) }
+    sealIo.failWrite()
+    expect((await run.threadMemorySeal!.writeShutdown(run.threadMemory!.completedStores())).kind).toBe('failed')
+    const order: string[] = []
+    const stopKeys = run.threadMemoryRetries!.stopKeys, stopSeal = run.threadMemoryRetries!.stopSeal, write = run.threadMemorySeal!.writeShutdown
+    run.threadMemoryRetries!.stopKeys = () => { order.push('keys'); stopKeys() }
+    run.threadMemorySeal!.writeShutdown = async stores => { order.push('shutdown'); return write(stores) }
+    run.threadMemoryRetries!.stopSeal = () => { order.push('seal'); stopSeal() }
+    sealIo.heal(); await run.stop()
+    expect(order).toEqual(['keys', 'shutdown', 'seal'])
+    expect(run.clock.pendingCount()).toBe(0)
+    const calls = [io.calls.length, sealIo.calls.length], posts = notices(run, 'Thread Memory recovered').length
+    await run.clock.advance(8 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect([io.calls.length, sealIo.calls.length]).toEqual(calls)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(posts)
+    if (failure === 'append') expect(readThreadSeal(f.h.stateDir).entries.alpha!.clean).toBe(true)
+    expectMemoryReportsSafe(run)
+  })
+
+  test.each(['submitted', 'open'] as const)('an admitted store flush is cancelled in the %s teardown window and its kept join recovers in the next life', async window => {
+    const f = outageFixture(mode), io = threadFsControls(f.h.stateDir)
+    const stop = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>()
+    let sequenceStops = 0
+    const run = await f.start({ threadMemory: { fs: io.fs, stopSequence: key => {
+      if (key === 'alpha' && window === 'open' && ++sequenceStops === 2) return stop.promise
+      return Promise.resolve()
+    } } })
+    io.fail('writeSync', 'alpha')
+    await f.intake(run, 'mention')
+    const fact = run.queued('alpha')[0]!.accepted.thread_join!
+    const before = readFileSync(threadPath(f.h.stateDir)), authority = run.controller.sharedChannels()!
+    const stamp = authority.channelStamp('alpha', channel)
+    const persona = run.serverConfig()!.personas.find(p => p.key === 'alpha')!
+    const priorTurn = window === 'submitted' ? run.inPersonaTurn('alpha', () => stop.promise) : Promise.resolve()
+    const flush = run.threadMemory!.flush
+    let pending: ReturnType<typeof flush> | undefined
+    run.threadMemory!.flush = key => {
+      const result = flush(key) // The real store writer is already queued before cancellation.
+      if (key === 'alpha') { pending = result; entered.resolve() }
+      return result
+    }
+    io.heal()
+    const timer = run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    await entered.promise
+    const teardown = run.composition!.lifecycle.teardown(persona)
+    try {
+      expect(run.threadMemoryWindow('alpha')).toBe('submitted')
+      await timer
+      expect(run.threadMemoryWindow('alpha')).toBe(window)
+      expect(run.appliedKeys()).toContain('alpha')
+      expect(await pending).toEqual({ kind: 'cancelled' })
+      expect(readFileSync(threadPath(f.h.stateDir))).toEqual(before)
+      expect(run.threadMemory!.keptFacts('alpha')).toEqual([expect.objectContaining({ at: fact.at, stamp: fact.stamp })])
+      expect(run.threadMemoryEvents.filter(e => e.key === 'alpha' && (e.type === 'saved-after-failure' || e.type === 'outage-settled'))).toEqual([])
+      expect(notices(run, 'Thread Memory recovered')).toEqual([])
+      // A late old-life failure cannot acquire another owner; a sibling still saves.
+      const attempts = io.calls.filter(c => c.path === threadPath(f.h.stateDir)).length
+      run.observeThreadMemoryEvent(run.threadMemoryEvents.find(e => e.type === 'append-failed' && e.key === 'alpha')!)
+      await f.intake(run, 'mention', THREAD_ROOTS.third, 'bravo')
+      await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+      expect(io.calls.filter(c => c.path === threadPath(f.h.stateDir))).toHaveLength(attempts)
+      expect(readThreads(f.h.stateDir, 'bravo').filter(r => r.kind === 'join')).toHaveLength(1)
+      expect(notices(run, 'Thread Memory not saved')).toHaveLength(1)
+    } finally {
+      run.threadMemory!.flush = flush
+      stop.resolve(); await priorTurn; await teardown; await timer
+    }
+    // Keep the channel incarnation: real queue recovery, not a test-injected join,
+    // must save the retained fact after the old journal owner was forgotten.
+    run.stub('alpha').script.inventory.push(membershipPage([channel, neighbor]))
+    await run.composition!.lifecycle.bringUp(persona, run.serverConfig()!)
+    run.registerSession('alpha'); await run.membershipClock.runNext(); await run.clock.flush()
+    expect(authority.channelStamp('alpha', channel)).toEqual(stamp)
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toEqual([
+      expect.objectContaining({ root, at: fact.at, stamp: fact.stamp }),
+    ])
+    expect(run.threadMemory!.outage('alpha')).toEqual({ unknown: false, missing: false, unsaved: 0 })
+    const reply = await f.intake(run)
+    expect(run.queued('alpha').find(i => i.accepted.ts === reply.ts)!.accepted.via).toBe('thread')
+    await run.clock.advance(8 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toHaveLength(1)
+    // Teardown ended the old episode: saving the next life's recovered fact is quiet.
+    expect(notices(run, 'Thread Memory recovered')).toEqual([])
+    expect(memoryLines(run, 'recovered')).toEqual([])
+    expectMemoryReportsSafe(run)
+  })
+
+  test('a kept incoming join survives an undecided first read and recovers once after real publication without traffic', async () => {
+    const f = outageFixture(mode), first = await f.start()
+    await first.stop()
+    const io = threadFsControls(f.h.stateDir); io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs } })
+    await f.intake(run, 'mention')
+    const fact = run.queued('alpha')[0]!.accepted.thread_join!, authority = run.controller.sharedChannels()!
+    const before = readFileSync(threadPath(f.h.stateDir))
+    f.h.failChannelDeliveryWrites({ step: 'fsyncSync', call: 2 })
+    expect(authority.assign('alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision).kind).toBe('unresolved')
+    expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'undecided' })
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(run.threadMemory!.outage('alpha')).toEqual({ unknown: false, missing: false, unsaved: 1 })
+    expect(run.threadMemoryRetryEvents.filter(e => e.type === 'append-retry-started')).toEqual([{ type: 'append-retry-started', key: 'alpha' }])
+    expect(notices(run, 'Thread Memory recovered')).toEqual([])
+    f.h.clearChannelDeliveryWriteFailure()
+    expect(authority.recoverDurability().kind).toBe('applied')
+    await run.clock.flush()
+    expect(readFileSync(threadPath(f.h.stateDir))).toEqual(before)
+    expect(notices(run, 'Thread Memory recovered')).toEqual([])
+    await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toEqual([expect.objectContaining({ at: fact.at, stamp: fact.stamp, root })])
+    expect(notices(run, 'Thread Memory unreadable')).toHaveLength(1)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(1)
+    expect(notices(run, 'Thread Memory not saved')).toEqual([])
+    run.threadMemory!.published(); await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(1)
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toHaveLength(1)
+    expectMemoryReportsSafe(run)
+  })
+
+  test.each(['saved', 'failed'] as const)('real publication recovers a queued join and releases its live hold; recovery waits for a %s append', async outcome => {
+    const appendFails = outcome === 'failed'
+    const f = outageFixture(mode), io = threadFsControls(f.h.stateDir)
+    const first = await f.start({ threadMemory: { fs: io.fs } })
+    io.fail('writeSync', 'alpha'); await f.intake(first, 'mention'); await first.crash()
+    io.heal(); io.fail('readFileSync', 'alpha')
+    const run = await f.start({ threadMemory: { fs: io.fs } })
+    const reply = await f.intake(run), held = run.queue.unresolvedHolds('alpha')[0]!
+    const authority = run.controller.sharedChannels()!
+    f.h.failChannelDeliveryWrites({ step: 'fsyncSync', call: 2 })
+    expect(authority.assign('alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision).kind).toBe('unresolved')
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(run.threadMemory!.outage('alpha')).toEqual({ unknown: false, missing: false, unsaved: 1 })
+    expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+    expect(notices(run, 'Thread Memory recovered')).toEqual([])
+    const before = readFileSync(threadPath(f.h.stateDir))
+    if (appendFails) io.fail('fsyncSync', 'alpha')
+    f.h.clearChannelDeliveryWriteFailure()
+    expect(authority.recoverDurability().kind).toBe('applied')
+    await run.clock.flush()
+    expect(run.heldReleases).toEqual([{ key: 'alpha', seq: held.seq, mode: 'live' }])
+    expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+    expect(f.reactions(run).filter(a => a.timestamp === reply.ts)).toHaveLength(1)
+    expect(run.logs.filter(l => l.includes('received') && l.includes(reply.ts))).toHaveLength(1)
+    expect(run.threadMemory!.outage('alpha').unsaved).toBe(appendFails ? 1 : 0)
+    if (appendFails) expect(readFileSync(threadPath(f.h.stateDir))).toEqual(before)
+    expect(notices(run, 'Thread Memory not saved')).toHaveLength(appendFails ? 1 : 0)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(appendFails ? 0 : 1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(appendFails ? 0 : 1)
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(readThreads(f.h.stateDir).filter(r => r.kind === 'join')).toHaveLength(1)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(1)
+    run.threadMemory!.published(); await run.memoryHolds!.retryPending('alpha')
+    await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(run.heldReleases).toHaveLength(1)
+    expect(notices(run, 'Thread Memory recovered')).toHaveLength(1)
+    expect(memoryLines(run, 'recovered')).toHaveLength(1)
+    await f.drain(run)
+    expectMemoryReportsSafe(run)
+  })
+
+  test.each(['before-append', 'durable-completion', 'synchronous-queue-observer', 'release-feedback'] as const)(
+    'firstRead cancellation at %s preserves exactly one committed loss across same-key bring-up', async boundary => {
+      const f = outageFixture(mode), first = await f.start()
+      await f.intake(first, 'mention'); await f.drain(first); await first.stop()
+      const io = threadFsControls(f.h.stateDir); io.fail('readFileSync', 'alpha')
+      const stop = Promise.withResolvers<void>(), reached = Promise.withResolvers<void>(), feedback = Promise.withResolvers<void>()
+      const beforeAppend = Promise.withResolvers<void>()
+      let atCommit = () => {}, teardown: Promise<void> | undefined, pending: Promise<unknown> | undefined
+      const run = await f.start({ threadMemory: { fs: io.fs,
+        onQueueEvent: e => { if (e.type === 'holds-resolved' && e.key === 'alpha') atCommit() },
+        stopSequence: key => key === 'alpha' ? stop.promise : Promise.resolve(),
+        beforeRelease: key => {
+          if (key !== 'alpha') return Promise.resolve()
+          reached.resolve(); return feedback.promise
+        },
+      } })
+      const released = await f.intake(run), withdrawn = await f.intake(run, 'reply', THREAD_ROOTS.secondary)
+      const holds = run.queue.unresolvedHolds('alpha')
+      expect(holds).toHaveLength(2)
+      const persona = run.serverConfig()!.personas.find(p => p.key === 'alpha')!
+      const submit = () => { teardown = run.composition!.lifecycle.teardown(persona); reached.resolve() }
+      if (boundary === 'durable-completion') atCommit = () => queueMicrotask(submit)
+      if (boundary === 'synchronous-queue-observer') atCommit = submit
+      const resolve = run.memoryHolds!.resolve
+      run.memoryHolds!.resolve = (...args) => { const result = resolve(...args); if (args[0] === 'alpha') pending = result; return result }
+      const save = run.queue.resolveHolds
+      if (boundary === 'before-append') run.queue.resolveHolds = async (key, decisions, current, committed) => {
+        if (key === 'alpha') { reached.resolve(); await beforeAppend.promise }
+        return save(key, decisions, current, committed)
+      }
+      try {
+        io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS); await reached.promise
+        if (boundary === 'release-feedback' || boundary === 'before-append') submit()
+        expect(run.threadMemoryWindow('alpha')).not.toBe('none')
+        expect(run.appliedKeys()).toContain('alpha')
+        beforeAppend.resolve(); feedback.resolve(); await run.clock.flush()
+        expect(await pending).toBe('cancelled')
+        const committed = boundary !== 'before-append'
+        expect(run.queue.unresolvedHolds('alpha')).toHaveLength(committed ? 0 : 2)
+        expect(readQueue(f.h.stateDir).filter(r => r.kind === 'withdrawn')).toHaveLength(committed ? 1 : 0)
+        expect(run.memoryHoldEvents.filter(e => e.type === 'withdrawn')).toHaveLength(committed ? 1 : 0)
+        expect(run.heldReleases).toHaveLength(boundary === 'release-feedback' ? 1 : 0)
+        expect(run.threadMemoryRetryEvents.filter(e => e.type === 'read-after-retries')).toEqual([])
+        const writes = io.writes().length
+        run.threadMemoryRetries!.appendFailed('alpha')
+        run.observeThreadMemoryEvent(run.threadMemoryEvents.find(e => e.type === 'read-failed' && e.key === 'alpha')!)
+        expect(await run.memoryHolds!.resolve('alpha', 'live')).toBe('cancelled')
+        await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+        expect(io.writes()).toHaveLength(writes)
+        stop.resolve(); await teardown
+        atCommit = () => {}; run.queue.resolveHolds = save
+        await run.composition!.lifecycle.bringUp(persona, run.serverConfig()!)
+        run.registerSession('alpha'); await run.clock.flush()
+        expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+        expect(run.memoryHoldEvents.filter(e => e.type === 'withdrawn')).toEqual([{
+          type: 'withdrawn', key: 'alpha', holds: [{ seq: holds[1]!.seq, channel, thread_ts: THREAD_ROOTS.secondary, ts: withdrawn.ts }],
+        }])
+        expect(notices(run, 'Joins lost')).toHaveLength(1)
+        expect(String(notices(run, 'Joins lost')[0]!.text)).toContain(withdrawn.ts)
+        expect(memoryLines(run, 'joins-lost')).toHaveLength(1)
+        expect(run.heldReleases).toHaveLength(boundary === 'before-append' || boundary === 'release-feedback' ? 1 : 0)
+        await run.memoryHolds!.resolve('alpha', 'live'); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+        expect(notices(run, 'Joins lost')).toHaveLength(1)
+        expect(memoryLines(run, 'joins-lost')).toHaveLength(1)
+        expect(run.queue.items('alpha').filter(isOpenItem).map(i => i.accepted.ts)).toEqual([released.ts])
+        await f.drain(run); expectMemoryReportsSafe(run)
+      } finally { beforeAppend.resolve(); feedback.resolve(); stop.resolve(); await pending; await teardown }
+    },
+  )
+
   test.each([false, true])('startup defers eligible holds until shared publication recovers their joins (stale=%s)', async stale => {
     const f = outageFixture(mode), io = threadFsControls(f.h.stateDir)
     const first = await f.start({ threadMemory: { fs: io.fs } })
@@ -434,6 +872,11 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     expect(released.hold).toBeUndefined(); expect(third.queue.openCount('alpha')).toBe(2)
     expect(third.memoryHoldEvents).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [{ seq: holds[1]!.seq, channel,
       thread_ts: THREAD_ROOTS.secondary, ts: absent.ts }] }])
+    expect(notices(third, 'Joins lost')).toHaveLength(1)
+    expect(String(notices(third, 'Joins lost')[0]!.text)).toContain(absent.ts)
+    expect(memoryLines(third, 'joins-lost')).toHaveLength(1)
+    expect(memoryLines(third, 'joins-lost')[0]).toContain(absent.ts)
+    expectMemoryReportsSafe(third)
     expect(f.reactions(third).filter(a => a.timestamp === held.ts)).toEqual([expect.objectContaining({ name: 'hourglass', channel, timestamp: held.ts })])
     expect(f.reactions(third).some(a => a.timestamp === absent.ts)).toBe(false)
     expect(readQueue(f.h.stateDir).filter(r => r.kind === 'released' || r.kind === 'withdrawn')).toHaveLength(0)

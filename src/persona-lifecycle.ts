@@ -368,6 +368,9 @@ export interface PersonaLifecycleDeps {
   connections: Pick<PersonaConnectionManager, 'stop' | 'reconnectCredentials' | 'replaceRetryTokens'>
   /** The inbound routing: a removed persona's dedupe store is dropped. */
   routing: Pick<PersonaRouting, 'forget'>
+  /** Cancel Thread Memory retries and hold resolution synchronously at teardown
+   * submission, before any awaited step. Later routing cleanup repeats it. */
+  cancelThreadMemory?(key: string): void
   /** Load before opening this persona's Socket Mode connection. */
   loadThreadMemory?(key: string): void | Promise<void>
   /**
@@ -859,6 +862,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     const { key } = persona
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     const cancels: [string, () => unknown][] = [
+      ['cancelling its Thread Memory background work', () => deps.cancelThreadMemory?.(key)],
       ['stopping its delivery', () => deps.stopDelivery?.(key)],
       [LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key)],
       ["cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key)],
@@ -960,6 +964,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     const { key } = persona
 
     // first group, before the wait for its launch in flight.
+    await step('cancelling its Thread Memory background work', () => deps.cancelThreadMemory?.(key))
     // its dialog approver first, so no Enter reaches the old
     // life (the approver that launch would start does not start).
     await step('stopping its delivery', () => deps.stopDelivery?.(key))

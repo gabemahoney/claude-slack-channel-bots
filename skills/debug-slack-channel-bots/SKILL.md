@@ -1846,6 +1846,359 @@ at the restart limit alone does not qualify.
 - **Cause:** Unreadable journal records were quarantined. The preserved bytes and one notice per persona per server start support investigation.
 - **Fix:** Keep the named quarantine file and ask the senders to send those messages again. Readable accepted records remain queued; this is distinct from a disconnected bot retaining its queue.
 
+---
+
+## Thread Memory reports and log lines
+
+A persona with a `thread_hybrid` channel keeps its Joined Threads in its own Thread Memory, `<state dir>/threads/<key>.jsonl`. One seal file, `<state dir>/thread-memory-seal.json`, covers all personas.
+
+Each report goes to the persona's notice destination and to `server.log` as one `[slack]` line, once per episode; the six log-only labels below post nothing and can log again on later failures. Reports carry channel IDs, Thread Roots, message timestamps and paths, never message text or credential values; configured names and paths remain complete except for the *Joins lost* name excerpt described below, safely quoted and Slack-escaped in notices, while untrusted error descriptions are redacted, including paths quoted inside an error.
+
+These reports are for the operator: the bot is told not to act on them, even when its notice destination is a channel it reads. During an outage, `off`, `mentions` and `all` channels keep their usual delivery behavior; DMs, other personas, already known Joined Threads, @mentions and Broadcasts keep flowing.
+
+Failed saves (creation or append), reads and seal writes retry in the background without new traffic: 5 seconds (`THREAD_MEMORY_RETRY_MIN_MS`), then 10, 20, 40 and at most 60 seconds (`THREAD_MEMORY_RETRY_MAX_MS`) between attempts. A retry does not post a bot message again; teardown or removal cancels that persona's retries and silently ends its open episodes, and a later bring-up starts fresh ones.
+
+Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` storage error. Notice blocks show the body; Slack posts normally prefix it with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack. The overflow examples show the complete post so its prefix is included in the bound; log paths use JSON quotes without Slack escaping.
+
+### `thread-memory-not-saved`
+
+```text
+:warning: *Thread Memory not saved* — "Alpha" (key=alpha); channels: C0123. Could not save "&lt;state dir&gt;/threads/alpha.jsonl" (journal-append): Error code=EACCES message="permission denied". Joins are kept and will be saved once storage works. Check the file's permissions and storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-not-saved: persona=alpha channels=["C0123"] step=journal-append path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; joins kept, saving retried; check permissions/storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+  ```
+
+- **Meaning:** Joins remain in memory, still select replies and will be saved when storage works. One report covers the outage; it ends when Thread Memory is readable and all retained work is settled, as described under [Thread Memory recovered](#thread-memory-recovered).
+- **Cause:** The first failed append or creation step opens the episode. The `step` field is `seal-entry`, `journal-header`, `journal-append` or `marker`; the line's `path` identifies the persona's journal, including when creation failed at the shared seal entry or created marker.
+- **Fix:** Check the named path's disk, mount and permissions, and the state directory for a seal-entry or marker failure. No saved incoming message needs resending just because its join was not saved; if incoming messages also cannot be saved, Slack retries only a limited number of times and may disable events, so check the app's **Event Subscriptions** and follow [Message not saved](#message-not-saved).
+
+### `thread-memory-unreadable`
+
+```text
+:warning: *Thread Memory unreadable* — "Alpha" (key=alpha); channels: C0123. Cannot read "&lt;state dir&gt;/threads/alpha.jsonl". Replies in this bot's threads are saved and wait until Thread Memory can be read. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again. Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-unreadable: persona=alpha channels=["C0123"] path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; replies saved and waiting; fix permissions/storage, or stop CSCB, move the journal aside and start again. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+  ```
+
+  ```text
+  [slack] thread-memory-unreadable: persona=alpha channels=["C0123"] path="" journal missing on retry; Thread Memory stays unknown until the next start; waiting replies remain saved
+  ```
+
+- **Meaning:** Thread Memory is unknown. Replies whose selection needs it are saved as Memory Holds and acknowledged, waiting for the read; known joins and the independent traffic listed above keep working. The first successful read judges pending joins, attempts to release or withdraw each held reply, then saves joins kept meanwhile; a failed hold-resolution write retries separately, and the outage stays open until retained Thread Memory work is settled.
+- **Cause:** A journal read fails at start or bring-up. Reads retry in the background; if a retry finds the journal gone, the second line above is logged once, with `path=""`, and no second notice: read retries stop, Thread Memory stays unknown, nothing creates or appends that journal, and unresolved replies stay held until the next start.
+- **Fix:** Restore the journal's permissions or storage. To start this persona's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; *Thread Memory changed while stopped* follows, and *Joins lost* names withdrawn waiting replies to send again. If incoming storage also fails, check the app's **Event Subscriptions** for disabled events and follow [Message not saved](#message-not-saved); do not move the journal while CSCB is running.
+
+### `thread-memory-joins-lost`
+
+Threads only:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+```
+
+Withdrawn messages only:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Send again: C0123 / 1700000001.000001.
+```
+
+Quarantined lines with no readable thread identity:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 2 quarantined line(s) have no readable thread identity.
+```
+
+Threads, withdrawn messages and unreadable lines together:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 2 quarantined line(s) have no readable thread identity.
+Thread: C0123 / 1700000000.000001.
+Send again: C0123 / 1700000001.000001.
+```
+
+A complete overflow post for 120 thread entries retains 105 complete entries and counts the remaining 15:
+
+```text
+Persona "Alpha…" (key=alpha): :warning: *Joins lost* — "Alpha…" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+Thread: C0123 / 1700000000.000002.
+Thread: C0123 / 1700000000.000003.
+Thread: C0123 / 1700000000.000004.
+Thread: C0123 / 1700000000.000005.
+Thread: C0123 / 1700000000.000006.
+Thread: C0123 / 1700000000.000007.
+Thread: C0123 / 1700000000.000008.
+Thread: C0123 / 1700000000.000009.
+Thread: C0123 / 1700000000.000010.
+Thread: C0123 / 1700000000.000011.
+Thread: C0123 / 1700000000.000012.
+Thread: C0123 / 1700000000.000013.
+Thread: C0123 / 1700000000.000014.
+Thread: C0123 / 1700000000.000015.
+Thread: C0123 / 1700000000.000016.
+Thread: C0123 / 1700000000.000017.
+Thread: C0123 / 1700000000.000018.
+Thread: C0123 / 1700000000.000019.
+Thread: C0123 / 1700000000.000020.
+Thread: C0123 / 1700000000.000021.
+Thread: C0123 / 1700000000.000022.
+Thread: C0123 / 1700000000.000023.
+Thread: C0123 / 1700000000.000024.
+Thread: C0123 / 1700000000.000025.
+Thread: C0123 / 1700000000.000026.
+Thread: C0123 / 1700000000.000027.
+Thread: C0123 / 1700000000.000028.
+Thread: C0123 / 1700000000.000029.
+Thread: C0123 / 1700000000.000030.
+Thread: C0123 / 1700000000.000031.
+Thread: C0123 / 1700000000.000032.
+Thread: C0123 / 1700000000.000033.
+Thread: C0123 / 1700000000.000034.
+Thread: C0123 / 1700000000.000035.
+Thread: C0123 / 1700000000.000036.
+Thread: C0123 / 1700000000.000037.
+Thread: C0123 / 1700000000.000038.
+Thread: C0123 / 1700000000.000039.
+Thread: C0123 / 1700000000.000040.
+Thread: C0123 / 1700000000.000041.
+Thread: C0123 / 1700000000.000042.
+Thread: C0123 / 1700000000.000043.
+Thread: C0123 / 1700000000.000044.
+Thread: C0123 / 1700000000.000045.
+Thread: C0123 / 1700000000.000046.
+Thread: C0123 / 1700000000.000047.
+Thread: C0123 / 1700000000.000048.
+Thread: C0123 / 1700000000.000049.
+Thread: C0123 / 1700000000.000050.
+Thread: C0123 / 1700000000.000051.
+Thread: C0123 / 1700000000.000052.
+Thread: C0123 / 1700000000.000053.
+Thread: C0123 / 1700000000.000054.
+Thread: C0123 / 1700000000.000055.
+Thread: C0123 / 1700000000.000056.
+Thread: C0123 / 1700000000.000057.
+Thread: C0123 / 1700000000.000058.
+Thread: C0123 / 1700000000.000059.
+Thread: C0123 / 1700000000.000060.
+Thread: C0123 / 1700000000.000061.
+Thread: C0123 / 1700000000.000062.
+Thread: C0123 / 1700000000.000063.
+Thread: C0123 / 1700000000.000064.
+Thread: C0123 / 1700000000.000065.
+Thread: C0123 / 1700000000.000066.
+Thread: C0123 / 1700000000.000067.
+Thread: C0123 / 1700000000.000068.
+Thread: C0123 / 1700000000.000069.
+Thread: C0123 / 1700000000.000070.
+Thread: C0123 / 1700000000.000071.
+Thread: C0123 / 1700000000.000072.
+Thread: C0123 / 1700000000.000073.
+Thread: C0123 / 1700000000.000074.
+Thread: C0123 / 1700000000.000075.
+Thread: C0123 / 1700000000.000076.
+Thread: C0123 / 1700000000.000077.
+Thread: C0123 / 1700000000.000078.
+Thread: C0123 / 1700000000.000079.
+Thread: C0123 / 1700000000.000080.
+Thread: C0123 / 1700000000.000081.
+Thread: C0123 / 1700000000.000082.
+Thread: C0123 / 1700000000.000083.
+Thread: C0123 / 1700000000.000084.
+Thread: C0123 / 1700000000.000085.
+Thread: C0123 / 1700000000.000086.
+Thread: C0123 / 1700000000.000087.
+Thread: C0123 / 1700000000.000088.
+Thread: C0123 / 1700000000.000089.
+Thread: C0123 / 1700000000.000090.
+Thread: C0123 / 1700000000.000091.
+Thread: C0123 / 1700000000.000092.
+Thread: C0123 / 1700000000.000093.
+Thread: C0123 / 1700000000.000094.
+Thread: C0123 / 1700000000.000095.
+Thread: C0123 / 1700000000.000096.
+Thread: C0123 / 1700000000.000097.
+Thread: C0123 / 1700000000.000098.
+Thread: C0123 / 1700000000.000099.
+Thread: C0123 / 1700000000.000100.
+Thread: C0123 / 1700000000.000101.
+Thread: C0123 / 1700000000.000102.
+Thread: C0123 / 1700000000.000103.
+Thread: C0123 / 1700000000.000104.
+Thread: C0123 / 1700000000.000105.
+15 more thread/message entry(s); see the server log for all identifiers.
+```
+
+For a configured name of 2,100 `A` characters, the complete post uses the same excerpt in prefix and body:
+
+```text
+Persona "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…" (key=alpha): :warning: *Joins lost* — "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+```
+
+- **Line:** The mixed example logs the full persona name and every identifier:
+
+  ```text
+  [slack] thread-memory-joins-lost: persona=alpha threads=[channel=C0123 root=1700000000.000001] messages=[channel=C0123 ts=1700000001.000001] unreadable_lines=2 bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot="Alpha" (key=alpha)
+  ```
+
+- **Meaning:** Each loss is reported once: one read's quarantined lines or one resolution's durably withdrawn Memory Holds. A quarantine and the holds it causes can therefore produce two posts at one start; lost threads are treated as threads the bot is not in unless a readable or kept join names them.
+- **Cause:** Unreadable journal lines other than an invalid final line, or waiting replies that cannot be matched to a join when Memory Holds are resolved. A lone torn final line is an append that was never saved and gets no *Joins lost* report; its incoming queue record recovers the join.
+- **Fix:** A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot, and use `server.log` for all identifiers when the post gives a count of the rest.
+
+`THREAD_MEMORY_NOTICE_MAX_CHARS` is 4,000 characters for the complete Slack-escaped *Joins lost* post, prefix and any count footer included. It first uses the full name and all identifiers unchanged; only on overflow does it use the same first-64-character-plus-ellipsis name excerpt in prefix and body, without splitting a Unicode character or Slack escape, then recount after escaping.
+
+If that still does not fit, it keeps complete identifier lines in order and replaces the rest with the exact omitted count and server-log pointer, retaining the fixed advice and unreadable-line count. Even a short name gets the ellipsis when this overflow form is needed, as `Alpha…` above shows; the configuration name is unchanged, and the uncapped log always keeps the full name and all identifiers.
+
+### `thread-memory-changed-while-stopped`
+
+Changed wording:
+
+```text
+:warning: *Thread Memory changed while stopped* — "Alpha" (key=alpha); channels: C0123. Some Joined Threads may be missing, or may be ones the bot should have forgotten. CSCB uses the Thread Memory it found. Check the threads the bot should be in; a new @mention puts it back in a thread.
+```
+
+Unclean wording:
+
+```text
+:warning: *Thread Memory changed while stopped* — "Alpha" (key=alpha); channels: C0123. CSCB didn't shut down cleanly, so it can't tell whether Thread Memory changed. CSCB uses the Thread Memory it found. Check the threads the bot should be in; a new @mention puts it back in a thread.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-changed-while-stopped: persona=alpha channels=["C0123"] case=journal-missing wording=changed Joined Threads may be missing or ones the bot should have forgotten; check threads, a new @mention puts the bot back
+  ```
+
+  ```text
+  [slack] thread-memory-changed-while-stopped: persona=alpha channels=["C0123"] case=unclean-stop wording=unclean CSCB didn't shut down cleanly; cannot tell whether Thread Memory changed; check threads, a new @mention puts the bot back
+  ```
+
+- **Meaning:** CSCB uses the Thread Memory it found, but cannot guarantee that its Joined Threads match what should remain. This report appears at most once per persona per server run, whether detected at start or on the first successful read; a later matching observation does not post again.
+- **Cause:** The first applicable case below supplies `case` and `wording`. The two line forms above differ only in those fields and the fixed explanation for changed versus unclean.
+- **Fix:** Check the threads the bot should be in; a new @mention puts it back in a thread. Never delete Thread Memory files to clear the report.
+
+| `case` | What was found | `wording` |
+| --- | --- | --- |
+| `unclean-stop` | The previous seal does not record a clean shutdown for this persona. | `unclean` |
+| `journal-missing` | The seal names Thread Memory whose journal is missing or has no created store. | `changed` |
+| `journal-changed` | The journal's store identity differs or its last record number is lower than the seal records. | `changed` |
+| `entry-missing` | A journal is present but the seal has no entry for it. | `changed` |
+| `hybrid-without-store` | A persona has a `thread_hybrid` channel, a seal existed, but neither its journal nor its seal entry is present. | `unclean` if a previous seal entry records an unclean stop; otherwise `changed` |
+| `marker-without-store` | The saved created marker says Thread Memory existed, but its journal and seal entry are absent. | `changed` |
+| `queue-changed` | After a recorded clean stop, the queue journal's identity or contents differ from what the seal saved. | `changed` |
+
+A first successful read can reveal `journal-missing` or `journal-changed` that an unreadable journal concealed. A first start with no earlier store or seal does not report a change.
+
+Restoring the entire state directory can go undetected when its Thread Memory journals, clean seal and queues remain mutually consistent and the restore preserves the file identities the seal checks. Copying a queue whose identity differs from the clean seal's record is detected even if its contents are unchanged.
+
+### `thread-memory-recovered`
+
+```text
+:white_check_mark: *Thread Memory recovered* — "Alpha" (key=alpha); channels: C0123. Thread Memory can be read and every kept join is saved.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-recovered: persona=alpha channels=["C0123"] Thread Memory readable; every kept join saved
+  ```
+
+- **Meaning:** Thread Memory is readable, its journal is not missing and every retained join or creation step is saved. If both not-saved and unreadable episodes are open, one recovered post and line close them together after the last outstanding work settles; healthy observations without an open outage post nothing.
+- **Cause:** A successful read or save, or a later decision about pending joins, settles the outage. A join still awaiting a channel decision keeps it open; current joins must be saved durably, while stale joins no longer needed by a held reply can be discarded, allowing recovery without an append. Background saving continues without new traffic after a pending decision becomes available, and that decision does not advance an existing retry deadline.
+- **Fix:** No action is needed. This report confirms Thread Memory recovery, not that every held reply's separate queue resolution has been saved; a [holds-not-resolved](#thread-memory-holds-not-resolved) failure still needs its own storage fix.
+
+### `thread-memory-quarantined`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-quarantined: persona=alpha lines=2 invalid_final_lines=1 path="<state dir>/threads/alpha.unreadable-2026-10-30T00-00-00.000Z" invalid lines quarantined; an invalid final line has no Joins lost report
+  ```
+
+- **Meaning:** No notice is posted for this label. `lines` counts quarantined lines and `invalid_final_lines` counts invalid final lines; their original bytes are kept in `<state dir>/threads/<key>.unreadable-<UTC start time>`, with colons in the timestamp replaced by hyphens.
+- **Cause:** A journal read found invalid records. Other damaged lines can separately cause *Joins lost*; a lone torn final line is an append that was never saved, so the incoming queue record recovers its join and no *Joins lost* is posted for that line.
+- **Fix:** Keep the quarantine file for investigation and check the journal's disk and storage. Readable joins remain usable; follow [Joins lost](#thread-memory-joins-lost) for any separately reported losses.
+
+### `thread-memory-compaction-failed`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-compaction-failed: persona=alpha step=journal-rewrite path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; compaction not confirmed; journal retained, retried at maintenance
+  ```
+
+- **Meaning:** Nothing is posted. `step=journal-rewrite` identifies a compaction that could not be confirmed; the journal is retained and compaction is retried at maintenance.
+- **Cause:** Rewriting or durably saving the compacted journal failed. The failure does not clear known joins or wait on another persona; maintenance runs hourly (`QUEUE_COMPACT_INTERVAL_MS`).
+- **Fix:** Check the named journal's disk, mount and permissions. Leave it in place for the next maintenance attempt.
+
+### `thread-memory-removal-failed`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-removal-failed: persona=alpha step=journal-unlink path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; removal retried at next start
+  ```
+
+- **Meaning:** Nothing is posted. `step` names the unfinished removal: `journal-unlink`, `seal-entry` or `marker`; `path` identifies the persona's journal for all three steps. Remaining removal work is retried at the next start.
+- **Cause:** Removal could not durably delete the journal, remove the shared seal entry or clear the saved created marker. The persona's retries are cancelled before removal.
+- **Fix:** Restore permissions and storage for the named journal and state directory, then let the next start finish removal. Keep any remaining files in place; successful removal logs no line.
+
+### `thread-memory-seal-unreadable`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-seal-unreadable: persona=all path="<state dir>/thread-memory-seal.json" Error code=EACCES message="permission denied"; seal treated as having no entries
+  ```
+
+  ```text
+  [slack] thread-memory-seal-unreadable: persona=all path="<state dir>/thread-memory-seal.json" Error message="Invalid Thread Memory seal"; seal treated as having no entries
+  ```
+
+- **Meaning:** Nothing is posted for this label. `persona=all` identifies the shared seal, whose unreadable or invalid contents count as having no entries; CSCB rebuilds its running entries after load and rewrites the seal when there is Thread Memory to record.
+- **Cause:** The seal could not be read, parsed or validated. Separate *Thread Memory changed while stopped* reports may follow for personas whose earlier state cannot be verified.
+- **Fix:** Check the named seal's disk, mount and permissions and preserve damaged bytes for investigation. Follow any separate changed-while-stopped report; a failed replacement write follows the next entry's retries.
+
+### `thread-memory-seal-not-saved`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-seal-not-saved: persona=all written_but_not_synced=false path="<state dir>/thread-memory-seal.json" Error code=EACCES message="permission denied"; seal write retried
+  ```
+
+  ```text
+  [slack] thread-memory-seal-not-saved: persona=all written_but_not_synced=true path="<state dir>/thread-memory-seal.json" Error code=EACCES message="permission denied"; seal write retried
+  ```
+
+- **Meaning:** Nothing is posted for this label. `persona=all` identifies the shared seal; `written_but_not_synced=true` means the write happened but durability was not confirmed, which still counts as a failure.
+- **Cause:** Writing or syncing the seal failed. One shared retry series uses the 5-to-60-second spacing above without stopping any persona's intake, delivery or independent Thread Memory retries; a new journal waiting for its seal entry keeps its joins in memory meanwhile.
+- **Fix:** Check the named seal's disk, mount and permissions. A failed final shutdown write also logs this line after notice episodes close; shutdown then cancels retries, so that final line promises no retry after the process stops, and the next start may report an unclean stop.
+
+### `thread-memory-holds-not-resolved`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-holds-not-resolved: persona=alpha step=resolution-append Error code=EACCES message="permission denied"; Memory Hold resolution not saved, retried
+  ```
+
+- **Meaning:** Nothing is posted. `step=resolution-append` means the decision to release or withdraw Memory Holds could not be saved in that persona's queue journal; those replies remain unresolved meanwhile.
+- **Cause:** The resolution write failed. CSCB retries that persona's resolution without new traffic, with waits of 10, 30, 60, 120, 300 and then 900 seconds (`RETYPE_BACKOFF_MS`); this is separate from Thread Memory's read/save retry spacing.
+- **Fix:** Check `<state dir>/queue/<key>.jsonl` and its disk, mount and permissions. Let the saved decisions release eligible replies; resend only messages a subsequent *Joins lost* report lists as withdrawn.
+
+---
+
 ## A persona's instance runs but isn't connected
 
 The persona is up and its Claude instance runs, but it is not connected.
@@ -6939,6 +7292,10 @@ Check the matching notice or diagnostic under [Delivery notices](#delivery-notic
 and [Persona diagnostic classes](#persona-diagnostic-classes). Storage failures need
 a disk check; stuck delivery needs the notice's remedy; waiting messages need the
 persona's hold or down state resolved. Accepted items remain queued in order.
+
+### Symptom: A persona posts a Thread Memory notice
+
+Read the persona's report and follow its entry under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
 
 ### Symptom: A persona posts a *Waiting on a prompt* or *Not connected* notice
 

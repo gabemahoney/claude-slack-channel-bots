@@ -33,7 +33,12 @@
  * PERSONA_DIAGNOSTIC_CLASSES (imported, side-effect free) names a `##`–`####`
  * heading in the skill (the skill gives each class a `###` heading naming it),
  * so a class added without a skill entry, or an entry cut down to a passing
- * mention, fails here. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
+ * mention, fails here. DELIVERY_DIAGNOSTIC_CLASSES and
+ * THREAD_MEMORY_DIAGNOSTIC_CLASSES also require nonempty Line, Meaning,
+ * Cause and Fix bullets plus their log label; the five Thread Memory report
+ * entries quote the notice titles rendered by their production builders.
+ * In-memory omission controls use the same check as the shipped document.
+ * RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
  * side-effect free) gets the same heading check in its own `test.each`, plus
  * a non-empty, duplicate-free check on the list. The stored-choice store's
  * own closed list, CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES (src/channel-delivery.ts,
@@ -138,6 +143,12 @@ import {
   PERSONA_DESTINATION_FAILED,
   PERSONA_DIAGNOSTIC_CLASSES,
   DELIVERY_DIAGNOSTIC_CLASSES,
+  THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+  THREAD_MEMORY_NOT_SAVED,
+  THREAD_MEMORY_UNREADABLE,
+  THREAD_MEMORY_JOINS_LOST,
+  THREAD_MEMORY_CHANGED_WHILE_STOPPED,
+  THREAD_MEMORY_RECOVERED,
   PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
   channelDeliverySetCause,
@@ -179,6 +190,15 @@ import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helper
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { deliveryResultSamples } from './test-helpers/shared-channels.ts'
+import { THREAD_PERSONAS, THREAD_CHANNELS, THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
+import {
+  buildThreadMemoryNotSavedNotice,
+  buildThreadMemoryUnreadableNotice,
+  buildThreadMemoryJoinsLostNotice,
+  buildThreadMemoryChangedWhileStoppedNotice,
+  buildThreadMemoryRecoveredNotice,
+} from '../src/thread-memory-reports.ts'
 import {
   classHeading,
   flat,
@@ -551,11 +571,62 @@ function skillHasClassHeading(label: string): boolean {
   return headings(text).some((heading) => heading.level >= 2 && heading.level <= 4 && re.test(heading.title))
 }
 
+/** The parts required of each full diagnostic entry. */
+const ENTRY_PARTS = ['Line', 'Meaning', 'Cause', 'Fix'] as const
+
+/** Use the same rule for the real document and its omission controls. */
+function fullDiagnosticEntryProblems(text: string, label: string): string[] {
+  const entry = requiredSection(text, classHeading(label), SKILL_REL)
+  const { prose } = splitFences(entry)
+  return [
+    ...ENTRY_PARTS.filter(part => !new RegExp(`^- \\*\\*${part}:\\*\\*[ \\t]+\\S`, 'm').test(prose)),
+    ...(entry.includes(`[slack] ${label}:`) ? [] : ['the line']),
+  ]
+}
+
+// Only the five report labels have notices. Log-only labels are still audited
+// through the entire exported class list above, including future additions.
+const THREAD_REPORT_SAMPLES: ReadonlyArray<readonly [string, () => string]> = [
+  [THREAD_MEMORY_NOT_SAVED, () => buildThreadMemoryNotSavedNotice(threadReportRef(), [THREAD_CHANNELS.primary], threadPath('<state dir>'), 'journal-append', new Error('fixture storage failure'))],
+  [THREAD_MEMORY_UNREADABLE, () => buildThreadMemoryUnreadableNotice(threadReportRef(), [THREAD_CHANNELS.primary], threadPath('<state dir>'))],
+  [THREAD_MEMORY_JOINS_LOST, () => buildThreadMemoryJoinsLostNotice(
+    { name: THREAD_PERSONAS.primary, key: THREAD_PERSONAS.primary },
+    { threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [] },
+  ).text],
+  [THREAD_MEMORY_CHANGED_WHILE_STOPPED, () => buildThreadMemoryChangedWhileStoppedNotice(threadReportRef(), [THREAD_CHANNELS.primary], 'changed')],
+  [THREAD_MEMORY_RECOVERED, () => buildThreadMemoryRecoveredNotice(threadReportRef(), [THREAD_CHANNELS.primary])],
+]
+
+function threadReportRef(): string {
+  return renderPersonaRef(THREAD_PERSONAS.primary, THREAD_PERSONAS.primary)
+}
+
+function noticeTitle(render: () => string): string {
+  const notice = render()
+  assertNoLeak(notice, 'Thread Memory documentation notice')
+  const title = notice.match(/\*[^*\n]+\*/)?.[0]
+  if (!title) throw new Error('Thread Memory notice builder returned no title')
+  return title
+}
+
+function hasNoticeTitle(text: string, label: string, title: string): boolean {
+  return splitFences(requiredSection(text, classHeading(label), SKILL_REL)).blocks
+    .some(block => block.body.includes(title))
+}
+
 describe('the debugging skill covers every persona diagnostic class', () => {
   test('delivery diagnostic labels belong to the audited persona catalogue', () => {
     expect(DELIVERY_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
     expect(new Set(DELIVERY_DIAGNOSTIC_CLASSES).size).toBe(DELIVERY_DIAGNOSTIC_CLASSES.length)
     expect(PERSONA_DIAGNOSTIC_CLASSES).toEqual(expect.arrayContaining([...DELIVERY_DIAGNOSTIC_CLASSES]))
+  })
+  test('Thread Memory diagnostic labels belong to the audited persona catalogue', () => {
+    expect(THREAD_MEMORY_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
+    expect(new Set(THREAD_MEMORY_DIAGNOSTIC_CLASSES).size).toBe(THREAD_MEMORY_DIAGNOSTIC_CLASSES.length)
+    expect(PERSONA_DIAGNOSTIC_CLASSES).toEqual(expect.arrayContaining([...THREAD_MEMORY_DIAGNOSTIC_CLASSES]))
+    const reports = THREAD_REPORT_SAMPLES.map(([label]) => label)
+    expect(new Set(reports).size).toBe(5)
+    expect(THREAD_MEMORY_DIAGNOSTIC_CLASSES).toEqual(expect.arrayContaining(reports))
   })
   // Labels come from the exported closed set, never a hand-copied list, so a
   // class added later without a skill entry fails here.
@@ -563,13 +634,50 @@ describe('the debugging skill covers every persona diagnostic class', () => {
     'the skill has a heading for class %s',
     (label) => {
       expect(skillHasClassHeading(label)).toBe(true)
-      if ((DELIVERY_DIAGNOSTIC_CLASSES as readonly string[]).includes(label)) {
-        const entry = requiredSection(debugSkill(), classHeading(label), SKILL_REL)
-        expect(['Line', 'Meaning', 'Cause', 'Fix'].filter((part) => !new RegExp(`^- \\*\\*${part}:\\*\\*\\s+\\S`, 'm').test(entry))).toEqual([])
-        expect(entry).toContain(`[slack] ${label}:`)
+      if (([...DELIVERY_DIAGNOSTIC_CLASSES, ...THREAD_MEMORY_DIAGNOSTIC_CLASSES] as readonly string[]).includes(label)) {
+        expect(fullDiagnosticEntryProblems(debugSkill(), label)).toEqual([])
       }
     },
   )
+
+  test.each([...THREAD_MEMORY_DIAGNOSTIC_CLASSES])('self-check: %s needs its own heading and log line', label => {
+    const text = debugSkill()
+    const range = sectionRange(text, classHeading(label))!
+    const withoutHeading = text.split('\n').filter((_, i) => i !== range.start).join('\n')
+    expect(() => fullDiagnosticEntryProblems(withoutHeading, label)).toThrow('has no heading')
+    const withoutLine = editSection(text, classHeading(label), body => body.replaceAll(`[slack] ${label}:`, ''))
+    expect(fullDiagnosticEntryProblems(withoutLine, label)).toEqual(['the line'])
+  })
+
+  test.each(THREAD_MEMORY_DIAGNOSTIC_CLASSES.flatMap(label => ENTRY_PARTS.map(part => [label, part] as const)))(
+    'self-check: %s needs a nonempty %s part in its own entry', (label, part) => {
+      for (const replacement of ['', `- **${part}:**`]) {
+        const changed = editSection(debugSkill(), classHeading(label), body => body.replace(
+          new RegExp(`^- \\*\\*${part}:\\*\\*[^\\n]*`, 'm'), replacement,
+        ))
+        expect(changed).not.toBe(debugSkill())
+        expect(fullDiagnosticEntryProblems(changed, label)).toEqual([part])
+      }
+    },
+  )
+
+  test('self-check: adding a diagnostic label without an entry fails', () => {
+    const extra = `${THREAD_MEMORY_DIAGNOSTIC_CLASSES[0]}-undocumented`
+    const labels = [...THREAD_MEMORY_DIAGNOSTIC_CLASSES, extra]
+    expect(() => labels.map(label => fullDiagnosticEntryProblems(debugSkill(), label))).toThrow('has no heading')
+  })
+
+  test.each(THREAD_REPORT_SAMPLES)('%s quotes the title rendered by its notice builder', (label, render) => {
+    expect(hasNoticeTitle(debugSkill(), label, noticeTitle(render))).toBe(true)
+  })
+
+  test.each(THREAD_REPORT_SAMPLES)('self-check: %s fails when its quoted notice title is removed', (label, render) => {
+    const title = noticeTitle(render)
+    const changed = editSection(debugSkill(), classHeading(label), body => body.replaceAll(title, ''))
+    expect(changed).not.toBe(debugSkill())
+    expect(hasNoticeTitle(changed, label, title)).toBe(false)
+    expect(fullDiagnosticEntryProblems(changed, label)).toEqual([])
+  })
 })
 
 describe('the debugging skill covers every reload diagnostic class', () => {
@@ -647,9 +755,6 @@ const INVITED_CHANNEL_CLASSES = [
 PERSONA_INVITED_CHANNEL,
 PERSONA_CHANNEL_DELIVERY_SET
 ] as const
-
-/** The parts asks of each entry, each a bold-lead bullet (`- **Line:**`). */
-const ENTRY_PARTS = ['Line', 'Meaning', 'Cause', 'Fix'] as const
 
 /** A bullet whose bold lead is `part` (`- **Fix:**`), at the start of a line. */
 function partLead(part: string): RegExp {

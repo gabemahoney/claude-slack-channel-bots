@@ -28,6 +28,8 @@ export function judgeMemoryHolds(
   return decisions
 }
 export interface MemoryHoldResolverDeps {
+  /** Refuse work throughout teardown, including new requests from old events. */
+  canRun?(key: string): boolean
   queue: Pick<DeliveryQueue, 'unresolvedHolds' | 'resolveHolds' | 'item'> & Partial<Pick<DeliveryQueue, 'compact'>>
   memory: Pick<ThreadMemory, 'joinedBy' | 'pruneHeldJoins'>
   release(key: string, item: QueueItem, mode: MemoryHoldMode): void | Promise<void>
@@ -52,7 +54,8 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
   }
   const lives = new Map<string, Life>()
   let stopped = false
-  const current = (key: string, life: Life) => !stopped && lives.get(key) === life
+  const active = (key: string) => !stopped && (deps.canRun?.(key) ?? true)
+  const current = (key: string, life: Life) => active(key) && lives.get(key) === life
   function event(value: MemoryHoldEvent): void {
     try { void Promise.resolve(deps.onEvent?.(value)).catch(() => {}) } catch { /* observers cannot undo saved facts */ }
   }
@@ -91,7 +94,14 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
     })
     let saved: HoldResolution[] = []
     try {
-      if (decisions.length) saved = await deps.queue.resolveHolds(key, decisions, () => current(key, life))
+      if (decisions.length) saved = await deps.queue.resolveHolds(key, decisions, () => current(key, life), committed => {
+        // This handoff belongs to the durable commit, not this resolver life.
+        // It must precede both cancellation at the async return boundary and
+        // any released item's awaited feedback. Only newly saved holds count.
+        const savedSeqs = new Set(committed.map(decision => decision.seq))
+        const savedWithdrawn = withdrawn.filter(hold => savedSeqs.has(hold.seq))
+        if (savedWithdrawn.length) event({ type: 'withdrawn', key, holds: savedWithdrawn })
+      })
     } catch (error) {
       if (!current(key, life)) return 'cancelled'
       event({ type: 'resolution-failed', key, error })
@@ -114,17 +124,13 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
     }
     if (!current(key, life)) return 'cancelled'
     for (const decision of decisions) life.modes.delete(decision.seq)
-    const savedSeqs = new Set(saved.map(decision => decision.seq))
-    const savedWithdrawn = withdrawn.filter(hold => savedSeqs.has(hold.seq))
-    if (savedWithdrawn.length) event({ type: 'withdrawn', key, holds: savedWithdrawn })
-    if (!current(key, life)) return 'cancelled'
     deps.memory.pruneHeldJoins(key)
     void compact(key, life)
     return 'resolved'
   }
   const api: MemoryHoldResolver = {
     resolve(key, mode, compactAfter = false) {
-      if (stopped) return Promise.resolve('cancelled')
+      if (!active(key)) return Promise.resolve('cancelled')
       let life = lives.get(key)
       if (!life) { life = { writer: Promise.resolve(), step: 0, compact: false, modes: new Map() }; lives.set(key, life) }
       life.compact ||= compactAfter

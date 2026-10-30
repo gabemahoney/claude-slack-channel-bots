@@ -52,7 +52,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { createThreadMemory, type ThreadMemory } from './thread-memory.ts'
+import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent } from './thread-memory.ts'
+import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from './thread-memory-retry.ts'
+import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from './thread-memory-reports.ts'
 import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent } from './memory-holds.ts'
 import { recoverQueuedJoins } from './thread-join-recovery.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
@@ -1145,6 +1147,39 @@ let deliveryQueue: ReplyReminderQueue | undefined
 let threadMemory: ThreadMemory | undefined
 let memoryHolds: MemoryHoldResolver | undefined
 let threadMemorySeal: ThreadMemorySeal | undefined
+let threadMemoryRetries: ThreadMemoryRetries | undefined
+let threadMemoryReporting: ReturnType<typeof createThreadMemoryReporting> | undefined
+type BufferedThreadMemoryEvent = (
+  | { source: 'memory'; event: ThreadMemoryEvent }
+  | { source: 'seal'; event: ThreadMemorySealEvent }
+  | { source: 'retry'; event: ThreadMemoryRetryEvent }
+  | { source: 'holds'; event: MemoryHoldEvent }
+) & { outage?: ReturnType<ThreadMemory['outage']> }
+const bufferedThreadMemoryEvents: BufferedThreadMemoryEvent[] = []
+function dispatchThreadMemoryReport(value: BufferedThreadMemoryEvent): void {
+  try {
+    // Keep observation-time readiness with startup events. Replaying an early
+    // read against the final healthy store would close its outage too soon.
+    if ((value.source === 'memory' || value.source === 'retry') && 'key' in value.event && value.outage === undefined) {
+      value = { ...value, outage: threadMemory?.outage(value.event.key) }
+    }
+    if (!threadMemoryReporting) {
+      // The seal retains these for startupFindings, including late first reads.
+      if (value.source !== 'seal' || value.event.type !== 'changed-while-stopped') bufferedThreadMemoryEvents.push(value)
+      return
+    }
+    switch (value.source) {
+      case 'memory': threadMemoryReporting.threadMemoryEvent(value.event, value.outage); return
+      case 'seal': threadMemoryReporting.sealEvent(value.event); return
+      case 'retry': threadMemoryReporting.retryEvent(value.event, value.outage); return
+      case 'holds': threadMemoryReporting.holdsEvent(value.event); return
+    }
+  } catch { /* reporting must not reach a store or skip its retry consumer */ }
+}
+/** The existing lifecycle window fences old events as well as armed work. */
+function threadMemoryWorkAllowed(key: string): boolean {
+  return !shuttingDown && !personaEpisodes?.isClosed() && (personaEpisodes?.teardownWindowState(key) ?? 'none') === 'none'
+}
 let unsubscribeThreadMemory: (() => void) | undefined
 let replyReminders: ReplyReminders | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
@@ -1158,14 +1193,23 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
 const bufferedHeldReleases = new Map<string, { key: string; item: QueueItem }>()
-/** Task 4b binds reporting here and calls resolveMemoryHolds after its first
- * successful read and queued-join recovery. No read retry belongs here. */
-export const memoryHoldEvents = { emit: (_event: MemoryHoldEvent): void => {} }
+/** Independent observer ports; none can interrupt durability. */
+export const memoryHoldEvents = { emit: (event: MemoryHoldEvent): void => dispatchThreadMemoryReport({ source: 'holds', event }) }
+export const threadMemoryEvents = { emit: (event: ThreadMemoryEvent): void => {
+  dispatchThreadMemoryReport({ source: 'memory', event })
+  try {
+    if (event.type === 'append-failed' || event.type === 'creation-failed') threadMemoryRetries?.appendFailed(event.key)
+    else if (event.type === 'read-failed') threadMemoryRetries?.readFailed(event.key)
+  } catch { /* a retry consumer cannot affect reporting or the store */ }
+} }
 export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> {
   return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve()
 }
 /** Observer port for Thread Memory reporting; the seal retains startup findings. */
-export const threadMemorySealEvents = { emit: (_event: ThreadMemorySealEvent): void => {} }
+export const threadMemorySealEvents = { emit: (event: ThreadMemorySealEvent): void => {
+  dispatchThreadMemoryReport({ source: 'seal', event })
+  try { if (event.type === 'seal-write-failed') threadMemoryRetries?.sealWriteFailed() } catch { /* isolated retry consumer */ }
+} }
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
 /** binds event handling here; supplies facts without notices or wording. */
@@ -1488,13 +1532,20 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await remindersStopping
   await deliveryClients?.close()
   await deliveryQueue?.stop()
+  threadMemoryRetries?.stopKeys()
   unsubscribeThreadMemory?.()
   await threadMemory?.quiesce()
   if (threadMemorySeal?.loadedAtStart() && threadMemory) {
-    await threadMemorySeal.writeShutdown(threadMemory.completedStores())
+    const result = await threadMemorySeal.writeShutdown(threadMemory.completedStores())
+    // Episodes are already closed, so their observer suppresses this event.
+    // The final authorized durability operation still needs its log-only result.
+    try {
+      if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced))
+    } catch { /* a diagnostic failure must not skip the remaining shutdown stops */ }
   }
   await threadMemory?.stop()
   await threadMemorySeal?.stop()
+  threadMemoryRetries?.stopSeal()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -2804,6 +2855,7 @@ export async function main(): Promise<void> {
   })
   threadMemory = createThreadMemory({
     stateDir: STATE_DIR, dryRun: isDryRun(), seal: threadMemorySeal,
+    canRun: threadMemoryWorkAllowed,
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
     authorityReady: () => reloadController?.sharedChannels() !== undefined,
@@ -2813,6 +2865,29 @@ export async function main(): Promise<void> {
     canRemove: key => reloadController?.sharedChannels()?.reviewHeld(key) === false,
     setCreated: key => reloadController?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' },
     clearCreated: key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
+    onEvent: event => threadMemoryEvents.emit(event),
+  })
+  threadMemoryRetries = createThreadMemoryRetries({
+    canRun: threadMemoryWorkAllowed,
+    clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    flush: key => threadMemory!.flush(key),
+    retryRead: key => threadMemory!.retryRead(key),
+    sealFlush: () => threadMemorySeal!.flush(),
+    firstRead: async (key, current) => {
+      const live = () => current() && !shuttingDown && getAppliedPersona(key) !== undefined
+      if (!live()) return
+      try { threadMemory?.retryPendingJoins(key) } catch { /* continue to resolution and saving */ }
+      if (!live()) return
+      try { await memoryHolds?.resolve(key, 'live') } catch { /* saving is independent */ }
+      if (!live()) return
+      try {
+        const result = await threadMemory?.flush(key)
+        // A readable journal can still keep joins behind an undecided stamp.
+        // Keep the existing save owner until publication lets its retry save.
+        if (live() && (result?.kind === 'failed' || (result?.kind === 'kept' && (threadMemory?.outage(key).unsaved ?? 0) > 0))) threadMemoryRetries?.appendFailed(key)
+      } catch { if (live()) threadMemoryRetries?.appendFailed(key) }
+    },
+    onEvent: event => dispatchThreadMemoryReport({ source: 'retry', event }),
   })
   threadMemory.readAtStart()
   await threadMemorySeal.loadAtStart(threadMemory.journalFacts())
@@ -2821,6 +2896,7 @@ export async function main(): Promise<void> {
   if (shuttingDown) return
   for (const key of deliveryQueue.keys()) for (const hold of deliveryQueue.unresolvedHolds(key)) threadMemory.advancePast(key, hold.arrived_at)
   memoryHolds = createMemoryHoldResolver({
+    canRun: threadMemoryWorkAllowed,
     queue: deliveryQueue, memory: threadMemory,
     release: (key, item, mode) => personaRouting.releaseHeld(key, item, mode),
     now: Date.now,
@@ -2946,7 +3022,9 @@ export async function main(): Promise<void> {
         try { await personaLifecycleOps.teardown(persona) } finally {
           if (!personaConfig?.personas.some(applied => applied.key === persona.key)) {
             try { memoryHolds?.forget(persona.key) } finally {
-              await threadMemory?.remove(persona.key)
+              try { threadMemoryRetries?.forget(persona.key, 'removal') } finally {
+                await threadMemory?.remove(persona.key)
+              }
             }
           }
         }
@@ -3568,6 +3646,14 @@ export async function main(): Promise<void> {
   for (const { key, item } of bufferedHeldReleases.values()) deliveryReporting.received(key, deliveryQueue.item(key, item.accepted.seq) ?? item, 'recovered')
   bufferedHeldReleases.clear()
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
+  threadMemoryReporting = createThreadMemoryReporting({
+    episodes: noticeEpisodes, persona: getAppliedPersona,
+    log: line => console.error(line),
+    threadHybridChannels: key => reload.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
+    outage: key => threadMemory!.outage(key),
+  })
+  for (const event of bufferedThreadMemoryEvents.splice(0)) dispatchThreadMemoryReport(event)
+  threadMemoryReporting.startupFindings(threadMemorySeal.startupFindings())
   deliveryLifecycle = createDeliveryLifecycle({
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
   })
@@ -3738,9 +3824,13 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
+    cancelThreadMemory: key => forgetPersonaState(key, [
+      k => threadMemoryRetries?.forget(k), k => memoryHolds?.forget(k),
+    ]),
     routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
       k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k),
-      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemory?.forget(k),
+      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k),
+      k => threadMemoryRetries?.forget(k), k => threadMemory?.forget(k),
     ]) },
     loadThreadMemory: async key => {
       await threadMemory?.loadKey(key)

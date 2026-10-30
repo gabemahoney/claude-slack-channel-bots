@@ -3098,6 +3098,12 @@ describe('tool list and instructions', () => {
     expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS)
   })
 
+  test('Thread Memory and Joins lost notices in the notice destination are for the operator, not the bot to act on', () => {
+    expect(MCP_INSTRUCTIONS.split('\n').filter(line => line.startsWith('Thread Memory'))).toEqual([
+      'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
+    ])
+  })
+
   // negotiated tools only; the system prompt owns full tag semantics.
   test('the compact contract retains all contract points in order and every tool/via value under its cap', async () => {
     const { client } = await openPersonaSession(h.alpha)
@@ -3106,7 +3112,8 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
     const points = [
       'The sender reads Slack', 'Messages arrive as the <channel> tag described in the system prompt',
-      'via:', '<@ID>', 'attachment_count', 'In strict mode', SET_CHANNEL_DELIVERY_TOOL, 'With DMs on', 'Pass message_id', 'reply accepts files',
+      'via:', '<@ID>', 'attachment_count', 'In strict mode', SET_CHANNEL_DELIVERY_TOOL,
+      'Thread Memory notices', 'With DMs on', 'Pass message_id', 'reply accepts files',
     ]
     let last = -1
     for (const point of points) {

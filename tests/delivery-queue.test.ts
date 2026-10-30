@@ -10,7 +10,7 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { deliveredRecord, fixedRecord, heldSlackInput, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, withdrawnRecord } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
-import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, THREAD_TIME } from './test-helpers/thread-memory.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
 import { createDeliveryQueue as createMainDeliveryQueue, isQueueRecord as isMainQueueRecord } from './fixtures/main-delivery-queue/delivery-queue.ts'
 
 let dir: string
@@ -1285,6 +1285,67 @@ describe('Memory Hold queue records', () => {
     expect(replay.unresolvedHolds('alpha')).toEqual([])
     expect(replay.openCount('alpha')).toBe(1)
     expect(itemOpenedAt(replay.item('alpha', 1)!)).toBe(resolutions[0]!.at)
+    assertNoLeak(events)
+  })
+
+  test('commit observer sees only the saved subset after publication, before writable and general observers', async () => {
+    const io = threadFsControls(dir), order: string[] = [], commits: HoldResolution[][] = [], events: QueueEvent[] = []
+    const q = await open({ fs: io.fs, onEvent: event => { events.push(event); order.push(event.type) } })
+    await storeHold(q, THREAD_TIME)
+    await storeHold(q, THREAD_TIME, { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } })
+    await storeHold(q, THREAD_TIME, { ts: THREAD_ROOTS.primary, key: { ...slackInput().key!, ts: THREAD_ROOTS.primary } })
+    await q.accept('alpha', injectedInput())
+    await q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: THREAD_TIME }])
+    const saved: HoldResolution[] = [{ seq: 3, outcome: 'withdrawn', at: THREAD_TIME + 1 }, { seq: 2, outcome: 'released', at: THREAD_TIME + 1 }]
+    const candidates: HoldResolution[] = [{ seq: 1, outcome: 'withdrawn', at: THREAD_TIME }, ...saved,
+      { ...saved[0]!, outcome: 'released' }, { seq: 4, outcome: 'withdrawn', at: THREAD_TIME }, { seq: 99, outcome: 'released', at: THREAD_TIME }]
+    const observations: unknown[] = []
+    const observer = (batch: readonly HoldResolution[]) => {
+      order.push('committed'); commits.push(structuredClone([...batch]))
+      observations.push({ writable: q.isWritable!('alpha'), unresolved: q.unresolvedHolds('alpha'),
+        state: q.item('alpha', 3)!.hold!.state, open: q.openCount('alpha'),
+        journal: readQueue(dir).filter(r => r.kind === 'withdrawn') })
+      // Callback data cannot corrupt the returned batch or general event.
+      batch[0]!.outcome = 'released'
+    }
+    io.fail('writeSync', 'alpha', { match: path => path === queuePath(dir) })
+    await expect(q.resolveHolds('alpha', candidates, undefined, observer)).rejects.toThrow()
+    expect(commits).toEqual([]); expect(q.isWritable!('alpha')).toBe(false)
+    io.heal(); order.length = 0; events.length = 0
+    expect(await q.resolveHolds('alpha', candidates, () => false, observer)).toEqual([])
+    expect(commits).toEqual([]); expect(order).toEqual([])
+    expect(await q.resolveHolds('alpha', candidates, undefined, observer)).toEqual(saved)
+    expect(commits).toEqual([saved])
+    expect(observations).toEqual([{ writable: true, unresolved: [], state: 'withdrawn', open: 3,
+      journal: [withdrawnRecord(3, THREAD_TIME + 1)] }])
+    expect(order).toEqual(['committed', 'writable', 'holds-resolved'])
+    expect(events.at(-1)).toEqual({ type: 'holds-resolved', key: 'alpha', resolutions: saved })
+    const bytes = fs.readFileSync(queuePath(dir))
+    expect(await q.resolveHolds('alpha', candidates, undefined, observer)).toEqual([])
+    expect(await q.resolveHolds('alpha', [], undefined, observer)).toEqual([])
+    expect(commits).toEqual([saved]); expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    assertNoLeak({ commits, events, order })
+  })
+
+  test.each(['throw', 'reject', 'pending'] as const)('a %s commit observer cannot undo durability or block either writer', async outcome => {
+    const events: QueueEvent[] = [], q = await open({ onEvent: e => events.push(e) })
+    await storeHold(q, THREAD_TIME); await storeHold(q, THREAD_TIME, {}, 'beta')
+    const saved: HoldResolution[] = [{ seq: 1, outcome: 'withdrawn', at: THREAD_TIME }]
+    let calls = 0
+    const pending = q.resolveHolds('alpha', saved, undefined, () => {
+      calls++
+      if (outcome === 'throw') throw new Error('observer failed')
+      if (outcome === 'reject') return Promise.reject(new Error('observer failed'))
+      return new Promise<void>(() => {})
+    })
+    expect(await q.resolveHolds('beta', saved)).toEqual(saved)
+    await expect(pending).resolves.toEqual(saved)
+    expect((await q.accept('alpha', injectedInput())).status).toBe('accepted')
+    expect(calls).toBe(1); expect(q.isWritable!('alpha')).toBe(true)
+    expect(q.item('alpha', 1)!.hold!.state).toBe('withdrawn')
+    expect(readQueue(dir).filter(r => r.kind === 'withdrawn')).toEqual([withdrawnRecord(1, THREAD_TIME)])
+    expect(events.filter(e => e.type === 'append-failed')).toEqual([])
+    expect(events.filter(e => e.type === 'holds-resolved')).toHaveLength(2)
     assertNoLeak(events)
   })
 

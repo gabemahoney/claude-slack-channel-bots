@@ -226,6 +226,7 @@ import {
   PERSONA_DIRECTORY_UNUSABLE,
   PERSONA_SLACK_UNREACHABLE,
   PERSONA_START,
+  THREAD_MEMORY_DIAGNOSTIC_CLASSES,
   formatCredentialsChangeFailed,
   formatPersonaDiagnostic,
   personaCheckFailure,
@@ -1363,8 +1364,9 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the persona and typed-delivery diagnostic label set is exactly the declared classes', () => {
-    expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
+  test('the persona, typed-delivery and Thread Memory diagnostic label set is exactly the declared classes', () => {
+    expect(new Set(PERSONA_DIAGNOSTIC_CLASSES).size).toBe(PERSONA_DIAGNOSTIC_CLASSES.length)
+    expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual(([
       'delivery-stuck',
       'message-delivered',
       'message-not-saved',
@@ -1393,7 +1395,8 @@ describe('diagnostic lines', () => {
       'queue-unwritable',
       'system-prompt-unwritable',
       'unclaimed-channel',
-    ])
+      ...THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+    ] satisfies PersonaDiagnosticClass[]).sort())
   })
 
   // Rows: label, the check to run, and the path its diagnostic must carry.

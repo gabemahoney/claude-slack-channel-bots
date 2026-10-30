@@ -24,3 +24,5 @@ export const THREAD_MEMORY_RETRY_MAX_MS = 60_000
  * new channel message, and the range an own-post lookup reads.
  */
 export const OWN_ROOT_CLOCK_SKEW_MS = 120_000
+/** Bound a Thread Memory loss report, including the notifier's persona prefix. */
+export const THREAD_MEMORY_NOTICE_MAX_CHARS = 4000

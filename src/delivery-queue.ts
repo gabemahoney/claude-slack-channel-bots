@@ -123,8 +123,12 @@ export interface DeliveryQueue {
   openCount(key: string): number
   /** Includes decisions whose store is in progress, for stale-join retention. */
   unresolvedHolds(key: string): UnresolvedHold[]
-  /** Returns only resolutions newly saved by this call, in input order. */
-  resolveHolds(key: string, resolutions: readonly HoldResolution[], current?: () => boolean): Promise<HoldResolution[]>
+  /** Returns only resolutions newly saved by this call, in input order.
+   * onCommitted observes that batch synchronously after publication, before
+   * other observers or the caller's continuation can cancel its reporting.
+   * It is not awaited, and its errors cannot change the durable result. */
+  resolveHolds(key: string, resolutions: readonly HoldResolution[], current?: () => boolean,
+    onCommitted?: (saved: readonly HoldResolution[]) => void): Promise<HoldResolution[]>
   /** A failed post-accept append suspends all keys until an append succeeds. */
   isWritable?(key: string): boolean
   keys(): string[]
@@ -689,7 +693,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       if (storing) holds.set(storing.seq, storing)
       return structuredClone([...holds.values()].sort((a, b) => a.seq - b.seq))
     },
-    async resolveHolds(key, resolutions, current = () => true) {
+    async resolveHolds(key, resolutions, current = () => true, onCommitted) {
       try {
         const copy = structuredClone(resolutions)
         return await serial(key, () => {
@@ -707,7 +711,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           const records: HoldResolutionRecord[] = saved.map(r => ({ v: 1, kind: r.outcome, seq: r.seq, at: r.at }))
           durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
           for (const record of records) update(j, record)
-          if (appendBlocked.delete(key)) event({ type: 'writable', key })
+          const wasBlocked = appendBlocked.delete(key)
+          // Transfer committed evidence before a queue observer can submit
+          // teardown. Never turn an observer failure into an append failure.
+          try { void Promise.resolve(onCommitted?.(structuredClone(saved))).catch(() => {}) } catch { /* saved facts remain saved */ }
+          if (wasBlocked) event({ type: 'writable', key })
           event({ type: 'holds-resolved', key, resolutions: structuredClone(saved) })
           return saved
         })

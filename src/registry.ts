@@ -1163,7 +1163,7 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
-/** every session receives the nine retained points in order. */
+/** Every session receives these eleven points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
   'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
@@ -1173,6 +1173,7 @@ export const MCP_INSTRUCTIONS = [
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
   'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
   `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and replies in threads the bot is in). Use it when someone in that channel asks; new assignments require open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
+  'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
   'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',

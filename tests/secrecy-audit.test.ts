@@ -171,6 +171,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
   // Thread Memory's lookups and own-post observation: each makes or reads an authenticated Slack request on a persona's client.
   [/^src\/thread-memory\.ts$/, "the bounded metadata attempts, which run a persona's authenticated Slack requests and classify their raw failures (an error's message can hold a token) into safe codes"],
+  [/^src\/thread-memory-reports\.ts$/, "Thread Memory's notice and diagnostic builders and reporter, which carry configured identities and paths plus described storage failures to Slack posts and log lines"],
   [/^src\/own-post\.ts$/, "the own-post observer, whose issues carry the issuing persona's bot identity and whose fault callback receives an owner's raw fault, own-post eligibility over the applied config and current membership, and the reading of upload completions as Slack returned them"],
   [/^src\/file-upload-observation\.ts$/, "the file-completion observation, which wraps a persona's raw Web API client and hands each completion response, as Slack returned it, to its listener"],
 ]
@@ -190,6 +191,11 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
+  'tests/test-helpers/thread-memory.ts': {
+    threadConfig: 'builds Thread Memory persona configuration',
+    makeThreadMemoryHarness: 'builds applied configuration and captures Thread Memory reports and storage failures',
+    makeThreadMembershipHarness: 'builds authenticated membership and Thread Memory composition',
+  },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
@@ -699,10 +705,10 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
   })
 
-  // each makes, wraps or parses a persona's authenticated Slack requests, and its
-  // classifications carry codes taken from Slack failures.
+  // Authenticated observations and operator reporting can carry failure text.
   test.each([
     ['src/thread-memory.ts', 'classifyMetadataFailure', 'THREAD_MEMORY_LOOKUP_METHODS', 'MetadataFailure', 'tests/thread-memory.test.ts'],
+    ['src/thread-memory-reports.ts', 'createThreadMemoryReporting', 'THREAD_MEMORY_DIAGNOSTIC_CLASSES', 'ThreadMemoryLoss', 'tests/thread-memory-reports.test.ts'],
     ['src/own-post.ts', 'completionFiles', 'SLACK_FILE_ID_RE', 'CompletedFile', 'tests/own-post.test.ts'],
     ['src/file-upload-observation.ts', 'observeFileCompletions', undefined, 'FileCompletionListener', 'tests/registry.test.ts'],
   ] as const)('%s is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', (module, fn, constant, type, suite) => {
@@ -716,10 +722,11 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  test('the Thread Memory, own-post and file-completion observation modules are touched by suites today, and a touching suite without its assertNoLeak calls fails the rule', () => {
+  test('the Thread Memory store/reporter, own-post and file-completion modules are touched today, and a suite without its assertNoLeak calls fails the rule', () => {
     const touched = (module: string) => SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
     for (const [suite, module] of [
       ['tests/thread-memory.test.ts', 'src/thread-memory.ts'],
+      ['tests/thread-memory-reports.test.ts', 'src/thread-memory-reports.ts'],
       ['tests/own-post.test.ts', 'src/own-post.ts'],
       ['tests/registry.test.ts', 'src/file-upload-observation.ts'],
     ] as const) {
@@ -727,6 +734,30 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
       expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes(module))).toBe(true)
       expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    }
+  })
+
+  test('Thread Memory report builders and configuration helpers require leak checks without treating record-only fixtures as touching', () => {
+    const suite = 'tests/thread-memory-reports.test.ts'
+    for (const source of [
+      "import { buildThreadMemoryNotSavedNotice as notice } from '../src/thread-memory-reports.ts'",
+      "import * as reports from '../src/thread-memory-reports.ts'",
+      "const reports = await import('../src/thread-memory-reports.ts')",
+    ]) expect(touchReasonsOf(suite, source)).toHaveLength(1)
+    const helper = 'tests/test-helpers/thread-memory.ts'
+    for (const fn of ['threadConfig', 'makeThreadMemoryHarness', 'makeThreadMembershipHarness']) {
+      expect(touchReasonsOf(suite, `import { ${fn} as fixture } from './test-helpers/thread-memory.ts'`)).toHaveLength(1)
+      const touching = SUITES.filter(file => touchReasons(file).some(reason => reason.startsWith(`imports ${fn} from ${helper}:`)))
+      expect(touching.length).toBeGreaterThan(0)
+      expect(touching.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map(file => [file, true, false]))
+      for (const file of touching) {
+        const withoutCalls = codeOf(file).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+        expect(touchReasonsOf(file, withoutCalls).some(reason => reason.includes(helper))).toBe(true)
+        expect(callsAssertNoLeak(file, withoutCalls)).toBe(false)
+      }
+    }
+    for (const imported of ['threadPath', 'threadJoin', 'THREAD_PERSONAS', 'type ThreadMemoryHarness']) {
+      expect(touchReasonsOf(suite, `import { ${imported} } from './test-helpers/thread-memory.ts'`)).toEqual([])
     }
   })
 

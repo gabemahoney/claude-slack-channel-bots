@@ -12,13 +12,14 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
   type MetadataFailure } from '../src/thread-memory.ts'
-import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimited } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { PersonaSlackTokens } from '../src/persona-credentials.ts'
 import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE, type ThreadJoin } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
   type JudgeSealInput, type ThreadMemorySealCase, type ThreadMemorySealEntry } from '../src/thread-memory-seal.ts'
@@ -29,11 +30,24 @@ import {
   runningSealEntry, cleanSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
 } from './test-helpers/thread-memory.ts'
 import { membershipPage, readSharedState } from './test-helpers/shared-channels.ts'
-import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
 import { makeDeferredWebApiCall } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
+import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
+import {
+  buildThreadMemoryNotSavedNotice, buildThreadMemoryNotSavedLine, buildThreadMemoryUnreadableNotice,
+  buildThreadMemoryUnreadableLine, buildThreadMemoryRecoveredNotice, buildThreadMemoryRecoveredLine,
+  buildThreadMemoryJoinsLostNotice, buildThreadMemoryJoinsLostLine, buildThreadMemoryQuarantinedLine,
+  buildThreadMemoryChangedWhileStoppedNotice, buildThreadMemoryChangedWhileStoppedLine,
+  buildThreadMemorySealNotSavedLine, buildThreadMemoryCompactionFailedLine, buildThreadMemoryRemovalFailedLine,
+  type ThreadMemoryLoss,
+} from '../src/thread-memory-reports.ts'
+import { THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE } from '../src/persona-diagnostics.ts'
+import type { MemoryHoldEvent } from '../src/memory-holds.ts'
 
 const T0 = 1_700_000_000_000
 
@@ -79,7 +93,8 @@ afterEach(async () => {
   for (const h of threadRuns.splice(0)) {
     await h.close()
     if ('membership' in h) assertNoLeak(h.membership.captured())
-    assertNoLeak({ events: h.events, sealEvents: h.sealEvents, state: readSharedState(h.stateDir),
+    expect(h.clock.pendingCount()).toBe(0)
+    assertNoLeak({ events: h.events, sealEvents: h.sealEvents, retryEvents: h.retryEvents, posts: h.posts, logs: h.logs, state: readSharedState(h.stateDir),
       ...(existsSync(threadSealPath(h.stateDir)) ? { seal: writtenFile(threadSealPath(h.stateDir)) } : {}),
       ...(existsSync(join(h.stateDir, 'threads')) ? { threads: writtenFile(join(h.stateDir, 'threads')) } : {}) })
   }
@@ -228,7 +243,7 @@ describe('Thread Memory store', () => {
     const error = h.io.fail(op)
     await h.memory.compact('alpha')
     expect(journalBytes(h)).toEqual(before); expect(view(h)).toBe('joined')
-    expect(h.events.at(-1)).toEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), error })
+    expect(h.events.at(-1)).toEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-rewrite', error })
     expect(readdirSync(join(h.stateDir, 'threads')).filter(n => n.endsWith('.tmp'))).toEqual([])
     h.io.heal(); await h.memory.compact('alpha')
     expect(savedJoins(h)).toHaveLength(1)
@@ -304,7 +319,7 @@ describe('Thread Memory store', () => {
     await h.memory.compact()
     expect(journalBytes(h).equals(before)).toBe(false)
     expect(savedJoins(h)).toEqual([joinRecord({ ...fact, at: fact.at - 1 }, 3)])
-    expect(h.events.at(-1)).toEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), error })
+    expect(h.events.at(-1)).toEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-rewrite', error })
     h.io.heal(); await h.memory.compact()
     const restarted = fixture({ reopen: true }, h.stateDir); await restarted.start()
     expect(view(restarted)).toBe('joined'); expect(restarted.memory.store('alpha')?.lastRecordNumber).toBe(3)
@@ -460,7 +475,7 @@ describe('Thread Memory store', () => {
     expect(journalBytes(h)).toEqual(before)
     expect([view(h), view(h, R.secondary)]).toEqual(['joined', 'joined'])
     expect(h.memory.keptFacts('alpha')).toEqual([first, second]); expect(h.memory.isJoinSaved('alpha', first)).toBe(false)
-    expect(h.events.at(-1)).toEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), error })
+    expect(h.events.at(-1)).toEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error })
     h.io.heal(); h.io.reset(); expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
     expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
     expect(savedJoins(h)).toEqual([joinRecord(first, 2), joinRecord(second, 3)])
@@ -501,7 +516,7 @@ describe('Thread Memory store', () => {
     expect((await h.memory.remove('alpha')).kind).toBe('failed')
     expect(journalBytes(h)).toEqual(before); expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
     expect(h.markerCalls.filter(c => c.action === 'clear')).toEqual([])
-    expect(h.events.at(-1)).toEqual({ type: 'removal-failed', key: 'alpha', path: threadPath(h.stateDir), error })
+    expect(h.events.at(-1)).toEqual({ type: 'removal-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-unlink', error })
     const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
     expect(existsSync(threadPath(h.stateDir))).toBe(false)
     expect(reopened.authority.threadMemoryCreated('alpha')).toBe(false)
@@ -586,6 +601,774 @@ async function deliverRecoveredItem(queue: Awaited<ReturnType<typeof makeQueue>>
   const item = queue.item(key, seq)!
   await queue.append(key, fixedRecord(seq, [item.accepted.text]))
   await queue.append(key, deliveredRecord(seq))
+}
+
+function reportingFixture(options: Parameters<typeof fixture>[0] = {}, dir?: string) {
+  const h = fixture({ seal: true, failureHandling: true, ...options }, dir)
+  return { ...h, seal: h.seal!, retries: h.retries!, reporting: h.reporting!, episodes: h.episodes! }
+}
+function notice(h: ThreadMemoryHarness, body: (ref: string) => string, key = 'alpha') {
+  const persona = h.authority.config().personas.find(p => p.key === key)!
+  return { key, text: formatPersonaNotice(persona, body(renderPersonaRef(persona.name, key))) }
+}
+const recoveryNotice = (h: ThreadMemoryHarness, key = 'alpha') =>
+  notice(h, ref => buildThreadMemoryRecoveredNotice(ref, h.authority.threadView().threadHybridChannels(key)), key)
+function lossNotice(h: ThreadMemoryHarness, loss: ThreadMemoryLoss, key = 'alpha') {
+  const persona = h.authority.config().personas.find(p => p.key === key)!
+  const result = buildThreadMemoryJoinsLostNotice(persona, loss)
+  return { key, text: formatPersonaNotice(persona, result.text, result.options) }
+}
+function seedReadable(h: ThreadMemoryHarness, facts: ThreadJoin[] = [], key = 'alpha') {
+  seedThreads(h.stateDir, [threadHeader(), ...facts.map((fact, i) => joinRecord(fact, i + 2))], key)
+  expect(h.authority.setThreadMemoryCreated(key).kind).toBe('saved')
+  if (h.seal) seedThreadSeal(h.stateDir, {
+    ...(existsSync(threadSealPath(h.stateDir)) ? readThreadSeal(h.stateDir).entries : {}),
+    [key]: cleanSealEntry(h.stateDir, key, { lastRecordNumber: facts.length + 1 }),
+  })
+}
+
+describe('Thread Memory failure handling through the store', () => {
+  test('retryRead retries unreadable files, judges the first read and merges saved, kept and pending joins', async () => {
+    const h = sealFixture(), disk = h.fact(), kept = h.fact({ root: R.secondary }), pending = h.fact({ root: R.third })
+    seedReadable(h, [disk])
+    seedThreadSeal(h.stateDir, { alpha: cleanSealEntry(h.stateDir, 'alpha', { storeId: 'old-store' }) })
+    const error = h.io.fail('readFileSync'); await h.start()
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 0, missing: false })
+    expect(await h.memory.retryRead('alpha')).toBe('unreadable')
+    expect(h.events.at(-1)).toEqual({ type: 'read-failed', key: 'alpha', path: threadPath(h.stateDir), error })
+    expect(h.memory.addJoin('alpha', kept)).toBe(true)
+    h.memory.recoverJoins('alpha', [pending])
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 2, missing: false })
+    expect(view(h, R.secondary)).toBe('joined'); expect(view(h)).toBe('unknown')
+    expect(h.seal.startupFindings()).toEqual([])
+    h.io.heal()
+    expect(await h.memory.retryRead('alpha')).toBe('read')
+    expectSealFinding(h, 'journal-changed')
+    expect(h.events.at(-1)).toEqual({ type: 'read', key: 'alpha', path: threadPath(h.stateDir), firstSuccessfulRead: true })
+    expect([view(h), view(h, R.secondary)]).toEqual(['joined', 'joined'])
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 2, missing: false })
+    h.memory.retryPendingJoins('alpha'); expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    for (const fact of [disk, kept, pending]) expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    const events = [...h.events]; h.io.reset()
+    expect(await h.memory.retryRead('alpha')).toBe('read')
+    expect(h.events).toEqual(events); expect(h.io.calls).toEqual([])
+  })
+
+  test('a startup read retry stays pending without I/O until activation can judge the journal', async () => {
+    const h = reportingFixture(); seedReadable(h)
+    const error = h.io.fail('readFileSync'); h.memory.readAtStart(); h.io.heal(); h.io.reset()
+    expect(await h.memory.retryRead('alpha')).toBe('unreadable')
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.io.calls).toEqual([])
+    expect(h.retryEvents).toEqual([{ type: 'read-retry-started', key: 'alpha' }])
+    expect(h.logs).toEqual([buildThreadMemoryUnreadableLine('alpha', [C.primary], threadPath(h.stateDir), error)])
+    await h.seal.loadAtStart(h.memory.journalFacts()); await h.memory.activate()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(h.posts).toEqual([
+      notice(h, ref => buildThreadMemoryUnreadableNotice(ref, [C.primary], threadPath(h.stateDir))), recoveryNotice(h),
+    ])
+    expect(h.retryEvents).toContainEqual({ type: 'read-after-retries', key: 'alpha', attempts: 2 })
+  })
+
+  test('missing on retry is sticky across load, publication, compaction and flush until a new start', async () => {
+    const h = sealFixture(); seedThreads(h.stateDir, [threadHeader()])
+    h.io.fail('readFileSync'); await h.start()
+    h.io.removeJournal(); h.io.heal(); h.io.reset(); h.sealIo.reset()
+    const shared = readFileSync(h.authority.path), seal = readFileSync(threadSealPath(h.stateDir))
+    expect(await h.memory.retryRead('alpha')).toBe('missing')
+    const kept = h.fact(); expect(h.memory.addJoin('alpha', kept)).toBe(true)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 1, missing: true })
+    expect([view(h), view(h, R.secondary)]).toEqual(['joined', 'unknown'])
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).toEqual({ kind: 'kept' })
+    await h.memory.loadKey('alpha'); h.memory.published(); await h.memory.compact()
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'kept' })
+    expect(await h.memory.retryRead('alpha')).toBe('missing')
+    expect(h.io.calls.filter(c => c.op === 'readFileSync')).toHaveLength(1)
+    expect(h.io.writes()).toEqual([]); expect(h.sealIo.writes()).toEqual([]); expect(h.markerCalls).toEqual([])
+    expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    expect(readFileSync(h.authority.path)).toEqual(shared); expect(readFileSync(threadSealPath(h.stateDir))).toEqual(seal)
+    // Even restored bytes cannot revive this lifecycle's missing journal.
+    seedThreads(h.stateDir, [threadHeader(), joinRecord(kept)])
+    await h.memory.loadKey('alpha'); expect(await h.memory.retryRead('alpha')).toBe('missing')
+    expect(h.memory.outage('alpha').unknown).toBe(true)
+    h.io.removeJournal(); await h.crash()
+    const restarted = sealFixture({ reopen: true }, h.stateDir); await restarted.start()
+    expect(restarted.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(restarted.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(view(restarted)).toBe('not-joined'); expect(savedJoins(restarted)).toEqual([])
+  })
+
+  test.each(['seal-entry', 'journal-header', 'marker'] as const)('failed creation at %s counts unsaved work and completes in order on its background retry', async step => {
+    const h = reportingFixture()
+    if (step === 'seal-entry') h.sealIo.failWrite()
+    else if (step === 'journal-header') h.io.fail('writeSync')
+    else h.failShared(() => 'before')
+    await h.start()
+    const failure = h.events.find(e => e.type === 'creation-failed')!
+    expect(failure).toEqual({ type: 'creation-failed', key: 'alpha', path: threadPath(h.stateDir), step, error: expect.any(Error) })
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 1, missing: false })
+    const fact = h.fact(); expect(h.memory.addJoin('alpha', fact)).toBe(true)
+    expect(h.memory.outage('alpha').unsaved).toBe(2); expect(view(h)).toBe('joined')
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.posts).toHaveLength(1); expect(h.authority.threadMemoryCreated('alpha')).toBe(false)
+    expect(savedJoinsIfPresent(h)).toEqual([])
+    h.io.heal(); h.sealIo.heal(); h.failShared()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+    expect(h.posts).toHaveLength(2); expect(h.posts.at(-1)).toEqual(recoveryNotice(h))
+    expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(h.markerCalls.at(-1)).toEqual({ action: 'set', key: 'alpha', fileExists: true, synced: true })
+    const header = readThreads(h.stateDir)[0]!
+    expect(header.kind).toBe('header'); expect(sealEntry(h).storeId).toBe(h.memory.store('alpha')!.storeId!)
+    expect(h.retryEvents.filter(e => e.type === 'append-retry-started')).toEqual([{ type: 'append-retry-started', key: 'alpha' }])
+    expect(h.logs.filter(line => line === buildThreadMemoryRecoveredLine('alpha', [C.primary]))).toHaveLength(1)
+  })
+
+  test('append retries save selecting facts without traffic, with one outage and one recovery per persona', async () => {
+    const h = reportingFixture(); expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    await h.start(); const before = journalBytes(h), first = h.fact(), second = h.fact({ root: R.secondary })
+    const error = h.io.fail('writeSync')
+    expect((await h.memory.saveJoins('alpha', [first])).kind).toBe('failed')
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect((await h.memory.saveJoins('alpha', [second])).kind).toBe('failed')
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS * 2)
+    expect(journalBytes(h)).toEqual(before)
+    expect([view(h), view(h, R.secondary)]).toEqual(['joined', 'joined'])
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 2, missing: false })
+    expect(h.posts).toEqual([notice(h, ref => buildThreadMemoryNotSavedNotice(ref, [C.primary], threadPath(h.stateDir), 'journal-append', error))])
+    expect(h.logs).toEqual([buildThreadMemoryNotSavedLine('alpha', [C.primary], threadPath(h.stateDir), 'journal-append', error)])
+    expect(h.retryEvents.filter(e => e.type === 'append-retry-started')).toEqual([{ type: 'append-retry-started', key: 'alpha' }])
+    const sibling = h.fact({}, 'beta'); expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+    expectOnlySavedJoin(h, sibling, 'beta')
+    h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+    expect(savedJoins(h)).toEqual([joinRecord(first, 2), joinRecord(second, 3)])
+    expect(h.posts).toHaveLength(2); expect(h.posts.at(-1)).toEqual(recoveryNotice(h))
+    expect(h.logs).toHaveLength(2); expect(h.logs.at(-1)).toBe(buildThreadMemoryRecoveredLine('alpha', [C.primary]))
+    const writes = h.io.writes().length; await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+    expect(h.posts).toHaveLength(2); expect(h.io.writes()).toHaveLength(writes)
+    expect(h.retryEvents.every(e => !('key' in e) || e.key === 'alpha')).toBe(true)
+  })
+
+  test('read recovery merges pending and kept joins; both outages close only after the failed flush is saved', async () => {
+    const h = reportingFixture(); expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    const disk = h.fact(), kept = h.fact({ root: R.secondary }), pending = h.fact({ root: R.third })
+    seedReadable(h, [disk]); const sibling = h.fact({}, 'beta'); seedReadable(h, [sibling], 'beta')
+    h.io.fail('readFileSync'); await h.start()
+    expect(h.memory.addJoin('alpha', kept)).toBe(true); h.memory.recoverJoins('alpha', [pending])
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.posts).toHaveLength(1); expect(h.logs).toHaveLength(1)
+    expect(h.memory.isJoinSaved('beta', sibling)).toBe(true)
+    const extra = h.fact({ root: R.secondary }, 'beta')
+    expect(await h.memory.saveJoins('beta', [extra])).toEqual({ kind: 'saved' })
+    h.io.heal(); const writeError = h.io.fail('writeSync')
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS * 2)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 2, missing: false })
+    expect(h.posts).toEqual([
+      notice(h, ref => buildThreadMemoryUnreadableNotice(ref, [C.primary], threadPath(h.stateDir))),
+      notice(h, ref => buildThreadMemoryNotSavedNotice(ref, [C.primary], threadPath(h.stateDir), 'journal-append', writeError)),
+    ])
+    expect(h.episodes.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(true)
+    expect(h.episodes.isOpen('alpha', THREAD_MEMORY_NOT_SAVED)).toBe(true)
+    expect(savedJoins(h)).toEqual([joinRecord(disk)])
+    h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+    for (const fact of [disk, kept, pending]) expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+    expect(h.posts).toHaveLength(3); expect(h.posts.at(-1)).toEqual(recoveryNotice(h))
+    expect(h.logs.filter(line => line === buildThreadMemoryRecoveredLine('alpha', [C.primary]))).toHaveLength(1)
+    expect(h.episodes.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(false)
+    expect(h.episodes.isOpen('alpha', THREAD_MEMORY_NOT_SAVED)).toBe(false)
+    expect(h.posts.every(post => post.key === 'alpha')).toBe(true)
+  })
+
+  describe('read recovery across authority publication', () => {
+    async function deferredPublication(kind: 'kept' | 'pending', outcome: 'current' | 'stale' = 'current',
+      canRun?: NonNullable<Parameters<typeof fixture>[0]>['canRun']) {
+      const h = reportingFixture({ seal: false, canRun })
+      expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+      seedReadable(h); seedReadable(h, [], 'beta')
+      const queue = await makeQueue(h.stateDir, { now: h.clock.now })
+      try {
+        h.io.fail('readFileSync'); await h.start()
+        const fact = h.fact({ source: kind === 'kept' ? 'mention' : 'broadcast' })
+        expect((await queue.accept('alpha', slackInput({ channel: fact.channel, via: fact.source,
+          text: `private-publication-${LEAK_SENTINEL}`,
+          thread_join: { thread_ts: fact.root, stamp: fact.stamp, at: fact.at },
+        }))).status).toBe('accepted')
+        if (kind === 'kept') {
+          expect(h.memory.addJoin('alpha', fact)).toBe(true)
+          expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'kept' })
+          expect(view(h)).toBe('joined')
+        }
+        // A real unsynced authority change defers stamp judgment. Recovering
+        // durability later publishes either the same stamp or a stale choice.
+        h.failShared(() => 'unsynced')
+        expect((outcome === 'current' ? h.mode('open') : h.choose('mentions')).kind).toBe('unresolved')
+        expect(h.authority.channelStamp('alpha', fact.channel)).toEqual({ kind: 'undecided' })
+        if (kind === 'pending') recoverQueuedJoins('alpha', queue, h.memory)
+        expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 1, missing: false })
+        h.io.heal()
+        return { h, fact, queue, publish() {
+          h.failShared(); expect(h.authority.recoverDurability().kind).toBe('applied')
+        } }
+      } catch (error) { await queue.stop(); throw error }
+    }
+    function expectRecovery(h: ReturnType<typeof reportingFixture>, count: 0 | 1) {
+      expect(h.posts.filter(p => p.text === recoveryNotice(h).text)).toHaveLength(count)
+      expect(h.logs.filter(line => line === buildThreadMemoryRecoveredLine('alpha', h.authority.threadView().threadHybridChannels('alpha')))).toHaveLength(count)
+      expect(h.episodes.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(count === 0)
+    }
+
+    test.each([
+      ['kept', 'current'], ['pending', 'current'], ['kept', 'stale'], ['pending', 'stale'],
+    ] as const)('%s join with a %s publication settles once without new traffic', async (kind, outcome) => {
+      const { h, fact, queue, publish } = await deferredPublication(kind, outcome)
+      try {
+        const before = journalBytes(h)
+        await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+        expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 1, missing: false })
+        expect(h.memory.isJoinSaved('alpha', fact)).toBe(false)
+        expect(h.posts).toEqual([notice(h, ref => buildThreadMemoryUnreadableNotice(ref, [C.primary], threadPath(h.stateDir)))])
+        expectRecovery(h, 0)
+        expect(h.retryEvents.filter(e => e.type === 'append-retry-started')).toHaveLength(kind === 'kept' ? 1 : 0)
+        const deadline = h.clock.pending()[0]?.dueAt
+        h.io.reset(); publish()
+        if (outcome === 'current') {
+          expect(h.authority.channelStamp('alpha', fact.channel)).toEqual({ kind: 'decided', ...fact.stamp })
+          // Publication schedules saving; it cannot claim an append is durable.
+          expect(h.memory.outage('alpha').unsaved).toBe(1); expectRecovery(h, 0)
+          expect(journalBytes(h)).toEqual(before)
+          h.memory.published(); await h.clock.flush()
+          if (kind === 'kept') {
+            expect(h.clock.pending().map(t => t.dueAt)).toEqual([deadline!])
+            expectRecovery(h, 0)
+            await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1)
+            expect(h.io.writes()).toEqual([]); expect(journalBytes(h)).toEqual(before)
+            await h.clock.advance(1)
+          }
+          expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+          expect(savedJoins(h)).toEqual([joinRecord(fact)])
+          expect(view(h)).toBe('joined')
+          expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
+        } else {
+          expect(h.memory.isJoinSaved('alpha', fact)).toBe(false)
+          expect(view(h)).toBe('not-joined')
+          expect(savedJoins(h)).toEqual([]); expect(journalBytes(h)).toEqual(before)
+          expect(h.io.writes()).toEqual([])
+        }
+        expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+        expect(h.memory.keptFacts('alpha')).toEqual([]); expectRecovery(h, 1)
+        expect(h.events.filter(e => e.type === 'outage-settled')).toEqual([
+          { type: 'outage-settled', key: 'alpha', path: threadPath(h.stateDir) },
+        ])
+        expect(h.posts).toHaveLength(2); expect(h.posts.every(p => p.key === 'alpha')).toBe(true)
+        const posts = [...h.posts], logs = [...h.logs], writes = [...h.io.writes()]
+        await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)
+        h.memory.published(); await h.clock.flush()
+        expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs); expect(h.io.writes()).toEqual(writes)
+        expect(h.clock.pendingCount()).toBe(0); expect(queue.items('alpha')).toHaveLength(1)
+      } finally { await queue.stop() }
+    })
+
+    test('a published pending join reports recovery only after its failed fsync becomes durable', async () => {
+      const { h, fact, queue, publish } = await deferredPublication('pending')
+      try {
+        await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+        const error = h.io.fail('fsyncSync'); h.io.reset(); publish()
+        expectRecovery(h, 0); expect(h.memory.outage('alpha').unsaved).toBe(1)
+        await h.clock.flush()
+        expect(h.io.calls.some(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toBe(true)
+        expect(h.events).toContainEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error })
+        expect(h.events.filter(e => e.type === 'outage-settled')).toEqual([])
+        expect(h.memory.isJoinSaved('alpha', fact)).toBe(false); expectRecovery(h, 0)
+        expect(h.episodes.isOpen('alpha', THREAD_MEMORY_NOT_SAVED)).toBe(true)
+        expect(h.posts).toHaveLength(2)
+        h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1)
+        expectRecovery(h, 0)
+        await h.clock.advance(1)
+        expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+        expect(savedJoins(h)).toEqual([joinRecord(fact)])
+        expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+        expectRecovery(h, 1); expect(h.episodes.isOpen('alpha', THREAD_MEMORY_NOT_SAVED)).toBe(false)
+        expect(h.posts).toHaveLength(3)
+        const posts = [...h.posts], logs = [...h.logs]
+        h.memory.published(); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)
+        expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs); expect(h.clock.pendingCount()).toBe(0)
+      } finally { await queue.stop() }
+    })
+
+    test.each(['kept', 'pending'] as const)('cancelling %s saving at publication retains the fact and lets a sibling save', async kind => {
+      const blocked = new Set<string>()
+      const { h, fact, queue, publish } = await deferredPublication(kind, 'current', key => !blocked.has(key))
+      try {
+        await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+        const before = journalBytes(h), posts = [...h.posts], logs = [...h.logs]
+        h.io.reset(); publish(); blocked.add('alpha'); h.retries.forget('alpha')
+        await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)
+        expect(journalBytes(h)).toEqual(before); expect(h.io.writes()).toEqual([])
+        expect(h.memory.isJoinSaved('alpha', fact)).toBe(false)
+        expect(h.memory.keptFacts('alpha')).toEqual([fact]); expect(view(h)).toBe('joined')
+        expect(h.events.filter(e => e.type === 'outage-settled')).toEqual([])
+        expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs); expectRecovery(h, 0)
+        const sibling = h.fact({}, 'beta')
+        expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+        expectOnlySavedJoin(h, sibling, 'beta'); expect(journalBytes(h)).toEqual(before)
+        expect(h.posts).toEqual(posts); expect(h.clock.pendingCount()).toBe(0)
+        // This is a store gate control; pb owns the actual lifecycle schedule.
+        blocked.delete('alpha')
+        expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+        expect(savedJoins(h)).toEqual([joinRecord(fact)]); expectRecovery(h, 1)
+      } finally { await queue.stop() }
+    })
+
+    test('decided publication cannot settle a missing journal or start saving its kept join', async () => {
+      const { h, fact, queue, publish } = await deferredPublication('kept')
+      try {
+        h.io.removeJournal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+        expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 1, missing: true })
+        const posts = [...h.posts], logs = [...h.logs]
+        h.io.reset(); publish(); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)
+        expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 1, missing: true })
+        expect(h.memory.keptFacts('alpha')).toEqual([fact]); expect(view(h)).toBe('joined')
+        expect(h.io.writes()).toEqual([]); expect(existsSync(threadPath(h.stateDir))).toBe(false)
+        expect(h.events.filter(e => e.type === 'outage-settled')).toEqual([])
+        expect(h.retryEvents.filter(e => e.type === 'append-retry-started')).toEqual([])
+        expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs); expectRecovery(h, 0)
+        expect(h.clock.pendingCount()).toBe(0)
+      } finally { await queue.stop() }
+    })
+  })
+
+  test('missing on a background read logs once, stays unknown and never posts recovery', async () => {
+    const h = reportingFixture(); seedReadable(h)
+    h.io.fail('readFileSync'); await h.start(); h.io.removeJournal(); h.io.heal()
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 0, missing: true })
+    expect(h.retryEvents).toEqual([{ type: 'read-retry-started', key: 'alpha' }, { type: 'journal-missing-on-retry', key: 'alpha' }])
+    expect(h.posts).toHaveLength(1)
+    expect(h.logs.at(-1)).toBe(buildThreadMemoryUnreadableLine('alpha', [C.primary], '', undefined, true))
+    const calls = [...h.io.calls]; await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)
+    expect(h.io.calls).toEqual(calls); expect(h.logs).toHaveLength(2); expect(h.posts).toHaveLength(1)
+    expect(existsSync(threadPath(h.stateDir))).toBe(false)
+  })
+
+  test('outage discards stale unreferenced facts but keeps facts still named by a hold', async () => {
+    const held: Array<{ channel: string; stamp: ThreadJoin['stamp'] }> = []
+    const h = fixture({ heldStamps: () => held }); await h.start(); const first = h.fact()
+    h.io.fail('writeSync'); await h.memory.saveJoins('alpha', [first])
+    held.push({ channel: first.channel, stamp: first.stamp })
+    expect(h.choose('all').kind).toBe('applied')
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 1, missing: false })
+    held.length = 0
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    const pending = h.fact(); h.memory.forget('alpha'); h.io.heal(); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
+    h.memory.recoverJoins('alpha', [pending]); expect(h.memory.outage('alpha').unsaved).toBe(1)
+    expect(h.choose('all').kind).toBe('applied')
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 0, missing: false })
+  })
+
+  test.each(['absent', 'saved', 'kept'] as const)('quarantine reports readable identities and unknown lines, preserving %s evidence', async evidence => {
+    const h = reportingFixture({ seal: false }), fact = h.fact()
+    const lost = damagedThreadLine(joinRecord(fact), 'json')
+    const unidentified = damagedThreadLine(threadHeader(), 'invalid-header')
+    seedThreads(h.stateDir, [threadHeader(), lost, unidentified, joinRecord(h.fact({ root: R.third }), 4),
+      ...(evidence === 'saved' ? [joinRecord(fact, 5)] : [])])
+    if (evidence === 'kept') h.io.fail('readFileSync')
+    await h.start()
+    if (evidence === 'kept') {
+      expect(h.memory.addJoin('alpha', fact)).toBe(true); h.io.heal()
+      await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    }
+    const quarantine = h.events.find(e => e.type === 'lines-quarantined')!
+    if (quarantine.type !== 'lines-quarantined') throw new Error('expected quarantine')
+    expect(quarantine.facts).toEqual([
+      { line: 2, invalidFinalLine: false, channel: C.primary, root: R.primary },
+      { line: 3, invalidFinalLine: false },
+    ])
+    expect(readFileSync(quarantine.quarantinePath)).toEqual(Buffer.concat([lost, unidentified]))
+    const loss = { threads: [{ channel: C.primary, root: R.primary }], messages: [], unreadableLines: 1 }
+    const expected = lossNotice(h, loss)
+    expect(h.posts.filter(p => p.text === expected.text)).toEqual([expected])
+    expect(h.logs).toContain(buildThreadMemoryQuarantinedLine('alpha', quarantine.quarantinePath, 2, 0))
+    expect(h.logs.filter(line => line === buildThreadMemoryJoinsLostLine(h.authority.config().personas[0]!, loss))).toHaveLength(1)
+    expect(view(h)).toBe(evidence === 'absent' ? 'not-joined' : 'joined')
+    expect(view(h, R.third)).toBe('joined')
+  })
+
+  test('a lone torn final line is quarantined and logged without a Joins lost post', async () => {
+    const h = reportingFixture({ seal: false }), torn = damagedThreadLine(joinRecord(h.fact()), 'torn')
+    seedThreads(h.stateDir, [threadHeader(), torn]); await h.start()
+    const quarantine = h.events.find(e => e.type === 'lines-quarantined')!
+    if (quarantine.type !== 'lines-quarantined') throw new Error('expected quarantine')
+    expect(h.posts).toEqual([])
+    expect(h.logs).toEqual([buildThreadMemoryQuarantinedLine('alpha', quarantine.quarantinePath, 1, 1)])
+    expect(readFileSync(quarantine.quarantinePath).equals(torn)).toBe(true)
+    expect(view(h)).toBe('not-joined')
+  })
+
+  test('long-name quarantine keeps the formatted notice bounded and the full name and every lost thread in its log', async () => {
+    const h = reportingFixture({ seal: false }), name = 'N'.repeat(2100)
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', [name, 'beta'])).kind).toBe('applied')
+    const persona = h.authority.config().personas[0]!, key = persona.key
+    const lost = [h.fact({}, key), h.fact({ root: R.secondary }, key)], saved = h.fact({ root: R.third }, key)
+    seedThreads(h.stateDir, [threadHeader(),
+      ...lost.map((fact, i) => damagedThreadLine(joinRecord(fact, i + 2), 'json')),
+      joinRecord(saved, 4)], key)
+    const sourceBytes = h.authority.sourceBytes()
+    await h.start()
+    const loss = { threads: lost.map(fact => ({ channel: fact.channel, root: fact.root })), messages: [], unreadableLines: 0 }
+    expect(h.posts).toEqual([lossNotice(h, loss, key)])
+    const text = h.posts[0]!.text
+    expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    expect(text).not.toContain(name)
+    // The complete identifiers still fit after the name fallback; none is counted away.
+    expect(text.split('\n').slice(1)).toHaveLength(lost.length)
+    for (const fact of lost) {
+      expect(text).toContain(`${fact.channel} / ${fact.root}.`)
+      expect(h.memory.view(key, fact.channel, fact.root)).toBe('not-joined')
+    }
+    const line = buildThreadMemoryJoinsLostLine(persona, loss)
+    expect(h.logs.filter(log => log === line)).toHaveLength(1)
+    expect(line).toContain(renderPersonaRef(name, key))
+    for (const fact of lost) expect(line).toContain(`channel=${fact.channel} root=${fact.root}`)
+    expectOnlySavedJoin(h, joinRecord(saved, 4), key)
+    expect(h.authority.config().personas[0]).toEqual(persona)
+    expect(h.authority.sourceBytes()).toEqual(sourceBytes)
+  })
+
+  test('withdrawn holds report every identifier once; the post counts overflow and the log keeps it all', async () => {
+    const h = reportingFixture(); await h.start()
+    const inputs = Array.from({ length: 120 }, (_, i) => {
+      const ts = `${THREAD_TIME / 1000}.${String(i + 10).padStart(6, '0')}`
+      return heldSlackInput(memoryHold(h.clock.now(), { thread_ts: ts, stamp: h.fact().stamp }), {
+        channel: C.primary, ts, text: `private-message-${LEAK_SENTINEL}`, key: { chat_id: C.primary, ts },
+      })
+    })
+    const event: Extract<MemoryHoldEvent, { type: 'withdrawn' }> = { type: 'withdrawn', key: 'alpha',
+      holds: inputs.map((input, i) => ({ seq: i + 1, channel: input.channel!, thread_ts: input.hold!.thread_ts, ts: input.ts! })),
+    }
+    h.reporting.holdsEvent(event)
+    const loss = { threads: event.holds.map(x => ({ channel: x.channel, root: x.thread_ts })),
+      messages: event.holds.map(x => ({ channel: x.channel, ts: x.ts })) }
+    expect(h.posts).toEqual([lossNotice(h, loss)])
+    expect(h.posts[0]!.text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    const lines = h.posts[0]!.text.split('\n'), shown = lines.length - 2
+    expect(shown).toBeGreaterThan(0); expect(shown).toBeLessThan(event.holds.length * 2)
+    expect(lines.at(-1)).toStartWith(String(event.holds.length * 2 - shown))
+    expect(h.logs).toEqual([buildThreadMemoryJoinsLostLine(h.authority.config().personas[0]!, loss)])
+    for (const hold of event.holds) expect(h.logs[0]).toContain(`channel=${hold.channel} ts=${hold.ts}`)
+    expect(h.logs[0]!.length).toBeGreaterThan(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    assertNoLeak({ event, posts: h.posts, logs: h.logs })
+  })
+
+  test.each(['startup-changed', 'startup-unclean', 'first-read'] as const)('%s reports the real seal finding once despite startup replay', async mode => {
+    const h = reportingFixture(); seedReadable(h, [h.fact()])
+    seedThreadSeal(h.stateDir, { alpha: mode === 'startup-unclean' ? runningSealEntry() : cleanSealEntry(h.stateDir, 'alpha', { storeId: 'previous-store' }) })
+    if (mode === 'first-read') h.io.fail('readFileSync')
+    await h.start()
+    if (mode === 'first-read') {
+      expect(h.seal.startupFindings()).toEqual([])
+      h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    }
+    const findings = h.seal.startupFindings()
+    expect(findings).toEqual([{ key: 'alpha', case: mode === 'startup-unclean' ? 'unclean-stop' : 'journal-changed',
+      wording: mode === 'startup-unclean' ? 'unclean' : 'changed' }])
+    h.reporting.startupFindings(findings); h.reporting.startupFindings(findings)
+    const finding = findings[0]!
+    const expected = notice(h, ref => buildThreadMemoryChangedWhileStoppedNotice(ref, [C.primary], finding.wording))
+    expect(h.posts.filter(post => post.text === expected.text)).toEqual([expected])
+    expect(h.logs.filter(line => line === buildThreadMemoryChangedWhileStoppedLine('alpha', [C.primary], finding.case, finding.wording))).toHaveLength(1)
+  })
+
+  test.each([false, true])('seal write failure (unsynced=%s) retries without holding persona reads, appends or selection', async unsynced => {
+    const h = reportingFixture(); expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    const disk = h.fact(); seedReadable(h, [disk]); seedReadable(h, [], 'beta')
+    h.io.fail('readFileSync'); await h.start(); h.sealIo.failWrite(unsynced)
+    const result = await h.seal.flush()
+    expect(result.kind).toBe('failed')
+    if (result.kind !== 'failed') throw new Error('expected seal write refusal')
+    expect(result.unsynced).toBe(unsynced)
+    expect(h.logs.at(-1)).toBe(buildThreadMemorySealNotSavedLine(threadSealPath(h.stateDir), result.error, unsynced))
+    expect(h.posts).toHaveLength(1)
+    // These all finish before virtual time moves or the shared seal heals.
+    h.io.heal(); expect(await h.memory.retryRead('alpha')).toBe('read')
+    const sibling = h.fact({}, 'beta')
+    expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+    expect(view(h)).toBe('joined'); expectOnlySavedJoin(h, sibling, 'beta')
+    expect(h.clock.now()).toBe(THREAD_TIME)
+    const posts = [...h.posts], failureCount = h.sealEvents.filter(e => e.type === 'seal-write-failed').length
+    h.sealIo.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.retryEvents).toContainEqual({ type: 'seal-written-after-retries', attempts: 1 })
+    expect(h.sealEvents.filter(e => e.type === 'seal-write-failed')).toHaveLength(failureCount)
+    expect(h.posts).toEqual(posts)
+    expect(Object.keys(readThreadSeal(h.stateDir).entries).sort()).toEqual(['alpha', 'beta'])
+  })
+
+  test('compaction and removal failures log their step and path without posting', async () => {
+    const h = reportingFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()])
+    const rewrite = h.io.fail('renameSync'); await h.memory.compact()
+    expect(h.logs).toEqual([buildThreadMemoryCompactionFailedLine('alpha', threadPath(h.stateDir), 'journal-rewrite', rewrite)])
+    h.io.heal(); const unlink = h.io.fail('unlinkSync'); expect((await h.memory.remove('alpha')).kind).toBe('failed')
+    expect(h.logs.at(-1)).toBe(buildThreadMemoryRemovalFailedLine('alpha', threadPath(h.stateDir), 'journal-unlink', unlink))
+    expect(h.logs).toHaveLength(2); expect(h.posts).toEqual([])
+    expect(existsSync(threadPath(h.stateDir))).toBe(true)
+  })
+
+  test.each(['forget', 'remove', 'stopKeys'] as const)('%s cancels both real read and append series before their next timer can run', async action => {
+    const h = reportingFixture({ seal: false }); expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    seedReadable(h); h.io.fail('readFileSync'); await h.start(); h.io.fail('writeSync', 'beta')
+    await h.memory.saveJoins('beta', [h.fact({}, 'beta')])
+    expect(h.clock.pendingCount()).toBe(2)
+    if (action === 'stopKeys') h.retries.stopKeys()
+    else for (const key of ['alpha', 'beta']) h.retries.forget(key, action === 'remove' ? 'removal' : 'teardown')
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.retryEvents.filter(e => e.type === 'retry-cancelled').sort((a, b) => ('key' in a ? a.key : '').localeCompare('key' in b ? b.key : ''))).toEqual([
+      { type: 'retry-cancelled', series: 'read', key: 'alpha', why: action === 'remove' ? 'removal' : action === 'stopKeys' ? 'shutdown' : 'teardown' },
+      { type: 'retry-cancelled', series: 'append', key: 'beta', why: action === 'remove' ? 'removal' : action === 'stopKeys' ? 'shutdown' : 'teardown' },
+    ])
+    h.io.heal()
+    if (action === 'remove') for (const key of ['alpha', 'beta']) expect(await h.memory.remove(key)).toEqual({ kind: 'saved' })
+    else if (action === 'forget') for (const key of ['alpha', 'beta']) h.memory.forget(key)
+    const calls = [...h.io.calls], posts = [...h.posts], logs = [...h.logs]
+    expect(await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)).toBe(0)
+    expect(h.io.calls).toEqual(calls); expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs)
+    if (action === 'remove') for (const key of ['alpha', 'beta']) expect(existsSync(threadPath(h.stateDir, key))).toBe(false)
+  })
+
+  test('forgetting an unreadable persona leaves its sibling append retry and reports intact', async () => {
+    const h = reportingFixture({ seal: false }); expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    seedReadable(h); h.io.fail('readFileSync'); await h.start()
+    h.io.fail('writeSync', 'beta'); const fact = h.fact({}, 'beta')
+    await h.memory.saveJoins('beta', [fact])
+    expect(h.clock.pendingCount()).toBe(2)
+    h.retries.forget('alpha'); h.memory.forget('alpha'); h.episodes.forget('alpha')
+    expect(h.clock.pendingCount()).toBe(1)
+    const alphaPosts = h.posts.filter(p => p.key === 'alpha')
+    h.io.heal(); h.io.reset(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.memory.isJoinSaved('beta', fact)).toBe(true)
+    expect(h.posts.filter(p => p.key === 'alpha')).toEqual(alphaPosts)
+    expect(h.posts.at(-1)).toEqual(recoveryNotice(h, 'beta'))
+    expect(h.io.calls.some(c => c.path === threadPath(h.stateDir, 'alpha'))).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('shutdown cancels key and seal retries, including a failed final seal write', async () => {
+    const h = reportingFixture(); await h.start()
+    h.io.fail('writeSync'); await h.memory.saveJoins('alpha', [h.fact()])
+    h.sealIo.failWrite(); await h.seal.flush()
+    expect(h.retryEvents).toContainEqual({ type: 'seal-retry-started' })
+    const before = h.sealEvents.filter(e => e.type === 'seal-write-failed').length
+    // The server's final-result handler owns shutdown logging; its executable
+    // coverage belongs in server-startup-wiring.test.ts.
+    // Ordinary reporter callbacks stay silent once episodes close, even while
+    // the real seal makes its last write and the retry owner is still alive.
+    h.episodes.close()
+    const posts = [...h.posts], logs = [...h.logs]
+    await h.close()
+    // The last shutdown write was attempted despite an already active series.
+    expect(h.sealEvents.filter(e => e.type === 'seal-write-failed')).toHaveLength(before + 1)
+    expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs)
+    expect(h.retryEvents.filter(e => e.type === 'retry-cancelled')).toEqual([
+      { type: 'retry-cancelled', series: 'append', key: 'alpha', why: 'shutdown' },
+      { type: 'retry-cancelled', series: 'seal', why: 'shutdown' },
+    ])
+    expect(h.clock.pendingCount()).toBe(0)
+    h.io.heal(); h.sealIo.heal(); h.io.reset(); h.sealIo.reset()
+    h.retries.appendFailed('alpha'); h.retries.readFailed('alpha'); h.retries.sealWriteFailed()
+    expect(await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS * 2)).toBe(0)
+    expect(h.io.calls).toEqual([]); expect(h.sealIo.calls).toEqual([])
+  })
+
+  test('failed and recovered join writes expose metadata only, never incoming text or credential fields', async () => {
+    const h = reportingFixture(); await h.start()
+    const message = `private-message-${LEAK_SENTINEL}`, token = fakeToken(BOT_TOKEN_PREFIX, 'thread-report')
+    const fact = { ...h.fact(), text: message, token }
+    h.io.fail('writeSync'); expect((await h.memory.saveJoins('alpha', [fact])).kind).toBe('failed')
+    h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.posts).toHaveLength(2); expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+    const captured = { posts: h.posts, logs: h.logs, events: h.events, retries: h.retryEvents,
+      joins: h.memory.joins('alpha'), journal: writtenFile(threadPath(h.stateDir)) }
+    assertNoLeak(captured)
+    expect(JSON.stringify(captured)).not.toContain(message)
+  })
+
+  test('a closed work gate cancels an admitted flush without losing kept facts or blocking a sibling', async () => {
+    const blocked = new Set<string>()
+    const h = reportingFixture({ seal: false, canRun: key => !blocked.has(key) })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    await h.start(); const fact = h.fact()
+    h.io.fail('writeSync'); expect((await h.memory.saveJoins('alpha', [fact])).kind).toBe('failed')
+    h.io.heal(); h.io.reset()
+    const before = journalBytes(h), events = [...h.events], posts = [...h.posts], logs = [...h.logs]
+    // Admission precedes the gate change; the serialized store turn has yet to run.
+    // The real lifecycle schedule is covered by the reload harness.
+    const admitted = h.memory.flush('alpha')
+    blocked.add('alpha'); h.retries.forget('alpha')
+    expect(await admitted).toEqual({ kind: 'cancelled' })
+    expect(journalBytes(h)).toEqual(before); expect(h.io.calls).toEqual([])
+    expect(h.memory.keptFacts('alpha')).toEqual([fact]); expect(view(h)).toBe('joined')
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 1, missing: false })
+    expect(h.events).toEqual(events); expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs)
+    expect(await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)).toBe(0)
+    const sibling = h.fact({}, 'beta')
+    expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+    expectOnlySavedJoin(h, sibling, 'beta'); expect(journalBytes(h)).toEqual(before)
+    // Reopening the gate alone preserves the original kept fact for a later save.
+    blocked.delete('alpha')
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(savedJoins(h)).toEqual([joinRecord(fact)]); expect(h.memory.keptFacts('alpha')).toEqual([])
+    expect(h.posts).toEqual([...posts, recoveryNotice(h)])
+    expect(h.events.filter(e => e.type === 'saved-after-failure')).toHaveLength(1)
+  })
+
+  test('a closed work gate cancels an admitted read and preserves unknown, kept and pending facts', async () => {
+    const blocked = new Set<string>()
+    const h = reportingFixture({ seal: false, canRun: key => !blocked.has(key) })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    const disk = h.fact(), kept = h.fact({ root: R.secondary }), pending = h.fact({ root: R.third })
+    seedReadable(h, [disk]); seedReadable(h, [], 'beta')
+    h.io.fail('readFileSync'); await h.start()
+    expect(h.memory.addJoin('alpha', kept)).toBe(true); h.memory.recoverJoins('alpha', [pending])
+    h.io.heal(); h.io.reset()
+    const before = journalBytes(h), events = [...h.events], posts = [...h.posts], logs = [...h.logs]
+    const admitted = h.memory.retryRead('alpha')
+    blocked.add('alpha'); h.retries.forget('alpha')
+    h.retries.readFailed('alpha'); h.retries.appendFailed('alpha')
+    expect(h.clock.pendingCount()).toBe(0)
+    // The cancelled read has no separate cancellation result: its lack of I/O,
+    // unchanged unknown view and retained evidence distinguish it from a read.
+    expect(await admitted).toBe('read')
+    await h.memory.loadKey('alpha'); await h.memory.compact('alpha')
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'cancelled' })
+    h.memory.published(); h.memory.retryPendingJoins('alpha'); await h.clock.flush()
+    expect(h.io.calls).toEqual([]); expect(journalBytes(h)).toEqual(before)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 2, missing: false })
+    expect(h.memory.keptFacts('alpha')).toEqual([kept])
+    expect([view(h), view(h, R.secondary), view(h, R.third)]).toEqual(['unknown', 'joined', 'unknown'])
+    expect(h.events).toEqual(events); expect(h.posts).toEqual(posts); expect(h.logs).toEqual(logs)
+    const sibling = h.fact({}, 'beta')
+    expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+    expectOnlySavedJoin(h, sibling, 'beta')
+    blocked.delete('alpha')
+    h.retries.readFailed('alpha'); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    for (const fact of [disk, kept, pending]) expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+    expect(savedJoins(h)).toHaveLength(3)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(h.posts).toEqual([...posts, recoveryNotice(h)])
+  })
+
+  test('a gate closed during creation cancels its queued join but preserves it for recovery', async () => {
+    const marker = gate(), blocked = new Set<string>()
+    const h = fixture({ canRun: key => !blocked.has(key), setCreated: async key => {
+      if (key === 'alpha') await marker.wait()
+      return h.authority.setThreadMemoryCreated(key)
+    } })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    const starting = h.start()
+    try {
+      await marker.entered
+      const fact = h.fact(), queued = h.memory.saveJoins('alpha', [fact]), before = journalBytes(h)
+      h.io.reset(); blocked.add('alpha'); marker.release(); await starting
+      expect(await queued).toEqual({ kind: 'cancelled' })
+      expect(journalBytes(h)).toEqual(before)
+      expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir))).toEqual([])
+      expect(h.memory.store('alpha')?.created).toBe(false)
+      expect(h.memory.keptFacts('alpha')).toEqual([fact]); expect(view(h)).toBe('joined')
+      expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 2, missing: false })
+      expect(h.events.filter(e => e.key === 'alpha')).toEqual([])
+      const sibling = h.fact({}, 'beta')
+      expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+      expectOnlySavedJoin(h, sibling, 'beta')
+      blocked.delete('alpha')
+      expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+      expect(savedJoins(h)).toEqual([joinRecord(fact)])
+      expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+      expect(h.events.filter(e => e.type === 'created' && e.key === 'alpha')).toHaveLength(1)
+    } finally { marker.release(); await starting }
+  })
+
+  test('a replacement journal rejects the old queued writer and accepts resupplied recovery facts', async () => {
+    const blocked = new Set<string>(), h = fixture({ canRun: key => !blocked.has(key) })
+    await h.start(); const fact = h.fact()
+    h.io.fail('writeSync'); expect((await h.memory.saveJoins('alpha', [fact])).kind).toBe('failed')
+    h.io.heal(); const before = journalBytes(h), events = [...h.events]
+    const admitted = h.memory.flush('alpha')
+    blocked.add('alpha'); expect(h.memory.keptFacts('alpha')).toEqual([fact])
+    h.memory.forget('alpha'); blocked.delete('alpha')
+    const loading = h.memory.loadKey('alpha')
+    expect(await admitted).toEqual({ kind: 'cancelled' }); await loading
+    expect(journalBytes(h)).toEqual(before); expect(view(h)).toBe('not-joined')
+    expect(h.events.slice(events.length).some(e => e.type === 'saved-after-failure')).toBe(false)
+    // Recovery's source is tested with the real queue in the reload suite.
+    h.memory.recoverJoins('alpha', [fact])
+    expect(view(h)).toBe('joined'); expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(savedJoins(h)).toEqual([joinRecord(fact)]); expect(h.memory.keptFacts('alpha')).toEqual([])
+  })
+
+  test('a closed work gate fences a newly published key before its deferred load and creation', async () => {
+    const blocked = new Set<string>(), h = fixture({ canRun: key => !blocked.has(key) })
+    await h.start(); h.io.reset()
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+    blocked.add('beta'); await h.clock.flush()
+    expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir, 'beta'))).toEqual([])
+    expect(existsSync(threadPath(h.stateDir, 'beta'))).toBe(false)
+    expect(h.authority.threadMemoryCreated('beta')).toBe(false)
+    const fact = h.fact(); expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'saved' })
+    blocked.delete('beta'); await h.memory.loadKey('beta')
+    const sibling = h.fact({}, 'beta')
+    expect(await h.memory.saveJoins('beta', [sibling])).toEqual({ kind: 'saved' })
+    expectOnlySavedJoin(h, sibling, 'beta')
+  })
+
+  test('configured paths survive composed unreadable and not-saved reports with safe quoting and Slack escaping', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'thread-memory-path-')); threadDirs.push(base)
+    const dir = join(base, fakeToken(BOT_TOKEN_PREFIX, 'configured-path'), '<ops>&"quoted"\nline\u2028separator')
+    mkdirSync(dir, { recursive: true })
+    // This fixture has a deliberate token-shaped configured path. Audit only
+    // those exact structured fields below; the ordinary teardown audit stays
+    // strict for every other fixture. Config and credentials remain under base.
+    const h = makeThreadMemoryHarness(dir, { seal: true, failureHandling: true, input: threadConfig(base) })
+    const path = threadPath(dir), quoted = JSON.stringify(path).replace(/\u2028/g, '\\u2028')
+    const escaped = escapeSlackControlCharacters(quoted)
+    try {
+      const disk = h.fact(), kept = h.fact({ root: R.secondary }); seedReadable(h, [disk])
+      h.io.fail('readFileSync'); await h.start()
+      expect(h.memory.addJoin('alpha', kept)).toBe(true)
+      expect(h.posts).toHaveLength(1); expect(h.logs).toHaveLength(1)
+      expect(h.posts[0]!.text).toContain(escaped); expect(h.logs[0]).toContain(`path=${quoted}`)
+      h.io.heal(); h.io.fail('writeSync'); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(h.posts).toHaveLength(2); expect(h.logs).toHaveLength(2)
+      expect(h.posts[1]!.text).toContain(escaped); expect(h.logs[1]).toContain(`path=${quoted}`)
+      expect(h.memory.isJoinSaved('alpha', kept)).toBe(false)
+      for (const line of h.logs) expect(/[\r\n\u2028\u2029]/.test(line)).toBe(false)
+      for (const post of h.posts) expect(post.text).not.toContain('<ops>')
+      h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      expect(h.posts).toHaveLength(3); expect(h.posts.at(-1)).toEqual(recoveryNotice(h))
+      expect(h.memory.isJoinSaved('alpha', kept)).toBe(true)
+      expect(savedJoins(h)).toEqual([joinRecord(disk), joinRecord(kept, 3)])
+    } finally {
+      await h.close(); expect(h.clock.pendingCount()).toBe(0)
+      assertNoLeak({
+        posts: h.posts.map(post => ({ ...post, text: post.text.replace(escaped, '<configured-path>') })),
+        logs: h.logs.map(line => line.replace(`path=${quoted}`, 'path="<configured-path>"')),
+        events: h.events.map(event => {
+          expect(event.path).toBe(path)
+          return { ...event, path: '<configured-path>' }
+        }),
+        sealEvents: h.sealEvents.map(event => {
+          if (!('path' in event)) return event
+          expect(event.path).toBe(threadSealPath(dir))
+          return { ...event, path: '<configured-path>' }
+        }), retries: h.retryEvents,
+        state: writtenFile(h.authority.path), journal: writtenFile(path), seal: writtenFile(threadSealPath(dir)),
+      })
+    }
+  })
+})
+
+function savedJoinsIfPresent(h: ThreadMemoryHarness) {
+  return existsSync(threadPath(h.stateDir)) ? savedJoins(h) : []
 }
 
 describe('Thread Memory queued join recovery', () => {
@@ -1494,7 +2277,7 @@ describe('Thread Memory seal creation and durable writer', () => {
     const cause = h.io.fail('fsyncSync', 'alpha', { match: path => path === join(h.stateDir, 'threads') })
     const result = await h.memory.flush('alpha')
     expect(result).toEqual({ kind: 'failed', error: cause })
-    expect(h.events).toContainEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), error: cause })
+    expect(h.events).toContainEqual({ type: 'compaction-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-rewrite', error: cause })
     expect(readThreads(h.stateDir)).toEqual([expect.objectContaining({ kind: 'header', storeId: pending.storeId })])
     expect(h.memory.store('alpha')?.storeId).toBeUndefined()
     expect(h.memory.store('alpha')?.created).toBe(false)

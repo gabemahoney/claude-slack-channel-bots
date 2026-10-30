@@ -2,14 +2,16 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { buildThreadMemoryChangedWhileStoppedNotice, buildThreadMemoryNotSavedNotice, buildThreadMemoryRecoveredNotice } from '../src/thread-memory-reports.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { SHARED_CHANNEL_IDS, membershipPage } from './test-helpers/shared-channels.ts'
-import { makeChannelMessage, makeMembershipEvent, mentionText, broadcastText } from './test-helpers/slack-stub.ts'
+import { makeChannelMessage, makeMembershipEvent, mentionText, broadcastText, stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { THREAD_ROOTS, readThreads, threadFsControls, threadPath } from './test-helpers/thread-memory.ts'
 
 const channel = SHARED_CHANNEL_IDS.primary
@@ -20,9 +22,14 @@ let runs: ReloadRun[]
 let engines: EngineHarness[]
 let sequence: number
 let personas: PersonaInput[]
+type ReportKind = 'not-saved' | 'recovered' | 'unclean'
+type ExpectedReport = ReportKind | { kind: ReportKind; channels: string[] }
+let expectedReports: Map<ReloadRun, Record<string, ExpectedReport[]>>
+const afterCrash: Record<string, ExpectedReport[]> = { alpha: ['unclean'], bravo: ['unclean'] }
 
 beforeEach(() => {
   h = makeReloadHarness({ personaConfigDirs: true }); runs = []; engines = []; sequence = 0
+  expectedReports = new Map()
   personas = ['alpha', 'bravo'].map(name => h.persona(name, {
     channels: [{ id: channel, delivery: 'thread_hybrid' }, { id: neighbor, delivery: 'thread_hybrid' }],
     permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' },
@@ -31,17 +38,40 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  for (const engine of engines) {
-    assertNoLeak({ calls: engine.calls, events: engine.events, errors: engine.errors })
-    await engine.cleanup()
+  try {
+    for (const engine of engines) assertNoLeak({ calls: engine.calls, events: engine.events, errors: engine.errors })
+    for (const run of runs) {
+      assertNoLeak(run.captured())
+      expectReports(run, expectedReports.get(run) ?? {})
+    }
+  } finally {
+    // An unexpected report must not strand a run or its timers.
+    try { for (const engine of engines) await engine.cleanup() }
+    finally { await h.cleanup() }
   }
-  for (const run of runs) {
-    expect(run.slackPosts()).toEqual([])
-    assertNoLeak(run.captured())
-    await run.stop()
-  }
-  await h.cleanup()
 })
+
+function expectReports(run: ReloadRun, expected: Record<string, ExpectedReport[]>) {
+  expectedReports.set(run, expected)
+  let total = 0
+  for (const persona of run.serverConfig()!.personas) {
+    const ref = renderPersonaRef(persona.name, persona.key)
+    const texts = (expected[persona.key] ?? []).map(report => {
+      const kind = typeof report === 'string' ? report : report.kind
+      const channels = typeof report === 'string' ? [channel, neighbor] : report.channels
+      if (kind === 'unclean') return buildThreadMemoryChangedWhileStoppedNotice(ref, channels, 'unclean')
+      if (kind === 'recovered') return buildThreadMemoryRecoveredNotice(ref, channels)
+      const failure = run.threadMemoryEvents.find(e => e.type === 'append-failed' && e.key === persona.key)
+      if (failure?.type !== 'append-failed') throw new Error('expected injected join append failure')
+      expect(failure.step).toBe('journal-append')
+      return buildThreadMemoryNotSavedNotice(ref, channels, threadPath(h.stateDir, persona.key), failure.step, failure.error)
+    })
+    const posts = texts.map(text => ({ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, text) }))
+    expect(run.stub(persona.name).calls.postMessage).toEqual(posts)
+    total += posts.length
+  }
+  expect(run.slackPosts()).toHaveLength(total)
+}
 
 function options(extra: ReloadRunOptions = {}): ReloadRunOptions {
   return {
@@ -148,6 +178,8 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(engine.textCalls().length).toBe(accepted.length + 2)
     expect(reopened.queue.openCount('bravo')).toBe(1)
     expect(joins('bravo')).toHaveLength(1)
+    expectReports(first, { alpha: ['not-saved'] })
+    expectReports(reopened, afterCrash)
   })
 
   test('delivered unsaved join survives startup and hourly compaction, then becomes a key', async () => {
@@ -178,6 +210,8 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(readQueue(h.stateDir).filter(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'key'))
       .toMatchObject([{ seq: 1, key: { chat_id: channel } }])
     expect(joins()).toMatchObject([{ root, at: fact.at }])
+    expectReports(first, { alpha: ['not-saved'] })
+    expectReports(reopened, { alpha: ['unclean', 'not-saved', 'recovered'], bravo: ['unclean'] })
     assertNoLeak({ queue: writtenFile(queuePath(h.stateDir)), memory: writtenFile(threadPath(h.stateDir)) })
   })
 
@@ -216,6 +250,8 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     await intake(reopened, 'mention')
     await intake(reopened, 'reply')
     expect(reopened.queued('alpha').at(-1)!.accepted.via).toBe('thread')
+    expectReports(first, { alpha: ['not-saved'] })
+    expectReports(reopened, afterCrash)
   })
 
   test('undecided start candidate waits for current shared-state publication', async () => {
@@ -251,6 +287,9 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(reopened.membership.read('alpha', channel, mode).kind).toBe('eligible')
     await intake(reopened, 'reply')
     expect(reopened.queued('alpha').at(-1)!.accepted.via).toBe('thread')
+    expectReports(first, { alpha: ['not-saved'] })
+    // The primary stamp was undecided when the startup report was observed.
+    expectReports(reopened, { alpha: [{ kind: 'unclean', channels: [neighbor] }], bravo: ['unclean'] })
   })
 
   test('same-incarnation teardown and bring-up recover a forgotten unsaved join', async () => {
@@ -280,6 +319,7 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(readFileSync(queuePath(h.stateDir, 'bravo'))).toEqual(otherQueue)
     expect(readFileSync(threadPath(h.stateDir, 'bravo'))).toEqual(otherThreads)
     expect(view(run, 'bravo')).toBe('joined')
+    expectReports(run, { alpha: ['not-saved', 'not-saved'] })
   })
 
   test('covered delivered records still advance the clock before startup compaction removes them', async () => {
@@ -303,6 +343,8 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(view(reopened)).toBe('joined')
     await intake(reopened, 'mention', { thread: THREAD_ROOTS.third })
     expect(reopened.queued('alpha')[0]!.accepted.thread_join!.at).toBeGreaterThan(times[1]!)
+    expectReports(first, { alpha: ['not-saved', 'recovered'] })
+    expectReports(reopened, afterCrash)
   })
 
   test('identity reset leaves old accepted work deliverable without restoring its join', async () => {
@@ -387,6 +429,10 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     await deliverQueued(reopened)
     expect(view(reopened)).toBe('not-joined')
     expect(reopened.queue.openCount('bravo')).toBe(1)
+    // Publishing the replacement declaration prunes the stale join before
+    // teardown; that observation has no current hybrid channels yet.
+    expectReports(first, { alpha: ['not-saved', { kind: 'recovered', channels: [] }] })
+    expectReports(reopened, { alpha: [{ kind: 'unclean', channels: [] }], bravo: ['unclean'] })
   })
 
   test('AC-V02/AC-C01: intake joins survive modes, same-value writes, relaunch, restarts and time; leave forgets only one channel', async () => {
@@ -466,5 +512,7 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     await intake(run, 'reply')
     expect(run.queued('alpha').at(-1)!.accepted.via).toBe('thread')
     expect(view(run, 'alpha', THREAD_ROOTS.secondary)).toBe('not-joined')
+    expectReports(runs[0]!, {})
+    for (const restarted of runs.slice(1)) expectReports(restarted, afterCrash)
   })
 })
