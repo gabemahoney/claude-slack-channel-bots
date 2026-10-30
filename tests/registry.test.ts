@@ -3117,7 +3117,8 @@ describe('tool list and instructions', () => {
     for (const token of ['channel_name', 'part', 'chat_id', 'thread_ts', 'reply', 'download_attachment', SET_CHANNEL_DELIVERY_TOOL, 'react', 'edit_message', 'fetch_messages', 'files']) expect(MCP_INSTRUCTIONS).toContain(token)
     const via = MCP_INSTRUCTIONS.split('\n').find(line => line.startsWith('via:'))!
     for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all', 'thread']) expect(via).toMatch(new RegExp(`\\b${value} =`))
-    expect(via).toContain('thread = a reply delivered because you participate in that thread')
+    expect(via).toContain('thread = a reply in a thread the bot is in')
+    expect(MCP_INSTRUCTIONS).not.toMatch(/participat|followed[ -]thread/i)
     expect(via.split(';').find(reason => reason.trim().startsWith('thread ='))).not.toMatch(/whole.channel|exclusive|only (?:you|this persona)/i)
     expect(MCP_INSTRUCTIONS).toMatch(/<@ID> mentions a Slack user or persona/)
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
@@ -3125,6 +3126,22 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS).toContain('to reply to remove the ack reaction')
     expect(MCP_INSTRUCTIONS).not.toContain('source=')
     assertNoLeak(MCP_INSTRUCTIONS)
+  })
+
+  test('the advertised delivery tool and parameter name every choice and explain thread_hybrid replies', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+    const { tools } = await client.listTools()
+    const tool = tools.find(t => t.name === SET_CHANNEL_DELIVERY_TOOL)!
+    expect(tool).toBeDefined()
+    const delivery = tool.inputSchema.properties!.delivery as { description: string }
+    for (const description of [tool.description, delivery.description]) {
+      expect(typeof description).toBe('string')
+      for (const value of ['off', 'mentions', 'all', 'thread_hybrid']) {
+        expect(description).toMatch(new RegExp(`\\b${value}\\b`))
+      }
+      expect(description).not.toMatch(/participat|followed[ -]thread/i)
+    }
+    expect(delivery.description).toContain('"thread_hybrid" (mentions and replies in threads the bot is in)')
   })
 })
 
@@ -3159,6 +3176,7 @@ describe('session instructions in both channel modes', () => {
     expect(MCP_INSTRUCTIONS).toContain('In strict mode you may act in your configured non-off channels.')
     expect(MCP_INSTRUCTIONS).toContain('In open mode Slack enforces channel access.')
     expect(MCP_INSTRUCTIONS).toMatch(new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to off, mentions[^\n]*all[^\n]*thread_hybrid`))
+    expect(MCP_INSTRUCTIONS).toContain('thread_hybrid (mentions and replies in threads the bot is in)')
     expect(MCP_INSTRUCTIONS).toContain('Use it when someone in that channel asks; new assignments require open mode.')
   })
 })

@@ -23,10 +23,13 @@ import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
+import { createQueuedAckCallback } from '../src/ack-tracker.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
-afterEach(async () => { for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.queue.stop(); assertNoLeak(h.captured()) }; resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(async () => { for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.threads?.close(); await h.queue.stop(); assertNoLeak(h.captured()) }; resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
 function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
   const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'mentions' }], dm: { enabled: true } }, { name: 'beta', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'mentions' }] }], dir, { membership: observedMembership({ alpha: [CA, CS, ...(opts.mode === 'open' ? [CX] : [])], beta: [CB, CS] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...opts }); harnesses.push(h); return h
 }
@@ -322,7 +325,7 @@ describe('fungible mode', () => {
     expect(h.queued('alpha')).toHaveLength(form === 'false' ? 1 : 0); expect(facts(h, 'beta')).toEqual([])
   })
 })
-describe('thread_hybrid selects only @mentions and Broadcasts', () => {
+describe('thread_hybrid without Thread Memory still selects @mentions and Broadcasts', () => {
   const CT = 'C0THREAD1', ROOT = '1700000000.000100'
   function threadHarness(mode: ChannelMode) {
     const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CT, delivery: 'thread_hybrid' }] }], dir, { mode, membership: observedMembership({ alpha: [CT] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
@@ -360,6 +363,166 @@ describe('thread_hybrid selects only @mentions and Broadcasts', () => {
     expect(h.queued('alpha').map(i => ({ ts: i.accepted.ts, thread_ts: i.accepted.thread_ts, via: i.accepted.via }))).toEqual([
       { ts: ROOT, thread_ts: undefined, via: 'mention' }, { ts: '1700000000.000102', thread_ts: ROOT, via },
     ])
+  })
+})
+describe.each(['strict', 'open'] as const)('%s routing through Thread Memory', mode => {
+  async function joinedHarness(options: Parameters<typeof makeRoutingHarness>[2] = {}) {
+    const h = makeRoutingHarness([
+      { name: 'alpha', channels: [{ id: CA, delivery: 'thread_hybrid' }, { id: CB, delivery: 'thread_hybrid' }] },
+      { name: 'beta', channels: [{ id: CA, delivery: 'thread_hybrid' }, { id: CB, delivery: 'thread_hybrid' }], permission_prompts: CA },
+    ], dir, { mode, threadMemory: {}, membership: observedMembership({ alpha: [CA, CB], beta: [CA, CB] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...options })
+    harnesses.push(h)
+    await h.ready()
+    return h
+  }
+  async function seedJoin(h: RoutingHarness, key = 'alpha', channel = CA) {
+    const threads = h.threads!
+    expect(await threads.memory.saveJoins(key, [threads.fact({ channel, root: THREAD_ROOTS.primary }, key)])).toEqual({ kind: 'saved' })
+    expect(threads.memory.view(key, channel, THREAD_ROOTS.primary)).toBe('joined')
+  }
+  const reply = (overrides: Parameters<typeof makeChannelMessage>[0] = {}) =>
+    makeChannelMessage({ channel: CA, thread_ts: THREAD_ROOTS.primary, ...overrides })
+
+  test('reads a join made after routing construction; thread and mention items keep acceptance, queued feedback, delivered tags and reminder eligibility', async () => {
+    const feedback: Promise<void>[] = []
+    let queued: ReturnType<typeof createQueuedAckCallback> | undefined
+    const h = await joinedHarness({ dedupeClock: () => 0, onReceived: (key, item) => { feedback.push(queued!(key, item)) } })
+    queued = createQueuedAckCallback({ queue: h.queue, getReaction: () => h.config!.queued_ack_reaction, clientFor: key => h.p(key).stub.web })
+    await seedJoin(h)
+    const events = [reply({ text: 'unmentioned joined reply' }), reply({ text: mentionText(h.p('alpha').stub.identity.botUserId) })]
+    const atAck: AcceptedRecord[][] = []
+    for (const event of events) {
+      await h.receive(event, ['alpha'], () => { atAck.push(readQueue(dir).filter((r): r is AcceptedRecord => r.kind === 'accepted' && !('compact' in r))) })
+    }
+    await Promise.all(feedback)
+    expect(atAck.map(records => records.map(r => r.via))).toEqual([['thread'], ['thread', 'mention']])
+    expect(facts(h, 'alpha')).toEqual(events.map((event, i) => ({ channel: CA, ts: event.ts as string, text: event.text as string, via: i === 0 ? 'thread' : 'mention' })))
+    expect(h.threadMemoryReads).toEqual([['alpha', CA, THREAD_ROOTS.primary]])
+    const reaction = h.config!.queued_ack_reaction!
+    expect(h.p('alpha').stub.calls.reactionsAdd).toEqual(events.map(event => ({ channel: CA, timestamp: event.ts as string, name: reaction })))
+    expect(h.p('beta').stub.calls.reactionsAdd).toEqual([])
+    expect(h.p('beta').stub.calls.reactionsRemove).toEqual([])
+    expect(h.queued('alpha').map(i => i.accepted.queued_ack_reaction)).toEqual([reaction, reaction])
+    expect(h.queued('alpha').every(i => i.fixed!.parts.every(part => part.includes(`via="${i.accepted.via}"`)))).toBe(true)
+    expect(h.queued('beta')).toEqual([])
+    const engine = await makeEngineHarness({ queue: h.queue, stateDir: dir })
+    try {
+      await engine.tick()
+      await engine.until(() => h.queue.openCount('alpha') === 0)
+      expect(engine.textCalls().map(call => call.params.text)).toEqual(h.queued('alpha').flatMap(i => i.fixed!.parts))
+      expect(engine.textCalls()[0]!.params.text).toContain('via="thread"')
+      expect(h.queue.replyReminderItems('alpha').map(i => i.seq)).toEqual(h.queued('alpha').map(i => i.accepted.seq))
+      expect(engine.errors).toEqual([])
+    } finally { await engine.cleanup() }
+  })
+
+  test('sibling-thread and plain messages drop; joined mentions and Broadcasts keep precedence', async () => {
+    const h = await joinedHarness()
+    await seedJoin(h)
+    const dropped = [reply({ thread_ts: THREAD_ROOTS.secondary }), makeChannelMessage({ channel: CA })]
+    for (const event of dropped) await h.receive(event, ['alpha'])
+    expect(h.queued('alpha')).toEqual([])
+    expect(existsSync(queuePath(dir))).toBe(false)
+    expect(h.logs.filter(line => line.includes('not-mentioned'))).toHaveLength(dropped.length)
+    expect(h.p('alpha').stub.callLog).toEqual([])
+    const events = [reply({ text: mentionText(h.p('alpha').stub.identity.botUserId) }), reply({ text: broadcastText('here') })]
+    for (const event of events) await h.receive(event, ['alpha'])
+    expect(facts(h, 'alpha')).toEqual(events.map((event, i) => ({ channel: CA, ts: event.ts as string, text: event.text as string, via: i === 0 ? 'mention' : 'broadcast' })))
+    expect(facts(h, 'beta')).toEqual([])
+    expect(h.threadMemoryReads).toEqual([['alpha', CA, THREAD_ROOTS.secondary]])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(4)
+  })
+
+  test.each([false, true])('paired app_mention/message retains the mode rule and one accepted item (mention first=%p)', async mentionFirst => {
+    const h = await joinedHarness()
+    await seedJoin(h)
+    const message = reply({ text: mentionText(h.p('alpha').stub.identity.botUserId) })
+    const app = makeAppMention({ ...message, type: 'app_mention' })
+    await h.receive(mentionFirst ? app : message, ['alpha'])
+    const accepted = { channel: CA, ts: message.ts as string, text: message.text as string, via: 'mention' }
+    expect(facts(h, 'alpha')).toEqual(mode === 'open' && mentionFirst ? [] : [accepted])
+    expect(facts(h, 'beta')).toEqual([])
+    await h.receive(mentionFirst ? message : app, ['alpha'])
+    expect(facts(h, 'alpha')).toEqual([accepted])
+    expect(facts(h, 'beta')).toEqual([])
+    expect(readQueue(dir).filter(r => r.kind === 'accepted')).toHaveLength(1)
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(2)
+    expect(h.threadMemoryReads).toEqual([])
+  })
+
+  test('changing away and back invalidates the old join and routing reads the new stamp', async () => {
+    const h = await joinedHarness()
+    await seedJoin(h)
+    const beforeChange = reply(), afterChange = reply()
+    const accepted = { channel: CA, ts: beforeChange.ts as string, text: beforeChange.text as string, via: 'thread' }
+    await h.receive(beforeChange, ['alpha'])
+    expect(facts(h, 'alpha')).toEqual([accepted])
+    expect(facts(h, 'beta')).toEqual([])
+    const oldStamp = h.threads!.authority.channelStamp('alpha', CA)
+    expect(h.threads!.choose('mentions', 'alpha', CA).kind).toBe('applied')
+    expect(h.threads!.choose('thread_hybrid', 'alpha', CA).kind).toBe('applied')
+    expect(h.threads!.authority.channelStamp('alpha', CA)).not.toEqual(oldStamp)
+    await h.receive(afterChange, ['alpha'])
+    expect(facts(h, 'alpha')).toEqual([accepted])
+    expect(facts(h, 'beta')).toEqual([])
+    expect(h.logs.filter(line => line.includes('not-mentioned'))).toHaveLength(1)
+    expect(h.threadMemoryReads).toHaveLength(2)
+  })
+
+  test.each(['off', 'mentions', 'all'] as const)('%s keeps selection and acknowledgement without consulting Thread Memory', async choice => {
+    const h = await joinedHarness()
+    await seedJoin(h)
+    expect(h.threads!.choose(choice, 'alpha', CA).kind).toBe('applied')
+    const events = [reply(), reply({ text: mentionText(h.p('alpha').stub.identity.botUserId) }), reply({ text: broadcastText('channel') })]
+    for (const event of events) await h.receive(event, ['alpha'])
+    const accepted = events.map((event, i) => ({ channel: CA, ts: event.ts as string, text: event.text as string, via: ['receive_all', 'mention', 'broadcast'][i] }))
+    expect(facts(h, 'alpha')).toEqual(choice === 'off' ? [] : choice === 'mentions' ? accepted.slice(1) : accepted)
+    expect(facts(h, 'beta')).toEqual([])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(events.length)
+    expect(h.threadMemoryReads).toEqual([])
+  })
+
+  test('AC-V03: changing P on A and B preserves Q choices and joins; shared-all reasons count only all personas', async () => {
+    const h = await joinedHarness()
+    for (const key of ['alpha', 'beta']) for (const channel of [CA, CB]) await seedJoin(h, key, channel)
+    // Different choices on A while each persona still has Joined Threads on B.
+    expect(h.threads!.choose('all', 'alpha', CA).kind).toBe('applied')
+    const betaJoins = h.threads!.memory.joins('beta')
+    const betaChoices = [CA, CB].map(channel => h.channelDelivery!.storedChoice('beta', channel))
+    for (const channel of [CA, CB]) {
+      expect(h.threads!.choose('off', 'alpha', channel).kind).toBe('applied')
+      expect([CA, CB].map(c => h.channelDelivery!.storedChoice('beta', c))).toEqual(betaChoices)
+      expect(h.threads!.memory.joins('beta')).toEqual(betaJoins)
+      await h.receive(reply({ channel }), ['alpha', 'beta'])
+    }
+    expect(h.queued('alpha')).toEqual([])
+    expect(h.queued('beta').map(i => [i.accepted.channel, i.accepted.via])).toEqual([[CA, 'thread'], [CB, 'thread']])
+    for (const key of ['alpha', 'beta']) expect(h.threads!.choose('all', key, CA).kind).toBe('applied')
+    await h.receive(makeChannelMessage({ channel: CA }))
+    expect(h.queued('alpha').at(-1)!.accepted.via).toBe('receive_all_shared')
+    expect(h.queued('beta').at(-1)!.accepted.via).toBe('receive_all_shared')
+    expect(h.threads!.choose('thread_hybrid', 'beta', CA).kind).toBe('applied')
+    for (const text of ['plain', mentionText(h.p('alpha').stub.identity.botUserId), broadcastText('here')]) await h.receive(makeChannelMessage({ channel: CA, text }), ['alpha'])
+    expect(h.queued('alpha').map(i => [i.accepted.channel, i.accepted.via])).toEqual([[CA, 'receive_all_shared'], [CA, 'receive_all'], [CA, 'mention'], [CA, 'broadcast']])
+    expect(h.queued('beta').map(i => [i.accepted.channel, i.accepted.via])).toEqual([[CA, 'thread'], [CB, 'thread'], [CA, 'receive_all_shared']])
+  })
+
+  test('AC-V07: another persona’s Notice Destination never reduces all or joined-thread delivery', async () => {
+    const h = await joinedHarness()
+    expect(h.p('beta').persona.permission_prompts).toBe(CA)
+    expect(h.threads!.choose('all', 'alpha', CA).kind).toBe('applied')
+    const beta = h.p('beta').stub.identity
+    for (const text of ['Permission requested', 'Server notice']) {
+      await h.receive(makeBotMessage({ channel: CA, user: beta.botUserId, bot_id: beta.botId, text }), ['alpha'])
+    }
+    await h.receive(makeChannelMessage({ channel: CA }), ['alpha'])
+    expect(h.queued('alpha').map(i => i.accepted.via)).toEqual(['receive_all', 'receive_all', 'receive_all'])
+    expect(h.threads!.choose('thread_hybrid', 'alpha', CA).kind).toBe('applied')
+    await seedJoin(h)
+    await h.receive(makeBotMessage({ channel: CA, user: beta.botUserId, bot_id: beta.botId, thread_ts: THREAD_ROOTS.primary }), ['alpha'])
+    expect(h.queued('alpha').map(i => [i.accepted.channel, i.accepted.via])).toEqual([[CA, 'receive_all'], [CA, 'receive_all'], [CA, 'receive_all'], [CA, 'thread']])
+    expect(h.queued('beta')).toEqual([])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(4)
   })
 })
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {

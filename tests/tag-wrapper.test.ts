@@ -86,7 +86,7 @@ describe('UTF-8 bounded parts', () => {
       expect(part).toContain('thread_ts="1700000000.000100"')
       expect(part).toContain('attachment_count="1" attachments="notes &quot;draft&quot;.txt"')
     }
-    expect(TAG_DESCRIPTION).toContain('via="thread" means a reply delivered because this persona participates in that thread.')
+    expect(TAG_DESCRIPTION).toContain('via="thread" means a reply in a thread the bot is in.')
     expect(TAG_DESCRIPTION).not.toMatch(/whole.channel|exclusive audience|only this persona/i)
   })
   test('keeps an exactly full tag unsplit and splits one more byte', () => {

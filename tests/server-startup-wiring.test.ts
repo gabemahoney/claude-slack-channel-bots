@@ -4280,7 +4280,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'threadStampUndecided', 'threadStampEpisodes',
+      'threadMemory', 'threadStampUndecided', 'threadStampEpisodes',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5240,7 +5240,6 @@ describe('main() adapts the recovered shared authority once before bring-up', ()
 /** set_channel_delivery's call-time inputs; renaming one fails the typecheck. */
 const SESSION_TOOLS_MEMBERSHIP: keyof SessionToolDeps = 'readChannelMembership'
 const SESSION_TOOLS_UP: keyof SessionToolDeps = 'isPersonaUp'
-const SESSION_TOOLS_APPLIED: keyof SessionToolDeps = 'getAppliedPersonas'
 const SESSION_TOOLS_LOG: keyof SessionToolDeps = 'log'
 
 
@@ -5249,7 +5248,7 @@ describe('the routing and the session tools read the one stored-choice store thr
   // so a dropped member, or one bound to a copy taken at import (before
   // main() loads the store), would type-check and pass every behaviour suite
   // while the routing applied no stored choice and the tool refused every
-  // call or judged the loop guard on a stale persona set. Only this audit
+  // call. Only this audit
   // makes sure production binds them, each to a call-time read.
   test.each<[string, () => string | undefined]>([
     ['the routing\'s getChannelDelivery', () => onlyCallProps('createPersonaRouting').get(ROUTING_CHANNEL_DELIVERY)],
@@ -5258,13 +5257,11 @@ describe('the routing and the session tools read the one stored-choice store thr
     expect(member()).toBe(`() => ${CHANNEL_DELIVERY_HOLDER}`)
   })
 
-  test('the session tools read current membership and up/shutdown state at every call, getAppliedPersonas reads the applied config holder\'s personas at each call, and log writes to console.error', () => {
+  test('the session tools read current membership and up/shutdown state at every call, and log writes to console.error', () => {
     const props = objectProperties(spreadConstObject('sessionToolDeps'))
-    const routing = constOf('createPersonaRouting')
     expect(insideMain(onlyCallOf('createPersonaRouting'))).toBe(false)
     expect(props.get(SESSION_TOOLS_MEMBERSHIP)).toBe("(key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }")
     expect(props.get(SESSION_TOOLS_UP)).toBe('key => !shuttingDown && isPersonaUp(key)')
-    expect(props.get(SESSION_TOOLS_APPLIED)).toBe(`() => ${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
     expect(props.get(SESSION_TOOLS_LOG)).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
   })
 
@@ -5274,7 +5271,7 @@ describe('the routing and the session tools read the one stored-choice store thr
     const named = indicesOf(/\bgetChannelDelivery\b/g, SERVER_CODE)
     expect(named).toHaveLength(2)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_MEMBERSHIP, SESSION_TOOLS_UP, SESSION_TOOLS_APPLIED, SESSION_TOOLS_LOG].join('|')
+    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_MEMBERSHIP, SESSION_TOOLS_UP, SESSION_TOOLS_LOG].join('|')
     expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*(?:\\.\\s*(?:${members})\\b|\\[)`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
@@ -5479,6 +5476,47 @@ describe('the own-post observer is ownerless and server.ts builds no participati
 describe('Thread Memory server lifecycle wiring', () => {
   const factory: keyof typeof ThreadMemoryModule = 'createThreadMemory'
   const sealFactory: keyof typeof ThreadMemorySealModule = 'createThreadMemorySeal'
+  const routingMember: keyof PersonaRoutingDeps = 'threadMemory'
+
+  test('routing reads the one Thread Memory holder at call time, with unknown before main creates it', () => {
+    const routing = onlyCallOf('createPersonaRouting')
+    const binding = onlyCallProps('createPersonaRouting').get(routingMember)
+    expect(binding).toBe("(key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown'")
+    declaredOnce('threadMemory')
+    const declaration = indicesOf(/\blet\s+threadMemory\s*:\s*ThreadMemory\s*\|\s*undefined\s*(?=\n)/g, SERVER_CODE)
+    expect(declaration).toHaveLength(1)
+    expect(insideMain(declaration[0]!)).toBe(false)
+    expect(declaration[0]!).toBeLessThan(routing)
+    expect(insideMain(routing)).toBe(false)
+    const assigned = assignmentsTo('threadMemory')
+    expect(assigned.map(({ value }) => value)).toEqual([`${factory}({`])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+
+    // Execute the actual adapter alone, with its holder in an isolated closure;
+    // importing or starting the server cannot expose this private dependency.
+    const adapter = new Function(`let threadMemory; return {
+      read: (${binding}), set: value => { threadMemory = value }
+    }`)() as {
+      read: NonNullable<PersonaRoutingDeps['threadMemory']>
+      set: (value: Pick<ThreadMemoryModule.ThreadMemory, 'view'>) => void
+    }
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('unknown')
+    const calls: string[][] = []
+    adapter.set({ view: (...args) => { calls.push(args); return 'joined' } })
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('joined')
+    adapter.set({ view: (...args) => { calls.push(args); return 'not-joined' } })
+    expect(adapter.read('beta', 'C0OTHER', '2.000001')).toBe('not-joined')
+    expect(calls).toEqual([['alpha', 'C0THREAD', '1.000001'], ['beta', 'C0OTHER', '2.000001']])
+  })
+
+  test('the Thread Memory adapter is supplied only in the routing call and never replaced elsewhere', () => {
+    const named = indicesOf(new RegExp(`\\b${routingMember}\\s*:`, 'g'), SERVER_CODE)
+    // The typed holder declaration and the inline routing member, with no
+    // other object carrying a replacement member (including Object.assign).
+    expect(named).toHaveLength(2)
+    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(indicesOf(new RegExp(`(?:\\.\\s*${routingMember}\\b|\\[\\s*['"]${routingMember}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+  })
 
   test('one seal uses the queue state directory, real filesystem and live shared-state readers, and publishes its events', () => {
     expect(importSource(SERVER_CODE, sealFactory)).toBe('./thread-memory-seal.ts')

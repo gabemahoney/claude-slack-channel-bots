@@ -141,8 +141,8 @@ export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
  * first event in the persona's life that took its fungible path for that
  * channel, delivered or not. Logged once per persona life and channel, to
  * `server.log` only. The cause (`invitedChannelCause`) names the channel ID,
- * `public` or `private`, and the persona's channel delivery there after the
- * loop guard; the line has no path.
+ * `public` or `private`, and the persona's saved channel delivery
+ * (`off`, `mentions`, `all` or `thread_hybrid`); the line has no path.
  */
 export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
 
@@ -152,8 +152,8 @@ export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
  * the store's write succeeded, to `server.log` only; nothing is posted to
  * Slack. The cause (`channelDeliverySetCause`) names the channel ID, the
  * stored choice before the call (`none` when there was none) and after it,
- * and the persona's channel delivery there after the loop guard; the line
- * has no path.
+ * and the persona's saved channel delivery (`off`, `mentions`, `all` or
+ * `thread_hybrid`); the line has no path.
  */
 export const PERSONA_CHANNEL_DELIVERY_SET = 'persona-channel-delivery-set'
 
@@ -177,8 +177,9 @@ export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED,
 export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 /** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
-export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id'>): string {
-  return `source=${a.source} ${a.source === 'slack' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}`
+export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id' | 'via'>): string {
+  return `source=${a.source} ${a.source === 'slack' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}` +
+    (a.source === 'slack' && a.via === 'thread' ? ' via=thread' : '')
 }
 export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: string, identity: string, detail = ''): string {
   return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
@@ -325,9 +326,9 @@ export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure)
  * The `persona-invited-channel` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
- *   `hears <public|private> channel <channel> in open mode, at channel delivery <mentions|all>`
+ *   `hears <public|private> channel <channel> in open mode, at channel delivery <off|mentions|all|thread_hybrid>`
  *
- * `delivery` is the persona's channel delivery after the loop guard. Pure.
+ * `delivery` is the persona's channel delivery. Pure.
  */
 export function invitedChannelCause(
   channel: string,
@@ -344,11 +345,11 @@ export const NO_STORED_CHOICE = 'none'
  * The `persona-channel-delivery-set` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
- *   `stored choice for channel <channel> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
+ *   `stored choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid>`
  *
  * `before` is the stored choice before the call, undefined when there was
  * none (written `none`); `after` is the choice the call stored; `delivery`
- * is the persona's channel delivery there after the loop guard. Pure.
+ * is the persona's channel delivery there. Pure.
  */
 export function channelDeliverySetCause(
   channel: string,
@@ -358,7 +359,7 @@ export function channelDeliverySetCause(
 ): string {
   return (
     `stored choice for channel ${channel} set from ${before ?? NO_STORED_CHOICE} to ${after}, ` +
-    `at channel delivery ${delivery} after the loop guard`
+    `at channel delivery ${delivery}`
   )
 }
 

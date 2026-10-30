@@ -128,7 +128,7 @@ export function channelDeliverySetCause(
   after: 'off' | 'mentions' | 'all' | 'thread_hybrid',
   delivery: 'off' | 'mentions' | 'all' | 'thread_hybrid',
 ): string {
-  return `stored choice for channel ${channel} set from ${before ?? 'none'} to ${after}, at channel delivery ${delivery} after the loop guard`
+  return `stored choice for channel ${channel} set from ${before ?? 'none'} to ${after}, at channel delivery ${delivery}`
 }
 
 /** src/persona-diagnostics.ts `unclaimedChannelCause` (the declarative cause, as 0.11.1 writes it). */

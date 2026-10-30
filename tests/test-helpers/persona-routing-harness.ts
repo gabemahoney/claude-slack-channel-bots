@@ -73,6 +73,7 @@ import { makeNotifierStack } from './persona-notifier.ts'
 import { errTmuxUnresponsive } from './agent-director-stub.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { conflictForPersona } from './conflict-cases.ts'
+import { makeThreadMemoryHarness, type ThreadMemoryHarness } from './thread-memory.ts'
 import { eligibleMembership } from './fungible-decision.ts'
 
 /** Explicit observations for tests of queue/recovery behavior. This projection
@@ -555,14 +556,9 @@ export interface RoutingHarnessOptions {
    * mode.
    */
   mode?: ChannelMode
-  /**
-   * Per-name fungible destinations: each
-   * named persona's `invited.permission_prompts` (`"dm"` or a channel ID),
-   * set on its spec, so `h.config` holds it in fungible mode and the
-   * decision's fungible destinations and the notifier read it there. Absent:
-   * a spec's own `invited`, else none (`dm` in fungible mode).
-   */
-  fungibleDestinations?: Readonly<Record<string, string>>
+  /** Opt in to real Thread Memory over the same shared authority as routing. */
+  threadMemory?: Record<string, never>
+  onReceived?: PersonaRoutingDeps['onReceived']
   /**
    * Load the stored-choice store the routing reads (`h.channelDelivery`
    * ) over the caller's state directory (see
@@ -622,6 +618,9 @@ export interface HarnessPost {
 }
 
 export interface RoutingHarness {
+  threads?: ThreadMemoryHarness
+  threadMemoryReads: Array<[string, string, string]>
+  ready(): Promise<void>
   queue: ReturnType<typeof createDeliveryQueue>
   queued(name: string): QueueItem[]
   /** The applied config the routing reads at call time; set to null for none, or edit it. */
@@ -754,19 +753,9 @@ export function makeRoutingHarness(
   opts: RoutingHarnessOptions = {},
 ): RoutingHarness {
   if (opts.channelDelivery !== undefined) requireTempStateDir(opts.channelDelivery.stateDir)
-  // Each persona's fungible destination set on its spec, by the name the
-  // builders give it, so the one configuration holds it.
-  const builtNames = makeMultiPersonaConfig(specs, baseDir, opts.overrides).personas.map((p) => p.name)
-  for (const name of Object.keys(opts.fungibleDestinations ?? {})) {
-    if (!builtNames.includes(name)) throw new Error(`no persona ${name}`)
-  }
-  const configSpecs: PersonaSpec[] = specs.map((spec, i) => {
-    const destination = opts.fungibleDestinations?.[builtNames[i]!]
-    return destination === undefined ? spec : { ...spec, permission_prompts: destination }
-  })
   /** The configuration under `mode`'s switch, or the switch `overrides` sets when no mode is given. */
   const configIn = (mode: ChannelMode | undefined): PersonaConfig =>
-    makeMultiPersonaConfig(configSpecs, baseDir, {
+    makeMultiPersonaConfig(specs, baseDir, {
       ...opts.overrides,
       ...(mode === undefined ? {} : { channel_mode: mode }),
     })
@@ -922,6 +911,8 @@ export function makeRoutingHarness(
   const queueReady = queue.start()
   const h: RoutingHarness = {
     queue,
+    threadMemoryReads: [],
+    ready: async () => { await queueReady; await threadReady },
     queued: name => queue.items(byName(name).persona.key),
     config,
     p: byName,
@@ -957,13 +948,13 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: async (event, names, ack, envelope) => { await queueReady; return routing.receive(
+    receive: async (event, names, ack, envelope) => { await h.ready(); return routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
       envelopeFlagOf(envelope),
     ) },
-    receiveKeys: async (event, keys, envelope) => { await queueReady; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
+    receiveKeys: async (event, keys, envelope) => { await h.ready(); return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
     setMode: (mode) => {
       h.config = configIn(mode)
     },
@@ -1030,9 +1021,17 @@ export function makeRoutingHarness(
     h.channelDelivery.authority.subscribe(next => { h.config = next })
   }
 
+  if (opts.threadMemory !== undefined) h.threads = makeThreadMemoryHarness(baseDir, { authority: h.channelDelivery!.authority })
+  const threadReady = h.threads?.start()
+
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
     membership: opts.membership,
+    threadMemory: opts.threadMemory === undefined ? undefined : (key, channel, root) => {
+      h.threadMemoryReads.push([key, channel, root])
+      return h.threads!.memory.view(key, channel, root)
+    },
+    onReceived: opts.onReceived,
     queue,
     prepare: preparation.prepare,
     getPersonaConfig: () => {

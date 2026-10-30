@@ -4573,6 +4573,10 @@ describe('expected texts match the package', () => {
     ["unclaimed-channel (0.11.1's declarative cause)", UNCLAIMED_CHANNEL_CLASS, UNCLAIMED_CHANNEL, runnerUnclaimedChannelCause(CH), srcUnclaimedChannelCause(CH)],
   ])('the %s line C logs', (_what, cls, srcCls, cause, srcCause) => {
     expect([cls, cause]).toEqual([srcCls, srcCause])
+    if (cls === CHANNEL_DELIVERY_SET_CLASS) {
+      expect(cause).not.toContain(' after the loop guard')
+      expect(srcCause).not.toContain(' after the loop guard')
+    }
     expect(personaLine(cls, 2, C_NAME, cause)).toBe(formatPersonaDiagnostic({ class: srcCls as PersonaDiagnosticClass, ...cPersona, index: 2, cause: srcCause }))
   })
 

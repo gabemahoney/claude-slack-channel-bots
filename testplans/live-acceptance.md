@@ -2482,7 +2482,7 @@ Steps:
 Expected:
 
 - C says done. Step 3's `toolcalls` line is newer than step 1's count, names the run channel and has `"delivery":"all"`, `"attemptId":"<ATTEMPT_ID>"`, explicit `"intent":"assignment"` (or `"intent":"retry"` after response loss with the same binding), and `"outcome":"ok"`. Missing or wrong identifier/intent/value, no result, or a refusal fails the check.
-- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): stored choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all after the loop guard` for the first run after Check 30. Match `from` to step 1's actual `<PREVIOUS_CHOICE>`: on a deliberate repeat with `all` already saved, expect `from all to all` instead.
+- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): stored choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all` for the first run after Check 30. Match `from` to step 1's actual `<PREVIOUS_CHOICE>`: on a deliberate repeat with `all` already saved, expect `from all to all` instead.
 
   No line or duplicate lines fails the check. An `ok` history response alone is not evidence of a fresh application; the one diagnostic since the mark must establish this run's new application.
 - Step 4: C answers "heard-all" in `<RUN_CHANNEL_NAME>`, under its own name and avatar.

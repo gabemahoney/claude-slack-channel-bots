@@ -804,10 +804,6 @@ const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
         `${SKILL_REL}, under "## A persona can't open a DM",`,
       ),
   ],
-  [
-    "the silence entry's loop-guard row",
-    (text) => rowHolding(requiredSection(text, `## ${SILENCE_TITLE}`, SKILL_REL), '| **The loop guard**', `${SKILL_REL}, under "## ${SILENCE_TITLE}",`),
-  ],
 ]
 
 /**
@@ -1034,15 +1030,15 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
     () =>
       personaLineTemplate(PERSONA_INVITED_CHANNEL, invitedChannelCause(CHANNEL, 'public', 'mentions'))
         .replace('hears public channel', 'hears <public|private> channel')
-        .replace('at channel delivery mentions', 'at channel delivery <mentions|all>'),
+        .replace('at channel delivery mentions', `at channel delivery <${DELIVERY_MODES.join('|')}>`),
   ],
 [
     `the ${PERSONA_CHANNEL_DELIVERY_SET} line`,
     classHeading(PERSONA_CHANNEL_DELIVERY_SET),
     () =>
-      personaLineTemplate(PERSONA_CHANNEL_DELIVERY_SET, channelDeliverySetCause(CHANNEL, undefined, 'all', 'mentions'))
+      personaLineTemplate(PERSONA_CHANNEL_DELIVERY_SET, channelDeliverySetCause(CHANNEL, undefined, 'all', 'all'))
         .replace(`from ${NO_STORED_CHOICE} to all,`, `from <${NO_STORED_CHOICE}|${DELIVERY_MODES.join('|')}> to <${DELIVERY_MODES.join('|')}>,`)
-        .replace('at channel delivery mentions after', `at channel delivery <${DELIVERY_MODES.join('|')}> after`),
+        .replace(/at channel delivery all$/, `at channel delivery <${DELIVERY_MODES.join('|')}>`),
   ],
 [
     `the open-mode ${UNCLAIMED_CHANNEL} line`,

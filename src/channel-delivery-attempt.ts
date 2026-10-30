@@ -25,7 +25,6 @@ export function validChannelDeliveryAttempt(value: unknown): value is ChannelDel
 export interface ChannelDeliveryFacts {
   saved: DeliveryMode
   effective: DeliveryMode
-  heldByLoopGuard: boolean
 }
 export const BOT_ATTEMPT_REJECTIONS = ['membership', 'inactive', 'strict', 'dry-run', 'write-failed'] as const
 export type BotAttemptRejection = typeof BOT_ATTEMPT_REJECTIONS[number]
@@ -73,9 +72,7 @@ function order(value: unknown, maximum: number): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= maximum
 }
 function validFacts(value: unknown, delivery: DeliveryMode): value is ChannelDeliveryFacts {
-  return object(value) && Object.keys(value).length === 3 && value.saved === delivery &&
-    typeof value.heldByLoopGuard === 'boolean' &&
-    (value.heldByLoopGuard ? delivery !== 'off' && value.effective === 'mentions' : value.effective === delivery)
+  return object(value) && Object.keys(value).length === 2 && value.saved === delivery && value.effective === delivery
 }
 function reserveAttemptPosition(positions: Map<number, SharedBotAttempt>, position: number, record: SharedBotAttempt): void {
   if (positions.has(position)) throw new Error('Invalid durable bot attempt order.')

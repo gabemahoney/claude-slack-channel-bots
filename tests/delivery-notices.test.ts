@@ -11,6 +11,9 @@ import { existsSync } from 'node:fs'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
+import { MESSAGE_DELIVERED } from '../src/persona-diagnostics.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try {
@@ -192,6 +195,39 @@ test('received is once per accepted identity, including replay preparation and f
   r.reporting.received(r.alpha, item); r.reporting.received(r.alpha, item)
   expect(r.logs).toEqual([buildDeliveryDiagnostic(MESSAGE_RECEIVED, r.ref(), deliveryIdentity(item.accepted))])
   expect(JSON.stringify(r.logs)).not.toContain('private accepted body')
+})
+test.each([false, true])('received and delivered logs retain via=thread through real delivery (restart before delivery=%p)', async restart => {
+  let reporting: DeliveryNoticeHarness | undefined
+  const engine = await makeEngineHarness({ onEvent: event => reporting?.reporting.engineEvent(event) })
+  const r = await makeDeliveryNoticeHarness({ queue: engine.queue }); runs.push(r)
+  reporting = r
+  try {
+    const result = await engine.queue.accept('alpha', slackInput({ via: 'thread', thread_ts: THREAD_ROOTS.primary, text: 'private thread reply' }))
+    if (result.status !== 'accepted') throw new Error('thread fixture acceptance failed')
+    if (restart) await engine.restartServer()
+    const item = engine.queue.items('alpha')[0]!
+    expect(item.accepted.via).toBe('thread')
+    expect(item.fixed).toBeUndefined()
+    // Recovered accepted-only work enters the same preparation/reporting path.
+    r.reporting.received('alpha', item)
+    await engine.preparation.prepare('alpha', item)
+    await engine.tick()
+    await engine.until(() => engine.queue.openCount('alpha') === 0)
+    await r.flush()
+    const received = r.logs.filter(line => line.includes(MESSAGE_RECEIVED))
+    const delivered = r.logs.filter(line => line.includes(MESSAGE_DELIVERED))
+    expect(received).toHaveLength(1)
+    expect(delivered).toHaveLength(1)
+    for (const line of [...received, ...delivered]) {
+      expect(line).toContain(' via=thread')
+      expect(line).toContain(`chat_id="${item.accepted.channel}"`)
+      expect(line).not.toContain('private thread reply')
+    }
+    expect(engine.textCalls().map(call => call.params.text)).toEqual(engine.queue.items('alpha')[0]!.fixed!.parts)
+    expect(engine.textCalls()[0]!.params.text).toContain('via="thread"')
+    expect(engine.errors).toEqual([])
+    assertNoLeak(r.logs)
+  } finally { await engine.cleanup() }
 })
 test('the durable per-item not-taken-in notice survives server restart while retyping continues', async () => {
   let r: DeliveryNoticeHarness | undefined

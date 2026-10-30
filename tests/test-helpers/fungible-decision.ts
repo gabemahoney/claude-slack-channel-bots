@@ -42,6 +42,7 @@ import type {
   decideDelivery,
 } from '../../src/delivery-decision.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
+import type { ThreadMemoryView } from '../../src/thread-memory.ts'
 import type { MembershipReading } from '../../src/channel-membership.ts'
 import {
   broadcastText,
@@ -135,6 +136,8 @@ export const FAIL_IF_READ: unique symbol = Symbol('fail-if-read')
 /** Stored choices as a plain lookup: persona key → channel → choice. */
 export type StoredLookup = Readonly<Record<string, Readonly<Record<string, DeliveryMode>>>>
 
+export type ThreadRead = readonly [key: string, channel: string, root: string]
+
 /** One row of the decision table. */
 export interface FungibleDecisionRow {
   /** The scenario, for the test title. */
@@ -162,6 +165,13 @@ export interface FungibleDecisionRow {
   readonly viewChannels?: Readonly<Record<string, unknown>>
   /** Call the decision with three arguments: no fungible-mode inputs at all. */
   readonly omitFungibleInputs?: true
+  /** Fixed read-only answers, keyed by persona, channel and thread root. */
+  readonly threadViews?: Readonly<Record<string, Readonly<Record<string, Readonly<Record<string, ThreadMemoryView>>>>>>
+  readonly omitThreadMemory?: true
+  readonly threadStampUndecided?: FungibleDecisionInputs['threadStampUndecided']
+  /** Every expected lookup, in order. Omitted means no lookup. */
+  readonly threadReads?: readonly ThreadRead[]
+  readonly channelDelivery?: ChannelDeliveryResult
   /** The whole outcome, as written. */
   readonly expected: DeliveryDecision
 }
@@ -217,11 +227,6 @@ function receivingPersonaOf(row: FungibleDecisionRow): DeliveryPersona {
   return replacesSection(row, persona.key) ? withReplacedSection(row, base, persona.key) : { ...base, channels: persona.channels }
 }
 
-/** Every applied persona's fungible destination the configuration sets, from its `fungible_destination`. */
-function destinationsOf(config: PersonaConfig): FungibleDecisionInputs['fungibleDestinations'] {
-  return config.personas.flatMap((p) => (p.permission_prompts === undefined ? [] : [{ key: p.key, destination: p.permission_prompts }]))
-}
-
 /** The row's stored choices as the decision reads them: a read-only lookup with the row's readability, no store and no file. */
 function storedChoicesOf(row: FungibleDecisionRow): StoredChoices | undefined {
   const stored = row.stored
@@ -238,8 +243,7 @@ export function eligibleMembership(key: string): MembershipReading {
 /** `channelDeliveryFor`'s inputs besides the persona and the channel. */
 function channelDeliveryInputsOf(row: FungibleDecisionRow): ChannelDeliveryInputs {
   const storedChoices = storedChoicesOf(row)
-  const fungibleDestinations = destinationsOf(row.config)
-  return storedChoices === undefined ? { fungibleDestinations } : { fungibleDestinations, storedChoices }
+  return { storedChoices }
 }
 
 /**
@@ -247,10 +251,9 @@ function channelDeliveryInputsOf(row: FungibleDecisionRow): ChannelDeliveryInput
  * (each persona as the routing passes it, or the row's replacement); and,
  * unless the row omits it, the fungible-mode inputs, with the mode from the
  * configuration's switch through `channelModeOf`, the flag as received,
- * `CHANNEL_ID_RE` itself, the row's stored choices and each persona's
- * `fungible_destination`.
+ * `CHANNEL_ID_RE` itself, the row's stored choices and fixed Thread Memory view.
  */
-export function decisionArgsOf(row: FungibleDecisionRow): Parameters<typeof decideDelivery> {
+export function decisionArgsOf(row: FungibleDecisionRow, reads: ThreadRead[] = []): Parameters<typeof decideDelivery> {
   const persona = receivingPersonaOf(row)
   const applied = row.config.personas.map((p) => appliedViewOf(row, p))
   if (row.omitFungibleInputs) return [row.event, persona, applied]
@@ -259,6 +262,11 @@ export function decisionArgsOf(row: FungibleDecisionRow): Parameters<typeof deci
     isExtSharedChannel: row.flag,
     channelIdPattern: CHANNEL_ID_RE,
     memberships: row.memberships ?? new Map([P_KEY, Q_KEY, R_KEY].map(key => [key, eligibleMembership(key)])),
+    threadMemory: row.omitThreadMemory ? undefined : (key, channel, root) => {
+      reads.push([key, channel, root])
+      return row.threadViews?.[key]?.[channel]?.[root] ?? 'not-joined'
+    },
+    threadStampUndecided: row.threadStampUndecided,
     ...channelDeliveryInputsOf(row),
   }
   return [row.event, persona, applied, inputs]
@@ -354,9 +362,6 @@ function fungibleCast(pDm = true, p: PersonaSpec = {}, q: PersonaSpec = {}, r: P
 const FUNGIBLE_CAST = fungibleCast()
 const FUNGIBLE_CAST_DM_OFF = fungibleCast(false)
 
-/** Fungible mode with every other persona's destination `dm`. */
-const DM_DESTINATIONS_CAST = fungibleCast(true, {}, { permission_prompts: 'dm' })
-
 // ---------------------------------------------------------------------------
 // Outcomes
 // ---------------------------------------------------------------------------
@@ -383,8 +388,8 @@ function refused(refusal: FungibleRefusal): DeliveryDecision {
 }
 
 /** `channelDeliveryFor`'s result. */
-function delivery(value: DeliveryMode | undefined, heldByLoopGuard = false): ChannelDeliveryResult {
-  return { delivery: value, heldByLoopGuard }
+function delivery(value: DeliveryMode | undefined): ChannelDeliveryResult {
+  return { delivery: value }
 }
 
 /** A short form of a flag value for labels. */
@@ -571,11 +576,11 @@ const storedAllRows: FungibleDecisionRow[] = [
     expected: deliver('receive_all_shared', onPath('private', 'all')),
   },
   {
-    label: 'P\'s own destination, P\'s and Q\'s stored all, Q held by the loop guard: plain message',
+    label: 'P\'s own destination, P\'s and Q\'s stored all, Q also hears all: plain message',
     event: publicMessage(P_DESTINATION),
     config: FUNGIBLE_CAST, flag: FLAG.false,
     stored: { [P_KEY]: { [P_DESTINATION]: 'all' }, [Q_KEY]: { [P_DESTINATION]: 'all' } },
-    expected: deliver('receive_all', onPath('public', 'all')),
+    expected: deliver('receive_all_shared', onPath('public', 'all')),
   },
   {
     label: 'public channel, P\'s and Q\'s stored all: P\'s direct mention',
@@ -775,46 +780,6 @@ const groupDmRows: FungibleDecisionRow[] = ONE_FLAG_PER_FORM.flatMap((flag): Fun
 ])
 
 // ---------------------------------------------------------------------------
-// Group 7: the loop guard, P's stored all
-// ---------------------------------------------------------------------------
-
-const loopGuardRows: ChannelDeliveryRow[] = [
-  {
-    label: 'Q\'s fungible destination, P\'s stored all: plain message',
-    event: publicMessage(Q_DESTINATION),
-    config: FUNGIBLE_CAST, flag: FLAG.false,
-    stored: { [P_KEY]: { [Q_DESTINATION]: 'all' } },
-    expected: drop('not-mentioned', onPath('public', 'mentions')),
-    channelDelivery: delivery('mentions', true),
-  },
-  {
-    label: 'R\'s fungible destination, a private channel, P\'s stored all: P\'s direct mention',
-    event: privateMessage(PRIVATE_CHANNEL, P_MENTION),
-    config: fungibleCast(true, {}, {}, { permission_prompts: PRIVATE_CHANNEL }),
-    flag: FLAG.false,
-    stored: { [P_KEY]: { [PRIVATE_CHANNEL]: 'all' } },
-    expected: deliver('mention', onPath('private', 'mentions')),
-    channelDelivery: delivery('mentions', true),
-  },
-  {
-    label: 'P\'s own fungible destination, P\'s stored all: plain message',
-    event: publicMessage(P_DESTINATION),
-    config: FUNGIBLE_CAST, flag: FLAG.false,
-    stored: { [P_KEY]: { [P_DESTINATION]: 'all' } },
-    expected: deliver('receive_all', onPath('public', 'all')),
-    channelDelivery: delivery('all'),
-  },
-  {
-    label: 'every other persona\'s destination dm, P\'s stored all: plain message',
-    event: publicMessage(PUBLIC_CHANNEL),
-    config: DM_DESTINATIONS_CAST, flag: FLAG.false,
-    stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' } },
-    expected: deliver('receive_all', onPath('public', 'all')),
-    channelDelivery: delivery('all'),
-  },
-]
-
-// ---------------------------------------------------------------------------
 // Group 8: in fungible mode the first steps run first (non-message, own, no-author)
 // ---------------------------------------------------------------------------
 
@@ -917,15 +882,15 @@ const currentAuthorityRows: FungibleDecisionRow[] = (['strict', 'open'] as const
       ...base, label: `${mode} ${value}: ${label}`, event: publicMessage(PUBLIC_CHANNEL, text),
       stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, expected: outcome(value, via),
     })))
-  const siblings = (['eligible', 'ineligible', 'unresolved', 'missing', 'guarded', 'unreadable'] as const).map((kind): FungibleDecisionRow => {
+  const siblings = (['eligible', 'ineligible', 'unresolved', 'missing', 'destination', 'unreadable'] as const).map((kind): FungibleDecisionRow => {
     const memberships = new Map<string, MembershipReading>([[P_KEY, eligibleMembership(P_KEY)]])
     if (kind !== 'missing') memberships.set(Q_KEY, kind === 'ineligible' ? { kind: 'ineligible', reason: 'absent' } :
       kind === 'unresolved' ? { kind: 'unresolved', reason: 'current-membership-missing' } : eligibleMembership(Q_KEY))
     return { ...base, label: `${mode} effectively-all sibling ${kind}`,
-      config: kind === 'guarded' ? { ...config, personas: config.personas.map(p => p.key === P_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) } : config,
+      config: kind === 'destination' ? { ...config, personas: config.personas.map(p => p.key === P_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) } : config,
       memberships, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' }, [Q_KEY]: { [PUBLIC_CHANNEL]: 'all' } },
       readableFor: kind === 'unreadable' ? key => key !== Q_KEY : undefined,
-      expected: outcome('all', kind === 'eligible' || (kind === 'guarded' && mode === 'strict') ? 'receive_all_shared' : 'receive_all') }
+      expected: outcome('all', kind === 'eligible' || kind === 'destination' ? 'receive_all_shared' : 'receive_all') }
   })
   const unavailable = (['missing-store', 'missing-choice', 'missing-membership', 'unresolved-membership', 'absent', 'affected', 'unaffected'] as const).map((kind): FungibleDecisionRow => ({
     ...base, label: `${mode} ${kind} never becomes a fallback choice`,
@@ -947,50 +912,158 @@ const currentAuthorityRows: FungibleDecisionRow[] = (['strict', 'open'] as const
   ]
 })
 
-/** Until Thread Memory, `thread_hybrid` selects like `mentions`: only an
- * @mention or a `here`/`channel` Broadcast, never an unmentioned reply. The
- * older matrices retain ownership of exhaustive message-shape/sharing
- * combinations. */
-const threadRows: FungibleDecisionRow[] = (['strict', 'open'] as const).flatMap(mode => {
-  const root = '1700000000.000100', ts = '1700000000.000101'
-  const config = { ...FUNGIBLE_CAST, channel_mode: mode }
-  const guardedConfig = { ...config, personas: config.personas.map(p => p.key === Q_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) }
-  const base = { config, flag: false }
-  const event = (extra: Record<string, unknown> = {}) => makeChannelMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, ...extra })
-  const path = (value: DeliveryMode) => mode === 'open' ? { fungible: onPath('public', value) } : {}
-  const selected = (via: Via, value: DeliveryMode = 'thread_hybrid'): DeliveryDecision => ({ action: 'deliver', via, ...path(value) })
-  const dropped = (reason: 'not-mentioned' | 'channel-off', value: DeliveryMode = 'thread_hybrid'): DeliveryDecision => ({ action: 'drop', reason, ...path(value) })
-  const row = (label: string, extra: Partial<FungibleDecisionRow>, expected: DeliveryDecision): FungibleDecisionRow => ({
-    ...base, label: `${mode} thread: ${label}`, event: event(), stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'thread_hybrid' } }, ...extra, expected,
-  })
-  const values = (['off', 'mentions', 'all', 'thread_hybrid'] as const).flatMap(value => [
-    row(`${value} unmentioned reply`, { stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } } }, value === 'all' ? selected('receive_all', value) : dropped(value === 'off' ? 'channel-off' : 'not-mentioned', value)),
-    ...[false, true].map(reply => row(`${value} ${reply ? 'reply' : 'root'} labelled mention before a broadcast`, {
-      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, event: event({ thread_ts: reply ? root : undefined, text: `${mentionText(P_USER, 'alpha')} ${broadcastText('here')}` }),
-    }, value === 'off' ? dropped('channel-off', value) : selected('mention', value))),
-  ])
-  return [...values,
-    ...[undefined, '', null, 'bad', 1700000000, '1700000000.1', ts].map(parent => row(`root or malformed parent ${String(parent)}`, { event: event({ thread_ts: parent }) }, dropped('not-mentioned'))),
-    ...(['here', 'channel'] as const).map(kind => row(`${kind} reply keeps broadcast`, { event: event({ text: broadcastText(kind) }) }, selected('broadcast'))),
-    ...(['here', 'channel'] as const).map(kind => row(`${kind} root keeps broadcast`, { event: event({ thread_ts: undefined, text: broadcastText(kind) }) }, selected('broadcast'))),
-    row('everyone is not a broadcast', { event: event({ text: broadcastText('everyone') }) }, dropped('not-mentioned')),
-    row('user-group mention is not P\'s mention', { event: event({ text: userGroupMentionText('S0GROUP') }) }, dropped('not-mentioned')),
-    row('DM in a thread is decided by dm.enabled', { event: makeDm({ text: mentionText(P_USER), thread_ts: root }) }, deliver('dm')),
-    row('own user is excluded', { event: event({ user: P_USER }) }, drop('own')),
-    row('own bot is excluded', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: P_BOT }) }, drop('own')),
-    row('other persona\'s bot reply is not mentioned', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: Q_BOT }) }, dropped('not-mentioned')),
-    row('other persona\'s bot reply mentioning P', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts, thread_ts: root, bot_id: Q_BOT, text: P_MENTION }) }, selected('mention')),
-    row('unresolved membership wins over a mention', { event: event({ text: P_MENTION }), memberships: new Map([[P_KEY, { kind: 'unresolved', reason: 'current-membership-missing' }]]) }, { action: 'unresolved', reason: 'membership-unresolved' }),
-    row('absence wins over a mention', { event: event({ text: P_MENTION }), memberships: new Map([[P_KEY, { kind: 'ineligible', reason: 'absent' }]]) }, { action: 'drop', reason: 'channel-ineligible' }),
-    row('all retains shared precedence', { stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' }, [Q_KEY]: { [PUBLIC_CHANNEL]: 'all' } } }, selected('receive_all_shared', 'all')),
-    row('loop guard changes effective value only in open mode', { config: guardedConfig },
-      mode === 'open' ? dropped('not-mentioned', 'mentions') : dropped('not-mentioned')),
-    row('loop guard keeps a mention', { config: guardedConfig, event: event({ text: P_MENTION }) },
-      mode === 'open' ? selected('mention', 'mentions') : selected('mention')),
-    row('mention with a malformed parent keeps mention', { event: event({ text: mentionText(P_USER), thread_ts: 'invalid-parent' }) }, selected('mention')),
-    row('mention with no timestamps keeps mention', { event: event({ text: mentionText(P_USER), thread_ts: undefined, ts: undefined }) }, selected('mention')),
-  ]
+/** Shared rows are split by mode by the two suites. The lookup's answers are
+ * immutable data, independent of the expected decision and recorded reads. */
+const THREAD_ROOT = '1700000000.000100'
+const OTHER_ROOT = '1700000000.000200'
+const REPLY_TS = '1700000000.000101'
+const JOINED_VIEW = Object.freeze({
+  [P_KEY]: Object.freeze({ [PUBLIC_CHANNEL]: Object.freeze({
+    [THREAD_ROOT]: 'joined' as const, [OTHER_ROOT]: 'not-joined' as const,
+  }) }),
 })
+const THREAD_READ: ThreadRead = [P_KEY, PUBLIC_CHANNEL, THREAD_ROOT]
+const VALUES = ['off', 'mentions', 'all', 'thread_hybrid'] as const
+
+function threadGroups(mode: 'strict' | 'open') {
+  const config = { ...FUNGIBLE_CAST, channel_mode: mode }
+  const event = (extra: Record<string, unknown> = {}) => makeChannelMessage({
+    channel: PUBLIC_CHANNEL, ts: REPLY_TS, thread_ts: THREAD_ROOT, ...extra,
+  })
+  const path = (value: DeliveryMode) => mode === 'open' ? onPath('public', value) : undefined
+  const selected = (via: Via, value: DeliveryMode = 'thread_hybrid') => deliver(via, path(value))
+  const dropped = (reason: 'not-mentioned' | 'channel-off' = 'not-mentioned', value: DeliveryMode = 'thread_hybrid') => drop(reason, path(value))
+  const row = (label: string, extra: Partial<FungibleDecisionRow>, expected: DeliveryDecision): FungibleDecisionRow => ({
+    config, flag: false, label: `${mode}: ${label}`, event: event(),
+    stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'thread_hybrid' } }, threadViews: JOINED_VIEW,
+    ...extra, expected,
+  })
+  const rootMessage = event({ thread_ts: REPLY_TS })
+  const joinedReply = event()
+  const messages = [
+    { label: 'direct mention', event: event({ thread_ts: undefined, text: P_MENTION }), via: 'mention' },
+    { label: 'Broadcast', event: event({ thread_ts: undefined, text: broadcastText('here') }), via: 'broadcast' },
+    { label: 'unrelated root', event: rootMessage, via: undefined },
+    { label: 'joined reply', event: joinedReply, via: 'thread' },
+    { label: 'not-joined reply', event: event({ thread_ts: OTHER_ROOT }), via: undefined },
+  ] as const
+  const matrix = VALUES.flatMap(value => messages.map(message => row(`${value} ${message.label}`, {
+    event: message.event, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } },
+    threadReads: value === 'thread_hybrid' && message.label.endsWith('reply')
+      ? [[P_KEY, PUBLIC_CHANNEL, message.label === 'joined reply' ? THREAD_ROOT : OTHER_ROOT]] : [],
+  }, value === 'off' ? dropped('channel-off', value)
+    : message.via === 'mention' || message.via === 'broadcast' ? selected(message.via, value)
+    : value === 'all' ? selected('receive_all', value)
+    : value === 'thread_hybrid' && message.via === 'thread' ? selected('thread') : dropped('not-mentioned', value))))
+
+  const threads = [
+    ...[undefined, '', null, 'bad', 1700000000, '1700000000.1', REPLY_TS].map(parent => row(
+      `root or malformed parent ${String(parent)}`, { event: event({ thread_ts: parent }) }, dropped())),
+    ...VALUES.flatMap(value => [
+      row(`${value} joined reply mention precedes Broadcast and thread`, {
+        stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } },
+        event: event({ text: `${mentionText(P_USER, 'alpha')} ${broadcastText('here')}` }),
+      }, value === 'off' ? dropped('channel-off', value) : selected('mention', value)),
+      ...(['here', 'channel'] as const).map(kind => row(`${value} joined reply ${kind} precedes thread`, {
+        stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, event: event({ text: broadcastText(kind, 'room') }),
+      }, value === 'off' ? dropped('channel-off', value) : selected('broadcast', value))),
+    ]),
+    ...[['everyone', broadcastText('everyone')], ['user group', userGroupMentionText('S0GROUP')]].map(([label, text]) => row(
+      `${label} mention in a joined reply`, { event: event({ text }), threadReads: [THREAD_READ] }, selected('thread'))),
+    ...(['file_share', 'bot_message', 'thread_broadcast', 'me_message'] as const).map(subtype => row(
+      `joined ${subtype} reply`, { event: event({ subtype }), threadReads: [THREAD_READ] }, selected('thread'))),
+    row('other persona bot-only reply', {
+      event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts: REPLY_TS, thread_ts: THREAD_ROOT, bot_id: Q_BOT }),
+      threadReads: [THREAD_READ],
+    }, selected('thread')),
+    row('other persona user reply', { event: event({ user: Q_USER }), threadReads: [THREAD_READ] }, selected('thread')),
+    row('other persona bot reply mentioning P', {
+      event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts: REPLY_TS, thread_ts: THREAD_ROOT, bot_id: Q_BOT, text: P_MENTION }),
+    }, selected('mention')),
+    row('mention with malformed parent keeps mention', { event: event({ text: P_MENTION, thread_ts: 'invalid-parent' }) }, selected('mention')),
+    row('mention without timestamps keeps mention', { event: event({ text: P_MENTION, thread_ts: undefined, ts: undefined }) }, selected('mention')),
+    row('view is scoped to the receiving persona', {
+      receiver: Q_KEY, stored: { [Q_KEY]: { [PUBLIC_CHANNEL]: 'thread_hybrid' } }, threadReads: [[Q_KEY, PUBLIC_CHANNEL, THREAD_ROOT]],
+    }, dropped()),
+    row('view is scoped to the channel', {
+      event: event({ channel: Q_DESTINATION }), stored: { [P_KEY]: { [Q_DESTINATION]: 'thread_hybrid' } },
+      threadReads: [[P_KEY, Q_DESTINATION, THREAD_ROOT]],
+    }, dropped()),
+  ]
+  const noLookup = [
+    row('own user is excluded before lookup', { event: event({ user: P_USER }) }, drop('own')),
+    row('own bot is excluded before lookup', { event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts: REPLY_TS, thread_ts: THREAD_ROOT, bot_id: P_BOT }) }, drop('own')),
+    row('unsupported subtype is excluded before lookup', { event: event({ subtype: 'message_changed' }) }, drop('non-message')),
+    row('no author is excluded before lookup', { event: event({ user: undefined }) }, drop('no-author')),
+    row('DM precedence', { event: makeDm({ text: `${P_MENTION} ${broadcastText('here')}`, thread_ts: THREAD_ROOT }) }, deliver('dm')),
+    row('disabled DM', { config: { ...FUNGIBLE_CAST_DM_OFF, channel_mode: mode }, event: makeDm({ thread_ts: THREAD_ROOT }) }, drop('dm-disabled')),
+    row('group DM', { event: makeGroupDmMessage({ thread_ts: THREAD_ROOT }) }, drop('group-dm')),
+    row('unreadable store', { readable: false }, unresolved('state-unavailable')),
+    row('missing choice', { stored: {} }, unresolved('choice-missing')),
+    row('missing membership', { memberships: new Map() }, unresolved('membership-unresolved')),
+    row('unresolved membership', { memberships: new Map([[P_KEY, { kind: 'unresolved', reason: 'current-membership-missing' }]]) }, unresolved('membership-unresolved')),
+    row('departed membership', { memberships: new Map([[P_KEY, { kind: 'ineligible', reason: 'absent' }]]) }, { action: 'drop', reason: 'channel-ineligible' }),
+    row('undecided stamp preserves its earlier hold', { threadStampUndecided: () => true }, { action: 'unresolved', reason: 'thread-stamp-undecided' }),
+    ...(mode === 'open' ? [
+      row('externally shared reply', { flag: true }, refused('externally-shared')),
+      row('missing sharing evidence', { flag: undefined }, refused('flag-missing')),
+      row('malformed channel', { event: event({ channel: MALFORMED_CHANNEL }) }, refused('channel-id-malformed')),
+    ] : []),
+  ]
+  // Only these expected outcomes change when unknown Memory Holds are built.
+  const unknownView = [
+    row('unknown view', { threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [THREAD_ROOT]: 'unknown' } } }, threadReads: [THREAD_READ] }, dropped()),
+    row('missing view input', { omitThreadMemory: true }, dropped()),
+  ]
+  // The same matrix at Q's notice destination, plus prompt/notice bot posts.
+  // Moving/removing Q's destination and moving P's own destination preserve it.
+  const destinations: ChannelDeliveryRow[] = [
+    ...matrix,
+    ...VALUES.flatMap(value => ['permission prompt', 'status notice'].map(text => row(`${value} Q ${text}`, {
+      event: makeBotMessage({ channel: PUBLIC_CHANNEL, bot_id: Q_BOT, text }),
+      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } },
+    }, value === 'off' ? dropped('channel-off', value) : value === 'all' ? selected('receive_all', value) : dropped('not-mentioned', value)))),
+    row('Q bot reply in joined thread', {
+      event: makeBotMessage({ channel: PUBLIC_CHANNEL, ts: REPLY_TS, thread_ts: THREAD_ROOT, bot_id: Q_BOT }), threadReads: [THREAD_READ],
+    }, selected('thread')),
+  ].flatMap(original => {
+    const value = original.stored![P_KEY]![PUBLIC_CHANNEL]!
+    const variants = [
+      ['Q destination here', PUBLIC_CHANNEL, P_DESTINATION],
+      ['Q destination DM', 'dm', P_DESTINATION],
+      ['Q destination elsewhere', Q_DESTINATION, P_DESTINATION],
+      ['Q removed', undefined, P_DESTINATION],
+      ['P destination here', Q_DESTINATION, PUBLIC_CHANNEL],
+    ] as const
+    // The full selection table at the destination; movement controls need only
+    // the root and joined reply, where the destination formerly changed selection.
+    return variants.filter((_, index) => index === 0 || original.event === rootMessage || original.event === joinedReply).map(([label, q, p]) => ({
+      ...original, label: `${original.label}; ${label}`,
+      config: { ...config, personas: config.personas.filter(persona => q !== undefined || persona.key !== Q_KEY).map(persona => persona.key === Q_KEY
+        ? { ...persona, permission_prompts: q! } : persona.key === P_KEY ? { ...persona, permission_prompts: p } : persona) },
+      channelDelivery: delivery(value),
+    }))
+  })
+  const shared = (['all', 'thread_hybrid', 'mentions', 'off', 'not-applied'] as const).flatMap(sibling =>
+    [undefined, 'mention', 'broadcast'].map(via => row(`all beside ${sibling}; ${via ?? 'plain'}`, {
+      config: { ...config, personas: config.personas.filter(p => sibling !== 'not-applied' || p.key !== Q_KEY)
+        .map(p => p.key === Q_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) },
+      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' }, [Q_KEY]: { [PUBLIC_CHANNEL]: sibling === 'not-applied' ? 'all' : sibling } },
+      event: event({ text: via === 'mention' ? `${P_MENTION} ${broadcastText('here')}` : via === 'broadcast' ? broadcastText('here') : 'plain words' }),
+    }, selected(via === 'mention' || via === 'broadcast' ? via : sibling === 'all' ? 'receive_all_shared' : 'receive_all', 'all'))))
+  return { matrix, threads, noLookup, unknownView, destinations, shared }
+}
+
+const strictThreads = threadGroups('strict')
+const openThreads = threadGroups('open')
+export const THREAD_DECISION_GROUPS = {
+  matrix: { rows: [...strictThreads.matrix, ...openThreads.matrix] },
+  threads: { rows: [...strictThreads.threads, ...openThreads.threads] },
+  noLookup: { rows: [...strictThreads.noLookup, ...openThreads.noLookup] },
+  unknownView: { rows: [...strictThreads.unknownView, ...openThreads.unknownView] },
+  destinations: { rows: [...strictThreads.destinations, ...openThreads.destinations] },
+  shared: { rows: [...strictThreads.shared, ...openThreads.shared] },
+} as const
 
 /** One group: its rows. */
 export interface FungibleDecisionGroup<R extends FungibleDecisionRow = FungibleDecisionRow> {
@@ -1005,10 +1078,9 @@ export const FUNGIBLE_DECISION_GROUPS = {
   ignoresChannels: { rows: ignoresChannelsRows },
   conditions: { rows: conditionRows },
   groupDms: { rows: groupDmRows },
-  loopGuard: { rows: loopGuardRows },
   firstSteps: { rows: firstStepRows },
   unreadableStore: { rows: unreadableStoreRows },
   dmInFungibleMode: { rows: dmRows },
   currentAuthority: { rows: currentAuthorityRows },
-  threads: { rows: threadRows },
+  ...THREAD_DECISION_GROUPS,
 } as const satisfies Readonly<Record<string, FungibleDecisionGroup>>

@@ -694,11 +694,6 @@ export interface SessionToolDeps {
   /** Read current authenticated evidence; this never performs a network lookup. */
   readChannelMembership?(key: string, channel: string, mode: ChannelMode): MembershipReading
   /**
-   * The applied personas of the configuration in effect, read at each `set_channel_delivery` call for the loop guard's
-   * input. Absent: only the calling persona.
-   */
-  getAppliedPersonas?(): readonly Persona[]
-  /**
    * Receives the `persona-channel-delivery-set` line of each newly applied
    * `set_channel_delivery` call: the `[slack]`
    * stream of `server.log`, as the routing's `log` receives
@@ -934,7 +929,7 @@ export const SET_CHANNEL_DELIVERY_DESCRIPTION =
 export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
   'A public or private channel ID (C... or G...). New assignments require authenticated current membership and explicit non-external-sharing evidence.'
 export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
-  '"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" (mentions and replies in followed threads). Keep the original value on retry.'
+  '"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" (mentions and replies in threads the bot is in). Keep the original value on retry.'
 export const SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION =
   'A nonempty identifier you create and retain before first submission. Use a fresh identifier for each deliberate assignment; retain it across response loss, reconnect and restart. Never change it on retry.'
 export const SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION =
@@ -987,8 +982,7 @@ export function channelDeliveryDryRunRefusal(name: string, key: string): string 
 export function channelDeliveryCurrentFactsText(current: ChannelDeliveryCurrentFacts): string {
   if (current.kind === 'available') {
     const { facts } = current
-    return `Current saved ${facts.saved}, effective ${facts.effective} in ${current.mode} mode` +
-      (facts.heldByLoopGuard ? ' (restricted by the other-persona destination loop guard).' : '.')
+    return `Current saved ${facts.saved}, effective ${facts.effective} in ${current.mode} mode.`
   }
   const reason: Record<ChannelDeliveryUnavailableReason, string> = {
     'shared-state-unreadable': 'the shared state is not trustworthy',
@@ -1013,8 +1007,7 @@ export function channelDeliveryAttemptResultText(
   const now = current ? ` ${channelDeliveryCurrentFactsText(current)}` : ''
   if (result.kind === 'applied') {
     const facts = result.outcome.facts
-    return lead + `${result.historical ? 'previously applied' : 'newly applied'} at position ${result.outcome.resolvedOrder}; original saved ${facts.saved}, effective ${facts.effective}` +
-      (facts.heldByLoopGuard ? ' (restricted by the other-persona destination loop guard).' : '.') +
+    return lead + `${result.historical ? 'previously applied' : 'newly applied'} at position ${result.outcome.resolvedOrder}; original saved ${facts.saved}, effective ${facts.effective}.` +
       (result.historical ? ' This history read made no new assignment.' : '') + now
   }
   if (result.kind === 'not-applied') {
@@ -1065,12 +1058,8 @@ export function channelDeliveryChannelRefusal(name: string, key: string, channel
 
 /** Render a new application only, using its original effective facts. */
 export function channelDeliverySetResultText(channel: string, stored: DeliveryMode, result: ChannelDeliveryResult): string {
-  const lead = `Stored ${stored} as your channel delivery for channel ${channel}. ` +
-    `From the next message in that channel, your channel delivery there is ${result.delivery}`
-  return result.heldByLoopGuard
-    ? `${lead}: the channel is another persona's permission destination, where its permission prompts and notices go, ` +
-      `so the loop guard holds it at ${result.delivery} whatever is stored.`
-    : `${lead}.`
+  return `Stored ${stored} as your channel delivery for channel ${channel}. ` +
+    `From the next message in that channel, your channel delivery there is ${result.delivery}.`
 }
 
 /** Only for a proven pre-rename failure; ambiguous outcomes use attempt results. */
@@ -1179,11 +1168,11 @@ export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
   'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
   'Messages arrive as the <channel> tag described in the system prompt, carrying channel_name and, for a long message, part.',
-  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; thread = a reply delivered because you participate in that thread; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where only you receive every message.',
+  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; thread = a reply in a thread the bot is in; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where only you receive every message.',
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
   'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
-  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and followed-thread replies). Use it when someone in that channel asks; new assignments require open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
+  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and replies in threads the bot is in). Use it when someone in that channel asks; new assignments require open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
   'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
@@ -1771,7 +1760,7 @@ export function createSessionServer(
       if (!access()) return toolError(personaNotAppliedRefusal(name, key))
       const mode = deps.getChannelMode?.() ?? 'strict'
       const current = ['binding-conflict', 'inactive', 'invalid'].includes(outcome.kind) ? undefined : currentChannelDeliveryFacts(
-        key, request.channel, mode, store, deps.getAppliedPersonas?.() ?? [getPersona(key)!],
+        key, request.channel, mode, store,
         deps.readChannelMembership?.(key, request.channel, mode),
       )
       const text = channelDeliveryAttemptResultText(persona.name, key, request.channel, outcome, current)

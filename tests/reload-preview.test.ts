@@ -2102,7 +2102,7 @@ describe('buildChangePlan calculates current and reviewed channel projections', 
     label: string
     modes: [PersonaConfig['channel_mode'], PersonaConfig['channel_mode']]
     memberships: [MembershipReading | undefined, MembershipReading | undefined]
-    otherDestination?: [boolean, boolean]
+    otherDestination?: [boolean | string | null, boolean | string | null]
     effect?: Partial<ReviewedChannelEffect>
     expected: Pick<ReviewedChannelView, 'currentEffective' | 'effective' | 'membership' | 'activatesInStrict'>
   }
@@ -2119,10 +2119,13 @@ describe('buildChangePlan calculates current and reviewed channel projections', 
       expected: { currentEffective: 'off', effective: 'off', membership: unresolved, activatesInStrict: false } },
     { label: 'no saved or reviewed choice stays unlisted', modes: ['strict', 'strict'], memberships: [eligible, eligible], effect: { saved: undefined, reviewed: undefined, kind: 'omitted' },
       expected: { currentEffective: 'unlisted', effective: 'unlisted', membership: eligible, activatesInStrict: false } },
-    { label: 'a new other-persona destination constrains only the reviewed open choice', modes: ['open', 'open'], memberships: [eligible, eligible], otherDestination: [false, true], effect: { reviewed: 'thread_hybrid' },
-      expected: { currentEffective: 'all', effective: 'mentions', membership: eligible, activatesInStrict: false } },
-    { label: 'removing the other-persona destination releases only the reviewed loop guard', modes: ['open', 'open'], memberships: [eligible, eligible], otherDestination: [true, false], effect: { reviewed: 'all' },
-      expected: { currentEffective: 'mentions', effective: 'all', membership: eligible, activatesInStrict: false } },
+    ...(['strict', 'open'] as const).flatMap(mode => (['off', 'mentions', 'all', 'thread_hybrid'] as const).flatMap(delivery =>
+      ([['adding', 'dm', true], ['moving to DM', true, 'dm'], ['moving to another channel', true, false], ['removing', true, null]] as const).map(([label, before, after]): Case => ({
+        label: `${mode}: ${label} another persona destination preserves current and reviewed ${delivery}`,
+        modes: [mode, mode], memberships: [eligible, eligible], otherDestination: [before, after],
+        effect: { saved: delivery, reviewed: delivery },
+        expected: { currentEffective: delivery, effective: delivery, membership: eligible, activatesInStrict: false },
+      })))),
     { label: 'the own destination never constrains an open choice', modes: ['open', 'open'], memberships: [eligible, eligible], effect: { reviewed: 'all' },
       expected: { currentEffective: 'all', effective: 'all', membership: eligible, activatesInStrict: false } },
     { label: 'strict mode ignores another persona destination', modes: ['strict', 'strict'], memberships: [eligible, eligible], otherDestination: [true, true], effect: { reviewed: 'thread_hybrid' },
@@ -2140,16 +2143,22 @@ describe('buildChangePlan calculates current and reviewed channel projections', 
   ])('$label', ({ modes, memberships, otherDestination = [false, false], effect: fields, expected }) => {
     const configs = modes.map((mode, i) => {
       const input = baseInput(); input.channel_mode = mode
-      if (otherDestination[i]) {
+      if (otherDestination[i] === null) input.personas = input.personas.filter(p => p.name !== 'bravo')
+      else if (otherDestination[i]) {
         const bravo = entry(input, 'bravo')
-        bravo.channels = [...bravo.channels!, { id: 'C0A0001', delivery: 'mentions' }]
-        bravo.permission_prompts = 'C0A0001'
+        if (otherDestination[i] === 'dm') {
+          bravo.permission_prompts = 'dm'
+          bravo.dm = { enabled: true, contact: 'U0OPERATOR' }
+        } else {
+          bravo.channels = [...bravo.channels!, { id: 'C0A0001', delivery: 'mentions' }]
+          bravo.permission_prompts = 'C0A0001'
+        }
       }
       return parse(input)
     })
     const effect: ReviewedChannelEffect = { key: 'alpha', channel: 'C0A0001', kind: 'declared', saved: 'all', reviewed: 'mentions', previousOrder: 17, replacement: false, ...fields }
     // Same-mode cases supply the same current fact; different-mode cases must
-    // ask for the appropriate mode. The loop guard uses each config separately.
+    // ask for the appropriate mode. Destinations never reduce either projection.
     const plan = buildChangePlan(configs[0]!, valid(configs[1]!), facts({
       sharedReview: { generation: 4, channels: [effect] },
       ...(memberships[0] === undefined ? {} : { membership: (key, channel, mode) => {

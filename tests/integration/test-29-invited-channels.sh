@@ -42,8 +42,8 @@
 # - B, fungible mode (steps 1 to 11): the fungible path, both orders
 #   of a mention's two events, a broadcast, a private channel, the externally
 #   shared, missing and non-boolean flags, a group DM, alpha's own fungible
-#   destination, then set_channel_delivery: stored, refused, held by the loop
-#   guard, and shared delivery, exactly once to each persona.
+#   destination, then set_channel_delivery: stored, refused, applied as written
+#   in another persona's destination, and shared delivery, exactly once to each persona.
 # - Restart: a plain stop (the bots keep running) and a live start;
 #   shared choices, identities and reviewed bytes survive fresh discovery;
 #   the reconnect's new MCP clients
@@ -588,7 +588,7 @@ attempt_args() {
 }
 
 # Read the production-validated durable outcome AFTER the call. Expected current
-# effectiveness is supplied by this scenario's independent guard/eligibility setup.
+# effectiveness is supplied by this scenario's independent choice/eligibility setup.
 expect_attempt() {
     local step="$1" dir="$2" args="$3" key="$4" effective="$5" history="${6:-new}" want_error="${7:-false}" expected
     call_tool "${dir}" "${args}"
@@ -798,7 +798,7 @@ A1_HEARD_CAUSE="$(printed invitedChannelCause "${A1}" public mentions)"
 F2_HEARD_CAUSE="$(printed invitedChannelCause "${F2}" private mentions)"
 F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" mentions all all)"
 F1_SET_AGAIN_CAUSE="$(printed channelDeliverySetCause "${F1}" all all all)"
-A1_SET_HELD_CAUSE="$(printed channelDeliverySetCause "${A1}" mentions all mentions)"
+A1_SET_ALL_CAUSE="$(printed channelDeliverySetCause "${A1}" mentions all all)"
 F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${F1_CAUSE}")"
 X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X1_CAUSE}")"
 X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X2_CAUSE}")"
@@ -810,7 +810,7 @@ BRAVO_HEARS_F2="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${F2_HEARD_CA
 BRAVO_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${A1_HEARD_CAUSE}")"
 ALPHA_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_CAUSE}")"
 ALPHA_SET_F1_AGAIN="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_AGAIN_CAUSE}")"
-BRAVO_SET_A1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${A1_SET_HELD_CAUSE}")"
+BRAVO_SET_A1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${A1_SET_ALL_CAUSE}")"
 BRAVO_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${F1_SET_CAUSE}")"
 # alpha's persona-invited-channel head, whatever the cause: its line printed
 # with a marker cause and cut there.
@@ -1112,21 +1112,19 @@ expect_tool "step 9: alpha's set_channel_delivery F1 ${BAD_DELIVERY}" "${ALPHA_D
     "$(attempt_args "${TEST_NAME}-invalid-value" "${F1}" "${BAD_DELIVERY}")" true "${ALPHA_VALUE_REFUSAL}"
 expect_since "${B9_MARK}" "[slack] ${PERSONA_CHANNEL_DELIVERY_SET}:" 0 "step 9: persona-channel-delivery-set lines"
 
-# 10. bravo and A1, alpha's fungible destination: a mention is delivered (A1
-#     joins bravo's heard set); bravo's call for A1 with `all` is accepted but
-#     held at `mentions`; bravo, A1, plain: no delivery.
+# 10. bravo and A1, alpha's notice destination: a mention is delivered (A1
+#     joins bravo's heard set); bravo's call for A1 with `all` applies as
+#     written; bravo, A1, plain: delivered `receive_all_shared`, since alpha
+#     also has A1 at `all`.
 B10_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
 wait_queued "step 10: bravo A1 mention" "${BRAVO_DIR}" "${A1}" "${PUSH_TS}" "${VIA_MENTION}"
 expect_since "${B10_MARK}" "${BRAVO_HEARS_A1}" 1 "step 10: bravo's persona-invited-channel lines for A1"
-expect_attempt "step 10: bravo's set_channel_delivery A1 all" "${BRAVO_DIR}" "${BRAVO_A1_ALL_ARGS}" "${BRAVO_KEY}" mentions
+expect_attempt "step 10: bravo's set_channel_delivery A1 all" "${BRAVO_DIR}" "${BRAVO_A1_ALL_ARGS}" "${BRAVO_KEY}" all
 expect_since "${B10_MARK}" "${BRAVO_SET_A1}" 1 "step 10: bravo's persona-channel-delivery-set lines for A1"
-B10_PLAIN_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(plain_text)"
 B10_TS="${PUSH_TS}"
-wait_since "${B10_PLAIN_MARK}" "$(plain_drop "${BRAVO_REF}" "${A1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
-    "step 10: no not-mentioned line for bravo A1"
-expect_queued "step 10: bravo A1 plain" 0 "${BRAVO_DIR}" "${A1}" "${B10_TS}"
+wait_queued "step 10: bravo A1 plain (shared)" "${BRAVO_DIR}" "${A1}" "${B10_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 
 # 11. bravo and F1, shared delivery: a mention is delivered, bravo stores
 #     `all` for F1, then one plain F1 message pushed to both personas is
@@ -1248,7 +1246,7 @@ OFF_F1_TS="${PUSH_TS}"
 wait_queued "switch off: alpha F1 keeps its shared applied choice" "${ALPHA_DIR}" "${F1}" "${OFF_F1_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 expect_since "${OFF_MARK}" "${F1_UNCLAIMED}" 0 "switch off: an applied channel is still configured"
 
-# alpha and bravo both hold A1 at all; strict mode has no open destination guard.
+# alpha and bravo keep A1 at all after the switch, including alpha's notice destination.
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 OFF_A1_TS="${PUSH_TS}"
 wait_queued "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${OFF_A1_TS}" "${VIA_RECEIVE_ALL_SHARED}"

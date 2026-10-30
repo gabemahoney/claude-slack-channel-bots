@@ -1,12 +1,13 @@
-/** Pure non-thread selection over the applied shared choices and current
+/** Pure selection over the applied shared choices, Thread Memory view and current
  * authenticated membership. An unresolved decision withholds acknowledgement;
  * it is distinct from an established exclusion. DMs and message/author filters
- * precede channel authority. A `thread_hybrid` channel selects only @mentions
- * and Broadcasts here; Thread Memory adds its replies.
+ * precede channel authority. A `thread_hybrid` channel selects @mentions,
+ * Broadcasts and replies in threads the persona is in, from Thread Memory.
  * SPDX-License-Identifier: MIT
  */
-import type { ChannelEntry, ChannelMode, DeliveryMode, DM_DESTINATION } from './config.ts'
+import type { ChannelEntry, ChannelMode, DeliveryMode } from './config.ts'
 import type { MembershipReading } from './channel-membership.ts'
+import type { ThreadMemoryView } from './thread-memory.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,16 +45,6 @@ const FUNGIBLE_MODE: ChannelMode = 'open'
 /** The channel delivery that hears every message. */
 const DELIVERY_ALL: DeliveryMode = 'all'
 
-/** The channel delivery that hears mentions and broadcasts only. */
-const DELIVERY_MENTIONS: DeliveryMode = 'mentions'
-
-/**
- * The destination value that sends by DM (`DM_DESTINATION` in
- * `src/config.ts`, held to it by its type). A DM destination is no channel,
- * so the loop guard never holds anything for it.
- */
-const DM_DESTINATION_VALUE: typeof DM_DESTINATION = 'dm'
-
 /**
  * Why an event that passed steps 1 to 3 does not take the fungible path
  * in the order the conditions are checked: its `channel_type`
@@ -76,10 +67,10 @@ export const FUNGIBLE_REFUSALS = [
 /**
  * How a delivered message reached the persona,
  * first match wins: `dm` (a direct message to P), `mention` (P's user
- * mention), `broadcast` (`<!here>` / `<!channel>`), `thread` (a reply
- * Thread Memory selects for P), `receive_all_shared`
- * (`all` for P and at least one other applied persona: their `delivery`
- * entries in declarative mode, their channel deliveries in fungible mode),
+ * mention), `broadcast` (`<!here>` / `<!channel>`), `thread` (a reply in a
+ * thread the persona is in, from its Thread Memory view), `receive_all_shared`
+ * (`all` for P and at least one other applied, available persona: their saved
+ * choices apply as written in both modes),
  * `receive_all`.
  */
 export type Via = 'dm' | 'mention' | 'broadcast' | 'receive_all_shared' | 'receive_all' | 'thread'
@@ -126,7 +117,7 @@ export type FungibleRefusal = (typeof FUNGIBLE_REFUSALS)[number]
 export type FungibleChannelType = 'public' | 'private'
 
 /**
- * What an outcome says about an event that took the fungible path: the channel type and P's channel delivery after the loop guard.
+ * What an outcome says about an event that took the fungible path: the channel type and P's saved channel delivery, applied as written.
  */
 export interface FungiblePath {
   /** `public` for `channel_type` `channel`, `private` for `group`. */
@@ -185,21 +176,8 @@ export interface StoredChoices {
   storedChoice(key: string, channel: string): DeliveryMode | undefined
 }
 
-/** One applied persona's fungible destination: `dm` or a channel ID. */
-export interface PersonaFungibleDestination {
-  key: string
-  /** The persona's destination in fungible mode, as the one destination rule resolves it. */
-  destination: string
-}
-
 /** What a channel delivery is computed from, besides the persona and the channel. */
 export interface ChannelDeliveryInputs {
-  /**
-   * Every applied persona's fungible destination, P's included, from the
-   * configuration in effect. In fungible mode this is the list of applied
-   * personas the decision reads.
-   */
-  fungibleDestinations: readonly PersonaFungibleDestination[]
   /** The shared choice projection. Absence leaves selection unresolved. */
   storedChoices?: StoredChoices
 }
@@ -210,6 +188,8 @@ export interface ChannelDeliveryInputs {
  * cannot authorize channel selection.
  */
 export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
+  /** Synchronous, read-only Thread Memory lookup, used only for dependent replies. */
+  threadMemory?(key: string, channel: string, threadRoot: string): ThreadMemoryView
   /** Shared-state restoration may hold a stamp while choices remain readable. */
   threadStampUndecided?(key: string, channel: string): boolean
   /** Current, synchronous observations for this event's channel, by persona.
@@ -230,11 +210,6 @@ export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
 export interface ChannelDeliveryResult {
   /** Absent when no trustworthy saved choice exists; never a default off. */
   delivery: DeliveryMode | undefined
-  /**
-   * True when the loop guard applies: the channel is another applied
-   * persona's fungible destination, so a non-off choice becomes `mentions`.
-   */
-  heldByLoopGuard: boolean
 }
 
 /** The receiving persona P as `decideDelivery` sees it. */
@@ -300,7 +275,7 @@ export function decideDelivery(
       break
   }
 
-  if (fungible?.mode === FUNGIBLE_MODE) return decideFungibleChannel(ev, channel, persona, fungible)
+  if (fungible?.mode === FUNGIBLE_MODE) return decideFungibleChannel(ev, channel, persona, applied, fungible)
   const availability = channelAvailability(persona.key, channel, fungible)
   if (availability) return availability
   const saved = fungible?.storedChoices?.storedChoice(persona.key, channel)
@@ -309,7 +284,7 @@ export function decideDelivery(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention' }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast' }
-  if (saved === 'thread_hybrid' && dependentReplyUndecided(ev, persona.key, channel, fungible)) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
+  if (saved === 'thread_hybrid') return decideThreadReply(ev, persona.key, channel, fungible)
   if (saved !== 'all') return { action: 'drop', reason: 'not-mentioned' }
   const shared = applied.some((p) =>
     p.key !== persona.key && !channelAvailability(p.key, channel, fungible) &&
@@ -326,6 +301,7 @@ function decideFungibleChannel(
   ev: Record<string, unknown>,
   channel: string,
   persona: DeliveryPersona,
+  applied: readonly AppliedPersonaView[],
   inputs: FungibleDecisionInputs,
 ): DeliveryDecision {
   const channelType = ev['channel_type']
@@ -344,17 +320,33 @@ function decideFungibleChannel(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention', fungible: path }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast', fungible: path }
-  if (path.channelDelivery === 'thread_hybrid' && dependentReplyUndecided(ev, persona.key, channel, inputs)) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
+  if (path.channelDelivery === 'thread_hybrid') return decideThreadReply(ev, persona.key, channel, inputs, path)
   if (path.channelDelivery !== DELIVERY_ALL) return { action: 'drop', reason: 'not-mentioned', fungible: path }
-  const shared = inputs.fungibleDestinations.some((other) =>
+  const shared = applied.some((other) =>
     other.key !== persona.key && !channelAvailability(other.key, channel, inputs) &&
       channelDeliveryFor(other.key, channel, inputs).delivery === DELIVERY_ALL)
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all', fungible: path }
 }
 
-/** Called after independent mentions and broadcasts have already selected. */
-function dependentReplyUndecided(ev: Record<string, unknown>, key: string, channel: string, inputs?: FungibleDecisionInputs): boolean {
-  return isThreadTimestamp(ev['thread_ts']) && ev['thread_ts'] !== ev['ts'] && inputs?.threadStampUndecided?.(key, channel) === true
+/** Only eligible thread_hybrid channels reach this branch, after mentions and broadcasts. */
+function decideThreadReply(
+  ev: Record<string, unknown>, key: string, channel: string,
+  inputs: FungibleDecisionInputs | undefined, path?: FungiblePath,
+): DeliveryDecision {
+  const context = path ? { fungible: path } : {}
+  const notMentioned: DropDecision = { action: 'drop', reason: 'not-mentioned', ...context }
+  const root = replyThreadRoot(ev)
+  if (root === undefined) return notMentioned
+  if (inputs?.threadStampUndecided?.(key, channel) === true) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
+  const view = inputs?.threadMemory?.(key, channel, root) ?? 'unknown'
+  // Unknown Thread Memory currently excludes the reply, pending durable Memory Holds.
+  if (view === 'unknown') return notMentioned
+  return view === 'joined' ? { action: 'deliver', via: 'thread', ...context } : notMentioned
+}
+
+/** A root message's own timestamp never makes that message a thread reply. */
+function replyThreadRoot(ev: Record<string, unknown>): string | undefined {
+  return isThreadTimestamp(ev['thread_ts']) && ev['thread_ts'] !== ev['ts'] ? ev['thread_ts'] : undefined
 }
 
 /** Whether a persona's configured channel entries name `channel`. Pure. */
@@ -398,35 +390,16 @@ function fungibleRefusalOf(
   return undefined
 }
 
-/**
- * Persona `key`'s channel delivery for `channel` in fungible mode, and whether the loop guard held it:
- *
- * - `off` remains off, before any destination guard;
- * - a non-off choice becomes `mentions`, held, when `channel` is the destination of any
- *   applied persona other than `key` (the loop guard). The persona's own
- *   destination is never held, since its own posts are dropped before the
- *   channel steps, and a `dm` destination holds nothing;
- * - otherwise the persona's stored choice for `channel`, when the store is
- *   readable;
- * - otherwise unresolved (`delivery` is undefined).
- *
- * Whether any persona lists `channel` in its channel entries plays no part.
- * The one copy of the rule: `decideDelivery` uses it for P and for every
- * other persona, and `set_channel_delivery` for its result. Pure.
- */
+/** The saved choice applies as written when the store is readable.
+ * Missing or unreadable choices remain unresolved. Pure. */
 export function channelDeliveryFor(
   key: string,
   channel: string,
   inputs: ChannelDeliveryInputs,
 ): ChannelDeliveryResult {
-  const held = inputs.fungibleDestinations.some((other) =>
-    other.key !== key && other.destination !== DM_DESTINATION_VALUE && other.destination === channel)
   const store = inputs.storedChoices
   const stored = store !== undefined && (store.readableFor?.(key, channel) ?? store.readable) ? store.storedChoice(key, channel) : undefined
-  if (stored === undefined) return { delivery: undefined, heldByLoopGuard: false }
-  if (stored === 'off') return { delivery: 'off', heldByLoopGuard: false }
-  if (held) return { delivery: DELIVERY_MENTIONS, heldByLoopGuard: true }
-  return { delivery: stored, heldByLoopGuard: false }
+  return { delivery: stored }
 }
 
 /** step 2: the author is P's bot user, or the event carries P's bot ID. */

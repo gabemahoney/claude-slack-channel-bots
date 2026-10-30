@@ -1,7 +1,25 @@
 import { describe, expect, test } from 'bun:test'
-import { formatPersonaDiagnostic, PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
+import { deliveryIdentity, formatPersonaDiagnostic, PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
 import { threadMemoryLoadAtApplyFailedLine } from '../src/persona-lifecycle.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
+import { injectedInput, slackInput } from './test-helpers/delivery-queue.ts'
+
+describe('delivery identity thread reason', () => {
+  test('pins the fixed thread suffix on Slack identities', () => {
+    const identity = deliveryIdentity({ ...slackInput({ via: 'thread' }), ts: '1700000000.000001' })
+    expect(identity).toBe('source=slack chat_id="C0TEST001" ts="1700000000.000001" sender_id="U0TEST001" via=thread')
+  })
+  test.each([undefined, 'dm', 'mention', 'broadcast', 'receive_all', 'receive_all_shared', 'thread-extra', LEAK_SENTINEL])('Slack via %p leaves the identity unchanged and never echoes arbitrary values', via => {
+    const identity = deliveryIdentity({ ...slackInput({ via }), ts: '1700000000.000001' })
+    expect(identity).toBe('source=slack chat_id="C0TEST001" ts="1700000000.000001" sender_id="U0TEST001"')
+    assertNoLeak(identity)
+  })
+  test.each(['cron', 'interject'] as const)('%s with a thread reason keeps its existing identity', source => {
+    const identity = deliveryIdentity({ ...injectedInput({ source, via: 'thread' }), ts: '1700000000.000001' })
+    expect(identity).toBe(`source=${source} sender="interject" ts="1700000000.000001" sender_id="interject"`)
+    assertNoLeak(identity)
+  })
+})
 
 describe('undecided Thread Memory stamp diagnostic', () => {
   test('pins the exported cause, review/apply remedy and finite-Slack-retry limitation', () => {

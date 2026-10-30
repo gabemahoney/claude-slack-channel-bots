@@ -43,7 +43,6 @@ import { queueRetentionClause } from './reload-preview-clauses.ts'
 import { REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_ABSENCE_REPLACEMENT } from './reload-preview-clauses.ts'
 import type { ReviewedChannelEffect } from './shared-channels.ts'
 import type { MembershipReading } from './channel-membership.ts'
-import { channelDeliveryFor } from './delivery-decision.ts'
 import { reviewIntentLine } from './reload-request.ts'
 import {
   channelModeOf,
@@ -417,19 +416,11 @@ function reviewedChannelViews(applied: PersonaConfig, next: PersonaConfig, facts
   return (facts.sharedReview?.channels ?? []).map(effect => {
     const membership: MembershipReading = effect.replacement ? { kind: 'unresolved', reason: 'current-membership-missing' } :
       facts.membership?.(effect.key, effect.channel, next.channel_mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }
-    const delivery = next.channel_mode === 'open' ? channelDeliveryFor(effect.key, effect.channel, {
-      fungibleDestinations: next.personas.map(persona => ({ key: persona.key, destination: persona.permission_prompts })),
-      storedChoices: { readable: true, storedChoice: () => effect.reviewed },
-    }).delivery : effect.reviewed
     const effective = effect.reviewed === undefined ? 'unlisted' : effect.reviewed === 'off' ? 'off' :
-      membership.kind === 'eligible' ? delivery! : membership.kind === 'ineligible' ? `inactive (${membership.reason})` : `unverified (${membership.reason})`
+      membership.kind === 'eligible' ? effect.reviewed : membership.kind === 'ineligible' ? `inactive (${membership.reason})` : `unverified (${membership.reason})`
     const before = facts.membership?.(effect.key, effect.channel, applied.channel_mode)
-    const currentDelivery = applied.channel_mode === 'open' ? channelDeliveryFor(effect.key, effect.channel, {
-      fungibleDestinations: applied.personas.map(persona => ({ key: persona.key, destination: persona.permission_prompts })),
-      storedChoices: { readable: true, storedChoice: () => effect.saved },
-    }).delivery : effect.saved
     const currentEffective = effect.saved === undefined ? 'unlisted' : effect.saved === 'off' ? 'off' :
-      before?.kind === 'eligible' ? currentDelivery! : before?.kind === 'ineligible' ? `inactive (${before.reason})` : 'unverified'
+      before?.kind === 'eligible' ? effect.saved : before?.kind === 'ineligible' ? `inactive (${before.reason})` : 'unverified'
     return { ...effect, membership, effective, currentEffective,
       activatesInStrict: applied.channel_mode === 'open' && next.channel_mode === 'strict' &&
         effect.reviewed === 'mentions' && membership.kind === 'eligible' && before?.kind === 'ineligible' && before.reason === 'external-sharing' }

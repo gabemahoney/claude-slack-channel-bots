@@ -1308,7 +1308,7 @@ const toolTextSample = lazy(() => {
  * [export name, form ('' for a text with one form), text]. The listing texts
  * as exported; each builder rendered with `toolTextSample()`, the value and
  * channel refusals in their echoed and their not-shown forms, the result in
- * its plain and its loop-guard-held forms; and the two resolution refusals
+ * its plain form; and the two resolution refusals
  * every tool shares, named for this tool. Each
  * text is rendered when its case runs.
  */
@@ -1330,8 +1330,7 @@ const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, te
     [channelDeliveryValueRefusal.name, 'not shown', () => channelDeliveryValueRefusal(s().name, s().key, s().hiddenValue)],
     [channelDeliveryChannelRefusal.name, 'echoed', () => channelDeliveryChannelRefusal(s().name, s().key, s().channel)],
     [channelDeliveryChannelRefusal.name, 'not shown', () => channelDeliveryChannelRefusal(s().name, s().key, s().hiddenChannel)],
-    [channelDeliverySetResultText.name, 'plain', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'all', heldByLoopGuard: false })],
-    [channelDeliverySetResultText.name, 'held by the loop guard', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'mentions', heldByLoopGuard: true })],
+    [channelDeliverySetResultText.name, '', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'all' })],
     [channelDeliveryWriteFailedText.name, '', () => channelDeliveryWriteFailedText(s().name, s().key, s().path)],
     [channelDeliveryNotStoredText.name, '', () => channelDeliveryNotStoredText(s().name, s().key, 'set_at')],
     [sessionNotMatchedRefusal.name, '', () => sessionNotMatchedRefusal(SET_CHANNEL_DELIVERY_TOOL)],
@@ -1750,7 +1749,6 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     const TWO_FORMS: Record<string, readonly string[]> = {
       [channelDeliveryValueRefusal.name]: ['echoed', 'not shown'],
       [channelDeliveryChannelRefusal.name]: ['echoed', 'not shown'],
-      [channelDeliverySetResultText.name]: ['plain', 'held by the loop guard'],
       [channelDeliveryAttemptResultText.name]: deliveryResultSamples().map(sample => sample.form),
       [channelDeliveryCurrentFactsText.name]: deliveryCurrentSamples().map(sample => sample.form),
     }
@@ -1768,7 +1766,7 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
       'not-applied-dry-run', 'not-applied-write-failed', 'pending', 'unresolved', 'binding-conflict', 'invalid', 'inactive',
     ])
     const current = deliveryCurrentSamples()
-    expect(new Set(current.map(sample => sample.form)).size).toBe(31)
+    expect(new Set(current.map(sample => sample.form)).size).toBe(30)
   })
 
   test('the shipped-text audit includes each actual recovery clause and strict unreadable-state refusal', () => {
@@ -1787,7 +1785,14 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     expect(text(channelDeliveryValueRefusal.name, 'not shown')).not.toContain(String(sample.hiddenValue))
     expect(text(channelDeliveryChannelRefusal.name, 'echoed')).toContain(JSON.stringify(sample.channel))
     expect(text(channelDeliveryChannelRefusal.name, 'not shown')).not.toContain(sample.hiddenChannel)
-    expect(text(channelDeliverySetResultText.name, 'held by the loop guard')).not.toBe(text(channelDeliverySetResultText.name, 'plain'))
+  })
+
+  test.each([...DELIVERY_MODES])('the %s result reports the saved choice in its one plain form', delivery => {
+    const { channel } = toolTextSample()
+    expect(channelDeliverySetResultText(channel, delivery, { delivery })).toBe(
+      `Stored ${delivery} as your channel delivery for channel ${channel}. ` +
+      `From the next message in that channel, your channel delivery there is ${delivery}.`,
+    )
   })
 
   test(`the audit reads ${CREDENTIALS_SCRIPT}, whose prompts and messages the operator sees`, () => {
@@ -2230,7 +2235,7 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
   })
 })
 
-/** A thread reason describes this recipient's participation, without an audience promise. */
+/** A thread reason describes a thread this bot is in, without an audience promise. */
 function threadAudienceProblems(text: string): string[] {
   const checks: Array<[string, RegExp]> = [
     ['whole-channel audience', /(?:every|all) messages? (?:in|from) (?:the|this) channel|(?:whole|entire) channel/i],
@@ -2241,9 +2246,9 @@ function threadAudienceProblems(text: string): string[] {
 
 describe('exported thread reason wording', () => {
   const surfaces = [['MCP instructions', MCP_INSTRUCTIONS], ['tag description', TAG_DESCRIPTION]] as const
-  const meaning = /a reply delivered because (?:you participate|this persona participates) in that thread/i
+  const meaning = /a reply in a thread the bot is in/i
 
-  test.each(surfaces)('%s explains thread participation without promising a channel or exclusive audience', (_name, text) => {
+  test.each(surfaces)('%s explains a reply in a thread the bot is in without promising a channel or exclusive audience', (_name, text) => {
     const clause = text.match(/(?:thread =|via="thread" means)\s*([^\n]*?)(?=;\s*\w+ =|\n|$)/)?.[1] ?? ''
     expect(clause).toMatch(meaning)
     expect(threadAudienceProblems(clause)).toEqual([])
@@ -2259,13 +2264,20 @@ describe('exported thread reason wording', () => {
     ['only this persona receives it', 'exclusive audience'],
     ['just you participate', 'exclusive audience'],
     ['an exclusive recipient', 'exclusive audience'],
-  ])('the audience audit rejects %s even beside the participation explanation', (claim, problem) => {
-    expect(threadAudienceProblems(`A reply delivered because this persona participates in that thread; ${claim}.`)).toEqual([problem])
+  ])('the audience audit rejects %s even beside the thread explanation', (claim, problem) => {
+    expect(threadAudienceProblems(`A reply in a thread the bot is in; ${claim}.`)).toEqual([problem])
   })
 
-  test('the participation meaning is required, not just a thread label', () => {
+  test('the thread meaning is required, not just a thread label or the former participation wording', () => {
     expect('thread = an unmentioned reply').not.toMatch(meaning)
     expect('thread = a reply delivered because another persona participates in that thread').not.toMatch(meaning)
+  })
+
+  test.each(surfaces)('%s rejects reverting to the former participation wording', (_name, text) => {
+    expect(text).toMatch(meaning)
+    const reverted = text.replace(meaning, 'a reply delivered because this persona participates in that thread')
+    expect(reverted).not.toBe(text)
+    expect(reverted).not.toMatch(meaning)
   })
 
   test('the receiving row retains Slack attributes and reminder eligibility without an audience promise', () => {
@@ -7757,17 +7769,12 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('A mode switch preserves them'),
     ci('A removed, renamed or replaced persona never inherits its previous incarnation’s choices'),
   ]],
-['Channel modes: the loop guard holds other personas at mentions without enabling off choices', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
-    ci('Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off'),
-    ci('Off wins before the guard, including for mentions and broadcasts; the saved value stays intact'),
-    ci('Its own destination and a `"dm"` destination hold nothing'),
-  ]],
-// decideDelivery checks channelAvailability for each sibling and, in open,
-// channelDeliveryFor's effective value: a guarded saved-all member cannot count.
+// decideDelivery checks current channelAvailability and the all choice for each sibling.
 [`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci(`**${code(RECEIVE_ALL_SHARED)} requires effective eligibility.**`),
     ci('In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel'),
-    ci('A saved-all choice alone does not count: departed, unverified or loop-guarded personas cannot supply it'),
+    ci('A saved-all choice alone does not count: departed, unverified or'),
+    ci('personas cannot supply it'),
     ci('otherwise the reason is `receive_all`'),
   ]],
 [`Channel modes: the warning against two personas at ${ALL} in one channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
@@ -7802,16 +7809,17 @@ const README_DEO_ROWS: readonly DocRow[] = [
 ['receiving: current verified eligibility in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, 'For new non-thread channel intake,'), [
     ci('both modes require current verified eligible membership and a trustworthy non-off choice'),
     ci('open also requires a public/private channel with explicit non-external-sharing evidence'),
-    ci('Off suppresses mentions and broadcasts before the open loop guard'),
+    ci('Off suppresses mentions and broadcasts'),
     ci('unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress'),
   ]],
 [`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, kindRowOf(RECEIVE_ALL_SHARED), [
     ci('Neither a direct mention nor a broadcast, with effective `all` for this persona and another currently eligible persona in the same channel'),
-    ci('Departed, unverified, off or loop-guarded saved-all siblings do not count'),
+    ci('Departed, unverified, off or'),
+    ci('saved-all siblings do not count'),
   ]],
 ['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
     ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona is currently eligible and effectively all there`),
-    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel after current membership, eligibility and loop-guard checks`),
+    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel after current membership, eligibility`),
   ]],
 ['receiving: followed replies use this persona\'s participation under effective thread_hybrid', text => tableCells(kindRowOf('thread')(text))[1] ?? '', [
     /Neither a direct mention nor a broadcast/i,
@@ -8113,11 +8121,6 @@ describe('the README describes both channel modes', () => {
       ['four persistent listening choices with missing choices unresolved', 'A missing or unreadable assignment holds affected intake; it is not a saved `off` choice', 'A missing or unreadable assignment defaults to `off`'],
       ['four persistent listening choices with missing choices unresolved', 'A mode switch preserves them', 'A mode switch resets them'],
       ['four persistent listening choices with missing choices unresolved', 'never inherits its previous incarnation’s choices', 'inherits its previous incarnation’s choices'],
-      ['the loop guard holds other personas at mentions without enabling off choices', 'is held at `mentions`', 'is held at `all`'],
-      ['the loop guard holds other personas at mentions without enabling off choices', 'whose applied choice is non-off', 'whose applied choice is off'],
-      ['the loop guard holds other personas at mentions without enabling off choices', 'Off wins before the guard', 'The guard overrides off'],
-      ['the loop guard holds other personas at mentions without enabling off choices', 'the saved value stays intact', 'the saved value becomes mentions'],
-      ['the loop guard holds other personas at mentions without enabling off choices', 'Its own destination and a `"dm"` destination hold nothing', 'Its own destination and a `"dm"` destination hold every channel'],
     ])('self-check: Channel modes: %s rejects omission or reversal of "%s"', (label, original, reversal) => {
       const element = `Channel modes: ${label}`
       const row = README_DEO_ROWS.find(([name]) => name === element)
@@ -8152,14 +8155,13 @@ describe('the README describes both channel modes', () => {
         ['A saved-all choice alone does not count', 'A saved-all choice alone counts'],
         ['departed, ', 'departed personas can supply it; '],
         ['unverified or ', 'unverified personas can supply it; '],
-        ['loop-guarded personas cannot supply it', 'loop-guarded personas can supply it'],
         ['otherwise the reason is `receive_all`', 'otherwise the reason is `receive_all_shared`'],
       ]],
       ['receiving: current verified eligibility in both modes', [
         ['current verified eligible membership', 'listed or historical membership'],
         ['a trustworthy non-off choice', 'a missing choice defaulting to off'],
         ['explicit non-external-sharing evidence', 'unknown external-sharing evidence'],
-        ['Off suppresses mentions and broadcasts before the open loop guard', 'The open loop guard enables mentions and broadcasts for off'],
+        ['Off suppresses mentions and broadcasts', 'Off enables mentions and broadcasts'],
         ['unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress', 'unresolved facts acknowledge a drop and block independent recipients and accepted work'],
       ]],
       [`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, [
@@ -8169,11 +8171,10 @@ describe('the README describes both channel modes', () => {
         ['Departed, ', 'Departed siblings count. '],
         ['unverified, ', 'unverified siblings count; '],
         ['off or ', 'off siblings count; '],
-        ['loop-guarded saved-all siblings do not count', 'loop-guarded saved-all siblings count'],
       ]],
       ['receiving: the receive_all row, scoped per mode', [
         ['no other persona is currently eligible and effectively all there', 'no other persona has a saved-all entry there'],
-        ['after current membership, eligibility and loop-guard checks', 'whether or not that app remains in the channel'],
+        ['after current membership, eligibility', 'whether or not that app remains in the channel'],
       ]],
     ] as const).flatMap(([element, mutations]) => mutations.map(([original, reversal]) => [element, original, reversal] as const)))(
       'self-check: %s rejects omission or reversal of "%s"', (element, original, reversal) => {

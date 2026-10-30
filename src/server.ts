@@ -726,13 +726,10 @@ const sessionToolDeps: SessionToolDeps = {
   // beside set_channel_delivery's inputs, each
   // read at call time. The one stored-choice store, through the holder main()
   // sets (undefined before then, so the call is refused and nothing is
-  // written); current up/membership evidence; the applied personas of the
-  // configuration in effect, for the loop guard. The routing is built further
-  // down, so it is named only inside the arrow.
+  // written); and current up/membership evidence.
   getChannelDelivery: () => channelDeliveryStore,
   isPersonaUp: key => !shuttingDown && isPersonaUp(key),
   readChannelMembership: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
-  getAppliedPersonas: () => personaConfig?.personas ?? [],
   // the persona-channel-delivery-set line goes to the
   // [slack] stream, as the routing's persona lines do.
   log: (line) => console.error(line),
@@ -1189,6 +1186,7 @@ const personaRouting = createPersonaRouting({
   // sets, which the session tools and the reload controller read too. Before
   // main() loads the store it is undefined, so no stored choice applies.
   getChannelDelivery: () => channelDeliveryStore,
+  threadMemory: (key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown',
   threadStampUndecided: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
   threadStampEpisodes: {
     begin: (key, channel) => personaEpisodes?.threadStampUndecided.begin(key, channel) ?? false,

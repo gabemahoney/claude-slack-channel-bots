@@ -1,4 +1,5 @@
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
+import { THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
 import * as nodeFs from 'node:fs'
 import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
@@ -162,6 +163,7 @@ import {
   makeDm,
   makePrivateChannelMessage,
   mentionText,
+  broadcastText,
   stubOpenedDmId,
   type SlackEvent,
   type StubSlackOptions,
@@ -6311,6 +6313,127 @@ describe('at apply: no credential value in any log line, error, notice, tool res
   })
 })
 
+describe('delivery and Joined Threads survive destination changes', () => {
+  test.each((['strict', 'open'] as const).flatMap(mode =>
+    (['off', 'mentions', 'all', 'thread_hybrid'] as const).map(delivery => ({ mode, delivery }))))(
+    '$mode / $delivery keeps choices, stamps and joins through confirmed destinations and mode switches', async ({ mode, delivery }) => {
+    const channel = EXTRA_CHANNEL, neighbor = OTHER_CHANNEL
+    const { run, personas: [alpha, bravo] } = await running([
+      ['alpha', { channels: [{ id: channel, delivery }, { id: neighbor, delivery: 'thread_hybrid' }],
+        permission_prompts: 'dm', dm: { enabled: true, contact: CONTACT } }],
+      ['bravo', { channels: [{ id: channel, delivery: 'mentions' }, { id: neighbor, delivery: 'mentions' }],
+        permission_prompts: 'dm', dm: { enabled: true, contact: CONTACT } }],
+    ], { ...REAL_WITH_SESSIONS, threadMemory: {}, top: { channel_mode: mode } })
+    const authority = run.controller.sharedChannels()!
+    if (delivery === 'thread_hybrid') await run.joinThread('alpha', channel, THREAD_ROOTS.primary)
+    await run.joinThread('alpha', neighbor, THREAD_ROOTS.secondary)
+    const before = authority.snapshot().personas.alpha!, session = run.session('alpha')
+    const stamps = [channel, neighbor].map(c => authority.channelStamp('alpha', c))
+    const journal = readFileSync(threadPath(h.stateDir, 'alpha'))
+    const confirmTransition = async (personas: PersonaInput[], nextMode: 'strict' | 'open', expected: Array<ReloadLifecycleRecord & { op: 'update-in-place' | 'teardown' }>) => {
+      const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+      const adCalls = stubCallCount(run.composition!.agentDirector)
+      const adOrder = run.composition!.agentDirectorOrder.length
+      const kept = run.serverConfig()!.personas.map(({ name, key }) => ({
+        name, key, side: slackSideOf(run, name), client: run.connections.clientFor(key),
+        socket: run.stub(name).socket, session: run.session(name),
+      }))
+      const untouched = kept.filter(({ key }) => !expected.some(record => record.key === key))
+        .map(({ name }) => watchUntouched(run, name))
+      const expectKept = (removed: string[] = []) => {
+        expect(run.since(cp).slackBuilds).toBe(0)
+        expect(run.since(cp).slackCalls).toEqual([])
+        for (const before of kept) {
+          expect(slackSideOf(run, before.name)).toEqual(removed.includes(before.key)
+            ? { ...before.side, disconnects: before.side.disconnects.map(n => n + 1) } : before.side)
+          if (removed.includes(before.key)) continue
+          expect(run.connections.clientFor(before.key)).toBe(before.client)
+          expect(run.stub(before.name).socket).toBe(before.socket)
+          expect(run.session(before.name)).toBe(before.session)
+          expect(before.session!.connected).toBe(true)
+        }
+      }
+      await previewConfig(run, personas, { channel_mode: nextMode })
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+      expect(run.composition!.calls.slice(calls)).toEqual([])
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+      expectKept()
+      h.confirm(); await run.ticks.tick()
+      expect(run.since(cp).lifecycle).toEqual(expected)
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual(expected.flatMap(({ op, key }) => [
+        { op, key, phase: 'start' }, { op, key, phase: 'settled' },
+      ]))
+      const removed = expected.filter(({ op }) => op === 'teardown').map(({ key }) => key)
+      expectKept(removed)
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls + removed.length)
+      expect(run.composition!.agentDirectorOrder.slice(adOrder)).toEqual(removed.map(key => `kill ${personaInstanceId(key)}`))
+      for (const key of removed) {
+        expect(run.connections.manager.status(key)).toBeUndefined()
+        expect(run.bringUps.state(key)).toBeUndefined()
+      }
+      for (const check of untouched) check()
+      for (const before of kept.filter(({ key }) => !expected.some(record => record.key === key))) {
+        expect(run.composition!.calls.slice(calls).filter(([, key]) => key === before.key)).toEqual([])
+      }
+      if (removed.length === 0) {
+        expect(run.composition!.calls.slice(calls)).toEqual(expected.map(({ key }) => ['destinations.forget', key]))
+      }
+      expectNoPostNoLeak(run)
+    }
+    let sequence = 0
+    const assertUnchanged = async () => {
+      expect(authority.snapshot().personas.alpha!.assignments).toEqual(before.assignments)
+      expect(authority.choice('alpha', channel)).toBe(delivery)
+      expect([channel, neighbor].map(c => authority.channelStamp('alpha', c))).toEqual(stamps)
+      expect(readFileSync(threadPath(h.stateDir, 'alpha'))).toEqual(journal)
+      expect(run.threadMemory!.view('alpha', channel, THREAD_ROOTS.primary)).toBe(delivery === 'thread_hybrid' ? 'joined' : 'not-joined')
+      expect(run.threadMemory!.view('alpha', neighbor, THREAD_ROOTS.secondary)).toBe('joined')
+      expect(run.session('alpha')).toBe(session)
+      const from = run.queued('alpha').length
+      const events = [
+        { text: 'plain message' },
+        { text: 'reply in joined thread', thread_ts: THREAD_ROOTS.primary },
+        { text: 'reply in other thread', thread_ts: THREAD_ROOTS.third },
+        { text: `${mentionText(run.stub('alpha').identity.botUserId)} mention`, thread_ts: THREAD_ROOTS.primary },
+        { text: `${broadcastText()} broadcast`, thread_ts: THREAD_ROOTS.primary },
+      ].map(event => makeChannelMessage({ channel, ...event, ts: `1700000010.${String(++sequence).padStart(6, '0')}` }))
+      for (const event of events) await run.deliver('alpha', event)
+      const selected = delivery === 'off' ? [] : delivery === 'all'
+        ? [[0, 'receive_all'], [1, 'receive_all'], [2, 'receive_all'], [3, 'mention'], [4, 'broadcast']] as const
+        : delivery === 'thread_hybrid' ? [[1, 'thread'], [3, 'mention'], [4, 'broadcast']] as const
+          : [[3, 'mention'], [4, 'broadcast']] as const
+      expect(run.queued('alpha').slice(from).map(({ accepted: { channel, ts, text, via } }) => ({ channel, ts, text, via }))).toEqual(
+        selected.map(([index, via]) => ({ channel, ts: events[index]!.ts as string, text: events[index]!.text as string, via })))
+      expect(run.queued('bravo')).toEqual([])
+      assertNoLeak(run.captured())
+    }
+    await assertUnchanged()
+    // Each transition is a real preview and confirmed application. No assignment
+    // request accompanies it, so destination edits cannot rewrite the choices.
+    for (const destination of [channel, 'dm', neighbor, channel]) {
+      await confirmTransition([alpha!, { ...bravo!, permission_prompts: destination }], mode, [
+        { op: 'update-in-place', key: h.key('bravo'), via: 'apply', settings: ['permission_prompts'] },
+      ])
+      await assertUnchanged()
+    }
+    for (const nextMode of [mode === 'open' ? 'strict' : 'open', mode] as const) {
+      await confirmTransition([alpha!, { ...bravo!, permission_prompts: channel }], nextMode, [])
+      expect(run.serverConfig()!.channel_mode).toBe(nextMode)
+      run.stub('alpha').script.inventory.push(membershipPage([channel, neighbor]))
+      run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+      await assertUnchanged()
+    }
+    await confirmTransition([alpha!], mode, [{ op: 'teardown', key: h.key('bravo'), via: 'apply' }])
+    await assertUnchanged()
+    await confirmTransition([{ ...alpha!, permission_prompts: channel }], mode, [
+      { op: 'update-in-place', key: h.key('alpha'), via: 'apply', settings: ['permission_prompts'] },
+    ])
+    await assertUnchanged()
+    expectNoPostNoLeak(run)
+  })
+})
+
 describe('durable queues across confirmed persona changes', () => {
   test('next routed event and ordinary MCP tools share operator/bot/mode/destination changes without replacing sessions or clients', async () => {
     const shared = EXTRA_CHANNEL, discovered = 'C0DISCOVER', moved = OTHER_CHANNEL
@@ -6363,27 +6486,27 @@ describe('durable queues across confirmed persona changes', () => {
     let number = 0
     const event = (text: string, channel = shared) => makeChannelMessage({ channel, text, ts: `1700000020.${String(++number).padStart(6, '0')}` })
     const send = async (text: string) => { await run.deliver('alpha', event(text)); return run.queued('alpha').length }
-    // A saved all is guarded by bravo's destination, and the paired mention
+    // A saved all applies even in bravo's destination, and the paired mention
     // events retain exactly one accepted original item.
-    expect(await send('guarded plain')).toBe(0)
-    const mention = event(`  <@${run.stub('alpha').identity.botUserId}> original\r\n😀  `)
+    expect(await send('plain at another destination')).toBe(1)
+    const mention = event(`  ${mentionText(run.stub('alpha').identity.botUserId)} original\r\n😀  `)
     await run.deliver('alpha', makeAppMention({ ...mention, type: 'app_mention' })); await run.deliver('alpha', mention)
-    expect(run.queued('alpha')).toHaveLength(1)
-    expect(run.queued('alpha')[0]!.accepted).toMatchObject({ text: mention.text, via: 'mention' })
+    expect(run.queued('alpha')).toHaveLength(2)
+    expect(run.queued('alpha')[1]!.accepted).toMatchObject({ text: mention.text, via: 'mention' })
     const movedBravo = { ...bravo!, permission_prompts: moved }
     h.writeConfig({ personas: [alpha!, movedBravo], channel_mode: 'open' })
     await confirmTransition([{ op: 'update-in-place', key: h.key('bravo'), via: 'apply', settings: ['permission_prompts'] }], [h.key('bravo')])
     expect(authority.choice('alpha', shared)).toBe('all')
-    expect(await send('unguarded saved all')).toBe(2)
+    expect(await send('saved all after destination moved')).toBe(3)
     run.stub('alpha').script.inventory.push(membershipPage([{ id: shared, is_channel: true, is_group: false, is_im: false, is_mpim: false, is_ext_shared: true }]))
     run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
     expect(run.membership.read('alpha', shared, 'open')).toEqual({ kind: 'ineligible', reason: 'external-sharing' })
-    expect(await send('open external share refused')).toBe(2)
+    expect(await send('open external share refused')).toBe(3)
     run.stub('alpha').script.inventory.push(membershipPage([shared]))
     run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
     const request = deliveryAttempt('composition-bot-off', shared, 'off')
     expect((await run.callTool('alpha', 'set_channel_delivery', request)).isError).toBe(false)
-    expect(await send('off after real MCP')).toBe(2)
+    expect(await send('off after real MCP')).toBe(3)
     expect((await run.callTool('alpha', 'fetch_messages', { channel: shared })).isError).toBe(false)
     const strictInput = [alpha!, movedBravo]
     h.writeConfig({ personas: strictInput, channel_mode: 'strict' })
@@ -6413,18 +6536,19 @@ describe('durable queues across confirmed persona changes', () => {
     }
     await assign('all')
     expect(run.membership.read('alpha', shared, 'strict').kind).toBe('eligible')
-    expect(await send('strict externally shared accepted')).toBe(3)
-    await assign('off'); expect(await send('operator off')).toBe(3); await refusesEveryTool(shared)
+    expect(await send('strict externally shared accepted')).toBe(4)
+    await assign('off'); expect(await send('operator off')).toBe(4); await refusesEveryTool(shared)
     await assign('all')
     expect(authority.choice('alpha', shared)).toBe('all')
     expect((await run.callTool('alpha', 'fetch_messages', { channel: shared })).isError).toBe(false)
     await run.stub('alpha').socket.deliver({ type: 'channel_left', channel: shared,
       event_ts: ((run.membershipClock.now() + 1) / 1000).toFixed(3) }, { event_id: 'EvCOMPOSEDLEAVE' })
     expect(authority.choice('alpha', shared)).toBeUndefined(); await refusesEveryTool(shared)
-    expect(await send('removed')).toBe(3)
+    expect(await send('removed')).toBe(4)
     expect(run.queued('alpha').map(({ accepted: { text, channel, via } }) => ({ text, channel, via }))).toEqual([
+      { text: 'plain at another destination', channel: shared, via: 'receive_all_shared' },
       { text: String(mention.text), channel: shared, via: 'mention' },
-      { text: 'unguarded saved all', channel: shared, via: 'receive_all_shared' },
+      { text: 'saved all after destination moved', channel: shared, via: 'receive_all_shared' },
       { text: 'strict externally shared accepted', channel: shared, via: 'receive_all_shared' },
     ])
     expect(run.queued('bravo')).toEqual([])

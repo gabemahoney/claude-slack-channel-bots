@@ -7,6 +7,7 @@ import { createMembershipScanner, membershipConnectionListener, type MembershipS
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
+import { threadJoin } from './thread-memory.ts'
 
 import {
   accessSync,
@@ -1089,6 +1090,8 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 export interface ReloadRun {
   readonly threadMemory: ThreadMemory | undefined
   readonly threadMemoryEvents: ThreadMemoryEvent[]
+  /** Seed through the real store under the authority's current Channel Stamp. */
+  joinThread(name: string, channel: string, root: string): Promise<void>
   /** Write a real operator request; a later tick records it. */
   request(action: ReviewRequest['action'], assignments?: OperatorAssignment[], requestId?: string): ReviewRequest
   queue: ReturnType<typeof createDeliveryQueue>
@@ -2118,6 +2121,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // the start loads the store, and after a refused start, it is
       // undefined, so no stored choice applies and nothing throws.
       getChannelDelivery: () => channelDeliveryStore,
+      threadMemory: (key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown',
       threadStampUndecided: (key, channel) => controller.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
       threadStampEpisodes: episodes.threadStampUndecided,
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
@@ -2960,7 +2964,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // holder, undefined before the start loads it, so the tool refuses and
       // writes nothing; no second store is built, so its writes take the
       // run's writer path and `h.failChannelDeliveryWrites`); the routing's
-      // current membership and up/shutdown state; and the applied personas.
+      // current membership and up/shutdown state.
       // The tool's `persona-channel-delivery-set` line goes to `run.logs` in
       // every run (server.ts sends it to `console.error`, the `[slack]`
       // stream).
@@ -2968,7 +2972,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       getChannelDelivery: () => channelDeliveryStore,
       isPersonaUp: key => !stopped && isPersonaUp(key),
       readChannelMembership: (key, channel, mode) => membership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
-      getAppliedPersonas: () => serverConfig()?.personas ?? [],
       log,
     }
 
@@ -3044,6 +3047,15 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const run: ReloadRun = {
       threadMemory,
       threadMemoryEvents,
+      async joinThread(name, channel, root) {
+        const key = personaKey(name), stamp = controller.sharedChannels()?.channelStamp(key, channel)
+        if (!threadMemory || stamp?.kind !== 'decided' || !stamp.threadHybridSince) {
+          throw new Error('joinThread needs opted-in Thread Memory and a current thread_hybrid Channel Stamp')
+        }
+        const result = await threadMemory.saveJoins(key, [threadJoin({ channel, root,
+          stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, at: threadMemory.clock(key) })])
+        if (result.kind !== 'saved') throw new Error('joinThread could not save its join')
+      },
       async prepareQueued() { await preparation.recover(serverConfig()?.personas.map(p => p.key) ?? []) },
       queue,
       queueEvents,

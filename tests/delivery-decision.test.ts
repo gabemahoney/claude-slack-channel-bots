@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { eligibleMembership } from './test-helpers/fungible-decision.ts'
+import { eligibleMembership, THREAD_DECISION_GROUPS, decisionArgsOf, channelDeliveryArgsOf, type ThreadRead } from './test-helpers/fungible-decision.ts'
 
 import { CHANNEL_ID_RE, type ChannelEntry } from '../src/config.ts'
 import {
@@ -21,6 +21,7 @@ import {
   type DeliveryPersona,
   type Via,
   decideDelivery,
+  channelDeliveryFor,
 } from '../src/delivery-decision.ts'
 import {
   broadcastText,
@@ -86,7 +87,7 @@ function decide(
   // Explicit current observations and applied projection, independently passed
   // to production. Missing choices stay unresolved even for a verified member.
   return decideDelivery(event, receiver, applied, {
-    mode: 'strict', channelIdPattern: CHANNEL_ID_RE, fungibleDestinations: [],
+    mode: 'strict', channelIdPattern: CHANNEL_ID_RE,
     memberships: new Map(applied.map(p => [p.key, eligibleMembership(p.key)])),
     storedChoices: { readable: true, storedChoice: (key, channel) =>
       (key === receiver.key ? receiver : applied.find(p => p.key === key))?.channels.find(c => c.id === channel)?.delivery },
@@ -413,3 +414,14 @@ describe('no arbitration', () => {
     expect(results).toEqual(Array.from({ length: 20 }, () => deliver('mention')))
   })
 })
+
+for (const [name, group] of Object.entries(THREAD_DECISION_GROUPS)) {
+  describe(`strict Thread Memory: ${name}`, () => {
+    test.each(group.rows.filter(row => row.config.channel_mode === 'strict'))('$label', row => {
+      const reads: ThreadRead[] = []
+      expect(decideDelivery(...decisionArgsOf(row, reads))).toStrictEqual(row.expected)
+      expect(reads).toEqual([...(row.threadReads ?? [])])
+      if (row.channelDelivery) expect(channelDeliveryFor(...channelDeliveryArgsOf(row))).toStrictEqual(row.channelDelivery)
+    })
+  })
+}

@@ -494,12 +494,20 @@ test.each(['pending-at-terminal', 'pending-at-inventory'] as const)('attempt pos
 test('the production reader refuses malformed typed evidence without dumping identifiers or injected data', () => {
   const config = input(); config.channel_mode = 'open'
   const authority = makeSharedAuthority(root, config), store = createChannelDeliveryStore(authority, () => true)
-  expect(store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('valid-source-record', 'C0TEST001', 'all'), () => undefined).kind).toBe('applied')
-  for (const { state } of malformedBotHistories(authority.snapshot())) {
+  const request = deliveryAttempt('valid-source-record', 'C0TEST001', 'all')
+  const applied = store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined)
+  expect(applied.kind).toBe('applied')
+  if (applied.kind !== 'applied') throw new Error('expected a durable application')
+  expect(applied.outcome.facts).toEqual({ saved: 'all', effective: 'all' })
+  const valid = authority.snapshot()
+  expect(parseSharedChannelState(serializeSharedChannelState(valid), authority.path)).toEqual(valid)
+  expect(readSharedState(root)).toEqual(valid)
+  expect(createSharedChannelAuthority(authority.path, readSharedState(root)!).lookupBotAttempt('alpha', authority.incarnation('alpha')!, request)).toEqual({ ...applied, historical: true })
+  for (const { label, state } of malformedBotHistories(valid)) {
     const bytes = serializeSharedChannelState(state)
     let failure: unknown
     try { parseSharedChannelState(bytes, authority.path) } catch (error) { failure = error }
-    expect(failure).toBeInstanceOf(Error)
+    expect(failure, label).toBeInstanceOf(Error)
     assertNoLeak(String(failure))
     expect(String(failure)).not.toContain('must-not-be-persisted')
   }

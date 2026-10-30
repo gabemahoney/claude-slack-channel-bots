@@ -306,8 +306,8 @@ import type { ChannelDeliveryCurrentFacts, ChannelDeliveryUnavailableReason } fr
  * Binding comes from production hashing; no raw caller identifier is a result. */
 export function deliveryResultSamples(): Array<{ form: string; result: BotAttemptResult; current?: ChannelDeliveryCurrentFacts }> {
   const binding = botAttemptBinding('alpha', 'text-fixture-life', deliveryAttempt('text-fixture-retained', SHARED_CHANNEL_IDS.primary, 'all'))
-  const facts = { saved: 'all' as const, effective: 'mentions' as const, heldByLoopGuard: true }
-  const current: ChannelDeliveryCurrentFacts = { kind: 'available', mode: 'strict', facts: { saved: 'off', effective: 'off', heldByLoopGuard: false } }
+  const facts = { saved: 'all' as const, effective: 'all' as const }
+  const current: ChannelDeliveryCurrentFacts = { kind: 'available', mode: 'strict', facts: { saved: 'off', effective: 'off' } }
   const outcome = { ...binding, startedOrder: 2, resolvedOrder: 3, status: 'applied' as const, facts }
   return [
     ...[false, true].map(historical => ({ form: historical ? 'historical' : 'new', result: { kind: 'applied' as const, historical, outcome }, current })),
@@ -319,9 +319,8 @@ export function deliveryCurrentSamples(): Array<{ form: string; current: Channel
   const reasons: ChannelDeliveryUnavailableReason[] = ['shared-state-unreadable', 'channel-removed', 'absent', 'external-sharing', 'invalid-channel', 'installation-unverified', 'current-membership-missing', 'event-order-conflict', 'history-unresolved', 'event-not-durable', 'eligibility-missing']
   return [
     ...(['strict', 'open'] as const).flatMap(mode => (['off', 'mentions', 'all', 'thread_hybrid'] as const).map(saved => ({
-      form: `${mode}-${saved}`, current: { kind: 'available' as const, mode, facts: { saved, effective: saved, heldByLoopGuard: false } },
+      form: `${mode}-${saved}`, current: { kind: 'available' as const, mode, facts: { saved, effective: saved } },
     }))),
-    { form: 'current-guard', current: { kind: 'available', mode: 'open', facts: { saved: 'all', effective: 'mentions', heldByLoopGuard: true } } },
     ...reasons.flatMap(reason => [undefined, 'all' as const].map(saved => ({ form: `${reason}-${saved ?? 'unknown'}`, current: { kind: 'unavailable' as const, reason, ...(saved ? { saved } : {}) } }))),
   ]
 }
@@ -347,8 +346,9 @@ export function malformedBotHistories(state: SharedChannelState): Array<{ label:
     ['noninteger start', r => { r.startedOrder = 1.5 }],
     ['terminal before start', r => { r.resolvedOrder = Number(r.startedOrder) - 1 }],
     ['future terminal', (r, s) => { r.resolvedOrder = s.revision + 1 }],
-    ['original saved mismatch', r => { r.facts = { saved: 'off', effective: 'off', heldByLoopGuard: false } }],
-    ['invented effective fallback', r => { r.facts = { saved: r.delivery, effective: 'off', heldByLoopGuard: true } }],
+    ['original saved mismatch', r => { r.facts = { saved: 'off', effective: 'off' } }],
+    ['invented effective fallback', r => { r.facts = { saved: r.delivery, effective: 'off' } }],
+    ['obsolete third fact key', r => { r.facts = { saved: r.delivery, effective: r.delivery, heldByLoopGuard: false } }],
     ['unknown rejection reason', r => { r.status = 'not-applied'; r.reason = 'timeout'; delete r.facts; delete r.previous }],
     ['pending with terminal fields', r => { r.status = 'pending' }],
     ['assignment precedes application', (r, s) => { s.personas[String(r.key)]!.assignments[String(r.channel)]!.order = Number(r.startedOrder) }],

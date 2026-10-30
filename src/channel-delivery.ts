@@ -3,8 +3,6 @@
  */
 import { sameSharedDeclaration, type SharedChannelAuthority, type PersonaDeclaration } from './shared-channels.ts'
 import type { ChannelMode, DeliveryMode, Persona } from './config.ts'
-import { channelDeliveryFor } from './delivery-decision.ts'
-import { fungibleDestinationsOf } from './persona-destination.ts'
 import type { BotAttemptRejection, BotAttemptResult, ChannelDeliveryAttemptRequest, ChannelDeliveryFacts, SharedBotAttempt } from './channel-delivery-attempt.ts'
 import type { MembershipFault, MembershipReading } from './channel-membership.ts'
 
@@ -19,17 +17,13 @@ export type ChannelDeliveryCurrentFacts =
 export function currentChannelDeliveryFacts(
   key: string, channel: string, mode: ChannelMode,
   store: Pick<ChannelDeliveryStore, 'readableFor' | 'storedChoice'>,
-  personas: readonly Persona[], membership: MembershipReading | undefined,
+  membership: MembershipReading | undefined,
 ): ChannelDeliveryCurrentFacts {
   if (!store.readableFor(key, channel)) return { kind: 'unavailable', reason: 'shared-state-unreadable' }
   const saved = store.storedChoice(key, channel)
   if (saved === undefined) return { kind: 'unavailable', reason: 'channel-removed' }
   if (membership?.kind !== 'eligible') return { kind: 'unavailable', saved, reason: membership?.reason ?? 'current-membership-missing' }
-  const effective = channelDeliveryFor(key, channel, {
-    fungibleDestinations: mode === 'open' ? fungibleDestinationsOf({ channel_mode: mode }, personas) : [],
-    storedChoices: { readable: true, storedChoice: () => saved },
-  })
-  return { kind: 'available', mode, facts: { saved, effective: effective.delivery!, heldByLoopGuard: effective.heldByLoopGuard } }
+  return { kind: 'available', mode, facts: { saved, effective: saved } }
 }
 
 export const SET_CHANNEL_DELIVERY_TOOL = 'set_channel_delivery'
@@ -84,12 +78,7 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority, cu
         if (refusal) return { kind: 'refused', reason: refusal }
         if (retiring.has(key) || authority.incarnation(key) !== incarnation || authority.reviewHeld(key)) return { kind: 'refused', reason: 'inactive' }
         if (!currentMembership?.(key, request.channel)) return { kind: 'refused', reason: 'membership' }
-        const config = authority.config()
-        const result = channelDeliveryFor(key, request.channel, {
-          fungibleDestinations: fungibleDestinationsOf(config, config.personas),
-          storedChoices: { readable: true, storedChoice: () => request.delivery },
-        })
-        const facts: ChannelDeliveryFacts = { saved: request.delivery, effective: result.delivery!, heldByLoopGuard: result.heldByLoopGuard }
+        const facts: ChannelDeliveryFacts = { saved: request.delivery, effective: request.delivery }
         return { kind: 'authorized', facts }
       }, applied)
     },

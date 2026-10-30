@@ -335,10 +335,9 @@
  *                                                src/registry.ts: the tool's refusals in
  *                                                declarative mode, for a channel not known, and
  *                                                for a delivery value it does not take
- *   channelDeliverySetResultText <channel> <stored> <delivery> <held|not-held>
+ *   channelDeliverySetResultText <channel> <stored> <delivery>
  *                                                src/registry.ts: an accepted call's result, the
- *                                                channel delivery <delivery>, held at it by the
- *                                                loop guard or not
+ *                                                stored choice and effective channel delivery
  *   modeSwitchLine <mode> [<persona-name>…]      src/reload-plan.ts: the switch's preview line
  *                                                turning <mode> (one of src/config.ts
  *                                                CHANNEL_MODES) on, for the personas named, in
@@ -3960,28 +3959,24 @@ const deliverySetCause: Entry = {
   },
 }
 
-/** How a result's loop-guard hold is named on the command line. */
-const HELD_WORDS: Readonly<Record<string, boolean>> = { held: true, 'not-held': false }
-
 /**
- * `channelDeliverySetResultText(<channel>, <stored>, { delivery, heldByLoopGuard })`
+ * `channelDeliverySetResultText(<channel>, <stored>, { delivery })`
  * (registry.ts): the result of an accepted `set_channel_delivery` call.
  */
 const deliverySetResult: Entry = {
-  synopsis: '<channel> <stored> <delivery> <held|not-held>',
+  synopsis: '<channel> <stored> <delivery>',
   async print(args, context) {
     const entry = 'channelDeliverySetResultText'
-    expectArguments(entry, args, ['channel', 'stored', 'delivery', 'held|not-held'])
-    const [channel, stored, delivery, held] = args
-    if (!Object.hasOwn(HELD_WORDS, held!)) usageFail(`${entry}: the hold must be held or not-held (got '${held}')`)
+    expectArguments(entry, args, ['channel', 'stored', 'delivery'])
+    const [channel, stored, delivery] = args
     await checkDeliveryArgument(context, entry, 'stored', stored!)
     await checkDeliveryArgument(context, entry, 'delivery', delivery!)
-    const build = await packageFunction<(channel: string, stored: string, result: { delivery: string; heldByLoopGuard: boolean }) => unknown>(
+    const build = await packageFunction<(channel: string, stored: string, result: { delivery: string }) => unknown>(
       context,
       'registry.ts',
       entry,
     )
-    return builtString(entry, build(channel!, stored!, { delivery: delivery!, heldByLoopGuard: HELD_WORDS[held!]! }))
+    return builtString(entry, build(channel!, stored!, { delivery: delivery! }))
   },
 }
 
@@ -4008,7 +4003,7 @@ const deliveryAttemptResult: Entry = {
     const config = authority.config(), saved = authority.choice(key!, channel!)
     if (effective !== 'channel-removed') await checkDeliveryArgument(context, entry, 'effective', effective!)
     const current = effective === 'channel-removed' ? { kind: 'unavailable', reason: 'channel-removed' } :
-      { kind: 'available', mode: config.channel_mode, facts: { saved, effective, heldByLoopGuard: saved !== 'off' && saved !== effective } }
+      { kind: 'available', mode: config.channel_mode, facts: { saved, effective } }
     const build = await packageFunction<(name: string, key: string, channel: string, result: object, current: object) => unknown>(context, 'registry.ts', entry)
     return builtString(entry, build(config.personas.find(p => p.key === key)!.name, key!, channel!, outcome, current))
   },

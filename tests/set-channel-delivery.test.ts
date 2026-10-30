@@ -6,13 +6,14 @@ import { join, relative } from 'node:path'
 import { SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import { absenceReplacementBinding, parseSharedChannelState, sameChannelStamp, type ChannelStamp, type SharedChannelAuthority, type SharedChannelStampState, type SharedChannelState, type SharedThreadView } from '../src/shared-channels.ts'
 import type { DeliveryMode } from '../src/config.ts'
-import { channelDeliveryDeclarativeRefusal, channelDeliveryValueRefusal } from '../src/registry.ts'
+import { channelDeliveryAttemptResultText, channelDeliveryDeclarativeRefusal, channelDeliveryValueRefusal } from '../src/registry.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions, type ReloadRunActivity } from './test-helpers/reload-harness.ts'
 import { SET_CHANNEL_DELIVERY_INPUT_SCHEMA, SET_CHANNEL_DELIVERY_DESCRIPTION, MCP_INSTRUCTIONS } from '../src/registry.ts'
-import { PERSONA_CHANNEL_DELIVERY_SET } from '../src/persona-diagnostics.ts'
-import { makeDeferredWebApiCall, makeChannelMessage } from './test-helpers/slack-stub.ts'
+import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from '../src/persona-diagnostics.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
+import { makeDeferredWebApiCall, makeChannelMessage, mentionText } from './test-helpers/slack-stub.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
 import { sharedReviewDependency } from '../src/reload-review.ts'
 import { REVIEW_ABSENCE_REPLACEMENT } from '../src/reload-preview-clauses.ts'
@@ -159,10 +160,10 @@ async function call(args: Record<string, unknown>, name = 'alpha', session?: Par
     expect(result.text).not.toContain('Unknown tool')
   }
  })
- test('strict mode refuses a valid fresh attempt without binding or changing durable state', async () => {
+ test.each(['off', 'mentions', 'all', 'thread_hybrid'] as const)('strict mode refuses a fresh %s attempt without binding or changing durable state', async delivery => {
   const { alpha, authority } = await start('strict', false)
   const before = readFileSync(h.paths.lastApplied)
-  const result = await call(deliveryAttempt(LEAK_SENTINEL, alpha.channels![0]!.id, 'all'))
+  const result = await call(deliveryAttempt(LEAK_SENTINEL, alpha.channels![0]!.id, delivery))
   expect(result).toEqual({ isError: true, text: channelDeliveryDeclarativeRefusal(alpha.name, h.key(alpha.name)) })
   expect(readFileSync(h.paths.lastApplied)).toEqual(before)
   expect(authority.revision).toBe(1)
@@ -174,7 +175,11 @@ async function call(args: Record<string, unknown>, name = 'alpha', session?: Par
   const events = watchViews(authority)
   const result = await call(deliveryAttempt(`all-values-${delivery}`, channel, delivery))
   expect(result.isError).toBe(false)
-  expect(result.text).toContain(delivery)
+  const outcome = botApplications(authority.snapshot())[0]!
+  expect(outcome.facts).toEqual({ saved: delivery, effective: delivery })
+  expect(result.text).toBe(channelDeliveryAttemptResultText(alpha.name, 'alpha', channel,
+    { kind: 'applied', historical: false, outcome },
+    { kind: 'available', mode: 'open', facts: { saved: delivery, effective: delivery } }))
   // Mint over another value, in the application's own durable write; the binding write delivers no view.
   const view = expectPublication(events, authority, 'alpha', channel)
   const first = view.stamp('alpha', channel)
@@ -191,6 +196,15 @@ async function call(args: Record<string, unknown>, name = 'alpha', session?: Par
   expect(run.appliedConfigs).toHaveLength(published + 1)
   expect(existsSync(join(h.stateDir, 'channel-delivery.json'))).toBe(false)
   expect(parseSharedChannelState(readFileSync(h.paths.lastApplied), h.paths.lastApplied)!.personas[h.key('alpha')]!.assignments[channel]!.delivery).toBe(delivery)
+  const plain = makeChannelMessage({ channel, text: 'next ordinary event', ts: '1700000001.000001' })
+  const mention = makeChannelMessage({ channel, text: `${mentionText(run.stub('alpha').identity.botUserId)} next mention`, ts: '1700000001.000002' })
+  await run.deliver('alpha', plain)
+  await run.deliver('alpha', mention)
+  expect(run.queued('alpha').map(({ accepted: { channel, ts, text, via } }) => ({ channel, ts, text, via }))).toEqual([
+    ...(delivery === 'all' ? [{ channel, ts: plain.ts as string, text: plain.text as string, via: 'receive_all' }] : []),
+    ...(delivery === 'off' ? [] : [{ channel, ts: mention.ts as string, text: mention.text as string, via: 'mention' }]),
+  ])
+  expect(run.queued('beta')).toEqual([])
   // A fresh thread_hybrid attempt keeps a thread_hybrid entry's value and mints over any other.
   expect((await call(deliveryAttempt(`then-thread-hybrid-${delivery}`, channel, 'thread_hybrid'))).isError).toBe(false)
   const hybrid = expectPublication(events, authority, 'alpha', channel).stamp('alpha', channel)
@@ -686,18 +700,80 @@ test('exact installed-byte recovery publishes and diagnoses once at the original
   expect(assignmentLogs()).toHaveLength(1)
 })
 
-test('historical guard facts and current strict operator choice remain separate across reopen; dry history is read only', async () => {
+test.each(['all', 'thread_hybrid'] as const)('%s in another persona destination reports equal facts and selects the next event', async delivery => {
+  const { alpha, beta, authority } = await start('open', true, { threadMemory: {} })
+  const channel = beta.channels![0]!.id
+  run.stub('alpha').script.inventory.push(membershipPage([alpha.channels![0]!.id, channel]))
+  run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+  expect(authority.choice('alpha', channel)).toBe('mentions')
+  const request = deliveryAttempt(`destination-${delivery}`, channel, delivery)
+  const result = await call(request), outcome = applications()[0]!
+  expect(outcome.facts).toEqual({ saved: delivery, effective: delivery })
+  expect(botApplications(durableState())[0]!.facts).toEqual(outcome.facts)
+  expect(result).toEqual({ isError: false, text: channelDeliveryAttemptResultText(alpha.name, 'alpha', channel,
+    { kind: 'applied', historical: false, outcome },
+    { kind: 'available', mode: 'open', facts: { saved: delivery, effective: delivery } }) })
+  expect(assignmentLogs()).toEqual([formatPersonaDiagnostic({ class: PERSONA_CHANNEL_DELIVERY_SET,
+    name: alpha.name, key: 'alpha', index: 0, cause: channelDeliverySetCause(channel, 'mentions', delivery, delivery) })])
+  expect([result.text, ...assignmentLogs()].join('\n')).not.toMatch(/loop.?guard|restrict|destination/i)
+  if (delivery === 'thread_hybrid') await run.joinThread('alpha', channel, THREAD_ROOTS.primary)
+  const joined = makeChannelMessage({ channel, thread_ts: THREAD_ROOTS.primary,
+    ts: '1700000001.000001', text: 'a reply in the joined thread' })
+  const unrelated = makeChannelMessage({ channel, thread_ts: THREAD_ROOTS.secondary,
+    ts: '1700000001.000002', text: 'a reply in a different thread' })
+  const expected = [{ channel, ts: joined.ts as string, text: joined.text as string, via: delivery === 'all' ? 'receive_all_shared' : 'thread' }]
+  await run.deliver('alpha', joined)
+  expect(run.queued('alpha').map(({ accepted: { channel, ts, text, via } }) => ({ channel, ts, text, via }))).toEqual(expected)
+  expect(run.queued('beta')).toEqual([])
+  await run.deliver('alpha', unrelated)
+  if (delivery === 'all') expected.push({ channel, ts: unrelated.ts as string, text: unrelated.text as string, via: 'receive_all_shared' })
+  expect(run.queued('alpha').map(({ accepted: { channel, ts, text, via } }) => ({ channel, ts, text, via }))).toEqual(expected)
+  expect(run.queued('beta')).toEqual([])
+})
+
+test.each(['strict', 'open'] as const)('%s discovery keeps its default and an explicit off through both mode switches and a new destination', async initialMode => {
+  const { alpha, beta, authority } = await start(initialMode)
+  const channel = C.private
+  const discover = async () => {
+    run.stub('alpha').script.inventory.push(membershipPage([alpha.channels![0]!.id, channel]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+  }
+  await discover()
+  expect(authority.choice('alpha', channel)).toBe(initialMode === 'open' ? 'mentions' : 'off')
+  if (initialMode === 'strict') {
+    h.writeConfig({ channel_mode: 'open', personas: [alpha, beta] }); await confirmPending()
+  }
+  expect((await call(deliveryAttempt('keep-off', channel, 'off'))).isError).toBe(false)
+  const stamp = authority.channelStamp('alpha', channel)
+  const destinationBeta = { ...beta, permission_prompts: channel }
+  let sequence = 0
+  for (const mode of ['strict', 'open'] as const) {
+    h.writeConfig({ channel_mode: mode, personas: [alpha, destinationBeta] }); await confirmPending()
+    await discover(); await discover()
+    expect(authority.choice('alpha', channel)).toBe('off')
+    expect(authority.channelStamp('alpha', channel)).toEqual(stamp)
+    await run.deliver('alpha', makeChannelMessage({ channel, text: `${mentionText(run.stub('alpha').identity.botUserId)} still off`,
+      ts: `1700000001.${String(++sequence).padStart(6, '0')}` }))
+    expect(run.queued('alpha')).toEqual([])
+    expect(run.queued('beta')).toEqual([])
+  }
+})
+
+test('historical unrestricted facts and current strict operator choice remain separate across reopen; dry history is read only', async () => {
   const { alpha, beta, authority } = await start()
   const channel = beta.channels![0]!.id
   run.stub('alpha').script.inventory.push(membershipPage([alpha.channels![0]!.id, channel]))
   run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
   const request = deliveryAttempt(LEAK_SENTINEL, channel, 'all')
   const first = await call(request)
-  expect(first.text).toContain('original saved all, effective mentions (restricted')
+  const original = applications()[0]!
+  expect(original.facts).toEqual({ saved: 'all', effective: 'all' })
+  expect(first.text).toBe(channelDeliveryAttemptResultText(alpha.name, 'alpha', channel,
+    { kind: 'applied', historical: false, outcome: original },
+    { kind: 'available', mode: 'open', facts: { saved: 'all', effective: 'all' } }))
   h.writeConfig({ channel_mode: 'strict', personas: [alpha, { ...beta, permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' } }] })
   run.request('request', [buildOperatorAssignment({ ...alpha, key: 'alpha' }, authority.incarnation('alpha')!, channel, 'off')])
   await tick(); await confirm()
-  const original = applications()[0]!
   for (const dryRun of [false, true]) {
     await stop(); run = await startRun({ realLifecycle: true, dryRun }); run.registerSession('alpha')
     if (!dryRun) {
@@ -706,9 +782,10 @@ test('historical guard facts and current strict operator choice remain separate 
     const bytes = readFileSync(h.paths.lastApplied), cp = run.checkpoint(), count = run.appliedConfigs.length
     const result = await call(retryAttempt(request))
     expect(result.isError).toBe(false)
-    expect(result.text).toContain(`previously applied at position ${original.resolvedOrder}`)
-    expect(result.text).toContain('original saved all, effective mentions (restricted')
-    expect(result.text).toContain(dryRun ? 'Current saved off; effective delivery is unavailable' : 'Current saved off, effective off in strict mode')
+    expect(result.text).toBe(channelDeliveryAttemptResultText(alpha.name, 'alpha', channel,
+      { kind: 'applied', historical: true, outcome: original }, dryRun
+        ? { kind: 'unavailable', saved: 'off', reason: 'current-membership-missing' }
+        : { kind: 'available', mode: 'strict', facts: { saved: 'off', effective: 'off' } }))
     expect((await call(deliveryAttempt('fresh-in-strict', channel, 'all'))).isError).toBe(true)
     expect(readFileSync(h.paths.lastApplied)).toEqual(bytes)
     expectNoApplication(cp, count)

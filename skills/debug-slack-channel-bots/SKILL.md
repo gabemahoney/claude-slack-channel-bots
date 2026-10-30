@@ -437,7 +437,10 @@ running are not affected. See
 
 Delivery diagnostics carry metadata only: the persona, source, conversation or sender,
 timestamp, sender ID and the diagnostic's counts, paths or reason. They never carry
-message text. RAW event, injected-message and first actual Slack dispatch lines
+message text. For Slack replies delivered because the bot is in the thread,
+`via=thread` follows `sender_id` in `message-received`, `message-delivered` and
+related dispatch/retry diagnostics, including recovered work. Other delivery
+reasons add no suffix. RAW event, injected-message and first actual Slack dispatch lines
 retain their existing text excerpts; receipt confirmation has its own line.
 
 ### `message-not-saved`
@@ -1145,7 +1148,7 @@ credentials workflow, never these requests or chat.
 ### `persona-invited-channel`
 
 - **State:** the persona is `up`; this is an audit line, not a failure.
-- **Line:** `[slack] persona-invited-channel: personas[<i>] "<name>" (key=<key>): hears <public|private> channel <id> in open mode, at channel delivery <mentions|all>`
+- **Line:** `[slack] persona-invited-channel: personas[<i>] "<name>" (key=<key>): hears <public|private> channel <id> in open mode, at channel delivery <off|mentions|all|thread_hybrid>`
 - **Meaning:** The persona hears that channel in open mode. The line:
   - is logged only in open mode (`channel_mode` is `"open"`),
     never in strict mode;
@@ -1179,11 +1182,7 @@ credentials workflow, never these requests or chat.
   persona hearing it, remove its app from the channel in Slack. To change the
   delivery shown, ask the persona in that channel: its agent calls
   `set_channel_delivery`, which logs a
-  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. The
-  delivery shown is `mentions`, whatever the persona chose for the channel,
-  when the channel is another persona's open destination (its
-  `permission_prompts` channel), so two personas can't answer each
-  other in a loop. A newly verified join without a choice uses `mentions` in open mode; duplicate joins preserve explicit choices, including `off`. Without such a join or an assignment, delivery is `off`; an unreadable authority has no fallback choice (see [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. A newly verified join without a choice uses `mentions` in open mode; duplicate joins preserve explicit choices, including `off`. Without such a join or an assignment, delivery is `off`; an unreadable authority has no fallback choice (see [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
   that hears a channel but doesn't answer there is covered under
   [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
 - **Two personas at `all` in one channel:** don't. Each receives every
@@ -1194,11 +1193,11 @@ credentials workflow, never these requests or chat.
 ### `persona-channel-delivery-set`
 
 - **State:** the persona is `up`; this is an audit line, not a failure.
-- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): stored choice for channel <id> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid> after the loop guard`
+- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): stored choice for channel <id> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid>`
 
   `from` is the stored choice before the application (`none` when absent),
-  `to` is the newly saved choice, and `at channel delivery` is its effective
-  delivery after the loop guard at that application. The line has no `path` part.
+  `to` is the newly saved choice, and `at channel delivery` is the persona's
+  channel delivery there at that application, equal to the saved choice. The line has no `path` part.
 - **Meaning:** A new logical attempt durably applied one channel choice. The line:
   - is logged once per new durable application, including a deliberate
     same-value assignment with a fresh identifier. Retaining an attempt or
@@ -1242,16 +1241,12 @@ credentials workflow, never these requests or chat.
   current authorization. Other fixes are under
   [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
 
-  A line with `to all` or `to thread_hybrid` and `at channel delivery mentions`
-  records the other-persona destination loop guard. The saved choice remains;
-  `off` stays off. The result's original restriction describes that application,
-  not necessarily the channel's current restriction.
 - **Results and history:** An applied result identifies the persona/channel,
   says `newly applied` or `previously applied` at its original position, and
-  reports original saved/effective delivery and any loop-guard restriction.
+  reports original saved/effective delivery.
   A historical result adds `This history read made no new assignment.`
 
-  Current saved/effective facts, mode and restriction are reported separately;
+  Current saved/effective facts and mode are reported separately;
   a later operator choice is not overwritten. When current evidence is missing,
   removed, ineligible or untrustworthy, the result identifies what is unavailable
   rather than inventing an effective choice.
@@ -1693,7 +1688,6 @@ membership or an old setup record does not establish either current state.
 | **An edit that adds a mention** (open mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In open mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which open mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
 | **A message posted before the invite** | No line at all, not even a `RAW message event` line: Slack sends the app no event for a message posted before it joined the channel. | Post the message again. The persona can read earlier messages with `fetch_messages` when asked. |
 | **The channel at `mentions`, and the message doesn't @mention the persona** (open mode) | A plain `… dropped message from channel=<id> …: not-mentioned` line. The channel's `persona-invited-channel` line shows `at channel delivery mentions`. | @mention the persona, or ask it in that channel to switch the channel to `all` (it calls `set_channel_delivery`; see [`persona-channel-delivery-set`](#persona-channel-delivery-set)). |
-| **The loop guard** (open mode) | As for `mentions` above, but the channel is another applied persona's open destination (its `permission_prompts` channel), so the `persona-invited-channel` line shows `mentions` whatever this persona chose. A `persona-channel-delivery-set` line for it reads `to all, at channel delivery mentions after the loop guard`. | @mention the persona there. Asking it to switch to `all` changes nothing while the guard holds the channel. To serve it at `all`, have the operator give the other persona a different `permission_prompts` (another listed channel, or explicit `"dm"` with DMs on and a contact) and confirm the change. |
 | **The shared authority is unresolved** | A shared-authority error; further choice writes are refused. | Preserve authority and prepared evidence, then restore trustworthy shared state (see [The stored-choice file](#the-stored-choice-file-configjsonlast-applied)). |
 | **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or an existing recovery notice at its destination. Accepted messages stay queued. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 
@@ -1710,7 +1704,7 @@ channel, not only @mentions and broadcasts.
 - **Open mode.** The persona's agent chose `all` for that channel with
   `set_channel_delivery`. Its sign is a
   [`persona-channel-delivery-set`](#persona-channel-delivery-set) line for
-  the channel ending `to all, at channel delivery all after the loop guard`.
+  the channel ending `to all, at channel delivery all`.
   The choice is kept across restarts, so the line can be in an older log
   generation, or rotated away: the channel's entry in
   [`config.json.last-applied`](#the-stored-choice-file-configjsonlast-applied)
@@ -6879,7 +6873,7 @@ grep -E 'unavailable-retry: persona=<key> |Deferring persona=<key>: |pending-row
 
 ### Symptom: A persona doesn't receive messages in a channel or DM
 
-See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery, the loop guard) and, for DMs, [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
+See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery) and, for DMs, [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
 
 ### Symptom: A persona is silent in a channel it was invited to
 

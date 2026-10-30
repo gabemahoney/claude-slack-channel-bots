@@ -18,7 +18,6 @@ import {
   type FungiblePath,
   type StoredChoices,
 } from './delivery-decision.ts'
-import { fungibleDestinationsOf } from './persona-destination.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
@@ -76,6 +75,8 @@ export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_res
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
+  /** Read the live Thread Memory view only when the decision needs a reply's membership. */
+  threadMemory?: FungibleDecisionInputs['threadMemory']
   /** Pure stamp observation; independent selection never depends on it. */
   threadStampUndecided?(key: string, channel: string): boolean
   /** Shared log-only episode owner. Absent fixtures still hold intake, without the diagnostic. */
@@ -375,15 +376,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }))
   }
 
-  /**
-   * The decision's fungible-mode inputs,
-   * built only in fungible mode, from the configuration in effect and the
-   * stored choices read now: the mode, the envelope flag as received,
-   * `CHANNEL_ID_RE`, the stored choices, and each applied persona's
-   * destination through the one destination rule. Undefined in declarative
-   * mode, so the decision is declarative mode's and nothing of the fungible
-   * section is read.
-   */
+  /** Applied choices and current membership, read for each event in both modes. */
   function fungibleInputs(
     config: PersonaRoutingConfig,
     mode: ChannelMode,
@@ -403,8 +396,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       isExtSharedChannel,
       channelIdPattern: CHANNEL_ID_RE,
       storedChoices: deps.getChannelDelivery?.() ?? undefined,
+      threadMemory: deps.threadMemory,
       threadStampUndecided: deps.threadStampUndecided,
-      fungibleDestinations: fungibleDestinationsOf(config, config.personas),
       memberships,
     }
   }
