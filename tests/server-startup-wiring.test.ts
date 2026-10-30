@@ -20,7 +20,9 @@ import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '..
 import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
 import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
-import type { PersonaConfig } from '../src/config.ts'
+import { channelModeOf, type PersonaConfig } from '../src/config.ts'
+import type { SharedStateReportingDeps } from '../src/shared-state-reports.ts'
+import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryQueueOptions, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
@@ -5274,7 +5276,7 @@ describe('the session tools read the channel mode of the configuration in effect
   // mode taken once at start (a const or let, a value handed in, a later
   // reassignment of the member) or a different deps object would not follow
   // the configuration in effect.
-  test('sessionToolDeps, built at module scope and passed to createSessionServer, has getChannelMode exactly `() => channelModeOf(<applied config holder>)`, and server.ts names channelModeOf only there and in its import, and getChannelMode only there', () => {
+  test('sessionToolDeps, built at module scope and passed to createSessionServer, has getChannelMode exactly `() => channelModeOf(<applied config holder>)`, and channelModeOf is used only by the tools and shared-state reporter, with getChannelMode only here', () => {
     const holder = loadedConfigName(SERVER_CODE)
     // An arrow with no parameters whose body calls config.ts's channelModeOf
     // on the holder itself, so each call reads the holder anew.
@@ -5291,9 +5293,10 @@ describe('the session tools read the channel mode of the configuration in effect
     expect(onlyCallArgs('createSessionServer')[1]).toBe('sessionToolDeps')
 
     // Nothing takes the mode once: channelModeOf is named only in its import
-    // and this member, and the member is named nowhere else, so nothing
-    // reassigns it or binds a second one.
-    expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(2)
+    // and the two late-bound members. The tools member is named nowhere
+    // else, so nothing reassigns it or binds a second one.
+    expect(onlyCallProps('createSharedStateReporting').get('mode')).toBe(props.get(SESSION_TOOLS_CHANNEL_MODE))
+    expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(3)
     expect(indicesOf(new RegExp(`\\b${SESSION_TOOLS_CHANNEL_MODE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 })
@@ -5786,7 +5789,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     const args = splitTopLevel(onlyCallArguments(props.get('routing')!, 'forgetPersonaState'))
     expect(args[0]).toBe('key')
     expect(splitTopLevel(args[1]!.slice(1, -1))).toEqual([
-      'k => personaRouting.forget(k)', 'k => deliveryReporting?.forget(k)', 'k => deliveryPreparation?.forget(k)',
+      'k => personaRouting.forget(k)', 'k => deliveryReporting?.forget(k)', 'k => sharedStateReporting?.forget(k)', 'k => deliveryPreparation?.forget(k)',
       'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => memoryHolds?.forget(k)',
       'k => threadMemoryRetries?.forget(k)', 'k => threadMemory?.forget(k)',
     ])
@@ -6510,12 +6513,12 @@ describe('Memory Hold server wiring', () => {
     const error = new Error('fixture forget failed')
     const routing = expression<{ forget(key: string): Promise<void> }>(onlyCallProps('createPersonaLifecycle').get('routing')!, {
       forgetPersonaState,
-      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'].map(name => [name, {
+      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'].map(name => [name, {
         forget: (received: string) => { expect(received).toBe(key); calls.push(name); if (name === 'memoryHolds') throw error },
       }])),
     })
     await expect(routing.forget(key)).rejects.toBe(error)
-    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'])
+    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'])
   })
 
   test('removed-key cleanup forgets the resolver before removing memory even after lifecycle teardown fails', async () => {
@@ -6691,7 +6694,7 @@ describe('production bring-up reaction recovery', () => {
     const bindings = {
       membershipStatus, membershipReadiness,
       composePersonaStatusListeners, createPersonaUpFlushListener, personaNotifier: n.h.notifier, bringUps: controller,
-      deliveryPreparation: preparation, deliveryReporting: reporting, clientFor: conn.clientFor,
+      deliveryPreparation: preparation, deliveryReporting: reporting, sharedStateReporting: undefined, clientFor: conn.clientFor,
       personaConfig: config, appliedConfig: config, configInEffect,
     }
     conn.onStatus = expression(onlyCallProps('createPersonaConnectionManager').get('onStatus')!, bindings)
@@ -6760,6 +6763,179 @@ describe('production bring-up reaction recovery', () => {
       assertNoLeak({ lines: conn.lines, logs: n.logs, calls: stub.callLog, authority: writtenFile(authority.path) })
       await n.cleanup(); await e.cleanup(); _resetAckTracker()
     }
+  })
+})
+
+// Exercise only extracted production wiring, never main or reporter policy.
+describe('shared-state reporting production wiring', () => {
+  const factory = 'createSharedStateReporting'
+  const watch = 'reload\\.sharedChannels\\(\\)!\\.watch'
+
+  function mainStatements(): string[] {
+    const tree = ts.createSourceFile('main.ts', SERVER_CODE.slice(...mainBody(SERVER_CODE)), ts.ScriptTarget.Latest, true)
+    return tree.statements.map(node => node.getText(tree))
+  }
+
+  test('one reporter beside delivery reporting shares episodes, log, persona and the recovered authority', () => {
+    const at = onlyCallOf(factory), props = onlyCallProps(factory)
+    expect(importSource(SERVER_CODE, factory)).toBe('./shared-state-reports.ts')
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf('createDeliveryReporting'))
+    expect(at).toBeGreaterThan(onlyCallOf('createChannelMembership'))
+    expect(at).toBeLessThan(onlyCallOf('createMembershipScanner'))
+    const delivery = onlyCallProps('createDeliveryReporting')
+    for (const name of ['episodes', 'log', 'persona']) expect(props.get(name)).toBe(delivery.get(name))
+    expect(props.get('episodes')).toBe(constOf('createPersonaEpisodes'))
+    expect(props.get('authority')).toBe(onlyCallProps('createChannelMembership').get('authority'))
+    expect(props.get('membership')).toBe('channelMembership')
+    expect(props.get('mode')).toBe(objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_CHANNEL_MODE))
+    expect(SERVER_CODE).toMatch(/sharedStateReporting = createSharedStateReporting\(/)
+  })
+
+  test('scanner and mode adapters read holders at call time, including before the scanner exists', () => {
+    const props = onlyCallProps(factory), calls: unknown[][] = []
+    const authority = {}, membership = {}, episodes = {}
+    const adapters = expression<() => {
+      deps: SharedStateReportingDeps
+      replace(scanner: Pick<MembershipScanner, 'status' | 'ended'>, mode: 'strict' | 'open'): void
+    }>(`() => {
+      let membershipScanner;
+      let personaConfig = { channel_mode: 'strict' };
+      const deps = { ${[...props].map(([name, value]) => `${name}: ${value}`).join(',')} };
+      return { deps, replace(scanner, mode) { membershipScanner = scanner; personaConfig = { channel_mode: mode }; } };
+    }`, {
+      noticeEpisodes: episodes, channelMembership: membership, reload: { sharedChannels: () => authority }, channelModeOf,
+      getAppliedPersona: (key: string) => ({ key, name: key }), console: { error: (...args: unknown[]) => calls.push(args) },
+    })()
+    expect<object>(adapters.deps.episodes).toBe(episodes)
+    expect<object>(adapters.deps.authority).toBe(authority)
+    expect<object>(adapters.deps.membership).toBe(membership)
+    expect(adapters.deps.mode()).toBe('strict')
+    expect(adapters.deps.scanStatus(THREAD_PERSONAS.primary)).toEqual({ state: 'unverified', pages: 0, positives: 0 })
+    expect(adapters.deps.scanEnded(THREAD_PERSONAS.primary)).toBe(false)
+    for (const mode of ['open', 'strict'] as const) {
+      const status = { state: 'complete' as const, pages: 1, positives: 1 }
+      adapters.replace({
+        status: key => { calls.push(['status', mode, key]); return status },
+        ended: key => { calls.push(['ended', mode, key]); return mode === 'strict' },
+      }, mode)
+      expect(adapters.deps.mode()).toBe(mode)
+      expect(adapters.deps.scanStatus(THREAD_PERSONAS.primary)).toBe(status)
+      expect(adapters.deps.scanEnded(THREAD_PERSONAS.secondary)).toBe(mode === 'strict')
+    }
+    expect(calls).toEqual(['open', 'strict'].flatMap(mode => [
+      ['status', mode, THREAD_PERSONAS.primary], ['ended', mode, THREAD_PERSONAS.secondary],
+    ]))
+  })
+
+  test('the authority watch coalesces into a deferred full check of current configured keys and suppresses shutdown work', () => {
+    const at = onlyCallOf(watch), statements = mainStatements()
+    expect(at).toBeGreaterThan(onlyCallOf(factory))
+    expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
+    const index = statements.findIndex(code => code.startsWith('unsubscribeSharedStateReporting ='))
+    expect(index).toBeGreaterThan(0)
+    const registration = statements.slice(index - 1, index + 1).join('\n')
+    const pending: Array<() => void> = [], checks: string[][] = []
+    let listener: (() => void) | undefined
+    const unsubscribe = () => {}
+    const wiring = expression<() => { configure(keys: string[]): void; shutdown(): void; unsubscribe(): void }>(`() => {
+      let shuttingDown = false, personaConfig, unsubscribeSharedStateReporting;
+      ${registration}
+      return {
+        configure(keys) { personaConfig = { personas: keys.map(key => ({ key })) }; },
+        shutdown() { shuttingDown = true; },
+        unsubscribe: unsubscribeSharedStateReporting,
+      };
+    }`, {
+      reload: { sharedChannels: () => ({ watch: (callback: () => void) => { expect(listener).toBeUndefined(); listener = callback; return unsubscribe } }) },
+      sharedStateReporting: { checkAll: (keys: string[]) => checks.push(keys) },
+      queueMicrotask: (callback: () => void) => pending.push(callback),
+    })()
+    expect(wiring.unsubscribe).toBe(unsubscribe)
+    expect(listener).toBeDefined()
+    expect(pending).toHaveLength(0)
+    wiring.configure([THREAD_PERSONAS.primary])
+    listener!(); listener!(); listener!()
+    expect(checks).toEqual([])
+    expect(pending).toHaveLength(1)
+    wiring.configure([THREAD_PERSONAS.secondary, THREAD_PERSONAS.primary])
+    pending.shift()!()
+    expect(checks).toEqual([[THREAD_PERSONAS.secondary, THREAD_PERSONAS.primary]])
+    listener!()
+    expect(pending).toHaveLength(1)
+    pending.shift()!()
+    expect(checks).toHaveLength(2)
+    listener!()
+    expect(pending).toHaveLength(1)
+    wiring.shutdown()
+    pending.shift()!()
+    listener!()
+    expect(pending).toHaveLength(0)
+    expect(checks).toHaveLength(2)
+  })
+
+  test('scanner status and reload callbacks reach the same late-bound reporter', () => {
+    const status = onlyCallProps('createMembershipScanner').get('onStatus')
+    const failed = onlyCallProps('createReloadController').get('onApplyFailed')
+    expect(status).toBe('key => sharedStateReporting?.check(key)')
+    expect(failed).toBe('failure => sharedStateReporting?.reloadApplyFailed(failure)')
+    const applied = onlyCallProps('createReloadController').get('onApplied')!
+    expect(indicesOf(/sharedStateReporting\?\.reloadApplied\(\)/g, applied)).toHaveLength(1)
+    const calls: unknown[][] = []
+    const callbacks = expression<() => {
+      status(key: string): void; failed(value: object): void; install(): void
+    }>(`() => {
+      let sharedStateReporting;
+      return { status: (${status}), failed: (${failed}), install() { sharedStateReporting = reporter; } };
+    }`, { reporter: { check: (key: string) => calls.push(['check', key]), reloadApplyFailed: (value: unknown) => calls.push(['failed', value]) } })()
+    const failure = { record: 'authority', fingerprint: 'fixture' }
+    callbacks.status(THREAD_PERSONAS.primary); callbacks.failed(failure)
+    expect(calls).toEqual([])
+    callbacks.install()
+    callbacks.status(THREAD_PERSONAS.primary); callbacks.failed(failure)
+    expect(calls).toEqual([['check', THREAD_PERSONAS.primary], ['failed', failure]])
+  })
+
+  test.each([false, true])('startup checks all configured keys after bring-up and activates repair only when reported: %s', activated => {
+    const checkAt = onlyCallOf('sharedStateReporting\\.checkAll')
+    const repairAt = onlyCallOf('sharedStateReporting\\.repairActivated')
+    expect(checkAt).toBeGreaterThan(onlyCallOf('runStartBringUp'))
+    expect(repairAt).toBeGreaterThan(onlyCallOf('runStartBringUp'))
+    expect(checkAt).toBeLessThan(onlyCallOf('initHealthCheck'))
+    expect(atMainTopLevel(SERVER_CODE, checkAt)).toBe(true)
+    const statements = mainStatements()
+    const index = statements.findIndex(code => code.startsWith('const sharedStateKeys ='))
+    expect(index).toBeGreaterThan(0)
+    const calls: unknown[][] = [], keys = [THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary]
+    expression<() => void>(`() => { ${statements.slice(index, index + 3).join('\n')} }`, {
+      personaConfig: { personas: keys.map(key => ({ key })) },
+      reload: { repairActivated: () => activated },
+      sharedStateReporting: {
+        repairActivated: (received: string[]) => calls.push(['repair', received]),
+        checkAll: (received: string[]) => calls.push(['check', received]),
+      },
+    })()
+    expect(calls).toEqual([...(activated ? [['repair', keys]] : []), ['check', keys]])
+  })
+
+  test('every delivery forget site also forgets shared reporting, and shutdown stops and unsubscribes before closing episodes', () => {
+    const routing = onlyCallProps('createPersonaLifecycle').get('routing')!
+    const deliveryForget = callsOf('deliveryReporting\\?\\.forget')
+    const sharedForget = callsOf('sharedStateReporting\\?\\.forget')
+    expect(deliveryForget).toHaveLength(1)
+    expect(sharedForget).toHaveLength(deliveryForget.length)
+    expect(routing).toContain('k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k)')
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stop = onlyCallOf('sharedStateReporting\\?\\.stop')
+    const unsubscribe = onlyCallOf('unsubscribeSharedStateReporting\\?\\.')
+    const close = onlyCallOf('personaEpisodes\\?\\.close')
+    for (const at of [stop, unsubscribe]) {
+      expect(at).toBeGreaterThan(start)
+      expect(at).toBeLessThan(end)
+      expect(at).toBeLessThan(close)
+    }
+    expect(SERVER_CODE.slice(start, stop)).toContain('shuttingDown = true')
+    expect(SERVER_CODE.slice(unsubscribe, end)).toContain('unsubscribeSharedStateReporting = undefined')
   })
 })
 

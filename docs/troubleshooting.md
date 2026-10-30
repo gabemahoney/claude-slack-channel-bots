@@ -82,6 +82,9 @@ For *Message not saved*, check the server disk; a [`queue-unwritable`](../skills
 **A persona posts a Thread Memory notice**
 Read the persona's Thread Memory report and follow its entry. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-notice).
 
+**A persona posts a *Channel state unresolved*, *Channel membership evidence unresolved* or *Channel state recovered* notice**
+Read the report and follow its entry. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-channel-state-unresolved-channel-membership-evidence-unresolved-or-channel-state-recovered-notice).
+
 **A persona posts a *Waiting on a prompt* or *Not connected* notice**
 The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
 

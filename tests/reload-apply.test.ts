@@ -4,6 +4,7 @@ import { THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
 import * as nodeFs from 'node:fs'
 import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
+import { reviewOutcomeLine } from '../src/reload-review.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
 import { queuePath, readQueue, slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
@@ -88,6 +89,7 @@ import {
   reloadRetiredKeysPutBackClause,
   reloadRetiredKeysPutBackFailedClause,
   reloadSharedAuthorityApplyFailedLine,
+  type ReloadApplyFailure,
 } from '../src/reload.ts'
 import { LAUNCH_RESUMED_UNREPORTED, type LaunchSessionResult } from '../src/restart.ts'
 import {
@@ -1279,6 +1281,113 @@ function recordedNow(run: ReloadRun, entries: Record<string, RetiredKeyCause>): 
 function recordWriteFailedLines(run: ReloadRun): string[] {
   return run.logsOf(RELOAD_RECORD_WRITE_FAILED)
 }
+
+describe('confirmed apply failure observer', () => {
+  const points = ['beginReviewAttempt', 'retired-keys', 'commitReview'] as const
+  test.each(points.flatMap(point => [false, true].map(throws => ({ point, throws }))))('$point reports once after its existing line; throwing=$throws preserves the failed apply', async ({ point, throws }) => {
+    const observed: { failure: ReloadApplyFailure; lines: string[] }[] = []
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], {
+      onApplyFailed(failure) {
+        observed.push({ failure, lines: [...recordWriteFailedLines(run)] })
+        if (throws) throw new Error(sentinelInMessage('apply-observer'))
+      },
+    })
+    const added = h.persona('charlie'); h.materialize(added)
+    await previewConfig(run, [alpha!, added])
+    const fingerprint = h.pendingFingerprint()!
+    const before = applicationState(h.readRecord()!), applied = run.controller.applied()
+    const cp = run.checkpoint()
+    h.confirm()
+    // Attempt / retirement / activation each open a temp file and directory.
+    h.failWrites(point === 'retired-keys' ? { path: h.retiredKeysFile, call: 1 } : { path: h.paths.lastApplied, call: point === 'beginReviewAttempt' ? 1 : 3 })
+    await run.ticks.tick()
+    const failureLines = recordWriteFailedLines(run)
+    expect(failureLines).toEqual([reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed',
+      point === 'retired-keys' ? '' : errnoSuffix({ code: 'EIO' }), point === 'beginReviewAttempt' ? '' : reloadRetiredKeysPutBackClause(h.retiredKeysFile))])
+    expect(observed).toEqual([{ failure: { fingerprint, record: point === 'retired-keys' ? 'retired-keys' : 'authority',
+      failure: point === 'retired-keys' ? '' : errnoSuffix({ code: 'EIO' }), personas: [h.key(bravo!.name)] }, lines: failureLines }])
+    expect(run.controller.applied()).toBe(applied)
+    expect(applicationState(h.readRecord()!)).toEqual(before)
+    expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
+    expect(run.retiredKeys.keys()).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.appliedConfigs).toEqual([])
+    expect(h.pendingExists()).toBe(true)
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    const observerLines = run.logs.filter(line => line.startsWith('[slack] reload: reporting the failed configuration change failed:'))
+    expect(observerLines).toHaveLength(throws ? 1 : 0)
+    if (throws) expect(observerLines[0]).not.toMatch(/[\r\n]/)
+    assertNoLeak({ observed, observerLines })
+    expectNoPostNoLeak(run)
+  })
+
+  test.each(['settings-only', 'add-only'] as const)('%s failure names every applied persona and no addition', async change => {
+    const failures: ReloadApplyFailure[] = []
+    const { run, personas } = await running(['alpha', 'bravo'], { onApplyFailed: failure => { failures.push(failure) } })
+    const added = h.persona('charlie'); h.materialize(added)
+    await previewConfig(run, change === 'add-only' ? [...personas, added] : personas, change === 'settings-only' ? { reply_chunk_limit: 1234 } : {})
+    const fingerprint = h.pendingFingerprint()!
+    h.confirm(); h.failWrites({ path: h.paths.lastApplied, call: 1 }); await run.ticks.tick()
+    expect(failures).toEqual([{ fingerprint, record: 'authority', failure: errnoSuffix({ code: 'EIO' }), personas: keysOf('alpha', 'bravo') }])
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expect(run.appliedConfigs).toEqual([])
+    expectNoPostNoLeak(run)
+  })
+
+  test.each(['destructive', 'in-place', 'credentials', 'next-launch', 'overlapping'] as const)('%s plan names only its applied persona, once', async change => {
+    const failures: ReloadApplyFailure[] = []
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], { onApplyFailed: failure => { failures.push(failure) } })
+    let changed = bravo!
+    if (change === 'destructive') changed = movedDirectory(changed)
+    if (change === 'in-place' || change === 'overlapping') changed = { ...changed, stop_hook_bootstrap: false }
+    if (change === 'credentials' || change === 'overlapping') h.writeCredentials(bravo!)
+    if (change === 'next-launch' || change === 'overlapping') changed = { ...changed, claude_config_dir: h.home }
+    await previewConfig(run, [alpha!, changed])
+    const fingerprint = h.pendingFingerprint()!
+    h.confirm(); h.failWrites({ path: h.paths.lastApplied, call: 1 }); await run.ticks.tick()
+    expect(failures).toEqual([{ fingerprint, record: 'authority', failure: errnoSuffix({ code: 'EIO' }), personas: [h.key(bravo!.name)] }])
+    expect(run.appliedConfigs).toEqual([])
+    expectNoPostNoLeak(run)
+  })
+
+  test.each(['attempt-unresolved', 'commit-unresolved', 'attempt-stale', 'commit-stale', 'stale-confirmation', 'invalid-plan'] as const)('%s never invokes the definite-failure observer', async outcome => {
+    const failures: ReloadApplyFailure[] = []
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], {
+      sharedStateReports: true, onApplyFailed: failure => { failures.push(failure) },
+    })
+    const before = applicationState(h.readRecord()!), applied = run.controller.applied()
+    await previewConfig(run, outcome === 'invalid-plan' ? [{ ...alpha!, channels: [{ id: alpha!.channels![0]!.id, delivery: 'invalid' as DeliveryMode }] }, bravo!] : [alpha!])
+    h.confirm()
+    if (outcome === 'stale-confirmation') h.writeConfig({ ...configOf(alpha!), reply_chunk_limit: 1234 })
+    if (outcome.endsWith('unresolved')) h.failWrites({ path: h.paths.lastApplied, step: 'fsyncSync', call: outcome === 'attempt-unresolved' ? 2 : 4 })
+    // Force the race result at the authority seam; confirmation parsing still runs normally.
+    const authority = run.controller.sharedChannels()!
+    const stale = outcome === 'commit-stale' ? spyOn(authority, 'commitReview').mockReturnValue({ kind: 'stale', revision: authority.revision }) : undefined
+    const staleAttempt = outcome === 'attempt-stale' ? spyOn(authority, 'transact').mockReturnValueOnce({ kind: 'stale', revision: authority.revision }) : undefined
+    const cp = run.checkpoint()
+    try { await run.ticks.tick() } finally { stale?.mockRestore(); staleAttempt?.mockRestore() }
+    expect(failures).toEqual([])
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
+    if (outcome.endsWith('unresolved')) {
+      expect(authority.readable).toBe(false)
+      expect(recordWriteFailedLines(run)).toHaveLength(1)
+      expect(recordWriteFailedLines(run)[0]).toContain('unresolved')
+    } else {
+      expect(applicationState(h.readRecord()!)).toEqual(before)
+      if (outcome.endsWith('-stale')) expect(recordWriteFailedLines(run)[0]).toContain('stale')
+      if (outcome === 'stale-confirmation') {
+        expect(run.logs.filter(line => line === reviewOutcomeLine('superseded'))).toHaveLength(1)
+        expect(h.applyExists()).toBe(false)
+      }
+      if (outcome === 'invalid-plan') expect(run.invalidLines().some(line => line.includes('confirmed configuration is invalid'))).toBe(true)
+    }
+    // Unresolved authority may report its own hold, never a definite apply failure.
+    expect(run.slackPosts().filter(post => JSON.stringify(post).includes('*Configuration change not applied*'))).toEqual([])
+    assertNoLeak(run.captured())
+  })
+})
 
 /**
  * Hold `key` as retired only in memory, as a start sweep whose write failed

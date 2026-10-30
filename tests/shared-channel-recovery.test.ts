@@ -7,13 +7,15 @@ import { join } from 'node:path'
 import { DEFAULT_PERSONA_CONFIG_FS, type DeliveryMode, type PersonaConfigFs } from '../src/config.ts'
 import {
   createSharedChannelAuthority, parseSharedChannelState, sameChannelStamp, serializeSharedChannelState,
-  type ChannelStamp, type SharedChannelStampState, type SharedChannelState, type SharedThreadView, type ThreadMemoryMarkerResult,
+  type ChannelStamp, type SharedChannelAuthority, type SharedChannelStampState, type SharedChannelState, type SharedThreadView, type ThreadMemoryMarkerResult,
 } from '../src/shared-channels.ts'
 import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
 import { errnoSuffix } from '../src/persona-credentials.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { activationRecord, applicationState, channelPopulation, configBytes, expectCurrent, expectSuperseded, holdsLifetime } from './test-helpers/shared-channels.ts'
+import { activationRecord, applicationState, botAttemptRecord, channelPopulation, configBytes, expectCurrent, expectSuperseded, holdsLifetime, makeSharedAuthority, makeMembershipHarness, SHARED_CHANNEL_IDS as C } from './test-helpers/shared-channels.ts'
+import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
+import { makeDm } from './test-helpers/slack-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
 import { cannedGetResult, stubCallCount } from './test-helpers/agent-director-stub.ts'
@@ -38,6 +40,242 @@ function assignmentsOf(state: SharedChannelState) {
   return Object.fromEntries(Object.entries(state.personas).map(([key, life]) => [key, life.assignments]))
 }
 function lastAppliedWrites(run: ReloadRun) { return run.writes.filter(write => write.path === h.paths.lastApplied).length }
+
+/** Readability is the oracle, including a channel outside the inventory to
+ * distinguish a persona-wide hold from a finite list of changed projections. */
+function expectScopeMatches(authority: SharedChannelAuthority, states: SharedChannelState[]) {
+  const keys = [...new Set(states.flatMap(state => Object.keys(state.personas)))]
+  for (const key of keys) {
+    const channels = [...new Set(states.flatMap(state => {
+      const life = state.personas[key]
+      const raw = (state.applied.personas as Array<{ name: string; permission_prompts: string }>).find(p => h.key(p.name) === key)
+      return [...Object.keys(life?.assignments ?? {}), ...Object.keys(life?.membership ?? {}),
+        ...Object.keys(life?.leaves ?? {}), ...Object.keys(life?.membershipAbsenceConflicts ?? {}),
+        ...(raw?.permission_prompts && raw.permission_prompts !== 'dm' ? [raw.permission_prompts] : [])]
+    }))].sort()
+    const scope = { channels: channels.filter(channel => !authority.readableFor(key, channel)),
+      dm: !authority.readableFor(key, String(makeDm().channel)),
+      all: !authority.readableFor(key, channelPopulation(1, 8000)[0]!.id) }
+    expect(authority.unresolvedScope(key)).toEqual(scope.all || scope.dm || scope.channels.length ? scope : undefined)
+  }
+}
+
+test.each(['operator-channel', 'operator-dm', 'operator-mode', 'bot'] as const)('reporting hooks match readable projections after an unsynced %s application and I/O retry', async action => {
+  const alpha = h.persona('alpha', { channels: [C.primary, C.secondary].map(id => ({ id, delivery: 'all' })), permission_prompts: C.primary,
+    dm: { enabled: true, contact: 'U0OPERATOR' } })
+  const beta = h.persona('beta'); h.materialize(alpha, beta)
+  h.writeConfig({ channel_mode: 'open', personas: [alpha, beta] })
+  let armed = false
+  const run = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK, beforeWrite(path, bytes) {
+    if (!armed || path !== h.paths.lastApplied || !(action === 'bot' ? botAttemptRecord(bytes, path, 'applied') : activationRecord(bytes, path))) return
+    armed = false; h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
+  } })
+  const authority = run.controller.sharedChannels()!
+  run.stub('alpha').script.inventory.push(membershipPage([C.primary, C.secondary]))
+  run.stub('beta').script.inventory.push(membershipPage([beta.permission_prompts]))
+  await run.membershipClock.runNext()
+  const before = authority.snapshot()
+  expect(authority.unreadableCause).toBeUndefined(); expectScopeMatches(authority, [before])
+  if (action === 'bot') {
+    run.registerSession('alpha'); armed = true
+    expect((await run.callTool('alpha', 'set_channel_delivery', deliveryAttempt('report-unsynced', C.primary, 'off'))).isError).toBe(true)
+  } else {
+    const next = action === 'operator-channel' ? { ...alpha, channels: [{ id: C.primary, delivery: 'off' }, { id: C.secondary, delivery: 'all' }] } :
+      action === 'operator-dm' ? { ...alpha, dm: { ...alpha.dm, contact: 'U0CHANGED' } } : alpha
+    h.writeConfig({ channel_mode: action === 'operator-mode' ? 'strict' : 'open', personas: [next, beta] })
+    await run.ticks.tick(); h.confirm(); armed = true; await run.ticks.tick()
+  }
+  expect(armed).toBe(false)
+  h.clearWriteFailure()
+  const uncertainBytes = h.readRecord()!, uncertain = disk()
+  expect(authority.readable).toBe(false); expect(authority.unreadableCause).toBe('unsynced')
+  expectScopeMatches(authority, [before, uncertain])
+  expect(authority.unresolvedScope('alpha')).toBeDefined()
+  if (action !== 'operator-mode') expect(authority.unresolvedScope('beta')).toBeUndefined()
+  h.failWrites({ step: 'writeSync', call: 1, code: 'EIO' })
+  expect(authority.recoverDurability()).toEqual({ kind: 'unresolved', revision: authority.revision })
+  expect(authority.failure).toBe(errnoSuffix({ code: 'EIO' }))
+  expect(authority.unreadableCause).toBe('unsynced'); expectScopeMatches(authority, [before, uncertain])
+  expect(h.readRecord()).toEqual(uncertainBytes)
+  h.clearWriteFailure()
+  expect(authority.recoverDurability()).toEqual({ kind: 'applied', revision: uncertain.revision })
+  expect(authority.unreadableCause).toBeUndefined(); expectScopeMatches(authority, [before, uncertain])
+  expect(authority.snapshot()).toEqual(uncertain); expect(h.readRecord()).toEqual(uncertainBytes)
+})
+
+test('reporting hooks match an unsynced authenticated membership write without granting an acknowledgement', async () => {
+  const f = makeMembershipHarness(h.stateDir, { names: ['alpha', 'beta'], channels: [{ id: C.secondary, delivery: 'all' }] })
+  try {
+    await f.start()
+    const before = f.authority.snapshot()
+    f.unsyncWrites(() => true)
+    await f.event(true, C.primary)
+    const uncertain = f.writes.at(-1)!
+    expect(f.h.stub(f.h.p('alpha')).socket.acks).toEqual([])
+    expect(f.authority.unreadableCause).toBe('unsynced')
+    expectScopeMatches(f.authority, [before, uncertain])
+    expect(f.authority.unresolvedScope('alpha')!.channels).toContain(C.primary)
+    expect(f.authority.unresolvedScope('beta')).toBeUndefined()
+    f.unsyncWrites(() => false); f.failWrites(() => true)
+    expect(f.authority.recoverDurability().kind).toBe('unresolved')
+    expect(f.authority.unreadableCause).toBe('unsynced'); expectScopeMatches(f.authority, [before, uncertain])
+    f.failWrites(() => false)
+    expect(f.authority.recoverDurability().kind).toBe('applied')
+    expect(f.authority.unreadableCause).toBeUndefined(); expectScopeMatches(f.authority, [before, uncertain])
+    assertNoLeak(f.captured())
+  } finally { await f.close() }
+})
+
+test.each(['recover', 'stage'] as const)('changed uncertain bytes keep the existing failure and clear only on successful %s', action => {
+  const input = { personas: [h.persona('alpha', { channels: [{ id: C.primary, delivery: 'all' }], permission_prompts: C.primary })] }
+  let unsynced = true, writes = 0
+  const authority = makeSharedAuthority(h.dir, input, { write(path, bytes) {
+    writes++; durableWriteFileSync(path, bytes)
+    if (unsynced) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+  } })
+  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('unresolved')
+  const exact = h.readRecord()!, before = authority.snapshot(), uncertain = disk()
+  const damaged = h.writeRecordBytes('changed uncertain authority evidence')
+  unsynced = false
+  const priorWrites = writes
+  for (let i = 0; i < 2; i++) {
+    expect(authority.recoverDurability()).toEqual({ kind: 'unresolved', revision: before.revision })
+    expect(authority.failure).toBe(errnoSuffix(new Error('Uncertain authority evidence changed; preserve it for reviewed recovery.')))
+    expect(authority.unreadableCause).toBe('evidence-changed')
+    expectScopeMatches(authority, [before, uncertain])
+    expect(writes).toBe(priorWrites); expect(h.readRecord()).toEqual(damaged)
+  }
+  if (action === 'recover') {
+    h.writeRecordBytes(exact)
+    expect(authority.unreadableCause).toBe('evidence-changed')
+    expect(authority.recoverDurability()).toEqual({ kind: 'applied', revision: uncertain.revision })
+    expect(authority.unreadableCause).toBeUndefined(); expect(authority.unresolvedScope('alpha')).toBeUndefined()
+    expect(authority.failure).toBe(''); expect(authority.snapshot()).toEqual(uncertain)
+    expect(h.readRecord()).toEqual(exact)
+  } else {
+    expect(authority.stageRestoration(sharedRecoveryRequest('report-stage', damaged), damaged, configBytes(input)).kind).toBe('unresolved')
+    expect(authority.unreadableCause).toBe('restoration-staged')
+    expect(authority.recoverDurability().kind).toBe('unresolved')
+    expect(authority.unreadableCause).toBe('restoration-staged')
+    expectScopeMatches(authority, [before, disk()])
+  }
+  expect(writes).toBe(priorWrites + 1)
+})
+
+test('readable authority reports every projection held by interrupted reviewed retirement, until recovery', async () => {
+  const alpha = h.persona('alpha'), beta = h.persona('beta'); h.materialize(alpha, beta)
+  h.writeConfig({ personas: [alpha, beta] })
+  let armed = false
+  const run = await start({ beforeWrite(path, bytes) {
+    if (armed && path === h.paths.lastApplied && activationRecord(bytes, path)) h.failWrites({ code: 'EIO' })
+  } })
+  const authority = run.controller.sharedChannels()!
+  h.writeConfig({ personas: [beta] }); await run.ticks.tick(); h.confirm(); armed = true; await run.ticks.tick()
+  expect(authority.readable).toBe(true); expect(authority.unreadableCause).toBeUndefined()
+  expect(authority.reviewHeld('alpha')).toBe(true)
+  expect(authority.unresolvedScope('alpha')).toMatchObject({ all: true, dm: true })
+  expectScopeMatches(authority, [authority.snapshot()])
+  expect(authority.unresolvedScope('beta')).toBeUndefined()
+  armed = false; h.clearWriteFailure(); await run.ticks.tick()
+  expect(authority.reviewHeld('alpha')).toBe(false); expect(authority.unresolvedScope('alpha')).toBeUndefined()
+})
+
+test('watch reports every mutation outcome after publication, isolates exceptions and unsubscribes', () => {
+  const input = { personas: [h.persona('alpha')] }
+  let failure: 'none' | 'definite' | 'unsynced' = 'none', writes = 0
+  const authority = makeSharedAuthority(h.dir, input, { write(path, bytes) {
+    writes++
+    if (failure === 'definite') throw Object.assign(new Error('fixture write failure'), { code: 'EIO' })
+    durableWriteFileSync(path, bytes)
+    if (failure === 'unsynced') throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+  } })
+  const order: string[] = []
+  authority.subscribe(() => order.push('subscribe'))
+  const unthrow = authority.watch(() => { order.push('throw'); throw new Error('observer failure') })
+  const unwatch = authority.watch(() => order.push('watch'))
+  const check = (kind: string, action: () => { kind: string }, publishes = false) => {
+    order.length = 0
+    expect(action().kind).toBe(kind)
+    expect(order).toEqual([...(publishes ? ['subscribe'] : []), 'throw', 'watch'])
+  }
+  const assign = () => authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision)
+  check('applied', assign, true)
+  const appliedWrites = writes
+  check('stale', () => authority.transact(authority.revision - 1, () => { throw new Error('stale callback must not run') }))
+  check('failed', () => authority.transact(authority.revision, () => { throw new Error('change refused') }))
+  expect(writes).toBe(appliedWrites)
+  failure = 'definite'; check('failed', assign)
+  failure = 'unsynced'; check('unresolved', assign)
+  const exact = h.readRecord()!
+  check('unresolved', () => authority.transact(authority.revision, () => {}))
+  failure = 'definite'; check('unresolved', () => authority.recoverDurability())
+  failure = 'none'
+  const damage = h.writeRecordBytes('changed evidence for watcher')
+  check('unresolved', () => authority.recoverDurability())
+  h.writeRecordBytes(exact)
+  check('applied', () => authority.recoverDurability(), true)
+  check('applied', () => authority.recoverDurability())
+  const request = sharedRecoveryRequest('watch-stage', damage)
+  check('stale', () => authority.stageRestoration(request, damage, configBytes(input)))
+  h.writeRecordBytes(damage)
+  failure = 'definite'; check('failed', () => authority.stageRestoration(request, damage, configBytes(input)))
+  failure = 'none'; check('unresolved', () => authority.stageRestoration(request, damage, configBytes(input)))
+  check('stale', () => authority.stageRestoration(request, damage, configBytes(input)))
+  check('unresolved', () => authority.recoverDurability())
+  unthrow(); unwatch(); order.length = 0
+  expect(authority.recoverDurability().kind).toBe('unresolved')
+  expect(order).toEqual([])
+})
+
+test.each(['transact', 'recover'] as const)('watch can start a new mutation after %s releases the lock', operation => {
+  let unsynced = operation === 'recover'
+  const authority = makeSharedAuthority(h.dir, { personas: [h.persona('alpha')] }, { write(path, bytes) {
+    durableWriteFileSync(path, bytes)
+    if (unsynced) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+  } })
+  const assign = (channel: string) => authority.assign('alpha', authority.incarnation('alpha')!, channel, 'off', authority.revision)
+  if (operation === 'recover') expect(assign(C.primary).kind).toBe('unresolved')
+  unsynced = false
+  const order: string[] = [], nested: string[] = []
+  authority.subscribe(() => order.push('subscribe'))
+  let enter = true
+  const stop = authority.watch(() => {
+    order.push('watch')
+    if (enter) { enter = false; nested.push(assign(C.secondary).kind) }
+  })
+  expect((operation === 'recover' ? authority.recoverDurability() : assign(C.primary)).kind).toBe('applied')
+  expect(nested).toEqual(['applied'])
+  expect(order).toEqual(['subscribe', 'watch', 'subscribe', 'watch'])
+  expect(authority.choice('alpha', C.secondary)).toBe('off')
+  stop()
+})
+
+test.each(['restore', 'replace'] as const)('repairActivated belongs only to the run that activates reviewed %s', async action => {
+  const alpha = h.persona('alpha'); h.materialize(alpha)
+  const input = h.writeConfig({ personas: [alpha] })
+  let run = await start()
+  expect(run.controller.repairActivated()).toBe(false)
+  const authority = run.controller.sharedChannels()!
+  const damage = h.writeRecordBytes('damaged repair flag evidence')
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('repair-flag', damage, action === 'replace' ? input : undefined)))
+  if (action === 'restore') {
+    await run.ticks.tick()
+    expect(authority.unreadableCause).toBe('restoration-staged')
+    // Identical projections remain usable although a reviewed repair is staged.
+    expectScopeMatches(authority, [authority.snapshot(), disk()])
+    expect(authority.unresolvedScope('alpha')).toBeUndefined()
+    expect(run.controller.repairActivated()).toBe(false)
+  }
+  await run.stop()
+  run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
+  expect(run.controller.repairActivated()).toBe(false)
+  await run.stop(); h.confirm()
+  run = await recoveryStart(); expect(run.outcome.kind).toBe('applied')
+  expect(run.controller.repairActivated()).toBe(true)
+  await run.stop()
+  run = await recoveryStart(); expect(run.outcome.kind).toBe('applied')
+  expect(run.controller.repairActivated()).toBe(false)
+})
 
 test('shared transaction order reservations reject invalid spans before callbacks or writes and preserve ordinary one-order commits', async () => {
   const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })

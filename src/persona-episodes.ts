@@ -490,6 +490,15 @@ export const PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE = 'thread-memory-unre
 export const PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST = 'thread-memory-joins-lost'
 /** A startup/first-read finding until the key is forgotten; Thread Memory reporting posts once per run. */
 export const PERSONA_EPISODE_KIND_THREAD_MEMORY_CHANGED_WHILE_STOPPED = 'thread-memory-changed-while-stopped'
+/** Shared-state reporter: first unreadable projection/unsaved evidence through
+ * decided state and membership for all named channels; repair starts silently. */
+export const PERSONA_EPISODE_KIND_SHARED_STATE_UNRESOLVED = 'shared-state-unresolved'
+/** Shared-state reporter: conflicting history or an ended incomplete scan
+ * through a complete scan, no history holds and decided named channels. */
+export const PERSONA_EPISODE_KIND_MEMBERSHIP_EVIDENCE_UNRESOLVED = 'membership-evidence-unresolved'
+/** Shared-state reporter: one definite apply failure per confirmed fingerprint;
+ * ends silently on successful apply or when the persona is forgotten. */
+export const PERSONA_EPISODE_KIND_RELOAD_APPLY_FAILED = 'reload-apply-failed'
 
 /** Every notice or log-only diagnostic kind with a latch here. */
 export const PERSONA_EPISODE_KINDS = [
@@ -511,6 +520,9 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_CHANGED_WHILE_STOPPED,
+  PERSONA_EPISODE_KIND_SHARED_STATE_UNRESOLVED,
+  PERSONA_EPISODE_KIND_MEMBERSHIP_EVIDENCE_UNRESOLVED,
+  PERSONA_EPISODE_KIND_RELOAD_APPLY_FAILED,
 ] as const
 
 /** A notice or log-only diagnostic kind with a latch here. */

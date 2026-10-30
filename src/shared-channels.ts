@@ -667,6 +667,29 @@ function readableIn(facts: SharedReadability, key: string, channel?: string): bo
     isDeepStrictEqual(own(before.leaves, channel), own(after.leaves, channel)) &&
     isDeepStrictEqual(own(before.membershipAbsenceConflicts ?? {}, channel), own(after.membershipAbsenceConflicts ?? {}, channel))
 }
+export interface SharedUnresolvedScope { channels: string[]; dm: boolean; all: boolean }
+export type SharedUnreadableCause = 'unsynced' | 'evidence-changed' | 'restoration-staged'
+/** Reporting inventory only; the projection reader remains the authority. */
+export function sharedPersonaChannels(state: SharedChannelState, key: string): string[] {
+  const life = own(state.personas, key)
+  const channels = new Set([...Object.keys(life?.assignments ?? {}), ...Object.keys(life?.membership ?? {}),
+    ...Object.keys(life?.leaves ?? {}), ...Object.keys(life?.membershipAbsenceConflicts ?? {})])
+  const destination = life ? rawPersona(state, key)['permission_prompts'] : undefined
+  if (typeof destination === 'string' && CHANNEL_ID_RE.test(destination)) channels.add(destination)
+  return [...channels].sort()
+}
+function unresolvedScopeIn(facts: SharedReadability, key: string): SharedUnresolvedScope | undefined {
+  if (facts.readable && !heldByReview(facts.current, key)) return undefined
+  const channels = new Set(sharedPersonaChannels(facts.current, key))
+  if (facts.uncertain) for (const channel of sharedPersonaChannels(facts.uncertain, key)) channels.add(channel)
+  const before = own(facts.current.personas, key)
+  const after = own(facts.uncertain?.personas ?? {}, key)
+  const all = heldByReview(facts.current, key) || !facts.uncertain || !before || !after ||
+    before.incarnation !== after.incarnation || facts.current.applied['channel_mode'] !== facts.uncertain.applied['channel_mode']
+  const scope = { channels: [...channels].filter(channel => !readableIn(facts, key, channel)).sort(),
+    dm: !readableIn(facts, key, 'D'), all }
+  return scope.all || scope.dm || scope.channels.length ? scope : undefined
+}
 /** A staged recovery leaves unchanged projections readable, yet no stamp under
  * it can be decided: the restart reviews the stage before any join counts. */
 function stampIn(facts: SharedReadability, key: string, channel: string): SharedChannelStampState | undefined {
@@ -699,6 +722,10 @@ function threadViewSignature(facts: SharedReadability): string {
 export interface SharedChannelAuthority {
   readonly path: string
   readonly readable: boolean
+  readonly unreadableCause: SharedUnreadableCause | undefined
+  unresolvedScope(key: string): SharedUnresolvedScope | undefined
+  /** Outcome observers run after publication and outside the mutation lock. */
+  watch(listener: () => void): () => void
   /** Unchanged projections remain usable after an ambiguous whole-file write.
    * This never grants another write against the uncertain revision. */
   readableFor(key: string, channel?: string): boolean
@@ -767,11 +794,31 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   let uncertain: SharedChannelState | undefined
   let uncertainPublish: ((config: PersonaConfig) => void) | undefined
   let recoveryStaged = false
+  let unreadableCause: SharedUnreadableCause | undefined
   let mutating = false
   let failure = ''
   const write = deps.write ?? durableWriteFileSync
   const mint = deps.threadHybridSince ?? randomUUID
   const listeners = new Set<(config: PersonaConfig) => void>()
+  const watchers = new Set<() => void>()
+  let pendingWatchOutcomes = 0
+  let watching = false
+  function reportOutcome<T>(run: () => T): T {
+    try { return run() } finally {
+      pendingWatchOutcomes++
+      if (!mutating && !watching) {
+        watching = true
+        try {
+          while (pendingWatchOutcomes > 0) {
+            pendingWatchOutcomes--
+            for (const listener of [...watchers]) {
+              try { listener() } catch { /* reporting cannot change an outcome */ }
+            }
+          }
+        } finally { watching = false }
+      }
+    }
+  }
   const threadViewListeners = new Set<(view: SharedThreadView) => void>()
   const readability = (): SharedReadability => ({ current, uncertain, readable, recoveryStaged })
   let deliveredThreadView = threadViewSignature(readability())
@@ -1019,70 +1066,82 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   const authority: SharedChannelAuthority = {
     path,
     get readable() { return readable },
+    get unreadableCause() { return readable ? undefined : unreadableCause },
+    unresolvedScope: key => unresolvedScopeIn(readability(), key),
+    watch(listener) { watchers.add(listener); return () => watchers.delete(listener) },
     readableFor: (key, channel) => readableIn(readability(), key, channel),
     get revision() { return current.revision },
     get failure() { return failure },
     recoverDurability() {
-      if (recoveryStaged) return { kind: 'unresolved', revision: current.revision }
-      if (readable) return { kind: 'applied', revision: current.revision }
-      if (mutating || !uncertain) return { kind: 'unresolved', revision: current.revision }
-      const before = current
-      const recovered = uncertain
-      const publish = uncertainPublish
-      mutating = true
-      try {
-        // The rename already installed these exact validated bytes. Repeating
-        // their durable write finishes that outcome, never invents old-state
-        // rollback or assigns again at a later revision.
-        const bytes = serializeSharedChannelState(recovered)
-        if (!Buffer.from(readPersonaConfigBytes(path, deps.readFs)).equals(Buffer.from(bytes))) throw new Error('Uncertain authority evidence changed; preserve it for reviewed recovery.')
-        write(path, bytes)
-        current = recovered
-        uncertain = undefined
-        uncertainPublish = undefined
-        readable = true
-        failure = ''
-      } catch (err) {
-        failure = errnoSuffix(err)
-        mutating = false
-        return { kind: 'unresolved', revision: current.revision }
-      }
-      try { publishChange(before, publish) } finally { mutating = false }
-      return { kind: 'applied', revision: current.revision }
+      return reportOutcome(() => {
+        if (recoveryStaged) return { kind: 'unresolved', revision: current.revision }
+        if (readable) return { kind: 'applied', revision: current.revision }
+        if (mutating || !uncertain) return { kind: 'unresolved', revision: current.revision }
+        const before = current
+        const recovered = uncertain
+        const publish = uncertainPublish
+        mutating = true
+        try {
+          // The rename already installed these exact validated bytes. Repeating
+          // their durable write finishes that outcome, never invents old-state
+          // rollback or assigns again at a later revision.
+          const bytes = serializeSharedChannelState(recovered)
+          if (!Buffer.from(readPersonaConfigBytes(path, deps.readFs)).equals(Buffer.from(bytes))) {
+            unreadableCause = 'evidence-changed'
+            throw new Error('Uncertain authority evidence changed; preserve it for reviewed recovery.')
+          }
+          write(path, bytes)
+          current = recovered
+          uncertain = undefined
+          uncertainPublish = undefined
+          readable = true
+          unreadableCause = undefined
+          failure = ''
+        } catch (err) {
+          failure = errnoSuffix(err)
+          mutating = false
+          return { kind: 'unresolved', revision: current.revision }
+        }
+        try { publishChange(before, publish) } finally { mutating = false }
+        return { kind: 'applied', revision: current.revision }
+      })
     },
     stageRestoration(request, evidence, prepared) {
-      if (mutating || recoveryStaged || request.action !== 'restore' || recoveryHash(evidence) !== request.evidence_sha256) return { kind: 'stale', revision: current.revision }
-      const anchor = uncertain ?? current
-      let staged: SharedChannelState
-      try {
-        if (!Buffer.from(readPersonaConfigBytes(path, deps.readFs)).equals(Buffer.from(evidence))) return { kind: 'stale', revision: current.revision }
-        // An independently installed valid authority is not evidence that this
-        // running owner's older memory may overwrite it.
-        let installed: SharedChannelState | undefined
-        try { installed = parseSharedChannelState(evidence, path, deps) } catch { /* damaged evidence is preserved below */ }
-        if (installed && !isDeepStrictEqual(installed, anchor)) return { kind: 'stale', revision: current.revision }
-        if (readable && installed) return { kind: 'stale', revision: current.revision }
-        staged = clone(anchor)
-        staged.revision++
-        staged.recovery = { boundary: (deps.incarnation ?? randomUUID)(), phase: 'review', request: clone(request),
-          evidenceBase64: Buffer.from(evidence).toString('base64'), preparedBase64: Buffer.from(prepared).toString('base64'),
-          anchorBase64: Buffer.from(serializeSharedChannelState(anchor)).toString('base64') }
-        if (!parseSharedChannelState(serializeSharedChannelState(staged), path, deps)) throw new Error('Invalid recovery stage.')
-      } catch (err) { failure = errnoSuffix(err); return { kind: 'failed', revision: current.revision } }
-      mutating = true
-      try { write(path, serializeSharedChannelState(staged)) }
-      catch (err) {
-        failure = errnoSuffix(err)
-        if (!(err instanceof DurableWriteUnsyncedError)) { mutating = false; return { kind: 'failed', revision: current.revision } }
-      }
-      // Freeze ordinary mutation in this process. Unchanged projections and
-      // accepted queues can progress; activation belongs to the next start.
-      recoveryStaged = true
-      readable = false
-      uncertain = staged
-      mutating = false
-      deliverThreadView(false)
-      return { kind: 'unresolved', revision: current.revision }
+      return reportOutcome(() => {
+        if (mutating || recoveryStaged || request.action !== 'restore' || recoveryHash(evidence) !== request.evidence_sha256) return { kind: 'stale', revision: current.revision }
+        const anchor = uncertain ?? current
+        let staged: SharedChannelState
+        try {
+          if (!Buffer.from(readPersonaConfigBytes(path, deps.readFs)).equals(Buffer.from(evidence))) return { kind: 'stale', revision: current.revision }
+          // An independently installed valid authority is not evidence that this
+          // running owner's older memory may overwrite it.
+          let installed: SharedChannelState | undefined
+          try { installed = parseSharedChannelState(evidence, path, deps) } catch { /* damaged evidence is preserved below */ }
+          if (installed && !isDeepStrictEqual(installed, anchor)) return { kind: 'stale', revision: current.revision }
+          if (readable && installed) return { kind: 'stale', revision: current.revision }
+          staged = clone(anchor)
+          staged.revision++
+          staged.recovery = { boundary: (deps.incarnation ?? randomUUID)(), phase: 'review', request: clone(request),
+            evidenceBase64: Buffer.from(evidence).toString('base64'), preparedBase64: Buffer.from(prepared).toString('base64'),
+            anchorBase64: Buffer.from(serializeSharedChannelState(anchor)).toString('base64') }
+          if (!parseSharedChannelState(serializeSharedChannelState(staged), path, deps)) throw new Error('Invalid recovery stage.')
+        } catch (err) { failure = errnoSuffix(err); return { kind: 'failed', revision: current.revision } }
+        mutating = true
+        try { write(path, serializeSharedChannelState(staged)) }
+        catch (err) {
+          failure = errnoSuffix(err)
+          if (!(err instanceof DurableWriteUnsyncedError)) { mutating = false; return { kind: 'failed', revision: current.revision } }
+        }
+        // Freeze ordinary mutation in this process. Unchanged projections and
+        // accepted queues can progress; activation belongs to the next start.
+        recoveryStaged = true
+        unreadableCause = 'restoration-staged'
+        readable = false
+        uncertain = staged
+        mutating = false
+        deliverThreadView(false)
+        return { kind: 'unresolved', revision: current.revision }
+      })
     },
     snapshot: () => clone(current),
     config: () => sharedAppliedConfig(current, path, deps),
@@ -1143,46 +1202,49 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       return answer(result.kind === 'applied' ? 'recorded' : result.kind)
     },
     transact(expectedRevision, change, orderSpan = 1, publish) {
-      if (!readable) return { kind: 'unresolved', revision: current.revision }
-      if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
-      if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
-      const next = clone(current)
-      const before = current
-      next.revision += orderSpan
-      const appliedRevision = next.revision
-      let prepared: SharedChannelState | undefined
-      mutating = true
-      failure = ''
-      try {
-        change(next, next.revision)
-        if (next.revision !== appliedRevision) throw new Error('Invalid shared application order.')
-        const bytes = serializeSharedChannelState(next)
-        const published = parseSharedChannelState(bytes, path, deps)
-        if (!published) throw new Error('Invalid shared authority format.')
-        prepared = published
-        write(path, bytes)
-        current = published
-      } catch (err) {
-        mutating = false
-        failure = errnoSuffix(err)
-        // Never overwrite ambiguous evidence with a rollback or allow another
-        // writer to decide that the old memory won after an unsynced rename.
-        if (err instanceof DurableWriteUnsyncedError) {
-          readable = false
-          uncertain = prepared
-          uncertainPublish = publish
-          deliverThreadView(false)
-          return { kind: 'unresolved', revision: current.revision }
+      return reportOutcome(() => {
+        if (!readable) return { kind: 'unresolved', revision: current.revision }
+        if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
+        if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
+        const next = clone(current)
+        const before = current
+        next.revision += orderSpan
+        const appliedRevision = next.revision
+        let prepared: SharedChannelState | undefined
+        mutating = true
+        failure = ''
+        try {
+          change(next, next.revision)
+          if (next.revision !== appliedRevision) throw new Error('Invalid shared application order.')
+          const bytes = serializeSharedChannelState(next)
+          const published = parseSharedChannelState(bytes, path, deps)
+          if (!published) throw new Error('Invalid shared authority format.')
+          prepared = published
+          write(path, bytes)
+          current = published
+        } catch (err) {
+          mutating = false
+          failure = errnoSuffix(err)
+          // Never overwrite ambiguous evidence with a rollback or allow another
+          // writer to decide that the old memory won after an unsynced rename.
+          if (err instanceof DurableWriteUnsyncedError) {
+            readable = false
+            unreadableCause = 'unsynced'
+            uncertain = prepared
+            uncertainPublish = publish
+            deliverThreadView(false)
+            return { kind: 'unresolved', revision: current.revision }
+          }
+          return { kind: 'failed', revision: current.revision }
         }
-        return { kind: 'failed', revision: current.revision }
-      }
-      try {
-        // Metadata has durable order, but no applied publication or assignment.
-        publishChange(before, publish)
-      } finally {
-        mutating = false
-      }
-      return { kind: 'applied', revision: appliedRevision }
+        try {
+          // Metadata has durable order, but no applied publication or assignment.
+          publishChange(before, publish)
+        } finally {
+          mutating = false
+        }
+        return { kind: 'applied', revision: appliedRevision }
+      })
     },
     observeMembership(key, incarnation, observation, expectedRevision) {
       if (!readable) return { kind: 'unresolved', revision: current.revision }

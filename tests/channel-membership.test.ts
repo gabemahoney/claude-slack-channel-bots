@@ -15,6 +15,7 @@ import { parseSharedChannelState } from '../src/shared-channels.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import type { MembershipEvidence } from '../src/channel-membership-evidence.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
+import { membershipScanDiagnostic, MEMBERSHIP_INVENTORY_COMPLETE, MEMBERSHIP_INVENTORY_INCOMPLETE, type MembershipScanStatus } from '../src/channel-membership-scan.ts'
 
 const runs: MembershipHarness[] = [], dirs: string[] = []
 function fixture(opts: Parameters<typeof makeMembershipHarness>[1] = {}, dir = mkdtempSync(join(tmpdir(), 'membership-'))) {
@@ -24,11 +25,72 @@ function fixture(opts: Parameters<typeof makeMembershipHarness>[1] = {}, dir = m
 const stub = (f: MembershipHarness, key = 'alpha') => f.h.stub(f.h.p(key))
 const reading = (f: MembershipHarness, channel: string = C.primary, key = 'alpha') => f.membership.read(key, channel, f.authority.config().channel_mode)
 const life = (f: MembershipHarness, key = 'alpha') => f.authority.snapshot().personas[key]!
+const scanLines = (f: MembershipHarness) => f.lines.filter(line =>
+  [MEMBERSHIP_INVENTORY_COMPLETE, MEMBERSHIP_INVENTORY_INCOMPLETE].some(label => line.startsWith(`[slack] ${label} `)))
 afterEach(async () => {
   for (const f of runs.splice(0)) { await f.close(); expect(f.h.clock.pendingCount()).toBe(0); assertNoLeak(f.captured()) }
   _resetAckTracker()
   _resetRegistry()
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+test.each([false, true])('scan reporting mirrors logged statuses, deduplicates and preserves progress when observer throws=%p', async throws => {
+  const reports: Array<{ key: string; status: MembershipScanStatus; ended: boolean; readEnded: boolean; logged: string | undefined }> = []
+  const f = fixture({ onScanStatus(key, status, ended) {
+    reports.push({ key, status: { ...status }, ended, readEnded: f.scanner.ended(key), logged: scanLines(f).at(-1) })
+    if (throws) throw new Error('reporting observer failed')
+  } })
+  expect(f.scanner.ended('alpha')).toBe(false)
+  const checkReports = () => {
+    expect(reports.map(({ key, status }) => membershipScanDiagnostic(key, status))).toEqual(scanLines(f))
+    for (const report of reports) {
+      expect(report.key).toBe('alpha')
+      expect(report.logged).toBe(membershipScanDiagnostic(report.key, report.status))
+      expect(report.readEnded).toBe(report.ended)
+    }
+  }
+  stub(f).script.inventory.push({ kind: 'platform', error: 'missing_scope' })
+  await f.start()
+  checkReports()
+  expect(reports.length).toBeGreaterThan(0)
+  expect(reports.every(report => !report.ended)).toBe(true)
+  const scheduled = reports.length
+  f.scanner.request('alpha'); f.scanner.request('alpha')
+  expect(reports).toHaveLength(scheduled); checkReports()
+  await f.scan()
+  expect(reports.at(-1)).toMatchObject({ status: { state: 'incomplete', problem: 'access', slackError: 'missing_scope' }, ended: true, readEnded: true })
+  checkReports()
+  const retryAt = f.scanner.status('alpha').nextAttemptAt!
+  stub(f).script.inventory.push(membershipPage([C.primary]))
+  await f.h.clock.advanceTo(retryAt)
+  expect(reports.at(-1)).toMatchObject({ status: { state: 'complete', pages: 1, positives: 1 }, ended: true, readEnded: true })
+  expect(reading(f).kind).toBe('eligible')
+  checkReports()
+})
+
+test('durable unresolved history at startup publishes incomplete without an ended scan, then an ended failure', async () => {
+  const first = fixture(); await first.start()
+  const timestamp = (first.h.clock.now() / 1000).toFixed(3)
+  await first.event(true, C.primary, { id: 'EvREPORTCONFLICT', timestamp })
+  await first.event(false, C.primary, { id: 'EvREPORTCONFLICT', timestamp })
+  expect(reading(first)).toEqual({ kind: 'unresolved', reason: 'history-unresolved' })
+  await first.close()
+  const reports: Array<{ key: string; status: MembershipScanStatus; ended: boolean; readEnded: boolean }> = []
+  const reopened = fixture({ reopen: true, onScanStatus(key, status, ended) {
+    reports.push({ key, status: { ...status }, ended, readEnded: reopened.scanner.ended(key) })
+  } }, first.stateDir)
+  stub(reopened).script.inventory.push(membershipPage([C.primary]))
+  await reopened.start()
+  expect(stub(reopened).calls.inventory).toEqual([])
+  expect(reopened.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'history-unresolved' })
+  expect(reports.at(-1)).toMatchObject({ ended: false, readEnded: false })
+  const before = reports.length
+  reopened.scanner.request('alpha'); reopened.scanner.request('alpha')
+  expect(reports).toHaveLength(before)
+  await reopened.scan()
+  expect(reports.at(-1)).toMatchObject({ status: { state: 'incomplete', problem: 'history-unresolved' }, ended: true, readEnded: true })
+  expect(reports.map(({ key, status }) => membershipScanDiagnostic(key, status))).toEqual(scanLines(reopened))
+  expect(reading(reopened)).toEqual({ kind: 'unresolved', reason: 'history-unresolved' })
 })
 
 test.each(['open', 'strict'] as const)('authenticated %s join/leave is durable before actual socket ack; duplicate cannot overwrite a later explicit choice', async mode => {

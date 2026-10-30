@@ -26,3 +26,5 @@ export const THREAD_MEMORY_RETRY_MAX_MS = 60_000
 export const OWN_ROOT_CLOCK_SKEW_MS = 120_000
 /** Bound a Thread Memory loss report, including the notifier's persona prefix. */
 export const THREAD_MEMORY_NOTICE_MAX_CHARS = 4000
+/** Bound shared-state notices; their diagnostics retain the entire channel list. */
+export const SHARED_STATE_NOTICE_MAX_CHANNELS = 20

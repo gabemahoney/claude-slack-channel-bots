@@ -41,9 +41,15 @@ is the authority. This skill links to its sections instead of repeating them.
   you to.
 - Apart from that rename, write only `config.json` and the optional
   system-prompt file, both in the state directory.
-- `config.json` holds no tokens. If a value in it starts with `xoxb-` or
-  `xapp-`, don't display it; tell the operator a token was pasted into the
-  configuration and must move to a credentials file.
+- `config.json` holds settings and paths; actual tokens belong only in
+  credentials files. If an actual token was pasted into the configuration,
+  don't display it; tell the operator to remove it and use the terminal-only
+  [Credentials command](#credentials-command).
+- Preserve configured persona names and full structured configured paths in
+  Slack and logs, safely quoted and escaped, even when token-shaped: an
+  `xoxb-` or `xapp-` prefix alone does not make these fields credentials.
+  Continue redacting actual credentials and untrusted failure text, including
+  configured names or paths quoted inside that text.
 
 ---
 

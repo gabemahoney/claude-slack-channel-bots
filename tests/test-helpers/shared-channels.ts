@@ -3,7 +3,7 @@ import { expect } from 'bun:test'
 import { existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
-import { durableWriteFileSync } from '../../src/atomic-write.ts'
+import { durableWriteFileSync, DurableWriteUnsyncedError } from '../../src/atomic-write.ts'
 import { parsePersonaConfigBytes, type PersonaConfigInput } from '../../src/config.ts'
 import {
   createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState,
@@ -156,7 +156,7 @@ export function malformedThreadMemoryMarkers(state: SharedChannelState): Array<{
 // Production membership composition over the shared connection/Slack fixtures.
 // No discovery result is inferred from config; callers script every positive.
 import { createChannelMembership } from '../../src/channel-membership.ts'
-import { createMembershipScanner, membershipConnectionListener } from '../../src/channel-membership-scan.ts'
+import { createMembershipScanner, membershipConnectionListener, type MembershipScanDeps } from '../../src/channel-membership-scan.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { makeConnectionHarness } from './persona-connection-harness.ts'
 import { makePersona } from './persona-config.ts'
@@ -177,11 +177,14 @@ export function makeMembershipHarness(stateDir: string, options: {
   channels?: Array<{ id: string; delivery: DeliveryMode }>;
   /** Defaults to the fixture counter, continuing past a reopened state's values. */
   threadHybridSince?: () => string;
+  /** Observe the production scanner, separately from connection status. */
+  onScanStatus?: MembershipScanDeps['onStatus'];
 } = {}) {
   const names = options.names ?? ['alpha']
   const input = makePersonaConfigInput({ ...(options.queuedAckReaction ? { queued_ack_reaction: options.queuedAckReaction } : {}), channel_mode: options.mode ?? 'open', personas: names.map(name =>
     makePersona({ name, channels: options.channels ?? [], permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' } }, stateDir)) }, stateDir)
   let refuseWrite: (state: SharedChannelState) => boolean = () => false
+  let unsyncedWrite: (state: SharedChannelState) => boolean = () => false
   const writes: SharedChannelState[] = []
   const reopened = options.reopen ? readSharedState(stateDir)! : undefined
   const deps: SharedChannelDeps = { now: () => h.clock.now(), threadHybridSince: options.threadHybridSince ?? fixtureThreadHybridSince(reopened), write(path, bytes) {
@@ -189,6 +192,7 @@ export function makeMembershipHarness(stateDir: string, options: {
     writes.push(state)
     if (refuseWrite(state)) throw Object.assign(new Error('fixture disk full'), { code: 'ENOSPC' })
     durableWriteFileSync(path, bytes)
+    if (unsyncedWrite(state)) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
   } }
   const authority = options.reopen
     ? createSharedChannelAuthority(sharedChannelPath(stateDir), reopened!, deps)
@@ -211,7 +215,7 @@ export function makeMembershipHarness(stateDir: string, options: {
   const lines: string[] = []
   const log = (line: string) => { lines.push(line) }
   const membership = createChannelMembership({ authority, dryRun: options.dryRun ?? false, log, requestReconciliation: key => scanner.request(key) })
-  const scanner = createMembershipScanner({ authority, membership, connections: h.manager, clock: h.clock, dryRun: options.dryRun ?? false, log })
+  const scanner = createMembershipScanner({ authority, membership, connections: h.manager, clock: h.clock, dryRun: options.dryRun ?? false, log, onStatus: options.onScanStatus })
   const membershipStatus = membershipConnectionListener(membership, scanner, h.manager, options.dryRun ?? false)
   h.onStatus = (key, status) => { membershipStatus(key, status); if (options.realBringUp) bringUps.onConnectionStatus(key, status) }
   const router = createPersonaEventRouter({ membership, routing: { receive: async () => {} }, clientFor: h.clientFor, getPersona: h.getPersona, log })
@@ -220,6 +224,8 @@ export function makeMembershipHarness(stateDir: string, options: {
   return {
     h, authority, membership, scanner, bringUps, lines, writes, stateDir,
     failWrites(predicate: typeof refuseWrite) { refuseWrite = predicate },
+    /** Install the exact production bytes, then report an uncertain directory sync. */
+    unsyncWrites(predicate: typeof unsyncedWrite) { unsyncedWrite = predicate },
     allowAdmission(allowed: boolean) { admission = allowed },
     async start() { await h.clock.advanceTo(options.startTime ?? MEMBERSHIP_FIXTURE_TIME); for (const persona of h.config!.personas) { if (options.realBringUp) await bringUps.bringUp(persona, h.config!.personas); else await h.bringUp(persona) } },
     async scan() { await h.clock.runNext(); await h.clock.flush() },

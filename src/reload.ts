@@ -445,8 +445,17 @@ export type HeldCredentialsDigestQuery = (key: string) => CredentialsDigest | un
 /** An applied persona's current bring-up state (the bring-up controller's `state`), or undefined when unknown. */
 export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 
+export interface ReloadApplyFailure {
+  fingerprint: string
+  record: 'authority' | 'retired-keys'
+  /** Echo-safe filesystem suffix, never a raw error. */
+  failure: string
+  personas: string[]
+}
+
 /** Dependencies of `createReloadController`. */
 export interface ReloadControllerDeps {
+  onApplyFailed?(failure: ReloadApplyFailure): void
   /** Per-controller review epoch; restart always requires a fresh review of
    * current membership. Injected for deterministic source-path fixtures. */
   reviewSession?: () => string
@@ -1494,6 +1503,8 @@ export interface ReloadController {
    * the configuration; a second call throws.
    */
   resolveStart(): ReloadStartOutcome
+  /** Only this process's activation qualifies for a repair completion report. */
+  repairActivated(): boolean
   sharedChannels(): SharedChannelAuthority | undefined
   /**
    * The start bring-up pass over the applied set, through the injected
@@ -1562,6 +1573,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       () => !detectionStopped,
     )
   let phase: StartPhase = 'unresolved'
+  let repairActivated = false
   let appliedState: AppliedConfiguration | undefined
   let sharedChannels: SharedChannelAuthority | undefined
 
@@ -1635,7 +1647,10 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       const recovery = runStartupRecovery({ paths, home: deps.home, configFs: deps.configFs, credentialsFs: deps.credentialsFs,
         dryRun: deps.dryRun, now: deps.now, boundary: deps.reviewSession, write, remove: deps.remove ?? durableUnlinkSync,
         retiredKeys: deps.retiredKeys, log: deps.log })
-      if (recovery === 'activated') selection = selectConfiguration(paths, deps.home, deps.configFs)
+      if (recovery === 'activated') {
+        repairActivated = true
+        selection = selectConfiguration(paths, deps.home, deps.configFs)
+      }
       else if (recovery === 'unresolved') selection = { ok: false, source: 'record',
         message: 'The shared recovery outcome is unresolved. Preserve authority, retirement evidence, confirmation and input; restart to recover the retained outcome before any new review.' }
     }
@@ -1751,6 +1766,13 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
+  function notifyApplyFailed(failure: ReloadApplyFailure): void {
+    try { deps.onApplyFailed?.(failure) }
+    catch (err) {
+      deps.log(`[slack] reload: reporting the failed configuration change failed: ${describeThrownValue(err)}`)
+    }
+  }
+
   /** Apply exact reviewed bytes at their authority revision. Step 1 prepares
    * retirement, durably applies the shared authority, then stops retired
    * workers and publishes the whole combination. Definite failure restores
@@ -1775,6 +1797,12 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // Resolve every planned persona before any durable mutation. The candidate
     // already includes merged automatic choices at the reviewed revision.
     const mergedInputs = applyStepInputs(plan, current.config, candidate.config)
+    const reportFailed = (record: ReloadApplyFailure['record'], failure: string): void => {
+      const appliedKeys = new Set(current.config.personas.map(persona => persona.key))
+      const named = [...new Set([...plan.removed, ...plan.destructive, ...plan.inPlace, ...plan.credentials, ...plan.nextLaunch]
+        .map(persona => persona.key).filter(key => appliedKeys.has(key)))]
+      notifyApplyFailed({ fingerprint: review.fingerprint, record, failure, personas: named.length ? named : [...appliedKeys] })
+    }
     // The one file-free adapter owns the retiring-session guard.
     const channelDelivery = deps.channelDelivery()
     if (detectionStopped) return false
@@ -1788,6 +1816,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     const attempt = beginReviewAttempt(sharedChannels, review, recovery)
     if (attempt.kind !== 'applied') {
       deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, attempt.kind, sharedChannels.failure, ''))
+      if (attempt.kind === 'failed') reportFailed('authority', sharedChannels.failure)
       return false
     }
     const failAttempt = (): string => {
@@ -1801,6 +1830,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     if (recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITE_FAILED) {
       const restored = failAttempt()
       deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, 'failed', sharedChannels.failure, restored))
+      reportFailed('retired-keys', sharedChannels.failure)
       return false
     }
     if (detectionStopped || !state.revalidate() || sharedChannels.revision !== attempt.revision) {
@@ -1860,6 +1890,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
         setRetiring(channelDelivery, retiring, true)
       }
       deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, result?.kind ?? 'failed', failure, restored))
+      if (result?.kind === 'failed') reportFailed('authority', failure)
       return false
     }
     if (detectionStopped) return true
@@ -1895,6 +1926,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
 
   return {
     resolveStart,
+    repairActivated: () => repairActivated,
     runStartBringUp,
     startDetection,
     stopDetection,

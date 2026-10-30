@@ -226,6 +226,15 @@ const ADMITTED_READS: readonly AdmittedRead[] = [
   { file: 'reload.ts', within: 'createPendingDetection > candidateOf', read: 'reviewed.channels', count: 1, reason: 'channel effects returned by shared authority planReviewed for the preview, not a persona channels list or a delivery decision' },
   { file: 'reload.ts', within: 'createPendingDetection > derive', read: 'persona.permission_prompts', count: 1, reason: 'AC-W05/W07/W08: bind applied and candidate destination declarations into reloadReviewBinding so a changed destination revokes review authorization; no destination resolution or posting' },
   { file: 'reload-recovery.ts', within: 'fingerprint', read: 'p.permission_prompts', count: 1, reason: 'bind the retained repair destination to its review fingerprint; never selects a runtime destination or admits delivery' },
+  { file: 'persona-diagnostics.ts', within: 'sharedScopeIdentity', read: 'scope.channels', count: 1, reason: 'serialize the report scope DTO channel identifiers into a diagnostic, not persona configuration' },
+  { file: 'shared-state-reports.ts', within: 'scopeText', read: 'scope.channels', count: 1, reason: 'format channel identifiers from the reporting scope DTO, not persona configuration' },
+  { file: 'shared-state-reports.ts', within: 'buildMembershipEvidenceUnresolvedNotice', read: 'scope.channels', count: 1, reason: 'bound displayed evidence to the report scope DTO channel identifiers' },
+  { file: 'shared-state-reports.ts', within: 'scopeOf', read: 'scope.channels', count: 1, reason: 'copy the remembered reporting scope set into a notice DTO' },
+  { file: 'shared-state-reports.ts', within: 'remember', read: 'scope.channels', count: 1, reason: 'accumulate affected channel identifiers from the reporting DTO' },
+  { file: 'shared-state-reports.ts', within: 'remember', read: 'target.channels', count: 1, reason: 'extend the remembered report scope set; no configuration or membership write' },
+  { file: 'shared-state-reports.ts', within: 'createSharedStateReporting > reportState', read: 'scope?.channels', count: 1, reason: 'observe the authority unresolved-scope metadata, not persona configuration' },
+  { file: 'shared-state-reports.ts', within: 'createSharedStateReporting > reportState', read: 'reportScope.channels', count: 1, reason: 'classify reporting DTO channel identifiers as usable or held for the staged notice' },
+  { file: 'shared-state-reports.ts', within: 'createSharedStateReporting > closeReady > decided', read: 'remembered.channels', count: 2, reason: 'extend and check the report episode scope before a closing notice; no configuration or intake decision' },
 ]
 
 /** How a field is read. */
@@ -784,6 +793,33 @@ describe('negative controls for the reader audit', () => {
     expect(syntaxFindings(mutant)).toEqual([])
     const findings = outsideListFindings(mutant, FIXED_READERS, admitted)
     expect(findings).toEqual([finding.startsWith('admitted read') ? finding : `src/${file}: ${finding}`])
+  })
+
+  test.each(ADMITTED_READS.filter(entry => ['persona-diagnostics.ts', 'shared-state-reports.ts'].includes(entry.file)))
+  ('report metadata admission rejects extra, missing, adjacent and relocated reads: %j', entry => {
+    const { file, within, read, count } = entry
+    const source = readFileSync(join(SRC_DIR, file), 'utf8')
+    const modules = new Map([[file, source]])
+    const admitted = ADMITTED_READS.filter(candidate => candidate.file === file)
+    expect(outsideListFindings(modules, FIXED_READERS, admitted)).toEqual([])
+    const sites = fieldReads(modules, file).filter(site => admits(entry, site))
+    expect(sites).toHaveLength(count)
+    const site = sites[0]!.node
+    const replace = (replacement: string) => source.slice(0, site.getStart()) + replacement + source.slice(site.getEnd())
+    const countFinding = (actual: number) => `admitted read matches ${actual} reads, not ${count}: src/${file} ${read} (in ${within})`
+    const cases: readonly [string, string[]][] = [
+      [replace(`(${read}, ${read})`), [countFinding(count + 1)]],
+      [replace('undefined'), [countFinding(count - 1)]],
+      [replace(`(persona.channels, ${read})`), [`src/${file}: property read of channels persona.channels (in ${within})`]],
+      [replace('undefined') + `\nfunction other() { return ${read} }`, [
+        `src/${file}: ${read.includes('?.') ? 'optional property' : 'property'} read of channels ${read} (in other)`, countFinding(count - 1),
+      ]],
+    ]
+    for (const [code, findings] of cases) {
+      const mutant = new Map([[file, code]])
+      expect(syntaxFindings(mutant)).toEqual([])
+      expect(outsideListFindings(mutant, FIXED_READERS, admitted)).toEqual(findings)
+    }
   })
 
   test("a read inside the list but outside its file's part is a finding, and a part with no read is one", () => {

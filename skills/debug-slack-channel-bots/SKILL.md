@@ -48,9 +48,15 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   without the operator's say-so.
 - NEVER edit `config.json` or a credentials file without the operator's
   say-so. Tell the operator what to change instead.
-- `config.json` names only paths and holds no tokens. If a value in it starts
-  with `xoxb-` or `xapp-`, don't display it; tell the operator a token has been
-  pasted into the configuration and must be moved to a credentials file.
+- `config.json` holds settings and paths; actual tokens belong only in
+  credentials files. If an actual token was pasted into the configuration,
+  don't display it; tell the operator to remove it and use the setup skill's
+  terminal-only [Credentials command](../setup-slack-channel-bots/SKILL.md#credentials-command).
+- Preserve configured persona names and full structured configured paths in
+  Slack and logs, safely quoted and escaped, even when token-shaped: an
+  `xoxb-` or `xapp-` prefix alone does not make these fields credentials.
+  Continue redacting actual credentials and untrusted failure text, including
+  configured names or paths quoted inside that text.
 - NEVER edit, or offer to edit, agent-director's config file
   (`~/.config/agent-director/config.toml`). An *agent-director refuses its config
   file* notice is for a human only (see
@@ -2196,6 +2202,225 @@ Restoring the entire state directory can go undetected when its Thread Memory jo
 - **Meaning:** Nothing is posted. `step=resolution-append` means the decision to release or withdraw Memory Holds could not be saved in that persona's queue journal; those replies remain unresolved meanwhile.
 - **Cause:** The resolution write failed. CSCB retries that persona's resolution without new traffic, with waits of 10, 30, 60, 120, 300 and then 900 seconds (`RETYPE_BACKOFF_MS`); this is separate from Thread Memory's read/save retry spacing.
 - **Fix:** Check `<state dir>/queue/<key>.jsonl` and its disk, mount and permissions. Let the saved decisions release eligible replies; resend only messages a subsequent *Joins lost* report lists as withdrawn.
+
+---
+
+## Shared channel state reports
+
+These reports cover a persona's channels in the one shared channel list, `config.json.last-applied`, and its verified channel membership. Each report goes to the persona's notice destination and to `server.log` as one `[slack]` line, once per episode.
+
+A worse cause or evidence posts once more; channels found later join the open episode without another post or line. Staging a restoration inside either open episode logs its new case without another post.
+
+A notice names at most 20 channels (`SHARED_STATE_NOTICE_MAX_CHANNELS`), then counts the rest; its line lists every channel in that report. Reports carry persona keys, channel IDs, paths and safe error codes, never message text or credentials. Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` suffix when present; notice blocks show the body, normally prefixed with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack.
+
+Affected undecidable intake stays held and unacknowledged. Unaffected channels and DMs, other personas and already accepted queues keep working; a staged repair lists membership readiness separately from Channel Stamp-dependent reply holds. Otherwise eligible @mentions, Broadcasts and other intake independent of those stamps continue. Reporting changes no hold, acknowledgement, write or recovery.
+
+Slack retries an unacknowledged event only a limited number of times: a message never accepted may be lost and should be sent again; follow [Message not saved](#message-not-saved) to check the app's **Event Subscriptions** for disabled events.
+
+When the notice destination channel is affected, including a whole-persona outage, the report still goes once through that destination's usual hold and its line is still written. Failed posts retry through the destination hold, which logs [`persona-destination-failed`](#persona-destination-failed); they create no second report or report about the notice. The report line is written even when the notice is muted.
+
+Teardown and removal end open episodes silently; later bring-up starts fresh ones. A persona withheld from bring-up by an unfinished reviewed retirement logs at detection and receives its queued notice once it can post.
+
+These failures post no additional report:
+
+- A start refused for an unreadable, invalid or unwritable last-applied record: no persona is connected, and the refusal and [`reload-shared-recovery`](#reload-shared-recovery) preview already reach the operator.
+- A definite failed or stale bot attempt or write, or a stale configuration apply, that leaves trustworthy state: its tool result or line already explains the outcome. A confirmed configuration apply that fails definitely instead posts *Configuration change not applied*; see [`reload-record-write-failed`](#reload-record-write-failed).
+- A pending or unresolved `set_channel_delivery` attempt, or a strict-mode tool refusal: its tool result explains it. Untrustworthy state behind an unresolved attempt still produces *Channel state unresolved*.
+- Membership evidence faults before the persona's scan run has ended, including conflicting history while the scan is running or only requested, and scan problems `transport` or `superseded`. Transport means Slack is unreachable, so the notice could not be posted either; a superseded scan supplies no current conclusion. Existing [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete) and related membership lines remain available.
+
+### `shared-state-unresolved`
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); channels: C0123. Shared channel authority: "&lt;state dir&gt;/config.json.last-applied" (EACCES). A shared-state write was renamed but not synced. CSCB finishes it at its next configuration checks once the state directory can be synced. Check the disk and filesystem. If the file changes meanwhile, existing recovery can still finish when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart. Messages there stay held. Other channels and personas, and already accepted queues, keep working. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+For `evidence-changed`, `retirement-unresolved` and channel-specific `not-saved`, the opening, held-message text and retry warning stay the same; the problem and action sentences are:
+
+- `evidence-changed`: The file no longer holds what CSCB wrote, so CSCB won't guess. Preserve the evidence. Existing recovery can still finish without restarting when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart. Choices that cannot be restored are lost and must be set again.
+- `retirement-unresolved`: A confirmed change's persona retirement could not be finished or undone. CSCB retries at each configuration check. Check the state directory's disk; the retirement must be recovered before affected intake resumes.
+- `not-saved`: CSCB could not save membership evidence for these channels. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends.
+
+When a scan ends with a storage failure and no unresolved channels can be enumerated, the `not-saved` inventory form lists known channels rather than claiming they are all held. This can follow a failed observation of a newly discovered channel or a failed inventory commit; verified usable channels continue, while only intake depending on missing membership evidence stays held and unacknowledged.
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); membership inventory incomplete; known channels: C0123. Shared channel authority: "&lt;state dir&gt;/config.json.last-applied" (EACCES). CSCB could not save a complete membership inventory. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends. Verified usable channels keep working. Only intake depending on missing membership evidence stays held and unacknowledged. Recovery requires a complete membership inventory. Other channels and personas, and already accepted queues, keep working. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+A staged restoration lists channels with decided membership separately from channels whose membership is unresolved. These lists describe membership readiness only: decided membership can still be ineligible, and thread-dependent replies in `thread_hybrid` channels remain held and unacknowledged while their Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other stamp-independent intake continue:
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); all its channels; repair pending. Shared channel authority: "&lt;state dir&gt;/config.json.last-applied" (EACCES). A reviewed restoration is staged. Restart CSCB to review and confirm it; staging alone does not complete the repair. Repair is pending for this persona. Membership decided: C0123. Membership unresolved (intake held): C0456. These lists describe membership readiness only. Thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue. Other channels and personas, and already accepted queues, keep working. Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+With identical membership projections, the unresolved-membership list can be empty while thread-dependent replies remain held. The status sentences are:
+
+```text
+Repair is pending for this persona. Membership decided: C0123, C0456. Membership unresolved (intake held): none. These lists describe membership readiness only. Thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue.
+```
+
+If DMs are held too, the unresolved-membership sentence ends `; DMs are held too.`. The decided and unresolved membership lists share the same 20-channel budget, reserving space for unresolved entries first. The staged form without a membership breakdown uses these problem and status sentences:
+
+```text
+A reviewed restoration is staged. Restart CSCB to review and confirm it; staging alone does not complete the repair. Messages in the affected channels stay held.
+```
+
+Every staged notice and log uses this intake-specific retry warning (`SHARED_STATE_STAGED_SLACK_RETRY_WARNING`), so it does not imply that continuing mentions or Broadcasts go unacknowledged:
+
+```text
+Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+Other scope examples replace only the opening sentence; the overflow example has 22 channels:
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); channels: C0123, C0124, C0125, C0126, C0127, C0128, C0129, C0130, C0131, C0132, C0133, C0134, C0135, C0136, C0137, C0138, C0139, C0140, C0141, C0142 and 2 more.
+```
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); all its channels: C0123.
+```
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); channels: C0123; DMs also affected.
+```
+
+- **Line:** Each cause has its own action text. These are the channel-scoped forms, the inventory form and the staged membership-readiness form:
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=unsynced channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; finish the write at configuration checks; check disk/filesystem; if evidence changes, existing recovery can still finish when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=evidence-changed channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; preserve evidence; existing recovery can still finish without restarting when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart; unrestorable choices must be set again. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=retirement-unresolved channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; retirement recovery retries at configuration checks; check the state directory disk. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=not-saved channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; membership reconciliation retries in the background; check the state directory disk. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=not-saved scope=inventory known_channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; complete membership inventory not saved; verified usable channels keep working; only intake depending on missing membership evidence stays held and unacknowledged; recovery requires a complete membership inventory; membership reconciliation retries in the background; check the state directory disk. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=restoration-staged scope=all channels=["C0123","C0456"] repair_pending=true membership_decided=["C0123"] membership_held=["C0456"] path="<state dir>/config.json.last-applied" EACCES; restart to review and confirm staged restoration; channel lists describe membership readiness only; thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided; otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue. Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+  Whole-persona scope adds `scope=all` before `channels`, except the `not-saved` inventory form, which uses `scope=inventory known_channels=[...]`; affected DMs add `dm=true` after the channel list. Staging adds `repair_pending=true` and the complete `membership_decided` and `membership_held` lists. `membership_held=[]` means no listed channel has unresolved membership; it does not clear the separate hold on thread-dependent replies while Channel Stamps are undecided.
+
+  The optional failure suffix follows the quoted path; without a failure, its following `; ` is omitted too.
+
+- **Meaning:** The first affected channel, DM or whole-persona scope opens an episode at a write, configuration check, membership save or start check; a staged restoration opens a repair-pending episode even when its membership projections remain decided; thread-dependent replies still wait for decided Channel Stamps. The episode ends only after its cause clears, every channel it accumulated reads as decided, and its DM and whole-persona unresolved claims clear.
+
+  The inventory form also waits for a complete scan, even if a retry makes every known channel usable. Its known-channel list does not establish that the inventory is complete or identify every held channel.
+- **Cause:** `unsynced` means the write was renamed but its directory sync did not finish; `evidence-changed` means the file changed under that uncertain write. `restoration-staged` means reviewed restoration is waiting for restart review; `retirement-unresolved` means an interrupted reviewed retirement is held; `not-saved` means membership evidence could not be saved while the shared list remains readable, either an `event-not-durable` hold or an ended `storage` scan.
+
+  Severity rises in this order: `not-saved`, `retirement-unresolved`, `unsynced`, `evidence-changed`, `restoration-staged`; staging inside an open episode is the log-only exception above. Equal or milder causes do not post again.
+- **Fix:** For `unsynced`, check the named path's disk and filesystem; later configuration checks finish the exact write when the directory can sync.
+
+  `evidence-changed` remains until existing recovery succeeds or restoration is staged; use [reviewed restoration or explicit replacement](#reload-shared-recovery) when exact recovery cannot finish, then restart, and set unrestorable choices again. Do not edit durable state by hand.
+
+  For `restoration-staged`, restart to review and confirm; staging alone is not completion. For `retirement-unresolved`, check the state directory's disk while configuration checks retry retirement. For `not-saved`, check storage while background reconciliation retries; see [`channel-membership-storage-failed`](#channel-membership-storage-failed) and [`reload-record-write-failed`](#reload-record-write-failed).
+
+  None of these repairs retrieves events Slack stopped retrying: send missing messages again and check **Event Subscriptions** as [Message not saved](#message-not-saved) describes.
+
+### `membership-evidence-unresolved`
+
+History gap (`absence-order`):
+
+```text
+:warning: *Channel membership evidence unresolved* — "Alpha" (key=alpha); channels: C0123. C0123: the bot was seen absent, but CSCB cannot tell whether that leave came before or after a choice confirmed meanwhile. Retries, reconciliation and time cannot settle this history; only reviewed recovery can, through an explicit absence replacement for the channel or reviewed restoration. Messages whose eligibility depends on this missing evidence stay held. Other channels and personas, and already accepted queues, keep working. Elapsed time does not establish missing evidence. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+For `event-history`, the per-channel evidence sentence is:
+
+```text
+C0123: a membership event conflicts with recorded history.
+```
+
+An ended scan with `deadline`:
+
+```text
+:warning: *Channel membership evidence unresolved* — "Alpha" (key=alpha); channels: C0123.  Slack's membership list could not be read in time. CSCB retries; if this continues, check Slack's status and the workspace size. Messages whose eligibility depends on this missing evidence stay held. Other channels and personas, and already accepted queues, keep working. Elapsed time does not establish missing evidence. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+Other ended-scan problems replace its problem and action sentences with the following text. The `access` example also shows the optional Slack reason and next-attempt time:
+
+- `access`: The bot lacks a scope or channel access needed to read membership. Add the scope named in the debugging skill and reinstall; retries alone cannot fix it. Slack reason: missing_scope. Next attempt at: 1700000000000.
+- `authentication`: Slack refused the bot's credentials. Fix the bot token through a confirmed configuration change; retries alone cannot fix it.
+- `installation-unverified`: CSCB could not verify the app installation. Check the installation and its credentials; retries alone cannot fix it.
+- `malformed-page`: Slack returned a membership page CSCB cannot read. CSCB retries; the incomplete page establishes no missing fact.
+- `current-membership-missing`: A complete scan still left current membership undecided for these channels. CSCB retries; check the debugging skill's current-membership-missing entry.
+- `eligibility-missing`: A complete scan still left channel eligibility undecided. CSCB retries; check the debugging skill's eligibility-missing entry.
+- `event-order-conflict`: A complete scan still left membership event order undecided. CSCB retries; check the debugging skill's event-order-conflict entry.
+
+- **Line:** History and ended-scan forms, including an optional safe Slack error and next-attempt time:
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=history channels=["C0123"] path="<state dir>/config.json.last-applied" missing_evidence=[C0123:absence-order] EACCES; history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=history channels=["C0123"] path="<state dir>/config.json.last-applied" missing_evidence=[C0123:event-history] EACCES; history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=scan-ended channels=["C0123"] path="<state dir>/config.json.last-applied" problem=deadline EACCES; background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=scan-ended channels=["C0123"] path="<state dir>/config.json.last-applied" problem=access slack_error=missing_scope next_attempt_at=1700000000000 EACCES; background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+  Other scan problems replace the `problem` value above; their log action text is identical. A report can carry both `missing_evidence` and `problem`; it uses `cause=history` and the history action text.
+
+  `missing_evidence` lists every channel and its evidence kind, uncapped; history gaps beyond the notice's displayed channels are counted with `And N more channel evidence gaps; see the server log.`. Whole-persona scope adds `scope=all`; the optional failure suffix follows the quoted path.
+
+- **Meaning:** Once a scan has ended, missing history or an incomplete scan's missing or inaccessible evidence is reported. A request's initial `incomplete` status is not an ended scan. The episode stays open through retries and ends only when no `history-unresolved` channel remains, the latest scan is complete, and every accumulated channel has decided membership; a whole-persona claim also needs no unresolved channel remaining.
+- **Cause:** History is `absence-order` when an observed absence cannot be ordered against a confirmed choice, or `event-history` when an event conflicts with recorded history. Scan problems name a deadline, inaccessible membership, refused credentials, an unverified installation, a malformed page, or current membership, eligibility or event order still missing after reading the list.
+
+  Severity groups rise from `deadline`, `malformed-page`, `current-membership-missing`, `eligibility-missing` and `event-order-conflict`, to `access`, `authentication` and `installation-unverified`, then to either history kind. Same or lower severity stays in the open episode; a worse group posts once more only after the scan ends.
+- **Fix:** Only reviewed recovery settles history: an explicit absence replacement for the channel or reviewed restoration; retries, reconciliation and time cannot. For scan problems follow the action above; `access`, `authentication` and `installation-unverified` need their named repair, not retries alone.
+
+  See [`channel-membership-unresolved`](#channel-membership-unresolved), [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete) and [Membership recovery bounds](#membership-recovery-bounds) for scopes and repair limits. Elapsed time establishes no missing fact, and finite Slack retries can lose never-accepted messages; send missing messages again after repair and check **Event Subscriptions** via [Message not saved](#message-not-saved).
+
+### `shared-state-recovered`
+
+The `state` and `evidence` closing variants have the same notice body:
+
+```text
+:white_check_mark: *Channel state recovered* — "Alpha" (key=alpha); channels: C0123. The channel state and current membership for these channels are trustworthy again; held messages there are decided now. Slack retries are finite. Messages Slack stopped retrying meanwhile are not recovered; send missing messages again.
+```
+
+After an activated reviewed restoration or replacement (`repair`):
+
+```text
+:white_check_mark: *Channel state recovered* — "Alpha" (key=alpha); channels: C0123. The reviewed restoration or replacement is applied and this persona's current membership is verified. The channel state and current membership for these channels are trustworthy again; held messages there are decided now. Slack retries are finite. Messages Slack stopped retrying meanwhile are not recovered; send missing messages again.
+```
+
+- **Line:** The closing cause names the last episode, or reviewed repair:
+
+```text
+[slack] shared-state-recovered: persona=alpha cause=state closed=state channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.
+```
+
+```text
+[slack] shared-state-recovered: persona=alpha cause=evidence closed=evidence channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.
+```
+
+```text
+[slack] shared-state-recovered: persona=alpha cause=repair closed=repair channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.
+```
+
+  Scope and optional failure fields follow the unresolved report's form; the closing channel list includes channels accumulated during the episode.
+
+- **Meaning:** One recovered report follows the last open state/evidence episode's closure, under its recovered mark; an earlier-closing episode is silent. Without an onset report there is no ordinary recovery report. `state` means shared-state unresolved closed last; `evidence` means membership evidence closed last, including when both close together.
+- **Cause:** Required state and membership became trustworthy. The `repair` variant is tracked only in the run whose start activated reviewed restoration or replacement; it needs a complete scan and decided channels, and may post without an onset. If that run restarts before membership is decided, the completion report is lost: the later start has only the existing `retained repair activation` log line, while any failure still open is reported as usual.
+- **Fix:** No further repair is needed. Messages Slack stopped retrying meanwhile are not recovered: send missing messages again, and follow [Message not saved](#message-not-saved) to check **Event Subscriptions** for disabled events.
 
 ---
 
@@ -6498,6 +6723,20 @@ start runs it. The usual case is the first start failing on the listening addres
 
 ### `reload-record-write-failed`
 
+
+```text
+:warning: *Configuration change not applied* — "Alpha" (key=alpha); could not write the shared channel authority at "&lt;state dir&gt;/config.json.last-applied" (EACCES). Nothing in the confirmed change was applied. This persona and every other persona keep running as before, and the change stays pending. Fix the cause, for example disk space or permissions, then review the pending change again and confirm it afresh; a failed confirmation is not reused.
+```
+
+The retired-key record variant:
+
+```text
+:warning: *Configuration change not applied* — "Alpha" (key=alpha); could not write the retired-key record (EACCES). Nothing in the confirmed change was applied. This persona and every other persona keep running as before, and the change stays pending. Fix the cause, for example disk space or permissions, then review the pending change again and confirm it afresh; a failed confirmation is not reused.
+```
+
+Each applied persona the confirmed change names receives this once per confirmed change, or every applied persona receives it when the change names none; it has no closing notice, including after a later successful apply.
+Fix the cause, then review and confirm the pending change afresh; repeating the same failed confirmation posts nothing more.
+
 - **Line:** `[slack] reload-record-write-failed: …` names the shared authority path and, when available, a safe filesystem error code. At startup no persona comes up. Confirmation distinguishes `application failed` from `application unresolved`.
 - **Cause:** The authority or retired-key record could not be written durably; check permissions, free space and directory-sync support.
 - **Definite failure:** Prior applied state and pending intent remain. The gesture is not silently retried. Fix the cause, read the fresh preview and confirm again; replaying an attempted/rejected review cannot assign.
@@ -7296,6 +7535,10 @@ persona's hold or down state resolved. Accepted items remain queued in order.
 ### Symptom: A persona posts a Thread Memory notice
 
 Read the persona's report and follow its entry under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
+
+### Symptom: A persona posts a *Channel state unresolved*, *Channel membership evidence unresolved* or *Channel state recovered* notice
+
+Read the persona's report and follow its entry under [Shared channel state reports](#shared-channel-state-reports).
 
 ### Symptom: A persona posts a *Waiting on a prompt* or *Not connected* notice
 

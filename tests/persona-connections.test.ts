@@ -227,6 +227,7 @@ import {
   PERSONA_SLACK_UNREACHABLE,
   PERSONA_START,
   THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+  SHARED_STATE_DIAGNOSTIC_CLASSES,
   formatCredentialsChangeFailed,
   formatPersonaDiagnostic,
   personaCheckFailure,
@@ -1364,7 +1365,7 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the persona, typed-delivery and Thread Memory diagnostic label set is exactly the declared classes', () => {
+  test('the persona, typed-delivery, Thread Memory and shared-state diagnostic label set is exactly the declared classes', () => {
     expect(new Set(PERSONA_DIAGNOSTIC_CLASSES).size).toBe(PERSONA_DIAGNOSTIC_CLASSES.length)
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual(([
       'delivery-stuck',
@@ -1396,6 +1397,7 @@ describe('diagnostic lines', () => {
       'system-prompt-unwritable',
       'unclaimed-channel',
       ...THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+      ...SHARED_STATE_DIAGNOSTIC_CLASSES,
     ] satisfies PersonaDiagnosticClass[]).sort())
   })
 

@@ -77,7 +77,9 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `claude_config_dir` | path | no | top-level `claude_config_dir` | Claude config directory for this persona. See [Next-launch settings](#next-launch-settings). |
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
 
-`dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
+`dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes.
+
+A path is absolute, `~` or starts with `~/`. Structured configured-path fields in Slack notices, logs and previews show the full path, with `~` expanded and safe quoting and escaping, even when token-shaped. Actual credentials and untrusted failure text remain redacted, including a configured path quoted inside that text.
 
 ### Channel entries
 

@@ -376,6 +376,7 @@ describe('once per episode, for every declared kind', () => {
       'message-not-saved', 'delivery-stuck', 'messages-waiting',
       'thread-memory-not-saved', 'thread-memory-unreadable',
       'thread-memory-joins-lost', 'thread-memory-changed-while-stopped',
+      'shared-state-unresolved', 'membership-evidence-unresolved', 'reload-apply-failed',
     ]))
   })
 

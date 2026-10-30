@@ -40,6 +40,7 @@ export interface MembershipScanDeps {
   dryRun: boolean
   clock?: PersonaConnectionClock
   log(line: string): void
+  onStatus?(key: string, status: MembershipScanStatus, ended: boolean): void
 }
 export interface MembershipScanner {
   /** Scheduling only. Never starts a network operation in the calling stack. */
@@ -49,6 +50,7 @@ export interface MembershipScanner {
   stop(key: string): void
   close(): void
   status(key: string): MembershipScanStatus
+  ended(key: string): boolean
 }
 
 /** Called before other up-status consumers. A gap revokes old evidence
@@ -79,6 +81,7 @@ interface ScanEntry {
   notBefore: number
   status: MembershipScanStatus
   lastDiagnostic?: string
+  ended?: boolean
 }
 class ScanFailure extends Error {
   constructor(readonly problem: MembershipScanProblem, readonly outcome?: SlackValidationFailure) { super('Membership inventory remains incomplete.') }
@@ -122,12 +125,14 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
   })
   const blank = (): MembershipScanStatus => ({ state: 'unverified', pages: 0, positives: 0 })
   const valid = (entry: ScanEntry, controller: AbortController) => !closed && entries.get(entry.key) === entry && entry.active === controller && !controller.signal.aborted
-  function publish(entry: ScanEntry): void {
+  function publish(entry: ScanEntry, ended = false): void {
     const signature = JSON.stringify([entry.status.state, entry.status.problem, entry.status.slackError,
       entry.status.deadline, entry.status.nextAttemptAt, entry.status.retryAfterSeconds])
     if (signature === entry.lastDiagnostic) return
     entry.lastDiagnostic = signature
+    entry.ended = ended
     try { deps.log(membershipScanDiagnostic(entry.key, entry.status)) } catch { /* diagnostics do not change evidence */ }
+    try { deps.onStatus?.(entry.key, { ...entry.status }, ended) } catch { /* reporting does not change evidence */ }
   }
   function arm(entry: ScanEntry): void {
     if (closed || deps.dryRun || entry.timer || entry.active) return
@@ -192,7 +197,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     entry.status = { ...entry.status, state: 'incomplete', problem, retryAfterSeconds, slackError }
     entry.notBefore = Math.max(entry.notBefore, clock.now() + membershipRetryDelay(entry.failures++, retryAfterSeconds))
     entry.status.nextAttemptAt = entry.notBefore
-    publish(entry)
+    publish(entry, true)
     arm(entry)
   }
   function assertCurrent(entry: ScanEntry, controller: AbortController, generation: MembershipGeneration, observations: number, deadline: number): void {
@@ -306,7 +311,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
       entry.status = { ...entry.status, state: 'complete', nextAttemptAt: undefined, problem: undefined }
       entry.failures = 0
       entry.notBefore = clock.now() + MEMBERSHIP_RETRY_MIN_MS
-      publish(entry)
+      publish(entry, true)
     } catch (error) {
       if (!valid(entry, controller)) return
       if (error instanceof MembershipDeadlineError) problem = 'deadline'
@@ -356,5 +361,6 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     },
     close() { closed = true; unsubscribe(); for (const key of [...entries.keys()]) stop(key) },
     status: key => ({ ...(entries.get(key)?.status ?? blank()) }),
+    ended: key => entries.get(key)?.ended ?? false,
   }
 }

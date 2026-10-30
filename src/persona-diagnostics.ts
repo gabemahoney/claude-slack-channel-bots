@@ -193,6 +193,68 @@ export const THREAD_MEMORY_DIAGNOSTIC_CLASSES = [
   THREAD_MEMORY_SEAL_NOT_SAVED, THREAD_MEMORY_HOLDS_NOT_RESOLVED,
 ] as const
 export type ThreadMemoryDiagnosticClass = typeof THREAD_MEMORY_DIAGNOSTIC_CLASSES[number]
+export const SHARED_STATE_UNRESOLVED = 'shared-state-unresolved'
+export const MEMBERSHIP_EVIDENCE_UNRESOLVED = 'membership-evidence-unresolved'
+export const SHARED_STATE_RECOVERED = 'shared-state-recovered'
+export const SHARED_STATE_DIAGNOSTIC_CLASSES = [SHARED_STATE_UNRESOLVED, MEMBERSHIP_EVIDENCE_UNRESOLVED, SHARED_STATE_RECOVERED] as const
+export type SharedStateDiagnosticClass = typeof SHARED_STATE_DIAGNOSTIC_CLASSES[number]
+export type SharedStateCause = 'unsynced' | 'evidence-changed' | 'restoration-staged' | 'retirement-unresolved' | 'not-saved'
+export type SharedStateClosing = 'state' | 'evidence' | 'repair'
+export type MembershipHistoryEvidence = 'absence-order' | 'event-history'
+export type MembershipReportProblem = 'deadline' | 'access' | 'authentication' | 'installation-unverified' | 'malformed-page' |
+  'current-membership-missing' | 'eligibility-missing' | 'event-order-conflict'
+export interface SharedStateReportScope {
+  channels: readonly string[]
+  all?: boolean
+  dm?: boolean
+  /** Membership-only reporting: usable means decided (including ineligible),
+   * not unrestricted intake. Staged Channel Stamps still hold dependent replies. */
+  repairPending?: { usable: readonly string[]; held: readonly string[] }
+}
+export interface MembershipReportEvidence {
+  history?: readonly { channel: string; evidence: MembershipHistoryEvidence }[]
+  problem?: MembershipReportProblem
+  slackError?: string
+  nextAttemptAt?: number
+}
+export const SHARED_STATE_SLACK_RETRY_WARNING = 'Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.'
+export const SHARED_STATE_STAGED_SLACK_RETRY_WARNING = 'Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.'
+/** Keep the configured path separate from identifiers and untrusted failures,
+ * so token-shaped directories remain complete and safely quoted. */
+export function buildSharedStateDiagnostic(kind: SharedStateDiagnosticClass, persona: string, identity: string, detail = '', configuredPath?: string): string {
+  const path = configuredPath === undefined ? '' : ` path=${JSON.stringify(configuredPath).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')}`
+  return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${path}${detail ? ` ${safe(detail)}` : ''}`.replace(/[\u2028\u2029]/g, ' ').trimEnd()
+}
+const sharedScopeIdentity = (scope: SharedStateReportScope, inventory = false): string =>
+  `${inventory ? 'scope=inventory known_channels=' : `${scope.all ? 'scope=all ' : ''}channels=`}${JSON.stringify(scope.channels)}${scope.dm ? ' dm=true' : ''}` +
+  (scope.repairPending ? ` repair_pending=true membership_decided=${JSON.stringify(scope.repairPending.usable)} membership_held=${JSON.stringify(scope.repairPending.held)}` : '')
+export function buildSharedStateUnresolvedLine(key: string, scope: SharedStateReportScope, cause: SharedStateCause, path: string, failure = ''): string {
+  const inventory = cause === 'not-saved' && scope.all === true
+  const next: Record<SharedStateCause, string> = {
+    unsynced: 'finish the write at configuration checks; check disk/filesystem; if evidence changes, existing recovery can still finish when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart',
+    'evidence-changed': 'preserve evidence; existing recovery can still finish without restarting when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart; unrestorable choices must be set again',
+    'restoration-staged': 'restart to review and confirm staged restoration; channel lists describe membership readiness only; thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided; otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue',
+    'retirement-unresolved': 'retirement recovery retries at configuration checks; check the state directory disk',
+    'not-saved': (inventory ? 'complete membership inventory not saved; verified usable channels keep working; only intake depending on missing membership evidence stays held and unacknowledged; recovery requires a complete membership inventory; ' : '') +
+      'membership reconciliation retries in the background; check the state directory disk',
+  }
+  return buildSharedStateDiagnostic(SHARED_STATE_UNRESOLVED, key, `cause=${cause} ${sharedScopeIdentity(scope, inventory)}`,
+    `${failure ? `${failure}; ` : ''}${next[cause]}. ${cause === 'restoration-staged' ? SHARED_STATE_STAGED_SLACK_RETRY_WARNING : SHARED_STATE_SLACK_RETRY_WARNING}`, path)
+}
+export function buildMembershipEvidenceUnresolvedLine(key: string, scope: SharedStateReportScope, evidence: MembershipReportEvidence, path: string, failure = ''): string {
+  const history = evidence.history?.map(item => `${item.channel}:${item.evidence}`).join(',') ?? ''
+  return buildSharedStateDiagnostic(MEMBERSHIP_EVIDENCE_UNRESOLVED, key,
+    `cause=${history ? 'history' : 'scan-ended'} ${sharedScopeIdentity(scope)}`,
+    (history ? `missing_evidence=[${history}] ` : '') + (evidence.problem ? `problem=${evidence.problem} ` : '') +
+      (evidence.slackError ? `slack_error=${evidence.slackError} ` : '') +
+      (evidence.nextAttemptAt === undefined ? '' : `next_attempt_at=${evidence.nextAttemptAt} `) +
+    `${failure ? `${failure}; ` : ''}` + (history ? 'history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. ' :
+      'background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. ') + SHARED_STATE_SLACK_RETRY_WARNING, path)
+}
+export function buildSharedStateRecoveredLine(key: string, scope: SharedStateReportScope, closing: SharedStateClosing, path: string, failure = ''): string {
+  return buildSharedStateDiagnostic(SHARED_STATE_RECOVERED, key, `cause=${closing} closed=${closing} ${sharedScopeIdentity(scope)}`,
+    `${failure ? `${failure}; ` : ''}state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.`, path)
+}
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 /** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
 export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id' | 'via'>): string {
@@ -220,6 +282,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_THREAD_STAMP_UNDECIDED,
   ...DELIVERY_DIAGNOSTIC_CLASSES,
   ...THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+  ...SHARED_STATE_DIAGNOSTIC_CLASSES,
   PERSONA_START,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_UNREADABLE,

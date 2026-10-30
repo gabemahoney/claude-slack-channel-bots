@@ -209,6 +209,7 @@ import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
+import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
@@ -1191,6 +1192,8 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
   setDeliveryLifecycle(value)
 }
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
+let sharedStateReporting: ReturnType<typeof createSharedStateReporting> | undefined
+let unsubscribeSharedStateReporting: (() => void) | undefined
 const bufferedQueueEvents: QueueEvent[] = []
 const bufferedHeldReleases = new Map<string, { key: string; item: QueueItem }>()
 /** Independent observer ports; none can interrupt durability. */
@@ -1466,6 +1469,9 @@ let cronScheduler: CronScheduler | null = null
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  sharedStateReporting?.stop()
+  unsubscribeSharedStateReporting?.()
+  unsubscribeSharedStateReporting = undefined
   membershipScanner?.close()
   channelMembership?.close()
   membershipReadiness?.close()
@@ -3060,7 +3066,9 @@ export async function main(): Promise<void> {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
       personaConfig = configInEffect(appliedConfig, config)
       void deliveryPreparation?.recover(config.personas.map(p => p.key))
+      sharedStateReporting?.reloadApplied()
     },
+    onApplyFailed: failure => sharedStateReporting?.reloadApplyFailed(failure),
   })
   reloadController = reload
   const start = reload.resolveStart()
@@ -3642,6 +3650,23 @@ export async function main(): Promise<void> {
     queued: createQueuedAckCallback({ getReaction: () => getReplySettings().queued_ack_reaction, clientFor, queue: deliveryQueue! }),
     delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor, queue: deliveryQueue! }),
   })
+  sharedStateReporting = createSharedStateReporting({
+    episodes: noticeEpisodes, persona: getAppliedPersona,
+    log: line => console.error(line),
+    authority: reload.sharedChannels()!, membership: channelMembership,
+    mode: () => channelModeOf(personaConfig),
+    scanStatus: key => membershipScanner?.status(key) ?? { state: 'unverified', pages: 0, positives: 0 },
+    scanEnded: key => membershipScanner?.ended(key) ?? false,
+  })
+  let sharedStateCheckPending = false
+  unsubscribeSharedStateReporting = reload.sharedChannels()!.watch(() => {
+    if (shuttingDown || sharedStateCheckPending) return
+    sharedStateCheckPending = true
+    queueMicrotask(() => {
+      sharedStateCheckPending = false
+      if (!shuttingDown) sharedStateReporting?.checkAll(personaConfig?.personas.map(persona => persona.key) ?? [])
+    })
+  })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
   for (const { key, item } of bufferedHeldReleases.values()) deliveryReporting.received(key, deliveryQueue.item(key, item.accepted.seq) ?? item, 'recovered')
   bufferedHeldReleases.clear()
@@ -3779,6 +3804,7 @@ export async function main(): Promise<void> {
   membershipScanner = createMembershipScanner({
     authority: reload.sharedChannels()!, membership: channelMembership,
     connections: manager, dryRun: isDryRun(), log: line => console.error(line),
+    onStatus: key => sharedStateReporting?.check(key),
   })
   membershipStatus = membershipConnectionListener(channelMembership, membershipScanner, manager, isDryRun())
   membershipReadiness = createMembershipReadiness({
@@ -3828,7 +3854,7 @@ export async function main(): Promise<void> {
       k => threadMemoryRetries?.forget(k), k => memoryHolds?.forget(k),
     ]),
     routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
-      k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k),
+      k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k),
       k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k),
       k => threadMemoryRetries?.forget(k), k => threadMemory?.forget(k),
     ]) },
@@ -4303,6 +4329,11 @@ export async function main(): Promise<void> {
   // shutdown() stops the health check and the detection tick; neither is
   // started after it has begun.
   if (shuttingDown) return
+
+  // Startup reports include keys withheld from bring-up by retirement review.
+  const sharedStateKeys = personaConfig.personas.map(persona => persona.key)
+  if (reload.repairActivated()) sharedStateReporting.repairActivated(sharedStateKeys)
+  sharedStateReporting.checkAll(sharedStateKeys)
 
   // Initialize and start the health-check poller.
   initHealthCheck({

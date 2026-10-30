@@ -113,7 +113,8 @@ function endOfBringUpStatement(bringUpAt: number): number {
  * that config is still unset, then the swap
  * `<loaded> = configInEffect(<start-time>, <applied>)` (start-time first:
  * `configInEffect` keeps its first argument's server-wide values and takes
- * only the second's personas); fails the test otherwise.
+ * only the second's personas), then queue recovery and the shared-state
+ * reporter's successful-apply callback; fails the test otherwise.
  */
 function startTimeConfig(): string {
   const { loaded } = startResolution(SERVER_CODE)
@@ -122,7 +123,7 @@ function startTimeConfig(): string {
     new RegExp(
       `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
         `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*void\\s+deliveryPreparation\\?\\.recover\\(\\1\\.personas\\.map\\(p\\s*=>\\s*p\\.key\\)\\)\\s*;?\\s*\\}$`,
+        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*void\\s+deliveryPreparation\\?\\.recover\\(\\1\\.personas\\.map\\(p\\s*=>\\s*p\\.key\\)\\)\\s*;?\\s*sharedStateReporting\\?\\.reloadApplied\\(\\)\\s*;?\\s*\\}$`,
     ),
   )
   expect(swap).not.toBeNull()
@@ -412,7 +413,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // Cancel retries and hold resolution through the isolation helper at
       // teardown submission; the later routing cleanup still includes both.
       ['cancelThreadMemory', 'key => forgetPersonaState(key, [ k => threadMemoryRetries?.forget(k), k => memoryHolds?.forget(k), ])'],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemoryRetries?.forget(k), k => threadMemory?.forget(k), ]) }`],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemoryRetries?.forget(k), k => threadMemory?.forget(k), ]) }`],
       // A later bring-up awaits this key's Thread Memory load, then recovers
       // queued joins and starts detached hold resolution before connecting,
       // only while running with both holders.

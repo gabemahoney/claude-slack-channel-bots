@@ -74,8 +74,8 @@
  *   - self-checks show each pattern finds what it looks for, and that
  *     agent-director's words in a quoted description would fail the checks
  *     if the own-lines helper stopped removing the description.
- * This file pins no notice text: each builder's exact text is asserted in
- * its own suite.
+ * Thread Memory and shared-state text pins live here; other builders pin
+ * their exact text in their own suites.
  *
  * Pure: every builder here is a pure function of its arguments; nothing is
  * started, written or posted. The JSONL safeguard has no pure builder, so it
@@ -224,7 +224,7 @@ import {
   waitTimedOutUnreadReport,
   type NotConnectedNotice,
 } from '../src/session-manager.ts'
-import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, redactSlackLogText } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
 import {
@@ -241,6 +241,14 @@ import {
   type ThreadMemoryLoss,
 } from '../src/thread-memory-reports.ts'
 import { THREAD_MEMORY_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
+import { PERSONA_DIAGNOSTIC_CLASSES, SHARED_STATE_STAGED_SLACK_RETRY_WARNING } from '../src/persona-diagnostics.ts'
+import {
+  SHARED_STATE_NOTICE_MAX_CHANNELS, SHARED_STATE_DIAGNOSTIC_CLASSES, SHARED_STATE_SLACK_RETRY_WARNING,
+  buildSharedStateUnresolvedNotice, buildMembershipEvidenceUnresolvedNotice, buildSharedStateRecoveredNotice, buildReloadApplyFailedNotice,
+  buildSharedStateDiagnostic, buildSharedStateUnresolvedLine, buildMembershipEvidenceUnresolvedLine, buildSharedStateRecoveredLine,
+  type SharedStateCause, type SharedStateClosing, type SharedStateReportScope,
+  type MembershipHistoryEvidence, type MembershipReportEvidence, type MembershipReportProblem,
+} from '../src/shared-state-reports.ts'
 
 import {
   cannedGetResult,
@@ -276,6 +284,7 @@ import {
 import { assertNoLeak, APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { THREAD_CHANNELS, THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
+import { channelPopulation, sharedChannelPath, MEMBERSHIP_FIXTURE_TIME } from './test-helpers/shared-channels.ts'
 
 // ---------------------------------------------------------------------------
 // The catalogue
@@ -859,6 +868,73 @@ function threadMemoryEntries(): NoticeEntry[] {
   ]
 }
 
+// Record keys make additions to the exported unions require a catalogue row.
+const SHARED_CAUSES = { unsynced: true, 'evidence-changed': true, 'restoration-staged': true, 'retirement-unresolved': true, 'not-saved': true } satisfies Record<SharedStateCause, true>
+const SHARED_HISTORY = { 'absence-order': true, 'event-history': true } satisfies Record<MembershipHistoryEvidence, true>
+const SHARED_PROBLEMS = { deadline: true, access: true, authentication: true, 'installation-unverified': true, 'malformed-page': true, 'current-membership-missing': true, 'eligibility-missing': true, 'event-order-conflict': true } satisfies Record<MembershipReportProblem, true>
+const SHARED_CLOSINGS = { state: true, evidence: true, repair: true } satisfies Record<SharedStateClosing, true>
+const sharedCauses = Object.keys(SHARED_CAUSES) as SharedStateCause[]
+const sharedHistory = Object.keys(SHARED_HISTORY) as MembershipHistoryEvidence[]
+const sharedProblems = Object.keys(SHARED_PROBLEMS) as MembershipReportProblem[]
+const sharedClosings = Object.keys(SHARED_CLOSINGS) as SharedStateClosing[]
+const SHARED_CHANNELS = channelPopulation(SHARED_STATE_NOTICE_MAX_CHANNELS + 3).map(c => c.id)
+const SHARED_PATH = sharedChannelPath('/notice-texts-shared-state')
+const sharedRef = () => renderPersonaRef(PERSONA.name, KEY)
+// This directory is a nonsecret configured value, not a credential fixture.
+const sharedTokenPath = () => sharedChannelPath(`/notice-texts-shared-state/${BOT_TOKEN_PREFIX}configured-authority`)
+const sharedFailure = (path = sharedTokenPath()) => `EIO ${sentinelInMessage('authority-failure')}; path=${JSON.stringify(path)}`
+const SHARED_CONFIGURED_FIELDS = [
+  { label: 'ordinary fields', name: PERSONA.name, path: SHARED_PATH },
+  { label: 'URL-like name and nonsecret token-shaped directory', name: 'https://configured.invalid/ops?team=blue', path: sharedTokenPath() },
+  { label: 'token-shaped name and app-token-shaped directory', name: fakeToken(BOT_TOKEN_PREFIX, 'configured-shared-name'), path: sharedChannelPath(`/scratch/${APP_TOKEN_PREFIX}configured-directory`) },
+  { label: 'quotes, backslash, newlines and Slack controls', name: 'Ops "<&>" \\\r\n\t\u2028\u2029', path: sharedChannelPath(`/scratch/"<&>"\\\r\n\t\u2028\u2029/${BOT_TOKEN_PREFIX}configured-directory`) },
+  { label: 'long configured name is not excerpted', name: 'Ops 🚀 <&> '.repeat(300), path: SHARED_PATH },
+]
+// Extra payload fields must never be serialized by these metadata-only builders.
+function sharedScope(overrides: Partial<SharedStateReportScope> = {}): SharedStateReportScope {
+  const scope = { channels: [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary], text: MEMORY_BODY, user: MEMORY_USER, ...overrides }
+  return scope
+}
+function sharedEvidence(overrides: MembershipReportEvidence): MembershipReportEvidence {
+  const evidence = { text: MEMORY_BODY, user: MEMORY_USER, ...overrides }
+  return evidence
+}
+const SHARED_SCOPE_CASES: readonly (readonly [string, SharedStateReportScope])[] = [
+  ['at bound', sharedScope({ channels: SHARED_CHANNELS.slice(0, SHARED_STATE_NOTICE_MAX_CHANNELS) })],
+  ['over bound', sharedScope({ channels: SHARED_CHANNELS })],
+  ['all and DM', sharedScope({ all: true, dm: true })],
+]
+const SHARED_INVENTORY_SCOPES = SHARED_SCOPE_CASES.map(([label, scope]) => [`inventory ${label}`, { ...scope, all: true }] as const)
+const SHARED_STAGED_SCOPES: readonly (readonly [string, SharedStateReportScope])[] = [
+  ['identical usable projections', sharedScope({ all: true, repairPending: { usable: [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary], held: [] } })],
+  ['usable and held projections', sharedScope({ all: true, dm: true, repairPending: { usable: [THREAD_CHANNELS.primary], held: [THREAD_CHANNELS.secondary] } })],
+  ['staged over bound', sharedScope({ all: true, channels: SHARED_CHANNELS, repairPending: { held: SHARED_CHANNELS.slice(0, 2), usable: SHARED_CHANNELS.slice(2) } })],
+  ['staged all membership held', sharedScope({ all: true, repairPending: { usable: [], held: [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary] } })],
+  ['staged empty inventory', sharedScope({ all: true, channels: [], repairPending: { usable: [], held: [] } })],
+]
+function sharedStateEntries(): NoticeEntry[] {
+  const row = (builder: string, variant: string, render: () => string, configuredSpans?: readonly string[]) => entry('shared-state', builder, variant, () => formatPersonaNotice(PERSONA, render()), configuredSpans)
+  const path = escapeSlackControlCharacters(quotedMemoryPath(sharedTokenPath()))
+  return [
+    ...sharedCauses.map(cause => row(buildSharedStateUnresolvedNotice.name, cause, () => buildSharedStateUnresolvedNotice(sharedRef(), sharedScope(), cause, SHARED_PATH))),
+    ...SHARED_INVENTORY_SCOPES.map(([label, scope]) => row(buildSharedStateUnresolvedNotice.name, label, () => buildSharedStateUnresolvedNotice(sharedRef(), scope, 'not-saved', SHARED_PATH))),
+    ...(['authority', 'retired-keys'] as const).map(record => row(buildReloadApplyFailedNotice.name, record,
+      () => buildReloadApplyFailedNotice(sharedRef(), { record, path: sharedTokenPath(), failure: sharedFailure() }),
+      record === 'authority' ? [`the shared channel authority at ${path} (`] : [])),
+    ...sharedHistory.map(evidence => row(buildMembershipEvidenceUnresolvedNotice.name, evidence, () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), sharedScope(), sharedEvidence({ history: [{ channel: THREAD_CHANNELS.primary, evidence }] })))),
+    ...sharedProblems.flatMap(problem => [undefined, 'missing_scope'].map(slackError => row(buildMembershipEvidenceUnresolvedNotice.name, `${problem}; ${slackError ?? 'no slack_error'}`, () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), sharedScope(), sharedEvidence({ problem, slackError, nextAttemptAt: MEMBERSHIP_FIXTURE_TIME }))))),
+    ...sharedClosings.map(closing => row(buildSharedStateRecoveredNotice.name, closing, () => buildSharedStateRecoveredNotice(sharedRef(), sharedScope(), closing))),
+    ...SHARED_SCOPE_CASES.flatMap(([label, scope]) => [
+      row(buildSharedStateUnresolvedNotice.name, label, () => buildSharedStateUnresolvedNotice(sharedRef(), scope, 'unsynced', SHARED_PATH)),
+      row(buildMembershipEvidenceUnresolvedNotice.name, label, () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), scope, sharedEvidence({ history: scope.channels.map(channel => ({ channel, evidence: 'absence-order' })) }))),
+      row(buildSharedStateRecoveredNotice.name, label, () => buildSharedStateRecoveredNotice(sharedRef(), scope, 'repair')),
+    ]),
+    ...SHARED_STAGED_SCOPES.map(([label, scope]) => row(buildSharedStateUnresolvedNotice.name, label, () => buildSharedStateUnresolvedNotice(sharedRef(), scope, 'restoration-staged', SHARED_PATH))),
+    row(buildSharedStateUnresolvedNotice.name, 'token-bearing path and failure', () => buildSharedStateUnresolvedNotice(sharedRef(), sharedScope(), 'unsynced', sharedTokenPath(), sharedFailure()), [`Shared channel authority: ${path} (`]),
+    row(buildMembershipEvidenceUnresolvedNotice.name, 'token-bearing Slack reason', () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), sharedScope(), sharedEvidence({ problem: 'access', slackError: sentinelInMessage('scan-error') }))),
+  ]
+}
+
 /** The JSONL persistence safeguard's storage and AD-reference notices (keeps their text): one per variant. */
 const JSONL_NON_PERSISTENT = 'non-persistent storage'
 const JSONL_ROTATED = 'AD rotated transcript reference'
@@ -1049,6 +1125,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...notConnectedEntries(),
   ...deliveryEntries(),
   ...threadMemoryEntries(),
+  ...sharedStateEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
   ...capEntries(),
@@ -1079,7 +1156,7 @@ const NOT_APPLICABLE: Readonly<Partial<Record<NoticeGroup, string>>> = Object.fr
 })
 
 /** Every id the completeness guard covers: to. */
-const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed', 'thread-memory'] as const
+const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed', 'thread-memory', 'shared-state'] as const
 
 /**
  * The server notices posted to Slack that names beyond the catalogued
@@ -1207,6 +1284,7 @@ describe('no catalogued notice names clear-latch', () => {
       "ad-config-malformed",
       "unusable-name",
       "thread-memory",
+      "shared-state",
     ] as NoticeGroup[]).sort())
   })
 })
@@ -1417,6 +1495,216 @@ const CASES = NOTICE_CATALOGUE.map((e) => [titleOf(e), e] as const)
 
 /** The entries posted to Slack: every entry outside `LOG_ONLY_GROUPS`. */
 const SLACK_CASES = CASES.filter(([, e]) => !LOG_ONLY_GROUPS.includes(e.group))
+
+describe('Shared-state catalogue content and diagnostic lines', () => {
+  const variants = (builder: string) => NOTICE_CATALOGUE.filter(e => e.group === 'shared-state' && e.builder === builder).map(e => e.variant)
+
+  test('every exported cause, evidence, problem and closing has a catalogue row; no transport or superseded report', () => {
+    expect(variants(buildReloadApplyFailedNotice.name)).toEqual(['authority', 'retired-keys'])
+    expect(variants(buildSharedStateUnresolvedNotice.name)).toEqual([
+      ...sharedCauses, ...SHARED_INVENTORY_SCOPES.map(([label]) => label), ...SHARED_SCOPE_CASES.map(([label]) => label), ...SHARED_STAGED_SCOPES.map(([label]) => label), 'token-bearing path and failure',
+    ])
+    expect(variants(buildMembershipEvidenceUnresolvedNotice.name)).toEqual([
+      ...sharedHistory, ...sharedProblems.flatMap(problem => [`${problem}; no slack_error`, `${problem}; missing_scope`]),
+      ...SHARED_SCOPE_CASES.map(([label]) => label), 'token-bearing Slack reason',
+    ])
+    expect(variants(buildSharedStateRecoveredNotice.name)).toEqual([...sharedClosings, ...SHARED_SCOPE_CASES.map(([label]) => label)])
+    expect([...sharedCauses, ...sharedHistory, ...sharedProblems, ...sharedClosings].filter(v => ['transport', 'superseded'].includes(v))).toEqual([])
+    expect(SHARED_STATE_DIAGNOSTIC_CLASSES).toEqual(['shared-state-unresolved', 'membership-evidence-unresolved', 'shared-state-recovered'])
+    for (const kind of SHARED_STATE_DIAGNOSTIC_CLASSES) expect(PERSONA_DIAGNOSTIC_CLASSES.filter(value => value === kind)).toHaveLength(1)
+  })
+
+  test('notice texts, actions, repair limits and diagnostic actions (one literal pin)', () => {
+    for (const record of ['authority', 'retired-keys'] as const) {
+      const text = buildReloadApplyFailedNotice(sharedRef(), { record, path: SHARED_PATH, failure: 'EIO' })
+      expect(text).toBe(`:warning: *Configuration change not applied* — ${sharedRef()}; could not write ${record === 'authority' ? `the shared channel authority at ${JSON.stringify(SHARED_PATH)}` : 'the retired-key record'} (EIO). Nothing in the confirmed change was applied. This persona and every other persona keep running as before, and the change stays pending. Fix the cause, for example disk space or permissions, then review the pending change again and confirm it afresh; a failed confirmation is not reused.`)
+      const redacted = buildReloadApplyFailedNotice(sharedRef(), { record, path: sharedTokenPath(), failure: sharedFailure() })
+      const fields = record === 'authority' ? [`the shared channel authority at ${escapeSlackControlCharacters(quotedMemoryPath(sharedTokenPath()))} (`] : []
+      assertNoLeak(withoutConfiguredSpans(redacted, fields))
+      expect(redacted).not.toContain(MEMORY_BODY)
+      expect(redacted).not.toContain(MEMORY_USER)
+    }
+    expect(SHARED_STATE_NOTICE_MAX_CHANNELS).toBe(20)
+    expect(SHARED_STATE_SLACK_RETRY_WARNING).toBe('Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.')
+    expect(SHARED_STATE_STAGED_SLACK_RETRY_WARNING).toBe('Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.')
+    const ref = sharedRef(), scope = sharedScope(), channels = scope.channels.join(', ')
+    const continuing = 'Other channels and personas, and already accepted queues, keep working.'
+    const warning = SHARED_STATE_SLACK_RETRY_WARNING
+    const causes: Record<SharedStateCause, readonly [string, string]> = {
+      unsynced: ["A shared-state write was renamed but not synced. CSCB finishes it at its next configuration checks once the state directory can be synced. Check the disk and filesystem. If the file changes meanwhile, existing recovery can still finish when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart.", 'finish the write at configuration checks; check disk/filesystem; if evidence changes, existing recovery can still finish when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart'],
+      'evidence-changed': ["The file no longer holds what CSCB wrote, so CSCB won't guess. Preserve the evidence. Existing recovery can still finish without restarting when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart. Choices that cannot be restored are lost and must be set again.", 'preserve evidence; existing recovery can still finish without restarting when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart; unrestorable choices must be set again'],
+      'restoration-staged': ['A reviewed restoration is staged. Restart CSCB to review and confirm it; staging alone does not complete the repair.', 'restart to review and confirm staged restoration; channel lists describe membership readiness only; thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided; otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue'],
+      'retirement-unresolved': ["A confirmed change's persona retirement could not be finished or undone. CSCB retries at each configuration check. Check the state directory's disk; the retirement must be recovered before affected intake resumes.", 'retirement recovery retries at configuration checks; check the state directory disk'],
+      'not-saved': ["CSCB could not save membership evidence for these channels. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends.", 'membership reconciliation retries in the background; check the state directory disk'],
+    }
+    for (const cause of sharedCauses) {
+      const held = cause === 'restoration-staged' ? 'Messages in the affected channels stay held.' : 'Messages there stay held.'
+      const causeWarning = cause === 'restoration-staged' ? SHARED_STATE_STAGED_SLACK_RETRY_WARNING : warning
+      expect(buildSharedStateUnresolvedNotice(ref, scope, cause, SHARED_PATH)).toBe(`:warning: *Channel state unresolved* — ${ref}; channels: ${channels}. Shared channel authority: ${JSON.stringify(SHARED_PATH)}. ${causes[cause][0]} ${held} ${continuing} ${causeWarning}`)
+      expect(buildSharedStateUnresolvedLine(KEY, scope, cause, SHARED_PATH)).toBe(`[slack] shared-state-unresolved: persona=${KEY} cause=${cause} channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} ${causes[cause][1]}. ${causeWarning}`)
+    }
+    const inventory = { ...scope, all: true }
+    expect(buildSharedStateUnresolvedNotice(ref, inventory, 'not-saved', SHARED_PATH)).toBe(`:warning: *Channel state unresolved* — ${ref}; membership inventory incomplete; known channels: ${channels}. Shared channel authority: ${JSON.stringify(SHARED_PATH)}. CSCB could not save a complete membership inventory. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends. Verified usable channels keep working. Only intake depending on missing membership evidence stays held and unacknowledged. Recovery requires a complete membership inventory. ${continuing} ${warning}`)
+    expect(buildSharedStateUnresolvedLine(KEY, inventory, 'not-saved', SHARED_PATH)).toBe(`[slack] shared-state-unresolved: persona=${KEY} cause=not-saved scope=inventory known_channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} complete membership inventory not saved; verified usable channels keep working; only intake depending on missing membership evidence stays held and unacknowledged; recovery requires a complete membership inventory; membership reconciliation retries in the background; check the state directory disk. ${warning}`)
+    const history: Record<MembershipHistoryEvidence, string> = {
+      'absence-order': 'the bot was seen absent, but CSCB cannot tell whether that leave came before or after a choice confirmed meanwhile',
+      'event-history': 'a membership event conflicts with recorded history',
+    }
+    const evidenceTail = ` Messages whose eligibility depends on this missing evidence stay held. ${continuing} Elapsed time does not establish missing evidence. ${warning}`
+    for (const evidence of sharedHistory) {
+      const facts = sharedEvidence({ history: [{ channel: THREAD_CHANNELS.primary, evidence }] })
+      expect(buildMembershipEvidenceUnresolvedNotice(ref, scope, facts)).toBe(`:warning: *Channel membership evidence unresolved* — ${ref}; channels: ${channels}. ${THREAD_CHANNELS.primary}: ${history[evidence]}. Retries, reconciliation and time cannot settle this history; only reviewed recovery can, through an explicit absence replacement for the channel or reviewed restoration.${evidenceTail}`)
+      expect(buildMembershipEvidenceUnresolvedLine(KEY, scope, facts, SHARED_PATH)).toBe(`[slack] membership-evidence-unresolved: persona=${KEY} cause=history channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} missing_evidence=[${THREAD_CHANNELS.primary}:${evidence}] history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. ${warning}`)
+    }
+    const problems: Record<MembershipReportProblem, string> = {
+      deadline: "Slack's membership list could not be read in time. CSCB retries; if this continues, check Slack's status and the workspace size.",
+      access: 'The bot lacks a scope or channel access needed to read membership. Add the scope named in the debugging skill and reinstall; retries alone cannot fix it.',
+      authentication: "Slack refused the bot's credentials. Fix the bot token through a confirmed configuration change; retries alone cannot fix it.",
+      'installation-unverified': 'CSCB could not verify the app installation. Check the installation and its credentials; retries alone cannot fix it.',
+      'malformed-page': 'Slack returned a membership page CSCB cannot read. CSCB retries; the incomplete page establishes no missing fact.',
+      'current-membership-missing': "A complete scan still left current membership undecided for these channels. CSCB retries; check the debugging skill's current-membership-missing entry.",
+      'eligibility-missing': "A complete scan still left channel eligibility undecided. CSCB retries; check the debugging skill's eligibility-missing entry.",
+      'event-order-conflict': "A complete scan still left membership event order undecided. CSCB retries; check the debugging skill's event-order-conflict entry.",
+    }
+    for (const problem of sharedProblems) for (const slackError of [undefined, 'missing_scope']) {
+      const facts = sharedEvidence({ problem, slackError, nextAttemptAt: MEMBERSHIP_FIXTURE_TIME })
+      expect(buildMembershipEvidenceUnresolvedNotice(ref, scope, facts)).toBe(`:warning: *Channel membership evidence unresolved* — ${ref}; channels: ${channels}.  ${problems[problem]}${slackError ? ` Slack reason: ${slackError}.` : ''} Next attempt at: ${MEMBERSHIP_FIXTURE_TIME}.${evidenceTail}`)
+      expect(buildMembershipEvidenceUnresolvedLine(KEY, scope, facts, SHARED_PATH)).toBe(`[slack] membership-evidence-unresolved: persona=${KEY} cause=scan-ended channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} problem=${problem}${slackError ? ` slack_error=${slackError}` : ''} next_attempt_at=${MEMBERSHIP_FIXTURE_TIME} background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. ${warning}`)
+    }
+    for (const closing of sharedClosings) {
+      expect(buildSharedStateRecoveredNotice(ref, scope, closing)).toBe(`:white_check_mark: *Channel state recovered* — ${ref}; channels: ${channels}. ${closing === 'repair' ? "The reviewed restoration or replacement is applied and this persona's current membership is verified. " : ''}The channel state and current membership for these channels are trustworthy again; held messages there are decided now. Slack retries are finite. Messages Slack stopped retrying meanwhile are not recovered; send missing messages again.`)
+      expect(buildSharedStateRecoveredLine(KEY, scope, closing, SHARED_PATH)).toBe(`[slack] shared-state-recovered: persona=${KEY} cause=${closing} closed=${closing} channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.`)
+    }
+    for (const [label, staged] of SHARED_STAGED_SCOPES.filter(([, scope]) => scope.channels.length <= SHARED_STATE_NOTICE_MAX_CHANNELS)) {
+      const pending = staged.repairPending!
+      const status = `Repair is pending for this persona. Membership decided: ${pending.usable.join(', ') || 'none'}. Membership unresolved (intake held): ${pending.held.join(', ') || 'none'}${staged.dm ? '; DMs are held too' : ''}. These lists describe membership readiness only. Thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue.`
+      const text = buildSharedStateUnresolvedNotice(ref, staged, 'restoration-staged', SHARED_PATH)
+      expect(text, label).toBe(`:warning: *Channel state unresolved* — ${ref}; all its channels; repair pending. Shared channel authority: ${JSON.stringify(SHARED_PATH)}. ${causes['restoration-staged'][0]} ${status} ${continuing} ${SHARED_STATE_STAGED_SLACK_RETRY_WARNING}`)
+      expect(text).not.toContain('Still usable:')
+      expect(text).not.toContain('Held: none')
+      const line = buildSharedStateUnresolvedLine(KEY, staged, 'restoration-staged', SHARED_PATH)
+      expect(line, label).toBe(`[slack] shared-state-unresolved: persona=${KEY} cause=restoration-staged scope=all channels=${JSON.stringify(staged.channels)}${staged.dm ? ' dm=true' : ''} repair_pending=true membership_decided=${JSON.stringify(pending.usable)} membership_held=${JSON.stringify(pending.held)} path=${JSON.stringify(SHARED_PATH)} ${causes['restoration-staged'][1]}. ${SHARED_STATE_STAGED_SLACK_RETRY_WARNING}`)
+      expect(line).not.toMatch(/ (?:usable|held)=/)
+    }
+  })
+
+  test.each(SHARED_SCOPE_CASES)('%s names every channel within the shared bound, the remainder and affected DM', (_label, scope) => {
+    const notices = [
+      [buildSharedStateUnresolvedNotice(sharedRef(), scope, 'unsynced', SHARED_PATH), false],
+      [buildMembershipEvidenceUnresolvedNotice(sharedRef(), scope, sharedEvidence({ history: scope.channels.map(channel => ({ channel, evidence: 'absence-order' })) })), false],
+      [buildSharedStateRecoveredNotice(sharedRef(), scope, 'repair'), false],
+      [buildSharedStateUnresolvedNotice(sharedRef(), { ...scope, all: true }, 'not-saved', SHARED_PATH), true],
+    ] as const
+    for (const [text, inventory] of notices) {
+      expect(text).toContain(sharedRef())
+      for (const channel of scope.channels.slice(0, SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).toContain(channel)
+      for (const channel of scope.channels.slice(SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).not.toContain(channel)
+      const remaining = scope.channels.length - SHARED_STATE_NOTICE_MAX_CHANNELS
+      if (remaining > 0) expect(text).toContain(`and ${remaining} more`)
+      else expect(text).not.toContain(' more')
+      expect(text.includes('all its channels')).toBe(scope.all === true && !inventory)
+      expect(text.includes('membership inventory incomplete; known channels:')).toBe(inventory)
+      expect(text.includes('DMs also affected')).toBe(scope.dm === true)
+    }
+    assertNoLeak(notices)
+  })
+
+  test('staged membership lists share one display budget; no channel beyond it leaks through the heading', () => {
+    const scope = SHARED_STAGED_SCOPES.find(([label]) => label === 'staged over bound')![1]
+    const text = buildSharedStateUnresolvedNotice(sharedRef(), scope, 'restoration-staged', SHARED_PATH)
+    for (const channel of SHARED_CHANNELS.slice(0, SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).toContain(channel)
+    for (const channel of SHARED_CHANNELS.slice(SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).not.toContain(channel)
+    expect(text).toContain(`and ${SHARED_CHANNELS.length - SHARED_STATE_NOTICE_MAX_CHANNELS} more`)
+    assertNoLeak(text)
+  })
+
+  test.each(SHARED_CONFIGURED_FIELDS.flatMap(fields => [false, true].map(all => ({ ...fields, all }))))('$label: all diagnostic variants preserve the full configured path and redact failures (all=$all)', ({ path, all }) => {
+    const scope = sharedScope({ channels: SHARED_CHANNELS, all, dm: true })
+    const failure = sharedFailure(path)
+    const lines: Array<readonly [string, string, boolean?, boolean?]> = [
+      ...sharedCauses.map(cause => [SHARED_STATE_DIAGNOSTIC_CLASSES[0], buildSharedStateUnresolvedLine(KEY,
+        cause === 'restoration-staged' ? { ...scope, repairPending: { usable: SHARED_CHANNELS, held: [] } } : scope,
+        cause, path, failure), cause === 'not-saved' && all, cause === 'restoration-staged'] as const),
+      ...sharedHistory.map(evidence => [SHARED_STATE_DIAGNOSTIC_CLASSES[1], buildMembershipEvidenceUnresolvedLine(KEY, scope, sharedEvidence({ history: SHARED_CHANNELS.map(channel => ({ channel, evidence })) }), path, failure)] as const),
+      ...sharedProblems.flatMap(problem => [undefined, 'missing_scope'].map(slackError => [SHARED_STATE_DIAGNOSTIC_CLASSES[1], buildMembershipEvidenceUnresolvedLine(KEY, scope, sharedEvidence({ problem, slackError, nextAttemptAt: MEMBERSHIP_FIXTURE_TIME }), path, failure)] as const)),
+      ...sharedClosings.map(closing => [SHARED_STATE_DIAGNOSTIC_CLASSES[2], buildSharedStateRecoveredLine(KEY, scope, closing, path, failure)] as const),
+    ]
+    expect([...new Set(lines.map(([kind]) => kind))]).toEqual([...SHARED_STATE_DIAGNOSTIC_CLASSES])
+    for (const [kind, line, inventory = false, staged = false] of lines) {
+      assertNoLeak(withoutConfiguredSpans(line, [` path=${quotedMemoryPath(path)} `]))
+      expect(line).toStartWith(`[slack] ${kind}: persona=${KEY} `)
+      expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(line).toContain(` ${inventory ? 'known_channels' : 'channels'}=${JSON.stringify(SHARED_CHANNELS)}`)
+      expect(line).toContain(`path=${quotedMemoryPath(path)}`)
+      const actualPath = line.match(/ path=("(?:[^"\\]|\\.)*") /)![1]!
+      expect(JSON.parse(actualPath)).toBe(path)
+      expect(line).toContain(redactSlackLogText(failure).replace(/[\r\n\u2028\u2029]/g, ' '))
+      expect(line.includes('scope=all')).toBe(all && !inventory)
+      expect(line.includes('scope=inventory')).toBe(inventory)
+      expect(line).toContain('dm=true')
+      expect(line).not.toContain(MEMORY_BODY)
+      expect(line).not.toContain(MEMORY_USER)
+      if (kind !== SHARED_STATE_DIAGNOSTIC_CLASSES[2]) expect(line).toContain(staged ? SHARED_STATE_STAGED_SLACK_RETRY_WARNING : SHARED_STATE_SLACK_RETRY_WARNING)
+    }
+    for (const evidence of sharedHistory) {
+      const line = buildMembershipEvidenceUnresolvedLine(KEY, scope, { history: SHARED_CHANNELS.map(channel => ({ channel, evidence })) }, SHARED_PATH)
+      for (const channel of SHARED_CHANNELS) expect(line).toContain(`${channel}:${evidence}`)
+    }
+  })
+
+  test('staging diagnostics retain every decided/held membership channel and the generic line builder sanitizes each field', () => {
+    for (const [, scope] of SHARED_STAGED_SCOPES) {
+      const line = buildSharedStateUnresolvedLine(KEY, scope, 'restoration-staged', SHARED_PATH)
+      expect(line).toContain(`repair_pending=true membership_decided=${JSON.stringify(scope.repairPending!.usable)} membership_held=${JSON.stringify(scope.repairPending!.held)}`)
+      assertNoLeak(line)
+    }
+    for (const kind of SHARED_STATE_DIAGNOSTIC_CLASSES) {
+      const line = buildSharedStateDiagnostic(kind, `${KEY}\n${fakeToken(BOT_TOKEN_PREFIX, 'key')}`, `identity\r${fakeToken(APP_TOKEN_PREFIX, 'identity')}`, `detail\u2028${sentinelInMessage('detail')}\u2029`)
+      expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+      assertNoLeak(line)
+    }
+  })
+
+  test.each(SHARED_CONFIGURED_FIELDS)('$label: all four notices preserve configured fields and redact untrusted failures', ({ name, path }) => {
+    const ref = renderPersonaRef(name, KEY)
+    const escapedRef = escapeSlackControlCharacters(ref).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+    const quotedPath = escapeSlackControlCharacters(quotedMemoryPath(path))
+    const failure = `${sharedFailure(path)}\n<&>`
+    const safeFailure = escapeSlackControlCharacters(redactSlackLogText(failure).replace(/[\r\n\u2028\u2029]/g, ' '))
+    const rendered: Array<{ text: string; pathField?: string; hasFailure: boolean }> = [
+      { text: buildSharedStateUnresolvedNotice(ref, sharedScope(), 'unsynced', path, failure), pathField: `Shared channel authority: ${quotedPath} (`, hasFailure: true },
+      { text: buildSharedStateUnresolvedNotice(ref, SHARED_STAGED_SCOPES[0]![1], 'restoration-staged', path, failure), pathField: `Shared channel authority: ${quotedPath} (`, hasFailure: true },
+      ...[false, true].map(all => ({ text: buildSharedStateUnresolvedNotice(ref, sharedScope({ all }), 'not-saved', path, failure), pathField: `Shared channel authority: ${quotedPath} (`, hasFailure: true })),
+      { text: buildMembershipEvidenceUnresolvedNotice(ref, sharedScope(), sharedEvidence({ problem: 'access', slackError: failure })), hasFailure: true },
+      { text: buildSharedStateRecoveredNotice(ref, sharedScope(), 'repair'), hasFailure: false },
+      ...(['authority', 'retired-keys'] as const).map(record => ({
+        text: buildReloadApplyFailedNotice(ref, { record, path, failure }),
+        pathField: record === 'authority' ? `the shared channel authority at ${quotedPath} (` : undefined,
+        hasFailure: true,
+      })),
+    ]
+    for (const { text, pathField, hasFailure } of rendered) {
+      const fields = [` — ${escapedRef}; `, ...(pathField ? [pathField] : [])]
+      assertNoLeak(withoutConfiguredSpans(text, fields))
+      expect(text).toContain(` — ${escapedRef}; `)
+      if (pathField) expect(text).toContain(pathField)
+      if (hasFailure) {
+        expect(text).toContain(safeFailure)
+        expect(text).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+      }
+      expect(text).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(text).not.toContain('<&>')
+      expect(text).not.toContain('&amp;lt;')
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+      // Only the designated occurrence is allowed. A duplicate configured
+      // path in untrusted failure text must still trip the credential audit.
+      for (const leak of [sharedTokenPath(), fakeToken(APP_TOKEN_PREFIX, 'unrelated-shared-credential')]) {
+        expect(() => assertNoLeak(withoutConfiguredSpans(`${text} error=${leak}`, fields))).toThrow('assertNoLeak')
+      }
+    }
+  })
+})
 
 describe('Thread Memory catalogue content and loss budget', () => {
   test('the catalogue retains every loss variant and name boundary', () => {
@@ -1877,7 +2165,7 @@ describe('a description quoted from agent-director is redacted and capped at MAX
   test('every builder that quotes agent-director has a redaction-and-cap row', () => {
     // Thread Memory quotes storage errors, not agent-director descriptions;
     // its loss notice has its own final-message budget below.
-    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => e.group !== 'thread-memory' && redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
+    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => e.group !== 'thread-memory' && e.group !== 'shared-state' && redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
     const capped = new Set(capRows.map(([, e]) => e.builder))
     expect([...quoting].filter((builder) => !capped.has(builder)).sort()).toEqual([])
   })

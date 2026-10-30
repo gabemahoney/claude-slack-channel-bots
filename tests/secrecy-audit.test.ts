@@ -121,6 +121,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
   [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
+  [/^src\/shared-state-reports\.ts$/, 'shared-state notice builders and reporter carry authority failure text, configured identities and paths into Slack notices and diagnostic lines'],
   [/^src\/shared-recovery\.ts$/, 'damaged authority evidence, prepared input and recovery request parsing'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
@@ -709,6 +710,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
   test.each([
     ['src/thread-memory.ts', 'classifyMetadataFailure', 'THREAD_MEMORY_LOOKUP_METHODS', 'MetadataFailure', 'tests/thread-memory.test.ts'],
     ['src/thread-memory-reports.ts', 'createThreadMemoryReporting', 'THREAD_MEMORY_DIAGNOSTIC_CLASSES', 'ThreadMemoryLoss', 'tests/thread-memory-reports.test.ts'],
+    ['src/shared-state-reports.ts', 'createSharedStateReporting', 'SHARED_STATE_DIAGNOSTIC_CLASSES', 'SharedStateReportScope', 'tests/shared-state-reports.test.ts'],
     ['src/own-post.ts', 'completionFiles', 'SLACK_FILE_ID_RE', 'CompletedFile', 'tests/own-post.test.ts'],
     ['src/file-upload-observation.ts', 'observeFileCompletions', undefined, 'FileCompletionListener', 'tests/registry.test.ts'],
   ] as const)('%s is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', (module, fn, constant, type, suite) => {
@@ -722,11 +724,13 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
-  test('the Thread Memory store/reporter, own-post and file-completion modules are touched today, and a suite without its assertNoLeak calls fails the rule', () => {
+  test('the state stores/reporters, own-post and file-completion modules are touched today, and a suite without its assertNoLeak calls fails the rule', () => {
     const touched = (module: string) => SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
     for (const [suite, module] of [
       ['tests/thread-memory.test.ts', 'src/thread-memory.ts'],
       ['tests/thread-memory-reports.test.ts', 'src/thread-memory-reports.ts'],
+      ['tests/shared-state-reports.test.ts', 'src/shared-state-reports.ts'],
+      ['tests/shared-state-reports-integration.test.ts', 'src/shared-state-reports.ts'],
       ['tests/own-post.test.ts', 'src/own-post.ts'],
       ['tests/registry.test.ts', 'src/file-upload-observation.ts'],
     ] as const) {

@@ -13,6 +13,7 @@ import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type Thr
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent, type ThreadMemorySealOptions } from '../../src/thread-memory-seal.ts'
 import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from '../../src/thread-memory-retry.ts'
 import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from '../../src/thread-memory-reports.ts'
+import { createSharedStateReporting } from '../../src/shared-state-reports.ts'
 import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
 import { threadJoin } from './thread-memory.ts'
 
@@ -162,6 +163,7 @@ import {
   RELOAD_PREVIEW,
   reloadFilePaths,
   type ReloadController,
+  type ReloadControllerDeps,
   type ReloadFilePaths,
   type ReloadLifecycleOps,
   type ReloadStartOutcome,
@@ -961,6 +963,8 @@ export interface PreparedPersonaState {
 // ---------------------------------------------------------------------------
 
 export interface ReloadRunOptions {
+  /** Bind main's shared-authority watcher, scan observer and notice lifecycle. */
+  sharedStateReports?: boolean
   /** Opt in to the production Thread Memory and real lifecycle composition.
    * Journals live in stateDir; optional fs overrides inject storage failures. */
   threadMemory?: {
@@ -1026,6 +1030,8 @@ export interface ReloadRunOptions {
   applySteps?: ApplyStepSlots
   /** Also called with every configuration the controller's `onApplied` is told (after `run.appliedConfigs` records it). */
   onApplied?: (config: PersonaConfig) => void
+  /** Observe definite apply failures after reporting; throws reach the controller's isolation catch. */
+  onApplyFailed?: ReloadControllerDeps['onApplyFailed']
   /** Bind an instrumented or real delivery worker's retirement callback. */
   stopDelivery?: (key: string) => unknown
   /**
@@ -1947,7 +1953,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     if (dryRun) process.env['SLACK_DRY_RUN'] = '1'
     else delete process.env['SLACK_DRY_RUN']
     const realLaunch = runOpts.realLaunch === true
-    const realLifecycle = runOpts.realLifecycle === true || realLaunch || runOpts.threadMemory !== undefined
+    const realLifecycle = runOpts.realLifecycle === true || realLaunch || runOpts.threadMemory !== undefined || runOpts.sharedStateReports === true
     // With the real composition, one serializer shared by the manager, the
     // bring-up controller and the lifecycle, as server.ts shares its one.
     const serializer = realLifecycle ? createPersonaSerializer() : undefined
@@ -2077,7 +2083,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       log,
       isDryRun: () => dryRun,
       getPersonaConfig: appliedConfig,
-      ...(runOpts.threadMemory === undefined ? {} : { clock: connections.clock }),
+      ...(runOpts.threadMemory === undefined && !runOpts.sharedStateReports ? {} : { clock: connections.clock }),
     })
     // As main builds them: the run's one
     // set of notice episodes, on the run's fake clock, posting through the
@@ -2093,7 +2099,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         episodeNotices.push({ key, text })
         void noticeStack.notifier.notify(key, text, options)
       },
-      ...(runOpts.threadMemory === undefined ? {} : { teardownWindow: noticeStack.notifier.teardownWindowState }),
+      ...(runOpts.threadMemory === undefined && !runOpts.sharedStateReports ? {} : { teardownWindow: noticeStack.notifier.teardownWindowState }),
       log,
       clock: connections.clock,
     })
@@ -2243,6 +2249,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     let membership: ChannelMembership | undefined
     let membershipScanner: MembershipScanner | undefined
     let membershipStatus: ReturnType<typeof membershipConnectionListener> | undefined
+    let sharedStateReporting: ReturnType<typeof createSharedStateReporting> | undefined
+    let unsubscribeSharedStateReporting: (() => void) | undefined
     const coreRouting = createPersonaRouting({
       membership: {
         read: (key, channel, mode) => membership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
@@ -2535,8 +2543,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         // The run's routing's per-key forget, as server.ts binds it, so a
         // torn-down key's dedupe store and heard set are dropped.
-        routing: { forget: rec('routing.forget', (key) => threadMemory === undefined ? routing.forget(key) :
-          forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemoryRetries!.forget(k), k => threadMemory.forget(k)])) },
+        routing: { forget: rec('routing.forget', (key) => {
+          sharedStateReporting?.forget(key)
+          if (threadMemory === undefined) routing.forget(key)
+          else forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemoryRetries!.forget(k), k => threadMemory.forget(k)])
+        }) },
         ...(threadMemory === undefined ? {} : { cancelThreadMemory: (key: string) => forgetPersonaState(key, [
           k => threadMemoryRetries!.forget(k), k => memoryHolds!.forget(k),
         ]), loadThreadMemory: async (key: string) => {
@@ -2551,8 +2562,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
         // The run's one destination resolver, which the notices post through.
         destinations: { forget: rec('destinations.forget', (key) => noticeStack.destinations.forget(key)) },
-        destinationHold: { cancel: rec('destinationHold.cancel', key => { if (threadMemory) noticeStack.hold.cancel(key) }) },
-        notifier: threadMemory ? noticeStack.notifier : { forget: rec('notifier.forget', () => 0) },
+        destinationHold: { cancel: rec('destinationHold.cancel', key => { if (threadMemory || runOpts.sharedStateReports) noticeStack.hold.cancel(key) }) },
+        notifier: threadMemory || runOpts.sharedStateReports ? noticeStack.notifier : { forget: rec('notifier.forget', () => 0) },
         appliedPersonas: () => controller.applied()?.config.personas ?? [],
         dryRun,
         // An apply here never runs during shutdown.
@@ -2763,6 +2774,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         connections.config = applied
         await Promise.all(applied.personas.map((persona) => bringUpAndLaunch(persona, applied, 'start')))
         if (startHold !== undefined) await startHold
+        const sharedStateKeys = controller.applied()?.config.personas.map(persona => persona.key) ?? []
+        if (controller.repairActivated()) sharedStateReporting?.repairActivated(sharedStateKeys)
+        sharedStateReporting?.checkAll(sharedStateKeys)
       },
       async bringUp(persona, applied, options?: ApplyBringUpOptions) {
         connections.config = applied
@@ -2962,7 +2976,26 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         !dryRun && !stopped && isPersonaUp(key) && membership?.read(key, channel, 'open').kind === 'eligible')
       const wireMembership = () => {
         membership = createChannelMembership({ authority, dryRun, log, requestReconciliation: key => membershipScanner?.request(key) })
-        membershipScanner = createMembershipScanner({ authority, membership, connections: connections.manager, clock: membershipClock, dryRun, log })
+        if (runOpts.sharedStateReports) {
+          sharedStateReporting = createSharedStateReporting({
+            episodes, persona: getAppliedPersona, log, authority, membership,
+            mode: () => channelModeOf(appliedConfig()),
+            scanStatus: key => membershipScanner?.status(key) ?? { state: 'unverified', pages: 0, positives: 0 },
+            scanEnded: key => membershipScanner?.ended(key) ?? false,
+          })
+          let sharedStateCheckPending = false
+          unsubscribeSharedStateReporting = authority.watch(() => {
+            if (stopped || sharedStateCheckPending) return
+            sharedStateCheckPending = true
+            queueMicrotask(() => {
+              sharedStateCheckPending = false
+              if (!stopped) sharedStateReporting?.checkAll(appliedConfig()?.personas.map(persona => persona.key) ?? [])
+            })
+          })
+        }
+        membershipScanner = createMembershipScanner({ authority, membership, connections: connections.manager, clock: membershipClock, dryRun, log,
+          ...(runOpts.sharedStateReports ? { onStatus: (key: string) => sharedStateReporting?.check(key) } : {}),
+        })
         membershipStatus = membershipConnectionListener(membership, membershipScanner, connections.manager, dryRun)
       }
       if (threadMemory) {
@@ -3044,6 +3077,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         const hook = applyHook
         applyHook = undefined
         hook?.(config)
+        sharedStateReporting?.reloadApplied()
+      },
+      onApplyFailed: failure => {
+        sharedStateReporting?.reloadApplyFailed(failure)
+        runOpts.onApplyFailed?.(failure)
       },
     })
 
@@ -3512,7 +3550,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     async function finishRun(graceful: boolean): Promise<void> {
       if (stopped) return
       stopped = true
-      if (threadMemory) episodes.close()
+      sharedStateReporting?.stop()
+      unsubscribeSharedStateReporting?.()
+      if (threadMemory || runOpts.sharedStateReports) episodes.close()
       memoryHolds?.stop()
       membershipScanner?.close()
       membership?.close()
