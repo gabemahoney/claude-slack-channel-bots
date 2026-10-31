@@ -756,6 +756,8 @@ export interface RoutingHarness {
    * returned; rejects when the tool reports an error.
    */
   reply(name: string, args: Record<string, unknown>): Promise<void>
+  /** Results from the real reply tool, including errors, in completion order. */
+  replyResults: Array<Awaited<ReturnType<Client['callTool']>>>
   /** Everything the harness captured, for `assertNoLeak`. */
   captured(): Record<string, unknown>
 }
@@ -919,6 +921,7 @@ export function makeRoutingHarness(
     await client.connect(clientTransport)
     try {
       const result = await client.callTool({ name: 'reply', arguments: args })
+      h.replyResults.push(result)
       if (result.isError) throw new Error(`reply as ${name} reported an error`)
     } finally {
       await client.close()
@@ -1008,7 +1011,9 @@ export function makeRoutingHarness(
     notices: [],
     noticeText: (name, body) => formatPersonaNotice(byName(name).persona, body),
     reply,
+    replyResults: [],
     captured: () => ({
+      replyResults: h.replyResults,
       logs: h.logs,
       calls: Object.fromEntries(handles.map((x) => [x.persona.name, x.stub.calls])),
       notifications: [...handles.map((x) => x.notifications), ...extraNotifications],

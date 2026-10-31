@@ -53,7 +53,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { WebClient } from '@slack/web-api'
-import { writeFileSync } from 'fs'
+import { statSync, writeFileSync } from 'fs'
 import { join, resolve } from 'path'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
@@ -85,10 +85,14 @@ import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, sl
 import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
-import { completionFiles, type OwnPostObserver } from './own-post.ts'
+import { completionFiles, ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostAnswer, type OwnPostObserver, type OwnPostStart } from './own-post.ts'
 import { withFileCompletions } from './file-upload-observation.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
+/** The filename sent to Slack and used in each upload's content digest. */
+export const OWN_POST_UPLOAD_FILENAME = 'file.txt'
+/** An upload refused by the final file guard before any upload call. */
+export const OWN_POST_UPLOAD_REFUSED = 'upload_refused'
 // Peer-PID + sessions.json registry have been deleted. The
 // agent-director library owns session state.
 
@@ -702,7 +706,7 @@ export interface SessionToolDeps {
    */
   log?: (line: string) => void
   /**
-   * Confirms each successful reply post to thread participation. Absent:
+   * Observes each reply chunk and upload's intent and answer. Absent:
    * nothing is observed and posting is unchanged.
    */
   ownPosts?: OwnPostObserver
@@ -1480,10 +1484,7 @@ export function createSessionServer(
           firstChunk = false
           clearAck()
         }
-        // Issued before the first post, so a later lifetime or identity change is visible at confirmation.
-        const ownPost = deps.ownPosts?.issue(persona.key, 'text', chatId)
-        const fileOwnPost = files?.length ? deps.ownPosts?.issue(persona.key, 'file', chatId) : undefined
-        let filePart = 0
+        const target = { channel: chatId, ...(threadTs ? { parent: threadTs } : {}) }
         // Confirmed parts survive any later failure; none is posted again.
         let sent = 0
         let uploaded = 0
@@ -1494,6 +1495,12 @@ export function createSessionServer(
           return toolError(replyPartialFailureText(prefix(), slackPlatformReason(err)))
         }
         for (const chunk of chunks) {
+          // Each call captures its own intent and waits only for that append.
+          let op: OwnPostStart | undefined
+          try {
+            op = deps.ownPosts?.start(persona.key, 'text', target, { kind: 'text', text: chunk })
+            if (op?.ready) await op.ready
+          } catch { /* join bookkeeping cannot stop the remaining parts */ }
           let res: Awaited<ReturnType<WebClient['chat']['postMessage']>>
           try {
             res = await web.chat.postMessage({
@@ -1504,18 +1511,19 @@ export function createSessionServer(
               unfurl_media: false,
             })
           } catch (err) {
+            try {
+              deps.ownPosts?.end(op?.operation, ownPostAnswerOfError(err))
+            } catch { /* join bookkeeping cannot stop the remaining parts */ }
             if (sent === 0) throw err
             return partialFailure(err)
           }
+          // Settle before reaction cleanup and before any other await.
+          try {
+            deps.ownPosts?.end(op?.operation, ownPostAnswerOfPost(chatId, res))
+          } catch { /* join bookkeeping cannot stop the remaining parts */ }
           sent++
           const ts = typeof res.ts === 'string' && res.ts !== '' ? res.ts : undefined
           lastTs = ts ?? lastTs
-          // Protection is published before reaction cleanup and before any await.
-          if (ownPost) {
-            try {
-              deps.ownPosts!.confirm(ownPost, { channel: chatId, ...(ts ? { ts } : {}), ...(threadTs ? { parent: threadTs } : {}), part: sent })
-            } catch { /* participation cannot stop the remaining authorized parts */ }
-          }
           succeeded()
         }
 
@@ -1523,9 +1531,24 @@ export function createSessionServer(
         // widen the window in which a symlink could be re-pointed at a file
         // the up-front pass would have refused.
         for (const filePath of files ?? []) {
+          let op: OwnPostStart | undefined
+          try {
+            const size = statSync(resolve(filePath)).size
+            op = deps.ownPosts?.start(persona.key, 'file', target, { kind: 'file', name: OWN_POST_UPLOAD_FILENAME, size })
+            if (op?.ready) await op.ready
+          } catch { /* missing metadata or join bookkeeping cannot stop the upload */ }
+          let ended = false
+          const endUpload = (answer: OwnPostAnswer) => {
+            if (ended) return
+            ended = true
+            try {
+              deps.ownPosts?.end(op?.operation, answer)
+            } catch { /* join bookkeeping cannot stop the remaining parts */ }
+          }
           try {
             assertSendable(filePath)
           } catch (err) {
+            endUpload({ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED })
             const posted = `${sent} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
             return toolError(
               `${err instanceof Error ? err.message : String(err)} ` +
@@ -1536,6 +1559,7 @@ export function createSessionServer(
           const uploadArgs: Record<string, any> = {
             channel_id: chatId,
             file: resolve(filePath),
+            filename: OWN_POST_UPLOAD_FILENAME,
           }
           if (threadTs) uploadArgs.thread_ts = threadTs
           // Each nested completion is confirmed in its own reaction, so a
@@ -1544,11 +1568,7 @@ export function createSessionServer(
           const onCompletion = (response: unknown) => {
             for (const file of completionFiles(response, chatId, threadTs)) {
               completed = true
-              if (!fileOwnPost) continue
-              try {
-                deps.ownPosts!.confirm(fileOwnPost, { channel: chatId, part: ++filePart, file: file.id,
-                  ...(threadTs ? { parent: threadTs } : file.root ? { ts: file.root } : {}) })
-              } catch { /* participation cannot stop the remaining authorized parts */ }
+              endUpload({ kind: 'confirmed', channel: chatId, file: file.id })
             }
             if (completed) succeeded()
           }
@@ -1557,7 +1577,9 @@ export function createSessionServer(
             // A client built without the observation reports its completions only in the aggregate.
             const responses = (result as { files?: unknown } | undefined)?.files
             if (!completed && Array.isArray(responses)) for (const response of responses) onCompletion(response)
+            endUpload({ kind: 'no-answer' })
           } catch (err) {
+            endUpload(ownPostAnswerOfError(err))
             if (!completed) {
               if (sent === 0 && uploaded === 0) throw err
               return partialFailure(err)

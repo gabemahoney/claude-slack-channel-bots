@@ -41,8 +41,8 @@
  *   derives the prompt again on a later tick.
  * - Notices are handed over with `deliver`. A persona that is not held (no
  *   episode open, no notice waiting) has the notice attempted at once, with
- *   the post issued before `deliver` first yields (so a channel destination
- *   keeps the raised order the notifier relies on). Otherwise the notice
+ *   the channel post issued before `deliver` first yields unless its
+ *   own-post intent needs to settle first. Otherwise the notice
  *   joins the persona's FIFO of held notices, behind the earlier ones, and
  *   nothing is attempted. When the persona's retry is due its own timer
  *   attempts the held notices in order, one at a time: the first failure
@@ -277,8 +277,8 @@ export interface PersonaDestinationHold {
   begin(key: string): HoldAttempt | undefined
   /**
    * Hand over one notice for the persona, whose client the caller has just
-   * read. Attempted at once when the persona is not held (the post issued
-   * before this first yields); held otherwise. Resolves once the immediate
+   * read. Attempted at once when the persona is not held (a channel post
+   * waits only for its own-post intent); held otherwise. Resolves once the immediate
    * attempt settles, or at once when the notice is held. Never rejects.
    */
   deliver(persona: Persona, client: DestinationSlackClient, notice: HoldNotice): Promise<void>
@@ -856,7 +856,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     }
     const started = entry.generation
     const at = attemptDestination(persona)
-    // Issued before the first `await` for a channel destination (the resolver's guarantee).
+    // A channel post is issued now unless the resolver must wait for its own-post intent.
     const result = await deps.destinations.post(persona, client, notice.message, NOTICE_POST)
     if (!isCurrent(entry)) return
     const settled = settleSafely(entry, started, persona, at, result)

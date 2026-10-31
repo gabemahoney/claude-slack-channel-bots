@@ -138,7 +138,7 @@ export interface NotifierStackDeps {
    * attempt, as `src/server.ts` passes it.
    */
   getPersonaConfig: () => DestinationConfig
-  /** The confirmed-own-post adapter the resolver reports each surfaced success to, as `src/server.ts` passes it. Default: none. */
+  /** The per-call observer: start before each surfaced Slack post, await its optional ready, then end with Slack's answer, as `src/server.ts` wires it. Default: none. */
   ownPosts?: OwnPostObserver
 }
 
@@ -271,6 +271,8 @@ export interface NotifierHarnessOptions {
    * `config`'s switch (declarative when it has none).
    */
   getPersonaConfig?: () => DestinationConfig
+  /** The per-call own-post observer passed through to the destination resolver. Default: none. */
+  ownPosts?: OwnPostObserver
 }
 
 export interface NotifierHarness {
@@ -370,6 +372,7 @@ export function makeNotifierHarness(
     log,
     ...(recorder !== undefined ? { recordStartupError: recorder } : {}),
     getPersonaConfig: opts.getPersonaConfig ?? (() => ({ channel_mode: config.channel_mode ?? 'strict' })),
+    ownPosts: opts.ownPosts,
   })
 
   function stub(key: string): StubSlack {

@@ -160,14 +160,15 @@
  *     line still leaves the short prompt to post next. Each line is
  * asserted with its text from its builder, whose
  *     literal texts one `pin:` case holds.
- * - Confirmed own posts: a prompt is registered at its success and a wedge
- *     warning latched, each confirmed once (`prompt`, `warning`) with Slack's
- *     channel and ts, through own-post confirmation, hold-settle and trail
- *     faults; a prompt whose own-post confirmation faults stays at its channel and ts after a
- *     destination change and is decided by a click on its own persona's
- *     connection only; a prompt without a ts is never reposted until a
- *     teardown forgets it. Through the ownerless observer `src/server.ts`
- *     wires, a prompt posts once and is registered.
+ * - Own-post operations: each prompt, fallback and warning starts and ends
+ *     separately. A held intent wait blocks posting and registration; later
+ *     ticks never duplicate it. Observer/owner, intent/outcome append, hold
+ *     and trail faults leave successful prompts registered and updateable.
+ *     A destination change keeps the original message answerable through its
+ *     own persona's connection. Real-owner prompts join their returned ts,
+ *     a rejected full prompt records none before its fallback joins, and off
+ *     channels and DMs register no own post. No observer still permits prompt
+ *     registration; a success without a ts is never reposted.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -237,7 +238,10 @@ import {
   makeStubClient,
   type CannedGetResult,
 } from './test-helpers/agent-director-stub.ts'
-import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeMultiPersonaConfig, makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
+import { holdOwnPostReady, makeOwnPostHarness, makeRecordingOwnPostObserver, type OwnPostHarness } from './test-helpers/own-post.ts'
+import { configBytes, makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { HUMAN_ONLY_SENTENCE } from './test-helpers/conflict-cases.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
@@ -5028,39 +5032,64 @@ describe('poller tick — a throw on one row, request or closed entry is caught 
   })
 })
 
-/**
- * A recording own-post adapter: each confirmation the resolver hands it, by
- * surface, channel and ts. With `fails`, each confirmation throws once
- * recorded (an own-post confirmation fault right after the success).
- */
-function recordingOwnPosts(fails = false) {
-  const confirmed: Array<{ surface: string; channel: string; ts?: string }> = []
-  const ownPosts: OwnPostObserver = {
-    start: () => undefined, end: () => {},
-    issue: (key, surface) => ({ key, surface, operation: `op-${confirmed.length}`, issuer: {} }),
-    confirm: (issue, posted) => {
-      confirmed.push({ surface: issue!.surface, channel: posted.channel, ...(posted.ts ? { ts: posted.ts } : {}) })
-      if (fails) throw new Error('injected own-post confirmation failure')
-    },
-  }
-  return { confirmed, ownPosts }
-}
-
 describe('a confirmed prompt or warning stays registered and latched through post-success faults', () => {
-  type Fault = 'own-post confirmation' | 'hold settle' | 'trail'
-  /** Persona A's poller over the real resolver and hold, its own-post adapter recording every confirmation unless `observer` replaces it. */
-  function confirmedScenario(fault?: Fault, observer?: OwnPostObserver) {
-    const logCalls: unknown[][] = []
-    const recording = recordingOwnPosts(fault === 'own-post confirmation')
-    const { confirmed } = recording, ownPosts = observer ?? recording.ownPosts
+  const POST_TS = THREAD_ROOTS.primary
+  type Fault = 'observer start' | 'observer end' | 'owner end' | 'intent append' | 'outcome append' | 'hold settle' | 'trail'
+  const cleanups: Array<() => void | Promise<void>> = []
+  afterEach(async () => {
+    const failures: unknown[] = []
+    for (const cleanup of cleanups.splice(0).reverse()) {
+      try { await cleanup() } catch (error) { failures.push(error) }
+    }
+    if (failures.length) throw new AggregateError(failures, 'permission own-post cleanup failed')
+  })
+
+  /** Same applied config feeds the poller, resolver, membership and own-post owner. */
+  async function realOwner(delivery: 'thread_hybrid' | 'off' = 'thread_hybrid', destination = A_DEST) {
+    const dir = mkdtempSync(join(tmpdir(), 'poller-own-post-'))
+    cleanups.push(() => { rmSync(dir, { recursive: true, force: true }) })
+    const members = makeMembershipHarness(dir, {
+      mode: 'strict', names: [NAME_A], channels: [{ id: A_DEST, delivery }],
+    })
+    cleanups.push(() => members.close())
+    const input = makePersonaConfigInput({ channel_mode: 'strict', personas: [makePersona({
+      name: NAME_A, channels: [{ id: A_DEST, delivery }], permission_prompts: destination,
+      dm: { enabled: true, contact: D_CONTACT },
+    }, dir)] }, dir)
+    expect(members.authority.applyReviewed(configBytes(input), members.authority.revision).kind).toBe('applied')
+    members.h.stub(members.h.p(NAME_A)).script.inventory.push(membershipPage([A_DEST]))
+    await members.start()
+    await members.scan()
+    const h = await makeOwnPostHarness(dir, { members })
+    cleanups.push(() => h.close())
+    config = h.authority.config()
+    A = config.personas[0]!
+    return h
+  }
+
+  /** Persona A's poller over the real resolver and fake-clock destination hold. */
+  function confirmedScenario(fault?: Fault, observer?: OwnPostObserver | null, owner?: OwnPostHarness) {
+    const logCalls: unknown[][] = [], ownerFaults: string[] = []
+    const failure = new Error(sentinelInMessage('own-post fault'))
+    const recording = makeRecordingOwnPostObserver(Array.from({ length: 3 }, () => ({
+      ...(fault === 'observer start' ? { throwStart: failure } : {}),
+      ...(fault === 'observer end' || fault === 'owner end' ? { throwEnd: failure } : {}),
+    })))
+    const ownPosts = observer === null ? undefined : observer ?? (fault === 'owner end'
+      ? createOwnPostObserver(() => ({ startOperation: recording.observer.start, endOperation: recording.observer.end }),
+        error => { ownerFaults.push(describeThrownValue(error)) })
+      : recording.observer)
     const log = (line: string): void => {
       logCalls.push([line])
       if (fault === 'hold settle' && line.includes(': cleared: ')) throw new Error('injected settle failure')
     }
-    const destinations = createPersonaDestinations({ log, getPersonaConfig: () => config, ownPosts })
-    const clock = createFakeClock()
-    const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor: clients.clientFor, clock, log })
+    const currentConfig = () => owner?.authority.config() ?? config
+    const currentPersona = (key: string) => currentConfig().personas.find(p => p.key === key)
+    const destinations = createPersonaDestinations({ log, getPersonaConfig: currentConfig, ownPosts })
+    const clock = owner?.clock ?? createFakeClock()
+    const hold = createPersonaDestinationHold({ destinations, getPersona: currentPersona, clientFor: clients.clientFor, clock, log })
     const trail = makeTrailCapture()
+    let trailFaults = 0
     let open: PermissionRequestRow[] = [requestA()]
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow()] }),
@@ -5068,84 +5097,233 @@ describe('a confirmed prompt or warning stays registered and latched through pos
       getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
         cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
     }), {
-      destinations, destinationHold: hold, log: (...args) => { logCalls.push(args) },
+      destinations, destinationHold: hold, getPersona: currentPersona, log: (...args) => { logCalls.push(args) },
       emitTrail: (event) => {
-        if (fault === 'trail' && event.event === 'cscb.chat_post.attempted' && event['ok'] === true) throw new Error('injected trail failure')
+        if (fault === 'trail' && (event.event === 'cscb.chat_post.attempted' || event.event === 'cscb.poller.wedge_detected') && event['ok'] === true) {
+          trailFaults++
+          throw new Error('injected trail failure')
+        }
         trail.emit(event)
       },
     })
-    return { ivl, clock, logCalls, confirmed, trail, close: (rows: PermissionRequestRow[]) => { open = rows } }
+    cleanups.push(() => { assertNoLeak({ logCalls, trail: trail.events, ownerFaults, events: owner?.events }) })
+    const tick = async () => { ivl.fire(); await clock.flush() }
+    return { ivl, tick, clock, logCalls, recording, ownerFaults, trail, trailFaults: () => trailFaults, close: (rows: PermissionRequestRow[]) => { open = rows } }
+  }
+
+  /** Exact ordered start/end pairs, with a distinct operation for each actual Slack call. */
+  function expectOperations(recording: ReturnType<typeof makeRecordingOwnPostObserver>, surface: 'prompt' | 'warning',
+    answers: Array<Parameters<OwnPostObserver['end']>[1]>, channel = A_DEST) {
+    expect(recording.calls).toHaveLength(answers.length * 2)
+    const operations = []
+    for (const [i, answer] of answers.entries()) {
+      const start = recording.calls[i * 2]!
+      expect(start).toMatchObject({ kind: 'start', key: KEY_A, surface, target: { channel },
+        content: { kind: 'text', text: posts(stubA)[i]!.text } })
+      if (start.kind !== 'start') throw new Error('expected own-post start')
+      expect(start.operation).toBeDefined()
+      operations.push(start.operation)
+      const end = recording.calls[i * 2 + 1]!
+      expect(end).toEqual({ kind: 'end', operation: start.operation, answer })
+      if (end.kind !== 'end') throw new Error('expected own-post end')
+      expect(end.operation).toBe(start.operation)
+    }
+    expect(new Set(operations).size).toBe(answers.length)
   }
 
   test.each<[Fault, 'full' | 'short']>([
-    ['own-post confirmation', 'full'], ['own-post confirmation', 'short'], ['trail', 'full'], ['trail', 'short'], ['hold settle', 'full'],
-  ])('%s fault after a %s prompt posts: registered with its returned channel and ts, never posted again or replaced by a fallback', async (fault, form) => {
-    const s = confirmedScenario(fault)
-    if (fault === 'hold settle') stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
-    if (form === 'short') stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
-    scriptPostTs(stubA, POST_TS)
-    await s.ivl.tick()
-    if (fault === 'hold settle') { await s.clock.advance(5000); await s.ivl.tick() }
-    if (form === 'short') await s.ivl.tick()
+    ['observer start', 'full'], ['observer start', 'short'],
+    ['observer end', 'full'], ['observer end', 'short'], ['owner end', 'full'], ['owner end', 'short'],
+    ['intent append', 'full'], ['intent append', 'short'], ['outcome append', 'full'], ['outcome append', 'short'],
+    ['trail', 'full'], ['trail', 'short'], ['hold settle', 'full'],
+  ])('%s fault with a %s prompt: posts once, remains registered, and closes at its returned channel and ts', async (fault, form) => {
+    const owner = fault === 'intent append' || fault === 'outcome append' ? await realOwner() : undefined
+    const s = confirmedScenario(fault, owner?.observer, owner)
+    if (fault === 'hold settle') {
+      stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
+      await s.tick()
+      await s.clock.advance(5000)
+    }
+    if (form === 'short') {
+      stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+      await s.tick()
+      expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    }
+    if (fault === 'intent append') owner!.io.fail('writeSync', KEY_A)
+    const pending = makeDeferredWebApiCall()
+    stubA.script.post.push(pending.outcome)
+    await s.tick()
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
     const attempts = 1 + (fault === 'hold settle' ? 1 : 0) + (form === 'short' ? 1 : 0)
     expect(posts(stubA)).toHaveLength(attempts)
+    if (fault === 'outcome append') {
+      expect(owner!.records(KEY_A).filter(r => r.kind === 'post-intent')).toHaveLength(form === 'short' ? 2 : 1)
+      owner!.io.fail('writeSync', KEY_A)
+    }
+    pending.settle({ kind: 'ok', result: { ts: POST_TS } })
+    await s.clock.flush()
     if (form === 'short') expect(posts(stubA).at(-1)!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
-    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
-    for (let n = 0; n < 3; n++) await s.ivl.tick()
+    for (let n = 0; n < 3; n++) await s.tick()
     expect(posts(stubA)).toHaveLength(attempts)
-    expect(s.confirmed).toHaveLength(1)
-    // The original conversation still closes through the registered entry.
+    if (owner) {
+      expect(owner.view(KEY_A, A_DEST, POST_TS)).toBe('joined')
+      expect(owner.events.filter(e => e.type === 'registered')).toHaveLength(attempts)
+      expect(owner.threads.events.filter(e => e.type === 'append-failed')).toHaveLength(1)
+      const records = owner.records(KEY_A)
+      expect(records.filter(r => r.kind === 'post-intent')).toHaveLength(fault === 'intent append' ? attempts - 1 : attempts)
+      expect(records.filter(r => r.kind === 'post-outcome').map(r => r.outcome)).toEqual(form === 'short' ? ['none'] : [])
+    } else if (fault === 'observer start') {
+      expect(s.recording.calls).toHaveLength(attempts * 2)
+      expect(s.recording.calls.filter(c => c.kind === 'start')).toHaveLength(attempts)
+      expect(s.recording.calls.at(-1)).toEqual({ kind: 'end', operation: undefined,
+        answer: { kind: 'confirmed', channel: A_DEST, ts: POST_TS } })
+    } else {
+      expectOperations(s.recording, 'prompt', [
+        ...(fault === 'hold settle' ? [{ kind: 'failed' as const, code: 'not_in_channel' }] : []),
+        ...(form === 'short' ? [{ kind: 'failed' as const, code: 'invalid_blocks' }] : []),
+        { kind: 'confirmed', channel: A_DEST, ts: POST_TS },
+      ])
+    }
+    if (fault === 'owner end') expect(s.ownerFaults).toHaveLength(attempts)
+    if (fault === 'trail') expect(s.trailFaults()).toBe(1)
     s.close([])
-    await s.ivl.tick()
-    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
-    expect(s.confirmed).toHaveLength(1)
-    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, `${fault} after ${form} prompt`)
+    await s.tick()
+    expect(updates(stubA).map(c => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(posts(stubA)).toHaveLength(attempts)
+    expect(slackCalls(stubB, stubD)).toBe(0)
   })
 
-  test('through the ownerless observer src/server.ts wires, a prompt posts once and is registered with its channel and ts', async () => {
-    const s = confirmedScenario(undefined, createOwnPostObserver(() => undefined))
+  test.each(['full', 'short'] as const)('%s prompt has one operation per call, including a failed full prompt before its fallback', async form => {
+    const s = confirmedScenario()
+    if (form === 'short') stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
     scriptPostTs(stubA, POST_TS)
-    for (let n = 0; n < 4; n++) await s.ivl.tick()
-    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
-    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
-    expect(chatPosts(s.trail).filter((e) => e['ok'] === true)).toHaveLength(1)
-    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'prompt through the ownerless observer')
+    await s.tick()
+    if (form === 'short') {
+      expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+      expectOperations(s.recording, 'prompt', [{ kind: 'failed', code: 'invalid_blocks' }])
+      await s.tick()
+      expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    }
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA)).toHaveLength(form === 'short' ? 2 : 1)
+    expectOperations(s.recording, 'prompt', [
+      ...(form === 'short' ? [{ kind: 'failed' as const, code: 'invalid_blocks' }] : []),
+      { kind: 'confirmed', channel: A_DEST, ts: POST_TS },
+    ])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
   })
 
-  test('a prompt Slack confirms without a ts is posted but not answerable: never registered, never posted again, its line says so', async () => {
+  test.each(['resolve', 'reject'] as const)('ready held then %s: no early post or registration, and overlapping ticks never duplicate it', async settlement => {
+    const ready = holdOwnPostReady()
+    const recording = makeRecordingOwnPostObserver([{ ready: ready.ready }])
+    const s = confirmedScenario(undefined, recording.observer)
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    expect(recording.calls).toHaveLength(1)
+    expect(recording.calls[0]).toMatchObject({ kind: 'start', surface: 'prompt', target: { channel: A_DEST } })
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA)).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(recording.calls).toHaveLength(1)
+    if (settlement === 'resolve') ready.resolve()
+    else ready.reject(new Error(sentinelInMessage('intent wait failed')))
+    await s.clock.flush()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    await s.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expectOperations(recording, 'prompt', [{ kind: 'confirmed', channel: A_DEST, ts: POST_TS }])
+  })
+
+  test.each(['full', 'short'] as const)('%s prompt joins its returned ts through the real owner; only a failed full prompt records none', async form => {
+    const h = await realOwner()
+    const s = confirmedScenario(undefined, h.observer, h)
+    if (form === 'short') {
+      stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+      await s.tick()
+      expect(h.view(KEY_A, A_DEST, POST_TS)).toBe('not-joined')
+      expect(h.records(KEY_A).filter(r => r.kind === 'post-outcome').map(r => r.outcome)).toEqual(['none'])
+    }
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    for (let n = 0; n < 3; n++) await s.tick()
+    const count = form === 'short' ? 2 : 1
+    expect(posts(stubA)).toHaveLength(count)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(h.view(KEY_A, A_DEST, POST_TS)).toBe('joined')
+    const intents = h.records(KEY_A).filter(r => r.kind === 'post-intent')
+    const outcomes = h.records(KEY_A).filter(r => r.kind === 'post-outcome')
+    expect(intents).toHaveLength(count)
+    expect(outcomes.map(r => [r.operationId, r.outcome])).toEqual(intents.map((r, i) => [r.operationId, i === count - 1 ? 'joined' : 'none']))
+    expect(new Set(intents.map(r => r.operationId)).size).toBe(count)
+    expect(h.events.filter(e => e.type === 'registered')).toHaveLength(count)
+    const reopened = await h.reopen()
+    cleanups.push(() => reopened.close())
+    expect(reopened.view(KEY_A, A_DEST, POST_TS)).toBe('joined')
+  })
+
+  test.each(['off', 'dm'] as const)('%s destination posts and stays answerable but registers no own-post operation or join', async destination => {
+    const channel = destination === 'dm' ? D_DM : A_DEST
+    const h = await realOwner(destination === 'off' ? 'off' : 'thread_hybrid', destination === 'dm' ? DM_DESTINATION : A_DEST)
+    const s = confirmedScenario(undefined, h.observer, h)
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA).map(c => c.channel)).toEqual([channel])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: channel, messageTs: POST_TS })
+    expect(h.events).toEqual([])
+    expect(h.read.pendingOwnPosts(KEY_A, channel)).toEqual([])
+    expect(h.records(KEY_A).filter(r => r.kind === 'post-intent' || r.kind === 'join')).toEqual([])
+    expect(h.view(KEY_A, channel, POST_TS)).not.toBe('joined')
+    s.close([])
+    await s.tick()
+    expect(updates(stubA).map(c => [c.channel, c.ts])).toEqual([[channel, POST_TS]])
+  })
+
+  test('with no observer, a prompt posts once and registers its channel and ts', async () => {
+    const s = confirmedScenario(undefined, null)
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < 4; n++) await s.tick()
+    expect(posts(stubA).map(c => c.channel)).toEqual([A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+    expect(chatPosts(s.trail).filter(e => e['ok'] === true)).toHaveLength(1)
+  })
+
+  test('a prompt returned without a ts is posted but not answerable: never registered or posted again', async () => {
     const s = confirmedScenario()
     scriptPostTs(stubA, undefined)
-    for (let n = 0; n < 4; n++) await s.ivl.tick()
+    for (let n = 0; n < 4; n++) await s.tick()
     expect(posts(stubA)).toHaveLength(1)
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
-    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST }])
+    expectOperations(s.recording, 'prompt', [{ kind: 'no-answer' }])
     expect(logLines(s.logCalls, buildPromptPostedWithoutTsLine(INSTANCE_A, TOKEN_A))).toHaveLength(1)
-    expect(chatPosts(s.trail).filter((e) => e['ok'] === true)).toHaveLength(1)
+    expect(chatPosts(s.trail).filter(e => e['ok'] === true)).toHaveLength(1)
   })
 
-  test('a real Slack failure confirms nothing and is retried; the later success is the one confirmation', async () => {
+  test('a Slack destination failure ends failed; its later retry has a separate successful operation', async () => {
     const s = confirmedScenario()
     stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
     scriptPostTs(stubA, POST_TS)
-    await s.ivl.tick()
-    expect(s.confirmed).toEqual([])
+    await s.tick()
+    expectOperations(s.recording, 'prompt', [{ kind: 'failed', code: 'not_in_channel' }])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
     await s.clock.advance(5000)
-    await s.ivl.tick()
-    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
+    await s.tick()
+    expectOperations(s.recording, 'prompt', [
+      { kind: 'failed', code: 'not_in_channel' }, { kind: 'confirmed', channel: A_DEST, ts: POST_TS },
+    ])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ messageTs: POST_TS })
   })
 
-  test('a prompt whose own-post confirmation faults stays answerable: a destination change leaves it at its original channel and ts, a click through the real handler decides it there, and another persona\'s connection cannot', async () => {
-    const s = confirmedScenario('own-post confirmation')
+  test('a prompt whose observer end throws stays answerable at its original destination, only through its own persona connection', async () => {
+    const s = confirmedScenario('observer end')
     scriptPostTs(stubA, POST_TS)
-    await s.ivl.tick()
+    await s.tick()
     reconfigure(KEY_A, { permission_prompts: A_WORK })
-    await s.ivl.tick()
+    await s.tick()
     expect(posts(stubA)).toHaveLength(1)
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
-
     const decided: DecideParams[] = []
     const decider = { decide: async (params: DecideParams) => { decided.push(params); return cannedDecideResult('delivered') } }
     initOutageState({ getClient: () => decider as unknown as AgentDirectorClient, notify: () => {} })
@@ -5156,32 +5334,20 @@ describe('a confirmed prompt or warning stays registered and latched through pos
     expect(decided).toEqual([])
     expect(await click(KEY_A)).toBe(true)
     expect(decided).toEqual([{ instance_id: INSTANCE_A, request_token: TOKEN_A, decision: 'allow' }])
-    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(updates(stubA).map(c => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ handled: true })
     expect(slackCalls(stubB, stubD)).toBe(0)
     expect(posts(stubA)).toHaveLength(1)
-    expect(s.confirmed).toEqual([{ surface: 'prompt', channel: A_DEST, ts: POST_TS }])
-    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'own-post confirmation faulted prompt answered')
+    expectOperations(s.recording, 'prompt', [{ kind: 'confirmed', channel: A_DEST, ts: POST_TS }])
   })
 
-  test.each<['none' | 'own-post confirmation' | 'trail']>([['none'], ['own-post confirmation'], ['trail']])(
-    'a wedge warning is confirmed once as a warning own post at its destination and, with fault %s after it posts, stays latched: one warning however many empty ticks follow',
-    async (fault) => {
-      const own = recordingOwnPosts(fault === 'own-post confirmation')
-      const log = (line: string): void => { s.logCalls.push([line]) }
-      const s = makeNotUpScenario(
-        (e) => fault === 'trail' && e.event === 'cscb.poller.wedge_detected' && e['ok'] === true ? new Error('injected trail failure') : undefined,
-        { destinations: createPersonaDestinations({ log, getPersonaConfig: () => config, ownPosts: own.ownPosts }) },
-      )
-      s.listed.delete(B)
-      scriptPostTs(stubA, POST_TS)
-      await s.drive(K)
-      expect(wedgeWarnings().map((c) => c.channel)).toEqual([A_DEST])
-      expect(own.confirmed).toEqual([{ surface: 'warning', channel: A_DEST, ts: POST_TS }])
-      await s.drive(K * 2)
-      expect(wedgeWarnings()).toHaveLength(1)
-      expect(own.confirmed).toHaveLength(1)
-      assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, `wedge warning, ${fault} fault`)
-    },
-  )
+  test.each(['none', 'observer end', 'trail'] as const)('warning operation stays latched through %s fault', async fault => {
+    const s = confirmedScenario(fault === 'none' ? undefined : fault)
+    s.close([])
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < K * 3; n++) await s.tick()
+    expect(wedgeWarnings().map(c => c.channel)).toEqual([A_DEST])
+    expectOperations(s.recording, 'warning', [{ kind: 'confirmed', channel: A_DEST, ts: POST_TS }])
+    if (fault === 'trail') expect(s.trailFaults()).toBe(1)
+  })
 })

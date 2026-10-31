@@ -60,6 +60,10 @@
  * each case). No token is used; every stub carries `LEAK_SENTINEL` and
  * `afterEach` runs `assertNoLeak` over every captured log line, post and
  * startup-errors entry, and the written `startup-errors.log`.
+ * Own-post cases use the real notifier/hold/resolver with the shared recording
+ * observer or the real owner over scratch Thread Memory. Intent waits preserve
+ * raised order without hold timers; observer faults and failed persistence keep
+ * posting independent of bookkeeping. Only eligible channel notices join.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
@@ -90,12 +94,15 @@ import {
 } from '../src/persona-notifier.ts'
 import { createPersonaDestinations, type DestinationFailure } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold } from '../src/persona-destination-hold.ts'
+import { createOwnPostObserver, type OwnPostAnswer } from '../src/own-post.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type NotifierHarness } from './test-helpers/persona-notifier.ts'
-import { stubOpenedDmId, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeDeferredWebApiCall, stubOpenedDmId, type SettledWebApiOutcome, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { holdOwnPostReady, makeOwnPostHarness, makeRecordingOwnPostObserver } from './test-helpers/own-post.ts'
+import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
@@ -1536,4 +1543,177 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.startupEntries()[0]!.text).toContain('<redacted-token>')
     assertNoLeak({ lines: h.logs, entries: h.startupEntries(), file: writtenFile(h.startupErrorsPath) })
   })
+})
+
+describe('notices as own-post operations', () => {
+  const ts = '1700000000.000951'
+  const answers: Array<{ label: string; outcome: SettledWebApiOutcome; answer: OwnPostAnswer }> = [
+    { label: 'confirmed', outcome: { kind: 'ok', result: { ts } }, answer: { kind: 'confirmed', channel: '', ts } },
+    { label: 'payload refused', outcome: { kind: 'platform', error: 'invalid_blocks' }, answer: { kind: 'failed', code: 'invalid_blocks' } },
+    { label: 'no answer', outcome: { kind: 'network' }, answer: { kind: 'no-answer' } },
+  ]
+
+  for (const destination of ['channel', 'dm'] as const) {
+    test.each(answers)(`${destination}: $label is observed once with the actual target and posted text`, async row => {
+      const recording = makeRecordingOwnPostObserver()
+      h = makeNotifierHarness({ personas: [f.A, f.B, f.D] }, { ownPosts: recording.observer, leakMarker: LEAK_SENTINEL })
+      const persona = destination === 'channel' ? f.A : f.D
+      const channel = destination === 'channel' ? persona.permission_prompts! : stubOpenedDmId(persona.dm.contact!)
+      const slack = makeDeferredWebApiCall()
+      h.stub(persona.key).script.post.push(slack.outcome)
+      const text = 'First line\n  second line stays intact'
+      const work = h.notifier.notify(persona.key, text)
+      await h.clock.flush()
+      const starts = recording.calls.filter(call => call.kind === 'start')
+      expect(starts).toHaveLength(1)
+      expect(recording.calls).toEqual([{
+        kind: 'start', key: persona.key, surface: 'notice', target: { channel },
+        content: { kind: 'text', text: formatPersonaNotice(persona, text) }, operation: starts[0]!.operation,
+      }])
+      expect(starts[0]!.operation).toBeDefined()
+      expect(h.posts(persona.key)).toEqual([{ channel, text: formatPersonaNotice(persona, text) }])
+      expect(h.totalPosts()).toBe(1)
+      expect(h.stub(persona.key).callLog.map(call => call.method)).toEqual(
+        destination === 'dm' ? ['conversations.open', 'chat.postMessage'] : ['chat.postMessage'],
+      )
+      slack.settle(row.outcome)
+      await work
+      expect(recording.calls).toHaveLength(2)
+      expect(recording.calls[1]).toEqual({ kind: 'end', operation: starts[0]!.operation,
+        answer: row.answer.kind === 'confirmed' ? { ...row.answer, channel } : row.answer })
+      const end = recording.calls[1]!
+      expect(end.operation).toBe(starts[0]!.operation)
+      expect(h.totalPosts()).toBe(1)
+      assertNoLeak({ posts: h.allPosts(), logs: h.logs, observations: recording.calls })
+    })
+  }
+
+  test.each([{ validated: true }, { validated: false }])('all intent waits preserve raised order without timers (validated=$validated)', async ({ validated }) => {
+    const gates = [holdOwnPostReady(), holdOwnPostReady(), holdOwnPostReady()]
+    const recording = makeRecordingOwnPostObserver(gates.map(gate => ({ ready: gate.ready })))
+    h = makeNotifierHarness({ personas: [f.A] }, { validated, ownPosts: recording.observer, leakMarker: LEAK_SENTINEL })
+    const bodies = ['first notice', 'second notice', 'third notice']
+    const work = bodies.map(body => h.notifier.notify(f.A.key, body))
+    if (!validated) {
+      await Promise.all(work)
+      expect(recording.calls).toEqual([])
+      h.validate(f.A.key)
+      work.push(h.notifier.flush(f.A.key))
+    }
+    await h.clock.flush()
+    const starts = recording.calls.filter(call => call.kind === 'start')
+    expect(starts.map(call => call.content)).toEqual(bodies.map(body => ({ kind: 'text', text: formatPersonaNotice(f.A, body) })))
+    expect(new Set(starts.map(call => call.operation)).size).toBe(bodies.length)
+    expect(h.totalPosts()).toBe(0)
+    expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
+    expect(h.clock.pending()).toEqual([])
+    for (const [index, gate] of gates.entries()) {
+      gate.resolve()
+      await h.clock.flush()
+      expect(h.posts(f.A.key)).toEqual(bodies.slice(0, index + 1).map(body => ({
+        channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, body),
+      })))
+      expect(recording.calls.filter(call => call.kind === 'end').map(call => call.operation)).toEqual(
+        starts.slice(0, index + 1).map(call => call.operation),
+      )
+      expect(recording.calls.filter(call => call.kind === 'end')[index]!.operation).toBe(starts[index]!.operation)
+      expect(h.clock.pending()).toEqual([])
+    }
+    await Promise.all(work)
+    expect(h.clock.firedCount()).toBe(0)
+    expect(h.logs).toEqual([])
+    assertNoLeak({ posts: h.allPosts(), logs: h.logs, observations: recording.calls })
+  })
+
+  test.each(['observer start', 'observer end', 'owner start', 'owner end'] as const)(
+    '%s throwing preserves the observer-free posts, logs and hold state', async fault => {
+      const failure = new Error(sentinelInMessage('notice-bookkeeping'))
+      const recording = makeRecordingOwnPostObserver(Array.from({ length: 3 }, () =>
+        fault === 'observer start' ? { throwStart: failure } : fault === 'observer end' ? { throwEnd: failure } : {}))
+      let ownerCalls = 0
+      const ownerObserver = createOwnPostObserver(() => ({
+        startOperation(...args) {
+          if (fault === 'owner start') { ownerCalls++; throw failure }
+          return recording.observer.start(...args)
+        },
+        endOperation() { ownerCalls++; throw failure },
+      }))
+      const config = { personas: [f.A] }
+      const baseline = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL })
+      h = makeNotifierHarness(config, { ownPosts: fault.startsWith('owner') ? ownerObserver : recording.observer, leakMarker: LEAK_SENTINEL })
+      try {
+        for (const fixture of [baseline, h]) {
+          fixture.stub(f.A.key).script.post.push({ kind: 'ok', result: { ts } }, { kind: 'platform', error: 'invalid_blocks' }, { kind: 'ok', result: { ts } })
+          for (const body of ['before failure', 'refused payload', 'after failure']) await fixture.notifier.notify(f.A.key, body)
+        }
+        expect(baseline.totalPosts()).toBe(3)
+        expect(baseline.logs).toHaveLength(1)
+        expect(h.allPosts()).toEqual(baseline.allPosts())
+        expect(h.logs).toEqual(baseline.logs)
+        expect(h.hold.view(f.A.key)).toEqual(baseline.hold.view(f.A.key))
+        expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
+        expect(h.clock.pending()).toEqual([])
+        if (fault.startsWith('owner')) expect(ownerCalls).toBe(3)
+        else expect(recording.calls.filter(call => call.kind === (fault === 'observer start' ? 'start' : 'end'))).toHaveLength(3)
+      } finally {
+        baseline.hold.cancelAll()
+        try { assertNoLeak({ posts: baseline.allPosts(), logs: baseline.logs, actualPosts: h.allPosts(), actualLogs: h.logs }) }
+        finally { baseline.cleanup() }
+      }
+    },
+  )
+
+  test.each(['thread_hybrid', 'off', 'dm', 'intent append failure', 'outcome append failure'] as const)(
+    '%s through the real owner keeps notice delivery independent of joins', async scenario => {
+      const channel = SHARED_CHANNEL_IDS.primary
+      const owner = await makeOwnPostHarness(dir, { membership: {
+        channels: [{ id: channel, delivery: scenario === 'off' ? 'off' : 'thread_hybrid' }],
+      } })
+      const persona = { ...owner.authority.config().personas[0]!, permission_prompts: scenario === 'dm' ? DM_DESTINATION : channel }
+      const config = { ...owner.authority.config(), personas: [persona] }
+      const baseline = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL })
+      h = makeNotifierHarness(config, { getPersonaConfig: owner.authority.config, ownPosts: owner.observer, leakMarker: LEAK_SENTINEL })
+      try {
+        const target = scenario === 'dm' ? stubOpenedDmId(persona.dm.contact!) : channel
+        const excluded = scenario === 'off' || scenario === 'dm'
+        const appendFails = scenario === 'intent append failure' || scenario === 'outcome append failure'
+        const slack = makeDeferredWebApiCall()
+        h.stub(persona.key).script.post.push(slack.outcome)
+        baseline.stub(persona.key).script.post.push({ kind: 'ok', result: { ts } })
+        if (scenario === 'intent append failure') owner.io.fail('writeSync', persona.key)
+        const work = h.notifier.notify(persona.key, 'Owner-backed notice')
+        await owner.flush()
+        await h.clock.flush()
+        expect(h.totalPosts()).toBe(1)
+        expect(owner.records(persona.key).filter(record => record.kind === 'post-intent')).toHaveLength(
+          excluded || scenario === 'intent append failure' ? 0 : 1,
+        )
+        if (scenario === 'outcome append failure') owner.io.fail('writeSync', persona.key)
+        slack.settle({ kind: 'ok', result: { ts } })
+        await work
+        await owner.flush()
+        await baseline.notifier.notify(persona.key, 'Owner-backed notice')
+        expect(h.posts(persona.key)).toEqual([{ channel: target, text: formatPersonaNotice(persona, 'Owner-backed notice') }])
+        expect(h.allPosts()).toEqual(baseline.allPosts())
+        expect(h.logs).toEqual(baseline.logs)
+        expect(h.hold.view(persona.key)).toEqual(baseline.hold.view(persona.key))
+        expect(h.hold.view(persona.key)).toEqual(NOT_HELD)
+        expect(h.clock.pending()).toEqual([])
+        expect(owner.events.filter(event => event.type === 'registered')).toHaveLength(excluded ? 0 : 1)
+        expect(owner.read.pendingOwnPosts(persona.key, target)).toEqual([])
+        expect(owner.view(persona.key, target, ts)).toBe(excluded ? 'not-joined' : 'joined')
+        const records = owner.records(persona.key)
+        expect(records.filter(record => record.kind === 'post-outcome').map(record => record.outcome)).toEqual(
+          excluded || appendFails ? [] : ['joined'],
+        )
+        expect(owner.threads.events.filter(event => event.type === 'append-failed')).toHaveLength(appendFails ? 1 : 0)
+        expect(owner.memory.hasKeptJoin(persona.key, target, ts)).toBe(appendFails)
+        assertNoLeak({ posts: h.allPosts(), logs: h.logs, owner: owner.captured() })
+      } finally {
+        baseline.hold.cancelAll()
+        try { assertNoLeak({ posts: baseline.allPosts(), logs: baseline.logs, ownerEvents: owner.events }) }
+        finally { baseline.cleanup(); await owner.close() }
+      }
+    },
+  )
 })

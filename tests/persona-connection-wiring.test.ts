@@ -116,7 +116,7 @@ import {
   openArchiveDatabase,
   type NameResolverWebClient,
 } from '../src/message-archive.ts'
-import { createSessionServer, registerSession, type SessionToolDeps } from '../src/registry.ts'
+import { createSessionServer, OWN_POST_UPLOAD_FILENAME, registerSession, type SessionToolDeps } from '../src/registry.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
@@ -1039,7 +1039,7 @@ describe('carry: reply file uploads go through the manager\'s long-lived client 
     expect(result.isError).toBeUndefined()
     expect(postSpy).toHaveBeenCalledTimes(1)
     expect(uploadSpy).toHaveBeenCalledTimes(1)
-    expect(uploadSpy.mock.calls[0]![0]).toEqual({ channel_id: CA, file } as never)
+    expect(uploadSpy.mock.calls[0]![0]).toEqual({ channel_id: CA, file, filename: OWN_POST_UPLOAD_FILENAME } as never)
     expect(h.stub(h.A).calls.filesUploadV2).toHaveLength(1)
     expect(slackCalls(h.stub(h.B))).toBe(bBefore)
     assertNoLeak({ result, consoleLines })

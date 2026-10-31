@@ -1,5 +1,5 @@
 /**
- * own-post.ts — The bot's own posts: the surfaces that confirm one, the
+ * own-post.ts — The bot's own posts: per-call operations on each surface, the
  * observer that keeps a post's success apart from the bookkeeping after it,
  * own-post channel eligibility, and the reading of upload completions.
  *
@@ -15,18 +15,15 @@
 import { CHANNEL_ID_RE, channelModeOf, type ChannelMode, type DeliveryMode, type Persona, type ServerSettings } from './config.ts'
 import { isThreadTimestamp, personaListsChannel, type StoredChoices } from './delivery-decision.ts'
 import type { MembershipReading } from './channel-membership.ts'
-import type { SharedChannelLifetime } from './shared-channels.ts'
 import { slackPlatformReason } from './persona-connection-errors.ts'
 export type { OwnPostContent } from './thread-memory.ts'
 import type { OwnPostContent } from './thread-memory.ts'
 export { createOwnPostJoins } from './own-post-joins.ts'
 export type { OwnPostJoins, OwnPostJoinsDeps, PendingOwnPost, OwnPostEvent, OwnPostOutcome } from './own-post-joins.ts'
 
-/** Surfaces that confirm an own post. `file` is reserved for upload completions. */
+/** Surfaces that start an own-post operation. `file` is reserved for uploads. */
 export const OWN_POST_SURFACES = ['text', 'prompt', 'warning', 'notice', 'file'] as const
 export type OwnPostSurface = typeof OWN_POST_SURFACES[number]
-/** The authenticated identity that issued a post, captured before its await. */
-export interface OwnPostIssuer { botUserId?: string; botId?: string }
 
 // ---------------------------------------------------------------------------
 // Own-post eligibility
@@ -96,32 +93,6 @@ export function ownPostEligibility(sources: OwnPostEligibilitySources): (key: st
 // Post-success separation
 // ---------------------------------------------------------------------------
 
-/** Captured before the post's await, so a replacement identity or lifetime is never rebound. */
-export interface OwnPostIssue {
-  key: string
-  surface: OwnPostSurface
-  operation: string
-  incarnation?: string
-  /** The persona's reset order, when the channel was known at issue. */
-  resetOrder?: number
-  /** The channel the post was issued for, when known before the post. */
-  channel?: string
-  /** That channel's whole lifetime at issue: a leave, rejoin or reset since supersedes the post. */
-  lifetime?: SharedChannelLifetime
-  issuer: OwnPostIssuer
-  /** Epoch milliseconds at issue, before the post's await. */
-  issuedAt?: number
-}
-/** What Slack's success response showed: the actual channel and returned timestamp. */
-export interface OwnPostPosted {
-  channel: string
-  ts?: string
-  parent?: string
-  /** 1-based part within the operation; one when absent. */
-  part?: number
-  /** A completed file's ID (`file` surface); `ts` then only when its own share named the root. */
-  file?: string
-}
 /** The bookkeeping an observed own post is handed to. */
 export interface OwnPostOwner {
   startOperation(key: string, surface: OwnPostSurface, target: OwnPostTarget, content: OwnPostContent): OwnPostStart | undefined
@@ -163,10 +134,6 @@ export function ownPostAnswerOfPost(channel: string, response: unknown): OwnPost
 export interface OwnPostObserver {
   start(key: string, surface: OwnPostSurface, target: OwnPostTarget, content: OwnPostContent): OwnPostStart | undefined
   end(operation: OwnPostOperation | undefined, answer: OwnPostAnswer): void
-  /** Replaced by start; inert until all posting surfaces migrate. */
-  issue(key: string, surface: OwnPostSurface, channel?: string): OwnPostIssue | undefined
-  /** Replaced by end; inert until all posting surfaces migrate. */
-  confirm(issue: OwnPostIssue | undefined, posted: OwnPostPosted): void
 }
 /** The shared adapter over the current owner; a fault, sync or async, reaches `onFault`. */
 export function createOwnPostObserver(owner: () => OwnPostOwner | undefined,
@@ -190,8 +157,6 @@ export function createOwnPostObserver(owner: () => OwnPostOwner | undefined,
       owners.delete(operation)
       try { void Promise.resolve(current?.endOperation(operation, answer)).catch(fault) } catch (error) { fault(error) }
     },
-    issue: () => undefined,
-    confirm: () => {},
   }
 }
 

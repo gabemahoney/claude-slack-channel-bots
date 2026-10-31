@@ -282,10 +282,9 @@ export interface PersonaNotifier {
    * Post the persona's held notices in raised order once its client is
    * validated; leaves the queue as it is while the client is not validated,
    * or while the persona's teardown window is open (posts nothing then).
-   * For a channel destination every post is issued before this returns; for
-   * a `dm` destination the posts go out, still in raised order, once the
-   * shared DM open settles. The promise resolves once they all settle. Never
-   * rejects.
+   * Each post may wait for its own-post intent; a post with no wait can
+   * overtake a waiting one. A `dm` destination first waits for the shared DM
+   * open. The promise resolves once they all settle. Never rejects.
    */
   flush(key: string): Promise<void>
   /**
@@ -472,9 +471,8 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     deps.log(`[slack] persona-notifier: failed to post notice for ${ref} to ${where}: ${describeThrownValue(failure.error)}`)
   }
 
-  // Handed to the hold, which for a channel destination issues the post
-  // before the first `await` when the persona is not held, so calling `post`
-  // issues it synchronously; only the settling is awaited. A `dm` destination
+  // Handed to the hold, which attempts an unheld persona's post at once.
+  // A channel post waits only for its own-post intent; a `dm` destination
   // is resolved first (the open, or the cached conversation).
   function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
@@ -712,10 +710,9 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     held.delete(key)
     // Re-route each held notice: the persona is looked up again, so one no
     // longer applied is dropped with a log line. `map` calls `notify` for
-    // every notice before the first `await`, so the posts keep raised order:
-    // to a channel each is issued before this yields; to a `dm` destination
-    // they all wait on the one shared open and go out in raised order once it
-    // settles.
+    // every notice before the first `await`, starting attempts in raised
+    // order. Each may wait for its own-post intent; a post with no wait can
+    // overtake a waiting one. A `dm` destination shares one open first.
     await Promise.all(queue.map((notice) => notify(key, notice.text, notice.options)))
   }
 

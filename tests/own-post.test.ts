@@ -73,7 +73,7 @@ describe('the own-post observer', () => {
     ended(); await clock.flush(); expect(endSettled).toBe(true)
   })
 
-  test('absent or throwing start returns undefined; undefined end and legacy methods never read the owner', () => {
+  test('absent or throwing start returns undefined; undefined end never reads the owner', () => {
     const faults: unknown[] = [], error = new Error('injected start fault')
     expect(createOwnPostObserver(() => undefined).start('alpha', 'text', TARGET, CONTENT)).toBeUndefined()
     for (const owner of [
@@ -86,8 +86,6 @@ describe('the own-post observer', () => {
     let reads = 0
     const observer = createOwnPostObserver(() => { reads++; throw error })
     expect(observer.end(undefined, NO_ANSWER)).toBeUndefined()
-    expect(observer.issue('alpha', 'text', C)).toBeUndefined()
-    expect(observer.confirm({ key: 'alpha', surface: 'text', operation: 'legacy', issuer: {} }, { channel: C, ts: ROOT })).toBeUndefined()
     expect(reads).toBe(0)
   })
 

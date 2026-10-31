@@ -1054,6 +1054,110 @@ describe('thread_hybrid without Thread Memory still selects @mentions and Broadc
     ])
   })
 })
+describe.each(['strict', 'open'] as const)('%s own-post joins through intake and delivery', mode => {
+  async function ownPostHarness() {
+    const h = makeRoutingHarness(['alpha', 'beta'].map(name => ({
+      name, channels: [{ id: CA, delivery: 'thread_hybrid' }], permission_prompts: CA,
+      dm: { enabled: true },
+    })), dir, { mode, threadMemory: {}, membership: observedMembership({ alpha: [CA], beta: [CA] }),
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
+    harnesses.push(h)
+    await h.ready()
+    return h
+  }
+  const humanReply = (root: string = THREAD_ROOTS.primary) =>
+    makeChannelMessage({ channel: CA, thread_ts: root, text: 'unmentioned human reply' })
+
+  test.each(['reply', 'notice', 'reply with failed appends'] as const)(
+    '%s joins its confirmed root; the human reply is acknowledged once and delivered as thread, but siblings drop', async surface => {
+      const h = await ownPostHarness(), t = h.threads!, stub = h.p('alpha').stub
+      if (surface === 'reply with failed appends') t.io.fail('writeSync', 'alpha')
+      stub.script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } })
+      const text = 'a new thread from CSCB'
+      if (surface === 'notice') await h.notifier.notify('alpha', text)
+      else {
+        await h.reply('alpha', { chat_id: CA, text })
+        expect(h.replyResults).toEqual([{ content: [{ type: 'text', text: `Sent 1 message(s) to ${CA} [ts: ${THREAD_ROOTS.primary}]` }] }])
+      }
+      expect(stub.calls.postMessage).toHaveLength(1)
+      expect(stub.calls.postMessage[0]).toMatchObject({ channel: CA, text: surface === 'notice' ? h.noticeText('alpha', text) : text })
+      expect(stub.calls.postMessage[0]!.thread_ts).toBeUndefined()
+      expect(t.memory.view('alpha', CA, THREAD_ROOTS.primary)).toBe('joined')
+      expect(t.memory.view('beta', CA, THREAD_ROOTS.primary)).toBe('not-joined')
+      if (surface === 'reply with failed appends') {
+        await t.clock.flush()
+        expect(t.events.filter(e => e.type === 'append-failed' && e.key === 'alpha')).toHaveLength(1)
+        expect(t.memory.outage('alpha').unsaved).toBeGreaterThan(0)
+        expect(readThreads(dir).filter(r => r.kind === 'join')).toEqual([])
+      }
+
+      const event = humanReply(), atAck: AcceptedRecord[][] = []
+      await h.receive(event, ['alpha', 'beta'], () => {
+        atAck.push(readQueue(dir).filter((r): r is AcceptedRecord => r.kind === 'accepted' && !('compact' in r)))
+      })
+      expect(atAck).toEqual([[expect.objectContaining({ channel: CA, ts: event.ts, via: 'thread', thread_ts: THREAD_ROOTS.primary })]])
+      expect(facts(h, 'alpha')).toEqual([{ channel: CA, ts: event.ts as string, text: event.text as string, via: 'thread' }])
+      expect(h.queued('beta')).toEqual([])
+      const beforeSibling = h.logs.length
+      await h.receive(humanReply(THREAD_ROOTS.secondary), ['alpha'])
+      expect(h.order.filter(x => x === 'ack')).toHaveLength(1)
+      expect(h.logs.slice(beforeSibling).filter(line => line.includes('not-mentioned'))).toHaveLength(1)
+      expect(h.queued('alpha')).toHaveLength(1)
+      expect(h.queued('beta')).toEqual([])
+
+      const engine = await makeEngineHarness({ queue: h.queue, stateDir: dir })
+      try {
+        await engine.tick()
+        await engine.until(() => h.queue.openCount('alpha') === 0)
+        expect(engine.textCalls().map(call => call.params.text)).toEqual(h.queued('alpha').flatMap(item => item.fixed!.parts))
+        expect(engine.textCalls()).toHaveLength(1)
+        expect(engine.textCalls()[0]!.params.text).toContain('via="thread"')
+        expect(engine.textCalls()[0]!.params.text).toContain(event.text as string)
+        expect(engine.errors).toEqual([])
+      } finally { await engine.cleanup() }
+      expect(stub.calls.postMessage).toHaveLength(1)
+      expect(h.p('beta').stub.calls.postMessage).toHaveLength(0)
+    },
+  )
+
+  test.each(['off', 'DM'] as const)('a post in %s joins nothing and the later channel reply is dropped', async target => {
+    const h = await ownPostHarness(), t = h.threads!, stub = h.p('alpha').stub
+    if (target === 'off') expect(t.choose('off', 'alpha', CA).kind).toBe('applied')
+    const channel = target === 'DM' ? makeDm().channel as string : CA
+    stub.script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } })
+    // Strict mode refuses reply tools in off channels; server notices still
+    // post to their configured destination and must never establish a join.
+    if (target === 'off') await h.notifier.notify('alpha', 'posted outside thread following')
+    else await h.reply('alpha', { chat_id: channel, text: 'posted outside thread following' })
+    expect(stub.calls.postMessage).toHaveLength(1)
+    expect(stub.calls.postMessage[0]!.channel).toBe(channel)
+    expect(t.memory.joins('alpha')).toEqual([])
+    expect(t.memory.joins('beta')).toEqual([])
+    expect(readThreads(dir).filter(r => r.kind === 'post-intent')).toEqual([])
+    await h.receive(humanReply(), ['alpha'])
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(1)
+    expect(h.queued('alpha')).toEqual([])
+    expect(h.queued('beta')).toEqual([])
+    expect(existsSync(queuePath(dir))).toBe(false)
+    if (target === 'DM') expect(h.logs.filter(line => line.includes('not-mentioned'))).toHaveLength(1)
+  })
+
+  test('an own bot event made outside CSCB joins nothing; its later human reply drops as not-mentioned', async () => {
+    const h = await ownPostHarness(), { botUserId, botId } = h.p('alpha').stub.identity
+    await h.receive(makeBotMessage({ channel: CA, ts: THREAD_ROOTS.primary, user: botUserId, bot_id: botId }), ['alpha'])
+    expect(h.queued('alpha')).toEqual([])
+    expect(h.threads!.memory.joins('alpha')).toEqual([])
+    const beforeReply = h.logs.length
+    await h.receive(humanReply(), ['alpha'])
+    expect(h.logs.slice(beforeReply).filter(line => line.includes('not-mentioned'))).toHaveLength(1)
+    expect(h.order.filter(x => x === 'ack')).toHaveLength(2)
+    expect(h.queued('alpha')).toEqual([])
+    expect(h.queued('beta')).toEqual([])
+    expect(existsSync(queuePath(dir))).toBe(false)
+    expect(h.allPosts()).toEqual([])
+  })
+})
+
 describe.each(['strict', 'open'] as const)('%s routing through Thread Memory', mode => {
   async function joinedHarness(options: Parameters<typeof makeRoutingHarness>[2] = {}) {
     const h = makeRoutingHarness([

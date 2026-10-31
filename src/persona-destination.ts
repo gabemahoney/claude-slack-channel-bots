@@ -62,7 +62,7 @@ import type { WebClient } from '@slack/web-api'
 import { DM_DESTINATION, type Persona, type ServerSettings } from './config.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
-import type { OwnPostObserver, OwnPostSurface } from './own-post.ts'
+import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostObserver, type OwnPostStart, type OwnPostSurface } from './own-post.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -162,9 +162,9 @@ export type DestinationPostResult =
 export interface DestinationPostOptions {
   surface?: OwnPostSurface
   /**
-   * Called synchronously at the success response, after dependent-selection
-   * protection and before any awaited bookkeeping, so a caller can register
-   * the success before anything fallible runs. Its throw is ignored.
+   * Called synchronously at the success response, after settling the own-post
+   * operation and before any await. Join bookkeeping faults cannot prevent
+   * the caller from registering the success. Its throw is ignored.
    */
   onPosted?(posted: DestinationPosted): void
 }
@@ -193,7 +193,7 @@ export interface PersonaDestinationsDeps {
    * Production passes the server's applied configuration.
    */
   getPersonaConfig(): DestinationConfig
-  /** Confirms each successful post to thread participation; absent, nothing is observed. */
+  /** Observes each surfaced post's intent and answer; absent, nothing is observed. */
   ownPosts?: OwnPostObserver
 }
 
@@ -214,9 +214,10 @@ export interface PersonaDestinations {
    * configured channel, or the DM with `dm.contact` (opened on `client` unless
    * cached). The destination is resolved, by the one destination rule over
    * the configuration in effect, synchronously at the call. For a channel
-   * destination the post is issued synchronously (before the first `await`).
-   * A success is confirmed (`options`) before it is returned; neither the
-   * confirmation nor the callback can turn it into a failure. Never rejects.
+   * destination the post is issued synchronously unless its own-post intent
+   * needs to settle first. The operation ends and `onPosted` runs before a
+   * success is returned; neither join bookkeeping nor the callback can turn
+   * it into a failure. Never rejects.
    */
   post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage, options?: DestinationPostOptions): Promise<DestinationPostResult>
   /**
@@ -410,8 +411,8 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     return entry
   }
 
-  // The channel path makes no `await` before `chat.postMessage`, so callers
-  // that issue several posts in a row keep their order.
+  // The channel path posts synchronously unless an intent append must settle;
+  // a post with no intent wait can overtake one that is waiting.
   async function post(
     persona: Persona,
     client: DestinationSlackClient,
@@ -421,10 +422,6 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     // One read of the configuration in effect for the whole attempt.
     const config = deps.getPersonaConfig()
     const destination = resolvePersonaDestination(config, persona)
-    // Captured before any await, so a replacement identity or lifetime is never bound to this post.
-    const ownPost = options?.surface !== undefined
-      ? issueOwnPost(persona.key, options.surface, destination.kind === 'channel' ? destination.channelId : undefined)
-      : undefined
     let channelId: string
     // The cache entry the post used, so a stale-conversation failure drops
     // that entry only, never a newer one.
@@ -441,27 +438,35 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     }
     const args: { channel: string; text: string; blocks?: never } = { channel: channelId, text: message.text }
     if (message.blocks !== undefined) args.blocks = message.blocks as never
+    let op: OwnPostStart | undefined
+    if (options?.surface !== undefined) {
+      try {
+        op = deps.ownPosts?.start(persona.key, options.surface, { channel: channelId }, { kind: 'text', text: message.text })
+        if (op?.ready) await op.ready
+      } catch { /* join bookkeeping cannot turn a post into a failure */ }
+    }
     let response: unknown
     try {
       response = await client.chat.postMessage(args)
     } catch (err) {
+      if (options?.surface !== undefined) {
+        try {
+          deps.ownPosts?.end(op?.operation, ownPostAnswerOfError(err))
+        } catch { /* join bookkeeping cannot turn a post into a failure */ }
+      }
       const code = classifySlackError(err)
       if (used && code === CHANNEL_NOT_FOUND_ERROR && dmCache.get(persona.key) === used) dmCache.delete(persona.key)
       return { outcome: 'failed', step: 'chat.postMessage', code, channelId, error: err }
     }
+    if (options?.surface !== undefined) {
+      try {
+        deps.ownPosts?.end(op?.operation, ownPostAnswerOfPost(channelId, response))
+      } catch { /* join bookkeeping cannot turn a post into a failure */ }
+    }
     const ts = (response as { ts?: unknown } | undefined)?.ts
     const posted: DestinationPosted = { outcome: 'posted', channelId, ts: typeof ts === 'string' && ts !== '' ? ts : undefined }
-    if (ownPost) {
-      try {
-        deps.ownPosts!.confirm(ownPost, { channel: channelId, ...(posted.ts ? { ts: posted.ts } : {}) })
-      } catch { /* participation cannot turn a confirmed post into a failure */ }
-    }
     try { options?.onPosted?.({ ...posted }) } catch { /* nor can the caller's success bookkeeping */ }
     return posted
-  }
-
-  function issueOwnPost(key: string, surface: OwnPostSurface, channel?: string) {
-    try { return deps.ownPosts?.issue(key, surface, channel) } catch { return undefined }
   }
 
   function forget(personaKey: string): void {

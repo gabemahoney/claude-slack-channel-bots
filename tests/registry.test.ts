@@ -100,6 +100,8 @@ import {
   SET_CHANNEL_DELIVERY_TOOL,
   slackRefusalToolErrorText,
   replyPartialFailureText,
+  OWN_POST_UPLOAD_FILENAME,
+  OWN_POST_UPLOAD_REFUSED,
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
@@ -115,10 +117,13 @@ import {
   type PersonaSpec,
 } from './test-helpers/persona-config.ts'
 import { observeFileCompletions, withFileCompletions } from '../src/file-upload-observation.ts'
+import { holdOwnPostReady, makeRecordingOwnPostObserver, makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
+import { threadFsControls, threadPath } from './test-helpers/thread-memory.ts'
 import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
-import { createOwnPostObserver, type OwnPostIssue, type OwnPostObserver } from '../src/own-post.ts'
+import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
 import {
   asWebClient,
+  slackAbortError,
   makeDeferredWebApiCall,
   makeStubSlack,
   openedDm,
@@ -1493,7 +1498,7 @@ describe('DM targets (through the MCP server)', () => {
     const log = stubOf(h.alpha).callLog
     expect(log.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
     expect(stubOf(h.alpha).calls.postMessage.map((c) => [c.channel, (c as { text?: string }).text])).toEqual([[OPENED, 'one\n'], [OPENED, 'two\n'], [OPENED, 'three']])
-    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: OPENED, file }] as any)
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: OPENED, file, filename: OWN_POST_UPLOAD_FILENAME }] as any)
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 
@@ -2562,7 +2567,7 @@ describe('reply files', () => {
 
     expect(result.isError).toBeUndefined()
     expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
-    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file, thread_ts: MSG_TS }] as any)
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file, filename: OWN_POST_UPLOAD_FILENAME, thread_ts: MSG_TS }] as any)
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
     expect(existsSync(file)).toBe(true)
   })
@@ -2596,7 +2601,7 @@ describe('reply files', () => {
     )
     expect(postedTs).not.toBe('')
     expect(stub.calls.postMessage).toHaveLength(1)
-    expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file: plain }] as any)
+    expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file: plain, filename: OWN_POST_UPLOAD_FILENAME }] as any)
     assertNoLeak({ result, lines: h.lines })
   })
 })
@@ -2605,30 +2610,31 @@ describe('reply files', () => {
 // reply files: each nested upload completion observed on the persona's client
 // ---------------------------------------------------------------------------
 
+type OwnPostRecording = ReturnType<typeof makeRecordingOwnPostObserver>
+
+function expectOwnPostPairs(recording: OwnPostRecording, count: number) {
+  const starts = recording.calls.filter(c => c.kind === 'start')
+  const ends = recording.calls.filter(c => c.kind === 'end')
+  expect(starts).toHaveLength(count)
+  expect(ends).toHaveLength(count)
+  expect(new Set(starts.map(c => c.operation)).size).toBe(count)
+  for (const start of starts) {
+    expect(start.operation).toBeDefined()
+    expect(ends.filter(c => c.operation === start.operation)).toHaveLength(1)
+  }
+}
+
+function fileEndAnswers(recording: OwnPostRecording) {
+  const operations = recording.calls.filter(c => c.kind === 'start' && c.surface === 'file').map(c => c.operation)
+  return recording.calls.filter(c => c.kind === 'end' && operations.includes(c.operation)).map(c => c.kind === 'end' && c.answer)
+}
+
 describe('reply files: nested upload completions observed on the real client', () => {
   const TEXT_TS = '1700000000.000300'
   const SHARE_TS = '1700000000.000301'
   /** A `files.completeUploadExternal` answer for `id`, shared as a new root at `share` when given. */
   const completion = (id: string, channel = A_ALL, share?: string): SettledWebApiOutcome =>
     ({ kind: 'ok', result: { files: [{ id, ...(share ? { shares: { public: { [channel]: [{ ts: share }] } } } : {}) }] } })
-
-  /** A recording own-post adapter: each issue is its own operation; every file confirmation is kept with its issue. */
-  function recordingOwnPosts() {
-    const issued: OwnPostIssue[] = []
-    const files: Array<{ issue: OwnPostIssue; channel: string; file?: string; ts?: string; part?: number }> = []
-    const ownPosts: OwnPostObserver = {
-      start: () => undefined, end: () => {},
-      issue: (key, surface, channel) => {
-        const issue: OwnPostIssue = { key, surface, operation: `op-${issued.length + 1}`, issuer: {}, ...(channel ? { channel } : {}) }
-        issued.push(issue)
-        return issue
-      },
-      confirm: (issue, posted) => {
-        if (issue?.surface === 'file') files.push({ issue, channel: posted.channel, file: posted.file, ts: posted.ts, part: posted.part })
-      },
-    }
-    return { files, ownPosts }
-  }
 
   /** The session deps with `ownPosts`, each persona's client handed out as the connection manager does: observed on the raw client, then wrapped by the auth watch. */
   function observedDeps(ownPosts: OwnPostObserver, observed = true): SessionToolDeps {
@@ -2653,7 +2659,8 @@ describe('reply files: nested upload completions observed on the real client', (
   }
 
   test('a group completed before its aggregate rejected keeps its one confirmation, counts as uploaded and clears the ack once; a later file that fails reports the partial post and nothing is posted or completed again', async () => {
-    const { files, ownPosts } = recordingOwnPosts()
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
     const stub = stubOf(h.alpha)
     trackAck(h.alpha.key, A_ALL, MSG_TS)
     stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
@@ -2665,15 +2672,20 @@ describe('reply files: nested upload completions observed on the real client', (
 
     expect(result.isError).toBe(true)
     expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: TEXT_TS, uploaded: 1, files: 2 }, 'file_upload_failed'))
-    expect(files.map(({ issue, ...posted }) => [issue.surface, issue.channel, posted])).toEqual([['file', A_ALL, { channel: A_ALL, file: 'F0DONE0001', ts: SHARE_TS, part: 1 }]])
+    expect(fileEndAnswers(recording)).toEqual([
+      { kind: 'confirmed', channel: A_ALL, file: 'F0DONE0001' },
+      { kind: 'failed', code: 'file_upload_failed' },
+    ])
+    expectOwnPostPairs(recording, 3)
     expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 2, 3])
     expect(stub.calls.reactionsRemove).toEqual([REMOVE_EYES])
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
     assertNoLeak({ result, lines: h.lines })
   })
 
-  test('a completion that resolves after its aggregate already rejected is still confirmed on its own operation, after the tool result', async () => {
-    const { files, ownPosts } = recordingOwnPosts()
+  test('a completion arriving after its aggregate rejected cannot end the operation twice', async () => {
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
     const stub = stubOf(h.alpha), late = makeDeferredWebApiCall()
     stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
     stub.uploadGroups.push(2)
@@ -2683,17 +2695,20 @@ describe('reply files: nested upload completions observed on the real client', (
     const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
 
     expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: TEXT_TS, uploaded: 0, files: 1 }, 'internal_error'))
-    expect(files).toEqual([])
+    expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: 'internal_error' }])
     late.settle(completion('F0LATE0001'))
-    await settleMicrotasks(() => files.length > 0)
-    expect(files.map(({ issue, ...posted }) => [issue.surface, issue.channel, posted])).toEqual([['file', A_ALL, { channel: A_ALL, file: 'F0LATE0001', part: 1 }]])
+    await settleMicrotasks(() => stub.calls.completeUploadExternal.length === 2)
+    await new Promise(resolve => setImmediate(resolve))
+    expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: 'internal_error' }])
+    expectOwnPostPairs(recording, 2)
     expect(stub.calls.filesUploadV2).toHaveLength(1)
     assertNoLeak({ result, lines: h.lines })
   })
 
   test.each([['observed on the client', true], ['a client built without the observation (the aggregate fallback)', false]] as const)(
     'one completed upload is confirmed exactly once: %s', async (_name, observed) => {
-      const { files, ownPosts } = recordingOwnPosts()
+      const recording = makeRecordingOwnPostObserver()
+      const ownPosts = recording.observer
       const stub = stubOf(h.alpha)
       stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
       const session = await openWith(h.alpha, observedDeps(ownPosts, observed))
@@ -2701,12 +2716,14 @@ describe('reply files: nested upload completions observed on the real client', (
       const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
 
       expect(result.content[0]!.text).toBe(`Sent 1 message(s) + 1 file(s) to ${A_ALL} [ts: ${TEXT_TS}]`)
-      expect(files.map(({ issue, ...posted }) => [issue.surface, posted])).toEqual([['file', { channel: A_ALL, file: 'F0STUB0001', part: 1 }]])
+      expect(fileEndAnswers(recording)).toEqual([{ kind: 'confirmed', channel: A_ALL, file: 'F0STUB0001' }])
+      expectOwnPostPairs(recording, 2)
       expect(stub.calls.completeUploadExternal).toEqual([{ files: [{ id: 'F0STUB0001' }], channel_id: A_ALL }] as any)
     })
 
-  test('concurrent uploads of one persona and of two personas each confirm only their own completion, settled in reverse order', async () => {
-    const { files, ownPosts } = recordingOwnPosts()
+  test('concurrent uploads of one persona and of two personas each end with only their own completion, settled in reverse order', async () => {
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
     const deps = observedDeps(ownPosts)
     const alpha = stubOf(h.alpha), beta = stubOf(h.beta)
     const alphaDone = [makeDeferredWebApiCall(), makeDeferredWebApiCall()], betaDone = makeDeferredWebApiCall()
@@ -2727,16 +2744,20 @@ describe('reply files: nested upload completions observed on the real client', (
     alphaDone[0]!.settle(completion(fileFor[channelOf(alpha, 0)]!, channelOf(alpha, 0)))
     for (const result of await Promise.all(replies)) expect(result.isError).toBeUndefined()
 
-    expect(files.map(({ issue, channel, file }) => [issue.key, issue.channel, channel, file]).sort()).toEqual([
-      [h.alpha.key, A_ALL, A_ALL, fileFor[A_ALL]],
-      [h.alpha.key, A_MENTIONS, A_MENTIONS, fileFor[A_MENTIONS]],
-      [h.beta.key, B_CHANNEL, B_CHANNEL, fileFor[B_CHANNEL]],
+    expect(recording.calls.filter(c => c.kind === 'start').filter(c => c.surface === 'file').map(start => {
+      const end = recording.calls.find(c => c.kind === 'end' && c.operation === start.operation)
+      return [start.key, start.target.channel, end?.kind === 'end' ? end.answer : undefined]
+    }).sort()).toEqual([
+      [h.alpha.key, A_ALL, { kind: 'confirmed' as const, channel: A_ALL, file: fileFor[A_ALL] }],
+      [h.alpha.key, A_MENTIONS, { kind: 'confirmed' as const, channel: A_MENTIONS, file: fileFor[A_MENTIONS] }],
+      [h.beta.key, B_CHANNEL, { kind: 'confirmed' as const, channel: B_CHANNEL, file: fileFor[B_CHANNEL] }],
     ].sort())
-    expect(new Set(files.map((f) => f.issue.operation)).size).toBe(3)
+    expectOwnPostPairs(recording, 6)
   })
 
   test('a completion made outside any bound upload reaches no upload\'s listener, even while one is in flight', async () => {
-    const { files, ownPosts } = recordingOwnPosts()
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
     const stub = stubOf(h.alpha), inside = makeDeferredWebApiCall()
     stub.script.completeUpload.push(inside.outcome)
     const session = await openWith(h.alpha, observedDeps(ownPosts))
@@ -2747,7 +2768,8 @@ describe('reply files: nested upload completions observed on the real client', (
     inside.settle(completion('F0INSIDE01'))
     expect((await reply).isError).toBeUndefined()
 
-    expect(files.map((f) => f.file)).toEqual(['F0INSIDE01'])
+    expect(fileEndAnswers(recording)).toEqual([{ kind: 'confirmed', channel: A_ALL, file: 'F0INSIDE01' }])
+    expectOwnPostPairs(recording, 2)
   })
 
   test('observing a client twice wraps its completion once; a bound upload hears each resolved completion once and a rejected one not at all, with the caller\'s results unchanged', async () => {
@@ -2772,23 +2794,20 @@ describe('reply files: nested upload completions observed on the real client', (
 })
 
 // ---------------------------------------------------------------------------
-// reply through the ownerless observer server.ts builds until Epic 5c
+// reply without an own-post observer
 // ---------------------------------------------------------------------------
 
-describe('reply through the ownerless own-post observer', () => {
-  /** Exactly the observer `src/server.ts` builds. */
-  const ownerlessOwnPosts = () => createOwnPostObserver(() => undefined)
+describe('reply without an own-post observer', () => {
   const PARTS = ['QZPART01', 'QZPART02', 'QZPART03']
   const partTs = (n: number) => `1700000000.${String(n).padStart(6, '0')}`
 
   test.each([2, 3])('a failure at text chunk %i of 3 reports the confirmed prefix, posts no part twice and logs one operator line without the reply\'s text', async (failing) => {
-    const ownPosts = ownerlessOwnPosts()
     const logged: string[] = []
     const stub = stubOf(h.alpha)
     for (let i = 1; i < failing; i++) stub.script.post.push({ kind: 'ok' })
     stub.script.post.push({ kind: 'platform', error: 'channel_not_found' })
     const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
-      ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 8 }), ownPosts, log: (line) => void logged.push(line),
+      ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 8 }), log: (line) => void logged.push(line),
     })
 
     const result = await session.call('reply', { chat_id: A_ALL, text: PARTS.join('') })
@@ -2806,7 +2825,6 @@ describe('reply through the ownerless own-post observer', () => {
   })
 
   test('a reply with text and a file posts each part once, reports success, clears its ack and logs nothing', async () => {
-    const ownPosts = ownerlessOwnPosts()
     const stub = stubOf(h.alpha)
     observeFileCompletions(stub.web)
     trackAck(h.alpha.key, A_ALL, MSG_TS)
@@ -2814,7 +2832,7 @@ describe('reply through the ownerless own-post observer', () => {
     writeFileSync(file, 'one')
     const consumedAt: Array<{ posts: number; uploads: number }> = []
     const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
-      ...h.deps, ownPosts,
+      ...h.deps,
       consumeAck: (key, channel, ts, remove) => {
         consumedAt.push({ posts: stub.calls.postMessage.length, uploads: stub.calls.filesUploadV2.length })
         return remove ? consumeAck(key, channel, ts, remove) : consumeAck(key, channel, ts)
@@ -2835,6 +2853,421 @@ describe('reply through the ownerless own-post observer', () => {
     expect(consumedAt).toEqual([{ posts: 1, uploads: 0 }])
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
     expect(h.lines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-call own-post observation through the real reply tool
+// ---------------------------------------------------------------------------
+
+function openReply(deps: SessionToolDeps = h.deps, persona = h.alpha) {
+  return openSession(registerSession(persona.working_directory, persona.key, makeTransport(), makeServer()), deps)
+}
+
+function replyFile(name = 'one.txt', content = name) {
+  const path = join(h.inboxDir, name)
+  writeFileSync(path, content)
+  return path
+}
+
+/** Keep the delivered reaction's original name even though reply settings now say eyes. */
+async function captureReplyAck(stub: StubSlack, key: string) {
+  const args = { channel: A_ALL, timestamp: MSG_TS, name: 'hourglass' }
+  await addDeliveryAck(key, A_ALL, MSG_TS,
+    () => stub.web.reactions.add(args), () => stub.web.reactions.remove(args))
+}
+
+/** Drain the in-memory MCP transport, without a wall-clock delay. */
+async function replyReached(done: () => boolean) {
+  for (let i = 0; i < 50 && !done(); i++) await new Promise(resolve => setImmediate(resolve))
+  expect(done()).toBe(true)
+}
+
+describe('reply own-post call boundaries', () => {
+  test.each(['channel', 'opened DM'] as const)('%s: three chunks and two files have independent operations, exact content and ready gates', async targetKind => {
+    const stub = stubOf(h.alpha), gates = Array.from({ length: 5 }, holdOwnPostReady)
+    const recording = makeRecordingOwnPostObserver(gates.map(gate => ({ ready: gate.ready })))
+    const files = [replyFile('one.bin', 'é'), replyFile('two.bin', 'three')]
+    const target = targetKind === 'channel' ? A_ALL : 'U0USER001'
+    const channel = targetKind === 'channel' ? A_ALL : stubOpenedDmId(target)
+    if (targetKind === 'opened DM') applyPersona(h.alpha, true)
+    trackAck(h.alpha.key, channel, MSG_TS)
+    const atAck: string[][] = []
+    const session = await openReply({
+      ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 3 }), ownPosts: recording.observer,
+      consumeAck: (...args) => { atAck.push(recording.calls.map(c => c.kind)); return args[3] ? consumeAck(args[0], args[1], args[2], args[3]) : consumeAck(args[0], args[1], args[2]) },
+    })
+    const pending = session.call('reply', { chat_id: target, text: 'aaabbbccc', thread_ts: MSG_TS, message_id: MSG_TS, files })
+    try {
+      for (let i = 0; i < gates.length; i++) {
+        await replyReached(() => recording.calls.filter(c => c.kind === 'start').length === i + 1)
+        expect(recording.calls.map(c => c.kind)).toEqual([...Array.from({ length: i }, () => ['start', 'end'] as const).flat(), 'start'])
+        expect(stub.calls.postMessage.length + stub.calls.filesUploadV2.length).toBe(i)
+        gates[i]!.resolve()
+      }
+      const result = await pending
+      expect(result.isError).toBeUndefined()
+      expectOwnPostPairs(recording, 5)
+      expect(recording.calls.filter(c => c.kind === 'start').map(({ key, surface, target, content }) => ({ key, surface, target, content }))).toEqual([
+        ...['aaa', 'bbb', 'ccc'].map(text => ({ key: h.alpha.key, surface: 'text' as const, target: { channel, parent: MSG_TS }, content: { kind: 'text' as const, text } })),
+        ...[2, 5].map(size => ({ key: h.alpha.key, surface: 'file' as const, target: { channel, parent: MSG_TS }, content: { kind: 'file' as const, name: OWN_POST_UPLOAD_FILENAME, size } })),
+      ])
+      expect(stub.calls.postMessage).toEqual(['aaa', 'bbb', 'ccc'].map(text => ({ channel, text, thread_ts: MSG_TS, unfurl_links: false, unfurl_media: false })))
+      expect(stub.calls.filesUploadV2).toEqual(files.map(file => ({ channel_id: channel, file, filename: OWN_POST_UPLOAD_FILENAME, thread_ts: MSG_TS })))
+      expect(recording.calls.filter(c => c.kind === 'end').map(c => c.answer)).toEqual([
+        ...[1, 2, 3].map(n => ({ kind: 'confirmed' as const, channel, ts: `1700000000.00000${n}` })),
+        ...[1, 2].map(n => ({ kind: 'confirmed' as const, channel, file: `F0STUB000${n}` })),
+      ])
+      expect(atAck).toEqual([['start', 'end']])
+      expect(stub.calls.reactionsRemove).toEqual([{ channel, timestamp: MSG_TS, name: 'eyes' }])
+    } finally { for (const gate of gates) gate.resolve(); await pending }
+  })
+
+  test('the upload guard rechecks after ready and ends a refused operation before returning the existing refusal', async () => {
+    const gate = holdOwnPostReady(), recording = makeRecordingOwnPostObserver([{}, { ready: gate.ready }])
+    const file = replyFile(), checked: number[] = [], stub = stubOf(h.alpha)
+    let refuse = false
+    const session = await openReply({ ...h.deps, ownPosts: recording.observer, assertSendable(path) {
+      checked.push(stub.calls.filesUploadV2.length)
+      h.deps.assertSendable(path)
+      if (refuse) throw new Error('file is no longer sendable')
+    } })
+    const pending = session.call('reply', { chat_id: A_ALL, text: 'here', files: [file] })
+    try {
+      await replyReached(() => recording.calls.length === 3)
+      expect(checked).toEqual([0])
+      expect(stub.calls.filesUploadV2).toHaveLength(0)
+      refuse = true; gate.resolve()
+      const result = await pending
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(`file is no longer sendable The reply text was already posted (1 message(s) to ${A_ALL} [ts: 1700000000.000001]); 0 of 1 file(s) were uploaded before this refusal.`)
+      expect(checked).toEqual([0, 0])
+      expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED }])
+      expectOwnPostPairs(recording, 2)
+      expect(stub.calls.filesUploadV2).toHaveLength(0)
+    } finally { gate.resolve(); await pending }
+  })
+
+  test.each([
+    ['platform', { kind: 'platform', error: 'not_in_channel' }, { kind: 'failed', code: 'not_in_channel' }],
+    ['request', { kind: 'network' }, { kind: 'no-answer' }],
+    ['abort', { kind: 'reject', value: slackAbortError() }, { kind: 'no-answer' }],
+    ['missing timestamp', { kind: 'ok', result: { ts: undefined } }, { kind: 'no-answer' }],
+  ] as const)('a text %s answer ends once before returning', async (_label, outcome, answer) => {
+    const recording = makeRecordingOwnPostObserver(), stub = stubOf(h.alpha)
+    stub.script.post.push(outcome)
+    const session = await openReply({ ...h.deps, ownPosts: recording.observer })
+    const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL })
+    expect(recording.calls.filter(c => c.kind === 'end').map(c => c.answer)).toEqual([answer])
+    expectOwnPostPairs(recording, 1)
+    expect(stub.calls.postMessage).toHaveLength(1)
+    expect(result.isError).toBe(outcome.kind === 'ok' ? undefined : true)
+  })
+
+  test.each([
+    ['platform', { kind: 'platform', error: 'file_upload_failed' }, { kind: 'failed', code: 'file_upload_failed' }],
+    ['request', { kind: 'network' }, { kind: 'no-answer' }],
+    ['abort', { kind: 'reject', value: slackAbortError() }, { kind: 'no-answer' }],
+    ['missing file', { kind: 'ok', result: { files: [] } }, { kind: 'no-answer' }],
+  ] as const)('an upload %s answer ends its operation once', async (_label, outcome, answer) => {
+    const recording = makeRecordingOwnPostObserver(), stub = stubOf(h.alpha)
+    stub.script.upload.push(outcome)
+    const session = await openReply({ ...h.deps, ownPosts: recording.observer })
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile()] })
+    expect(fileEndAnswers(recording)).toEqual([answer])
+    expectOwnPostPairs(recording, 2)
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
+    expect(result.isError).toBe(outcome.kind === 'ok' ? undefined : true)
+  })
+})
+
+describe('reply bookkeeping faults preserve posting and reaction cleanup', () => {
+  const faults = ['no observer', 'owner start throws', 'owner end throws', 'start throws', 'end throws', 'undefined operation', 'ready rejects'] as const
+  function observer(fault: typeof faults[number]): OwnPostObserver | undefined {
+    const error = new Error(sentinelInMessage('bookkeeping'))
+    if (fault === 'no observer') return undefined
+    if (fault === 'owner start throws' || fault === 'owner end throws') {
+      const recording = makeRecordingOwnPostObserver()
+      return createOwnPostObserver(() => ({
+        startOperation: (...args) => { if (fault === 'owner start throws') throw error; return recording.observer.start(...args) },
+        endOperation() { throw error },
+      }))
+    }
+    const step = fault === 'start throws' ? { throwStart: error }
+      : fault === 'end throws' ? { throwEnd: error }
+      : fault === 'undefined operation' ? { start: 'undefined' as const }
+      : { ready: Promise.reject(error).catch(() => { throw error }) }
+    // Rejections are handled at creation as well as by the surface's await.
+    if (step.ready) void step.ready.catch(() => {})
+    return makeRecordingOwnPostObserver(Array.from({ length: 5 }, () => step)).observer
+  }
+
+  test.each([...faults])('%s: three chunks and two files still post once and clear the ack on the first success', async fault => {
+    const stub = stubOf(h.alpha), atAck: Array<[number, number]> = []
+    await captureReplyAck(stub, h.alpha.key)
+    const session = await openReply({ ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 4 }), ownPosts: observer(fault),
+      consumeAck: (...args) => { atAck.push([stub.calls.postMessage.length, stub.calls.filesUploadV2.length]); return args[3] ? consumeAck(args[0], args[1], args[2], args[3]) : consumeAck(args[0], args[1], args[2]) },
+    })
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'aaaabbbbcccc', files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
+    expect(result).toEqual({ content: [{ type: 'text', text: `Sent 3 message(s) + 2 file(s) to ${A_ALL} [ts: 1700000000.000003]` }] })
+    expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual(['aaaa', 'bbbb', 'cccc'])
+    expect(stub.calls.filesUploadV2).toHaveLength(2)
+    expect(atAck).toEqual([[1, 0]])
+    expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+    expect(h.lines).toEqual([])
+  })
+
+  test.each([...faults])('%s: a later upload failure keeps completed parts and the first text success clears the ack', async fault => {
+    const stub = stubOf(h.alpha)
+    observeFileCompletions(stub.web)
+    stub.script.completeUpload.push({ kind: 'ok' }, { kind: 'platform', error: 'file_upload_failed' })
+    await captureReplyAck(stub, h.alpha.key)
+    const session = await openReply({ ...h.deps, ownPosts: observer(fault) })
+    const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: '1700000000.000001', uploaded: 1, files: 2 }, 'file_upload_failed'))
+    expect(stub.calls.postMessage).toHaveLength(1)
+    expect(stub.calls.filesUploadV2).toHaveLength(2)
+    expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+    expect(h.lines).toHaveLength(1)
+    expect(h.lines[0]).toContain('sent=1/1 uploaded=1/2:')
+    expect(h.lines[0]).toContain('file_upload_failed')
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each([...faults])('%s: a later text failure preserves the partial result, log and ack cleanup', async fault => {
+    const stub = stubOf(h.alpha)
+    stub.script.post.push({ kind: 'ok' }, { kind: 'platform', error: 'channel_not_found' })
+    await captureReplyAck(stub, h.alpha.key)
+    const session = await openReply({ ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }), ownPosts: observer(fault) })
+    const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3), files: [replyFile()], message_id: MSG_TS })
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: '1700000000.000001', uploaded: 0, files: 1 }, 'channel_not_found'))
+    expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual([LEAK_SENTINEL, LEAK_SENTINEL])
+    expect(stub.calls.filesUploadV2).toHaveLength(0)
+    expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+    expect(h.lines).toHaveLength(1)
+    expect(h.lines[0]).toContain('sent=1/3 uploaded=0/1:')
+    expect(h.lines[0]).toContain('channel_not_found')
+    assertNoLeak({ result, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reply joins through the server's real owner composition
+// ---------------------------------------------------------------------------
+
+describe('reply joins through real Thread Memory', () => {
+  beforeEach(() => mkdirSync(join(h.dir, 'owner')))
+  const ROOT = '1700000100.000001', PARENT = '1700000100.000002', OTHER = '1700000100.000003'
+  const options = { membership: { channels: [{ id: A_ALL, delivery: 'thread_hybrid' as const }] } }
+
+  async function openOwner(owner: OwnPostHarness, key = 'alpha', overrides: Partial<SessionToolDeps> = {}) {
+    const persona = owner.sources.persona(key)!, stub = owner.members.h.stub(owner.members.h.p(key))
+    observeFileCompletions(stub.web)
+    const entry = registerSession(persona.working_directory, key, makeTransport(), makeServer(), owner.authority.incarnation(key))
+    const session = await openSession(entry, {
+      ...h.deps, getPersona: owner.sources.persona, getChannelMode: () => channelModeOf(owner.authority.config()),
+      getChannelDelivery: () => owner.choices, readChannelMembership: owner.members.membership.read,
+      clientFor: owner.members.h.clientFor, ownPosts: owner.observer, ...overrides,
+    })
+    return { session, stub }
+  }
+
+  const registrations = (owner: OwnPostHarness) => owner.events.filter(event => event.type === 'registered')
+  const outcomes = (owner: OwnPostHarness, key = 'alpha') => owner.records(key).filter(record => record.kind === 'post-outcome')
+  async function finish(owner: OwnPostHarness) {
+    try { assertNoLeak({ results: h.results, lines: h.lines, owner: owner.captured() }) } finally { await owner.close() }
+  }
+
+  test('three top-level chunks join three roots in memory and on reopen; each has its own saved intent and outcome', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      const { session, stub } = await openOwner(owner, 'alpha', { getReplySettings: () => ({ ...REPLY_SETTINGS, reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }) })
+      const roots = [ROOT, PARENT, OTHER]
+      stub.script.post.push(...roots.map(ts => ({ kind: 'ok' as const, result: { ts } })))
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3) })
+      expect(result.isError).toBeUndefined()
+      expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual(Array(3).fill(LEAK_SENTINEL))
+      for (const root of roots) expect(owner.view('alpha', A_ALL, root)).toBe('joined')
+      await owner.flush()
+      const ids = registrations(owner).map(e => e.operationId)
+      expect(new Set(ids).size).toBe(3)
+      expect(owner.records().filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual(ids)
+      expect(outcomes(owner).map(r => [r.operationId, r.outcome])).toEqual(ids.map(id => [id, 'joined']))
+      owner = await owner.reopen()
+      for (const root of roots) expect(owner.view('alpha', A_ALL, root)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root).sort()).toEqual([...roots].sort())
+    } finally { await finish(owner) }
+  })
+
+  test.each(['mapped parent', 'Slack thread takes precedence', 'parent upload'] as const)('%s joins the real root; a subsequent reply there writes no new intent', async kind => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      await owner.storeSlack('alpha', { channel: A_ALL, ts: PARENT, key: { chat_id: A_ALL, ts: PARENT }, thread_ts: ROOT })
+      const { session, stub } = await openOwner(owner)
+      const first = makeDeferredWebApiCall()
+      stub.script.post.push(first.outcome)
+      const isFile = kind === 'parent upload'
+      const pending = session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, thread_ts: PARENT, ...(isFile ? { files: [replyFile()] } : {}) })
+      await replyReached(() => stub.calls.postMessage.length === 1)
+      expect(owner.read.pendingOwnPosts('alpha', A_ALL)).toMatchObject([{ root: ROOT }])
+      // Let the text have no answer so the file, rather than the text, establishes the join.
+      first.settle({ kind: 'ok', result: isFile ? { ts: undefined } : { ts: OTHER, ...(kind === 'Slack thread takes precedence' ? { message: { thread_ts: OTHER } } : {}) } })
+      expect((await pending).isError).toBeUndefined()
+      const expected = kind === 'Slack thread takes precedence' ? OTHER : ROOT
+      expect(owner.view('alpha', A_ALL, expected)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, PARENT)).toBe('not-joined')
+      await owner.flush()
+      const before = owner.records(), eventCount = registrations(owner).length
+      expect((await session.call('reply', { chat_id: A_ALL, text: 'again', thread_ts: expected })).isError).toBeUndefined()
+      await owner.flush()
+      expect(owner.records()).toEqual(before)
+      expect(registrations(owner)).toHaveLength(eventCount)
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined'])
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, expected)).toBe('joined')
+    } finally { await finish(owner) }
+  })
+
+  test('a new-message upload remains pending for its thread even when completion shares name a root', async () => {
+    const owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      const { session, stub } = await openOwner(owner)
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
+      stub.script.completeUpload.push({ kind: 'ok', result: { files: [{ id: 'F0AWAIT001', shares: { public: { [A_ALL]: [{ ts: OTHER, thread_ts: PARENT }] } } }] } })
+      expect((await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile()] })).isError).toBeUndefined()
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
+      expect(owner.view('alpha', A_ALL, PARENT)).toBe('not-joined')
+      expect(owner.read.pendingOwnPosts('alpha', A_ALL)).toMatchObject([{ state: 'awaiting-thread' }])
+      expect(owner.owner.awaitingUploads('alpha', A_ALL)).toMatchObject([{ file: 'F0AWAIT001' }])
+      await owner.flush()
+      expect(registrations(owner)).toHaveLength(2)
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined'])
+      expect(owner.memory.unresolvedIntents('alpha')).toHaveLength(1)
+    } finally { await finish(owner) }
+  })
+
+  test('a refused later chunk records none and leaves earlier roots joined after reopening', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      const { session, stub } = await openOwner(owner, 'alpha', { getReplySettings: () => ({ ...REPLY_SETTINGS, reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }) })
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } }, { kind: 'platform', error: 'not_in_channel' })
+      await captureReplyAck(stub, 'alpha')
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3), message_id: MSG_TS })
+      expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: ROOT, uploaded: 0, files: 0 }, 'not_in_channel'))
+      expect(stub.calls.postMessage).toHaveLength(2)
+      expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
+      await owner.flush()
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined', 'none'])
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
+    } finally { await finish(owner) }
+  })
+
+  test.each(['off', 'DM', 'dry-run', 'edit_message', 'fetch_messages'] as const)('%s registers no own post and writes no Thread Memory records', async action => {
+    const owner = await makeOwnPostHarness(join(h.dir, 'owner'), {
+      membership: { mode: 'open', channels: [{ id: A_ALL, delivery: 'off' }] },
+      memory: { dryRun: action === 'dry-run' },
+    })
+    try {
+      // Activating thread_hybrid may create its header; the tool must write nothing thereafter.
+      if (action !== 'off' && action !== 'DM') expect(owner.threads.choose('thread_hybrid', 'alpha', A_ALL).kind).toBe('applied')
+      const recording = makeRecordingOwnPostObserver()
+      const { session, stub } = await openOwner(owner, 'alpha', { ownPosts: {
+        start(...args) { recording.observer.start(...args); return owner.observer.start(...args) },
+        end: owner.observer.end,
+      } })
+      await owner.flush()
+      const before = owner.records()
+      owner.io.reset()
+      if (action === 'dry-run') process.env['SLACK_DRY_RUN'] = '1'
+      const target = action === 'DM' ? 'D0DIRECT1' : A_ALL
+      const tool = action === 'edit_message' || action === 'fetch_messages' ? action : 'reply'
+      const result = await session.call(tool, TOOL_ARGS[tool](target))
+      expect(result.isError).toBeUndefined()
+      expect(recording.calls).toHaveLength(action === 'off' || action === 'DM' ? 1 : 0)
+      expect(stub.calls.postMessage).toHaveLength(action === 'off' || action === 'DM' ? 1 : 0)
+      expect(registrations(owner)).toEqual([])
+      expect(owner.read.pendingOwnPosts('alpha', target)).toEqual([])
+      await owner.flush()
+      expect(owner.records()).toEqual(before)
+      expect(owner.io.writes()).toEqual([])
+      if (before.length === 0) expect(existsSync(threadPath(owner.stateDir))).toBe(false)
+      expect(owner.view('alpha', A_ALL, ROOT)).not.toBe('joined')
+    } finally { await finish(owner) }
+  })
+
+  test('two personas sharing the same bot identity join only the roots their own replies create', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), { ...options, membership: { ...options.membership, names: ['alpha', 'beta'] }, start: false })
+    try {
+      const a = owner.members.h.stub(owner.members.h.p('alpha')), b = owner.members.h.stub(owner.members.h.p('beta'))
+      Object.assign(b.identity, a.identity)
+      b.script.botsInfo.push({ kind: 'ok', result: { bot: { id: a.identity.botId, user_id: a.identity.botUserId, app_id: a.identity.appId, deleted: false } } })
+      await owner.start()
+      expect(owner.members.h.identityFor('alpha')).toEqual(owner.members.h.identityFor('beta'))
+      const alpha = await openOwner(owner), beta = await openOwner(owner, 'beta')
+      a.script.post.push({ kind: 'ok', result: { ts: ROOT } }); b.script.post.push({ kind: 'ok', result: { ts: OTHER } })
+      for (const result of await Promise.all([alpha.session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL }), beta.session.call('reply', { chat_id: A_ALL, text: 'beta' })])) expect(result.isError).toBeUndefined()
+      const check = () => {
+        expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined'); expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
+        expect(owner.view('beta', A_ALL, OTHER)).toBe('joined'); expect(owner.view('beta', A_ALL, ROOT)).toBe('not-joined')
+      }
+      check(); await owner.flush()
+      expect(outcomes(owner)).toHaveLength(1); expect(outcomes(owner, 'beta')).toHaveLength(1)
+      owner = await owner.reopen(); check()
+    } finally { await finish(owner) }
+  })
+
+  test.each(['intent', 'outcome', 'unreadable'] as const)('%s failure cannot stop or repeat chunks/uploads, change the result, or delay reaction cleanup', async failure => {
+    const dir = join(h.dir, 'owner')
+    let owner = await makeOwnPostHarness(dir, options)
+    try {
+      if (failure === 'unreadable') {
+        await owner.close()
+        const io = threadFsControls(dir); io.fail('readFileSync')
+        owner = await makeOwnPostHarness(dir, { membership: { ...options.membership, reopen: true }, memory: { reopen: true, fs: io } })
+        expect(owner.memory.store('alpha')?.readable).toBe(false)
+      } else if (failure === 'intent') owner.io.fail('writeSync')
+      const readyFlags: boolean[] = []
+      const { session, stub } = await openOwner(owner, 'alpha', {
+        getReplySettings: () => ({ ...REPLY_SETTINGS, reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }),
+        ownPosts: { start(...args) { const start = owner.observer.start(...args); readyFlags.push(!!start?.ready); return start }, end: owner.observer.end },
+      })
+      const held = makeDeferredWebApiCall()
+      stub.script.post.push(held.outcome, { kind: 'ok', result: { ts: OTHER } })
+      await captureReplyAck(stub, 'alpha')
+      const pending = session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(2), files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
+      await replyReached(() => stub.calls.postMessage.length === 1)
+      if (failure === 'outcome') owner.io.fail('writeSync')
+      held.settle({ kind: 'ok', result: { ts: ROOT } })
+      const result = await pending
+      expect(result).toEqual({ content: [{ type: 'text', text: `Sent 2 message(s) + 2 file(s) to ${A_ALL} [ts: ${OTHER}]` }] })
+      expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual([LEAK_SENTINEL, LEAK_SENTINEL])
+      expect(stub.calls.filesUploadV2).toHaveLength(2)
+      expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, OTHER)).toBe('joined')
+      expect(registrations(owner)).toHaveLength(4)
+      if (failure === 'unreadable') expect(readyFlags).toEqual([false, false, false, false])
+      await owner.flush()
+      expect(owner.threads.events.some(e => e.type === (failure === 'unreadable' ? 'read-failed' : 'append-failed'))).toBe(true)
+      expect(h.lines).toEqual([])
+      stub.script.post.push({ kind: 'ok', result: { ts: PARENT } }, { kind: 'platform', error: 'not_in_channel' })
+      const partial = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3), files: [replyFile('later.txt')] })
+      expect(partial.isError).toBe(true)
+      expect(partial.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: PARENT, uploaded: 0, files: 1 }, 'not_in_channel'))
+      expect(stub.calls.postMessage).toHaveLength(4)
+      expect(stub.calls.filesUploadV2).toHaveLength(2)
+      expect(owner.view('alpha', A_ALL, PARENT)).toBe('joined')
+      expect(h.lines).toHaveLength(1)
+      expect(h.lines[0]).toContain('sent=1/3 uploaded=0/1:')
+      expect(h.lines[0]).toContain('not_in_channel')
+    } finally { await finish(owner) }
   })
 })
 

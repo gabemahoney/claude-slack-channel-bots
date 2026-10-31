@@ -197,6 +197,9 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     makeThreadMemoryHarness: 'builds applied configuration and captures Thread Memory reports and storage failures',
     makeThreadMembershipHarness: 'builds authenticated membership and Thread Memory composition',
   },
+  'tests/test-helpers/own-post.ts': {
+    makeOwnPostHarness: 'builds own-post observation over authenticated membership, applied configuration and Thread Memory',
+  },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
@@ -477,12 +480,13 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     ]) expect(touchReasonsOf(suite, code)).toEqual([expect.stringContaining('from src/own-post.ts: the own-post observer')])
     for (const code of [
       "import { OWN_POST_SURFACES } from '../src/own-post.ts'",
-      "import type { OwnPostIssue, OwnPostObserver } from '../src/own-post.ts'",
+      "import type { OwnPostAnswer, OwnPostObserver } from '../src/own-post.ts'",
       "import { type OwnPostObserver } from '../src/own-post.ts'",
       "import type * as OwnPost from '../src/own-post.ts'",
     ]) expect(touchReasonsOf(suite, code)).toEqual([])
     expect(callsAssertNoLeak(suite)).toBe(true)
     expect(suite in EXEMPT).toBe(false)
+    expect(touchReasonsOf(suite, "import { makeOwnPostHarness } from './test-helpers/own-post.ts'")).toHaveLength(1)
   })
 
   test('operator request/review functions and new helpers remain secret-bearing surfaces without exemptions', () => {

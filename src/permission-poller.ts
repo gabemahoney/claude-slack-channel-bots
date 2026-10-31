@@ -1023,7 +1023,7 @@ async function observeWedgeCandidate(
       `[slack] permission-poller: spawn ${instanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
     )
     // F3: latch only on success, at the success response, so a later
-    // trail, log or enrollment fault cannot hide it; a failed post leaves
+    // trail, log or join bookkeeping fault cannot hide it; a failed post leaves
     // warningFired false so a subsequent tick retries and exactly one
     // message lands on recovery.
     const latch = () => { state.warningFired = true }
@@ -1618,8 +1618,8 @@ async function postPermissionPrompt(
   const { text, blocks } = prompt
   const emit = deps.emitTrail ?? defaultEmitTrail
   const compositeKey = makeCompositeKey(row.instance_id, permission.request_token)
-  // Registered at the success response, before the hold, enrollment or trail
-  // bookkeeping can fail, so a posted prompt stays answerable and is never posted again.
+  // Registered at the success response despite join bookkeeping faults and
+  // before hold or trail bookkeeping, so a posted prompt stays answerable and is never posted again.
   const register = (posted: DestinationPosted) => {
     if (posted.ts) {
       livePermissions.set(compositeKey, {

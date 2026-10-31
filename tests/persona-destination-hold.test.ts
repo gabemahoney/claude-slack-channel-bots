@@ -76,7 +76,7 @@ import {
   type PersonaDestinationHold,
 } from '../src/persona-destination-hold.ts'
 import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
-import type { OwnPostObserver } from '../src/own-post.ts'
+import { holdOwnPostReady, makeRecordingOwnPostObserver } from './test-helpers/own-post.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -130,8 +130,16 @@ let lookupError: Error
 let resolverThrows: number
 /** A logged line matching this throws after it is recorded (a failing post-success logger). */
 let logThrows: RegExp | undefined
-/** Each own post the resolver confirmed, by surface and channel. */
-let observedPosts: { surface: string; channel: string }[]
+let ownPosts: ReturnType<typeof makeRecordingOwnPostObserver>
+/** Successful settlements, retaining the corresponding start's surface. */
+function observedPosts() {
+  return ownPosts.calls.flatMap(call => {
+    if (call.kind !== 'end' || call.answer.kind !== 'confirmed') return []
+    const start = ownPosts.calls.find(c => c.kind === 'start' && c.operation === call.operation)
+    if (!start || start.kind !== 'start') throw new Error('end without a matching start')
+    return [{ surface: start.surface, channel: call.answer.channel }]
+  })
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'persona-destination-hold-'))
@@ -158,17 +166,12 @@ beforeEach(() => {
   lookupError = new Error(`lookup failed (${sentinelInMessage('lookup')})`)
   resolverThrows = 0
   logThrows = undefined
-  observedPosts = []
+  ownPosts = makeRecordingOwnPostObserver()
   const log = (line: string): void => {
     logs.push(line)
     if (logThrows?.test(line)) throw new Error('injected log failure')
   }
-  const ownPosts: OwnPostObserver = {
-    start: () => undefined, end: () => {},
-    issue: (key, surface) => ({ key, surface, operation: `op-${observedPosts.length + 1}`, issuer: {} }),
-    confirm: (issue, posted) => { observedPosts.push({ surface: issue!.surface, channel: posted.channel }) },
-  }
-  const real = createPersonaDestinations({ log, getPersonaConfig: () => inEffect, ownPosts })
+  const real = createPersonaDestinations({ log, getPersonaConfig: () => inEffect, ownPosts: ownPosts.observer })
   const destinations: PersonaDestinations = {
     post: (persona, c, message, options) => {
       if (resolverThrows > 0) {
@@ -762,7 +765,7 @@ describe('a confirmed post survives a failing settle', () => {
     await clock.flush()
     expect(postedTexts(C)).toEqual(['prompt 1', 'n1', 'prompt 2'])
     expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
-    expect(observedPosts).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }, { surface: 'prompt', channel: 'C0CEE0001' }])
+    expect(observedPosts()).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }, { surface: 'prompt', channel: 'C0CEE0001' }])
     expectOneOpening()
     expect(clearedLines()).toHaveLength(1)
     hold.begin(C.key)!.release()
@@ -779,7 +782,7 @@ describe('a confirmed post survives a failing settle', () => {
     expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     await deliver(C, 'after')
     expect(postedTexts(C)).toEqual(['prompt 1', 'prompt 2', 'after'])
-    expect(observedPosts.map(p => p.surface)).toEqual(['prompt', 'notice'])
+    expect(observedPosts().map(p => p.surface)).toEqual(['prompt', 'notice'])
     expectOneOpening()
     expect(clearedLines()).toHaveLength(1)
   })
@@ -800,12 +803,12 @@ describe('a confirmed post survives a failing settle', () => {
     expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     await clock.advance(60_000)
     expect(postedTexts(C)).toEqual(['n1', 'n1', 'n2', 'n3'])
-    expect(observedPosts).toEqual([0, 1, 2].map(() => ({ surface: 'notice', channel: 'C0CEE0001' })))
+    expect(observedPosts()).toEqual([0, 1, 2].map(() => ({ surface: 'notice', channel: 'C0CEE0001' })))
     expectOneOpening()
     expect(clearedLines()).toHaveLength(1)
   })
 
-  test('a delivered notice whose opening line throws is still held and retried on schedule, then posted once; failures confirm nothing', async () => {
+  test('a delivered notice whose opening line throws is still held and retried on schedule, then posted once; failures record no successful post', async () => {
     stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
     logThrows = /persona-destination-failed:(?!.*: cleared:)/
     await deliver(C, 'n1')
@@ -814,13 +817,13 @@ describe('a confirmed post survives a failing settle', () => {
     expectOneOpening()
     expect(logs.indexOf(startLines()[0]!)).toBeLessThan(logs.indexOf(settleFailed(C)[0]!))
     expect(hold.view(C.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5000 })
-    expect(observedPosts).toEqual([])
+    expect(observedPosts()).toEqual([])
     logThrows = undefined
     await clock.advance(5000)
     expect(postedTexts(C)).toEqual(['n1', 'n1'])
     expect(posts(C).length).toBe(2)
     expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
-    expect(observedPosts).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }])
+    expect(observedPosts()).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }])
     expectOneOpening()
     expect(clearedLines()).toHaveLength(1)
   })
@@ -831,6 +834,41 @@ describe('a confirmed post survives a failing settle', () => {
 // ---------------------------------------------------------------------------
 
 describe('held-notice retries', () => {
+  test('a retry waiting on ready posts nothing, starts no duplicate attempt and arms no extra timer', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await deliver(C, 'n1')
+    expect(startLines()).toHaveLength(1)
+    expect(clock.pendingCount()).toBe(1)
+    const ready = holdOwnPostReady()
+    ownPosts.enqueue({ ready: ready.ready })
+    await clock.runNext()
+    expect(ownPosts.calls.map(c => c.kind)).toEqual(['start', 'end', 'start'])
+    expect(postedTexts(C)).toEqual(['n1'])
+    expect(clock.pendingCount()).toBe(0)
+    const fired = clock.firedCount()
+    await clock.advance(3_600_000)
+    expect(hold.begin(C.key)).toBeUndefined()
+    expect(ownPosts.calls.map(c => c.kind)).toEqual(['start', 'end', 'start'])
+    expect(postedTexts(C)).toEqual(['n1'])
+    expect(clock.firedCount()).toBe(fired)
+    expect(clock.pendingCount()).toBe(0)
+    expect(hold.view(C.key).heldNotices).toBe(1)
+    ready.resolve()
+    await clock.flush()
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
+    expect(ownPosts.calls.map(c => c.kind)).toEqual(['start', 'end', 'start', 'end'])
+    expect(observedPosts()).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }])
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(clearedLines()).toHaveLength(1)
+    expect(startLines()).toHaveLength(1)
+    expect(clock.pendingCount()).toBe(0)
+    await clock.advance(3_600_000)
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
+    expect(clock.firedCount()).toBe(fired)
+    expect(ownPosts.calls).toHaveLength(4)
+    hold.begin(C.key)!.release()
+  })
+
   test('while a held-notice retry is in flight nothing else is attempted for the persona, however long it takes', async () => {
     const retry = makeDeferredWebApiCall()
     stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' }, retry.outcome)

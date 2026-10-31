@@ -30,7 +30,7 @@
  * (`describeDestinationFailure`, `describeDestinationFailureCause`).
  *
  * Pure module under test: built over one `makeStubSlack` stub per persona
- * (leak marker on) and a line capture. No token, file or timer is used;
+ * (leak marker on) and a line capture. Real-owner cases use isolated Thread Memory;
  * `afterEach` runs `assertNoLeak` over every log line and result.
  */
 
@@ -56,7 +56,9 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
+import { createOwnPostObserver, ownPostAnswerOfError, type OwnPostObserver } from '../src/own-post.ts'
+import { holdOwnPostReady, makeOwnPostHarness, makeRecordingOwnPostObserver, type OwnPostStep } from './test-helpers/own-post.ts'
+import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import {
@@ -516,84 +518,208 @@ describe('posting', () => {
 // Never rejects
 // ---------------------------------------------------------------------------
 
-describe('confirmed own posts', () => {
-  type Fault = 'issue' | 'confirm' | 'onPosted'
-  /** A resolver over a recording own-post adapter: what the resolver handed it, and when, beside the caller's callback. */
-  function observed(faults: readonly Fault[] = []) {
-    const events: Array<[string, unknown?]> = []
-    const issued = { key: C.key, surface: 'notice' as const, operation: 'op-1', issuer: {} }
-    const ownPosts: OwnPostObserver = {
-      start: () => undefined, end: () => {},
-      issue(key, surface, channel) { events.push(['issue', { key, surface, channel }]); if (faults.includes('issue')) throw new Error('injected issue'); return { ...issued, key, surface } },
-      confirm(issue, posted) { events.push(['confirm', { issue: issue?.surface, posted }]); if (faults.includes('confirm')) throw new Error('injected confirm') },
-    }
-    const resolver = createPersonaDestinations({ log: (line) => logs.push(line), getPersonaConfig: () => ({ channel_mode: 'strict' as const }), ownPosts })
-    const onPosted = (posted: DestinationPosted) => { events.push(['onPosted', posted]); if (faults.includes('onPosted')) throw new Error('injected onPosted') }
-    return { events, resolver, onPosted }
+describe('own-post operations', () => {
+  function observed(steps: OwnPostStep[] = []) {
+    const recording = makeRecordingOwnPostObserver(steps)
+    const resolver = createPersonaDestinations({ log: line => logs.push(line),
+      getPersonaConfig: () => ({ channel_mode: 'strict' }), ownPosts: recording.observer })
+    return { ...recording, resolver }
   }
 
-  test('a surfaced post is issued for its resolved channel before the first await and confirmed with Slack\'s channel and ts before onPosted, before it is returned', async () => {
-    const { events, resolver, onPosted } = observed()
+  test.each(['prompt', 'warning', 'notice'] as const)('%s starts before Slack without a ready wait, and ends once before onPosted and return', async surface => {
+    const { calls, resolver } = observed()
     const answer = makeDeferredWebApiCall()
     stub(C).script.post.push(answer.outcome)
-    const pending = resolver.post(C, client(C), { text: 'notice' }, { surface: 'prompt', onPosted })
-    // The channel lets the owner see a leave, rejoin or reset during the post as superseding it.
-    expect(events).toEqual([['issue', { key: C.key, surface: 'prompt', channel: 'C0CHAN002' }]])
+    const message = { text: 'exact notice\nwith whitespace  ', blocks: [{ type: 'section' }] }
+    const atPost: string[][] = [], atCallback: string[][] = [], callbacks: DestinationPosted[] = []
+    const web = stub(C).web, original = web.chat.postMessage
+    web.chat.postMessage = ((...args: Parameters<typeof original>) => {
+      atPost.push(calls.map(c => c.kind))
+      return original(...args)
+    }) as typeof original
+    const pending = resolver.post(C, client(C), message, { surface, onPosted(posted) {
+      atCallback.push(calls.map(c => c.kind)); callbacks.push(posted)
+    } })
+    // No await has occurred: both the start and the actual Slack call exist.
+    expect(calls).toEqual([{ kind: 'start', key: C.key, surface,
+      target: { channel: 'C0CHAN002' }, content: { kind: 'text', text: message.text }, operation: expect.any(Object) }])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', ...message }])
+    expect(atPost).toEqual([['start']])
     await drainMicrotasks()
-    expect(events).toHaveLength(1)
-    answer.settle({ kind: 'ok', result: { ts: '1700000000.000900' } })
-    const result = record(await pending)
+    expect(calls).toHaveLength(1)
+    expect(callbacks).toEqual([])
+    answer.settle({ kind: 'ok', result: { ts: '1700000000.000900', message: { thread_ts: '1700000000.000800' } } })
     const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000900' }
-    expect(result).toEqual(posted)
-    expect(events.slice(1)).toEqual([['confirm', { issue: 'prompt', posted: { channel: 'C0CHAN002', ts: '1700000000.000900' } }], ['onPosted', posted]])
-  })
-
-  test.each([[['issue']], [['confirm']], [['onPosted']], [['confirm', 'onPosted']]] as const)('a %j fault never turns a confirmed post into a failure or skips the caller\'s callback', async faults => {
-    const { events, resolver, onPosted } = observed(faults)
-    const result = record(await resolver.post(C, client(C), { text: 'notice' }, { surface: 'notice', onPosted }))
-    expect(result).toEqual({ outcome: 'posted', channelId: 'C0CHAN002', ts: expect.any(String) })
-    expect(events.map(([name]) => name)).toEqual((faults as readonly Fault[]).includes('issue') ? ['issue', 'onPosted'] : ['issue', 'confirm', 'onPosted'])
-    expect(posts(C)).toHaveLength(1)
+    expect(record(await pending)).toEqual(posted)
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ kind: 'end', operation: calls[0]!.operation,
+      answer: { kind: 'confirmed', channel: 'C0CHAN002', ts: posted.ts, threadTs: '1700000000.000800' } })
+    expect(calls[1]!.operation).toBe(calls[0]!.operation)
+    expect(atCallback).toEqual([['start', 'end']])
+    expect(callbacks).toEqual([posted])
+    results.push(callbacks)
     expect(logs).toEqual([])
   })
 
-  test('a success without a ts confirms none and hands undefined to the caller; no surface observes nothing', async () => {
-    const { events, resolver, onPosted } = observed()
-    stub(C).script.post.push({ kind: 'ok', result: { ts: '' } })
-    expect(record(await resolver.post(C, client(C), { text: 'no ts' }, { surface: 'prompt', onPosted }))).toEqual({ outcome: 'posted', channelId: 'C0CHAN002', ts: undefined })
-    expect(events.slice(1)).toEqual([['confirm', { issue: 'prompt', posted: { channel: 'C0CHAN002' } }], ['onPosted', { outcome: 'posted', channelId: 'C0CHAN002', ts: undefined }]])
-    events.length = 0
-    expect(record(await resolver.post(C, client(C), { text: 'plain' }, { onPosted }))).toMatchObject({ outcome: 'posted' })
-    expect(events.map(([name]) => name)).toEqual(['onPosted'])
-  })
-
-  test('failed and refused posts confirm nothing; a DM destination is confirmed with the opened D… conversation for the owner to classify', async () => {
-    const { events, resolver, onPosted } = observed()
-    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
-    expect(record(await resolver.post(C, client(C), { text: 'fails' }, { surface: 'notice', onPosted }))).toMatchObject({ outcome: 'failed', step: 'chat.postMessage' })
-    expect(record(await resolver.post({ ...A, dm: { enabled: false, contact: 'U0ALPHA01' } }, client(A), { text: 'refused' }, { surface: 'notice', onPosted })))
-      .toEqual({ outcome: 'refused', reason: 'dm_disabled' })
-    expect(events.map(([name]) => name)).toEqual(['issue', 'issue'])
-    stub(A).script.open.push(openedDm('D0ALPHADM'))
-    expect(record(await resolver.post(A, client(A), { text: 'dm' }, { surface: 'notice', onPosted }))).toMatchObject({ outcome: 'posted', channelId: 'D0ALPHADM' })
-    expect(events.slice(2).map(([name, value]) => name === 'confirm' ? (value as { posted: { channel: string } }).posted.channel : name)).toEqual(['issue', 'D0ALPHADM', 'onPosted'])
-    // A DM destination has no channel lifetime to capture at issue.
-    expect(events[2]).toEqual(['issue', { key: A.key, surface: 'notice', channel: undefined }])
-  })
-
-  test('a surfaced notice through the ownerless observer server.ts builds posts once, hands Slack\'s channel and ts to onPosted and logs nothing', async () => {
-    const ownPosts = createOwnPostObserver(() => undefined)
-    const resolver = createPersonaDestinations({ log: (line) => logs.push(line), getPersonaConfig: () => ({ channel_mode: 'strict' as const }), ownPosts })
-    const called: DestinationPosted[] = []
-    stub(C).script.post.push({ kind: 'ok', result: { ts: '1700000000.000901' } })
-
-    const result = record(await resolver.post(C, client(C), { text: 'notice' }, { surface: 'notice', onPosted: (posted) => void called.push(posted) }))
-
-    const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000901' }
-    expect(result).toEqual(posted)
-    expect(called).toEqual([posted])
-    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'notice' }])
+  test.each(['resolve', 'reject'] as const)('a held ready blocks Slack until it settles (%s), then posts exactly once', async settlement => {
+    const held = holdOwnPostReady(), { calls, resolver } = observed([{ ready: held.ready }])
+    const callbacks: DestinationPosted[] = []
+    const pending = resolver.post(C, client(C), { text: 'waiting' }, { surface: 'notice', onPosted: p => { callbacks.push(p) } })
+    await drainMicrotasks()
+    expect(calls.map(c => c.kind)).toEqual(['start'])
+    expect(posts(C)).toEqual([])
+    expect(callbacks).toEqual([])
+    if (settlement === 'resolve') held.resolve()
+    else held.reject(new Error('injected readiness failure'))
+    const result = record(await pending)
+    expect(result).toMatchObject({ outcome: 'posted', channelId: 'C0CHAN002' })
+    if (result.outcome !== 'posted') throw new Error('expected posted result')
+    expect(callbacks).toEqual([result]); results.push(callbacks)
+    expect(calls.map(c => c.kind)).toEqual(['start', 'end'])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'waiting' }])
     expect(logs).toEqual([])
+  })
+
+  test.each(['platform', 'network', 'sync'] as const)('a %s post failure ends its operation exactly once and never calls onPosted', async kind => {
+    const { calls, resolver } = observed()
+    let synchronousCalls = 0, callbacks = 0
+    if (kind === 'sync') stub(C).web.chat.postMessage = (() => {
+      synchronousCalls++; throw new Error('sync post failure')
+    }) as DestinationSlackClient['chat']['postMessage']
+    else stub(C).script.post.push(kind === 'platform' ? { kind: 'platform', error: 'invalid_blocks' } : { kind: 'network' })
+    const result = record(await resolver.post(C, client(C), { text: 'fails' }, { surface: 'prompt', onPosted: () => { callbacks++ } }))
+    expect(result).toMatchObject({ outcome: 'failed', step: 'chat.postMessage', channelId: 'C0CHAN002' })
+    if (result.outcome !== 'failed') throw new Error('expected failed post')
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ kind: 'end', operation: calls[0]!.operation, answer: ownPostAnswerOfError(result.error) })
+    expect(calls[1]!.operation).toBe(calls[0]!.operation)
+    expect(callbacks).toBe(0)
+    await drainMicrotasks()
+    expect(kind === 'sync' ? synchronousCalls : posts(C).length).toBe(1)
+    expect(logs).toEqual([])
+  })
+
+  test('an ok response without ts ends no-answer and preserves the callback and result', async () => {
+    const { calls, resolver } = observed(), callbacks: DestinationPosted[] = []
+    stub(C).script.post.push({ kind: 'ok', result: { ts: undefined } })
+    const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: undefined }
+    expect(record(await resolver.post(C, client(C), { text: 'no ts' }, { surface: 'prompt', onPosted: p => { callbacks.push(p) } }))).toEqual(posted)
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ kind: 'end', operation: calls[0]!.operation, answer: { kind: 'no-answer' } })
+    expect(callbacks).toEqual([posted]); results.push(callbacks)
+  })
+
+  test.each(['start', 'end'] as const)('a payload failure with a throwing %s stays failed and is never posted again', async fault => {
+    const error = new Error('injected observer failure')
+    const { calls, resolver } = observed([fault === 'start' ? { throwStart: error } : { throwEnd: error }])
+    stub(C).script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+    let callbacks = 0
+    const result = record(await resolver.post(C, client(C), { text: 'bad payload' }, {
+      surface: 'prompt', onPosted: () => { callbacks++ },
+    }))
+    expect(result).toMatchObject({ outcome: 'failed', step: 'chat.postMessage', code: 'invalid_blocks', channelId: 'C0CHAN002' })
+    expect(calls.map(c => c.kind)).toEqual(['start', 'end'])
+    expect(calls[1]).toMatchObject({ answer: { kind: 'failed', code: 'invalid_blocks' } })
+    await drainMicrotasks()
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'bad payload' }])
+    expect(callbacks).toBe(0)
+    expect(logs).toEqual([])
+  })
+
+  test('a DM starts only after the open and names the opened conversation', async () => {
+    const { calls, resolver } = observed(), opening = makeDeferredWebApiCall()
+    stub(A).script.open.push(opening.outcome)
+    const pending = resolver.post(A, client(A), { text: 'dm notice' }, { surface: 'notice' })
+    await drainMicrotasks()
+    expect(calls).toEqual([]); expect(posts(A)).toEqual([])
+    const opened = openedDm('D0ALPHADM')
+    if (opened.kind !== 'ok') throw new Error('expected opened DM fixture')
+    opening.settle(opened)
+    const result = record(await pending)
+    expect(result).toMatchObject({ outcome: 'posted', channelId: 'D0ALPHADM' })
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toMatchObject({ kind: 'start', key: A.key, surface: 'notice',
+      target: { channel: 'D0ALPHADM' }, content: { kind: 'text', text: 'dm notice' } })
+    expect(calls[1]).toMatchObject({ kind: 'end', answer: { kind: 'confirmed', channel: 'D0ALPHADM' } })
+    expect(calls[1]!.operation).toBe(calls[0]!.operation)
+    expect(methods(A)).toEqual(['conversations.open', 'chat.postMessage'])
+  })
+
+  test.each(['no surface', 'DM disabled', 'no contact', 'failed open', 'open without ID'] as const)('%s starts no operation', async kind => {
+    const { calls, resolver } = observed()
+    const persona = kind === 'no surface' ? C : kind === 'DM disabled' ? { ...A, dm: { enabled: false } }
+      : kind === 'no contact' ? { ...A, dm: { enabled: true } } : A
+    if (kind === 'failed open') stub(A).script.open.push({ kind: 'platform', error: 'missing_scope' })
+    if (kind === 'open without ID') stub(A).script.open.push({ kind: 'ok', result: { channel: undefined } })
+    const result = record(await resolver.post(persona, client(persona), { text: 'excluded' }, kind === 'no surface' ? undefined : { surface: 'notice' }))
+    expect(result.outcome).toBe(kind === 'no surface' ? 'posted' : kind.startsWith('open') || kind === 'failed open' ? 'failed' : 'refused')
+    expect(calls).toEqual([])
+    expect(posts(persona)).toHaveLength(kind === 'no surface' ? 1 : 0)
+  })
+
+  const faults = ['no observer', 'start', 'end', 'owner start', 'owner end', 'onPosted', 'no operation'] as const
+  for (const surface of ['prompt', 'warning', 'notice'] as const) {
+    test.each([...faults])(`${surface} with %s preserves one post, callback values and result without logging`, async fault => {
+      const failure = new Error('injected bookkeeping failure')
+      const recording = makeRecordingOwnPostObserver([fault === 'start' ? { throwStart: failure }
+        : fault === 'end' ? { throwEnd: failure } : fault === 'no operation' ? { start: 'undefined' } : {}])
+      let ownerCalls = 0
+      const owner = createOwnPostObserver(() => ({
+        startOperation(...args) {
+          if (fault === 'owner start') { ownerCalls++; throw failure }
+          return recording.observer.start(...args)
+        },
+        endOperation() { ownerCalls++; throw failure },
+      }))
+      const ownPosts: OwnPostObserver | undefined = fault === 'no observer' ? undefined
+        : fault.startsWith('owner') ? owner : recording.observer
+      const resolver = createPersonaDestinations({ log: line => logs.push(line), getPersonaConfig: () => ({ channel_mode: 'strict' }), ownPosts })
+      const callbacks: DestinationPosted[] = []
+      stub(C).script.post.push({ kind: 'ok', result: { ts: '1700000000.000901' } })
+      const result = record(await resolver.post(C, client(C), { text: 'notice' }, { surface, onPosted(posted) {
+        callbacks.push(posted)
+        if (fault === 'onPosted') throw failure
+      } }))
+      const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000901' }
+      expect(result).toEqual(posted)
+      expect(callbacks).toEqual([posted]); results.push(callbacks)
+      expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'notice' }])
+      if (fault.startsWith('owner')) expect(ownerCalls).toBe(1)
+      expect(logs).toEqual([])
+    })
+  }
+})
+
+describe('destination joins through the production owner', () => {
+  test.each(['prompt', 'notice', 'failed', 'off', 'dm', 'intent failure'] as const)('%s preserves posting and records only its eligible join', async scenario => {
+    const channel = SHARED_CHANNEL_IDS.primary, ts = '1700000000.000950'
+    const h = await makeOwnPostHarness(dir, { membership: { channels: [{ id: channel, delivery: scenario === 'off' ? 'off' : 'thread_hybrid' }] } })
+    const slack = makeStubSlack({ leakMarker: LEAK_SENTINEL }), callbacks: DestinationPosted[] = []
+    try {
+      const persona = { ...h.authority.config().personas[0]!, permission_prompts: scenario === 'dm' ? DM_DESTINATION : channel }
+      const resolver = createPersonaDestinations({ log: line => logs.push(line), getPersonaConfig: h.authority.config, ownPosts: h.observer })
+      slack.script.post.push(scenario === 'failed' ? { kind: 'platform', error: 'not_in_channel' } : { kind: 'ok', result: { ts } })
+      if (scenario === 'intent failure') h.io.fail('writeSync')
+      const result = record(await resolver.post(persona, asWebClient(slack.web), { text: 'owner notice' }, {
+        surface: scenario === 'prompt' ? 'prompt' : 'notice', onPosted: p => { callbacks.push(p) },
+      }))
+      await h.flush()
+      expect(slack.calls.postMessage).toHaveLength(1)
+      const target = scenario === 'dm' ? stubOpenedDmId(persona.dm.contact!) : channel
+      expect(result).toMatchObject({ outcome: scenario === 'failed' ? 'failed' : 'posted', channelId: target })
+      expect(callbacks).toEqual(scenario === 'failed' ? [] : [{ outcome: 'posted', channelId: target, ts }])
+      results.push(callbacks)
+      const excluded = scenario === 'off' || scenario === 'dm'
+      expect(h.events.filter(e => e.type === 'registered')).toHaveLength(excluded ? 0 : 1)
+      expect(h.read.pendingOwnPosts(persona.key, target)).toEqual([])
+      expect(h.view(persona.key, target, ts)).toBe(excluded || scenario === 'failed' ? 'not-joined' : 'joined')
+      const records = h.records(persona.key)
+      expect(records.filter(r => r.kind === 'post-intent')).toHaveLength(excluded || scenario === 'intent failure' ? 0 : 1)
+      expect(records.filter(r => r.kind === 'post-outcome').map(r => r.outcome)).toEqual(excluded || scenario === 'intent failure' ? [] : [scenario === 'failed' ? 'none' : 'joined'])
+      if (scenario === 'intent failure') expect(h.owner.memoryOnlyJoins(persona.key)).toEqual([{ channel, root: ts }])
+      expect(logs).toEqual([])
+      assertNoLeak({ result: results, callbacks, logs, owner: h.captured() })
+    } finally { await h.close() }
   })
 })
 
