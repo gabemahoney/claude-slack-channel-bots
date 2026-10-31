@@ -117,6 +117,68 @@ describe('retained timing regressions', () => {
     }
   })
 
+  /** real_wait_delivery's optional `-- <case assertion...>` (b.p9r): every
+   * receipt/progress/diagnostic call, the assertion and each poll trace to
+   * stderr. Synthetic bounds: 3 s without progress, 5 s overall. */
+  function caseWait(call: string, statuses: number[], { ready = 'always', progress = 'stalled' } = {}) {
+    const result = shell([
+      declaration(real, 'real_wait_delivery'), declaration(scenario, '_scenario_poll_until'), declaration(scenario, '_scenario_check_timeout'),
+      'REAL_DELIVERY_WAIT_S=3', 'REAL_DELIVERY_MAX_WAIT_S=5', 'SCENARIO_POLL_S=1',
+      'REAL_RECEIPTS=receipts', 'SCENARIO_AD_SHIM_LOG=shim', 'clock="$HOME/clock"', 'printf "0\\n" > "$clock"',
+      // Fixed paths keep the traced receipt arguments exact.
+      'SLACK_STATE_DIR=state', 'HOME=/home/control',
+      '_scenario_now_ms() { cat "$clock"; }',
+      'sleep() { local now; read -r now < "$clock"; printf "sleep\\n" >&2; printf "%s\\n" "$((now+1000))" > "$clock"; }',
+      `ready_mode=${ready} progress_mode=${progress} statuses=(${statuses.join(' ')}) asserted=0`,
+      'bun() { local now; read -r now < "$clock"; printf "bun %s\\n" "$*" >&2; if [[ "$2" == progress ]]; then [[ "$progress_mode" == advancing ]] && echo "$((now/1000+1))" || echo 1; else [[ "$ready_mode" == always ]] || { [[ "$ready_mode" == later ]] && ((now > 0)); }; fi; }',
+      'check_case() { local s="${statuses[asserted]:-${statuses[-1]}}"; asserted=$((asserted+1)); printf "assert %s\\n" "$*" >&2; return "$s"; }',
+      '_real_delivery_diagnostic() { printf "diagnostic %s\\n" "$*" >&2; }',
+      call,
+    ].join('\n'))
+    return { status: result.status, trace: result.stderr.trimEnd().split('\n') }
+  }
+  const ready = 'bun receipts ready state control shim /home/control/.claude/projects 4 no-retype'
+  const progress = 'bun receipts progress state control shim /home/control/.claude/projects 4 no-retype'
+  const withCase = 'real_wait_delivery control 4 no-retype -- check_case a b'
+
+  test.each(['always', 'never'] as const)('real_wait_delivery without -- keeps its receipt calls and verdict when ready is %s', mode => {
+    const without = caseWait('real_wait_delivery control 4 no-retype', [0], { ready: mode })
+    expect(without).toEqual(mode === 'always' ? { status: 0, trace: [ready] } : { status: 1, trace: [
+      ready, progress, 'sleep', ready, progress, 'sleep', ready, progress, 'sleep', ready, progress,
+      'diagnostic control 4 no-retype',
+      'real persona control has open/unconfirmed deliveries (no-progress watchdog; receipts=1; idle bound=3s; overall bound=5s)'] })
+    // A case assertion runs only after a passing ready audit, so a wait that
+    // never gets one is identical with it, diagnostic arguments included.
+    if (mode === 'never') expect(caseWait(withCase, [0], { ready: mode })).toEqual(without)
+  })
+
+  test.each([
+    ['receipts pending twice, then complete', [75, 75, 0], 0, 3],
+    ['case proof fails', [1], 1, 1],
+    ['receipts pending, then the case proof fails', [75, 1], 1, 2],
+    ['case assertion exits with another status', [3], 3, 1],
+  ] as const)('real_wait_delivery -- case assertion: %s', (_name, statuses, status, asserted) => {
+    const pending = [ready, 'assert a b', progress, 'sleep']
+    expect(caseWait(withCase, [...statuses])).toEqual({ status,
+      trace: [...Array.from({ length: asserted - 1 }, () => pending).flat(), ready, 'assert a b'] })
+  })
+
+  test('real_wait_delivery -- runs its case assertion only after a passing ready audit', () => {
+    expect(caseWait(withCase, [0], { ready: 'later' })).toEqual({ status: 0, trace: [ready, progress, 'sleep', ready, 'assert a b'] })
+  })
+
+  test.each([
+    ['stalled', 'no-progress', 4, 1],
+    ['advancing', 'overall', 6, 5],
+  ] as const)('real_wait_delivery -- receipts pending with %s progress ends at the %s watchdog', (progressMode, reason, asserted, receipts) => {
+    const result = caseWait(withCase, [75], { progress: progressMode })
+    expect(result.status).toBe(1)
+    expect(result.trace.filter(line => line === 'assert a b')).toHaveLength(asserted)
+    // The diagnostic receives only the wait's own arguments.
+    expect(result.trace.slice(-2)).toEqual(['diagnostic control 4 no-retype',
+      `real persona control has open/unconfirmed deliveries (${reason} watchdog; receipts=${receipts}; idle bound=3s; overall bound=5s)`])
+  })
+
   test('test-35 rejects an old connection for a same-session resume', () => {
     const result = shell([
       declaration(real, '_real_connected'),

@@ -3,7 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import * as fs from 'node:fs'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createDeliveryQueue, type AcceptedInput, type QueueItem } from '../src/delivery-queue.ts'
@@ -18,27 +18,56 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
 import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, workloadItem, workloadItems } from './integration/fixtures/transcript-receipts.ts'
 import { checkAc76Admission, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
+import { runTest33Slice, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
-async function fixture(seed = true) {
+type SendKind = 'text' | 'enter' | 'retype'
+/** Durable attempt offsets for test33's key-fault legs. `fault` names the
+ * injected shim outcome consumed by the attempt at that offset; reset adds its
+ * guarded delayed Enter and the relaunch's first AD waiting observation. */
+const plans = {
+  plain: { stages: [[10, 'text']] },
+  retype: { stages: [[10, 'text'], [10010, 'retype']], fault: [10, 'swallow'] },
+  'unknown-typed': { stages: [[10, 'text'], [10010, 'enter']], fault: [10, 'unknown-typed'] },
+  reset: { stages: [[10, 'text'], [20500, 'retype'], [81000, 'retype'], [101000, 'enter'],
+    [111000, 'retype'], [141500, 'enter'], [171500, 'retype']], fault: [111000, 'swallow'], waiting: 100000 },
+  'reset missing retype': { stages: [[10, 'text'], [20500, 'retype'], [81000, 'retype'], [101000, 'enter'],
+    [111000, 'retype'], [141500, 'enter']], fault: [111000, 'swallow'], waiting: 100000 },
+} satisfies Record<string, { stages: [number, SendKind][]; fault?: [number, string]; waiting?: number }>
+type Plan = keyof typeof plans
+async function fixture(seed = true, projects = false) {
   const stateDir = mkdtempSync(join(tmpdir(), 'reminder-receipts-'))
   let now = 1000
   const queue = createDeliveryQueue({ stateDir, now: () => now })
   cleanups.push(async () => { await queue.stop(); rmSync(stateDir, { recursive: true, force: true }) })
   await queue.start()
-  const transcript = join(stateDir, 'session.jsonl'), shimLog = join(stateDir, 'shim.log'), journal = join(stateDir, 'queue/alpha.jsonl')
+  // test33 slices find transcripts under the scenario's HOME/.claude/projects.
+  const transcriptDir = projects ? join(stateDir, '.claude/projects/work') : stateDir
+  mkdirSync(transcriptDir, { recursive: true })
+  const transcript = join(transcriptDir, 'session.jsonl'), shimLog = join(stateDir, 'shim.log'), journal = join(stateDir, 'queue/alpha.jsonl')
   const takes: object[] = [], calls: string[] = [], lines: string[] = []
   const adapters = { parseDeliveryTranscriptRecord, receiptTextMatches }
   const persona = makeMultiPersonaConfig([{ name: 'alpha' }], stateDir).personas[0]!
-  async function complete(item: QueueItem) {
+  async function complete(item: QueueItem, plan: Plan = 'plain') {
     const a = item.accepted, seq = a.seq, text = `<channel seq="${seq}">${a.text}</channel>`
     const diagnostic = (kind: string) => `[${new Date(now).toISOString()}] [slack] ${kind}: persona="alpha" (key=alpha) source=${a.source} ${a.source === 'slack' ? 'chat_id' : 'sender'}=${JSON.stringify(a.channel ?? a.sender)} ts=${JSON.stringify(a.ts)} sender_id=${JSON.stringify(a.user ?? a.sender)}`
     if (a.reminder_for === undefined) lines.push(diagnostic('message-received'))
     await queue.append('alpha', { v: 1, kind: 'fixed', seq, parts: [text] })
-    now += 10
-    await queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: 1, send_kind: 'text', at: now, session_id: 'session', transcript_path: transcript, transcript_size: 0 })
-    calls.push(`call\t${now / 1000}\t1\t1\tbun\tsend-keys --instance-id cscb_alpha --text ${text.replace(/[^a-zA-Z0-9]/g, c => '\\' + c)} --no-enter`)
+    const base = now, { stages, fault, waiting } = plans[plan] as { stages: [number, SendKind][]; fault?: [number, string]; waiting?: number }
+    for (const [attempt, [offset, send_kind]] of stages.entries()) {
+      now = base + offset
+      await queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: attempt + 1, send_kind, at: now, session_id: 'session', transcript_path: transcript, transcript_size: 0 })
+      const words = send_kind === 'enter' ? '--key Enter'
+        : `--text ${text.replace(/[^a-zA-Z0-9]/g, c => '\\' + c)} --no-enter`
+      calls.push(`call\t${now / 1000}\t${seq}-${attempt}\t1\tbun\tsend-keys --instance-id cscb_alpha ${words}`)
+      if (fault?.[0] === offset) {
+        calls.push(`fault\t${now / 1000}\t${seq}-${attempt}\t1\tbun\tsend-keys no_enter ${fault[1]}`)
+        // A swallowed text still receives its guarded delayed Enter.
+        if (fault[1] === 'swallow') calls.push(`call\t${(now + 500) / 1000}\t${seq}-delayed\t1\tbun\tsend-keys --instance-id cscb_alpha --key Enter`)
+      }
+    }
+    if (waiting !== undefined) lines.push('[slack] delivery-launch-first-waiting: ' + JSON.stringify({ key: 'alpha', session_id: 'session', at: base + waiting }))
     now += 10
     takes.push({ ...promptEntry(text), uuid: `take-${seq}`, sessionId: 'session', timestamp: new Date(now).toISOString() })
     await queue.append('alpha', { v: 1, kind: 'delivered', seq, part: 1, at: now, receipt: { path: transcript, uuid: `take-${seq}` } })
@@ -48,10 +77,11 @@ async function fixture(seed = true) {
     writeFileSync(shimLog, calls.join('\n') + '\n')
     writeFileSync(join(stateDir, 'server.log'), lines.join('\n') + '\n')
   }
-  async function send(input: AcceptedInput) {
+  async function send(input: AcceptedInput, plan: Plan = 'plain') {
     const result = await queue.accept('alpha', input)
     if (result.status !== 'accepted' || !result.item) throw new Error('fixture acceptance failed')
-    await complete(result.item)
+    await complete(result.item, plan)
+    return result.item
   }
   if (seed) {
     await send(slackInput())
@@ -561,3 +591,200 @@ test.each([
   }
   expect(() => auditReceipts({ ...h.options, noRetype: mode === 'reminder retyped' }, h.entries(), h.adapters)).toThrow(reason)
 })
+
+/** test33 legs whose full receipt wait is followed by a case audit that
+ * re-reads newer evidence (b.p9r). A production reminder can be accepted
+ * between the two reads. */
+const test33Legs = {
+  'reset-spacing': { count: 4, reminders: 2, reminderFor: 5 },
+  'key-proof': { count: 2, reminders: 0, reminderFor: 1 },
+  'unknown-proof': { count: 2, reminders: 0, reminderFor: 1 },
+} as const satisfies Record<Test33Leg, object>
+const legNames = Object.keys(test33Legs) as Test33Leg[]
+
+const legPlans = { 'reset-spacing': 'reset', 'key-proof': 'retype', 'unknown-proof': 'unknown-typed' } as const satisfies Record<Test33Leg, Plan>
+/** `plan` is the key-fault plan of the leg's own (last) original input. */
+async function test33Evidence(leg: Test33Leg, plan: Plan = legPlans[leg]) {
+  const h = await fixture(false, true)
+  const observe = (state: 'working' | 'waiting') => h.queue.observeReplyReminders('alpha',
+    cannedGetResult({ state, session_id: 'session' }, h.persona, h.options.stateDir), REPLY_REMINDER_TEXT, true, () => true)
+  const slack = (n: number) => { const ts = `1700000000.00000${n}`; return slackInput({ ts, key: { chat_id: 'C0TEST001', ts } }) }
+  await h.send(slack(1))
+  if (leg === 'reset-spacing') {
+    // As in the archived run: ordinals 1-4 are sequences 1, 2, 5 and 6, and
+    // sequence 5's candidate saw AD working before the reset item completed.
+    await h.send(slack(2))
+    await observe('working')
+    for (const reminder of await observe('waiting')) await h.complete(reminder)
+    await h.send(slack(3))
+    await observe('working')
+    await h.send(slack(4), plan)
+  } else {
+    await observe('working')
+    await h.send(slack(2), plan)
+  }
+  h.options.expectedCount = test33Legs[leg].count
+  return { h, observe, slack, pending: [] as QueueItem[] }
+}
+type Test33Evidence = Awaited<ReturnType<typeof test33Evidence>>
+
+/** `inject` runs once the slice's first full receipt audit has succeeded;
+ * `settle` runs at the slice's first poll, else after it. The following leg's
+ * full audit then reads the same settled evidence. */
+async function raceTest33(leg: Test33Leg, e: Test33Evidence, race: {
+  inject?(): Promise<void>; settle?(): Promise<void>
+} = {}) {
+  let injected = 0, settled = false
+  const settle = async () => {
+    if (settled || !injected) return
+    settled = true
+    await race.settle?.()
+  }
+  const result = await runTest33Slice(leg, e.h.options.stateDir, {
+    afterReady: async () => { injected++; await race.inject?.() },
+    poll: settle,
+  })
+  await settle()
+  let final: { ok: true; audit: ReturnType<typeof auditReceipts> } | { ok: false; error: string }
+  try { final = { ok: true, audit: e.h.audit() } } catch (error) { final = { ok: false, error: (error as Error).message } }
+  return { result, injected, final }
+}
+const reminderRace = (e: Test33Evidence) => ({
+  inject: async () => { e.pending.push(...await e.observe('waiting')) },
+  settle: async () => { for (const item of e.pending) await e.h.complete(item) },
+})
+
+test.each(legNames)('test33 %s passes its receipt wait and case audit at once when no later work arrives', async leg => {
+  const e = await test33Evidence(leg)
+  const { result, injected, final } = await raceTest33(leg, e)
+  expect(injected).toBe(1)
+  expect(result).toMatchObject({ code: 0, signal: null, stderr: '', errors: [] })
+  expect(final).toMatchObject({ ok: true, audit: { items: test33Legs[leg].count, reminders: test33Legs[leg].reminders } })
+})
+
+/** How each leg's corrected wait treats its case assertion's exit status. The
+ * case runs its complete receipt audit first: while that fails it exits pending
+ * (75) and the wait re-polls; only once it passes does the case's own proof
+ * run, and that proof failing is its verdict (1), with no further poll. */
+test.each(legNames)('test33 %s completes when a legitimate reply reminder is accepted after its successful receipt wait', async leg => {
+  const e = await test33Evidence(leg)
+  const { result, injected, final } = await raceTest33(leg, e, reminderRace(e))
+  // The production observer accepted one open reminder for an earlier,
+  // fully delivered Slack input after the wait's complete audit succeeded.
+  expect(injected).toBe(1)
+  expect(e.pending.map(item => [item.accepted.source, item.accepted.sender, item.accepted.reminder_for]))
+    .toEqual([['interject', 'reply-reminder', test33Legs[leg].reminderFor]])
+  // Only the case receipt audit is pending, so the whole wait re-polls once.
+  expect(result).toMatchObject({ code: 0, signal: null, stderr: '', polls: 1, ready: 2,
+    calls: ['ready:0', `${leg}:75`, 'progress:0', 'ready:0', `${leg}:0`],
+    errors: [pendingError(e)] })
+  // Every reminder still needs full receipt/FIFO proof; none is filtered out.
+  expect(final).toMatchObject({ ok: true, audit: { items: test33Legs[leg].count, reminders: test33Legs[leg].reminders + 1 } })
+})
+
+const pendingError = (e: Test33Evidence, log: 'received' | 'delivered' = 'delivered') =>
+  `real-case-assertions: receipts pending: Item ${e.pending[0]!.accepted.seq} has no valid message-${log} timestamp`
+/** After the pending case audit, the ready audit sees the open (or defective)
+ * item too. Synthetic bounds: 3 s without original-receipt progress, 5 s overall. */
+function expectNoProgressWatchdog(leg: Test33Leg, e: Test33Evidence, result: Test33Result,
+  { receipts = test33Legs[leg].count as number, polls = 3 } = {}) {
+  const open = Array.from({ length: polls }, () => ['ready:1', 'progress:0']).flat()
+  expect(result.calls.slice(0, -2)).toEqual(['ready:0', `${leg}:75`, 'progress:0', ...open])
+  expect(result.calls.slice(-2)).toEqual(['diagnostic:0', `${join(e.h.options.stateDir, 'real-delivery-status.json')}:0`])
+  expect(result).toMatchObject({ code: 1, signal: null, polls })
+  expect(result.stderr).toBe(`real persona alpha has open/unconfirmed deliveries (no-progress watchdog; receipts=${receipts}; idle bound=3s; overall bound=5s)\n`)
+}
+
+/** Corrected waits must still reject defective evidence, and an item that never
+ * completes must end under the existing synthetic watchdog rather than hang.
+ * Each control is the regression race plus one defect: the defect keeps the
+ * slice's ready audit failing to its watchdog, and the full audit names it. */
+test.each([
+  ['invalid reminder provenance', 'Invalid reply reminder provenance', (e: Test33Evidence) => ({ ...reminderRace(e),
+    settle: async () => {
+      await reminderRace(e).settle()
+      // The completed reminder claims an input that already had its reminder.
+      rewriteRows(e.h.journal, r => r.kind === 'accepted' && r.seq === e.pending[0]!.accepted.seq ? { ...r, reminder_for: 1 } : r)
+    } })],
+  ['missing reminder receipt', 'Item 7 part 1 has no exact transcript receipt', (e: Test33Evidence) => ({ ...reminderRace(e),
+    settle: async () => {
+      await reminderRace(e).settle()
+      rewriteRows(e.h.transcript, r => r.uuid === 'take-7' ? undefined : r)
+    } })],
+  ['mismatched reminder receipt', 'Durable receipt does not identify matching take-in', (e: Test33Evidence) => ({ ...reminderRace(e),
+    settle: async () => {
+      await reminderRace(e).settle()
+      rewriteRows(e.h.journal, r => r.kind === 'delivered' && r.seq === 7 ? { ...r, receipt: { ...r.receipt, uuid: 'take-5' } } : r)
+    } })],
+  ['reminder send overlapping the reset item', 'Successor send preceded prior receipt/delivery log', (e: Test33Evidence) => ({ ...reminderRace(e),
+    settle: async () => {
+      await reminderRace(e).settle()
+      // Log the reset item's completion only after the reminder was typed.
+      const log = join(e.h.options.stateDir, 'server.log'), reminderSent = jsonLines(e.h.journal).find(r => r.kind === 'sent' && r.seq === 7).at
+      writeFileSync(log, readFileSync(log, 'utf8').split('\n').map(line => line.includes('message-delivered:') && line.includes('ts="1700000000.000004"')
+        ? line.replace(/^\[[^\]]+\]/, `[${new Date(reminderSent + 1).toISOString()}]`) : line).join('\n'))
+    } })],
+  ['reminder that never completes', 'Item 7 has no valid message-delivered timestamp', (e: Test33Evidence) => ({ inject: reminderRace(e).inject })],
+  ['extra original input', 'Accepted item count differs', (e: Test33Evidence) => ({
+    inject: async () => {
+      const r = await e.h.queue.accept('alpha', e.slack(5))
+      if (r.status !== 'accepted' || !r.item) throw new Error('extra input was not accepted')
+      e.pending.push(r.item)
+    },
+    settle: reminderRace(e).settle })],
+] as const)('test33 reset-spacing race still rejects %s', async (name, reason, race) => {
+  const e = await test33Evidence('reset-spacing')
+  const { result, injected, final } = await raceTest33('reset-spacing', e, race(e))
+  expect(injected).toBe(1)
+  expect(result.signal).toBeNull()
+  // The slice's own verdict: pending once, then its ready audit keeps
+  // failing until the watchdog. The extra Slack input is pending on its
+  // received log, and its own receipt is progress, so the idle bound
+  // restarts once.
+  const extra = name === 'extra original input'
+  expectNoProgressWatchdog('reset-spacing', e, result, extra ? { receipts: 5, polls: 4 } : {})
+  expect(result.errors).toEqual([pendingError(e, extra ? 'received' : 'delivered')])
+  // Which defect it was.
+  expect(final).toMatchObject({ ok: false, error: expect.stringContaining(reason) })
+})
+
+const caseProofFailures = {
+  'reset-spacing': ['reset missing retype', 'reset requires the durable Enter/text/Enter/text recovery sequence'],
+  'key-proof': ['plain', 'missed text was not retyped'],
+  'unknown-proof': ['plain', 'unknown fault was not applied'],
+} as const satisfies Record<Test33Leg, readonly [Plan, string]>
+test.each(legNames)('test33 %s fails at its first audit-passing case assertion on its own case-proof failure once pending receipts complete', async leg => {
+  const [plan, reason] = caseProofFailures[leg]
+  const e = await test33Evidence(leg, plan)
+  const { result, injected, final } = await raceTest33(leg, e, reminderRace(e))
+  expect(injected).toBe(1)
+  // Pending first, then the own proof on the settled evidence; no watchdog.
+  expect(result).toMatchObject({ code: 1, signal: null, polls: 1, ready: 2, stderr: '',
+    calls: ['ready:0', `${leg}:75`, 'progress:0', 'ready:0', `${leg}:1`],
+    errors: [pendingError(e), `real-case-assertions: ${reason}`] })
+  // The receipts are complete, so the failure is the case's own proof alone.
+  expect(final).toMatchObject({ ok: true, audit: { items: test33Legs[leg].count, reminders: test33Legs[leg].reminders + 1 } })
+})
+
+test.each(legNames)('test33 %s with a bad case proof and a never-completing reminder fails at the existing no-progress watchdog, never passing', async leg => {
+  const e = await test33Evidence(leg, caseProofFailures[leg][0])
+  const { result, injected } = await raceTest33(leg, e, { inject: reminderRace(e).inject })
+  expect(injected).toBe(1)
+  expectNoProgressWatchdog(leg, e, result)
+  // The own proof never ran on incomplete evidence, so neither verdict masks the other.
+  expect(result.errors).toEqual([pendingError(e)])
+})
+
+// The slices above drive one leg each; this keeps every receipt proof, the
+// unsliced key-proof 1, 3 and 7 legs included, inside its delivery wait.
+test('test33 runs every receipt case proof only as its delivery wait\'s -- assertion, never as a bare follow-up', () => {
+  const lines = readFileSync(join(import.meta.dir, 'integration/test-33-fmk-real-keys.sh'), 'utf8').split('\n')
+  const proofs = lines.filter(line => /\bcase_assert (?:key-proof|reset-spacing|unknown-proof)\b/.test(line))
+  expect(proofs.filter(line => !/^\s*(?:\w+=\S+ )*real_wait_delivery [^#]* -- case_assert (?:key-proof|reset-spacing|unknown-proof)\b/.test(line))).toEqual([])
+  expect(proofs.map(line => line.match(/case_assert (\S+ \S+)/)![1])).toEqual([
+    'key-proof 1', 'key-proof 2', 'key-proof 3', 'reset-spacing 4', 'unknown-proof "${outcome}"', 'key-proof 7'])
+})
+
+function rewriteRows(path: string, map: (row: any) => any) {
+  writeFileSync(path, jsonLines(path).map(map).filter(row => row !== undefined).map(row => JSON.stringify(row)).join('\n') + '\n')
+}
