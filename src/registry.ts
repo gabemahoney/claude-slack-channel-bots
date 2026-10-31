@@ -78,7 +78,7 @@ import {
   type Persona,
   type ReplySettings,
 } from './config.ts'
-import type { ChannelDeliveryResult } from './delivery-decision.ts'
+import { channelDeliveryFor, type ChannelDeliveryResult } from './delivery-decision.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
@@ -1167,6 +1167,13 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
+export const FETCH_MESSAGES_DESCRIPTION = 'Fetch message history from a channel, DM conversation or thread. Returns a JSON array, oldest first. In a thread_hybrid channel with thread_ts, returns { messages, next_cursor } instead: one page of the thread, its channel message on the first page only; pass next_cursor back as cursor for the next page until none is returned.'
+export const FETCH_MESSAGES_CURSOR_DESCRIPTION = 'In a thread_hybrid channel with thread_ts: the next_cursor from the previous page, to read the next page (optional)'
+
+export function fetchMessagesCursorRefusal(): string {
+  return 'Tool "fetch_messages" refused: cursor must be a string.'
+}
+
 /** Every session receives these eleven points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
@@ -1180,7 +1187,7 @@ export const MCP_INSTRUCTIONS = [
   'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
-  'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
+  'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads Slack history; in a thread_hybrid channel, pass its next_cursor back as cursor to read a whole thread.',
 ].join('\n')
 
 /**
@@ -1278,8 +1285,7 @@ export function createSessionServer(
       },
       {
         name: 'fetch_messages',
-        description:
-          'Fetch message history from a channel, DM conversation or thread. Returns oldest-first.',
+        description: FETCH_MESSAGES_DESCRIPTION,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1292,6 +1298,7 @@ export function createSessionServer(
               type: 'string',
               description: 'If set, fetch replies in this thread',
             },
+            cursor: { type: 'string', description: FETCH_MESSAGES_CURSOR_DESCRIPTION },
           },
           required: ['channel'],
         },
@@ -1635,35 +1642,49 @@ export function createSessionServer(
         const limit = Math.min(args.limit || 20, 100)
         const threadTs: string | undefined = args.thread_ts
 
+        const paged = kind === 'channel' && !!threadTs && channelDeliveryFor(persona.key, channel, {
+          storedChoices: deps.getChannelDelivery?.(),
+        }).delivery === 'thread_hybrid'
+        if (paged && Object.hasOwn(args, 'cursor') && typeof args.cursor !== 'string') {
+          return toolError(fetchMessagesCursorRefusal())
+        }
+        const cursor = paged && args.cursor ? args.cursor as string : undefined
+
         let messages: any[]
+        let nextCursor: string | undefined
         if (threadTs) {
-          const res = await web.conversations.replies({ channel, ts: threadTs, limit })
+          const res = await web.conversations.replies({ channel, ts: threadTs, limit, ...(cursor ? { cursor } : {}) })
           messages = res.messages || []
+          if (paged) {
+            if (cursor) messages = messages.filter(m => m.ts !== threadTs)
+            const next = res.response_metadata?.next_cursor
+            if (typeof next === 'string' && next !== '') nextCursor = next
+          }
         } else {
           const res = await web.conversations.history({ channel, limit })
           messages = (res.messages || []).reverse()
         }
 
-        const formatted = await Promise.all(
-          messages.map(async (m: any) => {
-            const userName = m.user ? await resolveUserName(persona.key, m.user) : 'unknown'
-            return {
-              ts: m.ts,
-              user: userName,
-              user_id: m.user,
-              text: m.text,
-              thread_ts: m.thread_ts,
-              files: m.files?.map((f: any) => ({
-                name: f.name,
-                mimetype: f.mimetype,
-                size: f.size,
-              })),
-            }
-          }),
-        )
+        const formatMessage = async (m: any) => {
+          const userName = m.user ? await resolveUserName(persona.key, m.user) : 'unknown'
+          return {
+            ts: m.ts,
+            user: userName,
+            user_id: m.user,
+            text: m.text,
+            thread_ts: m.thread_ts,
+            files: m.files?.map((f: any) => ({
+              name: f.name,
+              mimetype: f.mimetype,
+              size: f.size,
+            })),
+          }
+        }
+        const formatted = await Promise.all(messages.map(formatMessage))
+        const result = paged ? { messages: formatted, ...(nextCursor ? { next_cursor: nextCursor } : {}) } : formatted
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         }
       }
 

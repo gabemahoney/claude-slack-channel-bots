@@ -1,5 +1,6 @@
 import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { longLivedWebClientOptions } from '../src/persona-slack-clients.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
 /**
@@ -97,6 +98,9 @@ import {
   isSlackHostedFileUrl,
   MCP_INSTRUCTIONS,
   MCP_INSTRUCTIONS_MAX_CHARS,
+  FETCH_MESSAGES_DESCRIPTION,
+  FETCH_MESSAGES_CURSOR_DESCRIPTION,
+  fetchMessagesCursorRefusal,
   SET_CHANNEL_DELIVERY_TOOL,
   slackRefusalToolErrorText,
   replyPartialFailureText,
@@ -125,7 +129,9 @@ import {
   asWebClient,
   slackAbortError,
   makeDeferredWebApiCall,
+  makePagedThread,
   makeStubSlack,
+  slackPlatformError,
   openedDm,
   stubOpenedDmId,
   type StubSlack,
@@ -263,6 +269,8 @@ let h: Harness
 let openClients: Client[] = []
 let savedDryRun: string | undefined
 let consoleSpy: ReturnType<typeof spyOn> | undefined
+/** Only authority records created by the fetch_messages reader, never credential fixtures. */
+let fetchAuthorityFiles: string[] = []
 
 /**
  * The server-wide reply settings the harness's `getReplySettings` returns
@@ -453,8 +461,14 @@ afterEach(async () => {
   if (savedDryRun === undefined) delete process.env['SLACK_DRY_RUN']
   else process.env['SLACK_DRY_RUN'] = savedDryRun
   globalThis.fetch = realFetch
-  rmSync(h.dir, { recursive: true, force: true })
-  assertNoLeak({ lines: h.lines, results: h.results }, 'registry.test afterEach')
+  try {
+    assertNoLeak({ lines: h.lines, results: h.results,
+      authorities: fetchAuthorityFiles.map(path => writtenFile(path)),
+    }, 'registry.test afterEach')
+  } finally {
+    fetchAuthorityFiles = []
+    rmSync(h.dir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -1334,6 +1348,9 @@ describe('tool posting scope (through the MCP server)', () => {
 
       expect(result.isError).toBe(true)
       expect(result.content[0]!.text).toBe(refusal(h.alpha, target))
+      if (tool === 'fetch_messages') {
+        expect(await session.call(tool, { ...TOOL_ARGS[tool](target), thread_ts: MSG_TS, cursor: 'unused-cursor' })).toEqual(result)
+      }
       expectNoSlackCall()
     },
   )
@@ -1429,6 +1446,9 @@ describe('DM targets (through the MCP server)', () => {
 
       expect(result.isError).toBe(true)
       expect(result.content[0]!.text).toBe(refusal(h.alpha, target, why))
+      if (tool === 'fetch_messages') {
+        expect(await session.call(tool, { ...TOOL_ARGS[tool](target), thread_ts: MSG_TS, cursor: 'unused-cursor' })).toEqual(result)
+      }
       expectNoSlackCall()
     },
   )
@@ -2014,6 +2034,9 @@ describe('call-time resolution', () => {
         if (mode === 'strict') {
           expect(result.isError).toBe(true)
           expect(result.content[0]!.text).toBe(CHANNEL_TARGET_STATE_UNRESOLVED)
+          if (tool === 'fetch_messages') {
+            expect(await session.call(tool, { channel: A_ALL, thread_ts: MSG_TS, cursor: 'unused-cursor' })).toEqual(result)
+          }
           expect(totalSlackCalls()).toBe(callsBefore); expect(h.fetches).toHaveLength(fetchesBefore)
         } else {
           expect(result.isError).toBeUndefined()
@@ -2510,35 +2533,262 @@ describe('download_attachment', () => {
 // ---------------------------------------------------------------------------
 
 describe('fetch_messages', () => {
-  const M1 = { ts: '1700000000.000100', user: 'U1', text: 'first' }
-  const M2 = { ts: '1700000000.000200', user: 'U2', text: 'second' }
-
-  test.each<[string, Record<string, unknown>, 'history' | 'replies', typeof M1[], 'conversationsHistory' | 'conversationsReplies', Record<string, unknown>]>([
-    ['conversations.history (newest first, returned oldest first)', {}, 'history', [M2, M1], 'conversationsHistory', { channel: A_ALL, limit: 20 }],
-    ['conversations.replies for thread_ts', { thread_ts: MSG_TS }, 'replies', [M1, M2], 'conversationsReplies', { channel: A_ALL, ts: MSG_TS, limit: 20 }],
-  ])("%s: names resolved through A's persona key", async (_label, extra, queue, messages, capture, callArgs) => {
-    stubOf(h.alpha).script[queue].push({ kind: 'ok', result: { messages } })
+  /** Real shared authority; every choice change uses its durable assignment API. */
+  async function reader(mode: ChannelMode = 'strict', options: StubSlackOptions = {}) {
+    const input = { channel_mode: mode, personas: [h.alpha, h.beta].map(p => ({
+      name: p.name, credentials_file: p.credentials_file, working_directory: p.working_directory,
+      channels: p.channels, permission_prompts: p.permission_prompts, dm: p.dm,
+    })) }
+    let failWrite = false
+    const authority = makeSharedAuthority(h.stateDir, input, { write: (path, bytes) => {
+      durableWriteFileSync(path, bytes)
+      if (failWrite) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+    } })
+    fetchAuthorityFiles.push(authority.path)
+    const choices = createChannelDeliveryStore(authority)
+    let storeAvailable = true
+    const assign = (delivery: ChannelEntry['delivery']) => authority.assign(
+      h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, delivery, authority.revision,
+    )
+    expect(assign('thread_hybrid').kind).toBe('applied')
+    const stub = makeStubSlack({ token: h.alphaToken, leakMarker: LEAK_SENTINEL, ...options })
+    h.clients.set(h.alpha.key, stub)
+    const web = stub.createWebClient(h.alphaToken, longLivedWebClientOptions())
     const resolved: Array<[string, string]> = []
-    const deps: SessionToolDeps = {
-      ...h.deps,
-      resolveUserName: async (key, userId) => {
-        resolved.push([key, userId])
-        return `name-${userId}`
-      },
+    h.mode = mode
+    const deps: SessionToolDeps = { ...h.modeDeps, getChannelDelivery: () => storeAvailable ? choices : undefined,
+      clientFor: key => key === h.alpha.key ? asWebClient(web) : h.deps.clientFor(key),
+      resolveUserName: async (key, user) => { resolved.push([key, user]); return `name-${user}` },
     }
-    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+    entry.personaIncarnation = authority.incarnation(h.alpha.key)
+    const session = await openSession(entry, deps)
+    return { session, stub, resolved, choices, assign, withoutStore: () => { storeAvailable = false }, makeUnreadable: () => {
+      failWrite = true
+      expect(assign('off').kind).toBe('unresolved')
+      expect(choices.readableFor(h.alpha.key, A_ALL)).toBe(false)
+    } }
+  }
 
-    const result = await session.call('fetch_messages', { channel: A_ALL, ...extra })
+  function formatted(thread: ReturnType<typeof makePagedThread>) {
+    return thread.messages.map(m => ({ ts: m.ts, user: `name-${m.user}`, user_id: m.user,
+      text: m.text, thread_ts: m.thread_ts,
+      files: m.files.map(({ name, mimetype, size }) => ({ name, mimetype, size })),
+    }))
+  }
 
-    expect(result.isError).toBeUndefined()
-    expect(JSON.parse(result.content[0]!.text)).toEqual([
-      { ts: M1.ts, user: 'name-U1', user_id: 'U1', text: 'first' },
-      { ts: M2.ts, user: 'name-U2', user_id: 'U2', text: 'second' },
+  test.each([false, true].flatMap(repeatRoot => [
+    { label: 'default', limit: undefined, effective: 20 },
+    { label: 'explicit', limit: 7, effective: 7 },
+    { label: 'minimum', limit: 1, effective: 1 },
+    { label: 'two', limit: 2, effective: 2 },
+    { label: 'maximum', limit: 100, effective: 100 },
+    { label: 'capped', limit: 150, effective: 100 },
+  ].map(row => ({ ...row, repeatRoot }))))(
+    'whole thread, repeated root=$repeatRoot, $label limit: every reply and cursor survives',
+    async ({ repeatRoot, limit, effective }) => {
+      const thread = makePagedThread(107, { repeatRoot })
+      const { session, stub, resolved } = await reader('strict', { repliesResponder: thread.respond })
+      const collected: unknown[] = []
+      let cursor: string | undefined
+      for (let page = 0; page < 2 * thread.messages.length; page++) {
+        const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs,
+          ...(limit === undefined ? {} : { limit }), ...(cursor === undefined ? {} : { cursor }) })
+        expect(result.isError).toBeUndefined()
+        expect(result.content).toEqual([{ type: 'text', text: expect.any(String) }])
+        const body = JSON.parse(result.content[0]!.text)
+        expect(Object.keys(body).sort()).toEqual(body.next_cursor ? ['messages', 'next_cursor'] : ['messages'])
+        expect(body.messages.length).toBeLessThanOrEqual(effective)
+        if (page === 0) expect(body.messages[0].ts).toBe(thread.rootTs)
+        else expect(body.messages.some((m: { ts: string }) => m.ts === thread.rootTs)).toBe(false)
+        const slackPage = thread.responses[page]!
+        expect(body.next_cursor).toBe(slackPage.response_metadata?.next_cursor || undefined)
+        expect(stub.calls.conversationsReplies[page]).toEqual({ channel: A_ALL, ts: thread.rootTs, limit: effective,
+          ...(cursor === undefined ? {} : { cursor }) })
+        collected.push(...body.messages)
+        cursor = body.next_cursor
+        if (!cursor) break
+      }
+      expect(cursor).toBeUndefined()
+      expect(collected).toEqual(formatted(thread))
+      expect(resolved).toEqual(thread.messages.map(m => [h.alpha.key, m.user]))
+      expect(stub.callLog.map(c => c.method)).toEqual(thread.responses.map(() => 'conversations.replies'))
+      expect(stubOf(h.beta).callLog).toEqual([])
+    },
+  )
+
+  test.each([false, true])('short pages with repeated root=%s continue even after a root-only page', async repeatRoot => {
+    const thread = makePagedThread(8, { repeatRoot, pageSizes: [2, 1, 2] })
+    const { session } = await reader('open', { repliesResponder: thread.respond })
+    const collected: unknown[] = []
+    let cursor: string | undefined
+    const lengths: number[] = []
+    do {
+      expect(lengths.length).toBeLessThan(10)
+      const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs,
+        ...(cursor ? { cursor } : {}) })
+      expect(result.isError).toBeUndefined()
+      const body = JSON.parse(result.content[0]!.text)
+      lengths.push(body.messages.length)
+      collected.push(...body.messages)
+      expect(body.next_cursor).toBe(thread.responses.at(-1)!.response_metadata?.next_cursor || undefined)
+      cursor = body.next_cursor
+      if (lengths.length <= 3) expect(typeof cursor).toBe('string')
+    } while (cursor)
+    expect(lengths.slice(0, 3)).toEqual(repeatRoot ? [2, 0, 1] : [2, 1, 2])
+    expect(collected).toEqual(formatted(thread))
+  })
+
+  test.each(['empty', 'absent'] as const)('one page, %s Slack final cursor; absent and empty input both use the original request', async finalCursor => {
+    const thread = makePagedThread(3, { finalCursor })
+    const { session, stub } = await reader('strict', { repliesResponder: thread.respond })
+    for (const extra of [{}, { cursor: '' }]) {
+      const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs, ...extra })
+      expect(result.isError).toBeUndefined()
+      expect(JSON.parse(result.content[0]!.text)).toEqual({ messages: formatted(thread) })
+    }
+    expect(stub.calls.conversationsReplies).toEqual(Array(2).fill({ channel: A_ALL, ts: thread.rootTs, limit: 20 }))
+  })
+
+  // Extend the old history/replies table with every non-paged scope. Comparing
+  // both calls preserves strict-mode refusals as well as successful bare arrays.
+  test.each((['strict', 'open'] as const).flatMap(mode =>
+    (['off', 'mentions', 'all', 'DM', 'history', 'missing', 'no store', 'unreadable', 'changed'] as const)
+      .map(scope => ({ mode, scope }))))('$mode / $scope ignores cursor and preserves legacy calls/results', async ({ mode, scope }) => {
+    const thread = makePagedThread(3)
+    const { session, stub, resolved, assign, withoutStore, makeUnreadable } = await reader(mode, { repliesResponder: thread.respond })
+    let channel = A_ALL
+    let queue: 'history' | 'replies' = 'replies'
+    let cursor: unknown = { ignored: 'non-string-legacy-cursor' }
+    if (scope === 'changed') {
+      const first = await session.call('fetch_messages', { channel, thread_ts: thread.rootTs, limit: 1 })
+      cursor = JSON.parse(first.content[0]!.text).next_cursor
+      expect(typeof cursor).toBe('string')
+      expect(assign('mentions').kind).toBe('applied')
+    } else if (scope === 'off' || scope === 'mentions' || scope === 'all') expect(assign(scope).kind).toBe('applied')
+    else if (scope === 'DM') { applyPersona(h.alpha, true); channel = 'D0DIRECT1' }
+    else if (scope === 'history') queue = 'history'
+    else if (scope === 'missing') channel = UNCONFIGURED
+    else if (scope === 'unreadable') makeUnreadable()
+    else if (scope === 'no store') withoutStore()
+    const args = { channel, ...(queue === 'replies' ? { thread_ts: thread.rootTs } : {}) }
+    const callStart = stub.callLog.length
+    const resolutionStart = resolved.length
+    stub.script[queue].push(thread.legacyOutcome(queue), thread.legacyOutcome(queue))
+    const original = await session.call('fetch_messages', args)
+    const withCursor = await session.call('fetch_messages', { ...args, cursor })
+    expect(withCursor).toEqual(original)
+    if (mode === 'strict' && ['missing', 'unreadable'].includes(scope)) {
+      expect(original.isError).toBe(true)
+      expect(stub.callLog.length).toBe(callStart)
+    } else {
+      expect(original.isError).toBeUndefined()
+      expect(JSON.parse(original.content[0]!.text)).toEqual(formatted(thread))
+      expect(stub.callLog.slice(callStart)).toEqual(Array(2).fill({ method: `conversations.${queue}`,
+        args: { channel, limit: 20, ...(queue === 'replies' ? { ts: thread.rootTs } : {}) } }))
+      expect(resolved.slice(resolutionStart)).toEqual(Array(2).fill(thread.messages.map(m => [h.alpha.key, m.user])).flat())
+    }
+  })
+
+  test.each((['strict', 'open'] as const).flatMap(mode =>
+    (['off', 'mentions', 'all'] as const).map(delivery => ({ mode, delivery }))))(
+    '$mode / $delivery long legacy thread stops at the first page despite Slack continuation', async ({ mode, delivery }) => {
+      const thread = makePagedThread(107)
+      const { session, stub, assign, resolved } = await reader(mode, { repliesResponder: thread.respond })
+      expect(assign(delivery).kind).toBe('applied')
+      const args = { channel: A_ALL, thread_ts: thread.rootTs }
+      const original = await session.call('fetch_messages', args)
+      expect(original.isError).toBeUndefined()
+      expect(JSON.parse(original.content[0]!.text)).toEqual(formatted(thread).slice(0, 20))
+      expect(stub.calls.conversationsReplies).toEqual([{ channel: A_ALL, ts: thread.rootTs, limit: 20 }])
+      const cursor = thread.responses[0]!.response_metadata!.next_cursor
+      expect(typeof cursor).toBe('string')
+      expect(cursor!.length).toBeGreaterThan(0)
+
+      const withCursor = await session.call('fetch_messages', { ...args, cursor })
+      expect(withCursor).toEqual(original)
+      expect(stub.callLog).toEqual(Array(2).fill({ method: 'conversations.replies',
+        args: { channel: A_ALL, ts: thread.rootTs, limit: 20 } }))
+      expect(thread.responses).toHaveLength(2)
+      expect(thread.responses[1]!.response_metadata!.next_cursor).toBe(cursor)
+      expect(resolved).toEqual(Array(2).fill(thread.messages.slice(0, 20).map(m => [h.alpha.key, m.user])).flat())
+    },
+  )
+
+  test.each(['strict', 'open'] as const)('%s invalid_cursor preserves mode-specific errors and logs without disclosing the cursor or error payload', async mode => {
+    const cursor = 'private-cursor-never-echo-this'
+    const { session, stub } = await reader(mode, { replies: [{ kind: 'platform', error: 'invalid_cursor' }] })
+    const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS, cursor })
+    const failedFor = `Tool "fetch_messages" failed for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}`
+    expect(result).toEqual({ isError: true, content: [{ type: 'text', text: mode === 'open'
+      ? slackRefusalToolErrorText('fetch_messages', h.alpha, A_ALL, 'invalid_cursor')
+      : `${failedFor}: the tool call failed (invalid_cursor).` }] })
+    const logPrefix = `[slack] ${failedFor}${mode === 'open' ? ` on channel ${JSON.stringify(A_ALL)}` : ''}: `
+    // Stack frames vary by call site; pin the diagnostic before its stack.
+    expect(h.lines.filter(line => line.startsWith(`[slack] ${failedFor}`)).map(line => line.split(' at ')[0])).toEqual([
+      logPrefix + describeThrownValue(slackPlatformError('invalid_cursor', undefined, LEAK_SENTINEL)).split(' at ')[0],
     ])
-    expect(resolved).toEqual([[h.alpha.key, 'U1'], [h.alpha.key, 'U2']])
-    const calls = stubOf(h.alpha).calls
-    expect(calls[capture]).toEqual([callArgs] as any)
-    expect(calls.conversationsHistory.length + calls.conversationsReplies.length).toBe(1)
+    expect(JSON.stringify({ result, lines: h.lines })).not.toContain(cursor)
+    expect(stub.calls.conversationsReplies).toEqual([{ channel: A_ALL, ts: MSG_TS, limit: 20, cursor }])
+    expect(stub.options.web.at(-1)!.options!.attachOriginalToWebAPIRequestError).toBe(false)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each([123, null, { value: LEAK_SENTINEL }, [LEAK_SENTINEL]].map(cursor => ({ cursor })))('non-string cursor %# is refused without echo or Slack call', async ({ cursor }) => {
+    const { session } = await reader()
+    const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS, cursor })
+    expect(result).toEqual({ isError: true, content: [{ type: 'text', text: fetchMessagesCursorRefusal() }] })
+    expectNoSlackCall()
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('a later rate-limited page stays pending on the long-lived client and returns its eventual answer once', async () => {
+    const thread = makePagedThread(4, { repeatRoot: true })
+    const held = makeDeferredWebApiCall()
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const { session, stub } = await reader('strict', { repliesResponder: args => {
+      if (args.cursor) { entered(); return held.outcome }
+      return thread.respond(args)
+    } })
+    const first = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs, limit: 2 })
+    const cursor = JSON.parse(first.content[0]!.text).next_cursor
+    expect(typeof cursor).toBe('string')
+    // The MCP client owns one request timeout; the handler must add no timer.
+    const timeouts = spyOn(globalThis, 'setTimeout')
+    const intervals = spyOn(globalThis, 'setInterval')
+    try {
+      let settled = false
+      const pending = session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs, cursor, limit: 3 })
+        .then(result => { settled = true; return result })
+      await started
+      for (let turn = 0; turn < 20; turn++) await Promise.resolve()
+      expect(settled).toBe(false)
+      expect(timeouts).toHaveBeenCalledTimes(1)
+      expect(intervals).not.toHaveBeenCalled()
+      expect(stub.calls.conversationsReplies).toEqual([
+        { channel: A_ALL, ts: thread.rootTs, limit: 2 },
+        { channel: A_ALL, ts: thread.rootTs, limit: 3, cursor },
+      ])
+      expect(stub.options.web.at(-1)!.options!.rejectRateLimitedCalls).toBeUndefined()
+      held.settle(thread.respond(stub.calls.conversationsReplies[1]!))
+      const result = await pending
+      expect(result.isError).toBeUndefined()
+      expect(JSON.parse(result.content[0]!.text)).toEqual({ messages: formatted(thread).slice(2) })
+      expect(stub.callLog.map(c => c.method)).toEqual(['conversations.replies', 'conversations.replies'])
+      expect(timeouts).toHaveBeenCalledTimes(1)
+      expect(intervals).not.toHaveBeenCalled()
+    } finally { timeouts.mockRestore(); intervals.mockRestore() }
+  })
+
+  test.each(['strict', 'open'] as const)('%s dry-run in thread_hybrid ignores cursor before any Slack call', async mode => {
+    const { session } = await reader(mode)
+    process.env['SLACK_DRY_RUN'] = '1'
+    const original = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS })
+    const paged = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS, cursor: 'unused' })
+    expect(paged).toEqual(original)
+    expect(paged.content[0]!.text).toBe(`[dry-run] Would fetch messages from ${A_ALL}`)
+    expectNoSlackCall()
   })
 })
 
@@ -3466,10 +3716,14 @@ describe('tool list and instructions', () => {
       reply: { properties: ['chat_id', 'text', 'thread_ts', 'files', 'message_id'], required: ['chat_id', 'text'] },
       react: { properties: ['chat_id', 'message_id', 'emoji'], required: ['chat_id', 'message_id', 'emoji'] },
       edit_message: { properties: ['chat_id', 'message_id', 'text'], required: ['chat_id', 'message_id', 'text'] },
-      fetch_messages: { properties: ['channel', 'limit', 'thread_ts'], required: ['channel'] },
+      fetch_messages: { properties: ['channel', 'limit', 'thread_ts', 'cursor'], required: ['channel'] },
       download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
       [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery', 'attempt_id', 'intent'], required: ['channel', 'delivery', 'attempt_id', 'intent'] },
     })
+    const fetch = tools.find(t => t.name === 'fetch_messages')!
+    expect(fetch.description).toBe(FETCH_MESSAGES_DESCRIPTION)
+    expect(fetch.inputSchema.properties!.cursor).toEqual({ type: 'string', description: FETCH_MESSAGES_CURSOR_DESCRIPTION })
+    for (const word of ['array', 'messages', 'next_cursor', 'cursor', 'thread_hybrid']) expect(fetch.description).toContain(word)
     // the whole tool definition (name, description, every schema
     // property name and description), so a reload tool or hint can't slip in.
     expect(Object.fromEntries(tools.map((t) => [t.name, reloadTermsIn(JSON.stringify(t))]))).toEqual(
@@ -3549,6 +3803,7 @@ describe('tool list and instructions', () => {
       'via:', '<@ID>', 'attachment_count', 'In strict mode', SET_CHANNEL_DELIVERY_TOOL,
       'Thread Memory notices', 'With DMs on', 'Pass message_id', 'reply accepts files',
     ]
+    expect(MCP_INSTRUCTIONS.split('\n')).toHaveLength(points.length)
     let last = -1
     for (const point of points) {
       const at = MCP_INSTRUCTIONS.indexOf(point)
@@ -3565,6 +3820,9 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
     expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')
     expect(MCP_INSTRUCTIONS).toContain('to reply to remove the ack reaction')
+    const lastLine = MCP_INSTRUCTIONS.split('\n').at(-1)!
+    expect(lastLine).toMatch(/fetch_messages.*thread_hybrid.*next_cursor.*cursor.*whole thread/)
+    expect(MCP_INSTRUCTIONS).not.toContain('conversations.history')
     expect(MCP_INSTRUCTIONS).not.toContain('source=')
     assertNoLeak(MCP_INSTRUCTIONS)
   })

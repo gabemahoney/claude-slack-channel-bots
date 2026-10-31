@@ -218,6 +218,65 @@ export function makeDeferredWebApiCall(): DeferredWebApiCall {
   }
 }
 
+/** A thread and argument-driven Slack pages. Cursors are opaque and reusable.
+ * Later pages optionally repeat the root, counting it against the request limit.
+ * At limit 1, root-only and reply-only pages alternate so the fixture progresses.
+ * `pageSizes` can shorten selected pages (including root-only pages); the cursor,
+ * never page length, tells a reader whether more replies remain.
+ */
+export function makePagedThread(count: number, options: {
+  repeatRoot?: boolean
+  pageSizes?: readonly number[]
+  finalCursor?: 'empty' | 'absent'
+} = {}) {
+  if (!Number.isInteger(count) || count < 1) throw new Error('makePagedThread needs at least the root')
+  const rootTs = '1700000000.000100'
+  const messages = Array.from({ length: count }, (_, i) => ({
+    ts: `1700000000.${String(100 + i).padStart(6, '0')}`,
+    user: `U0THREAD${i % 3}`,
+    text: `thread message ${i}`,
+    thread_ts: rootTs,
+    files: [{ id: `F0THREAD${i}`, name: `file-${i}.txt`, mimetype: 'text/plain', size: i + 1 }],
+  }))
+  type Position = { offset: number; page: number }
+  const positions = new Map<string, Position>()
+  const cursors = new Map<string, string>()
+  const responses: Array<{ messages: typeof messages; response_metadata?: { next_cursor: string } }> = []
+  function page(args: Parameters<WebClient['conversations']['replies']>[0]) {
+    const position = args.cursor ? positions.get(args.cursor) : { offset: 0, page: 0 }
+    if (!position || args.ts !== rootTs) throw new Error('paged thread: unknown cursor or root')
+    const limit = args.limit ?? 20
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('paged thread: positive integer limit required')
+    const size = Math.min(limit, options.pageSizes?.[position.page] ?? limit)
+    const repeated = position.page > 0 && options.repeatRoot && (limit > 1 || position.page % 2 === 1)
+    const prefix = repeated ? [messages[0]!] : []
+    const replies = messages.slice(position.offset, position.offset + Math.max(0, size - prefix.length))
+    const offset = position.offset + replies.length
+    let next_cursor = ''
+    if (offset < messages.length) {
+      const next = { offset, page: position.page + 1 }
+      const key = JSON.stringify(next)
+      next_cursor = cursors.get(key) ?? `page/${crypto.randomUUID()}+opaque=`
+      cursors.set(key, next_cursor)
+      positions.set(next_cursor, next)
+    }
+    return { messages: [...prefix, ...replies],
+      ...(next_cursor || options.finalCursor !== 'absent' ? { response_metadata: { next_cursor } } : {}) }
+  }
+  return {
+    rootTs, messages, responses, page,
+    respond(args: Parameters<WebClient['conversations']['replies']>[0]): SettledWebApiOutcome {
+      const result = page(args)
+      responses.push(result)
+      return { kind: 'ok', result }
+    },
+    /** Shared legacy payload builder, keeping Slack shapes out of test bodies. */
+    legacyOutcome(kind: 'history' | 'replies'): SettledWebApiOutcome {
+      return { kind: 'ok', result: { messages: kind === 'history' ? [...messages].reverse() : [...messages] } }
+    },
+  }
+}
+
 /** A socket `start()` result the test can settle a `deferred` outcome with: every kind but `deferred`. */
 export type SettledConnectOutcome =
   /** `hello` arrives: `connected` is emitted and `start()` resolves. */
@@ -346,6 +405,8 @@ export interface StubSlackOptions {
   history?: readonly WebApiOutcome[]
   /** Initial `conversations.replies` outcomes. */
   replies?: readonly WebApiOutcome[]
+  /** Argument-driven reply pages; scripted outcomes still take precedence. */
+  repliesResponder?: (args: Parameters<WebClient['conversations']['replies']>[0]) => WebApiOutcome
   /** Initial `conversations.info` outcomes. */
   info?: readonly WebApiOutcome[]
   /** Initial `reactions.add` outcomes. */
@@ -1048,7 +1109,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         replies: (args) => {
           record('conversations.replies', args)
           calls.conversationsReplies.push(args)
-          return messageList(script.replies.shift(), 'conversations.replies')
+          return messageList(script.replies.shift() ?? opts.repliesResponder?.(args), 'conversations.replies')
         },
         info: (args) => {
           record('conversations.info', args)
