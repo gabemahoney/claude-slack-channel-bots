@@ -4,8 +4,11 @@ import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
+import { test29ClosingFixture, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
+import { test29RestartFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 
 const integration = join(import.meta.dir, 'integration')
@@ -22,14 +25,14 @@ function block(text: string, start: string, end: string): string {
   return text.slice(from, to)
 }
 function shell(program: string, files: Record<string, string> = {}) {
-  const root = mkdtempSync('/tmp/cscb-timing-control-')
+  const root = mkdtempSync(join(tmpdir(), 'cscb-timing-control-'))
   try {
     for (const [name, contents] of Object.entries(files)) writeFileSync(join(root, name), contents)
     const result = spawnSync('bash', ['-c', [
       'set -euo pipefail', 'SCENARIO_ROOT="$HOME"', 'SCENARIO_AD_ROOT="$HOME"', 'SLACK_STATE_DIR="$HOME"',
       'fail() { printf "%s\\n" "$*" >&2; exit 1; }', program,
     ].join('\n')], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'tail', 'grep', 'cat', 'wc'] }),
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'tail', 'grep', 'cat', 'wc', 'python3', 'bun'] }),
       encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined(); expect(result.signal).toBeNull()
@@ -50,6 +53,143 @@ const polling = [
 ].join('\n')
 
 describe('retained timing regressions', () => {
+  test.each(['complete', 'accepted-only', 'missing-part', 'duplicate-part', 'foreign-seq', 'empty'])('test-29 restart still requires every receipt: %s', async mode => {
+    const text = source('test-29-invited-channels.sh')
+    const fixture = await test29RestartFixture(mode)
+    const result = shell([
+      polling, ...['queue_drained', 'queue_receipt_progress', 'wait_queue_drained', 'queue_drain_snapshot'].map(name => declaration(text, name)),
+      ...fixture.bindings, 'DELIVERY_IDLE_WAIT_S=2', 'DELIVERY_MAX_WAIT_S=8', 'EVENT_WAIT_S=2',
+      'thread_joins_saved() { return 0; }',
+      block(text, 'queue_drain_snapshot before-restart', 'STORE_BEFORE_RESTART='),
+    ].join('\n'), fixture.files)
+    expect(result.status).toBe(mode === 'complete' ? 0 : 1)
+    const snapshots = result.stdout.trim().split('\n').map(line => JSON.parse(line))
+    expect(snapshots.map(s => [s.phase, s.persona])).toEqual(fixture.expectedSnapshots)
+    expect(snapshots[0].accepted).toBe(mode === 'empty' ? 0 : 1)
+    expect(snapshots[0].complete).toBe(mode === 'complete' ? 1 : 0)
+    if (mode !== 'complete') expect(result.stderr).toContain('no-progress watchdog')
+  })
+
+  test('test-29 drain diagnostics bound detail and omit content and raw failures', async () => {
+    const text = source('test-29-invited-channels.sh')
+    const secret = fakeToken(BOT_TOKEN_PREFIX)
+    const fixture = await test29DiagnosticFixture(secret)
+    const result = shell([
+      declaration(text, 'queue_drain_snapshot'),
+      ...fixture.bindings,
+      'queue_drain_snapshot restart-timeout',
+    ].join('\n'), fixture.files)
+    expect(result.status).toBe(0)
+    expect(result.stdout).not.toContain(fixture.body)
+    const lines = result.stdout.trim().split('\n')
+    expect(lines).toHaveLength(2)
+    const snapshot = JSON.parse(lines[0]!)
+    expect(snapshot.accepted).toBe(70)
+    expect(snapshot.complete).toBe(0)
+    expect(snapshot.incomplete).toBe(70)
+    expect(snapshot.incomplete_items_omitted).toBe(62)
+    expect(snapshot.first_incomplete).toHaveLength(8)
+    expect(snapshot.first_incomplete[0]).toEqual(test29DiagnosticExpectedItem())
+    expect(lines[1]).toBe('recorded: queue snapshot unavailable')
+  })
+
+  test.each(['progressing', 'stalled', 'repeated', 'regressed', 'foreign', 'new-work', 'reminders', 'attempts', 'stale', 'malformed', 'unreadable', 'changed-identity', 'overall-limit'])('test-29 exact-workload progress watchdog: %s', async mode => {
+    const text = source('test-29-invited-channels.sh')
+    const fixture = await test29WatchdogFixture(mode)
+    const result = shell([
+      polling, ...['queue_drained', 'queue_receipt_progress', 'wait_queue_drained'].map(name => declaration(text, name)),
+      block(text, 'DELIVERY_IDLE_WAIT_S=', '# --- Prerequisites'),
+      ...(mode === 'overall-limit' ? ['DELIVERY_MAX_WAIT_S=300'] : []),
+      `mode=${mode}`,
+      ...fixture.bindings,
+      'cat "${TEST29_STAGE_PREFIX}0" > "$TEST29_CURRENT"',
+      'sleep() { local now; read -r now < "$HOME/clock"; now=$((now+60000)); printf "%s\\n" "$now" > "$HOME/clock"; cat "$TEST29_STAGE_PREFIX$((now/60000))" > "$TEST29_CURRENT"; if [[ "$mode" == unreadable ]]; then DELIVERIES_FILE[$TEST29_QUEUE_KEY]="$TEST29_MISSING"; fi; }',
+      'queue_drain_snapshot() { printf "diagnostic clock="; cat "$HOME/clock"; }',
+      'wait_queue_drained "$TEST29_QUEUE_KEY" control', 'cat "$HOME/clock"',
+    ].join('\n'), fixture.files)
+    expect(result.status).toBe(mode === 'progressing' ? 0 : 1)
+    if (mode === 'progressing') expect(result.stdout.trim()).toBe('240000')
+    else {
+      expect(result.stderr).toContain(mode === 'overall-limit' ? 'overall watchdog' : 'no-progress watchdog')
+      expect(result.stdout.trim()).toBe(`diagnostic clock=${mode === 'overall-limit' ? 300000 : 180000}`)
+    }
+  })
+
+  test.each(['valid', 'missing', 'duplicate', 'wrong-name', 'wrong-key', 'wrong-source', 'wrong-channel', 'wrong-ts', 'wrong-sender', 'missing-thread', 'extra-thread', 'unknown-suffix', 'trailing-junk'])('test-29 closing received set: %s', mode => {
+    const text = source('test-29-invited-channels.sh')
+    const check = block(text, 'import collections, glob, json, os, re, sys', '\nEOF')
+    const fixture = test29ClosingFixture(mode)
+    const result = shell(`python3 "$HOME/check.py" "$HOME" "$HOME" ${fixture.argv}`, {
+      'check.py': check, ...fixture.files,
+    })
+    expect(result.status).toBe(mode === 'valid' ? 0 : 1)
+    if (mode === 'valid') expect(result.stdout).toContain('2 exact acceptances')
+  })
+
+  test.each(['kept', 'unredirected-control', 'assertion-fails'])('test-29 assertion printer retains earlier diagnostics: %s', mode => {
+    const text = source('test-29-invited-channels.sh')
+    let call = block(text, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\nfor dir in')
+    if (mode === 'unredirected-control') call = call.replace(' > /dev/null', '')
+    // Exercise the printer's actual output operation without its image-only
+    // imports. A regular append-open stdout reproduces the runner's log sink.
+    const output = source('fixtures/fmk-texts.ts').match(/^  await Bun.write\(Bun.stdout, value\)$/m)![0]
+    const result = shell([
+      ...test29PrinterBindings(),
+      mode === 'assertion-fails' ? 'bun() { return 1; }' : 'bun() { command bun "$HOME/printer.ts"; }',
+      '( printf "before-restart\\n";', call, 'printf "after-restart\\n" ) >> "$HOME/retained.log" 2>&1',
+      'cat "$HOME/retained.log"',
+    ].join('\n'), test29PrinterFixture(output))
+    expect(result.status).toBe(mode === 'assertion-fails' ? 1 : 0)
+    if (mode !== 'assertion-fails') expect(result.stdout).toBe(mode === 'kept' ? 'before-restart\nafter-restart\n' : 'after-restart\n')
+  })
+
+  test.each([
+    ['switch-off', 'kept', ''], ['fungible', 'kept', ''],
+    ...['configuration_request', 'configuration_application_preserved', 'configuration_record_matches'].map(helper => ['switch-off', 'unredirected', helper]),
+    ...['operatorReviewPending', 'sharedApplicationPreserved', 'sharedConfigurationMatches'].map(printer => ['switch-off', 'fails', printer]),
+  ])('test-29 switch retains restart diagnostics: %s %s %s', (shape, mode, target) => {
+    const text = source('test-29-invited-channels.sh')
+    let confirm = declaration(text, 'confirm_switch')
+    if (mode === 'unredirected') {
+      // Restore one reviewed defect at a time, leaving the other calls protected.
+      confirm = confirm.replace(new RegExp(`^(\\s*${target} [^\\n]*) > /dev/null`, 'gm'), '$1')
+    }
+    const output = source('fixtures/fmk-texts.ts').match(/^  await Bun.write\(Bun.stdout, value\)$/m)![0]
+    const result = shell([
+      polling, confirm,
+      ...['configuration_request', 'configuration_application_preserved', 'configuration_record_matches'].map(name => declaration(scenario, name)),
+      // Only the assertion call chain and printer output are live. No scenario
+      // is sourced; configuration, server and file-move dependencies are inert.
+      ...['require_ci_image', 'require_scenario_state', 'cp', 'mv', 'write_persona_config', 'wait_for_file', 'wait_for_count', 'pending_has_line', 'check_pending_layout'].map(name => `${name}() { :; }`),
+      'launch_counts() { printf "0"; }', 'count_log() { printf "0"; }',
+      'sleep() { printf "30000\\n" > "$HOME/clock"; }',
+      ...test29PrinterBindings(true),
+      ...test29SwitchBindings(),
+      `FAIL_PRINTER=${mode === 'fails' ? target : 'none'}`,
+      'bun() { printf "%s\\n" "$2" >> "$HOME/calls"; command bun "$HOME/printer.ts" "$2" "$FAIL_PRINTER"; }',
+      // Collect the failed log without invoking the subshell in an if/|| list:
+      // that would disable errexit inside confirm_switch and hide a failure.
+      'set +e', '( set -e; printf "before-restart\\n";',
+      block(text, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\nfor dir in'),
+      'printf "after-restart\\n"',
+      block(text, `confirm_switch ${shape} "`, '\n'),
+      'printf "after-switch\\n" ) >> "$HOME/retained.log" 2>&1',
+      'status=$?', 'set -e', 'cat "$HOME/retained.log"', 'printf "calls:\\n"', 'cat "$HOME/calls"', 'exit "$status"',
+    ].join('\n'), test29PrinterFixture(output, true))
+    expect(result.status).toBe(mode === 'fails' ? 1 : 0)
+    const [log, calls] = result.stdout.split('calls:\n')
+    const order = test29SwitchCallOrder()
+    expect([...new Set(calls!.trim().split('\n'))]).toEqual(mode === 'fails' ? order.slice(0, order.indexOf(target!) + 1) : order)
+    if (mode === 'unredirected') expect(log).toBe('after-switch\n')
+    else {
+      expect(log).toStartWith('before-restart\nafter-restart\n')
+      if (mode === 'fails') {
+        expect(log).toContain(`assertion failed: ${target}\n`)
+        expect(log).not.toContain('after-switch')
+      } else expect(log).toBe('before-restart\nafter-restart\nafter-switch\n')
+    }
+  })
+
   test.each(['late-hook', 'late-transition', 'delayed-publication', 'wrong-session', 'wrong-instance', 'unapplied', 'missing-hook', 'missing-transition', 'missing-pending', 'stale-hook', 'second-resume'])('test-13 correlates applied hook/transition without cross-observer ordering: %s', mode => {
     const text = source('test-13-fmk-switch-over.sh')
     const proof = block(text, '    # It read pending until', '    for verb in read-pane send-keys; do')

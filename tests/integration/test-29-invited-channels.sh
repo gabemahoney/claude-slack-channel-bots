@@ -103,6 +103,9 @@ TICK_WAIT_S=20      # an edit showing up in config.json.pending (the 5 s reload 
 APPLY_WAIT_S=20     # a confirmation applied (the 5 s reload tick)
 EVENT_WAIT_S=15     # a pushed event's decision line or delivery
 RECORD_WAIT_S=10    # a line reaching the stub's record
+# Functional receipt completion follows the testing guide, not a launch SLA.
+DELIVERY_IDLE_WAIT_S=180
+DELIVERY_MAX_WAIT_S=1800
 
 # --- Prerequisites ---------------------------------------------------------
 for tool in bun tmux agent-director jq sha256sum realpath python3 cmp; do
@@ -464,6 +467,86 @@ queue_drained() {
               . as $part
               | any($records[]; .seq == $seq and .kind == "delivered" and .part == $part)))
     ' "${file}" > /dev/null 2>&1
+}
+
+# Count distinct receipted parts of the workload captured when the wait began.
+# Full accepted-record equality binds sequence, identity, source and content.
+# New acceptances, reminders, attempts and duplicate/foreign/stale receipts
+# never renew it.
+queue_receipt_progress() {
+    jq -se --argjson originals "$2" '
+      . as $records
+      | if ($originals | length) == 0 or
+          any($originals[]; . as $original | all($records[]; . != $original))
+        then error("original workload unavailable") else
+          [$originals[] | select(.reminder_for == null) | .seq as $seq | .received_at as $received_at
+            | ([$records[] | select(.seq == $seq and .kind == "fixed")][-1].parts // []) as $parts
+            | range(1; ($parts | length) + 1) as $part
+            | select(any($records[]; .seq == $seq and .kind == "delivered" and .part == $part
+                and (.at | type) == "number" and .at >= $received_at))
+            | [$seq, $part]] | unique | length
+        end
+    ' "${DELIVERIES_FILE[$1]}" 2>/dev/null
+}
+
+wait_queue_drained() {
+    local dir="$1" step="$2" originals started last_progress now progress most=0 reason
+    originals="$(jq -sc '[.[] | select(.kind == "accepted" and .compact == null)]' "${DELIVERIES_FILE[${dir}]}" 2>/dev/null)" \
+        || fail "${step}: original accepted workload unreadable"
+    _scenario_check_timeout "${DELIVERY_IDLE_WAIT_S}" wait_queue_drained
+    _scenario_check_timeout "${DELIVERY_MAX_WAIT_S}" wait_queue_drained
+    started="$(_scenario_now_ms)"
+    last_progress="${started}"
+    while :; do
+        progress="$(queue_receipt_progress "${dir}" "${originals}")" || progress=''
+        now="$(_scenario_now_ms)"
+        if (( now - started >= DELIVERY_MAX_WAIT_S * 1000 )); then reason=overall; break; fi
+        if [[ "${progress}" =~ ^[0-9]+$ ]]; then
+            # Progress cannot replace the existing all-items/all-parts gate.
+            if queue_drained "${dir}"; then return 0; fi
+            if (( progress > most )); then
+                most="${progress}"
+                last_progress="${now}"
+            fi
+        fi
+        if (( now - last_progress >= DELIVERY_IDLE_WAIT_S * 1000 )); then reason=no-progress; break; fi
+        sleep "${SCENARIO_POLL_S}"
+    done
+    queue_drain_snapshot receipt-timeout
+    fail "${step}: accepted deliveries never received all their receipts (${reason} watchdog; receipts=${most}; idle bound=${DELIVERY_IDLE_WAIT_S}s; overall bound=${DELIVERY_MAX_WAIT_S}s)"
+}
+
+# Counts cover both journals; detail is bounded to eight incomplete items and
+# eight recent numeric facts each. No message, fixed content or raw error is
+# emitted. These diagnostics never decide readiness or infer agent state.
+queue_drain_snapshot() {
+    local dir
+    for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+        jq -sc --arg phase "$1" --arg persona "${QUEUE_KEY[${dir}]}" '
+          def number_only: if type == "number" then . else null end;
+          . as $records
+          | [$records[] | select(.kind == "accepted" and .compact == null) |
+              .seq as $seq |
+              [$records[] | select(.seq == $seq)] as $item |
+              ([$item[] | select(.kind == "fixed")][-1].parts // null) as $parts |
+              (if ($parts | type) == "array" then $parts | length else 0 end) as $count |
+              [range(1; $count + 1) | . as $part |
+                select(any($item[]; .kind == "delivered" and .part == $part))] as $received |
+              {seq: ($seq | number_only), received_at: (.received_at | number_only),
+               parts: $count, receipted_parts: ($received | length),
+               complete: ($count > 0 and ($received | length) == $count),
+               recent: ([$item[] | select(.kind == "sent" or .kind == "refused" or .kind == "delivered")][-8:] |
+                 map({kind, part: (.part | number_only), attempt: (.attempt | number_only), at: (.at | number_only),
+                      send_kind: (if .send_kind == "text" or .send_kind == "enter" or .send_kind == "retype"
+                                  then .send_kind else null end)}))}] as $items
+          | {diagnostic: "queue-drain", phase: $phase, persona: $persona,
+             accepted: ($items | length), complete: ([$items[] | select(.complete)] | length),
+             incomplete: ([$items[] | select(.complete | not)] | length),
+             first_incomplete: ([$items[] | select(.complete | not)][:8]),
+             incomplete_items_omitted: ([0, ([$items[] | select(.complete | not)] | length) - 8] | max)}
+        ' "${DELIVERIES_FILE[${dir}]}" 2>/dev/null \
+            || printf 'recorded: queue snapshot unavailable\n'
+    done
 }
 
 # wait_queued <step> <dir> <chat-id> <ts> <via>: the delivery reaches the
@@ -1055,7 +1138,7 @@ check_upgrade_log() {
 
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json is not its copy, byte for byte"
 [[ -f "${LAST}" ]] || fail "phase A: config.json.last-applied was not written"
-configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "phase A: reviewed input differs from config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null || fail "phase A: reviewed input differs from config.json"
 # Compare the entire applied configuration, allowing exactly the entries
 # discovered as off in strict mode. U0 must remain genuinely unlisted.
 check_phase_a_inventory() {
@@ -1136,6 +1219,8 @@ check_upgrade_log "phase A after its last control"
 # switch's line, confirm it and wait for its applied line; config.json's
 # authority then preserves its reviewed bytes; automatic channel choices may
 # differ in the applied view, independently validated by the production parser.
+# Discard assertion-printer stdout: an empty Bun.write to the runner's regular
+# append-open log truncates earlier diagnostics. Keep stderr and failure status.
 confirm_switch() {
     local shape="$1" line="$2" step="$3" applied_before
     ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
@@ -1146,17 +1231,17 @@ confirm_switch() {
     write_persona_config "${shape}"
     if [[ "${shape}" == fungible ]]; then
         configuration_request "mode-${shape}" request "${ALPHA}/${F1}/mentions" "${ALPHA}/${U1}/all" \
-            "${BRAVO}/${F1}/mentions" "${BRAVO}/${F2}/mentions" "${BRAVO}/${A1}/mentions" "${BRAVO}/${U1}/all"
+            "${BRAVO}/${F1}/mentions" "${BRAVO}/${F2}/mentions" "${BRAVO}/${A1}/mentions" "${BRAVO}/${U1}/all" > /dev/null
     else
-        configuration_request "mode-${shape}" request
+        configuration_request "mode-${shape}" request > /dev/null
     fi
     wait_for_file "${PENDING}" "${TICK_WAIT_S}" "${step}: config.json.pending never appeared"
     wait_until 10 "${step}: the pending file never carried the switch's line" pending_has_line "${line}"
     check_pending_layout "${step}"
-    configuration_application_preserved "${CONFIG}" "${authority_before}" "${LAST}" || fail "${step}: authority envelope changed before confirmation"
+    configuration_application_preserved "${CONFIG}" "${authority_before}" "${LAST}" > /dev/null || fail "${step}: authority envelope changed before confirmation"
     mv -f -- "${PENDING}" "${APPLY}"
     wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "${step}: the confirmation was never applied"
-    configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "${step}: authority does not preserve the reviewed config.json bytes"
+    configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null || fail "${step}: authority does not preserve the reviewed config.json bytes"
 }
 
 # expect_sessions_kept <step> <alpha-channel> <alpha-ts> <bravo-channel> <bravo-ts>:
@@ -1184,12 +1269,12 @@ ALPHA_THREADS=true
 threads_applied_before="$(count_log "${APPLIED_CLASS}")"
 write_persona_config declarative
 configuration_request threads-strict request "${ALPHA}/${T1}/thread_hybrid" \
-    "${ALPHA}/${N1}/thread_hybrid" "${ALPHA}/${N2}/thread_hybrid" "${ALPHA}/${N3}/thread_hybrid"
+    "${ALPHA}/${N1}/thread_hybrid" "${ALPHA}/${N2}/thread_hybrid" "${ALPHA}/${N3}/thread_hybrid" > /dev/null
 wait_for_file "${PENDING}" "${TICK_WAIT_S}" "strict threads: no pending review"
 check_pending_layout "strict threads"
 mv -f -- "${PENDING}" "${APPLY}"
 wait_for_count "${APPLIED_CLASS}" $(( threads_applied_before + 1 )) "${APPLY_WAIT_S}" "strict threads: confirmation was not applied"
-configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "strict threads: reviewed configuration differs"
+configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null || fail "strict threads: reviewed configuration differs"
 THREAD_STAMPS[alpha]="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${T1}")"
 check_new_hybrid_choices "strict: changed value" "${ALPHA_LABEL}"
 join_thread_phase strict
@@ -1353,10 +1438,12 @@ two_persona_threads open
 # --- Persistence across a restart ----------------------
 # Queue acceptance above can precede typing and its receipt. Settle both
 # personas before checking an immediate idle-session reconnect on restart.
+queue_drain_snapshot before-restart
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-    wait_until "${SESSION_WAIT_S}" "restart: accepted deliveries of ${dir} never received all their receipts" queue_drained "${dir}"
+    wait_queue_drained "${dir}" "restart: ${dir}"
     wait_until "${EVENT_WAIT_S}" "restart: queued joins of ${dir} were not saved" thread_joins_saved "${dir}"
 done
+queue_drain_snapshot restart-drained
 STORE_BEFORE_RESTART="${SCENARIO_ROOT}/store-before-restart.json"
 cp -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"
 declare -A DELIVERIES_BEFORE=()
@@ -1395,7 +1482,9 @@ wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${ALPHA_LABEL}" \
     rec_at_least $(( alpha_sockets_before + 1 )) event=ws-open label="${ALPHA_LABEL}"
 wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${BRAVO_LABEL}" \
     rec_at_least $(( bravo_sockets_before + 1 )) event=ws-open label="${BRAVO_LABEL}"
-bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved "${CONFIG}" "${STORE_BEFORE_RESTART}" "${STORE_FILE}" \
+# The assertion printer returns empty stdout via Bun.write, which truncates a
+# regular-file stdout even when opened for append. Keep the runner log intact.
+bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved "${CONFIG}" "${STORE_BEFORE_RESTART}" "${STORE_FILE}" > /dev/null \
     || fail "restart: shared choices, identities or reviewed input changed"
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     # Delivered content is compacted at startup; its exact dedupe facts
@@ -1485,7 +1574,7 @@ two_persona_threads strict
 push_message "${BRAVO_LABEL}" "${DM}" im "$(plain_text)"
 DM_TS="${PUSH_TS}"
 wait_queued "E5: bravo direct DM" "${BRAVO_DIR}" "${DM}" "${DM_TS}" dm
-wait_until "${SESSION_WAIT_S}" "E5: bravo's direct DM never received its receipt" queue_drained "${BRAVO_DIR}"
+wait_queue_drained "${BRAVO_DIR}" "E5: bravo direct DM"
 RECEIVED_LABEL="$(printed MESSAGE_RECEIVED)"
 DELIVERED_LABEL="$(printed MESSAGE_DELIVERED)"
 python3 - "${SLACK_STATE_DIR}/server.log" "${DELIVERIES_FILE[${BRAVO_DIR}]}" "${DM}" "${DM_TS}" \
@@ -1521,7 +1610,7 @@ EOF
 # Every persona's complete accepted set, including absence of all other inputs.
 # Multiple journal records per item never count as additional acceptances.
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-    wait_until "${SESSION_WAIT_S}" "closing: ${dir} has accepted work without receipts" queue_drained "${dir}"
+    wait_queue_drained "${dir}" "closing: ${dir}"
     wait_until "${EVENT_WAIT_S}" "closing: ${dir} has unsaved queued joins" thread_joins_saved "${dir}"
     key="${QUEUE_KEY[${dir}]}"
     expected_rows="${SCENARIO_ROOT}/expected-queue-${key}.jsonl"
@@ -1546,9 +1635,10 @@ stop_tracked_pid "${STUB_PID}" 10 "the Slack stub did not exit on SIGTERM"
 # the complete accepted sets also pin exactly one received
 # diagnostic per persona/source/conversation/ts/sender. This includes paired
 # event dedupe, both shared recipients and the DM, and excludes every refused
-# input and nonrecipient. DELIVERIES_BEFORE preserves pre-compaction evidence;
-# via remains a queue assertion, not a diagnostic field. Read every rotation
-# after stopping the writers, following the positive decisions above.
+# input and nonrecipient. DELIVERIES_BEFORE preserves pre-compaction evidence.
+# Only thread-selected diagnostics carry via=thread (deliveryIdentity). Bind
+# that suffix to the expected reason; other reasons stay queue assertions.
+# Read every rotation after stopping the writers, following the positive decisions above.
 python3 - "${SLACK_STATE_DIR}" "${SCENARIO_ROOT}" "${RECEIVED_LABEL}" "${HUMAN}" "${ALPHA_KEY}" "${BRAVO_KEY}" "${ALPHA}" "${BRAVO}" << 'EOF' \
     || fail "closing: received diagnostics differ from the exact accepted set"
 import collections, glob, json, os, re, sys
@@ -1560,10 +1650,10 @@ for key in keys:
     with open(os.path.join(root, f"expected-queue-{key}.jsonl")) as f:
         for line in f:
             channel, ts, via = json.loads(line)
-            expected[(key, "slack", channel, ts, sender)] += 1
+            expected[(key, "slack", channel, ts, sender, via == "thread")] += 1
 assert expected and all(n == 1 for n in expected.values()), "invalid expected acceptance set"
 quoted = r'("(?:\\.|[^"\\])*")'
-pattern = re.compile(r'persona=' + quoted + r' \(key=(\S+)\) source=(slack) chat_id=' + quoted + r' ts=' + quoted + r' sender_id=' + quoted)
+pattern = re.compile(r'persona=' + quoted + r' \(key=(\S+)\) source=(slack) chat_id=' + quoted + r' ts=' + quoted + r' sender_id=' + quoted + r'( via=thread)?')
 actual = collections.Counter()
 for path in glob.glob(os.path.join(state, "server.log*")):
     with open(path) as f:
@@ -1573,9 +1663,9 @@ for path in glob.glob(os.path.join(state, "server.log*")):
                 continue
             match = pattern.fullmatch(line.split(marker, 1)[1].rstrip("\n"))
             assert match, "malformed received diagnostic"
-            name, key, source, channel, ts, user = match.groups()
+            name, key, source, channel, ts, user, thread = match.groups()
             assert key in names and json.loads(name) == names[key], "wrong received persona identity"
-            actual[(key, source, json.loads(channel), json.loads(ts), json.loads(user))] += 1
+            actual[(key, source, json.loads(channel), json.loads(ts), json.loads(user), thread is not None)] += 1
 assert actual == expected, f"received mismatch: missing={expected - actual}, extra={actual - expected}"
 print(f"received evidence: {sum(actual.values())} exact acceptances, paired events deduped")
 EOF
