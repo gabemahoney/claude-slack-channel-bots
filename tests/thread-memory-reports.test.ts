@@ -15,6 +15,7 @@ import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE, THREAD_MEMORY_CHANGED_WHILE_STOPPED,
+  THREAD_MEMORY_JOINS_LOST,
 } from '../src/persona-diagnostics.ts'
 import {
   createThreadMemoryReporting, buildThreadMemoryNotSavedNotice, buildThreadMemoryNotSavedLine,
@@ -31,6 +32,7 @@ import { createThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOutage, ty
 import type { ThreadMemoryRetryEvent } from '../src/thread-memory-retry.ts'
 import type { ThreadMemorySealEvent, ThreadMemorySealFinding } from '../src/thread-memory-seal.ts'
 import type { MemoryHoldEvent, WithdrawnMemoryHold } from '../src/memory-holds.ts'
+import type { OwnPostLookupEvent } from '../src/own-post-lookup.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, fakeToken, BOT_TOKEN_PREFIX, withoutName } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -41,13 +43,14 @@ import {
 } from './test-helpers/thread-memory.ts'
 
 const MESSAGE_BODY = 'reporter-private-message-body'
+const UPLOAD_NAME = 'reporter-private-upload.txt'
 const healthy = (): ThreadMemoryOutage => ({ unknown: false, unsaved: 0, missing: false })
 const quotedPath = (path: string) => JSON.stringify(path).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
 const failure = () => Object.assign(new Error(`fixture failure ${sentinelInMessage('thread-report')}`), {
   code: 'EIO', body: MESSAGE_BODY, headers: LEAK_SENTINEL, original: { text: MESSAGE_BODY },
 })
 // Deliberately attach fields the event consumer must never inspect or serialize.
-const privateFields = <T extends object>(event: T): T => Object.assign(event, { text: MESSAGE_BODY, headers: LEAK_SENTINEL })
+const privateFields = <T extends object>(event: T): T => Object.assign(event, { text: MESSAGE_BODY, file: { name: UPLOAD_NAME }, headers: LEAK_SENTINEL })
 const cleanups: Array<() => void | Promise<void>> = []
 afterEach(async () => {
   try { for (const cleanup of cleanups.reverse()) await cleanup() }
@@ -119,6 +122,7 @@ function fixture(name = 'alpha', validated = true) {
       }
       assertNoLeak(withoutName(checked, name, a!.key))
       expect(JSON.stringify(captured)).not.toContain(MESSAGE_BODY)
+      expect(JSON.stringify(captured)).not.toContain(UPLOAD_NAME)
       expect(clock.pendingCount()).toBe(0)
     } finally {
       episodes.close(); notifier.cleanup(); rmSync(dir, { recursive: true, force: true })
@@ -141,6 +145,12 @@ const holdLoss = (rows: WithdrawnMemoryHold[]): ThreadMemoryLoss => ({
   messages: rows.map(h => ({ channel: h.channel, ts: h.ts })),
 })
 const withdraw = (f: Fixture, rows = holds()): MemoryHoldEvent => privateFields({ type: 'withdrawn', key: f.a.key, holds: rows })
+const lostLookup = (f: Fixture, overrides: Partial<OwnPostLookupEvent> = {}): OwnPostLookupEvent => privateFields({
+  kind: 'joins-lost', key: f.a.key, channel: C.secondary, threads: [R.primary, R.secondary], cause: 'several', ...overrides,
+})
+const lookupLoss = ({ channel, threads, cause }: OwnPostLookupEvent): ThreadMemoryLoss => ({
+  threads: [], messages: [], ownPosts: [{ channel, threads, cause }],
+})
 
 describe('Thread Memory reporter event mappings and episodes', () => {
   test.each(['seal-entry', 'journal-header', 'marker', 'journal-append'] as const)('%s failures post and log once until recovery', step => {
@@ -238,6 +248,70 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     expect(f.logs.at(-1)).toBe(buildThreadMemoryJoinsLostLine(f.a, loss))
   })
 
+  test.each([
+    { label: 'several candidates', cause: 'several', threads: [R.primary, R.secondary] },
+    { label: 'unmatched own posts', cause: 'unmatched', threads: [R.secondary] },
+    { label: 'permanent Slack refusal', cause: 'channel_not_found', threads: [] },
+    { label: 'token-bearing Slack code', cause: sentinelInMessage('lookup-code'), threads: [], name: fakeToken(BOT_TOKEN_PREFIX, 'configured-lookup-name') },
+  ])('$label: each lookup posts and logs once with its own channel and threads', async ({ cause, threads, name }) => {
+    const f = fixture(name ?? 'Ops <&> "night" 🐝'), event = lostLookup(f, { cause, threads })
+    const loss = lookupLoss(event), notice = buildThreadMemoryJoinsLostNotice(f.a, loss)
+    for (let i = 0; i < 2; i++) {
+      f.reporter.lookupEvent(event)
+      expect(f.requests).toHaveLength(i + 1)
+      expect(f.logs).toHaveLength(i + 1)
+      expect(f.episodes.isOpen(f.a.key, THREAD_MEMORY_JOINS_LOST)).toBe(false)
+    }
+    expect(f.requests).toEqual(Array.from({ length: 2 }, () => ({ key: f.a.key, ...notice })))
+    expect(f.logs).toEqual(Array.from({ length: 2 }, () => buildThreadMemoryJoinsLostLine(f.a, loss)))
+    await f.clock.flush()
+    expect(f.notifier.posts(f.a.key)).toEqual(Array.from({ length: 2 }, () => ({
+      channel: C.primary, text: formatPersonaNotice(f.a, notice.text, notice.options),
+    })))
+    expect(f.notifier.posts(f.b.key)).toEqual([])
+  })
+
+  test.each(['quarantine', 'withdrawn holds'] as const)('lookup losses remain separate before and after %s', source => {
+    const f = fixture(), lookup = lostLookup(f), rows = holds(2), quarantine = f.quarantined()
+    const earlierLoss: ThreadMemoryLoss = source === 'quarantine'
+      ? { threads: [{ channel: C.secondary, root: R.primary }], messages: [], unreadableLines: 1 }
+      : holdLoss(rows)
+    f.reporter.lookupEvent(lookup)
+    if (source === 'quarantine') f.reporter.threadMemoryEvent(quarantine)
+    else f.reporter.holdsEvent(withdraw(f, rows))
+    f.reporter.lookupEvent(lookup)
+    expect(f.requests).toEqual([lookupLoss(lookup), earlierLoss, lookupLoss(lookup)].map(loss => ({
+      key: f.a.key, ...buildThreadMemoryJoinsLostNotice(f.a, loss),
+    })))
+    expect(f.logs).toEqual([
+      buildThreadMemoryJoinsLostLine(f.a, lookupLoss(lookup)),
+      ...(source === 'quarantine' ? [buildThreadMemoryQuarantinedLine(f.a.key, quarantine.quarantinePath, 3, 1)] : []),
+      buildThreadMemoryJoinsLostLine(f.a, earlierLoss),
+      buildThreadMemoryJoinsLostLine(f.a, lookupLoss(lookup)),
+    ])
+  })
+
+  test('a key\'s lookup losses leave its sibling\'s open episodes unchanged', () => {
+    const f = fixture()
+    f.reporter.threadMemoryEvent(f.append(f.b.key)); f.reporter.threadMemoryEvent(f.unreadable(f.b.key))
+    const siblingRequests = [...f.requests], siblingLogs = [...f.logs]
+    f.reporter.lookupEvent(lostLookup(f)); f.reporter.lookupEvent(lostLookup(f))
+    expect(f.requests.filter(p => p.key === f.b.key)).toEqual(siblingRequests)
+    expect(f.logs.slice(0, 2)).toEqual(siblingLogs)
+    expect(f.episodes.isOpen(f.b.key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+    expect(f.episodes.isOpen(f.b.key, THREAD_MEMORY_UNREADABLE)).toBe(true)
+    const siblingLookup = lostLookup(f, { key: f.b.key, channel: C.primary })
+    f.reporter.lookupEvent(siblingLookup)
+    expect(f.requests).toHaveLength(5)
+    expect(f.requests.at(-1)).toEqual({ key: f.b.key, ...buildThreadMemoryJoinsLostNotice(f.b, lookupLoss(siblingLookup)) })
+    expect(f.logs.at(-1)).toBe(buildThreadMemoryJoinsLostLine(f.b, lookupLoss(siblingLookup)))
+    f.reporter.threadMemoryEvent(f.append(f.b.key)); f.reporter.threadMemoryEvent(f.unreadable(f.b.key))
+    expect(f.requests).toHaveLength(5)
+    f.reporter.threadMemoryEvent(f.saved(f.b.key))
+    expect(f.requests).toHaveLength(6)
+    expect(f.requests.at(-1)!.text).toBe(buildThreadMemoryRecoveredNotice(f.ref(f.b.key), [C.primary]))
+  })
+
   const findings: Array<Pick<ThreadMemorySealFinding, 'case' | 'wording'>> = [
     { case: 'unclean-stop', wording: 'unclean' },
     ...(['journal-missing', 'journal-changed', 'entry-missing', 'hybrid-without-store', 'marker-without-store', 'queue-changed'] as const)
@@ -325,6 +399,7 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     f.reporter.threadMemoryEvent(f.quarantined()); f.reporter.threadMemoryEvent(f.saved())
     f.reporter.threadMemoryEvent(f.settled(), healthy())
     f.reporter.holdsEvent(withdraw(f))
+    f.reporter.lookupEvent(lostLookup(f))
     f.reporter.retryEvent({ type: 'journal-missing-on-retry', key: f.a.key })
     f.reporter.startupFindings([{ key: f.a.key, case: 'unclean-stop', wording: 'unclean' }])
     f.reporter.sealEvent({ type: 'changed-while-stopped', key: f.a.key, case: 'journal-changed', wording: 'changed' })
@@ -333,6 +408,8 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     f.notifier.notifier.settleTeardown(f.a.key)
     f.reporter.threadMemoryEvent(f.append())
     expect(f.requests).toHaveLength(2); expect(f.logs).toHaveLength(2)
+    f.reporter.lookupEvent(lostLookup(f))
+    expect(f.requests).toHaveLength(3); expect(f.logs).toHaveLength(3)
   })
 
   test('CR4: closed episodes suppress normal reporter observations, including late failed and unsynced seals', () => {
@@ -344,6 +421,7 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     f.reporter.threadMemoryEvent(f.settled(), healthy())
     f.reporter.threadMemoryEvent({ type: 'compaction-failed', key: f.a.key, path: f.path, step: 'journal-rewrite', error: failure() })
     f.reporter.holdsEvent(withdraw(f)); f.reporter.holdsEvent({ type: 'resolution-failed', key: f.a.key, error: failure() })
+    f.reporter.lookupEvent(lostLookup(f))
     f.reporter.retryEvent({ type: 'journal-missing-on-retry', key: f.a.key })
     f.reporter.retryEvent({ type: 'saved-after-retries', key: f.a.key, attempts: 1 })
     const finding: ThreadMemorySealFinding = { key: f.a.key, case: 'unclean-stop', wording: 'unclean' }
@@ -367,12 +445,15 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     expect(() => f.reporter.threadMemoryEvent(dependency === 'outage' ? f.saved() : f.append())).not.toThrow()
     expect(() => f.reporter.threadMemoryEvent(f.settled())).not.toThrow()
     expect(() => f.reporter.holdsEvent(withdraw(f))).not.toThrow()
+    expect(() => f.reporter.lookupEvent(lostLookup(f))).not.toThrow()
     expect(() => f.reporter.startupFindings([{ key: f.a.key, case: 'unclean-stop', wording: 'unclean' }])).not.toThrow()
     await f.clock.flush()
     f.throws.clear(); f.episodes.forget(f.a.key)
     const before = f.requests.length
     f.reporter.threadMemoryEvent(f.append())
     expect(f.requests).toHaveLength(before + 1)
+    f.reporter.lookupEvent(lostLookup(f))
+    expect(f.requests).toHaveLength(before + 2)
   })
 
   test.each(['saved', 'settled'] as const)('one key recovers via %s and forgets without changing its sibling episodes', recovery => {
@@ -532,6 +613,9 @@ function completeLossText(persona: { name: string; key: string }, loss: ThreadMe
   const lines = [
     ...loss.threads.map(t => buildThreadMemoryJoinsLostNotice(seed, { threads: [t], messages: [] }).text.split('\n')[1]!),
     ...loss.messages.map(m => buildThreadMemoryJoinsLostNotice(seed, { threads: [], messages: [m] }).text.split('\n')[1]!),
+    ...(loss.ownPosts ?? []).flatMap(post => (post.threads.length ? post.threads.map(root => [root]) : [[]]).map(threads =>
+      buildThreadMemoryJoinsLostNotice(seed, { threads: [], messages: [], ownPosts: [{ ...post, threads }] }).text.split('\n')[1]!,
+    )),
   ]
   return formatPersonaNotice(persona, [heading, ...lines].join('\n'), { personaRef: ref })
 }
@@ -571,6 +655,33 @@ describe('CR3 full escaped Joins lost payload through episodes and notifier', ()
 
   // Private excerpt size is specified by the MI/SRD exception, not a public API.
   const excerpt = (name: string) => Array.from(name).slice(0, 64).join('') + '…'
+  test('a lookup overflow held until validation keeps its budget, loss count and uncapped log', async () => {
+    const name = 'Ops <&> 🐝 '.repeat(200), f = fixture(name, false), before = structuredClone(f.a)
+    const event = lostLookup(f, { threads: holds(160).map(row => row.thread_ts) }), loss = lookupLoss(event)
+    f.reporter.lookupEvent(event)
+    expect(f.requests).toHaveLength(1)
+    expect(f.notifier.posts(f.a.key)).toEqual([])
+    f.notifier.validate(f.a.key); await f.notifier.notifier.flush(f.a.key); await f.clock.flush()
+    const posts = f.notifier.posts(f.a.key)
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.channel).toBe(C.primary)
+    const actual = posts[0]!.text, complete = completeLossText(f.a, loss, excerpt(name)).split('\n')
+    const lines = actual.split('\n'), footer = lines.pop()!
+    expect(actual.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    expect(actual).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u)
+    expect(actual.replace(/&(amp|lt|gt);/g, '')).not.toMatch(/[&<>]/)
+    expect(lines).toEqual(complete.slice(0, lines.length))
+    expect(lines.length).toBeGreaterThan(1)
+    const omitted = event.threads.length - (lines.length - 1)
+    expect(omitted).toBeGreaterThan(0)
+    expect(footer).toMatch(new RegExp(`^${omitted} more thread/message entry\\(s\\);.*server log.*identifiers\\.$`))
+    expect(f.logs).toEqual([buildThreadMemoryJoinsLostLine(f.a, loss)])
+    expect(f.logs[0]!.length).toBeGreaterThan(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    expect(f.logs[0]).toContain(renderPersonaRef(name, f.a.key))
+    expect(f.logs[0]).toContain(`channel=${event.channel} threads=${JSON.stringify(event.threads)} cause=${event.cause}`)
+    expect(f.a).toEqual(before)
+  })
+
   test('names immediately below and above the full-payload threshold choose the correct branch', async () => {
     const rows = holds(), loss = holdLoss(rows), seedName = 'A'.repeat(100)
     const seed = { name: seedName, key: personaKey(seedName) }

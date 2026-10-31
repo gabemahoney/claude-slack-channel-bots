@@ -224,37 +224,99 @@ export function makeDeferredWebApiCall(): DeferredWebApiCall {
  * `pageSizes` can shorten selected pages (including root-only pages); the cursor,
  * never page length, tells a reader whether more replies remain.
  */
-export function makePagedThread(count: number, options: {
+export interface PagedMessageSpec {
+  author?: 'own-user' | 'own-bot' | 'other-user' | 'other-bot'
+  placement?: 'channel' | 'root' | 'reply' | 'broadcast'
+  ts?: string
+  threadTs?: string
+  text?: string
+  file?: { name: string; size: number } | false
+  invalidTimestamp?: 'absent' | 'invalid'
+}
+export type PagedPageDamage = 'messages-absent' | 'messages-object' | 'cursor-number' | 'metadata-array' | 'not-ok'
+export interface PagedSlackMessage {
+  ts?: string; user?: string; bot_id?: string; thread_ts?: string; subtype?: string; text: string
+  files: Array<{ id: string; name: string; mimetype: string; size: number }>
+}
+export interface PagedThreadOptions {
   repeatRoot?: boolean
   pageSizes?: readonly number[]
   finalCursor?: 'empty' | 'absent'
-} = {}) {
+  rootTs?: string
+  channel?: string
+  identity?: { botUserId: string; botId: string }
+  /** Message descriptions, not Slack payloads; defaults preserve the original thread. */
+  message?: (index: number) => PagedMessageSpec
+  /** Zero-based page number; consumed per attempt, independently of other pages. */
+  pageOutcomes?: Readonly<Record<number, readonly WebApiOutcome[]>>
+}
+type LegacyPagedThreadOptions = Omit<PagedThreadOptions, 'message'> & { message?: never }
+type PagedThreadFixture = ReturnType<typeof buildPagedThread>
+type LegacyPagedThreadFixture = Omit<PagedThreadFixture, 'messages'> & {
+  messages: Array<PagedSlackMessage & { ts: string; user: string; thread_ts: string }>
+}
+export function makePagedThread(count: number, options?: LegacyPagedThreadOptions): LegacyPagedThreadFixture
+export function makePagedThread(count: number, options: PagedThreadOptions): PagedThreadFixture
+// Existing consumers use ReturnType<typeof makePagedThread> for the default fixture.
+export function makePagedThread(count: number, options?: LegacyPagedThreadOptions): LegacyPagedThreadFixture
+export function makePagedThread(count: number, options: PagedThreadOptions = {}): PagedThreadFixture {
+  return buildPagedThread(count, options)
+}
+function buildPagedThread(count: number, options: PagedThreadOptions) {
   if (!Number.isInteger(count) || count < 1) throw new Error('makePagedThread needs at least the root')
-  const rootTs = '1700000000.000100'
-  const messages = Array.from({ length: count }, (_, i) => ({
-    ts: `1700000000.${String(100 + i).padStart(6, '0')}`,
-    user: `U0THREAD${i % 3}`,
-    text: `thread message ${i}`,
-    thread_ts: rootTs,
-    files: [{ id: `F0THREAD${i}`, name: `file-${i}.txt`, mimetype: 'text/plain', size: i + 1 }],
-  }))
-  type Position = { offset: number; page: number }
+  const rootTs = options.rootTs ?? '1700000000.000100'
+  const messages: PagedSlackMessage[] = Array.from({ length: count }, (_, i) => {
+    const spec = options.message?.(i) ?? {}
+    const ts = spec.ts ?? (options.rootTs === undefined ? `1700000000.${String(100 + i).padStart(6, '0')}`
+      : (Number(rootTs) + i / 1000).toFixed(6))
+    const author = spec.author
+    if (author?.startsWith('own-') && !options.identity) throw new Error('paged thread: own author needs identity')
+    return {
+      ts: spec.invalidTimestamp === 'invalid' ? 'not-a-timestamp' : spec.invalidTimestamp === 'absent' ? undefined : ts,
+      ...(author === 'own-bot' || author === 'other-bot'
+        ? { bot_id: author === 'own-bot' ? options.identity!.botId : 'B0OTHER' }
+        : { user: author === 'own-user' ? options.identity!.botUserId : `U0THREAD${i % 3}` }),
+      text: spec.text ?? `thread message ${i}`,
+      ...(spec.placement === 'channel' ? {} : { thread_ts: spec.threadTs ?? (spec.placement === 'root' ? ts : rootTs) }),
+      ...(spec.placement === 'broadcast' ? { subtype: 'thread_broadcast' } : {}),
+      files: spec.file === false ? [] : [{ id: `F0THREAD${i}`, name: spec.file ? spec.file.name : `file-${i}.txt`,
+        mimetype: 'text/plain', size: spec.file ? spec.file.size : i + 1 }],
+    }
+  })
+  type PageArgs = Parameters<WebClient['conversations']['history']>[0] | Parameters<WebClient['conversations']['replies']>[0]
+  type Position = { offset: number; page: number; scope: string }
   const positions = new Map<string, Position>()
   const cursors = new Map<string, string>()
+  const outcomes = new Map(Object.entries(options.pageOutcomes ?? {}).map(([n, values]) => [Number(n), [...values]]))
   const responses: Array<{ messages: typeof messages; response_metadata?: { next_cursor: string } }> = []
-  function page(args: Parameters<WebClient['conversations']['replies']>[0]) {
-    const position = args.cursor ? positions.get(args.cursor) : { offset: 0, page: 0 }
-    if (!position || args.ts !== rootTs) throw new Error('paged thread: unknown cursor or root')
+  function positionOf(args: PageArgs, kind: 'history' | 'replies') {
+    const scope = JSON.stringify([kind, args.channel, 'ts' in args ? args.ts : undefined, args.oldest, args.latest, args.inclusive])
+    const position = args.cursor ? positions.get(args.cursor) : { offset: 0, page: 0, scope }
+    if (!position || position.scope !== scope || (kind === 'replies' && (!('ts' in args) || args.ts !== rootTs)) ||
+      (options.channel !== undefined && args.channel !== options.channel)) throw new Error('paged thread: unknown cursor, root or range')
+    return position
+  }
+  function buildPage(args: PageArgs, kind: 'history' | 'replies') {
+    const position = positionOf(args, kind)
     const limit = args.limit ?? 20
     if (!Number.isInteger(limit) || limit < 1) throw new Error('paged thread: positive integer limit required')
     const size = Math.min(limit, options.pageSizes?.[position.page] ?? limit)
-    const repeated = position.page > 0 && options.repeatRoot && (limit > 1 || position.page % 2 === 1)
+    const inRange = (message: typeof messages[number]) => {
+      if (message.ts === undefined || !/^\d+\.\d+$/.test(message.ts)) return true // malformed-page tests reach the reader
+      const time = Number(message.ts)
+      return (args.oldest === undefined || (args.inclusive ? time >= Number(args.oldest) : time > Number(args.oldest))) &&
+        (args.latest === undefined || (args.inclusive ? time <= Number(args.latest) : time < Number(args.latest)))
+    }
+    const selected = messages.filter(inRange)
+    if (kind === 'history') selected.sort((a, b) => Number(b.ts) - Number(a.ts))
+    const repeated = kind === 'replies' && position.page > 0 && options.repeatRoot && inRange(messages[0]!) &&
+      (limit > 1 || position.page % 2 === 1)
     const prefix = repeated ? [messages[0]!] : []
-    const replies = messages.slice(position.offset, position.offset + Math.max(0, size - prefix.length))
+    const replies = selected.slice(position.offset, position.offset + Math.max(0, size - prefix.length))
     const offset = position.offset + replies.length
     let next_cursor = ''
-    if (offset < messages.length) {
-      const next = { offset, page: position.page + 1 }
+    if (offset < selected.length) {
+      const next = { offset, page: position.page + 1, scope: position.scope }
       const key = JSON.stringify(next)
       next_cursor = cursors.get(key) ?? `page/${crypto.randomUUID()}+opaque=`
       cursors.set(key, next_cursor)
@@ -263,13 +325,37 @@ export function makePagedThread(count: number, options: {
     return { messages: [...prefix, ...replies],
       ...(next_cursor || options.finalCursor !== 'absent' ? { response_metadata: { next_cursor } } : {}) }
   }
+  const page = (args: Parameters<WebClient['conversations']['replies']>[0]) => buildPage(args, 'replies')
+  const historyPage = (args: Parameters<WebClient['conversations']['history']>[0]) => buildPage(args, 'history')
+  function respondPage(args: PageArgs, kind: 'history' | 'replies'): WebApiOutcome {
+    const position = positionOf(args, kind), result = buildPage(args, kind)
+    const outcome = outcomes.get(position.page)?.shift()
+    function finish(answer: SettledWebApiOutcome = { kind: 'ok' }): SettledWebApiOutcome {
+      if (answer.kind !== 'ok') return answer
+      responses.push(result)
+      return { kind: 'ok', result: { ...result, ...answer.result } }
+    }
+    return outcome?.kind === 'deferred' ? { kind: 'deferred', answer: outcome.answer.then(finish) } : finish(outcome)
+  }
+  function malformedOutcome(damage: PagedPageDamage): SettledWebApiOutcome {
+    const result: Record<string, unknown> = { messages }
+    if (damage === 'messages-absent') result.messages = undefined
+    if (damage === 'messages-object') result.messages = {}
+    if (damage === 'cursor-number') result.response_metadata = { next_cursor: 7 }
+    if (damage === 'metadata-array') result.response_metadata = []
+    if (damage === 'not-ok') result.ok = false
+    return { kind: 'ok', result }
+  }
   return {
-    rootTs, messages, responses, page,
+    rootTs, messages, responses, page, historyPage, malformedOutcome,
+    /** Original synchronous API; scripted page failures use respondReplies. */
     respond(args: Parameters<WebClient['conversations']['replies']>[0]): SettledWebApiOutcome {
       const result = page(args)
       responses.push(result)
       return { kind: 'ok', result }
     },
+    respondReplies: (args: Parameters<WebClient['conversations']['replies']>[0]) => respondPage(args, 'replies'),
+    respondHistory: (args: Parameters<WebClient['conversations']['history']>[0]) => respondPage(args, 'history'),
     /** Shared legacy payload builder, keeping Slack shapes out of test bodies. */
     legacyOutcome(kind: 'history' | 'replies'): SettledWebApiOutcome {
       return { kind: 'ok', result: { messages: kind === 'history' ? [...messages].reverse() : [...messages] } }
@@ -407,6 +493,7 @@ export interface StubSlackOptions {
   replies?: readonly WebApiOutcome[]
   /** Argument-driven reply pages; scripted outcomes still take precedence. */
   repliesResponder?: (args: Parameters<WebClient['conversations']['replies']>[0]) => WebApiOutcome
+  historyResponder?: (args: Parameters<WebClient['conversations']['history']>[0]) => WebApiOutcome
   /** Initial `conversations.info` outcomes. */
   info?: readonly WebApiOutcome[]
   /** Initial `reactions.add` outcomes. */
@@ -657,6 +744,8 @@ export interface StubSlack {
   readonly identity: { botUserId: string; botId: string; teamId: string; appId?: string }
   /** Outcome queues; push onto them at any time. */
   readonly script: StubSlackScript
+  /** May be installed after a connection harness builds its stub. Scripts win. */
+  readonly responders: { history?: StubSlackOptions['historyResponder']; replies?: StubSlackOptions['repliesResponder'] }
   /**
    * How many completion groups each unscripted `filesUploadV2` call
    * completes, consumed front to back (default 1, one file per call); each
@@ -966,6 +1055,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     apiCall: [],
   }
   const uploadGroups: number[] = []
+  const responders: StubSlack['responders'] = { history: opts.historyResponder, replies: opts.repliesResponder }
   const options: StubSlack['options'] = { web: [], socket: [] }
   const sockets: StubSocketClient[] = []
   const stubCallLog: StubWebCall[] = []
@@ -1104,12 +1194,12 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         history: (args) => {
           record('conversations.history', args)
           calls.conversationsHistory.push(args)
-          return messageList(script.history.shift(), 'conversations.history')
+          return messageList(script.history.shift() ?? responders.history?.(args), 'conversations.history')
         },
         replies: (args) => {
           record('conversations.replies', args)
           calls.conversationsReplies.push(args)
-          return messageList(script.replies.shift() ?? opts.repliesResponder?.(args), 'conversations.replies')
+          return messageList(script.replies.shift() ?? responders.replies?.(args), 'conversations.replies')
         },
         info: (args) => {
           record('conversations.info', args)
@@ -1425,6 +1515,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
   return {
     identity,
     script,
+    responders,
     uploadGroups,
     calls,
     callLog: stubCallLog,

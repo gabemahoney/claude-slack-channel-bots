@@ -35,9 +35,9 @@ afterEach(async () => {
 })
 
 /** Slack responses are built by the shared stub; result only overrides the tested fields. */
-async function postAnswer(result: Record<string, unknown> = { ts: ROOT }): Promise<OwnPostAnswer> {
+async function postAnswer(result: Record<string, unknown> = { ts: ROOT }, channel: string = C): Promise<OwnPostAnswer> {
   const slack = makeStubSlack({ post: [{ kind: 'ok', result }] })
-  return ownPostAnswerOfPost(C, await slack.web.chat.postMessage({ channel: C, text: CONTENT.text }))
+  return ownPostAnswerOfPost(channel, await slack.web.chat.postMessage({ channel, text: CONTENT.text }))
 }
 
 describe('the own-post observer', () => {
@@ -172,6 +172,7 @@ async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedId
     operation: (...args: Parameters<typeof rawOwner.operation>) => capture(rawOwner.operation(...args)),
     awaitingUploads: (...args: Parameters<typeof rawOwner.awaitingUploads>) => capture(rawOwner.awaitingUploads(...args)),
     memoryOnlyJoins: (...args: Parameters<typeof rawOwner.memoryOnlyJoins>) => capture(rawOwner.memoryOnlyJoins(...args)),
+    resolvedThreads: (...args: Parameters<typeof rawOwner.resolvedThreads>) => capture(rawOwner.resolvedThreads(...args)),
   }
   const memory = { ...h.memory,
     unresolvedIntents: (key: string) => capture(h.memory.unresolvedIntents(key)),
@@ -203,7 +204,7 @@ async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedId
     for (const persona of h.authority.config().personas) members.h.stub(members.h.p(persona.key)).script.inventory.push(membershipPage([C, C2]))
     await members.start(); await members.scan()
   }
-  const begin = (parent?: string, key = 'alpha', surface: 'text' | 'file' = 'text', channel = C) => {
+  const begin = (parent?: string, key = 'alpha', surface: 'text' | 'file' = 'text', channel: string = C) => {
     const started = observer.start(key, surface, { channel, ...(parent ? { parent } : {}) },
       surface === 'file' ? { kind: 'file', name: LEAK_SENTINEL, size: 12 } : CONTENT)
     expect(started).toBeDefined()
@@ -273,11 +274,14 @@ describe('own-post registration and outcomes', () => {
     expect(h.observer.end(post.operation, answer)).toBeUndefined()
     expect(h.view(expected)).toBe('joined'); expect(h.pending()).toHaveLength(0)
     expect(h.owner.operation('alpha', post.id)).toBeUndefined()
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([expected]))
+    expect(h.events.at(-1)).not.toHaveProperty('lookup')
     await savedOutcome(h, post.id, 'joined')
     await h.close()
     const reopened = await fixture({ reopen: h.dir })
     expect(reopened.view(expected)).toBe('joined')
     expect(reopened.owner.unknownOwnPosts('alpha')).toHaveLength(0)
+    expect(reopened.owner.resolvedThreads('alpha', C)).toEqual(new Set())
   })
 
   test('a joined root registers and writes nothing, even through a stored reply mapping', async () => {
@@ -298,6 +302,7 @@ describe('own-post registration and outcomes', () => {
       : kind === 'no-answer' ? ownPostAnswerOfError(slackRequestError()) : await postAnswer()
     h.observer.end(post.operation, answer)
     expect(h.view()).toBe('not-joined')
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set(kind === 'stale' ? [ROOT] : []))
     if (kind === 'no-answer') {
       expect(h.pending()).toMatchObject([{ operationId: post.id, state: 'unknown' }])
       expect(h.memory.unresolvedIntents('alpha')).toHaveLength(1)
@@ -398,6 +403,8 @@ describe('own-post eligibility and deferred joins', () => {
     const calls = h.members.h.stub(h.members.h.p('alpha')).web.callLog.length
     h.observer.end(post.operation, await postAnswer())
     expect(h.members.h.stub(h.members.h.p('alpha')).web.callLog).toHaveLength(calls)
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
+    expect(h.events.at(-1)).not.toHaveProperty('lookup')
     expect(h.view() === 'joined').toBe(joined)
     if (deferred) {
       expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'deferred' })
@@ -413,6 +420,7 @@ describe('own-post eligibility and deferred joins', () => {
     expect(h.pending()).toHaveLength(1)
     expect(ownPostEligibility(h.sources)('alpha', C).kind).toBe('ineligible')
     h.observer.end(post.operation, await postAnswer())
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
     expect(h.view()).toBe('not-joined'); await savedOutcome(h, post.id, 'none')
   })
 
@@ -510,24 +518,143 @@ describe('own-post eligibility and deferred joins', () => {
 })
 
 describe('lookup, upload, retention and persona scope', () => {
-  test.each(['found', 'not-found', 'stale', 'ineligible'] as const)('a restarted unresolved intent with a digest is resolved by lookup: %s', async result => {
-    const h = await fixture(), post = h.begin()
-    await post.ready; h.observer.end(post.operation, NO_ANSWER)
-    const intent = h.owner.unknownOwnPosts('alpha')[0]!
+  test.each([
+    ['top-level counts for holds', undefined, { found: { ts: REPLY }, holds: 'thread' }, 'current', REPLY],
+    ['mapped reply counts for holds', REPLY, { found: { ts: REPLY }, holds: 'thread' }, 'current', ROOT],
+    ['Slack thread overrides mapped parent', REPLY, { found: { ts: REPLY, threadTs: ROOT2 }, holds: 'thread' }, 'current', ROOT2],
+    ['found does not count for holds', undefined, { found: { ts: REPLY, threadTs: ROOT }, holds: 'none' }, 'current', ROOT],
+    ['empty range counts as failed', undefined, { notFound: true, holds: 'failed' }, 'current', undefined],
+    ['not-found does not count for holds', undefined, { notFound: true, holds: 'none' }, 'current', undefined],
+    ['stale found cannot count for holds', undefined, { found: { ts: REPLY, threadTs: ROOT }, holds: 'thread' }, 'stale', undefined],
+    ['stale found with no hold verdict', undefined, { found: { ts: REPLY, threadTs: ROOT }, holds: 'none' }, 'stale', undefined],
+    ['stale not-found is not a failure', undefined, { notFound: true, holds: 'failed' }, 'stale', undefined],
+    ['membership removal invalidates the stamp', undefined, { found: { ts: REPLY, threadTs: ROOT }, holds: 'thread' }, 'ineligible', undefined],
+  ] as const)('a restarted unresolved intent with a digest is resolved by lookup: %s', async (_label, parent, result, transition, root) => {
+    const h = await fixture()
+    if (parent === REPLY) await h.queue.accept('alpha', slackInput({ channel: C, ts: REPLY, key: { chat_id: C, ts: REPLY }, thread_ts: ROOT }))
+    const post = h.begin(parent)
+    await post.ready
+    // No end call: replay the durable intent as after a crash before confirmation.
+    const intent = h.memory.unresolvedIntents('alpha')[0]!
     expect(intent.digest).toMatch(/^[a-f0-9]{64}$/)
     await h.close()
     const next = await fixture({ reopen: h.dir })
-    expect(next.owner.unknownOwnPosts('alpha')).toMatchObject([{ operationId: post.id, digest: intent.digest, issuedAt: intent.issuedAt }])
-    if (result === 'stale') next.stale()
-    if (result === 'ineligible') await next.scan('ineligible')
-    next.owner.recordLookup('alpha', 'missing-operation', { notFound: true })
+    expect(next.owner.unknownOwnPosts('alpha')).toMatchObject([{ operationId: post.id, digest: intent.digest, issuedAt: intent.at }])
+    expect(next.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    if (transition === 'stale') next.stale()
+    if (transition === 'ineligible') await next.scan('ineligible')
     expect(next.events).toHaveLength(0)
-    next.owner.recordLookup('alpha', post.id, result === 'not-found' ? { notFound: true } : { found: { ts: REPLY, threadTs: ROOT } })
-    expect(next.view()).toBe(result === 'found' ? 'joined' : 'not-joined')
+    const release = next.owner.retainOutcomes('alpha', [post.id])
+    const lookup: OwnPostEvent['lookup'] = transition !== 'current' ? { holds: 'none' }
+      : result.holds === 'thread' ? { holds: 'thread', thread: root! } : { holds: result.holds }
+    const outcome: OwnPostEvent['outcome'] = root ? { kind: 'confirmed', thread: root, joined: true } : { kind: 'not-found', joined: false }
+    next.io.reset()
+    expect(next.owner.recordLookup('alpha', post.id, result)).toBeUndefined()
+    expect(next.io.calls).toEqual([])
+    expect(next.view(root ?? ROOT)).toBe(root ? 'joined' : 'not-joined')
     expect(next.pending()).toHaveLength(0)
+    expect(next.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome, lookup })
     expect(next.events).toEqual([{ type: 'decided', key: 'alpha', channel: C, operationId: post.id,
-      outcome: result === 'not-found' ? { kind: 'not-found', joined: false } : { kind: 'confirmed', thread: ROOT, joined: result === 'found' } }])
-    await savedOutcome(next, post.id, result === 'found' ? 'joined' : 'none')
+      outcome, lookup }])
+    const resolved = new Set(root ? [root] : [])
+    expect(next.owner.resolvedThreads('alpha', C)).toEqual(resolved)
+    await savedOutcome(next, post.id, root ? 'joined' : 'none')
+    release()
+    expect(next.owner.operation('alpha', post.id)).toBeUndefined()
+    expect(next.owner.resolvedThreads('alpha', C)).toEqual(resolved)
+    assertNoLeak({ events: next.events, lookup, outcome, journal: writtenFile(threadPath(next.dir)) })
+  })
+
+  test('unknown lookup IDs change no operation, event, resolved thread or journal', async () => {
+    const h = await fixture(), post = h.begin()
+    await post.ready; h.observer.end(post.operation, NO_ANSWER); await h.flush()
+    const before = { bytes: readFileSync(threadPath(h.dir)), events: h.events.slice(), unknown: h.owner.unknownOwnPosts('alpha') }
+    expect(h.owner.recordLookup('alpha', 'missing', { found: { ts: ROOT }, holds: 'thread' })).toBeUndefined()
+    expect(h.owner.recordLookup('alpha', 'missing', { notFound: true, holds: 'failed' })).toBeUndefined()
+    await h.flush()
+    expect(h.events).toEqual(before.events)
+    expect(h.owner.unknownOwnPosts('alpha')).toEqual(before.unknown)
+    expect(h.owner.operation('alpha', 'missing')).toBeUndefined()
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    expect(readFileSync(threadPath(h.dir))).toEqual(before.bytes)
+  })
+
+  test.each(['thread', 'none'] as const)('a current-stamp ineligible found keeps holds=%s and learns its thread without joining', async holds => {
+    const h = await fixture()
+    await h.scan('ineligible'); expect(h.choose('thread_hybrid').kind).toBe('applied')
+    const post = h.begin(); await post.ready
+    h.observer.end(post.operation, NO_ANSWER)
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    const lookup = holds === 'thread' ? { holds, thread: ROOT } : { holds }
+    expect(h.owner.recordLookup('alpha', post.id, { found: { ts: REPLY, threadTs: ROOT }, holds })).toBeUndefined()
+    expect(h.view()).toBe('not-joined')
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', lookup,
+      outcome: { kind: 'confirmed', thread: ROOT, joined: false } })
+    expect(h.events.at(-1)).toMatchObject({ type: 'decided', lookup })
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
+    await savedOutcome(h, post.id, 'none')
+    release()
+  })
+
+  test.each(['thread', 'none'] as const)('a found recorded under an undecided stamp keeps holds=%s but learns no resolved thread', async holds => {
+    const h = await fixture(), post = h.begin()
+    await post.ready; h.observer.end(post.operation, NO_ANSWER); h.undecided()
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    const lookup = holds === 'thread' ? { holds, thread: ROOT } : { holds }
+    expect(h.owner.recordLookup('alpha', post.id, { found: { ts: REPLY, threadTs: ROOT }, holds })).toBeUndefined()
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'deferred', lookup })
+    expect(h.events.at(-1)).toMatchObject({ type: 'decided', lookup })
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    expect(h.records().filter(r => r.kind === 'post-outcome')).toEqual([])
+    h.decideStamp(); h.owner.settleDeferred('alpha', C)
+    expect(h.view()).toBe('joined')
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', lookup })
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    await savedOutcome(h, post.id, 'joined')
+    release()
+  })
+
+  test.each(['confirmed', 'failed', 'deferred'] as const)('a Slack-decided %s operation has no lookup metadata', async kind => {
+    const h = await fixture(), post = h.begin()
+    await post.ready
+    if (kind === 'deferred') await h.scan('unresolved')
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    const answer = kind === 'failed' ? ownPostAnswerOfError(slackPlatformError('not_in_channel')) : await postAnswer()
+    expect(h.observer.end(post.operation, answer)).toBeUndefined()
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: kind === 'deferred' ? 'deferred' : 'decided',
+      outcome: { kind: kind === 'failed' ? 'failed' : 'confirmed', joined: kind === 'confirmed' } })
+    expect(h.owner.operation('alpha', post.id)).not.toHaveProperty('lookup')
+    expect(h.events.at(-1)).toMatchObject({ type: 'decided' })
+    expect(h.events.at(-1)).not.toHaveProperty('lookup')
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set(kind === 'failed' ? [] : [ROOT]))
+    release()
+  })
+
+  test('resolved threads survive discarded outcomes, stay per key and channel, and forget clears only one key', async () => {
+    const h = await fixture({ names: ['alpha', 'beta'] })
+    const posts = [h.begin(), h.begin(), h.begin(undefined, 'alpha', 'text', C2), h.begin(undefined, 'beta')]
+    await Promise.all(posts.map(post => post.ready))
+    h.observer.end(posts[0]!.operation, await postAnswer())
+    h.observer.end(posts[1]!.operation, await postAnswer({ ts: ROOT2 }))
+    h.observer.end(posts[2]!.operation, await postAnswer({ ts: ROOT2 }, C2))
+    h.observer.end(posts[3]!.operation, await postAnswer({ ts: REPLY }))
+    await h.flush()
+    expect(h.owner.operation('alpha', posts[0]!.id)).toBeUndefined()
+    h.io.reset()
+    const calls = h.members.h.stub(h.members.h.p('alpha')).web.callLog.slice()
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT, ROOT2]))
+    expect(h.owner.resolvedThreads('alpha', C2)).toEqual(new Set([ROOT2]))
+    expect(h.owner.resolvedThreads('beta', C)).toEqual(new Set([REPLY]))
+    expect(h.owner.resolvedThreads('beta', C2)).toEqual(new Set())
+    expect(h.owner.resolvedThreads('missing', C)).toEqual(new Set())
+    expect(h.io.calls).toEqual([])
+    expect(h.members.h.stub(h.members.h.p('alpha')).web.callLog).toEqual(calls)
+    h.owner.forget('alpha')
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    expect(h.owner.resolvedThreads('alpha', C2)).toEqual(new Set())
+    expect(h.owner.resolvedThreads('beta', C)).toEqual(new Set([REPLY]))
+    // A retained durable join is not a thread learnt by this new owner lifetime.
+    expect(h.view()).toBe('joined')
   })
 
   test('a parentless upload waits for its thread, then joins; only retained outcomes survive', async () => {
@@ -620,12 +747,13 @@ describe('lookup, upload, retention and persona scope', () => {
     const unsubscribe = h.owner.subscribe(event => { received.push(event) })
     const post = h.begin(); await post.ready
     h.observer.end(post.operation, NO_ANSWER)
-    h.owner.recordLookup('alpha', post.id, { found: { ts: ROOT } })
+    expect(h.owner.recordLookup('alpha', post.id, { found: { ts: ROOT }, holds: 'thread' })).toBeUndefined()
     await h.flush()
     expect(received).toEqual([
       { type: 'registered', key: 'alpha', channel: C, operationId: post.id },
       { type: 'unknown', key: 'alpha', channel: C, operationId: post.id },
-      { type: 'decided', key: 'alpha', channel: C, operationId: post.id, outcome: { kind: 'confirmed', thread: ROOT, joined: true } },
+      { type: 'decided', key: 'alpha', channel: C, operationId: post.id, outcome: { kind: 'confirmed', thread: ROOT, joined: true },
+        lookup: { holds: 'thread', thread: ROOT } },
     ])
     unsubscribe(); h.begin(ROOT2); expect(received).toHaveLength(3)
     assertNoLeak({ events: h.events, received, journal: writtenFile(threadPath(h.dir)), captured: h.members.captured() })

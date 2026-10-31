@@ -15,6 +15,8 @@ import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryR
 import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from '../../src/thread-memory-reports.ts'
 import { createSharedStateReporting } from '../../src/shared-state-reports.ts'
 import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
+import { createOwnPostJoins, createOwnPostObserver, ownPostChoice, ownPostEligibility, ownPostStampState, type OwnPostJoins, type OwnPostEvent } from '../../src/own-post.ts'
+import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from '../../src/own-post-lookup.ts'
 import { threadJoin } from './thread-memory.ts'
 
 import {
@@ -1109,6 +1111,9 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
+  readonly ownPostJoins: OwnPostJoins | undefined
+  readonly ownPostEvents: OwnPostEvent[]
+  readonly ownPostLookupEvents: OwnPostLookupEvent[]
   readonly threadMemorySeal: ThreadMemorySeal | undefined
   readonly threadMemoryRetries: ThreadMemoryRetries | undefined
   readonly threadMemoryRetryEvents: ThreadMemoryRetryEvent[]
@@ -2077,7 +2082,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     }
     // As server.ts wires its destination resolver:
     // the switch is read from the configuration in effect at each attempt.
+    let ownPostJoins: OwnPostJoins | undefined
+    let ownPostLookups: OwnPostLookups | undefined
+    const ownPostEvents: OwnPostEvent[] = [], ownPostLookupEvents: OwnPostLookupEvent[] = []
+    const ownPosts = runOpts.threadMemory === undefined ? undefined : createOwnPostObserver(() => ownPostJoins)
     const noticeStack = makeNotifierStack({
+      ownPosts,
       getPersona: getAppliedPersona,
       clientFor,
       log,
@@ -2173,6 +2183,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       },
     })
     function observeThreadMemoryEvent(event: ThreadMemoryEvent): void {
+        if (event.type === 'read' && controller?.sharedChannels() && memoryWorkAllowed(event.key)) ownPostLookups?.journalRead(event.key)
         threadMemoryEvents.push(event)
         const outage = threadMemory?.outage(event.key)
         dispatchReport(() => threadMemoryReporting?.threadMemoryEvent(event, outage))
@@ -2195,6 +2206,33 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       setCreated: key => controller?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' },
       clearCreated: key => controller?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
     })
+    if (threadMemory) {
+      const sources = {
+        config: appliedConfig, persona: getAppliedPersona, choices: () => channelDeliveryStore,
+        membership: (key: string, channel: string, mode: Parameters<ChannelMembership['read']>[2]) => membership?.read(key, channel, mode),
+      }
+      ownPostJoins = createOwnPostJoins({
+        memory: threadMemory, lookupSlackKey: queue.lookupSlackKey,
+        choice: ownPostChoice(sources), eligibility: ownPostEligibility(sources),
+        now: connections.clock.now, operationId: () => crypto.randomUUID(), isDryRun: () => dryRun,
+      })
+      ownPostJoins.subscribe(event => { ownPostEvents.push(event) })
+      if (!dryRun) ownPostLookups = createOwnPostLookups({
+        owner: ownPostJoins, memory: threadMemory,
+        stamp: (key, channel, stamp) => ownPostStampState(threadMemory, key, channel, stamp),
+        connections: {
+          metadataCall: (...args) => connections.manager.metadataCall(...args),
+          currentConnectionId: key => connections.manager.provenance(key)?.connectionId,
+          isUp: key => memoryWorkAllowed(key) && getAppliedPersona(key) !== undefined && isPersonaUp(key),
+          identity: key => connections.manager.identity(key),
+        },
+        clock: connections.clock,
+        onEvent: event => {
+          ownPostLookupEvents.push(event)
+          dispatchReport(() => threadMemoryReporting?.lookupEvent(event))
+        },
+      })
+    }
     if (threadMemory) threadMemoryRetries = createThreadMemoryRetries({
       canRun: memoryWorkAllowed, clock: connections.clock,
       flush: key => threadMemory.flush(key), retryRead: key => threadMemory.retryRead(key),
@@ -2210,6 +2248,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           const result = await threadMemory.flush(key)
           if (live() && (result.kind === 'failed' || (result.kind === 'kept' && threadMemory.outage(key).unsaved > 0))) threadMemoryRetries?.appendFailed(key)
         } catch { if (live()) threadMemoryRetries?.appendFailed(key) }
+        if (live()) ownPostLookups?.kick(key)
       },
       onEvent(event) {
         threadMemoryRetryEvents.push(event)
@@ -2275,7 +2314,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // the start loads the store, and after a refused start, it is
       // undefined, so no stored choice applies and nothing throws.
       getChannelDelivery: () => channelDeliveryStore,
-      threadMemory: (key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown',
+      threadMemory: (key, channel, root) => {
+        ownPostJoins?.settleDeferred(key, channel)
+        return threadMemory?.view(key, channel, root) ?? 'unknown'
+      },
       ...(threadMemory === undefined ? {} : { joins: {
         stamp: (key: string, channel: string) => controller?.sharedChannels()?.channelStamp(key, channel),
         hasSavedJoin: threadMemory.hasSavedJoin,
@@ -2294,6 +2336,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       (key, status) => membershipStatus?.(key, status),
       createPersonaUpFlushListener(noticeStack.notifier),
       (key, status) => bringUps.onConnectionStatus(key, status),
+      (key, status) => { if (status.state === 'up' && memoryWorkAllowed(key)) ownPostLookups?.kick(key) },
     )
 
     /**
@@ -2546,15 +2589,16 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         routing: { forget: rec('routing.forget', (key) => {
           sharedStateReporting?.forget(key)
           if (threadMemory === undefined) routing.forget(key)
-          else forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemoryRetries!.forget(k), k => threadMemory.forget(k)])
+          else forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemoryRetries!.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory.forget(k)])
         }) },
         ...(threadMemory === undefined ? {} : { cancelThreadMemory: (key: string) => forgetPersonaState(key, [
-          k => threadMemoryRetries!.forget(k), k => memoryHolds!.forget(k),
+          k => threadMemoryRetries!.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds!.forget(k),
         ]), loadThreadMemory: async (key: string) => {
           await threadMemory.loadKey(key)
           if (!stopped) {
             recoverQueuedJoins(key, queue, threadMemory)
             void memoryHolds!.resolve(key, 'recovered')
+            ownPostLookups?.kick(key)
           }
         } }),
         // The real tracker's per-key forget, as server.ts binds it, so a key
@@ -2810,6 +2854,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         }) } finally {
           if (!serverConfig()?.personas.some(p => p.key === persona.key)) {
             threadMemoryRetries?.forget(persona.key, 'removal')
+            ownPostLookups?.forget(persona.key)
+            ownPostJoins?.forget(persona.key)
             await threadMemory?.remove(persona.key)
           }
         }
@@ -3002,6 +3048,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         unsubscribeThreadMemory = authority.subscribeThreadView(() => {
           if (stopped) return
           threadMemory.published()
+          for (const persona of serverConfig()?.personas ?? []) {
+            ownPostJoins?.onSharedStatePublished(persona.key)
+            if (memoryWorkAllowed(persona.key)) ownPostLookups?.kick(persona.key)
+          }
           for (const key of queue.keys()) if (getAppliedPersona(key)) void memoryHolds!.retryPending(key)
         })
         threadMemoryReady = queueReady.then(() => {
@@ -3009,12 +3059,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           threadMemory.startMaintenance()
           return threadMemory.activate()
         }).then(() => {
+          for (const persona of serverConfig()?.personas ?? []) ownPostLookups?.journalRead(persona.key)
           for (const key of queue.keys()) {
             try {
               recoverQueuedJoins(key, queue, threadMemory)
               void memoryHolds!.resolve(key, 'recovered', true)
             } catch { /* retry this key at bring-up */ }
           }
+          for (const persona of serverConfig()?.personas ?? []) ownPostLookups?.kick(persona.key)
           queue.startMaintenance()
           threadMemoryReporting = createThreadMemoryReporting({
             episodes, persona: getAppliedPersona, log,
@@ -3171,6 +3223,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const toolResults: Array<{ key: string; result?: unknown; error?: unknown }> = []
     let sessionSeq = 0
     const toolDeps: SessionToolDeps = {
+      ownPosts,
       assertSendable: (path) => {
         throw new Error(`reload-harness: no file may be sent (${JSON.stringify(path)})`)
       },
@@ -3270,6 +3323,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     }
 
     const run: ReloadRun = {
+      ownPostJoins, ownPostEvents, ownPostLookupEvents,
       threadMemory,
       threadMemorySeal, threadMemoryRetries, threadMemoryRetryEvents, threadMemorySealEvents,
       observeThreadMemoryEvent,
@@ -3412,7 +3466,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       slackCalls,
       slackPosts: () => Object.values(slackCalls()).flat().filter((c) => c.method === 'chat.postMessage'),
       captured: (extra = {}) => ({
-        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases, threadMemoryRetryEvents, threadMemorySealEvents }),
+        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases, threadMemoryRetryEvents, threadMemorySealEvents, ownPostEvents, ownPostLookupEvents }),
         logs,
         statuses: connections.statuses,
         lifecycle: records,
@@ -3560,6 +3614,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         await preparation.stop()
         await queue.stop()
         threadMemoryRetries?.stopKeys()
+        ownPostLookups?.stop()
+        ownPostJoins?.stop()
         if (threadMemory) await threadMemoryReady
         unsubscribeThreadMemory?.()
         await threadMemory?.quiesce()
@@ -3572,6 +3628,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         threadMemoryRetries?.stopSeal()
       } else {
         threadMemoryRetries?.stopKeys(); threadMemoryRetries?.stopSeal()
+        ownPostLookups?.stop()
+        ownPostJoins?.stop()
         // Drop old-run memory and timers; no durable shutdown API runs.
         unsubscribeThreadMemory?.()
         queueIntervalLive = false

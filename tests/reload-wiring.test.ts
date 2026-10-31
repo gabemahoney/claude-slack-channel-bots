@@ -299,7 +299,7 @@ function lifecycleHolder(): string {
   const parameter = teardown.match(/^async \((\w+)\) => /)
   expect(parameter).not.toBeNull()
   const persona = parameter![1]!
-  expect(teardown).toBe(`async (${persona}) => { try { await ${holder}.teardown(${persona}) } finally { if (!${loadedConfigName(SERVER_CODE)}?.personas.some(applied => applied.key === ${persona}.key)) { try { await forgetPersonaState(${persona}.key, [key => ownPostJoins?.forget(key)]) } finally { try { memoryHolds?.forget(${persona}.key) } finally { try { threadMemoryRetries?.forget(${persona}.key, 'removal') } finally { await threadMemory?.remove(${persona}.key) } } } } } }`)
+  expect(teardown).toBe(`async (${persona}) => { try { await ${holder}.teardown(${persona}) } finally { if (!${loadedConfigName(SERVER_CODE)}?.personas.some(applied => applied.key === ${persona}.key)) { try { await forgetPersonaState(${persona}.key, [key => ownPostLookups?.forget(key), key => ownPostJoins?.forget(key)]) } finally { try { memoryHolds?.forget(${persona}.key) } finally { try { threadMemoryRetries?.forget(${persona}.key, 'removal') } finally { await threadMemory?.remove(${persona}.key) } } } } } }`)
   // All five on the same holder. bringUp forwards its third parameter, the
   // options carrying `recovery` (step 6): a binding that drops
   // it typechecks, but would bring a credentials-broken persona up as new.
@@ -412,12 +412,12 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       ['connections', constOf('createPersonaConnectionManager')],
       // Cancel retries and hold resolution through the isolation helper at
       // teardown submission; the later routing cleanup still includes both.
-      ['cancelThreadMemory', 'key => forgetPersonaState(key, [ k => threadMemoryRetries?.forget(k), k => memoryHolds?.forget(k), ])'],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemoryRetries?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k), ]) }`],
+      ['cancelThreadMemory', 'key => forgetPersonaState(key, [ k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds?.forget(k), ])'],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k), ]) }`],
       // A later bring-up awaits this key's Thread Memory load, then recovers
       // queued joins and starts detached hold resolution before connecting,
       // only while running with both holders.
-      ['loadThreadMemory', "async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { recoverQueuedJoins(key, deliveryQueue, threadMemory) void memoryHolds?.resolve(key, 'recovered').catch(() => {}) } }"],
+      ['loadThreadMemory', "async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { recoverQueuedJoins(key, deliveryQueue, threadMemory) void memoryHolds?.resolve(key, 'recovered').catch(() => {}) ownPostLookups?.kick(key) } }"],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],

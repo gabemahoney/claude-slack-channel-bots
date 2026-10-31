@@ -7,6 +7,11 @@ import { sameChannelStamp, type ChannelStamp } from './shared-channels.ts'
 import { ownPostDigest, type OwnPostContent, type ThreadMemory } from './thread-memory.ts'
 import type { OwnPostAnswer, OwnPostChoice, OwnPostEligibility, OwnPostOperation, OwnPostOwner, OwnPostStart, OwnPostSurface, OwnPostTarget } from './own-post.ts'
 
+export type OwnPostLookupHolds = 'thread' | 'failed' | 'none'
+export type OwnPostLookupOutcome = { holds: 'thread'; thread: string } | { holds: 'failed' | 'none' }
+export type OwnPostLookupResult =
+  | { found: { ts: string; threadTs?: string }; holds: 'thread' | 'none' }
+  | { notFound: true; holds: 'failed' | 'none' }
 export interface OwnPostOutcome {
   kind: 'confirmed' | 'failed' | 'not-found'
   thread?: string
@@ -18,10 +23,12 @@ export interface PendingOwnPost {
   stamp?: ChannelStamp; digest?: string; file?: string
   state: 'awaiting-answer' | 'unknown' | 'awaiting-thread' | 'deferred' | 'decided'
   outcome?: OwnPostOutcome
+  lookup?: OwnPostLookupOutcome
 }
 export type OwnPostEvent = {
   type: 'registered' | 'decided' | 'unknown'; key: string; channel: string; operationId: string
   outcome?: OwnPostOutcome
+  lookup?: OwnPostLookupOutcome
 }
 export interface OwnPostJoinsDeps {
   memory: ThreadMemory
@@ -37,7 +44,8 @@ export interface OwnPostJoins extends OwnPostOwner {
   unknownOwnPosts(key: string): readonly PendingOwnPost[]
   operation(key: string, operationId: string): PendingOwnPost | undefined
   awaitingUploads(key: string, channel: string): readonly PendingOwnPost[]
-  recordLookup(key: string, operationId: string, result: { found: { ts: string; threadTs?: string } } | { notFound: true }): void
+  recordLookup(key: string, operationId: string, result: OwnPostLookupResult): void
+  resolvedThreads(key: string, channel: string): ReadonlySet<string>
   learnUploadThread(key: string, operationId: string, threadTs: string): void
   retainOutcomes(key: string, operationIds: readonly string[]): () => void
   memoryOnlyJoins(key: string): { channel: string; root: string }[]
@@ -46,6 +54,13 @@ export interface OwnPostJoins extends OwnPostOwner {
   subscribe(listener: (event: OwnPostEvent) => void): () => void
   forget(key: string): void
   stop(): void
+}
+/** The owner and its background lookups judge the same current publication. */
+export function ownPostStampState(memory: Pick<ThreadMemory, 'channelStamp'>, key: string, channel: string,
+  recorded: ChannelStamp | undefined): 'current' | 'stale' | 'undecided' {
+  const stamp = memory.channelStamp(key, channel)
+  if (stamp?.kind === 'undecided') return 'undecided'
+  return recorded && sameChannelStamp(recorded, stamp) ? 'current' : 'stale'
 }
 interface Entry {
   post: PendingOwnPost
@@ -63,6 +78,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
   const retained = new Map<string, Map<string, number>>()
   const listeners = new Set<(event: OwnPostEvent) => void>()
   const publications = new Map<string, object>()
+  const resolved = new Map<string, Map<string, Set<string>>>()
   let stopped = false
 
   function safely<T>(fallback: T, work: () => T): T { try { return work() } catch { return fallback } }
@@ -74,9 +90,10 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
   }
   function snapshot(entry: Entry): PendingOwnPost { return structuredClone(entry.post) }
   function emit(type: OwnPostEvent['type'], entry: Entry): void {
-    const { key, channel, operationId, outcome } = entry.post
+    const { key, channel, operationId, outcome, lookup } = entry.post
     for (const listener of listeners) {
-      try { void Promise.resolve(listener({ type, key, channel, operationId, ...(outcome ? { outcome: { ...outcome } } : {}) })).catch(() => {}) } catch { /* isolated consumer */ }
+      try { void Promise.resolve(listener({ type, key, channel, operationId, ...(outcome ? { outcome: { ...outcome } } : {}),
+        ...(lookup ? { lookup: { ...lookup } } : {}) })).catch(() => {}) } catch { /* isolated consumer */ }
     }
   }
   function importIntents(key: string): Map<string, Entry> {
@@ -94,9 +111,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
     return found
   }
   function stampState(post: PendingOwnPost): 'current' | 'stale' | 'undecided' {
-    const stamp = memory.channelStamp(post.key, post.channel)
-    if (stamp?.kind === 'undecided') return 'undecided'
-    return post.stamp && sameChannelStamp(post.stamp, stamp) ? 'current' : 'stale'
+    return ownPostStampState(memory, post.key, post.channel, post.stamp)
   }
   function alreadyJoined(post: PendingOwnPost): boolean {
     return post.root !== undefined && (memory.view(post.key, post.channel, post.root) === 'joined' || memory.hasKeptJoin(post.key, post.channel, post.root))
@@ -150,7 +165,15 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       if (result !== undefined) finish(entry, result === 'joined')
     }
   }
-  function confirm(entry: Entry, thread: string): void {
+  function confirm(entry: Entry, thread: string, learn = true): void {
+    if (learn) {
+      const { key, channel } = entry.post
+      let channels = resolved.get(key)
+      if (!channels) { channels = new Map(); resolved.set(key, channels) }
+      let roots = channels.get(channel)
+      if (!roots) { roots = new Set(); channels.set(channel, roots) }
+      roots.add(thread)
+    }
     entry.post.outcome = { kind: 'confirmed', thread, joined: false }
     entry.post.state = 'deferred'
     if (entry.intentKept) decide(entry)
@@ -235,11 +258,19 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       if (!allowed(key)) return
       const entry = importIntents(key).get(operationId)
       if (!entry || entry.post.state !== 'unknown') return
-      if ('found' in result) {
+      const stamp = stampState(entry.post)
+      if ('found' in result && stamp !== 'stale') {
         const thread = isThreadTimestamp(result.found.threadTs) ? result.found.threadTs : entry.post.root ?? result.found.ts
-        if (isThreadTimestamp(thread)) confirm(entry, thread)
-      } else { entry.post.outcome = { kind: 'not-found', joined: false }; decide(entry) }
+        if (isThreadTimestamp(thread)) {
+          entry.post.lookup = result.holds === 'thread' ? { holds: 'thread', thread } : { holds: 'none' }
+          confirm(entry, thread, stamp === 'current')
+        }
+      } else {
+        entry.post.lookup = { holds: stamp === 'stale' ? 'none' : result.holds === 'failed' ? 'failed' : 'none' }
+        entry.post.outcome = { kind: 'not-found', joined: false }; decide(entry)
+      }
     }),
+    resolvedThreads: (key, channel) => safely(new Set<string>(), () => new Set(resolved.get(key)?.get(channel))),
     learnUploadThread: (key, operationId, threadTs) => safely(undefined, () => {
       if (!allowed(key) || !isThreadTimestamp(threadTs)) return
       const entry = importIntents(key).get(operationId)
@@ -284,7 +315,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       })
     },
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
-    forget(key) { entries.delete(key); retained.delete(key); publications.delete(key) },
+    forget(key) { entries.delete(key); retained.delete(key); publications.delete(key); resolved.delete(key) },
     stop() { stopped = true; publications.clear() },
   }
   return api

@@ -13,6 +13,7 @@ import type { ThreadMemorySealCase, ThreadMemorySealFinding, ThreadMemorySealEve
 import type { ThreadMemoryEvent, ThreadMemoryOutage } from './thread-memory.ts'
 import type { ThreadMemoryRetryEvent } from './thread-memory-retry.ts'
 import type { MemoryHoldEvent } from './memory-holds.ts'
+import type { OwnPostLookupEvent } from './own-post-lookup.ts'
 import type { PersonaEpisodes, PersonaEpisodeKind } from './persona-episodes.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { formatPersonaNotice } from './persona-notifier.ts'
@@ -27,6 +28,7 @@ export interface ThreadMemoryLoss {
   threads: readonly ThreadMemoryLostThread[]
   messages: readonly ThreadMemoryWithdrawnMessage[]
   unreadableLines?: number
+  ownPosts?: readonly { channel: string; threads: readonly string[]; cause: string }[]
 }
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n\u2028\u2029]/g, ' ')
 const slack = (text: string): string => escapeSlackControlCharacters(safe(text))
@@ -57,6 +59,9 @@ export function buildThreadMemoryJoinsLostNotice(persona: { name: string; key: s
   const lines = [
     ...loss.threads.map(t => `Thread: ${slack(t.channel)} / ${slack(t.root)}.`),
     ...loss.messages.map(m => `Send again: ${slack(m.channel)} / ${slack(m.ts)}.`),
+    ...(loss.ownPosts ?? []).flatMap(post => post.threads.length
+      ? post.threads.map(root => `Thread: ${slack(post.channel)} / ${slack(root)}.`)
+      : [`The thread for a post by the bot in ${slack(post.channel)} couldn't be found.`]),
   ]
   const unreadable = loss.unreadableLines ?? 0
   const heading = (ref: string) => `:warning: *Joins lost* — ${ref} is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.` +
@@ -102,8 +107,9 @@ export function buildThreadMemoryUnreadableLine(key: string, channels: readonly 
 export function buildThreadMemoryJoinsLostLine(persona: { name: string; key: string }, loss: ThreadMemoryLoss): string {
   const threads = loss.threads.map(t => `channel=${safe(t.channel)} root=${safe(t.root)}`).join('; ')
   const messages = loss.messages.map(m => `channel=${safe(m.channel)} ts=${safe(m.ts)}`).join('; ')
+  const ownPosts = loss.ownPosts?.map(post => `channel=${safe(post.channel)} threads=${JSON.stringify(post.threads.map(safe))} cause=${safe(post.cause)}`).join('; ')
   return buildThreadMemoryDiagnostic(THREAD_MEMORY_JOINS_LOST, persona.key,
-    `threads=[${threads}] messages=[${messages}] unreadable_lines=${loss.unreadableLines ?? 0}`,
+    `threads=[${threads}] messages=[${messages}] unreadable_lines=${loss.unreadableLines ?? 0}` + (ownPosts === undefined ? '' : ` own_posts=[${ownPosts}]`),
     'bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot') +
     ` bot=${lossPersonaRef(persona)}`
 }
@@ -255,6 +261,11 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
     retryEvent: (event: ThreadMemoryRetryEvent, outage?: ThreadMemoryOutage): void => protect(() => retryEvent(event, outage)),
     sealEvent: (event: ThreadMemorySealEvent): void => protect(() => sealEvent(event)),
     holdsEvent: (event: MemoryHoldEvent): void => protect(() => holdsEvent(event)),
+    lookupEvent: (event: OwnPostLookupEvent): void => protect(() => {
+      if (event.kind === 'joins-lost' && active(event.key)) loss(event.key, {
+        threads: [], messages: [], ownPosts: [{ channel: event.channel, threads: event.threads, cause: event.cause }],
+      })
+    }),
     startupFindings: (findings: readonly ThreadMemorySealFinding[]): void => {
       for (const finding of findings) protect(() => changed(finding))
     },

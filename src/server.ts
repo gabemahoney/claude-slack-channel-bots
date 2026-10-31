@@ -214,7 +214,8 @@ import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
-import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, type OwnPostJoins } from './own-post.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, ownPostStampState, type OwnPostJoins } from './own-post.ts'
+import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from './own-post-lookup.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
@@ -1151,12 +1152,14 @@ let threadMemory: ThreadMemory | undefined
 let memoryHolds: MemoryHoldResolver | undefined
 let threadMemorySeal: ThreadMemorySeal | undefined
 let threadMemoryRetries: ThreadMemoryRetries | undefined
+let ownPostLookups: OwnPostLookups | undefined
 let threadMemoryReporting: ReturnType<typeof createThreadMemoryReporting> | undefined
 type BufferedThreadMemoryEvent = (
   | { source: 'memory'; event: ThreadMemoryEvent }
   | { source: 'seal'; event: ThreadMemorySealEvent }
   | { source: 'retry'; event: ThreadMemoryRetryEvent }
   | { source: 'holds'; event: MemoryHoldEvent }
+  | { source: 'lookup'; event: OwnPostLookupEvent }
 ) & { outage?: ReturnType<ThreadMemory['outage']> }
 const bufferedThreadMemoryEvents: BufferedThreadMemoryEvent[] = []
 function dispatchThreadMemoryReport(value: BufferedThreadMemoryEvent): void {
@@ -1176,6 +1179,7 @@ function dispatchThreadMemoryReport(value: BufferedThreadMemoryEvent): void {
       case 'seal': threadMemoryReporting.sealEvent(value.event); return
       case 'retry': threadMemoryReporting.retryEvent(value.event, value.outage); return
       case 'holds': threadMemoryReporting.holdsEvent(value.event); return
+      case 'lookup': threadMemoryReporting.lookupEvent(value.event); return
     }
   } catch { /* reporting must not reach a store or skip its retry consumer */ }
 }
@@ -1201,6 +1205,12 @@ const bufferedHeldReleases = new Map<string, { key: string; item: QueueItem }>()
 /** Independent observer ports; none can interrupt durability. */
 export const memoryHoldEvents = { emit: (event: MemoryHoldEvent): void => dispatchThreadMemoryReport({ source: 'holds', event }) }
 export const threadMemoryEvents = { emit: (event: ThreadMemoryEvent): void => {
+  // At startup the queue must first advance the persona clock past its saved
+  // arrivals; activation below captures that read. A live first read captures
+  // here, before its asynchronous hold resolution and flush can move the end.
+  try {
+    if (event.type === 'read' && reloadController?.sharedChannels() && threadMemoryWorkAllowed(event.key)) ownPostLookups?.journalRead(event.key)
+  } catch { /* range capture cannot interrupt reporting or read recovery */ }
   dispatchThreadMemoryReport({ source: 'memory', event })
   try {
     if (event.type === 'append-failed' || event.type === 'creation-failed') threadMemoryRetries?.appendFailed(event.key)
@@ -1544,6 +1554,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await deliveryClients?.close()
   await deliveryQueue?.stop()
   threadMemoryRetries?.stopKeys()
+  ownPostLookups?.stop()
   ownPostJoins?.stop()
   unsubscribeThreadMemory?.()
   await threadMemory?.quiesce()
@@ -2894,6 +2905,18 @@ export async function main(): Promise<void> {
     operationId: () => crypto.randomUUID(),
     isDryRun,
   })
+  if (!isDryRun()) ownPostLookups = createOwnPostLookups({
+    owner: ownPostJoins, memory: threadMemory,
+    stamp: (key, channel, stamp) => ownPostStampState(threadMemory!, key, channel, stamp),
+    connections: {
+      metadataCall: (key, connectionId, method, args, signal) => connections!.metadataCall(key, connectionId, method, args, signal),
+      currentConnectionId: key => connections?.provenance(key)?.connectionId,
+      isUp: key => threadMemoryWorkAllowed(key) && getAppliedPersona(key) !== undefined && isPersonaUp(key),
+      identity: key => connections?.identity(key),
+    },
+    clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    onEvent: event => dispatchThreadMemoryReport({ source: 'lookup', event }),
+  })
   threadMemoryRetries = createThreadMemoryRetries({
     canRun: threadMemoryWorkAllowed,
     clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -2913,6 +2936,7 @@ export async function main(): Promise<void> {
         // Keep the existing save owner until publication lets its retry save.
         if (live() && (result?.kind === 'failed' || (result?.kind === 'kept' && (threadMemory?.outage(key).unsaved ?? 0) > 0))) threadMemoryRetries?.appendFailed(key)
       } catch { if (live()) threadMemoryRetries?.appendFailed(key) }
+      if (live()) ownPostLookups?.kick(key)
     },
     onEvent: event => dispatchThreadMemoryReport({ source: 'retry', event }),
   })
@@ -3048,7 +3072,7 @@ export async function main(): Promise<void> {
       teardown: async (persona) => {
         try { await personaLifecycleOps.teardown(persona) } finally {
           if (!personaConfig?.personas.some(applied => applied.key === persona.key)) {
-            try { await forgetPersonaState(persona.key, [key => ownPostJoins?.forget(key)]) } finally {
+            try { await forgetPersonaState(persona.key, [key => ownPostLookups?.forget(key), key => ownPostJoins?.forget(key)]) } finally {
               try { memoryHolds?.forget(persona.key) } finally {
                 try { threadMemoryRetries?.forget(persona.key, 'removal') } finally {
                   await threadMemory?.remove(persona.key)
@@ -3136,7 +3160,10 @@ export async function main(): Promise<void> {
   unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => {
     if (shuttingDown) return
     threadMemory?.published()
-    for (const persona of personaConfig?.personas ?? []) ownPostJoins?.onSharedStatePublished(persona.key)
+    for (const persona of personaConfig?.personas ?? []) {
+      ownPostJoins?.onSharedStatePublished(persona.key)
+      if (threadMemoryWorkAllowed(persona.key)) ownPostLookups?.kick(persona.key)
+    }
     // published() synchronously recovers deferred queue joins before these
     // per-key resolver turns run. A forgotten life is never recreated here.
     for (const key of deliveryQueue?.keys() ?? []) {
@@ -3145,6 +3172,7 @@ export async function main(): Promise<void> {
   })
   await threadMemory.activate()
   if (shuttingDown) return
+  for (const persona of personaConfig.personas) ownPostLookups?.journalRead(persona.key)
   for (const key of deliveryQueue.keys()) {
     try {
       recoverQueuedJoins(key, deliveryQueue, threadMemory)
@@ -3152,6 +3180,7 @@ export async function main(): Promise<void> {
     } catch { /* a retained queue copy retries at this key's bring-up */ }
   }
   // Resolution and its second compaction are detached; intake never waits.
+  for (const persona of personaConfig.personas) ownPostLookups?.kick(persona.key)
 
   channelMembership = createChannelMembership({
     authority: reload.sharedChannels()!, dryRun: isDryRun(),
@@ -3822,6 +3851,7 @@ export async function main(): Promise<void> {
       // Apply recovery precedes teardown/bring-up. Restore retained feedback
       // with the usable client, on initial success and background retry alike.
       (key, status) => { if (status.state === 'up') deliveryReporting?.reconcileQueued(key) },
+      (key, status) => { if (status.state === 'up' && threadMemoryWorkAllowed(key)) ownPostLookups?.kick(key) },
     ),
   })
   connections = manager
@@ -3875,18 +3905,19 @@ export async function main(): Promise<void> {
     bringUps: personaBringUps,
     connections: manager,
     cancelThreadMemory: key => forgetPersonaState(key, [
-      k => threadMemoryRetries?.forget(k), k => memoryHolds?.forget(k),
+      k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds?.forget(k),
     ]),
     routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
       k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k),
       k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k),
-      k => threadMemoryRetries?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k),
+      k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k),
     ]) },
     loadThreadMemory: async key => {
       await threadMemory?.loadKey(key)
       if (!shuttingDown && deliveryQueue && threadMemory) {
         recoverQueuedJoins(key, deliveryQueue, threadMemory)
         void memoryHolds?.resolve(key, 'recovered').catch(() => {})
+        ownPostLookups?.kick(key)
       }
     },
     destinations: personaDestinations,

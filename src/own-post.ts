@@ -18,8 +18,9 @@ import type { MembershipReading } from './channel-membership.ts'
 import { slackPlatformReason } from './persona-connection-errors.ts'
 export type { OwnPostContent } from './thread-memory.ts'
 import type { OwnPostContent } from './thread-memory.ts'
-export { createOwnPostJoins } from './own-post-joins.ts'
-export type { OwnPostJoins, OwnPostJoinsDeps, PendingOwnPost, OwnPostEvent, OwnPostOutcome } from './own-post-joins.ts'
+export { createOwnPostJoins, ownPostStampState } from './own-post-joins.ts'
+export type { OwnPostJoins, OwnPostJoinsDeps, PendingOwnPost, OwnPostEvent, OwnPostOutcome,
+  OwnPostLookupHolds, OwnPostLookupOutcome, OwnPostLookupResult } from './own-post-joins.ts'
 
 /** Surfaces that start an own-post operation. `file` is reserved for uploads. */
 export const OWN_POST_SURFACES = ['text', 'prompt', 'warning', 'notice', 'file'] as const

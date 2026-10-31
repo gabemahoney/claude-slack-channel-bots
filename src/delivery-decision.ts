@@ -405,7 +405,7 @@ export function channelDeliveryFor(
 }
 
 /** step 2: the author is P's bot user, or the event carries P's bot ID. */
-function isOwn(user: string | undefined, botId: string | undefined, persona: DeliveryPersona): boolean {
+export function isOwn(user: string | undefined, botId: string | undefined, persona: Pick<DeliveryPersona, 'botUserId' | 'botId'>): boolean {
   const ownUser = nonEmptyString(persona.botUserId)
   const ownBot = nonEmptyString(persona.botId)
   return (ownUser !== undefined && user === ownUser) || (ownBot !== undefined && botId === ownBot)

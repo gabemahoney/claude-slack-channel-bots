@@ -780,6 +780,7 @@ const MEMORY_CHANNELS = [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary]
 const MEMORY_PATH = threadPath('/scratch/notice-texts', KEY)
 const MEMORY_BODY = 'THREAD-MEMORY-MESSAGE-BODY-MUST-NOT-BE-RENDERED'
 const MEMORY_USER = 'THREAD-MEMORY-USER-NAME-MUST-NOT-BE-RENDERED'
+const MEMORY_FILE = 'thread-memory-private-upload.txt'
 const memoryRef = () => renderPersonaRef(PERSONA.name, KEY)
 function memoryError(path = memoryTokenPath()) {
   return Object.assign(new Error(`cannot write <journal> & ${sentinelInMessage('memory-error')}; path=${JSON.stringify(path)}`), {
@@ -809,6 +810,12 @@ const MEMORY_NON_LOSS_NOTICES = [
   ...(['changed', 'unclean'] as const).map(wording => ({ builder: buildThreadMemoryChangedWhileStoppedNotice.name, variant: wording, build: (ref: string) => buildThreadMemoryChangedWhileStoppedNotice(ref, MEMORY_CHANNELS, wording) })),
   { builder: buildThreadMemoryRecoveredNotice.name, variant: 'recovered', build: (ref: string) => buildThreadMemoryRecoveredNotice(ref, MEMORY_CHANNELS) },
 ]
+type MemoryOwnPostLoss = NonNullable<ThreadMemoryLoss['ownPosts']>[number]
+function memoryOwnPost(overrides: Partial<MemoryOwnPostLoss> = {}): MemoryOwnPostLoss {
+  return Object.assign({ channel: THREAD_CHANNELS.primary, threads: [THREAD_ROOTS.primary, THREAD_ROOTS.secondary], cause: 'several', ...overrides }, {
+    text: MEMORY_BODY, user: MEMORY_USER, file: { name: MEMORY_FILE }, credentials: LEAK_SENTINEL,
+  })
+}
 const MEMORY_LOSSES: readonly (readonly [string, () => ThreadMemoryLoss])[] = [
   ['threads only', () => ({ threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [] })],
   ['messages only', () => ({ threads: [], messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }] })],
@@ -821,6 +828,26 @@ const MEMORY_LOSSES: readonly (readonly [string, () => ThreadMemoryLoss])[] = [
     threads: Array.from({ length: 120 }, (_, i) => ({ channel: THREAD_CHANNELS.primary, root: `1700000000.${String(i).padStart(6, '0')}` })),
     messages: Array.from({ length: 120 }, (_, i) => ({ channel: THREAD_CHANNELS.secondary, ts: `1700000001.${String(i).padStart(6, '0')}` })),
     unreadableLines: 3,
+  })],
+  ['lookup named threads', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost()] })],
+  ['lookup unmatched threads', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost({ cause: 'unmatched' })] })],
+  ['lookup no named thread', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost({ threads: [], cause: 'channel_not_found' })] })],
+  ['lookup redacted Slack cause', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost({ threads: [], cause: `missing_scope\r\n${sentinelInMessage('lookup-code')}\u2028\u2029` })] })],
+  ['lookups mixed with earlier losses', () => ({
+    threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }],
+    messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }], unreadableLines: 3,
+    ownPosts: [memoryOwnPost(), memoryOwnPost({ channel: THREAD_CHANNELS.secondary, threads: [], cause: 'not_in_channel' })],
+  })],
+  ['mixed lookup overflow', () => ({
+    threads: [{ channel: THREAD_CHANNELS.secondary, root: THREAD_ROOTS.primary }],
+    messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }], unreadableLines: 3,
+    ownPosts: [memoryOwnPost({ threads: Array.from({ length: 240 }, (_, i) => `1700000002.${String(i).padStart(6, '0')}`) }),
+      memoryOwnPost({ channel: THREAD_CHANNELS.secondary, threads: [], cause: 'missing_scope' })],
+  })],
+  ['unknown-thread lookup overflow', () => ({
+    threads: [], messages: [], ownPosts: Array.from({ length: 100 }, (_, i) => memoryOwnPost({
+      channel: `C${String(i).padStart(8, '0')}`, threads: [], cause: 'is_archived',
+    })),
   })],
 ]
 function renderMemoryLoss(persona: { name: string; key: string }, loss: ThreadMemoryLoss): string {
@@ -1744,6 +1771,11 @@ describe('Thread Memory catalogue content and loss budget', () => {
       text: `:warning: *Joins lost* — ${ref} is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 3 quarantined line(s) have no readable thread identity.\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.primary}.\nSend again: ${THREAD_CHANNELS.secondary} / ${THREAD_ROOTS.secondary}.`,
       options: { personaRef: ref },
     })
+    const lookupLoss = MEMORY_LOSSES.find(([label]) => label === 'lookups mixed with earlier losses')![1]()
+    expect(buildThreadMemoryJoinsLostNotice(PERSONA, lookupLoss)).toEqual({
+      text: `${buildThreadMemoryJoinsLostNotice(PERSONA, loss).text}\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.primary}.\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.secondary}.\nThe thread for a post by the bot in ${THREAD_CHANNELS.secondary} couldn't be found.`,
+      options: { personaRef: ref },
+    })
   })
 
   test.each(MEMORY_LOSSES)('%s retains complete ordered identifiers or an exact count, and logs every loss', (_label, makeLoss) => {
@@ -1755,6 +1787,19 @@ describe('Thread Memory catalogue content and loss budget', () => {
     const identifiers = [
       ...loss.threads.map(t => `Thread: ${t.channel} / ${t.root}.`),
       ...loss.messages.map(m => `Send again: ${m.channel} / ${m.ts}.`),
+      ...(loss.ownPosts ?? []).flatMap(post => {
+        // Fitting fragments supply wording; independent channel/root checks
+        // prevent a builder that silently drops lookup identifiers passing.
+        const entries = post.threads.length ? post.threads.map(root => [root]) : [[]]
+        return entries.map(threads => {
+          const fragment = buildThreadMemoryJoinsLostNotice(PERSONA, {
+            threads: [], messages: [], ownPosts: [{ ...post, threads }],
+          }).text.split('\n')[1]!
+          expect(fragment).toContain(post.channel)
+          for (const root of threads) expect(fragment).toContain(root)
+          return fragment
+        })
+      }),
     ]
     const [, ...bodyLines] = notice.text.split('\n')
     const hasCount = bodyLines.at(-1)?.includes('more thread/message entry(s)') ?? false
@@ -1777,8 +1822,18 @@ describe('Thread Memory catalogue content and loss budget', () => {
     if (loss.unreadableLines) expect(line).toContain(`unreadable_lines=${loss.unreadableLines}`)
     for (const t of loss.threads) expect(line).toContain(`channel=${t.channel} root=${t.root}`)
     for (const m of loss.messages) expect(line).toContain(`channel=${m.channel} ts=${m.ts}`)
+    for (const post of loss.ownPosts ?? []) {
+      const safeCause = redactSlackLogText(post.cause).replace(/[\r\n\u2028\u2029]/g, ' ')
+      expect(line).toContain(`channel=${post.channel} threads=${JSON.stringify(post.threads)} cause=${safeCause}`)
+    }
+    expect(line).toStartWith('[slack]')
     expect(line).toContain(`bot=${memoryRef()}`)
     expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+    for (const output of [text, line]) {
+      expect(output).not.toContain(MEMORY_BODY)
+      expect(output).not.toContain(MEMORY_USER)
+      expect(output).not.toContain(MEMORY_FILE)
+    }
   })
 
   test.each(MEMORY_NAMES)('$label budgets the escaped prefix and body together; the log retains the full name', ({ label, name, excerpt }) => {
@@ -1849,6 +1904,7 @@ describe('Thread Memory catalogue content and loss budget', () => {
     const contaminated = {
       threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary, text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL }],
       messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary, text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL }],
+      ownPosts: [memoryOwnPost(), memoryOwnPost({ threads: [], cause: fakeToken(APP_TOKEN_PREFIX, 'lookup-code') })],
       text: MEMORY_BODY, user: MEMORY_USER,
     }
     const captured = [
@@ -1859,6 +1915,7 @@ describe('Thread Memory catalogue content and loss budget', () => {
     for (const text of captured) {
       expect(text).not.toContain(MEMORY_BODY)
       expect(text).not.toContain(MEMORY_USER)
+      expect(text).not.toContain(MEMORY_FILE)
     }
     for (const e of threadMemoryEntries().filter(e => e.variant.includes('token-bearing'))) {
       const text = e.render()
