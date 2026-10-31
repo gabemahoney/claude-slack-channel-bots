@@ -609,6 +609,59 @@ describe('slack-app-manifest.yml', () => {
     expect(readme).toMatch(/earlier manifest must have both scopes added and be re-installed/)
   })
 
+  // b.n24: scope presence is covered by the pinned list and provisioning tests.
+  // Keep each migration promise with its own permission, so the Lists note
+  // cannot accidentally satisfy the new scopes' operator guidance.
+  const housekeepingGuidance = [
+    ['canvases:read', [
+      '`canvases:read`', '`canvases:write`',
+      /(?:persona|bot)[^.]*read[^.]*maintain[^.]*status canvases/i,
+      /CSCB itself makes no canvas call/i,
+    ]],
+    ['reactions:read', [
+      '`reactions:read`',
+      /(?:persona|bot)[^.]*read[^.]*owner['’]s reaction answers/i,
+      '`reactions.get`',
+    ]],
+  ] as const
+  const migrationGuidance = [
+    /(?:earlier|existing)[^.]*app|app[^.]*earlier/i,
+    /(?:scope|`canvases:write`|`reactions:read`)[^.]*added[^.]*re-?install/i,
+    /until then[^]*fail[^]*`missing_scope`/i,
+  ] as const
+  const header = text.match(/^(?:#[^\n]*\n|\s*\n)*/)?.[0].replace(/^# ?/gm, '') ?? ''
+  const scopeParagraph = (document: string, scope: string): string =>
+    flat(document.split(/\n\s*\n/).find(paragraph => paragraph.includes(`\`${scope}\``)) ?? '')
+
+  for (const [scope, required] of housekeepingGuidance) {
+    test.each([
+      ['manifest header', () => header],
+      ['configuration reference', () => operatorText(CONFIGURATION_DOC)],
+    ] as const)(`%s explains ${scope} persona use and existing-app migration`, (_carrier, read) => {
+      expect(lacking(scopeParagraph(read(), scope), [...required, ...migrationGuidance])).toEqual([])
+    })
+
+    test(`sensitivity: ${scope} guidance rejects each omitted obligation`, () => {
+      const paragraph = scopeParagraph(header, scope)
+      const obligations = [...required, ...migrationGuidance]
+      expect(lacking(paragraph, obligations)).toEqual([])
+      for (const item of obligations) {
+        const pattern = typeof item === 'string' ? new RegExp(escapeRegExp(item), 'g') : new RegExp(item.source, `${item.flags}g`)
+        const edited = paragraph.replace(pattern, '')
+        expect(edited).not.toBe(paragraph)
+        expect(lacking(edited, obligations).length).toBeGreaterThan(0)
+      }
+    })
+  }
+
+  test('housekeeping header guidance follows the Lists paragraph', () => {
+    const lists = header.indexOf('`lists:read`')
+    expect(lists).toBeGreaterThanOrEqual(0)
+    for (const [scope] of housekeepingGuidance) {
+      expect(header.indexOf(`\`${scope}\``)).toBeGreaterThan(lists)
+    }
+  })
+
   test('message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
@@ -619,6 +672,8 @@ describe('slack-app-manifest.yml', () => {
     expect([...manifest.oauth_config.scopes.bot].sort()).toEqual(
       [
         'app_mentions:read',
+        'canvases:read',
+        'canvases:write',
         'channels:history',
         'channels:read',
         'chat:write',
@@ -630,6 +685,7 @@ describe('slack-app-manifest.yml', () => {
         'im:write',
         'lists:read',
         'lists:write',
+        'reactions:read',
         'reactions:write',
         'users:read',
       ].sort(),

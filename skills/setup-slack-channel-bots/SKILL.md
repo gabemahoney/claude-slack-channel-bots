@@ -282,6 +282,12 @@ message archive shows channel IDs: re-install each app to gain
 (`skills/debug-slack-channel-bots/SKILL.md`) for the steps. It can also lack
 the `lists:read` and `lists:write` scopes, which a bot needs to use a Slack
 List: add both the same way, then re-install.
+
+Also check for `canvases:read` and `canvases:write` for persona status canvases,
+and `reactions:read` for reading the owner's reaction answers: add any missing
+bot scopes under **OAuth & Permissions**, then re-install the app to the
+workspace. See [Credentials files](../../docs/configuration.md#credentials-files)
+for the maintained scope guidance.
 An app already used by another persona can't be reused.
 
 #### 5.3 Credentials file path

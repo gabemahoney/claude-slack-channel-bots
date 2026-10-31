@@ -104,12 +104,7 @@ A name of 1–40 characters, all lower-case letters, digits and `_`, is its own 
 
 `"Help Desk"`, for example, has the key `help_desk_95a3a6f5`. Each persona's `persona-start` line in `server.log` shows its key.
 
-The key is used for:
-
-- the persona's agent-director instance, `cscb_<key>`;
-- its tmux session, `slack_bot_<key>`;
-- the `CSCB_PERSONA` environment variable of its Claude instance;
-- targets: [`/interject`](bots.md#interject) and the [crontable](scheduled-prompts.md#scheduled-prompts-cscb_cron) accept the persona's name or its key.
+The key identifies the persona's agent-director instance (`cscb_<key>`), its tmux session (`slack_bot_<key>`) and the `CSCB_PERSONA` environment variable of its Claude instance. [`/interject`](bots.md#interject) and the [crontable](scheduled-prompts.md#scheduled-prompts-cscb_cron) accept the persona's name or its key.
 
 **No persona's key may start with another persona's key.** The server rejects such a pair when it checks the configuration (see [Load-time rules](#load-time-rules)), with an error that names both personas and suggests a new name. tmux matches a session target by prefix unless it is written with `=`, so a human's tmux command without `=` for one persona (for example `tmux attach -t slack_bot_dev`) could reach another persona's session. With personas `dev` and `dev_2`, that command could reach `slack_bot_dev_2`.
 
@@ -142,6 +137,10 @@ To rotate a persona's tokens, run the credentials command for it again (see the 
 Never put a token in `config.json`, a ticket or a chat.
 
 The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:write` bot scopes, so a bot can read and write, with its own bot token, a Slack List it has been given access to, such as one list shared by all bots. CSCB itself makes no Lists call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, every Lists call fails with `missing_scope`.
+
+The `canvases:read` and `canvases:write` bot scopes let a persona read and maintain status canvases. CSCB itself makes no canvas call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, calls requiring the missing scopes fail with `missing_scope`.
+
+The `reactions:read` bot scope lets a persona read the owner's reaction answers with `reactions.get`. An app created from an earlier manifest must have this scope added and be re-installed; until then, `reactions.get` fails with `missing_scope`.
 
 ### Channel delivery
 
