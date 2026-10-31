@@ -1245,8 +1245,9 @@ shim, with no store until 0.10.0's first `spawn`. Setup then:
 
 - installs the published CSCB 0.10.0 tarball as a bun global install under
   `SCENARIO_ROOT`, its agent-director dependency pinned to the image's 0.10.0
-  client (checked file for file). Its CLI there is the old CLI, and the build
-  under test later takes the same install path;
+  client (checked file for file except Bun's `.bun-tag` install metadata;
+  changed, missing or extra non-metadata files still fail). Its CLI there is
+  the old CLI, and the build under test later takes the same install path;
 - writes the pre-persona `config.json` (two routed channels) to
   `$HOME/.claude/channels/slack` (the old state directory, a real directory;
   neither `$HOME/.config/cscb` nor the new directory exists, as on a host of
@@ -1453,9 +1454,9 @@ the switch-over log and ends with `assert_no_server_tmux`,
 `assert_no_cscb_include_finished` and `assert_no_cscb_delete`.
 
 The host check. `tests/fmk-switch-over-runbook.test.ts`, run by plain
-`bun test`, reads the README's switch-over section through the shared step
+`bun test`, reads docs/migration.md's switch-over section through the shared step
 reader (`runbookSteps`, `tests/test-helpers/runbooks.ts`) and the script's
-marker calls. It fails unless the script enters steps 1 to N of the README
+marker calls. It fails unless the script enters steps 1 to N of docs/migration.md
 once each, in order, and declares exactly the substitution table above, each
 inside its step's section, with every marker a top-level line with a literal
 step and kind. So a change to the runbook's steps fails until Test 13

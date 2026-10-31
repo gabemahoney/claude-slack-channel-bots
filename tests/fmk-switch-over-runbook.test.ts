@@ -3,7 +3,7 @@
  * in docs/migration.md, with exactly host-only substitutions (
  * /ci Test line; the design note; ruling Q13).
  *
- * Reads two texts and runs neither, spawning nothing:
+ * The runbook checks read two texts without running them:
  * - the switch-over section of docs/migration.md, found by its title imported from `src/`
  *   and read through the shared step reader (`runbookSteps`,
  *   tests/test-helpers/runbooks.ts); N, its step count, comes from it;
@@ -25,11 +25,14 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import { requiredSection } from './test-helpers/markdown.ts'
 import { runbookSteps, stepHeadingPrefix } from './test-helpers/runbooks.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -267,4 +270,69 @@ test('test-13 explicitly proves earlier-release provenance before the fresh upgr
   expect(script.slice(replace, resume)).toContain('session_id')
   expect(script.slice(replace, resume)).toContain('cmp -s')
   expect(script.slice(resume)).toContain('tag_prompt')
+})
+
+describe('b.92v: test-13 old-client content verification', () => {
+  // Execute only the real comparison and refusal block over scratch trees.
+  // Never source the scenario or run an install, Docker, CSCB or agent-director.
+  const script = readRepoFile(SCRIPT_FILE)
+  const start = script.indexOf('OLD_CLIENT_DIR="$(client_dir_of ')
+  const end = script.indexOf('\nrecord "the old package:', start)
+  if (start < 0 || end < start) throw new Error('test-13 old-client comparison block not found')
+  const comparison = script.slice(start, end)
+  const cases = [
+    { label: 'identical client passes', metadata: false, change: 'none', accepted: true },
+    { label: 'only Bun .bun-tag metadata passes', metadata: true, change: 'none', accepted: true },
+    { label: 'changed client bytes fail even with the same version', metadata: false, change: 'changed', accepted: false },
+    { label: 'missing client file fails', metadata: false, change: 'missing', accepted: false },
+    { label: 'extra client file fails', metadata: false, change: 'extra', accepted: false },
+    { label: 'metadata does not hide changed client bytes', metadata: true, change: 'changed', accepted: false },
+    { label: 'metadata does not hide a missing client file', metadata: true, change: 'missing', accepted: false },
+    { label: 'metadata does not hide an extra client file', metadata: true, change: 'extra', accepted: false },
+    { label: 'other hidden files are substantive', metadata: false, change: 'hidden', accepted: false },
+  ] as const
+
+  test.each(cases.map(c => [c.label, c] as const))('%s', (_label, { metadata, change, accepted }) => {
+    const root = mkdtempSync('/tmp/cscb-old-client-regression-')
+    try {
+      const reference = join(root, 'ad-010-client')
+      const installed = join(root, 'resolved client')
+      for (const dir of [reference, installed]) {
+        mkdirSync(join(dir, 'dist'), { recursive: true })
+        writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'agent-director', version: OLD_AD_VERSION }))
+        writeFileSync(join(dir, 'dist', 'index.js'), 'export const client = "original";\n')
+      }
+      if (metadata) writeFileSync(join(installed, '.bun-tag'), 'installer metadata\n')
+      if (change === 'changed') writeFileSync(join(installed, 'dist', 'index.js'), 'export const client = "changed";\n')
+      if (change === 'missing') rmSync(join(installed, 'dist', 'index.js'))
+      if (change === 'extra') writeFileSync(join(installed, 'dist', 'extra.js'), 'unexpected client content\n')
+      if (change === 'hidden') writeFileSync(join(installed, '.unexpected'), 'unexpected hidden content\n')
+
+      const result = spawnSync('bash', ['-c', [
+        'set -euo pipefail',
+        'SCENARIO_ROOT="$HOME"',
+        'CSCB_PKG_DIR="$HOME/old-package"',
+        'client_dir_of() { printf "%s\\n" "$HOME/resolved client"; }',
+        'fail() { printf "FAIL: %s\\n" "$*" >&2; exit 1; }',
+        comparison,
+        'printf "client verification passed\\n"',
+      ].join('\n')], {
+        env: hostSafeChildEnv(root, { tools: ['bash', 'diff', 'sed'] }),
+        encoding: 'utf8', timeout: 2000,
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.signal).toBeNull()
+      // Include the real refusal/diff in a failure so the red run is evidence
+      // of the metadata-only setup defect, not just an unexplained exit code.
+      expect({ status: result.status, stderr: accepted ? result.stderr : '' }).toEqual({ status: accepted ? 0 : 1, stderr: '' })
+      if (accepted) expect(result.stdout).toContain('client verification passed')
+      else {
+        expect(result.stdout).not.toContain('client verification passed')
+        expect(result.stderr).toContain('setup: the old package resolves the client at')
+        expect(readFileSync(join(root, 'old-client.diff'), 'utf8')).toContain(change === 'extra' ? 'extra.js' : change === 'hidden' ? '.unexpected' : 'index.js')
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
