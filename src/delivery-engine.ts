@@ -540,6 +540,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       await s.busy
     },
     async recoverBeforeReconnect(key) {
+      // Recovery may expose retained work while its journal replacement is
+      // still pending. Reconnect owns a retry even when there is no open head;
+      // neither an empty queue nor AD waiting authorizes keys before repair.
+      if (deps.queue.isWritable?.(key) === false) {
+        try { await deps.queue.compact(key) } catch { return false }
+        if (deps.queue.isWritable?.(key) === false) return false
+      }
       const head = deps.queue.items(key).find(i => !i.delivered)
       if (!head || (!head.unknownSend && !head.records.some(r => r.kind === 'sent'))) return true
       api.wake(key)
@@ -547,7 +554,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       const reconciled = (): boolean => {
         // Retained GONE must be freshly reconciled by the serialized tick
         // before reconnect may type or retry the checked sequence.
-        if (s.gone) return false
+        if (s.gone || deps.queue.isWritable?.(key) === false) return false
         const k = build(key, s), pair = selectDeliveryTarget(k)
         if (pair[0] === 0) return true
         const attempt = latestDeliveryAttempt(k, pair)

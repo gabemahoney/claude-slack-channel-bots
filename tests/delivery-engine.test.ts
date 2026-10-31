@@ -6,7 +6,9 @@ import { refreshDeliveryTranscript } from '../src/session-manager.ts'
  * Receipt permutations and gate lifecycle live in their
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
 import { afterEach, describe, expect, test } from 'bun:test'
+import * as fs from 'node:fs'
 import { readFileSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeliveryCallBudget, createDeliveryEngines, createDeliveryLifecycle, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS, DeliveryBudgetWait, deliveryTextWasRefused, ENTER_DELAY_MS, NOT_NOW_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS } from '../src/delivery-engine.ts'
 import { applyDeliveryOwnRowRead, handleDeliveryKeyError, recoverDeliveryGone, setDeliveryLifecycle, setDeliveryPersonaLookup } from '../src/session-manager.ts'
@@ -15,7 +17,8 @@ import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { injectedInput, makeQueue, readQueue } from './test-helpers/delivery-queue.ts'
+import { injectedInput, makeQueue, readQueue, seedQueue } from './test-helpers/delivery-queue.ts'
+import type { AcceptedRecord, QueueRecord } from '../src/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeRecoveryHarness, personaOf, personaRow, retryNow } from './test-helpers/recovery-harness.ts'
 import { balancedAfter, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
@@ -1479,6 +1482,119 @@ describe('AD authority regressions', () => {
   })
 })
 
+
+describe('b.2is pending journal recovery consumers', () => {
+  const roots: string[] = [], recoveryHarnesses: EngineHarness[] = []
+  afterEach(async () => {
+    for (const h of recoveryHarnesses.splice(0)) await h.cleanup()
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
+  })
+  async function tornJournal(blocked: boolean, retained: 'accepted' | 'sent' | 'empty' = 'accepted') {
+    const root = fs.mkdtempSync(join(tmpdir(), 'delivery-recovery-')); roots.push(root)
+    const first: AcceptedRecord = { ...injectedInput({ text: 'retained delivery' }), v: 1, kind: 'accepted', seq: 1, received_at: 0, ts: '1.000000' }
+    const records: QueueRecord[] = retained === 'empty' ? [] : [first]
+    if (retained === 'sent') records.push(
+      { v: 1, kind: 'fixed', seq: 1, parts: [first.text] },
+      { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
+        session_id: 'alpha-session', transcript_path: join(root, 'alpha-session.jsonl'), transcript_size: 0 },
+    )
+    seedQueue(root, [...records, '{"v":1,"kind":"accepted","seq":3,'])
+    const journalPath = join(root, 'queue', 'alpha.jsonl'), original = fs.readFileSync(journalPath)
+    let fail = blocked, failures = 0
+    const queueFs = { ...fs, openSync(...args: Parameters<typeof fs.openSync>) {
+      if (fail && String(args[0]).endsWith('.tmp') && args[1] === 'wx') {
+        failures++
+        throw Object.assign(new Error('injected recovery ENOSPC'), { code: 'ENOSPC' })
+      }
+      return fs.openSync(...args)
+    } } as typeof fs
+    const h = await makeEngineHarness({ stateDir: root, queueFs }); recoveryHarnesses.push(h)
+    // Match startup: preparation runs once while recovery can still be blocked.
+    await h.preparation.recover()
+    if (blocked) {
+      // Give owned retries a chance to run while the storage fault persists.
+      for (let turn = 0; turn < 3; turn++) await h.clock.runNext()
+      expect(failures).toBeGreaterThan(0)
+      expect(h.queue.isWritable!('alpha')).toBe(false)
+      // Replay can be visible after durable quarantine; neither preparation
+      // nor the engine may mutate the journal or send keys before repair.
+      expect(fs.readFileSync(journalPath)).toEqual(original)
+      expect(h.keyCalls()).toEqual([])
+    }
+    return { h, restoreWrites() { fail = false } }
+  }
+  async function runOwnedTimers(h: EngineHarness, lastSeq: number) {
+    // Drive only timers owned by production preparation/engine. An explicit
+    // prepare(), recover() or tick() here would hide the missing handoff.
+    for (let turns = 0; turns < 1000 && !h.queue.item('alpha', lastSeq)?.delivered; turns++) {
+      await new Promise<void>(resolve => setImmediate(resolve))
+      await h.clock.runNext()
+    }
+  }
+
+  test.each(['startup', 'preparation retry', 'maintenance', 'later intake'] as const)('%s recovery prepares and delivers the accepted-only FIFO head', async via => {
+    const { h, restoreWrites } = await tornJournal(via !== 'startup')
+    restoreWrites()
+    if (via === 'maintenance') await h.queue.compact('alpha')
+    if (via === 'later intake') {
+      expect(await h.preparation.accept('alpha', injectedInput({ text: 'successor' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    }
+    const seqs = via === 'later intake' ? [1, 2] : [1]
+    await runOwnedTimers(h, seqs.at(-1)!)
+    expect(h.queue.isWritable!('alpha')).toBe(true)
+    expect(h.queue.item('alpha', 1)?.fixed).toBeDefined()
+    expect([...new Set(h.received.map(r => r.seq))].sort()).toEqual(seqs)
+    expect(h.queue.items('alpha').map(i => [i.accepted.seq, i.delivered])).toEqual(seqs.map(seq => [seq, true]))
+    const fixed = h.records().filter(r => r.kind === 'fixed').sort((a, b) => a.seq - b.seq)
+    expect(fixed.map(r => r.seq)).toEqual(seqs)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(fixed.flatMap(r => r.parts))
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual(seqs)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each([['available', false], ['pending', true]] as const)('reconnect waits for journal and retained-send recovery (startup rewrite %s)', async (_, blocked) => {
+    const { h, restoreWrites } = await tornJournal(blocked, 'sent')
+    h.p().connected = false
+    h.p().box = 'retained delivery'
+    if (blocked) {
+      // This is the same public lifecycle gate that reconnect callers trust.
+      expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
+      expect(h.keyCalls()).toEqual([])
+      restoreWrites()
+      // The reconnect gate itself must retry repair; no external compact call.
+    }
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    // The shared AD stub writes an exact receipt for the retained draft on
+    // Enter. Only after durable receipt reconciliation may reconnect type.
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.queue.item('alpha', 1)?.delivered).toBe(true)
+    expect(h.records().filter(r => r.kind === 'sent').map(r => 'send_kind' in r && r.send_kind)).toEqual(['text', 'enter'])
+    expect(h.records().filter(r => r.kind === 'delivered')).toHaveLength(1)
+    expect(h.textCalls()).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test('reconnect retries pending repair even when no valid queue head remains', async () => {
+    const { h, restoreWrites } = await tornJournal(true, 'empty')
+    h.p().connected = false
+    expect(h.queue.items('alpha')).toEqual([])
+    for (let retry = 0; retry < 2; retry++) {
+      expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
+      expect(h.queue.isWritable!('alpha')).toBe(false)
+      expect(h.keyCalls()).toEqual([])
+    }
+    restoreWrites()
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.queue.isWritable!('alpha')).toBe(true)
+    expect(h.queue.items('alpha')).toEqual([])
+    // Compaction may retain an allocation marker, but no delivery work.
+    expect(h.records().filter(r => !('compact' in r))).toEqual([])
+    expect(h.keyCalls()).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+})
 
 describe('disconnected delivery draft is recovered before reconnect control text', () => {
   async function retainedDraft(failRecoveryAppend = false) {
