@@ -82,9 +82,9 @@
  *   (`docker/Dockerfile.test.base`) reads the client-under-test check
  *   (`AD_CLIENT_CHECK_SOURCE`) and the two native agent installers from the
  *   repo context (never `package.json`), and only `install.sh` from its one named build context
- *   (no release-candidate context, no SHA256SUMS); pins a plain release that
- *   is CSCB's Phase 1 floor (`PHASE1_FLOOR_VERSION`) and `package.json`'s
- * pin, with its commit and SHA-256s; checks `install.sh`
+ *   (no release-candidate context, no SHA256SUMS); pins the approved current
+ *   runtime independently of CSCB's Phase 1 floor and `package.json`'s npm
+ *   client pin, with its commit and SHA-256s; checks `install.sh`
  *   against its SHA-256 before installing it off PATH; installs the release's
  *   binaries with that `install.sh --from-release` of the pinned tag and both
  *   pinned SHA-256s (no hooks, no symlink, a throwaway HOME); puts the binary
@@ -93,7 +93,7 @@
  *   off PATH (not in a PATH directory, not linked there, checked by the
  *   build) with its SHA-256 checked; checks the npm client tarball before the
  *   release record names it; installs its global client from npm at the
- *   release's version as its one package install and runs the check's
+ *   independent client pin as its one package install and runs the check's
  *   `--client` on it, writing nothing into it (no swap); fetches the 0.10.0
  *   binary for its pinned release off PATH, packs the 0.10.0 legs, installs
  *   `sqlite3` and `file` and writes the marker /etc/cscb-ci-image. Each rule
@@ -191,7 +191,7 @@ import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockD
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_SOURCE } from '../ci-live/lib/ad-client-check.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
 import { DEBUG_SKILL_PATH, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { LEGACY_DISPLAYED_STATE_AD_VERSION, LEGACY_DISPLAYED_STATE_AD_COMMIT, CI_AD_RUNTIME_COMMIT, CI_AD_RUNTIME_VERSION, LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
@@ -2174,7 +2174,7 @@ const INSTALL_CONTEXT = 'agent-director-install'
 const GLOBAL_CLIENT_DIR = '/root/.bun/install/global/node_modules/agent-director'
 
 /** The base's one package install: the global agent-director client from npm at exactly the release's version. */
-const GLOBAL_CLIENT_INSTALL = 'bun add -g --ignore-scripts "agent-director@${AD_VERSION}"'
+const GLOBAL_CLIENT_INSTALL = 'bun add -g --ignore-scripts "agent-director@${AD_CLIENT_VERSION}"'
 
 /** The release pins the base checks downloads against. */
 const RELEASE_SHA256_ARGS = ['AD_SHA256', 'AD_ADMIN_SHA256', 'AD_INSTALL_SH_SHA256', 'AD_CLIENT_TGZ_SHA256'] as const
@@ -2331,8 +2331,8 @@ function previousBaseTag(): string {
  * What is wrong with a base Dockerfile text (`docker/Dockerfile.test.base`'s
  * shape): empty when it reads only the client check and native agent installers from the repo context
  * and only the install script from its one named context (no
- * release-candidate context, no SHA256SUMS); pins a plain release that is
- * CSCB's Phase 1 floor and package.json's pin, with its commit and SHA-256s;
+ * release-candidate context, no SHA256SUMS); pins the current runtime and
+ * independently pins the client to CSCB's Phase 1 floor, with release hashes;
  * checks install.sh against its pin before installing it off PATH; installs
  * the release's binaries with that install.sh's `--from-release` of the
  * pinned tag and both pinned SHA-256s (no hooks, no symlink, a throwaway
@@ -2369,10 +2369,15 @@ function baseLayoutProblems(text: string): string[] {
 
   const version = args.AD_VERSION ?? ''
   if (!PLAIN_RELEASE.test(version)) problems.push(`AD_VERSION ${version || '(none)'} is not a plain major.minor.patch release`)
-  else if (version !== PHASE1_FLOOR_VERSION || version !== packageAdPin() || !meetsPhase1Floor(version)) {
-    problems.push(`AD_VERSION ${version} is not the Phase 1 floor ${PHASE1_FLOOR_VERSION} that package.json pins (${packageAdPin()})`)
+  else if (version !== CI_AD_RUNTIME_VERSION || !meetsPhase1Floor(version)) {
+    problems.push(`AD_VERSION ${version} is not the release-gate runtime ${CI_AD_RUNTIME_VERSION}`)
+  }
+  const clientVersion = args.AD_CLIENT_VERSION ?? ''
+  if (clientVersion !== PHASE1_FLOOR_VERSION || clientVersion !== packageAdPin()) {
+    problems.push(`AD_CLIENT_VERSION ${clientVersion || '(none)'} is not the Phase 1 floor ${PHASE1_FLOOR_VERSION} that package.json pins (${packageAdPin()})`)
   }
   if (!/^[0-9a-f]{40}$/.test(args.AD_COMMIT ?? '')) problems.push('AD_COMMIT is not a 40-hex commit')
+  else if (args.AD_COMMIT !== CI_AD_RUNTIME_COMMIT) problems.push(`AD_COMMIT is not the release-gate runtime's commit ${CI_AD_RUNTIME_COMMIT}`)
   for (const name of RELEASE_SHA256_ARGS) if (!/^[0-9a-f]{64}$/.test(args[name] ?? '')) problems.push(`${name} is not a pinned SHA-256`)
 
   // The release layer: install.sh from its context, then its --from-release.
@@ -2455,10 +2460,10 @@ function baseLayoutProblems(text: string): string[] {
   if (copyAt < 0 || copyAt > at || instructions.indexOf(release) > at) problems.push('the client layer runs before the client check is copied or the release is installed')
   if (!/^RUN set -[a-z]*e[a-z]*;/.test(client)) problems.push('the client layer does not run under set -e')
   if (clientVars.get('AD_CHECK') !== AD_CLIENT_CHECK || clientVars.get('GLOBAL_CLIENT') !== GLOBAL_CLIENT_DIR) problems.push(`the client layer's check is ${clientVars.get('AD_CHECK')} on ${clientVars.get('GLOBAL_CLIENT')}`)
-  if (clientVars.get('CLIENT_TGZ_URL') !== `https://registry.npmjs.org/agent-director/-/agent-director-${version}.tgz`) problems.push(`the client tarball comes from ${clientVars.get('CLIENT_TGZ_URL')}, not npm at ${version}`)
+  if (clientVars.get('CLIENT_TGZ_URL') !== `https://registry.npmjs.org/agent-director/-/agent-director-${clientVersion}.tgz`) problems.push(`the client tarball comes from ${clientVars.get('CLIENT_TGZ_URL')}, not npm at ${clientVersion}`)
   const tgzCheck = client.indexOf('!= "${AD_CLIENT_TGZ_SHA256}"')
   if (tgzCheck < 0 || tgzCheck > client.indexOf('release.json')) problems.push('the npm client tarball is not checked against AD_CLIENT_TGZ_SHA256 before the release record names it')
-  const record = ['--arg version "${AD_VERSION}"', '--arg commit "${AD_COMMIT}"', '--arg client_tarball "${CLIENT_TGZ}"'].filter((field) => !client.includes(field))
+  const record = ['--arg version "${AD_VERSION}"', '--arg commit "${AD_COMMIT}"', '--arg client_version "${AD_CLIENT_VERSION}"', '--arg client_tarball "${CLIENT_TGZ}"'].filter((field) => !client.includes(field))
   if (record.length > 0) problems.push(`the release record lacks ${record.join(', ')}`)
   const install = clientStatements.indexOf(GLOBAL_CLIENT_INSTALL)
   const check = clientStatements.indexOf('"${AD_CHECK}" --client "${GLOBAL_CLIENT}"')
@@ -2552,13 +2557,19 @@ const rcLayoutProblems = (text: string): string[] => leftoversIn(text, RC_LAYOUT
 
 /**
  * What in `text` pins a release candidate: one of {@link RC_LEFTOVERS}, or a
- * commit other than `releaseCommit` (the release's, `AD_COMMIT`). The contract's
+ * commit other than `releaseCommit` (the release's, `AD_COMMIT`), except
+ * the one reviewed `AD_LEGACY_COMMIT` ARG in the base Dockerfile. The contract's
  * release-candidate-counts wording (`<P1>-rc.N` counts as `<P1>`) names no
  * release candidate's version and passes.
  */
-function rcPinProblems(text: string, releaseCommit: string): string[] {
+function rcPinProblems(text: string, releaseCommit: string, file: string): string[] {
   const leftovers = leftoversIn(text, RC_LEFTOVERS)
-  const commits = [...new Set(text.match(COMMIT_RE) ?? [])].filter((commit) => commit !== releaseCommit)
+  // Only the reviewed base ARG may name the legacy release commit. Strip
+  // exactly one whole line, never globally allowlist that hash in other code.
+  const audited = file === BASE_DOCKERFILE
+    ? text.replace(new RegExp(`^ARG AD_LEGACY_COMMIT=${LEGACY_DISPLAYED_STATE_AD_COMMIT}$`, 'm'), '')
+    : text
+  const commits = [...new Set(audited.match(COMMIT_RE) ?? [])].filter((commit) => commit !== releaseCommit)
   return [...leftovers, ...commits.map((commit) => `a commit other than the release's: ${commit}`)]
 }
 
@@ -2595,6 +2606,12 @@ describe('the /ci images (source audit)', () => {
     CI_LIVE_SKILL,
   ]
 
+  test('b.iy3: the current runtime invalidates the cached pre-upgrade base', () => {
+    // v8 already exists with the old runtime. Agreement among references
+    // alone cannot make that cached image contain a different binary.
+    expect(BASE_IMAGE).not.toBe('cscb-ci-base:v8')
+  })
+
   test.each(TAGGED)('every base-image tag %s names is BASE_IMAGE; a planted previous tag is refused', (rel) => {
     expect(BASE_IMAGE).toMatch(/:v\d+$/)
     const text = repoFile(rel)
@@ -2621,9 +2638,11 @@ describe('the /ci images (source audit)', () => {
     expect(step).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
   })
 
-  test("the base's layout: the release (CSCB's Phase 1 floor and package.json's pin, a plain release) installed by its own install.sh --from-release with pinned SHA-256s, its binary alone first on PATH and checked, agent-director-admin off PATH, the global client from npm at the pin checked by the client check, and nothing else from the repo or a context", () => {
+  test("the base's layout: current release-gate runtime and commit independent of the unchanged npm client/floor, with checked binary, admin, installer and client provenance", () => {
     const { args } = baseImage()
-    expect(args.AD_VERSION).toBe(PHASE1_FLOOR_VERSION)
+    expect(args.AD_VERSION).toBe(CI_AD_RUNTIME_VERSION)
+    expect(args.AD_COMMIT).toBe(CI_AD_RUNTIME_COMMIT)
+    expect(args.AD_CLIENT_VERSION).toBe(PHASE1_FLOOR_VERSION)
     expect(packageAdPin()).toBe(PHASE1_FLOOR_VERSION)
     expect(baseLayoutProblems(repoFile(BASE_DOCKERFILE))).toEqual([])
   })
@@ -2633,7 +2652,8 @@ describe('the /ci images (source audit)', () => {
     ['the release-candidate context back', (t) => planted(planted(t, `FROM ubuntu:22.04 AS ${INSTALL_CONTEXT}`, `FROM ubuntu:22.04 AS agent-director-rc\nFROM ubuntu:22.04 AS ${INSTALL_CONTEXT}`), `--mount=type=bind,from=${INSTALL_CONTEXT},`, `--mount=type=bind,from=agent-director-rc,target=/mnt/agent-director-rc \\\n    --mount=type=bind,from=${INSTALL_CONTEXT},`), 'the named contexts are ["agent-director-rc","agent-director-install"]'],
     ['a SHA256SUMS check', (t) => planted(t, '    STAGE=$(mktemp -d); \\', '    sha256sum -c "${INSTALL_CTX}/SHA256SUMS"; \\\n    STAGE=$(mktemp -d); \\'), 'a SHA256SUMS is read'],
     ["a release candidate's version pin", (t) => planted(t, /^ARG AD_VERSION=\S+$/m, `ARG AD_VERSION=${PHASE1_RC_VERSION}`), `AD_VERSION ${PHASE1_RC_VERSION} is not a plain major.minor.patch release`],
-    ['a pin that is not the floor or package.json\'s', (t) => planted(t, /^ARG AD_VERSION=\S+$/m, `ARG AD_VERSION=${OLD_AD_VERSION}`), `AD_VERSION ${OLD_AD_VERSION} is not the Phase 1 floor`],
+    ['the old runtime instead of the release gate\'s', (t) => planted(t, /^ARG AD_VERSION=\S+$/m, `ARG AD_VERSION=${OLD_AD_VERSION}`), `AD_VERSION ${OLD_AD_VERSION} is not the release-gate runtime`],
+    ['a foreign runtime commit', (t) => planted(t, /^ARG AD_COMMIT=\S+$/m, `ARG AD_COMMIT=${'0'.repeat(40)}`), 'AD_COMMIT is not the release-gate runtime\'s commit'],
     ['install.sh unchecked', (t) => planted(t, '!= "${AD_INSTALL_SH_SHA256}"', '= ""'), 'install.sh is not checked against AD_INSTALL_SH_SHA256'],
     ['install.sh run without its pinned SHA-256s', (t) => planted(t, ' --sha256 "${AD_SHA256}" --admin-sha256 "${AD_ADMIN_SHA256}"', ''), 'install.sh --from-release runs without --sha256 "${AD_SHA256}", --admin-sha256 "${AD_ADMIN_SHA256}"'],
     ['the binary SHA-256 check dropped', (t) => planted(t, '"${BIN_SHA256}" != "${AD_SHA256}"', '-z "${BIN_SHA256}"'), 'the installed binary is not checked against AD_SHA256'],
@@ -2646,7 +2666,7 @@ describe('the /ci images (source audit)', () => {
     ["the build's agent-director-admin PATH check dropped", (t) => planted(t, 'if command -v agent-director-admin >/dev/null 2>&1; then', 'if false; then'), 'the build does not check that no agent-director-admin is on PATH'],
     ['agent-director-admin left 0700', (t) => planted(t, '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\', '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\\n    chmod 0700 "${AD_ADMIN}"; \\'), 'agent-director-admin is left mode 0700, not 0755'],
     ["agent-director-admin's directory left 0700", (t) => planted(t, '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\', '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\\n    chmod 0700 "${AD_ADMIN_DIR}"; \\'), "agent-director-admin's directory is left mode 0700, not 0755"],
-    ['the global client from a tarball, not npm', (t) => planted(t, GLOBAL_CLIENT_INSTALL, 'bun add -g --ignore-scripts "${CLIENT_TGZ}"'), 'the package installs are'],
+    ['the global client from a tarball, not npm', (t) => planted(t, /bun add -g --ignore-scripts "agent-director@\$\{AD_(?:CLIENT_)?VERSION\}"/, 'bun add -g --ignore-scripts "${CLIENT_TGZ}"'), 'the package installs are'],
     ['a swap of the global client', (t) => planted(t, '    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"', '    tar -xzf "${CLIENT_TGZ}" -C "${GLOBAL_CLIENT}" --strip-components=1; \\\n    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"'), 'files are written into the global client'],
     ['the global client losing its check', (t) => planted(t, '    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"', '    ls "${GLOBAL_CLIENT}"'), "0 RUNs run the client check's --client, not one"],
     ['the client tarball unchecked', (t) => planted(t, '!= "${AD_CLIENT_TGZ_SHA256}"', '= ""'), 'the npm client tarball is not checked against AD_CLIENT_TGZ_SHA256'],
@@ -2687,7 +2707,39 @@ describe('the /ci images (source audit)', () => {
     const files = rcAuditFiles()
     for (const rel of [BASE_DOCKERFILE, LIVE_DOCKERFILE, AD_CLIENT_CHECK_SOURCE, join('ci-live', 'lib', 'docker.ts'), CI_BASE_BUILD_STEP, CI_SKILL, CI_LIVE_SKILL, DEBUG_SKILL_PATH]) expect(files).toContain(rel)
     const commit = baseImage().args.AD_COMMIT!
-    expect(files.flatMap((rel) => rcPinProblems(repoFile(rel), commit).map((p) => `${rel}: ${p}`))).toEqual([])
+    expect(files.flatMap((rel) => rcPinProblems(repoFile(rel), commit, rel).map((p) => `${rel}: ${p}`))).toEqual([])
+  })
+
+  test('legacy displayed-state fixture has its own release identity and remains off PATH', () => {
+    const { args, instructions } = baseImage()
+    expect(args.AD_LEGACY_VERSION).toBe(LEGACY_DISPLAYED_STATE_AD_VERSION)
+    expect(args.AD_LEGACY_COMMIT).toBe(LEGACY_DISPLAYED_STATE_AD_COMMIT)
+    for (const key of ['AD_LEGACY_SHA256', 'AD_LEGACY_ADMIN_SHA256', 'AD_LEGACY_INSTALL_SH_SHA256']) {
+      expect(args[key]).toMatch(/^[0-9a-f]{64}$/)
+    }
+    const text = repoFile(BASE_DOCKERFILE)
+    expect(text).toContain('LEGACY_DIR="/opt/agent-director-${AD_LEGACY_VERSION}"')
+    expect(text).toContain('LEGACY_URL="https://github.com/gabemahoney/agent-director/releases/download/v${AD_LEGACY_VERSION}"')
+    expect(text).toContain('for legacy_bin in "${LEGACY_DIR}/bin/agent-director" "${LEGACY_DIR}/admin/agent-director-admin"')
+    expect(text).toContain('.version == $version and .commit == $commit')
+    expect(text).toContain('"${LEGACY_DIR}/release.json"')
+    expect(instructions.filter(i => i.startsWith('ENV PATH=')).join('\n')).not.toContain('LEGACY')
+    expect(instructions.filter(i => i.startsWith('ENV PATH=')).join('\n')).not.toContain(`/opt/agent-director-${LEGACY_DISPLAYED_STATE_AD_VERSION}`)
+  })
+
+  test('legacy commit exemption is limited to one exact base ARG; arbitrary or relocated pins still fail', () => {
+    const commit = baseImage().args.AD_COMMIT!
+    const base = repoFile(BASE_DOCKERFILE)
+    const allowed = `ARG AD_LEGACY_COMMIT=${LEGACY_DISPLAYED_STATE_AD_COMMIT}`
+    for (const [text, file] of [
+      [base.replace(allowed, `ARG AD_LEGACY_COMMIT=${'0'.repeat(40)}`), BASE_DOCKERFILE],
+      [base + '\n' + allowed, BASE_DOCKERFILE],
+      [allowed, LIVE_DOCKERFILE],
+      [base.replace(allowed, `ARG OTHER_COMMIT=${LEGACY_DISPLAYED_STATE_AD_COMMIT}`), BASE_DOCKERFILE],
+    ]) expect(rcPinProblems(text!, commit, file!)).toContainEqual(expect.stringContaining("a commit other than the release's"))
+    expect(rcPinProblems(base.replace(`ARG AD_LEGACY_VERSION=${LEGACY_DISPLAYED_STATE_AD_VERSION}`,
+      `ARG AD_LEGACY_VERSION=${PHASE1_RC_VERSION}`), commit, BASE_DOCKERFILE))
+      .toContain(`a release-candidate version: ${PHASE1_RC_VERSION}`)
   })
 
   /** Another commit, derived from the release's. */
@@ -2704,7 +2756,7 @@ describe('the /ci images (source audit)', () => {
     ["the contract's release-candidate-counts wording (excepted)", () => `# any ${PHASE1_FLOOR_VERSION}-rc.N counts as ${PHASE1_FLOOR_VERSION} (release candidates included)`, () => []],
   ])('a planted %s in an image file is reported', (_name, line, expected) => {
     const commit = baseImage().args.AD_COMMIT!
-    expect(rcPinProblems(`${repoFile(BASE_DOCKERFILE)}\n${line(commit)}\n`, commit)).toEqual(expected(commit))
+    expect(rcPinProblems(`${repoFile(BASE_DOCKERFILE)}\n${line(commit)}\n`, commit, BASE_DOCKERFILE)).toEqual(expected(commit))
   })
 
   test("no file in the integration tree names the release candidate's old layout: no build context or directory, directory variable, SHA256SUMS, swap helper or pin", () => {

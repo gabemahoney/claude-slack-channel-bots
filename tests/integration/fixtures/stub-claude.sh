@@ -82,6 +82,7 @@ MODE_MANUAL_START=manual-start
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_LINGER_ON_EXIT=linger-on-exit
 MODE_EXIT_ON_PAUSE=exit-on-pause
+MODE_DISPLAYED_STATES=displayed-states
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -109,7 +110,7 @@ fi
 case "${MODE}" in
     "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_MANUAL_START}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
-    "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}") ;;
+    "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}" | "${MODE_DISPLAYED_STATES}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_AT_ONCE}" >&2
@@ -155,6 +156,9 @@ HOOK_ARGV_JQ='
 HOOK_FILE="${TMPDIR:-/tmp}/stub-claude-hook-$$"
 START_HOOKS=()
 END_HOOKS=()
+PROMPT_HOOKS=()
+STOP_HOOKS=()
+PERMISSION_HOOKS=()
 if [[ -n "${SETTINGS_JSON}" ]]; then
     if jq -nj --argjson s "${SETTINGS_JSON}" --arg ev SessionStart \
         "${HOOK_ARGV_JQ}" > "${HOOK_FILE}" 2>/dev/null; then
@@ -163,6 +167,17 @@ if [[ -n "${SETTINGS_JSON}" ]]; then
     if jq -nj --argjson s "${SETTINGS_JSON}" --arg ev SessionEnd \
         "${HOOK_ARGV_JQ}" > "${HOOK_FILE}" 2>/dev/null; then
         mapfile -d '' -t END_HOOKS < "${HOOK_FILE}"
+    fi
+    if [[ "${MODE}" == "${MODE_DISPLAYED_STATES}" ]]; then
+        for event in UserPromptSubmit Stop PermissionRequest; do
+            jq -nj --argjson s "${SETTINGS_JSON}" --arg ev "${event}" "${HOOK_ARGV_JQ}" > "${HOOK_FILE}" || exit 1
+            case "${event}" in
+                UserPromptSubmit) mapfile -d '' -t PROMPT_HOOKS < "${HOOK_FILE}" ;;
+                Stop) mapfile -d '' -t STOP_HOOKS < "${HOOK_FILE}" ;;
+                PermissionRequest) mapfile -d '' -t PERMISSION_HOOKS < "${HOOK_FILE}" ;;
+            esac
+        done
+        (( ${#PROMPT_HOOKS[@]} > 0 && ${#STOP_HOOKS[@]} > 0 && ${#PERMISSION_HOOKS[@]} > 0 )) || exit 1
     fi
     rm -f "${HOOK_FILE}"
 fi
@@ -202,6 +217,70 @@ fire_session_end() {
             && fire_hooks "${END_HOOKS[@]}"
         rm -f "${HOOK_FILE}"
     fi
+}
+
+# Opt-in registered-hook controls. No AD state is written or fabricated. The
+# hook executable remains a direct child of the tracked stub (including each
+# background PermissionRequest), so AD's process/session gate still applies.
+# Controls are private files keyed by the actual SessionStart session UUID.
+DISPLAY_CONTROL="${STUB_DIR}/stub-claude-hooks.${SESSION_ID}"
+DISPLAY_RECORD="${DISPLAY_CONTROL}.jsonl"
+DISPLAY_NEXT=0
+DISPLAY_TEXT=""
+declare -A DISPLAY_HOOK_PIDS=()
+display_record() {
+    jq -nc --arg command "$1" --arg event "$2" --arg instance "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
+        --arg session "${SESSION_ID}" --argjson pid "${3:-$$}" --arg at "${EPOCHREALTIME}" \
+        '{command:$command,event:$event,instance_id:$instance,session_id:$session,pid:$pid,at:$at}' >> "${DISPLAY_RECORD}"
+}
+display_payload() {
+    jq -nc --arg event "$1" --arg session "${SESSION_ID}" --arg cwd "${REALCWD}" --arg path "${TRANSCRIPT}" --arg marker "${2:-}" \
+        '{hook_event_name:$event,session_id:$session,cwd:$cwd,transcript_path:$path,tool_name:"Bash",tool_input:{command:("printf fixture-"+$marker)}}' > "${HOOK_FILE}"
+}
+display_controls() {
+    [[ -f "${DISPLAY_CONTROL}" ]] || return 0
+    local commands=() command index token n pid
+    mapfile -t commands < "${DISPLAY_CONTROL}"
+    while (( DISPLAY_NEXT < ${#commands[@]} )); do
+        index="${DISPLAY_NEXT}"
+        DISPLAY_NEXT=$(( DISPLAY_NEXT + 1 ))
+        command="${commands[index]}"
+        case "${command}" in
+            receipt)
+                [[ -n "${DISPLAY_TEXT}" ]] || exit 1
+                append_user_receipt "${DISPLAY_TEXT}"
+                DISPLAY_TEXT=""
+                display_payload Stop
+                fire_hooks "${STOP_HOOKS[@]}"
+                display_record "${command}" Stop
+                ;;
+            permission-1|permission-2)
+                token="${command#permission-}"
+                [[ -z "${DISPLAY_HOOK_PIDS[${token}]:-}" ]] || exit 1
+                display_payload PermissionRequest "${token}"
+                # Exactly one registered AD command; refuse an unexpected
+                # registration instead of running a different hook topology.
+                n="${PERMISSION_HOOKS[0]}"
+                (( n + 1 == ${#PERMISSION_HOOKS[@]} )) || exit 1
+                "${PERMISSION_HOOKS[@]:1:n}" < "${HOOK_FILE}" > "${DISPLAY_CONTROL}.${token}.out" 2> "${DISPLAY_CONTROL}.${token}.err" &
+                pid=$!
+                DISPLAY_HOOK_PIDS["${token}"]="${pid}"
+                display_record "${command}" PermissionRequest "${pid}"
+                ;;
+            fallback-1|fallback-2)
+                token="${command#fallback-}"
+                pid="${DISPLAY_HOOK_PIDS[${token}]:-}"
+                [[ -n "${pid}" ]] || exit 1
+                # End only this fixture's outstanding registered hook. AD's
+                # next real read must independently confirm fallen_back.
+                kill -TERM "${pid}" || exit 1
+                wait "${pid}" 2>/dev/null || true
+                unset 'DISPLAY_HOOK_PIDS['"${token}"']'
+                display_record "${command}" hook-exited "${pid}"
+                ;;
+            *) exit 1 ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -488,7 +567,7 @@ case "${MODE}" in
         print_manual_start
         AWAITING_ENTER=1
         ;;
-    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}")
+    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}" | "${MODE_DISPLAYED_STATES}")
         if (( REPORT_DELAY_S > 0 )); then
             printf 'Starting worker\n'
             now_ms
@@ -556,7 +635,15 @@ handle_line() {
     # writes the transcript; a slash command (a line starting with `/`, such
     # as `/exit` or `/mcp reconnect`) is no message.
     if (( REPORTED )) && [[ "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
-        append_user_receipt "${line}"
+        if [[ "${MODE}" == "${MODE_DISPLAYED_STATES}" ]]; then
+            [[ -z "${DISPLAY_TEXT}" ]] || exit 1
+            DISPLAY_TEXT="${line}"
+            display_payload UserPromptSubmit
+            fire_hooks "${PROMPT_HOOKS[@]}"
+            display_record submitted UserPromptSubmit
+        else
+            append_user_receipt "${line}"
+        fi
     fi
     if (( AWAITING_ENTER )); then
         clear_manual_start
@@ -629,6 +716,11 @@ while :; do
         if (( rc > 128 )); then
             continue
         fi
+    elif [[ "${MODE}" == "${MODE_DISPLAYED_STATES}" ]]; then
+        display_controls
+        IFS= read -r -N 1 -t 0.1 key
+        rc=$?
+        (( rc > 128 )) && continue
     else
         IFS= read -r -N 1 key
         rc=$?

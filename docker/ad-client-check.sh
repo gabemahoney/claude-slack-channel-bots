@@ -19,11 +19,12 @@
 #       <dir> is an agent-director client. Check it as it is.
 #
 # The release record /opt/agent-director/client/release.json, written by the
-# base image's build from its pins, names the release's version and commit,
+# base image's build from its pins, names the runtime's version, commit and
+# digest, the independent client version,
 # the npm client tarball the build fetched and that tarball's pinned SHA-256.
 # The check, in order, stopping at the first failure:
 #   1 tarball        the client tarball has the record's pinned SHA-256;
-#   2 version        the client's package version is the record's version, a
+#   2 version        the client's package version is the record's client_version, a
 #                    plain major.minor.patch (no pre-release); with
 #                    --package, the package's dependency on agent-director
 #                    is exactly that version, and so is the package's
@@ -33,7 +34,7 @@
 #                    ErrTmuxUnresponsive and ErrTmuxSessionConflict, each an
 #                    AgentDirectorError class;
 #   5 binary         the first agent-director on PATH reports the record's
-#                    version and commit, so its version is the client's;
+#                    runtime version, commit and binary SHA-256;
 #   6 floor          that version (major.minor.patch) is at or above the
 #                    client's dist/version-floor.json min_binary_version;
 #   7 client-create  Client.create(), imported from the client's entry point,
@@ -41,7 +42,7 @@
 #
 # Exit codes:
 #   0  passed: one line on stdout,
-#        ad-client check passed: <client dir> is agent-director <version> from npm (tarball sha256 <sha>); agent-director <version> (<commit>) at <binary>; client floor <floor>
+#        ad-client check passed: <client dir> is agent-director <version> from npm (tarball sha256 <sha>); agent-director <version> (<commit>) at <binary> (binary sha256 <sha>); client floor <floor>
 #   1  a check failed: one line on stderr,
 #        ERROR: ad-client check <step>: <what differs>
 #   2  usage error: one ERROR: line on stderr
@@ -102,6 +103,8 @@ record_field() {
 }
 AD_VERSION=$(record_field version)
 AD_COMMIT=$(record_field commit)
+AD_SHA256=$(record_field binary_sha256)
+AD_CLIENT_VERSION=$(record_field client_version)
 AD_TGZ=$(record_field client_tarball)
 AD_TGZ_SHA256=$(record_field client_tarball_sha256)
 
@@ -149,10 +152,12 @@ TGZ_SHA256=$(sha256sum "${AD_TGZ}" | cut -d' ' -f1)
 # --- 2 version -----------------------------------------------------------
 [[ "${AD_VERSION}" =~ ${PLAIN_RELEASE_RE} ]] \
     || fail '2 (version)' "the release record's version ${AD_VERSION} is not a plain major.minor.patch release"
+[[ "${AD_CLIENT_VERSION}" =~ ${PLAIN_RELEASE_RE} ]] \
+    || fail '2 (version)' "the release record's client_version ${AD_CLIENT_VERSION} is not a plain major.minor.patch release"
 CLIENT_VERSION=$(jq -er '.version | strings' "${CLIENT_DIR}/package.json" 2>/dev/null) \
     || fail '2 (version)' "${CLIENT_DIR}/package.json has no string version"
-[ "${CLIENT_VERSION}" = "${AD_VERSION}" ] \
-    || fail '2 (version)' "the client at ${CLIENT_DIR} is agent-director ${CLIENT_VERSION}, not the release's ${AD_VERSION}"
+[ "${CLIENT_VERSION}" = "${AD_CLIENT_VERSION}" ] \
+    || fail '2 (version)' "the client at ${CLIENT_DIR} is agent-director ${CLIENT_VERSION}, not the pinned client ${AD_CLIENT_VERSION}"
 if [ "${MODE}" = --package ]; then
     PIN=$(jq -r '.dependencies["agent-director"] // "(none)"' "${TARGET}/package.json")
     [ "${PIN}" = "${CLIENT_VERSION}" ] \
@@ -203,6 +208,9 @@ BIN_VERSION=$(jq -ner 'input | .version | strings' "${SCRATCH}/version.out") \
     || fail '5 (binary)' "the agent-director binary ${BIN}: version printed no JSON object with a string version field"
 BIN_COMMIT=$(jq -ner 'input | .commit | strings' "${SCRATCH}/version.out") \
     || fail '5 (binary)' "the agent-director binary ${BIN}: version printed no JSON object with a string commit field"
+BIN_SHA256=$(sha256sum "${BIN}" | cut -d' ' -f1)
+[ "${BIN_SHA256}" = "${AD_SHA256}" ] \
+    || fail '5 (binary)' "the agent-director binary ${BIN} has SHA-256 ${BIN_SHA256}, not the pinned ${AD_SHA256}"
 if [ "${BIN_VERSION}" != "${AD_VERSION}" ] || [ "${BIN_COMMIT}" != "${AD_COMMIT}" ]; then
     fail '5 (binary)' "the first agent-director binary on PATH, ${BIN}, reports version ${BIN_VERSION} (${BIN_COMMIT}), not the release's ${AD_VERSION} (${AD_COMMIT}) that the client ${CLIENT_VERSION} pairs with"
 fi
@@ -245,4 +253,4 @@ CREATE_VERSION=$(cat "${SCRATCH}/create.out")
 [ "${CREATE_VERSION}" = "${BIN_VERSION}" ] \
     || fail '7 (client-create)' "Client.create() from ${ENTRY} reports agent-director version ${CREATE_VERSION}, not ${BIN_VERSION} (the first agent-director binary on PATH, ${BIN})"
 
-echo "ad-client check passed: ${CLIENT_DIR} is agent-director ${CLIENT_VERSION} from npm (tarball sha256 ${TGZ_SHA256}); agent-director ${BIN_VERSION} (${BIN_COMMIT}) at ${BIN}; client floor ${FLOOR}"
+echo "ad-client check passed: ${CLIENT_DIR} is agent-director ${CLIENT_VERSION} from npm (tarball sha256 ${TGZ_SHA256}); agent-director ${BIN_VERSION} (${BIN_COMMIT}) at ${BIN} (binary sha256 ${BIN_SHA256}); client floor ${FLOOR}"

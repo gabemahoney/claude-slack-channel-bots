@@ -9,7 +9,7 @@ allowed-tools: [Bash]
 
 The live, pre-deploy acceptance run of CSCB: the automated checks from the
 checked-in scenario `testplans/live-acceptance.md` (a local scenario document), against the **test workspace** only (never a production workspace),
-in a fresh container built from the `/ci` base (`cscb-ci-base:v8`), with the
+in a fresh container built from the `/ci` base (`cscb-ci-base:v9`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,
 tmux, agent-director store and port, runs on the default docker network (no
@@ -76,7 +76,7 @@ installed Google Chrome, headless; no browser download):
 ## Procedure
 
 1. Check docker (`docker info`) and the `/ci` base image with
-   `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v8`.
+   `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v9`.
    If inspection fails, stop and relay the failure; never fall back to
    raw Docker inspection. If the base is confirmed missing, `/ci` builds
    it when its prerequisites pass; inspect it again through the wrapper

@@ -636,7 +636,7 @@ describe('heavy execution with fake children', () => {
     expect(stdout).toContain('a'.repeat(64) + '\n')
     expect(stdout.some(line => line.includes('private inspect diagnostic'))).toBe(false)
     expect(calls.find(c => c.argv[1] === 'image' && c.argv[2] === 'inspect')!.argv)
-      .toEqual(['docker', 'image', 'inspect', 'cscb-ci-base:v8'])
+      .toEqual(['docker', 'image', 'inspect', 'cscb-ci-base:v9'])
     expect(calls.filter(c => c.argv[0] === 'bash')).toEqual([])
   })
 

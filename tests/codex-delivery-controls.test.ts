@@ -263,7 +263,7 @@ describe('D1 closing enforcement without a CSCB server (synthetic shell evidence
     // Only declarations are extracted. Never source scenario.sh on the host:
     // its real setup, installations, tmux and process discovery cannot run.
     const names = ['fail', '_scenario_add', '_scenario_to_us', '_scenario_split_line', '_scenario_eval_words', '_scenario_decode_words',
-      '_scenario_ad_verb', '_scenario_finished_kill_words', '_scenario_read_log', '_scenario_closing_ran', '_scenario_closing_passed',
+      '_scenario_ad_verb', '_scenario_finished_kill_words', '_scenario_shim_diagnostic', '_scenario_read_log', '_scenario_closing_ran', '_scenario_closing_passed',
       'assert_codex_d1_safety', '_scenario_closing_check', '_scenario_closing_recheck', '_scenario_cleanup']
     const selection = scenarioSource.slice(scenarioSource.indexOf('SCENARIO_CLOSING_ASSERTIONS=('), scenarioSource.indexOf("# agent-director's default stopping window"))
     const script = [

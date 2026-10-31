@@ -54,6 +54,15 @@ export const PHASE1_RC_VERSION = `${PHASE1_FLOOR_VERSION}-rc.1`
 /** The last agent-director release before Phase 1; the released client rejects it before CSCB's floor. */
 export const OLD_AD_VERSION = '0.10.0'
 
+/** b.iy3's approved release-gate runtime, independent of CSCB's client/floor. */
+export const CI_AD_RUNTIME_VERSION = '0.17.1'
+/** Peeled v0.17.1 release tag; a checkout's HEAD is not runtime provenance. */
+export const CI_AD_RUNTIME_COMMIT = 'c794af3865d113d85573601fdcc70bdc842b3471'
+
+/** Last release with displayed values in state and aged permission prompts. */
+export const LEGACY_DISPLAYED_STATE_AD_VERSION = '0.17.0'
+export const LEGACY_DISPLAYED_STATE_AD_COMMIT = '3ece400076aba2e6e675d51fc0533b8430bb8f2f'
+
 /** The client's development sentinel (`0.0.0-dev`); CSCB's floor refuses it. */
 export const DEV_PLACEHOLDER_VERSION: string = DEV_SENTINEL_VERSION
 
