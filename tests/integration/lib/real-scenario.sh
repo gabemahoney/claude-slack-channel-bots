@@ -260,14 +260,6 @@ _real_delivery_diagnostic() {
     bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" \
         || echo 'recorded: delivery AD diagnostic unavailable'
 }
-real_assert_no_retype() {
-    bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" no-retype \
-        || fail 'real fidelity receipt audit found a retype'
-}
-real_assert_delivery() {
-    bun "${REAL_RECEIPTS}" audit "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}" \
-        || fail 'real receipt/order/in-flight audit failed'
-}
 real_assert_latency() {
     bun "${REAL_RECEIPTS}" latency "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "$2" \
         || fail 'real AC76 latency audit failed'

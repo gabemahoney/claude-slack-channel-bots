@@ -614,9 +614,17 @@ reminder), so it runs the complete receipt audit first and exits 75
 wait re-polls under the same watchdogs, so a receipt defect fails at a
 watchdog with its diagnostic, as a failing `ready` audit does. The
 case's own proof runs only once that audit passes and exits 1 on failure; any
-exit but 0 or 75 fails the wait at once. The reset-spacing, key-proof and
-unknown-proof commands of `fixtures/real-case-assertions.ts` work this way,
-and test 33 runs each of them in this form.
+exit but 0 or 75 fails the wait at once.
+
+The reset-spacing, key-proof, unknown-proof, `receipts <count>` and
+`at-least-one-duplicate` commands of `fixtures/real-case-assertions.ts` work
+this way. Test 33 runs the first three in this form, test 104 `receipts 3`
+(printing `transcript-receipts.ts audit`'s `recorded: receipts` line) and AI
+AC106 `at-least-one-duplicate`; test 39's last receipt check re-polls
+`real_wait_delivery … no-retype` instead. AC106's earlier copy check stays in
+`wait_until 180 … case_assert at-least-one-duplicate`, which retries 75 and 1
+until the typed copy reaches the transcript; the `--` form would fail at once
+on 1 before then.
 
 Real-agent actions wait on AD `waiting` and typed refusals. Explicit `/compact` trials verify later exact receipts and durable queue progress; no pane or native compaction marker establishes lifecycle state. Diagnostics omit pane text.
 

@@ -18,7 +18,7 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
 import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, workloadItem, workloadItems } from './integration/fixtures/transcript-receipts.ts'
 import { checkAc76Admission, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
-import { runTest33Slice, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
+import { runFixture, runRealSlice, runTest33Slice, SITE_SLICES, type RealSlice, type Site, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
@@ -30,6 +30,7 @@ const plans = {
   plain: { stages: [[10, 'text']] },
   retype: { stages: [[10, 'text'], [10010, 'retype']], fault: [10, 'swallow'] },
   'unknown-typed': { stages: [[10, 'text'], [10010, 'enter']], fault: [10, 'unknown-typed'] },
+  'unknown-untyped': { stages: [[10, 'text'], [10010, 'retype']], fault: [10, 'unknown-untyped'] },
   reset: { stages: [[10, 'text'], [20500, 'retype'], [81000, 'retype'], [101000, 'enter'],
     [111000, 'retype'], [141500, 'enter'], [171500, 'retype']], fault: [111000, 'swallow'], waiting: 100000 },
   'reset missing retype': { stages: [[10, 'text'], [20500, 'retype'], [81000, 'retype'], [101000, 'enter'],
@@ -77,6 +78,14 @@ async function fixture(seed = true, projects = false) {
     writeFileSync(shimLog, calls.join('\n') + '\n')
     writeFileSync(join(stateDir, 'server.log'), lines.join('\n') + '\n')
   }
+  /** A second exact take-in of a delivered item, as AC106 types it through AD
+   * rather than CSCB: no durable or shim record. */
+  function duplicate(item: QueueItem) {
+    now += 10
+    takes.push({ ...promptEntry(`<channel seq="${item.accepted.seq}">${item.accepted.text}</channel>`), uuid: `copy-${item.accepted.seq}`, sessionId: 'session', timestamp: new Date(now).toISOString() })
+    now += 10
+    writeFileSync(transcript, takes.map(r => JSON.stringify(r)).join('\n') + '\n')
+  }
   async function send(input: AcceptedInput, plan: Plan = 'plain') {
     const result = await queue.accept('alpha', input)
     if (result.status !== 'accepted' || !result.item) throw new Error('fixture acceptance failed')
@@ -95,7 +104,7 @@ async function fixture(seed = true, projects = false) {
   }
   const options = { stateDir, key: 'alpha', shimLog, transcripts: [transcript], expectedCount: 4 }
   const entries = () => readTranscripts([transcript], adapters)
-  return { queue, journal, transcript, shimLog, options, adapters, entries, send, complete, persona, now: () => now,
+  return { queue, journal, transcript, shimLog, options, adapters, entries, send, complete, duplicate, persona, now: () => now,
     audit: () => auditReceipts(options, entries(), adapters) }
 }
 
@@ -783,6 +792,293 @@ test('test33 runs every receipt case proof only as its delivery wait\'s -- asser
   expect(proofs.filter(line => !/^\s*(?:\w+=\S+ )*real_wait_delivery [^#]* -- case_assert (?:key-proof|reset-spacing|unknown-proof)\b/.test(line))).toEqual([])
   expect(proofs.map(line => line.match(/case_assert (\S+ \S+)/)![1])).toEqual([
     'key-proof 1', 'key-proof 2', 'key-proof 3', 'reset-spacing 4', 'unknown-proof "${outcome}"', 'key-proof 7'])
+})
+
+/** Other real tails whose last delivery wait is followed by a receipt audit
+ * reading newer evidence (b.p9r). `audit` is the site's last receipt-consistent
+ * audit before that tail: test39's and test104's delivery wait, and AC106's
+ * ai_readback, which audits every receipt again after the wait. `pending` is
+ * the slice's calls once a reminder is accepted after that audit, up to the
+ * tail's first poll; `done` its calls after a later passing ready audit. */
+const sites = {
+  // The loop's two waits, then the tail's.
+  test39: { count: 2, plans: ['plain', 'plain'], audit: 'ready', dms: [['alpha', 'fidelity one'], ['alpha', 'fidelity two']],
+    pending: ['ready:0', 'ready:0', 'ready:1', 'progress:0'], done: [] },
+  // The case receipt audit is the reminder's first reader, then the fault check.
+  test104: { count: 3, plans: ['unknown-untyped', 'plain', 'plain'], audit: 'ready',
+    dms: [1, 2, 3].map(n => ['alpha', `queued AD contract delivery ${n}`]),
+    pending: ['ready:0', 'receipts:75', 'progress:0'], done: ['receipts:0', 'fault:0'] },
+  // The first DM and its duplicate copy precede the slice.
+  ai106: { count: 2, plans: ['plain', 'plain'], audit: 'readback', dms: [['alpha', expect.stringContaining('How many DMs')]],
+    pending: ['ready:0', 'readback:0', 'ready:1', 'progress:0'], done: ['at-least-one-duplicate:0'] },
+} as const satisfies Record<Site, { count: number; plans: readonly Plan[]; audit: string; dms: readonly unknown[]
+  pending: readonly string[]; done: readonly string[] }>
+const readyPasses = (calls: readonly string[]) => calls.filter(call => call === 'ready:0').length
+const siteNames = Object.keys(sites) as Site[]
+
+/** Each `real_dm` in the slice accepts and delivers the site's next original
+ * input. AD saw working after the first, so a later waiting observation accepts
+ * a reply reminder for sequence 1. */
+async function siteEvidence(site: Site, { duplicate = true } = {}) {
+  const h = await fixture(false, true)
+  const observe = (state: 'working' | 'waiting') => h.queue.observeReplyReminders('alpha',
+    cannedGetResult({ state, session_id: 'session' }, h.persona, h.options.stateDir), REPLY_REMINDER_TEXT, true, () => true)
+  const slack = (n: number) => { const ts = `1700000000.00000${n}`; return slackInput({ ts, key: { chat_id: 'C0TEST001', ts } }) }
+  const e = { h, observe, slack, sent: 0, dms: [] as string[][], items: [] as QueueItem[], pending: [] as QueueItem[],
+    async deliver() {
+      const item = await h.send(slack(e.sent + 1), sites[site].plans[e.sent])
+      e.items.push(item)
+      if (++e.sent === 1) await observe('working')
+      return item
+    } }
+  if (site === 'ai106') {
+    const first = await e.deliver()
+    if (duplicate) h.duplicate(first)
+  }
+  h.options.expectedCount = sites[site].count
+  return e
+}
+type SiteEvidence = Awaited<ReturnType<typeof siteEvidence>>
+
+/** `inject` runs once, at the site's first passing `audit` after every input
+ * was delivered, or with `later` at the next passing call after it other than
+ * `progress` (a gate the tail itself adds); `settle` at the slice's next poll,
+ * else after it. */
+async function raceSite(site: Site, e: SiteEvidence, race: { inject?(): Promise<void>; settle?(): Promise<void> } = {}, later = false) {
+  let injected = 0, settled = false, reached = false
+  const settle = async () => {
+    if (settled || !injected) return
+    settled = true
+    await race.settle?.()
+  }
+  const result = await runRealSlice(SITE_SLICES[site], e.h.options.stateDir, {
+    dm: async words => { e.dms.push(words); await e.deliver() },
+    afterAudit: async (command, code) => {
+      if (injected || code !== 0 || e.sent < sites[site].count) return
+      if (!reached) {
+        reached = command === sites[site].audit
+        if (!reached || later) return
+      } else if (command === 'progress') return
+      injected++
+      await race.inject?.()
+    },
+    poll: settle,
+  })
+  await settle()
+  expect(e.dms as unknown[]).toEqual([...sites[site].dms])
+  const audit = (noRetype = false) => {
+    try { return { ok: true, audit: auditReceipts({ ...e.h.options, noRetype }, e.h.entries(), e.h.adapters) } as const }
+    catch (error) { return { ok: false, error: (error as Error).message } as const }
+  }
+  return { result, injected, final: audit(), noRetype: audit(true) }
+}
+const siteReminder = (e: SiteEvidence, plan: Plan = 'plain') => ({
+  inject: async () => { e.pending.push(...await e.observe('waiting')) },
+  settle: async () => { for (const item of e.pending) await e.h.complete(item, plan) },
+})
+const reminderSeq = (e: SiteEvidence) => e.pending[0]!.accepted.seq
+const casePending = (e: SiteEvidence) => ({ code: 75, out: [],
+  err: [`real-case-assertions: receipts pending: Item ${reminderSeq(e)} has no valid message-delivered timestamp`] })
+
+test.each(siteNames)('%s tail completes when a legitimate reply reminder is accepted after its last passing receipt audit', async site => {
+  const e = await siteEvidence(site)
+  const { result, injected, final, noRetype } = await raceSite(site, e, siteReminder(e))
+  // The production observer accepted one open reminder for the first, fully
+  // delivered Slack input after the site's last passing receipt audit.
+  expect(injected).toBe(1)
+  expect(e.pending.map(item => [item.accepted.seq, item.accepted.source, item.accepted.sender, item.accepted.reminder_for]))
+    .toEqual([[sites[site].count + 1, 'interject', 'reply-reminder', 1]])
+  // The tail's wait re-polls once, and passes once the reminder completes.
+  const calls = [...sites[site].pending, 'ready:0', ...sites[site].done]
+  expect(result).toMatchObject({ code: 0, signal: null, stderr: '', polls: 1, ready: readyPasses(calls), calls,
+    errors: site === 'test104' ? casePending(e).err : [] })
+  // Every item, the reminder included, still has full receipt/FIFO proof.
+  const proof = { items: sites[site].count, reminders: 1 }
+  expect(final).toMatchObject({ ok: true, audit: site === 'ai106' ? { ...proof, duplicates: 1 } : proof })
+  // test39's tail is a fidelity proof: the reminder too was typed once.
+  if (site === 'test39') expect(noRetype).toMatchObject({ ok: true, audit: proof })
+})
+
+// Only AC106's tail has a passing check after its last receipt audit that a
+// later reminder can precede: its own delivery wait, before the duplicate
+// proof. test39's wait ends its tail, and test104's fault check after its wait
+// reads no receipts.
+test('ai106 tail also awaits a reply reminder accepted after its own passing delivery wait, before its duplicate proof', async () => {
+  const e = await siteEvidence('ai106')
+  const { result, injected, final } = await raceSite('ai106', e, siteReminder(e), true)
+  expect(injected).toBe(1)
+  // The duplicate case's receipt audit is pending, so the wait re-polls once.
+  const calls = ['ready:0', 'readback:0', 'ready:0', 'at-least-one-duplicate:75', 'progress:0', 'ready:0', 'at-least-one-duplicate:0']
+  expect(result).toMatchObject({ code: 0, signal: null, stderr: '', polls: 1, ready: readyPasses(calls), calls, errors: casePending(e).err })
+  expect(final).toMatchObject({ ok: true, audit: { items: 2, reminders: 1, duplicates: 1 } })
+})
+
+/** Corrected tails must still reject: each is the regression race plus one
+ * defect, and the full audit names which. The slice's own verdict: the tail's
+ * ready audit keeps failing on the defect until the existing no-progress
+ * watchdog ends it with the original receipts it saw. Synthetic bounds: 3 s
+ * without original-receipt progress, 5 s overall. */
+function expectSiteWatchdog(site: Site, e: SiteEvidence, outcome: Awaited<ReturnType<typeof raceSite>>,
+  { receipts = sites[site].count as number, polls = 3, errors = site === 'test104' ? casePending(e).err : [] as string[] } = {}) {
+  const { result } = outcome
+  expect(outcome.injected).toBe(1)
+  const calls = [...sites[site].pending, ...Array.from({ length: polls }, () => ['ready:1', 'progress:0']).flat(),
+    'diagnostic:0', `${join(e.h.options.stateDir, 'real-delivery-status.json')}:0`]
+  expect(result).toMatchObject({ code: 1, signal: null, polls, ready: readyPasses(calls), calls, errors })
+  expect(result.stderr).toBe(`real persona alpha has open/unconfirmed deliveries (no-progress watchdog; receipts=${receipts}; idle bound=3s; overall bound=5s)\n`)
+}
+
+test.each(siteNames)('%s tail ends a reminder that never completes at its existing watchdog, never passing', async site => {
+  const e = await siteEvidence(site)
+  const outcome = await raceSite(site, e, { inject: siteReminder(e).inject })
+  expectSiteWatchdog(site, e, outcome)
+  expect(outcome.final).toEqual({ ok: false, error: `Item ${reminderSeq(e)} has no valid message-delivered timestamp` })
+})
+
+test.each(siteNames.flatMap(site => [
+  [site, 'invalid reminder provenance', 'Invalid reply reminder provenance', (e: SiteEvidence) => ({ ...siteReminder(e),
+    settle: async () => {
+      await siteReminder(e).settle()
+      // The completed reminder links to itself, not to an earlier Slack input.
+      rewriteRows(e.h.journal, r => r.kind === 'accepted' && r.seq === reminderSeq(e) ? { ...r, reminder_for: reminderSeq(e) } : r)
+    } })],
+  [site, 'missing reminder receipt', 'part 1 has no exact transcript receipt', (e: SiteEvidence) => ({ ...siteReminder(e),
+    settle: async () => {
+      await siteReminder(e).settle()
+      rewriteRows(e.h.transcript, r => r.uuid === `take-${reminderSeq(e)}` ? undefined : r)
+    } })],
+] as const))('%s tail still rejects %s', async (site, _name, reason, race) => {
+  const e = await siteEvidence(site)
+  const outcome = await raceSite(site, e, race(e))
+  expectSiteWatchdog(site, e, outcome)
+  expect(outcome.final).toMatchObject({ ok: false, error: expect.stringContaining(reason) })
+})
+
+test('test39 tail still rejects a reply reminder typed twice, as text fidelity requires', async () => {
+  const e = await siteEvidence('test39')
+  const outcome = await raceSite('test39', e, siteReminder(e, 'retype'))
+  expectSiteWatchdog('test39', e, outcome)
+  // Every receipt is otherwise exact; only the no-retype proof fails.
+  expect(outcome.final).toMatchObject({ ok: true, audit: { items: 2, reminders: 1 } })
+  expect(outcome.noRetype).toEqual({ ok: false, error: 'Text fidelity case retyped' })
+})
+
+test('test104 tail still rejects a wrong original count: an extra input accepted after its wait', async () => {
+  const e = await siteEvidence('test104')
+  const outcome = await raceSite('test104', e, {
+    inject: async () => {
+      const r = await e.h.queue.accept('alpha', e.slack(4))
+      if (r.status !== 'accepted' || !r.item) throw new Error('extra input was not accepted')
+      e.pending.push(r.item)
+    },
+    settle: siteReminder(e).settle,
+  })
+  // The extra input's own receipt is progress, so the idle bound restarts once.
+  expectSiteWatchdog('test104', e, outcome, { receipts: 4, polls: 4,
+    errors: ['real-case-assertions: receipts pending: Accepted item count differs'] })
+  expect(outcome.final).toEqual({ ok: false, error: 'Accepted item count differs' })
+  e.h.options.expectedCount = 4
+  expect(e.h.audit()).toMatchObject({ items: 4, reminders: 0 })
+})
+
+test('ai106 tail still rejects a missing duplicate copy with at-least-one-duplicate\'s own verdict once receipts complete', async () => {
+  const e = await siteEvidence('ai106', { duplicate: false })
+  const outcome = await raceSite('ai106', e, siteReminder(e))
+  expect(outcome.injected).toBe(1)
+  // Pending once, then the own verdict (1) on the settled evidence ends the
+  // wait at once: no further poll, no watchdog.
+  const calls = [...sites.ai106.pending, 'ready:0', 'at-least-one-duplicate:1']
+  expect(outcome.result).toMatchObject({ code: 1, signal: null, stderr: '', polls: 1, ready: readyPasses(calls), calls,
+    errors: ['real-case-assertions: intended duplicate was not observed'] })
+  // The receipts are complete, so only the duplicate proof can fail.
+  expect(outcome.final).toMatchObject({ ok: true, audit: { items: 2, reminders: 1, duplicates: 0 } })
+})
+
+/** One `bun real-case-assertions.ts <command> <scenario args> [args]` call on
+ * a site's evidence, outside any slice. */
+const caseCli = (e: SiteEvidence, command: string, ...args: string[]) => runFixture('fixtures/real-case-assertions.ts',
+  [command, e.h.options.stateDir, 'alpha', e.h.shimLog, join(e.h.options.stateDir, '.claude/projects'), ...args])
+
+test('receipts <count> prints transcript-receipts audit\'s recorded line, and exits pending (75) while that audit fails', async () => {
+  const e = await siteEvidence('test39')
+  await e.deliver()
+  await e.deliver()
+  const audit = (count: string) => runFixture('fixtures/transcript-receipts.ts',
+    ['audit', e.h.options.stateDir, 'alpha', e.h.shimLog, join(e.h.options.stateDir, '.claude/projects'), count])
+  const complete = await caseCli(e, 'receipts', '2')
+  expect(complete).toEqual({ code: 0, out: (await audit('2')).out, err: [] })
+  expect(JSON.parse(complete.out[0]!.replace(/^recorded: receipts /, ''))).toMatchObject({ items: 2, reminders: 0, transcripts: 1 })
+  // Any audit failure is pending, so the delivery wait re-polls it: here a
+  // count no accepted inputs match yet,
+  expect(await caseCli(e, 'receipts', '3')).toEqual({ code: 75, out: [],
+    err: ['real-case-assertions: receipts pending: Accepted item count differs'] })
+  // and a reminder accepted since, until it completes.
+  await siteReminder(e).inject()
+  expect(await caseCli(e, 'receipts', '2')).toEqual(casePending(e))
+  await siteReminder(e).settle()
+  const settled = await caseCli(e, 'receipts', '2')
+  expect(settled).toEqual({ code: 0, out: (await audit('2')).out, err: [] })
+  expect(settled.out[0]).toContain('"items":2,"reminders":1,')
+})
+
+// A bad count is the caller's error, so its verdict (1) precedes the audit and
+// is never re-polled, even while receipts are pending.
+test.each([[[]], [['0']]])('receipts with count %j fails (1) before its audit, never pending', async args => {
+  const e = await siteEvidence('test39')
+  await e.deliver()
+  await e.deliver()
+  await siteReminder(e).inject()
+  expect(await caseCli(e, 'receipts', ...args)).toEqual({ code: 1, out: [],
+    err: ['real-case-assertions: receipts needs a positive original count'] })
+})
+
+// Only the complete audit's failure is pending; the duplicate verdict (1) runs
+// only once that audit passes, so neither masks the other. A missing copy on
+// complete receipts is the ai106 tail's own-verdict slice above.
+test.each([
+  [true, false, { code: 0, out: [], err: [] }],
+  [true, true, 'pending'],
+  [false, true, 'pending'],
+] as const)('at-least-one-duplicate with a copy=%p and a pending reminder=%p', async (duplicate, pending, expected) => {
+  const e = await siteEvidence('ai106', { duplicate })
+  if (pending) await siteReminder(e).inject()
+  expect(await caseCli(e, 'at-least-one-duplicate') as unknown).toEqual(expected === 'pending' ? casePending(e) : expected)
+})
+
+/** AC106's first duplicate check, a wait_until before the counting query:
+ * the copy reaching the transcript is what it waits for. */
+const ac106CopyWait: RealSlice = { script: 'real-agent/ai-scenario.sh',
+  after: ['elif [[ "${AI_CRITERION}" == 106 ]]', '--text "${TYPED}" >/dev/null\n'], before: 'real_wait_idle "${REAL_KEY}"',
+  requires: ["wait_until 180 'second exact DM copy never reached transcript' case_assert at-least-one-duplicate"], preset: [], tools: [] }
+
+test.each([
+  ['pending receipts (75)', true, 'at-least-one-duplicate:75'],
+  ['an unobserved copy (1)', false, 'at-least-one-duplicate:1'],
+] as const)('AC106\'s copy wait_until still retries %s to success', async (_name, pending, first) => {
+  const e = await siteEvidence('ai106', { duplicate: pending })
+  if (pending) await siteReminder(e).inject()
+  const result = await runRealSlice(ac106CopyWait, e.h.options.stateDir, {
+    // At the first poll the reminder completes, or the typed copy arrives.
+    poll: async () => { if (pending) await siteReminder(e).settle(); else e.h.duplicate(e.items[0]!) },
+  })
+  expect(result).toMatchObject({ code: 0, signal: null, stderr: '', polls: 1, calls: [first, 'at-least-one-duplicate:0'] })
+})
+
+// The site slices drive each tail once; this keeps the three b.p9r tails in
+// their bound forms, so none regresses to a bare one-shot receipt audit.
+test('test39, test104 and AC106 audit receipts after their last delivery only inside a re-polled wait', () => {
+  const script = (name: string) => readFileSync(join(import.meta.dir, name), 'utf8').split('\n')
+  const test39 = script('integration/test-39-fmk-real-fidelity.sh'), test104 = script('real-agent/test-104-fmk-real-idle-compact.sh')
+  const ai = script('real-agent/ai-scenario.sh')
+  for (const lines of [test39, test104, ai]) expect(lines.filter(line => /\breal_assert_(?:delivery|no_retype)\b/.test(line))).toEqual([])
+  // test39: after its input loop, only the re-polled no-retype wait precedes the shape proof.
+  expect(test39.slice(test39.indexOf('done') + 1, test39.indexOf('case_assert fidelity-shapes')).filter(line => !line.startsWith('#')))
+    .toEqual(['real_wait_delivery "${REAL_KEY}" "${COUNT}" no-retype'])
+  expect(test104.filter(line => line.includes('real-case-assertions.ts" receipts'))).toEqual([
+    'real_wait_delivery "${REAL_KEY}" 3 -- bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" receipts "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" 3'])
+  expect(ai.filter(line => /\bcase_assert at-least-one-duplicate\b/.test(line)).map(line => line.trim())).toEqual([
+    "wait_until 180 'second exact DM copy never reached transcript' case_assert at-least-one-duplicate",
+    'real_wait_delivery "${REAL_KEY}" 2 -- case_assert at-least-one-duplicate'])
 })
 
 function rewriteRows(path: string, map: (row: any) => any) {

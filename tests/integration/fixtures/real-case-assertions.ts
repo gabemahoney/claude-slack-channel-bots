@@ -2,7 +2,7 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { GetResult } from 'agent-director'
-import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
+import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, receiptsRecord, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 /** Exit status for a case whose complete receipt audit does not pass yet; its
@@ -139,7 +139,7 @@ function firstWaiting(): LaunchObservation[] {
 }
 function blocks(e:any):any[] { return e.value?.type==='assistant'&&Array.isArray(e.value?.message?.content)?e.value.message.content:[] }
 async function entries() { return readTranscripts(transcriptFiles(root!), await packedReceiptAdapters()) }
-async function confirmReceipts() {
+async function confirmReceipts(expectedCount?: number) {
   const adapters = await packedReceiptAdapters(), transcripts = transcriptFiles(root!)
   // This read is newer than the caller's ready audit and can hold work
   // accepted since, such as a reply reminder still in flight. Nothing is
@@ -150,7 +150,7 @@ async function confirmReceipts() {
   // fault or bounded time window; checks that later evidence can only make
   // fail, never pass (such as unknown-proof's no read-pane after the fault),
   // stay unscoped.
-  try { auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts }, readTranscripts(transcripts, adapters), adapters) }
+  try { return { ...auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts, expectedCount }, readTranscripts(transcripts, adapters), adapters), transcripts: transcripts.length } }
   catch (error) { throw new ReceiptsPending('receipts pending: '+(error instanceof Error?error.message:'unknown')) }
 }
 try {
@@ -371,9 +371,14 @@ try {
     for(const w of wanted){const index=remaining.findIndex(p=>matches(p,w));check(index>=0,'reply destination/thread/text/count mismatch');remaining.splice(index,1)}
     const texts=wanted.flatMap((w:any)=>w.text?[w.text]:[])
     check(!remaining.some(p=>texts.includes(p.text)&&!wanted.some((w:any)=>matches(p,w))),'wrong-target reply')
+  } else if(command==='receipts') {
+    // transcript-receipts audit's check and recorded line, as a delivery
+    // wait's -- assertion: it exits 75 while receipts are pending.
+    const count=Number(arg);check(Number.isSafeInteger(count)&&count>0,'receipts needs a positive original count')
+    const result=await confirmReceipts(count)
+    console.log(receiptsRecord(result,result.transcripts))
   } else if(command==='at-least-one-duplicate') {
-    const adapters=await packedReceiptAdapters(), all=await entries(), transcripts=transcriptFiles(root!)
-    check(auditReceipts({stateDir:state!,key:key!,shimLog:shim!,transcripts},all,adapters).duplicates>=1,'intended duplicate was not observed')
+    check((await confirmReceipts()).duplicates>=1,'intended duplicate was not observed')
   } else if(command==='corpus-wrapper') {
     const corpus=JSON.parse(readFileSync(arg,'utf8')), j=cumulativeJournal()
     for(const [i,row] of corpus.entries()) {
@@ -589,12 +594,28 @@ try {
       writeReset(patch)
       expectControl('reset-spacing '+name,()=>invoke('reset-spacing','1'),reason)
     }
+    const expectPending=(name:string,...args:string[])=>{
+      const result=invoke(name,...args), error=Buffer.from(result.stderr).toString()
+      check(result.exitCode===RECEIPTS_PENDING_EXIT&&error.includes('receipts pending: '),`${name} pending receipts control failed: ${error}`)
+      console.log(`recorded: ${name} pending receipts exit `+RECEIPTS_PENDING_EXIT)
+    }
     // A valid reset whose item has not logged its delivery yet is pending, not failed.
     writeReset()
     writeFileSync(join(dir,'server.log'),readFileSync(join(dir,'server.log'),'utf8').split('\n').filter(l=>!l.includes('message-delivered:')).join('\n'))
-    const pending=invoke('reset-spacing','1'), pendingError=Buffer.from(pending.stderr).toString()
-    check(pending.exitCode===RECEIPTS_PENDING_EXIT&&pendingError.includes('receipts pending: '),`reset-spacing pending receipts control failed: ${pendingError}`)
-    console.log('recorded: reset-spacing pending receipts exit '+RECEIPTS_PENDING_EXIT)
+    expectPending('reset-spacing','1')
+    // Receipt-only tails: pending while an item lacks its delivery log; only
+    // the duplicate check has a verdict of its own once receipts pass.
+    write(records,[originalTakes[0]!,{...originalTakes[0]!,uuid:'duplicate',timestamp:new Date(4000).toISOString()},originalTakes[1]!])
+    expectControl('at-least-one-duplicate observed copy',()=>invoke('at-least-one-duplicate'))
+    expectControl('receipts exact original count',()=>invoke('receipts','2'))
+    expectControl('receipts without a count',()=>invoke('receipts'),'receipts needs a positive original count')
+    // The count reaches the audit: complete receipts for two originals stay pending for three.
+    expectPending('receipts','3')
+    write()
+    expectControl('at-least-one-duplicate without a copy',()=>invoke('at-least-one-duplicate'),'intended duplicate was not observed')
+    write(records,originalTakes,[2000,22000],originalLines.filter(l=>!l.includes('message-delivered')))
+    expectPending('at-least-one-duplicate')
+    expectPending('receipts','2')
 
     const checkpoint=join(dir,'active-tool.json'), base=Date.now()-3500
     let checkpointDelay=0
