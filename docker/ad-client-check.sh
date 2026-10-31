@@ -173,7 +173,7 @@ fi
 mkdir "${SCRATCH}/tarball"
 tar -xzf "${AD_TGZ}" -C "${SCRATCH}/tarball" --strip-components=1 --no-same-owner \
     || fail '3 (content)' "cannot unpack ${AD_TGZ}"
-DIFFS=$(diff -rq --no-dereference "${SCRATCH}/tarball" "${CLIENT_DIR}" || true)
+DIFFS=$(diff -rq --no-dereference --exclude=.bun-tag "${SCRATCH}/tarball" "${CLIENT_DIR}" || true)
 if [ -n "${DIFFS}" ]; then
     FIRST=$(printf '%s\n' "${DIFFS}" | head -n 1)
     FIRST=${FIRST//"${SCRATCH}/tarball"/<tarball>}

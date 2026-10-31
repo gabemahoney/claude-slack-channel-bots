@@ -981,7 +981,7 @@ global_install "${PACKAGE_TGZ}" || fail "step 7: the global install of ${PACKAGE
 [[ "$(jq -r '.version' "${CSCB_PKG_DIR}/package.json")" == "${STAGED_VERSION}" ]] \
     || fail "step 7: ${CSCB_PKG_DIR} is not the staged ${STAGED_VERSION}"
 # The version string alone may be the old package's too: the files are the staged build's.
-if ! diff -rq --exclude=node_modules "${STAGED_PKG}" "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/installed.diff" 2>&1; then
+if ! diff -rq --exclude=node_modules --exclude=.bun-tag "${STAGED_PKG}" "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/installed.diff" 2>&1; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/installed.diff" >&2
     fail "step 7: the package installed at ${CSCB_PKG_DIR} is not the staged build"
 fi
