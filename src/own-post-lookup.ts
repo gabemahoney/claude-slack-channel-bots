@@ -1,14 +1,16 @@
 /**
  * own-post-lookup.ts — Background lookups that settle the bot's own posts
- * whose outcomes are unknown. Page readers retain identifiers and digests
- * only; construction and imports perform no I/O and start no timers.
+ * whose outcomes are unknown, and the reads that learn a new-message upload's
+ * thread from P's own `file_share` message. Page readers retain identifiers
+ * and digests only; construction and imports perform no I/O and start no timers.
  *
  * SPDX-License-Identifier: MIT
  */
 import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS } from './delivery-constants.ts'
 import { armNeverEarlyWait, type NeverEarlyWaitClock } from './ad-settings.ts'
 import { isOwn, isThreadTimestamp } from './delivery-decision.ts'
-import { compareTs, type OwnPostTarget, type OwnPostJoins, type PendingOwnPost } from './own-post.ts'
+import { CHANNEL_ID_RE } from './config.ts'
+import { compareTs, isSlackFile, type OwnPostTarget, type OwnPostJoins, type PendingOwnPost } from './own-post.ts'
 import type { PersonaConnectionManager } from './persona-connections.ts'
 import type { ChannelStamp } from './shared-channels.ts'
 import { SLACK_ERROR_CODE_RE, type SlackBotIdentity } from './persona-slack-validation.ts'
@@ -16,8 +18,9 @@ import { ownPostDigest, createMetadataAttempts, classifyMetadataFailure, metadat
   type MetadataFailure, type MetadataResult, type ThreadMemory, type ThreadMemoryLookupMethod } from './thread-memory.ts'
 
 export const OWN_POST_LOOKUP_PAGE_LIMIT = 200
-export interface OwnPostLookupRange { oldest: string; latest: string }
-export interface OwnPostLookupMessage { ts: string; threadTs?: string; digests: readonly string[] }
+/** An upload-thread read's range has no `latest`: Slack may share the file after the completion. */
+export interface OwnPostLookupRange { oldest: string; latest?: string }
+export interface OwnPostLookupMessage { ts: string; threadTs?: string; digests: readonly string[]; fileIds: readonly string[] }
 export type OwnPostLookupPage =
   | { kind: 'page'; own: OwnPostLookupMessage[]; nextCursor?: string }
   | { kind: 'malformed' }
@@ -30,9 +33,9 @@ export type OwnPostLookupJudgement =
   | { kind: 'none'; holds: 'failed' | 'none' }
   | { kind: 'lost'; reason: 'several' | 'unmatched'; threads: string[]; holds: 'none' }
 
-export function ownPostLookupRange(issueTime: number, endReading: number): OwnPostLookupRange {
+export function ownPostLookupRange(issueTime: number, endReading?: number): OwnPostLookupRange {
   return { oldest: (Math.max(0, issueTime - OWN_ROOT_CLOCK_SKEW_MS) / 1000).toFixed(6),
-    latest: ((endReading + OWN_ROOT_CLOCK_SKEW_MS) / 1000).toFixed(6) }
+    ...(endReading === undefined ? {} : { latest: ((endReading + OWN_ROOT_CLOCK_SKEW_MS) / 1000).toFixed(6) }) }
 }
 export function ownPostLookupRequest(target: OwnPostTarget, range: OwnPostLookupRange, cursor?: string):
   { method: ThreadMemoryLookupMethod; args: Record<string, unknown> } {
@@ -44,6 +47,13 @@ export function ownPostLookupRequest(target: OwnPostTarget, range: OwnPostLookup
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
+/** The valid Slack file IDs of a message's `files`, without duplicates. File IDs are not content. */
+function fileIdsOf(files: unknown): string[] {
+  if (!Array.isArray(files)) return []
+  const ids = new Set<string>()
+  for (const file of files) if (isSlackFile(file)) ids.add(file.id)
+  return [...ids]
+}
 
 export function readOwnPostLookupPage(response: unknown, inputs: {
   target: OwnPostTarget; range: OwnPostLookupRange; identity: Pick<SlackBotIdentity, 'botUserId' | 'botId'>; digestKey: string
@@ -59,7 +69,7 @@ export function readOwnPostLookupPage(response: unknown, inputs: {
       typeof message.bot_id === 'string' ? message.bot_id : undefined, inputs.identity)) continue
     const ts = message.ts, threadTs = message.thread_ts
     if (!isThreadTimestamp(ts)) return { kind: 'malformed' }
-    if (compareTs(ts, inputs.range.oldest) < 0 || compareTs(ts, inputs.range.latest) > 0) continue
+    if (compareTs(ts, inputs.range.oldest) < 0 || (inputs.range.latest !== undefined && compareTs(ts, inputs.range.latest) > 0)) continue
     if (threadTs !== undefined && !isThreadTimestamp(threadTs)) return { kind: 'malformed' }
     if (inputs.target.parent !== undefined) {
       if (ts === inputs.target.parent || ts === threadTs) continue
@@ -71,9 +81,34 @@ export function readOwnPostLookupPage(response: unknown, inputs: {
         digests.push(ownPostDigest(inputs.digestKey, { kind: 'file', name: file.name, size: file.size }))
       }
     }
-    own.push({ ts, ...(threadTs === undefined ? {} : { threadTs }), digests })
+    own.push({ ts, ...(threadTs === undefined ? {} : { threadTs }), digests, fileIds: fileIdsOf(message.files) })
   }
   return { kind: 'page', own, ...(cursor ? { nextCursor: cursor } : {}) }
+}
+
+/** P's own new-message file share, read from one Events API `message` event. */
+export interface OwnUploadShare { channel: string; ts: string; fileIds: readonly string[] }
+/**
+ * P's own channel-level `file_share` (or plain) message naming at least one
+ * valid file ID. Edits, deletions, replies, other subtypes and other authors
+ * give `undefined`. Pure; never throws.
+ */
+export function ownUploadShare(event: unknown, identity: Pick<SlackBotIdentity, 'botUserId' | 'botId'>): OwnUploadShare | undefined {
+  try {
+    if (!object(event) || (event.subtype !== undefined && event.subtype !== 'file_share')) return undefined
+    const { channel, ts } = event, threadTs = event.thread_ts
+    if (typeof channel !== 'string' || !CHANNEL_ID_RE.test(channel) || !isThreadTimestamp(ts)) return undefined
+    if (threadTs !== undefined && threadTs !== ts) return undefined
+    if (!isOwn(typeof event.user === 'string' ? event.user : undefined, typeof event.bot_id === 'string' ? event.bot_id : undefined, identity)) return undefined
+    const fileIds = fileIdsOf(event.files)
+    return fileIds.length ? { channel, ts, fileIds } : undefined
+  } catch { return undefined }
+}
+/** The earliest counted message sharing `fileId`: the upload's own share is the file's first. Pure. */
+export function uploadShareTs(own: readonly Pick<OwnPostLookupMessage, 'ts' | 'fileIds'>[], fileId: string): string | undefined {
+  let earliest: string | undefined
+  for (const message of own) if (message.fileIds.includes(fileId) && (earliest === undefined || compareTs(message.ts, earliest) < 0)) earliest = message.ts
+  return earliest
 }
 
 export function classifyOwnPostLookupFailure(failure: MetadataFailure, hasParent: boolean): OwnPostLookupFailure {
@@ -120,7 +155,7 @@ export interface OwnPostLookupEvent {
 }
 
 export interface OwnPostLookupsDeps {
-  owner: Pick<OwnPostJoins, 'unknownOwnPosts' | 'recordLookup' | 'resolvedThreads' | 'subscribe'>
+  owner: Pick<OwnPostJoins, 'unknownOwnPosts' | 'awaitingUploads' | 'recordLookup' | 'learnUploadThread' | 'resolvedThreads' | 'subscribe'>
   memory: Pick<ThreadMemory, 'view' | 'store' | 'clock' | 'digestKey'>
   stamp(key: string, channel: string, stamp: ChannelStamp): 'current' | 'stale' | 'undecided'
   connections: Pick<PersonaConnectionManager, 'metadataCall' | 'identity'> & {
@@ -135,16 +170,26 @@ export interface OwnPostLookups {
    * or flushing. This starts no lookup and never reads back into the owner. */
   journalRead(key: string): void
   kick(key: string): void
+  /** P's own message Event on P's connection: learn an awaiting upload's thread
+   * from its `file_share`. Synchronous; reads and updates in-memory state and
+   * may start Thread Memory appends without awaiting them (Task rb Decision 3).
+   * It awaits nothing, never throws and calls no Slack method, because intake
+   * calls it before the ack. */
+  ownMessage(key: string, event: unknown, identity: Pick<SlackBotIdentity, 'botUserId' | 'botId'>): void
   forget(key: string): void
   stop(): void
 }
 type LookupAnswer = { kind: 'pages-complete' } | { kind: 'lost'; code: string; threads: string[] } | { kind: 'none'; holds: 'none' }
 interface LookupJob {
+  /** `lookup` settles an unknown post; `upload` learns an awaiting upload's thread. */
+  kind: 'lookup' | 'upload'
   post: PendingOwnPost
   range?: OwnPostLookupRange
   cursor?: string
   own: OwnPostLookupMessage[]
   failures: number
+  /** Complete upload reads that have not found the share yet; spaces the next read. */
+  misses: number
   retryAt?: { start: number; delay: number }
   answer?: LookupAnswer
   /** Cancellation waits for a subsequent kick, not an immediate busy loop. */
@@ -191,16 +236,22 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
     // An operation started under an undecided stamp may not be in the owner's
     // unknown list yet. Its first-read end still precedes that stamp decision.
     for (const id of state.waitingEnds) captureEnd(key, state, id, state.readEnd)
-    const listed = deps.owner.unknownOwnPosts(key)
-    const ids = new Set(listed.map(post => post.operationId))
+    const listed = deps.owner.unknownOwnPosts(key), uploads = deps.owner.awaitingUploads(key)
+    const ids = new Set([...listed, ...uploads].map(post => post.operationId))
     for (const id of state.jobs.keys()) if (!ids.has(id)) { state.jobs.delete(id); state.ends.delete(id); state.waitingEnds.delete(id) }
     for (const post of listed) {
       let job = state.jobs.get(post.operationId)
-      if (!job) { job = { post, own: [], failures: 0 }; state.jobs.set(post.operationId, job) }
+      if (job?.kind !== 'lookup') { job = { kind: 'lookup', post, own: [], failures: 0, misses: 0 }; state.jobs.set(post.operationId, job) }
       else job.post = post
       captureEnd(key, state, post.operationId, state.readEnd)
       const end = state.ends.get(post.operationId)
       if (!job.range && end !== undefined) job.range = ownPostLookupRange(post.issuedAt, end)
+    }
+    // SR-3.2.3 bounds the upload read only below, by the issue time.
+    for (const post of uploads) {
+      const job = state.jobs.get(post.operationId)
+      if (job?.kind === 'upload') job.post = post
+      else state.jobs.set(post.operationId, { kind: 'upload', post, range: ownPostLookupRange(post.issuedAt), own: [], failures: 0, misses: 0 })
     }
     const flight = state.inFlight
     const connectionId = deps.connections.currentConnectionId(key)
@@ -248,6 +299,7 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
   function finish(key: string, state: PersonaLookups, job: LookupJob): boolean {
     const status = stamp(key, job)
     if (status === 'undecided') return false
+    if (job.kind === 'upload' && status === 'current' && job.answer?.kind === 'pages-complete') return learnUpload(key, state, job)
     // Keep complete pages while undecided: Joined Thread and resolved-operation
     // exclusions must use the current stamp immediately before recording.
     const answer = status === 'stale' ? { kind: 'none' as const, holds: 'none' as const }
@@ -265,6 +317,18 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
     }
     return true
   }
+  /** A complete upload read under a current stamp: learn the share, or read again later from the first page. */
+  function learnUpload(key: string, state: PersonaLookups, job: LookupJob): boolean {
+    const id = job.post.operationId, ts = job.post.file === undefined ? undefined : uploadShareTs(job.own, job.post.file)
+    if (ts === undefined) {
+      job.own = []; job.cursor = undefined; job.answer = undefined
+      job.retryAt = { start: deps.clock.now(), delay: metadataRetryDelay(++job.misses) }
+      return false
+    }
+    if (deps.owner.awaitingUploads(key, job.post.channel).some(post => post.operationId === id)) deps.owner.learnUploadThread(key, id, ts)
+    state.jobs.delete(id)
+    return true
+  }
   function judge(key: string, job: LookupJob): OwnPostLookupJudgement {
     const roots = deps.owner.resolvedThreads(key, job.post.channel)
     return judgeOwnPostLookup({ digest: job.post.digest!, hasParent: job.post.root !== undefined, own: job.own,
@@ -272,7 +336,7 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
   }
   async function page(key: string, state: PersonaLookups, job: LookupJob, connectionId: string,
     identity: SlackBotIdentity, digestKey: string): Promise<void> {
-    const target = { channel: job.post.channel, parent: job.post.root }
+    const target: OwnPostTarget = job.kind === 'upload' ? { channel: job.post.channel } : { channel: job.post.channel, parent: job.post.root }
     const request = ownPostLookupRequest(target, job.range!, job.cursor)
     const kickNumber = state.kicks
     state.inFlight = { job, connectionId }
@@ -297,7 +361,11 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
       else {
         const read = readOwnPostLookupPage(result.value, { target, range: job.range!, identity, digestKey })
         if (read.kind === 'page') {
-          job.own.push(...read.own); job.cursor = read.nextCursor; job.failures = 0; job.retryAt = undefined
+          // An upload read keeps only each counted message's ts and file IDs.
+          job.own.push(...(job.kind === 'upload'
+            ? read.own.filter(message => message.fileIds.length).map(message => ({ ts: message.ts, digests: [], fileIds: message.fileIds }))
+            : read.own))
+          job.cursor = read.nextCursor; job.failures = 0; job.retryAt = undefined
           if (!read.nextCursor) job.answer = { kind: 'pages-complete' }
           return
         }
@@ -322,7 +390,7 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
         if (finish(key, state, job)) continue
         if (!current(key, state)) return
         if (stamp(key, job) !== 'current' || job.answer || job.waitingAt === state.kicks) continue
-        if (!readable(key) || !job.range || !job.post.digest) continue
+        if (!readable(key) || !job.range || (job.kind === 'lookup' && !job.post.digest)) continue
         if (job.retryAt) {
           const remaining = job.retryAt.delay - Math.max(0, deps.clock.now() - job.retryAt.start)
           if (remaining > 0) {
@@ -360,11 +428,28 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
     try { state?.cancelWait?.() } catch { /* a forgotten generation cannot act */ }
   }
   const unsubscribe = deps.owner.subscribe(event => {
-    if (stopped || event.type !== 'unknown') return
+    if (stopped || (event.type !== 'unknown' && event.type !== 'awaiting-thread')) return
     const state = stateFor(event.key)
-    try { captureEnd(event.key, state, event.operationId) } catch { /* retried by the kick */ }
+    if (event.type === 'unknown') try { captureEnd(event.key, state, event.operationId) } catch { /* retried by the kick */ }
     kick(event.key)
   })
+  function ownMessage(key: string, event: unknown, identity: Pick<SlackBotIdentity, 'botUserId' | 'botId'>): void {
+    const state = personas.get(key)
+    if (stopped || !state) return
+    const share = ownUploadShare(event, identity)
+    if (!share) return
+    let dropped = false
+    for (const post of deps.owner.awaitingUploads(key, share.channel)) {
+      if (post.file === undefined || !share.fileIds.includes(post.file)) continue
+      // A stale stamp is left to the job, which closes the upload at its next step.
+      if (post.stamp && deps.stamp(key, post.channel, post.stamp) === 'stale') continue
+      deps.owner.learnUploadThread(key, post.operationId, share.ts)
+      // An attempt in flight for it is not revoked here; its answer is ignored
+      // once the entry has left awaitingUploads.
+      if (state.jobs.delete(post.operationId)) dropped = true
+    }
+    if (dropped) schedule(key, state)
+  }
   return {
     journalRead(key) {
       if (stopped) return
@@ -375,6 +460,7 @@ export function createOwnPostLookups(deps: OwnPostLookupsDeps): OwnPostLookups {
       } catch { /* the later kick can recover an unavailable clock */ }
     },
     kick: key => { try { kick(key) } catch { /* no exception reaches a lifecycle caller */ } },
+    ownMessage: (key, event, identity) => { try { ownMessage(key, event, identity) } catch { /* the event is handled as before */ } },
     forget,
     stop() {
       if (stopped) return

@@ -106,6 +106,7 @@ import { deliveredRecord, heldSlackInput, memoryHold, makeQueue, queuePath, slac
 import { threadJoin, threadHeader, seedThreads, threadFsControls, threadSealFsControls, threadConfig, threadPath, THREAD_PERSONAS, THREAD_ROOTS, THREAD_CHANNELS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeOwnPostHarness } from './test-helpers/own-post.ts'
+import { makeOwnFileShare } from './test-helpers/slack-stub.ts'
 import { ownPostStampState } from '../src/own-post.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -580,6 +581,8 @@ const ROUTING_ROW_READ: keyof PersonaRoutingDeps = 'readRowLiveness'
 const ROUTING_LATCHED: keyof PersonaRoutingDeps = 'isLatched'
 /** The persona routing's `tmux-unresponsive` member; renaming it fails the typecheck. */
 const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
+/** The persona routing's own-message intake hook; renaming it fails the typecheck. */
+const ROUTING_OWN_MESSAGE: keyof PersonaRoutingDeps = 'onOwnMessage'
 
 /**
  * the module-scope holder through which the persona routing's
@@ -4419,7 +4422,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'threadMemory', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored',
+      'threadMemory', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5757,6 +5760,76 @@ describe('own-post lookup server wiring', () => {
       expect(h.owner.unknownOwnPosts(key)).toHaveLength(1)
       assertNoLeak([h.captured(), reports])
     } finally { lookups.stop(); await h.close(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('routing\'s one own-message hook calls the one runner\'s ownMessage at call time, and does nothing without a runner', () => {
+    type Hook = NonNullable<PersonaRoutingDeps['onOwnMessage']>
+    const binding = onlyCallProps('createPersonaRouting').get(ROUTING_OWN_MESSAGE)
+    // Synchronous and awaits nothing: intake calls it before the ack.
+    expect(binding).toBe('(key, event, identity) => ownPostLookups?.ownMessage(key, event, identity)')
+    expect(callsOf('ownPostLookups\\?\\.ownMessage')).toHaveLength(1)
+    // No second runner or owner, and server.ts subscribes to no owner itself.
+    expect(callsOf(factory)).toHaveLength(1)
+    expect(callsOf('createOwnPostJoins')).toHaveLength(1)
+    expect(indicesOf(/\bownPostJoins\b[!?]*\.subscribe\s*\(/g, SERVER_CODE)).toEqual([])
+    const hook = expression<() => { call: Hook; set(runner?: Pick<OwnPostLookupModule.OwnPostLookups, 'ownMessage'>): void }>(`() => {
+      let ownPostLookups;
+      return { call: ${binding}, set: value => { ownPostLookups = value } };
+    }`, {})()
+    const identity = { botUserId: 'U0WIRING', botId: 'B0WIRING' } as Parameters<Hook>[2]
+    const event = makeOwnFileShare({ identity, channel: 'C0WIRING', ts: '1.000001' })
+    // No runner, as in a dry run (the guard above): nothing happens.
+    expect(hook.call('alpha', event, identity)).toBeUndefined()
+    const calls: Parameters<Hook>[] = []
+    hook.set({ ownMessage: (...args) => { calls.push(args as Parameters<Hook>) } })
+    hook.call('alpha', event, identity)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]![0]).toBe('alpha'); expect(calls[0]![1]).toBe(event); expect(calls[0]![2]).toBe(identity)
+  })
+
+  test('the owner\'s awaiting-thread event kicks the same runner through its one owner subscription, on a microtask', async () => {
+    const lookupCode = stripComments(readFileSync(join(SRC_DIR, 'own-post-lookup.ts'), 'utf-8'))
+    expect(indicesOf(/\.subscribe\s*\(/g, lookupCode)).toHaveLength(1)
+    const root = mkdtempSync(join(tmpdir(), 'cscb-upload-wiring-')), h = await makeOwnPostHarness(root)
+    const awaited: string[] = [], reports: OwnPostLookupModule.OwnPostLookupEvent[] = []
+    let subscriptions = 0
+    const owner = { ...h.owner,
+      subscribe(listener: Parameters<typeof h.owner.subscribe>[0]) { subscriptions++; return h.owner.subscribe(listener) },
+      awaitingUploads(key: string, channel?: string) { awaited.push(key); return h.owner.awaitingUploads(key, channel) } }
+    const lookups = createOwnPostLookups(expression<OwnPostLookupModule.OwnPostLookupsDeps>(callArguments(SERVER_CODE, onlyCallOf(factory)), {
+      ownPostJoins: owner, threadMemory: h.memory, ownPostStampState,
+      connections: h.members.h.manager, threadMemoryWorkAllowed: () => true,
+      getAppliedPersona: h.sources.persona, isPersonaUp: () => false,
+      SYSTEM_PERSONA_CONNECTION_CLOCK: h.clock,
+      dispatchThreadMemoryReport: ({ event }: { event: OwnPostLookupModule.OwnPostLookupEvent }) => reports.push(event),
+    }))
+    const key = h.authority.config().personas[0]!.key
+    const channel = h.authority.threadView().threadHybridChannels(key)[0]!
+    let stopped = false
+    try {
+      expect(subscriptions).toBe(1)
+      const post = h.observer.start(key, 'file', { channel }, { kind: 'file', name: 'wiring-upload.txt', size: 12 })
+      expect(post).toBeDefined(); await post!.ready
+      await h.flush()
+      awaited.length = 0
+      h.observer.end(post!.operation, { kind: 'confirmed', channel, file: 'F0WIRING1' })
+      expect(h.events.filter(event => event.type === 'awaiting-thread')).toHaveLength(1)
+      expect(awaited).toEqual([])
+      await h.flush()
+      expect(awaited).toContain(key)
+      expect(h.owner.awaitingUploads(key)).toHaveLength(1)
+      // stop() removes that one subscription: a later upload kicks nothing.
+      lookups.stop(); stopped = true
+      const later = h.observer.start(key, 'file', { channel }, { kind: 'file', name: 'wiring-upload.txt', size: 12 })
+      expect(later).toBeDefined(); await later!.ready
+      awaited.length = 0
+      h.observer.end(later!.operation, { kind: 'confirmed', channel, file: 'F0WIRING2' })
+      await h.flush()
+      expect(awaited).toEqual([])
+      expect(h.members.h.stub(h.members.h.p(h.authority.config().personas[0]!.name)).web.callLog
+        .filter(call => call.method === 'conversations.history')).toEqual([])
+      assertNoLeak([h.captured(), reports])
+    } finally { if (!stopped) lookups.stop(); await h.close(); rmSync(root, { recursive: true, force: true }) }
   })
 })
 

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DELIVERY_MODES, type ChannelMode } from '../src/config.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
-import { completionFiles, createOwnPostJoins, createOwnPostObserver, fileShareRoot,
+import { completionFiles, createOwnPostJoins, createOwnPostObserver,
   ownPostAnswerOfError, ownPostAnswerOfPost, ownPostChoice, ownPostEligibility,
   type OwnPostAnswer, type OwnPostContent, type OwnPostEvent, type OwnPostOperation, type OwnPostOwner,
 } from '../src/own-post.ts'
@@ -235,6 +235,15 @@ async function savedOutcome(h: Fixture, id: string, expected: 'joined' | 'none',
   await h.flush()
   expect(h.records(key).filter(r => r.kind === 'post-outcome' && r.operationId === id)).toMatchObject([{ outcome: expected }])
   expect(h.memory.unresolvedIntents(key).some(r => r.operationId === id)).toBe(false)
+}
+
+const UPLOAD = 'F0UPLOAD1'
+/** A parentless upload confirmed by file ID alone: it awaits its own share's thread. */
+async function awaiting(h: Fixture, key = 'alpha', channel: string = C, file = UPLOAD) {
+  const post = h.begin(undefined, key, 'file', channel)
+  await post.ready
+  expect(h.observer.end(post.operation, { kind: 'confirmed', channel, file })).toBeUndefined()
+  return post
 }
 
 describe('own-post registration and outcomes', () => {
@@ -579,6 +588,66 @@ describe('lookup, upload, retention and persona scope', () => {
     expect(readFileSync(threadPath(h.dir))).toEqual(before.bytes)
   })
 
+  test.each([
+    ['not found, holds none', { notFound: true, holds: 'none' }, 'current', 'none'],
+    ['failed read, holds failed', { notFound: true, holds: 'failed' }, 'current', 'failed'],
+    ['stale stamp, holds none', { notFound: true, holds: 'failed' }, 'stale', 'none'],
+  ] as const)('a not-found lookup closes an awaiting upload, saving none (%s)', async (_label, result, transition, holds) => {
+    const h = await fixture(), post = await awaiting(h)
+    if (transition === 'stale') h.stale()
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    h.io.reset()
+    expect(h.owner.recordLookup('alpha', post.id, result)).toBeUndefined()
+    expect(h.io.calls).toEqual([])
+    const outcome = { kind: 'not-found' as const, joined: false }, lookup = { holds }
+    const decided: OwnPostEvent = { type: 'decided', key: 'alpha', channel: C, operationId: post.id, outcome, lookup }
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome, lookup })
+    expect(h.events.at(-1)).toEqual(decided)
+    expect(h.pending()).toEqual([]); expect(h.owner.awaitingUploads('alpha')).toEqual([])
+    // Closed: neither its share nor another lookup reopens it.
+    h.owner.learnUploadThread('alpha', post.id, ROOT)
+    h.owner.recordLookup('alpha', post.id, { notFound: true, holds: 'none' })
+    expect(h.events.filter(e => e.type === 'decided')).toEqual([decided])
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    expect(h.view()).toBe('not-joined')
+    await savedOutcome(h, post.id, 'none')
+    release(); expect(h.owner.operation('alpha', post.id)).toBeUndefined()
+  })
+
+  test('a found lookup leaves an awaiting upload open for its own share', async () => {
+    const h = await fixture(), post = await awaiting(h)
+    await h.flush()
+    const bytes = readFileSync(threadPath(h.dir)), events = h.events.slice()
+    for (const holds of ['thread', 'none'] as const) {
+      expect(h.owner.recordLookup('alpha', post.id, { found: { ts: ROOT2, threadTs: ROOT2 }, holds })).toBeUndefined()
+    }
+    await h.flush()
+    expect(h.events).toEqual(events)
+    expect(readFileSync(threadPath(h.dir))).toEqual(bytes)
+    expect(h.owner.awaitingUploads('alpha')).toMatchObject([{ operationId: post.id, state: 'awaiting-thread' }])
+    expect(h.owner.operation('alpha', post.id)).not.toHaveProperty('lookup')
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    expect(h.view(ROOT2)).toBe('not-joined')
+    h.owner.learnUploadThread('alpha', post.id, ROOT)
+    expect(h.view()).toBe('joined')
+    await savedOutcome(h, post.id, 'joined')
+  })
+
+  test('an upload started under an undecided stamp closes on not-found, then saves none once its stamp is decided', async () => {
+    const h = await fixture(); h.undecided()
+    const post = h.begin(undefined, 'alpha', 'file'); expect(post.ready).toBeUndefined()
+    h.observer.end(post.operation, { kind: 'confirmed', channel: C, file: UPLOAD })
+    expect(h.owner.awaitingUploads('alpha')).toMatchObject([{ operationId: post.id, state: 'awaiting-thread' }])
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    h.owner.recordLookup('alpha', post.id, { notFound: true, holds: 'none' })
+    expect(h.owner.awaitingUploads('alpha')).toEqual([])
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'deferred', outcome: { kind: 'not-found', joined: false }, lookup: { holds: 'none' } })
+    h.decideStamp(); h.owner.settleDeferred('alpha')
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome: { kind: 'not-found', joined: false } })
+    await savedOutcome(h, post.id, 'none')
+    release()
+  })
+
   test.each(['thread', 'none'] as const)('a current-stamp ineligible found keeps holds=%s and learns its thread without joining', async holds => {
     const h = await fixture()
     await h.scan('ineligible'); expect(h.choose('thread_hybrid').kind).toBe('applied')
@@ -661,10 +730,10 @@ describe('lookup, upload, retention and persona scope', () => {
     const h = await fixture(), post = h.begin(undefined, 'alpha', 'file')
     await post.ready
     const releaseA = h.owner.retainOutcomes('alpha', [post.id]), releaseB = h.owner.retainOutcomes('alpha', [post.id, post.id])
-    h.observer.end(post.operation, { kind: 'confirmed', channel: C, file: 'F0UPLOAD1' })
-    expect(h.owner.awaitingUploads('alpha', C)).toMatchObject([{ operationId: post.id, file: 'F0UPLOAD1', state: 'awaiting-thread' }])
-    h.owner.learnUploadThread('alpha', 'missing', ROOT)
-    h.owner.learnUploadThread('alpha', post.id, 'invalid')
+    h.observer.end(post.operation, { kind: 'confirmed', channel: C, file: UPLOAD })
+    const listed = { operationId: post.id, channel: C, file: UPLOAD, state: 'awaiting-thread' }
+    expect(h.owner.awaitingUploads('alpha')).toMatchObject([listed])
+    expect(h.owner.awaitingUploads('alpha', C)).toMatchObject([listed])
     expect(h.view()).toBe('not-joined')
     h.owner.learnUploadThread('alpha', post.id, ROOT)
     expect(h.view()).toBe('joined'); expect(h.owner.awaitingUploads('alpha', C)).toHaveLength(0)
@@ -672,6 +741,148 @@ describe('lookup, upload, retention and persona scope', () => {
     releaseA(); releaseA(); expect(h.owner.operation('alpha', post.id)).toBeDefined()
     releaseB(); expect(h.owner.operation('alpha', post.id)).toBeUndefined()
     await savedOutcome(h, post.id, 'joined')
+  })
+
+  test('a confirmed parentless upload is listed with what its read needs, stays pending and fires one awaiting-thread event', async () => {
+    const h = await fixture(), issuedAt = h.clock.now(), stamp = h.fact().stamp
+    const post = await awaiting(h)
+    const expected = { operationId: post.id, key: 'alpha', channel: C, issuedAt, stamp, file: UPLOAD, state: 'awaiting-thread' }
+    h.io.reset()
+    expect(h.owner.awaitingUploads('alpha')).toMatchObject([expected])
+    expect(h.owner.awaitingUploads('alpha', C)).toMatchObject([expected])
+    expect(h.owner.awaitingUploads('alpha', C2)).toEqual([])
+    expect(h.io.calls).toEqual([])
+    expect(h.pending()).toMatchObject([expected])
+    const events: OwnPostEvent[] = [{ type: 'registered', key: 'alpha', channel: C, operationId: post.id },
+      { type: 'awaiting-thread', key: 'alpha', channel: C, operationId: post.id }]
+    expect(h.events).toEqual(events)
+    // Neither a repeated end nor a settlement or read announces it again.
+    h.observer.end(post.operation, { kind: 'confirmed', channel: C, file: UPLOAD })
+    h.owner.settleDeferred('alpha'); h.owner.onSharedStatePublished('alpha'); await h.flush()
+    expect(h.events).toEqual(events)
+    expect(h.owner.awaitingUploads('alpha')).toMatchObject([expected])
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+    expect(h.records().filter(r => r.kind === 'post-outcome')).toEqual([])
+    // The upload's content name is the sentinel: no listing, event or journal carries it.
+    assertNoLeak({ events: h.events, awaiting: h.owner.awaitingUploads('alpha'), journal: writtenFile(threadPath(h.dir)) })
+  })
+
+  test('without a channel every channel\'s awaiting uploads come back in issue order, and never another key\'s', async () => {
+    const h = await fixture({ names: ['alpha', 'beta'] })
+    const specs = [['alpha', C2], ['beta', C], ['alpha', C], ['alpha', C2]] as const, posts: ReturnType<Fixture['begin']>[] = []
+    for (const [key, channel] of specs) { posts.push(h.begin(undefined, key, 'file', channel)); await h.clock.advance(10) }
+    await Promise.all(posts.map(post => post.ready))
+    // Completions arrive in the reverse order of issue.
+    for (let i = posts.length - 1; i >= 0; i--) h.observer.end(posts[i]!.operation, { kind: 'confirmed', channel: specs[i]![1], file: `F0UPLOAD${i}` })
+    const listed = (key: string, channel?: string) => h.owner.awaitingUploads(key, channel).map(p => [p.operationId, p.key, p.channel, p.file])
+    const row = (i: number) => [posts[i]!.id, specs[i]![0], specs[i]![1], `F0UPLOAD${i}`]
+    expect(listed('alpha')).toEqual([row(0), row(2), row(3)])
+    expect(listed('alpha', C2)).toEqual([row(0), row(3)])
+    expect(listed('alpha', C)).toEqual([row(2)])
+    expect(listed('beta')).toEqual([row(1)])
+    expect(listed('missing')).toEqual([])
+    const issued = h.owner.awaitingUploads('alpha').map(p => p.issuedAt)
+    expect(issued).toEqual([...issued].sort((a, b) => a - b))
+    expect(h.events.filter(e => e.type === 'awaiting-thread').map(e => [e.operationId, e.key, e.channel]))
+      .toEqual([3, 2, 1, 0].map(i => row(i).slice(0, 3)))
+  })
+
+  test('a parent-bound upload confirms through its parent and never awaits its thread', async () => {
+    const h = await fixture()
+    await h.queue.accept('alpha', slackInput({ channel: C, ts: REPLY, key: { chat_id: C, ts: REPLY }, thread_ts: ROOT }))
+    for (const [parent, root] of [[ROOT2, ROOT2], [REPLY, ROOT]] as const) {
+      const post = h.begin(parent, 'alpha', 'file'); await post.ready
+      h.observer.end(post.operation, { kind: 'confirmed', channel: C, file: UPLOAD })
+      expect(h.owner.awaitingUploads('alpha')).toEqual([])
+      expect(h.view(root)).toBe('joined')
+      await savedOutcome(h, post.id, 'joined')
+    }
+    expect(h.events.filter(e => e.type === 'awaiting-thread')).toEqual([])
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT, ROOT2]))
+  })
+
+  test.each(['join', 'stale', 'ineligible', 'unresolved', 'undecided'] as const)('learning an awaiting upload\'s thread decides it once: %s', async kind => {
+    const h = await fixture()
+    if (kind === 'ineligible') { await h.scan('ineligible'); expect(h.choose('thread_hybrid').kind).toBe('applied') }
+    const post = await awaiting(h)
+    if (kind === 'stale') h.stale()
+    if (kind === 'unresolved') await h.scan('unresolved')
+    if (kind === 'undecided') h.undecided()
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    const slack = h.members.h.stub(h.members.h.p('alpha')).web, calls = slack.callLog.slice()
+    h.io.reset()
+    expect(h.owner.learnUploadThread('alpha', post.id, ROOT)).toBeUndefined()
+    expect(h.io.calls).toEqual([])
+    expect(slack.callLog).toEqual(calls)
+    const deferred = kind === 'unresolved' || kind === 'undecided'
+    const decided: OwnPostEvent = { type: 'decided', key: 'alpha', channel: C, operationId: post.id,
+      outcome: { kind: 'confirmed', thread: ROOT, joined: kind === 'join' } }
+    expect(h.events.at(-1)).toEqual(decided)
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: deferred ? 'deferred' : 'decided', outcome: decided.outcome })
+    expect(h.owner.awaitingUploads('alpha')).toEqual([])
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
+    expect(h.view() === 'joined').toBe(kind === 'join')
+    if (deferred) {
+      if (kind === 'unresolved') await h.scan('eligible')
+      else h.decideStamp()
+      h.owner.settleDeferred('alpha', C)
+    }
+    const joined = kind === 'join' || deferred
+    expect(h.view()).toBe(joined ? 'joined' : 'not-joined')
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome: { thread: ROOT, joined } })
+    // A second learning, of the same or another thread, changes nothing.
+    for (const thread of [ROOT, ROOT2]) h.owner.learnUploadThread('alpha', post.id, thread)
+    expect(h.view(ROOT2)).toBe('not-joined')
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
+    expect(h.events.filter(e => e.type === 'decided')).toEqual([decided])
+    await savedOutcome(h, post.id, joined ? 'joined' : 'none')
+    release()
+    await h.close()
+    const reopened = await fixture({ reopen: h.dir })
+    expect(reopened.view()).toBe(joined ? 'joined' : 'not-joined')
+    expect(reopened.owner.unknownOwnPosts('alpha')).toEqual([])
+    expect(reopened.owner.awaitingUploads('alpha')).toEqual([])
+  })
+
+  test('learning a thread changes nothing for a missing, unanswered, text, forgotten or invalid target', async () => {
+    const h = await fixture(), unanswered = h.begin(undefined, 'alpha', 'file'), text = h.begin()
+    await Promise.all([unanswered.ready, text.ready]); h.observer.end(text.operation, NO_ANSWER)
+    const open = await awaiting(h)
+    await h.flush()
+    const bytes = readFileSync(threadPath(h.dir)), events = h.events.slice()
+    const unchanged = async () => {
+      await h.flush()
+      expect(h.events).toEqual(events)
+      expect(readFileSync(threadPath(h.dir))).toEqual(bytes)
+      expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
+      expect(h.view()).toBe('not-joined')
+    }
+    for (const [key, id, thread] of [['alpha', 'missing', ROOT], ['alpha', unanswered.id, ROOT], ['alpha', text.id, ROOT],
+      ['alpha', open.id, 'invalid'], ['nobody', open.id, ROOT]] as const) {
+      expect(h.owner.learnUploadThread(key, id, thread)).toBeUndefined()
+    }
+    await unchanged()
+    expect(h.owner.operation('alpha', unanswered.id)).toMatchObject({ state: 'awaiting-answer' })
+    expect(h.owner.operation('alpha', text.id)).toMatchObject({ state: 'unknown' })
+    expect(h.owner.awaitingUploads('alpha')).toMatchObject([{ operationId: open.id }])
+    h.owner.forget('alpha')
+    expect(h.owner.awaitingUploads('alpha')).toEqual([])
+    h.owner.learnUploadThread('alpha', open.id, ROOT)
+    await unchanged()
+  })
+
+  test('a learnt upload thread whose outcome append fails still joins in memory and decides', async () => {
+    const h = await fixture(), post = await awaiting(h)
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    h.io.fail('writeSync')
+    expect(h.owner.learnUploadThread('alpha', post.id, ROOT)).toBeUndefined()
+    await h.flush()
+    expect(h.view()).toBe('joined')
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome: { kind: 'confirmed', thread: ROOT, joined: true } })
+    expect(h.owner.awaitingUploads('alpha')).toEqual([])
+    expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
+    expect(h.records().filter(r => r.kind === 'post-outcome')).toEqual([])
+    release()
   })
 
   test.each([true, false])('memoryOnlyJoins distinguishes deferred confirmations with saved intent=%s and excludes stale ones', async saved => {
@@ -761,29 +972,43 @@ describe('lookup, upload, retention and persona scope', () => {
 })
 
 describe('upload completions', () => {
-  const F = 'F0UPLOAD1'
-  const file = (shares: Array<{ ts: string; thread_ts?: string }>, channel: string = C, visibility: 'public' | 'private' = 'public') =>
-    ({ id: F, created: 1_700_000_000, shares: { [visibility]: { [channel]: shares } } })
+  const F = 'F0UPLOAD1', F2 = 'F0UPLOAD2'
+  /** A `files.completeUploadExternal` answer from the shared stub; result overrides its fields. */
+  async function completion(result: Record<string, unknown>): Promise<unknown> {
+    const slack = makeStubSlack()
+    slack.script.completeUpload.push({ kind: 'ok', result })
+    return slack.web.files.completeUploadExternal({ files: [{ id: F }], channel_id: C })
+  }
+  const shares = { public: { [C]: [{ ts: ROOT }] }, private: { [C2]: [{ ts: ROOT2 }] } }
 
-  test('a new upload root is its file\'s earliest share in the exact channel; IDs, creation times, other channels and re-shares name nothing', () => {
-    expect(fileShareRoot(file([{ ts: ROOT2 }, { ts: ROOT }]), C)).toEqual({ kind: 'root', root: ROOT })
-    expect(fileShareRoot(file([{ ts: ROOT }], C, 'private'), C)).toEqual({ kind: 'root', root: ROOT })
-    expect(fileShareRoot(file([{ ts: ROOT }], C2), C)).toEqual({ kind: 'unresolved', reason: 'no-share' })
-    expect(fileShareRoot(file([{ ts: ROOT2, thread_ts: ROOT }]), C)).toEqual({ kind: 'unresolved', reason: 'ambiguous' })
-    expect(fileShareRoot({ id: F, created: 1_700_000_000, timestamp: 1_700_000_000 }, C)).toEqual({ kind: 'unresolved', reason: 'no-share' })
-    expect(fileShareRoot({ id: F, shares: { public: { [C]: 'not-a-list' } } }, C)).toEqual({ kind: 'unresolved', reason: 'malformed' })
-    expect(completionFiles({ ok: true, files: [file([{ ts: ROOT }]), { id: 'not-a-file-id' }] }, C)).toEqual([{ id: F, root: ROOT }])
-    // A parent upload needs no share; an aggregate that is not ok confirms nothing.
-    expect(completionFiles({ ok: true, files: [file([{ ts: ROOT }])] }, C, ROOT2)).toEqual([{ id: F }])
-    expect(completionFiles({ ok: false, files: [file([{ ts: ROOT }])] }, C)).toEqual([])
-    expect(completionFiles({ ok: true, files: [{ id: F, created: 1_700_000_000 }] }, C)).toEqual([{ id: F }])
+  test.each([
+    ['valid IDs, in response order', { files: [{ id: F2 }, { id: F }] }, [{ id: F2 }, { id: F }]],
+    ['invalid and non-string IDs dropped', { files: [{ id: 'not-a-file-id' }, { id: 42 }, null, F2, { name: F2 }, { id: F }] }, [{ id: F }]],
+    ['shares naming a root ignored', { files: [{ id: F, shares }, { id: F2, shares: 'not-an-object' }] }, [{ id: F }, { id: F2 }]],
+    ['ok: false', { ok: false, error: 'invalid_file' }, []],
+    ['no files', { files: undefined }, []],
+    ['files not a list', { files: { id: F } }, []],
+  ] as const)('a completion confirms only by file ID: %s', async (_label, result, expected) => {
+    expect(completionFiles(await completion(result))).toEqual([...expected])
   })
 
-  test('a completion carrying the sentinel in its other fields gives back only file IDs and roots', () => {
-    const response = { ok: true, warning: LEAK_SENTINEL, response_metadata: { messages: [sentinelInMessage('completion')] },
-      files: [{ ...file([{ ts: ROOT, text: LEAK_SENTINEL } as { ts: string }]), name: LEAK_SENTINEL, url_private: sentinelInMessage('file') }] }
-    const read = { files: completionFiles(response, C), root: fileShareRoot(response.files[0], C) }
-    expect(read).toEqual({ files: [{ id: F, root: ROOT }], root: { kind: 'root', root: ROOT } })
+  test.each([undefined, null, 'ok', [{ id: F }]])('a non-object answer %p confirms nothing', answer => {
+    expect(completionFiles(answer)).toEqual([])
+  })
+
+  test('share data is never read, so a completion with shares confirms what one without them does', async () => {
+    let reads = 0
+    const shared = { id: F, get shares() { reads++; return shares } }
+    const withShares = completionFiles(await completion({ files: [shared] }))
+    expect(withShares).toEqual(completionFiles(await completion({})))
+    expect(withShares).toEqual([{ id: F }])
+    expect(reads).toBe(0)
+  })
+
+  test('a completion carrying the sentinel in its other fields gives back only file IDs', async () => {
+    const read = completionFiles(await completion({ warning: LEAK_SENTINEL, response_metadata: { messages: [sentinelInMessage('completion')] },
+      files: [{ id: F, name: LEAK_SENTINEL, title: LEAK_SENTINEL, url_private: sentinelInMessage('file'), shares }] }))
+    expect(read).toEqual([{ id: F }])
     assertNoLeak(read)
   })
 })

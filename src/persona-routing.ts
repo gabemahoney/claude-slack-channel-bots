@@ -15,6 +15,7 @@ import type { PersonaEventProvenance } from './persona-connections.ts'
 import {
   decideDelivery,
   channelDeliveryFor,
+  isOwn,
   isThreadTimestamp,
   type DeliveryDecision,
   type DropDecision,
@@ -118,6 +119,15 @@ export interface PersonaRoutingDeps {
   onHoldStored?(key: string): void | Promise<unknown>
   /** Fire-and-forget archive, before the decision, with no pre-ack await. */
   archive(key: string, event: unknown): void
+  /**
+   * P's own message on P's connection, with the identity the decision uses.
+   * Called synchronously inside intake, once per recipient and event, before
+   * the decision; it reads and updates in-memory state and may start Thread
+   * Memory appends without awaiting them (Task rb Decision 3). It awaits
+   * nothing, calls no Slack method, and its throw is ignored. The decision
+   * still drops the event as P's own.
+   */
+  onOwnMessage?(key: string, event: Record<string, unknown>, identity: SlackBotIdentity): void
   /** Writes one log line. */
   log(line: string): void
   /** Intake clock in epoch milliseconds. */
@@ -298,6 +308,10 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
     return persona ? renderPersonaRef(persona.name, persona.key) : `key=${key}`
   }
+  /** The identity the decision uses for a key: the provenance's when it is that key's, else the current one. */
+  function identityFor(key: string, provenance: PersonaEventProvenance | undefined): SlackBotIdentity | undefined {
+    return provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
+  }
 
   async function receive(
     event: unknown,
@@ -320,6 +334,12 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         try { deps.archive(key, event) } catch (err) {
           deps.log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
         }
+        // One entry for both intake paths, outside the serial decision callback.
+        try {
+          const ev = event as Record<string, unknown>, identity = identityFor(key, provenance)
+          if (deps.onOwnMessage && identity && isOwn(typeof ev['user'] === 'string' ? ev['user'] : undefined,
+            typeof ev['bot_id'] === 'string' ? ev['bot_id'] : undefined, identity)) deps.onOwnMessage(key, ev, identity)
+        } catch { /* the event is handled as before */ }
         try {
           const ev = event as Record<string, unknown>
           const config = deps.getPersonaConfig()
@@ -373,7 +393,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           }
           if (!config || !persona) return
           if (slackKey && deps.threadStampUndecided?.(key, slackKey.chat_id) !== true) deps.threadStampEpisodes?.end(key, slackKey.chat_id)
-          const identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
+          const identity = identityFor(key, provenance)
           const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel, slackKey?.chat_id))
           if (decision.action === 'unresolved') {
             if (decision.reason === 'thread-stamp-undecided' && slackKey && deps.threadStampEpisodes?.begin(key, slackKey.chat_id)) {
@@ -442,7 +462,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   ): SerialSelection {
     const config = deps.getPersonaConfig(), persona = config?.personas.find(p => p.key === key)
     if (!config || !persona) return {}
-    const mode = channelModeOf(config), identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
+    const mode = channelModeOf(config), identity = identityFor(key, provenance)
     const inputs = fungibleInputs(config, mode, extShared, slackKey?.chat_id)
     const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, inputs)
     const selection: SerialSelection = { persona, decision, stampDecided: !!slackKey && deps.threadStampUndecided?.(key, slackKey.chat_id) !== true }

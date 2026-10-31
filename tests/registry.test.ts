@@ -125,12 +125,16 @@ import { holdOwnPostReady, makeRecordingOwnPostObserver, makeOwnPostHarness, typ
 import { threadFsControls, threadPath } from './test-helpers/thread-memory.ts'
 import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
 import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
+import { metadataRetryDelay } from '../src/thread-memory.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS } from '../src/delivery-constants.ts'
 import {
   asWebClient,
   slackAbortError,
   makeDeferredWebApiCall,
+  makeOwnFileShare,
   makePagedThread,
   makeStubSlack,
+  slackFileId,
   slackPlatformError,
   openedDm,
   stubOpenedDmId,
@@ -139,6 +143,7 @@ import {
   type StubSlackScript,
   type StubWebCall,
   type StubWebMethod,
+  type PagedMessageSpec,
   type WebApiOutcome,
   type SettledWebApiOutcome,
 } from './test-helpers/slack-stub.ts'
@@ -2879,12 +2884,13 @@ function fileEndAnswers(recording: OwnPostRecording) {
   return recording.calls.filter(c => c.kind === 'end' && operations.includes(c.operation)).map(c => c.kind === 'end' && c.answer)
 }
 
+/** A `files.completeUploadExternal` answer for `id`, shared as a new root at `share` when given. */
+const completion = (id: string, channel = A_ALL, share?: string): SettledWebApiOutcome =>
+  ({ kind: 'ok', result: { files: [{ id, ...(share ? { shares: { public: { [channel]: [{ ts: share }] } } } : {}) }] } })
+
 describe('reply files: nested upload completions observed on the real client', () => {
   const TEXT_TS = '1700000000.000300'
   const SHARE_TS = '1700000000.000301'
-  /** A `files.completeUploadExternal` answer for `id`, shared as a new root at `share` when given. */
-  const completion = (id: string, channel = A_ALL, share?: string): SettledWebApiOutcome =>
-    ({ kind: 'ok', result: { files: [{ id, ...(share ? { shares: { public: { [channel]: [{ ts: share }] } } } : {}) }] } })
 
   /** The session deps with `ownPosts`, each persona's client handed out as the connection manager does: observed on the raw client, then wrapped by the auth watch. */
   function observedDeps(ownPosts: OwnPostObserver, observed = true): SessionToolDeps {
@@ -3328,7 +3334,33 @@ describe('reply joins through real Thread Memory', () => {
   const outcomes = (owner: OwnPostHarness, key = 'alpha') => owner.records(key).filter(record => record.kind === 'post-outcome')
   async function finish(owner: OwnPostHarness) {
     try { assertNoLeak({ results: h.results, lines: h.lines, owner: owner.captured() }) } finally { await owner.close() }
+    expect(owner.clock.pendingCount()).toBe(0)
   }
+
+  // Uploads as new channel messages: the server's lookup runner over the same owner.
+  const FILE = slackFileId(1), SHARE = '1700000100.000004', LATER = '1700000100.000005'
+  const lookupOptions = { ...options, lookups: true }
+  const historyCalls = (stub: StubSlack) => stub.callLog.filter(call => call.method === 'conversations.history')
+  /** Each confirmed decision's thread and join, in order: the text's, then the upload's. */
+  const confirmations = (owner: OwnPostHarness) => owner.events.filter(e => e.type === 'decided' && e.outcome?.kind === 'confirmed')
+    .map(e => [e.outcome!.thread, e.outcome!.joined])
+  /** P's own share of FILE at `ts` in `channel`, with the sentinel in its file name and text. */
+  const ownShare = (stub: StubSlack, ts: string, channel = A_ALL) =>
+    makeOwnFileShare({ identity: stub.identity, channel, ts, fileIds: [FILE], name: `${LEAK_SENTINEL}.txt`, text: LEAK_SENTINEL })
+  /** A_ALL's history: the reply's text at ROOT, then P's own share of FILE at each of `shares`. */
+  function history(stub: StubSlack, ...shares: string[]) {
+    stub.responders.history = makePagedThread(1 + shares.length, { rootTs: ROOT, channel: A_ALL, identity: stub.identity,
+      message: (i): PagedMessageSpec => i === 0 ? { ts: ROOT, author: 'own-user', placement: 'channel', text: LEAK_SENTINEL, file: false }
+        : { ts: shares[i - 1], author: 'own-user', placement: 'channel', fileIds: [FILE], file: { name: `${LEAK_SENTINEL}.txt`, size: LEAK_SENTINEL.length } },
+    }).respondHistory
+  }
+  /** The observer, delivering P's own share Event the moment an upload confirms, before the runner's next turn. */
+  const shareAtCompletion = (owner: OwnPostHarness, stub: StubSlack): OwnPostObserver => ({ start: owner.observer.start,
+    end(operation, answer) {
+      owner.observer.end(operation, answer)
+      if (answer.kind === 'confirmed' && answer.file) owner.lookups!.ownMessage('alpha', ownShare(stub, SHARE))
+    } })
+  const sent = (files: number, ts: string) => ({ content: [{ type: 'text', text: `Sent 1 message(s) + ${files} file(s) to ${A_ALL} [ts: ${ts}]` }] })
 
   test('three top-level chunks join three roots in memory and on reopen; each has its own saved intent and outcome', async () => {
     let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
@@ -3399,6 +3431,71 @@ describe('reply joins through real Thread Memory', () => {
     } finally { await finish(owner) }
   })
 
+  test.each(['Event', 'history'] as const)('a new-message upload joins its own share\'s ts once, learnt by %s, never a completion share\'s root', async source => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      const stub = owner.members.h.stub(owner.members.h.p('alpha'))
+      const { session } = await openOwner(owner, 'alpha', source === 'Event' ? { ownPosts: shareAtCompletion(owner, stub) } : {})
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
+      stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
+      history(stub) // no share yet
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result).toEqual(sent(1, ROOT))
+      if (source === 'history') {
+        // A complete read without the share learns nothing; the next read, once the share is listed, does.
+        await replyReached(() => historyCalls(stub).length === 1)
+        await owner.flush()
+        expect(owner.view('alpha', A_ALL, SHARE)).toBe('not-joined')
+        expect(owner.owner.awaitingUploads('alpha', A_ALL)).toMatchObject([{ file: FILE }])
+        history(stub, SHARE)
+        await owner.clock.advance(metadataRetryDelay(1))
+      }
+      await owner.flush()
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      expect(confirmations(owner)).toEqual([[ROOT, true], [SHARE, true]])
+      for (const ts of [ROOT, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('joined')
+      for (const ts of [OTHER, LATER]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
+      // A later share Event, and later time, change nothing.
+      owner.lookups!.ownMessage('alpha', ownShare(stub, LATER))
+      await owner.clock.advance(metadataRetryDelay(2))
+      await owner.flush()
+      expect(historyCalls(stub)).toHaveLength(source === 'Event' ? 0 : 2)
+      expect(confirmations(owner)).toEqual([[ROOT, true], [SHARE, true]])
+      expect(owner.view('alpha', A_ALL, LATER)).toBe('not-joined')
+      expect(stub.calls.postMessage).toHaveLength(1)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined', 'joined'])
+      expect(owner.memory.unresolvedIntents('alpha')).toEqual([])
+      owner = await owner.reopen()
+      for (const ts of [ROOT, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT, SHARE])
+    } finally { await finish(owner) }
+  })
+
+  test('a parent-bound upload joins its parent\'s Thread Root and reads no history, even when completion shares name another root', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      await owner.storeSlack('alpha', { channel: A_ALL, ts: PARENT, key: { chat_id: A_ALL, ts: PARENT }, thread_ts: ROOT })
+      const { session, stub } = await openOwner(owner)
+      // The text has no answer, so the file, rather than the text, establishes the join.
+      stub.script.post.push({ kind: 'ok', result: { ts: undefined } })
+      stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
+      history(stub, SHARE) // even a listed share of the file is never read
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, thread_ts: PARENT, files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result.isError).toBeUndefined()
+      await owner.clock.advance(metadataRetryDelay(2))
+      await owner.flush()
+      expect(historyCalls(stub)).toEqual([])
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      expect(confirmations(owner)).toEqual([[ROOT, true]])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      for (const ts of [PARENT, OTHER, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
+    } finally { await finish(owner) }
+  })
+
   test('a refused later chunk records none and leaves earlier roots joined after reopening', async () => {
     let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
     try {
@@ -3419,10 +3516,10 @@ describe('reply joins through real Thread Memory', () => {
     } finally { await finish(owner) }
   })
 
-  test.each(['off', 'DM', 'dry-run', 'edit_message', 'fetch_messages'] as const)('%s registers no own post and writes no Thread Memory records', async action => {
+  test.each(['off', 'DM', 'dry-run', 'edit_message', 'fetch_messages'] as const)('%s registers no own post, reads no upload thread and writes no Thread Memory records', async action => {
     const owner = await makeOwnPostHarness(join(h.dir, 'owner'), {
       membership: { mode: 'open', channels: [{ id: A_ALL, delivery: 'off' }] },
-      memory: { dryRun: action === 'dry-run' },
+      memory: { dryRun: action === 'dry-run' }, lookups: true,
     })
     try {
       // Activating thread_hybrid may create its header; the tool must write nothing thereafter.
@@ -3438,17 +3535,28 @@ describe('reply joins through real Thread Memory', () => {
       if (action === 'dry-run') process.env['SLACK_DRY_RUN'] = '1'
       const target = action === 'DM' ? 'D0DIRECT1' : A_ALL
       const tool = action === 'edit_message' || action === 'fetch_messages' ? action : 'reply'
-      const result = await session.call(tool, TOOL_ARGS[tool](target))
+      const posts = action === 'off' || action === 'DM'
+      if (posts) stub.script.completeUpload.push(completion(FILE, target))
+      // A dry run builds no lookup runner, as the server does.
+      expect(owner.lookups === undefined).toBe(action === 'dry-run')
+      const args = tool === 'reply' ? { ...TOOL_ARGS.reply(target), files: [replyFile('one.txt', LEAK_SENTINEL)] } : TOOL_ARGS[tool](target)
+      const result = await session.call(tool, args)
       expect(result.isError).toBeUndefined()
-      expect(recording.calls).toHaveLength(action === 'off' || action === 'DM' ? 1 : 0)
-      expect(stub.calls.postMessage).toHaveLength(action === 'off' || action === 'DM' ? 1 : 0)
+      expect(recording.calls).toHaveLength(posts ? 2 : 0)
+      expect(stub.calls.postMessage).toHaveLength(posts ? 1 : 0)
+      expect(stub.calls.filesUploadV2).toHaveLength(posts ? 1 : 0)
+      // P's own share of the upload resolves nothing here either.
+      if (posts) owner.lookups!.ownMessage('alpha', ownShare(stub, SHARE, target))
+      await owner.clock.advance(metadataRetryDelay(1))
+      expect(historyCalls(stub)).toHaveLength(tool === 'fetch_messages' ? 1 : 0)
       expect(registrations(owner)).toEqual([])
       expect(owner.read.pendingOwnPosts('alpha', target)).toEqual([])
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
       await owner.flush()
       expect(owner.records()).toEqual(before)
       expect(owner.io.writes()).toEqual([])
       if (before.length === 0) expect(existsSync(threadPath(owner.stateDir))).toBe(false)
-      expect(owner.view('alpha', A_ALL, ROOT)).not.toBe('joined')
+      for (const ts of [ROOT, SHARE]) expect(owner.view('alpha', target, ts)).not.toBe('joined')
     } finally { await finish(owner) }
   })
 
@@ -3517,6 +3625,40 @@ describe('reply joins through real Thread Memory', () => {
       expect(h.lines).toHaveLength(1)
       expect(h.lines[0]).toContain('sent=1/3 uploaded=0/1:')
       expect(h.lines[0]).toContain('not_in_channel')
+    } finally { await finish(owner) }
+  })
+
+  test.each(['hung', 'failing', 'appends failing'] as const)('upload read %s: every part posts once; the result, partial-failure text and ack cleanup are unchanged', async fault => {
+    const owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      const { session, stub } = await openOwner(owner)
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
+      stub.script.completeUpload.push(completion(FILE), { kind: 'platform', error: 'file_upload_failed' })
+      if (fault === 'hung') stub.script.history.push({ kind: 'never' })
+      else if (fault === 'failing') stub.script.history.push({ kind: 'platform', error: 'channel_not_found' })
+      else { history(stub, SHARE); owner.io.fail('writeSync') }
+      await captureReplyAck(stub, 'alpha')
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile('one.txt', LEAK_SENTINEL), replyFile('two.txt')], message_id: MSG_TS })
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: ROOT, uploaded: 1, files: 2 }, 'file_upload_failed'))
+      // Past a hung attempt's deadline and its retry.
+      await owner.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + metadataRetryDelay(1))
+      await owner.flush()
+      expect(stub.calls.postMessage).toHaveLength(1)
+      expect(stub.calls.filesUploadV2).toHaveLength(2)
+      expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+      expect(h.lines).toHaveLength(1)
+      expect(h.lines[0]).toContain('sent=1/1 uploaded=1/2:')
+      expect(h.lines[0]).toContain('file_upload_failed')
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(historyCalls(stub)).toHaveLength(fault === 'hung' ? 2 : 1)
+      expect(owner.owner.awaitingUploads('alpha')).toHaveLength(fault === 'hung' ? 1 : 0)
+      expect(owner.view('alpha', A_ALL, SHARE)).toBe(fault === 'appends failing' ? 'joined' : 'not-joined')
+      expect(owner.lookups!.events).toMatchObject(fault === 'failing' ? [{ kind: 'joins-lost', key: 'alpha', channel: A_ALL, threads: [] }] : [])
+      if (fault === 'appends failing') {
+        expect(owner.threads.events.some(e => e.type === 'append-failed')).toBe(true)
+        expect(confirmations(owner)).toEqual([[ROOT, true], [SHARE, true]])
+      }
     } finally { await finish(owner) }
   })
 })

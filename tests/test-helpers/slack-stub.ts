@@ -231,6 +231,9 @@ export interface PagedMessageSpec {
   threadTs?: string
   text?: string
   file?: { name: string; size: number } | false
+  /** The message shares these file IDs, in order, instead of its default `F0THREAD<i>`; each
+   * takes `file`'s name and size. One ID on two messages is one file shared twice. */
+  fileIds?: readonly string[]
   invalidTimestamp?: 'absent' | 'invalid'
 }
 export type PagedPageDamage = 'messages-absent' | 'messages-object' | 'cursor-number' | 'metadata-array' | 'not-ok'
@@ -279,8 +282,8 @@ function buildPagedThread(count: number, options: PagedThreadOptions) {
       text: spec.text ?? `thread message ${i}`,
       ...(spec.placement === 'channel' ? {} : { thread_ts: spec.threadTs ?? (spec.placement === 'root' ? ts : rootTs) }),
       ...(spec.placement === 'broadcast' ? { subtype: 'thread_broadcast' } : {}),
-      files: spec.file === false ? [] : [{ id: `F0THREAD${i}`, name: spec.file ? spec.file.name : `file-${i}.txt`,
-        mimetype: 'text/plain', size: spec.file ? spec.file.size : i + 1 }],
+      files: spec.file === false ? [] : (spec.fileIds ?? [`F0THREAD${i}`]).map(id => ({ id,
+        name: spec.file ? spec.file.name : `file-${i}.txt`, mimetype: 'text/plain', size: spec.file ? spec.file.size : i + 1 })),
     }
   })
   type PageArgs = Parameters<WebClient['conversations']['history']>[0] | Parameters<WebClient['conversations']['replies']>[0]
@@ -1985,6 +1988,58 @@ export function makeWebhookPost(overrides: EventOverrides = {}): SlackEvent {
     },
     overrides,
   )
+}
+
+/** A valid Slack file ID (`F` then upper-case letters or digits), distinct for each `n`. */
+export function slackFileId(n: number): string {
+  return `F0FILE${String(n).padStart(4, '0')}`
+}
+
+/**
+ * Shapes of `makeOwnFileShare`. `own` is the share that counts: P's channel-level
+ * message sharing the files. Every other shape must not count, and keeps the
+ * rest of the share, so only the named difference refuses it:
+ * `reply` (a `thread_ts` before its `ts`), `changed` (`message_changed`, the
+ * share also nested under `message`), `deleted` (`message_deleted`),
+ * `other-user` / `other-bot` (another author), `no-files`, `malformed-id`
+ * (a string that is no Slack file ID) and `non-string-id` (a numeric ID).
+ */
+export type OwnFileShareShape =
+  | 'own' | 'reply' | 'changed' | 'deleted' | 'other-user' | 'other-bot' | 'no-files' | 'malformed-id' | 'non-string-id'
+export interface OwnFileShareOptions {
+  /** The persona whose own share this is (`StubSlack['identity']` fits). */
+  identity: { botUserId: string; botId: string }
+  channel?: string
+  ts?: string
+  /** Default `[slackFileId(1)]`. */
+  fileIds?: readonly string[]
+  /** `user`: by bot user ID (the default); `bot`: by bot ID alone; `both`. */
+  author?: 'user' | 'bot' | 'both'
+  /** `file_share` (the default) or no `subtype`. */
+  subtype?: 'file_share' | 'absent'
+  shape?: OwnFileShareShape
+  /** Each file's name (default `upload.txt`) and the message text (default empty). */
+  name?: string
+  text?: string
+}
+
+/** A persona's own new-message file share, as the Events API delivers it on P's connection. */
+export function makeOwnFileShare(options: OwnFileShareOptions, overrides: EventOverrides = {}): SlackEvent {
+  const shape = options.shape ?? 'own', author = options.author ?? 'user'
+  const ts = typeof overrides.ts === 'string' ? overrides.ts : options.ts ?? randomTs()
+  const ids: readonly unknown[] = shape === 'no-files' ? [] : shape === 'malformed-id' ? ['f0-not-an-id']
+    : shape === 'non-string-id' ? [7] : options.fileIds ?? [slackFileId(1)]
+  const files = ids.map(id => ({ id, name: options.name ?? 'upload.txt', mimetype: 'text/plain', size: 1 }))
+  const by = shape === 'other-user' ? { user: 'U0OTHERUSR' }
+    : shape === 'other-bot' ? { user: 'U0OTHERBOT', bot_id: 'B0OTHERBOT' }
+    : { ...(author === 'bot' ? {} : { user: options.identity.botUserId }), ...(author === 'user' ? {} : { bot_id: options.identity.botId }) }
+  const share = { type: 'message', channel: options.channel ?? DEFAULT_CHANNEL, channel_type: 'channel',
+    ...(options.subtype === 'absent' ? {} : { subtype: 'file_share' }), ...by, team: DEFAULT_TEAM,
+    text: options.text ?? '', files, upload: false }
+  const subtype = shape === 'changed' ? { subtype: 'message_changed', message: { ...share, ts }, hidden: true }
+    : shape === 'deleted' ? { subtype: 'message_deleted', deleted_ts: ts, hidden: true } : {}
+  const thread = shape === 'reply' ? { thread_ts: (Number(ts) - 1).toFixed(6) } : {}
+  return makeEvent({ ...share, ...subtype, ...thread }, { ts, ...overrides })
 }
 
 /**

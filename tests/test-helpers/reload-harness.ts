@@ -17,6 +17,7 @@ import { createSharedStateReporting } from '../../src/shared-state-reports.ts'
 import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
 import { createOwnPostJoins, createOwnPostObserver, ownPostChoice, ownPostEligibility, ownPostStampState, type OwnPostJoins, type OwnPostEvent } from '../../src/own-post.ts'
 import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from '../../src/own-post-lookup.ts'
+import { assertSendable as libAssertSendable } from '../../src/lib.ts'
 import { threadJoin } from './thread-memory.ts'
 
 import {
@@ -976,6 +977,9 @@ export interface ReloadRunOptions {
     stopSequence?: (key: string) => Promise<void>
     beforeRelease?: (key: string) => Promise<void>
   }
+  /** Let `reply` send files from `<root>/inbox` through the production guard,
+   * bound as server.ts binds it; without this every file is refused. */
+  uploads?: boolean
   /** Observe the first admission boundary, before any start bring-up. */
   beforeStartBringUp?: (run: ReloadRun) => void | Promise<void>
   /** Actual MCP callbacks, held independently of the reload transaction. */
@@ -2303,6 +2307,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       ...(threadMemory === undefined ? {} : {
         onReceived: (key: string, item: QueueItem, mode?: MemoryHoldMode) => reporting!.received(key, item, mode),
         onHoldStored: (key: string) => !stopped && getAppliedPersona(key) ? memoryHolds!.resolve(key, 'live') : Promise.resolve(),
+        // As server.ts binds it: no runner in a dry run, so the hook does nothing.
+        onOwnMessage: (...args: Parameters<OwnPostLookups['ownMessage']>) => ownPostLookups?.ownMessage(...args),
       }),
       archive: () => undefined,
       log,
@@ -3225,6 +3231,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const toolDeps: SessionToolDeps = {
       ownPosts,
       assertSendable: (path) => {
+        if (runOpts.uploads) return libAssertSendable(path, stateDir, join(root, 'inbox'), controller?.protectedCredentialsFiles() ?? [])
         throw new Error(`reload-harness: no file may be sent (${JSON.stringify(path)})`)
       },
       getReplySettings,

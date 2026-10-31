@@ -1261,6 +1261,8 @@ const personaRouting = createPersonaRouting({
   },
   onHoldStored: key => resolveMemoryHolds(key),
   archive: (key, event) => archiveWrite?.(key, event),
+  // No runner in a dry run: the hook does nothing.
+  onOwnMessage: (key, event, identity) => ownPostLookups?.ownMessage(key, event, identity),
   log: (line) => console.error(line),
   // beside the stored choices and their
   // readability, read at each fungible-mode event through the holder main()

@@ -55,7 +55,7 @@ import { KILL_OUTCOME_KILLED } from '../../src/checked-kill.ts'
 import { _resetBackoffState, isAtCap, recordFailure } from '../../src/backoff.ts'
 import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../../src/conflict-latch.ts'
 import { createPersonaUpPredicate } from '../../src/persona-start.ts'
-import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
+import type { PersonaConnectionStatus, PersonaEventProvenance } from '../../src/persona-connections.ts'
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import {
   archiveSlackMessage,
@@ -566,6 +566,8 @@ export interface RoutingHarnessOptions {
   /** Queue I/O and event seams; all paths remain under baseDir. */
   queueOptions?: Pick<DeliveryQueueOptions, 'fs' | 'onEvent'>
   onReceived?: PersonaRoutingDeps['onReceived']
+  /** Passed to the routing unchanged. Absent, as by default: no own-message hook. */
+  onOwnMessage?: PersonaRoutingDeps['onOwnMessage']
   /**
    * Load the stored-choice store the routing reads (`h.channelDelivery`
    * ) over the caller's state directory (see
@@ -702,13 +704,15 @@ export interface RoutingHarness {
    * Feed one event to the named personas (default: all), with a recording ack
    * unless `ack` is given, and the envelope flag an envelope with `envelope`
    * overrides carries (`envelopeFlagOf`, default `false`; one
-   * of `ENVELOPE_FLAG_FORMS` for each form).
+   * of `ENVELOPE_FLAG_FORMS` for each form), and `provenance` passed to
+   * routing unchanged (default none).
    */
   receive(
     event: unknown,
     names?: readonly string[],
     ack?: () => Promise<void> | void,
     envelope?: EnvelopeOverrides,
+    provenance?: PersonaEventProvenance,
   ): Promise<void>
   /** Feed one event to raw persona keys, with a recording ack and the envelope flag as `receive` gives it. */
   receiveKeys(event: unknown, keys: readonly string[], envelope?: EnvelopeOverrides): Promise<void>
@@ -981,11 +985,12 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: async (event, names, ack, envelope) => { await h.ready(); return routing.receive(
+    receive: async (event, names, ack, envelope, provenance) => { await h.ready(); return routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
       envelopeFlagOf(envelope),
+      provenance,
     ) },
     receiveKeys: async (event, keys, envelope) => { await h.ready(); return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
     setMode: (mode) => {
@@ -1118,6 +1123,7 @@ export function makeRoutingHarness(
       return opts.threadMemory?.onHoldStored?.(key)
     },
     onReceived: opts.onReceived,
+    onOwnMessage: opts.onOwnMessage,
     queue,
     prepare: opts.threadMemory === undefined ? preparation.prepare : (key, item) => {
       h.preparationCalls.push({ key, seq: item.accepted.seq })

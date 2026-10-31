@@ -1,16 +1,19 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
-import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
 import { THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { OWN_POST_UPLOAD_FILENAME } from '../src/registry.ts'
 import { buildThreadMemoryJoinsLostLine, buildThreadMemoryJoinsLostNotice } from '../src/thread-memory-reports.ts'
 import { assertNoLeak, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
 import { queuePath } from './test-helpers/delivery-queue.ts'
 import { holdOwnPostReady } from './test-helpers/own-post.ts'
 import { makeReloadHarness, TEMPLATE_REFRESH_KEY, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
-import { makeChannelMessage, makeDeferredWebApiCall, makePagedThread, mentionText, stubOpenedDmId, type PagedMessageSpec, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeChannelMessage, makeDeferredWebApiCall, makeOwnFileShare, makePagedThread, mentionText, slackFileId, stubOpenedDmId, type PagedMessageSpec, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { readThreads, threadFsControls, threadPath, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 
 const channel = SHARED_CHANNEL_IDS.primary
@@ -483,9 +486,14 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     expect(lookups(run)).toHaveLength(1); expect(run.slackPosts()).toHaveLength(posts); expectLoss(run)
   })
 
-  test('dry run writes no Thread Memory journal and performs no lookup', async () => {
+  test('dry run writes no Thread Memory journal and performs no lookup, even for a file reply', async () => {
     setup(mode)
-    const run = await start({ dryRun: true })
+    const run = await start({ dryRun: true, uploads: true })
+    run.registerSession('alpha')
+    const result = await run.callTool('alpha', 'reply', { chat_id: channel, text: body, files: [uploadFile()] })
+    await flush(run)
+    expect(result).toEqual({ isError: false, text: `[dry-run] Would send message to ${channel}` })
+    expect(errors.map(args => args.join(' '))).toContain(`[slack] dry-run: reply to ${channel} (${body.length} chars)`)
     expect(existsSync(threadPath(h.stateDir))).toBe(false)
     expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
     expect(Object.values(run.slackCalls()).flat()).toHaveLength(0)
@@ -506,5 +514,245 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     await dry.stop()
     expect(readFileSync(threadPath(h.stateDir))).toEqual(bytes)
     expectLoss(dry)
+  })
+})
+
+// A file uploaded as a new channel message starts its own thread at P's own
+// share message, learnt from P's Event or a history read (SR-3.2.3).
+const share = '20.000001'
+const fileId = slackFileId(1)
+// The caller's file sits under the harness root the leak check scans, so only the reply text carries the sentinel.
+const uploadBody = 'upload body'
+function uploadFile() {
+  const dir = join(h.root, 'inbox')
+  mkdirSync(dir, { recursive: true })
+  const path = join(dir, 'upload.txt')
+  writeFileSync(path, uploadBody)
+  return path
+}
+/** A reply with one file; Slack's completion names `fileId`, or `completion` answers instead. */
+function upload(run: ReloadRun, completion?: WebApiOutcome, key = 'alpha') {
+  run.stub(key).script.completeUpload.push(completion ?? { kind: 'ok', result: { files: [{ id: fileId }] } })
+  return run.callTool(key, 'reply', { chat_id: channel, text: body, files: [uploadFile()] })
+}
+function uploads(run: ReloadRun, key = 'alpha') { return run.stub(key).calls.filesUploadV2 }
+function histories(run: ReloadRun, key = 'alpha') { return run.stub(key).calls.conversationsHistory }
+/** P's share in the history, or only another user's message when `found` is false. */
+function sharePages(found: boolean, extra: { outcomes?: Record<number, WebApiOutcome[]>; key?: string } = {}) {
+  return makePagedThread(1, { channel, identity: extra.key === 'bravo' ? siblingIdentity : identity, pageOutcomes: extra.outcomes,
+    message: (): PagedMessageSpec => found
+      ? { author: 'own-user', placement: 'channel', ts: share, text: '', file: { name: OWN_POST_UPLOAD_FILENAME, size: Buffer.byteLength(uploadBody) }, fileIds: [fileId] }
+      : { author: 'other-user', placement: 'channel', ts: share, text: 'unrelated', file: false } })
+}
+function shareEvent(run: ReloadRun, key = 'alpha') {
+  return makeOwnFileShare({ identity: run.stub(key).identity, channel, ts: share, fileIds: [fileId] })
+}
+/** Today's handling of P's own message: one ack, the `own` drop line and nothing queued. */
+async function deliverOwnShare(run: ReloadRun, key = 'alpha') {
+  const event = shareEvent(run, key), acks = run.stub(key).socket.acks.length, cp = run.checkpoint(), queued = run.queued(key).length
+  await run.deliver(key, event); await run.clock.flush()
+  const persona = run.serverConfig()!.personas.find(p => p.key === key)!
+  expect(run.stub(key).socket.acks).toHaveLength(acks + 1)
+  expect(run.since(cp).logs).toEqual([`[slack] RAW message event persona=${key}: ${JSON.stringify(event)}`,
+    `[slack] persona ${renderPersonaRef(persona.name, persona.key)} dropped message from channel=${channel} user=${run.stub(key).identity.botUserId}: own`])
+  expect(run.queued(key)).toHaveLength(queued)
+}
+function uploadJoins(key = 'alpha') { return joins(key).filter(j => j.source === 'own-post' && j.root === share) }
+/** The upload's outcomes: its intent follows the reply text's, which a restart may compact away. */
+function uploadOutcomes(key = 'alpha') {
+  const intent = intents(key).at(-1)
+  return intent ? outcomes(key).filter(o => o.operationId === intent.operationId) : []
+}
+async function uploadStart(extra: ReloadRunOptions = {}) { return start({ ...extra, uploads: true }) }
+
+describe.each(['strict', 'open'] as const)('%s upload threads', mode => {
+  test('an Event after the completion joins the share without a further read', async () => {
+    setup(mode)
+    const run = await uploadStart(), late = makeDeferredWebApiCall()
+    releases.push(() => { if (!late.settled) late.settle() })
+    withPages(run, sharePages(true, { outcomes: { 0: [late.outcome] } }))
+    expect((await upload(run)).isError).toBe(false)
+    await run.clock.flush()
+    expect(uploads(run)).toHaveLength(1); expect(posted(run)).toHaveLength(1)
+    // The completion's own kick has started a read, which is still unanswered.
+    expect(histories(run)).toHaveLength(1)
+    expect(view(run, share)).toBe('not-joined')
+    expect(run.ownPostJoins!.awaitingUploads('alpha').map(p => p.file)).toEqual([fileId])
+    await deliverOwnShare(run)
+    expect(view(run, share)).toBe('joined')
+    expect(run.ownPostJoins!.awaitingUploads('alpha')).toEqual([])
+    const next = await intake(run, share)
+    const cp = run.checkpoint(), elsewhere = await intake(run, THREAD_ROOTS.third)
+    expectDeliveries(run, [[next, 'thread']])
+    expect(run.since(cp).logs).toEqual([`[slack] RAW message event persona=alpha: ${JSON.stringify(elsewhere)}`,
+      `[slack] persona "alpha" (key=alpha) dropped message from channel=${channel} user=${elsewhere.user}: not-mentioned`])
+    await flush(run)
+    expect(uploadJoins()).toHaveLength(1); expect(uploadOutcomes().map(o => o.outcome)).toEqual(['joined'])
+    // Neither the Event nor the abandoned attempt reads again, and its late answer records nothing.
+    await run.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS)
+    const bytes = readFileSync(threadPath(h.stateDir))
+    late.settle(); await flush(run)
+    expect(readFileSync(threadPath(h.stateDir))).toEqual(bytes)
+    expect(histories(run)).toHaveLength(1); expect(lookups(run)).toHaveLength(1)
+    expectLoss(run)
+  })
+
+  test.each(['first', 'never'] as const)('an Event that comes %s leaves the share to one history read', async event => {
+    setup(mode)
+    const run = await uploadStart(), completion = makeDeferredWebApiCall()
+    releases.push(() => { if (!completion.settled) completion.settle() })
+    withPages(run, sharePages(true))
+    const result = upload(run, completion.outcome)
+    await run.clock.flush()
+    expect(run.stub('alpha').calls.completeUploadExternal).toHaveLength(1)
+    if (event === 'first') await deliverOwnShare(run)
+    expect(histories(run)).toHaveLength(0); expect(view(run, share)).toBe('not-joined')
+    completion.settle({ kind: 'ok', result: { files: [{ id: fileId }] } })
+    expect((await result).isError).toBe(false)
+    await flush(run)
+    expect(histories(run)).toHaveLength(1)
+    expect(histories(run)[0]).not.toHaveProperty('latest')
+    expect(view(run, share)).toBe('joined')
+    expect(uploadJoins()).toHaveLength(1); expect(uploadOutcomes().map(o => o.outcome)).toEqual(['joined'])
+    const next = await intake(run, share)
+    expectDeliveries(run, [[next, 'thread']])
+    await run.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS)
+    expect(histories(run)).toHaveLength(1); expect(uploads(run)).toHaveLength(1)
+    expectLoss(run)
+  })
+
+  test('crash while the upload awaits its thread: the restart lookup joins the share once', async () => {
+    setup(mode)
+    const first = await uploadStart()
+    withPages(first, sharePages(false))
+    expect((await upload(first)).isError).toBe(false)
+    await flush(first)
+    // Read once without the share; the next read waits for its spacing.
+    expect(histories(first)).toHaveLength(1)
+    expect(first.ownPostJoins!.awaitingUploads('alpha').map(p => p.file)).toEqual([fileId])
+    expect(uploadOutcomes()).toEqual([]); expect(view(first, share)).toBe('not-joined')
+    await crash(first)
+    const history = sharePages(true)
+    const recovered = await uploadStart({ slack: { alpha: { historyResponder: history.respondHistory } } })
+    await flush(recovered)
+    expect(view(recovered, share)).toBe('joined')
+    expect(uploadOutcomes().map(o => o.outcome)).toEqual(['joined']); expect(uploadJoins()).toHaveLength(1)
+    // di's digest lookup, bounded above by the read end.
+    expect(histories(recovered)).toHaveLength(1); expect(histories(recovered)[0]).toHaveProperty('latest')
+    expect(uploads(first)).toHaveLength(1); expect(uploads(recovered)).toHaveLength(0)
+    expect(posted(first)).toHaveLength(1); expect(posted(recovered)).toHaveLength(0)
+    const next = await intake(recovered, share)
+    expectDeliveries(recovered, [[next, 'thread']])
+    expectLoss(recovered)
+    await recovered.stop()
+    const again = await uploadStart()
+    expect(view(again, share)).toBe('joined'); expect(histories(again)).toHaveLength(0)
+    // The settled intent may be compacted; nothing is left to look up again.
+    expect(again.ownPostJoins!.unknownOwnPosts('alpha')).toEqual([]); expect(uploadJoins()).toHaveLength(1)
+    expectLoss(again)
+  })
+
+  test('a hung upload read holds up no delivery, reply or other persona', async () => {
+    setup(mode)
+    const run = await uploadStart(), late = makeDeferredWebApiCall()
+    releases.push(() => { if (!late.settled) late.settle() })
+    withPages(run, sharePages(true, { outcomes: { 0: [late.outcome] } }))
+    expect((await upload(run)).isError).toBe(false)
+    await run.clock.flush()
+    expect(histories(run)).toHaveLength(1)
+    const began = run.clock.now()
+    const mention = await intake(run, THREAD_ROOTS.third, true)
+    const next = await intake(run, THREAD_ROOTS.third)
+    run.stub('alpha').script.post.push({ kind: 'ok', result: { ts: '1700000000.002000' } })
+    expect((await reply(run, THREAD_ROOTS.third)).isError).toBe(false)
+    const siblingMention = await intake(run, THREAD_ROOTS.third, true, 'bravo')
+    const sibling = await intake(run, THREAD_ROOTS.third, false, 'bravo')
+    expectDeliveries(run, [[mention, 'mention'], [next, 'thread']], [[siblingMention, 'mention'], [sibling, 'thread']])
+    expect(run.clock.now()).toBe(began)
+    expect(histories(run)).toHaveLength(1); expect(view(run, share)).toBe('not-joined')
+    // The attempt's deadline ends it; the next read finds the share.
+    await run.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MIN_MS)
+    await flush(run)
+    expect(histories(run)).toHaveLength(2); expect(view(run, share)).toBe('joined')
+    const bytes = readFileSync(threadPath(h.stateDir))
+    late.settle(); await flush(run)
+    expect(readFileSync(threadPath(h.stateDir))).toEqual(bytes)
+    const reply2 = await intake(run, share)
+    expectDeliveries(run, [[mention, 'mention'], [next, 'thread'], [reply2, 'thread']], [[siblingMention, 'mention'], [sibling, 'thread']])
+    expect(uploadJoins()).toHaveLength(1); expectLoss(run)
+  })
+
+  test('teardown and bring-up cancel a hung upload read and settle it once from the journal', async () => {
+    setup(mode)
+    const run = await uploadStart(), late = makeDeferredWebApiCall()
+    releases.push(() => { if (!late.settled) late.settle() })
+    withPages(run, sharePages(true, { outcomes: { 0: [late.outcome] } }))
+    expect((await upload(run)).isError).toBe(false)
+    await run.clock.flush()
+    const persona = run.serverConfig()!.personas[0]!
+    await run.composition!.lifecycle.teardown(persona)
+    expect(histories(run)).toHaveLength(1); expect(uploadOutcomes()).toEqual([])
+    run.stub('alpha').script.inventory.push(membershipPage([channel]))
+    await run.composition!.lifecycle.bringUp(persona, run.serverConfig()!)
+    await run.membershipClock.runNext(); await flush(run)
+    expect(view(run, share)).toBe('joined')
+    expect(histories(run)).toHaveLength(2); expect(histories(run)[1]).toHaveProperty('latest')
+    expect(uploadOutcomes().map(o => o.outcome)).toEqual(['joined'])
+    late.settle(); await flush(run)
+    await run.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS)
+    expect(histories(run)).toHaveLength(2); expect(uploadOutcomes()).toHaveLength(1); expect(uploadJoins()).toHaveLength(1)
+    expect(uploads(run)).toHaveLength(1); expectLoss(run)
+    run.registerSession('alpha')
+    const next = await intake(run, share)
+    expectDeliveries(run, [[next, 'thread']])
+  })
+
+  test('removal cancels a hung upload read: nothing is read, recorded or recreated for the removed persona', async () => {
+    setup(mode)
+    const run = await uploadStart(), late = makeDeferredWebApiCall()
+    releases.push(() => { if (!late.settled) late.settle() })
+    withPages(run, sharePages(true, { outcomes: { 0: [late.outcome] } }))
+    expect((await upload(run)).isError).toBe(false)
+    await run.clock.flush()
+    expect(histories(run)).toHaveLength(1)
+    const began = run.clock.now()
+    h.writeConfig({ channel_mode: mode, personas: [personas[1]!] })
+    await run.ticks.tick()
+    h.confirm(); await run.ticks.tick(); await run.clock.flush()
+    expect(run.appliedKeys()).toEqual(['bravo'])
+    expect(run.clock.now()).toBe(began)
+    expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    expect(run.ownPostJoins!.awaitingUploads('alpha')).toEqual([])
+    const calls = run.stub('alpha').callLog.length
+    late.settle(); await run.clock.flush()
+    await run.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS)
+    expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    expect(run.stub('alpha').callLog).toHaveLength(calls); expect(histories(run)).toHaveLength(1)
+    expect(run.ownPostLookupEvents).toEqual([]); expect(run.ownPostJoins!.awaitingUploads('alpha')).toEqual([])
+    const sibling = await intake(run, THREAD_ROOTS.third, true, 'bravo')
+    expectDeliveries(run, [], [[sibling, 'mention']])
+    expectLoss(run)
+  })
+
+  test.each(['hung', 'spaced after a miss'] as const)('shutdown completes with an upload read %s and leaves no timer or late append', async read => {
+    setup(mode)
+    const run = await uploadStart(), late = makeDeferredWebApiCall()
+    releases.push(() => { if (!late.settled) late.settle() })
+    withPages(run, read === 'hung' ? sharePages(true, { outcomes: { 0: [late.outcome] } }) : sharePages(false))
+    if (read !== 'hung') late.settle()
+    expect((await upload(run)).isError).toBe(false)
+    await flush(run)
+    expect(histories(run)).toHaveLength(1)
+    // A miss leaves the next read's spacing timer pending.
+    if (read !== 'hung') expect(run.clock.pendingCount()).toBeGreaterThan(0)
+    const began = run.clock.now()
+    await run.stop()
+    expect(run.clock.now()).toBe(began); expect(run.clock.pendingCount()).toBe(0)
+    const bytes = readFileSync(threadPath(h.stateDir)), posts = run.slackPosts().length
+    if (!late.settled) late.settle()
+    await run.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + THREAD_MEMORY_RETRY_MAX_MS)
+    expect(readFileSync(threadPath(h.stateDir))).toEqual(bytes)
+    expect(histories(run)).toHaveLength(1); expect(run.slackPosts()).toHaveLength(posts)
+    expect(uploadOutcomes()).toEqual([]); expectLoss(run)
   })
 })

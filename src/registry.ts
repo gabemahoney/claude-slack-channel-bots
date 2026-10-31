@@ -1573,7 +1573,7 @@ export function createSessionServer(
           // group that succeeded stays a success when the aggregate rejects.
           let completed = false
           const onCompletion = (response: unknown) => {
-            for (const file of completionFiles(response, chatId, threadTs)) {
+            for (const file of completionFiles(response)) {
               completed = true
               endUpload({ kind: 'confirmed', channel: chatId, file: file.id })
             }

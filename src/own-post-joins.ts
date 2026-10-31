@@ -25,8 +25,9 @@ export interface PendingOwnPost {
   outcome?: OwnPostOutcome
   lookup?: OwnPostLookupOutcome
 }
+/** `awaiting-thread`: a confirmed new-message upload waits for its own share's `ts`. */
 export type OwnPostEvent = {
-  type: 'registered' | 'decided' | 'unknown'; key: string; channel: string; operationId: string
+  type: 'registered' | 'decided' | 'unknown' | 'awaiting-thread'; key: string; channel: string; operationId: string
   outcome?: OwnPostOutcome
   lookup?: OwnPostLookupOutcome
 }
@@ -43,7 +44,8 @@ export interface OwnPostJoins extends OwnPostOwner {
   pendingOwnPosts(key: string, channel: string): readonly PendingOwnPost[]
   unknownOwnPosts(key: string): readonly PendingOwnPost[]
   operation(key: string, operationId: string): PendingOwnPost | undefined
-  awaitingUploads(key: string, channel: string): readonly PendingOwnPost[]
+  /** Confirmed uploads still awaiting their thread, in issue order; every channel's without `channel`. */
+  awaitingUploads(key: string, channel?: string): readonly PendingOwnPost[]
   recordLookup(key: string, operationId: string, result: OwnPostLookupResult): void
   resolvedThreads(key: string, channel: string): ReadonlySet<string>
   learnUploadThread(key: string, operationId: string, threadTs: string): void
@@ -223,7 +225,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
     const thread = isThreadTimestamp(answer.threadTs) ? answer.threadTs : post.root ?? (isThreadTimestamp(answer.ts) ? answer.ts : undefined)
     if (answer.file) post.file = answer.file
     if (thread) confirm(entry, thread)
-    else if (answer.file) post.state = 'awaiting-thread'
+    else if (answer.file) { post.state = 'awaiting-thread'; emit('awaiting-thread', entry) }
     else { post.state = 'unknown'; emit('unknown', entry) }
   }
   function settleDeferred(key: string, channel?: string): void {
@@ -253,12 +255,25 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       entry.post.channel === channel && entry.post.state !== 'decided' && stampState(entry.post) === 'current').map(snapshot)),
     unknownOwnPosts: key => safely([], () => [...importIntents(key).values()].filter(entry => entry.post.state === 'unknown' && entry.post.stamp !== undefined).map(snapshot)),
     operation: (key, operationId) => safely(undefined, () => { const entry = importIntents(key).get(operationId); return entry ? snapshot(entry) : undefined }),
-    awaitingUploads: (key, channel) => safely([], () => [...importIntents(key).values()].filter(entry => entry.post.channel === channel && entry.post.state === 'awaiting-thread').map(snapshot)),
+    awaitingUploads: (key, channel) => safely([], () => [...importIntents(key).values()].filter(entry =>
+      (channel === undefined || entry.post.channel === channel) && entry.post.state === 'awaiting-thread')
+      .sort((a, b) => a.post.issuedAt - b.post.issuedAt).map(snapshot)),
     recordLookup: (key, operationId, result) => safely(undefined, () => {
       if (!allowed(key)) return
       const entry = importIntents(key).get(operationId)
-      if (!entry || entry.post.state !== 'unknown') return
+      if (!entry) return
       const stamp = stampState(entry.post)
+      // An upload awaiting its thread learns it only through learnUploadThread;
+      // a lookup can only close it.
+      if (entry.post.state === 'awaiting-thread' && 'notFound' in result) {
+        entry.post.lookup = { holds: stamp === 'stale' ? 'none' : result.holds === 'failed' ? 'failed' : 'none' }
+        entry.post.outcome = { kind: 'not-found', joined: false }
+        entry.post.state = 'deferred'
+        if (entry.intentKept) decide(entry)
+        else reportOutcome(entry)
+        return
+      }
+      if (entry.post.state !== 'unknown') return
       if ('found' in result && stamp !== 'stale') {
         const thread = isThreadTimestamp(result.found.threadTs) ? result.found.threadTs : entry.post.root ?? result.found.ts
         if (isThreadTimestamp(thread)) {

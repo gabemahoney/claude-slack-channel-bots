@@ -3,9 +3,11 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { createChannelDeliveryStore } from '../../src/channel-delivery.ts'
 import {
-  createOwnPostJoins, createOwnPostObserver, ownPostChoice, ownPostEligibility,
+  createOwnPostJoins, createOwnPostObserver, ownPostChoice, ownPostEligibility, ownPostStampState,
   type OwnPostEvent, type OwnPostObserver, type OwnPostOperation,
 } from '../../src/own-post.ts'
+import { createOwnPostLookups, type OwnPostLookupEvent, type OwnPostLookups } from '../../src/own-post-lookup.ts'
+import { createPersonaUpPredicate } from '../../src/persona-start.ts'
 import { makeQueue, slackInput } from './delivery-queue.ts'
 import { makeMembershipHarness, membershipPage, SHARED_CHANNEL_IDS, type MembershipHarness } from './shared-channels.ts'
 import { makeThreadMemoryHarness, readThreads, threadPath, type ThreadHarnessOptions } from './thread-memory.ts'
@@ -70,8 +72,36 @@ export interface OwnPostHarnessOptions {
   memory?: Omit<ThreadHarnessOptions, 'authority' | 'clock' | 'seal' | 'queueOptions'>
   operationId?: () => string
   isDryRun?: () => boolean
+  /** Also build the server's lookup runner over this owner (none in a dry run, as in the server). */
+  lookups?: boolean
   /** False leaves memory and helper-owned membership for start() to initialize. */
   start?: boolean
+}
+
+type LookupDeps = Parameters<typeof createOwnPostLookups>[0]
+/** The runner as `src/server.ts` builds it: the owner, Thread Memory, the owner's stamp reader and the
+ * persona's bounded client, on the harness clock. Its own subscription kicks it on the owner's `unknown`
+ * and `awaiting-thread` events; `start()` reads and kicks each persona as server startup does. */
+function buildOwnPostLookups(deps: Pick<LookupDeps, 'owner' | 'clock'> & { memory: LookupDeps['memory'] & Parameters<typeof ownPostStampState>[0] },
+  members: MembershipHarness, isApplied: (key: string) => boolean) {
+  const manager = members.h.manager, events: OwnPostLookupEvent[] = []
+  const runner = createOwnPostLookups({ ...deps,
+    stamp: (key, channel, stamp) => ownPostStampState(deps.memory, key, channel, stamp),
+    connections: {
+      metadataCall: (...args) => manager.metadataCall(...args),
+      currentConnectionId: key => manager.provenance(key)?.connectionId,
+      isUp: createPersonaUpPredicate(manager, { isUp: () => true, isApplied }),
+      identity: key => manager.identity(key),
+    },
+    onEvent: event => { events.push(event) },
+  })
+  return { runner, events,
+    /** P's own message Event on P's connection, with the identity routing would pass. */
+    ownMessage(key: string, event: unknown, identity: Parameters<OwnPostLookups['ownMessage']>[2] = members.h.identityFor(key)!) {
+      runner.ownMessage(key, event, identity)
+    },
+    stop: () => runner.stop(),
+  }
 }
 
 /** The caller owns stateDir (a scratch directory) and removes it after close().
@@ -93,13 +123,20 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
     choices: () => choices, membership: members.membership.read,
   }
   let dryRun = options.memory?.dryRun ?? false
+  const isDryRun = options.isDryRun ?? (() => dryRun)
   const owner = createOwnPostJoins({ memory: threads.memory, lookupSlackKey: queue.lookupSlackKey,
     choice: ownPostChoice(sources), eligibility: ownPostEligibility(sources), now: threads.clock.now,
-    operationId: options.operationId ?? (() => crypto.randomUUID()), isDryRun: options.isDryRun ?? (() => dryRun) })
+    operationId: options.operationId ?? (() => crypto.randomUUID()), isDryRun })
   const observer = createOwnPostObserver(() => owner), events: OwnPostEvent[] = []
   owner.subscribe(event => { events.push(event) })
+  const lookups = options.lookups && !isDryRun()
+    ? buildOwnPostLookups({ owner, memory: threads.memory, clock: threads.clock }, members, key => sources.persona(key) !== undefined)
+    : undefined
   const unsubscribe = members.authority.subscribeThreadView(() => {
-    for (const persona of members.authority.config().personas) owner.onSharedStatePublished(persona.key)
+    for (const persona of members.authority.config().personas) {
+      owner.onSharedStatePublished(persona.key)
+      lookups?.runner.kick(persona.key)
+    }
   })
   // Keep snapshots so later settlement/forgetting cannot erase output evidence.
   const returned: unknown[] = []
@@ -110,6 +147,7 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
     subscribe: owner.subscribe,
   }
   const captured = () => ({ membership: members.captured(), sharedWrites: members.writes, events, returned,
+    ...(lookups ? { lookupEvents: lookups.events } : {}),
     threadMemory: { events: threads.events, logs: threads.logs, posts: threads.posts,
       retryEvents: threads.retryEvents, sealEvents: threads.sealEvents },
     files: ['threads', 'queue'].map(name => join(stateDir, name)).filter(existsSync).map(writtenFile) })
@@ -125,11 +163,13 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
       }
       await members.start(); await members.scan()
     }
+    for (const persona of members.authority.config().personas) lookups?.runner.journalRead(persona.key)
+    for (const persona of members.authority.config().personas) lookups?.runner.kick(persona.key)
   }
   function close() {
     return closing ??= (async () => {
       try { assertNoLeak(captured()) } finally {
-        unsubscribe(); owner.stop()
+        unsubscribe(); lookups?.stop(); owner.stop()
         try { if (!options.queue) await queue.stop() } finally {
           try { await threads.close() } finally {
             try { if (!options.members) await members.close() } finally { assertNoLeak(captured()) }
@@ -143,7 +183,7 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
   }
   return {
     stateDir, threads, memory: threads.memory, io: threads.io, clock: threads.clock,
-    authority: members.authority, members, choices, sources, queue, owner, observer, read, events,
+    authority: members.authority, members, choices, sources, queue, owner, observer, read, events, lookups,
     start, close, captured, flush: threads.clock.flush,
     dryRun(value: boolean) { dryRun = value },
     view: (...args: Parameters<typeof threads.memory.view>) => capture(threads.memory.view(...args)),

@@ -17,9 +17,10 @@ import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
-import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, mentionText, ENVELOPE_FLAG_FORMS, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode } from '../src/config.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import type { PersonaEventProvenance } from '../src/persona-connections.ts'
+import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { readQueue, seedQueue, slackInput, queuePath, memoryHold } from './test-helpers/delivery-queue.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { configBytes, makeSharedAuthority, makeMembershipHarness, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
@@ -1485,4 +1486,155 @@ test.each(['quick', 'late'] as const)('%s lookup completion clears its injected 
     expect(readQueue(dir).filter(r => r.kind === 'fixed')).toHaveLength(1)
     expect(wakes).toEqual(['alpha']); expect(clock.pendingCount()).toBe(0)
   } finally { await preparation.stop(); await queue.stop() }
+})
+
+describe.each(['strict', 'open'] as const)('%s own-message hook', mode => {
+  const OWN_TS = '1700000100.000100', NEXT_TS = '1700000101.000100', DM = makeDm().channel as string
+  // Fixed identities, so runs in separate harnesses log and store the same bytes.
+  const IDS = { alpha: { botUserId: 'U0ALPHAOWN', botId: 'B0ALPHAOWN' }, beta: { botUserId: 'U0BETAOWN1', botId: 'B0BETAOWN1' } }
+  // Far more turns than intake takes to its ack; a wait that never ends stays under it.
+  const ACK_TURN_LIMIT = 200
+  const TARGETS = ['thread_hybrid', 'off', 'mentions', 'all', 'DM'] as const
+  type Target = typeof TARGETS[number]
+  type Hook = NonNullable<Parameters<typeof makeRoutingHarness>[2]>['onOwnMessage']
+  /** `recording` records only; the others record, then throw, return a pending promise or schedule a microtask. `absent` passes no hook. */
+  type Variant = 'recording' | 'absent' | 'throwing' | 'pending' | 'scheduling'
+  interface HookCall { key: string; event: Record<string, unknown>; identity: unknown }
+
+  async function hooked(variant: Variant, target: Target, options: { rerun?: boolean } = {}) {
+    const calls: HookCall[] = [], paths: string[] = []
+    let h!: RoutingHarness
+    const record: NonNullable<Hook> = (key, event, identity) => { calls.push({ key, event, identity }); h.order.push(`hook:${key}`) }
+    const hook: Hook = variant === 'absent' ? undefined
+      : variant === 'throwing' ? (key, event, identity) => { record(key, event, identity); throw new Error(sentinelInMessage('own-hook')) }
+      : variant === 'pending' ? (key, event, identity) => { record(key, event, identity); return new Promise<void>(() => {}) }
+      : variant === 'scheduling' ? (key, event, identity) => { record(key, event, identity); queueMicrotask(() => { h.order.push(`scheduled:${key}`) }) }
+      : record
+    const channels = [{ id: CA, delivery: target === 'DM' ? 'all' as const : target }]
+    h = makeRoutingHarness(['alpha', 'beta'].map(name => ({ name, channels, dm: { enabled: true } })), mkdtempSync(join(dir, 'own-')), {
+      mode, threadMemory: {}, membership: observedMembership({ alpha: [CA], beta: [CA] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+      stubOptions: IDS, onOwnMessage: hook,
+    })
+    harnesses.push(h)
+    await h.ready()
+    const decided = h.queue.acceptDecided, plain = h.queue.accept, lookup = h.queue.lookupSlackKey
+    h.queue.acceptDecided = (key, slackKey, decide) => {
+      paths.push(`serial:${key}`)
+      return decided(key, slackKey, facts => {
+        paths.push(`decide:${key}`)
+        // Re-select in the same turn, as a re-run of the callback would.
+        if (options.rerun) { decide(facts); paths.push(`decide:${key}`) }
+        return decide(facts)
+      })
+    }
+    h.queue.accept = (key, input) => { paths.push(`plain:${key}`); return plain(key, input) }
+    h.queue.lookupSlackKey = (key, slackKey) => { paths.push(`lookup:${key}`); return lookup(key, slackKey) }
+    h.order.length = 0
+    return { h, calls, paths }
+  }
+  const at = (target: Target) => target === 'DM' ? { channel: DM, channel_type: 'im' } : { channel: CA }
+  const share = (h: RoutingHarness, target: Target, name = 'alpha', options: Partial<OwnFileShareOptions> = {}) =>
+    makeOwnFileShare({ identity: h.p(name).stub.identity, ts: OWN_TS, ...options }, at(target))
+  const next = (h: RoutingHarness, target: Target) => target === 'DM' ? makeDm({ ts: NEXT_TS })
+    : makeChannelMessage({ channel: CA, ts: NEXT_TS, text: `${mentionText(h.p('alpha').stub.identity.botUserId)} after the share` })
+  /** Receive `event`, counting microtask turns from the call to its ack, and the Slack calls made by then. */
+  async function counted(h: RoutingHarness, event: unknown, names: readonly string[] = ['alpha']) {
+    let turns = 0, ackTurn: number | undefined, slackCallsAtAck: number | undefined
+    const work = h.receive(event, names, () => {
+      ackTurn = turns
+      slackCallsAtAck = h.all.reduce((n, x) => n + x.stub.callLog.length, 0)
+      h.order.push('ack')
+    })
+    while (ackTurn === undefined && turns < ACK_TURN_LIMIT) { await Promise.resolve(); turns++ }
+    expect(ackTurn).toBeDefined()
+    await work
+    return { ackTurn, slackCallsAtAck }
+  }
+  const ownLines = (h: RoutingHarness) => h.logs.filter(line => line.endsWith(': own'))
+  const pathOf = (target: Target, key = 'alpha') => target === 'thread_hybrid' ? [`serial:${key}`, `decide:${key}`] : [`lookup:${key}`]
+
+  describe.each([...TARGETS])('%s', target => {
+    test.each(['user', 'bot', 'both'] as const)("P's own share by %s ID calls the hook once with P's key, the event and P's identity, before the decision", async author => {
+      const { h, calls, paths } = await hooked('recording', target), event = share(h, target, 'alpha', { author })
+      await h.receive(event, ['alpha'])
+      expect(calls).toEqual([{ key: 'alpha', event, identity: h.p('alpha').stub.identity }])
+      // After the archive and the identity read; before the decision reads the config.
+      expect(h.order.slice(0, 4)).toEqual(['archive:alpha', 'identity:alpha', 'hook:alpha', 'config'])
+      expect(h.order.filter(x => x === 'hook:alpha' || x === 'ack')).toEqual(['hook:alpha', 'ack'])
+      expect(paths).toEqual(pathOf(target))
+      expect(ownLines(h)).toHaveLength(1)
+      expect(h.queued('alpha')).toEqual([]); expect(h.queued('beta')).toEqual([])
+    })
+
+    test("another persona's share, a human's message and other authors' shares call no hook for P", async () => {
+      const { h, calls } = await hooked('recording', target)
+      const human = target === 'DM' ? makeDm({ ts: NEXT_TS }) : makeChannelMessage({ channel: CA, ts: NEXT_TS })
+      const others = [share(h, target, 'beta'), human, share(h, target, 'alpha', { shape: 'other-bot' }), share(h, target, 'alpha', { shape: 'other-user' }),
+        makeBotMessage({ ...at(target), ts: OWN_TS })]
+      for (const event of others) await h.receive(event, ['alpha'])
+      expect(calls).toEqual([])
+      expect(ownLines(h)).toEqual([])
+    })
+
+    test("with a connection's provenance, the hook matches the decision's identity, not getBotIdentity's", async () => {
+      const { h, calls } = await hooked('recording', target), key = h.keys(['alpha'])[0]!
+      const connected = { botUserId: 'U0ALPHACONN', botId: 'B0ALPHACONN' }
+      expect(connected).not.toEqual(h.p('alpha').stub.identity)
+      const provenance: PersonaEventProvenance = { key, connectionId: 'alpha-connection', incarnation: undefined, identity: connected,
+        applied: true, candidate: false, isCurrent: () => true }
+      const byConnection = makeOwnFileShare({ identity: connected, ts: OWN_TS }, at(target))
+      await h.receive(byConnection, ['alpha'], undefined, undefined, provenance)
+      expect(calls).toEqual([{ key: 'alpha', event: byConnection, identity: connected }])
+      expect(ownLines(h)).toHaveLength(1)
+      await h.receive(share(h, target, 'alpha', { ts: NEXT_TS }), ['alpha'], undefined, undefined, provenance)
+      expect(calls).toHaveLength(1)
+      expect(ownLines(h)).toHaveLength(1)
+    })
+
+    test.each(['absent', 'throwing', 'pending', 'scheduling'] as const)('with the hook %s, the own drop, ack, archive, lines and the next event are as with a recording hook, with no wait or Slack call before the ack', async variant => {
+      async function run(v: Variant) {
+        // Each run registers its own sessions; the earlier run's are done with.
+        resetRoutingState()
+        const { h, calls, paths } = await hooked(v, target)
+        const own = await counted(h, share(h, target))
+        const after = await counted(h, next(h, target))
+        await h.settleJoinSaves()
+        return {
+          calls: calls.map(c => c.key), own, after, paths,
+          order: h.order.filter(x => !x.startsWith('hook:') && !x.startsWith('scheduled:')),
+          logs: h.logs, alpha: facts(h, 'alpha'), beta: facts(h, 'beta'),
+        }
+      }
+      const recording = await run('recording'), other = await run(variant)
+      expect(other).toEqual({ ...recording, calls: variant === 'absent' ? [] : ['alpha'] })
+      expect(recording.calls).toEqual(['alpha'])
+      expect(recording.own.slackCallsAtAck).toBe(0)
+      expect(recording.order.filter(x => x === 'ack')).toEqual(['ack', 'ack'])
+      expect(recording.order.filter(x => x.startsWith('archive:'))).toEqual(['archive:alpha', 'archive:alpha'])
+      expect(recording.logs.filter(line => line.endsWith(': own'))).toEqual([expect.stringContaining(`channel=${at(target).channel} `)])
+      expect(recording.paths).toEqual([...pathOf(target), ...pathOf(target), ...(target === 'thread_hybrid' || target === 'off' ? [] : ['plain:alpha'])])
+      // The own share queues nothing; the next event is handled as its target handles it.
+      expect(recording.alpha.map(f => f.ts)).toEqual(target === 'off' ? [] : [NEXT_TS])
+      expect(recording.beta).toEqual([])
+    })
+  })
+
+  test('re-running the serial decision callback calls the hook no more', async () => {
+    const { h, calls, paths } = await hooked('recording', 'thread_hybrid', { rerun: true }), event = share(h, 'thread_hybrid')
+    await h.receive(event, ['alpha'])
+    expect(paths).toEqual(['serial:alpha', 'decide:alpha', 'decide:alpha'])
+    expect(calls).toEqual([{ key: 'alpha', event, identity: h.p('alpha').stub.identity }])
+    expect(ownLines(h)).toHaveLength(1)
+    expect(h.order.filter(x => x === 'ack')).toEqual(['ack'])
+  })
+
+  test.each(['thread_hybrid', 'off', 'mentions', 'all'] as const)('%s: with two recipients, each own share reaches only its author, with its own identity', async target => {
+    const { h, calls } = await hooked('recording', target)
+    const alphaShare = share(h, target, 'alpha'), betaShare = share(h, target, 'beta', { ts: NEXT_TS })
+    await h.receive(alphaShare, ['alpha', 'beta'])
+    expect(calls).toEqual([{ key: 'alpha', event: alphaShare, identity: h.p('alpha').stub.identity }])
+    await h.receive(betaShare, ['alpha', 'beta'])
+    expect(calls.slice(1)).toEqual([{ key: 'beta', event: betaShare, identity: h.p('beta').stub.identity }])
+    expect(h.order.filter(x => x === 'ack')).toEqual(['ack', 'ack'])
+  })
 })

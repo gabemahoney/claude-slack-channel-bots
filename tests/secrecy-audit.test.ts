@@ -172,7 +172,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
   // Thread Memory's lookups and own-post observation: each makes or reads an authenticated Slack request on a persona's client.
   [/^src\/thread-memory\.ts$/, "the bounded metadata attempts, which run a persona's authenticated Slack requests and classify their raw failures (an error's message can hold a token) into safe codes"],
-  [/^src\/own-post-lookup\.ts$/, "own-post recovery lookups, which run a persona's authenticated Slack reads and classify their raw failures into safe outcomes"],
+  [/^src\/own-post-lookup\.ts$/, "own-post recovery lookups, which run a persona's authenticated Slack reads, read its own upload-share Events, and classify their raw failures into safe outcomes"],
   [/^src\/thread-memory-reports\.ts$/, "Thread Memory's notice and diagnostic builders and reporter, which carry configured identities and paths plus described storage failures to Slack posts and log lines"],
   [/^src\/own-post\.ts$/, "the own-post observer, whose issues carry the issuing persona's bot identity and whose fault callback receives an owner's raw fault, own-post eligibility over the applied config and current membership, and the reading of upload completions as Slack returned them"],
   [/^src\/file-upload-observation\.ts$/, "the file-completion observation, which wraps a persona's raw Web API client and hands each completion response, as Slack returned it, to its listener"],
@@ -752,7 +752,8 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const reloadFactory = 'makeReloadHarness'
     for (const suite of ['tests/own-post-lookup.test.ts', 'tests/own-post-recovery.test.ts']) {
       expect(suite in EXEMPT).toBe(false)
-      for (const name of ['ownPostLookupRange', 'ownPostLookupRequest', 'readOwnPostLookupPage', 'classifyOwnPostLookupFailure', 'judgeOwnPostLookup', 'createOwnPostLookups']) {
+      for (const name of ['ownPostLookupRange', 'ownPostLookupRequest', 'readOwnPostLookupPage', 'ownUploadShare', 'uploadShareTs',
+        'classifyOwnPostLookupFailure', 'judgeOwnPostLookup', 'createOwnPostLookups']) {
         const code = `import { ${name} as used } from '../src/own-post-lookup.ts'`
         expect(touchReasonsOf(suite, code)).toHaveLength(1)
         expect(callsAssertNoLeak(suite, code)).toBe(false)
@@ -760,6 +761,8 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       for (const code of [
         "import * as lookup from '../src/own-post-lookup.ts'",
         "const lookup = await import('../src/own-post-lookup.ts')",
+        // The runner's ownMessage reads the persona's own Events.
+        "import { createOwnPostLookups } from '../src/own-post-lookup.ts'\ncreateOwnPostLookups(deps).ownMessage(key, event, identity)",
         `import { ${reloadFactory} } from './test-helpers/reload-harness.ts'`,
       ]) {
         expect(touchReasonsOf(suite, code)).toHaveLength(1)
@@ -768,11 +771,22 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       for (const code of [
         "import { OWN_POST_LOOKUP_PAGE_LIMIT } from '../src/own-post-lookup.ts'",
         "import type * as lookup from '../src/own-post-lookup.ts'",
-        "import { type OwnPostLookups, type OwnPostLookupEvent } from '../src/own-post-lookup.ts'",
+        "import { type OwnPostLookups, type OwnPostLookupEvent, type OwnUploadShare } from '../src/own-post-lookup.ts'",
       ]) expect(touchReasonsOf(suite, code)).toEqual([])
     }
     // The global consumer scan above checks actual suites, including the reload
     // harness consumer when it lands, without requiring an unused direct import.
+  })
+
+  test('the own-post and upload-thread suites touch their modules today and leak-check them themselves, with no exemption', () => {
+    for (const [suite, surface] of [
+      ['tests/own-post.test.ts', 'src/own-post.ts'],
+      ['tests/own-post-lookup.test.ts', 'src/own-post-lookup.ts'],
+      ['tests/own-post-recovery.test.ts', 'makeReloadHarness'],
+      ['tests/registry.test.ts', 'src/own-post.ts'],
+    ] as const) {
+      expect([suite, touchReasons(suite).some((r) => r.includes(surface)), callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([suite, true, true, false])
+    }
   })
 
   test('Thread Memory report builders and configuration helpers require leak checks without treating record-only fixtures as touching', () => {

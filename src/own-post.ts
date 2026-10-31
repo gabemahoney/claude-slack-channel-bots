@@ -1,13 +1,13 @@
 /**
  * own-post.ts — The bot's own posts: per-call operations on each surface, the
  * observer that keeps a post's success apart from the bookkeeping after it,
- * own-post channel eligibility, and the reading of upload completions.
+ * own-post channel eligibility, and the confirmation of upload completions.
  *
  * The observer never throws or rejects, and waits only for the intent append.
  * Its owner's faults,
  * synchronous or asynchronous, go to the caller's fault callback, whose own
- * throw is swallowed. Upload completions name a root only through the file's
- * own share in the actual target channel; the earliest share there decides.
+ * throw is swallowed. An upload completion confirms its files by ID only; it
+ * names no thread.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -171,70 +171,27 @@ export const SLACK_FILE_ID_RE = /^F[A-Z0-9]{2,63}$/
 /** One completed file of an upload completion response. */
 export interface CompletedFile {
   id: string
-  /** The root its own share created, when the completion already carried it. */
-  root?: string
 }
-
-/** What share metadata proves about one file in one channel. */
-export type FileShareEvidence =
-  | { kind: 'root'; root: string }
-  | { kind: 'unresolved'; reason: 'no-share' | 'ambiguous' | 'malformed' }
 
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
-/** Every share entry of `file` in `channel`, public and private. Malformed entries are dropped. */
-function sharesIn(file: Record<string, unknown>, channel: string): Array<{ ts: string; thread_ts?: string }> | undefined {
-  const shares = file['shares']
-  if (shares === undefined) return []
-  if (!object(shares)) return undefined
-  const found: Array<{ ts: string; thread_ts?: string }> = []
-  for (const visibility of ['public', 'private']) {
-    const byChannel = shares[visibility]
-    if (byChannel === undefined) continue
-    if (!object(byChannel)) return undefined
-    const entries = byChannel[channel]
-    if (entries === undefined) continue
-    if (!Array.isArray(entries)) return undefined
-    for (const entry of entries) {
-      if (!object(entry) || !isThreadTimestamp(entry['ts'])) continue
-      const thread = entry['thread_ts']
-      found.push({ ts: entry['ts'], ...(isThreadTimestamp(thread) ? { thread_ts: thread } : {}) })
-    }
-  }
-  return found
-}
-
-/**
- * The root a new (parentless) upload of `file` created in `channel`: the
- * file's earliest share there, when that share is a root-level message. A
- * threaded earliest share, a tie, malformed shares or no share leave it
- * unresolved. Pure.
- */
-export function fileShareRoot(file: unknown, channel: string): FileShareEvidence {
-  if (!object(file)) return { kind: 'unresolved', reason: 'malformed' }
-  const shares = sharesIn(file, channel)
-  if (shares === undefined) return { kind: 'unresolved', reason: 'malformed' }
-  if (!shares.length) return { kind: 'unresolved', reason: 'no-share' }
-  const earliest = shares.reduce((a, b) => (compareTs(b.ts, a.ts) < 0 ? b : a))
-  const ties = shares.filter(s => s.ts === earliest.ts)
-  if (ties.some(s => s.thread_ts !== undefined && s.thread_ts !== s.ts)) return { kind: 'unresolved', reason: 'ambiguous' }
-  return { kind: 'root', root: earliest.ts }
+/** A file object with a valid Slack file ID: what an upload confirms and what its share is matched by. */
+export function isSlackFile(file: unknown): file is { id: string } {
+  return object(file) && typeof file['id'] === 'string' && SLACK_FILE_ID_RE.test(file['id'])
 }
 
 /**
  * The confirmed files of one `files.completeUploadExternal` response: each
- * file with a valid ID, and for a parentless upload the root its share in
- * `channel` names, when the response already carries it. A response that is
- * not `ok: true` confirms nothing. Pure.
+ * file with a valid ID, in response order. A response that is not `ok: true`
+ * with a `files` array confirms nothing. Nothing else in the answer is read:
+ * a parent-bound upload's thread is its requested parent's Thread Root, and a
+ * new-message upload's thread is learnt from P's own `file_share` message
+ * (SR-3.2.3). Pure.
  */
-export function completionFiles(response: unknown, channel: string, parent?: string): CompletedFile[] {
+export function completionFiles(response: unknown): CompletedFile[] {
   if (!object(response) || response['ok'] !== true || !Array.isArray(response['files'])) return []
   const files: CompletedFile[] = []
-  for (const file of response['files']) {
-    if (!object(file) || typeof file['id'] !== 'string' || !SLACK_FILE_ID_RE.test(file['id'])) continue
-    const share = parent === undefined ? fileShareRoot(file, channel) : undefined
-    files.push({ id: file['id'], ...(share?.kind === 'root' ? { root: share.root } : {}) })
-  }
+  for (const file of response['files']) if (isSlackFile(file)) files.push({ id: file.id })
   return files
 }
 

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   classifyOwnPostLookupFailure, createOwnPostLookups, judgeOwnPostLookup, OWN_POST_LOOKUP_PAGE_LIMIT,
-  ownPostLookupRange, ownPostLookupRequest, readOwnPostLookupPage,
+  ownPostLookupRange, ownPostLookupRequest, ownUploadShare, readOwnPostLookupPage, uploadShareTs,
   type OwnPostLookupEvent, type OwnPostLookupsDeps,
 } from '../src/own-post-lookup.ts'
 import { ownPostStampState, type OwnPostContent } from '../src/own-post.ts'
@@ -19,8 +19,8 @@ import { THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
 import { SHARED_CHANNEL_IDS, membershipPage } from './test-helpers/shared-channels.ts'
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import {
-  makePagedThread, makeStubSlack, makeDeferredWebApiCall,
-  type PagedMessageSpec, type PagedPageDamage, type PagedThreadOptions, type WebApiOutcome,
+  makeOwnFileShare, makePagedThread, makeStubSlack, makeDeferredWebApiCall, slackFileId,
+  type OwnFileShareOptions, type PagedMessageSpec, type PagedPageDamage, type PagedThreadOptions, type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 
 const C = SHARED_CHANNEL_IDS.primary
@@ -29,6 +29,8 @@ const IDENTITY = { botUserId: 'U0LOOKUP', botId: 'B0LOOKUP' }
 const TEXT = `content ${LEAK_SENTINEL}`
 const CONTENT: OwnPostContent = { kind: 'text', text: TEXT }
 const DIGEST_KEY = 'ab'.repeat(32)
+const FILE = slackFileId(1), OTHER_FILE = slackFileId(2)
+const FILE_CONTENT: OwnPostContent = { kind: 'file', name: `${LEAK_SENTINEL}.txt`, size: 5 }
 const seconds = (ms: number) => (ms / 1000).toFixed(6)
 const cleanups: Array<() => Promise<void>> = [], directories: string[] = []
 afterEach(async () => {
@@ -40,13 +42,13 @@ afterEach(async () => {
   if (errors.length) throw new AggregateError(errors, 'lookup cleanup failed')
 })
 
-async function rawPage(specs: PagedMessageSpec[], parent = false, damage?: PagedPageDamage) {
+async function rawPage(specs: PagedMessageSpec[], parent = false, damage?: PagedPageDamage, range = ownPostLookupRange(THREAD_TIME, THREAD_TIME)) {
   const history = makePagedThread(specs.length || 1, { rootTs: ROOT, identity: IDENTITY, message: i => specs[i] ?? { author: 'other-user' } })
   const stub = makeStubSlack({ ...IDENTITY, leakMarker: LEAK_SENTINEL,
     history: [damage ? history.malformedOutcome(damage) : history.legacyOutcome('history')] })
   const response = await stub.web.conversations.history({ channel: C })
   const result = readOwnPostLookupPage(response, { target: { channel: C, ...(parent ? { parent: ROOT } : {}) },
-    range: ownPostLookupRange(THREAD_TIME, THREAD_TIME), identity: IDENTITY, digestKey: DIGEST_KEY })
+    range, identity: IDENTITY, digestKey: DIGEST_KEY })
   assertNoLeak(result)
   return result
 }
@@ -97,7 +99,7 @@ describe('lookup pure contracts', () => {
     ['label', `\n${LEAK_SENTINEL} <https://example.invalid/path|label>\t`, `${LEAK_SENTINEL} https://example.invalid/path`],
   ])('%s normalizes identically to the stored intent without keeping content', async (_name, posted, original) => {
     const result = await rawPage([{ author: 'own-user', placement: 'channel', text: posted, file: false }])
-    expect(result).toEqual({ kind: 'page', own: [{ ts: ROOT, digests: [ownPostDigest(DIGEST_KEY, { kind: 'text', text: original! })] }] })
+    expect(result).toEqual({ kind: 'page', own: [{ ts: ROOT, digests: [ownPostDigest(DIGEST_KEY, { kind: 'text', text: original! })], fileIds: [] }] })
   })
 
   test.each([OWN_POST_UPLOAD_FILENAME, `${LEAK_SENTINEL}.txt`])('file digest uses exact name and bytes: %s', async name => {
@@ -182,6 +184,89 @@ describe('lookup pure contracts', () => {
   })
 })
 
+describe('upload pure contracts', () => {
+  test.each([0, OWN_ROOT_CLOCK_SKEW_MS - 1, THREAD_TIME])('an upload range from issue time %s has no latest, and its request sends none', issue => {
+    const range = ownPostLookupRange(issue), request = ownPostLookupRequest({ channel: C }, range)
+    expect(range).toEqual({ oldest: seconds(Math.max(0, issue - OWN_ROOT_CLOCK_SKEW_MS)) })
+    expect(request).toEqual({ method: 'conversations.history',
+      args: { channel: C, oldest: range.oldest, inclusive: true, limit: OWN_POST_LOOKUP_PAGE_LIMIT } })
+    expect('latest' in request.args).toBe(false)
+    assertNoLeak({ range, request })
+  })
+
+  test.each([
+    ['the default file', undefined, undefined, ['F0THREAD0']],
+    ['valid IDs once each, in order', [FILE, 'f0-not-an-id', FILE, OTHER_FILE, 'F', ''], undefined, [FILE, OTHER_FILE]],
+    ['no valid ID', ['f0-not-an-id', 'F'], undefined, []],
+    ['no files', undefined, false, []],
+  ] as const)('page reading keeps %s as fileIds', async (_name, fileIds, file, expected) => {
+    const result = await rawPage([{ author: 'own-bot', placement: 'channel', text: TEXT, ...(fileIds ? { fileIds } : {}),
+      file: file ?? { name: `${LEAK_SENTINEL}.txt`, size: 3 } }])
+    expect(result).toMatchObject({ kind: 'page', own: [{ ts: ROOT, fileIds: expected }] })
+  })
+
+  test('page reading with no end reading applies no upper bound', async () => {
+    const late = seconds(THREAD_TIME + OWN_ROOT_CLOCK_SKEW_MS * 1000), early = seconds(THREAD_TIME - OWN_ROOT_CLOCK_SKEW_MS - 1)
+    const specs: PagedMessageSpec[] = [{ author: 'own-user', placement: 'channel', ts: late, fileIds: [FILE] },
+      { author: 'own-user', placement: 'channel', ts: early, fileIds: [FILE] }]
+    const open = await rawPage(specs, false, undefined, ownPostLookupRange(THREAD_TIME))
+    const bounded = await rawPage(specs, false, undefined, ownPostLookupRange(THREAD_TIME, THREAD_TIME))
+    expect(open).toMatchObject({ kind: 'page', own: [{ ts: late, fileIds: [FILE] }] })
+    expect(open.kind === 'page' && open.own).toHaveLength(1)
+    expect(bounded).toEqual({ kind: 'page', own: [] })
+  })
+
+  const identity = IDENTITY
+  const share = (options: Omit<OwnFileShareOptions, 'identity'> = {}, overrides = {}) =>
+    makeOwnFileShare({ identity, channel: C, ts: ROOT, name: `${LEAK_SENTINEL}.txt`, text: TEXT, ...options }, overrides)
+  test.each([
+    ['by bot user ID', share(), [FILE]],
+    ['by bot ID alone', share({ author: 'bot' }), [FILE]],
+    ['by both', share({ author: 'both' }), [FILE]],
+    ['with no subtype', share({ subtype: 'absent' }), [FILE]],
+    ['as a thread root', share({}, { thread_ts: ROOT }), [FILE]],
+    ['with several files, once each', share({ fileIds: [FILE, 'f0-not-an-id', FILE, OTHER_FILE] }), [FILE, OTHER_FILE]],
+  ] as const)('ownUploadShare accepts P\'s own share %s', (_name, event, fileIds) => {
+    const result = ownUploadShare(event, identity)
+    expect(result).toEqual({ channel: C, ts: ROOT, fileIds }); assertNoLeak(result)
+  })
+
+  const throwing = new Proxy({}, { get() { throw new Error(LEAK_SENTINEL) }, has() { throw new Error(LEAK_SENTINEL) } })
+  test.each([
+    ['a reply', share({ shape: 'reply' })], ['an edit', share({ shape: 'changed' })], ['a deletion', share({ shape: 'deleted' })],
+    ['another user', share({ shape: 'other-user' })], ['another bot', share({ shape: 'other-bot' })],
+    ['another persona', makeOwnFileShare({ identity: { botUserId: 'U0OTHERP', botId: 'B0OTHERP' }, channel: C, ts: ROOT })],
+    ['no files', share({ shape: 'no-files' })], ['a malformed ID', share({ shape: 'malformed-id' })],
+    ['a non-string ID', share({ shape: 'non-string-id' })], ['another subtype', share({}, { subtype: 'bot_message' })],
+    ['an invalid channel', share({ channel: 'not-a-channel' })], ['an invalid ts', share({}, { ts: '17.1' })],
+    ['a missing ts', share({}, { ts: undefined })], ['no event', null], ['an array', [share()]], ['a throwing event', throwing],
+  ] as const)('ownUploadShare refuses %s without throwing', (_name, event) => {
+    let result: unknown = 'unset'
+    expect(() => { result = ownUploadShare(event, identity) }).not.toThrow()
+    expect(result).toBeUndefined()
+  })
+
+  async function own(specs: PagedMessageSpec[]) {
+    const read = await rawPage(specs, false, undefined, ownPostLookupRange(0))
+    if (read.kind !== 'page') throw new Error('expected page')
+    return read.own
+  }
+  const at = (ts: string, fileIds: string[], author: PagedMessageSpec['author'] = 'own-user'): PagedMessageSpec =>
+    ({ author, placement: 'channel', ts, fileIds, file: { name: `${LEAK_SENTINEL}.txt`, size: 1 } })
+  test.each([
+    ['within one page', [[at(seconds(THREAD_TIME + 2), [FILE]), at(seconds(THREAD_TIME), [OTHER_FILE, FILE]), at(seconds(THREAD_TIME + 1), [FILE])]], seconds(THREAD_TIME)],
+    ['across pages', [[at(seconds(THREAD_TIME + 2), [FILE])], [at(seconds(THREAD_TIME + 1), [OTHER_FILE])], [at(seconds(THREAD_TIME), [FILE])]], seconds(THREAD_TIME)],
+    ['by number, not text', [[at('1000000000.000001', [FILE])], [at('999999999.000002', [FILE])]], '999999999.000002'],
+    ['never another author\'s', [[at(seconds(THREAD_TIME), [FILE], 'other-bot'), at(seconds(THREAD_TIME + 1), [FILE])]], seconds(THREAD_TIME + 1)],
+    ['undefined with no share of it', [[at(seconds(THREAD_TIME), [OTHER_FILE])]], undefined],
+    ['undefined with no message', [], undefined],
+  ] as const)('uploadShareTs takes the earliest share %s', async (_name, pages, expected) => {
+    const messages = (await Promise.all(pages.map(page => own([...page])))).flat()
+    const result = uploadShareTs(messages, FILE)
+    expect(result).toBe(expected); assertNoLeak(result)
+  })
+})
+
 async function fixture(options: { dir?: string; unreadable?: boolean; names?: string[]; reopen?: boolean } = {}) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), 'own-post-lookup-'))
   if (!options.dir) directories.push(dir)
@@ -190,6 +275,7 @@ async function fixture(options: { dir?: string; unreadable?: boolean; names?: st
   const h = await makeOwnPostHarness(dir, { membership: { names: options.names, reopen: options.reopen }, memory: { fs: io, reopen: options.reopen } })
   const manager = h.members.h.manager
   const events: OwnPostLookupEvent[] = [], recorded: Parameters<typeof h.owner.recordLookup>[] = []
+  const learnt: Parameters<typeof h.owner.learnUploadThread>[] = []
   const readings: Array<{ key: string; at: number; value: number }> = []
   const connections: OwnPostLookupsDeps['connections'] = {
     metadataCall: (...args) => manager.metadataCall(...args), identity: key => manager.identity(key),
@@ -197,7 +283,8 @@ async function fixture(options: { dir?: string; unreadable?: boolean; names?: st
       isApplied: key => h.authority.config().personas.some(persona => persona.key === key) }),
     currentConnectionId: key => manager.provenance(key)?.connectionId,
   }
-  const deps: OwnPostLookupsDeps = { owner: { ...h.owner, recordLookup(...args) { recorded.push(structuredClone(args)); h.owner.recordLookup(...args) } },
+  const deps: OwnPostLookupsDeps = { owner: { ...h.owner, recordLookup(...args) { recorded.push(structuredClone(args)); h.owner.recordLookup(...args) },
+    learnUploadThread(...args) { learnt.push([...args]); h.owner.learnUploadThread(...args) } },
     memory: { ...h.memory, clock(key) { const value = h.memory.clock(key); readings.push({ key, at: h.clock.now(), value }); return value } },
     stamp: (key, channel, stamp) => ownPostStampState(h.memory, key, channel, stamp), connections, clock: h.clock,
     onEvent: event => { events.push(event) },
@@ -208,7 +295,7 @@ async function fixture(options: { dir?: string; unreadable?: boolean; names?: st
     if (closed) return
     closed = true
     runner.stop()
-    try { assertNoLeak({ events, recorded, captured: h.captured(), records: h.records() }) }
+    try { assertNoLeak({ events, recorded, learnt, captured: h.captured(), records: h.records() }) }
     finally { await h.close(); expect(h.clock.pendingCount()).toBe(0) }
   }
   cleanups.push(close)
@@ -250,8 +337,33 @@ async function fixture(options: { dir?: string; unreadable?: boolean; names?: st
     expect(h.threads.choose('off').kind).toBe('applied')
     expect(h.threads.choose('thread_hybrid').kind).toBe('applied')
   }
-  return { ...h, dir, runner, deps, connections, recorded, lookupEvents: events, readings, pages, stub, calls, begin, unknown, saved, undecided, decide, stale, close }
+  /** A parentless upload's completion with a file ID and no thread leaves it awaiting its share. */
+  function confirm(post: Awaited<ReturnType<typeof begin>>, file = FILE) {
+    h.observer.end(post.operation, { kind: 'confirmed', channel: C, file })
+    expect(h.owner.operation(post.key, post.id)?.state).toBe('awaiting-thread')
+  }
+  /** The confirmation kicks the runner, whose microtask starts the read before this resolves. */
+  async function upload(key = 'alpha', file = FILE) {
+    const post = await begin(undefined, key, FILE_CONTENT)
+    confirm(post, file)
+    return post
+  }
+  /** P's own file share Event, with sentinels in its file name and text. */
+  const share = (ts: string, options: Omit<OwnFileShareOptions, 'identity'> = {}, key = 'alpha', overrides = {}) => makeOwnFileShare({
+    identity: stub(key).identity, channel: C, ts, fileIds: [FILE], name: `${LEAK_SENTINEL}.txt`, text: TEXT, ...options }, overrides)
+  async function joinedAt(post: Awaited<ReturnType<typeof begin>>, ts: string) {
+    expect(learnt.filter(call => call[1] === post.id)).toEqual([[post.key, post.id, ts]])
+    expect(h.owner.operation(post.key, post.id)).toMatchObject({ state: 'decided', outcome: { kind: 'confirmed', thread: ts, joined: true } })
+    expect(h.view(post.key, C, ts)).toBe('joined')
+    expect(JSON.stringify([events, h.events])).not.toContain(FILE) // events carry no file ID
+    await saved(post.id, 'joined', post.key)
+  }
+  return { ...h, dir, runner, deps, connections, recorded, learnt, lookupEvents: events, readings, pages, stub, calls, begin, unknown,
+    confirm, upload, share, joinedAt, saved, undecided, decide, stale, close }
 }
+/** A history message description sharing `fileIds`. */
+const shared = (fileIds: string[], author: PagedMessageSpec['author'] = 'own-user', extra: PagedMessageSpec = {}): PagedMessageSpec =>
+  ({ author, placement: 'channel', text: TEXT, fileIds, file: { name: `${LEAK_SENTINEL}.txt`, size: 5 }, ...extra })
 
 type Fixture = Awaited<ReturnType<typeof fixture>>
 async function retryAfter(h: Fixture, delay: number, before = h.calls().length) {
@@ -663,5 +775,365 @@ describe('lookup runner', () => {
     broken = false
     await retryAfter(h, metadataRetryDelay(2), 0)
     expect(h.calls()).toHaveLength(1); await h.saved(post.id, 'joined')
+  })
+})
+
+describe('upload-thread reads', () => {
+  const uploadArgs = (issuedAt: number, cursor?: string) =>
+    ({ channel: C, ...ownPostLookupRange(issuedAt), inclusive: true, limit: OWN_POST_LOOKUP_PAGE_LIMIT, ...(cursor ? { cursor } : {}) })
+
+  test.each(['boundary', 'other-author', 'reply', 'broadcast'] as const)('reads all history from the issue time less the skew and learns P\'s earliest share past an earlier %s', async earlier => {
+    const h = await fixture(), count = OWN_POST_LOOKUP_PAGE_LIMIT * 2 + 5, issuedAt = h.clock.now()
+    const reply = { placement: earlier === 'broadcast' ? 'broadcast' : 'reply', threadTs: seconds(issuedAt + 1) } as const
+    // History is newest first, so the oldest message, at exactly `oldest`, is on the last page.
+    const data = h.pages(count, { rootTs: seconds(issuedAt - OWN_ROOT_CLOCK_SKEW_MS), message: i =>
+      i === 0 ? (earlier === 'other-author' ? shared([FILE], 'other-bot') : shared([FILE], 'own-bot', earlier === 'boundary' ? {} : reply))
+        : i === 1 || i === count - 1 ? shared([FILE], i === 1 ? 'own-user' : 'own-bot')
+          : shared([OTHER_FILE], i % 2 ? 'own-user' : 'other-user') })
+    const post = await h.upload(); await h.clock.flush()
+    expect(post.issuedAt).toBe(issuedAt)
+    const calls = h.calls()
+    expect(calls).toHaveLength(3)
+    for (const [i, call] of calls.entries()) {
+      expect(call.method).toBe('conversations.history')
+      expect(call.args).toEqual(uploadArgs(issuedAt, i ? data.responses[i - 1]!.response_metadata!.next_cursor : undefined))
+    }
+    await h.joinedAt(post, data.messages[earlier === 'boundary' ? 0 : 1]!.ts!)
+    expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+    h.runner.kick('alpha'); await h.clock.flush(); expect(h.calls()).toHaveLength(3); expect(h.learnt).toHaveLength(1)
+  })
+
+  test('a complete read without the share reads again from the first page at the retry spacing, with no overall bound', async () => {
+    const h = await fixture(), misses = 12, sizes = { pageSizes: [1, 1] }
+    h.pages(3, { ...sizes, message: () => shared([OTHER_FILE]) })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.calls()).toHaveLength(3)
+    const first = h.calls()[0]!.args, start = h.clock.now()
+    for (let i = 1; i <= misses; i++) {
+      for (let k = 0; k < 3; k++) h.runner.kick('alpha')
+      await h.clock.flush()
+      await retryAfter(h, metadataRetryDelay(i))
+      expect(h.calls()).toHaveLength(3 * (i + 1)); expect(h.calls()[3 * i]!.args).toEqual(first)
+      expect(h.learnt).toEqual([]); expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+      expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-thread')
+    }
+    expect(h.clock.now() - start).toBeGreaterThan(THREAD_MEMORY_RETRY_MAX_MS * 5)
+    const data = h.pages(3, { ...sizes, message: i => shared([i ? OTHER_FILE : FILE]) })
+    await retryAfter(h, metadataRetryDelay(misses + 1))
+    expect(h.calls()).toHaveLength(3 * (misses + 2)); expect(h.calls()[3 * (misses + 1)]!.args).toEqual(first)
+    await h.joinedAt(post, data.messages[0]!.ts!)
+    h.runner.kick('alpha'); await h.clock.flush(); expect(h.calls()).toHaveLength(3 * (misses + 2))
+  })
+
+  test.each(['network', 'dns', 'timeout', 'http', 'rate-limited'] as const)('%s retries the same page with spacing and Retry-After, keeping the cursor', async kind => {
+    const h = await fixture(), large = metadataRetryDelay(3) / 1000
+    const first: WebApiOutcome = kind === 'http' ? { kind, status: 503 } : kind === 'rate-limited' ? { kind, retryAfter: large } : { kind }
+    const data = h.pages(2, { pageSizes: [1], message: i => shared([i ? OTHER_FILE : FILE]),
+      pageOutcomes: { 0: [first], 1: [{ kind: 'network' }] } })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1)
+    const firstArgs = h.calls()[0]!.args
+    for (let i = 0; i < 3; i++) h.runner.kick('alpha')
+    await h.clock.flush(); await retryAfter(h, metadataRetryDelay(1, kind === 'rate-limited' ? large : undefined))
+    expect(h.calls()).toHaveLength(3); expect(h.calls()[1]!.args).toEqual(firstArgs)
+    const secondArgs = h.calls()[2]!.args
+    expect(secondArgs).toEqual(uploadArgs(post.issuedAt, data.responses[0]!.response_metadata!.next_cursor))
+    await retryAfter(h, metadataRetryDelay(1)) // a successful page reset the series
+    expect(h.calls()).toHaveLength(4); expect(h.calls()[3]!.args).toEqual(secondArgs)
+    await h.joinedAt(post, data.messages[0]!.ts!)
+  })
+
+  test('Retry-After beyond the timer maximum is chained, one timer at a time, to the exact deadline', async () => {
+    const h = await fixture(), delay = MAX_TIMER_DELAY_MS * 2 + metadataRetryDelay(1)
+    const data = h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [{ kind: 'rate-limited', retryAfter: delay / 1000 }] } })
+    const post = await h.upload(); await h.clock.flush()
+    const deadline = h.clock.now() + delay
+    while (h.clock.now() + MAX_TIMER_DELAY_MS < deadline) {
+      expect(h.clock.pendingCount()).toBe(1)
+      expect(h.clock.pending()[0]!.delayMs).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS)
+      expect(h.calls()).toHaveLength(1)
+      await h.clock.runNext()
+    }
+    await retryAfter(h, deadline - h.clock.now())
+    expect(h.clock.now()).toBe(deadline); expect(h.calls()).toHaveLength(2)
+    expect(h.calls()[1]!.args).toEqual(h.calls()[0]!.args)
+    await h.joinedAt(post, data.messages[0]!.ts!)
+  })
+
+  test.each(['never', 'deferred'] as const)('a %s page ends at the attempt deadline and is retried; a late answer learns nothing', async kind => {
+    const h = await fixture(), delayed = makeDeferredWebApiCall()
+    const data = h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [kind === 'never' ? { kind } : delayed.outcome] } })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.clock.pending()).toMatchObject([{ delayMs: THREAD_MEMORY_LOOKUP_DEADLINE_MS }])
+    await h.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS - 1)
+    expect(h.learnt).toEqual([]); expect(h.calls()).toHaveLength(1)
+    await h.clock.advance(1)
+    expect(h.clock.pending()).toMatchObject([{ delayMs: metadataRetryDelay(1) }])
+    if (kind === 'deferred') {
+      delayed.settle(); await h.clock.flush()
+      expect(h.learnt).toEqual([]); expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+      expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-thread')
+    }
+    await retryAfter(h, metadataRetryDelay(1))
+    expect(h.calls()).toHaveLength(2); expect(h.calls()[1]!.args).toEqual(h.calls()[0]!.args)
+    await h.joinedAt(post, data.messages[0]!.ts!)
+  })
+
+  test.each<[string, string]>([
+    ...['missing_scope', 'invalid_auth', 'not_in_channel', 'is_archived', 'channel_not_found', 'thread_not_found', 'unrecognized_failure']
+      .map((error): [string, string] => [error, error]),
+    ['messages-absent', 'malformed'], ['cursor-number', 'malformed'], ['reject', 'rejected'],
+  ])('permanent %s closes the upload with none and reports one joins-lost with no thread', async (kind, cause) => {
+    const h = await fixture(), damage = kind === 'messages-absent' || kind === 'cursor-number' ? kind : undefined
+    const data = h.pages(1, { message: () => shared([FILE]),
+      ...(damage || kind === 'reject' ? {} : { pageOutcomes: { 0: [{ kind: 'platform', error: kind }] } }) })
+    if (damage || kind === 'reject') h.stub().script.history.push(damage ? data.malformedOutcome(damage) : { kind: 'http', status: 403 })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.recorded).toEqual([['alpha', post.id, { notFound: true, holds: 'none' }]])
+    expect(h.lookupEvents).toEqual([{ kind: 'joins-lost', key: 'alpha', channel: C, threads: [], cause }])
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome: { kind: 'not-found', joined: false }, lookup: { holds: 'none' } })
+    expect(h.learnt).toEqual([]); expect(h.view('alpha', C, data.messages[0]!.ts!)).toBe('not-joined')
+    await h.saved(post.id, 'none')
+    h.runner.kick('alpha'); await h.clock.flush(); expect(h.lookupEvents).toHaveLength(1); expect(h.calls()).toHaveLength(1)
+  })
+
+  test.each(['before', 'in-flight', 'in-flight-without-kick', 'retry', 'permanent'] as const)('a stamp stale %s closes the upload with none, learning and reporting nothing', async when => {
+    const h = await fixture(), held = makeDeferredWebApiCall()
+    const data = h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: when === 'retry' ? [{ kind: 'network' }] : [held.outcome] } })
+    const post = await h.begin(undefined, 'alpha', FILE_CONTENT)
+    if (when === 'before') h.stale()
+    h.confirm(post); await h.clock.flush()
+    if (when !== 'before') {
+      expect(h.calls()).toHaveLength(1); h.stale()
+      if (when === 'in-flight' || when === 'retry') h.runner.kick('alpha')
+      await h.clock.flush()
+      held.settle(when === 'permanent' ? { kind: 'platform', error: 'channel_not_found' } : undefined); await h.clock.flush()
+    }
+    expect(h.calls()).toHaveLength(when === 'before' ? 0 : 1)
+    expect(h.recorded).toEqual([['alpha', post.id, { notFound: true, holds: 'none' }]])
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', lookup: { holds: 'none' } })
+    expect(h.learnt).toEqual([]); expect(h.owner.resolvedThreads('alpha', C).size).toBe(0)
+    expect(h.view('alpha', C, data.messages[0]!.ts!)).toBe('not-joined'); expect(h.lookupEvents).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0); await h.saved(post.id, 'none')
+  })
+
+  test('an undecided stamp makes no call until its kick after the decision', async () => {
+    const h = await fixture(), data = h.pages(1, { message: () => shared([FILE]) })
+    const post = await h.begin(undefined, 'alpha', FILE_CONTENT); h.undecided(); h.confirm(post); await h.clock.flush()
+    h.runner.kick('alpha'); await h.clock.flush()
+    expect(h.calls()).toEqual([]); expect(h.recorded).toEqual([]); expect(h.learnt).toEqual([]); expect(h.clock.pendingCount()).toBe(0)
+    h.decide(); await h.clock.flush(); expect(h.calls()).toEqual([])
+    h.runner.kick('alpha'); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1); await h.joinedAt(post, data.messages[0]!.ts!)
+  })
+
+  test('an unreadable journal makes no call until the kick after its first successful read', async () => {
+    const first = await fixture()
+    await first.close()
+    const h = await fixture({ dir: first.dir, reopen: true, unreadable: true })
+    expect(h.memory.store('alpha')?.readable).toBe(false)
+    // An upload read needs no digest, so only the journal's readable state may hold it.
+    h.deps.memory.digestKey = () => DIGEST_KEY
+    const data = h.pages(1, { message: () => shared([FILE]) })
+    const post = await h.upload(); h.runner.kick('alpha'); await h.clock.flush()
+    expect(h.calls()).toEqual([]); expect(h.clock.pendingCount()).toBe(0)
+    h.io.heal()
+    expect(await h.memory.retryRead('alpha')).toBe('read')
+    h.runner.journalRead('alpha'); await h.clock.flush()
+    expect(h.calls()).toEqual([])
+    h.runner.kick('alpha'); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1); expect(h.calls()[0]!.args).toEqual(uploadArgs(post.issuedAt))
+    expect(h.learnt).toEqual([['alpha', post.id, data.messages[0]!.ts!]])
+  })
+
+  test.each(['stopped', 'not-up'] as const)('a %s connection makes no call until a connected kick', async down => {
+    const h = await fixture(), data = h.pages(1, { message: () => shared([FILE]) })
+    const post = await h.begin(undefined, 'alpha', FILE_CONTENT), isUp = h.connections.isUp
+    if (down === 'stopped') await h.members.h.manager.stop('alpha')
+    else h.connections.isUp = () => false // the connection ID stays; only the up predicate refuses
+    h.confirm(post); await h.clock.flush()
+    expect(h.calls()).toEqual([]); expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS * 2)
+    if (down === 'stopped') {
+      h.stub().script.inventory.push(membershipPage([C]))
+      await h.members.h.bringUp(h.members.h.p('alpha')); await h.members.scan()
+    } else h.connections.isUp = isUp
+    expect(h.calls()).toEqual([])
+    h.runner.kick('alpha'); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1); expect(h.calls()[0]!.args).toEqual(uploadArgs(post.issuedAt))
+    await h.joinedAt(post, data.messages[0]!.ts!)
+  })
+
+  test.each(['lookup', 'upload'] as const)('one persona runs its lookup and upload one attempt at a time in issue order, %s first, while another persona reads beside it', async firstKind => {
+    const h = await fixture({ names: ['alpha', 'beta'] }), held = makeDeferredWebApiCall()
+    h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [held.outcome] } })
+    const beta = h.pages(1, { message: () => shared([FILE]) }, 'beta')
+    const early = firstKind === 'lookup' ? await h.begin() : undefined
+    await h.clock.advance(1)
+    const file = await h.begin(undefined, 'alpha', FILE_CONTENT)
+    await h.clock.advance(1)
+    const text = early ?? await h.begin(), other = await h.begin(undefined, 'beta', FILE_CONTENT)
+    h.confirm(file); h.unknown(text); h.confirm(other)
+    const lookupCall = { channel: C, oldest: ownPostLookupRange(text.issuedAt).oldest, latest: expect.any(String) }
+    const order = firstKind === 'lookup' ? [lookupCall, uploadArgs(file.issuedAt)] : [uploadArgs(file.issuedAt), lookupCall]
+    await h.clock.flush(); expect(h.calls()).toHaveLength(1)
+    h.runner.kick('alpha'); h.runner.kick('alpha'); await h.clock.flush() // kicks during the attempt start no second one
+    expect(h.calls()).toHaveLength(1); expect(h.calls()[0]!.args).toMatchObject(order[0]!)
+    expect(h.calls('beta')).toHaveLength(1)
+    expect(h.learnt).toEqual([['beta', other.id, beta.messages[0]!.ts!]])
+    held.settle(); await h.clock.flush()
+    expect(h.calls()).toHaveLength(2); expect(h.calls()[1]!.args).toMatchObject(order[1]!)
+    if (firstKind === 'upload') expect(h.calls()[0]!.args).toEqual(order[0])
+    expect(h.recorded.map(r => r[1])).toEqual([text.id])
+    expect(h.learnt.map(l => l[1])).toEqual([other.id, file.id])
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test.each(['forget', 'stop'] as const)('%s cancels a read in flight; its late answer and later Events change nothing', async action => {
+    const h = await fixture(), held = makeDeferredWebApiCall(), rekicked = makeDeferredWebApiCall()
+    const data = h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [held.outcome, ...(action === 'forget' ? [rekicked.outcome] : [])] } })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1)
+    if (action === 'forget') h.runner.forget('alpha'); else h.runner.stop()
+    expect(h.clock.pendingCount()).toBe(0)
+    held.settle(); await h.clock.flush()
+    h.runner.ownMessage('alpha', h.share(seconds(post.issuedAt + 1)), h.stub().identity); await h.clock.flush()
+    expect(h.learnt).toEqual([]); expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+    expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-thread'); expect(h.calls()).toHaveLength(1)
+    h.runner.kick('alpha'); h.runner.journalRead('alpha'); await h.clock.flush()
+    if (action === 'stop') { expect(h.calls()).toHaveLength(1); expect(h.learnt).toEqual([]); return }
+    // After the later kick, P's Event works again: it learns the thread while the new read is held.
+    expect(h.calls()).toHaveLength(2)
+    const ts = seconds(post.issuedAt + 7)
+    expect(ts).not.toBe(data.messages[0]!.ts)
+    h.runner.ownMessage('alpha', h.share(ts), h.stub().identity)
+    expect(h.learnt).toEqual([['alpha', post.id, ts]])
+    rekicked.settle(); await h.clock.flush()
+    expect(h.learnt).toHaveLength(1); expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+    expect(h.calls()).toHaveLength(2); expect(h.view('alpha', C, data.messages[0]!.ts!)).toBe('not-joined')
+    await h.joinedAt(post, ts)
+  })
+
+  test.each([['forget', 'failure'], ['forget', 'miss'], ['stop', 'failure'], ['stop', 'miss']] as const)('%s removes an upload\'s %s wait without a later call', async (action, wait) => {
+    const h = await fixture()
+    h.pages(1, { message: () => shared([wait === 'miss' ? OTHER_FILE : FILE]), ...(wait === 'failure' ? { pageOutcomes: { 0: [{ kind: 'network' }] } } : {}) })
+    await h.upload(); await h.clock.flush()
+    expect(h.clock.pending()).toMatchObject([{ delayMs: metadataRetryDelay(1) }])
+    if (action === 'forget') h.runner.forget('alpha'); else h.runner.stop()
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(metadataRetryDelay(1) * 2)
+    expect(h.calls()).toHaveLength(1); expect(h.learnt).toEqual([]); expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+  })
+
+  test('forgetting one persona leaves the other persona\'s upload read intact', async () => {
+    const h = await fixture({ names: ['alpha', 'beta'] }), a = makeDeferredWebApiCall(), b = makeDeferredWebApiCall()
+    h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [a.outcome] } })
+    const beta = h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [b.outcome] } }, 'beta')
+    const first = await h.upload(), other = await h.upload('beta'); await h.clock.flush()
+    h.runner.forget('alpha'); expect(h.clock.pendingCount()).toBe(1)
+    a.settle(); b.settle(); await h.clock.flush()
+    expect(h.learnt).toEqual([['beta', other.id, beta.messages[0]!.ts!]])
+    expect(h.owner.operation('alpha', first.id)?.state).toBe('awaiting-thread')
+    h.runner.ownMessage('beta', h.share(seconds(other.issuedAt + 1), {}, 'beta'), h.stub('beta').identity)
+    expect(h.learnt).toHaveLength(1)
+    await h.joinedAt(other, beta.messages[0]!.ts!)
+  })
+})
+
+describe('own file_share Events', () => {
+  test('P\'s own share right after the completion learns the thread at once, with no Slack call', async () => {
+    const h = await fixture(); h.pages(1, { message: () => shared([FILE]) })
+    const post = await h.begin(undefined, 'alpha', FILE_CONTENT), ts = seconds(post.issuedAt + 1)
+    h.confirm(post)
+    h.runner.ownMessage('alpha', h.share(ts), h.stub().identity)
+    expect(h.learnt).toEqual([['alpha', post.id, ts]])
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', outcome: { kind: 'confirmed', thread: ts } })
+    expect(h.owner.awaitingUploads('alpha')).toEqual([])
+    await h.clock.flush()
+    expect(h.calls()).toEqual([]); expect(h.clock.pendingCount()).toBe(0); expect(h.recorded).toEqual([])
+    await h.joinedAt(post, ts)
+  })
+
+  test('P\'s own share during a read learns the thread; the read\'s answer records nothing', async () => {
+    const h = await fixture(), held = makeDeferredWebApiCall()
+    const data = h.pages(1, { message: () => shared([FILE]), pageOutcomes: { 0: [held.outcome] } })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1)
+    const ts = seconds(post.issuedAt + 7)
+    expect(ts).not.toBe(data.messages[0]!.ts)
+    h.runner.ownMessage('alpha', h.share(ts), h.stub().identity)
+    expect(h.learnt).toEqual([['alpha', post.id, ts]])
+    await h.clock.flush(); expect(h.clock.pendingCount()).toBe(0)
+    held.settle(); await h.clock.flush()
+    expect(h.learnt).toHaveLength(1); expect(h.recorded).toEqual([]); expect(h.lookupEvents).toEqual([])
+    expect(h.calls()).toHaveLength(1); expect(h.view('alpha', C, data.messages[0]!.ts!)).toBe('not-joined')
+    await h.joinedAt(post, ts)
+  })
+
+  type Fx = Awaited<ReturnType<typeof fixture>>
+  // Each row gives the key ownMessage is called for and the event; the identity is alpha's.
+  test.each<[string, (h: Fx, ts: string) => [string, unknown]]>([
+    ['a reply', (h, ts) => ['alpha', h.share(ts, { shape: 'reply' })]],
+    ['an edit', (h, ts) => ['alpha', h.share(ts, { shape: 'changed' })]],
+    ['a deletion', (h, ts) => ['alpha', h.share(ts, { shape: 'deleted' })]],
+    ['another user\'s share', (h, ts) => ['alpha', h.share(ts, { shape: 'other-user' })]],
+    ['another bot\'s share', (h, ts) => ['alpha', h.share(ts, { shape: 'other-bot' })]],
+    ['another persona\'s share', (h, ts) => ['alpha', h.share(ts, {}, 'beta')]],
+    ['P\'s share on another persona\'s key', (h, ts) => ['beta', h.share(ts)]],
+    ['a share without that file ID', (h, ts) => ['alpha', h.share(ts, { fileIds: [OTHER_FILE] })]],
+    ['a share in another channel', (h, ts) => ['alpha', h.share(ts, { channel: SHARED_CHANNEL_IDS.secondary })]],
+    ['a share with no files', (h, ts) => ['alpha', h.share(ts, { shape: 'no-files' })]],
+    ['a share with a malformed ID', (h, ts) => ['alpha', h.share(ts, { shape: 'malformed-id' })]],
+    ['another subtype', (h, ts) => ['alpha', h.share(ts, {}, 'alpha', { subtype: 'bot_message' })]],
+  ])('%s learns nothing and starts no Slack call', async (_name, make) => {
+    const h = await fixture({ names: ['alpha', 'beta'] }); h.pages(1, { message: () => shared([OTHER_FILE]) })
+    const post = await h.upload(); h.runner.kick('beta'); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1); expect(h.clock.pending()).toMatchObject([{ delayMs: metadataRetryDelay(1) }])
+    const [key, event] = make(h, seconds(post.issuedAt + 1))
+    h.runner.ownMessage(key, event, h.stub().identity)
+    expect(h.learnt).toEqual([]); expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-thread')
+    await h.clock.flush()
+    expect(h.calls()).toHaveLength(1); expect(h.calls('beta')).toEqual([])
+    expect(h.clock.pending()).toMatchObject([{ delayMs: metadataRetryDelay(1) }])
+  })
+
+  test('P\'s own share before the completion learns nothing', async () => {
+    const h = await fixture(); h.pages(1, { message: () => shared([OTHER_FILE]) })
+    const post = await h.begin(undefined, 'alpha', FILE_CONTENT), ts = seconds(post.issuedAt + 1)
+    h.runner.kick('alpha'); await h.clock.flush()
+    h.runner.ownMessage('alpha', h.share(ts), h.stub().identity)
+    expect(h.learnt).toEqual([]); expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-answer')
+    h.confirm(post); await h.clock.flush()
+    expect(h.learnt).toEqual([]); expect(h.calls()).toHaveLength(1)
+    expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-thread')
+  })
+
+  test('P\'s own share under a stale stamp learns nothing, and the upload closes with none', async () => {
+    const h = await fixture(), data = h.pages(1, { message: () => shared([OTHER_FILE]) })
+    const post = await h.upload(); await h.clock.flush()
+    expect(h.calls()).toHaveLength(1)
+    h.stale()
+    h.runner.ownMessage('alpha', h.share(seconds(post.issuedAt + 1)), h.stub().identity)
+    expect(h.learnt).toEqual([])
+    h.runner.kick('alpha'); await h.clock.flush()
+    expect(h.recorded).toEqual([['alpha', post.id, { notFound: true, holds: 'none' }]])
+    expect(h.lookupEvents).toEqual([]); expect(h.calls()).toHaveLength(1); expect(h.clock.pendingCount()).toBe(0)
+    expect(h.view('alpha', C, data.messages[0]!.ts!)).toBe('not-joined'); await h.saved(post.id, 'none')
+  })
+
+  test.each(['awaitingUploads', 'learnUploadThread', 'stamp', 'event'] as const)('ownMessage never throws when %s throws, and calls no Slack method', async fault => {
+    const h = await fixture(); h.pages(1, { message: () => shared([OTHER_FILE]) })
+    const post = await h.upload(); await h.clock.flush()
+    const owner = { ...h.deps.owner }, stamp = h.deps.stamp
+    const fail = () => { throw new Error(LEAK_SENTINEL) }
+    if (fault === 'awaitingUploads') h.deps.owner.awaitingUploads = fail
+    if (fault === 'learnUploadThread') h.deps.owner.learnUploadThread = fail
+    if (fault === 'stamp') h.deps.stamp = fail
+    const event = fault === 'event' ? new Proxy({}, { get: fail, has: fail }) : h.share(seconds(post.issuedAt + 1))
+    expect(() => h.runner.ownMessage('alpha', event, h.stub().identity)).not.toThrow()
+    Object.assign(h.deps.owner, owner); h.deps.stamp = stamp
+    await h.clock.flush()
+    expect(h.learnt).toEqual([]); expect(h.calls()).toHaveLength(1)
+    expect(h.owner.operation('alpha', post.id)?.state).toBe('awaiting-thread')
   })
 })

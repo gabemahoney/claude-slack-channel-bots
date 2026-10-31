@@ -1862,7 +1862,7 @@ Each report goes to the persona's notice destination and to `server.log` as one 
 
 These reports are for the operator: the bot is told not to act on them, even when its notice destination is a channel it reads. During an outage, `off`, `mentions` and `all` channels keep their usual delivery behavior; DMs, other personas, already known Joined Threads, @mentions and Broadcasts keep flowing.
 
-Failed saves (creation or append), reads and seal writes retry in the background without new traffic: 5 seconds (`THREAD_MEMORY_RETRY_MIN_MS`), then 10, 20, 40 and at most 60 seconds (`THREAD_MEMORY_RETRY_MAX_MS`) between attempts. A retry does not post a bot message again; teardown or removal cancels that persona's retries and lookups and silently ends its open episodes, and a later bring-up starts fresh ones.
+Failed saves (creation or append), reads and seal writes retry in the background without new traffic: 5 seconds (`THREAD_MEMORY_RETRY_MIN_MS`), then 10, 20, 40 and at most 60 seconds (`THREAD_MEMORY_RETRY_MAX_MS`) between attempts. A retry does not post a bot message again; teardown or removal cancels that persona's retries, lookups and upload-thread reads and silently ends its open episodes, and a later bring-up starts fresh ones.
 
 Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` storage error. Notice blocks show the body; Slack posts normally prefix it with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack. The overflow examples show the complete post so its prefix is included in the bound; log paths use JSON quotes without Slack escaping.
 
@@ -1940,7 +1940,7 @@ Thread: C0123 / 1700000000.000001.
 Thread: C0123 / 1700000000.000002.
 ```
 
-An own-post lookup that cannot name a thread, including a permanent Slack refusal:
+An own-post lookup that cannot name a thread, including a permanent Slack refusal, or an upload-thread read Slack refused or answered unusably:
 
 ```text
 :warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
@@ -2084,14 +2084,18 @@ Thread: C0123 / 1700000000.000001.
   [slack] thread-memory-joins-lost: persona=alpha threads=[] messages=[] unreadable_lines=0 own_posts=[channel=C0123 threads=[] cause=not_in_channel] bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot="Alpha" (key=alpha)
   ```
 
-- **Meaning:** Each loss is reported once: one read's quarantined lines, one resolution's durably withdrawn Memory Holds, or one own-post lookup that could not settle the bot's thread. A quarantine and the holds it causes can therefore produce two posts at one start; lost threads are treated as threads the bot is not in unless a readable or kept join names them.
+- **Meaning:** Each loss is reported once: one read's quarantined lines, one resolution's durably withdrawn Memory Holds, or one own-post lookup or upload-thread read that could not settle the bot's thread. A quarantine and the holds it causes can therefore produce two posts at one start; lost threads are treated as threads the bot is not in unless a readable or kept join names them.
 
-  An own post has an unknown outcome when CSCB stops before Slack's answer or before saving its join, or the call ends without an answer. CSCB reads the channel's or thread's history in the background to find it; each lost lookup is reported on its own.
+  An own-post lookup follows an own post whose outcome is unknown, because CSCB stopped before Slack's answer or before saving its join, or the call ended without an answer. CSCB reads the channel's or thread's history in the background to find it; each lost lookup is reported on its own.
+
+  An upload-thread read follows a file the bot uploaded as a new channel message, which Slack confirmed: CSCB reads the channel's history for the bot's own message sharing that file, to learn which thread it started. When Slack refuses that read for good or answers it unusably, the upload was still made and only the bot's place in that file's thread is lost, so the post names the channel only.
 - **Cause:** Unreadable journal lines other than an invalid final line, or waiting replies that cannot be matched to a join when Memory Holds are resolved. A lone torn final line is an append that was never saved and gets no *Joins lost* report; its incoming queue record recovers the join.
 
-  For an own-post lookup, `cause=several` means several of the bot's messages match; `cause=unmatched` means its messages are present but none matches. Otherwise Slack permanently refused the read, for example `channel_not_found`, `not_in_channel`, `is_archived` or `missing_scope`, refused credentials such as `invalid_auth`, or lost channel access; an unusable answer can instead give `rejected` or `malformed`.
+  For an own-post lookup, `cause=several` means several of the bot's messages match; `cause=unmatched` means its messages are present but none matches. Otherwise Slack permanently refused the read, for example `channel_not_found`, `not_in_channel`, `is_archived` or `missing_scope`, refused credentials such as `invalid_auth`, or lost channel access; an unusable answer can instead give `rejected` or `malformed`. An upload-thread read is reported for every one of these answers, `rejected` and `malformed` included, and also for `thread_not_found` or `message_not_found`, because it reads no parent; it is never reported as `several` or `unmatched`.
 
-  Transient failures, rate limits and attempt timeouts post nothing and retry with the Thread Memory spacing above, honoring a longer `Retry-After`, with no overall limit. A missing parent (`thread_not_found` or `message_not_found`), a stale Channel Stamp after leaving `thread_hybrid` or changing its shared identity, and a complete history with no remaining message of the bot's own close silently; a unique match joins silently. Lookups wait while Thread Memory is unreadable, the connection is down or the Channel Stamp is undecided.
+  Transient failures, rate limits and attempt timeouts post nothing and retry with the Thread Memory spacing above, honoring a longer `Retry-After`, with no overall limit. A missing parent (`thread_not_found` or `message_not_found`), a stale Channel Stamp after leaving `thread_hybrid` or changing its shared identity, and a lookup's complete history with no remaining message of the bot's own close silently; a unique match joins silently.
+
+  An upload whose own share message isn't in the history yet posts nothing and is read again from the first page with the same spacing and no limit, until the share appears in the history or as the bot's own message event, or the Channel Stamp goes stale. If CSCB stops or the persona is torn down first, the next start's or bring-up's own-post lookup settles it. Lookups and upload-thread reads wait while Thread Memory is unreadable, the connection is down or the Channel Stamp is undecided.
 - **Fix:** A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot, and use `server.log` for all identifiers when the post gives a count of the rest.
 
   A lost own-post join by itself needs no resend of the bot's post: `Send again` lists withdrawn incoming messages. For a permanent refusal with `not_in_channel`, invite the persona's app to the channel (`/invite @<app name>`, as in [`persona-destination-failed`](#persona-destination-failed)); for `channel_not_found`, check the channel still exists, then invite the app if it is private; for `is_archived`, unarchive the channel or remove its entry from the persona's `channels` and confirm the pending change (see [Confirming a pending change](#confirming-a-pending-change)). For other permanent refusals, follow the entries for [app scopes and installation](../setup-slack-channel-bots/SKILL.md#52-slack-app-create-name-avatar-install), [re-installation](#fixed-on-slacks-side-same-tokens) or [refused credentials](#persona-credentials-refused), according to the cause.
