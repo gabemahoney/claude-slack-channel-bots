@@ -139,6 +139,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/permission-poller\.ts$/, "the permission poller, which posts through a persona's client and logs agent-director and Slack failure text"],
   [/^src\/permission-click-handler\.ts$/, "the click handler, which updates through a persona's client and logs and trails agent-director failure text"],
   [/^src\/persona-notifier\.ts$/, "the persona notifier, which posts notices through a persona's client and logs Slack failure text"],
+  [/^src\/notice-correction\.ts$/, 'the posted-notice correction, whose outcomes carry described Slack failure text to the logOutcome callback'],
   [/^src\/persona-destination[\w-]*\.ts$/, "the destination resolver and hold, which open DMs through a persona's client and describe Slack failures"],
   [/^src\/health-check\.ts$/, 'the health check, whose lines carry agent-director failure text'],
   [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
@@ -517,6 +518,23 @@ describe('every suite that touches config, credentials or reload calls assertNoL
 
   // each step's line carries the described agent-director failure (a failed get, a kill's
   // outcome), and a kill's result keeps the kill-failure descriptions raw for the alert to redact.
+  test('notice-correction functions touch the secrecy surface; constants and type-only imports do not', () => {
+    const suite = 'tests/notice-correction-user.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/notice-correction.ts'))).toBe(true)
+    for (const code of [
+      "import { correctPostedNotice } from '../src/notice-correction.ts'",
+      "import { correctPostedNotice as correct } from '../src/notice-correction.ts'",
+      "import * as correction from '../src/notice-correction.ts'",
+      "const correction = await import('../src/notice-correction.ts')",
+    ]) expect(touchReasonsOf(suite, code).some(reason => reason.includes('src/notice-correction.ts'))).toBe(true)
+    for (const code of [
+      "import { NOTICE_CORRECTION_TIMEOUT_MS } from '../src/notice-correction.ts'",
+      "import type { NoticeCorrectionOutcome } from '../src/notice-correction.ts'",
+      "import { type NoticeCorrectionDeps } from '../src/notice-correction.ts'",
+      "import type * as Correction from '../src/notice-correction.ts'",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([])
+  })
+
   test('src/live-row-sequence.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/live-row-sequence.test.ts'
     expect(SOURCE_SURFACES.some(([re]) => re.test('src/live-row-sequence.ts'))).toBe(true)

@@ -157,7 +157,7 @@ Any number of personas may list the same channel, each with its own `delivery`. 
 `dm.enabled` is each persona's DMs switch. It is off (`false`) by default.
 
 - **On:** anyone in the workspace can DM the persona's own Slack app, and that persona alone receives the DM and answers in it. The persona can also start a DM with a workspace user by passing the user's ID to `reply`, and posts there as itself.
-- **Off:** DMs to the persona's app are not delivered. The server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona never opens, reads or posts in a DM.
+- **Off:** DMs to the persona's app are not delivered; the server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona cannot open or read a DM, and only corrections to previously posted messages may post there. Permission prompts can still be updated, and [storage-warning recovery](../skills/debug-slack-channel-bots/SKILL.md#message-saved-after-retry) can edit its warning and post one fallback correction in the original DM.
 - **Group DMs** (DMs with more than one person) are never delivered to any persona, whatever `dm.enabled` says.
 
 `dm.contact` is the person who receives the persona's prompts and notices when its destination is `"dm"`: in declarative mode when `permission_prompts` is `"dm"`, and in fungible mode when `invited.permission_prompts` is `"dm"` or unset. In either mode a `"dm"` destination needs `dm.enabled: true` and a `dm.contact`. `dm.contact` gates nothing else: it doesn't limit who can DM the persona.

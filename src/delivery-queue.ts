@@ -80,7 +80,7 @@ export interface QueueItem {
   unknownSend: boolean; retypeCount: number; nextAttempt: number
 }
 export type QueueEvent =
-  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; error: unknown }
+  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; slackKey?: SlackKey; error: unknown }
   | { type: 'stored' | 'writable'; key: string }
   | { type: 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; path?: string; seq?: number; error: unknown }
   | { type: 'record-unreadable'; key: string; line: number; quarantinePath: string; alert: boolean }
@@ -564,7 +564,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           event({ type: 'stored', key })
           return { status: 'accepted' as const, seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
         })
-      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, error }); return { status: 'failed', error } }
+      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, slackKey: input.key, error }); return { status: 'failed', error } }
     },
     async append(key, record) {
       try {

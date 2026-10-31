@@ -422,6 +422,7 @@ describe('npm pack ships every runtime src file', () => {
   test('(hermetic): package.json files covers every runtime src/*.ts file with no ! entry excluding it', () => {
     const runtimeFiles = runtimeSrcFiles()
     expect(runtimeFiles.length).toBeGreaterThan(0)
+    expect(runtimeFiles).toContain('src/notice-correction.ts')
     const files = readPkg().files ?? []
     expect(runtimeFiles.filter((rel) => !filesCover(files, rel))).toEqual([])
   })

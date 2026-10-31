@@ -73,7 +73,9 @@ In fungible mode, a persona's destination is its `invited.permission_prompts`, `
 - **A channel ID:** any channel; it needs no listing and no DMs. Invite the persona's app to it, or Slack refuses the posts (see "A permission prompt or notice doesn't arrive" in [Troubleshooting](troubleshooting.md#troubleshooting)). Everyone in that channel sees the prompts and notices.
 - **`"dm"`, written or by default:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
 
-Because of the loop guard, no other persona receives every message in a fungible destination channel. After a confirmed switch change, the next prompt and the next notice, held notices included, go to the destination of the mode turned on; prompts already posted stay where they are and stay answerable.
+Because of the loop guard, no other persona receives every message in a fungible destination channel. After a confirmed switch change, new prompts and ordinary notices, held notices included, go to the destination of the mode turned on. Prompts already posted stay where they are and stay answerable.
+
+[Storage-warning recovery](../skills/debug-slack-channel-bots/SKILL.md#message-saved-after-retry) keeps both the edit and its one fallback correction in the warning's original channel or DM, even after the destination changes or DMs are turned off.
 
 ## Example in fungible mode
 

@@ -158,7 +158,7 @@ export interface NotifierStack {
 export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
   const { getPersona, clientFor, log } = deps
   const clock = deps.clock ?? createFakeClock()
-  const destinations = createPersonaDestinations({ log, getPersonaConfig: deps.getPersonaConfig })
+  const destinations = createPersonaDestinations({ log, clock, getPersonaConfig: deps.getPersonaConfig })
   const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
   const notifier = createPersonaNotifier({
     getPersona,
