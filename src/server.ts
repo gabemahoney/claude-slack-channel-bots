@@ -81,6 +81,7 @@ import {
   replySettingsOf,
   agentDirectorCallTimeoutMsOf,
   channelModeOf,
+  type ChannelMode,
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
@@ -213,7 +214,7 @@ import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
-import { createOwnPostObserver } from './own-post.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, type OwnPostJoins } from './own-post.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
@@ -709,10 +710,11 @@ function resolvePersonaUserName(personaKey: string, userId: string): Promise<str
 // ---------------------------------------------------------------------------
 
 /**
- * The one confirmed-own-post adapter, shared by replies, prompts, warnings and
- * notices. It has no owner yet, so it records nothing and never affects a post.
+ * The one own-post adapter, shared by replies, prompts, warnings and notices.
+ * main() installs its owner after constructing Thread Memory.
  */
-const ownPosts = createOwnPostObserver(() => undefined)
+let ownPostJoins: OwnPostJoins | undefined
+const ownPosts = createOwnPostObserver(() => ownPostJoins)
 
 const sessionToolDeps: SessionToolDeps = {
   ownPosts,
@@ -1255,7 +1257,10 @@ const personaRouting = createPersonaRouting({
   // sets, which the session tools and the reload controller read too. Before
   // main() loads the store it is undefined, so no stored choice applies.
   getChannelDelivery: () => channelDeliveryStore,
-  threadMemory: (key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown',
+  threadMemory: (key, channel, root) => {
+    ownPostJoins?.settleDeferred(key, channel)
+    return threadMemory?.view(key, channel, root) ?? 'unknown'
+  },
   joins: {
     stamp: (key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined,
     hasSavedJoin: (key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false,
@@ -1539,6 +1544,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await deliveryClients?.close()
   await deliveryQueue?.stop()
   threadMemoryRetries?.stopKeys()
+  ownPostJoins?.stop()
   unsubscribeThreadMemory?.()
   await threadMemory?.quiesce()
   if (threadMemorySeal?.loadedAtStart() && threadMemory) {
@@ -2873,6 +2879,21 @@ export async function main(): Promise<void> {
     clearCreated: key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
     onEvent: event => threadMemoryEvents.emit(event),
   })
+  const ownPostSources = {
+    config: () => personaConfig,
+    persona: getAppliedPersona,
+    choices: () => channelDeliveryStore,
+    membership: (key: string, channel: string, mode: ChannelMode) => channelMembership?.read(key, channel, mode),
+  }
+  ownPostJoins = createOwnPostJoins({
+    memory: threadMemory,
+    lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
+    choice: ownPostChoice(ownPostSources),
+    eligibility: ownPostEligibility(ownPostSources),
+    now: Date.now,
+    operationId: () => crypto.randomUUID(),
+    isDryRun,
+  })
   threadMemoryRetries = createThreadMemoryRetries({
     canRun: threadMemoryWorkAllowed,
     clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -3027,9 +3048,11 @@ export async function main(): Promise<void> {
       teardown: async (persona) => {
         try { await personaLifecycleOps.teardown(persona) } finally {
           if (!personaConfig?.personas.some(applied => applied.key === persona.key)) {
-            try { memoryHolds?.forget(persona.key) } finally {
-              try { threadMemoryRetries?.forget(persona.key, 'removal') } finally {
-                await threadMemory?.remove(persona.key)
+            try { await forgetPersonaState(persona.key, [key => ownPostJoins?.forget(key)]) } finally {
+              try { memoryHolds?.forget(persona.key) } finally {
+                try { threadMemoryRetries?.forget(persona.key, 'removal') } finally {
+                  await threadMemory?.remove(persona.key)
+                }
               }
             }
           }
@@ -3113,6 +3136,7 @@ export async function main(): Promise<void> {
   unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => {
     if (shuttingDown) return
     threadMemory?.published()
+    for (const persona of personaConfig?.personas ?? []) ownPostJoins?.onSharedStatePublished(persona.key)
     // published() synchronously recovers deferred queue joins before these
     // per-key resolver turns run. A forgotten life is never recreated here.
     for (const key of deliveryQueue?.keys() ?? []) {
@@ -3856,7 +3880,7 @@ export async function main(): Promise<void> {
     routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
       k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k),
       k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k),
-      k => threadMemoryRetries?.forget(k), k => threadMemory?.forget(k),
+      k => threadMemoryRetries?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k),
     ]) },
     loadThreadMemory: async key => {
       await threadMemory?.loadKey(key)

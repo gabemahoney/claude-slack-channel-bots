@@ -2617,6 +2617,7 @@ describe('reply files: nested upload completions observed on the real client', (
     const issued: OwnPostIssue[] = []
     const files: Array<{ issue: OwnPostIssue; channel: string; file?: string; ts?: string; part?: number }> = []
     const ownPosts: OwnPostObserver = {
+      start: () => undefined, end: () => {},
       issue: (key, surface, channel) => {
         const issue: OwnPostIssue = { key, surface, operation: `op-${issued.length + 1}`, issuer: {}, ...(channel ? { channel } : {}) }
         issued.push(issue)

@@ -523,6 +523,7 @@ describe('confirmed own posts', () => {
     const events: Array<[string, unknown?]> = []
     const issued = { key: C.key, surface: 'notice' as const, operation: 'op-1', issuer: {} }
     const ownPosts: OwnPostObserver = {
+      start: () => undefined, end: () => {},
       issue(key, surface, channel) { events.push(['issue', { key, surface, channel }]); if (faults.includes('issue')) throw new Error('injected issue'); return { ...issued, key, surface } },
       confirm(issue, posted) { events.push(['confirm', { issue: issue?.surface, posted }]); if (faults.includes('confirm')) throw new Error('injected confirm') },
     }

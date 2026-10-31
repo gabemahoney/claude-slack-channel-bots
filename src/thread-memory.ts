@@ -30,7 +30,7 @@
 
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from './delivery-queue.ts'
 import { durableUnlinkSync, DurableUnlinkUnsyncedError } from './atomic-write.ts'
@@ -231,6 +231,24 @@ export interface ThreadPostIntent extends ThreadRecordBase {
 export interface ThreadPostOutcome extends ThreadRecordBase {
   kind: 'post-outcome'; operationId: string; outcome: 'joined' | 'none'
 }
+export type OwnPostContent = { kind: 'text'; text: string } | { kind: 'file'; name: string; size: number }
+export type OwnPostIntent = Pick<ThreadPostIntent, 'operationId' | 'channel' | 'root' | 'at' | 'stamp'> &
+  ({ digest: string } | { content: OwnPostContent })
+export type UnresolvedOwnPostIntent = Pick<ThreadPostIntent, 'operationId' | 'channel' | 'root' | 'at' | 'stamp'> & { digest?: string }
+export type KeepIntentResult = { kept: false } | { kept: true; ready?: Promise<'saved' | 'failed'> }
+export type ResolveIntentResult = { joined: { channel: string; root: string; stamp: ChannelStamp } } | { none: true }
+
+/** The same normalisation is used for outgoing text and lookup candidates. */
+export function normaliseOwnPostText(text: string): string {
+  return text.replace(/&amp;|&lt;|&gt;/g, escape => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>' })[escape]!)
+    .replace(/<([^<>|]+)(?:\|[^<>]*)?>/g, '$1').trim()
+}
+/** Versioned, disjoint encodings keep file metadata separate from text. */
+export function ownPostDigest(digestKey: string, content: OwnPostContent): string {
+  const encoded = content.kind === 'text' ? ['own-post-v1', 'text', normaliseOwnPostText(content.text)]
+    : ['own-post-v1', 'file', content.name, content.size]
+  return createHmac('sha256', Buffer.from(digestKey, 'hex')).update(JSON.stringify(encoded)).digest('hex')
+}
 export type ThreadMemoryRecord = ThreadMemoryHeader | ThreadJoinRecord | ThreadPostIntent | ThreadPostOutcome
 export type ThreadMemoryView = 'joined' | 'not-joined' | 'unknown'
 export interface ThreadMemoryQuarantineFact {
@@ -295,7 +313,16 @@ export interface ThreadMemory {
   retryPendingJoins(key: string): void
   keptFacts(key: string): ThreadJoin[]
   joins(key: string): { join: ThreadJoin; savedAt?: number }[]
-  unresolvedIntents(key: string): ThreadPostIntent[]
+  isApplied(key: string): boolean
+  channelStamp(key: string, channel: string): ThreadMemoryStampState | undefined
+  digestKey(key: string): string | undefined
+  saveBlocked(key: string): boolean
+  keepIntent(key: string, intent: OwnPostIntent): KeepIntentResult
+  resolveIntent(key: string, operationId: string, result: ResolveIntentResult): 'joined' | 'none' | undefined
+  unresolvedIntents(key: string, channel?: string): UnresolvedOwnPostIntent[]
+  hasKeptJoin(key: string, channel: string, root: string): boolean
+  intentSaved(key: string, operationId: string): boolean
+  memoryOnlyOwnPostJoins(key: string): { channel: string; root: string }[]
   store(key: string): { storeId?: string; digestKey?: string; lastRecordNumber: number; readable: boolean; created: boolean } | undefined
   readFacts(key: string): { error?: unknown; quarantined: ThreadMemoryQuarantineFact[] }
   clock(key: string): number
@@ -359,6 +386,9 @@ function memoryStampMatches(a: ThreadMemoryStamp, b: ThreadMemoryStampState | un
 function stampKey(stamp: ThreadMemoryStamp): string { return JSON.stringify([stamp.incarnation, stamp.threadHybridSince]) }
 interface JoinedThread { join: ThreadJoin; saved?: ThreadJoinRecord }
 type JoinIndex = Map<string, Map<string, Map<string, JoinedThread>>>
+type KeptIntent = Omit<ThreadPostIntent, 'v' | 'seq' | 'digest'> & { digest?: string; content?: OwnPostContent }
+type KeptRecord = ({ kind: 'join' } & ThreadJoin) | KeptIntent | Omit<ThreadPostOutcome, 'v' | 'seq'>
+interface KeptWrite { records: KeptRecord[] }
 interface MemoryJournal extends AppendRollback {
   readable: boolean; exists: boolean; hasRecords: boolean; live: boolean; created: boolean; failed: boolean
   header?: ThreadMemoryHeader; highWater: number; records?: ThreadMemoryRecord[]
@@ -366,12 +396,16 @@ interface MemoryJournal extends AppendRollback {
   missing?: boolean
   joinedByChannel: JoinIndex
   heldJoins: JoinIndex
-  kept: ThreadJoin[]; intents: Map<string, ThreadPostIntent>
+  kept: ThreadJoin[]; intents: Map<string, KeptIntent>; savedIntents: Map<string, ThreadPostIntent>
+  intentsByChannel: Map<string, Map<string, KeptIntent>>
+  writes: KeptWrite[]
+  ownJoins: Map<string, ThreadJoin>
   error?: unknown; quarantined: ThreadMemoryQuarantineFact[]; quarantineRollback: AppendRollback
 }
 function emptyMemoryJournal(): MemoryJournal {
   return { readable: true, exists: false, hasRecords: false, live: false, created: false, failed: false, highWater: 0,
-    joinedByChannel: new Map(), heldJoins: new Map(), kept: [], intents: new Map(), quarantined: [], quarantineRollback: {} }
+    joinedByChannel: new Map(), heldJoins: new Map(), kept: [], intents: new Map(), savedIntents: new Map(),
+    intentsByChannel: new Map(), writes: [], ownJoins: new Map(), quarantined: [], quarantineRollback: {} }
 }
 
 /** All state belongs to this instance; reading, activation and timers are explicit. */
@@ -480,17 +514,57 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     j.kept = j.kept.filter(fact => readStamp(fact.channel)?.kind === 'undecided' || memoryStampMatches(fact.stamp, readStamp(fact.channel)) || named(key, fact.channel, fact.stamp))
   }
   function replay(key: string, j: MemoryJournal): void {
+    replayIntents(j)
     for (const record of j.records ?? []) {
       if (record.kind === 'join') {
         const stamp = options.stamp(key, record.channel)
         if (stamp?.kind === 'undecided' || memoryStampMatches(record.stamp, stamp)) retain(j, record, record)
         else if (named(key, record.channel, record.stamp)) retain(j, record, record, j.heldJoins)
-      } else if (record.kind === 'post-intent') j.intents.set(record.operationId, record)
-      else if (record.kind === 'post-outcome') j.intents.delete(record.operationId)
+      }
     }
     delete j.records
     judge(key, j)
     j.kept = j.kept.filter(fact => !savedJoin(j, fact))
+  }
+  function digestKept(j: MemoryJournal): void {
+    const digestKey = (j.header ?? j.creationHeader)?.digestKey
+    if (!digestKey) return
+    for (const write of j.writes) for (const record of write.records) {
+      if (record.kind !== 'post-intent' || !record.content) continue
+      record.digest = ownPostDigest(digestKey, record.content)
+      delete record.content
+    }
+  }
+  function replayIntents(j: MemoryJournal): void {
+    if (j.records) {
+      j.savedIntents.clear()
+      for (const record of j.records) {
+        if (record.kind === 'post-intent') j.savedIntents.set(record.operationId, record)
+        else if (record.kind === 'post-outcome') j.savedIntents.delete(record.operationId)
+      }
+    }
+    j.intents.clear(); j.intentsByChannel.clear()
+    for (const intent of j.savedIntents.values()) indexIntent(j, intent)
+    digestKept(j)
+    for (const write of j.writes) for (const record of write.records) {
+      if (record.kind === 'post-intent') indexIntent(j, record)
+      else if (record.kind === 'post-outcome') unindexIntent(j, record.operationId)
+    }
+  }
+  function indexIntent(j: MemoryJournal, intent: KeptIntent): void {
+    unindexIntent(j, intent.operationId)
+    j.intents.set(intent.operationId, intent)
+    let channel = j.intentsByChannel.get(intent.channel)
+    if (!channel) { channel = new Map(); j.intentsByChannel.set(intent.channel, channel) }
+    channel.set(intent.operationId, intent)
+  }
+  function unindexIntent(j: MemoryJournal, operationId: string): void {
+    const intent = j.intents.get(operationId)
+    if (!intent) return
+    j.intents.delete(operationId)
+    const channel = j.intentsByChannel.get(intent.channel)!
+    channel.delete(operationId)
+    if (!channel.size) j.intentsByChannel.delete(intent.channel)
   }
   function quarantineFact(text: string, line: number, final: boolean): ThreadMemoryQuarantineFact {
     let raw: Record<string, unknown> = {}
@@ -546,6 +620,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       for (const record of records) if (record.kind === 'join') retain(j, record, record)
       j.created = header !== undefined && options.markerKeys().includes(key)
       j.missing = false
+      replayIntents(j)
       if (emitRead) event({ type: 'read', key, path: pathFor(key), firstSuccessfulRead: wasUnknown })
       return 'read'
     } catch (error) {
@@ -569,10 +644,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       const records: ThreadMemoryRecord[] = []
       for (const roots of j.joinedByChannel.values()) for (const entries of roots.values()) for (const value of entries.values()) if (value.saved) records.push(value.saved)
       for (const roots of j.heldJoins.values()) for (const entries of roots.values()) for (const value of entries.values()) if (value.saved) records.push(value.saved)
-      records.push(...j.intents.values())
+      // A kept outcome must not erase the saved intent from the disk image.
+      records.push(...j.savedIntents.values())
       records.sort((a, b) => a.seq - b.seq)
       io.rewrite(pathFor(key), serializeThreadMemoryRecords([header, ...records]))
       j.header = header; j.hasRecords = true
+      digestKept(j)
       // The shared seal writer must never hold a persona's compaction turn.
       void options.seal?.entryCompacted(key, header.storeId, j.highWater)
     } catch (error) { event({ type: 'compaction-failed', key, path: pathFor(key), step: 'journal-rewrite', error }); throw error }
@@ -588,6 +665,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       // header is already saved; an unsaved header is private to creation.
       const header = j.header ?? (j.creationHeader ??= j.exists
         ? newHeader(j) : { ...newHeader(j), seq: j.highWater + 1, highWater: j.highWater + 1 })
+      digestKept(j)
       if (options.seal && !j.sealSaved) {
         const result = await options.seal.entryCreated(key, header.storeId, j.header ? j.highWater : header.highWater)
         if (!current(key, j)) return { kind: 'cancelled' }
@@ -662,39 +740,134 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     // never await its append or run a shared-state write synchronously.
     if (added.length) void api.saveJoins(key, added).catch(() => {})
   }
-  function keepJoin(j: MemoryJournal, fact: ThreadJoin): void {
-    if (!savedJoin(j, fact) && !j.kept.some(old => old.channel === fact.channel && old.root === fact.root && sameChannelStamp(old.stamp, { kind: 'decided', ...fact.stamp }) && old.at <= fact.at)) j.kept.push(fact)
+  function keepJoin(j: MemoryJournal, fact: ThreadJoin, write?: KeptWrite): void {
+    if (!savedJoin(j, fact) && !j.kept.some(old => old.channel === fact.channel && old.root === fact.root && sameChannelStamp(old.stamp, { kind: 'decided', ...fact.stamp }) && old.at <= fact.at)) {
+      j.kept.push(fact)
+      const record = { ...fact, kind: 'join' as const }
+      if (write) write.records.push(record)
+      else j.writes.push({ records: [record] })
+    }
   }
-  function addJoin(key: string, input: ThreadJoin): boolean {
+  function keepCurrentJoin(key: string, input: ThreadJoin, write?: KeptWrite): boolean {
     const fact = copyThreadJoin(input)
     const j = journals.get(key)
     if (!j || !current(key, j) || !memoryStampMatches(fact.stamp, options.stamp(key, fact.channel))) return false
     retain(j, fact); advancePast(key, fact.at)
-    keepJoin(j, fact)
+    keepJoin(j, fact, write)
     return true
   }
-  async function saveKept(key: string, j: MemoryJournal, requested?: readonly ThreadJoin[]): Promise<ThreadMemoryWriteResult> {
+  function addJoin(key: string, input: ThreadJoin): boolean { return keepCurrentJoin(key, input) }
+  function keepIntent(key: string, input: OwnPostIntent): KeepIntentResult {
+    const j = journals.get(key)
+    if (options.dryRun || !j || !current(key, j) || j.intents.has(input.operationId) || j.savedIntents.has(input.operationId)) return { kept: false }
+    if (!memoryId(input.operationId) || !memoryChannel(input.channel) || (input.root !== undefined && !memoryRoot(input.root)) ||
+      !memoryTime(input.at) || !validMemoryStamp(input.stamp)) return { kept: false }
+    const intent: KeptIntent = {
+      kind: 'post-intent', operationId: input.operationId, channel: input.channel,
+      ...(input.root === undefined ? {} : { root: input.root }), at: input.at,
+      stamp: { incarnation: input.stamp.incarnation, threadHybridSince: input.stamp.threadHybridSince },
+    }
+    if ('digest' in input) {
+      if (!/^[a-f0-9]{64}$/.test(input.digest)) return { kept: false }
+      intent.digest = input.digest
+    } else {
+      const content = input.content
+      intent.content = content.kind === 'text' ? { kind: 'text', text: content.text } : { kind: 'file', name: content.name, size: content.size }
+    }
+    const blocked = api.saveBlocked(key)
+    // A publication can discard the last unsaved stale join without a write.
+    if (j.failed && !blocked) j.failed = false
+    const write: KeptWrite = { records: [intent] }
+    indexIntent(j, intent); j.writes.push(write)
+    digestKept(j)
+    if (!j.readable || blocked) return { kept: true }
+    const ready = serial(key, async () => {
+      if (j.failed || !current(key, j)) return 'failed' as const
+      await saveKept(key, j, undefined, write)
+      return j.savedIntents.has(intent.operationId) || !j.writes.includes(write) ? 'saved' as const : 'failed' as const
+    }).catch(() => 'failed' as const)
+    return { kept: true, ready }
+  }
+  function resolveIntent(key: string, operationId: string, result: ResolveIntentResult): 'joined' | 'none' | undefined {
+    const j = journals.get(key)
+    if (options.dryRun || !j || !current(key, j) || !j.intents.has(operationId)) return undefined
+    if (j.failed && !api.saveBlocked(key)) j.failed = false
+    const intent = j.intents.get(operationId)!
+    const write: KeptWrite = { records: [] }
+    let outcome: 'joined' | 'none' = 'none'
+    if ('joined' in result && result.joined.channel === intent.channel &&
+      sameChannelStamp(intent.stamp, { kind: 'decided', ...result.joined.stamp }) &&
+      memoryStampMatches(intent.stamp, options.stamp(key, intent.channel))) {
+      const fact = copyThreadJoin({ ...result.joined, source: 'own-post', at: api.clock(key) })
+      if (keepCurrentJoin(key, fact, write)) {
+        // Even when another operation already joined this root, this outcome
+        // and its own join are saved atomically, preserving the earliest time.
+        if (!write.records.length) write.records.push({ ...fact, kind: 'join' })
+        j.ownJoins.set(operationId, fact)
+        outcome = 'joined'
+      }
+    }
+    write.records.push({ kind: 'post-outcome', operationId, outcome })
+    j.writes.push(write); unindexIntent(j, operationId)
+    if (j.readable && !j.failed) void serial(key, () => j.failed ? { kind: 'kept' } : saveKept(key, j, undefined, write)).catch(() => {})
+    return outcome
+  }
+  function recordsForWrite(key: string, write: KeptWrite): KeptRecord[] | undefined {
+    const joins = write.records.filter((record): record is KeptRecord & ThreadJoin => record.kind === 'join')
+    if (joins.some(fact => recoveryStamp(key, fact) === 'undecided')) return undefined
+    const stale = joins.some(fact => !memoryStampMatches(fact.stamp, options.stamp(key, fact.channel)))
+    return write.records.flatMap(record => {
+      if (record.kind === 'join' && recoveryStamp(key, record) === 'stale' && !named(key, record.channel, record.stamp)) return []
+      if (record.kind === 'post-outcome' && stale) return [{ ...record, outcome: 'none' as const }]
+      return [record]
+    })
+  }
+  async function saveKept(key: string, j: MemoryJournal, requested?: readonly ThreadJoin[], through?: KeptWrite): Promise<ThreadMemoryWriteResult> {
     if (!current(key, j)) return { kind: 'cancelled' }
     if (options.dryRun || !j.readable || (requested !== undefined && !j.created)) return { kind: 'kept' }
     const creation = await createStore(key, j)
     if (creation.kind !== 'saved') return creation
     if (!current(key, j)) return { kind: 'cancelled' }
-    const hadKept = j.kept.length > 0
+    const hadKept = j.writes.length > 0
     judge(key, j)
-    const facts = j.kept.filter(fact => (memoryStampMatches(fact.stamp, options.stamp(key, fact.channel)) || (recoveryStamp(key, fact) === 'stale' && named(key, fact.channel, fact.stamp))) && (!requested || requested.some(r =>
-      r.channel === fact.channel && r.root === fact.root && stampKey(r.stamp) === stampKey(fact.stamp) && fact.at <= r.at)))
-    try {
-      if (facts.length) {
-        const records: ThreadJoinRecord[] = facts.map((fact, i) => ({ ...fact, v: 1, kind: 'join', seq: j.highWater + i + 1 }))
-        io.durableAppend(pathFor(key), serializeThreadMemoryRecords(records), j)
-        for (const record of records) retain(j, record, record, recoveryStamp(key, record) === 'stale' ? j.heldJoins : j.joinedByChannel)
-        j.highWater = records.at(-1)!.seq
-        const saved = new Set(facts)
-        j.kept = j.kept.filter(fact => !saved.has(fact))
+    const last = through ? j.writes.indexOf(through) : j.writes.length - 1
+    const candidates = requested ? j.writes.filter(write => write.records.every(fact => fact.kind === 'join' && requested.some(r =>
+      r.channel === fact.channel && r.root === fact.root && sameChannelStamp(r.stamp, { kind: 'decided', ...fact.stamp }) && fact.at <= r.at))) : j.writes.slice(0, last + 1)
+    const writes: KeptWrite[] = [], records: ThreadMemoryRecord[] = []
+    digestKept(j)
+    for (const write of candidates) {
+      const facts = recordsForWrite(key, write)
+      // Defer only this join/outcome batch while its stamp is undecided;
+      // independent intents must still be appended before their ready settles.
+      // Intents contain no join and precede their own outcome in candidates.
+      if (!facts) continue
+      if (facts.some(fact => fact.kind === 'post-intent' && !fact.digest)) break
+      for (const fact of facts) {
+        // Content stays private even if a structural caller supplied extra fields.
+        if (fact.kind === 'post-intent') {
+          const { content: _content, ...intent } = fact
+          records.push({ ...intent, digest: fact.digest!, v: 1, seq: j.highWater + records.length + 1 })
+        } else if (fact.kind === 'join') records.push({ ...copyThreadJoin(fact), v: 1, kind: 'join', seq: j.highWater + records.length + 1 })
+        else records.push({ ...fact, v: 1, seq: j.highWater + records.length + 1 })
       }
-      if (j.failed && !j.kept.length) { j.failed = false; event({ type: 'saved-after-failure', key, path: pathFor(key) }) }
+      writes.push(write)
+    }
+    try {
+      if (records.length) {
+        io.durableAppend(pathFor(key), serializeThreadMemoryRecords(records), j)
+        for (const record of records) {
+          if (record.kind === 'join') retain(j, record, record, recoveryStamp(key, record) === 'stale' ? j.heldJoins : j.joinedByChannel)
+          else if (record.kind === 'post-intent') j.savedIntents.set(record.operationId, record)
+          else if (record.kind === 'post-outcome') { j.savedIntents.delete(record.operationId); j.ownJoins.delete(record.operationId) }
+        }
+        j.highWater = records.at(-1)!.seq
+      }
+      const savedWrites = new Set(writes)
+      j.writes = j.writes.filter(write => !savedWrites.has(write))
+      j.kept = j.kept.filter(fact => !savedJoin(j, fact))
+      if (j.failed && !j.writes.length) { j.failed = false; event({ type: 'saved-after-failure', key, path: pathFor(key) }) }
       else if (hadKept) observeSettled(key, j)
-      return { kind: j.kept.length ? 'kept' : 'saved' }
+      return { kind: j.writes.length ? 'kept' : 'saved' }
     } catch (error) {
       j.failed = true; event({ type: 'append-failed', key, path: pathFor(key), step: 'journal-append', error })
       return { kind: 'failed', error }
@@ -816,7 +989,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       const pending = (pendingJoins.get(key) ?? []).filter(fact => !savedJoin(j, fact) &&
         (recoveryStamp(key, fact) !== 'stale' || named(key, fact.channel, fact.stamp)))
       const creation = !j.created && (j.creationHeader !== undefined || (j.readable && (j.hasRecords || options.threadHybridChannels(key).length > 0)))
-      return { unknown: !j.readable, unsaved: kept.length + pending.length + Number(creation), missing: j.missing === true }
+      const posts = j.writes.reduce((count, write) => count + write.records.filter(record => record.kind !== 'join').length, 0)
+      return { unknown: !j.readable, unsaved: kept.length + posts + pending.length + Number(creation), missing: j.missing === true }
     },
     published() {
       if (stopped || quiesced) return
@@ -838,6 +1012,15 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
           continue
         }
         if (!j.created && options.threadHybridChannels(key).length) void serial(key, () => createStore(key, j)).catch(() => {})
+        // An own-post join/outcome batch can have waited for a decided stamp.
+        // Publication resumes it off the publisher's stack; failed saves
+        // retain their existing background retry owner and spacing.
+        if (j.readable && !j.failed && j.writes.some(write => write.records.some(record => record.kind !== 'join'))) {
+          void serial(key, async () => {
+            // An earlier writer can fail after this publication queued us.
+            if (!j.failed) await saveKept(key, j)
+          }).catch(() => {})
+        }
       }
     },
     view(key, channel, root) {
@@ -888,7 +1071,31 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       return structuredClone([...j.joinedByChannel.values()].flatMap(roots => [...roots.values()].flatMap(entries => [...entries.values()].map(value =>
         ({ join: value.join, ...(value.saved ? { savedAt: value.saved.at } : {}) })))))
     },
-    unresolvedIntents: key => structuredClone([...journals.get(key)?.intents.values() ?? []]),
+    isApplied: key => { const j = journals.get(key); return !options.dryRun && !!j && current(key, j) },
+    channelStamp: (key, channel) => options.stamp(key, channel),
+    digestKey: key => { const j = journals.get(key); return j?.readable ? (j.header ?? j.creationHeader)?.digestKey : undefined },
+    saveBlocked: key => journals.get(key)?.failed === true && api.outage(key).unsaved > 0,
+    keepIntent,
+    resolveIntent,
+    unresolvedIntents(key, channel) {
+      const j = journals.get(key)
+      const intents = channel === undefined ? j?.intents : j?.intentsByChannel.get(channel)
+      return [...intents?.values() ?? []].map(intent => j?.savedIntents.has(intent.operationId)
+        ? structuredClone(j.savedIntents.get(intent.operationId)!) : ({
+        operationId: intent.operationId, channel: intent.channel, ...(intent.root === undefined ? {} : { root: intent.root }),
+        at: intent.at, stamp: { ...intent.stamp }, ...(intent.digest === undefined ? {} : { digest: intent.digest }),
+      }))
+    },
+    hasKeptJoin: (key, channel, root) => journals.get(key)?.kept.some(fact => fact.channel === channel && fact.root === root && memoryStampMatches(fact.stamp, options.stamp(key, channel))) ?? false,
+    intentSaved: (key, operationId) => journals.get(key)?.savedIntents.has(operationId) ?? false,
+    memoryOnlyOwnPostJoins(key) {
+      const j = journals.get(key), pairs = new Map<string, { channel: string; root: string }>()
+      if (j) for (const [operationId, fact] of j.ownJoins) {
+        if (j.savedIntents.has(operationId) || savedJoin(j, fact) || recoveryStamp(key, fact) === 'stale') continue
+        pairs.set(JSON.stringify([fact.channel, fact.root]), { channel: fact.channel, root: fact.root })
+      }
+      return [...pairs.values()]
+    },
     store(key) {
       const j = journals.get(key)
       return j ? { storeId: j.header?.storeId, digestKey: j.header?.digestKey, lastRecordNumber: j.highWater, readable: j.readable, created: j.created } : undefined

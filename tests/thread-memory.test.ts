@@ -17,9 +17,11 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimited } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { PersonaSlackTokens } from '../src/persona-credentials.ts'
-import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE, type ThreadJoin } from '../src/thread-memory.ts'
+import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
+  normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
+import { createOwnPostJoins } from '../src/own-post.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
   type JudgeSealInput, type ThreadMemorySealCase, type ThreadMemorySealEntry } from '../src/thread-memory-seal.ts'
@@ -563,6 +565,446 @@ describe('Thread Memory store', () => {
     expect(h.events.filter(e => e.type.endsWith('failed'))).toEqual([])
     const empty = fixture({ dryRun: true }); await empty.start()
     expect(existsSync(join(empty.stateDir, 'threads'))).toBe(false); expect(empty.events).toEqual([])
+  })
+
+  describe('own-post intents and outcomes', () => {
+    function intent(fact: ThreadJoin, operationId = 'own-post'): OwnPostIntent {
+      return { operationId, channel: fact.channel, root: fact.root, stamp: { ...fact.stamp }, at: fact.at,
+        content: { kind: 'text', text: `private own-post ${LEAK_SENTINEL}` } }
+    }
+    function expectPrivate(h: ThreadMemoryHarness) {
+      assertNoLeak({ journal: writtenFile(threadPath(h.stateDir)), events: h.events, logs: h.logs, posts: h.posts,
+        intents: h.memory.unresolvedIntents('alpha'), kept: h.memory.keptFacts('alpha'), joins: h.memory.joins('alpha') })
+    }
+
+    test.each([
+      ['  &amp; &lt;  ', '& <'],
+      ['  &gt;  ', '>'],
+      ['\n<https://example.test/a?b=1&amp;c=2>\t', 'https://example.test/a?b=1&c=2'],
+      [' <https://example.test/a|a label> ', 'https://example.test/a'],
+      ['&lt;https://example.test/a|escaped label&gt;', 'https://example.test/a'],
+      [' <@U123|name> <#C123|channel> ', '@U123 #C123'],
+      ['  first  line\nsecond line  ', 'first  line\nsecond line'],
+    ])('normalises Slack text %s for the same digest', (text, normalised) => {
+      expect(normaliseOwnPostText(text)).toBe(normalised)
+      const key = threadHeader().digestKey
+      expect(ownPostDigest(key, { kind: 'text', text })).toBe(ownPostDigest(key, { kind: 'text', text: normalised }))
+    })
+
+    test('digests use each store key and distinguish text, file names and byte sizes', async () => {
+      const h = fixture(); expect(h.memory.digestKey('alpha')).toBeUndefined()
+      expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
+      await h.start()
+      const alpha = h.memory.digestKey('alpha')!, beta = h.memory.digestKey('beta')!
+      expect(alpha).toBe(readThreads(h.stateDir).find(r => r.kind === 'header')!.digestKey)
+      expect(alpha).not.toBe(beta)
+      const content = { kind: 'file' as const, name: 'report.txt', size: 42 }
+      const digest = ownPostDigest(alpha, content)
+      expect(digest).toMatch(/^[a-f0-9]{64}$/)
+      expect(digest).toBe(ownPostDigest(alpha, { ...content }))
+      expect(new Set([digest, ownPostDigest(beta, content),
+        ownPostDigest(alpha, { ...content, name: 'other.txt' }), ownPostDigest(alpha, { ...content, size: 43 }),
+        ownPostDigest(alpha, { kind: 'text', text: content.name }),
+        ownPostDigest(alpha, { kind: 'text', text: JSON.stringify([content.name, content.size]) }),
+      ]).size).toBe(6)
+      expect(ownPostDigest(alpha, { kind: 'text', text: 'first' })).not.toBe(ownPostDigest(alpha, { kind: 'text', text: 'second' }))
+      await h.close(); const next = fixture({ reopen: true }, h.stateDir); await next.start()
+      expect(next.memory.digestKey('alpha')).toBe(alpha)
+      expect(ownPostDigest(next.memory.digestKey('alpha')!, content)).toBe(digest)
+    })
+
+    test.each(['content', 'digest'] as const)('saves every intent field from %s, including an optional root, before ready settles', async kind => {
+      const h = fixture(); await h.start(); const fact = h.fact(), before = readThreads(h.stateDir)
+      const content = { kind: 'text' as const, text: `private intent ${LEAK_SENTINEL}` }
+      const digest = ownPostDigest(h.memory.digestKey('alpha')!, content)
+      for (const root of [fact.root, undefined]) {
+        const operationId = root ? 'parent-post' : 'channel-post'
+        const input = { operationId, channel: fact.channel, ...(root ? { root } : {}), at: fact.at, stamp: fact.stamp,
+          ...(kind === 'content' ? { content } : { digest }), text: LEAK_SENTINEL }
+        h.io.reset()
+        const kept = h.memory.keepIntent('alpha', input)
+        expect(kept.kept).toBe(true)
+        if (!kept.kept) throw new Error('intent refused')
+        expect(kept.ready).toBeDefined(); expect(h.memory.intentSaved('alpha', operationId)).toBe(false)
+        expect(h.io.writes()).toEqual([])
+        expect(await kept.ready).toBe('saved')
+        const record = postIntent(fact, { operationId, root, at: input.at, digest, seq: before.length + (root ? 1 : 2) })
+        expect(readThreads(h.stateDir).at(-1)).toEqual(record)
+        expect(h.memory.unresolvedIntents('alpha', C.primary)).toContainEqual(record)
+        expect(h.memory.intentSaved('alpha', operationId)).toBe(true)
+        expect(h.memory.keepIntent('alpha', input)).toEqual({ kept: false })
+        expectPrivate(h)
+      }
+      expect(h.memory.intentSaved('alpha', 'never-kept')).toBe(false)
+      await h.close(); const next = fixture({ reopen: true }, h.stateDir); await next.start()
+      expect(next.memory.unresolvedIntents('alpha')).toEqual(readThreads(next.stateDir).filter(r => r.kind === 'post-intent'))
+    })
+
+    test('an append waiting behind creation is not a failed-save episode and both intents get ready promises', async () => {
+      const held = gate(); let h!: ThreadMemoryHarness
+      h = fixture({ setCreated: async key => { await held.wait(); return h.authority.setThreadMemoryCreated(key) } })
+      const starting = h.start(); await held.entered
+      try {
+        expect(h.memory.digestKey('alpha')).toBeDefined()
+        const first = h.memory.keepIntent('alpha', intent(h.fact(), 'first'))
+        const second = h.memory.keepIntent('alpha', intent(h.fact(), 'second'))
+        expect(first.kept && first.ready).toBeInstanceOf(Promise)
+        expect(second.kept && second.ready).toBeInstanceOf(Promise)
+        let settled = false
+        if (second.kept) void second.ready?.then(() => { settled = true })
+        h.io.reset(); await h.clock.flush()
+        expect(settled).toBe(false); expect(h.memory.saveBlocked('alpha')).toBe(false)
+        expect(h.io.writes()).toEqual([])
+        held.release(); await starting
+        expect(first.kept && await first.ready).toBe('saved')
+        expect(second.kept && await second.ready).toBe('saved')
+        expect(readThreads(h.stateDir).filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual(['first', 'second'])
+      } finally { held.release(); await starting }
+      expectPrivate(h)
+    })
+
+    test.each((['mention', 'own-post'] as const).flatMap(predecessor =>
+      (['current', 'stale'] as const).map(outcome => [predecessor, outcome] as const)))
+    ('an undecided %s predecessor cannot bypass a healthy intent append and resumes with a %s stamp', async (predecessor, outcome) => {
+      const h = fixture({ failureHandling: true })
+      expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary])).kind).toBe('applied')
+      await h.start()
+      let serial = 0
+      // Eligibility is fixed here to isolate the store writer; choices and
+      // stamps still come from the real authority, as do its publications.
+      const owner = createOwnPostJoins({ memory: h.memory, lookupSlackKey: () => undefined,
+        eligibility: () => ({ kind: 'eligible', mode: 'strict', delivery: 'thread_hybrid' }),
+        choice: (key, channel) => h.authority.readableFor(key, channel)
+          ? { readable: true, choice: h.authority.choice(key, channel) } : { readable: false },
+        now: h.clock.now, operationId: () => `predecessor-post-${++serial}`, isDryRun: () => false })
+      const content = { kind: 'text' as const, text: `private predecessor ${LEAK_SENTINEL}` }
+      try {
+        let fact = h.fact(), predecessorId: string | undefined
+        let mentionSave: ReturnType<typeof h.memory.saveJoins> | undefined
+        if (predecessor === 'mention') {
+          expect(h.memory.addJoin('alpha', fact)).toBe(true)
+          mentionSave = h.memory.saveJoins('alpha', [fact])
+        } else {
+          const first = owner.startOperation('alpha', 'text', { channel: C.primary, parent: R.primary }, content)!
+          expect(first.ready).toBeInstanceOf(Promise); await first.ready
+          predecessorId = h.memory.unresolvedIntents('alpha', C.primary)[0]!.operationId
+          owner.endOperation(first.operation, { kind: 'confirmed', channel: C.primary, ts: R.primary })
+          fact = h.memory.keptFacts('alpha')[0]!
+        }
+        // No await between queueing the predecessor and making its stamp
+        // undecided: its writer must encounter that undecided publication.
+        h.failShared(() => 'unsynced')
+        expect(h.choose(outcome === 'current' ? 'thread_hybrid' : 'mentions').kind).toBe('unresolved')
+        expect(h.authority.channelStamp('alpha', C.primary)).toEqual({ kind: 'undecided' })
+        const healthy = h.fact({ channel: C.secondary, root: R.secondary })
+        expect(h.authority.channelStamp('alpha', C.secondary)).toEqual({ kind: 'decided', ...healthy.stamp })
+        const before = readThreads(h.stateDir)
+        h.io.reset()
+        const later = owner.startOperation('alpha', 'text', { channel: C.secondary, parent: healthy.root }, content)!
+        expect(later.ready).toBeInstanceOf(Promise)
+        const pending = h.memory.unresolvedIntents('alpha', C.secondary)[0]!
+        expect(h.memory.intentSaved('alpha', pending.operationId)).toBe(false)
+        expect(readThreads(h.stateDir)).toEqual(before)
+        const saved = postIntent(healthy, { ...pending, digest: ownPostDigest(h.memory.digestKey('alpha')!, content), seq: before.at(-1)!.seq + 1 })
+        // Read at the caller's readiness boundary, before any explicit flush
+        // or stamp recovery could hide a premature settlement.
+        await later.ready!.then(() => {
+          expect(readThreads(h.stateDir)).toEqual([...before, saved])
+          expect(h.memory.intentSaved('alpha', pending.operationId)).toBe(true)
+          expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'writeSync')).toHaveLength(1)
+          expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'fsyncSync')).toHaveLength(1)
+        })
+        if (mentionSave) expect(await mentionSave).toEqual({ kind: 'kept' })
+        await h.clock.flush()
+        expect(h.memory.keptFacts('alpha')).toEqual([fact])
+        expect(savedJoins(h)).toEqual([])
+        expect(h.memory.saveBlocked('alpha')).toBe(false)
+        expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: predecessor === 'mention' ? 1 : 2, missing: false })
+        // Compaction must retain the saved intents, leaving the undecided
+        // join/outcome batch in memory for the later authority decision.
+        await h.memory.compact()
+        expect(readThreads(h.stateDir).slice(1)).toEqual([...before.slice(1), saved])
+        expect(h.memory.keptFacts('alpha')).toEqual([fact])
+        h.io.reset(); const beforeDecision = journalBytes(h)
+        h.failShared(); expect(h.authority.recoverDurability().kind).toBe('applied')
+        expect(view(h)).toBe(outcome === 'current' ? 'joined' : 'not-joined')
+        expect(journalBytes(h)).toEqual(beforeDecision)
+        // Own-post batches resume on publication alone. Mention joins retain
+        // the queue caller's explicit save path after the stamp is decided.
+        if (predecessor === 'mention') expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'saved' })
+        await h.clock.flush()
+        const resumed = readThreads(h.stateDir).slice(before.length + 1)
+        const nextSeq = saved.seq + 1
+        expect(resumed).toEqual([
+          ...(outcome === 'current' ? [joinRecord(fact, nextSeq)] : []),
+          ...(predecessorId ? [postOutcome(postIntent(fact, { operationId: predecessorId }),
+            outcome === 'current' ? 'joined' : 'none', nextSeq + Number(outcome === 'current'))] : []),
+        ])
+        const appends = predecessor === 'mention' && outcome === 'stale' ? 0 : 1
+        expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'writeSync')).toHaveLength(appends)
+        expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'fsyncSync')).toHaveLength(appends)
+        expect(h.memory.keptFacts('alpha')).toEqual([])
+        expect(h.memory.unresolvedIntents('alpha')).toEqual([saved])
+        expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+        expect(h.memory.saveBlocked('alpha')).toBe(false)
+        expect(h.events.every(event => ['created', 'outage-settled'].includes(event.type))).toBe(true)
+        expect(h.retryEvents).toEqual([]); expect(h.posts).toEqual([]); expect(h.logs).toEqual([])
+        expect(h.clock.pendingCount()).toBe(0)
+        const settled = journalBytes(h)
+        await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+        expect(journalBytes(h)).toEqual(settled)
+        expectPrivate(h)
+        await h.close()
+        const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+        expect(view(reopened)).toBe(outcome === 'current' ? 'joined' : 'not-joined')
+        expect(reopened.memory.unresolvedIntents('alpha')).toEqual([saved])
+      } finally { owner.stop() }
+    })
+
+    test.each((['intent', 'outcome'] as const).flatMap(append => [1, 3].map(publications => [append, publications] as const)))
+    ('queued publications cannot retry a failed %s append before the minimum delay (%i publications)', async (append, publications) => {
+      const h = fixture({ failureHandling: true }); await h.start()
+      const fact = h.fact(), input = intent(fact)
+      if (append === 'outcome') {
+        const kept = h.memory.keepIntent('alpha', input)
+        expect(kept.kept && await kept.ready).toBe('saved')
+      }
+      const before = readThreads(h.stateDir), beforeBytes = journalBytes(h), startedAt = h.clock.now()
+      h.io.reset()
+      h.io.fail('writeSync', 'alpha', { times: publications === 1 ? 1 : Infinity })
+      const kept = append === 'intent' ? h.memory.keepIntent('alpha', input) : undefined
+      if (append === 'outcome') expect(h.memory.resolveIntent('alpha', input.operationId, { joined: fact })).toBe('joined')
+      // The authority publishes while j.failed is still false, before the
+      // first queued append runs. Reassigning hybrid preserves this stamp.
+      for (let i = 0; i < publications; i++) expect(h.choose('thread_hybrid').kind).toBe('applied')
+      if (kept) expect(kept.kept && await kept.ready).toBe('failed')
+      await h.clock.flush()
+      const attempts = () => h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'writeSync')
+      expect(h.clock.now()).toBe(startedAt)
+      expect(attempts()).toHaveLength(1)
+      expect(journalBytes(h)).toEqual(beforeBytes)
+      expect(h.events.filter(event => event.type === 'append-failed')).toHaveLength(1)
+      expect(h.memory.saveBlocked('alpha')).toBe(true)
+      expect(h.clock.pending().map(timer => timer.delayMs)).toEqual([THREAD_MEMORY_RETRY_MIN_MS])
+      await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1)
+      expect(attempts()).toHaveLength(1); expect(journalBytes(h)).toEqual(beforeBytes)
+      h.io.heal(); await h.clock.advance(1)
+      expect(attempts()).toHaveLength(2)
+      const records = readThreads(h.stateDir), added = records.slice(before.length)
+      if (append === 'intent') {
+        expect(added).toEqual([postIntent(fact, { operationId: input.operationId,
+          digest: ownPostDigest(h.memory.digestKey('alpha')!, { kind: 'text', text: `private own-post ${LEAK_SENTINEL}` }), seq: 2 })])
+        expect(h.memory.intentSaved('alpha', input.operationId)).toBe(true)
+      } else {
+        const ownJoin = h.memory.joins('alpha')[0]!.join
+        expect(added).toEqual([joinRecord(ownJoin, 3), { v: 1, kind: 'post-outcome', operationId: input.operationId, outcome: 'joined', seq: 4 }])
+        expect(h.memory.isJoinSaved('alpha', ownJoin)).toBe(true)
+        expect(h.memory.unresolvedIntents('alpha')).toEqual([])
+      }
+      expect(h.memory.saveBlocked('alpha')).toBe(false)
+      expect(h.events.filter(event => event.type === 'append-failed')).toHaveLength(1)
+      expect(h.retryEvents).toContainEqual({ type: 'saved-after-retries', key: 'alpha', attempts: 1 })
+      expect(h.clock.pendingCount()).toBe(0)
+      await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      expect(readThreads(h.stateDir)).toEqual(records); expect(attempts()).toHaveLength(2)
+      expectPrivate(h)
+    })
+
+    test.each(['writeSync', 'fsyncSync'] as const)('failed intent %s settles failed, later intents do not wait, and retries preserve fact order exactly once', async op => {
+      const h = fixture({ failureHandling: true }); await h.start()
+      const fact = h.fact(), first = intent(fact, 'first'), second = intent(h.fact({ root: R.secondary }), 'second')
+      h.memory.addJoin('alpha', fact)
+      const before = journalBytes(h), error = h.io.fail(op)
+      const kept = h.memory.keepIntent('alpha', first)
+      expect(kept.kept && kept.ready).toBeInstanceOf(Promise)
+      expect(kept.kept && await kept.ready).toBe('failed')
+      expect(h.events).toContainEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error })
+      expect(h.memory.saveBlocked('alpha')).toBe(true); expect(h.memory.intentSaved('alpha', 'first')).toBe(false)
+      h.io.reset()
+      expect(h.memory.keepIntent('alpha', second)).toEqual({ kept: true })
+      await h.clock.flush(); expect(h.io.writes()).toEqual([]); expect(journalBytes(h)).toEqual(before)
+      expect(h.memory.unresolvedIntents('alpha').map(i => i.operationId)).toEqual(['first', 'second'])
+      h.io.heal()
+      await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1)
+      expect(journalBytes(h)).toEqual(before)
+      await h.clock.advance(1)
+      const records = readThreads(h.stateDir)
+      expect(records.map(r => r.kind)).toEqual(['header', 'join', 'post-intent', 'post-intent'])
+      expect(records.map(r => r.seq)).toEqual([1, 2, 3, 4])
+      expect(records.filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual(['first', 'second'])
+      expect(h.memory.intentSaved('alpha', 'first')).toBe(true); expect(h.memory.intentSaved('alpha', 'second')).toBe(true)
+      expect(h.memory.saveBlocked('alpha')).toBe(false); expect(h.memory.keptFacts('alpha')).toEqual([])
+      expect(h.retryEvents).toContainEqual({ type: 'saved-after-retries', key: 'alpha', attempts: 1 })
+      await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); expect(readThreads(h.stateDir)).toEqual(records)
+      expectPrivate(h)
+    })
+
+    test('a failed creation keeps an intent without waiting and the existing retry saves it after the header', async () => {
+      const h = fixture({ failureHandling: true }); h.io.fail('writeSync'); await h.start()
+      expect(h.memory.saveBlocked('alpha')).toBe(true)
+      const key = h.memory.digestKey('alpha'); expect(key).toBeDefined()
+      h.io.reset(); expect(h.memory.keepIntent('alpha', intent(h.fact()))).toEqual({ kept: true })
+      await h.clock.flush(); expect(h.io.writes()).toEqual([])
+      h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(readThreads(h.stateDir).map(r => r.kind)).toEqual(['header', 'post-intent'])
+      expect(h.memory.digestKey('alpha')).toBe(key); expect(h.memory.intentSaved('alpha', 'own-post')).toBe(true)
+      expectPrivate(h)
+    })
+
+    test('first successful read digests unknown-key intents, merges disk facts and saves memory-only joins without traffic', async () => {
+      const h = fixture({ failureHandling: true }), fact = h.fact(), disk = postIntent(fact, { operationId: 'disk', seq: 2 })
+      const header = threadHeader({ digestKey: 'ef'.repeat(32) })
+      seedThreads(h.stateDir, [header, disk]); expect(h.authority.setThreadMemoryCreated('alpha').kind).toBe('saved')
+      h.io.fail('readFileSync'); await h.start(); expect(h.memory.digestKey('alpha')).toBeUndefined()
+      const unresolved = intent(fact, 'unresolved'), resolved = intent(fact, 'resolved')
+      h.io.reset()
+      expect(h.memory.keepIntent('alpha', unresolved)).toEqual({ kept: true })
+      expect(h.memory.keepIntent('alpha', resolved)).toEqual({ kept: true })
+      expect(h.memory.unresolvedIntents('alpha').every(i => i.digest === undefined)).toBe(true)
+      expect(h.memory.resolveIntent('alpha', 'resolved', { joined: fact })).toBe('joined')
+      expect(h.memory.hasKeptJoin('alpha', C.primary, R.primary)).toBe(true)
+      expect(h.memory.hasKeptJoin('alpha', C.primary, R.secondary)).toBe(false)
+      expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual([{ channel: C.primary, root: R.primary }])
+      expect(h.memory.intentSaved('alpha', 'resolved')).toBe(false)
+      await h.clock.flush(); expect(h.io.writes()).toEqual([])
+      expectPrivate(h)
+      h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(h.memory.digestKey('alpha')).toBe(header.digestKey)
+      const expectedDigest = ownPostDigest(header.digestKey, { kind: 'text', text: `private own-post ${LEAK_SENTINEL}` })
+      const records = readThreads(h.stateDir)
+      expect(records.map(r => r.kind)).toEqual(['header', 'post-intent', 'post-intent', 'post-intent', 'join', 'post-outcome'])
+      expect(records.filter(r => r.kind === 'post-intent').slice(1).map(r => r.digest)).toEqual([expectedDigest, expectedDigest])
+      expect(h.memory.unresolvedIntents('alpha').map(i => i.operationId)).toEqual(['disk', 'unresolved'])
+      expect(h.memory.unresolvedIntents('alpha').find(i => i.operationId === 'unresolved')!.digest).toBe(expectedDigest)
+      expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual([]); expect(h.memory.hasKeptJoin('alpha', C.primary, R.primary)).toBe(false)
+      expectPrivate(h)
+      await h.close(); const next = fixture({ reopen: true }, h.stateDir); await next.start()
+      expect(next.memory.unresolvedIntents('alpha').map(i => i.operationId)).toEqual(['disk', 'unresolved'])
+      expect(view(next)).toBe('joined'); expectPrivate(next)
+    })
+
+    test('a current confirmation selects immediately at a fresh clock reading and appends join then outcome atomically', async () => {
+      const h = fixture(); await h.start(); const fact = h.fact()
+      const kept = h.memory.keepIntent('alpha', intent(fact)); expect(kept.kept && await kept.ready).toBe('saved')
+      const earlier = h.memory.clock('alpha'); h.io.reset()
+      const confirmation = { ...fact, text: LEAK_SENTINEL }
+      expect(h.memory.resolveIntent('alpha', 'own-post', { joined: confirmation })).toBe('joined')
+      const first = { ...fact, source: 'own-post' as const, at: earlier + 1 }
+      expect(h.memory.joins('alpha')).toEqual([{ join: first }]); expect(view(h)).toBe('joined')
+      expect(h.memory.unresolvedIntents('alpha')).toEqual([]); expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual([])
+      expect(h.io.writes()).toEqual([])
+      await h.clock.flush()
+      expect(readThreads(h.stateDir).slice(-2)).toEqual([joinRecord(first, 3), { v: 1, kind: 'post-outcome', seq: 4, operationId: 'own-post', outcome: 'joined' }])
+      expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'writeSync')).toHaveLength(1)
+      expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'fsyncSync')).toHaveLength(1)
+      const second = h.memory.keepIntent('alpha', intent(fact, 'second')); expect(second.kept && await second.ready).toBe('saved')
+      expect(h.memory.resolveIntent('alpha', 'second', { joined: fact })).toBe('joined')
+      await h.clock.flush()
+      const later = savedJoins(h).at(-1)!
+      expect(later.at).toBeGreaterThan(first.at)
+      expect(h.memory.joins('alpha')).toEqual([{ join: first, savedAt: first.at }])
+      await h.memory.compact(); expect(savedJoins(h)).toEqual([joinRecord(first, 3)])
+      expectPrivate(h)
+      await h.close(); const next = fixture({ reopen: true }, h.stateDir); await next.start()
+      expectOnlySavedJoin(next, joinRecord(first, 3)); expect(next.memory.unresolvedIntents('alpha')).toEqual([])
+    })
+
+    test.each(['saved-intent', 'failed-intent'] as const)('a kept outcome with %s survives compaction and retries as one ordered append', async mode => {
+      const h = fixture({ failureHandling: true }); await h.start(); const fact = h.fact()
+      if (mode === 'failed-intent') h.io.fail('writeSync')
+      const kept = h.memory.keepIntent('alpha', intent(fact)); expect(kept.kept && await kept.ready).toBe(mode === 'saved-intent' ? 'saved' : 'failed')
+      if (mode === 'saved-intent') h.io.fail('writeSync')
+      expect(h.memory.resolveIntent('alpha', 'own-post', { joined: fact })).toBe('joined')
+      await h.clock.flush(); expect(view(h)).toBe('joined')
+      const ownJoin = h.memory.joins('alpha')[0]!.join
+      expect(h.memory.isJoinSaved('alpha', ownJoin)).toBe(false)
+      expect(h.memory.unresolvedIntents('alpha')).toEqual([])
+      expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual(mode === 'failed-intent' ? [{ channel: C.primary, root: R.primary }] : [])
+      expect(h.memory.keepIntent('alpha', intent(h.fact({ root: R.secondary }), 'pending'))).toEqual({ kept: true })
+      h.io.heal(); await h.memory.compact()
+      expect(readThreads(h.stateDir).map(r => r.kind)).toEqual(mode === 'saved-intent' ? ['header', 'post-intent'] : ['header'])
+      expect(h.memory.unresolvedIntents('alpha').map(i => i.operationId)).toEqual(['pending'])
+      h.io.reset(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(readThreads(h.stateDir).map(r => r.kind)).toEqual(['header', 'post-intent', 'join', 'post-outcome', 'post-intent'])
+      expect(readThreads(h.stateDir).map(r => r.seq)).toEqual([1, 2, 3, 4, 5])
+      expect(h.io.calls.filter(c => c.path === threadPath(h.stateDir) && c.op === 'writeSync')).toHaveLength(1)
+      expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual([]); expect(h.memory.isJoinSaved('alpha', ownJoin)).toBe(true)
+      const saved = journalBytes(h); await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS); expect(journalBytes(h)).toEqual(saved)
+      await h.memory.compact()
+      expect(readThreads(h.stateDir).map(r => r.kind)).toEqual(['header', 'join', 'post-intent'])
+      expectPrivate(h)
+      await h.close(); const next = fixture({ reopen: true }, h.stateDir); await next.start()
+      expect(view(next)).toBe('joined'); expect(next.memory.unresolvedIntents('alpha').map(i => i.operationId)).toEqual(['pending'])
+    })
+
+    test.each(['none', 'stale-at-confirmation', 'stale-before-append'] as const)('%s records only an outcome none and cannot revive a join after a new hybrid choice', async mode => {
+      const h = fixture(); await h.start(); const fact = h.fact()
+      const kept = h.memory.keepIntent('alpha', intent(fact)); expect(kept.kept && await kept.ready).toBe('saved')
+      if (mode === 'stale-at-confirmation') expect(h.choose('mentions').kind).toBe('applied')
+      expect(h.memory.resolveIntent('alpha', 'own-post', mode === 'none' ? { none: true } : { joined: fact })).toBe(mode === 'stale-before-append' ? 'joined' : 'none')
+      if (mode === 'stale-before-append') expect(h.choose('mentions').kind).toBe('applied')
+      await h.clock.flush()
+      expect(view(h)).toBe('not-joined'); expect(h.memory.hasKeptJoin('alpha', C.primary, R.primary)).toBe(false)
+      expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual([]); expect(savedJoins(h)).toEqual([])
+      expect(readThreads(h.stateDir).at(-1)).toEqual({ v: 1, kind: 'post-outcome', seq: 3, operationId: 'own-post', outcome: 'none' })
+      expect(h.memory.unresolvedIntents('alpha')).toEqual([])
+      expect(h.choose('thread_hybrid').kind).toBe('applied')
+      await h.memory.compact(); expect(view(h)).toBe('not-joined')
+      expect(readThreads(h.stateDir).map(r => r.kind)).toEqual(['header'])
+      expectPrivate(h)
+      await h.close(); const next = fixture({ reopen: true }, h.stateDir); await next.start(); expect(view(next)).toBe('not-joined')
+    })
+
+    test('unresolved indexes isolate personas and channels and return copies of both read and kept intents', async () => {
+      const h = fixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'], [C.primary, C.secondary]))
+      const disk = postIntent(h.fact(), { operationId: 'same-id', seq: 2 })
+      seedThreads(h.stateDir, [threadHeader(), disk]); await h.start()
+      const beta = intent(h.fact({}, 'beta'), 'same-id'), secondary = intent(h.fact({ channel: C.secondary }), 'secondary')
+      const keptBeta = h.memory.keepIntent('beta', beta), keptSecondary = h.memory.keepIntent('alpha', secondary)
+      expect(h.memory.unresolvedIntents('alpha', C.primary)).toEqual([disk])
+      expect(h.memory.unresolvedIntents('alpha', C.secondary).map(i => i.operationId)).toEqual(['secondary'])
+      expect(h.memory.unresolvedIntents('beta').map(i => i.operationId)).toEqual(['same-id'])
+      const copy = h.memory.unresolvedIntents('alpha'); copy[0]!.stamp.incarnation = 'changed-copy'; copy[1]!.operationId = 'changed-copy'
+      expect(h.memory.unresolvedIntents('alpha')[0]).toEqual(disk)
+      expect(h.memory.unresolvedIntents('alpha')[1]!.operationId).toBe('secondary')
+      expect(keptBeta.kept && await keptBeta.ready).toBe('saved'); expect(keptSecondary.kept && await keptSecondary.ready).toBe('saved')
+      h.io.reset(); expect(h.memory.resolveIntent('alpha', 'same-id', { none: true })).toBe('none')
+      expect(h.memory.unresolvedIntents('alpha', C.primary)).toEqual([])
+      expect(h.memory.unresolvedIntents('beta').map(i => i.operationId)).toEqual(['same-id']); expect(h.io.calls).toEqual([])
+      await h.clock.flush(); expectPrivate(h)
+    })
+
+    test.each(['forget', 'remove', 'unapplied', 'quiesce', 'stop', 'dry-run'] as const)('%s refuses new intents and outcomes without adding joins or writing', async mode => {
+      const h = fixture({ dryRun: mode === 'dry-run' }), fact = h.fact()
+      seedThreads(h.stateDir, [threadHeader(), postIntent(fact, { operationId: 'existing', seq: 2 })]); await h.start()
+      if (mode === 'forget') h.memory.forget('alpha')
+      else if (mode === 'remove') await h.memory.remove('alpha')
+      else if (mode === 'unapplied') expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['beta'])).kind).toBe('applied')
+      else if (mode === 'quiesce') await h.memory.quiesce()
+      else if (mode === 'stop') await h.memory.stop()
+      await h.clock.flush()
+      const before = existsSync(threadPath(h.stateDir)) ? journalBytes(h) : undefined
+      h.io.reset()
+      expect(h.memory.keepIntent('alpha', intent(fact))).toEqual({ kept: false })
+      expect(h.memory.resolveIntent('alpha', 'existing', { joined: fact })).toBeUndefined()
+      expect(h.memory.resolveIntent('alpha', 'existing', { none: true })).toBeUndefined()
+      await h.clock.flush(); expect(h.io.writes()).toEqual([])
+      expect(h.memory.joins('alpha')).toEqual([]); expect(h.memory.memoryOnlyOwnPostJoins('alpha')).toEqual([])
+      expect(h.memory.unresolvedIntents('alpha').some(i => i.operationId === 'own-post')).toBe(false)
+      expect(existsSync(threadPath(h.stateDir)) ? journalBytes(h) : undefined).toEqual(before)
+    })
+
+    test.each(['forget', 'remove'] as const)('%s fences an intent already queued on the writer', async action => {
+      const h = fixture(); await h.start(); const before = journalBytes(h)
+      h.io.reset(); const kept = h.memory.keepIntent('alpha', intent(h.fact()))
+      expect(kept.kept && kept.ready).toBeInstanceOf(Promise)
+      const removing = action === 'remove' ? h.memory.remove('alpha') : h.memory.forget('alpha')
+      expect(kept.kept && await kept.ready).toBe('failed'); await removing
+      expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toEqual([])
+      expect(h.memory.unresolvedIntents('alpha')).toEqual([])
+      if (action === 'forget') expect(journalBytes(h)).toEqual(before)
+      else expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    })
   })
 
   test('clock increases through stalled/backward wall time, read high-water and explicit advance, independently per persona', async () => {

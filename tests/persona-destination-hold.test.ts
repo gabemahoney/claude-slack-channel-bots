@@ -164,6 +164,7 @@ beforeEach(() => {
     if (logThrows?.test(line)) throw new Error('injected log failure')
   }
   const ownPosts: OwnPostObserver = {
+    start: () => undefined, end: () => {},
     issue: (key, surface) => ({ key, surface, operation: `op-${observedPosts.length + 1}`, issuer: {} }),
     confirm: (issue, posted) => { observedPosts.push({ surface: issue!.surface, channel: posted.channel }) },
   }

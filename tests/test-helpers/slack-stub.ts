@@ -808,6 +808,11 @@ export const slackRateLimited = (retryAfter: number, leakMarker?: string): Error
 export const slackHttpError = (statusCode: number): Error => codedError(
   `An HTTP protocol error occurred: statusCode = ${statusCode}`, WebApiErrorCode.HTTPError,
   { statusCode, statusMessage: 'stub status', headers: {}, body: {} })
+/** The request wrapper used by clients with original-error attachment off. */
+export const slackRequestError = (kind: 'network' | 'dns' | 'timeout' = 'network'): Error => requestError(kind,
+  { method: 'chat.postMessage', tokenPrefix: BOT_TOKEN_PREFIX, marker: undefined, attachOriginal: false, timeoutMs: undefined })
+/** Cancellation supplies no Slack response. */
+export const slackAbortError = (): Error => new DOMException('The operation was aborted', 'AbortError')
 
 /** Where a stub Web API client keeps what its prototype methods read through `this`. */
 const STUB_WEB_CLIENT_STATE = Symbol('stub web client state')

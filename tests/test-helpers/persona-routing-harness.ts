@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs'
 
 import { createDeliveryQueue, type QueueItem, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
-import { createOwnPostObserver } from '../../src/own-post.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, type OwnPostJoins } from '../../src/own-post.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -874,8 +874,9 @@ export function makeRoutingHarness(
   const log = (line: string): void => { h.logs.push(line) }
   const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
   const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
-  // As server.ts: the one adapter, with no owner.
-  const ownPosts = createOwnPostObserver(() => undefined)
+  // As server.ts: one observer reads the owner built over this harness's memory.
+  let ownPostJoins: OwnPostJoins | undefined
+  const ownPosts = createOwnPostObserver(() => ownPostJoins)
   const { notifier, hold, clock: holdClock } = makeNotifierStack({
     getPersona,
     clientFor: webClientFor,
@@ -990,7 +991,7 @@ export function makeRoutingHarness(
     channelDelivery: null,
     channelDeliveryWrites: [],
     heardChannels: (key) => routing.heardChannels(key),
-    forget: (key) => routing.forget(key),
+    forget: (key) => { try { ownPostJoins?.forget(key) } finally { routing.forget(key) } },
     keys: (names) => names.map((n) => byName(n).persona.key),
     registerFor: (name, reg) => {
       const session = registerFor(name, reg)
@@ -1058,12 +1059,37 @@ export function makeRoutingHarness(
     heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
   })
   const threadReady = h.threads?.start()
+  if (h.threads) {
+    const ownPostSources = {
+      config: () => h.config,
+      persona: getPersona,
+      choices: () => h.channelDelivery ?? undefined,
+      membership: (key: string, channel: string, mode: ChannelMode) => opts.membership?.read(key, channel, mode),
+    }
+    ownPostJoins = createOwnPostJoins({
+      memory: h.threads.memory,
+      lookupSlackKey: (key, slackKey) => queue.lookupSlackKey(key, slackKey),
+      choice: ownPostChoice(ownPostSources),
+      eligibility: ownPostEligibility(ownPostSources),
+      now: Date.now,
+      operationId: () => crypto.randomUUID(),
+      isDryRun: () => false,
+    })
+    const unsubscribe = h.channelDelivery!.authority.subscribeThreadView(() => {
+      for (const persona of h.config?.personas ?? []) ownPostJoins?.onSharedStatePublished(persona.key)
+    })
+    for (const method of ['close', 'crash'] as const) {
+      const closeMemory = h.threads[method]
+      h.threads[method] = async () => { ownPostJoins?.stop(); unsubscribe(); await closeMemory() }
+    }
+  }
 
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
     membership: opts.membership,
     threadMemory: opts.threadMemory === undefined ? undefined : (key, channel, root) => {
       h.threadMemoryReads.push([key, channel, root])
+      ownPostJoins?.settleDeferred(key, channel)
       return h.threads!.memory.view(key, channel, root)
     },
     threadStampUndecided: opts.threadMemory === undefined ? undefined :

@@ -5036,6 +5036,7 @@ describe('poller tick — a throw on one row, request or closed entry is caught 
 function recordingOwnPosts(fails = false) {
   const confirmed: Array<{ surface: string; channel: string; ts?: string }> = []
   const ownPosts: OwnPostObserver = {
+    start: () => undefined, end: () => {},
     issue: (key, surface) => ({ key, surface, operation: `op-${confirmed.length}`, issuer: {} }),
     confirm: (issue, posted) => {
       confirmed.push({ surface: issue!.surface, channel: posted.channel, ...(posted.ts ? { ts: posted.ts } : {}) })

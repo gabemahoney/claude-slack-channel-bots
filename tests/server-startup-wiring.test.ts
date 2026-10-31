@@ -5563,37 +5563,88 @@ describe('delivery ownership wiring', () => {
   })
 })
 
-describe('the own-post observer is ownerless and server.ts builds no participation', () => {
+describe('the own-post observer shares one Thread Memory owner', () => {
   const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
+  const owner: keyof typeof OwnPostModule = 'createOwnPostJoins'
+  const choice: keyof typeof OwnPostModule = 'ownPostChoice'
+  const eligibility: keyof typeof OwnPostModule = 'ownPostEligibility'
+  const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
 
   test('server.ts builds none of the removed participation pieces and defers no intake notice', () => {
     expect(SERVER_CODE.match(/participation|rootLookup|grantedScope|RECOVERY_CLOCK|reportOwnPost|beginIntake/gi)).toBeNull()
   })
 
-  test('the routing harness builds its own-post observer with server.ts\'s own arguments', () => {
-    const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
+  test('the routing harness mirrors the observer and owner over its own memory, queue and current membership', () => {
     const production = onlyCallArgs(observer)
-    expect(production).toEqual(['() => undefined'])
+    expect(production).toEqual(['() => ownPostJoins'])
     expect(splitTopLevel(onlyCallArguments(harness, observer))).toEqual(production)
+    for (const name of [observer, owner, choice, eligibility]) expect(importSource(harness, name)).toBe('../../src/own-post.ts')
+    const deps = Object.fromEntries(onlyCallProps(owner))
+    expect(Object.fromEntries(objectProperties(onlyCallArguments(harness, owner)))).toEqual({
+      ...deps,
+      memory: 'h.threads.memory',
+      lookupSlackKey: '(key, slackKey) => queue.lookupSlackKey(key, slackKey)',
+      isDryRun: '() => false',
+    })
+    const sourcesAt = indicesOf(/\bconst\s+ownPostSources\s*=\s*\{/g, harness)
+    expect(sourcesAt).toHaveLength(1)
+    expect(Object.fromEntries(objectProperties(harness.slice(harness.indexOf('{', sourcesAt[0]!))))).toEqual({
+      config: '() => h.config', persona: 'getPersona', choices: '() => h.channelDelivery ?? undefined',
+      membership: '(key: string, channel: string, mode: ChannelMode) => opts.membership?.read(key, channel, mode)',
+    })
   })
 
-  test('every posting surface shares the one ownerless own-post observer, built at module load', () => {
+  test('every posting surface shares the one observer, which reads the one owner holder at call time', () => {
     expect(importSource(SERVER_CODE, observer)).toBe('./own-post.ts')
     expect(callsOf(observer)).toHaveLength(1)
     declaredOnce('ownPosts')
     expect(constOf(observer)).toBe('ownPosts')
-    expect(onlyCallArgs(observer)).toEqual(['() => undefined'])
+    // No explicit onFault: retain the observer's default swallowing callback.
+    expect(onlyCallArgs(observer)).toEqual(['() => ownPostJoins'])
     expect(assignmentsTo('ownPosts')).toEqual([])
     expect(insideMain(onlyCallOf(observer))).toBe(false)
     expect(objectProperties(spreadConstObject('sessionToolDeps')).get('ownPosts')).toBe('ownPosts')
     expect(onlyCallProps('createPersonaDestinations').get('ownPosts')).toBe('ownPosts')
+    declaredOnce('ownPostJoins')
+    const assigned = assignmentsTo('ownPostJoins')
+    expect(assigned.map(({ value }) => value)).toEqual([`${owner}({`])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(onlyCallOf(owner)).toBeGreaterThan(onlyCallOf('createThreadMemory'))
+    expect(onlyCallOf(owner)).toBeLessThan(onlyCallOf('threadMemory\\.readAtStart'))
+    const getter = expression<() => { get(): OwnPostModule.OwnPostJoins | undefined; set(value: OwnPostModule.OwnPostJoins): void }>(`() => {
+      let ownPostJoins;
+      return { get: ${onlyCallArgs(observer)[0]}, set: value => { ownPostJoins = value } };
+    }`, {})()
+    expect(getter.get()).toBeUndefined()
+    const sentinel = {} as OwnPostModule.OwnPostJoins
+    getter.set(sentinel)
+    expect(getter.get()).toBe(sentinel)
   })
 
-  test('shutdown drains preparation before closing the journal, with no routing or owner stop', () => {
+  test('the owner gets the existing memory, queue and current shared sources, a wall clock, unique IDs and dry-run check', () => {
+    for (const name of [owner, choice, eligibility]) expect(importSource(SERVER_CODE, name)).toBe('./own-post.ts')
+    expect(Object.fromEntries(onlyCallProps(owner))).toEqual({
+      memory: 'threadMemory',
+      lookupSlackKey: '(key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey)',
+      choice: `${choice}(ownPostSources)`, eligibility: `${eligibility}(ownPostSources)`,
+      now: 'Date.now', operationId: '() => crypto.randomUUID()', isDryRun: 'isDryRun',
+    } satisfies Record<keyof OwnPostModule.OwnPostJoinsDeps, string>)
+    expect(onlyCallArgs(choice)).toEqual(['ownPostSources'])
+    expect(onlyCallArgs(eligibility)).toEqual(['ownPostSources'])
+    expect(Object.fromEntries(objectProperties(spreadConstObject('ownPostSources')))).toEqual({
+      config: '() => personaConfig', persona: 'getAppliedPersona', choices: '() => channelDeliveryStore',
+      membership: '(key: string, channel: string, mode: ChannelMode) => channelMembership?.read(key, channel, mode)',
+    } satisfies Record<keyof OwnPostModule.OwnPostEligibilitySources, string>)
+    expect(callsOf('createThreadMemory')).toHaveLength(1)
+    expect(callsOf('createChannelMembership')).toHaveLength(1)
+    expect(importSource(SERVER_CODE, 'isDryRun')).toBe('./tokens.ts')
+  })
+
+  test('shutdown drains preparation and queue, then stops the owner once before closing Thread Memory', () => {
     const [start, end] = shutdownBody(SERVER_CODE)
     const code = SERVER_CODE.slice(start, end)
     expect(code).not.toMatch(/personaRouting\.stop\s*\(/)
-    const calls = ['deliveryPreparation?.stop', 'deliveryQueue?.stop']
+    const calls = ['deliveryPreparation?.stop', 'deliveryQueue?.stop', 'ownPostJoins?.stop', 'threadMemory?.stop']
     const offsets = calls.map(name => {
       const at = indicesOf(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(', 'g'), code)
       expect(at).toHaveLength(1)
@@ -5601,6 +5652,7 @@ describe('the own-post observer is ownerless and server.ts builds no participati
       return at[0]!
     })
     expect(offsets).toEqual([...offsets].sort((a, b) => a - b))
+    expect(callsOf('ownPostJoins\\?\\.stop')).toHaveLength(1)
   })
 })
 
@@ -5612,10 +5664,11 @@ describe('Thread Memory server lifecycle wiring', () => {
   const retentionMember: keyof DeliveryQueueOptions = 'threadJoinSaved'
   const recovery: keyof typeof ThreadJoinRecoveryModule = 'recoverQueuedJoins'
 
-  test('routing reads the one Thread Memory holder at call time, with unknown before main creates it', () => {
+  test('routing settles deferred own posts synchronously before reading the live Thread Memory holder', () => {
     const routing = onlyCallOf('createPersonaRouting')
     const binding = onlyCallProps('createPersonaRouting').get(routingMember)
-    expect(binding).toBe("(key, channel, root) => threadMemory?.view(key, channel, root) ?? 'unknown'")
+    expect(binding).toBe("(key, channel, root) => { ownPostJoins?.settleDeferred(key, channel) return threadMemory?.view(key, channel, root) ?? 'unknown' }")
+    expect(callsOf('ownPostJoins\\?\\.settleDeferred')).toHaveLength(1)
     declaredOnce('threadMemory')
     const declaration = indicesOf(/\blet\s+threadMemory\s*:\s*ThreadMemory\s*\|\s*undefined\s*(?=\n)/g, SERVER_CODE)
     expect(declaration).toHaveLength(1)
@@ -5628,19 +5681,26 @@ describe('Thread Memory server lifecycle wiring', () => {
 
     // Execute the actual adapter alone, with its holder in an isolated closure;
     // importing or starting the server cannot expose this private dependency.
-    const adapter = new Function(`let threadMemory; return {
-      read: (${binding}), set: value => { threadMemory = value }
-    }`)() as {
+    const adapter = expression<() => {
       read: NonNullable<PersonaRoutingDeps['threadMemory']>
-      set: (value: Pick<ThreadMemoryModule.ThreadMemory, 'view'>) => void
-    }
+      set: (value: Pick<ThreadMemoryModule.ThreadMemory, 'view'>, owner: Pick<OwnPostModule.OwnPostJoins, 'settleDeferred'>) => void
+    }>(`() => {
+      let threadMemory, ownPostJoins;
+      return { read: (${binding}), set: (value, owner) => { threadMemory = value; ownPostJoins = owner } };
+    }`, {})()
     expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('unknown')
     const calls: string[][] = []
-    adapter.set({ view: (...args) => { calls.push(args); return 'joined' } })
+    let settled = false
+    const owner = { settleDeferred: (key: string, channel?: string) => { calls.push(['settle', key, channel!]); settled = true } }
+    adapter.set({ view: (...args) => { expect(settled).toBe(true); calls.push(['view', ...args]); return 'joined' } }, owner)
     expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('joined')
-    adapter.set({ view: (...args) => { calls.push(args); return 'not-joined' } })
+    settled = false
+    adapter.set({ view: (...args) => { expect(settled).toBe(true); calls.push(['view', ...args]); return 'not-joined' } }, owner)
     expect(adapter.read('beta', 'C0OTHER', '2.000001')).toBe('not-joined')
-    expect(calls).toEqual([['alpha', 'C0THREAD', '1.000001'], ['beta', 'C0OTHER', '2.000001']])
+    expect(calls).toEqual([
+      ['settle', 'alpha', 'C0THREAD'], ['view', 'alpha', 'C0THREAD', '1.000001'],
+      ['settle', 'beta', 'C0OTHER'], ['view', 'beta', 'C0OTHER', '2.000001'],
+    ])
   })
 
   test('the Thread Memory adapter is supplied only in the routing call and never replaced elsewhere', () => {
@@ -5767,7 +5827,9 @@ describe('Thread Memory server lifecycle wiring', () => {
 
   test('thread-view subscription and awaited activation follow the recovered choice adapter and precede membership, connections and bring-up', () => {
     const subscription = onlyCallOf('subscribeThreadView')
-    expect(splitTopLevel(callArguments(SERVER_CODE, subscription))).toEqual(['() => { if (shuttingDown) return threadMemory?.published() for (const key of deliveryQueue?.keys() ?? []) { if (getAppliedPersona(key)) void memoryHolds?.retryPending(key).catch(() => {}) } }'])
+    // This closed list of calls starts no save in the listener: the owners schedule work.
+    expect(splitTopLevel(callArguments(SERVER_CODE, subscription))).toEqual(['() => { if (shuttingDown) return threadMemory?.published() for (const persona of personaConfig?.personas ?? []) ownPostJoins?.onSharedStatePublished(persona.key) for (const key of deliveryQueue?.keys() ?? []) { if (getAppliedPersona(key)) void memoryHolds?.retryPending(key).catch(() => {}) } }'])
+    expect(callsOf('ownPostJoins\\?\\.onSharedStatePublished')).toHaveLength(1)
     expect(SERVER_CODE.slice(0, subscription).endsWith('reload.sharedChannels()!.')).toBe(true)
     const activation = onlyCallOf('threadMemory\\.activate')
     expect(atMainTopLevel(SERVER_CODE, activation)).toBe(true)
@@ -5791,11 +5853,13 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(splitTopLevel(args[1]!.slice(1, -1))).toEqual([
       'k => personaRouting.forget(k)', 'k => deliveryReporting?.forget(k)', 'k => sharedStateReporting?.forget(k)', 'k => deliveryPreparation?.forget(k)',
       'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => memoryHolds?.forget(k)',
-      'k => threadMemoryRetries?.forget(k)', 'k => threadMemory?.forget(k)',
+      'k => threadMemoryRetries?.forget(k)', 'k => ownPostJoins?.forget(k)', 'k => threadMemory?.forget(k)',
     ])
     expect(props.get('routing')).toContain('forget: key => forgetPersonaState(key, [')
     const lifecycle = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!)
-    expect(lifecycle.get('teardown')).toBe("async (persona) => { try { await personaLifecycleOps.teardown(persona) } finally { if (!personaConfig?.personas.some(applied => applied.key === persona.key)) { try { memoryHolds?.forget(persona.key) } finally { try { threadMemoryRetries?.forget(persona.key, 'removal') } finally { await threadMemory?.remove(persona.key) } } } } }")
+    const removalForget = splitTopLevel(onlyCallArguments(lifecycle.get('teardown')!, 'forgetPersonaState'))
+    expect(removalForget[0]).toBe('persona.key')
+    expect(splitTopLevel(removalForget[1]!.slice(1, -1))).toContain('key => ownPostJoins?.forget(key)')
   })
 
   test('start recovers every queue key immediately after activation, isolates each failure, and precedes all intake wiring', () => {
@@ -5867,9 +5931,10 @@ describe('Thread Memory server lifecycle wiring', () => {
     const statements = tree.statements.map(node => node.getText(tree).replace(/\s+/g, ' ').trim())
     const drain = statements.indexOf('await deliveryQueue?.stop()')
     expect(drain).toBeGreaterThanOrEqual(0)
-    expect(statements.slice(drain, drain + 8)).toEqual([
+    expect(statements.slice(drain, drain + 9)).toEqual([
       'await deliveryQueue?.stop()',
       'threadMemoryRetries?.stopKeys()',
+      'ownPostJoins?.stop()',
       'unsubscribeThreadMemory?.()',
       'await threadMemory?.quiesce()',
       "if (threadMemorySeal?.loadedAtStart() && threadMemory) { const result = await threadMemorySeal.writeShutdown(threadMemory.completedStores()) try { if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced)) } catch { } }",
@@ -6256,6 +6321,7 @@ describe('Thread Memory failure wiring', () => {
       io.reset(); if (failure !== 'none') io.failWrite(failure === 'unsynced')
       const run = threadMemoryShutdown({ memoryHolds: { stop() { order.push('holds') } },
         deliveryQueue: { stop() { order.push('queue'); return drain.promise } },
+        ownPostJoins: { stop() { order.push('own-post-stop') } },
         unsubscribeThreadMemory: () => order.push('unsubscribe'),
         threadMemory: {
           quiesce() { order.push('quiesce'); expect(clock.pendingCount()).toBe(0); return quiesce.promise },
@@ -6274,10 +6340,10 @@ describe('Thread Memory failure wiring', () => {
       const stopping = run(); await clock.flush()
       expect(order).toEqual(['holds', 'queue']); expect(io.calls).toEqual([])
       drain.resolve(); await clock.flush()
-      expect(order).toEqual(['holds', 'queue', 'keys-stop', 'unsubscribe', 'quiesce']); expect(io.calls).toEqual([])
+      expect(order).toEqual(['holds', 'queue', 'keys-stop', 'own-post-stop', 'unsubscribe', 'quiesce']); expect(io.calls).toEqual([])
       quiesce.resolve(); await stopping
       const failed = loaded && failure !== 'none'
-      expect(order).toEqual(['holds', 'queue', 'keys-stop', 'unsubscribe', 'quiesce', ...(loaded ? ['stores', 'write'] : []),
+      expect(order).toEqual(['holds', 'queue', 'keys-stop', 'own-post-stop', 'unsubscribe', 'quiesce', ...(loaded ? ['stores', 'write'] : []),
         ...(failed ? ['log'] : []), 'memory-stop', 'seal-stop', 'seal-retries-stop'])
       const failureEvents = events.filter((e): e is Extract<ThreadMemorySealModule.ThreadMemorySealEvent, { type: 'seal-write-failed' }> => e.type === 'seal-write-failed')
       expect(failureEvents).toHaveLength(failed ? 1 : 0)
@@ -6480,19 +6546,21 @@ describe('Memory Hold server wiring', () => {
     expect(mainExecutionAwaits().map(at => SERVER_CODE.slice(at, at + 70)).some(code => /memoryHolds\.(resolve|retryPending)/.test(code))).toBe(false)
   })
 
-  test('publication recovers joins before detached retries, visits applied keys only, and stops during shutdown', async () => {
+  test('publication recovers joins then schedules own posts for applied personas before detached hold retries', async () => {
     const subscription = callArguments(SERVER_CODE, onlyCallOf('subscribeThreadView'))
     const keys = Object.values(THREAD_PERSONAS), calls: unknown[][] = []
     const pending = Promise.withResolvers<void>()
     for (const shuttingDown of [false, true]) {
       const publish = expression<() => void>(subscription, {
         shuttingDown, threadMemory: { published: () => calls.push(['published']) },
+        personaConfig: { personas: keys.map(key => ({ key })) },
+        ownPostJoins: { onSharedStatePublished: (key: string) => calls.push(['own-post', key]) },
         deliveryQueue: { keys: () => keys }, getAppliedPersona: (key: string) => key === keys[1],
         memoryHolds: { retryPending: (key: string) => { calls.push(['retry', key]); return pending.promise } },
       })
       expect(publish()).toBeUndefined()
     }
-    expect(calls).toEqual([['published'], ['retry', keys[1]]])
+    expect(calls).toEqual([['published'], ...keys.map(key => ['own-post', key]), ['retry', keys[1]]])
     pending.reject(new Error('fixture resolution failed'))
     await createFakeClock().flush()
   })
@@ -6508,17 +6576,17 @@ describe('Memory Hold server wiring', () => {
     pending.resolve()
   })
 
-  test('teardown isolates resolver forget from the remaining per-key cleanup', async () => {
+  test.each(['memoryHolds', 'ownPostJoins'])('teardown isolates %s forget from the remaining per-key cleanup', async failed => {
     const calls: string[] = [], key = THREAD_PERSONAS.primary
     const error = new Error('fixture forget failed')
     const routing = expression<{ forget(key: string): Promise<void> }>(onlyCallProps('createPersonaLifecycle').get('routing')!, {
       forgetPersonaState,
-      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'].map(name => [name, {
-        forget: (received: string) => { expect(received).toBe(key); calls.push(name); if (name === 'memoryHolds') throw error },
+      ...Object.fromEntries(['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'ownPostJoins', 'threadMemory'].map(name => [name, {
+        forget: (received: string) => { expect(received).toBe(key); calls.push(name); if (name === failed) throw error },
       }])),
     })
     await expect(routing.forget(key)).rejects.toBe(error)
-    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'threadMemory'])
+    expect(calls).toEqual(['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'threadMemoryRetries', 'ownPostJoins', 'threadMemory'])
   })
 
   test('removed-key cleanup forgets the resolver before removing memory even after lifecycle teardown fails', async () => {
@@ -6527,6 +6595,7 @@ describe('Memory Hold server wiring', () => {
     for (const present of [true, false]) {
       const error = new Error('fixture teardown failed')
       const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
+        forgetPersonaState, ownPostJoins: { forget: (key: string) => calls.push(['own-post', key]) },
         personaLifecycleOps: { teardown: async () => { throw error } },
         personaConfig: { personas: present ? [{ key }] : [] },
         memoryHolds: { forget: (key: string) => calls.push(['forget', key]) },
@@ -6535,20 +6604,22 @@ describe('Memory Hold server wiring', () => {
       })
       await expect(run({ key })).rejects.toBe(error)
     }
-    expect(calls).toEqual([['forget', key], ['retries', key, 'removal'], ['remove', key]])
+    expect(calls).toEqual([['own-post', key], ['forget', key], ['retries', key, 'removal'], ['remove', key]])
   })
 
-  test('removed-key cleanup still removes Thread Memory when resolver forget throws', async () => {
+  test.each(['memoryHolds', 'ownPostJoins'])('removed-key cleanup still removes Thread Memory when %s forget throws', async failed => {
     const key = THREAD_PERSONAS.primary, calls: unknown[][] = [], error = new Error('fixture forget failed')
     const teardown = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!).get('teardown')!
     const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
+      forgetPersonaState,
+      ownPostJoins: { forget: (key: string) => { calls.push(['own-post', key]); if (failed === 'ownPostJoins') throw error } },
       personaLifecycleOps: { teardown: async () => {} }, personaConfig: { personas: [] },
-      memoryHolds: { forget: (key: string) => { calls.push(['forget', key]); throw error } },
+      memoryHolds: { forget: (key: string) => { calls.push(['forget', key]); if (failed === 'memoryHolds') throw error } },
       threadMemoryRetries: { forget: (...args: unknown[]) => calls.push(['retries', ...args]) },
       threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
     })
-    await run({ key }).catch(caught => { expect(caught).toBe(error) })
-    expect(calls).toEqual([['forget', key], ['retries', key, 'removal'], ['remove', key]])
+    await expect(run({ key })).rejects.toBe(error)
+    expect(calls).toEqual([['own-post', key], ['forget', key], ['retries', key, 'removal'], ['remove', key]])
   })
 
   test('start wake and reload count read open queue work through the shared predicates', () => {
