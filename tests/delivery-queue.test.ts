@@ -445,6 +445,218 @@ test('quarantines exact torn/middle/orphan bytes; damaged sent is unknown and su
   expect(fs.readFileSync(unreadable[0]!.quarantinePath, 'utf8')).toBe(bad + orphan + torn)
   await q.stop(); const replay = await open(); expect(replay.items('alpha')[0]!.unknownSend).toBe(true); expect(replay.items('alpha')[0]!.nextAttempt).toBe(2); expect(replay.items('alpha')[0]!.records.filter(r => r.kind === 'sent')).toMatchObject([{ attempt: 1, unknown_outcome: true }])
 })
+
+describe('b.2is torn-tail recovery', () => {
+  const first: AcceptedRecord = { ...injectedInput({ text: 'first 🙂' }), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1.000000' }
+  const tail = '{"v":1,"kind":"accepted","seq":3,"text":"torn 🙂'
+  const copies = () => fs.readdirSync(join(dir, 'queue')).filter(name => name.startsWith('alpha.unreadable-')).sort()
+  const findings = (q: DeliveryQueue) => q.startupFindings().filter((e): e is Extract<QueueEvent, { type: 'record-unreadable' }> => e.type === 'record-unreadable')
+  const recover = (options: Parameters<typeof open>[0] = {}) => open({ now: createFakeClock({ start: 1000 }).now, ...options })
+
+  test.each([
+    ['temp-open', 'accept'], ['temp-write', 'accept'], ['file-fsync', 'accept'], ['rename', 'accept'],
+    ['directory-fsync', 'accept'], ['directory-fsync', 'reopen'],
+  ] as const)('failed recovery rewrite %s preserves send evidence until durable recovery by %s', async (failure, retryBy) => {
+    const originalAccepted = { ...accepted(), text: first.text }
+    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed 🙂'] }
+    const torn = '{"v":1,"kind":"sent","seq":1,"attempt":7,"text":"torn 🙂'
+    seedQueue(dir, [originalAccepted, fixed, torn])
+    seedQueue(dir, [first], 'beta')
+    const original = fs.readFileSync(queuePath(dir))
+    const paths = new Map<number, string>()
+    let fail = true, failures = 0, renames = 0, syncingRename = false
+    const rewriteTemp = (fd: number) => paths.get(fd)?.startsWith(queuePath(dir) + '.') === true && paths.get(fd)!.endsWith('.tmp')
+    const fault = () => { failures++; throw new Error('EIO recovery rewrite ' + failure) }
+    const seam = {
+      ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) {
+        if (fail && failure === 'temp-open' && String(args[0]).startsWith(queuePath(dir) + '.') && String(args[0]).endsWith('.tmp')) fault()
+        const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd
+      },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+        if (fail && failure === 'temp-write' && rewriteTemp(fd)) {
+          fs.writeSync(fd, bytes, offset, Math.min(7, length))
+          fault()
+        }
+        return fs.writeSync(fd, bytes, offset, length)
+      },
+      fsyncSync(fd: number) {
+        // Quarantine must have synced successfully; fail only the directory
+        // durability boundary after the replacement journal has been renamed.
+        if (fail && failure === 'file-fsync' && rewriteTemp(fd)) fault()
+        if (syncingRename && paths.get(fd) === join(dir, 'queue')) {
+          syncingRename = false
+          if (fail && failure === 'directory-fsync') fault()
+        }
+        fs.fsyncSync(fd)
+      },
+      renameSync(from: fs.PathLike, to: fs.PathLike) {
+        if (fail && failure === 'rename' && String(to) === queuePath(dir)) fault()
+        fs.renameSync(from, to)
+        if (String(to) === queuePath(dir)) { renames++; syncingRename = true }
+      },
+    } as typeof fs
+    const events: QueueEvent[] = []
+    let q = await recover({ fs: seam, onEvent: event => { events.push(event) } })
+    expect(failures).toBe(1)
+    const initial = findings(q)
+    expect(initial).toMatchObject([{ key: 'alpha', line: 3, alert: false }])
+    const quarantinePath = initial[0]!.quarantinePath
+    const quarantines = copies()
+    expect(quarantines).toHaveLength(1)
+    const unknown: Extract<QueueRecord, { kind: 'sent' }> = { v: 1, kind: 'sent', seq: 1, attempt: 7, unknown_outcome: true, at: originalAccepted.received_at, quarantine: { path: quarantinePath, line: 3 } }
+    // Pending repair of alpha must not block a healthy persona's writes.
+    expect(await q.accept('beta', injectedInput({ text: 'healthy' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    for (let retry = 0; retry < 2; retry++) {
+      expect(await q.accept('alpha', injectedInput({ text: 'must not be accepted' }))).toMatchObject({ status: 'failed' })
+      expect(failures).toBe(retry + 2)
+      expect(q.isWritable!('alpha')).toBe(false)
+      // Durable quarantine exposes the complete replay for recovery consumers,
+      // including dedupe and unknown-send facts, but authorizes no mutation.
+      expect(q.items('alpha')).toMatchObject([{ accepted: originalAccepted, fixed, unknownSend: true, nextAttempt: 8, delivered: false }])
+      expect(q.item('alpha', 1)!.records).toEqual([originalAccepted, fixed, unknown])
+      expect(q.lookupSlackKey('alpha', originalAccepted.key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+      expect(findings(q)).toEqual(initial)
+      expect(copies()).toEqual(quarantines)
+      expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+      expect(fs.readdirSync(join(dir, 'queue')).filter(name => name.endsWith('.tmp'))).toEqual([])
+      if (failure === 'directory-fsync') {
+        expect(renames).toBeGreaterThan(0)
+        // Visible replacement bytes do not authorize writes before dir fsync.
+        expect(readQueue(dir).filter(r => r.kind === 'sent')).toEqual([unknown])
+        expect(readQueue(dir).filter(r => r.kind === 'accepted')).toEqual([originalAccepted])
+      } else {
+        expect(renames).toBe(0)
+        expect(fs.readFileSync(queuePath(dir))).toEqual(original)
+      }
+    }
+    expect(events.filter(e => e.type === 'recovery-failed')).toHaveLength(3)
+    fail = false
+    if (retryBy === 'reopen') {
+      // A new process has no pending in-memory replay: the renamed journal
+      // itself must retain uncertainty and its original quarantine reference.
+      await q.stop()
+      q = await recover()
+      expect(findings(q)).toEqual([])
+    }
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(q.lookupSlackKey('alpha', originalAccepted.key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+    expect(q.item('alpha', 1)).toMatchObject({ accepted: originalAccepted, fixed, unknownSend: true, nextAttempt: 8, delivered: false })
+    expect(q.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([unknown])
+    expect(readQueue(dir).filter(r => r.kind === 'sent')).toEqual([unknown])
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, originalAccepted.text], [2, 'second']])
+    expect(replay.item('alpha', 1)).toMatchObject({ accepted: originalAccepted, fixed, unknownSend: true, nextAttempt: 8, delivered: false })
+    expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([unknown])
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual(quarantines)
+    expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+  })
+
+  test.each([['successful', false], ['failed', true]] as const)('quarantines once across append/restart after a %s startup rewrite', async (_, failRewrite) => {
+    // The ticket's exact fragment; the valid prefix also checks byte offsets after UTF-8.
+    const torn = '{"v":1,"kind":"accepted","seq":3,'
+    seedQueue(dir, [first, torn])
+    let fail = failRewrite, rewriteFailures = 0
+    const seam = { ...fs, openSync(...args: Parameters<typeof fs.openSync>) {
+      if (fail && String(args[0]).endsWith('.tmp') && args[1] === 'wx') {
+        rewriteFailures++
+        throw Object.assign(new Error('injected ENOSPC opening rewrite temp'), { code: 'ENOSPC' })
+      }
+      return fs.openSync(...args)
+    } } as typeof fs
+    const q = await recover({ fs: seam })
+    expect(rewriteFailures).toBe(failRewrite ? 1 : 0)
+    const initial = findings(q)
+    expect(initial).toMatchObject([{ key: 'alpha', line: 2, alert: false }])
+    expect(fs.readFileSync(initial[0]!.quarantinePath)).toEqual(Buffer.from(torn))
+    fail = false
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, first.text], [2, 'second']])
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual([initial[0]!.quarantinePath.split('/').at(-1)!])
+    expect(fs.readFileSync(initial[0]!.quarantinePath)).toEqual(Buffer.from(torn))
+  })
+
+  test.each(['write', 'file-sync', 'directory-sync'] as const)('failed quarantine %s leaves the source intact and retries without copying the tail twice', async failure => {
+    seedQueue(dir, [first, tail])
+    const original = fs.readFileSync(queuePath(dir))
+    let fail = true, failures = 0
+    const paths = new Map<number, string>()
+    const quarantine = (fd: number) => paths.get(fd)?.includes('.unreadable-') === true
+    const seam = {
+      ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+        if (fail && quarantine(fd) && failure === 'write') {
+          fs.writeSync(fd, bytes, offset, Math.min(7, length))
+          failures++
+          throw new Error('EIO partial quarantine write')
+        }
+        return fs.writeSync(fd, bytes, offset, length)
+      },
+      fsyncSync(fd: number) {
+        if (fail && ((failure === 'file-sync' && quarantine(fd)) || (failure === 'directory-sync' && paths.get(fd) === join(dir, 'queue')))) {
+          failures++
+          throw new Error('EIO quarantine durability')
+        }
+        fs.fsyncSync(fd)
+      },
+    } as typeof fs
+    const q = await recover({ fs: seam })
+    for (let retry = 0; retry < 2; retry++) {
+      expect(q.items('alpha')).toEqual([])
+      expect(await q.accept('alpha', injectedInput({ text: 'must not be accepted' }))).toMatchObject({ status: 'failed' })
+      expect(fs.readFileSync(queuePath(dir))).toEqual(original)
+    }
+    expect(failures).toBeGreaterThan(0)
+    fail = false
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    const quarantines = copies()
+    expect(quarantines).toHaveLength(1)
+    expect(fs.readFileSync(join(dir, 'queue', quarantines[0]!))).toEqual(Buffer.from(tail))
+    // No explicit compaction: recovery itself must make the next append safe.
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, first.text], [2, 'second']])
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual(quarantines)
+    expect(fs.readFileSync(join(dir, 'queue', quarantines[0]!))).toEqual(Buffer.from(tail))
+  })
+
+  test('a torn sent tail keeps its unknown-outcome evidence when the startup rewrite fails', async () => {
+    const torn = '{"v":1,"kind":"sent","seq":1,"attempt":7,'
+    seedQueue(dir, [first, { v: 1, kind: 'fixed', seq: 1, parts: ['fixed 🙂'] }, torn])
+    let fail = true, rewriteFailures = 0
+    const seam = { ...fs, openSync(...args: Parameters<typeof fs.openSync>) {
+      if (fail && String(args[0]).endsWith('.tmp') && args[1] === 'wx') { rewriteFailures++; throw new Error('ENOSPC rewrite unavailable') }
+      return fs.openSync(...args)
+    } } as typeof fs
+    const q = await recover({ fs: seam })
+    expect(rewriteFailures).toBe(1)
+    const quarantines = copies()
+    expect(quarantines).toHaveLength(1)
+    const quarantinePath = join(dir, 'queue', quarantines[0]!)
+    expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+    fail = false
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    const recovered = q.item('alpha', 1)!
+    expect(recovered).toMatchObject({ accepted: first, unknownSend: true, nextAttempt: 8, delivered: false, fixed: { parts: ['fixed 🙂'] } })
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, first.text], [2, 'second']])
+    expect(replay.item('alpha', 1)).toMatchObject({ accepted: first, unknownSend: true, nextAttempt: 8, delivered: false, fixed: recovered.fixed })
+    expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual(recovered.records.filter(r => r.kind === 'sent'))
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual(quarantines)
+    expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+  })
+})
+
 test('1000 real-file accepts satisfy p99 <50ms without network', async () => {
   const q = await open(); const timings: number[] = []
   for (let i = 0; i < 1000; i++) { const at = performance.now(); expect((await q.accept('alpha', injectedInput())).status).toBe('accepted'); timings.push(performance.now() - at) }

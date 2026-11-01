@@ -98,7 +98,7 @@ export interface DeliveryQueue {
   item(key: string, seq: number): QueueItem | undefined
   items(key: string): QueueItem[]
   openCount(key: string): number
-  /** A failed post-accept append suspends all keys until an append succeeds. */
+  /** Pending journal repair or a failed post-accept append suspends keys. */
   isWritable?(key: string): boolean
   keys(): string[]
   compact(key?: string): Promise<void>
@@ -170,6 +170,8 @@ function formatMicros(us: bigint): string { return `${us / 1000000n}.${String(us
 interface AppendRollback { pendingRollback?: number }
 interface Journal extends AppendRollback {
   records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
+  /** Quarantine is durable; this replay must replace the source before writes. */
+  pendingRecovery?: boolean
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
 }
 function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0 } }
@@ -305,8 +307,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function load(key: string): void {
     const stored = journal(key)
     if (stored.loaded) return
-    // Publish only a complete replay: a failed read or quarantine append must
-    // remain retryable without exposing partial rows or dedupe facts.
+    if (stored.pendingRecovery) { finishRecovery(key, stored); return }
+    // Publish only a complete replay after quarantine is durable. Its existing
+    // items must remain visible to startup preparation and delivery recovery.
     const j = emptyJournal()
     let bytes: Buffer
     try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
@@ -360,8 +363,23 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         }
         event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
       }
+      // Retry this exact replay, without appending the quarantined bytes again.
+      // Rewriting also persists unknown-send markers atomically with removal of
+      // the damage; truncating a torn send alone would lose that evidence.
+      j.pendingRecovery = true
+      journals.set(key, j)
+      finishRecovery(key, j)
+      return
     }
-    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
+    j.loaded = true
+    journals.set(key, j)
+  }
+  function finishRecovery(key: string, stored: Journal): void {
+    try { rewrite(key, stored.records) } catch (error) { event({ type: 'recovery-failed', key, error }); throw error }
+    // A rename followed by failed directory fsync is still pending: no writer
+    // can append until retry makes this same recovered journal durable.
+    stored.pendingRecovery = false
+    stored.loaded = true
   }
   function rewrite(key: string, records: QueueRecord[]): void {
     const path = pathFor(key), temp = `${path}.${randomUUID()}.tmp`
@@ -624,7 +642,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     },
     items: key => materialize(journal(key)).map(item => structuredClone(item)),
     openCount: key => journal(key).openCount,
-    isWritable: key => !appendBlocked.has(key),
+    isWritable: key => !appendBlocked.has(key) && !journals.get(key)?.pendingRecovery,
     keys: () => [...journals.keys()],
     compact,
     startMaintenance() {
