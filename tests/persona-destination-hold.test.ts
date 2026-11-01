@@ -59,6 +59,7 @@ import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   createPersonaDestinations,
+  DM_OPEN_TIMEOUT_MS,
   destinationSettingOf,
   type DestinationConfig,
   type DestinationSlackClient,
@@ -154,7 +155,7 @@ beforeEach(() => {
   const log = (line: string): void => {
     logs.push(line)
   }
-  const real = createPersonaDestinations({ log, getPersonaConfig: () => inEffect })
+  const real = createPersonaDestinations({ log, clock, getPersonaConfig: () => inEffect })
   const destinations: PersonaDestinations = {
     post: (persona, c, message) => {
       if (resolverThrows > 0) {
@@ -603,6 +604,55 @@ describe('an attempt that started before the episode closed', () => {
 
 describe('the gate (begin)', () => {
   const prompt = (text: string) => ({ text })
+
+  test('a timed-out DM retry keeps the failure backoff and releases the gate before its old open settles', async () => {
+    const old = makeDeferredWebApiCall(), abort = new AbortController(), callbacks: string[] = []
+    stub(D).script.open.push({ kind: 'platform', error: 'missing_scope' }, old.outcome)
+    const warning = notice('warning')
+    warning.message.tracking = { signal: abort.signal, canPost: () => true, onPosted: () => { callbacks.push('posted') } }
+    await hold.deliver(D, client(D), warning)
+    const firstWait = onlyTimerDelay()
+    await clock.runNext()
+    expect(stub(D).calls.conversationsOpen).toHaveLength(2)
+    expect(hold.begin(D.key)).toBeUndefined()
+    await clock.advance(DM_OPEN_TIMEOUT_MS - 1)
+    expect(failures).toHaveLength(1)
+    await clock.advance(1)
+    expect(failures).toEqual([
+      { notice: 'warning', step: 'conversations.open', code: 'missing_scope', first: true, held: true },
+      { notice: 'warning', step: 'conversations.open', code: 'timeout', first: false, held: true },
+    ])
+    expect(hold.view(D.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: clock.now() + firstWait * 2 })
+    expect(startLines()).toHaveLength(1)
+    expect(clearedLines()).toEqual([])
+    expect(hold.begin(D.key)).toBeUndefined()
+    await clock.advance(firstWait * 2 - 1)
+    expect(hold.begin(D.key)).toBeUndefined()
+    abort.abort() // Recovery removes the obsolete warning, keeping the destination's due time.
+    expect(hold.view(D.key).heldNotices).toBe(0)
+    expect(clock.pendingCount()).toBe(0)
+    await clock.advance(1)
+    const current = { ...D, permission_prompts: 'C0FIXED01' }
+    applied.set(D.key, current)
+    const attempt = hold.begin(D.key)
+    expect(attempt).toBeDefined()
+    expect(old.settled).toBe(false)
+    expect(await attempt!.post(current, client(D), prompt('permission'))).toMatchObject({ outcome: 'posted', channelId: 'C0FIXED01' })
+    attempt!.release()
+    expect(startLines()).toHaveLength(1)
+    expect(clearedLines()).toHaveLength(1)
+    const outcomes = [...logs], failedAttempts = [...failures]
+    old.settle({ kind: 'platform', error: 'missing_scope' })
+    await clock.flush()
+    await clock.advance(DM_OPEN_TIMEOUT_MS * 2)
+    expect(logs).toEqual(outcomes)
+    expect(failures).toEqual(failedAttempts)
+    expect(callbacks).toEqual([])
+    expect(posts(D)).toEqual([{ channel: 'C0FIXED01', text: 'permission' }])
+    expect(stub(D).calls.conversationsOpen).toHaveLength(2)
+    expect(hold.view(D.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(clock.pendingCount()).toBe(0)
+  })
 
   test('after a failure it refuses until the due time and while a retry is in flight; a gated success posts the held notices at once, in order', async () => {
     const retry = makeDeferredWebApiCall()

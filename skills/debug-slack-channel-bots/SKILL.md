@@ -451,9 +451,33 @@ retain their existing text excerpts; receipt confirmation has its own line.
 ### `message-not-saved`
 
 - **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
-- **Meaning:** The incoming message could not be durably stored; it has not been accepted. Every failure is counted, including Slack retries.
+- **Meaning:** The incoming message could not be durably stored on this attempt; it was not accepted. Every failure is counted, including Slack retries.
 - **Cause:** The queue directory or disk cannot be written.
 - **Fix:** Check free space, mount availability and permissions on the named path. For Slack, follow **Message not saved** below; retry a failed injected message once storage works.
+
+The same class also records attempts to correct a warning after the exact message
+was saved:
+
+```text
+[slack] message-not-saved: persona="<name>" (key=<key>) chat_id="<chat>" ts="<ts>" edited_ts=<edit> recovery=<edit|correction> outcome=<success|failed>[ reason=<reason>]
+```
+
+`edited_ts` is `null` for an unedited message, otherwise its quoted edit timestamp.
+`recovery=edit` updates the warning; `recovery=correction` posts the one fallback
+in the same place. `outcome=failed` concerns that Slack operation: the message
+has already been saved, so this line is not a reason to resend it.
+
+Each operation waits up to 10 seconds. `reason=timeout` means no result arrived
+within that bound; Slack may still complete it, so both an edit and a correction
+can appear. `reason=missing_message_ts` means the original warning's response
+lacked its message timestamp: no edit was possible, so CSCB tries the correction.
+
+Other failure reasons are redacted Slack error descriptions. Check the original
+destination and Slack connectivity/access if correction fails; CSCB does not retry
+these operations.
+
+Cancellation during persona teardown or server shutdown logs
+no recovery outcome. See [Message saved after retry](#message-saved-after-retry).
 
 ### `message-received`
 
@@ -1177,14 +1201,22 @@ retain their existing text excerpts; receipt confirmation has its own line.
     that channel (in Slack, `/invite @<app name>` in the channel). In
     fungible mode the invite also makes the persona hear that channel, at
     `mentions` unless its agent chose otherwise.
+  - `timeout` with `conversations.open`: opening the destination DM did not
+    answer within 10 seconds. Simultaneous posts sharing that open use the
+    same deadline, even if one starts later. Check the host's connectivity
+    to Slack; CSCB retries with the backoff above. Cancelling a storage
+    warning releases its wait immediately without cancelling other posts
+    waiting for the same DM. A late answer cannot post the cancelled warning.
   - Any other error: another Slack error such as `channel_not_found` or
     `is_archived`, or a network error or timeout (`network_error`,
     `unknown_error`, …). It's held and retried the same way. Check that the
     channel the line names exists, isn't archived and has the persona's app
     in it (for `dm`, that `dm.contact` is a user in the workspace), that the
     persona's app is still installed, and that the server's host can reach
-    Slack. The Slack client retries a network failure itself first, for up to
-    about 30 minutes, so a network outage can reach this line late.
+    Slack. For `chat.postMessage`, the Slack client's network retries can
+    delay this line by about 30 minutes; DM opening has the 10-second bound
+    above. A timed-out DM open may still finish at Slack, but CSCB does not
+    post from that late answer.
   - To send the persona's prompts and notices somewhere else instead, change
     its destination setting in `config.json`: `permission_prompts` in
     declarative mode, `invited.permission_prompts` in fungible mode (a
@@ -1563,9 +1595,13 @@ down, report it as a bug, with the persona's lines.
 
 ## Delivery notices
 
-These notices go only to the persona's destination under its Slack identity, never
-to the conversation that sent the message merely because it was the source. They
-carry no message text. Accepted items never expire: every source shares the
+Ordinary new notices go to the persona's destination under its Slack identity,
+never to the conversation that sent the message merely because it was the source.
+[Storage-warning recovery](#message-saved-after-retry) keeps the edit and its one
+fallback in the warning's original channel or DM, even after a destination change
+or DMs are turned off. These notices carry no message text.
+
+Accepted items never expire: every source shares the
 persona's strict FIFO queue, with one item in flight until its transcript confirms
 all parts. A blocked head holds every later item. Delivery can repeat a message
 when confirmation is missing.
@@ -1576,9 +1612,39 @@ when confirmation is missing.
 :warning: *Message not saved* — a message from U0SENDER1 for Alpha could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.
 ```
 
-- **Meaning:** The message has not been accepted; no durable copy was saved.
+- **Meaning:** The incoming message could not be saved on the reported attempt. Check for a [recovery correction](#message-saved-after-retry) or the matching `message-received` line before resending.
 - **Cause:** The server could not store an incoming Slack message. If storing keeps failing for an hour, Slack may disable the app’s event subscriptions; restore storage and check the app’s event subscriptions in Slack. One notice covers the storage-failure episode, ending at the next successful store; server.log counts every failure.
 - **Fix:** Check the server disk, mount and queue permissions. Slack retries a few times; ask the sender to resend if no copy was saved. Failed injected messages return a failure to their caller instead of posting this notice.
+
+If the exact same message is saved for this persona before the warning is sent,
+CSCB cancels the pending warning. Recovery must match the conversation, message
+timestamp and edit timestamp: saving another message, another edit or another
+persona's copy does not correct this warning. A message never saved keeps its
+warning unchanged.
+
+### Message saved after retry
+
+```text
+:white_check_mark: *Message saved after retry* — the message from U0SENDER1 for Alpha was saved after a retry. No resend is needed.
+```
+
+CSCB edits an already-posted *Message not saved* warning to this text once that
+exact message is saved. If the edit fails, it tries one short correction in the
+original channel or DM, using the Slack identity that posted the warning, even
+if the persona's destination has changed or DMs have since been turned off. No
+warning is deleted.
+
+No resend is needed for that message. Saving it does not confirm or guarantee
+delivery to the bot; `message-delivered` confirms take-in. The edit and fallback
+are best effort, each with a 10-second wait and no further correction retries;
+their [recovery diagnostics](#message-not-saved) distinguish failure to correct
+Slack from failure to save the message.
+
+There is no deadline for a later exact-message recovery during tracking, but
+tracking ends at persona teardown or server shutdown and is not restored after
+a restart. A warning can therefore remain unchanged if recovery was not observed
+before then or both correction attempts failed; requests already sent to Slack
+may still complete after cancellation.
 
 ### Delivery stuck
 

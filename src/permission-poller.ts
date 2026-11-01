@@ -915,7 +915,7 @@ async function postWedgeWarning(
   }
   const emit = deps.emitTrail ?? defaultEmitTrail
   const result = await attempt.post(persona, web, { text })
-  if (result.outcome === 'refused') return false
+  if (result.outcome === 'refused' || result.outcome === 'cancelled') return false
   if (result.outcome === 'posted') {
     emit({
       event: 'cscb.poller.wedge_detected',
@@ -1600,7 +1600,7 @@ async function postPermissionPrompt(
   const emit = deps.emitTrail ?? defaultEmitTrail
   const compositeKey = makeCompositeKey(row.instance_id, permission.request_token)
   const result = await attempt.post(persona, web, { text, blocks })
-  if (result.outcome === 'refused') return
+  if (result.outcome === 'refused' || result.outcome === 'cancelled') return
   if (result.outcome === 'failed') {
     // failures land in BOTH server.log (real-time visibility) AND the
     // trail JSONL (after-the-fact debugging). Success paths stay trail-only,

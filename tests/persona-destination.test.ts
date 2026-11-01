@@ -30,7 +30,7 @@
  * (`describeDestinationFailure`, `describeDestinationFailureCause`).
  *
  * Pure module under test: built over one `makeStubSlack` stub per persona
- * (leak marker on) and a line capture. No token, file or timer is used;
+ * (leak marker on), a line capture and the shared fake clock; no real timer is used;
  * `afterEach` runs `assertNoLeak` over every log line and result.
  */
 
@@ -42,6 +42,7 @@ import { join } from 'node:path'
 import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import {
   NO_CONVERSATION_ID_CODE,
+  DM_OPEN_TIMEOUT_MS,
   createPersonaDestinations,
   describeDestinationFailure,
   describeDestinationFailureCause,
@@ -50,6 +51,8 @@ import {
   personaDestinationOf,
   type DestinationConfig,
   type DestinationFailure,
+  type DestinationMessageTracking,
+  type DestinationPostResult,
   type DestinationSlackClient,
   type DmDestinationRefusal,
   type PersonaDestinations,
@@ -67,6 +70,7 @@ import {
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -87,6 +91,7 @@ let logs: string[]
  */
 let results: unknown[]
 let d: PersonaDestinations
+let clock: FakeClock
 
 function makeFixture(): void {
   const config = makeMultiPersonaConfig(
@@ -101,7 +106,8 @@ function makeFixture(): void {
   stubs = new Map(config.personas.map((p) => [p.key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
   logs = []
   results = []
-  d = createPersonaDestinations({ log: (line) => logs.push(line), getPersonaConfig: () => config })
+  clock = createFakeClock()
+  d = createPersonaDestinations({ log: (line) => logs.push(line), clock, getPersonaConfig: () => config })
 }
 
 const stub = (p: Persona): StubSlack => stubs.get(p.key)!
@@ -137,13 +143,113 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  assertNoLeak({ lines: logs, results })
+  expect(clock.pendingCount()).toBe(0)
+  assertNoLeak({ lines: logs, results, posts: [...stubs.values()].flatMap(s => s.calls.postMessage) })
   rmSync(dir, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
+
+describe('bounded, cancellable shared DM opens', () => {
+  function tracked() {
+    const abort = new AbortController(), callbacks: string[] = []
+    const tracking: DestinationMessageTracking = {
+      signal: abort.signal,
+      canPost: () => { callbacks.push('canPost'); return true },
+      onPosted: () => { callbacks.push('onPosted') },
+      onPostFailed: () => { callbacks.push('onPostFailed') },
+    }
+    return { abort, callbacks, tracking }
+  }
+
+  test.each(['success', 'failure'] as const)('cancelling one consumer preserves the shared open for its surviving consumer: %s', async outcome => {
+    const opening = makeDeferredWebApiCall(), t = tracked()
+    stub(A).script.open.push(opening.outcome)
+    let otherResult: DestinationPostResult | undefined
+    const cancelled = d.post(A, client(A), { text: 'cancelled', tracking: t.tracking }).then(record)
+    const other = post(A, 'survivor').then(result => { otherResult = result; return result })
+    expect(opens(A)).toHaveLength(1)
+    t.abort.abort()
+    await clock.flush()
+    expect(await cancelled).toEqual({ outcome: 'cancelled' })
+    expect(otherResult).toBeUndefined()
+    expect(opening.settled).toBe(false)
+    // Another persona is independent while alpha still has a live consumer.
+    expect(await post(B, 'sibling')).toMatchObject({ outcome: 'posted', channelId: stubOpenedDmId(B.dm.contact!) })
+    expect(opens(B)).toHaveLength(1)
+    opening.settle(outcome === 'success' ? openedDm('D0SHARED1') : { kind: 'platform', error: 'missing_scope' })
+    expect(await other).toMatchObject(outcome === 'success'
+      ? { outcome: 'posted', channelId: 'D0SHARED1' }
+      : { outcome: 'failed', step: 'conversations.open', code: 'missing_scope' })
+    expect(posts(A)).toEqual(outcome === 'success' ? [{ channel: 'D0SHARED1', text: 'survivor' }] : [])
+    expect(t.callbacks).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    if (outcome === 'failure') stub(A).script.open.push(openedDm('D0SHARED1'))
+    expect(await post(A, 'next')).toMatchObject({ outcome: 'posted', channelId: 'D0SHARED1' })
+    expect(opens(A)).toHaveLength(outcome === 'success' ? 1 : 2)
+    expect(posts(B)).toHaveLength(1)
+  })
+
+  test.each([
+    ['cancel', 'success'], ['cancel', 'failure'],
+    ['timeout', 'success'], ['timeout', 'failure'],
+  ] as const)('%s releases a pending open; its late %s cannot settle or evict a newer open', async (reason, late) => {
+    const old = makeDeferredWebApiCall(), t = tracked()
+    stub(A).script.open.push(old.outcome)
+    let originalResult: DestinationPostResult | undefined, lateJoinResult: DestinationPostResult | undefined
+    const original = d.post(A, client(A), { text: 'old', tracking: t.tracking })
+      .then(result => { originalResult = record(result); return result })
+    if (reason === 'cancel') t.abort.abort()
+    else {
+      expect(DM_OPEN_TIMEOUT_MS).toBe(10_000) // Sole pin; all timing uses the exported bound.
+      await clock.advance(DM_OPEN_TIMEOUT_MS - 1)
+      expect(originalResult).toBeUndefined()
+      // A late consumer shares the original deadline, not a fresh full wait.
+      const lateJoin = post(A, 'late join').then(result => { lateJoinResult = result; return result })
+      await clock.flush()
+      expect(lateJoinResult).toBeUndefined()
+      expect(opens(A)).toHaveLength(1)
+      await clock.advance(1)
+      expect(lateJoinResult).toEqual({ outcome: 'failed', step: 'conversations.open', code: 'timeout' })
+      await lateJoin
+    }
+    await clock.flush()
+    const expected: DestinationPostResult = reason === 'cancel' ? { outcome: 'cancelled' }
+      : { outcome: 'failed', step: 'conversations.open', code: 'timeout' }
+    expect(originalResult).toEqual(expected)
+    expect(await original).toEqual(expected)
+    expect(old.settled).toBe(false)
+    expect(clock.pendingCount()).toBe(0)
+
+    const fresh = makeDeferredWebApiCall()
+    stub(A).script.open.push(fresh.outcome)
+    let newerResult: DestinationPostResult | undefined
+    const newer = post(A, 'newer').then(result => { newerResult = result; return result })
+    expect(opens(A)).toHaveLength(2)
+    old.settle(late === 'success' ? openedDm('D0STALE01') : { kind: 'platform', error: 'missing_scope' })
+    await clock.flush()
+    expect(newerResult).toBeUndefined()
+    expect(posts(A)).toEqual([])
+    expect(t.callbacks).toEqual([])
+    // Joining while the newer open is still pending catches stale cache eviction.
+    const peer = post(A, 'fresh peer')
+    expect(opens(A)).toHaveLength(2)
+    fresh.settle(openedDm('D0FRESH01'))
+    expect(await newer).toMatchObject({ outcome: 'posted', channelId: 'D0FRESH01' })
+    expect(await peer).toMatchObject({ outcome: 'posted', channelId: 'D0FRESH01' })
+    await post(A, 'cached fresh')
+    expect(posts(A)).toEqual(['newer', 'fresh peer', 'cached fresh'].map(text => ({ channel: 'D0FRESH01', text })))
+    expect(opens(A)).toHaveLength(2)
+    t.abort.abort()
+    await clock.advance(DM_OPEN_TIMEOUT_MS * 2)
+    expect(originalResult).toEqual(expected)
+    expect(t.callbacks).toEqual([])
+    expect(posts(A)).toHaveLength(3)
+    expect(clock.pendingCount()).toBe(0)
+  })
+})
 
 describe('resolution', () => {
   test('a dm destination opens the DM with its contact on its own client and posts to the returned D… ID; a second post reuses the cache', async () => {
@@ -747,7 +853,7 @@ function resolverOn(getConfig: () => DestinationConfig, sink: string[] = []): Pe
     sink.push(line)
     logs.push(line)
   }
-  return createPersonaDestinations({ log, getPersonaConfig: getConfig })
+  return createPersonaDestinations({ log, clock, getPersonaConfig: getConfig })
 }
 
 describe('destinationSettingOf: the setting in force, pinned per mode', () => {

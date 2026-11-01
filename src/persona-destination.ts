@@ -27,6 +27,9 @@
  * - a later post for the same persona and contact makes no second open;
  * - concurrent posts share the one in-flight open (the pending promise is the
  *   cache value), so a flush of several held notices makes one open;
+ * - each pending-open consumer can cancel its wait without stopping another;
+ *   waits share a bounded deadline, and the last departing consumer drops an
+ *   unfinished open so its late answer cannot supply a later attempt;
  * - a changed contact never reuses the old conversation: the next post opens
  *   again for the current contact;
  * - a failed open is never cached, so the next attempt opens again;
@@ -61,9 +64,9 @@
  * Dry run never reaches this module: the notifier's dry-run
  * branch returns first and the permission poller does not run.
  *
- * Pure module: no module-scope state, no I/O of its own, no
- * timers and nothing runs at import. The cache lives in the instance the
- * factory returns; the Slack client and the logger are injected.
+ * Pure module: no module-scope state or import-time I/O or timers. The cache
+ * and bounded waits live in the instance the factory returns; the Slack
+ * client, clock and logger are injected.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -73,6 +76,7 @@ import { DM_DESTINATION, channelModeOf, type Persona, type ServerSettings } from
 import type { PersonaFungibleDestination } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
+import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -89,6 +93,9 @@ const CHANNEL_NOT_FOUND_ERROR = 'channel_not_found'
 
 /** Failure code of a `conversations.open` that succeeded but returned no conversation ID. */
 export const NO_CONVERSATION_ID_CODE = 'no_conversation_id'
+
+/** Maximum wait for a shared DM open; expiry is a retryable destination failure. */
+export const DM_OPEN_TIMEOUT_MS = 10_000
 
 /** The setting that names a persona's destination in declarative mode. */
 export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
@@ -131,7 +138,7 @@ export interface DestinationFailure {
    * The Slack platform error (e.g. `missing_scope`, `not_in_channel`,
    * `channel_not_found`), else `network_error`, `aborted` or `unknown_error`
    * (`classifySlackError`); `no_conversation_id` for an open that returned no
-   * conversation ID.
+   * conversation ID, or `timeout` when its bounded wait expired.
    */
   code: string
   /** The conversation posted to; absent when the open failed. */
@@ -155,13 +162,29 @@ type DmOpenResult = { outcome: 'opened'; channelId: string } | DestinationFailur
 /** The outcome of one post to a persona's destination. */
 export type DestinationPostResult =
   | { outcome: 'posted'; channelId: string; ts: string | undefined }
+  | { outcome: 'cancelled' }
   | DestinationRefused
   | DestinationFailure
+
+/** The actual post identity and client, retained independently of later routing changes. */
+export interface DestinationPostedMessage {
+  client: DestinationSlackClient
+  channelId: string
+  ts: string | undefined
+}
+
+export interface DestinationMessageTracking {
+  signal: AbortSignal
+  canPost(): boolean
+  onPosted(post: DestinationPostedMessage): void
+  onPostFailed?(): void
+}
 
 /** The message to post: a top-level message, with no username or icon override. */
 export interface DestinationMessage {
   text: string
   blocks?: unknown[]
+  tracking?: DestinationMessageTracking
 }
 
 /**
@@ -174,6 +197,8 @@ export type DestinationConfig = Pick<ServerSettings, 'allow_invited_channels'> |
 
 /** Dependencies injected into `createPersonaDestinations`. */
 export interface PersonaDestinationsDeps {
+  /** Bounds pending DM opens. Defaults to the system clock. */
+  clock?: PersonaConnectionClock
   /** Writes one log line. */
   log(line: string): void
   /**
@@ -232,6 +257,9 @@ export interface PersonaDestinations {
 interface DmCacheEntry {
   contact: string
   pending: Promise<DmOpenResult>
+  deadline: number
+  waiters: number
+  opened: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +423,7 @@ export function safeFailureCode(code: string): string {
 
 /** Build a destination resolver with an empty per-persona DM cache. */
 export function createPersonaDestinations(deps: PersonaDestinationsDeps): PersonaDestinations {
+  const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const dmCache = new Map<string, DmCacheEntry>()
 
   function destinationOf(persona: PersonaDestinationFields): string {
@@ -431,13 +460,44 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     const contact = persona.dm.contact!
     const cached = dmCache.get(persona.key)
     if (cached && cached.contact === contact) return cached
-    const entry: DmCacheEntry = { contact, pending: openDm(client, contact) }
+    const entry: DmCacheEntry = {
+      contact, deadline: clock.now() + DM_OPEN_TIMEOUT_MS,
+      pending: openDm(client, contact), waiters: 0, opened: false,
+    }
     dmCache.set(persona.key, entry)
     // A failed open is never cached; a forget or a newer open meanwhile keeps its own entry.
     void entry.pending.then((result) => {
       if (result.outcome !== 'opened' && dmCache.get(persona.key) === entry) dmCache.delete(persona.key)
     })
     return entry
+  }
+
+  /** Release only this consumer; an abandoned open has no claim on a newer cache entry. */
+  function waitForDm(key: string, entry: DmCacheEntry, signal?: AbortSignal): Promise<DmOpenResult | { outcome: 'cancelled' }> {
+    if (entry.opened) return entry.pending
+    entry.waiters += 1
+    return new Promise(resolve => {
+      let settled = false
+      let timer: ReturnType<PersonaConnectionClock['setTimeout']>
+      const finish = (result: DmOpenResult | { outcome: 'cancelled' }) => {
+        if (settled) return
+        settled = true
+        clock.clearTimeout(timer)
+        signal?.removeEventListener('abort', cancel)
+        if (result.outcome === 'opened') entry.opened = true
+        entry.waiters -= 1
+        if (entry.waiters === 0 && !entry.opened && dmCache.get(key) === entry) dmCache.delete(key)
+        resolve(result)
+      }
+      const cancel = () => finish({ outcome: 'cancelled' })
+      timer = clock.setTimeout(() => finish({ outcome: 'failed', step: 'conversations.open', code: 'timeout' }),
+        Math.max(0, entry.deadline - clock.now()))
+      signal?.addEventListener('abort', cancel, { once: true })
+      // openDm catches Slack rejections. A late result cannot re-acquire the
+      // cache, post a cancelled message or settle this consumer a second time.
+      void entry.pending.then(finish)
+      if (signal?.aborted) cancel()
+    })
   }
 
   // The channel path makes no `await` before `chat.postMessage`, so callers
@@ -447,6 +507,8 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     client: DestinationSlackClient,
     message: DestinationMessage,
   ): Promise<DestinationPostResult> {
+    const cancelled = () => message.tracking?.signal.aborted || message.tracking?.canPost() === false
+    if (message.tracking?.signal.aborted) return { outcome: 'cancelled' }
     // One read of the configuration in effect for the whole attempt.
     const config = deps.getPersonaConfig()
     const destination = resolvePersonaDestination(config, persona)
@@ -460,18 +522,24 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
       const entry = dmEntry(config, persona, client)
       if ('outcome' in entry) return entry
       used = entry
-      const opened = await entry.pending
+      const opened = await waitForDm(persona.key, entry, message.tracking?.signal)
+      if (message.tracking?.signal.aborted) return { outcome: 'cancelled' }
       if (opened.outcome !== 'opened') return opened
       channelId = opened.channelId
     }
     const args: { channel: string; text: string; blocks?: never } = { channel: channelId, text: message.text }
     if (message.blocks !== undefined) args.blocks = message.blocks as never
+    // No await between this exact-message/lifecycle check and the Slack call.
+    if (cancelled()) return { outcome: 'cancelled' }
     try {
       const response = await client.chat.postMessage(args)
-      return { outcome: 'posted', channelId, ts: (response as { ts?: string }).ts }
+      const ts = (response as { ts?: string }).ts
+      try { message.tracking?.onPosted({ client, channelId, ts }) } catch { /* reporting cannot change a successful post */ }
+      return { outcome: 'posted', channelId, ts }
     } catch (err) {
       const code = classifySlackError(err)
       if (used && code === CHANNEL_NOT_FOUND_ERROR && dmCache.get(persona.key) === used) dmCache.delete(persona.key)
+      try { message.tracking?.onPostFailed?.() } catch { /* reporting cannot change the Slack outcome */ }
       return { outcome: 'failed', step: 'chat.postMessage', code, channelId, error: err }
     }
   }

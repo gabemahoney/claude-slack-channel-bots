@@ -337,6 +337,7 @@ interface QueuedNotice {
   notice: HoldNotice
   /** Set once the notice has failed an attempt (its callback's `first`). */
   failed: boolean
+  unwatch?: () => void
 }
 
 /** Everything the hold keeps for one persona. Nothing here is shared with another persona. */
@@ -507,7 +508,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       if (current) closeEpisode(entry, at)
       return 'posted'
     }
-    if (result.outcome === 'refused') return 'refused'
+    if (result.outcome === 'refused' || result.outcome === 'cancelled') return 'refused'
     if (!isDestinationFailure(result)) return 'payload'
     // Stale: the episode opened or closed since this attempt started, so the
     // failure is older evidence than that change. Log nothing, schedule
@@ -601,13 +602,25 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
 
   /** Insert in submission order; past the cap, drop (log, never post) the oldest one not being attempted. */
   function enqueue(entry: HoldEntry, queued: QueuedNotice, persona: Pick<Persona, 'name' | 'key'>): void {
+    const signal = queued.notice.message.tracking?.signal
+    if (signal?.aborted) return
     entry.name = persona.name
     let at = entry.notices.length
     while (at > 0 && entry.notices[at - 1]!.seq > queued.seq) at -= 1
     entry.notices.splice(at, 0, queued)
+    if (signal) {
+      const cancel = () => {
+        removeQueued(entry, queued)
+        if (entry.notices.length === 0) clearTimer(entry)
+        else ensureProgress(entry)
+      }
+      signal.addEventListener('abort', cancel, { once: true })
+      queued.unwatch = () => signal.removeEventListener('abort', cancel)
+    }
     if (entry.notices.length <= MAX_HELD_NOTICES_PER_PERSONA) return
     const oldest = entry.notices[0] === entry.attempting ? 1 : 0
     const [dropped] = entry.notices.splice(oldest, 1)
+    dropped?.unwatch?.()
     deps.log(
       `[slack] persona-destination-hold: more than ${MAX_HELD_NOTICES_PER_PERSONA} notices held for ` +
         `${renderPersonaRef(persona.name, persona.key)} while its destination fails — oldest held notice dropped, ` +
@@ -618,6 +631,8 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   function removeQueued(entry: HoldEntry, queued: QueuedNotice): void {
     const at = entry.notices.indexOf(queued)
     if (at !== -1) entry.notices.splice(at, 1)
+    queued.unwatch?.()
+    queued.unwatch = undefined
   }
 
   /** Run the notice's failure callback, never letting it throw. */
@@ -728,6 +743,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
           entry.attempting = undefined
         }
         if (!isCurrent(entry)) return
+        if (queued.notice.message.tracking?.signal.aborted) { removeQueued(entry, queued); continue }
         const settled = settle(entry, started, persona, at, result)
         if (settled === 'destination') {
           noticeFailed(entry, queued, result as DestinationFailure, true)
@@ -801,6 +817,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   }
 
   async function deliver(persona: Persona, client: DestinationSlackClient, notice: HoldNotice): Promise<void> {
+    if (notice.message.tracking?.signal.aborted) return
     const entry = entryFor(persona.key)
     nextSeq += 1
     const queued: QueuedNotice = { seq: nextSeq, notice, failed: false }
@@ -813,7 +830,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     const at = attemptDestination(persona)
     // Issued before the first `await` for a channel destination (the resolver's guarantee).
     const result = await deps.destinations.post(persona, client, notice.message)
-    if (!isCurrent(entry)) return
+    if (!isCurrent(entry) || notice.message.tracking?.signal.aborted) return
     const settled = settle(entry, started, persona, at, result)
     if (settled === 'destination') {
       noticeFailed(entry, queued, result as DestinationFailure, true)
@@ -836,6 +853,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     entries.delete(key)
     clearTimer(entry)
     const dropped = entry.notices.length
+    for (const queued of entry.notices) queued.unwatch?.()
     entry.notices.length = 0
     entry.episode = undefined
     return dropped > 0 ? { name: entry.name, dropped } : undefined

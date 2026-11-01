@@ -509,7 +509,7 @@ export type PersonaEpisodesClock = PersonaConnectionClock
  * raised during a persona teardown carries its entry's class
  * (`persona-kill-survivor`).
  */
-export type PersonaEpisodeSinkOptions = Pick<PersonaNoticeOptions, 'teardownEntryClass'>
+export type PersonaEpisodeSinkOptions = Pick<PersonaNoticeOptions, 'teardownEntryClass' | 'tracking'>
 
 /**
  * Receives each notice to post: the persona key, the notice body and its
@@ -577,12 +577,14 @@ export interface PersonaEpisodes {
    * `dispose` is logged and swallowed.
    */
   whenClosed(key: string, kind: PersonaEpisodeKind, dispose: () => void): boolean
+  /** Retained notice identities outlive episodes, but never persona teardown or server shutdown. */
+  whenForgotten(key: string, dispose: () => void): () => void
   /**
    * Hand `text` to the sink once for this mark (`PERSONA_EPISODE_DEFAULT_MARK`
    * when none is given) in the open episode. Returns true when it was handed
    * over; false when no episode is open or the mark was already posted in it.
    */
-  post(key: string, kind: PersonaEpisodeKind, text: string, mark?: string): boolean
+  post(key: string, kind: PersonaEpisodeKind, text: string, mark?: string, options?: PersonaEpisodeSinkOptions): boolean
   /**
    * Hand `text` to the sink, with `options`, for a notice of this kind that
    * has no episode (the kill-failure alert's survivor version
@@ -649,6 +651,7 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
   const byKey = new Map<string, Map<PersonaEpisodeKind, OpenEpisode>>()
   /** Counts above 0 by persona key, then by kind; kept apart from the open episodes. */
   const counts = new Map<string, Map<PersonaEpisodeKind, number>>()
+  const retained = new Map<string, Set<() => void>>()
   let lastEpisode = 0
   /** Set by `close`: every later `begin` is refused. */
   let closed = false
@@ -674,6 +677,17 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     byKey.clear()
     counts.clear()
     for (const { key, kind, ep } of closing) dispose(key, kind, ep)
+    for (const key of [...retained.keys()]) forgetRetained(key)
+  }
+
+  function forgetRetained(key: string): void {
+    const disposers = retained.get(key)
+    retained.delete(key)
+    for (const disposer of disposers ?? []) {
+      try { disposer() } catch (err) {
+        safeLog(deps.log, `[slack] persona-episodes: persona=${key} retained notice close failed: ${describeThrownValue(err)}`)
+      }
+    }
   }
 
   function start(key: string, kind: PersonaEpisodeKind, caseLabel: string | undefined): void {
@@ -752,12 +766,23 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       return true
     },
 
-    post(key, kind, text, mark = PERSONA_EPISODE_DEFAULT_MARK) {
+    whenForgotten(key, disposer) {
+      if (closed) { disposer(); return () => {} }
+      let disposers = retained.get(key)
+      if (!disposers) { disposers = new Set(); retained.set(key, disposers) }
+      disposers.add(disposer)
+      return () => {
+        disposers.delete(disposer)
+        if (disposers.size === 0 && retained.get(key) === disposers) retained.delete(key)
+      }
+    },
+
+    post(key, kind, text, mark = PERSONA_EPISODE_DEFAULT_MARK, options) {
       const current = open(key, kind)
       if (current === undefined || current.posted.has(mark)) return false
       // Marked before the sink runs, so a sink that re-enters posts nothing twice.
       current.posted.add(mark)
-      send(key, kind, text)
+      send(key, kind, text, options)
       return true
     },
 
@@ -817,6 +842,7 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
 
     forget(key) {
       counts.delete(key)
+      forgetRetained(key)
       const kinds = byKey.get(key)
       if (kinds === undefined) return
       byKey.delete(key)
