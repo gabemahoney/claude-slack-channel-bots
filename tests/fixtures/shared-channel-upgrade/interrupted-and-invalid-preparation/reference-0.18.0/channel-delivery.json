@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "personas": {
+    "alpha": {
+      "declaration": {
+        "name": "alpha",
+        "credentials_file": "~/personas/alpha/credentials.json",
+        "working_directory": "~/personas/alpha/work"
+      },
+      "channels": {
+        "G0TEST003": {
+          "delivery": "mentions",
+          "set_at": "2026-05-18T09:00:00Z"
+        }
+      }
+    }
+  }
+}

@@ -676,6 +676,22 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     test29Values[ref]?.()
   })
 
+  // test-47's refused starts and test-40's upgrade again: the current
+  // package's exports these scenarios' entries print or run. The earlier
+  // release's entries import another package, which this reader does not follow.
+  test.each([
+    'reload.ts:reloadFilePaths:function',
+    'reload.ts:createReloadController:function',
+    'config.ts:resolvePersonaConfig:function',
+    'config.ts:PERSONA_TOP_LEVEL_KEYS:defined',
+    'config.ts:PERSONA_ENTRY_KEYS:defined',
+    'persona-diagnostics.ts:THREAD_MEMORY_CHANGED_WHILE_STOPPED:constant',
+    'thread-memory-reports.ts:buildThreadMemoryChangedWhileStoppedNotice:function',
+    'thread-memory-reports.ts:buildThreadMemoryChangedWhileStoppedLine:function',
+  ])("test-47's and test-40's printer reads %s", (ref) => {
+    expect(named.has(ref)).toBe(true)
+  })
+
   test('every file the printer names is a src/ module this file imports', () => {
     const files = [...new Set(reading.refs.map((r) => r.file))].sort()
     expect(files.filter((f) => !existsSync(join(SRC_DIR, f)))).toEqual([])
@@ -1876,3 +1892,143 @@ test('shared receipt archives, saved joins, accounting and recorded buttons need
   assertNoLeak({ evidence, state })
   } finally { await q.stop() }
 }))
+
+describe("test-47's refused starts and test-40's earlier release", () => {
+  const exitCode = (code: number) => (err: unknown) => (err as { exitCode?: unknown }).exitCode === code
+
+  test('reloadStartRefusalLine prints the production start refusal for each source and leaves every file as it was', () => sharedPrinterControl(async ({ scratch, printer }) => {
+    const { entryValue: print } = printer
+    const startDir = (label: string) => {
+      const dir = mkdtempSync(join(scratch, `${label}-`))
+      return { dir, config: join(dir, 'config.json'), record: join(dir, 'config.json.last-applied') }
+    }
+    const valid = (dir: string) => makePersonaConfigInput({ channel_mode: 'strict', personas: [makePersona({ name: 'alpha' }, dir)] }, dir)
+    const listing = (dir: string) => readdirSync(dir).sort().map(name => [name, readFileSync(join(dir, name), 'utf8')])
+    const loaderError = (path: string, detail: string) =>
+      `loadPersonaConfig: invalid persona config in ${JSON.stringify(path)}: Persona config validation error: ${detail}`
+
+    const top = startDir('top-level-removed')
+    writeFileSync(top.config, JSON.stringify({ ...valid(top.dir), allow_invited_channels: true }))
+    const topBefore = listing(top.dir)
+    const topSentence = await print('removedKeyRefusal', ['allow_invited_channels'])
+    expect(topSentence).toBe('allow_invited_channels has been removed; use channel_mode.')
+    const topLine = await print('reloadStartRefusalLine', ['config', top.config, 'allow_invited_channels'])
+    expect(topLine).toBe(`[slack] Fatal: configuration error — ${loaderError(top.config, topSentence)}`)
+    expect(await print('reloadStartRefusalLine', ['config', top.config])).toBe(topLine)
+    await assert.rejects(print('reloadStartRefusalLine', ['record', top.config]), /refuses the config, not the record/)
+    await assert.rejects(print('reloadStartRefusalLine', ['config', top.config, 'channel_mode']), /does not name channel_mode/)
+    expect(listing(top.dir)).toEqual(topBefore)
+
+    const applied = startDir('applied-removed')
+    writeFileSync(applied.config, JSON.stringify(valid(applied.dir)))
+    const oldRecord = valid(applied.dir)
+    oldRecord.personas = [{ ...oldRecord.personas[0]!, invited: true } as (typeof oldRecord.personas)[number]]
+    writeFileSync(applied.record, JSON.stringify(oldRecord))
+    const appliedBefore = listing(applied.dir)
+    const entrySentence = await print('removedKeyRefusal', ['invited'])
+    expect(entrySentence).toBe('invited has been removed; use permission_prompts.')
+    expect(await print('reloadStartRefusalLine', ['record', applied.config, 'invited'])).toBe(
+      `[slack] Fatal: last-applied record error — ${loaderError(applied.record, `personas[0] "alpha" (key=alpha): ${entrySentence}`)} ` +
+      `Preserve the shared channel authority ${JSON.stringify(applied.record)} and prepared configuration ${JSON.stringify(applied.config)}; ` +
+      'restore trustworthy authority evidence before starting again.')
+    await assert.rejects(print('reloadStartRefusalLine', ['config', applied.config]), /refuses the record, not the config/)
+    expect(listing(applied.dir)).toEqual(appliedBefore)
+
+    // Invalid new input the upgrade cases prepare: each refusal names its setting.
+    const invalid: ReadonlyArray<[string, (input: ReturnType<typeof valid>) => object, string]> = [
+      ['channel-mode', input => ({ ...input, channel_mode: 'invited' }), 'channel_mode'],
+      ['missing-destination', input => ({ ...input, personas: input.personas.map(({ permission_prompts: _omitted, ...p }) => p) }), 'permission_prompts'],
+      ['invalid-destination', input => ({ ...input, personas: input.personas.map(p => ({ ...p, permission_prompts: 'not-a-channel' })) }), 'permission_prompts'],
+      ['unlisted-destination', input => ({ ...input, personas: input.personas.map(p => ({ ...p, permission_prompts: 'CUNLISTED' })) }), 'permission_prompts'],
+    ]
+    for (const [label, change, setting] of invalid) {
+      const files = startDir(label)
+      writeFileSync(files.config, JSON.stringify(change(valid(files.dir))))
+      const before = listing(files.dir)
+      const line = await print('reloadStartRefusalLine', ['config', files.config, setting])
+      expect(line.startsWith(`[slack] Fatal: configuration error — ${loaderError(files.config, '')}`)).toBe(true)
+      expect(line).toContain(`: ${setting} `)
+      expect(listing(files.dir)).toEqual(before)
+    }
+
+    // A start that would apply writes its record: never printed, nothing written.
+    const startable = startDir('startable')
+    writeFileSync(startable.config, JSON.stringify(valid(startable.dir)))
+    const startableBefore = listing(startable.dir)
+    await assert.rejects(print('reloadStartRefusalLine', ['config', startable.config]), /would use write/)
+    expect(listing(startable.dir)).toEqual(startableBefore)
+
+    await assert.rejects(print('reloadStartRefusalLine', ['pending', top.config]), exitCode(64))
+    await assert.rejects(print('reloadStartRefusalLine', ['config']), exitCode(64))
+  }))
+
+  test('removedKeyRefusal prints only a removed key\'s own rule, never a current or unknown setting\'s', () => sharedPrinterControl(async ({ printer }) => {
+    const { entryValue: print } = printer
+    for (const current of ['channel_mode', 'personas', 'permission_prompts', 'channels']) {
+      await assert.rejects(print('removedKeyRefusal', [current]), exitCode(64))
+    }
+    // An unknown key, and a test-only setting with a rule of its own naming no replacement.
+    for (const key of ['no_such_setting', 'test_timer_overrides']) {
+      await assert.rejects(print('removedKeyRefusal', [key]), new RegExp(`no rule removing '${key}' that names a current setting`))
+    }
+    // The renamed poll setting is a removal naming its replacement too.
+    expect(await print('removedKeyRefusal', ['claude_director_poll_interval_ms'])).toContain('agent_director_poll_interval_ms')
+    await assert.rejects(print('removedKeyRefusal', []), exitCode(64))
+  }))
+
+  test('the earlier-release entries print the earlier package\'s own exports and fail when they change', () => sharedPrinterControl(async ({ scratch, pkg, printer }) => {
+    const { entryValue: print } = printer
+    const diagnostics = await import(join(pkg, 'src/persona-diagnostics.ts'))
+    const notices = await import(join(pkg, 'src/delivery-notices.ts'))
+    const identity = await import(join(pkg, 'src/persona-identity.ts'))
+    const earlier = (label: string, files: Readonly<Record<string, string>>, name = 'claude-slack-channel-bots') => {
+      const dir = mkdtempSync(join(scratch, `earlier-${label}-`))
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '0.0.0-stand-in' }))
+      mkdirSync(join(dir, 'src'))
+      for (const [file, text] of Object.entries(files)) writeFileSync(join(dir, 'src', file), text)
+      return dir
+    }
+    const lineArgs = (dir: string) => [dir, 'Alpha Bot', 'alpha', '3', '/scratch/alpha.unreadable-start']
+    const noticeArgs = (dir: string) => [dir, 'Alpha Bot', 'alpha', '2', '/scratch/alpha.unreadable-start']
+
+    // A package whose exports differ from the current build's: the entries print its values.
+    const reporting = (body: string) => `export function createDeliveryReporting(deps) { return { queueEvent(e) { ${body} } } }\n`
+    const marked = earlier('marked', {
+      'delivery-notices.ts': reporting("deps.log(`MARKED ${deps.persona(e.key).name} ${e.type} ${e.line} ${e.quarantinePath} ${e.alert}`)") +
+        'export function buildQueueRecordUnreadableNotice(persona, count, path) { return `MARKED-NOTICE ${persona} ${count} ${path}` }\n',
+      'persona-identity.ts': 'export function renderPersonaRef(name, key) { return `REF(${name}|${key})` }\n',
+    })
+    expect(await print('earlierQueueRecordUnreadableLine', lineArgs(marked))).toBe('MARKED Alpha Bot record-unreadable 3 /scratch/alpha.unreadable-start false')
+    expect(await print('earlierQueueRecordUnreadableNotice', noticeArgs(marked))).toBe('MARKED-NOTICE REF(Alpha Bot|alpha) 2 /scratch/alpha.unreadable-start')
+
+    // Changed reporting, a missing export or another package fails.
+    const twice = earlier('twice', { 'delivery-notices.ts': reporting('deps.log("a"); deps.log("b")') })
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', lineArgs(twice)), /logged 2 line\(s\) and posted 0/)
+    const alerting = earlier('alerting', { 'delivery-notices.ts': reporting('deps.log("a"); deps.notify(e.key, "alert")') })
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', lineArgs(alerting)), /logged 1 line\(s\) and posted 1/)
+    const silent = earlier('silent', { 'delivery-notices.ts': reporting('') })
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', lineArgs(silent)), /logged 0 line\(s\)/)
+    const bare = earlier('bare', { 'delivery-notices.ts': 'export const nothing = 1\n', 'persona-identity.ts': 'export const nothing = 1\n' })
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', lineArgs(bare)), /exports no function createDeliveryReporting/)
+    await assert.rejects(print('earlierQueueRecordUnreadableNotice', noticeArgs(bare)), /exports no function renderPersonaRef/)
+    const other = earlier('other', {}, 'another-package')
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', lineArgs(other)), /is not an installed claude-slack-channel-bots package/)
+    await assert.rejects(print('earlierQueueRecordUnreadableNotice', noticeArgs(join(scratch, 'missing'))), /is not an installed claude-slack-channel-bots package/)
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', ['relative/pkg', ...lineArgs(marked).slice(1)]), exitCode(64))
+    await assert.rejects(print('earlierQueueRecordUnreadableLine', [...lineArgs(marked).slice(0, 3), '0', '/q']), exitCode(64))
+    await assert.rejects(print('earlierQueueRecordUnreadableNotice', [...noticeArgs(marked).slice(0, 3), 'two', '/q']), exitCode(64))
+
+    // The real reporting and builders, through a package directory over this build's src/:
+    // the interface the entries drive is the one the package implements.
+    const standIn = mkdtempSync(join(scratch, 'earlier-stand-in-'))
+    writeFileSync(join(standIn, 'package.json'), JSON.stringify({ name: 'claude-slack-channel-bots', version: '0.0.0-stand-in' }))
+    symlinkSync(join(pkg, 'src'), join(standIn, 'src'))
+    const ref = identity.renderPersonaRef('Alpha Bot', 'alpha')
+    const line = await print('earlierQueueRecordUnreadableLine', lineArgs(standIn))
+    expect(line.startsWith(diagnostics.buildDeliveryDiagnostic(diagnostics.QUEUE_RECORD_UNREADABLE, ref, ''))).toBe(true)
+    expect(line).toContain('line=3')
+    expect(line).toContain(JSON.stringify('/scratch/alpha.unreadable-start'))
+    expect(await print('earlierQueueRecordUnreadableNotice', noticeArgs(standIn))).toBe(
+      notices.buildQueueRecordUnreadableNotice(ref, 2, '/scratch/alpha.unreadable-start'))
+  }))
+})

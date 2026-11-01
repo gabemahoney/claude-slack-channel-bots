@@ -239,6 +239,32 @@
  *   stoppedDowngradeBaseline <config-path> <record-path>
  *       Print applied resume=false config only when no operator intent is outstanding.
  *       Manual stopped fixture transition retains and restores the original authority.
+ *   reloadStartRefusalLine <config|record> <config-path> [<setting>]
+ *       src/reload.ts createReloadController's start resolution over the files
+ *       beside <config-path> (record: <config-path>.last-applied), as the server
+ *       resolves them under the same HOME: the one `Fatal: configuration error`
+ *       (config) or `Fatal: last-applied record error` (record) line it logs. Fails
+ *       unless the start refuses that source; any write, delete or store the start
+ *       would reach also fails it. With <setting>, the refusal must name it as its
+ *       rule's setting (`: <setting> `). Other start lines (a record refusal's
+ *       reload-shared-recovery line) are not printed: see sharedRecoveryLine.
+ *   removedKeyRefusal <removed-key>
+ *       src/config.ts resolvePersonaConfig's sentence for a removed key, naming its
+ *       replacement (`<key> … <replacement>.`), from a candidate holding only that
+ *       key at the top level, else in one persona entry. A current setting
+ *       (PERSONA_TOP_LEVEL_KEYS, PERSONA_ENTRY_KEYS) is a usage failure; a key whose
+ *       rule names no current setting after it fails. Contained in that key's
+ *       reloadStartRefusalLine.
+ *   earlierQueueRecordUnreadableLine <earlier-package-dir> <persona-name> <key> <line> <quarantine-path>
+ *   earlierQueueRecordUnreadableNotice <earlier-package-dir> <persona-name> <key> <count> <quarantine-path>
+ *       The earlier release's own exports, imported from <earlier-package-dir> (its
+ *       installed package directory, `<install>/node_modules/claude-slack-channel-bots`),
+ *       never from CSCB_PKG_DIR. Line: its server-log line for one queue record it sets
+ *       aside at start, through its src/delivery-notices.ts createDeliveryReporting
+ *       given an alert-free record-unreadable event (0.18.0 exports no builder for the
+ *       `line=… path=…` part, nor the quarantine file's name). Notice: the body of its
+ *       src/delivery-notices.ts buildQueueRecordUnreadableNotice for
+ *       renderPersonaRef(<persona-name>, <key>); its notifier adds the persona prefix.
  *   reloadSharedAuthorityStartLine <config-path> <record-path>
  *       Build the production startup line using the validated record revision.
  *   PHASE1_FLOOR_VERSION                         src/ad-version-gate.ts, the Phase 1 floor
@@ -1345,7 +1371,7 @@ import { existsSync, readFileSync, openSync, closeSync, fstatSync, readSync, con
 import { basename, dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { realpathSync } from 'node:fs'
-import { resolve, sep } from 'node:path'
+import { isAbsolute, resolve, sep } from 'node:path'
 
 if (!existsSync('/etc/cscb-ci-image')) {
   console.error('FAIL: fmk-texts: refused: /etc/cscb-ci-image is absent; this printer runs only in a cscb-ci image (/ci)')
@@ -4555,6 +4581,145 @@ const stoppedDowngradeBaseline: Entry = {
   },
 }
 
+// test-47's refused starts (t1.tad.5i SR-1.2, SR-2.4, AC-U05, U07, U12, U13).
+// The installed reload controller resolves the start over the scenario's own
+// files, as the server does. Every write, delete or store it could reach
+// fails the entry, so it prints only a refusal that changes nothing.
+const reloadStartRefusalLine: Entry = {
+  synopsis: '<config|record> <config-path> [<setting>]',
+  async print(args, context) {
+    const entry = 'reloadStartRefusalLine'
+    expectSomeArguments(entry, args, ['config|record', 'config-path', 'setting'], 2)
+    const [source, configPath, setting] = args
+    if (source !== 'config' && source !== 'record') usageFail(`${entry}: the source must be config or record (got '${source}')`)
+    const filePaths = await packageFunction<(configPath: string) => object>(context, 'reload.ts', 'reloadFilePaths')
+    const create = await packageFunction<(deps: object) => { resolveStart(): { kind: string; source?: string; line?: string } }>(
+      context, 'reload.ts', 'createReloadController')
+    const reached: string[] = []
+    const refuse = (what: string) => (): never => { reached.push(what); throw new Error(`${PRINTER_NAME} reaches no ${what}`) }
+    const forbidden = (what: string) => new Proxy({}, { get: (_target, member) => refuse(`${what}.${String(member)}`)() })
+    const logged: string[] = []
+    let outcome: { kind: string; source?: string; line?: string }
+    try {
+      outcome = create({
+        paths: filePaths(configPath), log: (line: string) => { logged.push(line) },
+        write: refuse('write'), remove: refuse('remove'), applySteps: {},
+        lifecycle: forbidden('lifecycle'), retiredKeys: forbidden('retired-key store'), oldLifeHolds: forbidden('old-life hold set'),
+        channelDelivery: refuse('stored-choice store'), stopDelivery: refuse('delivery stop'),
+      }).resolveStart()
+    } catch (err) {
+      throw new PrinterFailure(`${entry}: the start resolution threw: ${err instanceof Error ? err.message : String(err)}`, PRINTER_FAIL_EXIT)
+    }
+    if (reached.length > 0) throw new PrinterFailure(`${entry}: the start would use ${reached.join(', ')}; this entry prints only a refusal that changes nothing`, PRINTER_FAIL_EXIT)
+    if (outcome.kind !== 'refused' || typeof outcome.line !== 'string') throw new PrinterFailure(`${entry}: the start does not refuse these files`, PRINTER_FAIL_EXIT)
+    if (outcome.source !== source) throw new PrinterFailure(`${entry}: the start refuses the ${outcome.source}, not the ${source}`, PRINTER_FAIL_EXIT)
+    if (!logged.includes(outcome.line)) throw new PrinterFailure(`${entry}: the refusal line was not logged`, PRINTER_FAIL_EXIT)
+    if (setting !== undefined && !outcome.line.includes(`: ${setting} `)) {
+      throw new PrinterFailure(`${entry}: the refusal does not name ${setting} as its rule's setting`, PRINTER_FAIL_EXIT)
+    }
+    return outcome.line
+  },
+}
+
+// The loader's sentence for a removed key, naming its replacement, from the
+// installed resolvePersonaConfig over a candidate holding only that key: at
+// the top level, then in one persona entry. A current setting is refused, and
+// a rule naming no current setting after the key is not a removal.
+const removedKeyRefusal: Entry = {
+  synopsis: '<removed-key>',
+  async print(args, context) {
+    const entry = 'removedKeyRefusal'
+    expectArguments(entry, args, ['removed-key'])
+    const [key] = args
+    const lists = [await packageExport(context, 'config.ts', 'PERSONA_TOP_LEVEL_KEYS'), await packageExport(context, 'config.ts', 'PERSONA_ENTRY_KEYS')]
+    if (lists.some((keys) => !Array.isArray(keys) || keys.some((k) => typeof k !== 'string'))) {
+      fail(PRINTER_FAIL_EXIT, `${entry}: the installed package's src/config.ts key lists are not arrays of strings`)
+    }
+    const current = (lists as string[][]).flat()
+    if (current.includes(key)) usageFail(`${entry}: '${key}' is a current setting, not a removed one`)
+    const resolveConfig = await packageFunction<(raw: unknown, configDir: string, home: string, options: object) => unknown>(context, 'config.ts', 'resolvePersonaConfig')
+    for (const candidate of [{ [key]: true, personas: [] }, { personas: [{ [key]: true }] }]) {
+      try {
+        resolveConfig(candidate, '/nonexistent-fmk-texts-config-dir', '/nonexistent-fmk-texts-home', { env: {} })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : ''
+        const at = message.indexOf(`: ${key} `)
+        if (at < 0) continue
+        const sentence = message.slice(at + 2)
+        const rest = sentence.slice(key.length)
+        if (current.some((replacement) => new RegExp(`\\b${replacement}\\b`).test(rest))) return sentence
+      }
+    }
+    throw new PrinterFailure(`${entry}: the installed loader has no rule removing '${key}' that names a current setting as its replacement`, PRINTER_FAIL_EXIT)
+  },
+}
+
+// test-40's earlier release (Task t2.yiv.sf.39 Decision 1: the published
+// 0.18.0 package). These entries import the earlier install's own modules
+// from <earlier-package-dir>, never the package under test.
+
+/** Module `relPath` of the earlier release whose package directory (holding its package.json and src/) is `pkgDir`. */
+async function earlierPackageModule(entry: string, pkgDir: string, relPath: string): Promise<Record<string, unknown>> {
+  if (!isAbsolute(pkgDir)) usageFail(`${entry}: <earlier-package-dir> must be an absolute path`)
+  let name: unknown
+  try { name = (JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as { name?: unknown }).name } catch { name = undefined }
+  if (name !== 'claude-slack-channel-bots') fail(PRINTER_FAIL_EXIT, `${entry}: ${pkgDir} is not an installed claude-slack-channel-bots package`)
+  return await import(join(pkgDir, 'src', relPath))
+}
+
+/** Function export `name` of the earlier release's `relPath`. */
+async function earlierPackageFunction<F>(entry: string, pkgDir: string, relPath: string, name: string): Promise<F> {
+  const value = (await earlierPackageModule(entry, pkgDir, relPath))[name]
+  if (typeof value !== 'function') fail(PRINTER_FAIL_EXIT, `${entry}: the earlier package's src/${relPath} exports no function ${name}`)
+  return value as F
+}
+
+// The earlier release's server-log line for one queue record it sets aside at
+// start: its own createDeliveryReporting given the record-unreadable event its
+// queue raises, with no alert. 0.18.0 exports no builder for the
+// `line=… path=…` part, so its reporting writes the whole line.
+const earlierQueueRecordUnreadableLine: Entry = {
+  synopsis: '<earlier-package-dir> <persona-name> <key> <line> <quarantine-path>',
+  async print(args) {
+    const entry = 'earlierQueueRecordUnreadableLine'
+    expectArguments(entry, args, ['earlier-package-dir', 'persona-name', 'key', 'line', 'quarantine-path'])
+    const [pkgDir, name, key, line, quarantinePath] = args
+    const lineNumber = Number(integerArgument(entry, 'line', line))
+    if (!Number.isSafeInteger(lineNumber) || lineNumber < 1) usageFail(`${entry}: <line> must be a positive line number`)
+    const create = await earlierPackageFunction<(deps: object) => { queueEvent(event: object): void }>(entry, pkgDir, 'delivery-notices.ts', 'createDeliveryReporting')
+    const unused = new Proxy({}, { get: () => { throw new Error('unused') } })
+    const logged: string[] = [], posted: string[] = []
+    const reporting = create({
+      queue: unused, episodes: unused, state: () => ({ up: false }),
+      persona: (k: string) => (k === key ? { name, key } : undefined),
+      log: (text: string) => { logged.push(text) }, notify: (_k: string, text: string) => { posted.push(text) },
+    })
+    reporting.queueEvent({ type: 'record-unreadable', key, line: lineNumber, quarantinePath, alert: false })
+    await new Promise((settle) => setTimeout(settle, 0))
+    if (logged.length !== 1 || posted.length !== 0) {
+      throw new PrinterFailure(`${entry}: the earlier release logged ${logged.length} line(s) and posted ${posted.length} notice(s) for one set-aside record`, PRINTER_FAIL_EXIT)
+    }
+    return logged[0]
+  },
+}
+
+// The earlier release's notice body for queue records it could not read at
+// start, from its own buildQueueRecordUnreadableNotice and renderPersonaRef.
+// Its notifier adds its own persona prefix when it posts.
+const earlierQueueRecordUnreadableNotice: Entry = {
+  synopsis: '<earlier-package-dir> <persona-name> <key> <count> <quarantine-path>',
+  async print(args) {
+    const entry = 'earlierQueueRecordUnreadableNotice'
+    expectArguments(entry, args, ['earlier-package-dir', 'persona-name', 'key', 'count', 'quarantine-path'])
+    const [pkgDir, name, key, count, quarantinePath] = args
+    const records = Number(integerArgument(entry, 'count', count))
+    if (!Number.isSafeInteger(records) || records < 1) usageFail(`${entry}: <count> must be a positive count`)
+    const ref = await earlierPackageFunction<(name: string, key: string) => unknown>(entry, pkgDir, 'persona-identity.ts', 'renderPersonaRef')
+    const build = await earlierPackageFunction<(persona: unknown, count: number, path: string) => unknown>(entry, pkgDir, 'delivery-notices.ts', 'buildQueueRecordUnreadableNotice')
+    return builtString(entry, build(ref(name, key), records, quarantinePath))
+  },
+}
+
 const sharedAuthorityStartLine: Entry = {
   synopsis: '<config-path> <record-path>',
   async print(args, context) {
@@ -5550,6 +5715,11 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   buildThreadMemoryOwnPostLostLine: threadLossEntry(false, true),
   buildThreadMemoryOwnPostLostNotice: threadLossEntry(true, true),
   stoppedDowngradeBaseline,
+  // test-47 (test-47-shared-channel-upgrade.sh) and test-40's earlier release.
+  reloadStartRefusalLine,
+  removedKeyRefusal,
+  earlierQueueRecordUnreadableLine,
+  earlierQueueRecordUnreadableNotice,
   operatorReviewRequest,
   operatorReviewPending,
   operatorReviewCancelled,

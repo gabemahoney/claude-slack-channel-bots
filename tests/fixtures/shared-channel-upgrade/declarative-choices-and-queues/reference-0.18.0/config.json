@@ -1,0 +1,67 @@
+{
+  "personas": [
+    {
+      "name": "alpha",
+      "credentials_file": "~/personas/alpha/credentials.json",
+      "working_directory": "~/personas/alpha/work",
+      "channels": [
+        {
+          "id": "C0TEST001",
+          "delivery": "all"
+        },
+        {
+          "id": "C0TEST002",
+          "delivery": "mentions"
+        },
+        {
+          "id": "C0UPGCONFA",
+          "delivery": "mentions"
+        },
+        {
+          "id": "C0UPGRETIRE",
+          "delivery": "mentions"
+        },
+        {
+          "id": "C0UPGADDED",
+          "delivery": "mentions"
+        }
+      ],
+      "dm": {
+        "enabled": false
+      },
+      "permission_prompts": "C0TEST001",
+      "invited": {
+        "permission_prompts": "C0TEST001"
+      }
+    },
+    {
+      "name": "bravo",
+      "credentials_file": "~/personas/bravo/rotated-credentials.json",
+      "working_directory": "~/personas/bravo/work",
+      "channels": [
+        {
+          "id": "C0UPGCONFB",
+          "delivery": "all"
+        },
+        {
+          "id": "C0TEST002",
+          "delivery": "mentions"
+        },
+        {
+          "id": "C0UPGOFF",
+          "delivery": "mentions"
+        }
+      ],
+      "dm": {
+        "enabled": true,
+        "contact": "U0UPGBRAVO"
+      },
+      "permission_prompts": "C0UPGCONFB",
+      "invited": {
+        "permission_prompts": "dm"
+      }
+    }
+  ],
+  "stop_timeout": 45,
+  "allow_invited_channels": true
+}

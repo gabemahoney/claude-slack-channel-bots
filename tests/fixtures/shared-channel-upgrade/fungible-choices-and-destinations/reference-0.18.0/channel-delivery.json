@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "personas": {
+    "alpha": {
+      "declaration": {
+        "name": "alpha",
+        "credentials_file": "~/personas/alpha/credentials.json",
+        "working_directory": "~/personas/alpha/work"
+      },
+      "channels": {
+        "C0TEST001": {
+          "delivery": "all",
+          "set_at": "2026-05-10T09:00:00Z"
+        },
+        "C0TEST002": {
+          "delivery": "all",
+          "set_at": "2026-05-24T09:00:00Z"
+        },
+        "C0UPGABSENT": {
+          "delivery": "all",
+          "set_at": "2026-05-12T09:00:00Z"
+        },
+        "C0UPGEXTERNAL": {
+          "delivery": "all",
+          "set_at": "2026-05-13T09:00:00Z"
+        },
+        "G0TEST003": {
+          "delivery": "mentions",
+          "set_at": "2026-05-11T09:00:00Z"
+        }
+      }
+    },
+    "bravo": {
+      "declaration": {
+        "name": "bravo",
+        "credentials_file": "~/personas/bravo/credentials.json",
+        "working_directory": "~/personas/bravo/previous-work"
+      },
+      "channels": {
+        "C0TEST001": {
+          "delivery": "mentions",
+          "set_at": "2026-05-15T09:00:00Z"
+        }
+      }
+    },
+    "charlie": {
+      "declaration": {
+        "name": "charlie",
+        "credentials_file": "~/personas/charlie/credentials.json",
+        "working_directory": "~/personas/charlie/work"
+      },
+      "channels": {
+        "C0TEST002": {
+          "delivery": "all",
+          "set_at": "2026-05-09T09:00:00Z"
+        }
+      }
+    }
+  }
+}

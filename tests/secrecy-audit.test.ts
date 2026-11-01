@@ -52,7 +52,8 @@
  *    config-file writer, the agent-director settings-file writer, the
  *    stored-choice file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
- *    stub and its marker-planting rejection factories), or sets a stub's
+ *    stub and its marker-planting rejection factories, the upgrade fixture
+ *    generator's config builders and writers), or sets a stub's
  *    `leakMarker`. A suite that matches but has no
  *    secret-bearing surface is listed in `EXEMPT` with its reason; an
  *    exemption that no longer matches
@@ -215,6 +216,15 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/ci-run.ts': {
     makeFakeCodexHome: 'writes fake Codex login and config files under the fixture root',
     makeFakeCodexLogin: 'builds injected Codex login dependencies with sentinel-bearing tokens',
+  },
+  'tests/test-helpers/shared-channel-upgrade.ts': {
+    oldConfigBytes018: 'serializes a 0.18.0 config naming persona credentials files',
+    oldStoredChoiceBytes018: 'serializes a 0.18.0 stored-choice file holding persona declarations',
+    writeOldReference018: 'writes a 0.18.0 config file and its applied baseline',
+    buildUpgradeCases: "builds every upgrade case's config, stored-choice and queue files",
+    writeUpgradeFixtures: "writes the upgrade cases' config, stored-choice and queue files",
+    materializeUpgradeCase: "writes a case's configs, applied baselines and stored-choice files, naming its credentials paths",
+    runUpgradeCaseCommand: 'runs the materialize and reference commands, printing credentials paths',
   },
 }
 
@@ -963,6 +973,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const importing = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('tests/test-helpers/channel-delivery.ts')))
     expect(importing).toContain('tests/cli.test.ts')
     expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
+  })
+
+  test("the upgrade generator's config builders and writers touch, its readers and constants do not, and every suite that imports them leak-checks with no exemption", () => {
+    const suite = 'tests/shared-channel-upgrade-fixtures.test.ts', helper = 'tests/test-helpers/shared-channel-upgrade.ts'
+    for (const name of Object.keys(HELPER_SURFACES[helper]!)) {
+      expect(touchReasonsOf(suite, `import { ${name} as used } from './test-helpers/shared-channel-upgrade.ts'`)).toEqual([`imports ${name} from ${helper}: ${HELPER_SURFACES[helper]![name]}`])
+    }
+    expect(touchReasonsOf(suite, "import { fillHome, listFixtureFiles, readUpgradeManifest, UPGRADE_FIXTURE_DIR } from './test-helpers/shared-channel-upgrade.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { MaterializeOptions } from './test-helpers/shared-channel-upgrade.ts'")).toEqual([])
+    const importing = SUITES.filter(file => touchReasons(file).some(reason => reason.includes(helper)))
+    expect(importing).toContain(suite)
+    expect(importing.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map(file => [file, true, false]))
+    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    expect(touchReasonsOf(suite, withoutCalls).some(reason => reason.includes(helper))).toBe(true)
   })
 
   test.each(['makeFakeCodexHome', 'makeFakeCodexLogin'])('%s consumers must leak-check without an exemption', helper => {

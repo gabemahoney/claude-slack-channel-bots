@@ -77,6 +77,14 @@
  *   statically imports only `node:` built-ins, type-only imports included,
  *   through the image-guarded fixtures' matcher (`nodeOnlyImportFindings`).
  *   It has no marker check, so it is not one of `IMAGE_GUARDED_TS_PATHS`.
+ * - The shared-channel upgrade fixtures: the image entry
+ *   `shared-channel-upgrade-case.ts` is one of `IMAGE_GUARDED_TS_PATHS` (it
+ *   loads the generator only after its marker check), and every file system
+ *   write in the generator `tests/test-helpers/shared-channel-upgrade.ts`
+ *   stands in one of `UPGRADE_WRITERS`, after that writer's
+ *   `guardScratchDir` call; the entry writes nothing itself. Read with the
+ *   parser, pinned with synthetic violations, then run over the tree.
+ *   test-47 (shared mode) is read by the directory-wide script audits.
  * - The harness's one agent-director delete, over every
  *   file under `tests/integration` (shell or TypeScript, shellcheck's and
  *   bun's config aside): in shell, any command whose first argument after
@@ -1693,10 +1701,12 @@ const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
  * The TypeScript fixtures run as a whole file in the image, each refusing
  * without the marker as its first statement and importing only `node:`
  * built-ins statically: the forced-call driver, the stub's MCP session and
- * the switch-over fixture and the scenario value printer.
+ * the switch-over fixture and the scenario value printer, and the
+ * shared-channel upgrade entry, which loads its generator only after the check.
  */
 const CODEX_DELIVERY_PATH = join(TESTS_DIR, 'real-agent', 'codex-delivery.ts')
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH, join(INTEGRATION_DIR, 'fixtures', 'displayed-states.ts'), join(INTEGRATION_DIR, 'fixtures', 'shared-stub-permission.ts')]
+const UPGRADE_ENTRY_PATH = join(INTEGRATION_DIR, 'fixtures', 'shared-channel-upgrade-case.ts')
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH, join(INTEGRATION_DIR, 'fixtures', 'displayed-states.ts'), join(INTEGRATION_DIR, 'fixtures', 'shared-stub-permission.ts'), UPGRADE_ENTRY_PATH]
 const CODEX_IMPORT_ONLY_PATHS = ['codex-guards.ts', 'codex-evidence.ts', 'codex-ai.ts', 'codex-gate.ts', 'codex-crash-barrier.ts'].map(name => join(TESTS_DIR, 'real-agent', name))
 // Every non-node static edge is exact and its destination is audited too.
 const CODEX_IMPORT_GRAPH: Record<string, readonly string[]> = {
@@ -2530,6 +2540,15 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(scripts.length - sourcing.length).toBeGreaterThan(0)
       expect(scripts.flatMap(({ file, source }) => shellEntryFindings(file, source))).toEqual([])
     })
+
+    test('test-47 (shared mode, the manual upgrade) is one of the scripts read, and it sources scenario.sh with nothing before its source line', () => {
+      const path = join(INTEGRATION_DIR, 'test-47-shared-channel-upgrade.sh')
+      const source = readFileSync(path, 'utf-8')
+
+      expect(integrationScripts()).toContain(path)
+      expect(shellLogicalLines(source).some(sourcesScenario)).toBe(true)
+      expect(shellEntryFindings(relative(REPO_ROOT, path), source)).toEqual([])
+    })
   })
 
   describe('the HOME-under-SCENARIO_ROOT check comes before each scenario.sh helper’s first step', () => {
@@ -2840,14 +2859,131 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(driverGuardFindings('fmk-driver.ts', source)).toEqual([])
     })
 
-    test('the audited files: the forced-call driver, the stub’s MCP session, the switch-over fixture and the scenario value printer, all present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts', 'displayed-states.ts', 'shared-stub-permission.ts'])
+    test('the audited files: the forced-call driver, the stub’s MCP session, the switch-over fixture, the scenario value printer and the upgrade entry, all present', () => {
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts', 'displayed-states.ts', 'shared-stub-permission.ts', 'shared-channel-upgrade-case.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 
     test.each(IMAGE_GUARDED_TS_PATHS.map((path) => [basename(path), path]))('the current tree: %s imports only node: built-ins statically and checks the marker first', (_file, path) => {
       expect(driverGuardFindings(relative(REPO_ROOT, path), readFileSync(path, 'utf-8'))).toEqual([])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the shared-channel upgrade fixtures write only after the
+// scratch guard
+// ---------------------------------------------------------------------------
+
+const UPGRADE_GENERATOR_PATH = join(TEST_HELPERS_DIR, 'shared-channel-upgrade.ts')
+
+/** The generator's guard: refuses the real home and a directory outside the OS temp dir or SCENARIO_ROOT. */
+const SCRATCH_GUARD = 'guardScratchDir'
+
+/** The rule each finding names. */
+const UPGRADE_WRITE_RULE = 'write-after-scratch-guard'
+
+/**
+ * The generator's functions that write, each with what it guards. Every other
+ * place may only read. The materializer then keeps each target strictly under
+ * the guarded root, which tests/shared-channel-upgrade-fixtures.test.ts runs.
+ */
+const UPGRADE_WRITERS: ReadonlyMap<string, string> = new Map([
+  ['writeOldReference018', 'reference-0.18.0: guards --out before its mkdir and writes'],
+  ['materializeUpgradeCase', 'materialize: guards --root, then refuses --state-dir, --home and any target not under it'],
+  ['writeUpgradeFixtures', 'the generator: the committed fixture directory, or a guarded directory for the drift check'],
+])
+
+/** The node:fs modules; only the read functions below may be imported from them outside a writer. */
+const FS_MODULES: readonly string[] = ['fs', 'node:fs', 'fs/promises', 'node:fs/promises']
+
+/** The node:fs functions that only read. Anything else from an fs module counts as a write. */
+const FS_READ_FUNCTIONS: ReadonlySet<string> = new Set(['existsSync', 'readFileSync', 'readdirSync', 'realpathSync', 'statSync', 'lstatSync', 'accessSync', 'readlinkSync'])
+
+/**
+ * The findings for `file`: an fs module loaded other than by named static
+ * import (a namespace or default import, `import()` or `require()`), a
+ * `Bun.write`, and every use of a writing fs function outside a function of
+ * `writers` or before that function's first `guardScratchDir` call. Each
+ * listed writer must still exist and write.
+ */
+function upgradeWriteFindings(file: string, source: string, writers: ReadonlyMap<string, string>): string[] {
+  const sf = parse(source, file)
+  const at = (node: ts.Node, what: string): string => `${file}:${finding(sf, node, `${UPGRADE_WRITE_RULE}: ${what}`)}`
+  const findings: string[] = []
+  const writes = new Set<string>()
+  for (const s of sf.statements) {
+    if (!ts.isImportDeclaration(s) || !FS_MODULES.includes(stringText(s.moduleSpecifier) ?? '') || s.importClause === undefined || s.importClause.isTypeOnly) continue
+    const bindings = s.importClause.namedBindings
+    if (s.importClause.name !== undefined || (bindings !== undefined && !ts.isNamedImports(bindings))) findings.push(at(s, 'an fs namespace or default import; the audit cannot follow it'))
+    if (bindings !== undefined && ts.isNamedImports(bindings)) {
+      for (const e of bindings.elements) if (!e.isTypeOnly && !FS_READ_FUNCTIONS.has((e.propertyName ?? e.name).text)) writes.add(e.name.text)
+    }
+  }
+  const written = new Set<string>()
+  forEachNode(sf, (node) => {
+    const loaded = moduleLoadOf(node)
+    if (loaded !== undefined && FS_MODULES.includes(loaded)) findings.push(at(node, `a dynamic load of ${loaded}; the audit cannot follow it`))
+    if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'Bun' && node.name.text === 'write') findings.push(at(node, 'Bun.write writes outside the audit'))
+    if (!ts.isIdentifier(node) || !writes.has(node.text) || ts.isImportSpecifier(node.parent)) return
+    let fn: ts.Node | undefined = node.parent
+    while (fn !== undefined && !(ts.isFunctionDeclaration(fn) && fn.parent === sf)) fn = fn.parent
+    const name = fn !== undefined ? (fn as ts.FunctionDeclaration).name?.text : undefined
+    if (name === undefined || !writers.has(name)) {
+      findings.push(at(node, `${node.text} outside the listed writers (${name ?? 'top level'})`))
+      return
+    }
+    written.add(name)
+    let guardStart = Infinity
+    forEachNode(fn!, (n) => {
+      if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === SCRATCH_GUARD) guardStart = Math.min(guardStart, n.getStart(sf))
+    })
+    if (guardStart > node.getStart(sf)) findings.push(at(node, `${name}: ${node.text} runs before ${SCRATCH_GUARD}`))
+  })
+  for (const name of writers.keys()) if (!written.has(name)) findings.push(`${file}:1: ${UPGRADE_WRITE_RULE}: ${name} is listed but writes nothing the audit can see`)
+  return findings
+}
+
+describe('static audit: the shared-channel upgrade fixtures write only after the scratch guard', () => {
+  const IMPORTS = lines("import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'", "import { isRealHome } from './host-safe-env.ts'")
+  const GUARD = `export function ${SCRATCH_GUARD}(dir: string, what: string): string { if (isRealHome(dir)) throw new Error(what); return dir }`
+  const WRITER = lines('export function writeOldReference018(options: { out: string }) {', `  const out = ${SCRATCH_GUARD}(options.out, '--out')`, '  mkdirSync(out)', "  writeFileSync(out + '/config.json', 'x')", '}')
+  const ONE = new Map([['writeOldReference018', 'test']])
+
+  const violations: [label: string, source: string][] = [
+    ['a write before the guard', lines(IMPORTS, GUARD, WRITER.replace(`  const out = ${SCRATCH_GUARD}(options.out, '--out')\n  mkdirSync(out)`, `  mkdirSync(options.out)\n  const out = ${SCRATCH_GUARD}(options.out, '--out')`))],
+    ['a writer with no guard', lines(IMPORTS, GUARD, WRITER.replace(`${SCRATCH_GUARD}(options.out, '--out')`, 'options.out'))],
+    ['a write in an unlisted function', lines(IMPORTS, GUARD, WRITER, `export function stray(dir: string) { ${SCRATCH_GUARD}(dir, 'x'); writeFileSync(dir, 'x') }`)],
+    ['a write at the top level', lines(IMPORTS, GUARD, WRITER, "writeFileSync('/tmp/x', 'x')")],
+    ['a write in a closure outside the writers', lines(IMPORTS, GUARD, WRITER, "export const put = (p: string) => writeFileSync(p, 'x')")],
+    ['an aliased write function in an unlisted function', lines(IMPORTS, "import { rmSync as remove } from 'node:fs'", GUARD, WRITER, "export function clean(dir: string) { remove(dir) }")],
+    ['a write function passed on as a value', lines(IMPORTS, GUARD, WRITER, 'export const deps = { writeFileSync }')],
+    ['an fs namespace import', lines(IMPORTS, "import * as fs from 'node:fs'", GUARD, WRITER)],
+    ['an fs default import', lines(IMPORTS, "import fs from 'fs'", GUARD, WRITER)],
+    ['a promises write outside the writers', lines(IMPORTS, "import { writeFile } from 'node:fs/promises'", GUARD, WRITER, "export async function later(p: string) { await writeFile(p, 'x') }")],
+    ['a dynamic load of node:fs', lines(IMPORTS, GUARD, WRITER, "export async function late() { const fs = await import('node:fs'); return fs }")],
+    ['Bun.write', lines(IMPORTS, GUARD, WRITER, "export async function bunWrite(p: string) { await Bun.write(p, 'x') }")],
+    ['a listed writer that no longer writes', lines(IMPORTS, GUARD, WRITER.replace("  mkdirSync(out)\n  writeFileSync(out + '/config.json', 'x')\n", '  return out\n'))],
+  ]
+
+  test.each(violations)('flags %s, naming the file and the rule', (_label, source) => {
+    expectNamedFindings(upgradeWriteFindings('shared-channel-upgrade.ts', source, ONE), 'shared-channel-upgrade.ts', UPGRADE_WRITE_RULE)
+  })
+
+  const allowed: [label: string, source: string][] = [
+    ['the guard, then writes', lines(IMPORTS, GUARD, WRITER)],
+    ['reads anywhere, and the read functions under another name', lines(IMPORTS, "import { statSync as stat } from 'node:fs'", GUARD, WRITER, "export function look(p: string) { return existsSync(p) && stat(p).isFile() ? readFileSync(p, 'utf8') : '' }")],
+    ['a type-only fs import and fs names in strings and comments', lines(IMPORTS, "import type { Stats } from 'node:fs'", GUARD, WRITER, "// writeFileSync('/x')", "export const text = 'rmSync(dir)'")],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(upgradeWriteFindings('shared-channel-upgrade.ts', source, ONE)).toEqual([])
+  })
+
+  test('the current tree: the generator writes only in its listed writers, after their guard, and the image entry writes nothing', () => {
+    expect([...UPGRADE_WRITERS.values()].every((why) => why.length > 0)).toBe(true)
+    expect(upgradeWriteFindings(relative(REPO_ROOT, UPGRADE_GENERATOR_PATH), readFileSync(UPGRADE_GENERATOR_PATH, 'utf-8'), UPGRADE_WRITERS)).toEqual([])
+    expect(upgradeWriteFindings(relative(REPO_ROOT, UPGRADE_ENTRY_PATH), readFileSync(UPGRADE_ENTRY_PATH, 'utf-8'), new Map())).toEqual([])
   })
 })
 

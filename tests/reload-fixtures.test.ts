@@ -111,9 +111,12 @@ test.each([
     if (mode === 'queued') writeFileSync(join(queue, 'alpha.jsonl'), 'accepted item\n')
     const result = spawnSync('bash', ['-eu', '-c', `
 SLACK_STATE_DIR=$1 SCENARIO_ROOT=$2 SCENARIO_FIXTURES=$2 INSTALL=$2 REAL_KEY=alpha
+OLD_REFERENCE=$2/reference-0.18.0 EARLIER_PKG=$2
+mkdir "$OLD_REFERENCE"; cp "$baseline" "$OLD_REFERENCE/config.json"; cp "$baseline" "$OLD_REFERENCE/config.json.last-applied"
 fail() { echo "$*" >&2; exit 1; }
 server_pid() { if [[ "$mode" == live ]]; then echo 42; fi; }
-bun() { if [[ $1 == -e ]]; then [[ "$mode" != old-loader-refuses ]]; else cat "$baseline"; fi; }
+queue_all_delivered() { [[ ! -s "$SLACK_STATE_DIR/queue/alpha.jsonl" ]]; }
+bun() { [[ $1 == -e && "$mode" != old-loader-refuses ]]; }
 configuration_applied_is() { cmp -s "$SLACK_STATE_DIR/config.json.last-applied" "$expected"; }
 ${functions}
 prepare_stopped_downgrade

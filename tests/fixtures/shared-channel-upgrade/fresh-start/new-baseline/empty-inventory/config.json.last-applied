@@ -1,0 +1,16 @@
+{
+  "channel_mode": "strict",
+  "personas": [
+    {
+      "name": "alpha",
+      "credentials_file": "~/personas/alpha/credentials.json",
+      "working_directory": "~/personas/alpha/work",
+      "channels": [],
+      "dm": {
+        "enabled": true,
+        "contact": "U0UPGALPHA"
+      },
+      "permission_prompts": "dm"
+    }
+  ]
+}

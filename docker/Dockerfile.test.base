@@ -1,4 +1,4 @@
-# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v9.
+# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v10.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
 # and the /ci-live image (docker/Dockerfile.live). From the repo build context
@@ -8,7 +8,7 @@
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
 #     --build-context agent-director-install=<directory holding install.sh> \
-#     -f docker/Dockerfile.test.base -t cscb-ci-base:v9 .
+#     -f docker/Dockerfile.test.base -t cscb-ci-base:v10 .
 #
 # agent-director is the release pinned below (AD_VERSION, AD_COMMIT): its
 # binaries come from agent-director's GitHub release, installed by that
@@ -391,10 +391,11 @@ ENV DISABLE_AUTOUPDATER=1
 COPY docker/install-real-agents.sh docker/install-real-codex.sh /opt/cscb-ci/
 RUN bash /opt/cscb-ci/install-real-agents.sh 2.1.280 2.1.296 && bash /opt/cscb-ci/install-real-codex.sh
 
-# npm publication 2026-10-14T17:20:30.700Z, the last
-# published version preceding. Preserve the separate 0.10.0 fixture.
-ARG CSCB_DOWNGRADE_VERSION=0.16.1
-ARG CSCB_DOWNGRADE_SHA256=95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164
+# The earlier release: published 0.18.0 (npm publication
+# 2026-10-21T08:49:18.397Z), the host baseline before the upgrade, with the
+# durable queue. Preserve the separate 0.10.0 fixture.
+ARG CSCB_DOWNGRADE_VERSION=0.18.0
+ARG CSCB_DOWNGRADE_SHA256=16d102793cc62395b771c431078b4124267b3d11cb8b56e84c48e8910d096b62
 RUN set -eu; \
     d="/opt/claude-slack-channel-bots-${CSCB_DOWNGRADE_VERSION}"; \
     mkdir -p "$d"; \
@@ -402,5 +403,5 @@ RUN set -eu; \
     f="$d/claude-slack-channel-bots-${CSCB_DOWNGRADE_VERSION}.tgz"; \
     printf '%s  %s\n' "$CSCB_DOWNGRADE_SHA256" "$f" | sha256sum --check --status; \
     test "$(tar -xOf "$f" package/package.json | jq -r .version)" = "$CSCB_DOWNGRADE_VERSION"; \
-    printf '{"version":"%s","published":"2026-10-14T17:20:30.700Z","sha256":"%s","registry":"https://registry.npmjs.org/claude-slack-channel-bots"}\n' "$CSCB_DOWNGRADE_VERSION" "$CSCB_DOWNGRADE_SHA256" > "$d/release.json"; \
+    printf '{"version":"%s","published":"2026-10-21T08:49:18.397Z","sha256":"%s","registry":"https://registry.npmjs.org/claude-slack-channel-bots"}\n' "$CSCB_DOWNGRADE_VERSION" "$CSCB_DOWNGRADE_SHA256" > "$d/release.json"; \
     chmod -R a+rX "$d"
