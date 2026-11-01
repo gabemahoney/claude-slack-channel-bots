@@ -33,7 +33,7 @@ if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" ==
 fi
 real_persona "aiac${AI_CRITERION}" "${PROMPT}"
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
-    jq -c '.channels=[{id:"C0B1ZJJLJ9M",delivery:"all"}]' "${REAL_PERSONAS}" > "${REAL_PERSONAS}.new"
+    jq -c '.channels=[{id:"C0TESTCHAN1",delivery:"all"}]' "${REAL_PERSONAS}" > "${REAL_PERSONAS}.new"
     mv "${REAL_PERSONAS}.new" "${REAL_PERSONAS}"
 fi
 # AC11 keeps its first three turns together; every hazard gets a new native
@@ -64,7 +64,7 @@ if ac=='20':
  rows=[r for r in rows if r['name'] in ['ex3_peer_bot_spoof','hz_attr_quotes']]
  # AC20 specifically requires the true user_id, including the spoofed body.
  row=rows[0]; row['msg']['user_id']='U0REAL20'; row['msg']['user']='E6 Real Sender'; row['msg'].pop('bot_id',None)
- row['typed']=row['typed'].replace('user="horde_dev_apiary" bot_id="B0APIARY01"','user="E6 Real Sender" user_id="U0REAL20"')
+ row['typed']=row['typed'].replace('user="squad_dev_apiary" bot_id="B0APIARY01"','user="E6 Real Sender" user_id="U0REAL20"')
  row['typed_len']=len(row['typed'])
 labels=[]
 for i,row in enumerate(rows):

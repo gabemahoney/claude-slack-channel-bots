@@ -355,7 +355,7 @@ test.each([[20, 'decision21c', 1], [20, '', 1], [20, 'other', 2], [12, 'decision
 })
 test('removing diagnostic additions preserves the approved AD-state-only scenario bytes', () => {
   expect(scenario.split(caseGate)).toHaveLength(2); expect(scenario.split(waitGate)).toHaveLength(2)
-  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('399cd9d0feeb86b0774367c58388c264ac2383cbfc27508b213ac01b76b391ac')
+  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('17fc300c751af5d1ffecad78addcf7f3dc5da28145515e8ddb45440e13ed2172')
 })
 
 function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {
