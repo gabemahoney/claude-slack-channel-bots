@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- Cut-off message evidence now logs `message-partial-receipt` and qualifies the *Message not taken in* and *Delivery stuck* notices. The full message stays queued until a complete transcript receipt arrives; existing agent-director-guarded retries continue. This reports observed loss without repairing the transport or establishing its cause. See [partial receipt diagnostics](skills/debug-slack-channel-bots/SKILL.md#message-partial-receipt).
+
 ---
 
 ## 0.18.2 (2026-11-01)

@@ -55,7 +55,7 @@ cli.ts CLI entry point — start/stop/clean_restart/credentials/clear-latch subc
     ├── delivery-engine.ts per-persona FIFO executor, durable attempts and receipts, indefinite retries, call budget and reporting events/status (see Per-persona delivery engine).
     ├── delivery-notices.ts exported notice/diagnostic builders and createDeliveryReporting: durable queue/engine facts become destination-only notices, episode transitions, safe logs and delivery callbacks; never authorizes typing.
     ├── notice-correction.ts one bounded edit of a retained notice and, on failure, one same-place correction through its original Slack client; injected clock and cancellation keep late results from restarting recovery work.
-    ├── delivery-receipt.ts incremental transcript reader, exact receipt matching, per-send windows, negative evidence and credit-once identities.
+    ├── delivery-receipt.ts incremental transcript reader, exact receipts and partial evidence, per-send windows and credit-once identities.
     ├── delivery-lifecycle.ts typing leases, AD row/session relaunch observations, deferred reconnect timer/engine ownership and cancellation.
     ├── delivery-constants.ts shared production timing and load bounds.
     ├── delivery-ad-scope.ts    Async-local isolated client and budget hook across shared reconnect/outage guards.
@@ -289,13 +289,13 @@ Agent-director owns readiness. First sends, retypes, recovery Enter and reconnec
 |---|---|
 | `delivery-policy.ts` | Pure engine/gate choices, guards and FIFO selection over durable facts and AD observations. |
 | `delivery-engine.ts` | Per-persona execution, durable attempts/receipts, separate key outcomes, retries and events; all I/O and clocks are injected. |
-| `delivery-receipt.ts` | Transcript discovery, incremental reads and exact confirmation of CSCB's own sent message, with frozen receipt windows and credit-once identities. |
+| `delivery-receipt.ts` | Transcript discovery, incremental reads, exact confirmation and reporting-only partial evidence for CSCB's own sent message, with per-send windows and credit-once identities. |
 | `delivery-lifecycle.ts` | Persona leases, launch/session identities, first-waiting memory, deferred reconnect timers and cancellation. |
 | `delivery-constants.ts` | Production timing and call-budget values. |
 | `delivery-ad-scope.ts` | Persona client and before-call budget hook across shared reconnect awaits. |
 | `agent-director-startup.ts` | Lazy isolated persona clients through `createDeliveryClientFactory`, common options/version checks and retryable construction. |
 
-**Durability and confirmation.** Before keys, the engine appends and fsyncs `sent` with attempt, part, send kind, launch/session and transcript EOF. Normal sends use `no_enter: true`, retain the lease through `ENTER_DELAY_MS` (500 ms), revalidate AD/non-screen guards and send Enter separately. A successful call is not a delivery receipt. Only an exact eligible own-message receipt permits the durable `delivered` append and FIFO advance.
+**Durability and confirmation.** Before keys, the engine appends and fsyncs `sent` with attempt, part, send kind, send time, session ID and transcript EOF. Normal sends use `no_enter: true`, retain the lease through `ENTER_DELAY_MS` (500 ms), revalidate AD/non-screen guards and send Enter separately. A successful call is not a delivery receipt. Only an exact eligible own-message receipt permits the durable `delivered` append and FIFO advance.
 
 Transcript references come only from AD's `jsonl_path` fields and durable attempts. The engine re-reads the current row while awaiting receipts, including when AD publishes a reference after a launch or resume. For a live Claude row with a session but no path and an unconfirmed attempt, `refreshDeliveryTranscript` uses the session manager's shared, memoized `find-missing` sweep to let AD heal its provisional reference, then the engine reads its own row again. The sweep retains refusal/latch handling and the isolated delivery client/call budget; cancellation prevents the follow-up read. Existing receipts from recorded or prior paths are checked first. A reference first observed after an attempt recorded an empty or different path emits a redacted `delivery-transcript-reference` diagnostic with the persona, AD instance, session and path, so receipt audits can bind the late reference independently of a delivered record. No native path is constructed locally.
 
@@ -311,7 +311,19 @@ Normal retry ownership may retry a refused sequence. An active sequence holds de
 
 **Receipts.** Eligible Claude human `user` records or human `queued_command` attachments and Codex user `response_item`/`input_text` blocks must match the complete sent text exactly, apart from defined paste-block unwrapping and adjacent LFs. Native queue/task ordering, assistant stop reasons and compaction records establish no idle, busy or lifecycle state.
 
-The first effective non-refused send defines the receipt window. Its own path uses stored byte EOF; previously observed paths use frozen pre-send EOF and newly discovered paths start at zero. UUID or path plus offset prevents crediting one record twice, including identical-text items. Recovery searches current, prior-session and stored sent paths. Missing files for a newly launched session are `not-yet-written`; unreadable/nonregular files cannot newly confirm receipts. File replacement, truncation and incomplete lines are receipt I/O concerns only.
+The first effective non-refused send defines the full-receipt window. Its own path uses stored byte EOF; previously observed paths use frozen pre-send EOF and newly discovered paths start at zero. UUID or path plus offset prevents crediting one record twice, including identical-text items. Recovery searches current, prior-session and stored sent paths. Missing files for a newly launched session are `not-yet-written`; unreadable/nonregular files cannot newly confirm receipts. File replacement, truncation and incomplete lines are receipt I/O concerns only.
+
+**Partial receipt evidence.** An eligible record's whole text may match a nonempty proper suffix of the fixed part, using only the same paste framing and adjacent-LF allowances. The suffix must contain at least 128 UTF-8 bytes, 96 non-whitespace Unicode code points and 48 distinct overlapping four-code-point sequences after removing whitespace for that distinctiveness check only; matching never trims whitespace or extracts quotations. Short, repetitive, prefix-only and ineligible records do not qualify, and a full eligible receipt anywhere in the search takes precedence.
+
+Partial evidence requires the first effective non-refused send for this part that matches AD's current session and follows both observed lifecycle changes and, when supplied, AD's launch start. `parseLaunchStart` rejects invalid non-null launch metadata; absent/null metadata leaves the session and window checks in force, and a quarantined unknown-outcome send alone cannot qualify. Partial records must be readable and uncredited, with these stricter windows:
+
+- A parsed record timestamp earlier than the selected send always rejects the fragment, even beyond a known EOF.
+- The send's stored EOF or a frozen observed pre-send EOF bounds the record by byte offset; without a valid record timestamp, that EOF can still support evidence.
+- Without either EOF, only a record timestamped at or after the send on AD's current path, with a nonempty session matching the send, qualifies. An unknown prior path cannot supply partial evidence.
+
+Evidence belongs only to the FIFO head's first undelivered part. A full receipt or a scan without qualifying evidence clears it; observed relaunch/session/launch-timestamp changes also exclude preceding attempts until a new own send. It never credits delivery, changes the full queued text, supplies agent state or authorizes keys: recovery remains the AD-guarded path below, and this guard does not repair transport loss or establish its cause.
+
+Partial evidence is reconstructed from durable sends and readable transcripts after server restart, with no new journal record. Frozen prior-path EOFs are volatile, so evidence supported only by those windows can disappear on replay and reporting becomes generic. Without AD launch metadata, durable session/time/EOF facts cannot distinguish an entirely unobserved same-session relaunch across restart from intact replay.
 
 The `receiptWorking` extension belongs to the unconfirmed part. A successful durable `delivered` append clears it and its receipt deadline before advancing to the next part or FIFO head; a failed append preserves the extension until its retry succeeds. Observing a new launch also clears the old extension. The next eligible part therefore uses fresh AD `waiting` without inheriting the previous part's receipt delay.
 
@@ -327,7 +339,7 @@ Reconnect shares the persona lease with delivery and revalidates AD `waiting`, m
 
 Launch IDs track server-start identity and authoritative observed launch/session changes. Native compaction causes no lifecycle transition. `forget` cancels persona execution/leases/timers while retaining the journal; `stop` cancels key pauses and awaits running work before client close and queue drain. Calls retain the per-persona sliding budget; empty queues make no delivery calls except independently deferred reconnects.
 
-**Events.** Engine events report launch observation/first waiting, receipt-backed delivery, retypes, first unconfirmed retype, waiting reason/head age and missing marker. The server wires them into reporting, reactions and upgrade observation. Events carry no pane classifications or inferred idle/compaction facts.
+**Events.** Engine events report launch observation/first waiting, receipt-backed delivery, partial evidence, retypes, first unconfirmed retype, waiting reason/head age and missing marker. The server wires them into reporting, reactions and upgrade observation. Events carry no pane classifications or inferred idle/compaction facts.
 
 ### Isolated Codex delivery harness
 
@@ -351,13 +363,17 @@ The local heavy coordinator's explicit `--codex-only` selection runs just the 15
 
 `src/delivery-notices.ts` consumes queue and engine events wired by `server.ts`; it never grants a lease or removes accepted work. `DeliveryStatus` carries queue age/count, AD row, marker/relay/connection, holds and receipt/refusal facts.
 
-`createDeliveryReporting` writes text-free `message-received`, `message-delivered`, `message-retyped`, `message-not-taken-in`, `delivery-stuck` and queue diagnostics through exported builders. Metadata is explicitly selected; raw errors, message text and file contents cannot enter those diagnostics. Existing RAW, injected-message and first Slack dispatch excerpts are separate surfaces.
+`createDeliveryReporting` writes text-free `message-received`, `message-delivered`, `message-retyped`, `message-not-taken-in`, `message-partial-receipt`, `delivery-stuck` and queue diagnostics through exported builders. Metadata is explicitly selected; raw errors, message text and file contents cannot enter those diagnostics. Existing RAW, injected-message and first Slack dispatch excerpts are separate surfaces.
+
+`message-partial-receipt` adds `part`, `expected_bytes` and `received_bytes` to the existing persona/delivery identity, ending `typed but cut off; full text remains queued`. Lengths count the fixed part and matched suffix in UTF-8, excluding unwrapped transcript paste framing; no fragment, transcript path or UUID is logged. The engine emits once per persona/item/part/receipt identity (UUID, else path plus offset) in its lifetime; replay can emit reconstructed evidence once again in a new process.
 
 `delivery-launch-observed` and `delivery-launch-first-waiting` are JSON diagnostics with `key`, `session_id` and `at`, without message text or an invented launch identifier. They report AD relaunch evidence and the first shared waiting observation.
 
 Ordinary new delivery notices pass through the persona notifier to its configured destination under its own identity. Storage-warning edits and their one fallback use the warning's original place and identity, even after a destination change or DMs are turned off, as described below.
 
 Reporting shares the central `PersonaEpisodes`: `message-not-saved` ends on the next successful store, while `delivery-stuck` and `messages-waiting` end when the head changes or empties. These episodes and reporting deduplication are per server run. In contrast, the queue's `noticed` record makes *Message not taken in* once per item across restarts; recording it is durable before the notice event.
+
+When partial evidence is available for a notice, *Message not taken in* adds “The text arrived cut off; the full message is kept.” and *Delivery stuck* adds “The text arrived cut off; the full message is still queued.” Other-cause remedies and notice lifetimes remain unchanged; later evidence does not edit an already-posted generic notice.
 
 **Storage-warning recovery.** A Slack `store-failed` event carries the complete `SlackKey` (`chat_id`, `ts`, `edited_ts`). Reporting retains that key per persona for the episode's warning, independently of the episode ending: another successful message can end the episode but cannot recover this warning, nor can a different edit or another persona's acceptance.
 

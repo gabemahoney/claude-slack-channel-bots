@@ -1,19 +1,20 @@
 /** notice decisions only; engine/intake/ack suites own their transitions. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS } from '../src/delivery-constants.ts'
 import { NOTICE_CORRECTION_TIMEOUT_MS, type NoticeCorrectionOutcome } from '../src/notice-correction.ts'
 import type { SlackKey } from '../src/delivery-queue.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import { PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
+import { MESSAGE_PARTIAL_RECEIPT, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { injectedInput, readQueue } from './test-helpers/delivery-queue.ts'
+import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { openedDm } from './test-helpers/slack-stub.ts'
-import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
+import { appendTranscript, pastedText, promptEntry, replyEntry } from './test-helpers/working-row-panes.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines }) } finally { await r.cleanup() } } })
@@ -67,9 +68,12 @@ test('delivery notices and all nine fixed remedies keep their required wording',
   ])
   expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'refused', 3)).toBe(
     ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. ' + deliveryStuckRemedy('refused', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)
+  expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'refused', 3, true)).toBe(
+    ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. The text arrived cut off; the full message is still queued. ' + deliveryStuckRemedy('refused', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)
   expect(buildMessageNotSavedNotice('Alpha', 'U0SENDER1')).toBe(":warning: *Message not saved* — a message from U0SENDER1 for Alpha could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.")
   expect(buildMessageSavedAfterRetryNotice('Alpha', 'U0SENDER1')).toBe(':white_check_mark: *Message saved after retry* — the message from U0SENDER1 for Alpha was saved after a retry. No resend is needed.')
   expect(buildMessageNotTakenInNotice('Alpha', 'U0SENDER1')).toBe(":warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.")
+  expect(buildMessageNotTakenInNotice('Alpha', 'U0SENDER1', true)).toBe(":warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. The text arrived cut off; the full message is kept. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.")
   expect(buildMessagesWaitingNotice('Alpha', 2, DELIVERY_STUCK_AFTER_MS, 'down')).toBe(':warning: *Messages waiting* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. The persona is down. The messages are kept and delivered once the persona is up.')
   expect(buildQueueRecordUnreadableNotice('Alpha', 2, '/scratch/quarantine')).toBe(':warning: *Queue record unreadable* — 2 queued message(s) for Alpha could not be read at start and will not be delivered. Their bytes are kept in `/scratch/quarantine`. Ask the senders to send them again.')
 })
@@ -98,6 +102,17 @@ test.each(reasons)('%s: over five minutes, once until queue progress; only the o
   await r.complete(item)
   r.waiting(next, engineReason, { ageMs: DELIVERY_STUCK_AFTER_MS + 1, ...patch }); await r.flush()
   expect(posts).toHaveLength(2)
+})
+
+test.each(reasons)('b.x4j partial evidence retains the %s remedy and episode deduplication', async (reason, engineReason, patch) => {
+  const r = await run(), item = await r.accept(), ageMs = DELIVERY_STUCK_AFTER_MS + 1
+  const status = { ageMs, ...patch, partialReceipt: { part: 1, expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) } }
+  r.waiting(item, engineReason, status); await r.flush()
+  r.waiting(item, engineReason, status); await r.flush()
+  expect(r.h.posts(r.alpha).map(post => post.text)).toEqual([
+    formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, ageMs, reason, (patch.retypeCount ?? 0) + 1, true)),
+  ])
+  expect(r.h.posts(r.beta)).toEqual([])
 })
 
 const waiting: [string, Partial<DeliveryReportState>, Partial<DeliveryStatus>][] = [
@@ -217,6 +232,142 @@ test('the durable per-item not-taken-in notice survives server restart while ret
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.posts(r.beta)).toEqual([])
   } finally { await e.cleanup() }
+})
+
+describe('b.x4j transcript-to-notice partial receipt guard', () => {
+  async function compose() {
+    let r: DeliveryNoticeHarness | undefined
+    const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+    r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
+    e.p().autoReceipt = false
+    return { e, r, async resetReporting() {
+      r!.rig.episodes.close()
+      r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
+      return r
+    } }
+  }
+  const partialLines = (r: DeliveryNoticeHarness) => r.logs.filter(line => line.includes(MESSAGE_PARTIAL_RECEIPT))
+
+  test.each(['raw', 'paste'] as const)('%s suffix: retain full FIFO head, report cut-off text, then accept late full receipt', async framing => {
+    const { e, r } = await compose()
+    try {
+      // Put a fake secret inside the surviving suffix, not only the lost prefix.
+      const text = partialReceiptText.replace('END-round2-trial.', `END-round2-trial. ${sentinelInMessage('partial-receipt')}`)
+      const suffix = text.slice(-349), fragment = promptEntry(framing === 'paste' ? `\n\n${pastedText(suffix)}\n\n` : suffix)
+      const head = await e.accept(text), next = await e.accept('FIFO successor')
+      e.p().keyHook = params => { if (params.key === 'Enter') appendTranscript(e.p().path, [fragment]); return undefined }
+      await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      expect(e.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([text, 'Enter'])
+      expect(e.queue.openCount('alpha')).toBe(2)
+      expect(head.accepted.text).toBe(text)
+      expect(e.queue.items('alpha')[0]!.fixed?.parts).toEqual([text])
+      expect(e.records().filter(record => record.kind === 'delivered')).toEqual([])
+      expect(r.delivered).toEqual([])
+      expect(e.engine.status('alpha')?.row).toBe('waiting')
+      await e.until(() => e.events.some(event => event.type === 'retyped'))
+      // The existing recovery Enter and full retype remain the only key path.
+      expect(e.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([text, 'Enter', 'Enter', text, 'Enter'])
+      await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now())
+      await r.flush()
+      const notices = [...r.h.posts(r.alpha)], diagnostics = [...partialLines(r)], typedCount = e.queue.items('alpha')[0]!.retypeCount + 1
+      expect(notices).toHaveLength(2)
+      expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
+      expect(e.records().filter(record => record.kind === 'delivered')).toEqual([])
+      expect(e.textCalls().every(call => call.params.text === text)).toBe(true)
+      expect(r.h.posts(r.beta)).toEqual([])
+      assertNoLeak({ logs: r.logs, notices })
+      expect(JSON.stringify({ logs: r.logs, notices })).not.toContain('END-round2-trial')
+      expect(JSON.stringify({ logs: r.logs, notices })).not.toContain('Inert numbered transport data')
+
+      e.p().keyHook = undefined; e.p().autoReceipt = true
+      const full = promptEntry(pastedText(text))
+      appendTranscript(e.p().path, [full])
+      const textsBeforeFull = e.textCalls().length
+      await e.until(() => e.queue.openCount('alpha') === 0)
+      expect(e.textCalls().slice(textsBeforeFull).map(call => call.params.text)).toEqual(['FIFO successor'])
+      expect(r.delivered.map(({ item }) => item.accepted.seq)).toEqual([head.accepted.seq, next.accepted.seq])
+      expect(e.records().filter(record => record.kind === 'delivered')).toMatchObject([
+        { seq: head.accepted.seq, part: 1, receipt: { uuid: full.uuid } }, { seq: next.accepted.seq, part: 1 },
+      ])
+      expect(e.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+      expect(e.errors).toEqual([])
+      // Keep all safety/progression assertions above the expected pre-fix failure.
+      expect({ diagnosticCount: diagnostics.length, afterFullCount: partialLines(r).length,
+        notTakenIn: /cut off/i.test(notices[0]!.text), stuck: /cut off/i.test(notices[1]!.text) })
+        .toEqual({ diagnosticCount: 1, afterFullCount: 1, notTakenIn: true, stuck: true })
+      expect(diagnostics[0]).toContain(deliveryIdentity(head.accepted))
+      expect(diagnostics[0]).toContain('part=1')
+      expect(diagnostics[0]).toContain(`expected_bytes=${Buffer.byteLength(text)}`)
+      expect(diagnostics[0]).toContain(`received_bytes=${Buffer.byteLength(suffix)}`)
+      expect(notices[0]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)))
+      expect(notices[1]!.text).toContain(deliveryStuckRemedy('not-taken-in', r.alpha, typedCount))
+      expect(diagnostics[0]).not.toContain(e.p().path)
+      expect(diagnostics[0]).not.toContain(fragment.uuid as string)
+    } finally { await e.cleanup() }
+  })
+
+  test.each(['part', 'item', 'launch', 'session', 'launch-timestamp', 'replay', 'timestamped-replay'] as const)('%s scopes cut-off reporting to applicable evidence', async scope => {
+    const composition = await compose(), e = composition.e
+    let r = composition.r
+    try {
+      if (scope === 'launch-timestamp' || scope === 'timestamped-replay') e.p().row.launch_started_at = new Date(e.clock.now()).toISOString()
+      await e.accept(partialReceiptText, 'alpha', scope === 'part' ? [partialReceiptText, 'later part'] : undefined)
+      if (scope === 'item') await e.accept('later item')
+      await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      appendTranscript(e.p().path, [promptEntry(partialReceiptSuffix)])
+      await e.advance(DELIVERY_ROW_POLL_MS)
+      const firstDiagnostics = partialLines(r).length
+      if (scope === 'part' || scope === 'item') {
+        appendTranscript(e.p().path, [promptEntry(partialReceiptText)])
+      } else if (scope === 'launch') {
+        // Same conversation, new AD launch; the old fragment precedes this send.
+        e.p().row.state = 'pending'; await e.advance(DELIVERY_ROW_POLL_MS)
+        e.p().row.state = 'waiting'; await e.advance(DELIVERY_ROW_POLL_MS)
+      } else if (scope === 'session') {
+        e.p().row.session_id = 'new-session'; await e.advance(DELIVERY_ROW_POLL_MS)
+      } else if (scope === 'launch-timestamp') {
+        e.p().row.launch_started_at = new Date(e.clock.now()).toISOString(); await e.advance(DELIVERY_ROW_POLL_MS)
+      } else {
+        if (scope === 'timestamped-replay') e.p().row.launch_started_at = new Date(e.clock.now()).toISOString()
+        await e.restartServer() // Evidence is rebuilt from journal + transcript.
+        r = await composition.resetReporting()
+      }
+      await e.until(() => e.records().some(record => record.kind === 'noticed'))
+      await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now())
+      await r.flush()
+      const notices = r.h.posts(r.alpha)
+      expect(notices).toHaveLength(2)
+      expect(notices.map(post => /cut off/i.test(post.text))).toEqual(scope === 'replay' ? [true, true] : [false, false])
+      expect(e.queue.openCount('alpha')).toBe(1)
+      expect(e.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+      expect(e.errors).toEqual([])
+      expect(firstDiagnostics).toBe(1)
+    } finally { await e.cleanup() }
+  })
+
+  test('b.x4j replay reconstructs a partial diagnostic once while retaining the durable not-taken-in notice', async () => {
+    const composition = await compose(), e = composition.e
+    let r = composition.r
+    try {
+      await e.accept(partialReceiptText)
+      await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      appendTranscript(e.p().path, [promptEntry(partialReceiptSuffix)])
+      await e.until(() => e.records().some(record => record.kind === 'noticed'))
+      await r.flush()
+      expect(r.h.posts(r.alpha).map(post => post.text)).toEqual([
+        formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)),
+      ])
+      expect(partialLines(r)).toHaveLength(1)
+      await e.restartServer(); r = await composition.resetReporting()
+      await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now()); await r.flush()
+      expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
+      expect(r.logs.filter(line => line.includes(MESSAGE_NOT_TAKEN_IN))).toEqual([])
+      expect(partialLines(r)).toHaveLength(1)
+      const posts = r.h.posts(r.alpha)
+      expect(posts).toHaveLength(1)
+      expect(posts[0]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, e.clock.now(), 'not-taken-in', e.queue.items('alpha')[0]!.retypeCount + 1, true)))
+    } finally { await e.cleanup() }
+  })
 })
 
 test('emptying the queue ends the waiting episode before new accepted work arrives', async () => {

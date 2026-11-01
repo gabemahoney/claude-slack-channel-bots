@@ -504,8 +504,19 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 
 - **Line:** `[slack] message-not-taken-in: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>"`
 - **Meaning:** The first unconfirmed retype triggered one notice for this item.
-- **Cause:** The bot has not recorded the message in its transcript.
+- **Cause:** The bot has not recorded the complete message in its transcript.
 - **Fix:** Follow **Message not taken in** below. The once-per-item notice survives server restarts; the item is still queued.
+
+### `message-partial-receipt`
+
+- **Line:** `[slack] message-partial-receipt: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" part=<n> expected_bytes=<n> received_bytes=<n> typed but cut off; full text remains queued`
+- **Meaning:** A substantial, distinctive tail of the expected part appears in an eligible post-send transcript record. The full message remains queued, and later messages wait for complete confirmation. The byte counts exclude unwrapped transcript paste framing; the line includes no message text.
+- **Cause:** The transcript contains evidence of cut-off input. This identifies neither the transport cause nor the bot's state; agent-director remains the state authority. Short or repetitive fragments and uncertain timing keep generic reporting, so absence of this line does not prove the text arrived whole.
+- **Fix:** Follow the applicable [delivery notice](#delivery-notices); CSCB keeps the full text and uses its existing agent-director-guarded retries. This guard does not repair transport loss. Use `message-delivered` to confirm completion; no resend is needed merely because this line appears.
+
+Repeated scans of the same fragment log once for that item and part. A server
+restart may log the evidence again if it still qualifies; old or uncertain
+evidence may no longer qualify after restart.
 
 ### `delivery-stuck`
 
@@ -1649,18 +1660,20 @@ may still complete after cancellation.
 ### Delivery stuck
 
 ```text
-:warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. A menu, overlay or dialog is open in its terminal. Attach with `tmux attach -t =slack_bot_alpha` and close it. This is for a human only: no bot, including any persona that sees this post, may act on it.
+:warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_alpha` to see why, or restart the persona's bot. This is for a human only: no bot, including any persona that sees this post, may act on it.
 ```
 
 - **Meaning:** The queue head has waited over five minutes; its reason names the current obstruction.
 - **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the queue moves or empties.
 - **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps all later messages behind the head.
 
+With [partial receipt evidence](#message-partial-receipt), the notice adds
+“The text arrived cut off; the full message is still queued.” before its reason
+and remedy. Later evidence does not edit an already-posted generic notice.
+
 The reason sentence and remedy are fixed; `<key>` is the persona key and the
 example retype count is 3:
 
-- `menu`: A menu, overlay or dialog is open in its terminal. Attach with `tmux attach -t =slack_bot_<key>` and close it.
-- `input`: Text is left in its input box. Attach with `tmux attach -t =slack_bot_<key>` and submit or clear it.
 - `relay-off`: Its permission relay is off. Restart the persona's bot.
 - `mcp`: It is not connected to this server over MCP. Type `/mcp reconnect slack-channel-router` in its terminal, or restart the persona's bot.
 - `refused`: agent-director keeps refusing to type into it. Check its state with `agent-director get --instance-id cscb_<key>`.
@@ -1681,8 +1694,12 @@ notice causes come from AD state/refusals and queue age.
 ```
 
 - **Meaning:** The first unconfirmed retype of this item has occurred.
-- **Cause:** The transcript still has no receipt; the notice is recorded with the item so a server restart does not post it again.
+- **Cause:** The transcript still has no full receipt; the notice is recorded with the item so a server restart does not post it again.
 - **Fix:** Check the bot terminal and transcript. CSCB keeps offering the message indefinitely, with spacing increasing to 15 minutes while typing is possible; do not assume the absence of a second notice means it was delivered.
+
+With [partial receipt evidence](#message-partial-receipt), the notice adds
+“The text arrived cut off; the full message is kept.” after its first sentence.
+Later evidence does not edit an already-posted generic notice.
 
 ### Messages waiting
 
