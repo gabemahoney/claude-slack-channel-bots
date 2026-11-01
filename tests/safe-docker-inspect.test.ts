@@ -8,6 +8,7 @@ import { safeDockerInspect } from '../scripts/safe-docker-inspect.ts'
 import { assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { expectDescendantsStopped } from './test-helpers/descendant-exit.ts'
 
 const inspectScript = resolve(import.meta.dir, '../scripts/safe-docker-inspect.ts')
 const id = 'a'.repeat(64)
@@ -391,12 +392,7 @@ await child.exited
       expect({ code, stdout, stderr, signal: child.signalCode ?? null })
         .toEqual({ code: 130, stdout: '', stderr: '', signal: null })
       await bounded(disconnected, 'descendant disconnect')
-      // A killed orphan can remain a zombie until the container's init reaps it.
-      // Either absent or zombie proves there is no executing descendant left.
-      for (const pid of pids) {
-        const stat = `/proc/${pid}/stat`
-        expect(!existsSync(stat) || readFileSync(stat, 'utf8').split(') ')[1]!.startsWith('Z ')).toBe(true)
-      }
+      await expectDescendantsStopped(pids)
     } finally {
       // Cleanup must work even if the wrapper's group kill or readiness fails.
       try { child?.kill('SIGKILL') } catch {}
@@ -413,6 +409,101 @@ await child.exited
       const results = await Promise.allSettled(cleanup)
       for (const result of results) if (result.status === 'rejected') throw result.reason
     }
+  })
+})
+
+describe('descendant exit synchronization regression', () => {
+  // This bug is in the CLI test's assertion. Exercise that same assertion with
+  // synthetic /proc observations, never real host PIDs or scheduling delays.
+  const pids = [810001, 810002] as const
+  const timeoutMs = 100
+  type State = 'R' | 'S' | 'Z' | 'absent'
+
+  function start(state: (pid: number, time: number) => State, readFailure?: string) {
+    const clock = createFakeClock()
+    const observations: { pid: number; time: number; state: State }[] = []
+    let status: 'pending' | 'stopped' | 'failed' = 'pending'
+    let failure: unknown
+    let readAttempts = 0
+    const observe = (path: string) => {
+      const pid = Number(/^\/proc\/(\d+)\/stat$/.exec(path)?.[1])
+      if (!pids.some(owned => owned === pid)) throw new Error('Unexpected fixture PID')
+      const observation = { pid, time: clock.now(), state: state(pid, clock.now()) }
+      observations.push(observation)
+      return observation
+    }
+    const pending = expectDescendantsStopped(pids, {
+      timeoutMs, now: clock.now,
+      sleep: ms => new Promise<void>(resolve => { clock.setTimeout(resolve, ms) }),
+      readStat: path => {
+        readAttempts++
+        const { pid, state } = observe(path)
+        if (readFailure || state === 'absent') {
+          throw Object.assign(new Error('Synthetic stat read failure'), { code: readFailure ?? 'ENOENT' })
+        }
+        return `${pid} (fake-docker) ${state} 1 0 0\n`
+      },
+    }).then(() => { status = 'stopped' }, error => { status = 'failed'; failure = error })
+    return { clock, observations, pending, status: () => status, failure: () => failure, readAttempts: () => readAttempts }
+  }
+
+  test.each(['Z', 'absent'] as const)('accepts transient running/sleeping descendants that become %s before the bound', async terminal => {
+    const h = start((pid, time) => pid === pids[0] ? 'Z' : time < 30 ? 'R' : time < 60 ? 'S' : terminal)
+    await h.clock.flush()
+    expect(h.status()).toBe('pending')
+    await h.clock.advance(59)
+    expect(h.status()).toBe('pending')
+    await h.clock.advance(timeoutMs - 59)
+    assertNoLeak(h.failure())
+    expect(h.status()).toBe('stopped')
+    expect(h.observations.some(sample => sample.pid === pids[1] && sample.state === terminal && sample.time >= 60)).toBe(true)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.pending
+  })
+
+  test('rejects a lasting survivor at the bound even when its sibling is already a zombie', async () => {
+    const h = start(pid => pid === pids[0] ? 'Z' : 'S')
+    await h.clock.flush()
+    expect(h.status()).toBe('pending')
+    await h.clock.advance(timeoutMs - 1)
+    expect(h.status()).toBe('pending')
+    await h.clock.advance(1)
+    assertNoLeak(h.failure())
+    expect(h.status()).toBe('failed')
+    const diagnostic = String(h.failure())
+    expect(diagnostic).toContain(String(pids[1]))
+    expect(diagnostic).toMatch(/\bS\b/)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.pending
+  })
+
+  test('accepts ENOENT when a descendant disappears after existence was observed but before stat is read', async () => {
+    const h = start(() => 'R', 'ENOENT')
+    await h.clock.flush()
+    assertNoLeak(h.failure())
+    expect(h.readAttempts()).toBeGreaterThan(0)
+    expect(h.status()).toBe('stopped')
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.pending
+  })
+
+  test('accepts descendants already absent or zombie without a delay', async () => {
+    const h = start(pid => pid === pids[0] ? 'absent' : 'Z')
+    await h.clock.flush()
+    expect(h.status()).toBe('stopped')
+    expect(h.clock.now()).toBe(0)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.pending
+  })
+
+  test.each(['EACCES', 'EIO'])('does not mistake a %s stat read failure for disappearance', async code => {
+    const h = start(() => 'R', code)
+    await h.clock.advance(timeoutMs)
+    assertNoLeak(h.failure())
+    expect(h.readAttempts()).toBeGreaterThan(0)
+    expect(h.status()).toBe('failed')
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.pending
   })
 })
 
