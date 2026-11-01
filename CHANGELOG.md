@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.18.2 (2026-11-01)
+
 - The Slack app manifest now grants `canvases:read`, `canvases:write` and `reactions:read` for personas to maintain status canvases and read the owner's reaction answers. Existing apps must have these scopes added and be re-installed to gain them; see [Credentials files](docs/configuration.md#credentials-files).
 - **Storage warnings recover after a successful retry.** Saving the exact same Slack message and edit cancels a pending *Message not saved* warning, or edits a posted warning to *Message saved after retry* with no resend needed. If the edit fails, CSCB tries one correction in the original channel or DM.
 
