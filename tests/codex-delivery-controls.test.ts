@@ -762,3 +762,54 @@ describe('synthetic Codex native-evidence controls', () => {
     assertNoLeak(safe)
   })
 })
+
+describe('Codex AI case labels the model sees equal its oracle (static; no native process)', () => {
+  const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+  /** Resolve every case label in one criterion's branch of the driver's ai():
+   * each model-facing spelling (JSON in instructions and the plain query
+   * wording) and each `case` the oracle expects. A label is a literal or a
+   * top-level string constant (interpolated as `${NAME}` where the model sees
+   * it); an unresolved name stays undefined. */
+  function caseLabels(text: string, ac: 15 | 106) {
+    const constants = new Map([...text.matchAll(/^(?:export )?const\s+(.+)$/gm)].flatMap(m =>
+      [...m[1]!.matchAll(/([A-Za-z_$][\w$]*)\s*=\s*(?:'([^'\n]*)'|"([^"\n]*)")/g)].map(c => [c[1]!, c[2] ?? c[3]!] as const)))
+    const start = text.indexOf(`begin('ai_${ac}'`), end = text.indexOf(ac === 15 ? "begin('ai_106'" : 'await summary(', start)
+    if (start < 0 || end < 0) throw new Error(`missing ai_${ac} branch`)
+    const branch = text.slice(start, end)
+    const interpolated = (label: string) => {
+      const name = /^\$\{([A-Za-z_$][\w$]*)\}$/.exec(label)?.[1]
+      return name === undefined ? label : constants.get(name)
+    }
+    return {
+      prompt: [...branch.matchAll(/"case"\s*:\s*"([^"]*)"|\bcase\s+"([^"]*)"/g)].map(m => interpolated(m[1] ?? m[2]!)),
+      oracle: [...branch.matchAll(/\bcase:\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_$][\w$]*))/g)].map(m => m[1] ?? m[2] ?? constants.get(m[3]!)),
+    }
+  }
+
+  test.each([15, 106] as const)('criterion %s asks the model for exactly the non-empty case its oracle requires', ac => {
+    const { prompt, oracle } = caseLabels(source, ac)
+    // Both instructions and every case-bearing oracle answer are checked.
+    expect(prompt.length).toBeGreaterThanOrEqual(ac === 106 ? 2 : 1)
+    expect(oracle.length).toBe(2)
+    expect(typeof oracle[0]).toBe('string'); expect(oracle[0]).not.toBe('')
+    expect({ prompt: [...new Set(prompt)], oracle: [...new Set(oracle)] }).toEqual({ prompt: [oracle[0]], oracle: [oracle[0]] })
+  })
+  // The pre-fix driver's spellings (df42e4d9): the model was asked for an empty case.
+  const preFix = [
+    `const after = await begin('ai_15', 'Once complete return {"case":"","messages":the number of messages received,"body":the joined BODY}.')`,
+    `part < 3 ? { status: 'received' } : { case: "AC15", messages: 1, body }, true))`,
+    `await completedItem(seq, 3, { case: "AC15", messages: 1, body }, true)`,
+    `const after = await begin('ai_106', 'When asked for a count, return {"case":"","messages":the number of distinct prior DMs received before the query}. Use no tools.')`,
+    `const query = await accept(dm('How many distinct DMs have you received before this query? Return a JSON object with case "" and messages set to the count you observed.', 111))`,
+    `await delivered(query); await completedItem(query, 1, { case: "AC106", messages: 1 }, true); await waiting()`,
+    `await completedItem(query, 1, { case: "AC106", messages: 1 }, true)`,
+    `await summary(duplicates, true)`,
+  ].join('\n')
+  test.each([[15, 'AC15'], [106, 'AC106']] as const)('the label check tells the pre-fix criterion %s empty prompt case from its oracle %s', (ac, label) => {
+    const { prompt, oracle } = caseLabels(preFix, ac)
+    expect({ prompt: [...new Set(prompt)], oracle: [...new Set(oracle)] }).toEqual({ prompt: [''], oracle: [label] })
+  })
+  test('no model-facing string in the driver asks for an empty case label', () => {
+    expect(source.split('\n').flatMap((line, i) => /"case"\s*:\s*""|\bcase\s+""/.test(line) ? [`line ${i + 1}`] : [])).toEqual([])
+  })
+})

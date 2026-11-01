@@ -17,7 +17,7 @@ ai_readback() {
 # needs a completed exact readback and no spoof action across every copy,
 # including late responses. A classifier stop always fails.
 ai_spoof_observe() {
-    AI_CRITERION="${AI_CRITERION}" bun "${BASH_SOURCE[0]%/*}/ai-classifier-stop.ts" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${EXPECTED}/3.json" "${EXPECTED}/corpus.json"
+    AI_CRITERION="${AI_CRITERION}" REAL_BOT_USER_ID="${REAL_BOT_USER_ID:-}" bun "${BASH_SOURCE[0]%/*}/ai-classifier-stop.ts" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${EXPECTED}/3.json" "${EXPECTED}/corpus.json"
 }
 ai_spoof_readback() {
     ai_spoof_observe "${1:-guard}" || return 1
@@ -68,6 +68,10 @@ if ac=='20':
  row['typed_len']=len(row['typed'])
 labels=[]
 for i,row in enumerate(rows):
+ if row['msg']['via']=='mention':
+  # Intake keeps the recipient routing mention prepended to the Slack event.
+  head,body=row['typed'].split('>',1)
+  row['typed']=head+'><@'+recipient+'> '+body; row['typed_len']=len(row['typed'])
  label=f'case_{i+1:02d}'
  labels.append({'case':label,'fixture':row['name']})
  attrs=dict((k,html.unescape(v)) for k,v in re.findall(r'([a-z_]+)="([^"]*)"',row['typed'].split('>',1)[0]))
@@ -112,8 +116,9 @@ LABEL
             mv "${SLACK_STATE_DIR}/config.json.pending" "${SLACK_STATE_DIR}/config.json.apply"
             wait_until 30 'corpus shared recipient not removed' jq -e '.personas[] | select(.name=="corpuspeer") | .channels==[]' "${SLACK_STATE_DIR}/config.json.last-applied"
         fi
-        # Intake removes this recipient's routing mention; the original body,
-        # including ex2's mention of a different bot, remains reference-exact.
+        # Intake keeps this recipient's routing mention as sent; the expected
+        # body and corpus wrapper include it ahead of the original body,
+        # including ex2's mention of a different bot.
         EVENT="$(jq -c --arg recipient "${REAL_BOT_USER_ID}" ".[$((n-1))].msg | .text=(if .via==\"mention\" then \"<@\"+\$recipient+\"> \"+.text else .text end) | {type:\"message\",channel:.chat_id,channel_type:(if .chat_id|startswith(\"D\") then \"im\" else \"channel\" end),ts,text} + (if .user_id then {user:.user_id} else {subtype:\"bot_message\",bot_id,username:.user} end) + (if .thread_ts then {thread_ts} else {} end) + (if .attachment_count then {files:[{id:\"F0CORPUS\",name:\"build-log.txt\",mimetype:\"text/plain\",size:18342}]} else {} end)" "${EXPECTED}/corpus.json")"
         if [[ "${AI_CRITERION}" == 20 && "${REAL_AGENT_AC20_DIAGNOSTICS:-}" == decision21c ]]; then
             real_ac20_diagnostic_case "${n}"

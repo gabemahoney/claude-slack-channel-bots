@@ -17,7 +17,7 @@ import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
 import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, workloadItem, workloadItems } from './integration/fixtures/transcript-receipts.ts'
-import { checkAc76Admission, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
+import { checkAc76Admission, connectionVersion, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
 import { runFixture, runRealSlice, runTest33Slice, SITE_SLICES, type RealSlice, type Site, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -122,44 +122,39 @@ function admissionFor(h: Awaited<ReturnType<typeof fixture>>, row = cannedGetRes
     check: (overrides: Partial<AdmissionAdapters> = {}) => checkAc76Admission(options, { ...adapters, ...overrides }) }
 }
 
-/** Execute test32's real latency loop and shell helpers, stopping at its first
- * DM boundary. Only AD, the receipt CLI transport, and the clock are injected;
- * no scenario startup, native binary, pane or operator state is reachable. */
-async function firstLatencyAdmission(home: string, reply: (request: string) => Promise<string>, timeout = false) {
-  const read = (path: string) => readFileSync(join(import.meta.dir, 'integration', path), 'utf8')
-  const real = read('lib/real-scenario.sh'), scenario = read('lib/scenario.sh')
-  const script = read('test-32-fmk-real-order.sh')
-  const preceding = script.indexOf('real_wait_delivery "${REAL_KEY}" 33')
-  const start = script.indexOf('for n in {1..20}; do', preceding)
-  const end = script.indexOf('real_assert_latency', start)
-  if (preceding < 0 || start < 0 || end < start) throw new Error('Missing test32 latency loop')
+// A whole run costs at most about 0.5 s here (test103's ~100 bridged samples),
+// so its tests keep Bun's 5 s default. The child's limit sits below that with
+// room for the kill and its output to close, so a stuck script fails on the
+// test's own assertions.
+const REAL_SHELL_CHILD_LIMIT_MS = 3500
+/** Execute real scenario shell after the real helper definitions plus injected
+ * boundaries: every effect `stubs` and the shared clock/AD stubs route is one
+ * tab-separated bridge request answered by the test. Nothing native, no CSCB
+ * server and no operator state is reachable. */
+async function runRealShell(home: string, stubs: string[], body: string, reply: (request: string[]) => Promise<string>) {
+  const read = (path: string) => readFileSync(join(import.meta.dir, path), 'utf8')
+  const scenario = read('integration/lib/scenario.sh')
   const functions = (text: string) => [...text.matchAll(/^\w+\(\) \{[\s\S]*?^\}/gm)].map(m => m[0]).join('\n')
   const program = [
     'set -euo pipefail', 'exec 3>&1', 'exec 1>/dev/null',
     // Definitions only: neither scenario source-time setup nor native setup runs.
-    functions(real),
+    functions(read('integration/lib/real-scenario.sh')), functions(read('integration/lib/real-recovery.sh')),
     ...['_scenario_poll_until', '_scenario_check_timeout'].map(name => {
       const match = scenario.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))
       if (!match) throw new Error(`Missing polling helper ${name}`)
       return match[0]
     }),
-    'SCENARIO_ROOT="$HOME"', 'REAL_KEY=alpha', 'REAL_LABEL=alpha',
-    'SCENARIO_AD_ROOT="$HOME/ad"', 'REAL_CONNECTION_LINE_BASE=0',
-    'REAL_RECEIPTS=receipts', 'SCENARIO_AD_SHIM_LOG="$HOME/shim.log"',
-    'REAL_DELIVERY_WAIT_S=3', 'REAL_DELIVERY_MAX_WAIT_S=3', 'SCENARIO_POLL_S=1',
-    'bridge() { local answer; printf "%s\\n" "$*" >&3; IFS= read -r answer; printf "%s\\n" "$answer"; }',
+    'SCENARIO_ROOT="$HOME"', 'SCENARIO_AD_ROOT="$HOME/ad"', 'SCENARIO_AD_SHIM_LOG="$HOME/shim.log"', 'SCENARIO_POLL_S=1',
+    'REAL_DELIVERY_WAIT_S=3', 'REAL_DELIVERY_MAX_WAIT_S=3',
+    String.raw`bridge() { local answer; (IFS=$'\t'; printf '%s\n' "$*") >&3; IFS= read -r answer; printf '%s\n' "$answer"; }`,
     'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
-    'real_instance() { echo cscb_alpha; }',
-    'real_ad() { bridge ad; }',
-    '_scenario_now_ms() { bridge now; }',
-    'sleep() { bridge poll >/dev/null; }',
-    'bun() { local answer; answer="$(bridge "$2")"; if [[ "$2" == progress ]]; then echo "$answer"; else [[ "$answer" == ok ]]; fi; }',
-    'real_dm() { bridge dm >/dev/null; exit 0; }',
-    script.slice(start, end),
+    '_scenario_now_ms() { bridge now; }', 'sleep() { bridge poll >/dev/null; }',
+    'real_instance() { echo "cscb_$1"; }', 'real_ad() { bridge ad "$@"; }',
+    ...stubs, body,
   ].join('\n')
   const child = spawn('bash', ['-c', program], {
-    env: hostSafeChildEnv(home, { tools: ['bash', 'jq'], extras: { SLACK_STATE_DIR: home } }),
-    stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000,
+    env: hostSafeChildEnv(home, { tools: ['bash', 'jq', 'wc', 'cat', 'cp', 'head', 'tail', 'grep'], extras: { SLACK_STATE_DIR: home } }),
+    stdio: ['pipe', 'pipe', 'pipe'], timeout: REAL_SHELL_CHILD_LIMIT_MS,
   })
   const closed = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
     child.once('error', reject)
@@ -168,17 +163,31 @@ async function firstLatencyAdmission(home: string, reply: (request: string) => P
   let stderr = ''
   child.stderr.on('data', data => { stderr += data })
   try {
-    for await (const request of createInterface({ input: child.stdout })) {
-      child.stdin.write(`${await reply(request)}\n`)
-    }
+    for await (const request of createInterface({ input: child.stdout })) child.stdin.write(`${await reply(request.split('\t'))}\n`)
     const result = await closed
     assertNoLeak(stderr)
-    expect(result).toEqual({ code: timeout ? 1 : 0, signal: null })
-    expect(stderr).toBe(timeout ? 'AC76 pre-sample admission timed out (see reason codes and counts)\n' : '')
+    return { ...result, stderr }
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill()
     await closed
   }
+}
+
+/** Execute test32's real latency loop and shell helpers, stopping at its first
+ * DM boundary. Only AD, the receipt CLI transport, and the clock are injected. */
+async function firstLatencyAdmission(home: string, reply: (request: string) => Promise<string>, timeout = false) {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh'), 'utf8')
+  const preceding = script.indexOf('real_wait_delivery "${REAL_KEY}" 33')
+  const start = script.indexOf('for n in {1..20}; do', preceding)
+  const end = script.indexOf('real_assert_latency', start)
+  if (preceding < 0 || start < 0 || end < start) throw new Error('Missing test32 latency loop')
+  const result = await runRealShell(home, [
+    'REAL_KEY=alpha', 'REAL_LABEL=alpha', 'REAL_CONNECTION_LINE_BASE=0', 'REAL_RECEIPTS=receipts',
+    'bun() { local answer; answer="$(bridge "$2")"; if [[ "$2" == progress ]]; then echo "$answer"; else [[ "$answer" == ok ]]; fi; }',
+    'real_dm() { bridge dm >/dev/null; exit 0; }',
+  ], script.slice(start, end), ([request]) => reply(request!))
+  expect({ code: result.code, signal: result.signal }).toEqual({ code: timeout ? 1 : 0, signal: null })
+  expect(result.stderr).toBe(timeout ? 'AC76 pre-sample admission timed out (see reason codes and counts)\n' : '')
 }
 
 test.each(['held observation', 'accepted reminder', 'drained control'] as const)(
@@ -269,6 +278,129 @@ test.each(['held observation', 'accepted reminder', 'drained control'] as const)
     }
   },
 )
+
+/** Execute test103's actual script with its scenario sources replaced: every
+ * server, Slack, AD, Bun and clock effect is one bridge request. */
+function runLatency100(home: string, key: string, reply: (request: string[]) => Promise<string>) {
+  const script = readFileSync(join(import.meta.dir, 'real-agent/test-103-fmk-real-latency100.sh'), 'utf8')
+    .split('\n').filter(line => !/^\s*source\s/.test(line)).join('\n')
+  const answered = (name: string) => `${name}() { local answer; answer="$(bridge ${name} "$@")"; [[ "$answer" == ok ]]; }`
+  return runRealShell(home, [
+    'SCENARIO_FIXTURES="$HOME/fixtures"', 'REAL_RECEIPTS="$SCENARIO_FIXTURES/transcript-receipts.ts"', 'REAL_LAUNCH_WAIT_S=3',
+    `real_persona() { bridge real_persona "$@" >/dev/null; REAL_NAME="$1"; REAL_KEY=${key}; REAL_LABEL="\${REAL_KEY//_/}"; REAL_WORK="$HOME/work"; }`,
+    'wait_until() { bridge wait_until "$2" >/dev/null; }',
+    ...['bun', 'real_prepare', 'real_write_config', 'real_start_stub', 'start_server', 'stop_server', 'real_wait_idle',
+      'real_wait_delivery', 'real_assert_latency', 'real_finish'].map(answered),
+    'real_dm() { local answer; answer="$(bridge real_dm "$@")"; [[ "$answer" != stop ]] || exit 0; [[ "$answer" == ok ]]; }',
+  ], script, reply)
+}
+// ac76-admission.ts CLI order: admission stateDir key shimLog root count scratch adBinary rowFile lineBase.
+const admissionArgs = (args: string[]) => args[0]?.endsWith('/ac76-admission.ts') && args[1] === 'admission'
+  ? { key: args[3]!, count: args[6]!, rowFile: args[9]!, lineBase: args[10]! } : undefined
+const latencySample = (args: string[]) => /^heavy ready-state latency (\d+)$/.exec(args[1] ?? '')?.[1]
+
+test('test103 gives latency100 the reply instruction and admits each of its 100 samples only through AC76 admission', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'latency100-shell-'))
+  cleanups.push(async () => rmSync(home, { recursive: true, force: true }))
+  const log = join(home, 'server.log'), connected = '[slack] Session connected: persona "latency100" (key=latency100)\n'
+  // A previous life's connection is historical; this launch connects again.
+  writeFileSync(log, `${connected}[slack] Session disconnected: persona "latency100" (key=latency100)\n`)
+  const config = makeMultiPersonaConfig([{ name: 'latency100' }], home).personas[0]!
+  const row = cannedGetResult({ state: 'waiting', session_id: 'session' }, config, home)
+  // AD still reports the previous life until real_wait_launch's launch wait,
+  // so a row file captured too early is not this launch's row.
+  const previous = cannedGetResult({ state: 'waiting', session_id: 'previous-session' }, config, home)
+  const events: { kind: string; args: string[]; admission?: { key: string; count: string; launchRow: boolean; connection: boolean; lineBase: string } }[] = []
+  let polls = 0, launched = false
+  const result = await runLatency100(home, 'latency100', async ([kind, ...args]) => {
+    if (kind === 'now') return String(polls * 1000)
+    if (kind === 'poll') { polls++; return 'ok' }
+    const event: (typeof events)[number] = { kind: kind!, args }
+    events.push(event)
+    if (kind === 'start_server') appendFileSync(log, connected)
+    if (kind === 'wait_until' && args[0] === 'real persona latency100 never launched/connected') launched = true
+    if (kind === 'ad') return JSON.stringify(launched ? row : previous)
+    const admission = kind === 'bun' ? admissionArgs(args) : undefined
+    if (admission) {
+      let launchRow = false
+      try { launchRow = JSON.parse(readFileSync(admission.rowFile, 'utf8')).session_id === row.session_id } catch { /* absent or invalid */ }
+      event.admission = { key: admission.key, count: admission.count, launchRow, lineBase: admission.lineBase,
+        connection: /^\d+$/.test(admission.lineBase) && connectionVersion(home, 'latency100', Number(admission.lineBase)) !== undefined }
+    }
+    return 'ok'
+  })
+  const persona = events.find(e => e.kind === 'real_persona' && e.args[0] === 'latency100')
+  const samples = events.flatMap((e, i) => e.kind === 'real_dm' && latencySample(e.args) ? [i] : [])
+  const gates = samples.map(i => {
+    const gate = events[i - 1], delivered = events.slice(0, i).filter(e => e.kind === 'real_wait_delivery').at(-1)
+    const a = gate?.admission
+    // The seeded log's two historical lines precede start_server's connection.
+    return { gate: a ? 'admission' : gate?.kind, count: a !== undefined && Number(a.count) >= 1 && a.count === delivered?.args[1],
+      key: a?.key === 'latency100', launchRow: a?.launchRow === true, connection: a?.connection === true, lineBase: a?.lineBase === '2' }
+  })
+  const valid = { gate: 'admission', count: true, key: true, launchRow: true, connection: true, lineBase: true }
+  expect({
+    exit: result.code, stderr: result.stderr,
+    replyInstruction: persona?.args[1]?.includes('call the Slack reply tool with text exactly OK') === true,
+    samples: samples.map(i => latencySample(events[i]!.args)).join(','),
+    gated: gates.filter(g => JSON.stringify(g) === JSON.stringify(valid)).length,
+    firstGate: gates[0],
+    latency: events.filter(e => e.kind === 'real_assert_latency').map(e => e.args),
+    // The AD stub answers any request, so pin the one row capture the script makes.
+    ad: events.filter(e => e.kind === 'ad').map(e => e.args),
+  }).toEqual({
+    exit: 0, stderr: '', replyInstruction: true,
+    samples: Array.from({ length: 100 }, (_, i) => String(i + 1)).join(','),
+    gated: 100, firstGate: valid, latency: [['latency100', '100']],
+    ad: [['get', '--instance-id', 'cscb_latency100']],
+  })
+})
+
+test('test103 holds its first sample while a prior reply reminder candidate is pending', async () => {
+  const h = await fixture(false)
+  const waiting = cannedGetResult({ state: 'waiting', session_id: 'session' }, h.persona, h.options.stateDir)
+  const admission = admissionFor(h, waiting)
+  // The persona's first connection belongs to this script's own start_server.
+  writeFileSync(admission.log, '')
+  const reasons: string[] = []
+  let polls = 0, ts = 0, sampled: { candidates: number; open: number; admitted: boolean } | undefined, admitted = false
+  const result = await runLatency100(h.options.stateDir, 'alpha', async ([kind, ...args]) => {
+    if (kind === 'now') return String(polls * 1000)
+    if (kind === 'poll') {
+      polls++
+      // The persona's reply-tool call resolves every pending prior candidate.
+      const targets = h.queue.replyReminderItems('alpha').map(record => ({ seq: record.seq }))
+      if (targets.length) await h.queue.recordReplyCall('alpha', targets)
+      return 'ok'
+    }
+    if (kind === 'start_server') admission.connect()
+    if (kind === 'ad') return JSON.stringify(waiting)
+    if (kind === 'real_dm') {
+      if (latencySample(args) === '1') {
+        sampled = { candidates: h.queue.replyReminderItems('alpha').length, open: h.queue.openCount('alpha'), admitted }
+        return 'stop'
+      }
+      // Any earlier DM is delivered exactly; AD then observes the turn working
+      // without a reply yet, leaving a production reminder candidate.
+      ts++
+      await h.send(slackInput({ ts: `1700000100.00000${ts}`, key: { chat_id: 'C0TEST001', ts: `1700000100.00000${ts}` } }))
+      await h.queue.observeReplyReminders('alpha', cannedGetResult({ state: 'working', session_id: 'session' }, h.persona, h.options.stateDir), REPLY_REMINDER_TEXT, true, () => true)
+      admission.connect()
+      admitted = false
+    }
+    const cli = kind === 'bun' ? admissionArgs(args) : undefined
+    if (cli) {
+      const check = await checkAc76Admission({ ...admission.options, expectedCount: Number(cli.count),
+        expectedRow: JSON.parse(readFileSync(cli.rowFile, 'utf8')), connectionLineBase: Number(cli.lineBase) }, admission.adapters)
+      reasons.push(check.reason)
+      admitted = check.ready
+      return check.ready ? 'ok' : 'wait'
+    }
+    return 'ok'
+  })
+  expect({ exit: result.code, stderr: result.stderr, blockedByCandidate: reasons.includes('candidates'), sampled })
+    .toEqual({ exit: 0, stderr: '', blockedByCandidate: true, sampled: { candidates: 0, open: 0, admitted: true } })
+})
 
 test('admission replays and compacts only a private copy, then obtains fresh AD waiting', async () => {
   const h = await fixture(false)

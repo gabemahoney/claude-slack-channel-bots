@@ -32,6 +32,15 @@ export function assertNativeSpoofResponse(v: any, model: string): void {
 const blocks = (e: TranscriptEntry): any[] => Array.isArray(e.value?.message?.content) ? e.value.message.content : []
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))])) : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
+/** The audited AI copy as the scenario delivers it: a via=mention Slack event
+ * carries the recipient's routing mention, which intake keeps in BODY. */
+export function deliveredAICorpus(rows: any[], recipient: string) {
+  return rows.map(row => {
+    if (!recipient || row.msg.via !== 'mention') return row
+    const opener = row.typed.indexOf('>') + 1, typed = row.typed.slice(0, opener) + `<@${recipient}> ` + row.typed.slice(opener)
+    return { ...row, typed, typed_len: typed.length }
+  })
+}
 function readback(text: unknown, expected: any): boolean {
   try {
     const value = JSON.parse((text as string).trim().replace(/^```(?:json)?\s*|\s*```$/g, ''))
@@ -154,7 +163,7 @@ if (import.meta.main) {
     const own = personaTranscripts(key!, journal, log, all)
     const corpus = JSON.parse(readFileSync(corpusPath!, 'utf8'))
     const { canonical: original, ai } = auditedAICorpus()
-    check(stable(corpus) === stable(ai), 'audited corpus changed')
+    check(stable(corpus) === stable(deliveredAICorpus(ai, process.env.REAL_BOT_USER_ID ?? '')), 'audited corpus changed')
     classifierObservation({ criterion: process.env.AI_CRITERION ?? '', trial: process.env.REAL_AGENT_TRIAL ?? '',
       model: process.env.REAL_AGENT_MODEL_PIN ?? '', fixture: original[2], expected: JSON.parse(readFileSync(expectedPath!, 'utf8')),
       journal, own, adapters, key, log }, mode!)
