@@ -51,6 +51,8 @@ export interface OwnPostJoins extends OwnPostOwner {
   learnUploadThread(key: string, operationId: string, threadTs: string): void
   retainOutcomes(key: string, operationIds: readonly string[]): () => void
   memoryOnlyJoins(key: string): { channel: string; root: string }[]
+  /** Confirmed deferred posts not yet handed to Thread Memory's writer. */
+  unsavedDeferredPosts(key: string): number
   settleDeferred(key: string, channel?: string): void
   onSharedStatePublished(key: string): void
   subscribe(listener: (event: OwnPostEvent) => void): () => void
@@ -125,6 +127,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
     if (digestKey) post.digest = ownPostDigest(digestKey, entry.content)
     const kept = memory.keepIntent(post.key, {
       operationId: post.operationId, channel: post.channel, root: post.root, at: post.issuedAt, stamp: post.stamp,
+      noticeOnly: post.surface === 'notice',
       ...(post.digest ? { digest: post.digest } : { content: entry.content }),
     })
     if (!kept.kept) return undefined
@@ -323,6 +326,9 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       }
       return [...pairs.values()]
     }),
+    unsavedDeferredPosts: key => safely(0, () => [...entries.get(key)?.values() ?? []].filter(entry =>
+      !entry.intentKept && entry.post.state === 'deferred' && entry.post.outcome?.kind === 'confirmed' &&
+      entry.post.outcome.thread !== undefined).length),
     settleDeferred: (key, channel) => safely(undefined, () => settleDeferred(key, channel)),
     onSharedStatePublished(key) {
       if (stopped || publications.has(key)) return

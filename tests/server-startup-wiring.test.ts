@@ -1273,7 +1273,9 @@ describe('main() installs the runtime agent-director version re-check right afte
   })
 
   test('shutdown makes no agent-director call: no client, no detection wrapper, no resolve and no verb the stub client records', () => {
-    const code = shutdownCode()
+    // The shutdown wiring test pins this receiver to Thread Memory's identity
+    // Map; its lookup shares the name of AD's get verb but is not an AD call.
+    const code = shutdownCode().replace(/\bcompleted\.get\s*\(/g, 'completed.mapLookup(')
     for (const name of ['getClient', 'withOutageDetection', 'withSpawnDetection', 'resolveSystemBinary']) {
       expect([name, indicesOf(new RegExp(`\\b${name}\\s*\\(`, 'g'), code)]).toEqual([name, []])
     }
@@ -5933,9 +5935,10 @@ describe('Thread Memory server lifecycle wiring', () => {
     const named = indicesOf(new RegExp(`\\b${routingMember}\\s*:`, 'g'), SERVER_CODE)
     // The typed holder declaration and the inline routing member, with no
     // other object carrying a replacement member (including Object.assign).
+    // An iterable spread of the holder is not a property access on an object.
     expect(named).toHaveLength(2)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    expect(indicesOf(new RegExp(`(?:\\.\\s*${routingMember}\\b|\\[\\s*['"]${routingMember}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`(?:(?<!\\.)\\.\\s*${routingMember}\\b|\\[\\s*['"]${routingMember}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
   })
 
   test('queue retention and routing joins read the live holder, preserve the decision clock and bind every argument', () => {
@@ -6029,6 +6032,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
       authorityReady: '() => reloadController?.sharedChannels() !== undefined',
       heldStamps: 'key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? []',
+      unsavedOwnPosts: 'key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0',
       threadHybridChannels: 'key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
       markerKeys: '() => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? []',
       canRemove: 'key => reloadController?.sharedChannels()?.reviewHeld(key) === false',
@@ -6148,7 +6152,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     }
   })
 
-  test('shutdown awaits queue drain and quiescence, seals completed stores only after load, then stops memory and seal even in dry run', () => {
+  test('shutdown awaits queue drain and quiescence, seals all known stores only after load, then stops memory and seal even in dry run', () => {
     const [start, end] = shutdownBody(SERVER_CODE)
     const code = SERVER_CODE.slice(start, end)
     const tree = ts.createSourceFile('shutdown-body.ts', code, ts.ScriptTarget.Latest, true)
@@ -6164,7 +6168,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       'ownPostJoins?.stop()',
       'unsubscribeThreadMemory?.()',
       'await threadMemory?.quiesce()',
-      "if (threadMemorySeal?.loadedAtStart() && threadMemory) { const result = await threadMemorySeal.writeShutdown(threadMemory.completedStores()) try { if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced)) } catch { } }",
+      "if (threadMemorySeal?.loadedAtStart() && threadMemory) { const completed = threadMemory.completedStores() const shutdownEntries = new Map([...threadMemory.journalFacts().keys()].map(key => { const identity = completed.get(key) ?? {} let memoryOnlyJoins: { channel: string; root: string }[] = [] try { memoryOnlyJoins = ownPostJoins?.memoryOnlyJoins(key) ?? [] } catch { } return [key, { ...identity, ...(memoryOnlyJoins.length ? { memoryOnlyJoins } : {}) }] as const })) const result = await threadMemorySeal.writeShutdown(shutdownEntries) try { if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced)) } catch { } }",
       'await threadMemory?.stop()',
       'await threadMemorySeal?.stop()',
       'threadMemoryRetries?.stopSeal()',
@@ -6225,7 +6229,8 @@ describe('Thread Memory failure wiring', () => {
     })
     const error = new Error('fixture unavailable'), path = 'fixture-journal'
     const memoryEvents: ThreadMemoryModule.ThreadMemoryEvent[] = [
-      { type: 'append-failed', key, path, step: 'journal-append', error },
+      { type: 'append-failed', key, path, step: 'journal-append', error, noticeOnly: false },
+      { type: 'append-failed', key, path, step: 'journal-append', error, noticeOnly: true },
       { type: 'creation-failed', key, path, step: 'journal-header', error },
       { type: 'read-failed', key, path, error }, { type: 'saved-after-failure', key, path },
       { type: 'outage-settled', key, path },
@@ -6236,7 +6241,7 @@ describe('Thread Memory failure wiring', () => {
     const lookup: OwnPostLookupModule.OwnPostLookupEvent = { kind: 'joins-lost', key, channel: THREAD_CHANNELS.primary, threads: [], cause: 'unmatched' }
     memoryEvents.forEach(wiring.memory); wiring.seal(seal); wiring.retry(retryEvent); wiring.holds(holds); wiring.lookup(lookup)
     expect(reported).toEqual([...memoryEvents.map(event => ['memory', event, outage]), ['seal', seal], ['retry', retryEvent, outage], ['holds', holds], ['lookup', lookup]])
-    expect(retried).toEqual([['append', key], ['append', key], ['read', key], ['seal']])
+    expect(retried).toEqual([['append', key], ['append', key], ['append', key], ['read', key], ['seal']])
     assertNoLeak([reported, retried])
   })
 
@@ -6250,13 +6255,15 @@ describe('Thread Memory failure wiring', () => {
     const holds: Parameters<MemoryReporter['holdsEvent']>[0] = { type: 'resolution-failed', key, error: new Error('fixture failure') }
     const lookup: OwnPostLookupModule.OwnPostLookupEvent = { kind: 'joins-lost', key, channel: THREAD_CHANNELS.primary, threads: [THREAD_ROOTS.primary], cause: 'ambiguous' }
     const finding: ThreadMemorySealModule.ThreadMemorySealFinding = { key, case: 'unclean-stop', wording: 'unclean' }
+    const lost: ThreadMemorySealModule.ThreadMemoryOwnPostLossFinding = { key, case: 'own-post-joins-lost', threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }] }
+    wiring.seal({ type: 'own-post-joins-lost', ...lost })
     wiring.memory(memory); wiring.seal({ type: 'changed-while-stopped', ...finding }); wiring.retry(retry); wiring.seal(seal); wiring.lookup(lookup); wiring.holds(holds)
     const observed = outage
     outage = { unknown: false, unsaved: 0, missing: false }
     const record = (source: string) => (...args: unknown[]) => { seen.push([source, ...args]) }
     const reporting: MemoryReporter = { threadMemoryEvent: record('memory'), retryEvent: record('retry'), sealEvent: record('seal'), holdsEvent: record('holds'), lookupEvent: record('lookup'), startupFindings: record('findings') }
-    wiring.start(reporting, { startupFindings: () => [finding] })
-    expect(seen).toEqual([['memory', memory, observed], ['retry', retry, observed], ['seal', seal], ['lookup', lookup], ['holds', holds], ['findings', [finding]]])
+    wiring.start(reporting, { startupFindings: () => [finding, lost] })
+    expect(seen).toEqual([['memory', memory, observed], ['retry', retry, observed], ['seal', seal], ['lookup', lookup], ['holds', holds], ['findings', [finding, lost]]])
     expect(wiring.buffered()).toEqual([])
     seen.length = 0
     wiring.start(reporting, { startupFindings: () => [] })
@@ -6533,7 +6540,7 @@ describe('Thread Memory failure wiring', () => {
       expect(calls).toEqual([`read:${key}`, `lookup-forget:${key}`, `forget:${key}`])
       const error = new Error('old life unavailable'), path = threadPath(root)
       const oldEvents = () => {
-        wiring.memory({ type: 'append-failed', key, path, step: 'journal-append', error }); wiring.memory({ type: 'read-failed', key, path, error })
+        wiring.memory({ type: 'append-failed', noticeOnly: false, key, path, step: 'journal-append', error }); wiring.memory({ type: 'read-failed', key, path, error })
         wiring.memory({ type: 'read', key, path, firstSuccessfulRead: true })
       }
       oldEvents(); expect(clock.pendingCount()).toBe(0)
@@ -6598,14 +6605,16 @@ describe('Thread Memory failure wiring', () => {
       const run = threadMemoryShutdown({ memoryHolds: { stop() { order.push('holds') } },
         deliveryQueue: { stop() { order.push('queue'); return drain.promise } },
         ownPostLookups: { stop() { order.push('lookup-stop') } },
-        ownPostJoins: { stop() { order.push('own-post-stop') } },
+        ownPostJoins: { stop() { order.push('own-post-stop') }, memoryOnlyJoins: () => [] },
         unsubscribeThreadMemory: () => order.push('unsubscribe'),
         threadMemory: {
           quiesce() { order.push('quiesce'); expect(clock.pendingCount()).toBe(0); return quiesce.promise },
-          completedStores() { order.push('stores'); return completed }, async stop() { order.push('memory-stop') },
+          completedStores() { order.push('stores'); return completed },
+          journalFacts() { return new Map([...completed].map(([key, identity]) => [key, { kind: 'read', ...identity }])) },
+          async stop() { order.push('memory-stop') },
         },
         threadMemorySeal: { ...seal,
-          async writeShutdown(stores: typeof completed) { order.push('write'); expect(stores).toBe(completed); return seal.writeShutdown(stores) },
+          async writeShutdown(stores: typeof completed) { order.push('write'); expect(stores).toEqual(completed); return seal.writeShutdown(stores) },
           async stop() { order.push('seal-stop'); await seal.stop() },
         },
         threadMemoryRetries: { ...retries,
@@ -6635,6 +6644,53 @@ describe('Thread Memory failure wiring', () => {
       expect(clock.pendingCount()).toBe(0)
       assertNoLeak([logs, posts, keyCalls, order, writtenFile(root)])
     } finally { drain.resolve(); quiesce.resolve(); retries.stopKeys(); await seal.stop(); retries.stopSeal(); episodes.close(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['none', THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary])('shutdown snapshots the stopped owner after quiescence and isolates a throwing key: %s', async throwing => {
+    const keys = Object.values(THREAD_PERSONAS), header = threadHeader()
+    const completed = new Map(keys.map(key => [key, { storeId: header.storeId, lastRecordNumber: header.highWater }]))
+    const threads = keys.map((_, index) => [{ channel: THREAD_CHANNELS.primary, root: Object.values(THREAD_ROOTS)[index]! }])
+    const quiesce = Promise.withResolvers<void>(), order: string[] = []
+    const writes: Array<Map<string, ThreadMemorySealModule.ThreadMemoryShutdownEntry>> = []
+    let ready = false
+    const run = threadMemoryShutdown({
+      memoryHolds: undefined, deliveryQueue: undefined, ownPostLookups: undefined, unsubscribeThreadMemory: undefined,
+      threadMemoryRetries: { stopKeys() { order.push('retry-stop') }, stopSeal() { order.push('seal-retry-stop') } },
+      ownPostJoins: {
+        stop() { order.push('owner-stop') },
+        memoryOnlyJoins(key: string) {
+          order.push(`snapshot:${key}`)
+          expect(ready).toBe(true)
+          if (key === throwing) throw new Error('fixture snapshot refused')
+          return threads[keys.indexOf(key as typeof keys[number])]
+        },
+      },
+      threadMemory: {
+        quiesce() { order.push('quiesce'); return quiesce.promise },
+        completedStores() { order.push('stores'); return completed },
+        journalFacts() { return new Map([...completed].map(([key, identity]) => [key, { kind: 'read', ...identity }])) },
+        stop() { order.push('memory-stop') },
+      },
+      threadMemorySeal: {
+        loadedAtStart: () => true,
+        writeShutdown(stores: typeof writes[number]) { order.push('write'); writes.push(stores); return { kind: 'written' } },
+        stop() { order.push('seal-stop') },
+      },
+    })
+    const work = run()
+    try {
+      await createFakeClock().flush()
+      expect(order).toEqual(['retry-stop', 'owner-stop', 'quiesce'])
+      expect(writes).toHaveLength(0)
+      ready = true; quiesce.resolve(); await work
+      expect(order).toEqual(['retry-stop', 'owner-stop', 'quiesce', 'stores', ...keys.map(key => `snapshot:${key}`),
+        'write', 'memory-stop', 'seal-stop', 'seal-retry-stop'])
+      expect(writes).toEqual([new Map(keys.map((key, index) => [key, {
+        ...completed.get(key)!, ...(key === throwing ? {} : { memoryOnlyJoins: threads[index] }),
+      }]))])
+      // Gathering a seal snapshot must not mutate the store's identity map.
+      expect([...completed.values()]).toEqual(keys.map(() => ({ storeId: header.storeId, lastRecordNumber: header.highWater })))
+    } finally { ready = true; quiesce.resolve(); await work }
   })
 
   test('reporter adapters read the replacement memory and shared authority at call time', () => {

@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
+import { CHANNEL_ID_RE } from './config.ts'
+import { isThreadTimestamp } from './delivery-decision.ts'
 
 export const THREAD_MEMORY_SEAL_FILE = 'thread-memory-seal.json'
 const QUEUE_HASH_CHUNK_BYTES = 64 * 1024
@@ -14,10 +16,18 @@ export type ThreadMemoryQueueIdentity =
   | { size: '0'; sha256: string; inode?: never; mtimeNs?: never }
   | { size: string; sha256: string; inode: string; mtimeNs: string }
 export interface ThreadMemoryStoreIdentity { storeId: string; lastRecordNumber: number }
-export type ThreadMemorySealEntry = ThreadMemoryStoreIdentity & (
-  | { clean: false; queue?: never }
-  | { clean: true; queue: ThreadMemoryQueueIdentity }
-)
+export interface ThreadMemoryOwnPostJoin { channel: string; root: string }
+type OptionalStoreIdentity = ThreadMemoryStoreIdentity | { storeId?: never; lastRecordNumber?: never }
+/** Omit both identity fields unless creation completed and the journal is readable. */
+export type ThreadMemoryShutdownEntry = OptionalStoreIdentity & {
+  memoryOnlyJoins?: readonly ThreadMemoryOwnPostJoin[]
+}
+export type ThreadMemorySealEntry =
+  | (OptionalStoreIdentity & { clean: false; queue?: never } & (
+    | { gracefulShutdown: true; memoryOnlyJoins?: readonly ThreadMemoryOwnPostJoin[] }
+    | { gracefulShutdown?: never; memoryOnlyJoins?: never }
+  ))
+  | (ThreadMemoryStoreIdentity & { clean: true; queue: ThreadMemoryQueueIdentity; memoryOnlyJoins?: readonly ThreadMemoryOwnPostJoin[] })
 export interface ThreadMemorySealFile { v: 1; entries: Record<string, ThreadMemorySealEntry> }
 export type ThreadMemoryJournalFact =
   | { kind: 'absent' | 'not-created' | 'unreadable' }
@@ -27,9 +37,13 @@ export type ThreadMemoryJournalFacts = ReadonlyMap<string, ThreadMemoryJournalFa
 export type ThreadMemorySealCase =
   | 'unclean-stop' | 'journal-missing' | 'journal-changed' | 'entry-missing'
   | 'hybrid-without-store' | 'marker-without-store' | 'queue-changed'
-export interface ThreadMemorySealFinding {
+export interface ThreadMemoryChangedFinding {
   key: string; case: ThreadMemorySealCase; wording: 'unclean' | 'changed'
 }
+export interface ThreadMemoryOwnPostLossFinding {
+  key: string; case: 'own-post-joins-lost'; threads: readonly ThreadMemoryOwnPostJoin[]
+}
+export type ThreadMemorySealFinding = ThreadMemoryChangedFinding | ThreadMemoryOwnPostLossFinding
 export type ThreadMemorySealWriteResult =
   | { kind: 'written' | 'skipped' | 'stopped' }
   | { kind: 'failed'; error: unknown; unsynced: boolean }
@@ -38,7 +52,8 @@ export type ThreadMemorySealEvent =
   | { type: 'queue-identity-failed'; key: string; phase: 'start' | 'shutdown'; error: unknown }
   | { type: 'seal-written'; path: string }
   | { type: 'seal-write-failed'; path: string; error: unknown; unsynced: boolean }
-  | ({ type: 'changed-while-stopped' } & ThreadMemorySealFinding)
+  | ({ type: 'changed-while-stopped' } & ThreadMemoryChangedFinding)
+  | ({ type: 'own-post-joins-lost' } & ThreadMemoryOwnPostLossFinding)
 
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const only = (v: Record<string, unknown>, keys: readonly string[]) => Object.keys(v).every(k => keys.includes(k))
@@ -50,11 +65,29 @@ function validQueueIdentity(v: unknown): v is ThreadMemoryQueueIdentity {
   return decimal(v.inode) && typeof v.mtimeNs === 'string' && /^(0|-?[1-9][0-9]*)$/.test(v.mtimeNs)
 }
 export function isThreadMemorySealEntry(v: unknown): v is ThreadMemorySealEntry {
-  if (!object(v) || typeof v.storeId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(v.storeId) ||
-      typeof v.lastRecordNumber !== 'number' || !Number.isSafeInteger(v.lastRecordNumber) || v.lastRecordNumber < 0) return false
+  if (!object(v)) return false
+  const hasIdentity = Object.hasOwn(v, 'storeId') || Object.hasOwn(v, 'lastRecordNumber')
+  if ((hasIdentity || v.clean === true) && (typeof v.storeId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(v.storeId) ||
+      typeof v.lastRecordNumber !== 'number' || !Number.isSafeInteger(v.lastRecordNumber) || v.lastRecordNumber < 0)) return false
   return v.clean === true
-    ? only(v, ['storeId', 'lastRecordNumber', 'clean', 'queue']) && validQueueIdentity(v.queue)
-    : v.clean === false && only(v, ['storeId', 'lastRecordNumber', 'clean'])
+    ? only(v, ['storeId', 'lastRecordNumber', 'clean', 'queue', 'memoryOnlyJoins']) && validQueueIdentity(v.queue) &&
+      (!Object.hasOwn(v, 'memoryOnlyJoins') || validMemoryOnlyJoins(v.memoryOnlyJoins))
+    : v.clean === false && (v.gracefulShutdown === true
+      ? only(v, ['storeId', 'lastRecordNumber', 'clean', 'gracefulShutdown', 'memoryOnlyJoins']) &&
+        (!Object.hasOwn(v, 'memoryOnlyJoins') || validMemoryOnlyJoins(v.memoryOnlyJoins))
+      : only(v, ['storeId', 'lastRecordNumber', 'clean']))
+}
+function validMemoryOnlyJoins(value: unknown): value is ThreadMemoryOwnPostJoin[] {
+  if (!Array.isArray(value)) return false
+  const pairs = new Set<string>()
+  return value.every(item => {
+    if (!object(item) || !only(item, ['channel', 'root']) || typeof item.channel !== 'string' ||
+        !CHANNEL_ID_RE.test(item.channel) || !isThreadTimestamp(item.root)) return false
+    const pair = JSON.stringify([item.channel, item.root])
+    if (pairs.has(pair)) return false
+    pairs.add(pair)
+    return true
+  })
 }
 /** Closed schemas keep arbitrary content out of this metadata-only file. */
 export function isThreadMemorySealFile(v: unknown): v is ThreadMemorySealFile {
@@ -63,10 +96,20 @@ export function isThreadMemorySealFile(v: unknown): v is ThreadMemorySealFile {
 }
 export function serializeThreadMemorySeal(file: ThreadMemorySealFile): Buffer {
   if (!isThreadMemorySealFile(file)) throw new Error('Invalid Thread Memory seal')
-  return Buffer.from(JSON.stringify(file) + '\n')
+  const entries = Object.fromEntries(Object.entries(file.entries).map(([key, entry]) => {
+    const { memoryOnlyJoins, ...identity } = entry
+    const sorted = memoryOnlyJoins?.map(({ channel, root }) => ({ channel, root }))
+      .sort((a, b) => a.channel < b.channel ? -1 : a.channel > b.channel ? 1 : a.root < b.root ? -1 : a.root > b.root ? 1 : 0)
+    return [key, { ...identity, ...(sorted?.length ? { memoryOnlyJoins: sorted } : {}) }]
+  }))
+  return Buffer.from(JSON.stringify({ v: file.v, entries }) + '\n')
 }
 export function queueIdentitiesMatch(a: ThreadMemoryQueueIdentity, b: ThreadMemoryQueueIdentity): boolean {
   return a.inode === b.inode && a.size === b.size && a.mtimeNs === b.mtimeNs && a.sha256 === b.sha256
+}
+function runningEntry(entry: ThreadMemorySealEntry): ThreadMemorySealEntry {
+  return entry.storeId === undefined ? { clean: false }
+    : { storeId: entry.storeId, lastRecordNumber: entry.lastRecordNumber, clean: false }
 }
 export interface JudgeSealInput {
   key: string; previous?: ThreadMemorySealEntry; journal: ThreadMemoryJournalFact
@@ -74,9 +117,9 @@ export interface JudgeSealInput {
   sealExisted: boolean; anyUnclean: boolean
 }
 /** First applicable SR-2.4.4 case wins. Unknown queue identity proves no change. */
-export function judgeSeal(input: JudgeSealInput): ThreadMemorySealFinding | undefined {
+export function judgeSeal(input: JudgeSealInput): ThreadMemoryChangedFinding | undefined {
   const { previous, journal } = input
-  const finding = (reason: ThreadMemorySealCase, unclean = false): ThreadMemorySealFinding =>
+  const finding = (reason: ThreadMemorySealCase, unclean = false): ThreadMemoryChangedFinding =>
     ({ key: input.key, case: reason, wording: unclean ? 'unclean' : 'changed' })
   if (previous && !previous.clean) return finding('unclean-stop', true)
   if (previous && (journal.kind === 'absent' || journal.kind === 'not-created')) return finding('journal-missing')
@@ -117,7 +160,7 @@ export interface ThreadMemorySeal extends ThreadMemorySealPort {
   loadAtStart(journals: ThreadMemoryJournalFacts): Promise<ThreadMemorySealWriteResult>
   loadedAtStart(): boolean
   startupFindings(): readonly ThreadMemorySealFinding[]
-  writeShutdown(entries: ReadonlyMap<string, ThreadMemoryStoreIdentity>): Promise<ThreadMemorySealWriteResult>
+  writeShutdown(entries: ReadonlyMap<string, ThreadMemoryShutdownEntry>): Promise<ThreadMemorySealWriteResult>
   flush(): Promise<ThreadMemorySealWriteResult>
   stop(): Promise<void>
 }
@@ -142,8 +185,14 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
     event({ type: 'seal-write-failed', path, error, unsynced })
     return { kind: 'failed', error, unsynced }
   }
-  function requestWrite(): Promise<ThreadMemorySealWriteResult> {
+  function requestWrite(shutdown = false): Promise<ThreadMemorySealWriteResult> {
     if (stopped) return Promise.resolve({ kind: 'stopped' })
+    if (!shutdown) for (const [key, entry] of entries) {
+      if (entry.clean) {
+        const { memoryOnlyJoins: _joins, ...identity } = entry
+        entries.set(key, identity)
+      } else entries.set(key, runningEntry(entry))
+    }
     if (queued) return queued
     if (!entries.size && !emptyWriteNeeded) return Promise.resolve({ kind: 'skipped' })
     const next = chain.catch(() => {}).then((): ThreadMemorySealWriteResult => {
@@ -198,12 +247,12 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
       if (fact?.kind === 'read' && fact.storeId !== undefined) {
         entries.set(key, { storeId: fact.storeId, lastRecordNumber: fact.lastRecordNumber, clean: false })
       } else if (fact?.kind === 'unreadable' && old) {
-        entries.set(key, { storeId: old.storeId, lastRecordNumber: old.lastRecordNumber, clean: false })
+        entries.set(key, runningEntry(old))
       }
     }
     if (previous.size || [...facts.values()].some(fact => fact.kind !== 'absent')) emptyWriteNeeded = true
   }
-  function record(finding: ThreadMemorySealFinding | undefined): void {
+  function record(finding: ThreadMemoryChangedFinding | undefined): void {
     if (!finding || findings.has(finding.key)) return
     findings.set(finding.key, finding)
     event({ type: 'changed-while-stopped', ...finding })
@@ -243,6 +292,12 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
       if (facts) journals = new Map(facts)
       const anyUnclean = [...previous.values()].some(entry => !entry.clean)
       for (const key of options.appliedKeys()) {
+        const old = previous.get(key)
+        if (old?.memoryOnlyJoins?.length) {
+          const finding: ThreadMemoryOwnPostLossFinding = { key, case: 'own-post-joins-lost', threads: structuredClone(old.memoryOnlyJoins) }
+          findings.set(`own-post:${key}`, finding)
+          event({ type: 'own-post-joins-lost', ...finding })
+        }
         const journal = journals.get(key) ?? { kind: 'absent' }
         if (journal.kind === 'unreadable') unreadableAtStart.add(key)
         record(judgeSeal({ key, previous: previous.get(key), journal, queue: queues.get(key),
@@ -256,7 +311,7 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
       // Judge an empty readable journal before creation gives it a new identity.
       if (old && journal.kind === 'not-created') {
         record({ key, case: 'journal-missing', wording: 'changed' })
-      } else if (old && journal.kind === 'read' &&
+      } else if (old?.storeId !== undefined && journal.kind === 'read' &&
           (journal.storeId !== old.storeId || journal.lastRecordNumber < old.lastRecordNumber)) {
         record({ key, case: 'journal-changed', wording: 'changed' })
       }
@@ -272,20 +327,28 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
       if (existed) emptyWriteNeeded = true
       return requestWrite()
     },
-    async writeShutdown(completed) {
+    async writeShutdown(snapshots) {
       if (!loaded || stopped) return { kind: 'stopped' }
-      for (const [key, entry] of entries) entries.set(key, { storeId: entry.storeId, lastRecordNumber: entry.lastRecordNumber, clean: false })
+      for (const [key, entry] of entries) entries.set(key, runningEntry(entry))
       let identityFailure: { error: unknown } | undefined
-      for (const [key, identity] of completed) {
+      for (const [key, identity] of snapshots) {
         checkKey(key)
+        if (identity.storeId === undefined) {
+          // An unreadable or incomplete journal supplies no certified identity.
+          // The marker certifies only that this list came from graceful shutdown.
+          if (entries.has(key) || identity.memoryOnlyJoins?.length) entries.set(key, identity.memoryOnlyJoins?.length
+            ? { clean: false, gracefulShutdown: true, memoryOnlyJoins: identity.memoryOnlyJoins }
+            : { clean: false })
+          continue
+        }
         try { entries.set(key, { ...identity, clean: true, queue: queueIdentity(key) }) }
         catch (error) {
           identityFailure = { error }
-          entries.set(key, { ...identity, clean: false })
+          entries.set(key, { storeId: identity.storeId, lastRecordNumber: identity.lastRecordNumber, clean: false })
           event({ type: 'queue-identity-failed', key, phase: 'shutdown', error })
         }
       }
-      const result = await requestWrite()
+      const result = await requestWrite(true)
       return result.kind !== 'failed' && identityFailure ? failed(identityFailure.error) : result
     },
     flush: requestWrite,

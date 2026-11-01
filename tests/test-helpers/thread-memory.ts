@@ -5,9 +5,10 @@ import { durableWriteFileSync, DurableWriteUnsyncedError } from '../../src/atomi
 import { createDeliveryQueue, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
 import {
   createThreadMemorySeal, isThreadMemorySealFile, serializeThreadMemorySeal, THREAD_MEMORY_SEAL_FILE,
-  type ThreadMemorySealEntry, type ThreadMemorySealFile, type ThreadMemorySealEvent,
+  type ThreadMemorySealEntry, type ThreadMemorySealFile, type ThreadMemorySealEvent, type ThreadMemoryOwnPostJoin,
 } from '../../src/thread-memory-seal.ts'
 import { queuePath } from './delivery-queue.ts'
+import type { OwnPostJoins } from '../../src/own-post.ts'
 import type { DeliveryMode, PersonaConfigInput } from '../../src/config.ts'
 import { createSharedChannelAuthority, type SharedChannelAuthority, type SharedChannelDeps } from '../../src/shared-channels.ts'
 import {
@@ -115,9 +116,9 @@ export function threadFsControls(dir: string) {
 }
 
 export const threadSealPath = (dir: string) => join(dir, THREAD_MEMORY_SEAL_FILE)
-export const runningSealEntry = (overrides: Partial<Pick<ThreadMemorySealEntry, 'storeId' | 'lastRecordNumber'>> = {}): ThreadMemorySealEntry =>
-  ({ storeId: overrides.storeId ?? threadHeader().storeId, lastRecordNumber: overrides.lastRecordNumber ?? threadHeader().highWater, clean: false })
-export function cleanSealEntry(dir: string, key = THREAD_PERSONAS.primary as string, overrides: Parameters<typeof runningSealEntry>[0] = {}): ThreadMemorySealEntry {
+export const runningSealEntry = (overrides: Partial<Pick<ThreadMemorySealEntry, 'storeId' | 'lastRecordNumber'>> = {}) =>
+  ({ storeId: overrides.storeId ?? threadHeader().storeId, lastRecordNumber: overrides.lastRecordNumber ?? threadHeader().highWater, clean: false as const })
+export function cleanSealEntry(dir: string, key = THREAD_PERSONAS.primary as string, overrides: Parameters<typeof runningSealEntry>[0] = {}): Extract<ThreadMemorySealEntry, { clean: true }> {
   const seal = createThreadMemorySeal({ stateDir: dir, queueJournalPath: k => queuePath(dir, k),
     appliedKeys: () => [], threadHybrid: () => false, created: () => false })
   return { ...runningSealEntry(overrides), clean: true, queue: seal.queueIdentity(key) }
@@ -132,15 +133,26 @@ export function readThreadSeal(dir: string): ThreadMemorySealFile {
   if (!isThreadMemorySealFile(value)) throw new Error('readThreadSeal: invalid production seal')
   return value
 }
+export function cleanOwnPostSealEntry(dir: string, threads: readonly ThreadMemoryOwnPostJoin[], key = THREAD_PERSONAS.primary as string, overrides: Parameters<typeof runningSealEntry>[0] = {}): ThreadMemorySealEntry {
+  const clean = cleanSealEntry(dir, key, overrides)
+  if (!clean.clean) throw new Error('fixture needs a clean seal entry')
+  return { ...clean, memoryOnlyJoins: threads }
+}
 export type ThreadSealDamage = 'json' | 'version' | 'persona-key' | 'missing-queue'
+  | 'running-own-posts' | 'own-post-channel' | 'own-post-root' | 'duplicate-own-post' | 'own-post-extra-key'
 /** Corrupt exactly one property of a valid production-serialized seed. */
 export function damagedThreadSeal(dir: string, kind: ThreadSealDamage): Buffer {
-  const bytes = serializeThreadMemorySeal({ v: 1, entries: { alpha: cleanSealEntry(dir) } })
+  const bytes = serializeThreadMemorySeal({ v: 1, entries: { alpha: cleanOwnPostSealEntry(dir, [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }]) } })
   if (kind === 'json') return bytes.subarray(0, -2)
   const value = JSON.parse(bytes.toString())
   if (kind === 'version') value.v++
   if (kind === 'persona-key') { value.entries['../invalid'] = value.entries.alpha; delete value.entries.alpha }
   if (kind === 'missing-queue') delete value.entries.alpha.queue
+  if (kind === 'running-own-posts') { value.entries.alpha.clean = false; delete value.entries.alpha.queue }
+  if (kind === 'own-post-channel') value.entries.alpha.memoryOnlyJoins[0].channel = 'invalid'
+  if (kind === 'own-post-root') value.entries.alpha.memoryOnlyJoins[0].root = 'invalid'
+  if (kind === 'duplicate-own-post') value.entries.alpha.memoryOnlyJoins.push({ ...value.entries.alpha.memoryOnlyJoins[0] })
+  if (kind === 'own-post-extra-key') value.entries.alpha.memoryOnlyJoins[0].text = 'unexpected-content'
   return Buffer.from(JSON.stringify(value) + '\n')
 }
 export function threadSealFsControls(dir: string) {
@@ -202,6 +214,9 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     : makeSharedAuthority(stateDir, options.input ?? threadConfig(stateDir), deps))
   const events: ThreadMemoryEvent[] = [], markerCalls: Array<{ action: 'set' | 'clear'; key: string; fileExists: boolean; synced: boolean }> = []
   const posts: Array<{ key: string; text: string }> = [], logs: string[] = [], retryEvents: ThreadMemoryRetryEvent[] = []
+  let ownPosts: Pick<OwnPostJoins, 'stop' | 'memoryOnlyJoins' | 'unsavedDeferredPosts'> | undefined
+  let startup = false
+  const bufferedSealEvents: ThreadMemorySealEvent[] = []
   let retries: ThreadMemoryRetries | undefined, reporting: ReturnType<typeof createThreadMemoryReporting> | undefined
   const episodes = options.failureHandling ? createPersonaEpisodes({ clock, log: line => logs.push(line),
     sink(key, text, noticeOptions) {
@@ -220,7 +235,10 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     onEvent(event) {
       sealEvents.push(event)
       if (event.type === 'seal-write-failed') retries?.sealWriteFailed()
-      reporting?.sealEvent(event); sealOptions.onEvent?.(event)
+      if (startup) {
+        if (event.type !== 'changed-while-stopped' && event.type !== 'own-post-joins-lost') bufferedSealEvents.push(event)
+      } else reporting?.sealEvent(event)
+      sealOptions.onEvent?.(event)
     },
   }) : undefined
   const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions }) : undefined
@@ -229,6 +247,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
     heldStamps: options.heldStamps,
+    unsavedOwnPosts: key => ownPosts?.unsavedDeferredPosts(key) ?? 0,
     canRun: options.canRun,
     threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
     markerKeys: () => authority.threadMemoryCreatedKeys(), canRemove: options.canRemove ?? (key => !authority.reviewHeld(key)),
@@ -274,10 +293,19 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
       if (!seal) {
         retries?.stopKeys(); unsubscribe(); await memory.stop(); retries?.stopSeal(); episodes?.close(); return
       }
+      ownPosts?.stop()
       await queue?.stop()
       retries?.stopKeys()
       await memory.quiesce()
-      if (clean && seal?.loadedAtStart()) await seal.writeShutdown(memory.completedStores())
+      if (clean && seal?.loadedAtStart()) {
+        const completed = memory.completedStores()
+        await seal.writeShutdown(new Map([...memory.journalFacts().keys()].map(key => {
+          const identity = completed.get(key) ?? {}
+          let memoryOnlyJoins: { channel: string; root: string }[] = []
+          try { memoryOnlyJoins = ownPosts?.memoryOnlyJoins(key) ?? [] } catch { /* isolate each key's snapshot */ }
+          return [key, { ...identity, ...(memoryOnlyJoins.length ? { memoryOnlyJoins } : {}) }] as const
+        })))
+      }
       unsubscribe(); await memory.stop(); await seal?.stop()
       retries?.stopSeal(); episodes?.close()
     })()
@@ -285,13 +313,17 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   return {
     stateDir, clock, io, authority, memory, events, markerCalls, unsubscribe, seal, sealIo, sealEvents, queue,
     retries, reporting, episodes, posts, logs, retryEvents,
+    attachOwnPosts(owner: Pick<OwnPostJoins, 'stop' | 'memoryOnlyJoins' | 'unsavedDeferredPosts'>) { ownPosts = owner },
     async start() {
+      startup = true
       memory.readAtStart()
       if (seal) {
         await seal.loadAtStart(memory.journalFacts())
         await queue?.start()
       }
       await memory.activate()
+      startup = false
+      for (const event of bufferedSealEvents.splice(0)) reporting?.sealEvent(event)
       if (seal) reporting?.startupFindings(seal.startupFindings())
       if (seal) memory.startMaintenance()
     },

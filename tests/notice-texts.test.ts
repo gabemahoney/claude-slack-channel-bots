@@ -229,6 +229,7 @@ import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
 import {
   THREAD_MEMORY_SLACK_RETRY_WARNING,
+  THREAD_MEMORY_OWN_POST_LOSS_WARNING,
   buildThreadMemoryNotSavedNotice, buildThreadMemoryUnreadableNotice,
   buildThreadMemoryJoinsLostNotice, buildThreadMemoryChangedWhileStoppedNotice,
   buildThreadMemoryRecoveredNotice,
@@ -1746,14 +1747,15 @@ describe('Thread Memory catalogue content and loss budget', () => {
   test('notice texts and the final Slack-message bound (one literal pin)', () => {
     expect(THREAD_MEMORY_NOTICE_MAX_CHARS).toBe(4000)
     expect(THREAD_MEMORY_SLACK_RETRY_WARNING).toBe("If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.")
+    expect(THREAD_MEMORY_OWN_POST_LOSS_WARNING).toBe("Joins from the bot's own posts are lost if CSCB stops before they are saved.")
     const ref = memoryRef(), channels = MEMORY_CHANNELS.join(', ')
     const error = Object.assign(new Error('storage unavailable'), { code: 'EIO' })
     const warning = THREAD_MEMORY_SLACK_RETRY_WARNING
     expect(buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, MEMORY_PATH, 'journal-append', error)).toBe(
-      `:warning: *Thread Memory not saved* — ${ref}; channels: ${channels}. Could not save ${JSON.stringify(MEMORY_PATH)} (journal-append): Error code=EIO message="storage unavailable". Joins are kept and will be saved once storage works. Check the file's permissions and storage. ${warning}`,
+      `:warning: *Thread Memory not saved* — ${ref}; channels: ${channels}. Could not save ${JSON.stringify(MEMORY_PATH)} (journal-append): Error code=EIO message="storage unavailable". Joins are kept and will be saved once storage works. ${THREAD_MEMORY_OWN_POST_LOSS_WARNING} Check the file's permissions and storage. ${warning}`,
     )
     expect(buildThreadMemoryUnreadableNotice(ref, MEMORY_CHANNELS, MEMORY_PATH)).toBe(
-      `:warning: *Thread Memory unreadable* — ${ref}; channels: ${channels}. Cannot read ${JSON.stringify(MEMORY_PATH)}. Replies in this bot's threads are saved and wait until Thread Memory can be read. ${warning} Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.`,
+      `:warning: *Thread Memory unreadable* — ${ref}; channels: ${channels}. Cannot read ${JSON.stringify(MEMORY_PATH)}. Replies in this bot's threads are saved and wait until Thread Memory can be read. ${THREAD_MEMORY_OWN_POST_LOSS_WARNING} ${warning} Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.`,
     )
     for (const [wording, sentence] of [
       ['changed', 'Some Joined Threads may be missing, or may be ones the bot should have forgotten.'],
@@ -1777,6 +1779,19 @@ describe('Thread Memory catalogue content and loss budget', () => {
       options: { personaRef: ref },
     })
   })
+
+  test.each(threadMemoryEntries().filter(e => [buildThreadMemoryNotSavedNotice.name, buildThreadMemoryUnreadableNotice.name].includes(e.builder)))(
+    '$builder: $variant carries the shared own-post warning once and preserves the notice budget', e => {
+      const text = e.render()
+      expect(text.split(THREAD_MEMORY_OWN_POST_LOSS_WARNING)).toHaveLength(2)
+      // Configured names stay intact; the existing long-name exception is
+      // covered below. Ordinary catalogue renderings still fit the bound.
+      if (!e.variant.includes('long name')) expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      assertNoLeak(withoutConfiguredSpans(text, e.configuredSpans))
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    },
+  )
 
   test.each(MEMORY_LOSSES)('%s retains complete ordered identifiers or an exact count, and logs every loss', (_label, makeLoss) => {
     const loss = makeLoss()
@@ -1946,6 +1961,7 @@ describe('Thread Memory diagnostic builders', () => {
     const loss = MEMORY_LOSSES.find(([label]) => label === 'mixed losses')![1]()
     return [
       ['thread-memory-not-saved', KEY, buildThreadMemoryNotSavedLine(KEY, channels, path, 'journal-append', error), path],
+      ['thread-memory-not-saved', KEY, buildThreadMemoryNotSavedLine(KEY, channels, path, 'journal-append', error, true), path],
       ['thread-memory-unreadable', KEY, buildThreadMemoryUnreadableLine(KEY, channels, path, error), path],
       ['thread-memory-unreadable', KEY, buildThreadMemoryUnreadableLine(KEY, channels, path, undefined, true), path],
       ['thread-memory-joins-lost', KEY, buildThreadMemoryJoinsLostLine(PERSONA, loss)],
@@ -1980,7 +1996,7 @@ describe('Thread Memory diagnostic builders', () => {
         expect(line!).not.toContain('&lt;journal&gt;')
       }
     }
-    expect(rendered.filter(([, , , configuredPath]) => configuredPath !== undefined)).toHaveLength(9)
+    expect(rendered.filter(([, , , configuredPath]) => configuredPath !== undefined)).toHaveLength(10)
     for (const [, , line] of rendered.filter(([, , line]) => line!.includes('code='))) {
       expect(line!).toContain('code=EACCES')
       expect(line!).toContain(`cannot write <journal> & ${REDACTED_TOKEN_PLACEHOLDER}`)
@@ -1992,6 +2008,7 @@ describe('Thread Memory diagnostic builders', () => {
     const error = new Error('storage unavailable'), cause = 'Error message="storage unavailable"'
     const expected = [
       `${c} step=journal-append ${p} ${cause}; joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
+      `${c} step=journal-append ${p} ${cause}; notice's own join bookkeeping failed; no notice posted; joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
       `${c} ${p} ${cause}; replies saved and waiting; fix permissions/storage, or stop CSCB, move the journal aside and start again. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
       `${c} ${p} journal missing on retry; Thread Memory stays unknown until the next start; waiting replies remain saved`,
       `threads=[channel=${THREAD_CHANNELS.primary} root=${THREAD_ROOTS.primary}] messages=[channel=${THREAD_CHANNELS.secondary} ts=${THREAD_ROOTS.secondary}] unreadable_lines=3 bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot=${memoryRef()}`,

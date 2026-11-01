@@ -1171,7 +1171,7 @@ function dispatchThreadMemoryReport(value: BufferedThreadMemoryEvent): void {
     }
     if (!threadMemoryReporting) {
       // The seal retains these for startupFindings, including late first reads.
-      if (value.source !== 'seal' || value.event.type !== 'changed-while-stopped') bufferedThreadMemoryEvents.push(value)
+      if (value.source !== 'seal' || (value.event.type !== 'changed-while-stopped' && value.event.type !== 'own-post-joins-lost')) bufferedThreadMemoryEvents.push(value)
       return
     }
     switch (value.source) {
@@ -1567,7 +1567,14 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   unsubscribeThreadMemory?.()
   await threadMemory?.quiesce()
   if (threadMemorySeal?.loadedAtStart() && threadMemory) {
-    const result = await threadMemorySeal.writeShutdown(threadMemory.completedStores())
+    const completed = threadMemory.completedStores()
+    const shutdownEntries = new Map([...threadMemory.journalFacts().keys()].map(key => {
+      const identity = completed.get(key) ?? {}
+      let memoryOnlyJoins: { channel: string; root: string }[] = []
+      try { memoryOnlyJoins = ownPostJoins?.memoryOnlyJoins(key) ?? [] } catch { /* isolate each key's snapshot */ }
+      return [key, { ...identity, ...(memoryOnlyJoins.length ? { memoryOnlyJoins } : {}) }] as const
+    }))
+    const result = await threadMemorySeal.writeShutdown(shutdownEntries)
     // Episodes are already closed, so their observer suppresses this event.
     // The final authorized durability operation still needs its log-only result.
     try {
@@ -2891,6 +2898,7 @@ export async function main(): Promise<void> {
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
     authorityReady: () => reloadController?.sharedChannels() !== undefined,
     heldStamps: key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? [],
+    unsavedOwnPosts: key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0,
     threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
     markerKeys: () => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
     canRemove: key => reloadController?.sharedChannels()?.reviewHeld(key) === false,

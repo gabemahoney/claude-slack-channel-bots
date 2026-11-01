@@ -21,19 +21,20 @@ import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRec
   normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
-import { createOwnPostJoins } from '../src/own-post.ts'
+import { createOwnPostJoins, ownPostAnswerOfPost, type OwnPostSurface } from '../src/own-post.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
   type JudgeSealInput, type ThreadMemorySealCase, type ThreadMemorySealEntry } from '../src/thread-memory-seal.ts'
 import {
   makeThreadMemoryHarness, makeThreadMembershipHarness, threadConfig, threadPath, threadHeader,
   threadJoin, joinRecord, postIntent, postOutcome, seedThreads, readThreads, damagedThreadLine,
-  THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_TIME, type ThreadMemoryHarness,
-  runningSealEntry, cleanSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
+  THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_TIME, type ThreadMemoryHarness, type ThreadHarnessOptions, slackTsOfMs,
+  runningSealEntry, cleanSealEntry, cleanOwnPostSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
 } from './test-helpers/thread-memory.ts'
+import { makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
 import { membershipPage, readSharedState } from './test-helpers/shared-channels.ts'
 import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
-import { makeDeferredWebApiCall } from './test-helpers/slack-stub.ts'
+import { makeDeferredWebApiCall, makeStubSlack } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
@@ -53,6 +54,7 @@ import type { MemoryHoldEvent } from '../src/memory-holds.ts'
 
 const T0 = 1_700_000_000_000
 
+const ownPostRuns: OwnPostHarness[] = []
 const threadRuns: Array<ThreadMemoryHarness | ReturnType<typeof makeThreadMembershipHarness>> = [], threadDirs: string[] = []
 const joinedChannels = [C.primary, C.secondary].map(id => ({ id, delivery: 'thread_hybrid' as const }))
 function fixture(options: Parameters<typeof makeThreadMemoryHarness>[1] = {}, dir?: string) {
@@ -92,6 +94,7 @@ function gate() {
   return { release, entered, async wait() { enter(); await pending } }
 }
 afterEach(async () => {
+  for (const h of ownPostRuns.splice(0)) await h.close()
   for (const h of threadRuns.splice(0)) {
     await h.close()
     if ('membership' in h) assertNoLeak(h.membership.captured())
@@ -477,7 +480,7 @@ describe('Thread Memory store', () => {
     expect(journalBytes(h)).toEqual(before)
     expect([view(h), view(h, R.secondary)]).toEqual(['joined', 'joined'])
     expect(h.memory.keptFacts('alpha')).toEqual([first, second]); expect(h.memory.isJoinSaved('alpha', first)).toBe(false)
-    expect(h.events.at(-1)).toEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error })
+    expect(h.events.at(-1)).toEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error, noticeOnly: false })
     h.io.heal(); h.io.reset(); expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
     expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
     expect(savedJoins(h)).toEqual([joinRecord(first, 2), joinRecord(second, 3)])
@@ -818,7 +821,7 @@ describe('Thread Memory store', () => {
       const kept = h.memory.keepIntent('alpha', first)
       expect(kept.kept && kept.ready).toBeInstanceOf(Promise)
       expect(kept.kept && await kept.ready).toBe('failed')
-      expect(h.events).toContainEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error })
+      expect(h.events).toContainEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error, noticeOnly: false })
       expect(h.memory.saveBlocked('alpha')).toBe(true); expect(h.memory.intentSaved('alpha', 'first')).toBe(false)
       h.io.reset()
       expect(h.memory.keepIntent('alpha', second)).toEqual({ kept: true })
@@ -1069,7 +1072,236 @@ function seedReadable(h: ThreadMemoryHarness, facts: ThreadJoin[] = [], key = 'a
   })
 }
 
+/** Reuse rn's real owner/authority/membership/queue composition. The memory
+ * harness additionally owns seal startup/shutdown and the reporter/retry clock. */
+async function ownPostFixture(options: Parameters<typeof makeOwnPostHarness>[1] = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'thread-own-post-'))
+  threadDirs.push(dir)
+  const memory: ThreadHarnessOptions = { seal: true, failureHandling: true, ...options.memory }
+  const h = await makeOwnPostHarness(dir, { ...options, memory, start: false })
+  h.threads.attachOwnPosts(h.owner)
+  await h.clock.advanceTo(THREAD_TIME)
+  if (options.start !== false) await h.start()
+  ownPostRuns.push(h); threadRuns.push(h.threads)
+  return h
+}
+const POST_CONTENT = { kind: 'text' as const, text: `private post ${LEAK_SENTINEL}` }
+function beginPost(h: OwnPostHarness, surface: OwnPostSurface = 'text', channel: string = C.primary, key = 'alpha') {
+  const started = h.observer.start(key, surface, { channel }, POST_CONTENT)
+  expect(started).toBeDefined()
+  return started!
+}
+async function confirmPost(h: OwnPostHarness, started: ReturnType<typeof beginPost>, root: string = R.primary, channel: string = C.primary) {
+  await started.ready
+  const slack = makeStubSlack({ post: [{ kind: 'ok', result: { ts: root } }] })
+  h.observer.end(started.operation, ownPostAnswerOfPost(channel, await slack.web.chat.postMessage({ channel, text: POST_CONTENT.text })))
+  await h.flush()
+}
+const sealedJoins = (h: ThreadMemoryHarness, key = 'alpha') => {
+  const entry = sealEntry(h, key)
+  return entry.memoryOnlyJoins
+}
+function undecideOwnPosts(h: OwnPostHarness) {
+  h.members.unsyncWrites(() => true)
+  expect(h.threads.mode('open').kind).toBe('unresolved')
+  expect(h.authority.channelStamp('alpha', C.primary)?.kind).toBe('undecided')
+}
+
 describe('Thread Memory failure handling through the store', () => {
+  test.each(['saved', 'discarded'] as const)('owner-only confirmed posts delay read recovery until %s after the channel decision', async resolution => {
+    const h = await ownPostFixture()
+    h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
+    undecideOwnPosts(h)
+    const post = beginPost(h)
+    expect(post.ready).toBeUndefined()
+    expect(h.memory.outage('alpha').unsaved).toBe(0)
+    await confirmPost(h, post)
+    expect(h.memory.unresolvedIntents('alpha')).toEqual([])
+    expect(h.owner.memoryOnlyJoins('alpha')).toEqual([{ channel: C.primary, root: R.primary }])
+    expect(h.memory.outage('alpha')).toEqual({ unknown: true, unsaved: 1, missing: false })
+    h.io.heal()
+    expect(await h.memory.retryRead('alpha')).toBe('read')
+    await h.flush()
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 1, missing: false })
+    const firstRead = [...h.threads.events].reverse().find(event => event.type === 'read')!
+    const outageAtRead = h.memory.outage('alpha')
+    expect(h.threads.episodes!.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(true)
+    expect(h.threads.posts).not.toContainEqual(recoveryNotice(h.threads))
+
+    // Publication either transfers the post into the writer or discards it.
+    // A failed append proves the transfer does not count the owner twice.
+    if (resolution === 'saved') h.io.fail('writeSync')
+    h.members.unsyncWrites(() => false)
+    expect(h.authority.recoverDurability().kind).toBe('applied')
+    if (resolution === 'discarded') expect(h.threads.choose('off').kind).toBe('applied')
+    await h.flush()
+    if (resolution === 'saved') {
+      expect(h.memory.outage('alpha').unsaved).toBe(3)
+      expect(h.threads.episodes!.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(true)
+      expect(h.threads.posts).not.toContainEqual(recoveryNotice(h.threads))
+      h.io.heal()
+      expect((await h.memory.flush('alpha')).kind).toBe('saved')
+      expect(readThreads(h.stateDir).slice(-3).map(r => r.kind)).toEqual(['post-intent', 'join', 'post-outcome'])
+    } else expect(readThreads(h.stateDir).some(r => r.kind === 'post-intent')).toBe(false)
+    expect(h.owner.memoryOnlyJoins('alpha')).toEqual([])
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(h.threads.episodes!.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(false)
+    expect(h.threads.posts.filter(p => p.text === recoveryNotice(h.threads).text)).toEqual([recoveryNotice(h.threads)])
+    h.owner.onSharedStatePublished('alpha'); h.memory.published()
+    await h.memory.flush('alpha'); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.threads.posts.filter(p => p.text === recoveryNotice(h.threads).text)).toHaveLength(1)
+
+    // Replay the real observations after the store is healthy, as startup's
+    // buffer does. The earlier read must still wait for the later settlement.
+    const reporting = h.threads.reporting!
+    const settled = [...h.threads.events].reverse().find(event => event.type === 'outage-settled' || event.type === 'saved-after-failure')!
+    expect(settled).toBeDefined()
+    reporting.threadMemoryEvent(h.threads.events.find(event => event.type === 'read-failed')!)
+    reporting.threadMemoryEvent(firstRead, outageAtRead)
+    expect(h.threads.episodes!.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(true)
+    expect(h.threads.posts.filter(p => p.text === recoveryNotice(h.threads).text)).toHaveLength(1)
+    reporting.threadMemoryEvent(settled, h.memory.outage('alpha'))
+    reporting.threadMemoryEvent(settled, h.memory.outage('alpha'))
+    expect(h.threads.episodes!.isOpen('alpha', THREAD_MEMORY_UNREADABLE)).toBe(false)
+    expect(h.threads.posts.filter(p => p.text === recoveryNotice(h.threads).text)).toHaveLength(2)
+  })
+
+  test.each(['readable', 'unreadable'] as const)('own-post facts keep the %s outage open until the real append retry saves all three', async state => {
+    const h = await ownPostFixture()
+    if (state === 'unreadable') {
+      h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
+      expect(h.memory.digestKey('alpha')).toBeUndefined()
+    } else h.io.fail('writeSync')
+    const post = beginPost(h); await post.ready
+    expect(h.memory.outage('alpha')).toEqual({ unknown: state === 'unreadable', unsaved: 1, missing: false })
+    await confirmPost(h, post)
+    expect(h.memory.outage('alpha').unsaved).toBe(3)
+    const episode = state === 'unreadable' ? THREAD_MEMORY_UNREADABLE : THREAD_MEMORY_NOT_SAVED
+    expect(h.threads.episodes!.isOpen('alpha', episode)).toBe(true)
+    const initial = [...h.threads.posts]
+    expect(initial).toHaveLength(1)
+    if (state === 'unreadable') {
+      h.io.heal(); h.io.fail('writeSync')
+      expect(await h.memory.retryRead('alpha')).toBe('read')
+      expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 3, missing: false })
+      expect(h.threads.posts).toEqual(initial)
+      expect(h.threads.episodes!.isOpen('alpha', episode)).toBe(true)
+      // Save is still failing after the successful read; retries own recovery.
+      await h.memory.flush('alpha')
+    }
+    await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(h.memory.outage('alpha').unsaved).toBe(3)
+    expect(h.threads.posts).not.toContainEqual(recoveryNotice(h.threads))
+    h.io.heal(); await h.clock.advance(THREAD_MEMORY_RETRY_MIN_MS * 2)
+    expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
+    expect(h.threads.posts.filter(p => p.text === recoveryNotice(h.threads).text)).toEqual([recoveryNotice(h.threads)])
+    expect(h.threads.episodes!.isOpen('alpha', episode)).toBe(false)
+    expect(readThreads(h.stateDir).slice(-3).map(r => r.kind)).toEqual(['post-intent', 'join', 'post-outcome'])
+  })
+
+  test.each((['notice', 'text', 'file', 'prompt', 'warning'] as const).flatMap(surface =>
+    (['intent', 'join-outcome', 'none-outcome', 'flush'] as const).map(kind => ({ surface, kind }))))(
+    'own-post noticeOnly follows $surface facts in a failed $kind append', async ({ surface, kind }) => {
+      const h = await ownPostFixture()
+      if (kind === 'intent' || kind === 'flush') h.io.fail('writeSync')
+      const post = beginPost(h, surface); await post.ready
+      if (kind !== 'intent') {
+        h.io.fail('writeSync')
+        if (kind === 'none-outcome') {
+          const slack = makeStubSlack({ post: [{ kind: 'ok', result: { ok: false, error: 'not_in_channel' } }] })
+          h.observer.end(post.operation, ownPostAnswerOfPost(C.primary, await slack.web.chat.postMessage({ channel: C.primary, text: POST_CONTENT.text })))
+          await h.flush()
+        } else await confirmPost(h, post)
+      }
+      if (kind === 'flush') {
+        h.threads.events.length = 0
+        expect((await h.memory.flush('alpha')).kind).toBe('failed')
+      }
+      const failures = h.threads.events.filter(e => e.type === 'append-failed')
+      expect(failures).toHaveLength(1)
+      expect(failures[0]).toMatchObject({ type: 'append-failed', key: 'alpha', step: 'journal-append', noticeOnly: surface === 'notice' })
+      expect(h.memory.outage('alpha').unsaved).toBe(kind === 'intent' || kind === 'none-outcome' ? 1 : kind === 'flush' ? 3 : 2)
+      h.io.heal(); expect((await h.memory.flush('alpha')).kind).toBe('saved')
+      const bytes = journalBytes(h.threads).toString()
+      expect(bytes).not.toContain('noticeOnly'); assertNoLeak(bytes)
+    })
+
+  test.each(['text', 'file', 'prompt', 'warning', 'mention', 'broadcast'] as const)('own-post mixed flush containing %s is not notice-only', async kind => {
+    const h = await ownPostFixture(); h.io.fail('writeSync')
+    await confirmPost(h, beginPost(h, 'notice'))
+    if (kind === 'mention' || kind === 'broadcast') h.memory.addJoin('alpha', h.threads.fact({ source: kind, root: R.secondary }))
+    else await confirmPost(h, beginPost(h, kind), R.secondary)
+    h.threads.events.length = 0
+    expect((await h.memory.flush('alpha')).kind).toBe('failed')
+    expect(h.threads.events.filter(e => e.type === 'append-failed').map(e => e.noticeOnly)).toEqual([false])
+  })
+
+  test.each(['membership', 'stamp', 'unknown-digest', 'lookup'] as const)('own-post notice provenance survives %s deferral until the actual failed append', async deferred => {
+    const h = await ownPostFixture()
+    if (deferred === 'unknown-digest') { h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha') }
+    const post = beginPost(h, 'notice'); await post.ready
+    if (deferred === 'membership') h.members.membership.invalidate('alpha')
+    if (deferred === 'stamp') undecideOwnPosts(h)
+    if (deferred === 'lookup') {
+      h.observer.end(post.operation, { kind: 'no-answer' })
+      const pending = h.owner.unknownOwnPosts('alpha')[0]!
+      h.io.fail('writeSync')
+      h.owner.recordLookup('alpha', pending.operationId, { found: { ts: R.primary }, holds: 'thread' })
+    } else await confirmPost(h, post)
+    if (deferred === 'membership') {
+      h.io.fail('writeSync')
+      h.members.h.stub(h.members.h.p('alpha')).script.inventory.push(membershipPage([C.primary]))
+      h.members.scanner.connectionChanged('alpha'); await h.flush(); await h.members.scan(); h.owner.onSharedStatePublished('alpha')
+    }
+    if (deferred === 'stamp') {
+      h.io.fail('writeSync'); h.members.unsyncWrites(() => false); expect(h.authority.recoverDurability().kind).toBe('applied')
+    }
+    if (deferred === 'unknown-digest') {
+      expect(h.memory.outage('alpha').unsaved).toBe(3)
+      h.io.heal(); h.io.fail('writeSync'); expect(await h.memory.retryRead('alpha')).toBe('read')
+      await h.memory.flush('alpha')
+    }
+    await h.flush()
+    const failures = h.threads.events.filter(e => e.type === 'append-failed')
+    expect(failures.length).toBeGreaterThan(0)
+    expect(failures.map(e => e.noticeOnly)).toEqual(failures.map(() => true))
+    expect(h.threads.posts.filter(p => p.text === recoveryNotice(h.threads).text)).toEqual([])
+  })
+
+  test('own-post notice provenance is absent from saved and compacted records, seals and recovered intents', async () => {
+    const h = await ownPostFixture()
+    const post = beginPost(h, 'notice'); await post.ready
+    h.observer.end(post.operation, { kind: 'no-answer' }); await h.flush()
+    const id = h.owner.unknownOwnPosts('alpha')[0]!.operationId
+    const appended = journalBytes(h.threads)
+    await h.memory.compact()
+    const compacted = journalBytes(h.threads)
+    await h.close()
+    for (const bytes of [appended, compacted, readFileSync(threadSealPath(h.stateDir))]) {
+      expect(bytes.toString()).not.toContain('noticeOnly'); expect(bytes.toString()).not.toContain('surface'); assertNoLeak(bytes.toString())
+    }
+    const next = reportingFixture({ reopen: true }, h.stateDir); await next.start()
+    const intent = next.memory.unresolvedIntents('alpha')[0]!
+    expect(intent.operationId).toBe(id); expect(intent).not.toHaveProperty('surface'); expect(intent).not.toHaveProperty('noticeOnly')
+    next.io.fail('writeSync')
+    expect(next.memory.resolveIntent('alpha', id, { joined: next.fact() })).toBe('joined'); await next.clock.flush()
+    expect(next.events.filter(e => e.type === 'append-failed').map(e => e.noticeOnly)).toEqual([false])
+    next.io.heal(); await next.memory.flush('alpha'); await next.memory.compact(); await next.close()
+    for (const bytes of [journalBytes(next), readFileSync(threadSealPath(next.stateDir))]) {
+      expect(bytes.toString()).not.toContain('noticeOnly'); assertNoLeak(bytes.toString())
+    }
+    for (const event of [...h.threads.events, ...next.events].filter(e => e.type !== 'append-failed')) expect(event).not.toHaveProperty('noticeOnly')
+    for (const event of [...h.threads.sealEvents, ...next.sealEvents]) expect(event).not.toHaveProperty('noticeOnly')
+  })
+
+  test('own-post creation failure is distinct from append notice provenance', async () => {
+    const h = await ownPostFixture({ start: false }); h.io.fail('writeSync'); await h.start()
+    await confirmPost(h, beginPost(h, 'notice'))
+    const failures = h.threads.events.filter(e => e.type === 'creation-failed')
+    expect(failures.length).toBeGreaterThan(0)
+    for (const event of failures) expect(event).not.toHaveProperty('noticeOnly')
+  })
+
   test('retryRead retries unreadable files, judges the first read and merges saved, kept and pending joins', async () => {
     const h = sealFixture(), disk = h.fact(), kept = h.fact({ root: R.secondary }), pending = h.fact({ root: R.third })
     seedReadable(h, [disk])
@@ -1320,7 +1552,7 @@ describe('Thread Memory failure handling through the store', () => {
         expectRecovery(h, 0); expect(h.memory.outage('alpha').unsaved).toBe(1)
         await h.clock.flush()
         expect(h.io.calls.some(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toBe(true)
-        expect(h.events).toContainEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error })
+        expect(h.events).toContainEqual({ type: 'append-failed', key: 'alpha', path: threadPath(h.stateDir), step: 'journal-append', error, noticeOnly: false })
         expect(h.events.filter(e => e.type === 'outage-settled')).toEqual([])
         expect(h.memory.isJoinSaved('alpha', fact)).toBe(false); expectRecovery(h, 0)
         expect(h.episodes.isOpen('alpha', THREAD_MEMORY_NOT_SAVED)).toBe(true)
@@ -1518,6 +1750,7 @@ describe('Thread Memory failure handling through the store', () => {
       wording: mode === 'startup-unclean' ? 'unclean' : 'changed' }])
     h.reporting.startupFindings(findings); h.reporting.startupFindings(findings)
     const finding = findings[0]!
+    if (finding.case === 'own-post-joins-lost') throw new Error('expected changed-while-stopped finding')
     const expected = notice(h, ref => buildThreadMemoryChangedWhileStoppedNotice(ref, [C.primary], finding.wording))
     expect(h.posts.filter(post => post.text === expected.text)).toEqual([expected])
     expect(h.logs.filter(line => line === buildThreadMemoryChangedWhileStoppedLine('alpha', [C.primary], finding.case, finding.wording))).toHaveLength(1)
@@ -2325,6 +2558,63 @@ describe('Thread Memory held-stamp retention', () => {
 })
 
 describe('Thread Memory seal judgments and closed metadata', () => {
+  test.each(['running-own-posts', 'own-post-channel', 'own-post-root', 'duplicate-own-post', 'own-post-extra-key'] as const)(
+    'own-post seal rejects %s damage as no entries and rewrites valid running metadata', async damage => {
+      const h = sealFixture(); seedThreads(h.stateDir, [threadHeader()])
+      writeFileSync(threadSealPath(h.stateDir), damagedThreadSeal(h.stateDir, damage))
+      await h.start()
+      expect(h.sealEvents.filter(e => e.type === 'seal-invalid')).toHaveLength(1)
+      expectSealFinding(h, 'entry-missing')
+      expect(sealEntry(h)).toEqual(runningSealEntry())
+    })
+
+  test.each((['flush', 'creation', 'compaction', 'removal', 'start'] as const).flatMap(write =>
+    [false, true].map(running => [write, running] as const)))('own-post list never survives a non-shutdown %s write; running=%s', async (write, running) => {
+    const h = sealFixture(); await h.start()
+    const identity = h.memory.completedStores().get('alpha')!
+    if (write === 'removal') await h.seal.entryCreated('beta', identity.storeId, identity.lastRecordNumber)
+    const memoryOnlyJoins = [{ channel: C.primary, root: R.primary }]
+    await h.seal.writeShutdown(new Map([['alpha', running ? { memoryOnlyJoins } : { ...identity, memoryOnlyJoins }]]))
+    expect(sealedJoins(h)).toHaveLength(1)
+    expect(sealEntry(h).clean).toBe(!running)
+    if (write === 'flush') await h.seal.flush()
+    if (write === 'creation') await h.seal.entryCreated('beta', identity.storeId, identity.lastRecordNumber)
+    if (write === 'compaction') await h.memory.compact()
+    if (write === 'removal') await h.seal.removeEntry('beta')
+    if (write === 'start') await h.seal.refreshAtStart(h.memory.journalFacts())
+    expect(sealedJoins(h)).toBeUndefined()
+    expect(sealEntry(h)).not.toHaveProperty('gracefulShutdown')
+  })
+
+  test('running own-post lists require the exact graceful-shutdown marker; legacy entries remain valid', async () => {
+    const h = sealFixture(); await h.start()
+    const threads = [{ channel: C.primary, root: R.secondary }, { channel: C.primary, root: R.primary }]
+    await h.seal.writeShutdown(new Map([['alpha', { memoryOnlyJoins: threads }]]))
+    const entry = sealEntry(h)
+    expect(entry).toEqual({ clean: false, gracefulShutdown: true, memoryOnlyJoins: [...threads].reverse() })
+    expect(isThreadMemorySealEntry(entry)).toBe(true)
+    const { memoryOnlyJoins, ...withoutList } = entry
+    expect(isThreadMemorySealEntry(withoutList)).toBe(true)
+    for (const gracefulShutdown of [undefined, false, 'true', 1, null]) {
+      expect(isThreadMemorySealEntry({ ...entry, gracefulShutdown })).toBe(false)
+    }
+    expect(isThreadMemorySealEntry({ clean: false, memoryOnlyJoins })).toBe(false)
+    for (const invalid of [
+      { ...entry, storeId: 'partial' }, { ...entry, lastRecordNumber: 0 },
+      { ...entry, queue: cleanSealEntry(h.stateDir).queue }, { ...entry, text: LEAK_SENTINEL },
+      { ...entry, memoryOnlyJoins: [...threads, threads[0]] },
+      { ...entry, memoryOnlyJoins: [{ channel: 'invalid', root: R.primary }] },
+      { ...entry, memoryOnlyJoins: [{ channel: C.primary, root: 'invalid' }] },
+      { ...entry, memoryOnlyJoins: [{ ...threads[0], text: LEAK_SENTINEL }] },
+    ]) expect(isThreadMemorySealEntry(invalid)).toBe(false)
+    // All old v1 forms still round-trip through the same closed serializer.
+    for (const legacy of [runningSealEntry(), cleanSealEntry(h.stateDir), { clean: false as const }]) {
+      const file = { v: 1 as const, entries: { alpha: legacy } }
+      expect(isThreadMemorySealFile(file)).toBe(true)
+      expect(JSON.parse(serializeThreadMemorySeal(file).toString())).toEqual(file)
+    }
+  })
+
   test('production schema accepts running, clean and empty files and rejects extra content at every level', () => {
     const h = sealFixture(), running = runningSealEntry(), clean = cleanSealEntry(h.stateDir)
     const validEntries: Array<Record<string, ThreadMemorySealEntry>> = [{}, { alpha: running }, { alpha: clean, beta: running }]
@@ -2407,6 +2697,169 @@ describe('Thread Memory seal judgments and closed metadata', () => {
 })
 
 describe('Thread Memory seal startup and restart', () => {
+  test.each((['unreadable', 'incomplete'] as const).flatMap(journal =>
+    (['graceful-joins', 'graceful-empty', 'crash-joins'] as const).map(stop => [journal, stop] as const)))(
+    'Decision 6: %s journal, %s preserves only known shutdown losses beside unclean-stop', async (journal, stop) => {
+      const h = await ownPostFixture({ start: false })
+      if (journal === 'incomplete') h.io.fail('writeSync')
+      await h.start()
+      if (journal === 'unreadable') {
+        expect(h.memory.completedStores().has('alpha')).toBe(true)
+        expect(readThreads(h.stateDir)[0]?.kind).toBe('header')
+        h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
+        expect(h.memory.outage('alpha').unknown).toBe(true)
+      }
+      expect(h.memory.completedStores().has('alpha')).toBe(false)
+      const threads = [{ channel: C.primary, root: R.primary }, { channel: C.primary, root: R.secondary }]
+      if (stop !== 'graceful-empty') {
+        for (const { root } of [...threads].reverse()) await confirmPost(h, beginPost(h), root)
+        expect(h.owner.memoryOnlyJoins('alpha')).toHaveLength(threads.length)
+      } else expect(h.owner.memoryOnlyJoins('alpha')).toEqual([])
+      const beforeStop = readFileSync(threadSealPath(h.stateDir))
+      h.threads.sealIo!.reset()
+      if (stop === 'crash-joins') { h.owner.stop(); await h.threads.crash() } else await h.close()
+      const entry = sealEntry(h.threads)
+      if (stop === 'graceful-joins') {
+        expect(entry).toEqual({ clean: false, gracefulShutdown: true, memoryOnlyJoins: threads })
+      } else if (stop === 'graceful-empty') expect(entry).toEqual({ clean: false })
+      else {
+        expect(readFileSync(threadSealPath(h.stateDir))).toEqual(beforeStop)
+        expect(entry.clean).toBe(false)
+        expect(entry.memoryOnlyJoins).toBeUndefined()
+        expect(entry).not.toHaveProperty('gracefulShutdown')
+      }
+      // An uncertified journal cannot supply either identity or a queue digest.
+      expect(h.threads.sealIo!.queueReads()).toEqual([])
+      assertNoLeak(readFileSync(threadSealPath(h.stateDir), 'utf8'))
+      const next = reportingFixture({ reopen: true }, h.stateDir); await next.start()
+      const loss: ThreadMemoryLoss = { threads, messages: [] }
+      const changed = { key: 'alpha', case: 'unclean-stop', wording: 'unclean' } as const
+      const hasLoss = stop === 'graceful-joins'
+      expect(next.seal.startupFindings()).toEqual([
+        ...(hasLoss ? [{ key: 'alpha', case: 'own-post-joins-lost' as const, threads }] : []), changed,
+      ])
+      expect(next.posts).toEqual([
+        ...(hasLoss ? [lossNotice(next, loss)] : []),
+        notice(next, ref => buildThreadMemoryChangedWhileStoppedNotice(ref, [C.primary], 'unclean')),
+      ])
+      expect(next.logs).toEqual([
+        ...(hasLoss ? [buildThreadMemoryJoinsLostLine(next.authority.config().personas[0]!, loss)] : []),
+        buildThreadMemoryChangedWhileStoppedLine('alpha', [C.primary], 'unclean-stop', 'unclean'),
+      ])
+      if (hasLoss) for (const { channel, root } of threads) {
+        expect(next.posts[0]!.text).toContain(channel); expect(next.posts[0]!.text).toContain(root)
+      }
+      expect(next.sealEvents.some(e => e.type === 'seal-invalid')).toBe(false)
+      const posts = [...next.posts], logs = [...next.logs]
+      for (const event of next.sealEvents) next.reporting.sealEvent(event)
+      expect(next.posts).toEqual(posts); expect(next.logs).toEqual(logs)
+      expect(sealedJoins(next)).toBeUndefined()
+      expect(sealEntry(next)).not.toHaveProperty('gracefulShutdown')
+      await next.close()
+      const last = reportingFixture({ reopen: true }, h.stateDir); await last.start()
+      expect(last.seal.startupFindings()).toEqual([])
+      expect(last.posts).toEqual([]); expect(last.logs).toEqual([])
+    })
+
+  test.each([false, true])('own-post shutdown lists only unsaved joins in canonical order; reverse=%s', async reverse => {
+    const h = await ownPostFixture({ membership: { names: ['alpha', 'beta'], channels: joinedChannels } })
+    h.io.fail('writeSync')
+    const threads = [{ channel: C.primary, root: R.primary }, { channel: C.primary, root: R.third }, { channel: C.secondary, root: R.secondary }]
+    for (const { channel, root } of reverse ? [...threads].reverse() : threads) await confirmPost(h, beginPost(h, 'text', channel), root, channel)
+    expect(h.owner.memoryOnlyJoins('alpha')).toHaveLength(threads.length)
+    expect(sealedJoins(h.threads)).toBeUndefined()
+    await h.close()
+    expect(sealEntry(h.threads).clean).toBe(true)
+    expect(sealedJoins(h.threads)).toEqual(threads)
+    expect(sealedJoins(h.threads, 'beta')).toBeUndefined()
+    const bytes = readFileSync(threadSealPath(h.stateDir), 'utf8')
+    assertNoLeak(bytes)
+    for (const forbidden of ['stamp', 'digest', 'text', 'noticeOnly']) expect(bytes).not.toContain(forbidden)
+    const next = reportingFixture({ reopen: true }, h.stateDir); await next.start()
+    const loss: ThreadMemoryLoss = { threads, messages: [] }
+    expect(next.seal.startupFindings()).toEqual([{ key: 'alpha', case: 'own-post-joins-lost', threads }])
+    expect(next.posts).toEqual([lossNotice(next, loss)])
+    expect(next.logs).toEqual([buildThreadMemoryJoinsLostLine(next.authority.config().personas[0]!, loss)])
+    expect(sealedJoins(next)).toBeUndefined()
+    await next.close()
+    const last = reportingFixture({ reopen: true }, h.stateDir); await last.start()
+    expect(last.seal.startupFindings()).toEqual([]); expect(last.posts).toEqual([])
+  })
+
+  test.each(['saved-intent', 'saved-join', 'stale', 'crash', 'incomplete'] as const)('own-post %s shutdown list follows intent durability and graceful-stop evidence', async mode => {
+    const h = await ownPostFixture(mode === 'incomplete' ? { start: false } : {})
+    if (mode === 'incomplete') { h.io.fail('writeSync'); await h.start() }
+    if (mode !== 'saved-intent') h.io.fail('writeSync')
+    const post = beginPost(h); await post.ready
+    if (mode === 'saved-intent') h.io.fail('writeSync')
+    await confirmPost(h, post)
+    if (mode === 'saved-join') { h.io.heal(); await h.memory.flush('alpha') }
+    if (mode === 'stale') expect(h.threads.choose('off').kind).toBe('applied')
+    if (mode === 'crash') { h.owner.stop(); await h.threads.crash() } else await h.close()
+    expect(sealedJoins(h.threads)).toEqual(mode === 'incomplete' ? [{ channel: C.primary, root: R.primary }] : undefined)
+    expect(sealEntry(h.threads).clean).toBe(mode !== 'crash' && mode !== 'incomplete')
+  })
+
+  test.each(['current-then-undecided', 'deferred-membership', 'deferred-stamp', 'started-undecided', 'deferred-saved-intent'] as const)(
+    'own-post shutdown preserves the %s reader after owner stop and store quiescence', async mode => {
+      const h = await ownPostFixture()
+      if (mode !== 'deferred-saved-intent') h.io.fail('writeSync')
+      if (mode === 'started-undecided') undecideOwnPosts(h)
+      const post = beginPost(h); await post.ready
+      if (mode === 'deferred-membership' || mode === 'deferred-saved-intent') h.members.membership.invalidate('alpha')
+      if (mode === 'deferred-stamp') undecideOwnPosts(h)
+      await confirmPost(h, post)
+      if (mode === 'current-then-undecided') undecideOwnPosts(h)
+      const expected = mode === 'deferred-saved-intent' ? [] : [{ channel: C.primary, root: R.primary }]
+      expect(h.owner.memoryOnlyJoins('alpha')).toEqual(expected)
+      h.owner.stop(); await h.memory.quiesce()
+      expect(h.owner.memoryOnlyJoins('alpha')).toEqual(expected)
+      await h.close()
+      expect(sealedJoins(h.threads) ?? []).toEqual(expected)
+    })
+
+  test('own-post sealed loss coexists with a deleted-journal finding without duplicate startup reporting', async () => {
+    const h = await ownPostFixture(); h.io.fail('writeSync')
+    await confirmPost(h, beginPost(h)); await h.close(); h.io.removeJournal()
+    const next = reportingFixture({ reopen: true }, h.stateDir); await next.start()
+    expect(next.seal.startupFindings()).toEqual([
+      { key: 'alpha', case: 'own-post-joins-lost', threads: [{ channel: C.primary, root: R.primary }] },
+      { key: 'alpha', case: 'journal-missing', wording: 'changed' },
+    ])
+    expect(next.posts).toEqual([
+      lossNotice(next, { threads: [{ channel: C.primary, root: R.primary }], messages: [] }),
+      notice(next, ref => buildThreadMemoryChangedWhileStoppedNotice(ref, [C.primary], 'changed')),
+    ])
+    expect(next.sealEvents.filter(e => e.type === 'own-post-joins-lost')).toHaveLength(1)
+  })
+
+  test.each(['unapplied', 'unreadable', 'invalid'] as const)('own-post sealed loss ignores %s evidence', async mode => {
+    const h = sealFixture(mode === 'unapplied' ? { appliedKeys: () => [] } : {})
+    seedThreads(h.stateDir, [threadHeader()])
+    seedThreadSeal(h.stateDir, { alpha: cleanOwnPostSealEntry(h.stateDir, [{ channel: C.primary, root: R.primary }]) })
+    if (mode === 'unreadable') h.sealIo.failRead()
+    if (mode === 'invalid') writeFileSync(threadSealPath(h.stateDir), damagedThreadSeal(h.stateDir, 'duplicate-own-post'))
+    await h.start()
+    expect(h.seal.startupFindings().filter(f => f.case === 'own-post-joins-lost')).toEqual([])
+    expect(h.sealEvents.filter(e => e.type === 'own-post-joins-lost')).toEqual([])
+  })
+
+  test('own-post startup report bounds the post with an exact remainder and logs all sealed threads', async () => {
+    const h = await ownPostFixture(); h.io.fail('writeSync')
+    const threads = Array.from({ length: Math.ceil(THREAD_MEMORY_NOTICE_MAX_CHARS / R.primary.length) }, (_, i) =>
+      ({ channel: C.primary, root: slackTsOfMs(THREAD_TIME + i) }))
+    for (const thread of threads) await confirmPost(h, beginPost(h), thread.root)
+    await h.close()
+    const next = reportingFixture({ reopen: true }, h.stateDir); await next.start()
+    expect(next.posts).toHaveLength(1); expect(next.logs).toHaveLength(1)
+    const text = next.posts[0]!.text, visible = threads.filter(t => text.includes(t.root))
+    expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    expect(visible.length).toBeGreaterThan(0); expect(visible.length).toBeLessThan(threads.length)
+    expect(text).toContain(`${threads.length - visible.length} more thread/message entry(s)`)
+    for (const thread of threads) expect(next.logs[0]).toContain(`channel=${thread.channel} root=${thread.root}`)
+    assertNoLeak({ posts: next.posts, logs: next.logs })
+  })
+
   test.each([
     ['missing journal', 'journal-missing'], ['different store', 'journal-changed'], ['older journal', 'journal-changed'],
     ['missing entry', 'entry-missing'], ['missing entry and journal', 'hybrid-without-store'],
@@ -2655,7 +3108,9 @@ describe('Thread Memory seal creation and durable writer', () => {
     expect(h.memory.store('alpha')?.digestKey).toBeUndefined()
     expect(h.memory.completedStores().size).toBe(0)
     expect(sealEntry(h).clean).toBe(false)
-    return { h, markerProofs, pending: sealEntry(h) }
+    const pending = sealEntry(h)
+    if (pending.storeId === undefined) throw new Error('fixture needs the pending creation identity')
+    return { h, markerProofs, pending }
   }
 
   test('CR1: losing the last hybrid during seal await keeps an empty journal incomplete until flush saves its header and join, then restarts cleanly', async () => {
@@ -2689,9 +3144,9 @@ describe('Thread Memory seal creation and durable writer', () => {
   })
 
   test('CR1: graceful shutdown keeps skipped empty-journal creation running; real hybrid publication after restart completes it', async () => {
-    const { h, pending } = await loseLastHybridDuringEmptyJournalCreation()
+    const { h } = await loseLastHybridDuringEmptyJournalCreation()
     await h.close()
-    expect(sealEntry(h)).toEqual(pending)
+    expect(sealEntry(h)).toEqual({ clean: false })
     const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
     expectSealFinding(next, 'unclean-stop', 'unclean')
     expect(next.authority.threadMemoryCreated('alpha')).toBe(false)

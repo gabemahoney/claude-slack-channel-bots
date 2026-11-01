@@ -30,7 +30,7 @@ import {
 } from '../src/thread-memory-reports.ts'
 import { createThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOutage, type ThreadMemoryQuarantineFact } from '../src/thread-memory.ts'
 import type { ThreadMemoryRetryEvent } from '../src/thread-memory-retry.ts'
-import type { ThreadMemorySealEvent, ThreadMemorySealFinding } from '../src/thread-memory-seal.ts'
+import type { ThreadMemorySealEvent, ThreadMemorySealFinding, ThreadMemoryChangedFinding, ThreadMemoryOwnPostLossFinding } from '../src/thread-memory-seal.ts'
 import type { MemoryHoldEvent, WithdrawnMemoryHold } from '../src/memory-holds.ts'
 import type { OwnPostLookupEvent } from '../src/own-post-lookup.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -94,8 +94,8 @@ function fixture(name = 'alpha', validated = true) {
     const p = config.personas.find(p => p.key === key)!
     return renderPersonaRef(p.name, p.key)
   }
-  const append = (key = a!.key): ThreadMemoryEvent => privateFields({ type: 'append-failed', key,
-    path: threadPath(dir, key), step: 'journal-append', error: failure() })
+  const append = (key = a!.key, noticeOnly = false): Extract<ThreadMemoryEvent, { type: 'append-failed' }> => privateFields({ type: 'append-failed', key,
+    path: threadPath(dir, key), step: 'journal-append', noticeOnly, error: failure() })
   const unreadable = (key = a!.key): ThreadMemoryEvent => privateFields({ type: 'read-failed', key,
     path: threadPath(dir, key), error: failure() })
   const saved = (key = a!.key): ThreadMemoryEvent => ({ type: 'saved-after-failure', key, path: threadPath(dir, key) })
@@ -155,8 +155,9 @@ const lookupLoss = ({ channel, threads, cause }: OwnPostLookupEvent): ThreadMemo
 describe('Thread Memory reporter event mappings and episodes', () => {
   test.each(['seal-entry', 'journal-header', 'marker', 'journal-append'] as const)('%s failures post and log once until recovery', step => {
     const f = fixture(), error = failure()
-    const event: ThreadMemoryEvent = privateFields({ type: step === 'journal-append' ? 'append-failed' : 'creation-failed',
-      key: f.a.key, path: f.path, step, error })
+    const event: ThreadMemoryEvent = privateFields(step === 'journal-append'
+      ? { type: 'append-failed', key: f.a.key, path: f.path, step, error, noticeOnly: false }
+      : { type: 'creation-failed', key: f.a.key, path: f.path, step, error })
     for (let i = 0; i < 3; i++) f.reporter.threadMemoryEvent(event)
     expect(f.requests).toEqual([{ key: f.a.key, text: buildThreadMemoryNotSavedNotice(f.ref(), [C.primary], f.path, step, error), options: undefined }])
     expect(f.logs).toEqual([buildThreadMemoryNotSavedLine(f.a.key, [C.primary], f.path, step, error)])
@@ -312,7 +313,106 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     expect(f.requests.at(-1)!.text).toBe(buildThreadMemoryRecoveredNotice(f.ref(f.b.key), [C.primary]))
   })
 
-  const findings: Array<Pick<ThreadMemorySealFinding, 'case' | 'wording'>> = [
+  const sealedLoss = (key: string): ThreadMemoryOwnPostLossFinding => privateFields({
+    key, case: 'own-post-joins-lost', threads: [{ channel: C.primary, root: R.primary }, { channel: C.secondary, root: R.secondary }],
+  })
+  test.each([
+    { case: 'journal-missing', wording: 'changed' },
+    { case: 'unclean-stop', wording: 'unclean' },
+  ] as const)('sealed own-post losses coexist with $case, end their own episodes and do not consume later losses', value => {
+    const f = fixture(), a = sealedLoss(f.a.key), b = sealedLoss(f.b.key)
+    const changed: ThreadMemoryChangedFinding = { key: f.a.key, ...value }
+    f.reporter.startupFindings([a, changed, b])
+    const loss: ThreadMemoryLoss = { threads: a.threads, messages: [] }
+    expect(f.requests).toEqual([
+      { key: f.a.key, ...buildThreadMemoryJoinsLostNotice(f.a, loss) },
+      { key: f.a.key, text: buildThreadMemoryChangedWhileStoppedNotice(f.ref(), [C.primary], changed.wording), options: undefined },
+      { key: f.b.key, ...buildThreadMemoryJoinsLostNotice(f.b, loss) },
+    ])
+    expect(f.logs).toEqual([
+      buildThreadMemoryJoinsLostLine(f.a, loss),
+      buildThreadMemoryChangedWhileStoppedLine(f.a.key, [C.primary], changed.case, changed.wording),
+      buildThreadMemoryJoinsLostLine(f.b, loss),
+    ])
+    for (const key of [f.a.key, f.b.key]) expect(f.episodes.isOpen(key, THREAD_MEMORY_JOINS_LOST)).toBe(false)
+    f.reporter.threadMemoryEvent(f.quarantined())
+    f.reporter.lookupEvent(lostLookup(f))
+    expect(f.requests).toHaveLength(5)
+    expect(f.requests.at(-1)).toEqual({ key: f.a.key, ...buildThreadMemoryJoinsLostNotice(f.a, lookupLoss(lostLookup(f))) })
+    expect(f.episodes.isOpen(f.a.key, THREAD_MEMORY_JOINS_LOST)).toBe(false)
+  })
+
+  test('sealed own-post loss is replayed only by startupFindings, not again by its seal event', () => {
+    const f = fixture(), finding = sealedLoss(f.a.key)
+    const event: ThreadMemorySealEvent = { type: 'own-post-joins-lost', ...finding }
+    f.reporter.sealEvent(event)
+    f.reporter.startupFindings([finding])
+    f.reporter.sealEvent(event)
+    expect(f.requests).toEqual([{ key: f.a.key, ...buildThreadMemoryJoinsLostNotice(f.a, { threads: finding.threads, messages: [] }) }])
+    expect(f.logs).toEqual([buildThreadMemoryJoinsLostLine(f.a, { threads: finding.threads, messages: [] })])
+  })
+
+  test.each(['submitted', 'open', 'closed'] as const)('sealed own-post loss stays silent when %s', state => {
+    const f = fixture(), finding = sealedLoss(f.a.key)
+    if (state === 'closed') f.episodes.close()
+    else {
+      f.notifier.notifier.submitTeardown(f.a.key)
+      if (state === 'open') f.notifier.notifier.openTeardownWindow(f.a)
+    }
+    f.reporter.startupFindings([finding])
+    f.reporter.sealEvent({ type: 'own-post-joins-lost', ...finding })
+    expect(f.requests).toEqual([]); expect(f.logs).toEqual([])
+  })
+
+  test('notice-only failures join an already reported outage without posting, logging or closing it', () => {
+    const f = fixture()
+    f.outages.set(f.a.key, { ...healthy(), unsaved: 3 })
+    f.reporter.threadMemoryEvent(f.append())
+    const requests = [...f.requests], logs = [...f.logs]
+    f.reporter.threadMemoryEvent(f.append(f.a.key, true)); f.reporter.threadMemoryEvent(f.saved())
+    expect(f.requests).toEqual(requests); expect(f.logs).toEqual(logs)
+    expect(f.episodes.isOpen(f.a.key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+    f.outages.set(f.a.key, healthy()); f.reporter.threadMemoryEvent(f.saved()); f.reporter.threadMemoryEvent(f.saved())
+    expect(f.requests.map(p => p.text).slice(1)).toEqual([buildThreadMemoryRecoveredNotice(f.ref(), [C.primary])])
+    expect(f.logs.slice(1)).toEqual([buildThreadMemoryRecoveredLine(f.a.key, [C.primary])])
+  })
+
+  test('notice-only outages log once, stay open while unsaved, end silently and can open again', () => {
+    const f = fixture(), event = f.append(f.a.key, true)
+    const line = buildThreadMemoryNotSavedLine(f.a.key, [C.primary], f.path, event.step, event.error, true)
+    for (let episode = 1; episode <= 2; episode++) {
+      f.outages.set(f.a.key, { ...healthy(), unsaved: 1 })
+      f.reporter.threadMemoryEvent(event); f.reporter.threadMemoryEvent(event); f.reporter.threadMemoryEvent(f.saved())
+      expect(f.episodes.isOpen(f.a.key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+      expect(f.episodes.hasPosted(f.a.key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      expect(f.logs).toEqual(Array(episode).fill(line)); expect(f.requests).toEqual([])
+      f.outages.set(f.a.key, healthy()); f.reporter.threadMemoryEvent(f.settled())
+      expect(f.episodes.isOpen(f.a.key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      expect(f.requests).toEqual([]); expect(f.logs).toEqual(Array(episode).fill(line))
+    }
+  })
+
+  test.each(['append', 'creation', 'read'] as const)('an ordinary %s failure after a silent episode still reports and recovers once, then a notice flap stays silent', kind => {
+    const f = fixture(), silent = f.append(f.a.key, true)
+    f.reporter.threadMemoryEvent(silent)
+    const event: ThreadMemoryEvent = kind === 'append' ? f.append() : kind === 'read' ? f.unreadable()
+      : { type: 'creation-failed', key: f.a.key, path: f.path, step: 'marker', error: failure() }
+    f.outages.set(f.a.key, { ...healthy(), unsaved: 3 })
+    f.reporter.threadMemoryEvent(event); f.reporter.threadMemoryEvent(event)
+    expect(f.requests.map(p => p.text)).toEqual([kind === 'read'
+      ? buildThreadMemoryUnreadableNotice(f.ref(), [C.primary], f.path)
+      : buildThreadMemoryNotSavedNotice(f.ref(), [C.primary], f.path, kind === 'creation' ? 'marker' : 'journal-append', failure())])
+    f.reporter.threadMemoryEvent(f.saved()); expect(f.requests).toHaveLength(1)
+    f.outages.set(f.a.key, healthy()); f.reporter.threadMemoryEvent(f.saved())
+    expect(f.requests.map(p => p.text).slice(1)).toEqual([buildThreadMemoryRecoveredNotice(f.ref(), [C.primary])])
+    const prior = [...f.requests], logs = f.logs.length
+    f.reporter.threadMemoryEvent(silent); f.reporter.threadMemoryEvent(silent); f.reporter.threadMemoryEvent(f.saved())
+    expect(f.requests).toEqual(prior)
+    expect(f.logs.slice(logs)).toEqual([buildThreadMemoryNotSavedLine(f.a.key, [C.primary], f.path, silent.step, silent.error, true)])
+    expect(f.episodes.isOpen(f.a.key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+  })
+
+  const findings: Array<Pick<ThreadMemoryChangedFinding, 'case' | 'wording'>> = [
     { case: 'unclean-stop', wording: 'unclean' },
     ...(['journal-missing', 'journal-changed', 'entry-missing', 'hybrid-without-store', 'marker-without-store', 'queue-changed'] as const)
       .map(value => ({ case: value, wording: 'changed' as const })),
@@ -484,7 +584,7 @@ describe('CR5/CR6 configured fields through the reporter and notifier', () => {
     // its separate structured field is the only permitted occurrence.
     const error = Object.assign(failure(), { message: `open ${JSON.stringify(path)}; external ${JSON.stringify(external)}; ${sentinelInMessage('reporter-error')}` })
     const originalPersona = structuredClone(f.a)
-    f.reporter.threadMemoryEvent({ type: 'append-failed', key: f.a.key, path, step: 'journal-append', error })
+    f.reporter.threadMemoryEvent({ type: 'append-failed', key: f.a.key, path, step: 'journal-append', error, noticeOnly: false })
     f.reporter.threadMemoryEvent({ type: 'read-failed', key: f.a.key, path, error })
     f.reporter.threadMemoryEvent(f.settled(), healthy())
     f.reporter.startupFindings([{ key: f.a.key, case: 'unclean-stop', wording: 'unclean' }])

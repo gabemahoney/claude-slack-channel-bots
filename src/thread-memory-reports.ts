@@ -9,7 +9,7 @@ import {
   THREAD_MEMORY_QUARANTINED, THREAD_MEMORY_COMPACTION_FAILED, THREAD_MEMORY_REMOVAL_FAILED,
   THREAD_MEMORY_SEAL_UNREADABLE, THREAD_MEMORY_SEAL_NOT_SAVED, THREAD_MEMORY_HOLDS_NOT_RESOLVED,
 } from './persona-diagnostics.ts'
-import type { ThreadMemorySealCase, ThreadMemorySealFinding, ThreadMemorySealEvent } from './thread-memory-seal.ts'
+import type { ThreadMemorySealCase, ThreadMemorySealFinding, ThreadMemoryChangedFinding, ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import type { ThreadMemoryEvent, ThreadMemoryOutage } from './thread-memory.ts'
 import type { ThreadMemoryRetryEvent } from './thread-memory-retry.ts'
 import type { MemoryHoldEvent } from './memory-holds.ts'
@@ -20,7 +20,7 @@ import { formatPersonaNotice } from './persona-notifier.ts'
 
 export { THREAD_MEMORY_DIAGNOSTIC_CLASSES, buildThreadMemoryDiagnostic } from './persona-diagnostics.ts'
 export type { ThreadMemorySealCase } from './thread-memory-seal.ts'
-export type ThreadMemoryChangedWording = ThreadMemorySealFinding['wording']
+export type ThreadMemoryChangedWording = ThreadMemoryChangedFinding['wording']
 export interface ThreadMemoryLostThread { channel: string; root: string }
 export interface ThreadMemoryWithdrawnMessage { channel: string; ts: string }
 /** Additional loss sources can supply these same identifiers without passing a record. */
@@ -39,12 +39,13 @@ const channelsText = (channels: readonly string[]): string => channels.length ? 
 const channelIdentity = (channels: readonly string[]): string => `channels=${JSON.stringify(channels.map(safe))}`
 const cause = (error: unknown): string => safe(describeThrownValueWithoutStack(error))
 export const THREAD_MEMORY_SLACK_RETRY_WARNING = "If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again."
+export const THREAD_MEMORY_OWN_POST_LOSS_WARNING = "Joins from the bot's own posts are lost if CSCB stops before they are saved."
 
 export function buildThreadMemoryNotSavedNotice(persona: string, channels: readonly string[], path: string, step: string, error: unknown): string {
-  return `:warning: *Thread Memory not saved* — ${configuredSlack(persona)}; channels: ${channelsText(channels)}. Could not save ${configuredSlack(JSON.stringify(path))} (${slack(step)}): ${slack(cause(error))}. Joins are kept and will be saved once storage works. Check the file's permissions and storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`
+  return `:warning: *Thread Memory not saved* — ${configuredSlack(persona)}; channels: ${channelsText(channels)}. Could not save ${configuredSlack(JSON.stringify(path))} (${slack(step)}): ${slack(cause(error))}. Joins are kept and will be saved once storage works. ${THREAD_MEMORY_OWN_POST_LOSS_WARNING} Check the file's permissions and storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`
 }
 export function buildThreadMemoryUnreadableNotice(persona: string, channels: readonly string[], path: string): string {
-  return `:warning: *Thread Memory unreadable* — ${configuredSlack(persona)}; channels: ${channelsText(channels)}. Cannot read ${configuredSlack(JSON.stringify(path))}. Replies in this bot's threads are saved and wait until Thread Memory can be read. ${THREAD_MEMORY_SLACK_RETRY_WARNING} Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.`
+  return `:warning: *Thread Memory unreadable* — ${configuredSlack(persona)}; channels: ${channelsText(channels)}. Cannot read ${configuredSlack(JSON.stringify(path))}. Replies in this bot's threads are saved and wait until Thread Memory can be read. ${THREAD_MEMORY_OWN_POST_LOSS_WARNING} ${THREAD_MEMORY_SLACK_RETRY_WARNING} Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.`
 }
 export interface ThreadMemoryLossNotice {
   text: string
@@ -96,8 +97,9 @@ export function buildThreadMemoryRecoveredNotice(persona: string, channels: read
   return `:white_check_mark: *Thread Memory recovered* — ${configuredSlack(persona)}; channels: ${channelsText(channels)}. Thread Memory can be read and every kept join is saved.`
 }
 
-export function buildThreadMemoryNotSavedLine(key: string, channels: readonly string[], path: string, step: string, error: unknown): string {
-  return buildThreadMemoryDiagnostic(THREAD_MEMORY_NOT_SAVED, key, `${channelIdentity(channels)} step=${safe(step)}`, `${cause(error)}; joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`, path)
+export function buildThreadMemoryNotSavedLine(key: string, channels: readonly string[], path: string, step: string, error: unknown, noticeOnly = false): string {
+  const notice = noticeOnly ? "notice's own join bookkeeping failed; no notice posted; " : ''
+  return buildThreadMemoryDiagnostic(THREAD_MEMORY_NOT_SAVED, key, `${channelIdentity(channels)} step=${safe(step)}`, `${cause(error)}; ${notice}joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`, path)
 }
 export function buildThreadMemoryUnreadableLine(key: string, channels: readonly string[], path: string, error?: unknown, missing = false): string {
   return buildThreadMemoryDiagnostic(THREAD_MEMORY_UNREADABLE, key, channelIdentity(channels),
@@ -165,16 +167,17 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
   function recover(key: string, outage = deps.outage(key)): void {
     if (outage.unknown || outage.unsaved || outage.missing) return
     const open = ([THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE] as const).filter(kind => deps.episodes.isOpen(key, kind))
+    const reported = open.some(kind => deps.episodes.hasPosted(key, kind))
     const last = open.pop()
     for (const kind of open) deps.episodes.end(key, kind)
     if (!last) return
     const channels = deps.threadHybridChannels(key)
-    post(key, last, buildThreadMemoryRecoveredNotice(ref(key), channels), buildThreadMemoryRecoveredLine(key, channels), 'recovered')
+    if (reported) post(key, last, buildThreadMemoryRecoveredNotice(ref(key), channels), buildThreadMemoryRecoveredLine(key, channels), 'recovered')
     deps.episodes.end(key, last)
     deps.episodes.resetCount(key, THREAD_MEMORY_UNREADABLE)
   }
-  function loss(key: string, facts: ThreadMemoryLoss): void {
-    if (deps.episodes.begin(key, THREAD_MEMORY_JOINS_LOST, `loss-${++lossNumber}`) === 'closed') return
+  function loss(key: string, facts: ThreadMemoryLoss, source = 'loss'): void {
+    if (deps.episodes.begin(key, THREAD_MEMORY_JOINS_LOST, `${source}-${++lossNumber}`) === 'closed') return
     try {
       const persona = deps.persona(key) ?? { name: key, key }
       const notice = buildThreadMemoryJoinsLostNotice(persona, facts)
@@ -184,7 +187,12 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
   }
   function changed(finding: ThreadMemorySealFinding): void {
     const { key } = finding
-    if (!active(key) || deps.episodes.begin(key, THREAD_MEMORY_CHANGED_WHILE_STOPPED) === 'closed') return
+    if (!active(key)) return
+    if (finding.case === 'own-post-joins-lost') {
+      loss(key, { threads: finding.threads, messages: [] }, 'seal-loss')
+      return
+    }
+    if (deps.episodes.begin(key, THREAD_MEMORY_CHANGED_WHILE_STOPPED) === 'closed') return
     const channels = deps.threadHybridChannels(key)
     post(key, THREAD_MEMORY_CHANGED_WHILE_STOPPED,
       buildThreadMemoryChangedWhileStoppedNotice(ref(key), channels, finding.wording),
@@ -195,8 +203,13 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
     if (!active(key)) return
     switch (event.type) {
       case 'append-failed': case 'creation-failed': {
-        if (deps.episodes.begin(key, THREAD_MEMORY_NOT_SAVED) === 'closed') return
+        const began = deps.episodes.begin(key, THREAD_MEMORY_NOT_SAVED)
+        if (began === 'closed') return
         const channels = deps.threadHybridChannels(key)
+        if (event.type === 'append-failed' && event.noticeOnly) {
+          if (began === 'begun') log(buildThreadMemoryNotSavedLine(key, channels, event.path, event.step, event.error, true))
+          return
+        }
         post(key, THREAD_MEMORY_NOT_SAVED, buildThreadMemoryNotSavedNotice(ref(key), channels, event.path, event.step, event.error),
           buildThreadMemoryNotSavedLine(key, channels, event.path, event.step, event.error))
         return
@@ -241,6 +254,7 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
     if (deps.episodes.isClosed()) return
     switch (event.type) {
       case 'changed-while-stopped': changed(event); return
+      case 'own-post-joins-lost': return // Replayed only through startupFindings.
       case 'seal-read-failed': case 'seal-invalid': log(buildThreadMemorySealUnreadableLine(event.path, event.error)); return
       case 'seal-write-failed': log(buildThreadMemorySealNotSavedLine(event.path, event.error, event.unsynced)); return
       default: return

@@ -1869,7 +1869,7 @@ Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` stora
 ### `thread-memory-not-saved`
 
 ```text
-:warning: *Thread Memory not saved* — "Alpha" (key=alpha); channels: C0123. Could not save "&lt;state dir&gt;/threads/alpha.jsonl" (journal-append): Error code=EACCES message="permission denied". Joins are kept and will be saved once storage works. Check the file's permissions and storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+:warning: *Thread Memory not saved* — "Alpha" (key=alpha); channels: C0123. Could not save "&lt;state dir&gt;/threads/alpha.jsonl" (journal-append): Error code=EACCES message="permission denied". Joins are kept and will be saved once storage works. Joins from the bot's own posts are lost if CSCB stops before they are saved. Check the file's permissions and storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
 ```
 
 - **Line:** The log uses the following form (both forms where shown):
@@ -1878,14 +1878,28 @@ Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` stora
   [slack] thread-memory-not-saved: persona=alpha channels=["C0123"] step=journal-append path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; joins kept, saving retried; check permissions/storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
   ```
 
-- **Meaning:** Joins remain in memory, still select replies and will be saved when storage works. One report covers the outage; it ends when Thread Memory is readable and all retained work is settled, as described under [Thread Memory recovered](#thread-memory-recovered).
+  A failure holding only a server notice's own join bookkeeping opens the outage with this log-only form:
+
+  ```text
+  [slack] thread-memory-not-saved: persona=alpha channels=["C0123"] step=journal-append path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; notice's own join bookkeeping failed; no notice posted; joins kept, saving retried; check permissions/storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+  ```
+
+- **Meaning:** Joins remain in memory, still select replies and will be saved when storage works. Joins from the bot's own posts kept only in memory are lost if CSCB stops before they are saved, as `THREAD_MEMORY_OWN_POST_LOSS_WARNING` says in the notice. The episode and [Thread Memory recovered](#thread-memory-recovered) wait until Thread Memory is readable and every retained fact, including own-post intents, outcomes and joins, is saved or otherwise settled.
+
+  A failure holding only a server notice's own join bookkeeping posts nothing and joins the existing outage; if none is open, it opens silently with one log-only line, preventing a chain of notices. A later failure involving another post or an ordinary join posts *Thread Memory not saved* once, but an outage that posted no report ends with no *Thread Memory recovered*.
+
+  A stuck-prompt warning's failure, a failure involving both notice and other bookkeeping, or a creation failure is reported normally.
 - **Cause:** The first failed append or creation step opens the episode. The `step` field is `seal-entry`, `journal-header`, `journal-append` or `marker`; the line's `path` identifies the persona's journal, including when creation failed at the shared seal entry or created marker.
-- **Fix:** Check the named path's disk, mount and permissions, and the state directory for a seal-entry or marker failure. No saved incoming message needs resending just because its join was not saved; if incoming messages also cannot be saved, Slack retries only a limited number of times and may disable events, so check the app's **Event Subscriptions** and follow [Message not saved](#message-not-saved).
+- **Fix:** Check the named path's disk, mount and permissions, and the state directory for a seal-entry or marker failure. A notice whose bookkeeping failed needs no resend: saving its facts is retried once storage works, without posting the notice again.
+
+  A graceful stop records own-post joins still kept only in memory in the shutdown seal, including when the journal is unreadable or its creation is incomplete. The next start names them in [Joins lost](#thread-memory-joins-lost) if the entry with that list was saved successfully and the seal is readable and valid. A crash cannot record that list; when the outage remained silent, only the log-only line records the notice's lost join.
+
+  No saved incoming message needs resending just because its join was not saved; if incoming messages also cannot be saved, Slack retries only a limited number of times and may disable events, so check the app's **Event Subscriptions** and follow [Message not saved](#message-not-saved).
 
 ### `thread-memory-unreadable`
 
 ```text
-:warning: *Thread Memory unreadable* — "Alpha" (key=alpha); channels: C0123. Cannot read "&lt;state dir&gt;/threads/alpha.jsonl". Replies in this bot's threads are saved and wait until Thread Memory can be read. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again. Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.
+:warning: *Thread Memory unreadable* — "Alpha" (key=alpha); channels: C0123. Cannot read "&lt;state dir&gt;/threads/alpha.jsonl". Replies in this bot's threads are saved and wait until Thread Memory can be read. Joins from the bot's own posts are lost if CSCB stops before they are saved. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again. Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.
 ```
 
 - **Line:** The log uses the following form (both forms where shown):
@@ -1899,6 +1913,8 @@ Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` stora
   ```
 
 - **Meaning:** Thread Memory is unknown. Replies whose selection needs it are saved as Memory Holds and acknowledged, waiting for the read. A reply in a thread that one of the bot's still-pending own posts could put the bot in is saved and acknowledged as a Post Hold instead, and everything this persona saves later waits behind that Post Hold, while other personas keep flowing. Apart from that, known joins and the independent traffic listed above keep working. The first successful read judges pending joins, attempts to release or withdraw each Memory Hold, then saves joins kept meanwhile; a failed hold-resolution write retries separately, and the outage stays open until retained Thread Memory work is settled.
+
+  The bot's own posts made while the journal is unreadable keep their joins only in memory; `THREAD_MEMORY_OWN_POST_LOSS_WARNING` warns that stopping before saving loses them. The first successful read does not end the episode or post *Thread Memory recovered* until those joins and their retained intents and outcomes are saved or otherwise settled.
 - **Cause:** A journal read fails at start or bring-up. Reads retry in the background; if a retry finds the journal gone, the second line above is logged once, with `path=""`, and no second notice: read retries stop, Thread Memory stays unknown, nothing creates or appends that journal, and unresolved Memory Holds stay held until the next start.
 - **Fix:** Restore the journal's permissions or storage. To start this persona's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; *Thread Memory changed while stopped* follows, and *Joins lost* names withdrawn waiting replies to send again. If incoming storage also fails, check the app's **Event Subscriptions** for disabled events and follow [Message not saved](#message-not-saved); do not move the journal while CSCB is running.
 
@@ -2084,12 +2100,18 @@ Thread: C0123 / 1700000000.000001.
   [slack] thread-memory-joins-lost: persona=alpha threads=[] messages=[] unreadable_lines=0 own_posts=[channel=C0123 threads=[] cause=not_in_channel] bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot="Alpha" (key=alpha)
   ```
 
-- **Meaning:** Each loss is reported once: one read's quarantined lines, one resolution's durably withdrawn Memory Holds, or one own-post lookup or upload-thread read that could not settle the bot's thread. A quarantine and the holds it causes can therefore produce two posts at one start; lost threads are treated as threads the bot is not in unless a readable or kept join names them.
+- **Meaning:** Each loss is reported once: one read's quarantined lines, one resolution's durably withdrawn Memory Holds, one own-post lookup or upload-thread read that could not settle the bot's thread, or one persona's list of own-post joins kept only in memory at a graceful stop. A quarantine and the holds it causes can therefore produce two posts at one start; lost threads are treated as threads the bot is not in unless a readable or kept join names them.
+
+  A graceful stop records those own-post joins' channels and Thread Roots in the seal, including confirmed posts still waiting for a channel decision whose intents were never saved. When the journal is unreadable or its creation is incomplete, the entry stays running and marks the list as written at graceful shutdown; it certifies no store ID or last record number.
+
+  If the entry with that list was saved successfully and the seal is readable and valid at the next start, the start names its list as one loss, using the threads-only notice and line above. A running entry also produces [Thread Memory changed while stopped](#thread-memory-changed-while-stopped) with the unclean-stop wording. A successful start write drops the list, so later starts do not name it again; a crash writes no shutdown list.
 
   An own-post lookup follows an own post whose outcome is unknown, because CSCB stopped before Slack's answer or before saving its join, or the call ended without an answer. CSCB reads the channel's or thread's history in the background to find it; each lost lookup is reported on its own.
 
   An upload-thread read follows a file the bot uploaded as a new channel message, which Slack confirmed: CSCB reads the channel's history for the bot's own message sharing that file, to learn which thread it started. When Slack refuses that read for good or answers it unusably, the upload was still made and only the bot's place in that file's thread is lost, so the post names the channel only.
 - **Cause:** Unreadable journal lines other than an invalid final line, or waiting replies that cannot be matched to a join when Memory Holds are resolved. A lone torn final line is an append that was never saved and gets no *Joins lost* report; its incoming queue record recovers the join.
+
+  A sealed loss means CSCB stopped gracefully before saving own-post joins whose intents were never saved. If that seal is unreadable or invalid at the next start, its list cannot name these joins; the seal is treated as having no entries, giving this persona [Thread Memory changed while stopped](#thread-memory-changed-while-stopped) instead.
 
   For an own-post lookup, `cause=several` means several of the bot's messages match; `cause=unmatched` means its messages are present but none matches. Otherwise Slack permanently refused the read, for example `channel_not_found`, `not_in_channel`, `is_archived` or `missing_scope`, refused credentials such as `invalid_auth`, or lost channel access; an unusable answer can instead give `rejected` or `malformed`. An upload-thread read is reported for every one of these answers, `rejected` and `malformed` included, and also for `thread_not_found` or `message_not_found`, because it reads no parent; it is never reported as `several` or `unmatched`.
 
@@ -2158,7 +2180,7 @@ Restoring the entire state directory can go undetected when its Thread Memory jo
   [slack] thread-memory-recovered: persona=alpha channels=["C0123"] Thread Memory readable; every kept join saved
   ```
 
-- **Meaning:** Thread Memory is readable, its journal is not missing and every retained join or creation step is saved. If both not-saved and unreadable episodes are open, one recovered post and line close them together after the last outstanding work settles; healthy observations without an open outage post nothing.
+- **Meaning:** Thread Memory is readable, its journal is not missing and every retained fact, including the bot's own-post intents, outcomes and joins, and every creation step is saved. If both not-saved and unreadable episodes are open, one recovered post and line close them together after the last outstanding work settles, provided at least one posted its report; healthy observations without an open outage and outages that posted no report produce no recovered post or line.
 - **Cause:** A successful read or save, or a later decision about pending joins, settles the outage. A join still awaiting a channel decision keeps it open; current joins must be saved durably, while stale joins no longer needed by a held reply can be discarded, allowing recovery without an append. Background saving continues without new traffic after a pending decision becomes available, and that decision does not advance an existing retry deadline.
 - **Fix:** No action is needed. This report confirms Thread Memory recovery, not that every held reply's separate queue resolution has been saved; a [holds-not-resolved](#thread-memory-holds-not-resolved) failure still needs its own storage fix.
 

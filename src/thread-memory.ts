@@ -233,6 +233,7 @@ export interface ThreadPostOutcome extends ThreadRecordBase {
 }
 export type OwnPostContent = { kind: 'text'; text: string } | { kind: 'file'; name: string; size: number }
 export type OwnPostIntent = Pick<ThreadPostIntent, 'operationId' | 'channel' | 'root' | 'at' | 'stamp'> &
+  { noticeOnly?: boolean } &
   ({ digest: string } | { content: OwnPostContent })
 export type UnresolvedOwnPostIntent = Pick<ThreadPostIntent, 'operationId' | 'channel' | 'root' | 'at' | 'stamp'> & { digest?: string }
 export type KeepIntentResult = { kept: false } | { kept: true; ready?: Promise<'saved' | 'failed'> }
@@ -255,7 +256,8 @@ export interface ThreadMemoryQuarantineFact {
   line: number; invalidFinalLine: boolean; channel?: string; root?: string
 }
 export type ThreadMemoryEvent =
-  | { type: 'append-failed' | 'creation-failed'; key: string; path: string; step: 'seal-entry' | 'journal-header' | 'journal-append' | 'marker'; error: unknown }
+  | { type: 'append-failed'; key: string; path: string; step: 'journal-append'; error: unknown; noticeOnly: boolean }
+  | { type: 'creation-failed'; key: string; path: string; step: 'seal-entry' | 'journal-header' | 'marker'; error: unknown }
   | { type: 'compaction-failed'; key: string; path: string; step: 'journal-rewrite'; error: unknown }
   | { type: 'removal-failed'; key: string; path: string; step: 'journal-unlink' | 'seal-entry' | 'marker'; error: unknown }
   | { type: 'read-failed'; key: string; path: string; error: unknown }
@@ -279,6 +281,8 @@ export interface ThreadMemoryOptions {
   authorityReady?(): boolean
   /** Read at use time, including Memory-Dependent decisions still being stored. */
   heldStamps?(key: string): readonly { channel: string; stamp: ChannelStamp }[]
+  /** Confirmed own-post facts still owned outside this journal's writer. */
+  unsavedOwnPosts?(key: string): number
   threadHybridChannels(key: string): readonly string[]
   markerKeys(): readonly string[]
   /** Staged replacement is not an applied removal; preserve its old evidence. */
@@ -386,8 +390,9 @@ function memoryStampMatches(a: ThreadMemoryStamp, b: ThreadMemoryStampState | un
 function stampKey(stamp: ThreadMemoryStamp): string { return JSON.stringify([stamp.incarnation, stamp.threadHybridSince]) }
 interface JoinedThread { join: ThreadJoin; saved?: ThreadJoinRecord }
 type JoinIndex = Map<string, Map<string, Map<string, JoinedThread>>>
-type KeptIntent = Omit<ThreadPostIntent, 'v' | 'seq' | 'digest'> & { digest?: string; content?: OwnPostContent }
-type KeptRecord = ({ kind: 'join' } & ThreadJoin) | KeptIntent | Omit<ThreadPostOutcome, 'v' | 'seq'>
+type KeptIntent = Omit<ThreadPostIntent, 'v' | 'seq' | 'digest'> & { digest?: string; content?: OwnPostContent; noticeOnly?: boolean }
+/** Reporting provenance stays in memory; journal records never carry it. */
+type KeptRecord = (({ kind: 'join' } & ThreadJoin) | KeptIntent | Omit<ThreadPostOutcome, 'v' | 'seq'>) & { noticeOnly?: boolean }
 interface KeptWrite { records: KeptRecord[] }
 interface MemoryJournal extends AppendRollback {
   readable: boolean; exists: boolean; hasRecords: boolean; live: boolean; created: boolean; failed: boolean
@@ -766,6 +771,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       kind: 'post-intent', operationId: input.operationId, channel: input.channel,
       ...(input.root === undefined ? {} : { root: input.root }), at: input.at,
       stamp: { incarnation: input.stamp.incarnation, threadHybridSince: input.stamp.threadHybridSince },
+      noticeOnly: input.noticeOnly === true,
     }
     if ('digest' in input) {
       if (!/^[a-f0-9]{64}$/.test(input.digest)) return { kept: false }
@@ -808,6 +814,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       }
     }
     write.records.push({ kind: 'post-outcome', operationId, outcome })
+    for (const record of write.records) record.noticeOnly = intent.noticeOnly === true
     j.writes.push(write); unindexIntent(j, operationId)
     if (j.readable && !j.failed) void serial(key, () => j.failed ? { kind: 'kept' } : saveKept(key, j, undefined, write)).catch(() => {})
     return outcome
@@ -834,6 +841,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     const candidates = requested ? j.writes.filter(write => write.records.every(fact => fact.kind === 'join' && requested.some(r =>
       r.channel === fact.channel && r.root === fact.root && sameChannelStamp(r.stamp, { kind: 'decided', ...fact.stamp }) && fact.at <= r.at))) : j.writes.slice(0, last + 1)
     const writes: KeptWrite[] = [], records: ThreadMemoryRecord[] = []
+    let noticeOnly = true
     digestKept(j)
     for (const write of candidates) {
       const facts = recordsForWrite(key, write)
@@ -843,12 +851,13 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       if (!facts) continue
       if (facts.some(fact => fact.kind === 'post-intent' && !fact.digest)) break
       for (const fact of facts) {
+        noticeOnly = noticeOnly && fact.noticeOnly === true
         // Content stays private even if a structural caller supplied extra fields.
         if (fact.kind === 'post-intent') {
-          const { content: _content, ...intent } = fact
+          const { content: _content, noticeOnly: _noticeOnly, ...intent } = fact
           records.push({ ...intent, digest: fact.digest!, v: 1, seq: j.highWater + records.length + 1 })
         } else if (fact.kind === 'join') records.push({ ...copyThreadJoin(fact), v: 1, kind: 'join', seq: j.highWater + records.length + 1 })
-        else records.push({ ...fact, v: 1, seq: j.highWater + records.length + 1 })
+        else records.push({ kind: 'post-outcome', operationId: fact.operationId, outcome: fact.outcome, v: 1, seq: j.highWater + records.length + 1 })
       }
       writes.push(write)
     }
@@ -869,7 +878,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       else if (hadKept) observeSettled(key, j)
       return { kind: j.writes.length ? 'kept' : 'saved' }
     } catch (error) {
-      j.failed = true; event({ type: 'append-failed', key, path: pathFor(key), step: 'journal-append', error })
+      j.failed = true; event({ type: 'append-failed', key, path: pathFor(key), step: 'journal-append', error, noticeOnly: records.length > 0 && noticeOnly })
       return { kind: 'failed', error }
     }
   }
@@ -990,16 +999,23 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         (recoveryStamp(key, fact) !== 'stale' || named(key, fact.channel, fact.stamp)))
       const creation = !j.created && (j.creationHeader !== undefined || (j.readable && (j.hasRecords || options.threadHybridChannels(key).length > 0)))
       const posts = j.writes.reduce((count, write) => count + write.records.filter(record => record.kind !== 'join').length, 0)
-      return { unknown: !j.readable, unsaved: kept.length + posts + pending.length + Number(creation), missing: j.missing === true }
+      return { unknown: !j.readable, unsaved: kept.length + posts + pending.length + Number(creation) + (options.unsavedOwnPosts?.(key) ?? 0), missing: j.missing === true }
     },
     published() {
       if (stopped || quiesced) return
       const settling = [...journals].filter(([key, j]) => j.kept.length > 0 || pendingJoins.has(key))
+      const deferredPosts = [...journals].filter(([key]) => (options.unsavedOwnPosts?.(key) ?? 0) > 0)
       for (const [key, j] of journals) if (workAllowed(key) && j.live) judge(key, j)
       for (const key of [...pendingJoins.keys()]) api.retryPendingJoins(key)
       // Recovery has added any needed joins before observing stale removals.
       // A queued append stays unsaved until saveKept observes its durable end.
       for (const [key, j] of settling) observeSettled(key, j)
+      // The owner settles unstamped posts on its publication microtask. Check
+      // after that turn: a discarded post needs no append to signal recovery,
+      // while a handed-off intent remains counted by this journal's writer.
+      for (const [key, j] of deferredPosts) {
+        void Promise.resolve().then(() => serial(key, () => observeSettled(key, j))).catch(() => {})
+      }
       // Promise-chain turns run after the synchronous publisher releases its
       // mutation lock; a marker setter must never run inside that publisher.
       for (const key of options.appliedKeys()) {

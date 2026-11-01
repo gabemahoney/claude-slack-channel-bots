@@ -482,7 +482,9 @@ export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 /** Log-only intake diagnostic, with a separate mark for each undecided channel. */
 export const PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED = 'thread-stamp-undecided'
 
-/** First append/creation failure until every kept fact is saved; posted by Thread Memory reporting. */
+/** First append/creation failure until every kept fact is saved; Thread Memory
+ * reporting opens notice-only append failures silently. A silent outage that
+ * never posted its report ends without a recovered notice. */
 export const PERSONA_EPISODE_KIND_THREAD_MEMORY_NOT_SAVED = 'thread-memory-not-saved'
 /** Failed read until readable with all kept facts saved, or forgotten; posted by Thread Memory reporting. */
 export const PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE = 'thread-memory-unreadable'

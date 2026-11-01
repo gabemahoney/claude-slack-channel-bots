@@ -198,6 +198,7 @@ import { deliveryResultSamples, sharedChannelPath, SHARED_CHANNEL_IDS } from './
 import { THREAD_PERSONAS, THREAD_CHANNELS, THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
+  THREAD_MEMORY_OWN_POST_LOSS_WARNING,
   buildThreadMemoryNotSavedNotice,
   buildThreadMemoryUnreadableNotice,
   buildThreadMemoryJoinsLostNotice,
@@ -701,6 +702,13 @@ describe('the debugging skill covers every persona diagnostic class', () => {
 
   test.each(REPORT_SAMPLES)('%s quotes the title rendered by its notice builder', (label, render) => {
     expect(hasNoticeTitle(debugSkill(), label, noticeTitle(render))).toBe(true)
+    if (label === THREAD_MEMORY_NOT_SAVED || label === THREAD_MEMORY_UNREADABLE) {
+      const notices = splitFences(requiredSection(debugSkill(), classHeading(label), SKILL_REL)).blocks
+        .filter(block => block.body.includes(noticeTitle(render)))
+      // The warning belongs in each quoted notice, not merely in the prose
+      // or in the neighbouring outage entry.
+      for (const notice of notices) expect(notice.body).toContain(THREAD_MEMORY_OWN_POST_LOSS_WARNING)
+    }
   })
 
   test.each(REPORT_SAMPLES)('self-check: %s fails when its quoted notice title is removed', (label, render) => {

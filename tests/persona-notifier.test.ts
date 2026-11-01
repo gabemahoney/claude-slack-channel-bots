@@ -67,11 +67,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { WebClient } from '@slack/web-api'
+import ts from 'typescript'
 
 import { DM_DESTINATION, type Persona } from '../src/config.ts'
 import { LATCH_CASE_LEFTOVER, conflictNoticeText } from '../src/conflict-latch.ts'
@@ -95,6 +96,15 @@ import {
 import { createPersonaDestinations, type DestinationFailure } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { createOwnPostObserver, type OwnPostAnswer } from '../src/own-post.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { THREAD_MEMORY_NOT_SAVED } from '../src/persona-diagnostics.ts'
+import { THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS } from '../src/delivery-constants.ts'
+import {
+  createThreadMemoryReporting, buildThreadMemoryNotSavedNotice, buildThreadMemoryNotSavedLine,
+  buildThreadMemoryRecoveredNotice, buildThreadMemoryRecoveredLine, THREAD_MEMORY_OWN_POST_LOSS_WARNING,
+} from '../src/thread-memory-reports.ts'
+import { createThreadMemoryRetries } from '../src/thread-memory-retry.ts'
+import type { ThreadMemoryEvent } from '../src/thread-memory.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -103,6 +113,8 @@ import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type Noti
 import { makeDeferredWebApiCall, stubOpenedDmId, type SettledWebApiOutcome, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { holdOwnPostReady, makeOwnPostHarness, makeRecordingOwnPostObserver } from './test-helpers/own-post.ts'
 import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
+import { THREAD_ROOTS, threadPath, readThreads } from './test-helpers/thread-memory.ts'
+import { onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
 import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
@@ -1716,4 +1728,228 @@ describe('notices as own-post operations', () => {
       }
     },
   )
+})
+
+/** Run the actual server event port and retry construction with this fixture's
+ * holders. main() is not runnable in a unit test and has no holder setter.
+ * As in server-startup-wiring, AST extraction executes production dispatch,
+ * including observation-time outage snapshots; it does not copy its rules.
+ */
+function noticeMemoryDispatch(bindings: Record<string, unknown>): {
+  emit(event: ThreadMemoryEvent): void
+  retries: ReturnType<typeof createThreadMemoryRetries>
+} {
+  const code = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8'))
+  const tree = ts.createSourceFile('server.ts', code, ts.ScriptTarget.Latest, true)
+  const functions = ['dispatchThreadMemoryReport', 'threadMemoryWorkAllowed'].map(name => {
+    const matches = tree.statements.filter(node => ts.isFunctionDeclaration(node) && node.name?.text === name)
+    expect(matches).toHaveLength(1)
+    return matches[0]!.getText(tree)
+  })
+  const ports = tree.statements.filter(ts.isVariableStatement).flatMap(node => [...node.declarationList.declarations])
+    .filter(node => node.name.getText(tree) === 'threadMemoryEvents')
+  expect(ports).toHaveLength(1)
+  const script = ts.transpileModule(`
+    const bufferedThreadMemoryEvents = [];
+    const shuttingDown = false, reloadController = undefined, ownPostLookups = undefined, memoryHolds = undefined;
+    ${functions.join('\n')}
+    const threadMemoryRetries = createThreadMemoryRetries(${onlyCallArguments(code, 'createThreadMemoryRetries')});
+    const port = ${ports[0]!.initializer!.getText(tree)};
+    return { emit: port.emit, retries: threadMemoryRetries };
+  `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  return new Function(...Object.keys(bindings), script)(...Object.values(bindings))
+}
+
+type NoticeMemoryOwner = Awaited<ReturnType<typeof makeOwnPostHarness>>
+async function withNoticeMemory(run: (rig: {
+  owner: NoticeMemoryOwner; persona: Persona; episodes: ReturnType<typeof createPersonaEpisodes>
+  fail(): Error; recovered(): string; notSaved(error: unknown): string
+}) => Promise<void>): Promise<void> {
+  const owner = await makeOwnPostHarness(dir)
+  const persona = { ...owner.authority.config().personas[0]!, permission_prompts: SHARED_CHANNEL_IDS.primary }
+  const config = { ...owner.authority.config(), personas: [persona] }, key = persona.key
+  h = makeNotifierHarness(config, { clock: owner.clock, getPersonaConfig: () => config,
+    ownPosts: owner.observer, leakMarker: LEAK_SENTINEL })
+  const episodes = createPersonaEpisodes({ clock: owner.clock, log: line => h.logs.push(line),
+    sink: (key, text, options) => h.notifier.notify(key, text, options) })
+  const channels = () => owner.authority.threadView().threadHybridChannels(key)
+  const reporting = createThreadMemoryReporting({ episodes, log: line => h.logs.push(line),
+    persona: k => config.personas.find(p => p.key === k),
+    threadHybridChannels: k => owner.authority.threadView().threadHybridChannels(k), outage: owner.memory.outage })
+  const dispatch = noticeMemoryDispatch({ createThreadMemoryRetries, SYSTEM_PERSONA_CONNECTION_CLOCK: owner.clock,
+    threadMemory: owner.memory, threadMemoryReporting: reporting, personaEpisodes: episodes,
+    getAppliedPersona: (k: string) => config.personas.find(p => p.key === k) })
+  // The shared helper exposes its event capture, but no onEvent option. Forward
+  // at that synchronous observation point without editing its other writer's
+  // helper or replaying events against a later (possibly healthy) outage.
+  const captured = owner.threads.events, push = captured.push
+  captured.push = function (...events) {
+    const length = push.apply(this, events)
+    events.forEach(dispatch.emit)
+    return length
+  }
+  try {
+    await run({ owner, persona, episodes,
+      fail: () => owner.io.fail('writeSync', key),
+      recovered: () => formatPersonaNotice(persona, buildThreadMemoryRecoveredNotice(ref(persona), channels())),
+      notSaved: error => formatPersonaNotice(persona, buildThreadMemoryNotSavedNotice(ref(persona), channels(), threadPath(dir, key), 'journal-append', error)),
+    })
+    assertNoLeak({ posts: h.allPosts(), logs: h.logs, journal: writtenFile(join(dir, 'threads')), owner: owner.captured() })
+  } finally {
+    episodes.close(); dispatch.retries.stopKeys(); dispatch.retries.stopSeal(); h.hold.cancelAll()
+    captured.push = push
+    await owner.close()
+  }
+}
+
+/** Verify durable own-post facts, rather than just the in-memory joined view. */
+function expectSavedNotice(owner: NoticeMemoryOwner, key: string, root: string): void {
+  const records = readThreads(dir, key)
+  const joins = records.filter(record => record.kind === 'join' && record.root === root && record.source === 'own-post')
+  expect(joins).toHaveLength(1)
+  const decisions = owner.events.filter(event => event.type === 'decided' && event.key === key && event.outcome?.thread === root)
+  expect(decisions).toHaveLength(1)
+  const operationId = decisions[0]!.operationId
+  expect(records.filter(record => record.kind === 'post-intent' && record.operationId === operationId)).toHaveLength(1)
+  expect(records.filter(record => record.kind === 'post-outcome' && record.operationId === operationId && record.outcome === 'joined')).toHaveLength(1)
+  expect(owner.memory.hasKeptJoin(key, SHARED_CHANNEL_IDS.primary, root)).toBe(false)
+}
+
+describe('notice join failures through notifier, owner, store, dispatcher and retries', () => {
+  const originalNotice = 'Fixture storage-independent notice'
+
+  test.each([false, true])('a silent notice failure recovers without posting again; later ordinary failure=%s', async ordinary => {
+    await withNoticeMemory(async ({ owner, persona, episodes, fail, recovered, notSaved }) => {
+      const key = persona.key, channel = SHARED_CHANNEL_IDS.primary, error = fail()
+      h.stub(key).script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } },
+        { kind: 'ok', result: { ts: THREAD_ROOTS.secondary } }, { kind: 'ok', result: { ts: THREAD_ROOTS.third } })
+      await h.notifier.notify(key, originalNotice); await owner.flush()
+      const original = { channel, text: formatPersonaNotice(persona, originalNotice) }
+      expect(h.posts(key)).toEqual([original])
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+      expect(episodes.hasPosted(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      expect(owner.memory.outage(key).unsaved).toBe(3)
+      expect(h.logs).toEqual([buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error, true)])
+      expect(readThreads(dir, key).filter(record => record.kind !== 'header')).toEqual([])
+      const expected = [original]
+      if (ordinary) {
+        const mention = owner.threads.fact({ root: THREAD_ROOTS.third })
+        expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('failed')
+        await owner.flush()
+        expected.push({ channel, text: notSaved(error) })
+        expect(h.posts(key)).toEqual(expected)
+        expect(h.posts(key)[1]!.text).toContain(THREAD_MEMORY_OWN_POST_LOSS_WARNING)
+        expect(episodes.hasPosted(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+      }
+      await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(h.posts(key)).toEqual(expected)
+      owner.io.heal()
+      await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      if (ordinary) expected.push({ channel, text: recovered() })
+      expect(h.posts(key)).toEqual(expected)
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      expect(owner.memory.outage(key).unsaved).toBe(0)
+      expectSavedNotice(owner, key, THREAD_ROOTS.primary)
+      expect(h.logs).toEqual([
+        buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error, true),
+        ...(ordinary ? [buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error),
+          buildThreadMemoryRecoveredLine(key, [channel])] : []),
+      ])
+      await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      expect(h.posts(key)).toEqual(expected)
+      expect(h.hold.view(key)).toEqual(NOT_HELD)
+    })
+  })
+
+  test('saving the original failed fact leaves the reported episode open until the notice facts save', async () => {
+    await withNoticeMemory(async ({ owner, persona, episodes, fail, recovered, notSaved }) => {
+      const key = persona.key, channel = SHARED_CHANNEL_IDS.primary, error = fail()
+      h.stub(key).script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } }, { kind: 'ok', result: { ts: THREAD_ROOTS.secondary } })
+      const mention = owner.threads.fact({ root: THREAD_ROOTS.third })
+      expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('failed')
+      await owner.flush()
+      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error) }])
+      expect(owner.memory.outage(key).unsaved).toBe(4)
+      owner.io.heal()
+      expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('kept')
+      fail()
+      expect(owner.memory.isJoinSaved(key, mention)).toBe(true)
+      expect(owner.memory.outage(key).unsaved).toBe(3)
+      await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error) }])
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+      owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error) }, { channel, text: recovered() }])
+      expect(owner.memory.outage(key).unsaved).toBe(0)
+      expectSavedNotice(owner, key, THREAD_ROOTS.primary)
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      expect(h.logs).toEqual([buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error),
+        buildThreadMemoryRecoveredLine(key, [channel])])
+    })
+  })
+
+  test('a recovered notice whose own outcome fails cannot start a chain across flapping retries', async () => {
+    await withNoticeMemory(async ({ owner, persona, episodes, fail, recovered, notSaved }) => {
+      const key = persona.key, channel = SHARED_CHANNEL_IDS.primary, error = fail()
+      const recoveryPost = makeDeferredWebApiCall()
+      h.stub(key).script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } }, recoveryPost.outcome)
+      const mention = owner.threads.fact({ root: THREAD_ROOTS.third })
+      expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('failed')
+      await owner.flush()
+      owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      const expected = [{ channel, text: notSaved(error) }, { channel, text: recovered() }]
+      expect(h.posts(key)).toEqual(expected)
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      const flapError = fail()
+      recoveryPost.settle({ kind: 'ok', result: { ts: THREAD_ROOTS.secondary } })
+      await owner.flush()
+      expect(owner.memory.outage(key).unsaved).toBe(2)
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
+      expect(episodes.hasPosted(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+        expect(h.posts(key)).toEqual(expected)
+      }
+      owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      expect(h.posts(key)).toEqual(expected)
+      expect(owner.memory.outage(key).unsaved).toBe(0)
+      expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
+      expectSavedNotice(owner, key, THREAD_ROOTS.secondary)
+      expect(h.logs).toEqual([buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error),
+        buildThreadMemoryRecoveredLine(key, [channel]),
+        buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', flapError, true)])
+    })
+  })
+
+  test.each(['mention', 'warning'] as const)('one mixed flush of notice facts and a %s reports and recovers once', async other => {
+    await withNoticeMemory(async ({ owner, persona, fail, recovered, notSaved }) => {
+      const key = persona.key, channel = SHARED_CHANNEL_IDS.primary, error = fail()
+      h.stub(key).script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } },
+        { kind: 'ok', result: { ts: THREAD_ROOTS.secondary } }, { kind: 'ok', result: { ts: THREAD_ROOTS.third } })
+      await h.notifier.notify(key, originalNotice); await owner.flush()
+      if (other === 'mention') expect(owner.memory.addJoin(key, owner.threads.fact({ root: THREAD_ROOTS.third }))).toBe(true)
+      else {
+        // A permission warning is a non-notice surface. Its kept private intent
+        // is sufficient to make this flush mixed; no extra Slack post is needed.
+        const warning = owner.observer.start(key, 'warning', { channel }, { kind: 'text', text: sentinelInMessage('private-warning') })
+        expect(warning?.operation).toBeDefined()
+        await warning?.ready
+      }
+      expect(h.totalPosts()).toBe(1)
+      expect((await owner.memory.flush(key)).kind).toBe('failed')
+      await owner.flush()
+      const expected = [{ channel, text: formatPersonaNotice(persona, originalNotice) }, { channel, text: notSaved(error) }]
+      expect(h.posts(key)).toEqual(expected)
+      await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(h.posts(key)).toEqual(expected)
+      owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
+      expected.push({ channel, text: recovered() })
+      expect(h.posts(key)).toEqual(expected)
+      expect(owner.memory.outage(key).unsaved).toBe(0)
+      expectSavedNotice(owner, key, THREAD_ROOTS.primary)
+      expect(h.logs).toEqual([buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error, true),
+        buildThreadMemoryNotSavedLine(key, [channel], threadPath(dir, key), 'journal-append', error),
+        buildThreadMemoryRecoveredLine(key, [channel])])
+    })
+  })
 })
