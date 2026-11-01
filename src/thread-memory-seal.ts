@@ -111,6 +111,13 @@ function runningEntry(entry: ThreadMemorySealEntry): ThreadMemorySealEntry {
   return entry.storeId === undefined ? { clean: false }
     : { storeId: entry.storeId, lastRecordNumber: entry.lastRecordNumber, clean: false }
 }
+/** Graceful shutdown's running entry keeps known memory-only joins. Its marker
+ * certifies only that the list came from graceful shutdown, never the store. */
+function shutdownRunningEntry(identity: ThreadMemoryShutdownEntry): ThreadMemorySealEntry {
+  const list = identity.memoryOnlyJoins?.length ? { gracefulShutdown: true as const, memoryOnlyJoins: identity.memoryOnlyJoins } : {}
+  return identity.storeId === undefined ? { clean: false, ...list }
+    : { storeId: identity.storeId, lastRecordNumber: identity.lastRecordNumber, clean: false, ...list }
+}
 export interface JudgeSealInput {
   key: string; previous?: ThreadMemorySealEntry; journal: ThreadMemoryJournalFact
   queue?: ThreadMemoryQueueIdentity; threadHybrid: boolean; created: boolean
@@ -335,16 +342,14 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
         checkKey(key)
         if (identity.storeId === undefined) {
           // An unreadable or incomplete journal supplies no certified identity.
-          // The marker certifies only that this list came from graceful shutdown.
-          if (entries.has(key) || identity.memoryOnlyJoins?.length) entries.set(key, identity.memoryOnlyJoins?.length
-            ? { clean: false, gracefulShutdown: true, memoryOnlyJoins: identity.memoryOnlyJoins }
-            : { clean: false })
+          if (entries.has(key) || identity.memoryOnlyJoins?.length) entries.set(key, shutdownRunningEntry(identity))
           continue
         }
         try { entries.set(key, { ...identity, clean: true, queue: queueIdentity(key) }) }
         catch (error) {
           identityFailure = { error }
-          entries.set(key, { storeId: identity.storeId, lastRecordNumber: identity.lastRecordNumber, clean: false })
+          // An unknown queue identity can't seal clean; the running entry still names the joins.
+          entries.set(key, shutdownRunningEntry(identity))
           event({ type: 'queue-identity-failed', key, phase: 'shutdown', error })
         }
       }

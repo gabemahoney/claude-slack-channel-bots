@@ -2697,7 +2697,9 @@ describe('Thread Memory seal judgments and closed metadata', () => {
 })
 
 describe('Thread Memory seal startup and restart', () => {
-  test.each((['unreadable', 'incomplete'] as const).flatMap(journal =>
+  // 'unreadable queue': the journal is readable, but the seal can't read the queue
+  // journal at shutdown, so the entry stays running with its store identity.
+  test.each((['unreadable', 'incomplete', 'unreadable queue'] as const).flatMap(journal =>
     (['graceful-joins', 'graceful-empty', 'crash-joins'] as const).map(stop => [journal, stop] as const)))(
     'Decision 6: %s journal, %s preserves only known shutdown losses beside unclean-stop', async (journal, stop) => {
       const h = await ownPostFixture({ start: false })
@@ -2709,27 +2711,34 @@ describe('Thread Memory seal startup and restart', () => {
         h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
         expect(h.memory.outage('alpha').unknown).toBe(true)
       }
-      expect(h.memory.completedStores().has('alpha')).toBe(false)
+      if (journal === 'unreadable queue') { await h.queue.accept('alpha', slackInput()); h.io.fail('writeSync') }
+      expect(h.memory.completedStores().has('alpha')).toBe(journal === 'unreadable queue')
       const threads = [{ channel: C.primary, root: R.primary }, { channel: C.primary, root: R.secondary }]
       if (stop !== 'graceful-empty') {
         for (const { root } of [...threads].reverse()) await confirmPost(h, beginPost(h), root)
         expect(h.owner.memoryOnlyJoins('alpha')).toHaveLength(threads.length)
       } else expect(h.owner.memoryOnlyJoins('alpha')).toEqual([])
-      const beforeStop = readFileSync(threadSealPath(h.stateDir))
+      const beforeStop = readFileSync(threadSealPath(h.stateDir)), identity = h.memory.completedStores().get('alpha') ?? {}
       h.threads.sealIo!.reset()
+      const cause = journal === 'unreadable queue'
+        ? h.threads.sealIo!.fail('openSync', 'alpha', { match: p => p === queuePath(h.stateDir) }) : undefined
       if (stop === 'crash-joins') { h.owner.stop(); await h.threads.crash() } else await h.close()
       const entry = sealEntry(h.threads)
       if (stop === 'graceful-joins') {
-        expect(entry).toEqual({ clean: false, gracefulShutdown: true, memoryOnlyJoins: threads })
-      } else if (stop === 'graceful-empty') expect(entry).toEqual({ clean: false })
+        expect(entry).toEqual({ ...identity, clean: false, gracefulShutdown: true, memoryOnlyJoins: threads })
+      } else if (stop === 'graceful-empty') expect(entry).toEqual({ ...identity, clean: false })
       else {
         expect(readFileSync(threadSealPath(h.stateDir))).toEqual(beforeStop)
         expect(entry.clean).toBe(false)
         expect(entry.memoryOnlyJoins).toBeUndefined()
         expect(entry).not.toHaveProperty('gracefulShutdown')
       }
-      // An uncertified journal cannot supply either identity or a queue digest.
-      expect(h.threads.sealIo!.queueReads()).toEqual([])
+      // An uncertified journal cannot supply either identity or a queue digest; a
+      // certified one's graceful stop tries the queue once, and that failure is still reported.
+      const queueRead = journal === 'unreadable queue' && stop !== 'crash-joins'
+      expect(h.threads.sealIo!.queueReads()).toEqual(queueRead ? [{ op: 'openSync', path: queuePath(h.stateDir), flags: 'r' }] : [])
+      expect(h.threads.sealEvents.filter(e => e.type === 'queue-identity-failed'))
+        .toEqual(queueRead ? [{ type: 'queue-identity-failed', key: 'alpha', phase: 'shutdown', error: cause }] : [])
       assertNoLeak(readFileSync(threadSealPath(h.stateDir), 'utf8'))
       const next = reportingFixture({ reopen: true }, h.stateDir); await next.start()
       const loss: ThreadMemoryLoss = { threads, messages: [] }
