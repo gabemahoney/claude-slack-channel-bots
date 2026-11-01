@@ -32,6 +32,46 @@ function sample(duplicate = false) {
 }
 
 describe('Codex delivery gate receipt audit', () => {
+  function lateReference(retypeOnly = false) {
+    const f = sample(), original = f.journal[2] as any
+    // The D1 driver records these production engine events directly. Keep
+    // all identity fields together; a delivered row alone is not a binding.
+    const reference = { instance, type: 'transcript-reference', key: f.key, instanceId: instance,
+      sessionId: session, path, at: 1150 }
+    const events: any[] = [{ ...reference, sessionId: '', path: '', at: 950 }, reference, ...f.events]
+    if (retypeOnly) {
+      f.journal.splice(3, 0, { ...original, transcript_path: '', transcript_size: 0, send_kind: 'retype', attempt: 2, at: 1050 })
+      f.shim += call(1051, texts[0])
+    } else { original.transcript_path = ''; original.transcript_size = 0 }
+    return { ...f, events }
+  }
+  test.each([false, true])('late AD reference binds an empty send path, retype-only=%s', retypeOnly => {
+    // A known initial send plus a pathless retype independently exercises
+    // the every-send guard after the receipt's some(send) guard has passed.
+    expect(auditCodexDelivery(lateReference(retypeOnly))).toMatchObject({ items: 2, duplicates: 0 })
+  })
+  test.each([false, true])('late Codex path rejects absent valid reference, retype-only=%s', retypeOnly => {
+    const f = lateReference(retypeOnly); f.events.splice(1, 1)
+    expect(() => auditCodexDelivery(f)).toThrow()
+  })
+  test.each([false, true])('late Codex path rejects mismatched session, retype-only=%s', retypeOnly => {
+    const f = lateReference(retypeOnly); f.events[1].sessionId = 'foreign-session'
+    expect(() => auditCodexDelivery(f)).toThrow()
+  })
+  test.each([
+    ['foreign persona', (f: ReturnType<typeof lateReference>) => { f.events[1].key = 'foreign' }],
+    ['foreign event instance', (f: ReturnType<typeof lateReference>) => { f.events[1].instance = 'cscb_foreign' }],
+    ['foreign AD instance', (f: ReturnType<typeof lateReference>) => { f.events[1].instanceId = 'cscb_foreign' }],
+    ['unrelated full path', (f: ReturnType<typeof lateReference>) => { f.events[1].path = '/foreign/synthetic.jsonl' }],
+    ['mismatched send session', (f: ReturnType<typeof lateReference>) => { (f.journal[2] as any).session_id = 'foreign-session' }],
+    ['receipt before send', (f: ReturnType<typeof lateReference>) => { f.rollout.records[1]!.at = 999 }],
+    ['invalid EOF', (f: ReturnType<typeof lateReference>) => { (f.journal[2] as any).transcript_size = -1 }],
+    ['unknown send outcome', (f: ReturnType<typeof lateReference>) => { (f.journal[2] as any).unknown_outcome = true }],
+  ] as const)('late Codex path rejects %s', (_, change) => {
+    const f = lateReference(); change(f)
+    expect(() => auditCodexDelivery(f)).toThrow()
+  })
+
   test('delivery gate passes on exact receipt evidence without any assistant answer or completion', () => {
     const fixture = sample(), result = auditCodexDelivery(fixture)
     expect(result).toMatchObject({ items: 2, duplicates: 0 })

@@ -273,8 +273,9 @@ if (import.meta.main) {
       const completed = async () => { try {
         const paths = transcriptFiles(root!), all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
         auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths }, all, adapters)
-        const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
-        completedAIReadback({ seq: caseNumber, expected, journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN! }); return true
+        const log = readFileSync(join(state!, 'server.log'), 'utf8').split('\n')
+        const own = personaTranscripts(key!, journal, log, all)
+        completedAIReadback({ seq: caseNumber, expected, journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN!, key: key!, log }); return true
       } catch { return false } }
       const retryObserved = () => {
         const events = readFileSync(join(directory, 'gateway.jsonl'), 'utf8').split('\n').slice(0, -1).filter(Boolean).map(line => JSON.parse(line))

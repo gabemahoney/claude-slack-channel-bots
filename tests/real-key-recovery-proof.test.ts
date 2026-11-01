@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assertFirstLaunchWaiting, assertResetKeyRecovery, assertSameConversationReplyPermission, assertSwallowedEnterRecovery, assertUnknownKeyRecovery } from './integration/fixtures/real-case-assertions.ts'
@@ -10,6 +10,7 @@ import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/creden
 import { buildTemplateParams, REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { ENTER_DELAY_MS } from '../src/delivery-engine.ts'
+import { runFixture } from './test-helpers/test33-receipt-boundary.ts'
 
 const instance = 'cscb_control'
 const fault = { at: 2000, pid: '2000', words: ['send-keys', 'key=Enter', 'swallow'] }
@@ -22,6 +23,126 @@ const fixed = { kind: 'fixed', seq: 1, parts: ['message'] }
 function proveEnter(journal: any[], calls: Parameters<typeof assertSwallowedEnterRecovery>[1], faults: Parameters<typeof assertSwallowedEnterRecovery>[2]) {
   return assertSwallowedEnterRecovery([fixed, ...journal], [key(1000, 'text'), key(2000, 'enter'), ...calls], faults, 1, instance)
 }
+
+// b.436 round 2: AD may report waiting before publishing the session ID.
+// Exercise both the imported proof and the actual first-launch CLI branch;
+// the existing fixture runner replaces only the image/process boundary.
+describe('fresh launch late AD identity', () => {
+  const start = 1000, firstSendAt = 1200, firstTextAt = 1201
+  const waiting = (session_id = 'native-session', at = 1100, key = 'control') => ({ key, session_id, at })
+  function fixture() {
+    return {
+      observations: [waiting('', start), waiting()],
+      sends: [{ ...text, at: firstSendAt }],
+      calls: [key(firstTextAt, 'text'), key(firstTextAt + 500, 'enter')],
+    }
+  }
+  type Fixture = ReturnType<typeof fixture>
+  function prove(f: Fixture) {
+    return assertFirstLaunchWaiting(f.observations, f.sends, 'control', start, firstTextAt)
+  }
+  function repeated(f: Fixture, session = 'native-session') {
+    f.sends.push({ ...text, send_kind: 'retype', at: 2200, session_id: session })
+    f.calls.push(key(2201, 'text'), key(2701, 'enter'))
+    return f
+  }
+  let home: string
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'first-launch-proof-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+  async function cli(f: Fixture) {
+    mkdirSync(join(home, 'queue'), { recursive: true })
+    const journal = [{ kind: 'accepted', seq: 1, received_at: start, text: 'message' }, fixed, ...f.sends]
+    writeFileSync(join(home, 'queue/control.jsonl'), journal.map(r => JSON.stringify(r)).join('\n') + '\n')
+    writeFileSync(join(home, 'server.log'), f.observations.map(r => '[slack] delivery-launch-first-waiting: ' + JSON.stringify(r)).join('\n') + '\n')
+    writeFileSync(join(home, 'shim.log'), f.calls.map(c => ['call', c.at / 1000, c.pid, '1', 'bun', c.words.join(' ')].join('\t')).join('\n') + '\n')
+    return runFixture('fixtures/real-case-assertions.ts', ['first-launch', home, 'control', join(home, 'shim.log'), join(home, 'projects'), String(start)])
+  }
+
+  test('skips an empty waiting observation before the matching session', () => {
+    expect(prove(fixture())).toEqual(waiting())
+  })
+  test('skips an earlier unrelated session before the matching session', () => {
+    const f = fixture(); f.observations[0]!.session_id = 'earlier-session'
+    expect(prove(f)).toEqual(waiting())
+  })
+  test('binds each reoffer to its own prior nonempty waiting session', () => {
+    const f = repeated(fixture(), 'next-session')
+    f.observations.push(waiting('', 1900), waiting('next-session', 2000))
+    expect(() => prove(f)).not.toThrow()
+  })
+  test.each([
+    ['no valid observation', (f: Fixture) => { f.observations.splice(1) }],
+    ['mismatched session', (f: Fixture) => { f.observations[1]!.session_id = 'foreign-session' }],
+    ['foreign persona', (f: Fixture) => { f.observations[1]!.key = 'other' }],
+    ['stale matching session', (f: Fixture) => { f.observations[1]!.at = start - 1 }],
+    ['matching session only after the send', (f: Fixture) => { f.observations = [waiting('native-session', firstTextAt)] }],
+    ['matching session only after the text', (f: Fixture) => { f.observations[1]!.at = firstTextAt + 1 }],
+    ['no sends', (f: Fixture) => { f.sends = [] }],
+    ['empty send identity', (f: Fixture) => { f.sends[0]!.session_id = '' }],
+    ['reoffer without its session observation', (f: Fixture) => { repeated(f, 'next-session') }],
+    ['reoffer observation only after its send', (f: Fixture) => { repeated(f, 'next-session'); f.observations.push(waiting('next-session', 2201)) }],
+  ] as const)('rejects %s', (_, change) => {
+    const f = fixture(); change(f)
+    expect(() => prove(f)).toThrow()
+  })
+
+  test.each([false, true])('actual first-launch accepts empty-then-valid evidence with a full text reoffer=%s', async reoffer => {
+    const f = fixture(); if (reoffer) repeated(f)
+    const result = await cli(f)
+    expect(result.code).toBe(0); expect(result.err).toEqual([])
+    expect(result.out).toHaveLength(1)
+    const timing = JSON.parse(result.out[0]!.slice('recorded: fresh-launch timing '.length))
+    expect(timing).toEqual({ after_waiting_ms: firstTextAt - 1100, enter_ms: reoffer ? [500, 500] : [500],
+      text_attempts: reoffer ? 2 : 1, duplicate_text_attempts: reoffer ? 1 : 0 })
+  })
+  test.each([
+    ['no nonempty observation', (f: Fixture) => { f.observations.splice(1) }],
+    ['mismatched session', (f: Fixture) => { f.observations[1]!.session_id = 'foreign-session' }],
+    ['waiting after durable send', (f: Fixture) => { f.observations = [waiting('native-session', firstTextAt)] }],
+  ] as const)('actual first-launch rejects %s', async (_, change) => {
+    const f = fixture(); change(f)
+    expect((await cli(f)).code).toBe(1)
+  })
+  test.each([
+    ['first 499ms pause', (f: Fixture) => { f.calls[1]!.at-- }, 'text/Enter pause shorter than 0.5 seconds'],
+    ['reoffer 499ms pause', (f: Fixture) => { repeated(f); f.calls[3]!.at-- }, 'text/Enter pause shorter than 0.5 seconds'],
+    ['Enter-only key retry', (f: Fixture) => { f.calls.push(key(1800, 'enter')) }, 'fresh launch needed an Enter-only retry'],
+    ['durable Enter-only recovery', (f: Fixture) => { f.sends.push({ ...text, send_kind: 'enter', at: 1800 }) }, 'fresh launch needed an Enter-only recovery'],
+  ] as const)('actual first-launch retains %s rejection', async (_, change, reason) => {
+    // A fully populated first observation isolates the existing safeguard;
+    // its failure must not be masked by the late-identity defect.
+    const f = fixture(); f.observations.shift(); change(f)
+    const result = await cli(f)
+    expect(result.code).toBe(1)
+    expect(result.err).toEqual(['real-case-assertions: ' + reason])
+  })
+
+  function destinations() {
+    return [{ channel: 'D0REPLY', text: 'E6-REPLY:1' }, { channel: 'C0REPLY', text: 'E6-REPLY:2' },
+      { channel: 'C0REPLY', thread_ts: '3.000001', text: 'E6-REPLY:3' }]
+  }
+  async function posts(actual: any[]) {
+    writeFileSync(join(home, 'posts.jsonl'), actual.map(r => JSON.stringify({ event: 'api', method: 'chat.postMessage', ...r })).join('\n') + '\n')
+    writeFileSync(join(home, 'expected.json'), JSON.stringify(destinations()))
+    return runFixture('fixtures/real-case-assertions.ts', ['posts', home, 'control', join(home, 'shim.log'), join(home, 'projects'),
+      join(home, 'posts.jsonl'), join(home, 'expected.json')])
+  }
+  test('actual posts check accepts the exact DM, mention and thread destinations', async () => {
+    expect(await posts(destinations())).toEqual({ code: 0, out: [], err: [] })
+  })
+  test.each(['DM', 'mention', 'thread channel', 'thread timestamp', 'unwanted thread on mention', 'extra wrong-target reply', 'missing reply'])(
+    'actual posts check rejects %s drift', async mode => {
+      const actual: any[] = destinations()
+      if (mode === 'DM') actual[0].channel = 'D0FOREIGN'
+      if (mode === 'mention') actual[1].channel = 'C0FOREIGN'
+      if (mode === 'thread channel') actual[2].channel = 'C0FOREIGN'
+      if (mode === 'thread timestamp') actual[2].thread_ts = '3.000002'
+      if (mode === 'unwanted thread on mention') actual[1].thread_ts = '3.000001'
+      if (mode === 'extra wrong-target reply') actual.push({ ...actual[0], channel: 'D0FOREIGN' })
+      if (mode === 'missing reply') actual.pop()
+      expect((await posts(actual)).code).toBe(1)
+    })
+})
 
 describe('same-conversation reply permission proof', () => {
   let home: string

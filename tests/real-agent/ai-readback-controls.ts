@@ -159,10 +159,10 @@ try {
   const reply = (uuid = 'response', timestamp = 30000, extra: any = {}) => native('assistant', uuid, timestamp, { parentUuid: 'receipt', requestedModel: model,
     message: { role: 'assistant', model, stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(bang) }] }, ...extra })
   const accepted = { kind: 'accepted', seq: 1, source: 'slack', channel: ai[3].msg.chat_id, ts: ai[3].msg.ts, user: ai[3].msg.user_id, received_at: 10000 }
-  const baseJournal = [accepted, { kind: 'fixed', seq: 1, parts: [ai[3].typed] },
+  const baseJournal: any[] = [accepted, { kind: 'fixed', seq: 1, parts: [ai[3].typed] },
     { kind: 'sent', seq: 1, part: 1, session_id: 'control', transcript_path: transcript, transcript_size: 0, at: 15000 },
     { kind: 'delivered', seq: 1, part: 1, at: 25000, receipt: { path: transcript, uuid: 'receipt' } }]
-  const diagnosticLine = (kind: string, at: number) => `[${new Date(at).toISOString()}] [slack] message-${kind}: persona=key=control source=slack chat_id=${JSON.stringify(accepted.channel)} ts=${JSON.stringify(accepted.ts)} sender_id=${JSON.stringify(accepted.user)}`
+  const diagnosticLine = (kind: string, at: number, identity = accepted) => `[${new Date(at).toISOString()}] [slack] message-${kind}: persona=key=control source=slack chat_id=${JSON.stringify(identity.channel)} ts=${JSON.stringify(identity.ts)} sender_id=${JSON.stringify(identity.user)}`
   writeFileSync(join(state, 'server.log'), diagnosticLine('received', 10000) + '\n' + diagnosticLine('delivered', 25000) + '\n')
   const shim = join(scratch, 'shim.log')
   const shimSend = (seconds: number, text: string) => 'call\t' + seconds + '\t1\t1\tcontrol\tsend-keys --instance-id cscb_control --text ' + text.replace(/[^a-zA-Z0-9_]/g, (c: string) => '\\' + c) + '\n'
@@ -225,6 +225,159 @@ try {
   writeNative([take, reply(), part2, reply('reassembled', 45000, { parentUuid: 'part2' })], [], multipart)
   succeeded(guard(), 'multipart final response')
   console.log('PASS: actual AI-local guard requires every durable part and a completed final-part response')
+
+  // b.436: the first durable send may precede AD's first transcript path.
+  // Keep this fixture separate: neither a prior control nor a delivered path
+  // may supply the independent persona/instance/session/path reference.
+  {
+    const root = join(scratch, 'late-reference'), state = join(root, 'state'), transcripts = join(root, 'transcripts')
+    mkdirSync(join(state, 'queue'), { recursive: true }); mkdirSync(transcripts)
+    const transcript = join(transcripts, 'control.jsonl'), foreign = join(transcripts, 'foreign.jsonl')
+    const shim = join(root, 'shim.log'), expectedFile = join(root, 'expected.json')
+    const prior = native('user', 'prior', 5000, { message: { role: 'user', content: '<channel>previous input</channel>' } })
+    const receiptOffset = Buffer.byteLength(JSON.stringify(prior) + '\n')
+    const lateReference = { key: 'control', instance_id: 'cscb_control', session_id: 'control', jsonl_path: transcript }
+    const single = () => ({
+      rows: [structuredClone(prior), structuredClone(take), reply()],
+      journal: structuredClone(baseJournal).map(r => r.kind === 'sent' ? { ...r, transcript_path: '', transcript_size: 0 }
+        : r.kind === 'delivered' ? { ...r, receipt: { ...r.receipt, path: transcript } } : r),
+      references: [{ ...lateReference }], expected: bang as any,
+      sends: shimSend(15, ai[3].typed), deliveredAt: 25000,
+    })
+    type LateEvidence = ReturnType<typeof single>
+    const send = (e: LateEvidence) => e.journal.find(r => r.kind === 'sent')!
+    const prepare = (e: LateEvidence) => {
+      writeFileSync(transcript, e.rows.map(r => JSON.stringify(r)).join('\n') + '\n')
+      writeFileSync(foreign, '')
+      writeFileSync(join(state, 'queue/control.jsonl'), e.journal.map(r => JSON.stringify(r)).join('\n') + '\n')
+      writeFileSync(join(state, 'server.log'), diagnosticLine('received', 10000, e.journal[0]) + '\n'
+        + e.references.map(r => '[1970-01-01T00:00:21.000Z] [slack] delivery-transcript-reference: ' + JSON.stringify(r) + '\n').join('')
+        + diagnosticLine('delivered', e.deliveredAt, e.journal[0]) + '\n')
+      writeFileSync(shim, e.sends); writeFileSync(expectedFile, JSON.stringify(e.expected))
+    }
+    const observe = () => run([process.execPath, join(tests, 'real-agent/ai-readback.ts'), state, 'control', shim,
+      transcripts, expectedFile, '1'], { REAL_AGENT_MODEL_PIN: model })
+    const acceptedLate = (e: LateEvidence, name: string) => {
+      prepare(e)
+      const result = observe()
+      succeeded(result, name)
+      const record = result.stdout.toString().split('\n').find(line => line.startsWith('recorded: AI current-turn field comparison '))
+      check(record, name + ': completed readback record missing')
+      const parsed = JSON.parse(record.slice('recorded: AI current-turn field comparison '.length))
+      same([parsed.seq, parsed.part, parsed.receipt_uuid, parsed.session_id, parsed.actual_model],
+        [1, e.journal[1].parts.length, e.journal.filter(r => r.kind === 'delivered').at(-1)!.receipt.uuid, 'control', model],
+        name + ': wrong completed final-part identity')
+      console.log('PASS: actual late-reference CLI accepts ' + name)
+    }
+    const rejectedLate = (e: LateEvidence, name: string, reason: RegExp) => {
+      prepare(e)
+      const result = observe()
+      check(result.exitCode === 1 && reason.test(result.stderr.toString())
+        && !result.stdout.toString().includes('recorded: AI current-turn field comparison '),
+      name + ' accepted or failed for the wrong reason: ' + result.stderr.toString())
+      console.log('PASS: actual late-reference CLI rejects ' + name)
+    }
+    acceptedLate(single(), 'pathless first send with a later independent AD reference')
+    const known = single(); send(known).transcript_path = transcript; send(known).transcript_size = receiptOffset
+    known.references = []
+    acceptedLate(known, 'known-path receipt exactly at its pre-send EOF')
+    const changed = single(); send(changed).transcript_path = foreign; send(changed).transcript_size = 1_000_000
+    acceptedLate(changed, 'changed AD path without applying the unrelated old path EOF')
+
+    const bindingFailure = /no exact transcript receipt|matching take-in|own receipt|native send window|transcript (?:reference|binding)/
+    const invalidBindings: [string, (e: LateEvidence) => void][] = [
+      ['missing reference', e => { e.references = [] }],
+      ...(['key', 'instance_id', 'session_id', 'jsonl_path'] as const).flatMap(field => [
+        ['missing reference ' + field, (e: LateEvidence) => { delete (e.references[0] as any)[field] }],
+        ['mismatched reference ' + field, (e: LateEvidence) => { e.references[0]![field] = field === 'jsonl_path' ? foreign : 'other' }],
+      ] as [string, (e: LateEvidence) => void][]),
+      ['reference for another directory with the same session basename', e => { e.references[0]!.jsonl_path = join(root, 'unrelated/control.jsonl') }],
+      ['missing send session', e => { delete send(e).session_id }],
+      ['mismatched send session', e => { send(e).session_id = 'other' }],
+      ['another session reference in the same directory', e => {
+        e.journal.push({ ...send(e), session_id: 'foreign' })
+        e.references[0] = { ...lateReference, session_id: 'foreign', jsonl_path: foreign }
+      }],
+    ]
+    for (const [name, change] of invalidBindings) { const e = single(); change(e); rejectedLate(e, name, bindingFailure) }
+    const invalidWindows: [string, (e: LateEvidence) => void, RegExp][] = [
+      ['receipt before acceptance', e => { e.rows[1]!.timestamp = 9000 }, /no exact transcript receipt|no exact own native receipt/],
+      ['receipt before send', e => { e.rows[1]!.timestamp = 14000 }, /native send window/],
+      ['send before acceptance', e => { send(e).at = 9999 }, /native send window/],
+      ['send without a timestamp', e => { delete send(e).at }, /native send window/],
+      ['delivery before receipt', e => { e.journal[3]!.at = 19000 }, /no exact own native receipt/],
+      ['missing pre-send EOF', e => { delete send(e).transcript_size }, /native send window/],
+      ['negative pre-send EOF', e => { send(e).transcript_size = -1 }, /native send window/],
+      ['fractional pre-send EOF', e => { send(e).transcript_size = 0.5 }, /native send window/],
+      ['known-path receipt before EOF despite a matching late reference', e => {
+        send(e).transcript_path = transcript; send(e).transcript_size = receiptOffset + 1
+      }, /native send window/],
+      ['unknown send outcome', e => { send(e).unknown_outcome = true }, bindingFailure],
+      ['wrong send sequence', e => { send(e).seq = 2 }, /native send window/],
+      ['wrong send part', e => { send(e).part = 2 }, /native send window/],
+      ['wrong receipt UUID', e => { e.journal[3]!.receipt.uuid = 'missing' }, /matching take-in|own receipt/],
+      ['wrong receipt session', e => { e.rows[1]!.sessionId = 'foreign' }, /no exact transcript receipt|own receipt/],
+      ['sidechain receipt', e => { e.rows[1]!.isSidechain = true }, /no exact transcript receipt|own receipt/],
+      ['sidechain exact response', e => { e.rows[2]!.isSidechain = true }, /no completed current-turn/],
+      ['foreign exact response', e => { e.rows[2]!.sessionId = 'foreign' }, /no completed current-turn/],
+      ['incomplete exact response', e => { e.rows[2]!.message.stop_reason = null }, /no completed current-turn/],
+    ]
+    for (const [name, change, reason] of invalidWindows) { const e = single(); change(e); rejectedLate(e, name, reason) }
+
+    // Use the unchanged scenario's seeded body and the packed production
+    // splitter, including the real 1700/1700/1600-byte multipart boundaries.
+    const bodyStart = scenario.indexOf('        BODY="$(python3'), bodyEnd = scenario.indexOf('        real_dm ', bodyStart)
+    check(bodyStart >= 0 && bodyEnd > bodyStart, 'AC15 body generator missing')
+    succeeded(run(['bash', '-eu', '-c', scenario.slice(bodyStart, bodyEnd)], { EXPECTED: root }), 'late-reference AC15 body generator')
+    const ac15 = JSON.parse(readFileSync(join(root, '1.json'), 'utf8'))
+    const { buildTagParts } = await import(join(resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'), 'src/tag-wrapper.ts'))
+    const ts = '1792226929.000001'
+    const ac15Message = { chat_id: 'D0AIAC15', channel_name: 'dm', message_id: ts,
+      user: 'stub-u0aiac15', user_id: 'U0AIAC15', ts, via: 'dm', text: ac15.body }
+    const parts = buildTagParts(ac15Message)
+    const bodies = parts.map((part: string) => part.slice(part.indexOf('>') + 1, -'</channel>'.length))
+    same(bodies.map((body: string) => Buffer.byteLength(body)), [1700, 1700, 1600], 'AC15 split changed')
+    same(bodies.join(''), ac15.body, 'AC15 body changed')
+    const multipartLate = (allPathless = false): LateEvidence => {
+      const e = single(); e.rows = [structuredClone(prior)]; e.expected = ac15; e.sends = ''; e.deliveredAt = 62000
+      e.journal = [{ ...accepted, channel: ac15Message.chat_id, ts: ac15Message.ts, user: ac15Message.user_id },
+        { kind: 'fixed', seq: 1, parts }]
+      for (const [index, text] of parts.entries()) {
+        const at = 20000 + index * 20000, uuid = 'late-part-' + (index + 1)
+        const offset = Buffer.byteLength(e.rows.map(r => JSON.stringify(r) + '\n').join(''))
+        e.rows.push(native('user', uuid, at, { message: { role: 'user', content: text } }),
+          reply('late-answer-' + (index + 1), at + 5000, { parentUuid: uuid, message: { role: 'assistant', model,
+            stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(index === 2 ? ac15 : { status: 'received' }) }] } }))
+        const pathless = allPathless || index === 0
+        e.journal.push({ kind: 'sent', seq: 1, part: index + 1, session_id: 'control', transcript_path: pathless ? '' : transcript,
+          transcript_size: pathless ? 0 : offset, at: at - 5000 },
+        { kind: 'delivered', seq: 1, part: index + 1, at: at + 2000, receipt: { path: transcript, uuid } })
+        e.sends += shimSend((at - 5000) / 1000, text)
+      }
+      return e
+    }
+    acceptedLate(multipartLate(), 'AC15 pathless first part and completed final-part reassembly')
+    const unbound = multipartLate(); unbound.references = []
+    rejectedLate(unbound, 'first part borrowing a later part path without its independent reference', bindingFailure)
+    const duplicate = () => {
+      const e = multipartLate(true)
+      e.rows.push(native('user', 'late-copy', 70000, { message: { role: 'user', content: parts[0] } }),
+        reply('late-copy-answer', 75000, { parentUuid: 'late-copy', message: { role: 'assistant', model,
+          stop_reason: 'end_turn', content: [{ type: 'text', text: '{"status":"received"}' }] } }))
+      return e
+    }
+    acceptedLate(duplicate(), 'AC15 independently bound duplicate copy with all sends pathless')
+    for (const [name, change, reason] of [
+      ['stale duplicate receipt', (e: LateEvidence) => { e.rows.at(-2)!.timestamp = 9000 }, /copy has no exact own native receipt/],
+      ['duplicate before its send', (e: LateEvidence) => { e.rows.at(-2)!.timestamp = 14000 }, /copy has no native send window/],
+      ['duplicate non-reply action', (e: LateEvidence) => { e.rows.at(-1)!.message.content.push({ type: 'tool_use', id: 'fetch', name: 'mcp__slack-channel-router__fetch_messages', input: {} }) }, /non-reply tool action observed/],
+      ['duplicate classifier stop', (e: LateEvidence) => { e.rows.push(native('system', 'late-stop', 76000, { parentUuid: 'late-copy', refusedUserMessageUuid: 'late-copy', subtype: 'model_refusal_no_fallback' })) }, /exchange has refusal\/API failure/],
+      ['incomplete final-part reassembly beside a completed duplicate', (e: LateEvidence) => { e.rows[6]!.message.stop_reason = null }, /no completed current-turn/],
+      ['unlinked final-part reassembly', (e: LateEvidence) => { e.rows[6]!.parentUuid = 'late-part-1' }, /invalid native assistant response/],
+    ] as [string, (e: LateEvidence) => void, RegExp][]) {
+      const e = duplicate(); change(e); rejectedLate(e, name, reason)
+    }
+  }
 
   const resumedPath = join(transcripts, 'resumed.jsonl')
   const resumedTake = native('user', 'resumed-user', 40000, { sessionId: 'resumed', message: { role: 'user', content: '<channel>resumed request</channel>' } })

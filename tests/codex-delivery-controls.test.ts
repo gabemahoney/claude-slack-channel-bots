@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readFileSync
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { cannedGetResult, makeStubClient } from './test-helpers/agent-director-stub.ts'
 import { codexContainment, codexArguments, configureScratchCodex, createScratchCodexLifecycle, scratchCodexContract, codexRetirementCheckpoint, CODEX_NATIVE, CODEX_AUTH_MOUNT, CODEX_NO_REPLY } from './real-agent/codex-guards.ts'
 import { checkCodexScratchConfigKeys, encodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
 import { completedCodexTurn, projectCodexRollout, safeCodexEvents } from './real-agent/codex-evidence.ts'
@@ -14,6 +15,80 @@ import { projectCrashProgress, publishCrashProgress, readCrashProgress, waitForC
 const session = 'synthetic-session', model = 'synthetic/model', text = 'synthetic exact input', sentAt = 1000
 const hostProjection = encodeCodexHostConfigKeys([['model']])
 const nativeConfig = '[tui]\nscreen_reader_detection_done = true\n'
+
+describe('Codex driver late AD readiness (synthetic; no native process)', () => {
+  function driver(observations: Record<string, unknown>[]) {
+    // Execute the actual poll, identity guard, launch and AI begin closure.
+    // The guarded driver entrypoint is never imported or executed.
+    const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+    const extract = (name: string) => {
+      const declaration = source.match(new RegExp(`^async function ${name}[\\s\\S]*?^\\}`, 'm'))?.[0]
+      if (!declaration) throw new Error(`missing driver declaration: ${name}`)
+      return declaration
+    }
+    const begin = source.slice(source.indexOf('  const begin = async '), source.indexOf('  const audit = async '))
+    expect(begin).toContain('const begin = async ')
+    let at = 0, reads = 0, builds = 0
+    const records: { label: string; value: any; reads: number }[] = [], checkpoints: string[] = []
+    const client = makeStubClient({ getFn: ({ instance_id }) => {
+      const observation = observations[Math.min(reads++, observations.length - 1)]!
+      return cannedGetResult({ instance_id, agent: 'codex', labels: { tag_prompt: '1' }, relay_mode: 'on',
+        cwd: '/synthetic/work', state: 'waiting', session_id: session, ...observation })
+    } })
+    const program = `
+      const { client, join, codexArguments, CODEX_NATIVE, Date, Bun, record, authContract, buildEngine } = deps;
+      let instance, stage, lastKey, engines;
+      const work = '/synthetic/work', codexHome = '/synthetic/home', key = 'synthetic';
+      const sessions = new Set(), liveInstances = new Set(), paths = { model: 'synthetic/model' };
+      const tagDescription = 'synthetic instructions', queue = { items: () => [{ accepted: { seq: 7 } }] };
+      const scratchLifecycle = { beforeSpawn() {}, afterSpawn() {} };
+      const writeFileSync = () => {}, stopEngine = async () => {};
+      ${['poll', 'row', 'waiting', 'start'].map(extract).join('\n')}
+      ${begin}
+      return { begin, sessions };
+    `
+    const actual = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+      client, join, codexArguments, CODEX_NATIVE, Date: { now: () => at }, Bun: { sleep: async (ms: number) => { at += ms } },
+      record: (label: string, value: any) => records.push({ label, value, reads }),
+      authContract: (checkpoint: string) => checkpoints.push(checkpoint), buildEngine: async () => { builds++ },
+    }) as { begin(label: string, instructions: string): Promise<number>; sessions: Set<string> }
+    return { ...actual, records, checkpoints, reads: () => reads, builds: () => builds, elapsed: () => at }
+  }
+
+  test.each(['already valid', 'empty then valid', 'working then waiting'])('begins only with a validated waiting session: %s', async kind => {
+    const observations = kind === 'empty then valid' ? [{ session_id: '' }, { session_id: '' }, {}]
+      : kind === 'working then waiting' ? [{ state: 'working' }, {}] : [{}]
+    const d = driver(observations)
+    expect(await d.begin('case-one', 'synthetic instructions')).toBe(7)
+    expect([...d.sessions]).toEqual([session]); expect(d.builds()).toBe(1)
+    expect(d.checkpoints).toEqual(['postidle'])
+    expect(d.records.filter(r => r.label === 'launch').map(r => r.reads)).toEqual([observations.length])
+  })
+  test.each(['', 123])('times out without declaring readiness or building for session %j', async session_id => {
+    const d = driver([{ session_id }])
+    await expect(d.begin('case-one', 'synthetic instructions')).rejects.toThrow('AD waiting row: observation incomplete within bound')
+    const bound = d.records.find(r => r.label === 'bound')!
+    expect(bound.value.step).toBe('AD waiting row'); expect(d.elapsed()).toBe(bound.value.milliseconds)
+    expect([...d.sessions]).toEqual([]); expect(d.builds()).toBe(0)
+    expect(d.checkpoints).toEqual([]); expect(d.records.some(r => r.label === 'launch')).toBe(false)
+  })
+  test('rejects a foreign instance even with a nonempty waiting session', async () => {
+    const d = driver([{ instance_id: 'foreign' }])
+    await expect(d.begin('case-one', 'synthetic instructions')).rejects.toThrow('wrong native row identity')
+    expect(d.records).toEqual([]); expect([...d.sessions]).toEqual([]); expect(d.builds()).toBe(0)
+  })
+  test.each(['', 'unvalidated-session'])('begin retains the validated row when a later read would have session %j', async session_id => {
+    const d = driver([{}, { session_id }])
+    expect(await d.begin('case-one', 'synthetic instructions')).toBe(7)
+    expect([...d.sessions]).toEqual([session]); expect(d.reads()).toBe(1); expect(d.builds()).toBe(1)
+  })
+  test('rejects a previously used conversation before building the next case', async () => {
+    const d = driver([{}])
+    await d.begin('case-one', 'synthetic instructions')
+    await expect(d.begin('case-two', 'synthetic instructions')).rejects.toThrow('AI case did not get a fresh native conversation')
+    expect([...d.sessions]).toEqual([session]); expect(d.builds()).toBe(1)
+  })
+})
 
 describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no native process)', () => {
   const progress = (patch: Partial<CrashProgress> = {}): CrashProgress => ({ version: 1, pid: 321, instance: 'cscb_codex_gate',

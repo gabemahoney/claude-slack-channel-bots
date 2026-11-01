@@ -7,6 +7,9 @@ import { createServer, request, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AC20_AFTER_RETRY_MS, AC20_COMPLETION_MS, AC20_DIAGNOSTIC_CEILING_MS, AC20_NATIVE_SHA256, gatewayCorrelations, linkedRetryForStalledRequest, nativeDebugProjection, observeAC20Completion, parseNativeProcessStat, startDiagnosticGateway } from './real-agent/ac20-diagnostics.ts'
+import { completedAIReadback } from './real-agent/ai-readback.ts'
+import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
+import { personaTranscripts, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
@@ -14,6 +17,10 @@ type Row = Parameters<Parameters<typeof nativeDebugProjection>[0]>[0]
 const source = readFileSync(join(import.meta.dir, 'real-agent/ac20-diagnostics.ts'), 'utf8')
 const shell = readFileSync(join(import.meta.dir, 'real-agent/ac20-diagnostics.sh'), 'utf8')
 const scenario = readFileSync(join(import.meta.dir, 'real-agent/ai-scenario.sh'), 'utf8')
+function completionCallback(...args: unknown[]): () => Promise<boolean> {
+  const closure = source.slice(source.indexOf('const completed = async'), source.indexOf('const retryObserved ='))
+  return new Function('transcriptFiles', 'readTranscripts', 'receiptJournal', 'auditReceipts', 'personaTranscripts', 'readFileSync', 'join', 'completedAIReadback', 'root', 'adapters', 'state', 'key', 'shim', 'caseNumber', 'expected', 'process', new Bun.Transpiler({ loader: 'ts' }).transformSync(closure + '\nreturn completed'))(...args)
+}
 const secret = fakeToken(BOT_TOKEN_PREFIX, 'ac20')
 function safe(value: unknown) {
   // Boolean assertions cannot print any full or partial injected credential.
@@ -209,13 +216,46 @@ describe('scenario and original oracle wiring', () => {
     } finally { rmSync(home, { recursive: true, force: true }) }
   })
   test('observer invokes the exact ordinary completedAIReadback after receipt ownership audit', () => {
-    const closure = source.slice(source.indexOf('const completed = async'), source.indexOf('const retryObserved ='))
-    const invoke = new Function('transcriptFiles', 'readTranscripts', 'receiptJournal', 'auditReceipts', 'personaTranscripts', 'readFileSync', 'join', 'completedAIReadback', 'root', 'adapters', 'state', 'key', 'shim', 'caseNumber', 'expected', 'process', new Bun.Transpiler({ loader: 'ts' }).transformSync(closure + '\nreturn completed'))
     const calls: string[] = [], paths = ['owned'], all = {}, journal = {}, own = {}, adapters = {}, expected = {}; let reject = false
-    const completed = invoke((value: unknown) => { expect(value).toBe('root'); return paths }, (p: unknown, a: unknown) => { expect(p).toBe(paths); expect(a).toBe(adapters); return all }, () => journal,
+    const completed = completionCallback((value: unknown) => { expect(value).toBe('root'); return paths }, (p: unknown, a: unknown) => { expect(p).toBe(paths); expect(a).toBe(adapters); return all }, () => journal,
       (args: unknown, entries: unknown, a: unknown) => { calls.push('audit'); expect(args).toEqual({ stateDir: 'state', key: 'key', shimLog: 'shim', transcripts: paths }); expect(entries).toBe(all); expect(a).toBe(adapters) },
-      () => own, () => 'line\n', join, (args: unknown) => { calls.push('oracle'); expect(args).toEqual({ seq: 2, expected, journal, own, adapters, model: 'azure/openai/gpt-6-astra' }); if (reject) throw new Error('ordinary oracle rejects') }, 'root', adapters, 'state', 'key', 'shim', 2, expected, { env: { REAL_AGENT_MODEL_PIN: 'azure/openai/gpt-6-astra' } })
+      () => own, () => 'line\n', join, (args: unknown) => { calls.push('oracle'); expect(args).toEqual({ seq: 2, expected, journal, own, adapters, model: 'azure/openai/gpt-6-astra', key: 'key', log: ['line', ''] }); if (reject) throw new Error('ordinary oracle rejects') }, 'root', adapters, 'state', 'key', 'shim', 2, expected, { env: { REAL_AGENT_MODEL_PIN: 'azure/openai/gpt-6-astra' } })
     return (async () => { expect(await completed()).toBe(true); expect(calls).toEqual(['audit', 'oracle']); reject = true; expect(await completed()).toBe(false) })()
+  })
+  test.each([
+    { name: 'pathless send and later matching AD reference', knownPath: false, session: 'session', directory: 'owned', passes: true },
+    { name: 'mismatched AD session', knownPath: false, session: 'foreign', directory: 'owned', passes: false },
+    { name: 'unrelated full AD path with the same basename', knownPath: false, session: 'session', directory: 'unrelated', passes: false },
+    { name: 'known send path without an AD reference', knownPath: true, session: null, directory: 'owned', passes: true },
+  ])('observer binds real readback: $name', async ({ knownPath, session, directory, passes }) => {
+    const root = join(tmpdir(), 'ac20-readback'), path = join(root, 'owned/session.jsonl'), key = 'aiac20'
+    const model = 'azure/openai/gpt-6-astra', text = '<channel>late reference</channel>', expected = { case: 'case_01', body: 'late reference' }
+    const journal = [
+      { kind: 'accepted', seq: 1, received_at: 10 },
+      { kind: 'fixed', seq: 1, parts: [text] },
+      { kind: 'sent', seq: 1, part: 1, at: 15, session_id: 'session', transcript_path: knownPath ? path : '', transcript_size: 0 },
+      { kind: 'delivered', seq: 1, part: 1, at: 25, receipt: { path, uuid: 'take' } },
+    ]
+    const all: TranscriptEntry[] = [
+      { path, offset: 20, at: 20, kind: 'take-in', uuid: 'take', text,
+        value: { type: 'user', uuid: 'take', sessionId: 'session', message: { role: 'user', content: text } } },
+      { path, offset: 30, at: 30, kind: 'other',
+        value: { type: 'assistant', uuid: 'reply', parentUuid: 'take', sessionId: 'session',
+          message: { role: 'assistant', model, stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(expected) }] } } },
+    ]
+    const adapters = { parseDeliveryTranscriptRecord, receiptTextMatches }
+    let log = '', audits = 0
+    // Only file reads and the prior receipt audit are isolated. Ownership and
+    // completion use their real import-safe helpers through the actual callback.
+    const completed = completionCallback(() => [path], () => all, () => journal, () => { audits++ }, personaTranscripts,
+      () => log, join, completedAIReadback, root, adapters, join(root, 'state'), key, join(root, 'shim'), 1, expected,
+      { env: { REAL_AGENT_MODEL_PIN: model } })
+    expect(await completed()).toBe(knownPath)
+    if (session !== null) log = '[1970-01-01T00:00:00.021Z] [slack] delivery-transcript-reference: ' + JSON.stringify({
+      key, instance_id: 'cscb_' + key, session_id: session, jsonl_path: join(root, directory, 'session.jsonl'),
+    })
+    expect(await completed()).toBe(passes)
+    expect(audits).toBe(2)
   })
 })
 

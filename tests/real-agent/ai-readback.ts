@@ -146,15 +146,54 @@ function ac15RequestEcho(entry: TranscriptEntry, adapters: ReceiptAdapters): boo
   return true
 }
 
+type SendTranscriptBinding = (send: any, entry: TranscriptEntry) => boolean
+
+// personaTranscripts supplies the audit's candidates, but its directory/session
+// sets are not an exact late-path proof. Keep each independent AD reference's
+// persona, instance, session and path together; never bind via a delivered row
+// or borrow a later part's known path for an earlier pathless send.
+export function nativeSendBinding(key: string | undefined, log: readonly string[]): SendTranscriptBinding {
+  const paths = new Map<string, Set<string>>()
+  const marker = '[slack] delivery-transcript-reference: '
+  for (const line of log) {
+    const index = line.indexOf(marker)
+    if (index < 0 || !key) continue
+    const reference = JSON.parse(line.slice(index + marker.length))
+    if (reference?.key !== key || reference.instance_id !== `cscb_${key}`
+      || typeof reference.session_id !== 'string' || !reference.session_id
+      || typeof reference.jsonl_path !== 'string' || !reference.jsonl_path
+      || basename(reference.jsonl_path, '.jsonl') !== reference.session_id) continue
+    const sessionPaths = paths.get(reference.session_id) ?? new Set<string>()
+    sessionPaths.add(reference.jsonl_path)
+    paths.set(reference.session_id, sessionPaths)
+  }
+  return (send, entry) => typeof send.session_id === 'string' && send.session_id.length > 0
+    && typeof send.transcript_path === 'string' && entry.value?.sessionId === send.session_id
+    && (send.transcript_path === entry.path || paths.get(send.session_id)?.has(entry.path) === true)
+}
+
+export function nativeSendWindow(send: any, entry: TranscriptEntry, acceptedAt: number, bound: SendTranscriptBinding): boolean {
+  // A known path retains its pre-send EOF, even if AD later references it.
+  // For an independently bound late path no pre-send EOF was recorded for
+  // that file: use zero plus the send/receipt time floor. A different path's
+  // EOF is never transferable. The original EOF must still be well formed.
+  return send.kind === 'sent' && !send.unknown_outcome && bound(send, entry)
+    && Number.isFinite(send.at) && send.at >= acceptedAt && send.at <= entry.at
+    && Number.isSafeInteger(send.transcript_size) && send.transcript_size >= 0
+    && Number.isSafeInteger(entry.offset) && entry.offset >= 0
+    && (send.transcript_path !== entry.path || send.transcript_size <= entry.offset)
+}
+
 // may acknowledge a part, but retrieval or any other action cannot
 // supply missing context. Inspect every copy's turn and its late descendants;
 // completion/JSON provenance remains the ordinary final-part oracle below.
-function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, journal: any[], own: TranscriptEntry[], adapters: ReceiptAdapters) {
+function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, journal: any[], own: TranscriptEntry[], adapters: ReceiptAdapters, bound: SendTranscriptBinding) {
   const sends = journal.filter(r => r.kind === 'sent' && r.seq === seq && !r.unknown_outcome)
   const sessions = new Map<string, TranscriptEntry[]>()
-  for (const send of sends) {
-    const key = JSON.stringify([send.transcript_path, send.session_id])
-    if (!sessions.has(key)) sessions.set(key, own.filter(e => e.path === send.transcript_path && e.value?.sessionId === send.session_id
+  for (const entry of own) {
+    if (!sends.some(send => bound(send, entry))) continue
+    const key = JSON.stringify([entry.path, entry.value.sessionId])
+    if (!sessions.has(key)) sessions.set(key, own.filter(e => e.path === entry.path && e.value?.sessionId === entry.value.sessionId
       && e.value.isSidechain !== true && !e.path.includes('/subagents/')).sort((a, b) => a.offset - b.offset))
   }
   for (const session of sessions.values()) {
@@ -167,9 +206,8 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
       check(typeof copy.uuid === 'string' && nativeTakeIn(copy, adapters) && copy.value.uuid === copy.uuid
         && copy.value.isMeta !== true && copy.value.sessionId === basename(copy.path, '.jsonl') && Number.isFinite(copy.at) && copy.at >= acceptedAt,
       'copy has no exact own native receipt')
-      check(sends.some(r => r.transcript_path === copy.path && r.session_id === copy.value.sessionId
-        && adapters.receiptTextMatches(copy.text!, parts[r.part - 1]) && Number.isFinite(r.at) && r.at >= acceptedAt && r.at <= copy.at
-        && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= copy.offset),
+      check(sends.some(r => Number.isSafeInteger(r.part) && r.part > 0 && r.part <= parts.length
+        && adapters.receiptTextMatches(copy.text!, parts[r.part - 1]) && nativeSendWindow(r, copy, acceptedAt, bound)),
       'copy has no native send window')
       const next = session.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
       // Queued commands start their own exchange even if their timestamp is
@@ -195,8 +233,9 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
   }
 }
 
-export function completedAIReadback({ seq, expected, journal, own, adapters, model, onMismatch }: {
+export function completedAIReadback({ seq, expected, journal, own, adapters, model, key, log = [], onMismatch }: {
   seq: number; expected: any; journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters; model: string
+  key?: string; log?: readonly string[]
   onMismatch?: (record: ReturnType<typeof readbackMismatch> & { responseUuid?: unknown; stopReason?: unknown }) => void
 }) {
   check(Number.isSafeInteger(seq) && seq > 0 && typeof expected?.case === 'string' && safeSelectedModel(model), 'AI readback identity missing')
@@ -207,6 +246,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
   }
   const accepted = one('accepted'), fixed = one('fixed')
   check(Number.isFinite(accepted.received_at) && Array.isArray(fixed.parts) && fixed.parts.length > 0, 'AI readback fixed input missing')
+  const bound = nativeSendBinding(key, log)
   let take: TranscriptEntry | undefined
   for (const [index, text] of fixed.parts.entries()) {
     const part = index + 1, delivered = one('delivered', part)
@@ -220,13 +260,10 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
       && !take.path.includes('/subagents/') && take.value.sessionId === basename(take.path, '.jsonl')
       && Number.isFinite(take.at) && take.at >= accepted.received_at && delivered.at >= take.at,
     'AI readback has no exact own native receipt')
-    check(journal.some(r => r.kind === 'sent' && r.seq === seq && r.part === part && !r.unknown_outcome
-      && r.session_id === take!.value.sessionId && r.transcript_path === take!.path
-      && Number.isFinite(r.at) && r.at >= accepted.received_at && r.at <= take!.at
-      && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= take!.offset),
+    check(journal.some(r => r.seq === seq && r.part === part && nativeSendWindow(r, take!, accepted.received_at, bound)),
     'AI readback receipt has no native send window')
   }
-  if (expected.case === "AC15") assertAC15Exchange(fixed.parts, accepted.received_at, seq, journal, own, adapters)
+  if (expected.case === "AC15") assertAC15Exchange(fixed.parts, accepted.received_at, seq, journal, own, adapters, bound)
   // Reassembly answers belong to the final delivered part. Explicit seqs also
   // preserve earlier DM checks after a later thread and across resume sessions.
   const receipt = take!
@@ -293,10 +330,11 @@ if (import.meta.main) {
     const adapters = await packedReceiptAdapters(), paths = transcriptFiles(root!)
     const all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
     auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths }, all, adapters)
-    const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
+    const log = readFileSync(join(state!, 'server.log'), 'utf8').split('\n')
+    const own = personaTranscripts(key!, journal, log, all)
     const expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
     const result = completedAIReadback({ seq: Number(seq), expected,
-      journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN ?? '', onMismatch: record => {
+      journal, own, adapters, key, log, model: process.env.REAL_AGENT_MODEL_PIN ?? '', onMismatch: record => {
         const line = AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ event: 'readback-mismatch',
           agent: 'claude', scenario: 'ai-readback', case: expected.case, seq: Number(seq), trial: process.env.REAL_AGENT_TRIAL, record }))
         reportFailureOnce(join(state!, 'ai-readback-mismatches.json'), line, console.log)
