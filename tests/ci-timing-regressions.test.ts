@@ -45,7 +45,7 @@ const event = (name: string, seconds: number, fields = {}) => ({
 const polling = [
   declaration(scenario, '_scenario_poll_until'), declaration(scenario, '_scenario_check_timeout'), declaration(scenario, 'wait_until'),
   'SCENARIO_POLL_S=1', 'LEG_B_WAIT_S=3', 'ROW_WAIT_S=3', 'printf "0\\n" > "$HOME/clock"',
-  '_scenario_now_ms() { cat "$HOME/clock"; }',
+  '_scenario_now_ms() { local now; read -r now < "$HOME/clock"; printf "%s\\n" "$now"; }',
   'sleep() { local now; read -r now < "$HOME/clock"; printf "%s\\n" "$((now+1000))" > "$HOME/clock"; }',
 ].join('\n')
 
@@ -127,22 +127,23 @@ describe('retained timing regressions', () => {
     expect(result.status).toBe(1)
   })
 
-  test.each(['restart', 'resume', 'fresh', 'upgrade'])('test-35 %s captures connection cursor after stop and requires a new own connection', mode => {
+  // Each evidence run gets its own default timeout, including negative polling.
+  test.each(['restart', 'resume', 'fresh', 'upgrade'].flatMap(mode =>
+    ['new', 'stale', 'foreign', 'old-row'].map(evidence => [mode, evidence] as const),
+  ))('test-35 %s/%s captures connection cursor after stop and requires a new own connection', (mode, evidence) => {
     const text = source('test-35-fmk-real-restarts.sh')
     const restart = block(text, '    OLD_SESSION=', '    NEW_SESSION=')
-    for (const evidence of ['new', 'stale', 'foreign', 'old-row']) {
-      const result = shell([
-        polling, declaration(real, 'real_wait_launch'), declaration(real, '_real_connected'),
-        `mode=${mode}`, `evidence=${evidence}`, 'REAL_KEY=control', 'REAL_LAUNCH_WAIT_S=3', 'started=0',
-        `real_instance() { echo ${instance}; }`, 'real_wait_idle() { :; }', 'ad_store_edit() { :; }',
-        'stop_server() { echo \'[slack] Session connected: persona "control" (key=control)\' >> "$HOME/server.log"; }',
-        'start_server() { started=1; if [[ "$evidence" == new || "$evidence" == old-row ]]; then echo \'[slack] Session connected: persona "control" (key=control)\' >> "$HOME/server.log"; elif [[ "$evidence" == foreign ]]; then echo \'[slack] Session connected: persona "other" (key=other)\' >> "$HOME/server.log"; fi; }',
-        `real_ad() { local sid=${session}; if [[ "$started" == 1 && "$evidence" != old-row && ( "$mode" == fresh || "$mode" == upgrade ) ]]; then sid=new-session; fi; printf '{"state":"waiting","instance_id":"${instance}","session_id":"%s","labels":{"tag_prompt":"1"}}\\n' "$sid"; }`,
-        restart,
-      ].join('\n'), { 'server.log': '' })
-      const pass = evidence === 'new' || (evidence === 'old-row' && ['restart', 'resume'].includes(mode))
-      expect({ mode, evidence, status: result.status }).toEqual({ mode, evidence, status: pass ? 0 : 1 })
-    }
+    const result = shell([
+      polling, declaration(real, 'real_wait_launch'), declaration(real, '_real_connected'),
+      `mode=${mode}`, `evidence=${evidence}`, 'REAL_KEY=control', 'REAL_LAUNCH_WAIT_S=3', 'started=0',
+      `real_instance() { echo ${instance}; }`, 'real_wait_idle() { :; }', 'ad_store_edit() { :; }',
+      'stop_server() { echo \'[slack] Session connected: persona "control" (key=control)\' >> "$HOME/server.log"; }',
+      'start_server() { started=1; if [[ "$evidence" == new || "$evidence" == old-row ]]; then echo \'[slack] Session connected: persona "control" (key=control)\' >> "$HOME/server.log"; elif [[ "$evidence" == foreign ]]; then echo \'[slack] Session connected: persona "other" (key=other)\' >> "$HOME/server.log"; fi; }',
+      `real_ad() { local sid=${session}; if [[ "$started" == 1 && "$evidence" != old-row && ( "$mode" == fresh || "$mode" == upgrade ) ]]; then sid=new-session; fi; printf '{"state":"waiting","instance_id":"${instance}","session_id":"%s","labels":{"tag_prompt":"1"}}\\n' "$sid"; }`,
+      restart,
+    ].join('\n'), { 'server.log': '' })
+    const pass = evidence === 'new' || (evidence === 'old-row' && ['restart', 'resume'].includes(mode))
+    expect({ mode, evidence, status: result.status }).toEqual({ mode, evidence, status: pass ? 0 : 1 })
   })
 
   test.each([
