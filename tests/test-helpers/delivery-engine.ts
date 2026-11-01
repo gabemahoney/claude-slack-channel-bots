@@ -12,7 +12,7 @@ import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
-export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
+export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; isUp?: DeliveryEngineDeps['isUp']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
   if (options.queue && !options.stateDir) throw new Error('an external queue needs its owned stateDir')
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
   const clock = createFakeClock(), events: DeliveryEngineEvent[] = [], errors: unknown[] = []
@@ -71,7 +71,8 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
       clientFor: options.clientFor ?? (async key => personas.get(key)!.stub),
       instanceId: key => `cscb_${key}`,
       persona: key => personas.get(key)?.state.applied ? { cwd: root, agent: options.configuredAgent ?? (personas.get(key)!.state.row.agent === 'codex' ? 'codex' : 'claude') } : undefined,
-      isUp: key => personas.get(key)?.state.up ?? false, isLatched: key => personas.get(key)?.state.latched ?? false,
+      // Composed controller tests bind the actual persona-up predicate here.
+      isUp: options.isUp ?? (key => personas.get(key)?.state.up ?? false), isLatched: key => personas.get(key)?.state.latched ?? false,
       isHeld: key => personas.get(key)?.state.held ?? false, isConnected: key => personas.get(key)?.state.connected ?? false,
       prepare: (key, item) => preparation.owns(key, item.accepted.seq) ? preparation.prepare(key, item) : Promise.resolve(),
       isRestartPendingOrActive: key => personas.get(key)?.state.restartPending ?? false, scheduleRestart: (key, cwd) => restarts.push({ key, cwd }),

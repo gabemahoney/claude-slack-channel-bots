@@ -102,7 +102,8 @@ import { describe, expect, test } from 'bun:test'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 
-import { LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak } from './test-helpers/credentials.ts'
+import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import ts from 'typescript'
 import { balancedAfter, callArguments, callsOf, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 
 /** The repository root (the parent of tests/). */
@@ -210,12 +211,85 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     slackPlatformError: 'builds a Slack platform rejection that, given a leak marker, plants it in a fake bot token in its message',
     slackRateLimited: 'builds a Slack rate-limited rejection that, given a leak marker, plants it in a fake bot token in its message',
   },
-  'tests/integration/fixtures/slack-stub-server.ts': { startSlackStub: "serves token-bearing Slack clients and records their requests and uploads" },
+  'tests/integration/fixtures/slack-stub-server.ts': { startSlackStub: "serves token-bearing Slack clients; records redeliveries, socket closes, lost answers and history pages without credential or connection-ticket values; only pre-existing synthetic connection markers remain" },
   'tests/test-helpers/ci-run.ts': {
     makeFakeCodexHome: 'writes fake Codex login and config files under the fixture root',
     makeFakeCodexLogin: 'builds injected Codex login dependencies with sentinel-bearing tokens',
   },
 }
+
+// These executable fixtures have no importable runtime surface: importing
+// them would execute their image entrypoints. Audit their source and captured
+// declaration controls instead of putting them in HELPER_SURFACES's imports.
+const IMAGE_CLIENT_SURFACES = {
+  'tests/integration/fixtures/shared-stub-permission.ts': 'reads registered permission outcomes and actual AD rows after the image guard; emits only bound identity, request token, decision and delivery metadata, with fixed failure text and no raw client errors',
+  'tests/integration/fixtures/stub-mcp-session.ts': 'holds MCP transports and captures SDK tool results; grouping, loss and replacement-session evidence contains request/session identity and HTTP status, never transport headers or credentials',
+} as const
+
+describe('shared fixture evidence secrecy', () => {
+  test('image-only client surfaces have explicit reasons and declaration evidence is leak-checked', () => {
+    for (const [file, reason] of Object.entries(IMAGE_CLIENT_SURFACES)) {
+      expect(existsSync(join(ROOT, file))).toBe(true)
+      expect(reason.length).toBeGreaterThan(30)
+      expect(readFileSync(join(ROOT, file), 'utf8')).toContain("existsSync('/etc/cscb-ci-image')")
+    }
+    for (const file of ['tests/host-safety.test.ts', 'tests/fmk-source-audit.test.ts']) expect(callsAssertNoLeak(file)).toBe(true)
+  })
+
+  const source = readFileSync(join(ROOT, 'tests/integration/fixtures/slack-stub-server.ts'), 'utf8')
+  const ast = ts.createSourceFile('slack-stub-server.ts', source, ts.ScriptTarget.Latest, true)
+  const fields: Record<string, string[]> = {
+    'socket-close': ['control', 'control_index', 'label', 'connection_id'],
+    'socket-close-missed': ['control', 'control_index', 'label'],
+    'fault-settled': ['request_id', 'resolution'],
+    redelivery: ['control', 'label', 'original_envelope_id', 'source_envelope_id', 'envelope_id', 'event_id', 'connection_id', 'retry_attempt'],
+    'push-installation': ['control', 'label', 'envelope_id', 'connection_id'],
+    'connection-refused': ['control', 'control_index', 'label', 'method', 'request_id', 'remaining'],
+    fault: ['control', 'fault_index', 'method', 'label', 'request_id', 'matching_call', 'outcome', 'performed', 'response_ts'],
+  }
+  const calls: ts.CallExpression[] = []
+  function collect(node: ts.Node) {
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'record' &&
+      node.arguments[0] && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text in fields) calls.push(node)
+    ts.forEachChild(node, collect)
+  }
+  collect(ast)
+  const redactorNames = ['TOKEN_LIKE_SOURCE', 'TOKEN_LIKE_ALL', 'PUSH_FIELD_MAX', 'pushFieldText']
+  const redactorSource = ast.statements.filter(n =>
+    ts.isFunctionDeclaration(n) ? redactorNames.includes(n.name?.text ?? '') :
+      ts.isVariableStatement(n) && n.declarationList.declarations.some(d => redactorNames.includes(d.name.getText(ast))))
+    .map(n => n.getText(ast)).join('\n')
+  const pushFieldText = new Function(ts.transpileModule(redactorSource, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\nreturn pushFieldText;')() as (value: unknown) => string | null
+
+  test('every new record kind is explicitly covered', () => {
+    expect(calls.map(c => (c.arguments[0] as ts.StringLiteral).text).sort()).toEqual(Object.keys(fields).sort())
+  })
+  test.each(Object.keys(fields))('%s projects metadata only from credential-bearing inputs', event => {
+    const call = calls.find(c => (c.arguments[0] as ts.StringLiteral).text === event)!
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'shared-evidence'), ticket = 'PRIVATE_CONNECTION_TICKET'
+    const bindings = {
+      pushFieldText, close: { label: token, ticket, token }, ws: { data: { connectionId: 'connection', ticket, token } }, index: 1,
+      requestId: 'request', resolution: 'aborted', label: token, originalEnvelopeId: 'original',
+      parsed: { redeliver: { envelope_id: 'source', ticket, token }, ticket, token, text: LEAK_SENTINEL },
+      envelopeId: 'envelope', eventId: 'event', target: { data: { connectionId: 'connection', ticket, token } }, retryAttempt: 2,
+      refusal: { index: 1, remaining: 3, ticket, token }, method: 'chat.postMessage', fields: { request_id: 'request', ticket, token },
+      call: 4, fault: { outcome: 'lost', performed: true, token, ticket, text: LEAK_SENTINEL },
+      body: { ts: '1234567890.000001', text: LEAK_SENTINEL, token, ticket },
+    }
+    const emitted: Record<string, unknown>[] = []
+    const emit = (kind: string, value: Record<string, unknown>) => { expect(kind).toBe(event); emitted.push(value) }
+    new Function('record', ...Object.keys(bindings), call.getText(ast))(emit, ...Object.values(bindings))
+    expect(emitted).toHaveLength(1)
+    expect(Object.keys(emitted[0]!).sort()).toEqual([...fields[event]!].sort())
+    assertNoLeak(emitted)
+    expect(JSON.stringify(emitted)).not.toContain(ticket)
+    expect(Object.keys(emitted[0]!).some(key => /token|ticket|authorization|headers|text|payload/.test(key))).toBe(false)
+    // The same check must reject a newly copied transport object or field.
+    for (const planted of [{ ...emitted[0], ticket }, { ...emitted[0], token }, { ...emitted[0], text: LEAK_SENTINEL }]) {
+      expect(Object.keys(planted).sort()).not.toEqual([...fields[event]!].sort())
+    }
+  })
+})
 
 /**
  * Suites that match the touching rule but have no secret-bearing surface:

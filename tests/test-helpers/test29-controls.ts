@@ -2,9 +2,29 @@
  * No scenario or native agent is run by these builders. */
 import { buildDeliveryDiagnostic, deliveryIdentity, MESSAGE_RECEIVED } from '../../src/persona-diagnostics.ts'
 import { renderPersonaRef } from '../../src/persona-identity.ts'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import ts from 'typescript'
+import { acceptedRecord, slackInput } from './delivery-queue.ts'
 
 const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
-const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+
+/** Only declarations from the real printer execute in the scratch harness.
+ * Its image-only CLI and native client discovery are never run on the host. */
+export function test29EvidencePrinter(): string {
+  const pkg = join(import.meta.dir, '../..')
+  const source = readFileSync(join(pkg, 'tests/integration/fixtures/fmk-texts.ts'), 'utf8')
+  const ast = ts.createSourceFile('printer.ts', source, ts.ScriptTarget.Latest, true)
+  const body = ast.statements.filter(n => ts.isImportDeclaration(n) || ts.isFunctionDeclaration(n) ||
+    ts.isVariableStatement(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n) || ts.isClassDeclaration(n))
+    .map(n => n.getText(ast)).join('\n')
+    .replace("process.env['CSCB_PKG_DIR'] ?? '/test-repo/node_modules/claude-slack-channel-bots'", JSON.stringify(pkg))
+    .replaceAll("import('./transcript-receipts.ts')", `import(${JSON.stringify(join(pkg, 'tests/integration/fixtures/transcript-receipts.ts'))})`)
+    .replace("return await import(Bun.resolveSync('agent-director', join(PKG_DIR, 'src')))", "throw new Error('native client forbidden in declaration audit')")
+    .replace('process.exit(code)', 'throw new PrinterFailure(reason, code)')
+  return body + `\ntry { process.stdout.write(await entryValue(process.argv[2], process.argv.slice(3)) + '\\n') }
+catch (error) { console.error(error.message); process.exitCode = error.exitCode ?? 1 }\n`
+}
 
 export function test29ClosingFixture(mode: string) {
   const sender = 'U1'
@@ -13,8 +33,10 @@ export function test29ClosingFixture(mode: string) {
   const personas = [alpha, bravo]
   // Serialize expectations before touching actual lines. They come from the
   // accepted scenario inputs, never from parsing or mutating diagnostic output.
-  const expected = Object.fromEntries(personas.map(persona => [
-    `expected-queue-${persona.key}.jsonl`, jsonl([[persona.channel, persona.ts, persona.via]]),
+  const expected = { 'expected.jsonl': jsonl(personas.map(persona => ({ ...persona, source: 'slack', user: sender }))) }
+  const snapshots = Object.fromEntries(personas.map(persona => [
+    `${persona.key}.jsonl`, jsonl([acceptedRecord(1, slackInput({ channel: persona.channel, ts: persona.ts,
+      key: { chat_id: persona.channel, ts: persona.ts }, via: persona.via, user: sender }), 100)]),
   ]))
   const lines = personas.map(persona => buildDeliveryDiagnostic(
     MESSAGE_RECEIVED, renderPersonaRef(persona.name, persona.key),
@@ -39,9 +61,10 @@ export function test29ClosingFixture(mode: string) {
   if (mode === 'extra-thread') lines[1] += ' via=thread'
   if (mode === 'trailing-junk') lines[0] += ' unexpected'
   return {
-    argv: [MESSAGE_RECEIVED, sender, alpha.key, bravo.key, alpha.name, bravo.name].map(shellQuote).join(' '),
+    bindings: ['EXPECTED_ALL="$HOME/expected.jsonl"', 'ALPHA_KEY=alpha', 'BRAVO_KEY=bravo', 'ALPHA_DIR=alpha', 'BRAVO_DIR=bravo',
+      'declare -A QUEUE_ARCHIVES=([alpha]="$HOME/alpha.jsonl" [bravo]="$HOME/bravo.jsonl")'],
     files: {
-      ...expected,
+      ...expected, ...snapshots,
       'server.log': lines.slice(0, 1).join('\n') + '\n',
       'server.log.1': lines.slice(1).join('\n') + '\n',
     },
@@ -73,6 +96,7 @@ export function test29SwitchCallOrder() {
 export function test29SwitchBindings() {
   return [
     'ALPHA=alpha', 'BRAVO=bravo', 'F1=F1', 'F2=F2', 'U1=U1', 'A1=A1',
+    'ALPHA_KEY=alpha', 'BRAVO_KEY=bravo', 'shared_thread_joins() { :; }',
     'ALPHA_REF=alpha', 'ALPHA_START=start', 'ALPHA_RELAUNCH=relaunch', 'BRAVO_REF=bravo', 'BRAVO_START=start', 'BRAVO_RELAUNCH=relaunch',
     'APPLIED_CLASS=applied', 'PENDING=unused', 'APPLY=unused', 'TICK_WAIT_S=1', 'APPLY_WAIT_S=1', 'SWITCH_ON_LINE=on', 'SWITCH_OFF_LINE=off',
   ]

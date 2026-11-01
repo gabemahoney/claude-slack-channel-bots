@@ -2,13 +2,12 @@
  * No scenario is sourced, no native process is launched, and clocks are fake. */
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
-import { test29ClosingFixture, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
-import { test29RestartFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
+import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
+import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 
 const integration = join(import.meta.dir, 'integration')
@@ -25,14 +24,18 @@ function block(text: string, start: string, end: string): string {
   return text.slice(from, to)
 }
 function shell(program: string, files: Record<string, string> = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'cscb-timing-control-'))
+  mkdirSync('/tmp/c9', { recursive: true })
+  const root = mkdtempSync('/tmp/c9/cscb-timing-control-')
   try {
-    for (const [name, contents] of Object.entries(files)) writeFileSync(join(root, name), contents)
+    for (const [name, contents] of Object.entries(files)) {
+      mkdirSync(dirname(join(root, name)), { recursive: true })
+      writeFileSync(join(root, name), contents.replaceAll(TEST29_ROOT, root))
+    }
     const result = spawnSync('bash', ['-c', [
       'set -euo pipefail', 'SCENARIO_ROOT="$HOME"', 'SCENARIO_AD_ROOT="$HOME"', 'SLACK_STATE_DIR="$HOME"',
       'fail() { printf "%s\\n" "$*" >&2; exit 1; }', program,
     ].join('\n')], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'tail', 'grep', 'cat', 'wc', 'python3', 'bun'] }),
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'tail', 'grep', 'cat', 'wc', 'python3', 'bun', 'realpath', 'mv', 'mkdir'] }),
       encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined(); expect(result.signal).toBeNull()
@@ -52,22 +55,128 @@ const polling = [
   'sleep() { local now; read -r now < "$HOME/clock"; printf "%s\\n" "$((now+1000))" > "$HOME/clock"; }',
 ].join('\n')
 
+const test29 = source('test-29-invited-channels.sh')
+const receiptPrinter = test29EvidencePrinter()
+const queueControls = [
+  'export SCENARIO_ROOT SLACK_STATE_DIR="$HOME/state"', 'SCENARIO_FIXTURES="$HOME"',
+  'mkdir -p "$SLACK_STATE_DIR/queue"', 'require_ci_image() { :; }',
+  ...['_scenario_scratch_file', 'shared_queue_snapshot', 'shared_queue_receipts', 'shared_wait_queue_drained'].map(name => declaration(scenario, name)),
+  ...['snapshot_queue', 'wait_queue_drained', 'queue_drain_snapshot'].map(name => declaration(test29, name)),
+].join('\n')
+// Include only this continued command and its failure branch; later scenario
+// assertions are independent of the printer's append-open stdout regression.
+const restartAssertion = block(test29, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\npreserved_four_values')
+
 describe('retained timing regressions', () => {
+  test('test-29 compaction preserves both consumer drains and diagnostics across restart', async () => {
+    const fixture = await test29CompactionFixture()
+    const result = shell([
+      polling, queueControls, ...fixture.bindings,
+      'DELIVERY_IDLE_WAIT_S=2', 'DELIVERY_MAX_WAIT_S=8',
+      'queue_drain_snapshot before-restart',
+      'wait_queue_drained "$ALPHA_DIR"', 'wait_queue_drained "$BRAVO_DIR"',
+      // Replace the live journal with production startup's compacted bytes;
+      // snapshot_queue must carry the earlier evidence across the boundary.
+      'cat "$HOME/compacted/alpha.jsonl" > "$SLACK_STATE_DIR/queue/alpha.jsonl"',
+      'cat "$HOME/compacted/bravo.jsonl" > "$SLACK_STATE_DIR/queue/bravo.jsonl"',
+      'wait_queue_drained "$ALPHA_DIR"', 'wait_queue_drained "$BRAVO_DIR"',
+      'queue_drain_snapshot after-restart',
+      // Retain another completed original without losing the first archive.
+      'for key in alpha bravo; do',
+      '  cat "$HOME/next-work/$key.jsonl" > "$SLACK_STATE_DIR/queue/$key.jsonl"',
+      '  wait_queue_drained "$key"',
+      '  cat "$HOME/compacted-again/$key.jsonl" > "$SLACK_STATE_DIR/queue/$key.jsonl"',
+      '  wait_queue_drained "$key"',
+      'done',
+      'queue_drain_snapshot after-second-restart',
+      'printf "clock="; cat "$HOME/clock"',
+    ].join('\n'), { ...fixture.files, 'fmk-texts.ts': receiptPrinter })
+    expect(result.status).toBe(0)
+    expect(result.stderr).toBe('')
+    const snapshots = result.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line))
+    // Two personas, each with a two-part Slack original and a cron original.
+    expect(snapshots).toEqual([
+      ...Array(4).fill({ accepted: 2, complete: true, progress: 3,
+        incomplete: 0, first_incomplete: [], incomplete_items_omitted: 0 }),
+      ...Array(2).fill({ accepted: 3, complete: true, progress: 4,
+        incomplete: 0, first_incomplete: [], incomplete_items_omitted: 0 }),
+    ])
+    expect(result.stdout).toEndWith('clock=0\n')
+    expect(result.stdout).not.toContain(fixture.body)
+  })
+
+  test.each([
+    ['absent-history', 'original workload unavailable'],
+    ...['missing-receipt', 'altered-receipt', 'wrong-transcript-text', 'wrong-transcript-session']
+      .map(mode => [mode, 'archived item lacks complete observed receipts']),
+    ...['missing-key', 'wrong-key', 'wrong-received-at', 'wrong-delivered-at', 'missing-allocation', 'wrong-allocation', 'foreign-original', 'stale-original']
+      .map(mode => [mode, 'archived item lacks matching live compaction evidence']),
+    ['incomplete-work', ''],
+  ])('test-29 compaction consumers reject insufficient evidence: %s', async (mode, reason) => {
+    const fixture = await test29CompactionFixture(mode)
+    const result = shell([
+      polling, queueControls, ...fixture.bindings,
+      'DELIVERY_IDLE_WAIT_S=2', 'DELIVERY_MAX_WAIT_S=8',
+      // Start from the archived pre-restart evidence, with only alpha damaged.
+      'for key in alpha bravo; do',
+      '  cat "$HOME/archive/$key.jsonl" > "$HOME/queue-evidence-$key.jsonl"',
+      '  cat "$HOME/compacted/$key.jsonl" > "$SLACK_STATE_DIR/queue/$key.jsonl"',
+      'done',
+      // Keep the real reader and its authority checks; intentionally drop only
+      // the history argument to distinguish it from the original workload.
+      ...(mode === 'absent-history' ? [
+        declaration(scenario, 'shared_queue_receipts').replace('shared_queue_receipts()', '_audit_queue_receipts()'),
+        'shared_queue_receipts() { _audit_queue_receipts "$1" "$2"; }',
+      ] : []),
+      'set +e', '( set -e; queue_drain_snapshot after-restart )', 'diagnostic=$?',
+      '( set -e; wait_queue_drained "$ALPHA_DIR" )', 'drain=$?', 'set -e',
+      'printf "diagnostic=%s drain=%s clock=" "$diagnostic" "$drain"; cat "$HOME/clock"',
+    ].join('\n'), { ...fixture.files, 'fmk-texts.ts': receiptPrinter })
+    expect(result.status).toBe(0)
+    expect(result.stdout).toEndWith(`diagnostic=${mode === 'incomplete-work' ? 0 : 1} drain=1 clock=2000\n`)
+    expect(result.stderr).toContain(`incomplete receipts for alpha (progress=${mode === 'incomplete-work' ? 3 : 0}, idle=2s, overall=8s)`)
+    expect(result.stdout).not.toContain(fixture.body)
+    expect(result.stderr).not.toContain(fixture.body)
+    if (mode === 'incomplete-work') {
+      const snapshots = result.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line))
+      expect(snapshots).toHaveLength(2)
+      expect(snapshots[0]).toEqual({ accepted: 3, complete: false, progress: 3, incomplete: 1,
+        first_incomplete: [{ seq: 3, received_at: 400, parts: 0, receipted_parts: 0, complete: false, recent: [] }],
+        incomplete_items_omitted: 0 })
+      expect(snapshots[1].complete).toBe(true)
+      expect(result.stdout).toContain('recorded: queue receipt evidence ' + JSON.stringify(snapshots[0]))
+    } else {
+      expect(result.stderr).toContain(reason!)
+      expect(result.stdout).not.toContain('"complete":true')
+    }
+  })
+
   test.each(['complete', 'accepted-only', 'missing-part', 'duplicate-part', 'foreign-seq', 'empty'])('test-29 restart still requires every receipt: %s', async mode => {
     const text = source('test-29-invited-channels.sh')
     const fixture = await test29RestartFixture(mode)
     const result = shell([
-      polling, ...['queue_drained', 'queue_receipt_progress', 'wait_queue_drained', 'queue_drain_snapshot'].map(name => declaration(text, name)),
+      polling, queueControls,
+      declaration(scenario, 'shared_queue_receipts').replace('shared_queue_receipts()', '_audit_queue_receipts()'),
+      'shared_queue_receipts() { printf "reader:%s\\n" "$1" >&2; _audit_queue_receipts "$@"; }',
       ...fixture.bindings, 'DELIVERY_IDLE_WAIT_S=2', 'DELIVERY_MAX_WAIT_S=8', 'EVENT_WAIT_S=2',
       'thread_joins_saved() { return 0; }',
       block(text, 'queue_drain_snapshot before-restart', 'STORE_BEFORE_RESTART='),
-    ].join('\n'), fixture.files)
+    ].join('\n'), { ...fixture.files, 'fmk-texts.ts': receiptPrinter })
     expect(result.status).toBe(mode === 'complete' ? 0 : 1)
-    const snapshots = result.stdout.trim().split('\n').map(line => JSON.parse(line))
-    expect(snapshots.map(s => [s.phase, s.persona])).toEqual(fixture.expectedSnapshots)
-    expect(snapshots[0].accepted).toBe(mode === 'empty' ? 0 : 1)
-    expect(snapshots[0].complete).toBe(mode === 'complete' ? 1 : 0)
-    if (mode !== 'complete') expect(result.stderr).toContain('no-progress watchdog')
+    const readers = [...result.stderr.matchAll(/^reader:(\w+)$/gm)].map(match => match[1])
+    const snapshots = result.stdout.trim().split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line))
+    if (mode === 'empty') {
+      expect(snapshots).toEqual([])
+      expect(readers).toEqual(['alpha'])
+      expect(result.stderr).toContain('original workload unavailable')
+      return
+    }
+    expect(snapshots).toHaveLength(mode === 'complete' ? 4 : 2)
+    expect(readers.slice(0, 2)).toEqual(['alpha', 'bravo'])
+    if (mode === 'complete') expect(readers).toEqual(['alpha', 'bravo', 'alpha', 'bravo', 'alpha', 'bravo'])
+    expect(snapshots[0].accepted).toBe(1)
+    expect(snapshots.every(s => s.complete === (mode === 'complete'))).toBe(true)
+    if (mode !== 'complete') expect(result.stderr).toContain('incomplete receipts for alpha')
   })
 
   test('test-29 drain diagnostics bound detail and omit content and raw failures', async () => {
@@ -75,60 +184,70 @@ describe('retained timing regressions', () => {
     const secret = fakeToken(BOT_TOKEN_PREFIX)
     const fixture = await test29DiagnosticFixture(secret)
     const result = shell([
-      declaration(text, 'queue_drain_snapshot'),
+      queueControls,
       ...fixture.bindings,
       'queue_drain_snapshot restart-timeout',
-    ].join('\n'), fixture.files)
-    expect(result.status).toBe(0)
+    ].join('\n'), { ...fixture.files, 'fmk-texts.ts': receiptPrinter })
+    // Keep the valid persona's bounded evidence before the other persona's
+    // torn, acceptance-less journal fails closed.
+    expect(result.status).toBe(1)
     expect(result.stdout).not.toContain(fixture.body)
+    expect(result.stderr).not.toContain(fixture.body)
     const lines = result.stdout.trim().split('\n')
-    expect(lines).toHaveLength(2)
+    expect(lines).toHaveLength(1)
     const snapshot = JSON.parse(lines[0]!)
     expect(snapshot.accepted).toBe(70)
-    expect(snapshot.complete).toBe(0)
+    expect(snapshot.complete).toBe(false)
     expect(snapshot.incomplete).toBe(70)
     expect(snapshot.incomplete_items_omitted).toBe(62)
     expect(snapshot.first_incomplete).toHaveLength(8)
     expect(snapshot.first_incomplete[0]).toEqual(test29DiagnosticExpectedItem())
-    expect(lines[1]).toBe('recorded: queue snapshot unavailable')
+    expect(result.stderr).toContain('original workload unavailable')
   })
 
   test.each(['progressing', 'stalled', 'repeated', 'regressed', 'foreign', 'new-work', 'reminders', 'attempts', 'stale', 'malformed', 'unreadable', 'changed-identity', 'overall-limit'])('test-29 exact-workload progress watchdog: %s', async mode => {
     const text = source('test-29-invited-channels.sh')
     const fixture = await test29WatchdogFixture(mode)
     const result = shell([
-      polling, ...['queue_drained', 'queue_receipt_progress', 'wait_queue_drained'].map(name => declaration(text, name)),
+      polling, queueControls,
       block(text, 'DELIVERY_IDLE_WAIT_S=', '# --- Prerequisites'),
       ...(mode === 'overall-limit' ? ['DELIVERY_MAX_WAIT_S=300'] : []),
       `mode=${mode}`,
       ...fixture.bindings,
       'cat "${TEST29_STAGE_PREFIX}0" > "$TEST29_CURRENT"',
-      'sleep() { local now; read -r now < "$HOME/clock"; now=$((now+60000)); printf "%s\\n" "$now" > "$HOME/clock"; cat "$TEST29_STAGE_PREFIX$((now/60000))" > "$TEST29_CURRENT"; if [[ "$mode" == unreadable ]]; then DELIVERIES_FILE[$TEST29_QUEUE_KEY]="$TEST29_MISSING"; fi; }',
-      'queue_drain_snapshot() { printf "diagnostic clock="; cat "$HOME/clock"; }',
-      'wait_queue_drained "$TEST29_QUEUE_KEY" control', 'cat "$HOME/clock"',
-    ].join('\n'), fixture.files)
+      'sleep() { local now; read -r now < "$HOME/clock"; now=$((now+60000)); printf "%s\\n" "$now" > "$HOME/clock"; cat "$TEST29_STAGE_PREFIX$((now/60000))" > "$TEST29_CURRENT"; if [[ "$mode" == unreadable ]]; then mv "$TEST29_CURRENT" "$TEST29_MISSING"; fi; }',
+      'set +e', '( set -e; wait_queue_drained "$TEST29_QUEUE_KEY" control )',
+      'status=$?', 'set -e', 'printf "clock="; cat "$HOME/clock"', 'exit "$status"',
+    ].join('\n'), { ...fixture.files, 'fmk-texts.ts': receiptPrinter })
     expect(result.status).toBe(mode === 'progressing' ? 0 : 1)
-    if (mode === 'progressing') expect(result.stdout.trim()).toBe('240000')
+    if (mode === 'progressing') expect(result.stdout.trim()).toBe('clock=240000')
     else {
-      expect(result.stderr).toContain(mode === 'overall-limit' ? 'overall watchdog' : 'no-progress watchdog')
-      expect(result.stdout.trim()).toBe(`diagnostic clock=${mode === 'overall-limit' ? 300000 : 180000}`)
+      expect(result.stderr).toContain('incomplete receipts for alpha')
+      // At the overall deadline the sampled fifth receipt is retained in the
+      // diagnostic, but cannot renew progress or bypass the absolute bound.
+      const progress = ['repeated', 'regressed'].includes(mode) ? 1 : mode === 'overall-limit' ? 4 : 0
+      expect(result.stderr).toContain(`progress=${progress}, idle=180s, overall=${mode === 'overall-limit' ? 300 : 1800}s`)
+      expect(result.stdout).toContain(`clock=${mode === 'overall-limit' ? 300000 : 180000}`)
+      if (mode === 'overall-limit') expect(result.stdout).toContain('"progress":5')
     }
   })
 
   test.each(['valid', 'missing', 'duplicate', 'wrong-name', 'wrong-key', 'wrong-source', 'wrong-channel', 'wrong-ts', 'wrong-sender', 'missing-thread', 'extra-thread', 'unknown-suffix', 'trailing-junk'])('test-29 closing received set: %s', mode => {
     const text = source('test-29-invited-channels.sh')
-    const check = block(text, 'import collections, glob, json, os, re, sys', '\nEOF')
     const fixture = test29ClosingFixture(mode)
-    const result = shell(`python3 "$HOME/check.py" "$HOME" "$HOME" ${fixture.argv}`, {
-      'check.py': check, ...fixture.files,
-    })
+    const result = shell([
+      'export SCENARIO_ROOT', 'SCENARIO_FIXTURES="$HOME"', 'require_ci_image() { :; }',
+      declaration(scenario, 'shared_assert_accounting'), ...fixture.bindings,
+      block(text, 'shared_assert_accounting "${EXPECTED_ALL}"', '\n# Compare every original'),
+    ].join('\n'), { 'fmk-texts.ts': receiptPrinter, ...fixture.files })
     expect(result.status).toBe(mode === 'valid' ? 0 : 1)
-    if (mode === 'valid') expect(result.stdout).toContain('2 exact acceptances')
+    if (mode === 'valid') expect(JSON.parse(result.stdout)).toEqual({ accepted: 2, received: 2 })
+    else expect(result.stderr).toContain('exact received diagnostic set mismatch')
   })
 
   test.each(['kept', 'unredirected-control', 'assertion-fails'])('test-29 assertion printer retains earlier diagnostics: %s', mode => {
     const text = source('test-29-invited-channels.sh')
-    let call = block(text, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\nfor dir in')
+    let call = restartAssertion
     if (mode === 'unredirected-control') call = call.replace(' > /dev/null', '')
     // Exercise the printer's actual output operation without its image-only
     // imports. A regular append-open stdout reproduces the runner's log sink.
@@ -170,7 +289,7 @@ describe('retained timing regressions', () => {
       // Collect the failed log without invoking the subshell in an if/|| list:
       // that would disable errexit inside confirm_switch and hide a failure.
       'set +e', '( set -e; printf "before-restart\\n";',
-      block(text, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\nfor dir in'),
+      restartAssertion,
       'printf "after-restart\\n"',
       block(text, `confirm_switch ${shape} "`, '\n'),
       'printf "after-switch\\n" ) >> "$HOME/retained.log" 2>&1',

@@ -426,6 +426,7 @@ tests/
                                    # real registered hooks, production receipt extension and measured Slack permission posts
     test-43-fmk-displayed-legacy.sh  # verified legacy AD in a separate HOME/store/socket: actual idle_screen and needs_intelligence;
                                    # unnormalized real-client negative controls and production normalized positive behavior
+    test-46-shared-channel-recovery.sh # shared mode: shared-channel and thread recovery across storage faults, kills and restarts, lost answers and connection gaps
     lib/
       displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting

@@ -17,11 +17,11 @@ import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
-import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, mentionText, ENVELOPE_FLAG_FORMS, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode } from '../src/config.ts'
 import type { PersonaEventProvenance } from '../src/persona-connections.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
-import { readQueue, seedQueue, slackInput, queuePath, memoryHold, postHold } from './test-helpers/delivery-queue.ts'
+import { readQueue, seedQueue, slackInput, injectedInput, queuePath, memoryHold, postHold } from './test-helpers/delivery-queue.ts'
 import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { configBytes, makeSharedAuthority, makeMembershipHarness, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
@@ -31,7 +31,7 @@ import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
-import { createQueuedAckCallback } from '../src/ack-tracker.ts'
+import { createQueuedAckCallback, createDeliveryAckCallback } from '../src/ack-tracker.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_TIME, readThreads, slackTsOfMs, threadPath, threadFsControls, seedThreads, threadHeader, threadConfig } from './test-helpers/thread-memory.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
@@ -643,6 +643,70 @@ describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
     }
   })
 
+  // MI decision4: packed ingress has independent persona envelopes. Compose
+  // its multi-recipient API here; successful admission's append ordering is
+  // already asserted by "two recipients join independently" above. Partial
+  // failures deliberately save retained joins without an aggregate ACK.
+  test('aggregate mention, Broadcast and followed reply retain truthful feedback through partial failure, replay and stamp replacement', async () => {
+    const io = threadFsControls(dir), events: QueueEvent[] = [], feedback: Promise<void>[] = []
+    let queued: ReturnType<typeof createQueuedAckCallback>
+    const h = await joined({ queueOptions: { fs: io.fs, onEvent: event => events.push(event) },
+      onReceived: (key, item) => { feedback.push(queued(key, item)) } })
+    queued = createQueuedAckCallback({ queue: h.queue, getReaction: () => h.config!.queued_ack_reaction,
+      clientFor: key => h.p(key).stub.web })
+    const both = ['alpha', 'beta']
+    const root = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary,
+      text: both.map(key => mentionText(h.p(key).stub.identity.botUserId)).join(' ') })
+    const broadcast = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.secondary, text: broadcastText() })
+    const followed = reply()
+    const inputs = [{ event: root, via: 'mention' }, { event: broadcast, via: 'broadcast' }, { event: followed, via: 'thread' }]
+    let acks = 0
+    for (const { event, via } of inputs) {
+      io.fail('writeSync', 'beta', { match: path => path === queuePath(dir, 'beta') })
+      const before = acks
+      await h.receive(event, both, () => { acks++ })
+      await h.settleJoinSaves(); await Promise.all(feedback)
+      expect(acks).toBe(before)
+      expect(facts(h, 'alpha').filter(item => item.ts === event.ts)).toEqual([expected(event, via)])
+      expect(facts(h, 'beta').filter(item => item.ts === event.ts)).toEqual([])
+      // A retained recipient may truthfully show queued even though the
+      // aggregate envelope is unacknowledged; the failed recipient may not.
+      expect(h.p('alpha').stub.calls.reactionsAdd.filter(call => call.timestamp === event.ts)).toEqual([
+        { channel: CA, timestamp: event.ts as string, name: h.config!.queued_ack_reaction! },
+      ])
+      expect(h.p('beta').stub.calls.reactionsAdd.filter(call => call.timestamp === event.ts)).toEqual([])
+      expect(savedJoins('alpha')).toHaveLength(via === 'mention' ? 1 : 2)
+      io.heal()
+      await h.receive(event, both, () => {
+        acks++
+        for (const key of both) expect(readQueue(dir, key).filter(r => r.kind === 'accepted' && !('compact' in r) && r.ts === event.ts)).toHaveLength(1)
+      })
+      await h.receive(event, both, () => { acks++ })
+      await h.settleJoinSaves(); await Promise.all(feedback)
+      expect(acks).toBe(before + 2)
+    }
+    expect(events.filter(e => e.type === 'store-failed').map(e => e.key)).toEqual(['beta', 'beta', 'beta'])
+    expect(events.filter(e => e.type === 'stored').map(e => e.key)).toEqual(['alpha', 'beta', 'alpha', 'beta', 'alpha', 'beta'])
+    const frozen = Object.fromEntries(both.map(key => [key, h.queued(key).map(item => ({ accepted: structuredClone(item.accepted), fixed: structuredClone(item.fixed) }))]))
+    for (const key of both) {
+      expect(facts(h, key)).toEqual(inputs.map(({ event, via }) => expected(event, via)))
+      expect(h.p(key).stub.calls.reactionsAdd.map(call => call.timestamp)).toEqual(inputs.map(({ event }) => event.ts as string))
+      const stamp = h.threads!.authority.channelStamp(key, CA)
+      expect(h.threads!.choose('mentions', key, CA).kind).toBe('applied')
+      expect(h.threads!.choose('thread_hybrid', key, CA).kind).toBe('applied')
+      expect(h.threads!.authority.channelStamp(key, CA)).not.toEqual(stamp)
+      expect(h.threads!.memory.view(key, CA, THREAD_ROOTS.primary)).toBe('not-joined')
+    }
+    for (const { event } of inputs) await h.receive(event, both, () => { acks++ })
+    await h.settleJoinSaves()
+    expect(acks).toBe(9)
+    for (const key of both) {
+      expect(h.queued(key).map(item => ({ accepted: item.accepted, fixed: item.fixed }))).toEqual(frozen[key])
+      expect(h.threads!.memory.view(key, CA, THREAD_ROOTS.primary)).toBe('not-joined')
+      expect(h.threads!.memory.view(key, CA, THREAD_ROOTS.secondary)).toBe('not-joined')
+    }
+  })
+
   test('an unloadable queue acknowledges drops but withholds deliveries until the same event can store', async () => {
     const io = threadFsControls(dir), events: QueueEvent[] = []
     const h = await joined({ queueOptions: { fs: io.fs, onEvent: e => events.push(e) } })
@@ -927,6 +991,163 @@ test.each(['strict', 'open'] as const)('%s staged restoration holds thread-depen
     } }])
     assertNoLeak({ logs, captured: run.captured() })
   } finally { await preparation?.stop(); await h.cleanup() }
+})
+
+// MI coverage decision 2026-11-01: an operator cannot keep the packed
+// server's connection while re-running local bring-up. Use the existing real
+// controller composition here; test 29 separately covers cold-start recovery.
+describe.each(['strict', 'open'] as const)('%s serving-but-not-up composed acceptance', channel_mode => {
+  async function held() {
+    const h = makeReloadHarness()
+    const alpha = h.persona('alpha', { channels: [{ id: CA, delivery: 'thread_hybrid' }, { id: CB, delivery: 'all' }],
+      permission_prompts: CB, dm: { enabled: true } })
+    h.materialize(alpha)
+    h.writeRecord({ channel_mode, personas: [alpha] }); h.writeConfig({ channel_mode, personas: [alpha] })
+    const run = await h.startDetecting({ realLifecycle: true, threadMemory: {}, slack: { alpha: { inventory: [membershipPage([CA, CB])] } } })
+    await run.membershipClock.runNext()
+    const socket = run.stub('alpha').socket
+    h.deleteWorkingDirectory(alpha)
+    run.bringUps.cancel('alpha')
+    const personas = run.controller.applied()!.config.personas
+    await run.bringUps.bringUp(personas[0]!, personas)
+    expect(run.connections.manager.status('alpha')?.state).toBe('up')
+    expect(run.stub('alpha').socket).toBe(socket)
+    expect(run.bringUps.state('alpha')?.outcome).toBe('retrying')
+    expect(run.isUp('alpha')).toBe(false)
+    expect(run.membership.read('alpha', CA, channel_mode).kind).toBe('eligible')
+    const feedback: Promise<void>[] = []
+    const delivered = createDeliveryAckCallback({ queue: run.queue, clientFor: key => run.connections.clientFor(key),
+      getReaction: () => run.serverConfig()!.ack_reaction })
+    const engine = await makeEngineHarness({ queue: run.queue, stateDir: h.stateDir, isUp: key => run.isUp(key),
+      onEvent: event => { if (event.type === 'item-delivered') feedback.push(delivered(event.key, run.queue.item(event.key, event.seq)!)) } })
+    async function withheld() {
+      await run.clock.flush(); await engine.tick()
+      expect(run.isUp('alpha')).toBe(false)
+      expect(engine.keyCalls()).toEqual([])
+      expect(run.queued('alpha').every(item => !item.delivered)).toBe(true)
+      expect(readQueue(h.stateDir).filter(record => record.kind === 'sent' || record.kind === 'delivered')).toEqual([])
+    }
+    async function recover(persona = alpha) {
+      h.makeWorkingDirectory(persona)
+      // Drive the controller's already-armed retry, without another bringUp call.
+      for (let n = 0; n < 10 && !run.isUp('alpha'); n++) await run.clock.runNext()
+      expect(run.bringUps.state('alpha')?.outcome).toBe('up')
+      expect(run.isUp('alpha')).toBe(true)
+      await engine.tick(); await engine.until(() => run.queue.openCount('alpha') === 0)
+      await Promise.all(feedback)
+      expect(engine.errors).toEqual([]); expect(engine.restarts).toEqual([])
+    }
+    async function close() {
+      try { assertNoLeak({ captured: run.captured(), calls: engine.calls, events: engine.events }) }
+      finally { await engine.cleanup(); await h.cleanup() }
+    }
+    return { h, alpha, run, engine, socket, withheld, recover, close }
+  }
+
+  test('thread text and file match the mention control, with durable acceptance then queued and receipt-backed delivered reactions', async () => {
+    const { h, run, engine, socket, withheld, recover, close } = await held()
+    try {
+      run.stub('alpha').script.info.push({ kind: 'ok', result: { channel: { name: 'composed-room' } } })
+      const root = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: mentionText(run.stub('alpha').identity.botUserId) })
+      await run.deliver('alpha', root)
+      const files = [{ name: 'thread-report.txt', mimetype: 'text/plain', size: 42 }]
+      const inputs = [
+        { via: 'thread', event: makeChannelMessage({ channel: CA, thread_ts: root.ts, text: '  exact thread text\nwith a file  ', files }) },
+        { via: 'mention', event: makeChannelMessage({ channel: CA, text: `${mentionText(run.stub('alpha').identity.botUserId)} exact mention text`, files }) },
+      ]
+      const acknowledged: AcceptedRecord[][] = []
+      const acceptances = () => readQueue(h.stateDir).filter((r): r is AcceptedRecord => r.kind === 'accepted')
+      // Read the durable queue after each acknowledged intake. Duplicate
+      // envelopes must each be acknowledged without a second acceptance.
+      for (const { event } of inputs) {
+        await run.deliver('alpha', event); acknowledged.push(acceptances())
+        await run.deliver('alpha', event)
+      }
+      await withheld()
+      expect(socket.acks).toHaveLength(5)
+      expect(acknowledged.map(records => records.length)).toEqual([2, 3])
+      const items = run.queued('alpha')
+      expect(items).toHaveLength(3)
+      expect(acceptances()).toEqual(items.map(item => item.accepted))
+      for (const [index, { event, via }] of inputs.entries()) {
+        const item = items[index + 1]!
+        expect(item.accepted).toMatchObject({ channel: CA, ts: event.ts, text: event.text, files, via })
+        expect(item.fixed!.parts).toEqual(buildTagParts({ chat_id: CA, channel_name: 'composed-room', message_id: event.ts as string,
+          user: 'stub-user', user_id: event.user as string, ts: event.ts as string, via,
+          ...(event.thread_ts ? { thread_ts: event.thread_ts as string } : {}),
+          attachment_count: '1', attachments: 'thread-report.txt (text/plain, 42 bytes)', text: event.text as string }))
+      }
+      const queued = run.serverConfig()!.queued_ack_reaction!, delivered = run.serverConfig()!.ack_reaction!
+      expect(run.stub('alpha').calls.reactionsAdd).toEqual(items.map(item => ({ channel: CA, timestamp: item.accepted.ts, name: queued })))
+      const expectedParts = items.flatMap(item => item.fixed!.parts)
+      await recover()
+      expect(engine.textCalls().map(call => call.params.text)).toEqual(expectedParts)
+      expect(engine.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual(items.map(i => i.accepted.seq))
+      for (const { event } of inputs) {
+        expect(run.stub('alpha').callLog.filter(call => ['reactions.add', 'reactions.remove'].includes(call.method) &&
+          typeof call.args === 'object' && call.args !== null && 'timestamp' in call.args && call.args.timestamp === event.ts)).toEqual([
+          { method: 'reactions.add', args: { channel: CA, timestamp: event.ts, name: queued } },
+          { method: 'reactions.remove', args: { channel: CA, timestamp: event.ts, name: queued } },
+          { method: 'reactions.add', args: { channel: CA, timestamp: event.ts, name: delivered } },
+        ])
+      }
+      expect(run.threadMemory!.view('alpha', CA, root.ts as string)).toBe('joined')
+    } finally { await close() }
+  })
+
+  test('mixed accepted work keeps sequence, content and via through mode, value, leave and identity changes before recovery, without rejoining', async () => {
+    const { h, alpha, run, engine, socket, withheld, recover, close } = await held()
+    try {
+      const root = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: mentionText(run.stub('alpha').identity.botUserId) })
+      await run.deliver('alpha', root)
+      const interject = await run.queue.accept('alpha', injectedInput({ text: 'interjected between Slack items' }))
+      expect(interject.status).toBe('accepted')
+      if (interject.status !== 'accepted' || !interject.item) throw new Error('expected interject acceptance')
+      await engine.preparation.prepare('alpha', interject.item)
+      const reply = makeChannelMessage({ channel: CA, thread_ts: root.ts, text: 'followed reply retains context' })
+      await run.deliver('alpha', reply)
+      const cron = await run.queue.accept('alpha', injectedInput({ source: 'cron', sender: 'scheduled', text: 'scheduled between Slack items' }))
+      expect(cron.status).toBe('accepted')
+      if (cron.status !== 'accepted' || !cron.item) throw new Error('expected cron acceptance')
+      await engine.preparation.prepare('alpha', cron.item)
+      await run.deliver('alpha', makeChannelMessage({ channel: CA, text: broadcastText() }))
+      await run.deliver('alpha', makeChannelMessage({ channel: CB, text: 'all channel original' }))
+      await run.deliver('alpha', makeDm({ text: 'direct original' }))
+      await withheld()
+      expect(socket.acks).toHaveLength(5)
+      const accepted = structuredClone(run.queued('alpha').map(item => item.accepted))
+      const parts = run.queued('alpha').flatMap(item => item.fixed!.parts)
+      expect(accepted.map(item => [item.source, item.via])).toEqual([
+        ['slack', 'mention'], ['interject', undefined], ['slack', 'thread'], ['cron', undefined],
+        ['slack', 'broadcast'], ['slack', 'receive_all'], ['slack', 'dm'],
+      ])
+      const authority = run.controller.sharedChannels()!, incarnation = authority.incarnation('alpha')
+      const changed = { ...alpha, channels: [{ id: CA, delivery: 'off' as const }, { id: CB, delivery: 'all' as const }] }
+      async function apply(persona: typeof alpha) {
+        h.writeConfig({ channel_mode: channel_mode === 'strict' ? 'open' : 'strict', personas: [persona] })
+        await run.ticks.tick(); expect(h.pendingExists()).toBe(true); h.confirm(); await run.ticks.tick()
+        await withheld()
+        expect(run.queued('alpha').map(item => item.accepted)).toEqual(accepted)
+        expect(run.queued('alpha').flatMap(item => item.fixed!.parts)).toEqual(parts)
+      }
+      await apply(changed)
+      expect(authority.choice('alpha', CA)).toBe('off')
+      expect(run.threadMemory!.view('alpha', CA, root.ts as string)).toBe('not-joined')
+      await run.deliver('alpha', ...makeMembershipEvent(run.stub('alpha').identity, 'leave', CA, run.membershipClock.now() + 1))
+      expect(authority.choice('alpha', CA)).toBeUndefined()
+      await withheld()
+      const replacement = { ...changed, working_directory: join(h.root, 'replacement-still-missing') }
+      await apply(replacement)
+      expect(authority.incarnation('alpha')).not.toBe(incarnation)
+      expect(readQueue(h.stateDir).filter(record => record.kind === 'accepted')).toEqual(accepted)
+      await recover(replacement)
+      expect(engine.textCalls().map(call => call.params.text)).toEqual(parts)
+      expect(engine.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual(accepted.map(item => item.seq))
+      expect(run.queued('alpha').map(item => item.accepted)).toEqual(accepted)
+      expect(run.threadMemory!.view('alpha', CA, root.ts as string)).toBe('not-joined')
+      expect(run.threadMemory!.joins('alpha')).toEqual([])
+    } finally { await close() }
+  })
 })
 
 async function each(h: RoutingHarness, event: unknown) { await h.receive(event, ['alpha']); await h.receive(event, ['beta']) }

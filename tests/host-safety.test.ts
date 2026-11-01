@@ -136,7 +136,11 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import assert from 'node:assert/strict'
+import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { existsSync, copyFileSync, unlinkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
@@ -1283,8 +1287,8 @@ describe('static audit: every child process call’s env is a direct hostSafeChi
     const files = hostTestFiles()
     expect(auditTree(files, (sf) => childProcessAudit(sf).findings)).toEqual([])
     expect(files.reduce((sum, path) => sum + childProcessAudit(parseFile(path)).calls, 0)).toBeGreaterThan(0)
-    // This file's two children (the inherited-TMUX_TMPDIR and TMPDIR cases) are found and accepted.
-    expect(childProcessAudit(parseFile(join(TESTS_DIR, 'host-safety.test.ts')))).toEqual({ calls: 2, findings: [] })
+    // The inherited-directory cases and shared declaration runner are all found and accepted.
+    expect(childProcessAudit(parseFile(join(TESTS_DIR, 'host-safety.test.ts')))).toEqual({ calls: 3, findings: [] })
   })
 
   test('the audited files: every test file bun runs, node_modules excluded, and every test helper', () => {
@@ -1692,7 +1696,7 @@ const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
  * the switch-over fixture and the scenario value printer.
  */
 const CODEX_DELIVERY_PATH = join(TESTS_DIR, 'real-agent', 'codex-delivery.ts')
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH, join(INTEGRATION_DIR, 'fixtures', 'displayed-states.ts')]
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH, join(INTEGRATION_DIR, 'fixtures', 'displayed-states.ts'), join(INTEGRATION_DIR, 'fixtures', 'shared-stub-permission.ts')]
 const CODEX_IMPORT_ONLY_PATHS = ['codex-guards.ts', 'codex-evidence.ts', 'codex-ai.ts', 'codex-gate.ts', 'codex-crash-barrier.ts'].map(name => join(TESTS_DIR, 'real-agent', name))
 // Every non-node static edge is exact and its destination is audited too.
 const CODEX_IMPORT_GRAPH: Record<string, readonly string[]> = {
@@ -1739,6 +1743,21 @@ const IMAGE_GUARD_RULE = {
 const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['_scenario_place', 'the copy-and-rename primitive: it refuses outside the image and for a destination outside SCENARIO_ROOT, and each audited caller counts its call as a step'],
   ['write_file', 'the scripts’ file writer in both modes: it writes only the path its caller names, and each audited caller counts its call as a step'],
+  ['_scenario_stub_control_patch', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_control_seed', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_controls', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_close_socket', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_fault', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_faults_clear', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_history', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_history_fault', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_history_seed', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_inventory_clear', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_inventory_fault', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_inventory_page', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_post_fail', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_post_lost', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['shared_queue_snapshot', 'shared-mode evidence only: image first, scratch-fenced output and temporary file outside live state, no HOME or AD access; audited below'],
   ['write_config', 'shared mode’s config.json writer: it writes only SLACK_STATE_DIR’s config.json, and new_state_dir makes each state dir under SCENARIO_ROOT'],
   ['hold_not_applied', 'shared mode’s reload hold: its one copy snapshots config.json.last-applied from SLACK_STATE_DIR into SCENARIO_ROOT'],
   ['tmux_shim_mode', '_scenario_fmk_setup runs it before the scenario HOME is exported; it writes only the tmux shim’s mode file under SCENARIO_ROOT'],
@@ -2269,7 +2288,7 @@ function helperHomeCheckFindings(file: string, source: string, helpers: readonly
     // Only the operator request publisher may substitute the scratch-state
     // guard: shared mode keeps the container HOME. It stays in this audit,
     // and the image-first audit and executable refusal controls also cover it.
-    const guardName = helper === 'configuration_request' ? 'require_scenario_state' : HOME_GUARD
+    const guardName = ['configuration_request', 'configuration_recovery_request'].includes(helper) ? 'require_scenario_state' : HOME_GUARD
     const guard = homeGuardIndex(body, guardName)
     if (guard < 0 || guard > firstStep) {
       const step = body[firstStep]
@@ -2822,7 +2841,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     })
 
     test('the audited files: the forced-call driver, the stub’s MCP session, the switch-over fixture and the scenario value printer, all present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts', 'displayed-states.ts'])
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts', 'displayed-states.ts', 'shared-stub-permission.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 
@@ -3870,7 +3889,121 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
  * `require_scenario_home` (shared mode has no scenario HOME); `/ci` always
  * carries the marker, so this static pin is the only proof of their refusal.
  */
-const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'stub_session_list_tools', '_scenario_stub_request', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', 'configuration_request']
+const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'stub_session_list_tools', '_scenario_stub_request', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', 'configuration_request',
+  'scenario_id',
+  'scenario_ts',
+  'scenario_text',
+  'scenario_mention_text',
+  'scenario_broadcast_text',
+  '_scenario_channel_type',
+  'slack_message_event',
+  'slack_mention_event',
+  'slack_reply_event',
+  'slack_push_message',
+  'slack_push_mention',
+  'slack_push_broadcast',
+  'slack_push_reply',
+  'slack_push_own_reply',
+  'slack_push_other_bot',
+  'slack_push_edit',
+  'slack_push_delete',
+  'slack_push_reaction',
+  'slack_push_dm',
+  'slack_push_group_dm',
+  '_scenario_push_membership',
+  'slack_membership_event',
+  'slack_push_member_joined',
+  'slack_push_channel_left',
+  'scenario_attachment',
+  'scenario_stub_name',
+  'slack_attachment_event',
+  'slack_push_attachment',
+  'slack_recorded_button',
+  'slack_push_button',
+  'shared_stub_permission',
+  'shared_stub_permission_setup',
+  'shared_stub_notice_setup',
+  'shared_stub_notice',
+  'slack_post_mark',
+  'slack_successful_post',
+  '_scenario_wait_post',
+  'slack_wait_successful_post',
+  'slack_wait_messages_waiting',
+  'slack_push_observed_post',
+  'shared_queue_snapshot',
+  'shared_queue_receipts',
+  'shared_wait_queue_drained',
+  'shared_thread_joins',
+  '_scenario_own_post_read',
+  'shared_own_post_records',
+  'shared_own_post_state',
+  'shared_wait_own_post_state',
+  'shared_queue_joins_saved',
+  'shared_dedupe_preserved',
+  'shared_delivery_expectation',
+  'shared_assert_accounting',
+  'shared_expected_parts',
+  'shared_assert_content',
+  '_scenario_shared_read',
+  'shared_injected_expected_parts',
+  'shared_assert_injected_content',
+  'shared_cron_identity',
+  'configuration_recovery_request',
+  'shared_recovery_pending',
+  'shared_recovery_consumed',
+  'shared_persona_facts',
+  '_scenario_stub_control_http',
+  'slack_stub_control_seed',
+  'slack_stub_controls',
+  '_scenario_stub_control_patch',
+  'slack_stub_identity',
+  '_scenario_stub_special_push',
+  'slack_stub_redeliver',
+  'slack_stub_push_installation',
+  'slack_stub_close_socket',
+  'slack_stub_inventory_body',
+  'slack_stub_inventory_page',
+  'slack_stub_inventory_clear',
+  'slack_stub_fault',
+  'slack_stub_inventory_fault',
+  'slack_stub_post_lost',
+  'slack_stub_post_fail',
+  'slack_stub_history_fault',
+  'slack_stub_faults_clear',
+  'slack_stub_history',
+  'slack_stub_history_seed',
+  '_scenario_complete_jsonl',
+  'slack_stub_records',
+  'slack_stub_record_count',
+  'slack_stub_record_field',
+  'slack_stub_control_fired',
+  'slack_ack_count',
+  'slack_wait_one_ack',
+  'slack_expect_no_ack',
+  'slack_envelope_times',
+  'scenario_attempt_id',
+  'attempt_args',
+  '_scenario_session_file',
+  '_scenario_session_submit',
+  'stub_session_submit',
+  'stub_session_group',
+  'stub_session_result',
+  'stub_session_call_lost',
+  'stub_session_sessions',
+  'scenario_attempt_call',
+  'scenario_attempt_group',
+  'expect_attempt',
+  '_scenario_shared_value',
+  'shared_channel_saved',
+  'shared_channel_effective',
+  'shared_thread_since',
+  'shared_thread_created',
+  'shared_thread_file',
+  'shared_attempt_order',
+  'shared_attempt_applications',
+  'shared_queue_items',
+  'shared_queued_count',
+]
 
 /**
  * The image-check findings for `helpers` in the shell file `file`: the first
@@ -3988,7 +4121,7 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
   })
 
   test.each(IMAGE_GUARDED_STUB_HELPERS.map((helper) => [helper]))('scenario.sh with %s’s require_ci_image removed is flagged, naming it', (helper) => {
-    const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    ${IMAGE_GUARD} "[^"\\n]*"\\n`), '$1')
+    const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{[\\s\\S]*?)\\b${IMAGE_GUARD} ("[^"\\n]*"|[A-Za-z_][\\w]*)(?:;|\\n)`), '$1')
     const findings = helperImageCheckFindings('scenario.sh', unguarded)
 
     expect(unguarded).not.toBe(source)
@@ -3999,8 +4132,8 @@ describe('static audit: the Slack stub and stub MCP session helpers run require_
 
   test.each(IMAGE_GUARDED_STUB_HELPERS.map((helper) => [helper]))('scenario.sh with %s’s require_ci_image only inside an if is flagged, naming it', (helper) => {
     const conditional = source.replace(
-      new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    ${IMAGE_GUARD} ("[^"\\n]*")\\n`),
-      `$1    if [[ -n "\${STRICT:-}" ]]; then\n        ${IMAGE_GUARD} $2\n    fi\n`,
+      new RegExp(`(\\n${helper}\\(\\) \\{[\\s\\S]*?)\\b${IMAGE_GUARD} ("[^"\\n]*"|[A-Za-z_][\\w]*)(?:;|\\n)`),
+      `$1    if [[ -n "\${STRICT:-}" ]]; then ${IMAGE_GUARD} $2; fi;\n`,
     )
     const findings = helperImageCheckFindings('scenario.sh', conditional)
 
@@ -4043,5 +4176,595 @@ describe('static audit: slack-stub-server.ts statically imports only node: built
     expect(changed).not.toBe(source)
     expectNamedFindings(findings, 'slack-stub-server.ts', IMAGE_GUARD_RULE.stubStaticImport)
     expect(findings).toHaveLength(1)
+  })
+})
+
+
+test('shared registered-hook controls bind the actual row and fail closed without replay', async () => {
+  mkdirSync('/tmp/c9', { recursive: true })
+  const scratch = mkdtempSync('/tmp/c9/shared-permission-audit-'), pkg = REPO_ROOT
+  const captured: unknown[][] = []
+  const clock = createFakeClock()
+  // The copied declaration receives its own context; production imports and
+  // the preload retain the process HOME, argv, console and clock untouched.
+  const context = { env: { HOME: join(scratch, 'home') } as Record<string, string>, argv: [] as string[],
+    log: (...args: unknown[]) => captured.push(args), now: clock.now, sleep: clock.advance }
+  mkdirSync(context.env.HOME!)
+  const source = readFileSync(join(INTEGRATION_DIR, 'fixtures/shared-stub-permission.ts'), 'utf8')
+  writeFileSync(join(scratch, 'permission-source.ts'), source)
+  const ast = parse(source, 'permission.ts')
+  let declarations = ast.statements.filter(n => ts.isImportDeclaration(n) || ts.isFunctionDeclaration(n) ||
+    ts.isVariableStatement(n) || ts.isTypeAliasDeclaration(n))
+    .filter(n => !n.getText(ast).startsWith('const watchdog =')).map(n => n.getText(ast)).join('\n')
+  const native = "await import(import.meta.resolve('agent-director', join(pkg, 'src/agent-director-client.ts')))"
+  expect(declarations.split(native)).toHaveLength(2)
+  declarations = declarations.replace(native, `({ Client: { create: async (options) => {
+    if (options.createIfMissing !== false || options.callTimeoutMs !== 5000) throw Error('client guard changed');
+    return auditClient;
+  } } })`).replace("process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'", JSON.stringify(pkg))
+  declarations = declarations.replaceAll('process.env', 'auditContext.env').replaceAll('process.argv', 'auditContext.argv')
+    .replaceAll('console.log', 'auditContext.log').replaceAll('Date.now()', 'auditContext.now()').replaceAll('Bun.sleep(', 'auditContext.sleep(')
+  declarations += '\nlet auditClient, auditContext; export function setAuditClient(client) { auditClient = client }; export function setAuditContext(context) { auditContext = context }; export { run };\n'
+  const path = join(scratch, 'controls.ts'); writeFileSync(path, declarations)
+  copyFileSync(join(INTEGRATION_DIR, 'fixtures/stub-claude.sh'), join(scratch, 'stub-claude.sh'))
+  const sentinel = /^SENTINEL="([^"\r\n]+)"$/m.exec(readFileSync(join(scratch, 'stub-claude.sh'), 'utf8'))![1]
+  const { run, setAuditClient, setAuditContext } = await import(path)
+  setAuditContext(context)
+  const { makePersonaConfigInput } = await import('./test-helpers/persona-config.ts')
+  const { parsePersonaConfigBytes } = await import('../src/config.ts')
+  const { initialSharedChannelState, serializeSharedChannelState } = await import('../src/shared-channels.ts')
+  const { personaKey, personaInstanceId } = await import('../src/persona-identity.ts')
+  const name = 'Notice fixture', key = personaKey(name), channel = 'CROOM'
+  const checks: string[] = []
+  async function check(label: string, fn: () => unknown) {
+    try { await fn(); checks.push(label) } catch (error) { throw new Error(label, { cause: error }) }
+  }
+  try {
+    const root = mkdtempSync(join(scratch,'worker-'))
+    const bin = join(root,'bin'), work = join(root,'work'), tmp = join(root,'tmp'), stateDir = join(root,'state')
+    for (const p of [bin,work,tmp,stateDir]) mkdirSync(p)
+    copyFileSync(join(scratch,'stub-claude.sh'),join(bin,'claude'))
+    context.env.SCENARIO_ROOT=root;context.env.TMPDIR=tmp;context.env.SLACK_STATE_DIR=stateDir
+    const config = join(stateDir,'config.json'), record = config+'.last-applied'
+    function configFor(delay: number, cwd=work) {
+      const input = makePersonaConfigInput({session_restart_delay:delay,personas:[{name,credentials_file:join(root,'credentials.json'),working_directory:cwd,channels:[{id:channel,delivery:'all'}],permission_prompts:channel}]},stateDir)
+      const bytes=Buffer.from(JSON.stringify(input));writeFileSync(config,bytes)
+      writeFileSync(record,serializeSharedChannelState(initialSharedChannelState(bytes,parsePersonaConfigBytes(bytes,config,stateDir))))
+    }
+    const session='11111111-1111-4111-8111-111111111111', id=personaInstanceId(key)
+    const transcript=join(context.env.HOME!,'.claude/projects',work.replace(/[/._]/g,'-'),session+'.jsonl')
+    mkdirSync(join(transcript,'..'),{recursive:true})
+    writeFileSync(transcript,JSON.stringify({type:'summary',summary:'stub-claude session',leafUuid:session})+'\n')
+    let row: any, calls: string[], change: undefined | (()=>void), gets: number, resumeError=false, sendError=false, stays=false
+    function reset() {
+      row={instance_id:id,session_id:session,agent:'claude',cwd:work,state:'waiting',labels:{persona:key,service:'cscb'},
+        jsonl_path:transcript,permission_requests:[],unproven_requests:[],last_seen_at:'recorded-hook'}
+      calls=[];gets=0;change=undefined;resumeError=false;sendError=false;stays=false;configFor(0)
+      writeFileSync(join(bin,'stub-claude-modes'),'displayed-states\t'+work+'\n')
+      setAuditClient(Object.assign(makeStubClient(), {
+        async get() { calls.push('get'); gets++; change?.(); return structuredClone(row) },
+        async sendKeys(args: any) { calls.push('send');assert.deepEqual(args,{instance_id:id,text:sentinel});if(sendError)throw Error('unknown');if(!stays)row.state='ended' },
+        async resume(args: any) { calls.push('resume');assert.deepEqual(args,{instance_id:id});if(resumeError)throw Error('uncertain');if(!stays)row.state='waiting' },
+        async close() { calls.push('close') },
+      }))
+    }
+    let n=0
+    const invoke=async (command: string,evidence=join(root,'evidence-'+(++n)),extra: string[]=[])=>{
+      context.argv=['bun','declarations',bin,command,work,key,evidence,...extra];await run();return evidence
+    }
+    await check('setup selects ordinary receipts and retains scratch paths',async()=>{
+      reset();context.argv=['bun','declarations',bin,'notice-setup',work];await run()
+      assert(readFileSync(join(bin,'stub-claude-modes'),'utf8').endsWith('at-once\t'+work+'\n'));assert.equal(calls.length,0)
+    })
+    await check('end verifies ended then resume verifies same-session waiting with one action',async()=>{
+      reset();const evidence=await invoke('notice-end');assert.equal(calls.filter(c=>c==='send').length,1)
+      assert.deepEqual(readFileSync(evidence,'utf8').trim().split('\n').map(l=>JSON.parse(l).phase),['end-requested','ended'])
+      const stateBefore=readFileSync(record);await invoke('notice-ended',evidence);assert.equal(row.state,'ended')
+      await invoke('notice-resume',evidence);assert.equal(row.state,'waiting');assert.equal(calls.filter(c=>c==='resume').length,1)
+      assert(readFileSync(join(bin,'stub-claude-modes'),'utf8').endsWith('at-once\t'+work+'\n'))
+      assert.deepEqual(readFileSync(record),stateBefore)
+      await assert.rejects(invoke('notice-resume',evidence));assert.equal(calls.filter(c=>c==='resume').length,1)
+    })
+    for (const state of ['working','pending','ask_user','check_permission','missing','ended']) await check('end refuses AD '+state,async()=>{
+      reset();row.state=state;await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
+    })
+    for (const field of ['permission_requests','unproven_requests']) await check('end refuses '+field,async()=>{
+      reset();row[field]=[{}];await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
+    })
+    await check('fresh-read change to working prevents sentinel',async()=>{
+      reset();change=()=>{if(gets===3)row.state='working'};await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
+    })
+    for (const field of ['instance_id','session_id','agent','cwd','jsonl_path']) await check('foreign '+field+' binding fails',async()=>{
+      reset();change=()=>{if(gets===2)row[field]=field==='cwd'?tmp:'foreign'};await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
+    })
+    for (const field of ['persona','service']) await check('foreign label '+field+' fails',async()=>{
+      reset();row.labels[field]='foreign';await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
+    })
+    await check('applied automatic restarts must be off; pending config cannot override',async()=>{
+      reset();configFor(1);writeFileSync(config,'{}');await assert.rejects(invoke('notice-end'));assert.equal(calls.length,0)
+    })
+    await check('wrong applied working directory fails before AD',async()=>{
+      reset();configFor(0,tmp);await assert.rejects(invoke('notice-end'));assert.equal(calls.length,0)
+    })
+    await check('outside, symlink and production-state evidence paths fail before AD',async()=>{
+      for(const kind of ['outside','symlink','state','state-alias']) {
+        reset();let evidence=kind==='outside'?join(scratch,'outside'):kind==='state'?join(stateDir,'evidence'):join(root,'linked-'+(++n))
+        if(kind==='symlink')symlinkSync(transcript,evidence)
+        if(kind==='state-alias'){symlinkSync(stateDir,evidence);evidence=join(evidence,'evidence')}
+        await assert.rejects(invoke('notice-end',evidence));assert.equal(calls.length,0)
+      }
+    })
+    await check('wrong stub bytes and transcript marker fail without keys',async()=>{
+      reset();writeFileSync(join(bin,'claude'),'wrong');await assert.rejects(invoke('notice-end'));assert.equal(calls.length,0)
+      copyFileSync(join(scratch,'stub-claude.sh'),join(bin,'claude'));reset()
+      const good=readFileSync(transcript);writeFileSync(transcript,'{}\n');await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'));writeFileSync(transcript,good)
+    })
+    await check('send error leaves requested evidence and never auto-retries',async()=>{
+      reset();sendError=true;const evidence=join(root,'send-error');await assert.rejects(invoke('notice-end',evidence));await assert.rejects(invoke('notice-end',evidence))
+      assert.equal(calls.filter(c=>c==='send').length,1);assert.equal(readFileSync(evidence,'utf8').trim().split('\n').length,1)
+    })
+    await check('a later end in the same conversation cannot reuse prior end evidence',async()=>{
+      reset();const evidence=await invoke('notice-end');row.last_seen_at='another-end-hook'
+      await assert.rejects(invoke('notice-resume',evidence));assert(!calls.includes('resume'))
+    })
+    await check('unobserved end expires even after successful send',async()=>{
+      reset();stays=true;const started=clock.now()
+      await assert.rejects(invoke('notice-end'),/transition not observed/)
+      expect(clock.now() - started).toBe(20000)
+      assert.equal(calls.filter(c=>c==='send').length,1)
+    })
+    await check('resume errors/foreign session/unobserved waiting never prove recovery',async()=>{
+      for(const kind of ['error','foreign','never']) {
+        reset();const evidence=await invoke('notice-end');resumeError=kind==='error';stays=kind==='never'
+        if(kind==='foreign')row.session_id='22222222-2222-4222-8222-222222222222'
+        const started=clock.now()
+        await assert.rejects(invoke('notice-resume',evidence))
+        expect(clock.now() - started).toBe(kind==='never'?20000:0)
+        assert.equal(calls.filter(c=>c==='resume').length,kind==='foreign'?0:1)
+      }
+    })
+    await check('both permission controls require registered evidence and observed outcome tokens', async () => {
+      reset()
+      const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
+      const events: object[] = []
+      change = () => {
+        const commands = existsSync(control) ? readFileSync(control, 'utf8').trim().split('\n') : []
+        for (const command of commands) if (!events.some((e: any) => e.command === command)) {
+          events.push({ command, instance_id: id, session_id: session })
+          row.permission_requests.push({ request_token: `observed-${command}`, delivery: 'delivered',
+            tool_input: JSON.stringify({ command: `printf fixture-${command.slice(-1)}` }) })
+        }
+        writeFileSync(record, events.map(e => JSON.stringify(e)).join('\n') + '\n')
+      }
+      for (const command of ['permission-1', 'permission-2']) {
+        context.argv = ['bun', 'declarations', bin, command, work, key]
+        await run()
+        expect(readFileSync(control + '.observed', 'utf8')).toContain(`observed-${command}\n`)
+        const before = readFileSync(control)
+        await expect(run()).rejects.toThrow()
+        expect(readFileSync(control)).toEqual(before)
+      }
+      change = undefined
+      setAuditClient(Object.assign(makeStubClient(), {
+        async get() { return structuredClone(row) },
+        async getPermission() { return { decision: 'allow', delivery: 'delivered' } },
+      }))
+      context.argv = ['bun', 'declarations', bin, 'outcome', work, key, 'observed-permission-1']
+      await run()
+      context.argv[6] = 'not-observed'
+      await expect(run()).rejects.toThrow()
+      unlinkSync(control); unlinkSync(record); unlinkSync(control + '.observed')
+    })
+    await check('receipt release requires a submitted item and never repeats an unobserved release', async () => {
+      reset()
+      const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
+      writeFileSync(record, JSON.stringify({ command: 'submitted', instance_id: id, session_id: session }) + '\n')
+      change = () => {
+        if (existsSync(control)) writeFileSync(record, ['submitted', 'receipt'].map(command =>
+          JSON.stringify({ command, instance_id: id, session_id: session })).join('\n') + '\n')
+      }
+      context.argv = ['bun', 'declarations', bin, 'receipt', work, key]
+      await run()
+      expect(readFileSync(control, 'utf8')).toBe('receipt\n')
+      change = undefined
+      writeFileSync(record, JSON.stringify({ command: 'submitted', instance_id: id, session_id: session }) + '\n')
+      await expect(run()).rejects.toThrow()
+      expect(readFileSync(control, 'utf8')).toBe('receipt\n')
+      unlinkSync(control); writeFileSync(record, '')
+      const started = clock.now()
+      await expect(run()).rejects.toThrow()
+      expect(clock.now() - started).toBe(20000)
+      expect(existsSync(control)).toBe(false)
+    })
+    await check('unsafe hook scratch and control paths fail before publishing', async () => {
+      reset()
+      context.argv = ['bun', 'declarations', bin, 'setup', work]
+      const previous = context.env.TMPDIR
+      context.env.TMPDIR = scratch
+      await expect(run()).rejects.toThrow()
+      context.env.TMPDIR = previous
+      const modes = join(bin, 'stub-claude-modes'), bytes = readFileSync(modes)
+      unlinkSync(modes); symlinkSync(transcript, modes)
+      await expect(run()).rejects.toThrow()
+      unlinkSync(modes); writeFileSync(modes, bytes)
+    })
+    assertNoLeak({ captured, checks })
+  } finally {
+    expect(clock.pendingCount()).toBe(0)
+    rmSync(scratch, { recursive: true, force: true })
+  }
+})
+
+
+function sharedShellControl(names: string[], body: string, options: {
+  args?: string[]; env?: Record<string, string>; setup?: (root: string) => void
+} = {}) {
+  mkdirSync('/tmp/c9', { recursive: true })
+  const root = mkdtempSync('/tmp/c9/shared-shell-audit-')
+  const source = readFileSync(SCENARIO_PATH, 'utf8')
+  writeFileSync(join(root, 'scenario-source.sh'), source)
+  const declarations = names.map(name => {
+    const match = source.match(new RegExp(`^${name}\\(\\) \{\n[\\s\\S]*?^\}`, 'm'))
+    if (!match) throw new Error(`missing shared declaration ${name}`)
+    return match[0]
+  }).join('\n')
+  for (const dir of ['home', 'state', 'state/threads']) mkdirSync(join(root, dir), { recursive: true })
+  for (const name of ['config.json', 'config.json.last-applied', 'config.json.pending']) writeFileSync(join(root, 'state', name), 'unchanged')
+  writeFileSync(join(root, 'state/threads/alpha.jsonl'), '')
+  for (const name of ['damaged', 'replacement', 'snapshot', 'server.log', 'review', 'retained']) writeFileSync(join(root, name), 'fixture')
+  const script = join(root, 'declarations.sh')
+  writeFileSync(script, declarations + '\n' + body)
+  try {
+    options.setup?.(root)
+    const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-euc', 'source "$SCRIPT"', 'audit', ...(options.args ?? [])], {
+      encoding: 'utf8', timeout: 4000,
+      env: hostSafeChildEnv(join(root, 'home'), { tools: ['realpath', 'jq', 'cat', 'mv', 'cp', 'mkdir', 'sha256sum', 'tr', 'python3'], extras: {
+        SCRIPT: script, SCENARIO_ROOT: root, SLACK_STATE_DIR: join(root, 'state'), SCENARIO_FIXTURES: join(root, 'fixtures'),
+        SCENARIO_SLACK_PUSH_S: '5', RECORD_WAIT_S: '10', SCENARIO_POLL_S: '0', TEST_NAME: 'audit', SCENARIO_TAG: 'audit',
+        TRACE: join(root, 'trace'), CLOCK: join(root, 'clock'), COUNTER: join(root, 'counter'), TIMEOUTS: join(root, 'timeouts'),
+        PROBE_CASE: 'direct', EXPECTED: 'unresolved', ...options.env,
+      } }),
+    })
+    assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+    const read = (path: string) => existsSync(join(root, path)) ? readFileSync(join(root, path), 'utf8') : ''
+    return { ...result, trace: read('trace'), bounds: read('timeouts'), request: read('state/config.json.request'),
+      retained: read('new-request'), originals: ['config.json', 'config.json.last-applied', 'config.json.pending'].map(n => read('state/' + n)) }
+  } finally { rmSync(root, { recursive: true, force: true }) }
+}
+
+describe('shared helper scratch guards and bounded observations', () => {
+  const guards = ['require_scenario_state', '_scenario_scratch_file', '_scenario_check_timeout']
+  const sharedEffects: Record<string, string[]> = {
+    slack_stub_control_seed: ['write_file'], slack_stub_controls: ['write_file'], _scenario_stub_control_patch: ['write_file'],
+    slack_stub_close_socket: ['_scenario_stub_control_patch'], slack_stub_fault: ['_scenario_stub_control_patch'],
+    slack_stub_faults_clear: ['_scenario_stub_control_patch'], slack_stub_history: ['_scenario_stub_control_patch'],
+    slack_stub_history_seed: ['_scenario_stub_control_patch'], slack_stub_inventory_clear: ['_scenario_stub_control_patch'],
+    slack_stub_inventory_page: ['_scenario_stub_control_patch'], slack_stub_history_fault: ['slack_stub_fault'],
+    slack_stub_inventory_fault: ['slack_stub_fault'], slack_stub_post_fail: ['slack_stub_fault'], slack_stub_post_lost: ['slack_stub_fault'],
+    shared_queue_snapshot: ['mv'],
+  }
+  function sharedEffectsFindings(source: string) {
+    const { functions, isOwnStep, stepFunctions } = shellStepModel(source), findings: string[] = []
+    for (const [helper, permitted] of Object.entries(sharedEffects)) {
+      const body = functions.get(helper) ?? []
+      const effects = body.filter(c => isOwnStep(c) || stepFunctions.has(c.name))
+      if (JSON.stringify(effects.map(c => c.name)) !== JSON.stringify(permitted)) findings.push(helper + ': unexpected effect')
+      const text = source.match(new RegExp(`^${helper}\\(\\) \\{\\n[\\s\\S]*?^\\}`, 'm'))?.[0] ?? ''
+      if (/\bHOME\b|agent-director|\btmux\b/.test(text)) findings.push(helper + ': host state access')
+      if (permitted[0] === 'write_file' || helper === 'shared_queue_snapshot') {
+        const guarded = homeGuardIndex(body, '_scenario_scratch_file'), first = body.indexOf(effects[0]!)
+        if (guarded < 0 || guarded >= first) findings.push(helper + ': unguarded scratch effect')
+        const expected = helper === 'slack_stub_control_seed' ? ['${path}'] :
+          helper === 'shared_queue_snapshot' ? ['--', '${output}.tmp', '${output}'] : ['${SCENARIO_SLACK_CONTROL}', '<<<', '${body}']
+        if (JSON.stringify(effects[0]?.args) !== JSON.stringify(expected)) findings.push(helper + ': write target changed')
+      }
+    }
+    return findings
+  }
+  test('shared-mode HOME classifications allow only their guarded writer or forwarding effect', () => {
+    const source = readFileSync(SCENARIO_PATH, 'utf8')
+    expect(sharedEffectsFindings(source)).toEqual([])
+    for (const helper of Object.keys(sharedEffects)) expect(HOME_CHECK_EXEMPT.get(helper)).toBeDefined()
+  })
+  test.each(Object.keys(sharedEffects))('%s classification cannot conceal a newly added file effect', helper => {
+    mkdirSync('/tmp/c9', { recursive: true })
+    const root = mkdtempSync('/tmp/c9/shared-effect-audit-'), copy = join(root, 'scenario.sh')
+    try {
+      const source = readFileSync(SCENARIO_PATH, 'utf8'), start = `${helper}() {\n`
+      expect(source).toContain(start)
+      writeFileSync(copy, source.replace(start, start + '    cp extra-source extra-destination\n'))
+      expect(sharedEffectsFindings(readFileSync(copy, 'utf8'))).toContain(helper + ': unexpected effect')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+  test.each(['shared_stub_permission_setup', 'shared_stub_notice_setup'])('%s exports fenced hook TMPDIR before dispatch', helper => {
+    const body = String.raw`
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+require_ci_image() { [[ "$PROBE_CASE" != image ]] || fail 'no image'; }
+shared_stub_permission() {
+  [[ "$TMPDIR" == "$SCENARIO_ROOT/stub-hooks-tmp" && -d "$TMPDIR" && ! -L "$TMPDIR" ]] || fail 'hook tmpdir not ready'
+  printf '%s\n' "$1" "$2" >> "$TRACE"
+}
+`
+    for (const mode of ['valid', 'symlink', 'image']) {
+      const r = sharedShellControl([...guards, helper], body + `\n${helper} "$SCENARIO_ROOT/work"`, {
+        env: { PROBE_CASE: mode }, setup(root) { if (mode === 'symlink') symlinkSync('/tmp/c9', join(root, 'stub-hooks-tmp')) },
+      })
+      expect(r.status === 0).toBe(mode === 'valid')
+      if (mode !== 'valid') expect(r.trace).toBe('')
+      else expect(r.trace).toMatch(helper === 'shared_stub_notice_setup' ? /^notice-setup\n/ : /^setup\n/)
+    }
+  })
+  test.each(['progressing', 'repeated', 'regressed', 'overall', 'unreadable'])('queue receipt %s observations enforce idle and overall bounds', mode => {
+    const body = String.raw`
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+require_ci_image() { :; }
+sleep() { :; }
+_scenario_now_ms() {
+  local n=0; [[ ! -f "$CLOCK" ]] || read -r n < "$CLOCK"
+  printf '%s\n' "$((n+1000))" > "$CLOCK"; printf '%s\n' "$n"
+}
+shared_queue_receipts() {
+  [[ "$*" == 'alpha original archive' ]] || fail 'receipt dispatch changed'
+  local n=0; [[ ! -f "$COUNTER" ]] || read -r n < "$COUNTER"
+  printf '%s\n' "$((n+1))" > "$COUNTER"; printf 'read\n' >> "$TRACE"
+  case "$PROBE_CASE" in
+    progressing) if ((n==2)); then printf '{"complete":true,"progress":2}\n'; else printf '{"complete":false,"progress":%s}\n' "$n"; fi ;;
+    repeated) printf '{"complete":false,"progress":1}\n' ;;
+    regressed) printf '{"complete":false,"progress":%s}\n' "$((n==0 ? 2 : 1))" ;;
+    overall) printf '{"complete":false,"progress":%s}\n' "$n" ;;
+    unreadable) return 1 ;;
+  esac
+}
+DELIVERY_IDLE_WAIT_S=3; DELIVERY_MAX_WAIT_S=7
+shared_wait_queue_drained alpha original archive
+`
+    const r = sharedShellControl(['_scenario_check_timeout', 'shared_wait_queue_drained'], body, { env: { PROBE_CASE: mode } })
+    expect(r.status === 0).toBe(mode === 'progressing')
+    const reads: Record<string, number> = { progressing: 3, repeated: 4, regressed: 4, overall: 7, unreadable: 3 }
+    expect(r.trace).toBe('read\n'.repeat(reads[mode]!))
+    if (mode !== 'progressing') expect(r.stderr).toContain('incomplete receipts')
+  })
+  test.each(['sharedSuccessfulPost', 'sharedMessagesWaitingPost'])('%s waits only for pending evidence', entry => {
+    const body = String.raw`
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+require_ci_image() { :; }
+sleep() { :; }
+_scenario_now_ms() {
+  local n=0; [[ ! -f "$CLOCK" ]] || read -r n < "$CLOCK"
+  printf '%s\n' "$((n+1000))" > "$CLOCK"; printf '%s\n' "$n"
+}
+bun() {
+  [[ "$2" == "$ENTRY" && "$3" == "$SCENARIO_SLACK_RECORD" && "$4" == binding ]] || fail 'changed post dispatch'
+  local n=0; [[ ! -f "$COUNTER" ]] || read -r n < "$COUNTER"
+  printf '%s\n' "$((n+1))" > "$COUNTER"; printf 'read\n' >> "$TRACE"
+  [[ "$PROBE_CASE" != invalid ]] || return 1
+  [[ "$PROBE_CASE" != pending && "$n" -ge 1 ]] || return 75
+  printf 'exact post\n'
+}
+SCENARIO_SLACK_RECORD="$SCENARIO_ROOT/snapshot"
+_scenario_wait_post "$ENTRY" binding
+`
+    for (const mode of ['advances', 'pending', 'invalid']) {
+      const r = sharedShellControl([...guards, '_scenario_wait_post'], body, { env: { PROBE_CASE: mode, ENTRY: entry, RECORD_WAIT_S: '3' } })
+      expect(r.status === 0).toBe(mode === 'advances')
+      expect(r.trace).toBe('read\n'.repeat(mode === 'advances' ? 2 : mode === 'pending' ? 3 : 1))
+    }
+  })
+  test.each(['slack_stub_control_seed', 'slack_stub_controls', '_scenario_stub_control_patch', 'shared_queue_snapshot'])('%s fences every shared-mode write before its first effect', helper => {
+    const names = [...guards, 'scenario_id', 'slack_stub_control_seed', 'slack_stub_controls', '_scenario_stub_control_patch', 'shared_queue_snapshot']
+    const prelude = String.raw`
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+require_ci_image() { [[ "$PROBE_CASE" != image ]] || fail 'no image'; }
+write_file() { printf 'write\n' >> "$TRACE"; cat > "$1"; }
+_scenario_stub_control_http() { printf 'http\n' >> "$TRACE"; }
+bun() { printf 'printer\n' >> "$TRACE"; printf 'snapshot'; }
+target="$SCENARIO_ROOT/target"
+[[ "$PROBE_CASE" != outside ]] || target=/tmp/c9/outside-target
+[[ "$PROBE_CASE" != live ]] || target="$SLACK_STATE_DIR/output"
+SCENARIO_SLACK_CONTROL="$target"
+`
+    const invocation: Record<string, string> = {
+      slack_stub_control_seed: 'slack_stub_control_seed "$target" alpha fake-suffix',
+      slack_stub_controls: 'slack_stub_controls "$target"',
+      _scenario_stub_control_patch: "_scenario_stub_control_patch '. + {controlled:true}'",
+      shared_queue_snapshot: 'shared_queue_snapshot "$target" alpha',
+    }
+    for (const mode of ['valid', 'outside', 'symlink', 'directory', 'parent-escape', 'image', ...(helper === 'shared_queue_snapshot' ? ['live'] : [])]) {
+      const r = sharedShellControl(names, prelude + '\n' + invocation[helper], { env: { PROBE_CASE: mode }, setup(root) {
+        const target = join(root, 'target')
+        if (mode === 'symlink') symlinkSync(join(root, 'retained'), target)
+        else if (mode === 'directory') mkdirSync(target)
+        else writeFileSync(target, JSON.stringify({ tokens: [], socket_closes: [], pushes: [] }))
+        if (mode === 'parent-escape') {
+          // The target's lexical path stays inside scratch; its real parent escapes.
+          const script = join(root, 'declarations.sh')
+          symlinkSync('/tmp/c9', join(root, 'escape'))
+          writeFileSync(script, readFileSync(script, 'utf8').replace('target="$SCENARIO_ROOT/target"', 'target="$SCENARIO_ROOT/escape/target"'))
+        }
+      } })
+      expect(r.status === 0).toBe(mode === 'valid')
+      if (mode !== 'valid') expect(r.trace).toBe('')
+      else expect(r.trace.length).toBeGreaterThan(0)
+    }
+  })
+  test('pure numeric and scratch validators are reachable only through guarded shared callers', () => {
+    const source = readFileSync(SCENARIO_PATH, 'utf8'), functions = shellFunctions(source)
+    for (const pure of ['_scenario_scratch_file', '_scenario_ack_bound']) {
+      expect(functions.has(pure)).toBe(true)
+      const callers = [...functions].filter(([, body]) => body.some(command => namesFunction(command, pure))).map(([name]) => name)
+      expect(callers.length).toBeGreaterThan(0)
+      expect(callers.filter(name => !IMAGE_GUARDED_STUB_HELPERS.includes(name))).toEqual([])
+      expect(helperImageCheckFindings('scenario.sh', source, callers)).toEqual([])
+    }
+  })
+  const ownPrelude = String.raw`
+set -euo pipefail
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+require_ci_image() {
+  [[ "$PROBE_CASE" != image ]] || fail 'image refused'
+}
+sleep() { :; }
+_scenario_now_ms() {
+  local now=0
+  [[ ! -f "$CLOCK" ]] || read -r now < "$CLOCK"
+  printf '%s\n' "$((now+1000))" > "$CLOCK"
+  printf '%s\n' "$now"
+}
+timeout() {
+  printf '%s\n' "$2" >> "$TIMEOUTS"
+  [[ "$1" == --signal=KILL ]] || fail 'unbounded read'
+  shift 2
+  "$@"
+}
+bun() {
+  local count=0
+  [[ ! -f "$COUNTER" ]] || read -r count < "$COUNTER"
+  count=$((count+1)); printf '%s\n' "$count" > "$COUNTER"
+  printf '%s\n' "$2" >> "$TRACE"
+  [[ "$3" == "$SLACK_STATE_DIR/threads/alpha.jsonl" ]] || fail 'wrong journal'
+  if [[ "$2" == sharedOwnPostState ]]; then
+    [[ "$#" == 7 && "$4" == operation && "$5" == CROOM && "$6" == stamp && "$7" == "$EXPECTED" ]] || fail 'dispatch changed'
+  else
+    [[ "$2" == sharedOwnPostRecords && "$#" == 3 ]] || fail 'wrong discovery dispatch'
+  fi
+  case "$PROBE_CASE" in
+    pending) return 75 ;;
+    advances) (( count > 1 )) || return 75 ;;
+    invalid|wrong|stale|outcome) return 1 ;;
+    timeout) return 137 ;;
+    late) printf '%s\n' 100000 > "$CLOCK" ;;
+  esac
+  printf '%s\n' observed
+}
+`
+  const ownNames = [...guards, '_scenario_own_post_read', 'shared_own_post_records', 'shared_own_post_state', 'shared_wait_own_post_state']
+  test.each(['unresolved', 'joined', 'none'])('own-post %s waits only for pending and forwards the exact target', state => {
+    const run = (mode: string, helper = 'shared_wait_own_post_state', key = 'alpha', env = {}) =>
+      sharedShellControl(ownNames, ownPrelude + `\n${helper} "${key}" operation CROOM stamp "$EXPECTED"`, { env: { PROBE_CASE: mode, EXPECTED: state, ...env } })
+    const passed = run('advances')
+    expect(passed.status).toBe(0); expect(passed.stdout.trim()).toBe('observed')
+    expect(passed.trace).toBe('sharedOwnPostState\nsharedOwnPostState\n')
+    expect(passed.bounds).toBe('5.000s\n5.000s\n')
+    const pending = run('pending')
+    expect(pending.status).not.toBe(0); expect(pending.stderr).toContain('within bound')
+    expect(pending.bounds).toBe('5.000s\n5.000s\n5.000s\n3.000s\n1.000s\n')
+    for (const mode of ['invalid', 'stale', 'outcome', 'timeout', 'late']) {
+      const failed = run(mode); expect(failed.status).not.toBe(0); expect(failed.trace).toBe('sharedOwnPostState\n')
+    }
+    for (const mode of ['image', 'bad-key', 'bad-bound']) {
+      const failed = run(mode, 'shared_wait_own_post_state', mode === 'bad-key' ? '../other' : 'alpha', mode === 'bad-bound' ? { RECORD_WAIT_S: '0' } : {})
+      expect(failed.status).not.toBe(0); expect(failed.trace).toBe('')
+    }
+  })
+  test.each(['outside', 'state-symlink', 'journal-symlink', 'journal-directory', 'thread-dir-symlink'])('own-post refuses %s before reading evidence', kind => {
+    const result = sharedShellControl(ownNames, ownPrelude + '\nshared_wait_own_post_state alpha operation CROOM stamp unresolved', {
+      env: kind === 'outside' ? { SLACK_STATE_DIR: '/tmp/c9' } : {},
+      setup(root) {
+        const state = join(root, 'state'), journal = join(state, 'threads/alpha.jsonl')
+        if (kind === 'journal-symlink' || kind === 'journal-directory') {
+          unlinkSync(journal)
+          if (kind === 'journal-symlink') symlinkSync(join(root, 'retained'), journal)
+          else mkdirSync(journal)
+        }
+        if (kind === 'state-symlink' || kind === 'thread-dir-symlink') {
+          const path = kind === 'state-symlink' ? state : join(state, 'threads')
+          rmSync(path, { recursive: true }); symlinkSync('/tmp/c9', path)
+        }
+      },
+    })
+    expect(result.status).not.toBe(0); expect(result.trace).toBe('')
+  })
+  const readPrelude = String.raw`
+set -euo pipefail
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+require_ci_image() { [[ "$PROBE_CASE" != image ]] || fail 'image refused'; }
+timeout() {
+    [[ "$1" == --signal=KILL && "$2" == 5s ]] || fail 'wrong bound'
+    printf '%s\n' "$2" >> "$TIMEOUTS"
+    [[ "$PROBE_CASE" != timeout ]] || return 137
+    shift 2
+    "$@"
+}
+bun() {
+    printf '%s\n' "$@" >> "$TRACE"
+    [[ "$PROBE_CASE" != printer-failure ]] || return 1
+    printf '%s' exact-printer-output
+}
+`
+  const readNames = [...guards, '_scenario_shared_read', 'configuration_recovery_request', 'shared_recovery_pending',
+    'shared_recovery_consumed', 'shared_injected_expected_parts', 'shared_assert_injected_content', 'shared_cron_identity']
+  const readers: Record<string, string> = {
+    configuration_recovery_request: 'id "$SCENARIO_ROOT/damaged" "$SCENARIO_ROOT/new-request"',
+    shared_recovery_pending: '"$SCENARIO_ROOT/retained" "$SCENARIO_ROOT/review"',
+    shared_recovery_consumed: '"$SCENARIO_ROOT/retained" "$SCENARIO_ROOT/review"',
+    shared_cron_identity: '"$SCENARIO_ROOT/snapshot" /prompt/path.md',
+    shared_injected_expected_parts: "'original <text>' 1.000001 sender",
+    shared_assert_injected_content: 'alpha "$SCENARIO_ROOT/server.log" "$SCENARIO_ROOT/snapshot" cron sender 1.000001 "original <text>" "[]"',
+  }
+  test.each(Object.keys(readers))('%s has one bounded dispatch and no image/bound bypass', helper => {
+    for (const mode of ['ok', 'image', 'timeout', 'printer-failure', 'bad-bound']) {
+      const r = sharedShellControl(readNames, readPrelude + `\n${helper} ${readers[helper]}`, {
+        env: { PROBE_CASE: mode, ...(mode === 'bad-bound' ? { SCENARIO_SLACK_PUSH_S: '0' } : {}) },
+      })
+      expect(r.status === 0).toBe(mode === 'ok')
+      expect(r.originals).toEqual(['unchanged', 'unchanged', 'unchanged'])
+      if (['image', 'timeout', 'bad-bound'].includes(mode)) expect(r.trace).toBe('')
+      if (mode === 'ok') {
+        expect(r.bounds).toBe('5s\n')
+        if (helper === 'configuration_recovery_request') { expect(r.retained).toBe('exact-printer-output'); expect(r.request).toBe(r.retained) }
+        else expect(r.stdout).toBe('exact-printer-output')
+      }
+    }
+  })
+  test.each(['retained-exists', 'live-output', 'request-symlink', 'temporary-directory', 'damaged-symlink', 'parent-escape'])('recovery publication rejects %s without publishing', kind => {
+    const args = kind === 'live-output' ? 'id "$SCENARIO_ROOT/damaged" "$SLACK_STATE_DIR/new-request"' : readers.configuration_recovery_request
+    const r = sharedShellControl(readNames, readPrelude + `\nconfiguration_recovery_request ${args}`, {
+      env: { PROBE_CASE: 'ok' }, setup(root) {
+        if (kind === 'retained-exists') writeFileSync(join(root, 'new-request'), 'previous')
+        if (kind === 'request-symlink') symlinkSync(join(root, 'retained'), join(root, 'state/config.json.request'))
+        if (kind === 'temporary-directory') mkdirSync(join(root, 'state/config.json.request.tmp'))
+        if (kind === 'damaged-symlink') { unlinkSync(join(root, 'damaged')); symlinkSync(join(root, 'retained'), join(root, 'damaged')) }
+        if (kind === 'parent-escape') { rmSync(join(root, 'state'), { recursive: true }); symlinkSync('/tmp/c9', join(root, 'state')) }
+      },
+    })
+    expect(r.status).not.toBe(0); expect(r.trace).toBe('')
+    if (kind !== 'request-symlink') expect(r.request).toBe('')
+  })
+  test('cancellation retains its submitted request across file replacement; other actions retain pending dispatch', () => {
+    const names = [...guards, '_scenario_poll_until', 'wait_until', 'configuration_request']
+    const body = String.raw`
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+require_ci_image() { :; }
+sleep() { :; }
+_scenario_now_ms() {
+  local now=0; [[ ! -f "$CLOCK" ]] || read -r now < "$CLOCK"
+  printf '%s\n' "$((now+15000))" > "$CLOCK"; printf '%s\n' "$now"
+}
+bun() {
+  local entry="$2"; shift 2
+  printf '%s\n' "$entry" >> "$TRACE"
+  if [[ "$entry" == operatorReviewRequest ]]; then printf '%s' retained-submission; return; fi
+  if [[ "$ACTION" == cancel ]]; then
+    [[ "$entry" == operatorReviewCancelled && "$3" == retained-submission ]] || fail 'wrong cancellation binding'
+    printf '%s' replaced-request > "$SLACK_STATE_DIR/config.json.request"
+    local count=0; [[ ! -f "$COUNTER" ]] || read -r count < "$COUNTER"
+    count=$((count+1)); printf '%s\n' "$count" > "$COUNTER"
+    [[ "$PROBE_CASE" == advances && "$count" -ge 3 ]]
+  else
+    [[ "$entry" == operatorReviewPending && "$3" == "$SLACK_STATE_DIR/config.json.pending" && "$4" == exact-id ]]
+  fi
+}
+configuration_request exact-id "$ACTION"
+`
+    for (const action of ['cancel', 'request', 'revise', 'refresh']) {
+      const r = sharedShellControl(names, body, { env: { ACTION: action, PROBE_CASE: 'advances' } })
+      expect(r.status).toBe(0)
+      expect(r.trace).toBe(action === 'cancel' ? 'operatorReviewRequest\n' + 'operatorReviewCancelled\n'.repeat(3) : 'operatorReviewRequest\noperatorReviewPending\n')
+    }
+    const stale = sharedShellControl(names, body, { env: { ACTION: 'cancel', PROBE_CASE: 'stale' } })
+    expect(stale.status).not.toBe(0); expect(stale.stderr).toContain('not within 30s')
+    expect(stale.trace).toBe('operatorReviewRequest\n' + 'operatorReviewCancelled\n'.repeat(3))
   })
 })

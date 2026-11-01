@@ -6,8 +6,9 @@
 # modes"), as Tests 10 and 12: its own state directory, port and persona
 # names (`<tag>_alpha`, `<tag>_bravo`, built from SCENARIO_TAG), the
 # container's HOME, agent-director store and tmux server, no shim and no
-# closing assertions. It makes no agent-director call of its own, seeds no
-# session and swaps no binary. A live start (`start_server --live`) points the
+# fmk closing assertions. Registered shared permission/notice helpers bind
+# real AD hooks and sessions; no synthetic state or pane parsing is used.
+# A live start (`start_server --live`) points the
 # server at fixtures/slack-stub-server.ts, started with --record and --control,
 # through CSCB_SLACK_API_URL; fixtures/stub-claude.sh is first on PATH as
 # `claude`, with a regular-file copy of fixtures/stub-mcp-session.ts beside it
@@ -16,10 +17,14 @@
 # server. The stub's push control (`slack_stub_push`) sends each event; the
 # session's accepted queue record (`stub_session_deliveries`) shows what reached
 # the persona; its tool calls (`stub_session_call`) call set_channel_delivery.
-# `health_check_interval` is 0 (no restart chases anything) and `exit_timeout`
+# Both health checks and automatic session restarts are disabled. `exit_timeout`
 # is 5 (stub-claude ignores the `/exit` that `stop --stop-bots` sends).
 #
 # Phases:
+# - Cold start: alpha's missing working directory prevents its Slack
+#   connection and worker launch. A refused push is not accepted ingress.
+#   Creating the directory lets the existing retry bring it up automatically;
+#   phase A proves subsequent intake and receipt-backed delivery.
 # - Start: both personas up, each launched `claude` the stub, both
 #   MCP sessions registered; a push to an unknown label is refused
 #   (`no-open-socket`) with its `push-refused` record line.
@@ -49,25 +54,46 @@
 #   destination, then set_channel_delivery: stored, refused, applied as written
 #   in another persona's destination, and shared delivery, exactly once to each persona.
 # - Threads in open mode: alpha's strict join and stamp survive the switch;
-#   bravo still has no Thread Memory under off/mentions/all. Tool assignments
+#   bravo's ordinary channels have no stamp or joins. Tool assignments
 #   enable bravo's threads; both mentioned personas join on their connections.
+# - In each mode: four-value selection/reason matrix, overlapping rules,
+#   duplicate/ignored/live membership and leaves; reply/upload joins, actual
+#   permission prompts at off/hybrid and another persona's destination matrix.
+#   All registered permission and explicit receipt phases precede notice recovery.
+# - Writes: all tool values, same-value order, operator/bot direction changes,
+#   omission, explicit off, cancelled/revised intent and stale confirmations.
 # - Restart: a plain stop (the bots keep running) and a live start;
 #   shared choices, identities and reviewed bytes survive fresh discovery;
 #   the reconnect's new MCP clients
 # repeat no call; the stored choice applies again.
 #   Both personas' joined threads and Channel Stamps survive too.
+#   Pending intent stays unapplied until refreshed and confirmed afterward;
+#   the complete inventory retains every member and excludes observed leaves.
 # - Switch off: declarative mode again, sessions kept (read after
 #   a delivery on each persona's connection), shared choices still applied
 #   and new tool assignments refused.
 #   Joined replies still arrive; a fresh two-persona mention joins in strict.
-# - Closing: `stop --stop-bots`; the port closed; the Slack stub
-#   stopped; no token-like text anywhere; the elapsed time on the PASS line.
+# - Actual ended-worker Messages waiting notices and same-conversation resume,
+#   in strict then open, completing both directed mode cycles. Actual posts
+#   independently supply own-join roots and the sibling's echoed input.
+# - Refusals and recovery: unknown, externally shared and temporarily unverified
+#   MCP targets; a successful inventory response delayed 20 s proves the latter.
+#   Ineligible own posts do not join; prior joins work after eligibility returns.
+# - Observed leave/restart/mode/rejoin gives fresh defaults and requires fresh
+#   joins. A fresh future preference survives old-leave replay and another
+#   absence reconciliation, while a never-joined preference also survives.
+# - Identity replacement resets copied choices, explicitly retains a reviewed
+#   hybrid choice with a fresh stamp, and retires every previous join.
+# - Closing: exact accepted/received sets and own-session receipts across
+#   compaction, original content/fixed parts for every item, one ACK per handled
+#   envelope; `stop --stop-bots`; the port
+#   closed; the Slack stub stopped; no token-like text anywhere; elapsed time.
 #
 # Runtime rules. Every wait polls and returns once its condition
 # holds. Nothing waits on a health tick (off), a restart delay, a dedupe
-# retention window, a grace period or a launch bound; the only timing the
-# server sets on its own is the reload tick (5 s after the previous pass,
-# src/reload-timer.ts), and each wait for it is bounded at TICK_WAIT_S or
+# retention window, a grace period or a launch bound. The server timers it
+# waits for are the cold-start directory retry and reload tick (5 s after
+# the previous pass, src/reload-timer.ts). Reload waits use TICK_WAIT_S or
 # APPLY_WAIT_S (20 s). The start and launch waits are bounded generously
 # because they wait on processes, not on a timing. Every "no …" or "exactly
 # one" check is read after the decision's own line (a drop line, an
@@ -75,8 +101,8 @@
 # on the same connection, never after a quiet period. Every push has its own
 # `ts`, but the two events of one mention and the one message pushed to both
 # personas.
-# Earlier phases measured 87 s on cscb-ci; the added thread phases' runtime
-# remains to be measured by the Epic's full /ci gate (target about 4 minutes).
+# Earlier complete coverage was about 284 s. This expanded scenario's duration
+# is unmeasured until parent /ci; its many confirmed reviews add reload ticks.
 #
 # Texts. Every text src/ exports comes from fixtures/fmk-texts.ts (the one
 # value printer), run in this shell. Texts src/ does not export are fragments,
@@ -150,29 +176,37 @@ BRAVO_INDEX=1
 # Channel and user IDs: each a valid Slack ID of 1 to 24 characters from
 # A-Z0-9 (src/registry.ts ECHOABLE_CHANNEL_REecho rule), each
 # channel matching src/config.ts CHANNEL_ID_RE.
-CH_TAG="${SCENARIO_TAG^^}"
-A1="C0${CH_TAG}A1"          # alpha: listed `all`; alpha's fungible destination in fungible mode
-A2="C0${CH_TAG}A2"          # alpha: listed `mentions`
-B1="C0${CH_TAG}B1"          # bravo: listed `mentions`
-F1="C0${CH_TAG}F1"          # public, discovered off in strict; explicitly mentions in open
-F2="G0${CH_TAG}F2"          # private (`group`), discovered off; bravo explicitly mentions in open
-U1="C0${CH_TAG}U1"          # public, discovered off; explicitly shared all after phase A
-U0="C0${CH_TAG}U0"          # genuinely unlisted: neither inventory nor configuration
-X1="C0${CH_TAG}X1"          # externally shared (flag true)
-X2="C0${CH_TAG}X2"          # no flag
-X3="C0${CH_TAG}X3"          # a flag that is not a boolean
-GDM="G0${CH_TAG}GD"         # a group DM (`mpim`)
-DM="D0${CH_TAG}DM"          # bravo's direct DM for the E5 delivery evidence
-T1="C0${CH_TAG}T1"          # both modes: dedicated thread_hybrid channel
-N1="C0${CH_TAG}N1"          # starts off, then thread_hybrid
-N2="C0${CH_TAG}N2"          # starts mentions, then thread_hybrid
-N3="C0${CH_TAG}N3"          # starts all, then thread_hybrid
-ALPHA_BOT_USER="U0${CH_TAG}ALPHA"
-ALPHA_BOT_ID="B0${CH_TAG}ALPHA"
-BRAVO_BOT_USER="U0${CH_TAG}BRAVO"
-BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
-HUMAN="U0${CH_TAG}HUMAN"    # every event's author
-CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
+A1="$(scenario_id C a1)"
+A2="$(scenario_id C a2)"
+B1="$(scenario_id C b1)"
+F1="$(scenario_id C f1)"
+F2="$(scenario_id G f2)"
+U1="$(scenario_id C u1)"
+U0="$(scenario_id C u0)"
+X1="$(scenario_id C x1)"
+X2="$(scenario_id C x2)"
+X3="$(scenario_id C x3)"
+GDM="$(scenario_id G group-dm)"
+DM="$(scenario_id D direct-dm)"
+T1="$(scenario_id C threads)"
+N1="$(scenario_id C initially-off)"
+N2="$(scenario_id C initially-mentions)"
+N3="$(scenario_id C initially-all)"
+# Separate stable controls keep all four choices present through both cycles.
+M_OFF="$(scenario_id C matrix-off)"
+M_MENTIONS="$(scenario_id C matrix-mentions)"
+M_ALL="$(scenario_id C matrix-all)"
+M_HYBRID="$(scenario_id C matrix-hybrid)"
+WRITE_CHANNEL="$(scenario_id C write-order)"
+FUTURE="$(scenario_id C never-joined)"
+EXTERNAL="$(scenario_id C verified-external)"
+DEST="$(scenario_id C composed-destination)"
+ALPHA_BOT_USER="$(scenario_id U alpha-bot)"
+ALPHA_BOT_ID="$(scenario_id B alpha-bot)"
+BRAVO_BOT_USER="$(scenario_id U bravo-bot)"
+BRAVO_BOT_ID="$(scenario_id B bravo-bot)"
+HUMAN="$(scenario_id U human)"
+CONTACT="$(scenario_id U contact)"
 for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${U0}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
     "${T1}" "${N1}" "${N2}" "${N3}" \
     "${ALPHA_BOT_USER}" "${BRAVO_BOT_USER}" "${HUMAN}" "${CONTACT}"; do
@@ -258,6 +292,8 @@ BRAVO_START="$(persona_start_match "${BRAVO_INDEX}" "${BRAVO}")"
 # fixtures/slack-stub-server.ts: the refusal of a push to a label with no open
 # WebSocket.
 NO_OPEN_SOCKET='no-open-socket'
+# src/persona-bringup.ts checkPersonaWorkingDirectory: inline failure cause.
+DIRECTORY_MISSING_CAUSE='working directory does not exist'
 # src/delivery-decision.ts FUNGIBLE_REFUSALS ids, passed to the printer, which
 # checks each against the export.
 REFUSAL_EXTERNALLY_SHARED='externally-shared'
@@ -327,55 +363,15 @@ count_server_log() {
     echo "${total}"
 }
 
-# The stub's record lines whose fields match every <field>=<value> (string
-# compare; a JSON true/false reads True/False).
-RECORD_QUERY="${SCENARIO_ROOT}/record-query.py"
-cat > "${RECORD_QUERY}" << 'EOF'
-import json, sys
-path, *specs = sys.argv[1:]
-checks = [spec.split("=", 1) for spec in specs]
-count = 0
-try:
-    with open(path) as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if all(rec.get(k) is not None and str(rec.get(k)) == v for k, v in checks):
-                count += 1
-except FileNotFoundError:
-    pass
-print(count)
-EOF
+# Keep the existing call sites while the shared reader owns JSONL validation.
 rec_count() {
-    python3 "${RECORD_QUERY}" "${STUB_RECORD}" "$@"
+    local event="${1#event=}"; shift
+    slack_stub_record_count "${event}" "$@"
 }
 rec_at_least() {
     local min="$1"; shift
     (( $(rec_count "$@") >= min ))
 }
-
-# The delivery-record query: lines of a stub MCP session's accepted queue record
-# whose `meta.chat_id` and `meta.ts` are given, and `meta.via` when given.
-DELIVERY_QUERY="${SCENARIO_ROOT}/delivery-query.py"
-cat > "${DELIVERY_QUERY}" << 'EOF'
-import json, sys
-path, chat, ts, via = sys.argv[1:5]
-count = 0
-with open(path) as f:
-    for line in f:
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        meta = rec if isinstance(rec, dict) and rec.get("kind") == "accepted" and rec.get("compact") is None else None
-        if not isinstance(meta, dict):
-            continue
-        if meta.get("channel") == chat and meta.get("ts") == ts and (via == "" or meta.get("via") == via):
-            count += 1
-print(count)
-EOF
 
 # The stub MCP session's request and results records, for checks
 # (fixtures/stub-mcp-session.ts, its line formats), each file a path resolved
@@ -430,18 +426,9 @@ else:
     sys.exit(64)
 EOF
 
-# deliveries <dir> <chat-id> <ts> [<via>]: how many deliveries the persona
-# working in <dir> received for that message (with that `via`, when given).
+# queued_count <dir> <chat-id> <ts> [<via>]: durable acceptance count.
 queued_count() {
-    local snapshot="${SCENARIO_ROOT}/deliveries-snapshot"
-    local key
-    case "$1" in
-        "${ALPHA_DIR}") key="${ALPHA_KEY}" ;;
-        "${BRAVO_DIR}") key="${BRAVO_KEY}" ;;
-        *) fail "queued_count: unknown persona working directory" ;;
-    esac
-    queue_accepted "${key}" > "${snapshot}"
-    python3 "${DELIVERY_QUERY}" "${snapshot}" "$2" "$3" "${4:-}"
+    shared_queued_count "${QUEUE_KEY[$1]}" "$2" "$3" "${4:-}"
 }
 
 queued() {
@@ -449,112 +436,53 @@ queued() {
 }
 
 declare -A EXPECTED_QUEUE_ROWS=()
+declare -A QUEUE_ARCHIVES=()
+declare -A RECEIPT_MODE=() EXPECTED_INPUTS=()
+ACKS="${SCENARIO_ROOT}/expected-envelopes"
+: > "${ACKS}"
 
-# Receipt completion, rather than acceptance, makes the restart's idle-bot
-# precondition true. Every fixed part of every accepted item has a receipt.
-queue_drained() {
-    local file="${DELIVERIES_FILE[$1]}"
-    jq -se '
-      . as $records
-      | [$records[] | select(.kind == "accepted" and .compact == null)] as $accepted
-      | ($accepted | length) > 0
-        and all($accepted[];
-          .seq as $seq
-          | ([$records[] | select(.seq == $seq and .kind == "fixed")][-1].parts // null) as $parts
-          | ($parts | type) == "array"
-            and ($parts | length) > 0
-            and all(range(1; ($parts | length) + 1);
-              . as $part
-              | any($records[]; .seq == $seq and .kind == "delivered" and .part == $part)))
-    ' "${file}" > /dev/null 2>&1
+# Freeze exact content and receipt evidence before each compaction boundary.
+snapshot_queue() {
+    local key="${QUEUE_KEY[$1]}" out="${SCENARIO_ROOT}/queue-evidence-${QUEUE_KEY[$1]}.jsonl"
+    if [[ -f "${out}" ]]; then shared_queue_snapshot "${out}" "${key}" "${out}"
+    else shared_queue_snapshot "${out}" "${key}"; fi
+    QUEUE_ARCHIVES["$1"]="${out}"
 }
-
-# Count distinct receipted parts of the workload captured when the wait began.
-# Full accepted-record equality binds sequence, identity, source and content.
-# New acceptances, reminders, attempts and duplicate/foreign/stale receipts
-# never renew it.
-queue_receipt_progress() {
-    jq -se --argjson originals "$2" '
-      . as $records
-      | if ($originals | length) == 0 or
-          any($originals[]; . as $original | all($records[]; . != $original))
-        then error("original workload unavailable") else
-          [$originals[] | select(.reminder_for == null) | .seq as $seq | .received_at as $received_at
-            | ([$records[] | select(.seq == $seq and .kind == "fixed")][-1].parts // []) as $parts
-            | range(1; ($parts | length) + 1) as $part
-            | select(any($records[]; .seq == $seq and .kind == "delivered" and .part == $part
-                and (.at | type) == "number" and .at >= $received_at))
-            | [$seq, $part]] | unique | length
-        end
-    ' "${DELIVERIES_FILE[$1]}" 2>/dev/null
-}
-
 wait_queue_drained() {
-    local dir="$1" step="$2" originals started last_progress now progress most=0 reason
-    originals="$(jq -sc '[.[] | select(.kind == "accepted" and .compact == null)]' "${DELIVERIES_FILE[${dir}]}" 2>/dev/null)" \
-        || fail "${step}: original accepted workload unreadable"
-    _scenario_check_timeout "${DELIVERY_IDLE_WAIT_S}" wait_queue_drained
-    _scenario_check_timeout "${DELIVERY_MAX_WAIT_S}" wait_queue_drained
-    started="$(_scenario_now_ms)"
-    last_progress="${started}"
-    while :; do
-        progress="$(queue_receipt_progress "${dir}" "${originals}")" || progress=''
-        now="$(_scenario_now_ms)"
-        if (( now - started >= DELIVERY_MAX_WAIT_S * 1000 )); then reason=overall; break; fi
-        if [[ "${progress}" =~ ^[0-9]+$ ]]; then
-            # Progress cannot replace the existing all-items/all-parts gate.
-            if queue_drained "${dir}"; then return 0; fi
-            if (( progress > most )); then
-                most="${progress}"
-                last_progress="${now}"
-            fi
-        fi
-        if (( now - last_progress >= DELIVERY_IDLE_WAIT_S * 1000 )); then reason=no-progress; break; fi
-        sleep "${SCENARIO_POLL_S}"
-    done
-    queue_drain_snapshot receipt-timeout
-    fail "${step}: accepted deliveries never received all their receipts (${reason} watchdog; receipts=${most}; idle bound=${DELIVERY_IDLE_WAIT_S}s; overall bound=${DELIVERY_MAX_WAIT_S}s)"
+    snapshot_queue "$1"
+    # The archive fixes the original workload and retains observed receipts
+    # removed from the live journal by compaction; supply it in both roles.
+    shared_wait_queue_drained "${QUEUE_KEY[$1]}" "${QUEUE_ARCHIVES[$1]}" "${QUEUE_ARCHIVES[$1]}"
+    snapshot_queue "$1"
 }
-
-# Counts cover both journals; detail is bounded to eight incomplete items and
-# eight recent numeric facts each. No message, fixed content or raw error is
-# emitted. These diagnostics never decide readiness or infer agent state.
 queue_drain_snapshot() {
     local dir
     for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-        jq -sc --arg phase "$1" --arg persona "${QUEUE_KEY[${dir}]}" '
-          def number_only: if type == "number" then . else null end;
-          . as $records
-          | [$records[] | select(.kind == "accepted" and .compact == null) |
-              .seq as $seq |
-              [$records[] | select(.seq == $seq)] as $item |
-              ([$item[] | select(.kind == "fixed")][-1].parts // null) as $parts |
-              (if ($parts | type) == "array" then $parts | length else 0 end) as $count |
-              [range(1; $count + 1) | . as $part |
-                select(any($item[]; .kind == "delivered" and .part == $part))] as $received |
-              {seq: ($seq | number_only), received_at: (.received_at | number_only),
-               parts: $count, receipted_parts: ($received | length),
-               complete: ($count > 0 and ($received | length) == $count),
-               recent: ([$item[] | select(.kind == "sent" or .kind == "refused" or .kind == "delivered")][-8:] |
-                 map({kind, part: (.part | number_only), attempt: (.attempt | number_only), at: (.at | number_only),
-                      send_kind: (if .send_kind == "text" or .send_kind == "enter" or .send_kind == "retype"
-                                  then .send_kind else null end)}))}] as $items
-          | {diagnostic: "queue-drain", phase: $phase, persona: $persona,
-             accepted: ($items | length), complete: ([$items[] | select(.complete)] | length),
-             incomplete: ([$items[] | select(.complete | not)] | length),
-             first_incomplete: ([$items[] | select(.complete | not)][:8]),
-             incomplete_items_omitted: ([0, ([$items[] | select(.complete | not)] | length) - 8] | max)}
-        ' "${DELIVERIES_FILE[${dir}]}" 2>/dev/null \
-            || printf 'recorded: queue snapshot unavailable\n'
+        snapshot_queue "${dir}"
+        shared_queue_receipts "${QUEUE_KEY[${dir}]}" "${QUEUE_ARCHIVES[${dir}]}" "${QUEUE_ARCHIVES[${dir}]}"
     done
 }
 
 # wait_queued <step> <dir> <chat-id> <ts> <via>: the delivery reaches the
 # accepted queue record, with that `via`.
 wait_queued() {
-    local step="$1"; shift
-    wait_until "${EVENT_WAIT_S}" "${step}: no delivery with via $4 in the accepted queue record of $1" queued "$@"
-    EXPECTED_QUEUE_ROWS["${QUEUE_KEY[$1]}|$2|$3|$4"]="$(jq -cn --arg c "$2" --arg t "$3" --arg v "$4" '[$c,$t,$v]')"
+    local step="$1" name sender="${6:-${HUMAN}}" identity; shift
+    wait_until "${EVENT_WAIT_S}" "${step}: missing acceptance" queued "$1" "$2" "$3" "$4"
+    case "$1" in "${ALPHA_DIR}") name="${ALPHA}" ;; "${BRAVO_DIR}") name="${BRAVO}" ;; esac
+    identity="${QUEUE_KEY[$1]}|$2|$3|$4"
+    if [[ -z "${EXPECTED_QUEUE_ROWS[${identity}]:-}" ]]; then
+        EXPECTED_QUEUE_ROWS["${identity}"]="$(shared_delivery_expectation "${QUEUE_KEY[$1]}" "${name}" slack "$2" "$3" "${sender}" "$4")"
+        [[ -n "${PUSHED_EVENTS[$2|$3]:-}" ]] || fail "${step}: no independently retained input"
+        EXPECTED_INPUTS["${identity}"]="${PUSHED_EVENTS[$2|$3]}"
+        if [[ "${RECEIPT_MODE[${QUEUE_KEY[$1]}]:-ordinary}" == manual ]]; then
+            shared_stub_permission receipt "$1" "${QUEUE_KEY[$1]}" > /dev/null
+        fi
+    fi
+    # Check carried joins while their stamp is still current, before any
+    # intentional leave/value/identity reset can retire this participation.
+    if [[ "$4" == mention || "$4" == broadcast ]]; then
+        wait_until "${EVENT_WAIT_S}" "${step}: carried join was not saved" accepted_join_saved "${QUEUE_KEY[$1]}" "$2" "$3"
+    fi
 }
 
 # expect_queued <step> <want> <dir> <chat-id> <ts> [<via>]
@@ -584,35 +512,36 @@ for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     RESULTS_FILE["${dir}"]="${STUB_REAL_DIR}/${SCENARIO_STUB_RESULTS_PREFIX}${record_key}${SCENARIO_STUB_RECORD_SUFFIX}"
 done
 
-# The push wrapper. Each push gets its own `ts` (new_ts, a counter on the
-# script's start time), but the two events of one mention and the one message
+# The push wrapper. Each push gets its own `ts` from the shared builder,
+# except the two events of one mention and the one message
 # pushed to both personas, which share theirs. PUSH_TS is the push's ts.
-TS_BASE="$(date +%s)"
 TS_SEQ=0
-declare -A PUSHED_TS=()
+declare -A PUSHED_TS=() PUSHED_EVENTS=()
 new_ts() {
     TS_SEQ=$(( TS_SEQ + 1 ))
-    printf -v PUSH_TS '%s.%06d' "${TS_BASE}" "${TS_SEQ}"
+    PUSH_TS="$(scenario_ts)"
 }
 
 # message_event <channel> <channel_type|""> <text> <ts>
 message_event() {
-    jq -c -n --arg c "$1" --arg ct "$2" --arg t "$3" --arg ts "$4" --arg u "${HUMAN}" \
-        '{type: "message", channel: $c, user: $u, text: $t, ts: $ts} + (if $ct == "" then {} else {channel_type: $ct} end)'
+    slack_message_event "$1" "$3" "$4" "${HUMAN}" "$2"
 }
 
 # app_mention_event <channel> <text> <ts>: Slack's app_mention, with no channel_type.
 app_mention_event() {
-    jq -c -n --arg c "$1" --arg t "$2" --arg ts "$3" --arg u "${HUMAN}" \
-        '{type: "app_mention", channel: $c, user: $u, text: $t, ts: $ts}'
+    slack_mention_event "$1" "$2" "$3" "${HUMAN}"
 }
 
 # push_event <label> <event-json> [<flag>]: one push; fails on a refusal.
 push_event() {
     local label="$1" ts
     ts="$(jq -r '.ts' <<< "$2")"
+    PUSHED_EVENTS["$(jq -r '.channel' <<< "$2")|${ts}"]="$2"
     PUSHED_TS["${label} ${ts} $(jq -r '.type' <<< "$2")"]=1
-    slack_stub_push "${label}" "$2" "${3:-}" > /dev/null
+    local envelope
+    envelope="$(slack_stub_push "${label}" "$2" "${3:-}")"
+    printf '%s\n' "${envelope}" >> "${ACKS}"
+    slack_wait_one_ack "${envelope}"
 }
 
 # push_message <label> <channel> <channel_type|""> <text> [<flag>]: a message
@@ -648,12 +577,8 @@ push_both() {
     push_event "${BRAVO_LABEL}" "$(message_event "$1" "$2" "$3" "${PUSH_TS}")"
 }
 
-plain_text() {
-    printf '%s plain message %s\n' "${TEST_NAME}" "${TS_SEQ}"
-}
-mention_text() {
-    printf '<@%s> %s mention\n' "$1" "${TEST_NAME}"
-}
+plain_text() { scenario_text "plain-${TS_SEQ}"; }
+mention_text() { scenario_mention_text "$1" "${TEST_NAME} mention"; }
 
 # The results reader: call_tool <dir> <json-args> calls set_channel_delivery
 # over the session of the stub working in <dir> (stub_session_call, bounded
@@ -678,24 +603,6 @@ expect_tool() {
     [[ "${CALL_TEXT}" == "$5" ]] || fail "${step}: the result reads '${CALL_TEXT}', expected '$5'"
 }
 
-# Every deliberate request is retained explicitly before submission. The
-# request JSONL written by stub_session_call preserves this binding as well.
-attempt_args() {
-    jq -cn --arg id "$1" --arg c "$2" --arg d "$3" --arg intent "${4:-assignment}" \
-        '{channel:$c,delivery:$d,attempt_id:$id,intent:$intent}'
-}
-
-# Read the production-validated durable outcome AFTER the call. Expected current
-# effectiveness is supplied by this scenario's independent choice/eligibility setup.
-expect_attempt() {
-    local step="$1" dir="$2" args="$3" key="$4" effective="$5" history="${6:-new}" want_error="${7:-false}" expected
-    call_tool "${dir}" "${args}"
-    expected="$(printed channelDeliveryAttemptResultText "${CONFIG}" "${CONFIG}.last-applied" "${key}" \
-        "$(jq -r .channel <<< "${args}")" "$(jq -r .delivery <<< "${args}")" "$(jq -r .attempt_id <<< "${args}")" "${history}" "${effective}")"
-    [[ "${CALL_IS_ERROR}" == "${want_error}" ]] || fail "${step}: unexpected error flag"
-    [[ "${CALL_TEXT}" == "${expected}" ]] || fail "${step}: result differs from retained outcome/current facts"
-}
-
 # Thread phases use real Slack events and the same acceptance/receipt ledger
 # as the earlier phases. The stub never answers these messages with reply.
 declare -A OLD_THREAD_ROOTS=() THREAD_STAMPS=() JOINED_ROOTS=()
@@ -710,7 +617,7 @@ thread_persona() {
 # push_thread_reply <label> <channel> <root> <text>
 push_thread_reply() {
     new_ts
-    push_event "$1" "$(message_event "$2" channel "$4" "${PUSH_TS}" | jq -c --arg root "$3" '. + {thread_ts: $root}')"
+    push_event "$1" "$(slack_reply_event "$2" "$3" "$4" "${PUSH_TS}" "${HUMAN}")"
 }
 
 # A fresh drop line is a decision witness, not a quiet-period assertion.
@@ -724,8 +631,8 @@ expect_unjoined_reply() {
     expect_queued "${step}" 0 "${THREAD_DIR}" "${channel}" "${ts}"
 }
 
-# other_value_threads <step> <label> <all-via>: before this persona has any
-# hybrid entry. Keep one root per value for the later transition check.
+# other_value_threads <step> <label> <all-via> [require-no-memory]: per-channel
+# negatives, plus the early persona-wide no-file/no-marker proof when true.
 other_value_threads() {
     local step="$1" who="$2" all_via="$3" channel root reply mark
     thread_persona "${who}"
@@ -750,7 +657,14 @@ other_value_threads() {
                 wait_queued "${step}: all reply" "${THREAD_DIR}" "${channel}" "${reply}" "${all_via}"
             fi
         fi
-        [[ ! -e "${SLACK_STATE_DIR}/threads/${THREAD_KEY}.jsonl" ]] || fail "${step}: a persona with no hybrid entry acquired Thread Memory"
+        [[ -z "$(shared_thread_since "${THREAD_KEY}" "${channel}")" ]] || fail "${step}: ordinary value acquired a stamp"
+        if [[ "$(shared_thread_file "${THREAD_KEY}")" == true ]]; then
+            [[ -z "$(shared_thread_joins "${THREAD_KEY}" | jq -c --arg c "${channel}" 'select(.channel==$c)')" ]] || fail "${step}: ordinary value acquired a join"
+        fi
+        if [[ "${4:-false}" == true ]]; then
+            [[ ! -e "${SLACK_STATE_DIR}/threads/${THREAD_KEY}.jsonl" ]] || fail "${step}: persona with no hybrid entry acquired Thread Memory"
+            [[ "$(shared_thread_created "${THREAD_KEY}")" == false ]] || fail "${step}: ordinary values set the Thread Memory marker"
+        fi
     done
 }
 
@@ -790,7 +704,7 @@ join_thread_phase() {
     plain="${PUSH_TS}"
     wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${T1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" "${mode}: plain channel message did not drop"
     expect_queued "${mode}: plain channel message" 0 "${ALPHA_DIR}" "${T1}" "${plain}"
-    push_message "${ALPHA_LABEL}" "${T1}" channel "<!here> ${TEST_NAME} ${mode} thread broadcast"
+    push_message "${ALPHA_LABEL}" "${T1}" channel "$(scenario_broadcast_text here "${mode} thread broadcast")"
     broadcast="${PUSH_TS}"
     push_thread_reply "${ALPHA_LABEL}" "${T1}" "${broadcast}" "$(plain_text)"
     broadcast_reply="${PUSH_TS}"
@@ -800,12 +714,12 @@ join_thread_phase() {
 
 two_persona_threads() {
     local mode="$1" root reply event dir
-    push_both "${T1}" channel "<@${ALPHA_BOT_USER}> <@${BRAVO_BOT_USER}> ${TEST_NAME} ${mode} shared thread"
+    push_both "${T1}" channel "$(scenario_mention_text "${ALPHA_BOT_USER}" "$(scenario_mention_text "${BRAVO_BOT_USER}" "${mode} shared thread")")"
     root="${PUSH_TS}"
     JOINED_ROOTS["${mode}-both"]="${root}"
     new_ts
     reply="${PUSH_TS}"
-    event="$(message_event "${T1}" channel "$(plain_text)" "${reply}" | jq -c --arg root "${root}" '. + {thread_ts: $root}')"
+    event="$(slack_reply_event "${T1}" "${root}" "$(plain_text)" "${reply}" "${HUMAN}")"
     push_event "${ALPHA_LABEL}" "${event}"
     push_event "${BRAVO_LABEL}" "${event}"
     for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
@@ -823,17 +737,674 @@ check_thread_persistence() {
     wait_queued "${step}: persisted join" "${THREAD_DIR}" "${T1}" "${PUSH_TS}" "${VIA_THREAD}"
 }
 
+# Compositions use only the shared evidence projections. These functions
+# describe operator inputs and expected decisions, never a second store format.
+declare -A MATRIX_ROOTS=() LEAVE_CHANNELS=() LEAVE_ROOTS=() LEAVE_ENVELOPES=()
+CAPTURED="${SCENARIO_ROOT}/captured-results"
+mkdir -p "${CAPTURED}"
+
+ack_control() {
+    [[ -n "$1" ]] || fail 'control returned no envelope'
+    printf '%s\n' "$1" >> "${ACKS}"
+    slack_wait_one_ack "$1"
+}
+
+edit_input() {
+    jq "$@" "${CONFIG}" > "${CONFIG}.candidate"
+    mv -- "${CONFIG}.candidate" "${CONFIG}"
+}
+input_choice() {
+    edit_input --arg who "$1" --arg c "$2" --arg d "$3" \
+        '(.personas[] | select(.name==$who) | .channels) |= (map(select(.id!=$c)) + [{id:$c,delivery:$d}])'
+}
+choice_is() { [[ "$(shared_channel_saved "$1" "$2")" == "$3" ]]; }
+channel_facts() { shared_persona_facts "$1" "$2" | jq -cS 'del(.mode,.historicalMembership)'; }
+assignment_order() { shared_persona_facts "$1" "$2" | jq -er --arg c "$2" '.assignments[$c].order'; }
+
+capture_review() {
+    cp -- "${PENDING}" "${CAPTURED}/$1.pending"
+    check_pending_layout "$1"
+}
+confirm_review() {
+    local step="$1" before wait_s="${2:-${APPLY_WAIT_S}}"
+    before="$(count_log "${APPLIED_CLASS}")"
+    capture_review "${step}"
+    mv -f -- "${PENDING}" "${APPLY}"
+    wait_for_count "${APPLIED_CLASS}" $(( before + 1 )) "${wait_s}" "${step}: confirmation did not apply"
+    wait_until "${wait_s}" "${step}: review not durably consumed" \
+        bun "${PRINTER}" sharedReviewConsumed "${CONFIG}" "${LAST}" "${CAPTURED}/${step}.pending" > /dev/null
+    configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null
+}
+review_assign() {
+    local step="$1"; shift
+    configuration_request "${step}" request "$@" > /dev/null
+    confirm_review "${step}"
+}
+expect_stale_review() {
+    local step="$1" old="$2" mark before
+    mark="$(log_mark)"; before="${SCENARIO_ROOT}/${step}-authority"
+    cp -- "${LAST}" "${before}"
+    cp -- "${old}" "${APPLY}"
+    wait_since "${mark}" "[slack] $(printed RELOAD_STALE_CONFIRMATION):" "${APPLY_WAIT_S}" "${step}: stale preview was not refused"
+    configuration_application_preserved "${CONFIG}" "${before}" "${LAST}" > /dev/null \
+        || fail "${step}: stale confirmation changed applied facts"
+}
+expect_preview_choice() {
+    local key="$1" channel="$2" kind="$3" saved="$4" reviewed="$5" member="$6" now="$7" next="$8" order="$9" expected
+    shift 9
+    expected="$(printed reviewedChannelLine "${key}" "${channel}" "${kind}" "${saved}" "${reviewed}" \
+        "${member}" "${now}" "${next}" "previousOrder=${order}" "$@")"
+    pending_has_line "${expected}" || fail 'preview did not distinguish saved choice, membership, intent and effective outcome'
+}
+
+# A negative decision has its own log witness. Positives enter the global
+# exact ledger; a later receipt audit covers content and final completion.
+matrix_message() {
+    local step="$1" who="$2" channel="$3" kind="$4" root="$5" want="$6" text ts mark
+    thread_persona "${who}"
+    mark="$(log_mark)"; new_ts; ts="${PUSH_TS}"
+    case "${kind}" in
+        mention) text="$(mention_text "${THREAD_BOT}")" ;;
+        broadcast) text="$(scenario_broadcast_text here "${step}")" ;;
+        overlap) text="$(scenario_mention_text "${THREAD_BOT}" "$(scenario_broadcast_text channel "${step}")")" ;;
+        *) text="$(scenario_text "${step}")" ;;
+    esac
+    if [[ "${root}" == - ]]; then
+        push_event "${who}" "$(slack_message_event "${channel}" "${text}" "${ts}" "${HUMAN}")"
+    else
+        push_event "${who}" "$(slack_reply_event "${channel}" "${root}" "${text}" "${ts}" "${HUMAN}")"
+    fi
+    if [[ "${want}" == channel-off || "${want}" == not-mentioned || "${want}" == channel-ineligible ]]; then
+        wait_since "${mark}" "$(plain_drop "${THREAD_REF}" "${channel}" "${want}")" "${EVENT_WAIT_S}" "${step}: missing drop witness"
+        expect_queued "${step}" 0 "${THREAD_DIR}" "${channel}" "${ts}"
+    else
+        wait_queued "${step}" "${THREAD_DIR}" "${channel}" "${ts}" "${want}"
+        expect_queued "${step}: exactly one reason" 1 "${THREAD_DIR}" "${channel}" "${ts}"
+    fi
+    MATRIX_TS="${ts}"
+}
+selection_matrix() {
+    local mode="$1" channel value mention broadcast plain followed root outside stamp
+    for value in off mentions all thread_hybrid; do
+        case "${value}" in
+            off) channel="${M_OFF}"; mention=channel-off; broadcast=channel-off; plain=channel-off; followed=channel-off ;;
+            mentions) channel="${M_MENTIONS}"; mention=mention; broadcast=broadcast; plain=not-mentioned; followed=not-mentioned ;;
+            all) channel="${M_ALL}"; mention=mention; broadcast=broadcast; plain=receive_all; followed=receive_all ;;
+            thread_hybrid) channel="${M_HYBRID}"; mention=mention; broadcast=broadcast; plain=not-mentioned; followed=thread ;;
+        esac
+        choice_is "${ALPHA_KEY}" "${channel}" "${value}" || fail "${mode}: matrix value changed"
+        [[ "$(shared_channel_effective "${ALPHA_KEY}" "${channel}" eligible)" == "${value}" ]] || fail "${mode}: effective value changed"
+        matrix_message "${mode}-${value}-mention" alpha "${channel}" mention - "${mention}"
+        root="${MATRIX_TS}"; MATRIX_ROOTS["${mode}|${value}"]="${root}"
+        matrix_message "${mode}-${value}-followed" alpha "${channel}" plain "${root}" "${followed}"
+        matrix_message "${mode}-${value}-broadcast" alpha "${channel}" broadcast - "${broadcast}"
+        matrix_message "${mode}-${value}-root" alpha "${channel}" plain - "${plain}"
+        outside="$(scenario_ts)"
+        matrix_message "${mode}-${value}-unfollowed" alpha "${channel}" plain "${outside}" "${plain}"
+        matrix_message "${mode}-${value}-overlap" alpha "${channel}" overlap "${root}" "${mention}"
+        if [[ "${value}" != thread_hybrid ]]; then
+            [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'ordinary value acquired Thread Hybrid Since'
+            [[ -z "$(shared_thread_joins "${ALPHA_KEY}" | jq -c --arg c "${channel}" 'select(.channel==$c)')" ]] \
+                || fail 'ordinary value acquired a Thread Memory join'
+        fi
+    done
+}
+
+start_matrix() {
+    local channel
+    for channel in "${M_OFF}" "${M_MENTIONS}" "${M_ALL}" "${M_HYBRID}" "${WRITE_CHANNEL}"; do
+        ack_control "$(slack_push_member_joined alpha "${channel}" "$(scenario_ts)")"
+        wait_until "${EVENT_WAIT_S}" 'matrix member did not receive strict default' choice_is "${ALPHA_KEY}" "${channel}" off
+    done
+    MATRIX_READY=true
+    input_choice "${ALPHA}" "${M_OFF}" off
+    input_choice "${ALPHA}" "${M_MENTIONS}" mentions
+    input_choice "${ALPHA}" "${M_ALL}" all
+    input_choice "${ALPHA}" "${M_HYBRID}" thread_hybrid
+    input_choice "${ALPHA}" "${WRITE_CHANNEL}" off
+    input_choice "${ALPHA}" "${FUTURE}" all
+    review_assign matrix-setup "${ALPHA}/${M_OFF}/off" "${ALPHA}/${M_MENTIONS}/mentions" \
+        "${ALPHA}/${M_ALL}/all" "${ALPHA}/${M_HYBRID}/thread_hybrid" "${ALPHA}/${FUTURE}/all"
+    selection_matrix strict
+    local before="${SCENARIO_ROOT}/strict-tool-authority" value
+    cp -- "${LAST}" "${before}"
+    for value in off mentions all thread_hybrid; do
+        expect_tool "strict refuses ${value}" "${ALPHA_DIR}" "$(attempt_args "strict-${value}" "${WRITE_CHANNEL}" "${value}")" true "${ALPHA_DECLARATIVE_REFUSAL}"
+    done
+    configuration_application_preserved "${CONFIG}" "${before}" "${LAST}" > /dev/null
+}
+
+# Whole current value/stamp/assignment facts and active joins, compared after
+# modes, destinations and ordinary worker relaunch. Disk membership is never
+# substituted for the live inventory/decision witnesses.
+preserved_four_values() {
+    local step="$1" channel value stamp
+    for value in off mentions all thread_hybrid; do
+        case "${value}" in off) channel="${M_OFF}" ;; mentions) channel="${M_MENTIONS}" ;; all) channel="${M_ALL}" ;; thread_hybrid) channel="${M_HYBRID}" ;; esac
+        choice_is "${ALPHA_KEY}" "${channel}" "${value}" || fail "${step}: ${value} was not preserved"
+        [[ "$(channel_facts "${ALPHA_KEY}" "${channel}")" == "${FOUR_FACTS[${value}]}" ]] || fail "${step}: choice/order/stamp changed"
+    done
+    stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${M_HYBRID}")"
+    [[ "$(shared_thread_joins "${ALPHA_KEY}" "${M_HYBRID}" "${stamp}" | jq -scS 'sort_by(.root)')" == "${FOUR_JOINS}" ]] \
+        || fail "${step}: Joined Threads changed"
+}
+freeze_four_values() {
+    local value channel stamp
+    declare -gA FOUR_FACTS=()
+    for value in off mentions all thread_hybrid; do
+        case "${value}" in off) channel="${M_OFF}" ;; mentions) channel="${M_MENTIONS}" ;; all) channel="${M_ALL}" ;; thread_hybrid) channel="${M_HYBRID}" ;; esac
+        FOUR_FACTS["${value}"]="$(channel_facts "${ALPHA_KEY}" "${channel}")"
+    done
+    wait_until "${EVENT_WAIT_S}" 'matrix joins not durably saved' thread_joins_saved "${ALPHA_DIR}"
+    stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${M_HYBRID}")"
+    FOUR_JOINS="$(shared_thread_joins "${ALPHA_KEY}" "${M_HYBRID}" "${stamp}" | jq -scS 'sort_by(.root)')"
+    [[ "${FOUR_JOINS}" != '[]' ]] || fail 'four-value control has no saved hybrid joins'
+}
+
+live_membership_phase() {
+    local mode="$1" default=off value channel event first facts sibling before root
+    [[ "${mode}" != open ]] || default=mentions
+    for value in off mentions all thread_hybrid; do
+        channel="$(scenario_id C "live-${mode}-${value}")"; LEAVE_CHANNELS["${mode}|${value}"]="${channel}"
+        event="$(slack_membership_event member_joined_channel alpha "${channel}" "$(scenario_ts)")"
+        ack_control "$(slack_stub_push alpha "${event}")"
+        wait_until "${EVENT_WAIT_S}" 'self join has no mode default' choice_is "${ALPHA_KEY}" "${channel}" "${default}"
+        facts="$(channel_facts "${ALPHA_KEY}" "${channel}")"
+        ack_control "$(slack_stub_push alpha "${event}")"
+        [[ "$(channel_facts "${ALPHA_KEY}" "${channel}")" == "${facts}" ]] || fail 'duplicate join made a second assignment'
+        if [[ "${mode}" == strict ]]; then
+            matrix_message "${mode}-default-${value}" alpha "${channel}" mention - channel-off
+        else
+            matrix_message "${mode}-default-${value}" alpha "${channel}" mention - mention
+        fi
+        # The sibling shares each channel; P's leave must not remove Q's choice.
+        ack_control "$(slack_push_member_joined bravo "${channel}" "$(scenario_ts)")"
+        wait_until "${EVENT_WAIT_S}" 'sibling join missing' choice_is "${BRAVO_KEY}" "${channel}" "${default}"
+        if [[ "${mode}" == strict ]]; then
+            input_choice "${ALPHA}" "${channel}" "${value}"
+            review_assign "live-${mode}-${value}" "${ALPHA}/${channel}/${value}"
+        else expect_attempt "live ${value}" "${ALPHA_DIR}" "$(attempt_args "live-${mode}-${value}" "${channel}" "${value}")" "${ALPHA_KEY}" "${value}"; fi
+        if [[ "${value}" == thread_hybrid ]]; then
+            matrix_message "live-${mode}-join" alpha "${channel}" mention - mention
+            LEAVE_ROOTS["${mode}"]="${MATRIX_TS}"
+            wait_until "${EVENT_WAIT_S}" 'pre-leave join not saved' thread_joins_saved "${ALPHA_DIR}"
+        fi
+        sibling="$(channel_facts "${BRAVO_KEY}" "${channel}")"
+        before="$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")"
+        # Capture a real dependency before removing this member. Each stale
+        # confirmation must be rejected after the corresponding durable leave.
+        configuration_request "leave-preview-${mode}-${value}" request "${ALPHA}/${channel}/${value}" > /dev/null
+        capture_review "leave-preview-${mode}-${value}"
+        first="$(slack_push_channel_left alpha "${channel}" "$(scenario_ts)")"
+        LEAVE_ENVELOPES["${mode}|${value}"]="${first}"
+        ack_control "${first}"
+        wait_until "${EVENT_WAIT_S}" 'leave did not remove saved entry' choice_is "${ALPHA_KEY}" "${channel}" ''
+        [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'leave retained Thread Hybrid Since'
+        [[ "$(channel_facts "${BRAVO_KEY}" "${channel}")" == "${sibling}" ]] || fail 'leave changed sibling choice'
+        [[ "$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")" == "${before}" ]] || fail 'leave changed another channel'
+        expect_stale_review "leave-stale-${mode}-${value}" "${CAPTURED}/leave-preview-${mode}-${value}.pending"
+        configuration_request "leave-cancel-${mode}-${value}" cancel > /dev/null
+        if [[ "${mode}" == open ]]; then
+            expect_attempt 'removed channel refuses bot write' "${ALPHA_DIR}" "$(attempt_args "removed-${value}" "${channel}" all)" "${ALPHA_KEY}" channel-removed new true
+        fi
+    done
+    # Definitively irrelevant envelopes are ACKed, with no assignment added.
+    channel="$(scenario_id C "ignored-${mode}")"
+    before="$(shared_persona_facts "${ALPHA_KEY}" | jq -cS 'del(.historicalMembership)')"
+    ack_control "$(slack_push_member_joined alpha "${channel}" "$(scenario_ts)" other)"
+    event="$(slack_membership_event member_joined_channel alpha "${channel}" "$(scenario_ts)")"
+    first="$(slack_stub_push_installation alpha "${event}" bravo)"; ack_control "${first}"
+    slack_stub_control_fired push-installation "envelope_id=${first}" > /dev/null
+    matrix_message "ignored-${mode}-barrier" alpha "${M_MENTIONS}" mention - mention
+    [[ "$(shared_persona_facts "${ALPHA_KEY}" | jq -cS 'del(.historicalMembership)')" == "${before}" ]] || fail 'ignored membership changed authority'
+}
+
+write_order_phase() {
+    local value want before order after stamp original config_copy
+    # Every open value changes the next event, with one independent sibling.
+    before="$(shared_persona_facts "${BRAVO_KEY}" | jq -cS 'del(.historicalMembership)')"
+    for value in off mentions all thread_hybrid; do
+        expect_attempt "open writes ${value}" "${ALPHA_DIR}" "$(attempt_args "open-write-${value}" "${WRITE_CHANNEL}" "${value}")" "${ALPHA_KEY}" "${value}"
+        [[ "$(shared_persona_facts "${BRAVO_KEY}" | jq -cS 'del(.historicalMembership)')" == "${before}" ]] || fail 'P assignment changed Q'
+        want=mention; [[ "${value}" != off ]] || want=channel-off
+        matrix_message "open-next-${value}" alpha "${WRITE_CHANNEL}" mention - "${want}"
+    done
+    original="${MATRIX_TS}"; stamp="$(shared_thread_since "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+    order="$(assignment_order "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+    expect_attempt 'same-value bot order' "${ALPHA_DIR}" "$(attempt_args same-bot "${WRITE_CHANNEL}" thread_hybrid)" "${ALPHA_KEY}" thread_hybrid
+    after="$(assignment_order "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+    (( after > order )) || fail 'same-value bot assignment took no later order'
+    [[ "$(shared_thread_since "${ALPHA_KEY}" "${WRITE_CHANNEL}")" == "${stamp}" ]] || fail 'same bot assignment reset stamp'
+    input_choice "${ALPHA}" "${WRITE_CHANNEL}" thread_hybrid
+    configuration_request same-operator request "${ALPHA}/${WRITE_CHANNEL}/thread_hybrid" > /dev/null
+    expect_preview_choice "${ALPHA_KEY}" "${WRITE_CHANNEL}" declared thread_hybrid thread_hybrid eligible thread_hybrid thread_hybrid "${after}"
+    confirm_review same-operator
+    order="$(assignment_order "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+    (( order > after )) || fail 'same-value operator assignment took no later order'
+    [[ "$(shared_thread_since "${ALPHA_KEY}" "${WRITE_CHANNEL}")" == "${stamp}" ]] || fail 'same operator assignment reset stamp'
+    matrix_message same-hybrid-join-kept alpha "${WRITE_CHANNEL}" plain "${original}" thread
+    # Bot -> operator -> bot: each successful later assignment controls intake.
+    input_choice "${ALPHA}" "${WRITE_CHANNEL}" off
+    review_assign operator-last "${ALPHA}/${WRITE_CHANNEL}/off"
+    matrix_message operator-last-off alpha "${WRITE_CHANNEL}" mention - channel-off
+    expect_attempt bot-last "${ALPHA_DIR}" "$(attempt_args bot-last "${WRITE_CHANNEL}" thread_hybrid)" "${ALPHA_KEY}" thread_hybrid
+    [[ "$(shared_thread_since "${ALPHA_KEY}" "${WRITE_CHANNEL}")" != "${stamp}" ]] || fail 'away/back reused old stamp'
+    matrix_message away-back-forgets alpha "${WRITE_CHANNEL}" plain "${original}" not-mentioned
+    matrix_message away-back-fresh-join alpha "${WRITE_CHANNEL}" mention "${original}" mention
+    matrix_message away-back-next-reply alpha "${WRITE_CHANNEL}" plain "${original}" thread
+    # Omitting a member differs from declaring off.
+    edit_input --arg c "${WRITE_CHANNEL}" '.personas[0].channels |= map(select(.id!=$c))'
+    configuration_request omit-member request > /dev/null
+    pending_has_line "$(printed REVIEW_OMISSION_CLAUSE)" || fail 'omission preview lacks retention clause'
+    confirm_review omit-member
+    matrix_message omission-keeps alpha "${WRITE_CHANNEL}" plain "${original}" thread
+    # Cancel and revise invalidate their retained original previews.
+    configuration_request cancel-intent request "${ALPHA}/${WRITE_CHANNEL}/off" > /dev/null
+    capture_review cancelled-intent
+    configuration_request cancelled cancel > /dev/null
+    expect_stale_review cancelled-preview "${CAPTURED}/cancelled-intent.pending"
+    matrix_message cancellation-keeps alpha "${WRITE_CHANNEL}" plain "${original}" thread
+    configuration_request revise-intent request "${ALPHA}/${WRITE_CHANNEL}/off" > /dev/null
+    capture_review superseded-intent
+    configuration_request revised revise "${ALPHA}/${WRITE_CHANNEL}/mentions" > /dev/null
+    expect_stale_review revised-preview "${CAPTURED}/superseded-intent.pending"
+    configuration_request revised-fresh refresh > /dev/null
+    confirm_review revised-fresh
+    matrix_message revision-controls alpha "${WRITE_CHANNEL}" plain "${original}" not-mentioned
+    # Pending intent survives a bot write and the one existing server restart.
+    input_choice "${ALPHA}" "${WRITE_CHANNEL}" off
+    configuration_request restart-intent request "${ALPHA}/${WRITE_CHANNEL}/off" > /dev/null
+    capture_review before-bot-pending
+    config_copy="${SCENARIO_ROOT}/pending-input-before-bot"; cp -- "${CONFIG}" "${config_copy}"
+    expect_attempt pending-bot "${ALPHA_DIR}" "$(attempt_args pending-bot "${WRITE_CHANNEL}" all)" "${ALPHA_KEY}" all
+    cmp -s "${CONFIG}" "${config_copy}" || fail 'bot write changed pending operator input'
+    expect_stale_review pending-stale "${CAPTURED}/before-bot-pending.pending"
+    configuration_request restart-refreshed refresh > /dev/null
+    expect_preview_choice "${ALPHA_KEY}" "${WRITE_CHANNEL}" declared all off eligible all off "$(assignment_order "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+    capture_review pending-across-restart
+    matrix_message pending-not-applied alpha "${WRITE_CHANNEL}" plain - receive_all
+}
+
+set_composed_choice() {
+    local mode="$1" who="$2" channel="$3" value="$4" step="$5" name
+    thread_persona "${who}"
+    if [[ "${who}" == alpha ]]; then name="${ALPHA}"; else name="${BRAVO}"; fi
+    if [[ "${mode}" == strict ]]; then
+        input_choice "${name}" "${channel}" "${value}"
+        review_assign "${step}" "${name}/${channel}/${value}"
+    else expect_attempt "${step}" "${THREAD_DIR}" "$(attempt_args "${step}" "${channel}" "${value}")" "${THREAD_KEY}" "${value}"; fi
+}
+join_count() {
+    local stamp
+    stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "$1" "$2")" || return 1
+    shared_thread_joins "$1" "$2" "${stamp}" | jq -s --arg root "$3" '[.[]|select(.root==$root)]|length'
+}
+joined_once() { [[ "$(join_count "$1" "$2" "$3")" == 1 ]]; }
+
+successful_tool() {
+    local result
+    result="$(stub_session_call "$2" "$3" "$4")"
+    jq -e '.isError==false and (has("error")|not)' <<< "${result}" > /dev/null || fail "$1: tool did not succeed"
+    printf '%s\n' "${result}" > "${CAPTURED}/$1.result"
+}
+
+own_posts_phase() {
+    local mode="$1" q="$2" dir key bot root text mark result post_ts stamp before file method envelope outside
+    thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"; bot="${THREAD_BOT}"
+    set_composed_choice "${mode}" "${q}" "${DEST}" thread_hybrid "${mode}-own-hybrid"
+    # No inbound mention supplied either own-post join. The root's original
+    # plain message is excluded, then the confirmed tool post joins it.
+    matrix_message "${mode}-reply-root-unjoined" "${q}" "${DEST}" plain - not-mentioned
+    root="${MATRIX_TS}"; text="$(scenario_text "${mode}-own-reply")"
+    successful_tool "${mode}-own-reply" "${dir}" reply "$(jq -cn --arg c "${DEST}" --arg r "${root}" --arg t "${text}" '{chat_id:$c,thread_ts:$r,text:$t}')"
+    wait_until "${EVENT_WAIT_S}" 'confirmed reply did not join once' joined_once "${key}" "${DEST}" "${root}"
+    matrix_message "${mode}-reply-follow" "${q}" "${DEST}" plain "${root}" thread
+    successful_tool "${mode}-own-reply-again" "${dir}" reply "$(jq -cn --arg c "${DEST}" --arg r "${root}" --arg t "${text}" '{chat_id:$c,thread_ts:$r,text:$t}')"
+    [[ "$(join_count "${key}" "${DEST}" "${root}")" == 1 ]] || fail 'repeat own reply duplicated its join'
+    matrix_message "${mode}-upload-root-unjoined" "${q}" "${DEST}" plain - not-mentioned
+    root="${MATRIX_TS}"; file="${SCENARIO_ROOT}/${mode}-upload.txt"
+    scenario_text "${mode}-uploaded-body" > "${file}"
+    mark="$(slack_post_mark)"
+    successful_tool "${mode}-upload" "${dir}" reply "$(jq -cn --arg c "${DEST}" --arg r "${root}" --arg f "${file}" '{chat_id:$c,thread_ts:$r,text:"",files:[$f]}')"
+    [[ "$(slack_stub_records api "label=${q}" method=files.completeUploadExternal answer=ok | jq -s --argjson mark "${mark}" '[.[]|select(.seq>$mark)]|length')" == 1 ]] || fail 'upload has no successful completion'
+    wait_until "${EVENT_WAIT_S}" 'confirmed upload did not join' joined_once "${key}" "${DEST}" "${root}"
+    matrix_message "${mode}-upload-follow" "${q}" "${DEST}" plain "${root}" thread
+    # None of these events represents a CSCB post operation. An edit that
+    # adds a mention must neither select nor create participation.
+    outside="$(scenario_ts)"; stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${key}" "${DEST}")"
+    before="$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')"
+    ack_control "$(slack_push_reaction "${q}" "${DEST}" "${outside}" thumbsup "$(scenario_ts)")"
+    ack_control "$(slack_push_edit "${q}" "${DEST}" "${outside}" "$(mention_text "${bot}")" "$(scenario_ts)")"
+    ack_control "$(slack_push_delete "${q}" "${DEST}" "${outside}" "$(scenario_ts)")"
+    push_event "${q}" "$(slack_message_event "${DEST}" "$(scenario_text outside-CSCB)" "${outside}" "${bot}")"
+    matrix_message "${mode}-outside-post-follow" "${q}" "${DEST}" plain "${outside}" not-mentioned
+    successful_tool "${mode}-edit-only" "${dir}" edit_message "$(jq -cn --arg c "${DEST}" --arg id "${outside}" --arg t "$(mention_text "${bot}")" '{chat_id:$c,message_id:$id,text:$t}')"
+    successful_tool "${mode}-react-only" "${dir}" react "$(jq -cn --arg c "${DEST}" --arg id "${outside}" '{chat_id:$c,message_id:$id,emoji:"thumbsup"}')"
+    [[ "$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')" == "${before}" ]] || fail 'reaction/edit/delete/outside post joined a thread'
+    # DM tools may post, but do not create channel participation. Group DM
+    # ingress remains excluded, even with a direct mention.
+    edit_input --arg who "$(if [[ "${q}" == alpha ]]; then echo "${ALPHA}"; else echo "${BRAVO}"; fi)" --arg contact "${CONTACT}" \
+        '(.personas[]|select(.name==$who)|.dm)={enabled:true,contact:$contact}'
+    review_assign "${mode}-enable-dm"
+    successful_tool "${mode}-own-dm" "${dir}" reply "$(jq -cn --arg c "${DM}" --arg t "$(scenario_text own-dm)" '{chat_id:$c,text:$t}')"
+    mark="$(log_mark)"
+    push_message "${q}" "${GDM}" mpim "$(mention_text "${bot}")"
+    wait_since "${mark}" "$(plain_drop "${THREAD_REF}" "${GDM}" group-dm)" "${EVENT_WAIT_S}" 'group DM did not drop'
+    expect_queued 'group DM' 0 "${dir}" "${GDM}" "${PUSH_TS}"
+    [[ -z "$(shared_thread_joins "${key}" | jq -c --arg dm "${DM}" --arg group "${GDM}" 'select(.channel==$dm or .channel==$group)')" ]] || fail 'DM acquired Thread Memory'
+}
+
+permission_outcome_allowed() {
+    local outcome
+    outcome="$(shared_stub_permission outcome "$1" "$2" "$3")" || return 1
+    jq -e '.decision=="allow" and .delivery=="delivered"' <<< "${outcome}" > /dev/null
+}
+permission_post() {
+    local mode="$1" q="$2" number="$3" value="$4" dir key name mark request token button
+    thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"
+    if [[ "${q}" == alpha ]]; then name="${ALPHA}"; else name="${BRAVO}"; fi
+    set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${mode}-prompt-${number}-${value}"
+    edit_input --arg who "${name}" --arg dest "${DEST}" '(.personas[]|select(.name==$who)|.permission_prompts)=$dest'
+    review_assign "${mode}-prompt-destination-${number}"
+    wait_queue_drained "${dir}"
+    mark="$(slack_post_mark)"
+    request="$(shared_stub_permission "permission-${number}" "${dir}" "${key}")"
+    token="$(jq -er '.request_token' <<< "${request}")"
+    # Bash is the registered fixture request's tool, not a copied prompt text.
+    PROMPT_POST="$(slack_wait_successful_post "${q}" "${DEST}" "${mark}" Bash)"
+    PROMPT_TS="$(jq -er '.ts' <<< "${PROMPT_POST}")"
+    if [[ "${value}" == thread_hybrid ]]; then
+        wait_until "${EVENT_WAIT_S}" 'confirmed permission prompt did not join' joined_once "${key}" "${DEST}" "${PROMPT_TS}"
+    else
+        [[ -z "$(shared_thread_joins "${key}" | jq -c --arg c "${DEST}" --arg r "${PROMPT_TS}" 'select(.channel==$c and .root==$r)')" ]] || fail 'off prompt joined'
+    fi
+    # src/permission-click-handler.ts accepts this nonpersistent Allow prefix.
+    button="$(slack_recorded_button "${q}" "${DEST}" "${PROMPT_TS}" perm_allow_)"
+    [[ -n "${button}" ]] || fail 'actual permission has no Allow button'
+    ack_control "$(slack_push_button "${q}" "${DEST}" "${PROMPT_TS}" perm_allow_ "${HUMAN}")"
+    wait_until "${EVENT_WAIT_S}" 'valid prompt response not delivered to registered hook' permission_outcome_allowed "${dir}" "${key}" "${token}"
+}
+
+observe_other_post() {
+    local p="$1" q="$2" post="$3" seq ts event
+    seq="$(jq -er '.seq' <<< "${post}")"; ts="$(jq -er '.ts' <<< "${post}")"
+    event="$(printed sharedObservedPostEvent "${STUB_RECORD}" "${q}" "${DEST}" "${seq}" \
+        "$(slack_stub_identity "${q}" user_id)" "$(slack_stub_identity "${q}" bot_id)")"
+    PUSHED_EVENTS["${DEST}|${ts}"]="${event}"
+    ack_control "$(slack_push_observed_post "${p}" "${q}" "${DEST}" "${seq}")"
+}
+destination_post_matrix() {
+    local mode="$1" p="$2" q="$3" post="$4" kind="$5" value name qname ts dir key ref mark before stamp joins
+    ts="$(jq -er '.ts' <<< "${post}")"
+    thread_persona "${p}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"; ref="${THREAD_REF}"
+    if [[ "${q}" == alpha ]]; then qname="${ALPHA}"; else qname="${BRAVO}"; fi
+    # The same real post is redelivered after successive choices. Dropped
+    # events store no dedupe key; exactly one acceptance occurs at all.
+    for value in off mentions thread_hybrid all; do
+        set_composed_choice "${mode}" "${p}" "${DEST}" "${value}" "${mode}-${kind}-recipient-${value}"
+        mark="$(log_mark)"; observe_other_post "${p}" "${q}" "${post}"
+        if [[ "${value}" == all ]]; then
+            wait_queued "${mode}-${kind}-other-post" "${dir}" "${DEST}" "${ts}" receive_all "$(slack_stub_identity "${q}" user_id)"
+        else
+            local reason=not-mentioned; [[ "${value}" != off ]] || reason=channel-off
+            wait_since "${mark}" "$(plain_drop "${ref}" "${DEST}" "${reason}")" "${EVENT_WAIT_S}" 'other post has no selection decision'
+            expect_queued "${mode}-${kind}-${value}" 0 "${dir}" "${DEST}" "${ts}"
+        fi
+        if [[ "${value}" == thread_hybrid ]]; then
+            matrix_message "${mode}-${kind}-recipient-join" "${p}" "${DEST}" mention "${ts}" mention
+            matrix_message "${mode}-${kind}-recipient-follow" "${p}" "${DEST}" plain "${ts}" thread
+            before="$(channel_facts "${key}" "${DEST}")"
+            stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${key}" "${DEST}")"
+            joins="$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')"
+            # Q's DM/back edits preserve P's complete choice and joins.
+            edit_input --arg who "${qname}" '(.personas[]|select(.name==$who)|.permission_prompts)="dm"'
+            review_assign "${mode}-${kind}-destination-dm"
+            [[ "$(channel_facts "${key}" "${DEST}")" == "${before}" ]] || fail 'Q destination DM changed P'
+            matrix_message "${mode}-${kind}-follow-in-dm" "${p}" "${DEST}" plain "${ts}" thread
+            edit_input --arg who "${qname}" --arg c "${DEST}" '(.personas[]|select(.name==$who)|.permission_prompts)=$c'
+            review_assign "${mode}-${kind}-destination-back"
+            [[ "$(channel_facts "${key}" "${DEST}")" == "${before}" ]] || fail 'Q destination back changed P'
+            [[ "$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')" == "${joins}" ]] || fail 'destination edits changed P joins'
+        fi
+    done
+}
+
+permission_phase() {
+    local mode="$1" q="$2" p=alpha qname original
+    [[ "${q}" != alpha ]] || p=bravo
+    if [[ "${q}" == alpha ]]; then qname="${ALPHA}"; original="${A1}"; else qname="${BRAVO}"; original=dm; fi
+    own_posts_phase "${mode}" "${q}"
+    permission_post "${mode}" "${q}" 1 off
+    permission_post "${mode}" "${q}" 2 thread_hybrid
+    destination_post_matrix "${mode}" "${p}" "${q}" "${PROMPT_POST}" prompt
+    matrix_message "${mode}-prompt-own-follow" "${q}" "${DEST}" plain "${PROMPT_TS}" thread
+    edit_input --arg who "${qname}" --arg dest "${original}" '(.personas[]|select(.name==$who)|.permission_prompts)=$dest'
+    review_assign "${mode}-restore-destination"
+}
+
+notice_phase() {
+    local mode="$1" q="$2" value="${3:-thread_hybrid}" p=alpha dir key name input evidence mark post ts connected phase
+    phase="${mode}-notice-${value}"
+    [[ "${q}" != alpha ]] || p=bravo
+    thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"
+    if [[ "${q}" == alpha ]]; then name="${ALPHA}"; input="${A2}"; else name="${BRAVO}"; input="${B1}"; fi
+    set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${phase}-own-value"
+    edit_input --arg who "${name}" --arg c "${DEST}" --arg contact "${CONTACT}" \
+        '(.personas[]|select(.name==$who)) |= (.permission_prompts=$c | .dm={enabled:true,contact:$contact})'
+    review_assign "${phase}-destination"
+    wait_queue_drained "${ALPHA_DIR}"; wait_queue_drained "${BRAVO_DIR}"
+    evidence="${SCENARIO_ROOT}/${phase}-worker.jsonl"; mark="$(slack_post_mark)"
+    connected="$(count_log "$(session_connected "${THREAD_REF}")")"
+    shared_stub_notice end "${dir}" "${key}" "${evidence}" > /dev/null
+    shared_stub_notice ended "${dir}" "${key}" "${evidence}" > /dev/null
+    RECEIPT_MODE["${key}"]=ordinary
+    matrix_message "${phase}-trigger" "${q}" "${input}" mention - mention
+    post="$(slack_wait_messages_waiting "${q}" "${DEST}" "${mark}" "${name}" "${key}" 1)"
+    ts="$(jq -er '.ts' <<< "${post}")"
+    shared_stub_notice ended "${dir}" "${key}" "${evidence}" > /dev/null
+    if [[ "${value}" == thread_hybrid ]]; then
+        wait_until "${EVENT_WAIT_S}" 'actual server notice did not join its own root' joined_once "${key}" "${DEST}" "${ts}"
+        destination_post_matrix "${mode}" "${p}" "${q}" "${post}" notice
+    else
+        [[ -z "$(shared_thread_joins "${key}" | jq -c --arg c "${DEST}" --arg r "${ts}" 'select(.channel==$c and .root==$r)')" ]] || fail 'off notice joined'
+    fi
+    snapshot_queue "${dir}"
+    shared_stub_notice resume "${dir}" "${key}" "${evidence}" > /dev/null
+    wait_for_count "$(session_connected "$(persona_ref "${name}")")" $(( connected + 1 )) "${SESSION_WAIT_S}" 'resumed worker did not reopen MCP'
+    wait_queue_drained "${dir}"
+    preserved_four_values "${mode}-worker-relaunch"
+    local want=thread; [[ "${value}" != off ]] || want=channel-off
+    matrix_message "${phase}-own-follow" "${q}" "${DEST}" plain "${ts}" "${want}"
+}
+
+mode_only() {
+    local mode="$1" before_alpha before_bravo alpha_launch bravo_launch alpha_joins bravo_joins
+    before_alpha="$(shared_persona_facts "${ALPHA_KEY}" | jq -cS 'del(.mode,.historicalMembership)')"
+    before_bravo="$(shared_persona_facts "${BRAVO_KEY}" | jq -cS 'del(.mode,.historicalMembership)')"
+    alpha_joins="$(shared_thread_joins "${ALPHA_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')"
+    bravo_joins="$(shared_thread_joins "${BRAVO_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')"
+    alpha_launch="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
+    bravo_launch="$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")"
+    edit_input --arg mode "${mode}" '.channel_mode=$mode'
+    review_assign "cycle-two-${mode}"
+    [[ "$(shared_persona_facts "${ALPHA_KEY}" | jq -cS 'del(.mode,.historicalMembership)')" == "${before_alpha}" ]] || fail 'cycle two changed alpha choices'
+    [[ "$(shared_persona_facts "${BRAVO_KEY}" | jq -cS 'del(.mode,.historicalMembership)')" == "${before_bravo}" ]] || fail 'cycle two changed bravo choices'
+    [[ "$(shared_thread_joins "${ALPHA_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')" == "${alpha_joins}" ]] || fail 'mode-only change altered alpha joins'
+    [[ "$(shared_thread_joins "${BRAVO_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')" == "${bravo_joins}" ]] || fail 'mode-only change altered bravo joins'
+    preserved_four_values "cycle-two-${mode}"
+    matrix_message cycle-two-alpha alpha "${A2}" mention - mention
+    matrix_message cycle-two-bravo bravo "${B1}" mention - mention
+    [[ "$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")" == "${alpha_launch}" ]] || fail 'mode-only confirmation launched alpha'
+    [[ "$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")" == "${bravo_launch}" ]] || fail 'mode-only confirmation launched bravo'
+}
+
+# The old leave has already survived the ordinary restart and both modes.
+# A new future preference is explicit; replaying that leave cannot remove it.
+future_after_leave() {
+    local channel="${LEAVE_CHANNELS[strict|all]}" before envelope
+    input_choice "${ALPHA}" "${channel}" all
+    configuration_request removed-future request "${ALPHA}/${channel}/all" > /dev/null
+    pending_has_line "$(printed REVIEW_FUTURE_CLAUSE)" || fail 'future review omits inactive future-choice clause'
+    confirm_review removed-future
+    choice_is "${ALPHA_KEY}" "${channel}" all || fail 'fresh future value missing'
+    before="$(channel_facts "${ALPHA_KEY}" "${channel}")"
+    envelope="$(slack_stub_redeliver alpha "${LEAVE_ENVELOPES[strict|all]}")"
+    ack_control "${envelope}"
+    slack_stub_control_fired redelivery "envelope_id=${envelope}" > /dev/null
+    matrix_message future-replay-barrier alpha "${A2}" mention - mention
+    [[ "$(channel_facts "${ALPHA_KEY}" "${channel}")" == "${before}" ]] || fail 'old leave removed fresh future preference'
+    FUTURE_AFTER_LEAVE_FACTS="${before}"
+    NEVER_JOINED_FACTS="$(channel_facts "${ALPHA_KEY}" "${FUTURE}")"
+}
+
+ineligible_and_unverified() {
+    local root outside before stamp event mark fault request_id sockets
+    # Known, authenticated channel: all writes are refused in open while
+    # external sharing makes it ineligible. Its previous joins remain saved.
+    ack_control "$(slack_push_member_joined alpha "${EXTERNAL}" "$(scenario_ts)")"
+    wait_until "${EVENT_WAIT_S}" 'external control lacks initial default' choice_is "${ALPHA_KEY}" "${EXTERNAL}" mentions
+    expect_attempt external-hybrid "${ALPHA_DIR}" "$(attempt_args external-hybrid "${EXTERNAL}" thread_hybrid)" "${ALPHA_KEY}" thread_hybrid
+    matrix_message external-original-join alpha "${EXTERNAL}" mention - mention
+    root="${MATRIX_TS}"; stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${EXTERNAL}")"
+    before="$(channel_facts "${ALPHA_KEY}" "${EXTERNAL}")"
+    event="$(slack_membership_event member_joined_channel alpha "${EXTERNAL}" "$(scenario_ts)")"
+    ack_control "$(slack_stub_push alpha "${event}" true)"
+    expect_attempt external-refusal "${ALPHA_DIR}" "$(attempt_args external-refusal "${EXTERNAL}" all)" "${ALPHA_KEY}" external-sharing new true
+    mark="$(log_mark)"; new_ts
+    push_event alpha "$(slack_reply_event "${EXTERNAL}" "${root}" "$(plain_text)" "${PUSH_TS}" "${HUMAN}")" true
+    wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${EXTERNAL}" channel-ineligible)" "${EVENT_WAIT_S}" 'external joined reply was not excluded'
+    expect_queued external-joined-reply 0 "${ALPHA_DIR}" "${EXTERNAL}" "${PUSH_TS}"
+    outside="$(scenario_ts)"
+    successful_tool external-own-post "${ALPHA_DIR}" reply "$(jq -cn --arg c "${EXTERNAL}" --arg r "${outside}" --arg t "$(scenario_text ineligible-post)" '{chat_id:$c,thread_ts:$r,text:$t}')"
+    [[ "$(join_count "${ALPHA_KEY}" "${EXTERNAL}" "${outside}")" == 0 ]] || fail 'ineligible own post joined'
+    [[ "$(channel_facts "${ALPHA_KEY}" "${EXTERNAL}")" == "${before}" ]] || fail 'ineligibility changed the saved choice/stamp'
+    ack_control "$(slack_push_member_joined alpha "${EXTERNAL}" "$(scenario_ts)")"
+    matrix_message external-restored-follow alpha "${EXTERNAL}" plain "${root}" thread
+    matrix_message external-post-stays-unjoined alpha "${EXTERNAL}" plain "${outside}" not-mentioned
+    [[ "$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${EXTERNAL}")" == "${stamp}" ]] || fail 'eligibility recovery reset participation'
+    ALPHA_MEMBERS+=("${EXTERNAL}")
+    slack_stub_inventory_page alpha '' '' "${ALPHA_MEMBERS[@]}"
+    # No known membership or saved entry: the actual MCP refusal is distinct
+    # from the following saved-but-unverified channel.
+    expect_attempt unknown-refusal "${ALPHA_DIR}" "$(attempt_args unknown-refusal "${U0}" all)" "${ALPHA_KEY}" channel-removed new true
+    choice_is "${ALPHA_KEY}" "${U0}" '' || fail 'unknown target acquired a choice'
+    before="$(channel_facts "${ALPHA_KEY}" "${M_MENTIONS}")"
+    sockets="$(slack_stub_record_count ws-open label=alpha)"
+    # This is a successful inventory answer with a bounded transport delay,
+    # below the production scan deadline, not a lost answer or failed scan.
+    slack_stub_inventory_fault alpha '' delay delay_ms=20000
+    slack_stub_close_socket alpha 0
+    wait_until "${RECORD_WAIT_S}" 'socket close control did not fire' slack_stub_control_fired socket-close label=alpha > /dev/null
+    wait_until "${RECORD_WAIT_S}" 'new socket did not open' rec_at_least $(( sockets + 1 )) event=ws-open label=alpha
+    wait_until "${RECORD_WAIT_S}" 'inventory delay did not fire' slack_stub_control_fired fault label=alpha method=users.conversations outcome=delay > /dev/null
+    fault="$(slack_stub_control_fired fault label=alpha method=users.conversations outcome=delay)"
+    request_id="$(jq -er '.request_id' <<< "${fault}")"
+    [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'inventory resolved before unverified case'
+    expect_attempt unverified-refusal "${ALPHA_DIR}" "$(attempt_args unverified-refusal "${M_MENTIONS}" all)" "${ALPHA_KEY}" current-membership-missing new true
+    [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'unverified result was observed after inventory resolved'
+    [[ "$(channel_facts "${ALPHA_KEY}" "${M_MENTIONS}")" == "${before}" ]] || fail 'unverified bot write changed saved facts'
+    wait_until 30 'successful delayed inventory did not settle' slack_stub_control_fired fault-settled "request_id=${request_id}" resolution=delay > /dev/null
+    wait_membership_complete "${ALPHA}"
+    matrix_message reverified-mention alpha "${M_MENTIONS}" mention - mention
+    [[ "$(channel_facts "${ALPHA_KEY}" "${FUTURE}")" == "${NEVER_JOINED_FACTS}" ]] || fail 'repeat empty reconciliation removed never-joined preference'
+    [[ "$(channel_facts "${ALPHA_KEY}" "${LEAVE_CHANNELS[strict|all]}")" == "${FUTURE_AFTER_LEAVE_FACTS}" ]] || fail 'repeat absence removed fresh future preference'
+}
+
+rejoin_after_absence() {
+    local mode value channel want root
+    for mode in strict open; do
+        for value in off mentions all thread_hybrid; do
+            channel="${LEAVE_CHANNELS[${mode}|${value}]}"; want=mentions
+            [[ "${mode}|${value}" != 'strict|all' ]] || want=all
+            ack_control "$(slack_push_member_joined alpha "${channel}" "$(scenario_ts)")"
+            wait_until "${EVENT_WAIT_S}" 'rejoin inherited an old preference' choice_is "${ALPHA_KEY}" "${channel}" "${want}"
+            [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'rejoin inherited old Thread Hybrid Since'
+            matrix_message "rejoin-${mode}-${value}" alpha "${channel}" mention - mention
+            if [[ "${want}" == all ]]; then
+                matrix_message fresh-future-all alpha "${channel}" plain - receive_all
+            fi
+            if [[ "${value}" == thread_hybrid ]]; then
+                root="${LEAVE_ROOTS[${mode}]}"
+                matrix_message "rejoin-${mode}-old-default" alpha "${channel}" plain "${root}" not-mentioned
+                expect_attempt "rejoin-${mode}-hybrid" "${ALPHA_DIR}" "$(attempt_args "rejoin-${mode}-hybrid" "${channel}" thread_hybrid)" "${ALPHA_KEY}" thread_hybrid
+                matrix_message "rejoin-${mode}-old-hybrid" alpha "${channel}" plain "${root}" not-mentioned
+                matrix_message "rejoin-${mode}-fresh-join" alpha "${channel}" mention "${root}" mention
+                matrix_message "rejoin-${mode}-fresh-follow" alpha "${channel}" plain "${root}" thread
+            fi
+            ALPHA_MEMBERS+=("${channel}")
+        done
+    done
+    slack_stub_inventory_page alpha '' '' "${ALPHA_MEMBERS[@]}"
+}
+
+identity_replacement() {
+    local incarnation sibling stamp root copied_order connected replacement expected
+    wait_queue_drained "${ALPHA_DIR}"; wait_queue_drained "${BRAVO_DIR}"
+    incarnation="$(shared_persona_facts "${ALPHA_KEY}" | jq -er .incarnation)"
+    sibling="$(shared_persona_facts "${BRAVO_KEY}" | jq -cS 'del(.historicalMembership)')"
+    root="${MATRIX_ROOTS[open|thread_hybrid]}"
+    # Both source values were reviewed before replacement: only the explicit
+    # retention listed in this review survives into the new incarnation.
+    input_choice "${ALPHA}" "${WRITE_CHANNEL}" thread_hybrid
+    review_assign identity-before "${ALPHA}/${WRITE_CHANNEL}/thread_hybrid"
+    matrix_message identity-retained-root alpha "${WRITE_CHANNEL}" mention - mention
+    IDENTITY_RETAINED_ROOT="${MATRIX_TS}"
+    stamp="$(shared_thread_since "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+    copied_order="$(assignment_order "${ALPHA_KEY}" "${M_HYBRID}")"
+    wait_queue_drained "${ALPHA_DIR}"
+    replacement="${CREDS_DIR}/alpha-replacement.json"
+    cp -- "${ALPHA_CREDS}" "${replacement}"; chmod 600 "${replacement}"
+    edit_input --arg who "${ALPHA}" --arg path "${replacement}" '(.personas[]|select(.name==$who)|.credentials_file)=$path'
+    configuration_request identity-replacement request "${ALPHA}/${WRITE_CHANNEL}/thread_hybrid" > /dev/null
+    pending_has_line "$(printed REVIEW_RESET_CLAUSE)" || fail 'identity review omitted reset loss'
+    pending_has_line "$(printed REVIEW_RETENTION_CLAUSE)" || fail 'identity review omitted explicit retention'
+    pending_has_line "${replacement}" || fail 'identity review hid the configured credentials path'
+    expect_preview_choice "${ALPHA_KEY}" "${M_HYBRID}" reset thread_hybrid - unresolved thread_hybrid unlisted "${copied_order}" replacement=true
+    expected="$(printed reviewedChannelLine "${ALPHA_KEY}" "${WRITE_CHANNEL}" declared - thread_hybrid unresolved unlisted 'unverified (current-membership-missing)' replacement=true inherited=thread_hybrid)"
+    pending_has_line "${expected}" || fail 'identity review did not distinguish explicit same-value retention'
+    connected="$(count_log "$(session_connected "${ALPHA_REF}")")"
+    # This confirmation tears down and launches a real worker, unlike an
+    # in-place value/destination review; use the existing startup bound.
+    confirm_review identity-replacement "${START_WAIT_S}"
+    wait_for_count "$(session_connected "${ALPHA_REF}")" $(( connected + 1 )) "${SESSION_WAIT_S}" 'replacement worker did not connect'
+    wait_membership_complete "${ALPHA}"
+    [[ "$(shared_persona_facts "${ALPHA_KEY}" | jq -er .incarnation)" != "${incarnation}" ]] || fail 'identity did not change incarnation'
+    [[ "$(shared_persona_facts "${BRAVO_KEY}" | jq -cS 'del(.historicalMembership)')" == "${sibling}" ]] || fail 'identity replacement changed sibling'
+    choice_is "${ALPHA_KEY}" "${M_HYBRID}" mentions || fail 'copied hybrid preference survived identity reset'
+    [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${M_HYBRID}")" ]] || fail 'copied hybrid stamp survived identity reset'
+    choice_is "${ALPHA_KEY}" "${WRITE_CHANNEL}" thread_hybrid || fail 'explicit retained choice lost'
+    [[ "$(shared_thread_since "${ALPHA_KEY}" "${WRITE_CHANNEL}")" != "${stamp}" ]] || fail 'identity reset retained old hybrid stamp'
+    matrix_message identity-copied-old-reply alpha "${M_HYBRID}" plain "${root}" not-mentioned
+    matrix_message identity-retained-old-reply alpha "${WRITE_CHANNEL}" plain "${IDENTITY_RETAINED_ROOT}" not-mentioned
+    matrix_message identity-new-join alpha "${WRITE_CHANNEL}" mention "${IDENTITY_RETAINED_ROOT}" mention
+    matrix_message identity-new-follow alpha "${WRITE_CHANNEL}" plain "${IDENTITY_RETAINED_ROOT}" thread
+}
+
 # Read only metadata from the actual journal. Waiting for every queued join
 # to be saved makes startup's removal of delivered content deterministic.
 # No fixture writes a Thread Memory journal or invents a Channel Stamp.
 thread_joins_saved() {
-    local key="${QUEUE_KEY[$1]}"
-    jq -ne --slurpfile queue "${DELIVERIES_FILE[$1]}" --slurpfile memory "${SLACK_STATE_DIR}/threads/${key}.jsonl" '
-      [$queue[] | select(.kind == "accepted" and .thread_join != null)] as $joined |
-      ($joined | length) > 0 and all($joined[]; . as $item |
-        any($memory[]; .kind == "join" and .channel == $item.channel and
-          .root == $item.thread_join.thread_ts and .stamp == $item.thread_join.stamp and
-          .at <= $item.thread_join.at))' > /dev/null 2>&1
+    local key="${QUEUE_KEY[$1]}" fact channel root stamp current items
+    items="$(shared_queue_items "${key}" | jq -c 'select(.thread_join)')" || return 1
+    while IFS= read -r fact; do
+        [[ -n "${fact}" ]] || continue
+        channel="$(jq -r '.channel' <<< "${fact}")"
+        root="$(jq -r '.thread_join.thread_ts' <<< "${fact}")"
+        stamp="$(jq -cS '.thread_join.stamp' <<< "${fact}")"
+        [[ "$(shared_channel_saved "${key}" "${channel}")" == thread_hybrid ]] || continue
+        current="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${key}" "${channel}" | jq -cS .)"
+        [[ "${stamp}" == "${current}" ]] || continue
+        [[ "$(shared_thread_joins "${key}" "${channel}" "${current}" | jq -s --arg root "${root}" '[.[]|select(.root==$root)]|length')" == 1 ]] || return 1
+    done <<< "${items}"
+}
+accepted_join_saved() {
+    local item stamp root
+    item="$(shared_queue_items "$1" | jq -c --arg c "$2" --arg ts "$3" 'select(.channel==$c and .ts==$ts)')" || return 1
+    [[ -n "${item}" ]] || return 1
+    [[ "$(jq -r 'has("thread_join")' <<< "${item}")" == true ]] || return 0
+    stamp="$(jq -c '.thread_join.stamp' <<< "${item}")"
+    root="$(jq -r '.thread_join.thread_ts' <<< "${item}")"
+    [[ "$(shared_thread_joins "$1" "$2" "${stamp}" | jq -s --arg root "${root}" '[.[]|select(.root==$root)]|length')" == 1 ]]
 }
 
 # A persona's registration and launch lines, as one comparable word: Session
@@ -913,17 +1484,9 @@ BRAVO_SUFFIX="${SCENARIO_TAG}bravo"
 write_credentials "${ALPHA_CREDS}" "${ALPHA_SUFFIX}"
 write_credentials "${BRAVO_CREDS}" "${BRAVO_SUFFIX}"
 
-# One label per persona, with the bot identity auth.test answers (so a
-# mention names it); any other token is refused.
-jq -n --arg asuf "${ALPHA_SUFFIX}" --arg al "${ALPHA_LABEL}" --arg au "${ALPHA_BOT_USER}" --arg ab "${ALPHA_BOT_ID}" \
-    --arg bsuf "${BRAVO_SUFFIX}" --arg bl "${BRAVO_LABEL}" --arg bu "${BRAVO_BOT_USER}" --arg bb "${BRAVO_BOT_ID}" \
-    --arg a1 "${A1}" --arg a2 "${A2}" --arg b1 "${B1}" --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" \
-    --arg t1 "${T1}" --arg n1 "${N1}" --arg n2 "${N2}" --arg n3 "${N3}" \
-    '{tokens: [
-        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: [$a1,$a2,$f1,$f2,$u1,$t1,$n1,$n2,$n3]},
-        {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb, memberships: [$b1,$a1,$f1,$f2,$u1,$t1,$n1,$n2,$n3]}],
-      default: {auth: "invalid_auth", connections: "invalid_auth"}}' | write_file "${STUB_CONTROL}" \
-    || fail "could not write the stub's control file ${STUB_CONTROL}"
+# Shared builders own identities and installation envelopes.
+slack_stub_control_seed "${STUB_CONTROL}" "${ALPHA_LABEL}" "${ALPHA_SUFFIX}" "${BRAVO_LABEL}" "${BRAVO_SUFFIX}"
+SCENARIO_SLACK_RECORD="${STUB_RECORD}"
 
 # The MCP config each persona's stub reads (config.json's mcp_config_path),
 # naming this scenario's port, as the package's install writes slack-mcp.json.
@@ -947,6 +1510,9 @@ SCENARIO_SLACK_STUB_URL="${STUB_API_URL%/api/}"
 export CSCB_SLACK_API_URL="${STUB_API_URL}"
 wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" \
     rec_at_least 1 event=control source=file
+slack_stub_controls "${STUB_CONTROL}"
+slack_stub_inventory_page "${ALPHA_LABEL}" '' '' "${A1}" "${A2}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}"
+slack_stub_inventory_page "${BRAVO_LABEL}" '' '' "${B1}" "${A1}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}"
 
 # --- Configurations --------------------------------------------------------
 # write_persona_config <declarative|fungible|switch-off>:
@@ -1005,21 +1571,52 @@ write_persona_config() {
   "bind": "127.0.0.1",
   "port": ${SCENARIO_PORT},
   "health_check_interval": 0,
+  "session_restart_delay": 0,
   "exit_timeout": 5,
   "mcp_config_path": "${MCP_CONFIG}"
 }
 EOF
+    if [[ "${MATRIX_READY:-false}" == true ]]; then
+        input_choice "${ALPHA}" "${M_OFF}" off
+        input_choice "${ALPHA}" "${M_MENTIONS}" mentions
+        input_choice "${ALPHA}" "${M_ALL}" all
+        input_choice "${ALPHA}" "${M_HYBRID}" thread_hybrid
+        input_choice "${ALPHA}" "${WRITE_CHANNEL}" off
+        input_choice "${ALPHA}" "${FUTURE}" all
+    fi
 }
 
 # --- Start --------------------------------------------
 ALPHA_THREADS=false
 write_persona_config declarative
+shared_stub_permission_setup "${ALPHA_DIR}" > /dev/null
+shared_stub_permission_setup "${BRAVO_DIR}" > /dev/null
+RECEIPT_MODE["${ALPHA_KEY}"]=manual
+RECEIPT_MODE["${BRAVO_KEY}"]=manual
 CONFIG_A_COPY="${SCENARIO_ROOT}/config-phase-a.json"
 cp -- "${CONFIG}" "${CONFIG_A_COPY}"
 
+# Reachable packed-server variant: no authenticated connection during the
+# directory hold. A failed push is evidence of refusal, never accepted ingress.
+ALPHA_COLD_SAVED="${SCENARIO_ROOT}/cold-start-alpha"
+mv -- "${ALPHA_DIR}" "${ALPHA_COLD_SAVED}"
 start_server --live
-wait_membership_complete "${ALPHA}"
+wait_for_log "$(matcher "${DIRECTORY_MISSING_CAUSE}" "${ALPHA_REF}" "${ALPHA_DIR}")" "${START_WAIT_S}" "cold start: no directory failure"
 wait_membership_complete "${BRAVO}"
+wait_for_log "${STARTUP_COMPLETE}" "${START_WAIT_S}" 'cold start: initial start pass did not finish'
+expect_completion 2 'cold start' '1 not brought up'
+[[ "$(rec_count event=ws-open label="${ALPHA_LABEL}")" == 0 ]] || fail 'cold start: held persona opened Slack'
+[[ -z "$(shared_queue_items "${ALPHA_KEY}")" ]] || fail 'cold start: held persona accepted work'
+[[ ! -d "${ALPHA_TRANSCRIPTS}" ]] || fail 'cold start: held persona launched a worker'
+reason="$(slack_stub_push --expect-refused "${ALPHA_LABEL}" "$(slack_message_event "${A1}" "$(scenario_text cold-start-refused)" "$(scenario_ts)" "${HUMAN}")")"
+[[ "${reason}" == "${NO_OPEN_SOCKET}" ]] || fail 'cold start: expected no connection'
+wait_until "${RECORD_WAIT_S}" 'cold start: no recorded refused push' \
+    rec_at_least 1 event=push-refused label="${ALPHA_LABEL}" reason="${NO_OPEN_SOCKET}"
+mkdir -- "${ALPHA_DIR}"
+mv -- "${ALPHA_COLD_SAVED}/.git" "${ALPHA_DIR}/.git"
+rmdir -- "${ALPHA_COLD_SAVED}"
+wait_for_log "$(matcher "persona ${ALPHA_REF}: up after its bring-up retry (directory)")" "${START_WAIT_S}" "cold start: automatic retry did not recover"
+wait_membership_complete "${ALPHA}"
 
 # The texts, printed while the start pass brings the personas up.
 UNCLAIMED_CHANNEL="$(printed UNCLAIMED_CHANNEL)"
@@ -1096,7 +1693,7 @@ STRICT_FRESH_ARGS="$(attempt_args "${TEST_NAME}-strict-fresh" "${F1}" all)"
 X1_ARGS="$(attempt_args "${TEST_NAME}-unverified-x1" "${X1}" all)"
 
 wait_for_log "${STARTUP_COMPLETE}" "${START_WAIT_S}" "start: the start pass never completed"
-expect_completion 2 "start" "0 not brought up"
+expect_completion 2 "start" "1 not brought up"
 expect_count "${ALPHA_START}" 1 "start: persona-start lines for ${ALPHA}"
 expect_count "${BRAVO_START}" 1 "start: persona-start lines for ${BRAVO}"
 for who in "${ALPHA_LABEL}" "${BRAVO_LABEL}"; do
@@ -1116,7 +1713,7 @@ done
 
 # Positive control: a push to a label no persona's token carries is
 # refused, and the stub records the refusal.
-unknown_event="$(message_event "${A1}" channel "$(plain_text)" "${TS_BASE}.000000")"
+unknown_event="$(message_event "${A1}" channel "$(plain_text)" "$(scenario_ts)")"
 reason="$(slack_stub_push --expect-refused "${UNKNOWN_LABEL}" "${unknown_event}")"
 [[ "${reason}" == "${NO_OPEN_SOCKET}" ]] \
     || fail "start: the push to unknown label ${UNKNOWN_LABEL} was refused as '${reason}', not ${NO_OPEN_SOCKET}"
@@ -1139,18 +1736,36 @@ check_upgrade_log() {
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json is not its copy, byte for byte"
 [[ -f "${LAST}" ]] || fail "phase A: config.json.last-applied was not written"
 configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null || fail "phase A: reviewed input differs from config.json"
-# Compare the entire applied configuration, allowing exactly the entries
-# discovered as off in strict mode. U0 must remain genuinely unlisted.
+# Compare the complete set of saved assignments, including the configured
+# values and strict discovery defaults. U0 must remain genuinely unlisted.
 check_phase_a_inventory() {
-    jq -ne --slurpfile input "${CONFIG}" --slurpfile record "${LAST}" \
-        --arg alpha "${ALPHA}" --arg bravo "${BRAVO}" --arg a1 "${A1}" \
-        --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" '
-        ($input[0] | .personas |= map(.channels = ((.channels +
-          (if .name == $alpha then [$f1,$f2,$u1]
-           elif .name == $bravo then [$a1,$f1,$f2,$u1]
-           else error("unexpected persona") end | map({id: ., delivery: "off"}))) | sort_by(.id)))) as $expected |
-        ($record[0].applied | .personas |= map(.channels |= sort_by(.id))) == $expected' > /dev/null
+    local key channel expected actual
+    for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
+        if [[ "${key}" == "${ALPHA_KEY}" ]]; then
+            expected="$(printf '%s\n' "${A1}" "${A2}" "${F1}" "${F2}" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}" | sort)"
+        else
+            expected="$(printf '%s\n' "${B1}" "${A1}" "${F1}" "${F2}" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}" | sort)"
+        fi
+        actual="$(shared_persona_facts "${key}" | jq -r '.assignments | keys[]' | sort)"
+        [[ "${actual}" == "${expected}" ]] || return 1
+        for channel in "${F1}" "${F2}" "${U1}"; do
+            [[ "$(shared_channel_saved "${key}" "${channel}")" == off ]] || return 1
+        done
+        [[ "$(shared_channel_saved "${key}" "${T1}")" == off ]] || return 1
+        [[ "$(shared_channel_saved "${key}" "${N1}")" == off ]] || return 1
+        [[ "$(shared_channel_saved "${key}" "${N2}")" == mentions ]] || return 1
+        [[ "$(shared_channel_saved "${key}" "${N3}")" == all ]] || return 1
+        if [[ "${key}" == "${ALPHA_KEY}" ]]; then
+            [[ "$(shared_channel_saved "${key}" "${A1}")" == all ]] || return 1
+            [[ "$(shared_channel_saved "${key}" "${A2}")" == mentions ]] || return 1
+        else
+            [[ "$(shared_channel_saved "${key}" "${A1}")" == off ]] || return 1
+            [[ "$(shared_channel_saved "${key}" "${B1}")" == mentions ]] || return 1
+        fi
+        [[ -z "$(shared_channel_saved "${key}" "${U0}")" ]] || return 1
+    done
 }
+
 check_phase_a_inventory || fail "phase A: applied configuration differs from the exact discovered strict choices"
 [[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: a legacy store was created"
 check_upgrade_log "phase A after the start"
@@ -1222,7 +1837,9 @@ check_upgrade_log "phase A after its last control"
 # Discard assertion-printer stdout: an empty Bun.write to the runner's regular
 # append-open log truncates earlier diagnostics. Keep stderr and failure status.
 confirm_switch() {
-    local shape="$1" line="$2" step="$3" applied_before
+    local shape="$1" line="$2" step="$3" applied_before alpha_joins bravo_joins
+    alpha_joins="$(shared_thread_joins "${ALPHA_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')"
+    bravo_joins="$(shared_thread_joins "${BRAVO_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')"
     ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
     BRAVO_LAUNCHES="$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")"
     applied_before="$(count_log "${APPLIED_CLASS}")"
@@ -1242,6 +1859,8 @@ confirm_switch() {
     mv -f -- "${PENDING}" "${APPLY}"
     wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "${step}: the confirmation was never applied"
     configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null || fail "${step}: authority does not preserve the reviewed config.json bytes"
+    [[ "$(shared_thread_joins "${ALPHA_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')" == "${alpha_joins}" ]] || fail "${step}: mode change altered alpha joins"
+    [[ "$(shared_thread_joins "${BRAVO_KEY}" | jq -scS 'sort_by(.channel,.root,.at)')" == "${bravo_joins}" ]] || fail "${step}: mode change altered bravo joins"
 }
 
 # expect_sessions_kept <step> <alpha-channel> <alpha-ts> <bravo-channel> <bravo-ts>:
@@ -1260,11 +1879,11 @@ expect_sessions_kept() {
 }
 
 # --- Thread phases: strict ---------------------------------------
-other_value_threads "strict: other values" "${ALPHA_LABEL}" "${VIA_RECEIVE_ALL_SHARED}"
+other_value_threads "strict: other values" "${ALPHA_LABEL}" "${VIA_RECEIVE_ALL_SHARED}" true
 [[ ! -e "${SLACK_STATE_DIR}/threads/${BRAVO_KEY}.jsonl" ]] || fail "strict: bravo acquired Thread Memory without a hybrid entry"
 
-# Explicitly review alpha's four new hybrid choices. Bravo keeps its
-# ordinary entries until the open-mode no-file control below.
+# Explicitly review alpha's four new hybrid choices. The persona-wide
+# no-file/no-marker proof above runs before either persona has a hybrid entry.
 ALPHA_THREADS=true
 threads_applied_before="$(count_log "${APPLIED_CLASS}")"
 write_persona_config declarative
@@ -1278,9 +1897,16 @@ configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null || fail 
 THREAD_STAMPS[alpha]="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${T1}")"
 check_new_hybrid_choices "strict: changed value" "${ALPHA_LABEL}"
 join_thread_phase strict
+start_matrix
+live_membership_phase strict
+ack_control "$(slack_push_member_joined alpha "${DEST}" "$(scenario_ts)")"
+ack_control "$(slack_push_member_joined bravo "${DEST}" "$(scenario_ts)")"
+permission_phase strict alpha
+freeze_four_values
 
 # --- Switch on ---------------------------------------------------
 confirm_switch fungible "${SWITCH_ON_LINE}" "switch on"
+preserved_four_values strict-to-open
 check_thread_persistence "strict to open" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"
 
 # --- Phase B: fungible mode --------------------------------------
@@ -1308,7 +1934,7 @@ B3_MARK="$(log_mark)"
 push_mention "${ALPHA_LABEL}" "${F1}" channel "$(mention_text "${ALPHA_BOT_USER}")" message-first
 B3_TS="${PUSH_TS}"
 wait_queued "step 3: alpha F1 mention (message first)" "${ALPHA_DIR}" "${F1}" "${B3_TS}" "${VIA_MENTION}"
-push_message "${ALPHA_LABEL}" "${F1}" channel "<!here> ${TEST_NAME} broadcast"
+push_message "${ALPHA_LABEL}" "${F1}" channel "$(scenario_broadcast_text here "${TEST_NAME} broadcast")"
 B3_HERE_TS="${PUSH_TS}"
 wait_queued "step 3: alpha F1 <!here>" "${ALPHA_DIR}" "${F1}" "${B3_HERE_TS}" "${VIA_BROADCAST}"
 # Read after a later delivery on alpha's connection.
@@ -1434,6 +2060,37 @@ join_thread_phase open
 # A thread joined only by alpha stays outside bravo's own Thread Memory.
 expect_unjoined_reply "open: independent persona joins" "${BRAVO_LABEL}" "${T1}" "${JOINED_ROOTS[open]}"
 two_persona_threads open
+selection_matrix open
+# all beside hybrid retains receive_all; only two effective all choices
+# produce receive_all_shared. Each assignment leaves the sibling unchanged.
+ack_control "$(slack_push_member_joined bravo "${M_ALL}" "$(scenario_ts)")"
+expect_attempt all-beside-hybrid "${BRAVO_DIR}" "$(attempt_args bravo-matrix-hybrid "${M_ALL}" thread_hybrid)" "${BRAVO_KEY}" thread_hybrid
+matrix_message cohabitation-alpha-all alpha "${M_ALL}" plain - receive_all
+matrix_message cohabitation-bravo-unjoined bravo "${M_ALL}" plain - not-mentioned
+matrix_message cohabitation-bravo-join bravo "${M_ALL}" mention - mention
+COHAB_ROOT="${MATRIX_TS}"
+matrix_message cohabitation-bravo-follow bravo "${M_ALL}" plain "${COHAB_ROOT}" thread
+COHAB_BEFORE="$(channel_facts "${BRAVO_KEY}" "${M_ALL}")"
+expect_attempt independent-alpha-off "${ALPHA_DIR}" "$(attempt_args cohab-alpha-off "${M_ALL}" off)" "${ALPHA_KEY}" off
+[[ "$(channel_facts "${BRAVO_KEY}" "${M_ALL}")" == "${COHAB_BEFORE}" ]] || fail 'alpha write changed bravo stamp/order'
+matrix_message independent-bravo-kept bravo "${M_ALL}" plain "${COHAB_ROOT}" thread
+expect_attempt restore-alpha-all "${ALPHA_DIR}" "$(attempt_args cohab-alpha-all "${M_ALL}" all)" "${ALPHA_KEY}" all
+live_membership_phase open
+permission_phase open bravo
+write_order_phase
+freeze_four_values
+# The complete restart inventory includes every retained member, excludes
+# the observed leaves, and has no entry for the never-joined future preference.
+BRAVO_LIVE_MEMBERS=()
+for mode in strict open; do
+    for value in off mentions all thread_hybrid; do BRAVO_LIVE_MEMBERS+=("${LEAVE_CHANNELS[${mode}|${value}]}"); done
+done
+ALPHA_MEMBERS=("${A1}" "${A2}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}"
+    "${M_OFF}" "${M_MENTIONS}" "${M_ALL}" "${M_HYBRID}" "${WRITE_CHANNEL}" "${DEST}")
+BRAVO_MEMBERS=("${B1}" "${A1}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}"
+    "${M_ALL}" "${BRAVO_LIVE_MEMBERS[@]}" "${DEST}")
+slack_stub_inventory_page alpha '' '' "${ALPHA_MEMBERS[@]}"
+slack_stub_inventory_page bravo '' '' "${BRAVO_MEMBERS[@]}"
 
 # --- Persistence across a restart ----------------------
 # Queue acceptance above can precede typing and its receipt. Settle both
@@ -1449,7 +2106,7 @@ cp -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"
 declare -A DELIVERIES_BEFORE=()
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     DELIVERIES_BEFORE["${dir}"]="${SCENARIO_ROOT}/deliveries-before-restart.$(basename "${dir}")"
-    queue_accepted "${QUEUE_KEY[${dir}]}" > "${DELIVERIES_BEFORE[${dir}]}"
+    shared_queue_snapshot "${DELIVERIES_BEFORE[${dir}]}" "${QUEUE_KEY[${dir}]}" "${QUEUE_ARCHIVES[${dir}]}"
 done
 completions_before="$(count_log "${STARTUP_COMPLETE}")"
 alpha_connected_before="$(count_log "$(session_connected "${ALPHA_REF}")")"
@@ -1486,19 +2143,19 @@ wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${BRAVO_LABEL}" \
 # regular-file stdout even when opened for append. Keep the runner log intact.
 bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved "${CONFIG}" "${STORE_BEFORE_RESTART}" "${STORE_FILE}" > /dev/null \
     || fail "restart: shared choices, identities or reviewed input changed"
-for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-    # Delivered content is compacted at startup; its exact dedupe facts
-    # survive, while this scenario retains its own acceptance evidence.
-    jq -sS 'map({seq,key,received_at}) | sort_by(.seq)' "${DELIVERIES_BEFORE[${dir}]}" \
-        > "${SCENARIO_ROOT}/expected-dedupe-after-restart"
-    jq -sS 'map(select(.kind == "accepted" and .compact != "allocation") | {seq,key,received_at}) | sort_by(.seq)' \
-        "${DELIVERIES_FILE[${dir}]}" > "${SCENARIO_ROOT}/actual-dedupe-after-restart"
-    cmp -s -- "${SCENARIO_ROOT}/expected-dedupe-after-restart" "${SCENARIO_ROOT}/actual-dedupe-after-restart" \
-        || fail "restart: dedupe facts of ${dir} changed"
-    queue_accepted "${QUEUE_KEY[${dir}]}" > "${SCENARIO_ROOT}/accepted-after-restart"
-    [[ ! -s "${SCENARIO_ROOT}/accepted-after-restart" ]] \
-        || fail "restart: receipted message content of ${dir} survived startup compaction"
+preserved_four_values AC-J14-complete-inventory
+choice_is "${ALPHA_KEY}" "${FUTURE}" all || fail 'empty membership evidence removed never-joined preference'
+choice_is "${ALPHA_KEY}" "${WRITE_CHANNEL}" all || fail 'restart promoted pending off intent'
+for mode in strict open; do
+    for value in off mentions all thread_hybrid; do
+        choice_is "${ALPHA_KEY}" "${LEAVE_CHANNELS[${mode}|${value}]}" '' || fail 'restart restored an observed leave'
+    done
 done
+for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    shared_dedupe_preserved "${QUEUE_KEY[${dir}]}" "${DELIVERIES_BEFORE[${dir}]}" > /dev/null
+    [[ -z "$(shared_queue_items "${QUEUE_KEY[${dir}]}")" ]] || fail 'restart: delivered content survived compaction'
+done
+
 
 # alpha calls the tool for F1 with `all` before any F1 event: accepted as a
 # stored channel, `all` before and after. Its result also shows the new
@@ -1531,11 +2188,23 @@ wait_queued "restart: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA
 expect_since "${RESTART_MARK}" "${ALPHA_HEARS_F1_ALL}" 1 "restart: alpha's persona-invited-channel lines for F1 in this run"
 expect_since "${RESTART_MARK}" "$(matcher "${ALPHA_INVITED_HEAD}" " ${F1} ")" 1 \
     "restart: alpha's persona-invited-channel lines naming F1 in this run"
+configuration_request after-restart-intent refresh > /dev/null
+expect_preview_choice "${ALPHA_KEY}" "${WRITE_CHANNEL}" declared all off eligible all off "$(assignment_order "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
+confirm_review after-restart-intent
+matrix_message after-restart-confirmed-off alpha "${WRITE_CHANNEL}" mention - channel-off
 
 # --- Switch off --------------------------------------------------
 STORE_BEFORE_OFF="${SCENARIO_ROOT}/store-before-off.json"
-cp -- "${STORE_FILE}" "${STORE_BEFORE_OFF}"
+declare -A CHOICES_BEFORE_OFF=()
+for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
+    CHOICES_BEFORE_OFF["${key}"]="$(shared_persona_facts "${key}" | jq -cS 'del(.mode,.historicalMembership)')"
+done
 confirm_switch switch-off "${SWITCH_OFF_LINE}" "switch off"
+preserved_four_values open-to-strict
+for key in "${ALPHA_KEY}" "${BRAVO_KEY}"; do
+    [[ "$(shared_persona_facts "${key}" | jq -cS 'del(.mode,.historicalMembership)')" == "${CHOICES_BEFORE_OFF[${key}]}" ]] \
+        || fail 'switch off: applied persona choices changed'
+done
 
 # alpha, F1, plain: strict mode retains its shared applied all choice.
 OFF_MARK="$(log_mark)"
@@ -1557,118 +2226,83 @@ wait_queued "switch off: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${OFF_B1_TS}"
 expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 
 # alpha's call for F1: refused with the declarative text; the file unchanged.
+cp -- "${STORE_FILE}" "${STORE_BEFORE_OFF}"
 expect_attempt "switch off: retained history remains readable" "${ALPHA_DIR}" "${F1_RETRY_ARGS}" "${ALPHA_KEY}" all history
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${STRICT_FRESH_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
-jq -ne --slurpfile before "${STORE_BEFORE_OFF}" --slurpfile after "${STORE_FILE}" '$before[0].personas == $after[0].personas' > /dev/null \
-    || fail "switch off: applied persona choices changed"
+configuration_application_preserved "${CONFIG}" "${STORE_BEFORE_OFF}" "${STORE_FILE}" > /dev/null \
+    || fail 'switch off: refused calls changed the applied authority'
 check_thread_persistence "open to strict: original strict join" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"
 for who in "${ALPHA_LABEL}" "${BRAVO_LABEL}"; do
     check_thread_persistence "open to strict: shared join" "${who}" "${JOINED_ROOTS[open-both]}"
 done
 two_persona_threads strict
+notice_phase strict alpha off
+notice_phase strict alpha
+# S -> O -> S -> O contains both required directed cycles. The ordinary
+# worker end/resume above is inside the latter cycle and preserves its choices.
+mode_only open
+notice_phase open bravo off
+notice_phase open bravo
+future_after_leave
+ineligible_and_unverified
+rejoin_after_absence
+identity_replacement
 
-# demo: retain one real stub DM's log and transcript
-# metadata before the successful scenario's EXIT trap deletes both. The
-# existing queue checks establish acceptance and receipt completion; this
-# export prints the observed evidence; exact log assertion follows below.
-push_message "${BRAVO_LABEL}" "${DM}" im "$(plain_text)"
+# E5: retain a real DM's exact receipt metadata through the shared adapter.
+DM_TEXT="$(plain_text)"
+push_message "${BRAVO_LABEL}" "${DM}" im "${DM_TEXT}"
 DM_TS="${PUSH_TS}"
 wait_queued "E5: bravo direct DM" "${BRAVO_DIR}" "${DM}" "${DM_TS}" dm
 wait_queue_drained "${BRAVO_DIR}" "E5: bravo direct DM"
-RECEIVED_LABEL="$(printed MESSAGE_RECEIVED)"
-DELIVERED_LABEL="$(printed MESSAGE_DELIVERED)"
-python3 - "${SLACK_STATE_DIR}/server.log" "${DELIVERIES_FILE[${BRAVO_DIR}]}" "${DM}" "${DM_TS}" \
-    "${RECEIVED_LABEL}" "${DELIVERED_LABEL}" << 'EOF'
-import json, re, sys
-log, journal, channel, ts, *labels = sys.argv[1:]
-print("E5 stub DM evidence (metadata only):")
-with open(log) as f:
-    for line in f:
-        if any(f"[slack] {label}:" in line for label in labels) and f'chat_id="{channel}"' in line and f'ts="{ts}"' in line:
-            print(line.rstrip())
-with open(journal) as f:
-    records = [json.loads(line) for line in f if line.strip()]
-accepted = next(r for r in records if r["kind"] == "accepted" and r.get("channel") == channel and r.get("ts") == ts)
-print("queue acceptance: " + json.dumps({k: accepted[k] for k in ("seq", "channel", "ts", "via", "received_at")}))
-for delivered in records:
-    if delivered["kind"] != "delivered" or delivered["seq"] != accepted["seq"]:
-        continue
-    receipt = delivered["receipt"]
-    print("queue receipt: " + json.dumps({k: delivered[k] for k in ("seq", "part", "at", "receipt")}))
-    with open(receipt["path"]) as f:
-        for line in f:
-            record = json.loads(line)
-            if record.get("uuid") != receipt.get("uuid"):
-                continue
-            content = record.get("message", {}).get("content", "")
-            tag = re.search(r"<channel\b([^>]*)>", content)
-            metadata = {k: record[k] for k in ("type", "uuid", "timestamp", "sessionId")}
-            metadata["tag"] = dict(re.findall(r'([a-z_]+)="([^"]*)"', tag[1])) if tag else None
-            print("transcript receipt: " + json.dumps(metadata))
-EOF
-
-# Every persona's complete accepted set, including absence of all other inputs.
-# Multiple journal records per item never count as additional acceptances.
-for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
-    wait_queue_drained "${dir}" "closing: ${dir}"
-    wait_until "${EVENT_WAIT_S}" "closing: ${dir} has unsaved queued joins" thread_joins_saved "${dir}"
-    key="${QUEUE_KEY[${dir}]}"
-    expected_rows="${SCENARIO_ROOT}/expected-queue-${key}.jsonl"
-    : > "${expected_rows}"
-    for fact in "${!EXPECTED_QUEUE_ROWS[@]}"; do
-        [[ "${fact}" == "${key}|"* ]] || continue
-        printf '%s\n' "${EXPECTED_QUEUE_ROWS[${fact}]}" >> "${expected_rows}"
-    done
-    jq -sS 'sort' "${expected_rows}" > "${expected_rows}.sorted"
-    queue_accepted "${key}" > "${SCENARIO_ROOT}/current-queue-${key}"
-    jq -sS 'map([.channel,.ts,.via]) | sort' "${DELIVERIES_BEFORE[${dir}]}" "${SCENARIO_ROOT}/current-queue-${key}" \
-        > "${SCENARIO_ROOT}/actual-queue-${key}"
-    cmp -s -- "${expected_rows}.sorted" "${SCENARIO_ROOT}/actual-queue-${key}" \
-        || fail "closing: persona ${key} has an unexpected accepted queue set"
-done
+DM_PARTS="$(shared_expected_parts "${DM_TEXT}" "${DM_TS}" "${HUMAN}" "$(scenario_stub_name user "${HUMAN}")" "${DM}" dm dm - -)"
+shared_assert_content "${BRAVO_KEY}" "${SLACK_STATE_DIR}/server.log" "${QUEUE_ARCHIVES[${BRAVO_DIR}]}" "${DM}" "${DM_TS}" "${DM_TEXT}" "${DM_PARTS}" -
 
 # --- Closing -----------------------------------------------------
+for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+    wait_queue_drained "${dir}" "closing: ${dir}"
+    wait_until "${EVENT_WAIT_S}" "closing: unsaved joins" thread_joins_saved "${dir}"
+done
 stop_server --stop-bots
-port_closed "${SCENARIO_PORT}" || fail "closing: something still answers on 127.0.0.1:${SCENARIO_PORT}"
-stop_tracked_pid "${STUB_PID}" 10 "the Slack stub did not exit on SIGTERM"
-
-# the complete accepted sets also pin exactly one received
-# diagnostic per persona/source/conversation/ts/sender. This includes paired
-# event dedupe, both shared recipients and the DM, and excludes every refused
-# input and nonrecipient. DELIVERIES_BEFORE preserves pre-compaction evidence.
-# Only thread-selected diagnostics carry via=thread (deliveryIdentity). Bind
-# that suffix to the expected reason; other reasons stay queue assertions.
-# Read every rotation after stopping the writers, following the positive decisions above.
-python3 - "${SLACK_STATE_DIR}" "${SCENARIO_ROOT}" "${RECEIVED_LABEL}" "${HUMAN}" "${ALPHA_KEY}" "${BRAVO_KEY}" "${ALPHA}" "${BRAVO}" << 'EOF' \
-    || fail "closing: received diagnostics differ from the exact accepted set"
-import collections, glob, json, os, re, sys
-state, root, label, sender, alpha_key, bravo_key, alpha, bravo = sys.argv[1:]
-names = {alpha_key: alpha, bravo_key: bravo}
-keys = list(names)
-expected = collections.Counter()
-for key in keys:
-    with open(os.path.join(root, f"expected-queue-{key}.jsonl")) as f:
-        for line in f:
-            channel, ts, via = json.loads(line)
-            expected[(key, "slack", channel, ts, sender, via == "thread")] += 1
-assert expected and all(n == 1 for n in expected.values()), "invalid expected acceptance set"
-quoted = r'("(?:\\.|[^"\\])*")'
-pattern = re.compile(r'persona=' + quoted + r' \(key=(\S+)\) source=(slack) chat_id=' + quoted + r' ts=' + quoted + r' sender_id=' + quoted + r'( via=thread)?')
-actual = collections.Counter()
-for path in glob.glob(os.path.join(state, "server.log*")):
-    with open(path) as f:
-        for line in f:
-            marker = f"[slack] {label}: "
-            if marker not in line:
-                continue
-            match = pattern.fullmatch(line.split(marker, 1)[1].rstrip("\n"))
-            assert match, "malformed received diagnostic"
-            name, key, source, channel, ts, user, thread = match.groups()
-            assert key in names and json.loads(name) == names[key], "wrong received persona identity"
-            actual[(key, source, json.loads(channel), json.loads(ts), json.loads(user), thread is not None)] += 1
-assert actual == expected, f"received mismatch: missing={expected - actual}, extra={actual - expected}"
-print(f"received evidence: {sum(actual.values())} exact acceptances, paired events deduped")
-EOF
+port_closed "${SCENARIO_PORT}" || fail 'closing: server port remains open'
+stop_tracked_pid "${STUB_PID}" 10 'Slack stub did not stop'
+EXPECTED_ALL="${SCENARIO_ROOT}/expected-acceptances.jsonl"
+: > "${EXPECTED_ALL}"
+for fact in "${!EXPECTED_QUEUE_ROWS[@]}"; do printf '%s\n' "${EXPECTED_QUEUE_ROWS[${fact}]}" >> "${EXPECTED_ALL}"; done
+shared_assert_accounting "${EXPECTED_ALL}" "${SLACK_STATE_DIR}/server.log" \
+    "${ALPHA_KEY}" "${QUEUE_ARCHIVES[${ALPHA_DIR}]}" "${BRAVO_KEY}" "${QUEUE_ARCHIVES[${BRAVO_DIR}]}"
+# Compare every original input (including Q's actual captured post) to its
+# accepted content, fixed parts and exact own-session transcript receipts.
+# Expected text is never reconstructed from the queue being checked.
+HUMAN_INPUTS="${SCENARIO_ROOT}/human-input-texts.jsonl"
+: > "${HUMAN_INPUTS}"
+for identity in "${!EXPECTED_INPUTS[@]}"; do
+    IFS='|' read -r key channel ts via <<< "${identity}"
+    input="${EXPECTED_INPUTS[${identity}]}"
+    text="$(jq -er '.text' <<< "${input}")"
+    sender="$(jq -er '.user' <<< "${input}")"
+    if [[ "${sender}" == "${HUMAN}" ]]; then jq -c '.text' <<< "${input}" >> "${HUMAN_INPUTS}"; fi
+    root="$(jq -r '.thread_ts // "-"' <<< "${input}")"
+    channel_name="$(scenario_stub_name channel "${channel}")"
+    [[ "${via}" != dm ]] || channel_name=dm
+    parts="$(shared_expected_parts "${text}" "${ts}" "${sender}" "$(scenario_stub_name user "${sender}")" "${channel}" "${channel_name}" "${via}" "${root}" -)"
+    if [[ "${key}" == "${ALPHA_KEY}" ]]; then dir="${ALPHA_DIR}"; else dir="${BRAVO_DIR}"; fi
+    shared_assert_content "${key}" "${SLACK_STATE_DIR}/server.log" "${QUEUE_ARCHIVES[${dir}]}" "${channel}" "${ts}" "${text}" "${parts}" - > /dev/null
+done
+# The bodies belong in delivery evidence, never in server diagnostics or
+# captured reviews/tool results. Q's own notice wording is excluded from this
+# sentinel check because the server legitimately prints its own notice text.
+python3 - "${HUMAN_INPUTS}" "${SLACK_STATE_DIR}/server.log" "${CAPTURED}" <<'PY'
+import json, pathlib, sys
+texts = {json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()}
+assert texts and all(texts), 'missing independent message-body sentinels'
+paths = [pathlib.Path(sys.argv[2]), *pathlib.Path(sys.argv[3]).iterdir()]
+for path in paths:
+    if any(text in path.read_text() for text in texts):
+        raise SystemExit('message body leaked into diagnostics or a captured result')
+PY
+while IFS= read -r envelope; do
+    [[ "$(slack_ack_count "${envelope}")" == 1 ]] || fail 'closing: missing or repeated ACK'
+done < "${ACKS}"
 
 # The token scan, read once every writer has stopped (the files stay until
 # the EXIT trap removes the scratch root). files: server.log and
@@ -1684,6 +2318,7 @@ for file in "${leak_files[@]}"; do
     [[ -f "${file}" ]] || fail "closing: ${file} is missing"
 done
 leak_files+=("${STUB_BIN}/stub-mcp-session.log" "${STUB_OUT}")
+leak_files+=("${CAPTURED}"/*)
 n="$(count_token_like "${leak_files[@]}")"
 [[ "${n}" == 0 ]] || fail "closing: ${n} token-like match(es) in server.log, the stub's record, the stub MCP session's records or ${STORE_FILE}"
 

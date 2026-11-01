@@ -99,8 +99,14 @@
  */
 
 import * as agentDirectorClient from 'agent-director'
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { pathToFileURL } from 'node:url'
+import { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -108,6 +114,7 @@ import ts from 'typescript'
 import type { PersonaConfigInput } from '../src/config.ts'
 import { createSharedChannelAuthority } from '../src/shared-channels.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { configBytes, makeSharedAuthority, readSharedState } from './test-helpers/shared-channels.ts'
 
@@ -2831,13 +2838,37 @@ describe('test-17 loses only a successful, targeted AD launch response', () => {
 describe('integration configuration and discovery prerequisites', () => {
   const source = readFileSync(join(import.meta.dir, 'integration/test-29-invited-channels.sh'), 'utf8')
   const builder = source.slice(source.indexOf('write_persona_config() {'), source.indexOf('\n\n# --- Start'))
-  const channels = source.slice(source.indexOf('CH_TAG='), source.indexOf('ALPHA_BOT_USER='))
+  const helpers = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
+  const declaration = (text: string, name: string) => {
+    const found = text.match(new RegExp(`^${name}\\(\\) \{\n[\\s\\S]*?^\}`, 'm'))
+    if (!found) throw new Error(`missing declaration ${name}`)
+    return found[0]
+  }
+  const channels = source.slice(source.indexOf('A1="$(scenario_id'), source.indexOf('ALPHA_BOT_USER='))
+  const ids = Object.fromEntries([...channels.matchAll(/^(\w+)="\$\(scenario_id ([CG]) ([\w-]+)\)"/gm)]
+    .map(([, name, kind, label]) => [name, kind + createHash('sha256').update(`fixture\n${label}`).digest('hex').slice(0, 20).toUpperCase()]))
+  const control = [
+    declaration(helpers, 'slack_stub_inventory_body'), declaration(helpers, 'slack_stub_inventory_page'),
+    `_scenario_stub_control_patch() { shift; jq -cn "$@" '{label:$l,memberships:[$page.channels[].id]}'; }`,
+    'inventory() {',
+    ...source.slice(source.indexOf('slack_stub_controls "'), source.indexOf('# --- Configurations')).split('\n')
+      .filter(line => line.startsWith('slack_stub_inventory_page ')),
+    '}', "inventory | jq -s '{tokens:.}'",
+  ].join('\n')
   function build(mode: string, body = builder, root?: string) {
     const home = root ?? mkdtempSync(join(tmpdir(), 'membership-config-contract-'))
     try {
+      const state = readSharedState(home)
+      writeFileSync(join(home, 'audit-personas.json'), JSON.stringify(state?.personas ?? {}))
       return spawnSync('/bin/bash', ['--noprofile', '--norc', '-uc', `
-SCENARIO_TAG=fixture
+SCENARIO_TAG=fixture TEST_NAME=fixture
+require_ci_image() { :; }
+fail() { printf '%s' "$1" >&2; exit 1; }
+${declaration(helpers, 'scenario_id')}
 ${channels}
+ALPHA_KEY=alpha BRAVO_KEY=bravo
+shared_persona_facts() { jq -c --arg key "$1" '.[$key]' "$FIXTURE_ROOT/audit-personas.json"; }
+shared_channel_saved() { jq -r --arg key "$1" --arg channel "$2" '.[$key].assignments[$channel].delivery // empty' "$FIXTURE_ROOT/audit-personas.json"; }
 SWITCH_KEY=channel_mode
 ALPHA=alpha BRAVO=bravo ALPHA_CREDS=/tmp/alpha-creds BRAVO_CREDS=/tmp/bravo-creds
 ALPHA_CREDS="\${FIXTURE_ROOT}/alpha-creds" BRAVO_CREDS="\${FIXTURE_ROOT}/bravo-creds"
@@ -2849,7 +2880,7 @@ write_config() { cat; }
 write_file() { cat; }
 fail() { printf '%s' "$1" >&2; exit 1; }
 ${body}
-write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home, { tools: ['cat', 'jq'], extras: { FIXTURE_ROOT: home } }) })
+write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home, { tools: ['cat', 'jq', 'sha256sum', 'tr', 'sort'], extras: { FIXTURE_ROOT: home } }) })
     } finally { if (!root) rmSync(home, { recursive: true, force: true }) }
   }
   test.each(['declarative', 'fungible', 'switch-off'])('test29 %s builder executes with nounset and retains distinct intended channel values', mode => {
@@ -2859,13 +2890,13 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
     const config = JSON.parse(result.stdout)
     expect(config.channel_mode).toBe(mode === 'declarative' ? undefined : mode === 'fungible' ? 'open' : 'strict')
     for (const persona of config.personas) {
-      const ids = persona.channels.map((entry: { id: string }) => entry.id)
-      expect(new Set(ids).size).toBe(ids.length)
-      expect(ids.every((id: string) => /^[CG][A-Z0-9]+$/.test(id))).toBe(true)
+      const channelIds = persona.channels.map((entry: { id: string }) => entry.id)
+      expect(new Set(channelIds).size).toBe(channelIds.length)
+      expect(channelIds.every((id: string) => /^[CG][A-Z0-9]+$/.test(id))).toBe(true)
       if (mode !== 'declarative') {
         // U1 was discovered off in phase A; both personas explicitly share it after the mode change.
-        expect(persona.channels).toContainEqual({ id: 'C0FIXTUREU1', delivery: 'all' })
-        expect(persona.channels).toContainEqual({ id: 'C0FIXTUREF1', delivery: 'mentions' })
+        expect(persona.channels).toContainEqual({ id: ids.U1!, delivery: 'all' })
+        expect(persona.channels).toContainEqual({ id: ids.F1!, delivery: 'mentions' })
       }
     }
   })
@@ -2890,7 +2921,6 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
     const routerLines: string[] = []
     f.h.onEvent = createPersonaEventRouter({ membership: f.membership, routing: managed.routing, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => routerLines.push(line) })
     try {
-      const control = source.slice(source.indexOf('jq -n --arg asuf '), source.indexOf('\n# The MCP config each persona'))
       const initial = build('declarative', builder, home), inventory = build('declarative', `${control}\nwrite_persona_config() { :; }`, home)
       expect(initial.status).toBe(0); expect(inventory.status).toBe(0)
       expect(f.authority.applyReviewed(Buffer.from(initial.stdout), f.authority.revision).kind).toBe('applied')
@@ -2898,7 +2928,7 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
         f.h.stub(f.h.p(token.label)).script.inventory.push(membershipPage(token.memberships))
       }
       await f.start(); await f.scan(); await managed.ready
-      const channel = 'C0FIXTUREU0', eligible = 'C0FIXTUREA2'
+      const channel = ids.U0!, eligible = ids.A2!
       const stub = f.h.stub(f.h.p('alpha'))
       const text = `  <@${stub.identity.botUserId}> original\r\n\r\nmention  `
       const message = makeChannelMessage({ channel, text, ts: '1700000001.000001' })
@@ -2977,7 +3007,6 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
   test('test29 actual discovery and phase-A oracle agree, retain an unlisted control and preserve choices across both mode switches', async () => {
     const { makeMembershipHarness, membershipPage } = await import('./test-helpers/shared-channels.ts')
     const home = mkdtempSync(join(tmpdir(), 'phase-a-inventory-')), f = makeMembershipHarness(home, { names: ['alpha', 'bravo'] })
-    const control = source.slice(source.indexOf('jq -n --arg asuf '), source.indexOf('\n# The MCP config each persona'))
     const check = source.slice(source.indexOf('check_phase_a_inventory() {'), source.indexOf('\ncheck_phase_a_inventory ||'))
     const checkBody = `${check}\nwrite_persona_config() { check_phase_a_inventory; }`
     try {
@@ -2988,22 +3017,22 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
       expect(f.authority.applyReviewed(Buffer.from(initial.stdout), f.authority.revision).kind).toBe('applied')
       const tokens = JSON.parse(inventory.stdout).tokens as Array<{ label: string; memberships: string[] }>
       for (const token of tokens) {
-        expect(token.memberships).not.toContain('C0FIXTUREU0')
+        expect(token.memberships).not.toContain(ids.U0!)
         f.h.stub(f.h.p(token.label)).script.inventory.push(membershipPage(token.memberships))
       }
       await f.start(); await f.scan()
       for (const key of ['alpha', 'bravo']) {
         expect(f.scanner.status(key).state).toBe('complete')
-        expect(f.authority.snapshot().personas[key]!.assignments.C0FIXTUREU1?.delivery).toBe('off')
-        expect(f.authority.snapshot().personas[key]!.assignments.C0FIXTUREU0).toBeUndefined()
+        expect(f.authority.snapshot().personas[key]!.assignments[ids.U1!]?.delivery).toBe('off')
+        expect(f.authority.snapshot().personas[key]!.assignments[ids.U0!]).toBeUndefined()
       }
       expect(build('declarative', checkBody, home).status).toBe(0)
       const strict = f.authority.snapshot()
-      expect(f.assign('C0FIXTUREU1', 'mentions').kind).toBe('applied')
+      expect(f.assign(ids.U1!, 'mentions').kind).toBe('applied')
       expect(build('declarative', checkBody, home).status).not.toBe(0)
-      expect(f.assign('C0FIXTUREU1', 'off').kind).toBe('applied')
+      expect(f.assign(ids.U1!, 'off').kind).toBe('applied')
       expect(build('declarative', checkBody, home).status).toBe(0)
-      expect(f.assign('C0FIXTUREU0', 'off').kind).toBe('applied')
+      expect(f.assign(ids.U0!, 'off').kind).toBe('applied')
       expect(build('declarative', checkBody, home).status).not.toBe(0)
       // Resume the untouched strict authority, then use the actual builders.
       const authority = createSharedChannelAuthority(f.authority.path, strict)
@@ -3012,14 +3041,14 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
         expect(next.status).toBe(0)
         expect(authority.applyReviewed(Buffer.from(next.stdout), authority.revision).kind).toBe('applied')
         for (const key of ['alpha', 'bravo']) {
-          expect(authority.snapshot().personas[key]!.assignments.C0FIXTUREU0).toBeUndefined()
-          expect(authority.snapshot().personas[key]!.assignments.C0FIXTUREU1?.delivery).toBe('all')
-          expect(authority.snapshot().personas[key]!.assignments.C0FIXTUREF1?.delivery).toBe(mode === 'fungible' ? 'mentions' : 'all')
+          expect(authority.snapshot().personas[key]!.assignments[ids.U0!]).toBeUndefined()
+          expect(authority.snapshot().personas[key]!.assignments[ids.U1!]?.delivery).toBe('all')
+          expect(authority.snapshot().personas[key]!.assignments[ids.F1!]?.delivery).toBe(mode === 'fungible' ? 'mentions' : 'all')
         }
-        expect(authority.snapshot().personas.alpha!.assignments.G0FIXTUREF2?.delivery).toBe('off')
-        expect(authority.snapshot().personas.bravo!.assignments.G0FIXTUREF2?.delivery).toBe('mentions')
+        expect(authority.snapshot().personas.alpha!.assignments[ids.F2!]?.delivery).toBe('off')
+        expect(authority.snapshot().personas.bravo!.assignments[ids.F2!]?.delivery).toBe('mentions')
         if (mode === 'fungible') for (const key of ['alpha', 'bravo']) {
-          expect(authority.assign(key, authority.incarnation(key)!, 'C0FIXTUREF1', 'all', authority.revision).kind).toBe('applied')
+          expect(authority.assign(key, authority.incarnation(key)!, ids.F1!, 'all', authority.revision).kind).toBe('applied')
         }
       }
       assertNoLeak(f.captured())
@@ -3300,5 +3329,529 @@ ${latencyLoop(source)}
     20, percentile, { log: (line: string) => output.push(line) })
     if (passes) { expect(check).not.toThrow(); expect(output[0]).toContain('samples=20') }
     else expect(check).toThrow(count === 19 ? 'Insufficient latency samples' : 'latency exceeded')
+  })
+})
+
+
+describe('shared scenario consumer evidence boundaries', () => {
+  const integration = join(import.meta.dir, 'integration')
+  const recovery = readFileSync(join(integration, 'test-46-shared-channel-recovery.sh'), 'utf8')
+  const healthy = readFileSync(join(integration, 'test-29-invited-channels.sh'), 'utf8')
+  const clean = (source: string) => source.replace(/\\\n\s*/g, ' ').split('\n')
+    .filter(line => !line.trim().startsWith('#')).map(line => line.trim()).join('\n')
+  const fn = (source: string, name: string) => source.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, 'm'))?.[0] ?? ''
+  const ordered = (source: string, pieces: string[]) => {
+    let offset = 0
+    for (const piece of pieces) {
+      const at = source.indexOf(piece, offset)
+      if (at < 0) return false
+      offset = at + piece.length
+    }
+    return true
+  }
+  function recoveryFindings(source: string): string[] {
+    const findings: string[] = [], pending = clean(fn(source, 'pending_post')), hold = clean(fn(source, 'post_hold')), all = clean(source)
+    const exact = 'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved'
+    if (!ordered(pending, [
+      'OP_STAMP="$(stamp p "${OP_CHANNEL}")"', 'before="$(shared_own_post_records',
+      'OP_CALL="$(stub_session_submit', 'OP_ID="$(jq -ser --argjson before "${before}" --arg c "${OP_CHANNEL}" --argjson stamp "${OP_STAMP}"',
+      '.operationId as $id|$before|index($id)|not', 'length==1 and .[0].channel==$c and .[0].stamp==$stamp',
+      '.incarnation==$stamp.incarnation and .assignments[$channel].threadHybridSince==$stamp.threadHybridSince',
+      exact + '  > "${EVIDENCE}/post-${case_name}-unresolved.json"',
+    ])) findings.push('pending post lacks independent identity/stamp or exact unresolved observation')
+    if (!ordered(hold, [
+      '.operations==[$operation] and .stamp==$stamp',
+      '.incarnation==$stamp.incarnation and .assignments[$channel].threadHybridSince==$stamp.threadHybridSince',
+      exact + '  > "${EVIDENCE}/post-${case_name}-held-unresolved.json"',
+    ])) findings.push('post hold lacks exact operation/stamp or unresolved observation')
+    // Each composed crash first reaches the guarded pending_post declaration.
+    for (const pair of [
+      ['pending_post "recovered-${performed}" "${performed}"', 'post_hold "recovered-${performed}"'],
+      ['pending_post "lookup-${problem}" true'], ['pending_post stale-value true'],
+      ['pending_post ambiguous true'], ['pending_post "identity-${reset}" true'],
+    ]) {
+      const start = all.indexOf(pair[0]!), end = all.indexOf('\ncrash', start)
+      if (start < 0 || end < 0 || !ordered(all.slice(start, end), pair)) findings.push('missing pending/crash boundary: ' + pair[0])
+    }
+    const leave = all.slice(all.indexOf('for boundary in before after; do'), all.indexOf('pending_post stale-value true'))
+    if (!ordered(leave, [
+      'pending_post "leave-${boundary}" true', 'post_hold "leave-${boundary}"',
+      'old_channel="${OP_CHANNEL}"; old_stamp="${OP_STAMP}"',
+      'no_ack "${leave}"',
+      'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${old_channel}" "${old_stamp}" unresolved  > "${EVIDENCE}/leave-before-kill-intent.json"',
+      'ack "${leave}"',
+      'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${old_channel}" "${old_stamp}" unresolved  > "${EVIDENCE}/leave-after-kill-historical-intent.json"',
+      '\ncrash',
+    ])) findings.push('leave boundary lacks historical exact observation')
+    for (const [start, target] of [
+      ['pending_post live-hold true', 'post-live-hold-after-receipts.json'],
+      ['pending_post confirmed-unsaved true 30000', 'confirmed-unsaved-before-kill.json'],
+    ]) {
+      const begin = all.indexOf(start), end = all.indexOf('\ncrash', begin)
+      const boundary = all.slice(begin, end)
+      if (begin < 0 || end < 0 || !boundary.includes(exact) || !boundary.includes(target)) findings.push('missing fresh unresolved boundary: ' + target)
+    }
+    const unresolved = all.split('\n').filter(line => line.startsWith('shared_wait_own_post_state ') && line.includes(' unresolved'))
+    if (unresolved.length !== 6 || unresolved.some(line => /\|\||;|&&/.test(line))) findings.push('missing or ignored unresolved assertion')
+    return findings
+  }
+  function healthyFindings(source: string): string[] {
+    const findings: string[] = [], all = clean(source), notice = clean(fn(source, 'notice_phase')), queued = clean(fn(source, 'wait_queued'))
+    if (!ordered(all, ['shared_stub_permission_setup "${ALPHA_DIR}"', 'shared_stub_permission_setup "${BRAVO_DIR}"',
+      'RECEIPT_MODE["${ALPHA_KEY}"]=manual', 'RECEIPT_MODE["${BRAVO_KEY}"]=manual', 'start_server --live'])) findings.push('manual hook setup must precede launch')
+    if (!ordered(notice, ['shared_stub_notice end ', 'shared_stub_notice ended ', 'RECEIPT_MODE["${key}"]=ordinary',
+      'matrix_message "${phase}-trigger"', 'post="$(slack_wait_messages_waiting', 'ts="$(jq -er \'.ts\' <<< "${post}")"',
+      'shared_stub_notice resume '])) findings.push('notice lifecycle or independent successful-post root changed')
+    if (!ordered(queued, ['EXPECTED_QUEUE_ROWS["${identity}"]="$(shared_delivery_expectation',
+      'EXPECTED_INPUTS["${identity}"]="${PUSHED_EVENTS[$2|$3]}"',
+      'if [[ "${RECEIPT_MODE[${QUEUE_KEY[$1]}]:-ordinary}" == manual ]]', 'shared_stub_permission receipt'])) findings.push('independent input/acceptance or manual receipt gate changed')
+    const other = clean(fn(source, 'other_value_threads'))
+    if (!other.includes('[[ ! -e "${SLACK_STATE_DIR}/threads/${THREAD_KEY}.jsonl" ]]') ||
+      !other.includes('[[ "$(shared_thread_created "${THREAD_KEY}")" == false ]]') ||
+      !ordered(all, ['other_value_threads "strict: other values" "${ALPHA_LABEL}" "${VIA_RECEIVE_ALL_SHARED}" true', 'ALPHA_THREADS=true'])) findings.push('early persona-wide no-file/no-marker evidence changed')
+    if (!ordered(all, ['slack_stub_inventory_fault alpha \'\' delay delay_ms=20000',
+      '[[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]]',
+      'expect_attempt unverified-refusal',
+      '[[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]]',
+      'resolution=delay > /dev/null'])) findings.push('membership refusal is not bracketed by the delayed successful scan')
+    return findings
+  }
+  test('healthy and recovery consumers retain independent observations and fail-closed boundaries', () => {
+    expect(recoveryFindings(recovery)).toEqual([])
+    expect(healthyFindings(healthy)).toEqual([])
+  })
+  test.each([
+    ['recovery observer', 'recovery', 'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved', ':'],
+    ['recovery identity', 'recovery', 'OP_STAMP="$(stamp p "${OP_CHANNEL}")"', 'OP_STAMP=from-own-post'],
+    ['historical leave stamp', 'recovery', '"${OP_ID}" "${old_channel}" "${old_stamp}" unresolved', '"${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved'],
+    ['manual receipt boundary', 'healthy', 'RECEIPT_MODE["${key}"]=ordinary', ':'],
+    ['independent input', 'healthy', 'EXPECTED_INPUTS["${identity}"]="${PUSHED_EVENTS[$2|$3]}"', 'EXPECTED_INPUTS["${identity}"]=queue'],
+    ['early marker', 'healthy', '[[ "$(shared_thread_created "${THREAD_KEY}")" == false ]]', 'true'],
+    ['unverified scan guard', 'healthy', '[[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]]', 'true'],
+  ])('consumer audit detects removed %s in a scratch copy', (_name, kind, needle, replacement) => {
+    mkdirSync('/tmp/c9', { recursive: true })
+    const root = mkdtempSync('/tmp/c9/consumer-audit-'), path = join(root, 'scenario.sh')
+    try {
+      const source = kind === 'recovery' ? recovery : healthy
+      expect(source).toContain(needle!)
+      writeFileSync(path, source.replaceAll(needle!, replacement!))
+      const findings = (kind === 'recovery' ? recoveryFindings : healthyFindings)(readFileSync(path, 'utf8'))
+      assertNoLeak(findings)
+      expect(findings.length).toBeGreaterThan(0)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+  test('unchanged CI discovery accepts recovery46 exactly once with no duplicate script number', async () => {
+    const ci = await import('../scripts/ci-run.ts')
+    const entries = ci.readIntegrationEntries(join(import.meta.dir, '..'))
+    expect(entries.ok).toBe(true)
+    if (!entries.ok) throw new Error('integration directory unreadable')
+    expect(ci.checkScriptNames(entries.value)).toEqual([])
+    expect(ci.checkDuplicateNumbers(entries.value)).toEqual([])
+    const scripts = ci.scriptListOf(entries.value)
+    const selected = ci.matchScript('test-46', scripts)
+    expect(selected?.fileName).toBe('test-46-shared-channel-recovery.sh')
+    expect(ci.matchScript('test-46-shared-channel-recovery.sh', scripts)).toEqual(selected)
+    expect(ci.checkDuplicateNumbers([...entries.value, { name: 'test-46-duplicate.sh', kind: 'regular' }])).toHaveLength(1)
+  })
+})
+
+describe('shared MCP client transport, grouping and session evidence', () => {
+  mkdirSync('/tmp/c9', { recursive: true })
+  const scratch = mkdtempSync('/tmp/c9/mcp-client-audit-')
+  const copy = join(scratch, 'stub-mcp-session.ts')
+  writeFileSync(copy, readFileSync(join(import.meta.dir, 'integration/fixtures/stub-mcp-session.ts')))
+  const source = readFileSync(copy, 'utf8')
+  afterAll(() => rmSync(scratch, { recursive: true, force: true }))
+  const declarations = source.slice(source.indexOf('function errorCode('), source.indexOf('\nasync function main('))
+  const control = source.slice(source.indexOf('  const parent = parentPid()'), source.indexOf('\n  const schedulePoll'))
+  const js = ts.transpileModule(`
+  const { Client, StreamableHTTPClientTransport, ListRootsRequestSchema,
+    AsyncLocalStorage, pathToFileURL, fetch, readFileSync, appendLine, say, setTimeout, clearTimeout } = deps;
+  const url = 'http://127.0.0.1/mcp', cwd = '/scratch/persona';
+  const requestsPath = 'requests', resultsPath = 'results', sessionsPath = 'sessions', deliveriesPath = 'deliveries';
+  const CLIENT_INFO = {name:'scratch-probe',version:'1'}, CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel';
+  const NEWLINE = 10;
+  ${source.match(/^const ROOTS_READY_TIMEOUT_MS = .+$/m)![0]}
+  ${source.match(/^const SUBMISSION_BARRIER_TIMEOUT_MS = .+$/m)![0]}
+  const parentPid = () => 1, describe = e => e instanceof Error ? e.name + ': ' + e.message : String(e);
+  ${declarations}
+  ${control}
+  return { connect, poll, parseRequest, end, ended,
+    bounds: { roots: ROOTS_READY_TIMEOUT_MS, barrier: SUBMISSION_BARRIER_TIMEOUT_MS },
+    close: async () => { end(0, 'probe done'); await client?.close(); } };
+  `, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  const build = new Function('deps', js)
+  const cleanups: Array<() => Promise<void>> = []
+  afterEach(async () => { for (const close of cleanups.splice(0)) await close() })
+
+  function deferred<T = void>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>(r => { resolve = r })
+    return { promise, resolve }
+  }
+
+  function rpcResponse(id: number | string, result: object, sid?: string) {
+    return Response.json({ jsonrpc: '2.0', id, result }, { headers: sid ? { 'mcp-session-id': sid } : {} })
+  }
+
+  function harness(files = new Map<string, string>(), respond?: (message: any, sid: string) => Promise<Response> | Response,
+    rootGate?: (sid: string) => Promise<void>, Transport = StreamableHTTPClientTransport) {
+    const clock = createFakeClock()
+    const starts: Array<{ sid: string; name: string; args: unknown }> = []
+    const roots: string[] = [], reads: string[] = [], cancels: string[] = [], logs: string[] = [], closed: string[] = []
+    const recordWaiters: Array<{event:string, resolve: (value: any) => void}> = []
+    const streams = new Map<string, ReadableStreamDefaultController<Uint8Array>>()
+    const observed = (path: string) => (files.get(path) ?? '').split('\n').filter(Boolean).map(line => JSON.parse(line))
+    let serial = observed('sessions').filter(x => x.event === 'connected').length
+    const appendLine = (path: string, record: any) => {
+      files.set(path, (files.get(path) ?? '') + JSON.stringify(record) + '\n')
+      for (const waiter of recordWaiters) if (record.event === waiter.event) waiter.resolve(record)
+    }
+    const toolResponse = (id: number | string, name: string) => {
+      const body = new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id,
+          result: { content: [{ type: 'text', text: name }] } }))) },
+        pull(controller) { controller.close() },
+      })
+      const cancel = body.cancel.bind(body)
+      body.cancel = (reason?: unknown) => { cancels.push(name); return cancel(reason) }
+      const response = new Response(body, { headers: { 'content-type': 'application/json' } })
+      const json = response.json.bind(response)
+      response.json = () => { reads.push(name); return json() }
+      return response
+    }
+    const fakeFetch = async (_input: unknown, init: RequestInit): Promise<Response> => {
+      const headers = new Headers(init.headers), sid = headers.get('mcp-session-id') ?? ''
+      if (init.method === 'GET') {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streams.set(sid, controller)
+            controller.enqueue(new TextEncoder().encode(`event: message\ndata: ${JSON.stringify({jsonrpc:'2.0',id:'roots-'+sid,method:'roots/list'})}\n\n`))
+            init.signal?.addEventListener('abort', () => { closed.push(sid); try { controller.close() } catch {} }, { once: true })
+          },
+        })
+        return new Response(body, { headers: { 'content-type': 'text/event-stream' } })
+      }
+      const message = JSON.parse(String(init.body))
+      if (message.method === 'initialize') {
+        return rpcResponse(message.id, { protocolVersion: message.params.protocolVersion,
+          capabilities: { tools: {} }, serverInfo: { name: 'scratch-probe', version: '1' } }, `probe-${++serial}`)
+      }
+      if (message.method === 'notifications/initialized') return new Response(null, { status: 202 })
+      if (message.result?.roots) {
+        expect(message.result.roots).toEqual([{ uri: 'file:///scratch/persona', name: '/scratch/persona' }])
+        await rootGate?.(sid)
+        roots.push(sid)
+        return new Response(null, { status: 202 })
+      }
+      if (message.method === 'notifications/cancelled') return new Response(null, { status: 202 })
+      if (message.method === 'tools/list') return rpcResponse(message.id, { tools: [] })
+      if (message.method !== 'tools/call') throw new Error('unexpected protocol message')
+      expect(roots).toContain(sid)
+      starts.push({sid, name: message.params.name, args: message.params.arguments})
+      let abort!: () => void
+      const stopped = new Promise<Response>((_resolve, reject) => {
+        abort = () => reject(new Error('fetch aborted'))
+        init.signal?.addEventListener('abort', abort, { once: true })
+      })
+      try {
+        return await Promise.race([Promise.resolve(respond ? respond(message, sid) : toolResponse(message.id, message.params.name)), stopped])
+      } finally { init.signal?.removeEventListener('abort', abort) }
+    }
+    const api: {
+      connect: (reason: 'start' | 'lost_response' | 'replacement') => Promise<void>; poll: () => Promise<void>; close: () => Promise<void>;
+      parseRequest: (value: string) => any; ended: Promise<number>; end: (code: number, reason: string) => void;
+      bounds: { roots: number; barrier: number };
+    } = build({ Client: MCPClient, StreamableHTTPClientTransport: Transport, ListRootsRequestSchema, AsyncLocalStorage, pathToFileURL,
+      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+      fetch: fakeFetch, appendLine, say: (line: string) => logs.push(line), readFileSync: (path: string, encoding?: string) => {
+        const text = files.get(path)
+        if (text === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+        return encoding ? text : Buffer.from(text)
+      } })
+    cleanups.push(async () => {
+      await api.close(); await clock.flush()
+      expect(clock.pendingCount()).toBe(0)
+      assertNoLeak({ results: observed('results'), sessions: observed('sessions'), logs })
+    })
+    return { ...api, clock, files, starts, roots, reads, cancels, logs, closed, toolResponse, observed,
+      onRecord: (event: string) => new Promise<any>(resolve => recordWaiters.push({event,resolve})),
+      write: (requests: unknown[]) => { files.set('requests', requests.map(r => JSON.stringify(r)).join('\n') + '\n') },
+      notify: (sid: string, params: object) => streams.get(sid)!.enqueue(new TextEncoder().encode(`event: message\ndata: ${JSON.stringify({jsonrpc:'2.0',method:'notifications/claude/channel',params})}\n\n`)),
+    }
+  }
+
+  const request = (id: string, fields: object = {}) => ({id, method:'tools/call', tool:id, arguments:{attempt_id:'retained',intent:'assignment'}, ...fields})
+  const turns = async () => { for (let i = 0; i < 80; i++) await Promise.resolve() }
+  // Feed real captured client output into test29's actual data-only reader.
+  // No integration entrypoint or scenario declaration is executed here.
+  function test29Records(command: 'skipped' | 'once', files: Record<string, string>) {
+    const consumer = readFileSync(join(import.meta.dir, 'integration/test-29-invited-channels.sh'), 'utf8')
+      .match(/cat > "\$\{STUB_RECORDS\}" << 'EOF'\n([\s\S]*?)\nEOF/)?.[1]
+    expect(consumer).toBeDefined()
+    const root = mkdtempSync(join(scratch, 'records-')), reader = join(root, 'reader.py')
+    try {
+      writeFileSync(reader, consumer!)
+      for (const [name, bytes] of Object.entries(files)) writeFileSync(join(root, name), bytes)
+      const args = command === 'skipped' ? ['log', 'ids'] : ['requests', 'results']
+      const child = spawnSync('python3', [reader, command, ...args.map(name => join(root, name))], {
+        encoding: 'utf8', timeout: 2000, env: hostSafeChildEnv(root, { tools: ['python3'] }),
+      })
+      assertNoLeak({ stdout: child.stdout, stderr: child.stderr, error: child.error })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+      return child.status
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }
+
+  test('ordinary requests remain serial, preserve line shapes, and retain skip state across a new client', async () => {
+    const first = deferred<Response>()
+    const h = harness(undefined, m => m.params.name === 'first' ? first.promise : h.toolResponse(m.id, m.params.name))
+    await h.connect('start')
+    h.write([request('first'), request('second')])
+    const pending = h.poll(); await turns()
+    expect(h.starts.map(x => x.name)).toEqual(['first']); expect(h.observed('results')).toEqual([])
+    first.resolve(h.toolResponse(1, 'first')); await pending
+    expect(h.starts.map(x => x.name)).toEqual(['first','second'])
+    expect(h.observed('results')).toEqual([{id:'first',isError:false,text:'first'}, {id:'second',isError:false,text:'second'}])
+    h.notify('probe-1', {content:'unchanged',meta:{via:'thread'}}); await turns()
+    expect(h.observed('deliveries')).toEqual([{content:'unchanged',meta:{via:'thread'}}])
+    await h.close()
+    const restart = harness(h.files)
+    await restart.connect('start'); await restart.poll()
+    expect(restart.starts).toEqual([])
+    expect(restart.observed('sessions').filter((x: any) => x.event === 'connected')).toHaveLength(2)
+    expect(test29Records('skipped', { log: restart.logs.join('\n'), ids: 'first\nsecond\n' })).toBe(0)
+    expect(test29Records('skipped', { log: restart.logs.filter(line => !line.includes('request second ')).join('\n'), ids: 'first\nsecond\n' })).toBe(1)
+    expect(restart.observed('results')).toEqual([{id:'first',isError:false,text:'first'}, {id:'second',isError:false,text:'second'}])
+    expect(test29Records('once', { requests: h.files.get('requests')!, results: h.files.get('results')! })).toBe(0)
+    expect(test29Records('once', { requests: h.files.get('requests')!, results: h.files.get('results')! + h.files.get('results')! })).toBe(1)
+  })
+
+  test('same-poll groups start all members before an answer and await all before the next batch', async () => {
+    const a = deferred<Response>(), b = deferred<Response>()
+    const h = harness(undefined, m => m.params.name === 'a' ? a.promise : m.params.name === 'b' ? b.promise : h.toolResponse(m.id, m.params.name))
+    await h.connect('start')
+    h.write([request('a',{group:'together'}), request('later'), request('b',{group:'together'}), request('a',{group:'together'})])
+    const pending = h.poll(); await turns()
+    expect(h.starts.map(x=>x.name)).toEqual(['a','b']); expect(h.observed('results')).toEqual([])
+    b.resolve(h.toolResponse(2,'b')); await turns()
+    expect(h.starts.map(x=>x.name)).toEqual(['a','b'])
+    a.resolve(h.toolResponse(1,'a')); await pending
+    expect(h.starts.map(x=>x.name)).toEqual(['a','b','later'])
+    expect(h.observed('results').map((x:any)=>x.id).sort()).toEqual(['a','b','later'])
+    expect(h.logs.some(line => /request a .*scheduled.*not run/.test(line))).toBe(true)
+    expect(test29Records('skipped', { log: h.logs.join('\n'), ids: 'a\n' })).toBe(1)
+  })
+
+  test('loss cancels an unread response and retry in the same poll uses a fresh roots-acknowledged session', async () => {
+    const gate = deferred(), entered = deferred()
+    const h = harness(undefined, undefined, sid => {
+      if (sid === 'probe-2') { entered.resolve(); return gate.promise }
+      return Promise.resolve()
+    })
+    await h.connect('start')
+    h.write([request('lost',{lose_response:true}), request('retry',{arguments:{attempt_id:'retained',intent:'retry'}})])
+    const pending = h.poll(); await entered.promise
+    expect(h.starts.map(x=>x.name)).toEqual(['lost'])
+    expect(h.reads).toEqual([])
+    expect(h.cancels).toEqual(['lost'])
+    expect(h.observed('results')).toEqual([{id:'lost',isError:true,text:'',status:'lost',session_id:'probe-1'}])
+    gate.resolve(); await pending
+    expect(h.starts).toEqual([
+      {sid:'probe-1',name:'lost',args:{attempt_id:'retained',intent:'assignment'}},
+      {sid:'probe-2',name:'retry',args:{attempt_id:'retained',intent:'retry'}},
+    ])
+    expect(h.reads).toEqual(['retry'])
+    expect(h.observed('results')[1]).toEqual({id:'retry',isError:false,text:'retry'})
+    expect(h.observed('sessions').filter((x:any)=>x.event === 'connected').map((x:any)=>x.reason)).toEqual(['start','lost_response'])
+    expect(h.observed('sessions').filter((x:any)=>x.event === 'request').map((x:any)=>[x.id,x.session_id])).toEqual([['lost','probe-1'],['retry','probe-2']])
+    await h.close()
+    const restarted = harness(h.files)
+    await restarted.connect('start'); await restarted.poll()
+    expect(restarted.starts).toEqual([])
+  })
+
+  test('closing a lost-response group answers every in-flight member once and continues on the new session', async () => {
+    const never = deferred<Response>()
+    const h = harness(undefined, m => m.params.name === 'peer' ? never.promise : h.toolResponse(m.id,m.params.name))
+    await h.connect('start')
+    h.write([request('lose',{group:'g',lose_response:true}),request('peer',{group:'g'}),request('next')])
+    await h.poll()
+    expect(h.starts.map(x=>[x.name,x.sid])).toEqual([['lose','probe-1'],['peer','probe-1'],['next','probe-2']])
+    const results = h.observed('results')
+    expect(results).toHaveLength(3)
+    expect(results.find((x:any)=>x.id==='lose').status).toBe('lost')
+    expect(results.find((x:any)=>x.id==='peer')).toMatchObject({isError:true,text:'',error:expect.any(String)})
+    expect(results.find((x:any)=>x.id==='next')).toEqual({id:'next',isError:false,text:'next'})
+  })
+
+  test('failure before response headers is an error, never a claimed response loss', async () => {
+    const h = harness(undefined, () => { throw new Error('fixture pre-headers disconnect') })
+    await h.connect('start'); h.write([request('failed',{lose_response:true})]); await h.poll()
+    expect(h.observed('results')).toEqual([{id:'failed',isError:true,text:'',error:expect.stringContaining('fixture pre-headers disconnect')}])
+    expect(h.observed('sessions').filter((x:any)=>x.event === 'connected')).toHaveLength(1)
+  })
+
+  test('two already received responses lost together each retain their loss marker', async () => {
+    const h = harness(); await h.connect('start')
+    h.write([request('loss-a',{group:'g',lose_response:true}),request('loss-b',{group:'g',lose_response:true})])
+    await h.poll()
+    expect(h.reads).toEqual([])
+    expect(h.cancels).toEqual(['loss-a','loss-b'])
+    expect(h.observed('results').map((x:any)=>[x.id,x.status])).toEqual([['loss-a','lost'],['loss-b','lost']])
+    expect(h.observed('sessions').filter((x:any)=>x.event==='connected')).toHaveLength(2)
+  })
+
+  test('incomplete lines wait for a later poll and groups never include unread partial members', async () => {
+    const h = harness(); await h.connect('start')
+    h.files.set('requests', JSON.stringify(request('one',{group:'g'}))+'\n'+JSON.stringify(request('two',{group:'g'})))
+    await h.poll(); expect(h.starts.map(x=>x.name)).toEqual(['one'])
+    h.files.set('requests',h.files.get('requests')+'\n'); await h.poll()
+    expect(h.starts.map(x=>x.name)).toEqual(['one','two'])
+    for (const fields of [{group:''},{group:1},{lose_response:'true'},{method:'tools/list',lose_response:false}]) {
+      expect(h.parseRequest(JSON.stringify(request('invalid',fields)))).toHaveProperty('invalid')
+    }
+  })
+
+  const pairRequest = (id: string, role: 'stale' | 'replacement', fields: object = {}) => request(id, {
+    group: 'replacement-pair',
+    arguments: {attempt_id:'retained',channel:'CEXAMPLE',delivery:'thread_hybrid',intent:'assignment',_stub_session:role},
+    ...fields,
+  })
+
+  test('two real SDK transports retain roots and one barrier, refuse stale HTTP without retry and keep the replacement', async () => {
+    const rootsGate = deferred(), rootsEntered = deferred(), stale = deferred<Response>(), current = deferred<Response>()
+    const h = harness(undefined, (message, sid) => message.params.name === 'old' ? stale.promise :
+      message.params.name === 'new' ? current.promise : h.toolResponse(message.id, message.params.name),
+      sid => { if (sid === 'probe-2') { rootsEntered.resolve(); return rootsGate.promise }; return Promise.resolve() })
+    await h.connect('start')
+    h.write([pairRequest('old','stale'), pairRequest('new','replacement'), request('historical', {
+      arguments:{attempt_id:'retained',channel:'CEXAMPLE',delivery:'thread_hybrid',intent:'retry'},
+    })])
+    const pending = h.poll(); await rootsEntered.promise
+    expect(h.starts).toEqual([])
+    expect(h.closed).toEqual([])
+    rootsGate.resolve(); await turns()
+    expect(h.roots).toEqual(['probe-1','probe-2'])
+    expect(h.starts.map(x=>[x.name,x.sid])).toEqual([['old','probe-1'],['new','probe-2']])
+    for (const start of h.starts) expect(start.args).toEqual({attempt_id:'retained',channel:'CEXAMPLE',delivery:'thread_hybrid',intent:'assignment'})
+    const events = h.observed('sessions')
+    expect(events.filter((x:any)=>x.event==='connected').map((x:any)=>x.reason)).toEqual(['start','replacement'])
+    expect(events.filter((x:any)=>x.event==='submission_ready').map((x:any)=>[x.id,x.session_id])).toEqual([['old','probe-1'],['new','probe-2']])
+    const barrier = events.find((x:any)=>x.event==='submission_barrier')
+    expect(barrier.requests.map((x:any)=>[x.id,x.session_id,x.session_role])).toEqual([['old','probe-1','stale'],['new','probe-2','replacement']])
+    const starts = events.filter((x:any)=>x.event==='http_start')
+    expect(starts.map((x:any)=>x.in_flight)).toEqual([['old'],['old','new']])
+    expect(events.indexOf(barrier)).toBeLessThan(events.indexOf(starts[0]))
+    expect(h.observed('results')).toEqual([])
+    stale.resolve(new Response('stale transport refused', {status:404})); await turns()
+    expect(h.starts.map(x=>x.name)).toEqual(['old','new'])
+    expect(h.observed('results')).toEqual([{id:'old',isError:true,text:'',error:expect.stringContaining('stale transport refused'),group:'replacement-pair',session_id:'probe-1',session_role:'stale'}])
+    expect(h.closed).toEqual([])
+    current.resolve(h.toolResponse(1,'new')); await pending
+    expect(h.closed).toEqual(['probe-1'])
+    expect(h.starts.map(x=>[x.name,x.sid])).toEqual([['old','probe-1'],['new','probe-2'],['historical','probe-2']])
+    expect(h.starts[2].args).toEqual({attempt_id:'retained',channel:'CEXAMPLE',delivery:'thread_hybrid',intent:'retry'})
+    expect(h.observed('results')[1]).toEqual({id:'new',isError:false,text:'new',group:'replacement-pair',session_id:'probe-2',session_role:'replacement'})
+    expect(h.observed('results')[2]).toEqual({id:'historical',isError:false,text:'historical'})
+    expect(h.observed('sessions').filter((x:any)=>x.event==='http_headers').map((x:any)=>[x.id,x.http_status])).toEqual([['old',404],['new',200]])
+    expect(h.observed('sessions').filter((x:any)=>x.event==='submission_aborted')).toEqual([])
+    await h.close()
+    const restarted = harness(h.files); await restarted.connect('start'); await restarted.poll()
+    expect(restarted.starts).toEqual([])
+    expect(restarted.roots).toEqual(['probe-3'])
+  })
+
+  test('role selection follows the opt-in arguments in either file order and preserves retry intent', async () => {
+    const h = harness()
+    await h.connect('start')
+    h.write([pairRequest('new-first','replacement'), pairRequest('old-second','stale',{
+      arguments:{attempt_id:'retained',channel:'CEXAMPLE',delivery:'thread_hybrid',intent:'retry',_stub_session:'stale'},
+    })])
+    await h.poll()
+    expect(h.starts.map(x=>[x.name,x.sid])).toEqual([['new-first','probe-2'],['old-second','probe-1']])
+    expect(h.starts[1].args).toEqual({attempt_id:'retained',channel:'CEXAMPLE',delivery:'thread_hybrid',intent:'retry'})
+    expect(h.observed('sessions').find((x:any)=>x.event==='http_start' && x.id==='old-second').in_flight).toEqual(['new-first','old-second'])
+    expect(h.closed).toEqual(['probe-1'])
+  })
+
+  test('bad pair composition sends no calls, opens no replacement and answers each unique request once', async () => {
+    for (const batch of [
+      [pairRequest('one','stale')],
+      [pairRequest('one','stale',{group:undefined}),pairRequest('two','replacement',{group:undefined})],
+      [pairRequest('one','stale'),pairRequest('two','stale')],
+      [pairRequest('one','stale'),pairRequest('two','replacement'),request('extra',{group:'replacement-pair'})],
+      [pairRequest('one','stale',{lose_response:true}),pairRequest('two','replacement')],
+      [pairRequest('one','stale'),{id:'two',method:'tools/list',group:'replacement-pair'}],
+    ]) {
+      const h=harness(); await h.connect('start'); h.write(batch); await h.poll()
+      expect(h.starts).toEqual([])
+      expect(h.roots).toEqual(['probe-1'])
+      expect(h.observed('results').map((x:any)=>x.id)).toEqual(batch.map(x=>x.id))
+      for (const result of h.observed('results')) expect(result).toMatchObject({isError:true,text:'',error:expect.stringContaining('session replacement needs')})
+      await h.close()
+    }
+    const h = harness()
+    for (const role of [null,true,{},'', 'current']) expect(h.parseRequest(JSON.stringify(request('bad',{arguments:{_stub_session:role}})))).toHaveProperty('invalid')
+  })
+
+  test('transport failure before either fetch releases no peer and records a failed barrier, never overlap', async () => {
+    class RefusingTransport extends StreamableHTTPClientTransport {
+      async send(message: any, options?: any) {
+        if (message.method==='tools/call' && this.sessionId==='probe-1') throw new Error('probe refuses before fetch')
+        return super.send(message, options)
+      }
+    }
+    const h=harness(undefined,undefined,undefined,RefusingTransport)
+    await h.connect('start'); h.write([pairRequest('old','stale'),pairRequest('new','replacement'),request('later')]); await h.poll()
+    expect(h.starts.map(x=>[x.name,x.sid])).toEqual([['later','probe-2']])
+    const events=h.observed('sessions')
+    expect(events.filter((x:any)=>x.event==='submission_barrier' || x.event==='http_start')).toEqual([])
+    expect(events.filter((x:any)=>x.event==='submission_aborted')).toHaveLength(1)
+    expect(h.observed('results').slice(0,2).every((x:any)=>x.isError && x.error && x.text==='')).toBe(true)
+    expect(h.closed).toEqual(['probe-1'])
+  })
+
+  test('a missing submission is bounded and late arrival cannot send after the barrier aborts', async () => {
+    const hold=deferred()
+    class DelayedTransport extends StreamableHTTPClientTransport {
+      async send(message: any, options?: any) {
+        if (message.method==='tools/call' && this.sessionId==='probe-1') await hold.promise
+        return super.send(message, options)
+      }
+    }
+    const h=harness(undefined,undefined,undefined,DelayedTransport)
+    await h.connect('start'); h.write([pairRequest('old','stale'),pairRequest('new','replacement')])
+    const ready=h.onRecord('submission_ready'), aborted=h.onRecord('submission_aborted'), pending=h.poll()
+    await ready
+    await h.clock.advance(h.bounds.barrier - 1)
+    expect(h.observed('sessions').filter((x:any)=>x.event==='submission_aborted')).toEqual([])
+    expect(h.starts).toEqual([])
+    await h.clock.advance(1)
+    expect((await aborted).error).toBe('paired SDK submission timed out')
+    expect(h.starts).toEqual([])
+    hold.resolve(); await pending
+    expect(h.starts).toEqual([])
+    expect(h.observed('sessions').filter((x:any)=>x.event==='submission_barrier')).toEqual([])
+    expect(h.observed('results')).toHaveLength(2)
+    for (const result of h.observed('results')) expect(result).toMatchObject({isError:true,text:'',error:expect.stringContaining('paired SDK submission timed out')})
+  })
+
+  test('replacement roots failure reports no submitted pair and keeps the gate failed', async () => {
+    const rootsFailed=deferred()
+    const h=harness(undefined,undefined, async sid => { if(sid==='probe-2') { rootsFailed.resolve(); throw new Error('probe roots reply refused') } })
+    await h.connect('start'); h.write([pairRequest('old','stale'),pairRequest('new','replacement')])
+    const pending=h.poll()
+    await rootsFailed.promise
+    await h.clock.advance(h.bounds.roots - 1)
+    expect(h.observed('results')).toEqual([])
+    expect(h.starts).toEqual([])
+    await h.clock.advance(1)
+    await pending
+    expect(await h.ended).toBe(1)
+    expect(h.starts).toEqual([])
+    expect(h.observed('sessions').filter((x:any)=>x.event==='submission_barrier')).toEqual([])
+    expect(h.observed('results')).toHaveLength(2)
+    expect(h.closed).toContain('probe-1')
   })
 })
