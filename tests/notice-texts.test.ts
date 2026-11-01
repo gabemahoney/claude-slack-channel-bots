@@ -729,7 +729,10 @@ function deliveryEntries(): NoticeEntry[] {
     entry("common", buildMessageSavedAfterRetryNotice.name, 'exact retry saved', () => buildMessageSavedAfterRetryNotice(PERSONA.name, 'U0SENDER1')),
     ...DELIVERY_STUCK_REASONS.map((reason) => entry("common", buildDeliveryStuckNotice.name, reason, () =>
       buildDeliveryStuckNotice(PERSONA.name, KEY, 2, DELIVERY_STUCK_AFTER_MS + 1, reason, 3))),
+    ...DELIVERY_STUCK_REASONS.map((reason) => entry("common", buildDeliveryStuckNotice.name, `${reason} with partial receipt`, () =>
+      buildDeliveryStuckNotice(PERSONA.name, KEY, 2, DELIVERY_STUCK_AFTER_MS + 1, reason, 3, true))),
     entry("common", buildMessageNotTakenInNotice.name, 'unconfirmed first retype', () => buildMessageNotTakenInNotice(PERSONA.name, 'U0SENDER1')),
+    entry("common", buildMessageNotTakenInNotice.name, 'unconfirmed first retype with partial receipt', () => buildMessageNotTakenInNotice(PERSONA.name, 'U0SENDER1', true)),
     ...MESSAGES_WAITING_STATES.map((state) => entry("common", buildMessagesWaitingNotice.name, state, () =>
       buildMessagesWaitingNotice(PERSONA.name, 2, DELIVERY_STUCK_AFTER_MS, state))),
     entry("common", buildQueueRecordUnreadableNotice.name, 'unreadable accepted record', () =>
@@ -1139,7 +1142,8 @@ describe('the notice catalogue is complete (to, and every named Slack notice)', 
     expect(variantsOf('ONSET_TEMPLATES')).toEqual(expect.arrayContaining(OUTAGE_CLASS_ORDER.map((outage) => `${outage} onset`)))
     expect(variantsOf(buildNotConnectedNotice.name)).toEqual(notConnectedVariants().map(([label]) => label))
     expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'auto-restart-disabled']))
-    expect(variantsOf(buildDeliveryStuckNotice.name)).toEqual([...DELIVERY_STUCK_REASONS])
+    expect(variantsOf(buildDeliveryStuckNotice.name)).toEqual([...DELIVERY_STUCK_REASONS, ...DELIVERY_STUCK_REASONS.map(reason => `${reason} with partial receipt`)])
+    expect(variantsOf(buildMessageNotTakenInNotice.name)).toEqual(['unconfirmed first retype', 'unconfirmed first retype with partial receipt'])
     expect(variantsOf(buildMessagesWaitingNotice.name)).toEqual([...MESSAGES_WAITING_STATES])
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_ROTATED])
   })

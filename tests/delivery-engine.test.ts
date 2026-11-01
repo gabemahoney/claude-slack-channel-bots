@@ -17,6 +17,7 @@ import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
+import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { injectedInput, makeQueue, readQueue, seedQueue } from './test-helpers/delivery-queue.ts'
 import type { AcceptedRecord, QueueRecord } from '../src/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -1001,6 +1002,112 @@ describe('durable FIFO and send sequence', () => {
 })
 
 describe('fresh send guards', () => {
+
+  test.each(['prior session', 'late current path'] as const)(
+    'b.x4j server replay never promotes a pre-send fragment from %s', async location => {
+      const h = await harness(), p = h.p(), prior = join(h.root, 'prior.jsonl')
+      p.autoReceipt = false
+      p.row.launch_started_at = new Date(h.clock.now()).toISOString()
+      const oldPath = location === 'prior session' ? prior : p.path
+      writeTranscript(oldPath, [{ ...promptEntry(partialReceiptSuffix),
+        sessionId: location === 'prior session' ? 'prior-session' : p.row.session_id,
+        timestamp: new Date(h.clock.now() - 1).toISOString() }])
+      if (location === 'prior session') p.row.prior_sessions = [{ jsonl_path: prior, session_id: 'prior-session' }]
+      else { p.row.jsonl_path = ''; p.row.transcript_status = 'never_written' }
+      await h.accept(partialReceiptText)
+      await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+      expect(h.events.filter(event => event.type === 'partial-receipt')).toEqual([])
+
+      await h.restartServer()
+      p.row.jsonl_path = p.path; p.row.transcript_status = 'present'
+      await h.tick(); await h.advance(DELIVERY_ROW_POLL_MS)
+      expect(h.engine.status('alpha')).toBeDefined()
+      expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+      expect(h.events.filter(event => event.type === 'partial-receipt')).toEqual([])
+      expect(h.queue.openCount('alpha')).toBe(1)
+      expect(h.queue.items('alpha')[0]).toMatchObject({ accepted: { text: partialReceiptText }, fixed: { parts: [partialReceiptText] } })
+      expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+      // Replay retains the existing recovery Enter for the uncertain attempt.
+      const replayKeys = h.keyCalls()
+      expect(replayKeys.map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter', 'Enter'])
+
+      appendTranscript(p.path, [{ ...promptEntry(partialReceiptSuffix), sessionId: p.row.session_id,
+        timestamp: new Date(h.clock.now()).toISOString() }])
+      await h.advance(DELIVERY_ROW_POLL_MS)
+      expect(h.events.filter(event => event.type === 'partial-receipt')).toEqual([
+        { type: 'partial-receipt', key: 'alpha', seq: 1, part: 1,
+          expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) },
+      ])
+      expect(h.engine.status('alpha')?.partialReceipt?.part).toBe(1)
+      expect(h.queue.openCount('alpha')).toBe(1)
+      const full = promptEntry(partialReceiptText)
+      appendTranscript(p.path, [full])
+      await delivered(h)
+      expect(h.records().filter(record => record.kind === 'delivered')).toMatchObject([{ receipt: { uuid: full.uuid } }])
+      expect(h.keyCalls()).toEqual(replayKeys)
+      expect(h.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+      expect(h.errors).toEqual([])
+    })
+
+  test.each(['uuid', 'path-offset'] as const)('b.x4j partial diagnostic dedup uses %s and new-launch evidence can be reported', async identity => {
+    const h = await harness(), p = h.p()
+    p.autoReceipt = false
+    p.row.launch_started_at = new Date(h.clock.now()).toISOString()
+    await h.accept(partialReceiptText)
+    await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    const fragment = promptEntry(partialReceiptSuffix)
+    if (identity === 'path-offset') delete fragment.uuid
+    appendTranscript(p.path, [fragment])
+    await h.advance(DELIVERY_ROW_POLL_MS * 3)
+    const partials = () => h.events.filter(event => event.type === 'partial-receipt')
+    expect(partials()).toEqual([{ type: 'partial-receipt', key: 'alpha', seq: 1, part: 1,
+      expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) }])
+    expect(h.engine.status('alpha')?.partialReceipt).toEqual({ part: 1,
+      expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) })
+    p.row.launch_started_at = new Date(h.clock.now()).toISOString()
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+    await h.until(() => h.textCalls().length === 2)
+    await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(partials()).toHaveLength(1) // Old file bytes cannot label the new send.
+    appendTranscript(p.path, [promptEntry(partialReceiptSuffix)])
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(partials()).toHaveLength(2)
+    expect(h.engine.status('alpha')?.partialReceipt?.part).toBe(1)
+    appendTranscript(p.path, [promptEntry(partialReceiptText)])
+    await delivered(h)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['working', 'relay-off', 'held'] as const)('b.x4j partial receipt cannot bypass %s or authorize another key', async guard => {
+    const h = await harness(), p = h.p()
+    await h.accept(partialReceiptText)
+    p.autoReceipt = false
+    await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    appendTranscript(p.path, [promptEntry(partialReceiptSuffix)])
+    if (guard === 'working') p.row.state = 'working'
+    else if (guard === 'relay-off') p.row.relay_mode = 'off'
+    else p.held = true
+    await h.advance(RECEIPT_WAIT_MS * 4)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter'])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.queue.items('alpha')[0]!.fixed?.parts).toEqual([partialReceiptText])
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    if (guard === 'working') expect(h.engine.status('alpha')?.row).toBe('working')
+    p.row.state = 'waiting'; p.row.relay_mode = 'on'; p.held = false
+    await h.until(() => h.events.some(event => event.type === 'retyped'))
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter', 'Enter', partialReceiptText, 'Enter'])
+    expect(h.textCalls()[1]!.at - h.textCalls()[0]!.at).toBeGreaterThanOrEqual(RECEIPT_WAIT_MS)
+    const retyped = h.textCalls()[1]!, enter = h.keyCalls().at(-1)!
+    expect(enter.at - retyped.at).toBeGreaterThanOrEqual(ENTER_DELAY_MS)
+    appendTranscript(p.path, [promptEntry(partialReceiptText)])
+    await delivered(h)
+    expect(h.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+    expect(h.errors).toEqual([])
+  })
 
   test.each(['working', 'relay', 'pending', 'check_permission', 'ask_user', 'latched', 'held', 'down', 'mcp', 'marker'] as const)('%s blocks and then releases the head', async guard => {
     const h = await harness(), p = h.p()

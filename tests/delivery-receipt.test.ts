@@ -10,6 +10,7 @@ import { buildWrapper, type TagMessage } from '../src/tag-wrapper.ts'
 import { deliveryFailureEvidence, readTranscripts } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
 import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
+import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { appendTranscript, codexPromptEntry, pastedText, promptEntry, queuedCommandEntry, queueOperationEntry, toolResultEntry, transcriptJsonl, writeTranscript, type TranscriptEntry } from './test-helpers/working-row-panes.ts'
 
@@ -238,6 +239,282 @@ describe('exact matching and agent schema', () => {
 })
 
 describe('receipt reader', () => {
+  test.each([
+    ['raw', 'claude', () => promptEntry(partialReceiptSuffix)],
+    ['paste with framing LFs', 'claude', () => promptEntry(`\n\n${pastedText(partialReceiptSuffix)}\n\n`)],
+    ['queued human command', 'claude', () => queuedCommandEntry(partialReceiptSuffix)],
+    ['Codex input', 'codex', () => codexPromptEntry(partialReceiptSuffix)],
+  ] as const)('b.x4j %s: distinctive suffix is partial evidence, never full receipt', async (_name, agent, entry) => {
+    const h = await fixture(agent, partialReceiptText)
+    await h.send()
+    h.append(entry())
+    const observed = h.read()
+    expect(observed.receipt).toBeUndefined()
+    expect(h.item().accepted.text).toBe(partialReceiptText)
+    expect(h.item().fixed?.parts).toEqual([partialReceiptText])
+    expect(h.item().delivered).toBe(false)
+    expect(observed).toMatchObject({ partialReceipt: { path: h.path, offset: 0, kind: 'take-in', receivedBytes: Buffer.byteLength(partialReceiptSuffix) } })
+  })
+
+  // Exercise the documented floors through the reader, without importing its
+  // private classifier. Distinct cyclic alphabets isolate the variety floor.
+  const alphabet = Array.from({ length: 64 }, (_, i) => String.fromCodePoint(33 + i)).join('')
+  test.each([
+    ['127 UTF-8 bytes', alphabet.repeat(2).slice(0, 127), false],
+    ['128 UTF-8 bytes', alphabet.repeat(2), true],
+    ['95 nonspace code points', alphabet.repeat(2).slice(0, 95) + ' '.repeat(40), false],
+    ['96 nonspace code points', alphabet.repeat(2).slice(0, 96) + ' '.repeat(40), true],
+    ['47 distinct four-character sequences', alphabet.slice(0, 47).repeat(4), false],
+    ['48 distinct four-character sequences', alphabet.slice(0, 48).repeat(4), true],
+    ['95 multibyte code points', Array.from({ length: 95 }, (_, i) => String.fromCodePoint(0x1f300 + i)).join(''), false],
+    ['96 multibyte code points', Array.from({ length: 96 }, (_, i) => String.fromCodePoint(0x1f300 + i)).join(''), true],
+  ] as const)('b.x4j conservative distinctiveness: %s', async (_name, suffix, qualifies) => {
+    const h = await fixture('claude', `lost prefix\n${suffix}`)
+    await h.send(); h.append(promptEntry(suffix))
+    const observed = h.read()
+    expect(observed.receipt).toBeUndefined()
+    if (qualifies) expect(observed).toMatchObject({ partialReceipt: { receivedBytes: Buffer.byteLength(suffix) } })
+    else expect(observed).not.toHaveProperty('partialReceipt', expect.anything())
+  })
+
+  test.each(['several frames', 'literal paste-looking suffix', 'multibyte paste'] as const)(
+    'b.x4j %s preserves exact suffix bytes', async kind => {
+      const unicode = Array.from({ length: 100 }, (_, i) => String.fromCodePoint(0x1f300 + i)).join('')
+      const suffix = kind === 'literal paste-looking suffix' ? pastedText(partialReceiptSuffix) : kind === 'multibyte paste' ? unicode : partialReceiptSuffix
+      const record = kind === 'several frames' ? `${pastedText(suffix.slice(0, 150))}${pastedText(suffix.slice(150), 'second')}`
+        : kind === 'multibyte paste' ? pastedText(suffix) : suffix
+      const h = await fixture('claude', `lost prefix\n${suffix}`)
+      await h.send(); h.append(promptEntry(record))
+      expect(h.read()).toMatchObject({ receipt: undefined, partialReceipt: { receivedBytes: Buffer.byteLength(suffix) } })
+    })
+
+  test.each([
+    ['before send', new Date(999).toISOString(), true],
+    ['at send', new Date(1000).toISOString(), true],
+    ['after send', new Date(1001).toISOString(), false],
+    ['invalid non-null start', 'invalid-launch-start', false],
+    ['space-separated start', '1970-01-01 00:00:00Z', false],
+    ['invalid calendar date', '1969-02-29T00:00:00Z', false],
+    ['supported leap second', '1969-12-31T23:59:60Z', true],
+    ['missing start', undefined, true],
+    ['null start', null, true],
+  ] as const)('b.x4j replay scopes partial evidence to AD launch start: %s', async (_name, launch_started_at, qualifies) => {
+    const h = await fixture('claude', partialReceiptText)
+    await h.send(); h.append(promptEntry(partialReceiptSuffix))
+    const reader = createDeliveryReceiptReader(), row = { ...h.row, launch_started_at }
+    const read = () => reader.read('claude', row, h.item(), 1)
+    expect(read().receipt).toBeUndefined()
+    if (qualifies) expect(read()).toHaveProperty('partialReceipt', expect.anything())
+    else expect(read()).not.toHaveProperty('partialReceipt', expect.anything())
+    // A complete historical receipt can still finish this exact queued part.
+    const full = promptEntry(partialReceiptText); h.append(full)
+    expect(read()).toMatchObject({ receipt: { uuid: full.uuid } })
+    expect(read()).not.toHaveProperty('partialReceipt', expect.anything())
+  })
+
+  test('b.x4j an old-session send cannot label a new session, but its full receipt remains valid', async () => {
+    const h = await fixture('claude', partialReceiptText)
+    await h.send(); h.append(promptEntry(partialReceiptSuffix))
+    h.row.session_id = 'new-session'
+    expect(h.read()).not.toHaveProperty('partialReceipt', expect.anything())
+    const full = promptEntry(partialReceiptText); h.append(full)
+    expect(h.read()).toMatchObject({ receipt: { uuid: full.uuid } })
+  })
+
+  test.each([
+    ['prior path before launch', 'prior', 250, false],
+    ['prior path after send', 'prior', 1001, false],
+    ['late current path before launch', 'current', 250, false],
+    ['late current path after launch but before send', 'current', 999, false],
+    ['late current path without timestamp', 'current', undefined, false],
+    ['late current path with invalid timestamp', 'current', 'invalid-record-time', false],
+    ['late current path at send', 'current', 1000, true],
+    ['late current path after send', 'current', 1001, true],
+  ] as const)('b.x4j unknown pre-send EOF: %s', async (_name, location, at, qualifies) => {
+    const h = await fixture('claude', partialReceiptText), prior = join(h.root, 'prior.jsonl')
+    await h.send(0, location === 'current' ? '' : h.path)
+    const fragment = promptEntry(partialReceiptSuffix)
+    fragment.sessionId = location === 'current' ? h.row.session_id : 'prior-session'
+    fragment.timestamp = typeof at === 'number' ? new Date(at).toISOString() : at
+    const path = location === 'current' ? h.path : prior
+    writeTranscript(path, [fragment])
+    const row = { ...h.row, launch_started_at: new Date(500).toISOString(),
+      prior_sessions: location === 'prior' ? [{ jsonl_path: prior, session_id: 'prior-session' }] : [] }
+    // A fresh reader has neither an observed EOF nor a cached pre-send window.
+    const observed = createDeliveryReceiptReader().read('claude', row, h.item(), 1)
+    expect(observed.receipt).toBeUndefined()
+    if (qualifies) expect(observed.partialReceipt).toMatchObject({ path, uuid: fragment.uuid, at,
+      receivedBytes: Buffer.byteLength(partialReceiptSuffix) })
+    else expect(observed.partialReceipt).toBeUndefined()
+  })
+
+  test.each(['send path', 'observed prior path'] as const)(
+    'b.x4j %s EOF accepts undated fragments but rejects explicitly pre-send timestamps', async location => {
+      const h = await fixture('claude', partialReceiptText), prior = join(h.root, 'prior.jsonl')
+      writeTranscript(prior, [promptEntry('unrelated earlier input')])
+      const row = { ...h.row, launch_started_at: new Date(500).toISOString(), prior_sessions: [{ jsonl_path: prior }] }
+      const read = () => h.reader.read('claude', row, h.item(), 1)
+      read() // Observe the prior path before the durable send freezes its EOF.
+      await h.send()
+      const path = location === 'send path' ? h.path : prior
+      appendTranscript(path, [{ ...promptEntry(partialReceiptSuffix), timestamp: new Date(999).toISOString() }])
+      expect(read().partialReceipt).toBeUndefined()
+      const fragment = promptEntry(partialReceiptSuffix)
+      delete fragment.timestamp
+      const offset = fs.statSync(path).size
+      appendTranscript(path, [fragment])
+      expect(read()).toMatchObject({ receipt: undefined, partialReceipt: { path, offset, uuid: fragment.uuid,
+        receivedBytes: Buffer.byteLength(partialReceiptSuffix) } })
+    })
+
+  test('b.x4j dated historical full receipt supersedes a valid late-path partial receipt', async () => {
+    const h = await fixture('claude', partialReceiptText), prior = join(h.root, 'prior.jsonl')
+    await h.send(0, '')
+    const row = { ...h.row, launch_started_at: new Date(500).toISOString(),
+      prior_sessions: [{ jsonl_path: prior, session_id: 'prior-session' }] }
+    writeTranscript(prior, [])
+    h.append({ ...promptEntry(partialReceiptSuffix), sessionId: h.row.session_id, timestamp: new Date(1001).toISOString() })
+    expect(h.reader.read('claude', row, h.item(), 1).partialReceipt).toBeDefined()
+    const full = promptEntry(partialReceiptText)
+    full.sessionId = 'prior-session'; full.timestamp = new Date(250).toISOString()
+    appendTranscript(prior, [full])
+    const observed = createDeliveryReceiptReader().read('claude', row, h.item(), 1)
+    expect(observed.receipt).toMatchObject({ path: prior, uuid: full.uuid, at: 250 })
+    expect(observed.partialReceipt).toBeUndefined()
+  })
+
+  test('b.x4j an unknown-outcome marker alone permits full recovery, never partial classification', async () => {
+    const h = await fixture('claude', partialReceiptText)
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, attempt: 1, unknown_outcome: true, at: 1000,
+      quarantine: { path: join(h.root, 'quarantine'), line: 1 } })
+    h.append({ ...promptEntry(partialReceiptSuffix), timestamp: new Date(2000).toISOString() })
+    expect(h.read().receipt).toBeUndefined()
+    expect(h.read()).not.toHaveProperty('partialReceipt', expect.anything())
+    const full = promptEntry(partialReceiptText); full.timestamp = new Date(2000).toISOString(); h.append(full)
+    expect(h.read()).toMatchObject({ receipt: { uuid: full.uuid } })
+  })
+
+  test('b.x4j full receipt in a prior file takes precedence over current-file partial evidence', async () => {
+    const h = await fixture('claude', partialReceiptText), prior = join(h.root, 'prior.jsonl')
+    const full = promptEntry(partialReceiptText)
+    await h.send(); h.append(promptEntry(partialReceiptSuffix)); writeTranscript(prior, [full])
+    const observed = h.reader.read('claude', { ...h.row, prior_sessions: [{ jsonl_path: prior }] }, h.item(), 1)
+    expect(observed).toMatchObject({ receipt: { path: prior, uuid: full.uuid } })
+    expect(observed).not.toHaveProperty('partialReceipt', expect.anything())
+  })
+
+  test.each([
+    ['short common closing tag', partialReceiptText, '</channel>'],
+    ['short ordinary tail', partialReceiptText, 'ACK.</channel>'],
+    ['long repeated common text', `private prefix ${'ok '.repeat(120)}`, 'ok '.repeat(100)],
+    ['whitespace only', `private prefix${' '.repeat(400)}`, ' '.repeat(349)],
+    ['unrelated turn containing the tail', partialReceiptText, `Someone quoted: ${partialReceiptSuffix}`],
+    ['prefix only', partialReceiptText, partialReceiptText.slice(0, 349)],
+    ['meaningful newline lost', partialReceiptText, partialReceiptSuffix.replace('\n', '')],
+    ['changed final byte', partialReceiptText, `${partialReceiptSuffix}!`],
+    ['mismatched paste IDs', partialReceiptText, pastedText(partialReceiptSuffix).replace('</pasted_content id="abcd">', '</pasted_content id="other">')],
+  ])('b.x4j rejects ambiguous or unrelated partial evidence: %s', async (_name, expected, record) => {
+    const h = await fixture('claude', expected)
+    await h.send()
+    h.append(promptEntry(record))
+    const observed = h.read()
+    expect(observed.receipt).toBeUndefined()
+    expect(observed).not.toHaveProperty('partialReceipt', expect.anything())
+  })
+
+  test.each(['unsent', 'pre-send', 'refused', 'meta', 'sidechain', 'agent-origin', 'queued-agent', 'queue-operation', 'assistant'] as const)(
+    'b.x4j %s fragment cannot supply partial evidence', async kind => {
+      const h = await fixture('claude', partialReceiptText)
+      const entry = promptEntry(partialReceiptSuffix)
+      if (kind === 'pre-send') h.append(entry)
+      if (kind !== 'unsent') {
+        const sent = await h.send()
+        if (kind === 'refused') await h.queue.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: sent.attempt, at: 1500 })
+      }
+      if (kind !== 'pre-send') h.append(kind === 'queue-operation' ? queueOperationEntry('enqueue', partialReceiptSuffix)
+        : kind === 'queued-agent' ? queuedCommandEntry(partialReceiptSuffix, { attachment: { type: 'queued_command', prompt: partialReceiptSuffix, origin: { kind: 'agent' } } })
+        : { ...entry, ...(kind === 'meta' ? { isMeta: true } : kind === 'sidechain' ? { isSidechain: true }
+          : kind === 'agent-origin' ? { origin: { kind: 'agent' } } : kind === 'assistant' ? { type: 'assistant' } : {}) })
+      const observed = h.read()
+      expect(observed.receipt).toBeUndefined()
+      expect(observed).not.toHaveProperty('partialReceipt', expect.anything())
+    })
+
+  test('b.x4j a full record wins over earlier duplicate fragments and receives the only delivery credit', async () => {
+    const h = await fixture('claude', partialReceiptText)
+    await h.send()
+    const fragment = promptEntry(partialReceiptSuffix)
+    h.append(fragment, fragment)
+    const beforeFull = h.read()
+    expect(beforeFull.receipt).toBeUndefined()
+    const fullOffset = fs.statSync(h.path).size
+    const full = promptEntry(pastedText(partialReceiptText))
+    h.append(full)
+    const observed = h.read()
+    expect(observed.receipt).toMatchObject({ path: h.path, offset: fullOffset, uuid: full.uuid })
+    expect(observed).not.toHaveProperty('partialReceipt', expect.anything())
+    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: 2000,
+      receipt: { path: h.path, uuid: observed.receipt!.uuid, offset: fullOffset } })
+    await h.accept()
+    await h.send()
+    h.append(full) // Same UUID is not another delivery, even at a new byte offset.
+    expect(h.read().receipt).toBeUndefined()
+    expect(h.read()).not.toHaveProperty('partialReceipt', expect.anything())
+    h.append(promptEntry(partialReceiptText))
+    expect(h.read().receipt).toBeDefined()
+    expect(beforeFull).toMatchObject({ partialReceipt: { uuid: fragment.uuid } })
+  })
+
+  test('b.x4j previously observed prior-file EOF also bounds partial evidence', async () => {
+    const h = await fixture('claude', partialReceiptText), prior = join(h.root, 'prior.jsonl')
+    writeTranscript(prior, [promptEntry(partialReceiptSuffix)])
+    const row = { ...h.row, prior_sessions: [{ jsonl_path: prior }] }
+    const read = () => h.reader.read('claude', row, h.item(), 1, h.queue.items('alpha'))
+    read()
+    await h.send()
+    expect(read()).not.toHaveProperty('partialReceipt', expect.anything())
+    const offset = fs.statSync(prior).size
+    appendTranscript(prior, [promptEntry(partialReceiptSuffix)])
+    expect(read()).toMatchObject({ receipt: undefined, partialReceipt: { path: prior, offset } })
+  })
+
+  test('b.x4j a receipt already credited to another item cannot also be partial evidence', async () => {
+    const h = await fixture('claude', partialReceiptText)
+    await h.send()
+    const fragment = promptEntry(partialReceiptSuffix)
+    h.append(fragment)
+    const earlier = await h.queue.accept('alpha', injectedInput({ text: partialReceiptSuffix }))
+    if (earlier.status === 'failed') throw new Error('fixture acceptance failed')
+    await h.queue.append('alpha', { v: 1, kind: 'fixed', seq: earlier.seq, parts: [partialReceiptSuffix] })
+    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: earlier.seq, part: 1, at: 2000,
+      receipt: { path: h.path, offset: 0, uuid: fragment.uuid as string } })
+    h.append(fragment)
+    expect(h.read().receipt).toBeUndefined()
+    expect(h.read()).not.toHaveProperty('partialReceipt', expect.anything())
+    const newFragment = promptEntry(partialReceiptSuffix)
+    h.append(newFragment)
+    expect(h.read()).toMatchObject({ partialReceipt: { uuid: newFragment.uuid } })
+  })
+
+  test('b.x4j unreadable cached fragments cannot supply partial evidence', async () => {
+    const h = await fixture('claude', partialReceiptText)
+    await h.send()
+    h.append(promptEntry(partialReceiptSuffix))
+    let refused = false
+    const reader = createDeliveryReceiptReader({ fs: { ...fs, openSync: ((...args: any[]) => {
+      if (refused) throw Object.assign(new Error('refused'), { code: 'EACCES' })
+      return (fs.openSync as any)(...args)
+    }) as typeof fs.openSync } })
+    const read = () => reader.read('claude', h.row, h.item(), 1)
+    const readable = read()
+    refused = true
+    expect(read()).toMatchObject({ availability: 'unreadable', receipt: undefined })
+    expect(read()).not.toHaveProperty('partialReceipt', expect.anything())
+    refused = false
+    expect(read()).toEqual(readable)
+    expect(readable).toMatchObject({ partialReceipt: { path: h.path, offset: 0 } })
+  })
+
   test('Codex receipt matching preserves every wrapper newline', async () => {
     const own = buildWrapper({ source: 'slack', text: 'a long exact body', user: 'U0SENDER', channel: 'C0CHANNEL', ts: '1792000100.000001' } as TagMessage), h = await fixture('codex', own)
     await h.send()

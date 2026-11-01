@@ -1366,6 +1366,7 @@ describe('diagnostic lines', () => {
       'message-delivered',
       'message-not-saved',
       'message-not-taken-in',
+      'message-partial-receipt',
       'message-received',
       'message-retyped',
       'persona-channel-delivery-set',

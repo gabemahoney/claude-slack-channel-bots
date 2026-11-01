@@ -16,12 +16,15 @@ export type { DeliveryLifecycle, DeliveryClock } from './delivery-lifecycle.ts'
 
 export * from './delivery-constants.ts'
 export type DeliveryReason = 'state' | 'marker' | 'mcp' | 'relay-off' | 'held' | 'dialog-hold' | 'transcript-unreadable' | 'queue-unwritable' | 'not-now' | 'receipt' | 'backoff'
+/** Reporting only; never an input to delivery policy or permission to type. */
+export interface PartialReceiptEvidence { part: number; expectedBytes: number; receivedBytes: number }
 /** Safe operational facts; never composer or message body text. */
 export interface DeliveryStatus {
   key: string; seq: number; count: number; ageMs: number; retypeCount: number
   row?: string; marker: boolean; relay: boolean; connected: boolean; up: boolean
   latched: boolean; held: boolean; receiptWorking: boolean; dialogMaybeOpen: boolean
   reconnectDeferred: boolean
+  partialReceipt?: PartialReceiptEvidence
 }
 export type DeliveryEngineEvent =
   | { type: 'launch-observed'; key: string; sessionId: string; at: number }
@@ -30,7 +33,9 @@ export type DeliveryEngineEvent =
   | { type: 'delivered'; key: string; seq: number; part: number }
   | { type: 'item-delivered'; key: string; seq: number; at: number; waitMs: number }
   | { type: 'first-typed'; key: string; seq: number; part: number }
-  | { type: 'retyped' | 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number }
+  | { type: 'partial-receipt'; key: string; seq: number; part: number; expectedBytes: number; receivedBytes: number }
+  | { type: 'retyped'; key: string; seq: number; part: number; count: number }
+  | { type: 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number; partialReceipt?: PartialReceiptEvidence }
   | { type: 'waiting'; key: string; seq: number; reason: DeliveryReason; ageMs: number; status?: DeliveryStatus }
   | { type: 'marker-missing'; key: string }
 export type DeliveryClient = Pick<Client, 'get' | 'sendKeys'>
@@ -97,16 +102,18 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number; transcriptReference?: string
+    partialReceipt?: PartialReceiptEvidence & { seq: number }; partialLaunch?: string; partialAfterAttempts: Map<number, number>
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
   let stopped = false
   const typed = new Set<string>()
+  const reportedPartials = new Set<string>()
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
   function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
-    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), partialAfterAttempts: new Map(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
@@ -115,9 +122,28 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const items = deps.queue.items(key).filter(i => !i.delivered), head = items[0]
     if (!head) return undefined
     const deferred = life.deferred(key)
+    const partial = s.partialReceipt
+    const part = head.fixed?.parts.findIndex((_, index) => !head.records.some(r => r.kind === 'delivered' && r.part === index + 1))
+    const partialReceipt = partial?.seq === head.accepted.seq && partial.part === (part ?? -1) + 1
+      ? { part: partial.part, expectedBytes: partial.expectedBytes, receivedBytes: partial.receivedBytes } : undefined
     return { key, seq: head.accepted.seq, count: items.length, ageMs: Math.max(0, clock.now() - head.accepted.received_at), retypeCount: head.retypeCount,
       row: s.restarted === true ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
-      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred }
+      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred, partialReceipt }
+  }
+  function resetPartialLaunch(key: string, s: State): void {
+    // AD's observed transition excludes earlier sends even when a resumed
+    // conversation keeps its session ID and has no launch timestamp.
+    s.partialReceipt = undefined
+    s.partialAfterAttempts = new Map(deps.queue.items(key).filter(i => !i.delivered).map(i => [i.accepted.seq, i.nextAttempt - 1]))
+  }
+  function observePartialReceipt(key: string, s: State, head: QueueItem, part: number, receipt: ReceiptObservation): void {
+    const partial = receipt.receipt ? undefined : receipt.partialReceipt
+    s.partialReceipt = partial ? { seq: head.accepted.seq, part, expectedBytes: Buffer.byteLength(head.fixed!.parts[part - 1]!), receivedBytes: partial.receivedBytes } : undefined
+    if (!partial || !s.partialReceipt) return
+    const identity = JSON.stringify([key, head.accepted.seq, part, partial.uuid ? ['uuid', partial.uuid] : [partial.path, partial.offset]])
+    if (reportedPartials.has(identity)) return
+    reportedPartials.add(identity)
+    emit({ type: 'partial-receipt', key, ...s.partialReceipt })
   }
   function wait(key: string, s: State, reason: DeliveryReason): void { const facts = status(key, s); if (facts) emit({ type: 'waiting', key, seq: facts.seq, reason, ageMs: facts.ageMs, status: facts }) }
   function schedule(key: string, s: State, delay = DELIVERY_ROW_POLL_MS): void {
@@ -138,6 +164,9 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     try {
       const row = await ad(key, s, 'get', client => client.get({ instance_id: deps.instanceId(key) }))
       if (stopped || s.stopped) return false
+      const partialLaunch = JSON.stringify([row.session_id, row.launch_started_at])
+      if (s.partialLaunch !== undefined && s.partialLaunch !== partialLaunch) resetPartialLaunch(key, s)
+      s.partialLaunch = partialLaunch
       s.row = row
       if (row.state !== 'waiting' || !row.unproven_requests?.length || row.unproven_requests.some(r => r.decision === null)) s.dialogHold = false
       life.observeRow(key, row)
@@ -252,7 +281,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const persona = deps.persona(key)
     const agentOf = (row: GetResult): DeliveryAgent => row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
     let row = s.row
-    let receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+    let receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key), s.partialAfterAttempts.get(head.accepted.seq))
     // Claude's SessionStart can precede its first transcript write. AD keeps
     // that reference empty until find-missing heals it; get alone cannot.
     // Keep receipts from recorded/prior paths usable without a sweep. Only
@@ -266,7 +295,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (stopped || s.stopped || !life.active(key) || !deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key)) return false
       if (!await readRow(key, s, true) || !s.row) return false
       row = s.row
-      receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+      receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key), s.partialAfterAttempts.get(head.accepted.seq))
     }
     // Preserve an AD binding absent from an earlier durable attempt.
     // This is reference evidence, independent of whether a receipt matched.
@@ -277,6 +306,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     }
     s.receipt = receipt
     s.receiptTarget = [head.accepted.seq, part]; s.receiptAttempt = effectiveSends(head, part).at(-1)?.attempt ?? 0
+    observePartialReceipt(key, s, head, part, receipt)
     const text = head.fixed?.parts[part - 1]
     const records = [
       ...(receipt.receipt ? [{ kind: 'take-in', text }] : []),
@@ -493,7 +523,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           // Concrete receipt time must elapse before calling a retype
           // unconfirmed; a receipt arriving meanwhile wins the next choice.
           if (s.e.phase === 'receipt' && (s.deadlines.receipt ?? 0) > clock.now()) { nextDelay = Math.min(DELIVERY_ROW_POLL_MS, s.deadlines.receipt! - clock.now()); break }
-          queueWrite(s, { v: 1, kind: 'noticed', seq: pair[0], at: clock.now() }, () => { s.e.noticed = [...s.e.noticed, pair[0]]; emit({ type: 'first-unconfirmed-retype', key, seq: pair[0], part, count: head!.retypeCount }) }); continue
+          queueWrite(s, { v: 1, kind: 'noticed', seq: pair[0], at: clock.now() }, () => { s.e.noticed = [...s.e.noticed, pair[0]]; emit({ type: 'first-unconfirmed-retype', key, seq: pair[0], part, count: head!.retypeCount, partialReceipt: status(key, s)?.partialReceipt }) }); continue
         }
         if (action === 'deferReconnect') {
           release(s)
@@ -579,6 +609,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   life.setRelaunchObserver((key, row) => {
     const s = states.get(key)
     if (s) {
+      resetPartialLaunch(key, s)
       s.relaunch = true
       if (row.state === 'pending' || (row.session_id !== undefined && row.session_id !== s.gone?.row.session_id)) s.gone = undefined
       s.restarted = !!s.gone

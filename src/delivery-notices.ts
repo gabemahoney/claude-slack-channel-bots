@@ -9,9 +9,9 @@ import { DELIVERY_STUCK_AFTER_MS } from './delivery-constants.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { renderPersonaRef } from './persona-identity.ts'
-import { MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode, type DeliveryDiagnosticClass } from './persona-diagnostics.ts'
+import { MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, MESSAGE_PARTIAL_RECEIPT, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode, type DeliveryDiagnosticClass } from './persona-diagnostics.ts'
 
-export { DELIVERY_DIAGNOSTIC_CLASSES, MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, MESSAGES_WAITING, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode } from './persona-diagnostics.ts'
+export { DELIVERY_DIAGNOSTIC_CLASSES, MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, MESSAGE_PARTIAL_RECEIPT, DELIVERY_STUCK, MESSAGES_WAITING, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode } from './persona-diagnostics.ts'
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 const slack = (text: string): string => escapeSlackControlCharacters(safe(text))
 export function deliveryAge(ageMs: number): string {
@@ -46,11 +46,11 @@ export function deliveryStuckRemedy(reason: DeliveryStuckReason, key: string, co
     case 'dialog-hold': return `agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.`
   }
 }
-export function buildDeliveryStuckNotice(persona: string, key: string, count: number, ageMs: number, reason: DeliveryStuckReason, typedCount: number): string {
-  return `:warning: *Delivery stuck* — ${count} message(s) for ${slack(persona)} are waiting; the oldest has waited ${deliveryAge(ageMs)}. ${deliveryStuckRemedy(reason, key, typedCount)} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
+export function buildDeliveryStuckNotice(persona: string, key: string, count: number, ageMs: number, reason: DeliveryStuckReason, typedCount: number, partialReceipt = false): string {
+  return `:warning: *Delivery stuck* — ${count} message(s) for ${slack(persona)} are waiting; the oldest has waited ${deliveryAge(ageMs)}. ${partialReceipt ? 'The text arrived cut off; the full message is still queued. ' : ''}${deliveryStuckRemedy(reason, key, typedCount)} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
 }
-export function buildMessageNotTakenInNotice(persona: string, sender: string): string {
-  return `:warning: *Message not taken in* — the message from ${slack(sender)} for ${slack(persona)} is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.`
+export function buildMessageNotTakenInNotice(persona: string, sender: string, partialReceipt = false): string {
+  return `:warning: *Message not taken in* — the message from ${slack(sender)} for ${slack(persona)} is still queued. ${partialReceipt ? 'The text arrived cut off; the full message is kept. ' : ''}CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.`
 }
 export const MESSAGES_WAITING_STATES = ['down', 'down at its restart limit', 'down with automatic restarts off', 'latched', 'held on invalid flags', 'held after a failed kill', 'waiting on an old life', 'waiting for its upgrade replacement'] as const
 export type MessagesWaitingState = typeof MESSAGES_WAITING_STATES[number]
@@ -246,9 +246,13 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       return
     }
     if (event.type === 'retyped') { log(MESSAGE_RETYPED, key, identity, `retype_count=${event.count}`); return }
+    if (event.type === 'partial-receipt') {
+      log(MESSAGE_PARTIAL_RECEIPT, key, identity, `part=${event.part} expected_bytes=${event.expectedBytes} received_bytes=${event.receivedBytes} typed but cut off; full text remains queued`)
+      return
+    }
     if (event.type === 'first-unconfirmed-retype') {
       log(MESSAGE_NOT_TAKEN_IN, key, identity)
-      protect(() => deps.notify(key, buildMessageNotTakenInNotice(ref(key), item.accepted.user ?? item.accepted.bot_id ?? item.accepted.sender ?? 'unknown'))); return
+      protect(() => deps.notify(key, buildMessageNotTakenInNotice(ref(key), item.accepted.user ?? item.accepted.bot_id ?? item.accepted.sender ?? 'unknown', !!event.partialReceipt))); return
     }
     if (event.type !== 'waiting' || !event.status) return
     const status = event.status, state = deps.state(key)
@@ -261,7 +265,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (!reason || status.ageMs <= (deps.stuckAfterMs ?? DELIVERY_STUCK_AFTER_MS)) return
     const begun = deps.episodes.begin(key, 'delivery-stuck')
     if (begun === 'begun') log(DELIVERY_STUCK, key, identity, `reason=${reason} age_ms=${status.ageMs}`)
-    deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1))
+    deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1, !!status.partialReceipt))
   }
   return { received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) {
     for (const warning of storageWarnings.get(key) ?? []) warning.dispose()
