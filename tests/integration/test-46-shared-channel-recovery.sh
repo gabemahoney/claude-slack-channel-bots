@@ -30,6 +30,10 @@ NO_ACKS="${EVIDENCE}/no-acks"
 : > "${NO_ACKS}"
 
 printed() { bun "${PRINTER}" "$@" || fail "printer entry $1 failed"; }
+# src/server.ts handleInitialized: an MCP session registered for a persona.
+session_connected() {
+    matcher "[slack] Session connected: persona $1"
+}
 declare -A NAME KEY WORK CREDS LABEL SNAP MANUAL INPUTS INJECTED
 for who in p q; do
     NAME[${who}]="${SCENARIO_TAG}_${who}"
@@ -211,9 +215,19 @@ push() {
     if [[ "${root}" == - ]]; then slack_push_message "${LABEL[${who}]}" "${channel}" "${text}" "${ts}" "${HUMAN}"
     else slack_push_reply "${LABEL[${who}]}" "${channel}" "${root}" "${text}" "${ts}" "${HUMAN}"; fi
 }
-choice_is() { [[ "$(shared_channel_saved "${KEY[$1]}" "$2")" == "$3" ]]; }
+# Readers are read into a variable first: `[[ "$(reader)" == 0 ]]` ignores a
+# failed reader's status, and jq -s still prints 0 or [] on empty input.
+choice_is() {
+    local saved
+    saved="$(shared_channel_saved "${KEY[$1]}" "$2")" || fail 'channel choice reader failed'
+    [[ "${saved}" == "$3" ]]
+}
 stamp() { printed sharedThreadStamp "${CONFIG}" "${LAST}" "${KEY[$1]}" "$2"; }
-current_joins() { shared_thread_joins "${KEY[$1]}" "$2" "$(stamp "$1" "$2")"; }
+current_joins() {
+    local current
+    current="$(stamp "$1" "$2")" || fail 'stamp reader failed'
+    shared_thread_joins "${KEY[$1]}" "$2" "${current}"
+}
 root_saved() {
     current_joins "$1" "$2" | jq -se --arg root "$3" '[.[]|select(.root==$root)]|length==1' > /dev/null
 }
@@ -348,7 +362,8 @@ for failed in p q; do
         duplicate="$(slack_stub_redeliver "${LABEL[${failed}]}" "${first}")"
         slack_stub_control_fired redelivery "envelope_id=${duplicate}" > /dev/null
         no_ack "${duplicate}"
-        [[ "$(shared_queued_count "${KEY[${failed}]}" "${B}" "${ts}")" == 0 ]] || fail 'failed queue retained input'
+        queued_n="$(shared_queued_count "${KEY[${failed}]}" "${B}" "${ts}")" || fail 'queue reader failed'
+        [[ "${queued_n}" == 0 ]] || fail 'failed queue retained input'
         control_ts="$(scenario_ts)"; control_text="$(scenario_text "${other}-independent-${kind}")"
         ack "$(push "${other}" "${A}" "${control_ts}" "${control_text}")"
         accepted "${other}" "${A}" "${control_ts}" receive_all_shared "${control_text}"
@@ -374,11 +389,13 @@ for who in p q; do
     ack "$(slack_push_member_joined "${LABEL[${who}]}" "${B}" "$(scenario_ts)")"
     wait_until 30 'rejoin did not use open default' choice_is "${who}" "${B}" mentions
     set_choice "${who}" "${B}" thread_hybrid "${who}-after-leave"
-    [[ "$(stamp "${who}" "${B}")" != "${before}" ]] || fail 'leave reused stamp'
+    stamp_now="$(stamp "${who}" "${B}")" || fail 'stamp reader failed'
+    [[ "${stamp_now}" != "${before}" ]] || fail 'leave reused stamp'
 done
 while IFS=$'\t' read -r who envelope ts kind; do
     ack "$(slack_stub_redeliver "${LABEL[${who}]}" "${envelope}")"
-    [[ -z "$(current_joins "${who}" "${B}")" ]] || fail 'old replay joined under new stamp'
+    joins_now="$(current_joins "${who}" "${B}")" || fail 'Thread Memory reader failed'
+    [[ -z "${joins_now}" ]] || fail 'old replay joined under new stamp'
 done < "${EVIDENCE}/replays"
 
 # Phase 3: after the manual-receipt boundary use ordinary receipt mode. Each
@@ -407,7 +424,8 @@ for action in join leave; do
     no_ack "${first}"
     duplicate="$(slack_stub_redeliver "${LABEL[p]}" "${first}")"
     no_ack "${duplicate}"
-    [[ "$(same_channel_facts p "${JOIN}")" == "${before}" ]] || fail 'failed membership changed durable choice'
+    facts_now="$(same_channel_facts p "${JOIN}")" || fail 'persona facts reader failed'
+    [[ "${facts_now}" == "${before}" ]] || fail 'failed membership changed durable choice'
     held_ts="$(scenario_ts)"; held_text="$(scenario_mention_text "$(slack_stub_identity "${LABEL[p]}" user_id)" "$(scenario_text held-membership)")"
     held="$(push p "${JOIN}" "${held_ts}" "${held_text}")"
     no_ack "${held}"
@@ -433,7 +451,8 @@ for action in join leave; do
     crash
     start
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${first}")"
-    [[ "$(same_channel_facts p "${JOIN}")" == "${durable}" ]] || fail 'durable membership replay applied twice'
+    facts_now="$(same_channel_facts p "${JOIN}")" || fail 'persona facts reader failed'
+    [[ "${facts_now}" == "${durable}" ]] || fail 'durable membership replay applied twice'
     # The pending request is refreshed separately; membership did not consume
     # it or overwrite the newer bot choice.
     choice_is p "${B}" thread_hybrid || fail 'pending edit silently applied'
@@ -462,7 +481,8 @@ set_choice p "${B}" thread_hybrid after-pending-hybrid
 review future-preference "${NAME[p]}/${JOIN}/all"
 future="$(same_channel_facts p "${JOIN}")"
 ack "$(slack_stub_redeliver "${LABEL[p]}" "${first}")"
-[[ "$(same_channel_facts p "${JOIN}")" == "${future}" ]] || fail 'old leave removed fresh future preference'
+facts_now="$(same_channel_facts p "${JOIN}")" || fail 'persona facts reader failed'
+[[ "${facts_now}" == "${future}" ]] || fail 'old leave removed fresh future preference'
 
 # Phase 5: caller-retained attempts across deliberately lost answers, MCP
 # reconnect and server death. Historical answers never reapply over a newer
@@ -485,7 +505,8 @@ for value in thread_hybrid all; do
     crash
     start
     expect_attempt restart-history "${WORK[p]}" "${retry}" "${KEY[p]}" mentions history
-    [[ "$(shared_attempt_order "${KEY[p]}" "${B}")" == "${order}" ]] || fail 'historical retry wrote another order position'
+    order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
+    [[ "${order_now}" == "${order}" ]] || fail 'historical retry wrote another order position'
     choice_is p "${B}" mentions || fail 'retry overwrote newer operator choice'
     foreign="$(scenario_attempt_call "${WORK[q]}" "${retry}")"
     expected="$(printed channelDeliveryAttemptStatusText "${NAME[q]}" "${KEY[q]}" "${B}" unresolved)"
@@ -497,7 +518,8 @@ before="$(shared_attempt_applications "${KEY[p]}")"
 unknown="$(scenario_attempt_call "${WORK[p]}" "$(attempt_args "$(scenario_attempt_id never-issued)" "${B}" all retry)")"
 expected="$(printed channelDeliveryAttemptStatusText "${NAME[p]}" "${KEY[p]}" "${B}" unresolved)"
 [[ "$(jq -r .isError <<< "${unknown}")" == true && "$(jq -r .text <<< "${unknown}")" == "${expected}"* ]] || fail 'unknown retry not unresolved'
-[[ "$(shared_attempt_applications "${KEY[p]}")" == "${before}" ]] || fail 'unknown retry wrote choice'
+apps_now="$(shared_attempt_applications "${KEY[p]}")" || fail 'attempt reader failed'
+[[ "${apps_now}" == "${before}" ]] || fail 'unknown retry wrote choice'
 
 # A membership refusal is durably known not-applied even if its answer is
 # lost. Repairing eligibility never turns that retained identifier into a write.
@@ -531,7 +553,8 @@ while IFS= read -r call; do
 done <<< "${ids}"
 stub_session_sessions "${WORK[p]}" | jq -se --arg old "${old_session}" \
     'any(.[]; .event=="connected" and .reason=="lost_response" and .session_id!=$old)' > /dev/null || fail 'duplicate retry did not use another real session'
-[[ "$(shared_attempt_order "${KEY[p]}" "${B}")" == "${group_order}" ]] || fail 'second-session copies acquired another order position'
+order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
+[[ "${order_now}" == "${group_order}" ]] || fail 'second-session copies acquired another order position'
 [[ "$(shared_attempt_applications "${KEY[p]}" "${B}")" == "$((before + 1))" ]] || fail 'second-session copies reapplied'
 
 # Two real transports submit identical payloads through one HTTP barrier.
@@ -614,14 +637,16 @@ jq -se --slurpfile prior "${EVIDENCE}/overlap-before-order.jsonl" --arg key "${K
 review newer-than-overlap "${NAME[p]}/${B}/mentions"
 retry="$(attempt_args "${id}" "${B}" all retry)"
 overlap_pair two-session-retry "${retry}" mentions history
-[[ "$(shared_attempt_order "${KEY[p]}" "${B}")" == "$(cat "${EVIDENCE}/overlap-applied-order.jsonl")" ]] \
+order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
+[[ "${order_now}" == "$(cat "${EVIDENCE}/overlap-applied-order.jsonl")" ]] \
     || fail 'overlapping retries added an order position'
 [[ "$(shared_attempt_applications "${KEY[p]}" "${B}")" == "$((before + 1))" ]] || fail 'overlapping retries reapplied'
 choice_is p "${B}" mentions || fail 'overlapping retry overwrote the newer operator choice'
 crash
 start
 expect_attempt two-session-restart-history "${WORK[p]}" "${retry}" "${KEY[p]}" mentions history
-[[ "$(shared_attempt_order "${KEY[p]}" "${B}")" == "$(cat "${EVIDENCE}/overlap-applied-order.jsonl")" ]] \
+order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
+[[ "${order_now}" == "$(cat "${EVIDENCE}/overlap-applied-order.jsonl")" ]] \
     || fail 'overlap history changed across process restart'
 set_choice p "${B}" thread_hybrid after-overlap-hybrid
 # The synchronous admission turn's pending-only observation is the existing
@@ -687,7 +712,8 @@ for page in first later; do
         wait_until 30 'socket close did not fire' has_record_after "${mark}" socket-close "label=${LABEL[p]}"
         wait_until 60 'page fault did not fire' has_record_after "${mark}" fault "label=${LABEL[p]}" method=users.conversations "outcome=${outcome}"
         wait_for_count "${incomplete}" "$((count + 1))" "$((membership_request_ms / 1000 + 30))" 'scan did not become incomplete at its deadline'
-        [[ "$(same_channel_facts p "${B}")" == "${before}" ]] || fail 'incomplete scan removed omitted channel'
+        facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
+        [[ "${facts_now}" == "${before}" ]] || fail 'incomplete scan removed omitted channel'
         held_ts="$(scenario_ts)"; held_text="$(scenario_mention_text "$(slack_stub_identity "${LABEL[p]}" user_id)" "$(scenario_text "${page}-${problem}-held")")"
         held="$(push p "${B}" "${held_ts}" "${held_text}")"
         no_ack "${held}"
@@ -723,7 +749,8 @@ PY
         ack "$(slack_stub_redeliver "${LABEL[p]}" "${held}")"
         accepted p "${B}" "${held_ts}" mention "${held_text}"
         receipt p
-        [[ "$(same_channel_facts p "${B}")" == "${before}" ]] || fail 'repaired scan changed chosen value/stamp'
+        facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
+        [[ "${facts_now}" == "${before}" ]] || fail 'repaired scan changed chosen value/stamp'
     done
 done
 
@@ -750,9 +777,11 @@ choice_is p "${GAP}" mentions || fail 'missed join not reconciled'
 gap_facts="$(same_channel_facts p "${GAP}")"
 wait_until "$((membership_request_ms / 1000 + 40))" 'old inventory request never settled/aborted' \
     has_record_after "${mark}" fault-settled "request_id=${request_id}"
-[[ "$(same_channel_facts p "${GAP}")" == "${gap_facts}" ]] || fail 'late contradictory page changed new membership'
+facts_now="$(same_channel_facts p "${GAP}")" || fail 'persona facts reader failed'
+[[ "${facts_now}" == "${gap_facts}" ]] || fail 'late contradictory page changed new membership'
 ack "$(slack_stub_redeliver "${LABEL[p]}" "${gap_env}")"
-[[ "$(shared_queued_count "${KEY[p]}" "${A}" "${gap_ts}")" == 0 ]] || fail 'old work admitted after proved absence'
+queued_n="$(shared_queued_count "${KEY[p]}" "${A}" "${gap_ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'old work admitted after proved absence'
 slack_stub_faults_clear "${LABEL[p]}"
 memberships
 ack "$(slack_push_member_joined "${LABEL[p]}" "${A}" "$(scenario_ts)")"
@@ -906,7 +935,8 @@ for startup_fault in delay partial failed; do
     wait_membership_complete "${KEY[q]}"
     wait_until 60 'startup fault not reached' has_record_after "${mark}" fault "label=${LABEL[p]}" method=users.conversations
     choice_is p "${A}" all || fail 'incomplete startup removed all choice'
-    [[ "$(stamp p "${B}")" == "${saved_stamp}" ]] || fail 'incomplete startup forgot joins'
+    stamp_now="$(stamp p "${B}")" || fail 'stamp reader failed'
+    [[ "${stamp_now}" == "${saved_stamp}" ]] || fail 'incomplete startup forgot joins'
     new_ts="$(scenario_ts)"; new_text="$(scenario_text "new-while-absent-${startup_fault}")"
     unresolved="$(push p "${A}" "${new_ts}" "${new_text}")"
     no_ack "${unresolved}"
@@ -916,21 +946,26 @@ for startup_fault in delay partial failed; do
     drain p
     result="$(scenario_attempt_call "${WORK[p]}" "$(attempt_args "$(scenario_attempt_id "absent-${startup_fault}")" "${A}" all)")"
     jq -e '.isError==true and (has("error")|not)' <<< "${result}" > /dev/null || fail 'delayed startup membership authorized new write'
-    [[ "$(shared_queued_count "${KEY[p]}" "${A}" "${new_ts}")" == 0 ]] || fail 'unresolved message accepted'
+    queued_n="$(shared_queued_count "${KEY[p]}" "${A}" "${new_ts}")" || fail 'queue reader failed'
+    [[ "${queued_n}" == 0 ]] || fail 'unresolved message accepted'
     slack_stub_faults_clear "${LABEL[p]}"
     slack_stub_inventory_clear "${LABEL[p]}"
     slack_stub_inventory_page "${LABEL[p]}" '' ''
     wait_until "${recovery_bound_s}" 'successful empty inventory did not complete' _scenario_membership_complete "${KEY[p]}" "$(printed MEMBERSHIP_READINESS_ROUTE)"
     choice_is p "${A}" '' || fail 'complete absence retained all entry'
     choice_is p "${B}" '' || fail 'complete absence retained hybrid entry'
-    [[ -z "$(shared_thread_since "${KEY[p]}" "${B}")" ]] || fail 'complete absence retained joined-thread stamp'
+    since_now="$(shared_thread_since "${KEY[p]}" "${B}")" || fail 'persona facts reader failed'
+    [[ -z "${since_now}" ]] || fail 'complete absence retained joined-thread stamp'
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${unresolved}")"
-    [[ "$(shared_queued_count "${KEY[p]}" "${A}" "${new_ts}")" == 0 ]] || fail 'absence replay admitted old message'
+    queued_n="$(shared_queued_count "${KEY[p]}" "${A}" "${new_ts}")" || fail 'queue reader failed'
+    [[ "${queued_n}" == 0 ]] || fail 'absence replay admitted old message'
     memberships
     for channel in "${A}" "${B}"; do ack "$(slack_push_member_joined "${LABEL[p]}" "${channel}" "$(scenario_ts)")"; done
     set_choice p "${A}" all "restored-all-${startup_fault}"
     set_choice p "${B}" thread_hybrid "restored-hybrid-${startup_fault}"
-    [[ "$(stamp p "${B}")" != "${saved_stamp}" && -z "$(current_joins p "${B}")" ]] || fail 'rejoin resurrected old Joined Threads'
+    stamp_now="$(stamp p "${B}")" || fail 'stamp reader failed'
+    joins_now="$(current_joins p "${B}")" || fail 'Thread Memory reader failed'
+    [[ "${stamp_now}" != "${saved_stamp}" && -z "${joins_now}" ]] || fail 'rejoin resurrected old Joined Threads'
 done
 
 # Phase 12: lost Slack answers and durable own-post recovery. Each operation
@@ -1014,13 +1049,21 @@ for performed in true false; do
     RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" "${outcome}" \
         > "${EVIDENCE}/post-recovered-${performed}-outcome.json"
     if [[ "${performed}" == true ]]; then root_saved p "${OP_CHANNEL}" "${OP_ROOT}" || fail 'found post did not join'
-    else [[ -z "$(current_joins p "${OP_CHANNEL}")" ]] || fail 'not-posted outcome joined'; fi
+    else
+        joins_now="$(current_joins p "${OP_CHANNEL}")" || fail 'Thread Memory reader failed'
+        [[ -z "${joins_now}" ]] || fail 'not-posted outcome joined'
+    fi
     [[ "$(record_after "${OP_MARK}" fault "label=${LABEL[p]}" method=chat.postMessage outcome=lost | jq length)" == 1 ]] || fail 'lost post was reposted'
-    [[ "$(record_after "${OP_MARK}" api "label=${LABEL[p]}" method=chat.postMessage "channel=${OP_CHANNEL}" answer=ok | jq length)" == 0 ]] || fail 'recovery issued another post'
+    records_n="$(record_after "${OP_MARK}" api "label=${LABEL[p]}" method=chat.postMessage "channel=${OP_CHANNEL}" answer=ok | jq length)" \
+        || fail 'stub record reader failed'
+    [[ "${records_n}" == 0 ]] || fail 'recovery issued another post'
     ts="$(scenario_ts)"; text="$(scenario_text "after-lookup-${performed}")"
     ack "$(push p "${OP_CHANNEL}" "${ts}" "${text}" "${OP_ROOT}")"
     if [[ "${performed}" == true ]]; then accepted p "${OP_CHANNEL}" "${ts}" thread "${text}" "${OP_ROOT}"; receipt p
-    else [[ "$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" == 0 ]] || fail 'not-posted thread selected reply'; fi
+    else
+        queued_n="$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" || fail 'queue reader failed'
+        [[ "${queued_n}" == 0 ]] || fail 'not-posted thread selected reply'
+    fi
 done
 
 # Phase 13: a live unanswered post cannot hold the reply indefinitely. Use a
@@ -1138,11 +1181,17 @@ PY
     stop_server
     stopped_mark="$(slack_post_mark)"
     sleep "$(( (lookup_max_ms + lookup_deadline_ms + 999) / 1000 + 1 ))"
-    [[ "$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" == 0 ]] || fail 'shutdown left an obsolete lookup retry'
+    records_n="$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" \
+        || fail 'stub record reader failed'
+    [[ "${records_n}" == 0 ]] || fail 'shutdown left an obsolete lookup retry'
     start_server
     sleep "$(( (lookup_deadline_ms + 999) / 1000 + 1 ))"
-    [[ "$(record_after "${stopped_mark}" api "label=${LABEL[p]}" method=conversations.history | jq length)" == 0 ]] || fail 'dry run made lookup'
-    [[ "$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" == 0 ]] || fail 'dry run entered lookup fault'
+    records_n="$(record_after "${stopped_mark}" api "label=${LABEL[p]}" method=conversations.history | jq length)" \
+        || fail 'stub record reader failed'
+    [[ "${records_n}" == 0 ]] || fail 'dry run made lookup'
+    records_n="$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" \
+        || fail 'stub record reader failed'
+    [[ "${records_n}" == 0 ]] || fail 'dry run entered lookup fault'
     stop_server
     slack_stub_faults_clear "${LABEL[p]}"
     start
@@ -1167,7 +1216,8 @@ for boundary in before after; do
     if [[ "${boundary}" == before ]]; then
         no_ack "${leave}"
         no_ack "$(slack_stub_redeliver "${LABEL[p]}" "${leave}")"
-        [[ "$(same_channel_facts p "${old_channel}")" == "${before}" ]] || fail 'failed leave changed authority'
+        facts_now="$(same_channel_facts p "${old_channel}")" || fail 'persona facts reader failed'
+        [[ "${facts_now}" == "${before}" ]] || fail 'failed leave changed authority'
         shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${old_channel}" "${old_stamp}" unresolved \
             > "${EVIDENCE}/leave-before-kill-intent.json"
     else
@@ -1193,14 +1243,17 @@ for boundary in before after; do
     start
     choice_is p "${old_channel}" mentions || fail 'offline rejoin inherited old choice'
     set_choice p "${old_channel}" thread_hybrid "fresh-after-leave-${boundary}"
-    [[ "$(stamp p "${old_channel}")" != "${old_stamp}" ]] || fail 'offline rejoin reused old stamp'
+    stamp_now="$(stamp p "${old_channel}")" || fail 'stamp reader failed'
+    [[ "${stamp_now}" != "${old_stamp}" ]] || fail 'offline rejoin reused old stamp'
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${leave}")"
     choice_is p "${old_channel}" thread_hybrid || fail 'old leave removed newer assignment'
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${old_envelope}")"
-    [[ -z "$(current_joins p "${old_channel}")" ]] || fail 'old accepted work revived old join'
+    joins_now="$(current_joins p "${old_channel}")" || fail 'Thread Memory reader failed'
+    [[ -z "${joins_now}" ]] || fail 'old accepted work revived old join'
     ts="$(scenario_ts)"; text="$(scenario_text "outside-new-stamp-${boundary}")"
     ack "$(push p "${old_channel}" "${ts}" "${text}" "${old_root}")"
-    [[ "$(shared_queued_count "${KEY[p]}" "${old_channel}" "${ts}")" == 0 ]] || fail 'old lookup/root selected under new stamp'
+    queued_n="$(shared_queued_count "${KEY[p]}" "${old_channel}" "${ts}")" || fail 'queue reader failed'
+    [[ "${queued_n}" == 0 ]] || fail 'old lookup/root selected under new stamp'
     root="$(scenario_ts)"; text="$(scenario_mention_text "$(slack_stub_identity "${LABEL[p]}" user_id)" "$(scenario_text "new-join-${boundary}")")"
     ack "$(push p "${old_channel}" "${root}" "${text}")"
     accepted p "${old_channel}" "${root}" mention "${text}"
@@ -1224,11 +1277,13 @@ set_choice p "${OP_CHANNEL}" thread_hybrid stale-value-back
 new_stamp="$(stamp p "${OP_CHANNEL}")"
 [[ "${new_stamp}" != "${OP_STAMP}" ]] || fail 'value cycle retained old stamp'
 wait_until "${lookup_bound_s}" 'stale lookup did not settle or abort' has_record_after "${mark}" fault-settled "request_id=${lookup_request}"
-[[ -z "$(current_joins p "${OP_CHANNEL}")" ]] || fail 'late lookup joined under fresh value'
+joins_now="$(current_joins p "${OP_CHANNEL}")" || fail 'Thread Memory reader failed'
+[[ -z "${joins_now}" ]] || fail 'late lookup joined under fresh value'
 slack_stub_faults_clear "${LABEL[p]}"
 ts="$(scenario_ts)"; text="$(scenario_text late-result-no-join)"
 ack "$(push p "${OP_CHANNEL}" "${ts}" "${text}" "${OP_ROOT}")"
-[[ "$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" == 0 ]] || fail 'stale lookup selected reply'
+queued_n="$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'stale lookup selected reply'
 
 # Phase 17: fault a bot choice before its durable application. Existing
 # assignments survive, no new application/order position can be reported,
@@ -1238,8 +1293,10 @@ applications="$(shared_attempt_applications "${KEY[p]}" "${B}")"
 directory_fault >> "${EVIDENCE}/faults"
 result="$(scenario_attempt_call "${WORK[p]}" "$(attempt_args "$(scenario_attempt_id choice-storage-fault)" "${B}" off)")"
 jq -e '.isError==true and (has("error")|not)' <<< "${result}" > /dev/null || fail 'unwritable choice falsely succeeded'
-[[ "$(same_channel_facts p "${B}")" == "${before}" ]] || fail 'unwritable choice changed prior value/stamp'
-[[ "$(shared_attempt_applications "${KEY[p]}" "${B}")" == "${applications}" ]] || fail 'failed choice acquired an application'
+facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
+[[ "${facts_now}" == "${before}" ]] || fail 'unwritable choice changed prior value/stamp'
+apps_now="$(shared_attempt_applications "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
+[[ "${apps_now}" == "${applications}" ]] || fail 'failed choice acquired an application'
 ts="$(scenario_ts)"; text="$(scenario_text sibling-during-choice-fault)"
 ack "$(push q "${A}" "${ts}" "${text}")"
 accepted q "${A}" "${ts}" receive_all_shared "${text}"
@@ -1269,12 +1326,14 @@ report_post p "${mark}" ambiguous-exact-notice buildThreadMemoryOwnPostLostNotic
 for root in "${OP_ROOT}" "${second_root}"; do
     ts="$(scenario_ts)"; text="$(scenario_text after-ambiguous-loss)"
     ack "$(push p "${OP_CHANNEL}" "${ts}" "${text}" "${root}")"
-    [[ "$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" == 0 ]] || fail 'reported lost join selected reply'
+    queued_n="$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" || fail 'queue reader failed'
+    [[ "${queued_n}" == 0 ]] || fail 'reported lost join selected reply'
 done
 stop_server
 start
 expect_count "${loss_line}" "$((loss_count + 1))" 'saved lost outcome reported again on restart'
-[[ -z "$(current_joins p "${OP_CHANNEL}")" ]] || fail 'lost outcome became joined after restart'
+joins_now="$(current_joins p "${OP_CHANNEL}")" || fail 'Thread Memory reader failed'
+[[ -z "${joins_now}" ]] || fail 'lost outcome became joined after restart'
 
 # Phase 19: a later chunk's definitive failure cannot undo or repost the
 # earlier confirmed chunk. No inbound echo is needed for its join; two own
@@ -1323,7 +1382,9 @@ assert_chunk_posts() {
 assert_chunk_posts
 wait_until 30 'earlier chunk failed to join without echo' root_saved p "${chunk_channel}" "${chunk_root}"
 assert_chunk_join() {
-    [[ "$(stamp p "${chunk_channel}")" == "${chunk_stamp}" ]] || fail 'chunk Channel Stamp changed'
+    local current
+    current="$(stamp p "${chunk_channel}")" || fail 'stamp reader failed'
+    [[ "${current}" == "${chunk_stamp}" ]] || fail 'chunk Channel Stamp changed'
     shared_thread_joins "${KEY[p]}" "${chunk_channel}" "${chunk_stamp}" > "${EVIDENCE}/chunk-joins.jsonl"
     jq -se --arg root "${chunk_root}" 'length==1 and .[0].root==$root' "${EVIDENCE}/chunk-joins.jsonl" \
         > /dev/null || fail 'confirmed chunk did not retain its sole exact join'
@@ -1331,7 +1392,8 @@ assert_chunk_join() {
 assert_chunk_join
 post_seq="${chunk_post_seq}"
 for copy in first duplicate; do ack "$(slack_push_observed_post "${LABEL[p]}" "${LABEL[p]}" "${chunk_channel}" "${post_seq}")"; done
-[[ "$(shared_queued_count "${KEY[p]}" "${chunk_channel}" "${chunk_root}")" == 0 ]] || fail 'own echo accepted as user work'
+queued_n="$(shared_queued_count "${KEY[p]}" "${chunk_channel}" "${chunk_root}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'own echo accepted as user work'
 assert_chunk_join
 assert_chunk_posts
 slack_stub_faults_clear "${LABEL[p]}"
@@ -1382,7 +1444,8 @@ for iteration in first repeated; do
     # queue join may be recovered; use the own-post chunk, never a queue root.
     ts="$(scenario_ts)"; text="$(scenario_text "deleted-own-root-${iteration}")"
     ack "$(push p "${chunk_channel}" "${ts}" "${text}" "$(jq -er .ts <<< "${post}")")"
-    [[ "$(shared_queued_count "${KEY[p]}" "${chunk_channel}" "${ts}")" == 0 ]] || fail 'deleted own-post join still selected'
+    queued_n="$(shared_queued_count "${KEY[p]}" "${chunk_channel}" "${ts}")" || fail 'queue reader failed'
+    [[ "${queued_n}" == 0 ]] || fail 'deleted own-post join still selected'
 done
 
 # Phase 22: each destructive identity boundary with accepted old-key work,
@@ -1450,22 +1513,26 @@ for reset in remove rename credentials working-directory; do
     wait_for_count "$(session_connected "$(persona_ref "${new_name}")")" "$((connected + 1))" "${START_WAIT_S}" 'new identity worker did not connect'
     wait_membership_complete "${new_key}"
     new_facts="$(shared_persona_facts "${new_key}")"
-    [[ "$(jq -er .incarnation <<< "${new_facts}")" != "${old_incarnation}" ]] || fail 'identity boundary retained incarnation'
+    new_incarnation="$(jq -er .incarnation <<< "${new_facts}")" || fail 'new identity facts lack an incarnation'
+    [[ "${new_incarnation}" != "${old_incarnation}" ]] || fail 'identity boundary retained incarnation'
     [[ "$(shared_channel_saved "${new_key}" "${A}")" == all ]] || fail 'identity inherited old bot preference'
     new_stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${new_key}" "${B}")"
     [[ "${new_stamp}" != "${old_stamp}" ]] || fail 'identity boundary reused thread stamp'
-    [[ -z "$(shared_thread_joins "${new_key}" "${B}" "${new_stamp}")" ]] || fail 'identity inherited Joined Threads'
+    joins_now="$(shared_thread_joins "${new_key}" "${B}" "${new_stamp}")" || fail 'Thread Memory reader failed'
+    [[ -z "${joins_now}" ]] || fail 'identity inherited Joined Threads'
     jq -e --arg b "${B}" 'all(.assignments|to_entries[]; .key==$b or .value.delivery!="thread_hybrid")' <<< "${new_facts}" > /dev/null \
         || fail 'identity inherited an unlisted hybrid assignment'
     ts="$(scenario_ts)"; text="$(scenario_text "identity-${reset}-delayed-reply")"
     ack "$(push p "${B}" "${ts}" "${text}" "${root}")"
-    [[ "$(shared_queued_count "${new_key}" "${B}" "${ts}")" == 0 ]] || fail 'delayed reply revived old join'
+    queued_n="$(shared_queued_count "${new_key}" "${B}" "${ts}")" || fail 'queue reader failed'
+    [[ "${queued_n}" == 0 ]] || fail 'delayed reply revived old join'
     wait_until "$((membership_request_ms / 1000 + 40))" 'old scan did not cancel or settle across reset' \
         has_record_after "${scan_mark}" fault-settled "request_id=${scan_request}"
     [[ "$(shared_channel_saved "${new_key}" "${A}")" == all ]] || fail 'late old scan removed new baseline'
     sleep "$(( (lookup_max_ms + lookup_deadline_ms + 999) / 1000 + 1 ))"
-    [[ "$(record_after "${reset_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" == 0 ]] \
-        || fail 'identity reset retained an obsolete own-post lookup retry'
+    records_n="$(record_after "${reset_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" \
+        || fail 'stub record reader failed'
+    [[ "${records_n}" == 0 ]] || fail 'identity reset retained an obsolete own-post lookup retry'
     if [[ "${reset}" == rename ]]; then
         if [[ -f "${SLACK_STATE_DIR}/queue/${new_key}.jsonl" ]]; then
             shared_queue_items "${new_key}" | jq -se --arg root "${root}" 'all(.[]; .ts!=$root)' > /dev/null || fail 'rename moved an old-key queue item'
@@ -1486,7 +1553,8 @@ for reset in remove rename credentials working-directory; do
     cp "${SNAP[p]}" "${identity_compaction_before}"
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${original}")"
     [[ "$(queued_total p "${B}" "${root}" mention)" == 1 ]] || fail 'reset replay duplicated old-key work'
-    [[ -z "$(current_joins p "${B}")" ]] || fail 'old queue replay joined under restored identity'
+    joins_now="$(current_joins p "${B}")" || fail 'Thread Memory reader failed'
+    [[ -z "${joins_now}" ]] || fail 'old queue replay joined under restored identity'
     assert_stamps
 done
 
@@ -1499,7 +1567,8 @@ post="$(RECORD_WAIT_S=45 slack_wait_successful_post "${LABEL[p]}" "${OP_CHANNEL}
 [[ "$(jq -er .ts <<< "${post}")" == "${OP_ROOT}" ]] || fail 'confirmed root differs from controlled Slack post'
 result="$(stub_session_result "${WORK[p]}" "${OP_CALL}")"
 jq -e '.isError==false and (has("error")|not)' <<< "${result}" > /dev/null || fail 'confirmed post did not return success'
-[[ -z "$(current_joins p "${OP_CHANNEL}")" ]] || fail 'file fault did not prevent durable own-post join'
+joins_now="$(current_joins p "${OP_CHANNEL}")" || fail 'Thread Memory reader failed'
+[[ -z "${joins_now}" ]] || fail 'file fault did not prevent durable own-post join'
 facts="$(shared_persona_facts "${KEY[p]}" "${OP_CHANNEL}")"
 jq -e --argjson stamp "${OP_STAMP}" --arg c "${OP_CHANNEL}" '.incarnation==$stamp.incarnation and .assignments[$c].threadHybridSince==$stamp.threadHybridSince' \
     <<< "${facts}" > /dev/null || fail 'confirmed unsaved post has stale authority'
@@ -1541,7 +1610,8 @@ shared_stub_notice resume "${WORK[p]}" "${KEY[p]}" "${EVIDENCE}/notice-loss-ende
 drain p
 ts="$(scenario_ts)"; text="$(scenario_text lost-notice-join-reply)"
 ack "$(push p "${NOTICE}" "${ts}" "${text}" "${notice_root}")"
-[[ "$(shared_queued_count "${KEY[p]}" "${NOTICE}" "${ts}")" == 0 ]] || fail 'unsaved notice-only join survived without a fact'
+queued_n="$(shared_queued_count "${KEY[p]}" "${NOTICE}" "${ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'unsaved notice-only join survived without a fact'
 
 # Phase 25: a confirmation copied into place while stopped remains stale
 # against a later durable bot preference, even with startup membership held.
@@ -1557,7 +1627,8 @@ start_server --live
 wait_membership_complete "${KEY[q]}"
 wait_until 30 'stopped confirmation case did not enter startup scan fault' has_record_after "${mark}" fault "label=${LABEL[p]}" method=users.conversations outcome=hang
 wait_for_count "${stale_class}" "$((before + 1))" 30 'stopped stale confirmation was not refused'
-[[ "$(same_channel_facts p "${B}")" == "${preserved}" ]] || fail 'stopped confirmation overwrote newer durable preference'
+facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
+[[ "${facts_now}" == "${preserved}" ]] || fail 'stopped confirmation overwrote newer durable preference'
 ts="$(scenario_ts)"; text="$(scenario_text stopped-confirmation-held)"
 envelope="$(push p "${B}" "${ts}" "${text}")"
 no_ack "${envelope}"
@@ -1565,7 +1636,8 @@ slack_stub_faults_clear "${LABEL[p]}"
 wait_until "${recovery_bound_s}" 'membership did not recover after stale confirmation' _scenario_membership_complete "${KEY[p]}" "$(printed MEMBERSHIP_READINESS_ROUTE)"
 configuration_request stopped-confirmation-cancel cancel > /dev/null
 ack "$(slack_stub_redeliver "${LABEL[p]}" "${envelope}")"
-[[ "$(shared_queued_count "${KEY[p]}" "${B}" "${ts}")" == 0 ]] || fail 'stale confirmation unexpectedly selected plain input'
+queued_n="$(shared_queued_count "${KEY[p]}" "${B}" "${ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'stale confirmation unexpectedly selected plain input'
 
 # Phase 26: shutdown cancels both an in-flight membership scan and its
 # scheduled retry. After the old response settles there are no new requests
@@ -1585,7 +1657,9 @@ for stage in hung retry-scheduled; do
     stop_server
     stopped_mark="$(slack_post_mark)"
     sleep "$(( (membership_retry_ms + membership_request_ms + 999) / 1000 + 1 ))"
-    [[ "$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=users.conversations | jq length)" == 0 ]] || fail 'stopped server started an obsolete scan/retry'
+    records_n="$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=users.conversations | jq length)" \
+        || fail 'stub record reader failed'
+    [[ "${records_n}" == 0 ]] || fail 'stopped server started an obsolete scan/retry'
     slack_stub_faults_clear "${LABEL[p]}"
     start
     assert_stamps
@@ -1684,7 +1758,8 @@ shared_thread_joins "${KEY[p]}" "${B}" "${restore_stamp}" | jq -se --arg root "$
 restore_held_ts="$(scenario_ts)"; restore_held_text="$(scenario_text staged-thread-held)"
 restore_held="$(push p "${B}" "${restore_held_ts}" "${restore_held_text}" "${restore_root}")"
 no_ack "${restore_held}"
-[[ "$(shared_queued_count "${KEY[p]}" "${B}" "${restore_held_ts}")" == 0 ]] || fail 'undecided stamp selected a dependent reply'
+queued_n="$(shared_queued_count "${KEY[p]}" "${B}" "${restore_held_ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'undecided stamp selected a dependent reply'
 for who in p q; do
     ts="$(scenario_ts)"; text="$(scenario_text "${who}-during-staged-repair")"
     ack "$(push "${who}" "${A}" "${ts}" "${text}")"
@@ -1773,8 +1848,10 @@ wait_until 30 'repair activation did not reach controlled membership gap' has_re
 expect_count "${recovered_match}" "${recovered_count}" 'repair reported recovery before current membership was trustworthy'
 record_after "${recovery_mark}" api method=chat.postMessage answer=ok | jq -e --arg expected "${early_recovery_text}" \
     'all(.[]; .text!=$expected)' > /dev/null || fail 'repair posted recovery before current membership'
-[[ "$(stamp p "${B}")" != "${restore_stamp}" ]] || fail 'restoration reused the old Thread Hybrid Since'
-[[ "$(shared_persona_facts "${KEY[p]}" | jq -r .incarnation)" == "$(jq -r .incarnation <<< "${restore_facts}")" ]] || fail 'restoration lost the retained incarnation'
+stamp_now="$(stamp p "${B}")" || fail 'stamp reader failed'
+[[ "${stamp_now}" != "${restore_stamp}" ]] || fail 'restoration reused the old Thread Hybrid Since'
+incarnation_now="$(shared_persona_facts "${KEY[p]}" | jq -er .incarnation)" || fail 'persona facts reader failed'
+[[ "${incarnation_now}" == "$(jq -r .incarnation <<< "${restore_facts}")" ]] || fail 'restoration lost the retained incarnation'
 choice_is p "${A}" all || fail 'restoration applied the separate pending preference'
 # Normal detection can already have reopened the preserved ordinary review.
 # Prove that exact pre-repair request is still separately reviewable, retain
@@ -1801,10 +1878,12 @@ shared_assert_content "${KEY[p]}" "${LOG}" "${SNAP[p]}" "${A}" "${restore_queue_
 cp "${SNAP[p]}" "${EVIDENCE}/restoration-completed-after-resume.jsonl"
 ack "$(slack_stub_redeliver "${LABEL[p]}" "${restore_envelope}")"
 ack "$(slack_stub_redeliver "${LABEL[p]}" "${restore_held}")"
-[[ "$(shared_queued_count "${KEY[p]}" "${B}" "${restore_held_ts}")" == 0 ]] || fail 'old joined thread was reused after reviewed repair'
+queued_n="$(shared_queued_count "${KEY[p]}" "${B}" "${restore_held_ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'old joined thread was reused after reviewed repair'
 ts="$(scenario_ts)"; text="$(scenario_text after-undecided-intent-crash)"
 ack "$(push p "${B}" "${ts}" "${text}" "${undecided_root}")"
-[[ "$(shared_queued_count "${KEY[p]}" "${B}" "${ts}")" == 0 ]] || fail 'unsaved undecided-stamp intent survived the documented crash limit'
+queued_n="$(shared_queued_count "${KEY[p]}" "${B}" "${ts}")" || fail 'queue reader failed'
+[[ "${queued_n}" == 0 ]] || fail 'unsaved undecided-stamp intent survived the documented crash limit'
 [[ "$(record_after "${undecided_mark}" api "label=${LABEL[p]}" method=chat.postMessage "channel=${B}" answer=ok | jq --arg text "${undecided_text}" '[.[]|select(.text==$text)]|length')" == 1 ]] || fail 'undecided-post recovery reposted'
 choice_is p "${A}" all || fail 'preserved ordinary intent silently applied'
 stop_server
@@ -1845,7 +1924,9 @@ cp "${EVIDENCE}/replacement-stale.pending" "${CONFIG}.apply"
 refused_recovery_start
 cp "${EVIDENCE}/replacement-prepared.json" "${CONFIG}"
 refused_recovery_start
-[[ "$(cat "${CONFIG}.pending")" != "$(cat "${EVIDENCE}/replacement-stale.pending")" ]] || fail 'replacement ABA reused stale confirmation'
+pending_now="$(cat "${CONFIG}.pending")" || fail 'replacement preview missing'
+stale_now="$(cat "${EVIDENCE}/replacement-stale.pending")" || fail 'retained stale preview missing'
+[[ "${pending_now}" != "${stale_now}" ]] || fail 'replacement ABA reused stale confirmation'
 shared_recovery_pending "${EVIDENCE}/replacement-request.json" "${CONFIG}.pending" > /dev/null
 cp "${CONFIG}.pending" "${EVIDENCE}/replacement-reviewed.pending"
 shared_recovery_pending "${EVIDENCE}/replacement-request.json" "${EVIDENCE}/replacement-reviewed.pending" > /dev/null
@@ -1862,9 +1943,12 @@ expect_count "${recovered_match}" "${recovered_count}" 'replacement reported rec
 record_after "${recovery_mark}" api method=chat.postMessage answer=ok | jq -e --arg expected "${early_recovery_text}" \
     'all(.[]; .text!=$expected)' > /dev/null || fail 'replacement posted recovery before current membership'
 cmp -s "${CONFIG}" "${EVIDENCE}/replacement-prepared.json" || fail 'replacement consumed separate prepared edits'
-[[ "$(shared_persona_facts "${KEY[p]}" | jq -r .incarnation)" != "${replacement_incarnation}" ]] || fail 'replacement retained an unrestorable incarnation'
-[[ "$(stamp p "${B}")" != "${replacement_stamp}" ]] || fail 'replacement retained an old Channel Stamp'
-[[ -z "$(current_joins p "${B}")" ]] || fail 'replacement inherited Joined Threads'
+incarnation_now="$(shared_persona_facts "${KEY[p]}" | jq -er .incarnation)" || fail 'persona facts reader failed'
+[[ "${incarnation_now}" != "${replacement_incarnation}" ]] || fail 'replacement retained an unrestorable incarnation'
+stamp_now="$(stamp p "${B}")" || fail 'stamp reader failed'
+[[ "${stamp_now}" != "${replacement_stamp}" ]] || fail 'replacement retained an old Channel Stamp'
+joins_now="$(current_joins p "${B}")" || fail 'Thread Memory reader failed'
+[[ -z "${joins_now}" ]] || fail 'replacement inherited Joined Threads'
 slack_stub_faults_clear "${LABEL[p]}"
 wait_until "${recovery_bound_s}" 'replacement membership did not become trustworthy' _scenario_membership_complete "${KEY[p]}" "$(printed MEMBERSHIP_READINESS_ROUTE)"
 replacement_facts="$(shared_persona_facts "${KEY[p]}")"
@@ -1915,9 +1999,14 @@ for identity in "${!INJECTED[@]}"; do
     shared_assert_injected_content "${KEY[${who}]}" "${LOG}" "${SNAP[${who}]}" "${source}" "${sender}" "${ts}" "${text}" "${parts}" > /dev/null
 done
 while IFS= read -r envelope; do [[ "$(slack_ack_count "${envelope}")" == 1 ]] || fail 'handled envelope ACK count changed'; done < "${ACKS}"
-while IFS= read -r envelope; do [[ "$(slack_ack_count "${envelope}")" == 0 ]] || fail 'withheld envelope was acknowledged'; done < "${NO_ACKS}"
-[[ "$(slack_stub_record_count push)" == "$(( $(wc -l < "${ACKS}") + $(wc -l < "${NO_ACKS}") ))" ]] || fail 'unaccounted push'
+while IFS= read -r envelope; do
+    acks_n="$(slack_ack_count "${envelope}")" || fail 'ACK reader failed'
+    [[ "${acks_n}" == 0 ]] || fail 'withheld envelope was acknowledged'
+done < "${NO_ACKS}"
+pushes_n="$(slack_stub_record_count push)" || fail 'stub record reader failed'
+[[ "${pushes_n}" == "$(( $(wc -l < "${ACKS}") + $(wc -l < "${NO_ACKS}") ))" ]] || fail 'unaccounted push'
 stop_tracked_pid "${STUB_PID}"
 leak_files=("${SLACK_STATE_DIR}"/server.log* "${LAST}" "${EVIDENCE}"/* "${STUB_BIN}"/stub-mcp-results.*.jsonl)
-[[ "$(count_token_like "${leak_files[@]}")" == 0 ]] || fail 'token-like data in recovery evidence'
+leaks_n="$(count_token_like "${leak_files[@]}")" || fail 'token scan failed'
+[[ "${leaks_n}" == 0 ]] || fail 'token-like data in recovery evidence'
 echo "PASS: ${TEST_NAME}"
