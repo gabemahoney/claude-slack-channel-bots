@@ -381,7 +381,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
       const survivors = await run(codexLoginContainerListArgs(), 30_000, true, false, true)
       assertNoCodexLoginContainers(survivors.code, survivors.text)
     }
-    if ((await run(['docker', 'image', 'inspect', 'cscb-ci-base:v8', '--format', '{{.Id}}'], 30_000)).code !== 0) {
+    if ((await run(['docker', 'image', 'inspect', 'cscb-ci-base:v9', '--format', '{{.Id}}'], 30_000)).code !== 0) {
       if ((await run(['bash', 'scripts/ci-base-build.sh'], 30 * 60_000)).code !== 0) throw new Error('Heavy base build failed')
     }
     if ((await run(['bun', 'pm', 'pack', '--ignore-scripts', '--filename', join(stage, 'package.tgz'), '--quiet'], 120_000)).code !== 0) throw new Error('Packing production failed')

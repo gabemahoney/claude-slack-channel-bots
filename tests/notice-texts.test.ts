@@ -152,6 +152,7 @@ import { DELIVERY_STUCK_AFTER_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/
 import {
   buildDeliveryStuckNotice,
   buildMessageNotSavedNotice,
+  buildMessageSavedAfterRetryNotice,
   buildMessageNotTakenInNotice,
   buildMessagesWaitingNotice,
   buildQueueRecordUnreadableNotice,
@@ -766,6 +767,7 @@ const DELIVERY_STUCK_REASONS: readonly DeliveryStuckReason[] = [
 function deliveryEntries(): NoticeEntry[] {
   return [
     entry("common", buildMessageNotSavedNotice.name, 'store failed', () => buildMessageNotSavedNotice(PERSONA.name, 'U0SENDER1')),
+    entry("common", buildMessageSavedAfterRetryNotice.name, 'exact retry saved', () => buildMessageSavedAfterRetryNotice(PERSONA.name, 'U0SENDER1')),
     ...DELIVERY_STUCK_REASONS.map((reason) => entry("common", buildDeliveryStuckNotice.name, reason, () =>
       buildDeliveryStuckNotice(PERSONA.name, KEY, 2, DELIVERY_STUCK_AFTER_MS + 1, reason, 3))),
     entry("common", buildMessageNotTakenInNotice.name, 'unconfirmed first retype', () => buildMessageNotTakenInNotice(PERSONA.name, 'U0SENDER1')),
@@ -1203,6 +1205,7 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   restartCapReachedNoticeText.name,
   buildNotConnectedNotice.name,
   buildMessageNotSavedNotice.name,
+  buildMessageSavedAfterRetryNotice.name,
   buildDeliveryStuckNotice.name,
   buildMessageNotTakenInNotice.name,
   buildMessagesWaitingNotice.name,

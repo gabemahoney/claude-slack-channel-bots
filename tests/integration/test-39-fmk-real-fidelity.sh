@@ -31,7 +31,9 @@ for input in "${INPUTS[@]}"; do
     real_wait_delivery "${REAL_KEY}" "${COUNT}" no-retype
     echo "recorded: fidelity input ${COUNT} confirmed exactly without retype"
 done
-real_assert_no_retype "${REAL_KEY}" "${COUNT}"
+# Work accepted after the last wait's audit, such as a reply reminder, is
+# awaited and must also be typed once, not raced by a one-shot audit.
+real_wait_delivery "${REAL_KEY}" "${COUNT}" no-retype
 case_assert fidelity-shapes
 echo 'recorded: native input rewrites escaped before typing: U+2028=>&#8232; U+0301=>&#769; U+0308=>&#776;'
 

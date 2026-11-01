@@ -28,19 +28,21 @@ exception is `hgx`, which takes a value only as an argument (see
     forwarded mail (see [The test mailbox](#the-test-mailbox)). It was
     created on the current VM through mail.tm's API, and its address is also
     in `/tmp/cscb-test-mailbox-address.txt`.
-- On the VM: docker, the `/ci` base image (if
-  `docker image inspect cscb-ci-base:v8` fails, run `/ci` once, with
-  `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google Chrome
+- On the VM: docker, the `/ci` base image (check with
+  `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v9`;
+  if confirmed missing, run `/ci` once with `CSCB_AD_SRC_DIR` set: see
+  `docker/README.md`; an inspection error stops the check, with no raw fallback), Google Chrome
   (`google-chrome --version`), bun, and `CSCB_AD_SRC_DIR` set to a checkout
   of agent-director's source tree holding the tag of the release the base
-  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.12.0`). A run
+  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.17.1`). A run
   takes its agent-director binary explicitly: the release's
   `agent-director-linux-amd64`, downloaded from agent-director's GitHub
   release into a scratch directory and checked against the base's pinned
   SHA-256 (see [Stage the release binary](#stage-the-release-binary)).
   Steps 5 and 6 pass it with `--agent-director-binary`, and the runner
   stages that file in the live image without running it on the host. The
-  image build checks it against the release's client in the base image.
+  image build checks its version, commit and SHA-256 against the runtime
+  record and proves the independently pinned `0.12.0` client accepts it.
   Without the option the runner stages the host's own agent-director
   binary, which the build refuses unless it is that release's (see "The
   live image's agent-director" in `docker/README.md`).

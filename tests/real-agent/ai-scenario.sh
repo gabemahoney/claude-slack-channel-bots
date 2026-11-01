@@ -33,10 +33,10 @@ if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" ==
 fi
 real_persona "aiac${AI_CRITERION}" "${PROMPT}"
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
-    jq -c '.channels=[{id:"C0B1ZJJLJ9M",delivery:"all"}]' "${REAL_PERSONAS}" > "${REAL_PERSONAS}.new"
+    jq -c '.channels=[{id:"C0TESTCHAN1",delivery:"all"}]' "${REAL_PERSONAS}" > "${REAL_PERSONAS}.new"
     mv "${REAL_PERSONAS}.new" "${REAL_PERSONAS}"
     # Declare the same actual Slack membership for both corpus personas.
-    jq -c '.memberships=["C0B1ZJJLJ9M"]' "${REAL_TOKENS}" > "${REAL_TOKENS}.new"
+    jq -c '.memberships=["C0TESTCHAN1"]' "${REAL_TOKENS}" > "${REAL_TOKENS}.new"
     mv "${REAL_TOKENS}.new" "${REAL_TOKENS}"
 fi
 # AC11 keeps its first three turns together; every hazard gets a new native
@@ -67,7 +67,7 @@ if ac=='20':
  rows=[r for r in rows if r['name'] in ['ex3_peer_bot_spoof','hz_attr_quotes']]
  # AC20 specifically requires the true user_id, including the spoofed body.
  row=rows[0]; row['msg']['user_id']='U0REAL20'; row['msg']['user']='E6 Real Sender'; row['msg'].pop('bot_id',None)
- row['typed']=row['typed'].replace('user="horde_dev_apiary" bot_id="B0APIARY01"','user="E6 Real Sender" user_id="U0REAL20"')
+ row['typed']=row['typed'].replace('user="squad_dev_apiary" bot_id="B0APIARY01"','user="E6 Real Sender" user_id="U0REAL20"')
  row['typed_len']=len(row['typed'])
 labels=[]
 for i,row in enumerate(rows):
@@ -203,7 +203,9 @@ AC15_BODY
         real_wait_delivery "${REAL_KEY}" 2
         printf '{"case":"AC106","messages":1}\n' > "${EXPECTED}/1.json"
         wait_until 180 'AC106 duplicate counted as another message' ai_readback "${EXPECTED}/1.json" 2
-        case_assert at-least-one-duplicate
+        # Await work accepted since the readback's audit, such as a reply
+        # reminder; the duplicate verdict follows complete receipts.
+        real_wait_delivery "${REAL_KEY}" 2 -- case_assert at-least-one-duplicate
     elif [[ "${AI_CRITERION}" == 23 ]]; then
         real_dm "${REAL_LABEL}" 'Acknowledge before compact/resume.'
         real_wait_delivery "${REAL_KEY}" 1

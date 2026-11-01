@@ -1,6 +1,7 @@
 /** Delivery reporting consumes durable facts and never authorizes keys. */
-import type { QueueEvent, QueueItem, DeliveryQueue, AcceptedRecord } from './delivery-queue.ts'
-import { isOpenItem } from './delivery-queue.ts'
+import { isOpenItem, slackKeyString, type SlackKey, type QueueEvent, type QueueItem, type DeliveryQueue, type AcceptedRecord } from './delivery-queue.ts'
+import type { PostedPersonaNotice } from './persona-notifier.ts'
+import { correctPostedNotice, type NoticeCorrectionOutcome } from './notice-correction.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from './conflict-latch.ts'
@@ -23,6 +24,14 @@ export function buildDeliveryDispatchLine(persona: string, accepted: AcceptedRec
 }
 export function buildMessageNotSavedNotice(persona: string, sender: string): string {
   return `:warning: *Message not saved* — a message from ${slack(sender)} for ${slack(persona)} could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.`
+}
+export function buildMessageSavedAfterRetryNotice(persona: string, sender: string): string {
+  return `:white_check_mark: *Message saved after retry* — the message from ${slack(sender)} for ${slack(persona)} was saved after a retry. No resend is needed.`
+}
+export function buildStorageNoticeRecoveryLine(persona: string, identity: SlackKey, operation: 'edit' | 'correction', result: NoticeCorrectionOutcome): string {
+  return buildDeliveryDiagnostic(MESSAGE_NOT_SAVED, persona,
+    `chat_id=${JSON.stringify(safe(identity.chat_id))} ts=${JSON.stringify(safe(identity.ts))} edited_ts=${JSON.stringify(identity.edited_ts === undefined ? null : safe(identity.edited_ts))}`,
+    `recovery=${operation} outcome=${result.outcome}${result.outcome === 'failed' ? ` reason=${safe(result.reason)}` : ''}`)
 }
 export type DeliveryStuckReason = 'relay-off' | 'mcp' | 'refused' | 'transcript' | 'queue-unwritable' | 'not-taken-in' | 'dialog-hold'
 export function deliveryStuckRemedy(reason: DeliveryStuckReason, key: string, count: number): string {
@@ -88,6 +97,11 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   let findingFlushPending = false
   const received = new Set<string>(), completed = new Set<string>(), failures = new Map<string, number>(), unwritable = new Set<string>(), heads = new Map<string, number>()
   const recoveredQueued = new Set<string>()
+  interface StorageWarning {
+    slackKey: SlackKey; posting: boolean; ready: boolean; correcting: boolean
+    post?: PostedPersonaNotice; abort: AbortController; dispose(): void; correct(): void
+  }
+  const storageWarnings = new Map<string, Set<StorageWarning>>()
   const ref = (key: string) => { const p = deps.persona(key); return p ? renderPersonaRef(p.name, key) : `key=${key}` }
   const protect = (run: () => unknown) => { try { const result = run(); if (result && typeof (result as Promise<unknown>).catch === 'function') void (result as Promise<unknown>).catch(() => {}) } catch { /* reporting cannot interrupt durability */ } }
   function log(kind: DeliveryDiagnosticClass, key: string, identity: string, detail = '') { protect(() => deps.log(buildDeliveryDiagnostic(kind, ref(key), identity, detail))) }
@@ -97,6 +111,15 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     deps.episodes.end(key, 'delivery-stuck'); deps.episodes.end(key, 'messages-waiting')
   }
   function receivedItem(key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live'): void {
+    // Intake calls this after its aggregate ack decision. Recovery stays
+    // detached, so a stuck Slack edit never holds acknowledgement/preparation.
+    if (item.accepted.source === 'slack' && item.accepted.key) {
+      for (const warning of storageWarnings.get(key) ?? []) {
+        if (slackKeyString(warning.slackKey) !== slackKeyString(item.accepted.key)) continue
+        warning.ready = true
+        warning.correct()
+      }
+    }
     if (item.hold && item.hold.state !== 'released') return
     const id = `${key}:${item.accepted.seq}`
     if (mode === 'recovered') recoveredQueued.add(id)
@@ -120,17 +143,76 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       }
     }
   }
+  /** A reply saved as a hold is received only at its release. Intake reports
+   * the hold's store after its aggregate ack decision, and an exact save
+   * corrects a posted warning then, as receivedItem does for other saves. */
+  function holdStored(key: string): void {
+    for (const warning of storageWarnings.get(key) ?? []) {
+      if (!deps.queue.lookupSlackKey(key, warning.slackKey)) continue
+      warning.ready = true
+      warning.correct()
+    }
+  }
+  function postStorageWarning(key: string, event: Extract<QueueEvent, { type: 'store-failed' }>): void {
+    const kind = 'message-not-saved', sender = event.user ?? event.bot_id ?? 'unknown'
+    if (deps.episodes.begin(key, kind) === 'closed' || deps.episodes.hasPosted(key, kind)) return
+    const text = buildMessageNotSavedNotice(ref(key), sender)
+    if (!event.slackKey) { deps.episodes.post(key, kind, text); return }
+    const slackKey = { ...event.slackKey }
+    const abort = new AbortController()
+    let unregister = () => {}
+    const active = () => !abort.signal.aborted && deps.episodes.teardownWindowState(key) === 'none'
+    const warning: StorageWarning = {
+      slackKey, posting: false, ready: false, correcting: false, abort,
+      dispose() {
+        abort.abort(); unregister()
+        const warnings = storageWarnings.get(key)
+        warnings?.delete(warning)
+        if (warnings?.size === 0) storageWarnings.delete(key)
+      },
+      correct() {
+        if (!active() || !warning.ready || !warning.post || warning.correcting) return
+        warning.correcting = true
+        protect(() => correctPostedNotice(warning.post!, buildMessageSavedAfterRetryNotice(ref(key), sender), {
+          clock: deps.episodes.clock, signal: abort.signal, isActive: active,
+          logOutcome: (operation, result) => protect(() => deps.log(buildStorageNoticeRecoveryLine(ref(key), slackKey, operation, result))),
+        }).finally(warning.dispose))
+      },
+    }
+    const warnings = storageWarnings.get(key) ?? new Set<StorageWarning>()
+    storageWarnings.set(key, warnings); warnings.add(warning)
+    unregister = deps.episodes.whenForgotten(key, warning.dispose)
+    const posted = deps.episodes.post(key, kind, text, undefined, { tracking: {
+      signal: abort.signal,
+      canPost() {
+        if (!active() || deps.queue.lookupSlackKey(key, slackKey)) { warning.dispose(); return false }
+        warning.posting = true
+        return true
+      },
+      onPosted(post) { if (!active()) return; warning.post = post; warning.correct() },
+      onPostFailed() {
+        warning.posting = false
+        if (deps.queue.lookupSlackKey(key, slackKey)) warning.dispose()
+      },
+    } })
+    if (!posted) warning.dispose()
+  }
   function queueEvent(event: QueueEvent): void {
     const key = event.key
     switch (event.type) {
-      case 'stored': failures.delete(key); deps.episodes.end(key, 'message-not-saved'); return
+      case 'stored':
+        failures.delete(key); deps.episodes.end(key, 'message-not-saved')
+        for (const warning of storageWarnings.get(key) ?? []) {
+          if (!warning.posting && deps.queue.lookupSlackKey(key, warning.slackKey)) warning.dispose()
+        }
+        return
       case 'writable': unwritable.delete(key); return
       case 'store-failed': {
         const count = (failures.get(key) ?? 0) + 1; failures.set(key, count)
         const source = event.source ?? 'slack'
         const identity = deliveryIdentity({ ...event, source, ts: event.ts ?? '' })
         log(MESSAGE_NOT_SAVED, key, identity, `count=${count} path=${JSON.stringify(event.path ?? '')} code=${queueErrorCode(event.error)}`)
-        if (source === 'slack') { deps.episodes.begin(key, 'message-not-saved'); deps.episodes.post(key, 'message-not-saved', buildMessageNotSavedNotice(ref(key), event.user ?? event.bot_id ?? 'unknown')) }
+        if (source === 'slack') postStorageWarning(key, event)
         return
       }
       case 'append-failed':
@@ -197,5 +279,8 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (begun === 'begun') log(DELIVERY_STUCK, key, identity, `reason=${reason} age_ms=${status.ageMs}`)
     deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1))
   }
-  return { received: (key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live') => protect(() => receivedItem(key, item, mode)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) { failures.delete(key); unwritable.delete(key); heads.delete(key) } }
+  return { received: (key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live') => protect(() => receivedItem(key, item, mode)), holdStored: (key: string) => protect(() => holdStored(key)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) {
+    for (const warning of storageWarnings.get(key) ?? []) warning.dispose()
+    failures.delete(key); unwritable.delete(key); heads.delete(key)
+  } }
 }

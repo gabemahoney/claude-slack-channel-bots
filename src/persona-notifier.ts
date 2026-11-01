@@ -137,6 +137,8 @@ import { describeThrownValue, slackPlatformReason } from './persona-connection-e
 import {
   createPersonaDestinations,
   type DestinationFailure,
+  type DestinationMessageTracking,
+  type DestinationPostedMessage,
   type PersonaDestinationsSource,
 } from './persona-destination.ts'
 import {
@@ -157,6 +159,10 @@ export interface PersonaNoticeOptions {
   /** Joins lost only: the builder's escaped full reference or approved name
    * excerpt, budgeted together with the body. Retained with a held notice. */
   personaRef?: string
+  /** Exact-message cancellation and the identity of a notice that actually posted. */
+  tracking?: Omit<DestinationMessageTracking, 'onPosted'> & {
+    onPosted(post: PostedPersonaNotice): void
+  }
   /**
    * Called with the failure (the step, the error class and, when one was
    * thrown, the rejection) when the notice's Slack post fails (or, for a `dm`
@@ -180,6 +186,10 @@ export interface PersonaNoticeOptions {
    * comes.
    */
   outage?: PersonaNoticeOutage
+}
+
+export interface PostedPersonaNotice extends DestinationPostedMessage {
+  format(text: string): string
 }
 
 /** An outage notice's phase and the outage classes it concerns (`OutageClass` labels). */
@@ -477,7 +487,15 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
     const holdNotice: HoldNotice = {
-      message: { text: formatPersonaNotice(persona, notice.text, notice.options) },
+      message: {
+        text: formatPersonaNotice(persona, notice.text, notice.options),
+        ...(notice.options?.tracking ? { tracking: {
+          ...notice.options.tracking,
+          onPosted: (posted: DestinationPostedMessage) => notice.options!.tracking!.onPosted({
+            ...posted, format: text => formatPersonaNotice(persona, text, notice.options),
+          }),
+        } } : {}),
+      },
       summary: firstNoticeLine(notice.text),
       onAttemptFailed: (failure, info) => {
         if (!info.held) logDroppedFailure(ref, failure)
@@ -659,6 +677,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
   }
 
   async function notify(key: string, givenText: string, givenOptions?: PersonaNoticeOptions): Promise<void> {
+    if (givenOptions?.tracking?.signal.aborted) return
     const left = routeTeardownNotice(key, givenText, givenOptions)
     if (left === undefined) return
     const { text, options } = left

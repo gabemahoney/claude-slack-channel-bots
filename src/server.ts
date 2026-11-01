@@ -1300,6 +1300,8 @@ const personaRouting = createPersonaRouting({
   onHoldStored: key => {
     try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
     try { postHolds?.check(key) } catch { /* independent hold owners */ }
+    // A held exact save corrects a posted storage warning without its release.
+    try { deliveryReporting?.holdStored(key) } catch { /* reporting is independent of the holds */ }
   },
   archive: (key, event) => archiveWrite?.(key, event),
   // No runner in a dry run: the hook does nothing.
@@ -1312,6 +1314,9 @@ const personaRouting = createPersonaRouting({
   getChannelDelivery: () => channelDeliveryStore,
   threadMemory: (key, channel, root) => {
     ownPostJoins?.settleDeferred(key, channel)
+    // A queue replay awaiting its repair rewrite holds untrusted joins: no
+    // thread is not-joined until the repair turn has recovered them.
+    if (deliveryQueue?.durabilityPending?.(key)) return 'unknown'
     return threadMemory?.view(key, channel, root) ?? 'unknown'
   },
   // The one owner's in-memory posts under the current stamp; none before it exists.
@@ -2915,10 +2920,11 @@ export async function main(): Promise<void> {
   // replay and compact every journal before Slack/HTTP admission.
   deliveryQueue = createDeliveryQueue({
     stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event),
-    // A journal start() couldn't read gets the start's steps in the turn that
-    // first loads it, before that turn's own work: the clock passes its holds'
-    // arrivals, then its key is recovered as at start. Until start has
-    // recovered every key, start's own pass covers it.
+    // A journal start() couldn't read, or whose repair rewrite failed, gets the
+    // start's steps in the turn that first loads or repairs it, before that
+    // turn's own work: the clock passes its holds' arrivals, then its key is
+    // recovered as at start. Until start has recovered every key, start's own
+    // pass covers it.
     onLoadedAfterStart: key => {
       if (!queueStartRecovered || shuttingDown) return
       for (const hold of deliveryQueue?.unresolvedHolds(key) ?? []) threadMemory?.advancePast(key, hold.arrived_at)

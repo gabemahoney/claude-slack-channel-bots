@@ -357,7 +357,7 @@ test('removing diagnostic additions preserves the approved AD-state-only scenari
   expect(scenario.split(caseGate)).toHaveLength(2); expect(scenario.split(waitGate)).toHaveLength(2)
   // Includes the reviewed three-line corpus membership declaration (7p.8d);
   // only the two diagnostic gates are removed, so every other byte stays pinned.
-  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('02dd5977c95ad066e4d6a85b1651681d970b74d42ff6e648a9846028720db8fc')
+  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('9ff7e72b9ac4d50b94ae0068a2ca2e85d0e63d4934037b42111793c53808525a')
 })
 
 function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {

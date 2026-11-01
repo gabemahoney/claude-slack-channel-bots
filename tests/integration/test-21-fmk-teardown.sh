@@ -20,9 +20,9 @@ t21_value() {
     t21_value_out="$(bun "${T21_PRINTER}" "$@")" || fail "the value printer failed for $*"
 }
 
-# t21_whole <var> <entry>: as t21_value, for a whole number.
+# t21_whole <var> <entry> [<arg>...]: as t21_value, for a whole number.
 t21_whole() {
-    t21_value "$1" "$2"
+    t21_value "$@"
     local -n t21_whole_out="$1"
     [[ "${t21_whole_out}" =~ ^[1-9][0-9]*$ ]] || fail "setup: $2 '${t21_whole_out}' is not a whole number"
 }
@@ -39,6 +39,10 @@ t21_value KILL_FAILED_LABEL PERSONA_KILL_FAILED_LABEL
 t21_value NOT_RESTARTED_LABEL CLEAN_RESTART_NOT_RESTARTED_LABEL
 t21_value SVC_LABEL SERVICE_LABEL
 t21_value LAST_APPLIED_SUFFIX LAST_APPLIED_FILE_SUFFIX
+t21_value SERVER_FLAG CLEAN_RESTART_SERVER_FLAG
+t21_value USAGE_LINE CLEAN_RESTART_USAGE
+t21_value NAMED_BOTS_LINE CLEAN_RESTART_NAMED_BOTS_LINE
+t21_whole CLEAN_EXIT_DELAY_S CLEAN_EXIT_RELAUNCH_DELAY
 
 # The teardown's escalation line (src/cli.ts teardownPersona, which has no
 # exported builder): `[slack] teardownBots: pause failed for persona <ref> —
@@ -62,6 +66,25 @@ SERVER_GONE_S=15
 # D's recovery after the restart (see "Waits" in the header).
 D_RECOVER_WAIT_S=$(( GRACE_MS / 1000 + RETRY_CEILING_S + ROW_WAIT_S ))
 (( D_RECOVER_WAIT_S >= 300 )) || D_RECOVER_WAIT_S=300
+# The server registering a reported-in stub's MCP session.
+CONNECT_WAIT_S=30
+# The clean-exit relaunch's launch record after the row read `ended`: the
+# check's delay, then the restart work's liveness read and its launch call.
+NAMED_RELAUNCH_BOUND_S=$(( CLEAN_EXIT_DELAY_S + 30 ))
+# The named-restart leg's session_restart_delay: a minute past that bound, so
+# the server's ordinary restart, this delay after the bot's session closed,
+# cannot land inside it: the row's `ended` and the session's close both come
+# of the bot's exit, so an ordinary restart's launch record would come about
+# this delay after `ended`.
+NAMED_RESTART_DELAY_S=$(( NAMED_RELAUNCH_BOUND_S + 60 ))
+# `clean_restart <bot>`'s wait for each stopped bot's relaunch under that
+# delay. It covers the ordinary restart too, so the CLI's exit 0 shows only
+# that R was relaunched; the bound above and the server's clean-exit line
+# show it was the clean-exit relaunch.
+t21_whole NAMED_WAIT_MS cleanRestartRelaunchWaitMs "${NAMED_RESTART_DELAY_S}"
+NAMED_WAIT_S=$(( (NAMED_WAIT_MS + 999) / 1000 ))
+(( NAMED_RELAUNCH_BOUND_S < NAMED_WAIT_S )) \
+    || fail "setup: the clean-exit relaunch bound ${NAMED_RELAUNCH_BOUND_S}s (CLEAN_EXIT_RELAUNCH_DELAY ${CLEAN_EXIT_DELAY_S}s + 30s) is not inside clean_restart's relaunch wait ${NAMED_WAIT_S}s"
 
 # ---------------------------------------------------------------------------
 # Personas: each with its own key, credentials, channel and directories
@@ -101,7 +124,9 @@ t21_persona E kille C0T21KLE1
 t21_persona F fallbackf C0T21FBF1
 t21_persona G fallbackg C0T21FBG1
 t21_persona D pendingd C0T21PND1
-ALL_PERSONAS=(A B C E F G D)
+t21_persona R restartr C0T21RSR1
+t21_persona K keptk C0T21KPK1
+ALL_PERSONAS=(A B C E F G D R K)
 
 # t21_persona_json <prefix>: one persona entry: its credentials file, working
 # directory, claude_config_dir and one channel, which also takes its
@@ -113,11 +138,14 @@ t21_persona_json() {
 }
 
 T21_RECORD_ASIDE=0
+# The `session_restart_delay` the next config.json sets; 0 but in the
+# named-restart leg, whose relaunch it allows.
+T21_RESTART_DELAY_S=0
 
 # t21_config_for_next_start <prefix>...: the operator's edit while the server
 # is stopped: config.json holds these personas (`health_check_interval` 0,
-# `session_restart_delay` 0), and the last-applied record is moved aside, so
-# the next start applies config.json as it stands.
+# `session_restart_delay` T21_RESTART_DELAY_S), and the last-applied record is
+# moved aside, so the next start applies config.json as it stands.
 t21_config_for_next_start() {
     local joined="" p record
     for p in "$@"; do
@@ -129,7 +157,7 @@ t21_config_for_next_start() {
   "bind": "127.0.0.1",
   "port": ${SCENARIO_PORT},
   "health_check_interval": 0,
-  "session_restart_delay": 0,
+  "session_restart_delay": ${T21_RESTART_DELAY_S},
   "exit_timeout": 5
 }
 EOF
@@ -199,11 +227,18 @@ t21_row_get() {
     [[ "${AD_RC}" == 0 ]] || fail "$2: harness get of $1 exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
 }
 
-# t21_row_snapshot <id> <step>: print the row as a harness `get` reads it,
-# keys sorted, on one line.
+# t21_row_snapshot <id> <step>: print, keys sorted on one line, the fields of
+# the row's `get` that only a launch, pause, kill or resume moves: its state
+# and when the raw state last changed, its end and launch starts, its session
+# id and earlier sessions, and its tmux session, agent and arguments. Fields
+# agent-director refreshes on an idle row (last_seen_at, context, liveness_*,
+# family_state, transcript_status) are left out, so two reads seconds or
+# minutes apart match unless the row's life changed.
 t21_row_snapshot() {
     t21_row_get "$1" "$2"
-    jq -cS . "${AD_OUT}"
+    jq -cS '{instance_id, state, state_changed_at, started_at, ended_at, launch_started_at,
+        session_id, prior_session_ids: [.prior_sessions[]?.session_id],
+        tmux_session_name, tmux_socket, agent, agent_args, cwd}' "${AD_OUT}"
 }
 
 # t21_lines <file>: how many lines <file> has (0 when missing).
@@ -536,6 +571,8 @@ t21_precheck_legs() {
     for cmd_name in CLI_COMMAND_CLEAN_RESTART CLI_COMMAND_STOP_BOTS; do
         t21_value cmd "${cmd_name}"
         read -r -a args <<< "${cmd}"
+        # clean_restart's whole-fleet form: its lines still name it bare.
+        [[ "${cmd_name}" != CLI_COMMAND_CLEAN_RESTART ]] || args+=("${SERVER_FLAG}")
         out="${SCENARIO_ROOT}/precheck-${args[0]}.out"
         t21_cli "${out}" "${args[@]}"
         (( T21_RC != 0 )) || { t21_show "${out}" "the command's output"; fail "${step}: ${cmd} exited 0"; }
@@ -610,14 +647,14 @@ t21_teardown_failure_legs() {
     stop_server
     t21_up "teardown failure: setup" C E
 
-    # clean_restart with every kill failing: the server restarted.
-    step="clean_restart with a failed teardown"
+    # clean_restart --server with every kill failing: the server restarted.
+    step="clean_restart --server with a failed teardown"
     pid="$(server_pid)"
     t21_mark
     tmux_shim_mode fail-kill
     out="${SCENARIO_ROOT}/teardown-clean_restart.out"
-    t21_cli "${out}" clean_restart
-    (( T21_RC != 0 )) || { t21_show "${out}" "the command's output"; fail "${step}: clean_restart exited 0"; }
+    t21_cli "${out}" clean_restart "${SERVER_FLAG}"
+    (( T21_RC != 0 )) || { t21_show "${out}" "the command's output"; fail "${step}: clean_restart ${SERVER_FLAG} exited 0"; }
     for p in C E; do
         t21_check_kill_failed_persona "${p}" CLI_COMMAND_CLEAN_RESTART "${out}" "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" "${step}"
     done
@@ -626,7 +663,7 @@ t21_teardown_failure_legs() {
     t21_value last teardownNotStoppedLine CLI_COMMAND_CLEAN_RESTART 2
     t21_check_last_line "${out}" "${last}" "${step}"
     new_pid="$(server_pid)"
-    [[ -n "${new_pid}" && "${new_pid}" != "${pid}" ]] || fail "${step}: server.pid reads '${new_pid}' after clean_restart, not a new PID (was ${pid})"
+    [[ -n "${new_pid}" && "${new_pid}" != "${pid}" ]] || fail "${step}: server.pid reads '${new_pid}' after clean_restart ${SERVER_FLAG}, not a new PID (was ${pid})"
     pid_alive "${new_pid}" || fail "${step}: the restarted bot server ${new_pid} is not running"
     echo "${TEST_NAME}: NOTE: ${step}: the bot server ${pid} was restarted as ${new_pid}"
     t21_check_rows_kept "${step}" C E
@@ -678,8 +715,8 @@ t21_not_restarted_leg() {
     t21_mark
     tmux_shim_mode fail-kill
     out="${SCENARIO_ROOT}/not-restarted.out"
-    t21_cli "${out}" clean_restart
-    (( T21_RC != 0 )) || { t21_show "${out}" "the command's output"; fail "${step}: clean_restart exited 0"; }
+    t21_cli "${out}" clean_restart "${SERVER_FLAG}"
+    (( T21_RC != 0 )) || { t21_show "${out}" "the command's output"; fail "${step}: clean_restart ${SERVER_FLAG} exited 0"; }
 
     # The precheck passed, the teardown failed.
     for p in F G; do
@@ -842,10 +879,183 @@ t21_pending_leg() {
     t21_note_calls "${mark}" "${D_ID}" "${step}"
 }
 
+# ---------------------------------------------------------------------------
+# S7: clean_restart's forms with the server running (b.ku8): a bare call is
+# refused with its usage line; `clean_restart <bot>` restarts that bot alone,
+# through the running server's relaunch
+# ---------------------------------------------------------------------------
+
+# t21_count_verbs_by <parent-pid> <time> <id> <verb>...: CSCB calls of any
+# <verb> naming <id>, made at or after <time> by the process <parent-pid>.
+t21_count_verbs_by() {
+    local parent="$1" since="$2" id="$3" verb total=0
+    shift 3
+    for verb in "$@"; do
+        total=$(( total + $(t21_run_count "${parent}" "${since}" "${verb}" "${id}") ))
+    done
+    echo "${total}"
+}
+
+# t21_check_untouched <step> <prefix> <snapshot> <session-ids>: the persona's
+# row's lifecycle fields read as <snapshot> (t21_row_snapshot), its session
+# and pane are still <session-ids>, and no CSCB process paused, killed or
+# relaunched it after the mark.
+t21_check_untouched() {
+    local step="$1" p="$2" id_var="${2}_ID" session_var="${2}_SESSION" after ids n verb
+    after="$(t21_row_snapshot "${!id_var}" "${step}")" || exit 1
+    [[ "${after}" == "$3" ]] || fail "${step}: ${!id_var}'s row changed: ${after} (was $3)"
+    ids="$(t21_session_ids "${!session_var}")" || fail "${step}: ${!session_var} is gone"
+    [[ "${ids}" == "$4" ]] || fail "${step}: ${!session_var} is now '${ids}', not '$4'"
+    for verb in pause kill spawn resume; do
+        n="$(t21_cscb_count_since "${MARK_TIME}" "${verb}" "${!id_var}")"
+        [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB ${verb} call(s) of ${!id_var} after the mark"
+    done
+}
+
+t21_named_restart_leg() {
+    local step="named restart" out pid n p ref_var line mark connected ended ended_t launches launch_t gap
+    local r_before k_before r_ids k_ids exited next_life next_head next_tail
+    stop_server
+    # R's stub ends on the pause's `/exit` as Claude Code does, so its row
+    # reads `ended` and the CLI sees a clean exit; the mode also reports in
+    # at once, so R's relaunched life reports in too. K's stays at-once.
+    stub_mode "${R_WORK}" "${STUB_MODE_EXIT_ON_PAUSE}"
+    T21_RESTART_DELAY_S="${NAMED_RESTART_DELAY_S}"
+    t21_up "${step}: setup" R K
+    T21_RESTART_DELAY_S=0
+    R_REF="$(persona_ref "${R_NAME}")" || exit 1
+    K_REF="$(persona_ref "${K_NAME}")" || exit 1
+    # Each stub's MCP session registered, so the server sees R's close.
+    for p in R K; do
+        ref_var="${p}_REF"
+        wait_for_count "$(matcher "[slack] Session connected: persona ${!ref_var}")" 1 "${CONNECT_WAIT_S}" \
+            "${step}: the server never registered ${!ref_var}'s session"
+    done
+    pid="$(server_pid)"
+    [[ -n "${pid}" ]] && pid_alive "${pid}" || fail "${step}: no bot server running before the commands"
+    r_before="$(t21_row_snapshot "${R_ID}" "${step}")" || exit 1
+    k_before="$(t21_row_snapshot "${K_ID}" "${step}")" || exit 1
+    r_ids="$(t21_session_ids "${R_SESSION}")" || fail "${step}: no session ${R_SESSION}"
+    k_ids="$(t21_session_ids "${K_SESSION}")" || fail "${step}: no session ${K_SESSION}"
+
+    # A bare clean_restart: its usage line alone, exit 2, nothing touched.
+    step="bare clean_restart"
+    t21_mark
+    out="${SCENARIO_ROOT}/bare-clean_restart.out"
+    t21_cli "${out}" clean_restart
+    (( T21_RC == 2 )) || { t21_show "${out}" "the command's output"; fail "${step}: exited ${T21_RC}, not 2"; }
+    n="$(t21_lines "${out}")"
+    [[ "${n}" == 1 ]] || { t21_show "${out}" "the command's output"; fail "${step}: printed ${n} line(s), not the usage line alone"; }
+    t21_check_last_line "${out}" "${USAGE_LINE}" "${step}"
+    n="$(t21_run_count "${T21_RUN_PID}" "${MARK_TIME}" "")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CLI-parented agent-director call(s)"
+    [[ "$(server_pid)" == "${pid}" ]] && pid_alive "${pid}" || fail "${step}: the bot server ${pid} is not the one running after the command"
+    n="$(t21_servers_since "${MARK_TIME}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} bot server(s) started after the mark"
+    t21_check_untouched "${step}" R "${r_before}" "${r_ids}"
+    t21_check_untouched "${step}" K "${k_before}" "${k_ids}"
+    echo "${TEST_NAME}: ${step}: refused with its usage line; the server and both rows untouched"
+
+    # clean_restart <R's key>: R stopped and relaunched by the running
+    # server, K and the server untouched.
+    step="clean_restart <bot>"
+    t21_mark
+    mark="${MARK_TIME}"
+    connected="$(count_log "$(matcher "[slack] Session connected: persona ${R_REF}")")"
+    out="${SCENARIO_ROOT}/named-clean_restart.out"
+    t21_cli "${out}" clean_restart "${R_KEY}"
+    if (( T21_RC != 0 )); then
+        t21_show "${out}" "the command's output"
+        t21_value line cleanRestartNotRelaunchedLine "${R_NAME}" "${NAMED_WAIT_MS}"
+        n="$(t21_count_exact "${out}" "${line}")"
+        (( n == 0 )) || fail "${step}: exited ${T21_RC}: ${R_NAME} was stopped but not seen relaunched within the CLI's ${NAMED_WAIT_S}s wait"
+        fail "${step}: exited ${T21_RC}, not 0 with ${R_NAME} stopped and relaunched"
+    fi
+    # The named form's progress line, once.
+    n="$(t21_count_after "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" "] ${NAMED_BOTS_LINE}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} clean_restart.log line(s) of the named form's progress line after the mark, not 1"
+    # R's teardown ended in one line: its exit seen at the first poll read
+    # after the pause, which comes TEARDOWN_POLL_FIRST_WAIT_MS after `ended`,
+    # well before the clean-exit relaunch; or, if that read is slow enough to
+    # land after the relaunch, the next-life line. Either is a clean stop the
+    # CLI reports with the same relaunched line. No teardown line names K.
+    t21_value next_head teardownNextLifeAfterPauseLine.head "${R_NAME}"
+    t21_value next_tail teardownNextLifeAfterPauseLine.tail "${R_NAME}"
+    # The clean exit's line (src/cli.ts teardownPersonaFrom, which has no
+    # exported builder): `[slack] teardownBots: persona <ref> exited cleanly in <ms>ms`.
+    exited="$(t21_count_after "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" "$(matcher "] [slack] teardownBots: persona ${R_REF} exited cleanly in " "ms")")"
+    next_life="$(t21_count_after "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" "$(matcher "] ${next_head}" "${next_tail}")")"
+    (( exited + next_life == 1 )) \
+        || fail "${step}: ${exited} clean-exit and ${next_life} next-life teardown line(s) of ${R_REF} in clean_restart.log after the mark, not one of them"
+    echo "${TEST_NAME}: ${step}: ${R_REF}'s teardown line: $( (( exited == 1 )) && echo "exited cleanly" || echo "its next life read live after the pause")"
+    n="$(t21_count_after "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" "[slack] teardownBots: persona ${K_REF}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} clean_restart.log teardown line(s) of ${K_REF}, which was not named"
+    # The relaunched line for R alone, printed and in clean_restart.log (the
+    # positive control for the log's next check).
+    t21_value line cleanRestartRelaunchedLine "${R_NAME}"
+    n="$(t21_count_exact "${out}" "${line}")"
+    [[ "${n}" == 1 ]] || { t21_show "${out}" "the command's output"; echo "  | expected: ${line}" >&2; fail "${step}: ${n} relaunched line(s) for ${R_NAME}, not 1"; }
+    n="$(t21_count_after "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" "] ${line}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} clean_restart.log line(s) of ${R_NAME}'s relaunched line after the mark, not 1"
+    t21_value line cleanRestartRelaunchedLine "${K_NAME}"
+    n="$(t21_count_exact "${out}" "${line}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} relaunched line(s) for ${K_NAME}, which was not named"
+    n="$(t21_count_after "${SLACK_STATE_DIR}/clean_restart.log" "${MARK_CLEAN}" '[slack] clean_restart: stopping server')"
+    [[ "${n}" == 0 ]] || fail "${step}: clean_restart.log says it stopped the server (${n} line(s))"
+
+    # The server kept running: same PID, none started.
+    [[ "$(server_pid)" == "${pid}" ]] || fail "${step}: server.pid reads '$(server_pid)', not the PID before the command, ${pid}"
+    pid_alive "${pid}" || fail "${step}: the bot server ${pid} is not running after the command"
+    n="$(t21_servers_since "${mark}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} bot server(s) started after the mark"
+
+    # R's old life ended through its pause: one CLI-parented pause, no kill,
+    # no CLI launch; the relaunch is the server's.
+    n="$(t21_run_count "${T21_RUN_PID}" "${mark}" pause "${R_ID}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} CLI-parented pause call(s) of ${R_ID}, not 1"
+    n="$(t21_count_verbs_by "${T21_RUN_PID}" "${mark}" "${R_ID}" kill spawn resume)"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CLI-parented kill, spawn or resume call(s) of ${R_ID}"
+    n="$(t21_count_verbs_by "${pid}" "${mark}" "${R_ID}" spawn resume)"
+    (( n >= 1 )) || fail "${step}: no spawn or resume of ${R_ID} by the bot server ${pid} after the mark"
+
+    # R's next life through agent-director: its row read ended once, then one
+    # launch record within the clean-exit bound, then waiting.
+    wait_until "${ROW_WAIT_S}" "${step}: ${R_ID}'s new life never reported in (waiting)" t21_row_is "${R_ID}" waiting
+    ended="$(t21_trail_after "${mark}" ad.spawn.state_transition "${R_ID}" | jq -c 'select(.new_state == "ended")')" \
+        || fail "${step}: could not read the trail's state changes of ${R_ID}"
+    n="$(grep -c . <<< "${ended}" || true)"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} trail record(s) of ${R_ID} reading ended after the mark, not 1: ${ended}"
+    ended_t="$(jq -r '.epoch' <<< "${ended}")"
+    launches="$( { t21_trail_after "${mark}" ad.spawn.reused "${R_ID}"; t21_trail_after "${mark}" ad.resume.moved_to_pending "${R_ID}"; } )" \
+        || fail "${step}: could not read the trail's launch records of ${R_ID}"
+    n="$(grep -c . <<< "${launches}" || true)"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} launch record(s) of ${R_ID} after the mark, not 1: ${launches}"
+    launch_t="$(jq -r '.epoch' <<< "${launches}")"
+    gap="$(awk -v a="${launch_t}" -v b="${ended_t}" 'BEGIN { printf "%.3f", a - b }')"
+    awk -v g="${gap}" -v max="${NAMED_RELAUNCH_BOUND_S}" 'BEGIN { exit !(g >= 0 && g <= max) }' \
+        || fail "${step}: ${R_ID}'s launch record came ${gap}s after its row read ended, not within 0..${NAMED_RELAUNCH_BOUND_S}s (CLEAN_EXIT_RELAUNCH_DELAY ${CLEAN_EXIT_DELAY_S}s + 30s; the ordinary restart comes after ${NAMED_RESTART_DELAY_S}s)"
+    # The server says the relaunch was its clean-exit check's, once, cutting
+    # the ordinary restart's delay short.
+    t21_value line cleanExitRelaunchLine "${R_KEY}" "${NAMED_RESTART_DELAY_S}"
+    n="$(t21_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${line}")"
+    [[ "${n}" == 1 ]] || { echo "  | expected: ${line}" >&2; fail "${step}: ${n} server.log line(s) of ${R_KEY}'s clean-exit relaunch after the mark, not 1"; }
+    wait_for_count "$(matcher "[slack] Session connected: persona ${R_REF}")" "$(( connected + 1 ))" "${CONNECT_WAIT_S}" \
+        "${step}: the server never registered ${R_REF}'s new session"
+    echo "${TEST_NAME}: NOTE: ${step}: ${R_SESSION} was '${r_ids}' and is now '$(t21_session_ids "${R_SESSION}" || true)'"
+    echo "${TEST_NAME}: ${step}: ${R_ID} ended at ${ended_t} and was relaunched $(jq -r '.event' <<< "${launches}") ${gap}s later (bound ${NAMED_RELAUNCH_BOUND_S}s)"
+    t21_note_calls "${mark}" "${R_ID}" "${step}"
+
+    # K untouched, its session still connected.
+    t21_check_untouched "${step}" K "${k_before}" "${k_ids}"
+    n="$(t21_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "$(matcher "[slack] Session disconnected" ": persona ${K_REF}")")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} server.log line(s) of ${K_REF}'s session disconnecting after the mark"
+}
+
 t21_precheck_legs
 t21_teardown_failure_legs
 t21_not_restarted_leg
 t21_pending_leg
+t21_named_restart_leg
 stop_server
 
 # The closing assertions.

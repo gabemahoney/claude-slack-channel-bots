@@ -2354,10 +2354,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       prepare: preparation.prepare,
       ...(threadMemory === undefined ? {} : {
         onReceived: (key: string, item: QueueItem, mode?: MemoryHoldMode) => reporting!.received(key, item, mode),
-        // As server.ts extends k8's hook: both hold owners, each isolated.
+        // As server.ts extends k8's hook: both hold owners, then reporting's
+        // correction of a posted storage warning by a held exact save, each isolated.
         onHoldStored: (key: string) => {
           try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
           try { postHolds?.check(key) } catch { /* independent hold owners */ }
+          try { reporting?.holdStored(key) } catch { /* reporting is independent of the holds */ }
         },
         monotonicNow: connections.clock.now,
         postHolds: { held: (key: string, hold: StoredPostHold) => postHolds?.held(key, hold) },
@@ -2377,6 +2379,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       getChannelDelivery: () => channelDeliveryStore,
       threadMemory: (key, channel, root) => {
         ownPostJoins?.settleDeferred(key, channel)
+        // As server.ts binds it: a queue replay awaiting its repair rewrite holds
+        // untrusted joins, so none of that key's threads is not-joined until then.
+        if (queue.durabilityPending?.(key)) return 'unknown'
         return threadMemory?.view(key, channel, root) ?? 'unknown'
       },
       ...(threadMemory === undefined ? {} : { joins: {

@@ -930,7 +930,7 @@ async function postWedgeWarning(
   }
   const emit = deps.emitTrail ?? defaultEmitTrail
   const result = await attempt.post(persona, web, { text }, { surface: 'warning', onPosted })
-  if (result.outcome === 'refused') return false
+  if (result.outcome === 'refused' || result.outcome === 'cancelled') return false
   if (result.outcome === 'posted') {
     onPosted?.()
     emit({
@@ -1640,7 +1640,7 @@ async function postPermissionPrompt(
     failedRequests.delete(compositeKey)
   }
   const result = await attempt.post(persona, web, { text, blocks }, { surface: 'prompt', onPosted: register })
-  if (result.outcome === 'refused') return
+  if (result.outcome === 'refused' || result.outcome === 'cancelled') return
   if (result.outcome === 'failed') {
     // failures land in BOTH server.log (real-time visibility) AND the
     // trail JSONL (after-the-fact debugging). Success paths stay trail-only,

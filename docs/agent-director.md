@@ -117,6 +117,8 @@ The server reads the table when it starts and every 120 s after that, whatever `
 
 If the file can't be read or parsed, or a `[tmux]` value is one agent-director refuses (not a whole number, negative, above 2^63 − 1, or below its minimum), the server keeps the last values it accepted (the defaults, if none yet) and writes one line to `server.log`. The `debug-slack-channel-bots` skill explains that line under "agent-director's timing settings". agent-director's own answers always decide; the server's reading of the file never overrides them.
 
+On agent-director 0.16 and 0.17.0, a bot's state can show as `needs_intelligence` (raw state `check_permission`: an unanswered prompt shows as `needs_intelligence` once `[state] needs_intelligence_timeout_seconds` passes) or `idle_screen` (raw state `working`); CSCB reads each as its raw state, so it relays the prompt and recovers the bot as usual. On other agent-director releases CSCB reads the state as given. agent-director's `[state]` timeouts need no change for CSCB.
+
 ### Sizing the agent-director call timeout
 
 `agent_director_call_timeout_ms` (default `60000`, an integer in `[1000, 3_600_000]`; see [Server-wide settings](server-settings.md#server-wide-settings)) is how long CSCB waits on each agent-director call it makes for its personas:

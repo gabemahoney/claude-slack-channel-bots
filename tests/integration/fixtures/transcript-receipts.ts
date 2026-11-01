@@ -326,6 +326,10 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
   }
   return { items: inputs.length, reminders: reminders.length, duplicates, tokens: transcriptTokens(ownEntries), timings }
 }
+/** The `recorded: receipts` line every full receipt audit command prints. */
+export function receiptsRecord(result: { items: number; reminders: number; timings: unknown[] }, transcripts: number): string {
+  return `recorded: receipts ${JSON.stringify({ items: result.items, reminders: result.reminders, transcripts, timings: result.timings })}`
+}
 export function percentile(values: number[], quantile: number): number {
   if (!values.length) throw new Error('No latency samples')
   return [...values].sort((a, b) => a - b)[Math.ceil(values.length * quantile) - 1]!
@@ -432,7 +436,7 @@ if (import.meta.main) {
     }
     const result = auditReceipts({ stateDir, key, shimLog, transcripts, expectedCount: command !== 'latency' && count ? Number(count) : undefined, noRetype: mode === 'no-retype' }, entries, adapters)
     if (command !== 'ready') {
-      console.log(`recorded: receipts ${JSON.stringify({ items: result.items, reminders: result.reminders, transcripts: transcripts.length, timings: result.timings })}`)
+      console.log(receiptsRecord(result, transcripts.length))
       if (command === 'latency') {
         const n = Number(count)
         if (!Number.isSafeInteger(n) || n <= 0 || result.timings.length < n) throw new Error('Insufficient latency samples')

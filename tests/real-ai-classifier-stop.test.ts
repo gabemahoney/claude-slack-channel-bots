@@ -1372,7 +1372,7 @@ test.each([
   ['extra neutralization permission', 'manifest', (audit: any) => { audit.cases[4].change = { from: '/help', to: '/status' }; return audit }, 'unapproved AI body neutralization'],
   ['missing reviewed input source', 'manifest', (audit: any) => { audit.prompt_input_sources.pop(); return audit }, 'AI prompt/input source inventory changed'],
   ['generated inline prompt', 'scenario', (bytes: string) => bytes.replace('Please acknowledge this DM.', 'Please echo another marker.'), 'reviewed AI prompt/input source changed'],
-  ['corpus membership declaration', 'scenario', (bytes: string) => bytes.replace('.memberships=["C0B1ZJJLJ9M"]', '.memberships=[]'), 'reviewed AI prompt/input source changed: real-agent/ai-scenario.sh'],
+  ['corpus membership declaration', 'scenario', (bytes: string) => bytes.replace('.memberships=["C0TESTCHAN1"]', '.memberships=[]'), 'reviewed AI prompt/input source changed: real-agent/ai-scenario.sh'],
   ['shared persona default prompt', 'shared-scenario', (bytes: string) => bytes.replace('Acknowledge every relayed channel message with exactly OK.', 'Reply with another marker.'), 'reviewed AI prompt/input source changed: integration/lib/real-scenario.sh'],
 ] as const)('rejects unreviewed %s drift before an AI trial', (_name, target, mutate, reason) => {
   const root = mkdtempSync(join(tmpdir(), 'ai-input-audit-'))

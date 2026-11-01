@@ -5647,7 +5647,7 @@ describe('the own-post observer shares one Thread Memory owner', () => {
 
   // The end-to-end Post Hold and k8 crash cases run over the reload harness's
   // hand copy of these, so a copy left behind a source change must fail here.
-  test('the reload harness mirrors the start step, its late-load binding, the start loop and the bring-up\'s Post Hold chain', () => {
+  test('the reload harness mirrors the start step, its late-load binding, the start loop, the bring-up\'s Post Hold chain, routing\'s thread view and the stored-hold hook', () => {
     const reload = stripComments(readFileSync(new URL('./test-helpers/reload-harness.ts', import.meta.url), 'utf-8'))
     const flat = (text: string) => text.replace(/\s+/g, ' ').trim()
     /** The one node anywhere in `code` that `keep` accepts; fails unless there is exactly one. */
@@ -5686,6 +5686,11 @@ describe('the own-post observer shares one Thread Memory owner', () => {
     expect(harness.loaded).toBe(asHarness(server.loaded))
     expect(harness.start).toEqual(server.start.map(asHarness))
     expect(harness.bringUp.map(asserted)).toEqual(server.bringUp.map(asHarness))
+    // Routing's thread view and stored-hold hook bodies, in the harness's names:
+    // its queue always exists, and its delivery reporting is `reporting`.
+    const intake = (code: string, names: Array<[RegExp, string]> = []) => ['threadMemory', 'onHoldStored']
+      .map(name => names.reduce((out, [from, to]) => out.replace(from, to), flat(bound(code, name).body.getText())))
+    expect(intake(reload)).toEqual(intake(SERVER_CODE, [[/\bdeliveryQueue\?\./g, 'queue.'], [/\bdeliveryReporting\b/g, 'reporting']]))
   })
 
   test('every posting surface shares the one observer, which reads the one owner holder at call time', () => {
@@ -5961,10 +5966,10 @@ describe('Thread Memory server lifecycle wiring', () => {
   const retentionMember: keyof DeliveryQueueOptions = 'threadJoinSaved'
   const recovery: keyof typeof ThreadJoinRecoveryModule = 'recoverQueuedJoins'
 
-  test('routing settles deferred own posts synchronously before reading the live Thread Memory holder', () => {
+  test('routing settles deferred own posts synchronously before reading the live Thread Memory holder, which is unknown while the key\'s queue repair is pending', () => {
     const routing = onlyCallOf('createPersonaRouting')
     const binding = onlyCallProps('createPersonaRouting').get(routingMember)
-    expect(binding).toBe("(key, channel, root) => { ownPostJoins?.settleDeferred(key, channel) return threadMemory?.view(key, channel, root) ?? 'unknown' }")
+    expect(binding).toBe("(key, channel, root) => { ownPostJoins?.settleDeferred(key, channel) if (deliveryQueue?.durabilityPending?.(key)) return 'unknown' return threadMemory?.view(key, channel, root) ?? 'unknown' }")
     expect(callsOf('ownPostJoins\\?\\.settleDeferred')).toHaveLength(1)
     declaredOnce('threadMemory')
     const declaration = indicesOf(/\blet\s+threadMemory\s*:\s*ThreadMemory\s*\|\s*undefined\s*(?=\n)/g, SERVER_CODE)
@@ -5980,10 +5985,11 @@ describe('Thread Memory server lifecycle wiring', () => {
     // importing or starting the server cannot expose this private dependency.
     const adapter = expression<() => {
       read: NonNullable<PersonaRoutingDeps['threadMemory']>
-      set: (value: Pick<ThreadMemoryModule.ThreadMemory, 'view'>, owner: Pick<OwnPostModule.OwnPostJoins, 'settleDeferred'>) => void
+      set: (value: Pick<ThreadMemoryModule.ThreadMemory, 'view'>, owner: Pick<OwnPostModule.OwnPostJoins, 'settleDeferred'>,
+        queue?: Pick<DeliveryQueue, 'durabilityPending'>) => void
     }>(`() => {
-      let threadMemory, ownPostJoins;
-      return { read: (${binding}), set: (value, owner) => { threadMemory = value; ownPostJoins = owner } };
+      let threadMemory, ownPostJoins, deliveryQueue;
+      return { read: (${binding}), set: (value, owner, queue) => { threadMemory = value; ownPostJoins = owner; deliveryQueue = queue } };
     }`, {})()
     expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('unknown')
     const calls: string[][] = []
@@ -5997,6 +6003,21 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(calls).toEqual([
       ['settle', 'alpha', 'C0THREAD'], ['view', 'alpha', 'C0THREAD', '1.000001'],
       ['settle', 'beta', 'C0OTHER'], ['view', 'beta', 'C0OTHER', '2.000001'],
+    ])
+    // A key whose queue replay awaits its repair rewrite has untrusted queued joins:
+    // each of its threads reads unknown once its deferred posts settle; others read the view.
+    calls.length = 0
+    const pending = new Set(['alpha'])
+    adapter.set({ view: (...args) => { calls.push(['view', ...args]); return 'not-joined' } }, owner,
+      { durabilityPending: key => pending.has(key) })
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('unknown')
+    expect(adapter.read('beta', 'C0OTHER', '2.000001')).toBe('not-joined')
+    pending.delete('alpha')
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('not-joined')
+    expect(calls).toEqual([
+      ['settle', 'alpha', 'C0THREAD'],
+      ['settle', 'beta', 'C0OTHER'], ['view', 'beta', 'C0OTHER', '2.000001'],
+      ['settle', 'alpha', 'C0THREAD'], ['view', 'alpha', 'C0THREAD', '1.000001'],
     ])
   })
 
@@ -7002,8 +7023,9 @@ describe('Memory Hold server wiring', () => {
       expect(withinCall(bindings, onlyCallOf(factory!))).toBe(1)
       expect(indicesOf(new RegExp(`(?:\\.\\s*${member}\\b|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
     }
-    // One hook for both owners, each in its own try: k8's live resolution, then the Post Hold check.
-    expect(onlyCallProps('createPersonaRouting').get('onHoldStored')).toBe('key => { try { void resolveMemoryHolds(key).catch(() => {}) } catch { } try { postHolds?.check(key) } catch { } }')
+    // One hook for its three owners, each in its own try: k8's live resolution,
+    // the Post Hold check, then reporting's correction of a held exact save.
+    expect(onlyCallProps('createPersonaRouting').get('onHoldStored')).toBe('key => { try { void resolveMemoryHolds(key).catch(() => {}) } catch { } try { postHolds?.check(key) } catch { } try { deliveryReporting?.holdStored(key) } catch { } }')
   })
 
   test.each([false, true])('actual held-stamp adapter sees the decision during store and its outcome; failed=%s', async fail => {
@@ -7058,21 +7080,22 @@ describe('Memory Hold server wiring', () => {
     }
   })
 
-  test('stored-hold callback resolves live and checks Post Holds through the current holders, each isolated, k8 guarded by shutdown and applied key', async () => {
+  test('stored-hold callback resolves live, checks Post Holds and corrects held storage warnings through the current holders, each isolated, k8 guarded by shutdown and applied key', async () => {
     const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
     const fn = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'resolveMemoryHolds')!
     expect(fn.getText(tree).replace(/\s+/g, ' ')).toBe("export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> { return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve() }")
     const adapter = expression<() => {
       stored: NonNullable<PersonaRoutingDeps['onHoldStored']>
       resolve: typeof ServerModule.resolveMemoryHolds
-      set(value?: Pick<MemoryHoldResolver, 'resolve'>, stopping?: boolean, applied?: boolean, post?: Pick<PostHoldsModule.PostHoldResolver, 'check'>): void
+      set(value?: Pick<MemoryHoldResolver, 'resolve'>, stopping?: boolean, applied?: boolean, post?: Pick<PostHoldsModule.PostHoldResolver, 'check'>,
+        reporting?: Pick<ReturnType<typeof createDeliveryReporting>, 'holdStored'>): void
     }>(`() => {
-      let memoryHolds, postHolds, shuttingDown = false, applied = true;
+      let memoryHolds, postHolds, deliveryReporting, shuttingDown = false, applied = true;
       const getAppliedPersona = () => applied;
       ${fn.getText(tree).replace(/^export /, '')}
       const stored = (${onlyCallProps('createPersonaRouting').get('onHoldStored')});
-      return { stored, resolve: resolveMemoryHolds, set(value, stopping = false, present = true, post) {
-        memoryHolds = value; shuttingDown = stopping; applied = present; postHolds = post;
+      return { stored, resolve: resolveMemoryHolds, set(value, stopping = false, present = true, post, reporting) {
+        memoryHolds = value; shuttingDown = stopping; applied = present; postHolds = post; deliveryReporting = reporting;
       } };
     }`, {})()
     const key = THREAD_PERSONAS.primary, calls: unknown[][] = []
@@ -7090,18 +7113,31 @@ describe('Memory Hold server wiring', () => {
       await adapter.stored(key)
     }
     expect(calls).toEqual(['first', 'replacement'].flatMap(marker => [[marker, key, 'live'], [marker, key, 'recovered']]))
-    // The same hook checks the current Post Hold holder; neither owner's failure skips the other or reaches routing.
+    // The same hook checks the current Post Hold holder, then asks the current
+    // reporting to correct a posted storage warning for an exact held save.
+    // No owner's failure skips a later one or reaches routing.
     calls.length = 0
     for (const how of ['ok', 'throws', 'rejects'] as const) {
       adapter.set({ resolve: (...args: Parameters<MemoryHoldResolver['resolve']>) => {
         calls.push(['resolve', how, ...args])
         if (how === 'throws') throw new Error('fixture resolve threw')
         return how === 'ok' ? Promise.resolve('resolved' as const) : Promise.reject(new Error('fixture resolve rejected'))
-      } }, false, true, { check: (k: string) => { calls.push(['check', how, k]); if (how !== 'ok') throw new Error('fixture check threw') } })
+      } }, false, true, { check: (k: string) => { calls.push(['check', how, k]); if (how !== 'ok') throw new Error('fixture check threw') } },
+      { holdStored: (k: string) => { calls.push(['holdStored', how, k]); if (how !== 'ok') throw new Error('fixture holdStored threw') } })
       expect(() => adapter.stored(key)).not.toThrow()
     }
     await createFakeClock().flush()
-    expect(calls).toEqual(['ok', 'throws', 'rejects'].flatMap(how => [['resolve', how, key, 'live'], ['check', how, key]]))
+    expect(calls).toEqual(['ok', 'throws', 'rejects'].flatMap(how => [['resolve', how, key, 'live'], ['check', how, key], ['holdStored', how, key]]))
+    // The reporting holder is read at call time: a replacement gets the next
+    // stored hold, and none at all is skipped quietly.
+    calls.length = 0
+    for (const marker of ['first', 'replacement']) {
+      adapter.set(undefined, false, true, undefined, { holdStored: (k: string) => { calls.push([marker, k]) } })
+      expect(() => adapter.stored(key)).not.toThrow()
+    }
+    adapter.set()
+    expect(() => adapter.stored(key)).not.toThrow()
+    expect(calls).toEqual([['first', key], ['replacement', key]])
   })
 
   test('a saved hold resolution wakes only its key\'s engine through the one call-time adapter, detached from intake', () => {

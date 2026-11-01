@@ -20,10 +20,9 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { readFileSync, mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs'
+import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { execFileSync } from 'node:child_process'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
@@ -148,14 +147,28 @@ describe('SR-6.1 poll window is wide enough for npm propagation', () => {
 // ---------------------------------------------------------------------------
 //
 // The loop text is lifted verbatim from the script (start `# SR-6.1 — poll` through
-// `done`, plus the timeout block) and spliced into a harness run in a temp dir with
-// a stubbed `npm` and a stubbed `sleep` at the front of PATH. Nothing real is
-// published, installed or fetched; `sleep` is a no-op that only records its argument,
-// so a 600-second window runs in well under a second.
+// `done`, plus the timeout block) and spliced into a harness run in a temp dir, after
+// bash function stubs for `npm` and `sleep` (a function wins over any `npm` or `sleep`
+// on PATH). Nothing real is published, installed or fetched; `sleep` is a no-op that
+// only records its argument, so no attempt waits on the clock. Each attempt still
+// forks a command substitution and a pipeline and launches the real `tr`, so on a
+// host where a fork costs ~30 ms the 120-attempt window takes several seconds.
+//
+// The real `npm` and `sleep` share a directory with bash, `seq` and `tr` on the
+// child's PATH, so a guard directory comes first on it: its `npm` and `sleep` say
+// on stderr that a PATH lookup reached them, record the hit in the run's directory
+// and exit 97. A lookup that bypasses the functions (`command npm`, `env npm`)
+// therefore never reaches the real tools, and `runPollIn` throws on any recorded
+// hit, since the loop discards npm's stderr and exit status. The functions still
+// win, so an attempt never runs a guard.
+
+/** Exit status of a guard `npm` or `sleep`: a PATH lookup bypassed the function stubs. */
+const GUARD_EXIT = 97
 
 let POLL_BLOCK: string
 let TIMEOUT_BLOCK: string
-let stubDir: string
+let guardRoot: string
+let guardBin: string
 
 beforeAll(() => {
   const script = readScript()
@@ -168,45 +181,71 @@ beforeAll(() => {
   expect(POLL_BLOCK).toContain('npm view')
   expect(TIMEOUT_BLOCK).toContain('sr_exit 60')
 
-  stubDir = mkdtempSync(join(tmpdir(), 'sr61-'))
-  mkdirSync(join(stubDir, 'bin'))
-  // Stub npm: emits the target version only from the Nth `npm view` onwards, where
-  // N is read from $SR61_STUB_SUCCEED_AT (0 = never succeed). Every call is tallied,
-  // and its full argv is recorded one line per call so tests can assert the script
-  // asked the registry the RIGHT question — otherwise the stub would answer any
-  // `npm <anything>` with the version and a wrong query would still pass.
-  writeFileSync(
-    join(stubDir, 'bin', 'npm'),
-    [
-      '#!/usr/bin/env bash',
-      'n=$(( $(cat "$SR61_STUB_DIR/npm-calls") + 1 ))',
-      'printf "%s" "$n" > "$SR61_STUB_DIR/npm-calls"',
-      'printf "%s\\n" "$*" >> "$SR61_STUB_DIR/npm-args"',
-      'if [ "$SR61_STUB_SUCCEED_AT" != "0" ] && [ "$n" -ge "$SR61_STUB_SUCCEED_AT" ]; then',
-      '  printf "%s\\n" "$SR61_STUB_VERSION"',
-      'fi',
-      'exit 0',
-    ].join('\n') + '\n',
-  )
-  // Stub sleep: records the requested seconds instead of burning wall clock.
-  writeFileSync(
-    join(stubDir, 'bin', 'sleep'),
-    [
-      '#!/usr/bin/env bash',
-      'printf "%s\\n" "$1" >> "$SR61_STUB_DIR/sleeps"',
-      'exit 0',
-    ].join('\n') + '\n',
-  )
-  chmodSync(join(stubDir, 'bin', 'npm'), 0o755)
-  chmodSync(join(stubDir, 'bin', 'sleep'), 0o755)
+  guardRoot = mkdtempSync(join(tmpdir(), 'sr61-guard-'))
+  guardBin = join(guardRoot, 'bin')
+  mkdirSync(guardBin)
+  for (const name of ['npm', 'sleep']) {
+    writeFileSync(
+      join(guardBin, name),
+      [
+        '#!/bin/sh',
+        `printf '%s\\n' "sr61 guard: the real ${name} was reached through PATH; the harness must call its ${name} function stub" >&2`,
+        `printf '%s\\n' ${name} >> "$SR61_STUB_DIR/guard-hits"`,
+        `exit ${GUARD_EXIT}`,
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    )
+  }
 })
 
 afterAll(() => {
-  if (stubDir) rmSync(stubDir, { recursive: true, force: true })
+  if (guardRoot) rmSync(guardRoot, { recursive: true, force: true })
 })
+
+// Stub npm: emits the target version only from the Nth `npm view` onwards, where N
+// is $SR61_STUB_SUCCEED_AT (0 = never succeed). Every call is tallied in a file (the
+// loop calls npm inside a pipeline subshell, so a shell variable would not survive),
+// and its full argv is recorded one line per call so tests can assert the script
+// asked the registry the RIGHT question — otherwise the stub would answer any
+// `npm <anything>` with the version and a wrong query would still pass.
+// Stub sleep: records the requested seconds instead of burning wall clock.
+const STUBS = [
+  'npm() {',
+  '  local n',
+  '  read -r n < "$SR61_STUB_DIR/npm-calls"',
+  '  n=$(( n + 1 ))',
+  '  printf "%s\\n" "$n" > "$SR61_STUB_DIR/npm-calls"',
+  '  printf "%s\\n" "$*" >> "$SR61_STUB_DIR/npm-args"',
+  '  if [ "$SR61_STUB_SUCCEED_AT" != "0" ] && [ "$n" -ge "$SR61_STUB_SUCCEED_AT" ]; then',
+  '    printf "%s\\n" "$SR61_STUB_VERSION"',
+  '  fi',
+  '  return 0',
+  '}',
+  'sleep() { printf "%s\\n" "$1" >> "$SR61_STUB_DIR/sleeps"; }',
+].join('\n')
+
+/**
+ * Time limit passed to every harness child: past it the child is killed with
+ * SIGKILL, so its `code` is 137 and its `signal` `'SIGKILL'`. It is the effective
+ * bound for the shared hook's runs, about twice their measured cost (~9.5 s on a
+ * host where each process costs ~30 ms), and sits below `LONG_RUNS_TIMEOUT_MS` so
+ * a stuck run there fails through its own test's assertions rather than as an
+ * anonymous hook timeout. The runs inside tests are bounded first by bun's
+ * default 5 s test timeout.
+ */
+const RUN_LIMIT_MS = 19_000
+
+/**
+ * After a kill, how long to wait for the child's output: a grandchild it left
+ * behind (a pipeline stage) can hold the pipes open past the kill.
+ */
+const KILLED_OUTPUT_GRACE_MS = 1_000
 
 interface PollRun {
   code: number
+  /** The signal that ended the child (`'SIGKILL'` past `RUN_LIMIT_MS`), or null when it exited. */
+  signal: string | null
   stdout: string
   stderr: string
   npmCalls: number
@@ -220,12 +259,13 @@ interface PollRun {
 /**
  * Run the extracted poll loop (optionally followed by the timeout block).
  * `succeedAt` is the 1-based `npm view` call on which the registry "surfaces"
- * the version; 0 means it never does.
+ * the version; 0 means it never does. Asynchronous, so independent runs can
+ * share the wall clock.
  */
-function runPoll(succeedAt: number, opts: { withTimeoutBlock?: boolean } = {}): PollRun {
+async function runPoll(succeedAt: number, opts: { withTimeoutBlock?: boolean } = {}): Promise<PollRun> {
   const runDir = mkdtempSync(join(tmpdir(), 'sr61-run-'))
   try {
-    return runPollIn(runDir, succeedAt, opts)
+    return await runPollIn(runDir, succeedAt, opts)
   } finally {
     // finally, not a trailing call: an assertion/setup throw inside the body
     // must not leak the temp dir (same pattern as publish-promote-bun-g-cwd.test.ts).
@@ -233,12 +273,12 @@ function runPoll(succeedAt: number, opts: { withTimeoutBlock?: boolean } = {}): 
   }
 }
 
-function runPollIn(
+async function runPollIn(
   runDir: string,
   succeedAt: number,
   opts: { withTimeoutBlock?: boolean },
-): PollRun {
-  writeFileSync(join(runDir, 'npm-calls'), '0')
+): Promise<PollRun> {
+  writeFileSync(join(runDir, 'npm-calls'), '0\n')
   writeFileSync(join(runDir, 'npm-args'), '')
   writeFileSync(join(runDir, 'sleeps'), '')
   const manifest = join(runDir, '.publish-state.json')
@@ -246,6 +286,7 @@ function runPollIn(
 
   const harness = [
     'set -euo pipefail',
+    STUBS,
     'NEXT_VERSION=9.9.9',
     `MANIFEST=${JSON.stringify(manifest)}`,
     // Stand-in for the script's sr_exit: same contract (print nothing, exit with code).
@@ -260,33 +301,42 @@ function runPollIn(
   const home = join(runDir, 'home')
   mkdirSync(home)
 
-  let code = 0
-  let stdout = ''
-  let stderr = ''
-  try {
-    // The stub bin dir goes first on PATH (pathDirs), so `npm` and `sleep`
-    // resolve to the stubs ahead of the real ones in the tools' directories.
-    // Named tools: bash (harness + stub shebangs), seq and tr (poll loop),
-    // cat (npm stub). Nothing else is inherited from process.env.
-    const out = execFileSync('bash', ['-c', harness], {
-      env: hostSafeChildEnv(home, {
-        tools: ['bash', 'seq', 'tr', 'cat'],
-        pathDirs: [join(stubDir, 'bin')],
-        extras: {
-          SR61_STUB_DIR: runDir,
-          SR61_STUB_VERSION: '9.9.9',
-          SR61_STUB_SUCCEED_AT: String(succeedAt),
-        },
-      }),
-      encoding: 'utf-8',
-      stdio: 'pipe',
-    })
-    stdout = out
-  } catch (e: any) {
-    code = typeof e.status === 'number' ? e.status : 1
-    stdout = e.stdout?.toString() ?? ''
-    stderr = e.stderr?.toString() ?? ''
+  // Named tools: bash (the harness) and seq and tr (the poll loop). `npm` and
+  // `sleep` are the harness's functions, with the guard directory first on PATH
+  // behind them. Nothing else is inherited from process.env.
+  const child = Bun.spawn(['bash', '-c', harness], {
+    env: hostSafeChildEnv(home, {
+      pathDirs: [guardBin],
+      tools: ['bash', 'seq', 'tr'],
+      extras: {
+        SR61_STUB_DIR: runDir,
+        SR61_STUB_VERSION: '9.9.9',
+        SR61_STUB_SUCCEED_AT: String(succeedAt),
+      },
+    }),
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: RUN_LIMIT_MS,
+    killSignal: 'SIGKILL',
+  })
+  const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
+  const code = await child.exited
+  const signal = child.signalCode
+  const [stdout, stderr] =
+    signal === null
+      ? await output
+      : await Promise.race([output, Bun.sleep(KILLED_OUTPUT_GRACE_MS).then((): [string, string] => ['', ''])])
+
+  const guardHits = join(runDir, 'guard-hits')
+  if (existsSync(guardHits)) {
+    const names = readFileSync(guardHits, 'utf-8').split('\n').filter(Boolean)
+    throw new Error(
+      `SR-6.1 harness reached the guard ${[...new Set(names)].join(', ')} on PATH (exit ${GUARD_EXIT}): ` +
+        'a lookup bypassed the function stubs and would have run the real tool',
+    )
   }
+
   const npmCalls = Number(readFileSync(join(runDir, 'npm-calls'), 'utf-8').trim())
   const npmArgs = readFileSync(join(runDir, 'npm-args'), 'utf-8')
     .split('\n')
@@ -298,6 +348,7 @@ function runPollIn(
   const verifiedMatch = stdout.match(/^VERIFIED=(\d+)$/m)
   return {
     code,
+    signal,
     stdout,
     stderr,
     npmCalls,
@@ -315,11 +366,39 @@ function runPollIn(
   }
 }
 
+/**
+ * Backstop for the shared hook below. It runs the three long loops together
+ * (two 120-attempt windows and the 43-attempt lag case); each attempt forks and
+ * launches processes, and on a host where that costs ~30 ms per process the
+ * concurrent runs take about 9.5 s, past bun's 5 s default. `RUN_LIMIT_MS` is the
+ * effective bound for these runs, about twice that cost; this timeout only has to
+ * exceed `RUN_LIMIT_MS` plus `KILLED_OUTPUT_GRACE_MS`, so a stuck run is killed and
+ * reported by its own test before this timeout fires.
+ */
+const LONG_RUNS_TIMEOUT_MS = 22_000
+
 describe('SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
+  // The three cases that read a never-surfacing window without the timeout
+  // block share one run: their input is identical.
+  let neverSurfaces: PollRun
+  let neverSurfacesWithTimeout: PollRun
+  let lag210s: PollRun
+
+  beforeAll(async () => {
+    const interval = readIntAssignment(readScript(), 'SR61_POLL_INTERVAL')!
+    // 210s of lag → the attempt at which the registry first answers.
+    ;[neverSurfaces, neverSurfacesWithTimeout, lag210s] = await Promise.all([
+      runPoll(0),
+      runPoll(0, { withTimeoutBlock: true }),
+      runPoll(Math.ceil(210 / interval) + 1),
+    ])
+  }, LONG_RUNS_TIMEOUT_MS)
+
   test('a registry that never surfaces the version is polled for the full window', () => {
     const attempts = readIntAssignment(readScript(), 'SR61_POLL_ATTEMPTS')!
     const interval = readIntAssignment(readScript(), 'SR61_POLL_INTERVAL')!
-    const r = runPoll(0)
+    const r = neverSurfaces
+    expect(r.signal).toBeNull()
     expect(r.code).toBe(0)
     expect(r.verified).toBe('0')
     expect(r.npmCalls).toBe(attempts)
@@ -332,7 +411,8 @@ describe('SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
   test('progress lines are emitted during a long wait, with attempt and elapsed markers ()', () => {
     const attempts = readIntAssignment(readScript(), 'SR61_POLL_ATTEMPTS')!
     const every = readIntAssignment(readScript(), 'SR61_PROGRESS_EVERY')!
-    const r = runPoll(0)
+    const r = neverSurfaces
+    expect(r.signal).toBeNull()
     const progress = [...r.stdout.matchAll(/attempt (\d+)\/(\d+).*?(\d+)s/g)]
     expect(progress.length).toBe(Math.floor(attempts / every))
     // First progress line lands on the Nth attempt and reports the real total.
@@ -342,8 +422,9 @@ describe('SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
     expect(Number(progress[0]![3])).toBeGreaterThan(0)
   })
 
-  test('a version that surfaces mid-window breaks early with VERIFIED=1', () => {
-    const r = runPoll(25)
+  test('a version that surfaces mid-window breaks early with VERIFIED=1', async () => {
+    const r = await runPoll(25)
+    expect(r.signal).toBeNull()
     expect(r.code).toBe(0)
     expect(r.verified).toBe('1')
     expect(r.npmCalls).toBe(25)
@@ -351,8 +432,9 @@ describe('SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
     expect(r.sleeps.length).toBe(24)
   })
 
-  test('a version visible on the first attempt returns immediately, no sleeping', () => {
-    const r = runPoll(1)
+  test('a version visible on the first attempt returns immediately, no sleeping', async () => {
+    const r = await runPoll(1)
+    expect(r.signal).toBeNull()
     expect(r.verified).toBe('1')
     expect(r.npmCalls).toBe(1)
     expect(r.sleeps).toEqual([])
@@ -362,21 +444,21 @@ describe('SR-6.1 poll loop behavior (stubbed npm + sleep)', () => {
   })
 
   test('every poll asks the registry the exact version query for the target package', () => {
-    const r = runPoll(0)
+    const r = neverSurfaces
+    expect(r.signal).toBeNull()
     const distinct = [...new Set(r.npmArgs)]
     expect(distinct).toEqual(['view claude-slack-channel-bots@9.9.9 version'])
     expect(r.npmArgs.length).toBe(r.npmCalls)
   })
 
   test('propagation lag of ~210s (the 0.10.0 observation) now verifies instead of timing out', () => {
-    const interval = readIntAssignment(readScript(), 'SR61_POLL_INTERVAL')!
-    // 210s of lag → the attempt at which the registry first answers.
-    const r = runPoll(Math.ceil(210 / interval) + 1)
-    expect(r.verified).toBe('1')
+    expect(lag210s.signal).toBeNull()
+    expect(lag210s.verified).toBe('1')
   })
 
   test('timeout still exits 60 with a diagnostic and leaves the manifest in place ()', () => {
-    const r = runPoll(0, { withTimeoutBlock: true })
+    const r = neverSurfacesWithTimeout
+    expect(r.signal).toBeNull()
     expect(r.code).toBe(60)
     expect(r.stderr).toContain('SR-6.1')
     expect(r.manifestExists).toBe(true)

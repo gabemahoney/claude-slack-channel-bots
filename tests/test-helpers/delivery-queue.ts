@@ -1,7 +1,7 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type AcceptedRecord, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
 import { postIntent, threadJoin, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP } from './thread-memory.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
@@ -54,3 +54,16 @@ export const withdrawnRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ 
 export const parkedRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'parked', seq, at })
 export const refusedRecord = (seq = 1, attempt = 1, at = 1000): RefusedRecord => ({ v: 1, kind: 'refused', seq, attempt, at })
 export const noticedRecord = (seq = 1, at = 1000): NoticedRecord => ({ v: 1, kind: 'noticed', seq, at })
+/** A Slack input's accepted record as the queue writes it: the input's fields, then the record's own. */
+export const acceptedRecord = (seq: number, input: AcceptedInput, received_at: number): AcceptedRecord =>
+  ({ ...input, v: 1, kind: 'accepted', seq, received_at, ts: input.ts ?? input.key?.ts ?? '' })
+/** A final line cut by a crash mid-append: `record`'s serialized line through its `through`
+ * field and the comma after it, with no newline. Never valid JSON. */
+export function tornRecord(record: QueueRecord, through: string): string {
+  const fields = Object.entries(record).filter(([, value]) => value !== undefined)
+  const end = fields.findIndex(([name]) => name === through) + 1
+  if (end === 0 || end === fields.length) throw new Error(`tornRecord: ${through} is not a field before the record's last`)
+  const torn = `{${fields.slice(0, end).map(([name, value]) => `${JSON.stringify(name)}:${JSON.stringify(value)},`).join('')}`
+  if (!JSON.stringify(record).startsWith(torn)) throw new Error('tornRecord: not a prefix of the serialized record')
+  return torn
+}

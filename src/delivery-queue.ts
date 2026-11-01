@@ -106,7 +106,7 @@ export function isOpenItem(item: QueueItem): boolean { return !item.delivered &&
 export function itemOpenedAt(item: QueueItem): number { return (item.hold?.state === 'released' ? item.hold.at : undefined) ?? item.accepted.released_at ?? item.accepted.received_at }
 export type QueueEvent =
   | { type: 'holds-resolved'; key: string; resolutions: HoldResolution[] }
-  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; error: unknown }
+  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; edited_ts?: string; slackKey?: SlackKey; error: unknown }
   | { type: 'stored' | 'writable'; key: string }
   | { type: 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; path?: string; seq?: number; error: unknown }
   | { type: 'record-unreadable'; key: string; line: number; quarantinePath: string; alert: boolean }
@@ -137,8 +137,12 @@ export interface DeliveryQueue {
    * It is not awaited, and its errors cannot change the durable result. */
   resolveHolds(key: string, resolutions: readonly HoldResolution[], current?: () => boolean,
     onCommitted?: (saved: readonly HoldResolution[]) => void): Promise<HoldResolution[]>
-  /** A failed post-accept append suspends all keys until an append succeeds. */
+  /** Pending journal repair or a failed post-accept append suspends keys. */
   isWritable?(key: string): boolean
+  /** A repaired replay is visible before its rewrite succeeds. Until then its
+   * thread facts (`thread_join`, and holds judged against Thread Memory) are
+   * not trusted; the loading turn that completes the repair recovers them. */
+  durabilityPending?(key: string): boolean
   keys(): string[]
   compact(key?: string, current?: () => boolean): Promise<void>
   startMaintenance(): void
@@ -164,9 +168,10 @@ export interface DeliveryQueueOptions {
   clearInterval?: typeof globalThis.clearInterval
   /** Synchronous confirmation that compaction may discard the queue's join copy. */
   threadJoinSaved?(key: string, channel: string, threadJoin: QueueThreadJoin): boolean
-  /** A journal start() didn't load (one unreadable then) has loaded. Called
-   * once, inside the turn that loaded it and before that turn's own work, so
-   * it must be synchronous with no I/O; its throw is ignored. */
+  /** A journal start() didn't load (one unreadable then, or whose repair
+   * rewrite failed) has loaded. Called once, inside the turn that loaded or
+   * repaired it and before that turn's own work, so it must be synchronous
+   * with no I/O; its throw is ignored. */
   onLoadedAfterStart?(key: string): void
 }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -243,6 +248,8 @@ function microseconds(ts: string): bigint { const [s, f = ''] = ts.split('.'); r
 function formatMicros(us: bigint): string { return `${us / 1000000n}.${String(us % 1000000n).padStart(6, '0')}` }
 interface Journal extends AppendRollback {
   records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
+  /** Quarantine is durable; this replay must replace the source before writes. */
+  pendingRecovery?: boolean
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
   holds: Map<number, UnresolvedHold>
 }
@@ -361,8 +368,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function load(key: string): void {
     const stored = journal(key)
     if (stored.loaded) return
-    // Publish only a complete replay: a failed read or quarantine append must
-    // remain retryable without exposing partial rows or dedupe facts.
+    if (stored.pendingRecovery) { finishRecovery(key, stored); return }
+    // Publish only a complete replay after quarantine is durable. Its existing
+    // items must remain visible to startup preparation and delivery recovery.
     const j = emptyJournal()
     let bytes: Buffer
     try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
@@ -411,9 +419,29 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         }
         event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed', 'released', 'withdrawn', 'parked'].includes(String(raw?.kind))) })
       }
+      // Retry this exact replay, without appending the quarantined bytes again.
+      // Rewriting also persists unknown-send markers atomically with removal of
+      // the damage; truncating a torn send alone would lose that evidence.
+      j.pendingRecovery = true
+      journals.set(key, j)
+      finishRecovery(key, j)
+      return
     }
-    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
-    stored.holds = j.holds
+    j.loaded = true
+    journals.set(key, j)
+    loadedAfterStart(key)
+  }
+  function finishRecovery(key: string, stored: Journal): void {
+    try { rewrite(pathFor(key), Buffer.from(stored.records.map(r => JSON.stringify(r) + '\n').join(''))) } catch (error) { event({ type: 'recovery-failed', key, error }); throw error }
+    // A rename followed by failed directory fsync is still pending: no writer
+    // can append until retry makes this same recovered journal durable.
+    stored.pendingRecovery = false
+    stored.loaded = true
+    // Its thread facts are trusted only now, so a repair after start gets the
+    // start's thread recovery in this turn, as a journal first read late does.
+    loadedAfterStart(key)
+  }
+  function loadedAfterStart(key: string): void {
     if (started && !stopped) { try { options.onLoadedAfterStart?.(key) } catch { /* the published load stands */ } }
   }
   function lastSend(item: QueueItem): SentRecord | undefined {
@@ -541,7 +569,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     return { status: 'accepted', seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
   }
   function storeFailed(key: string, input: AcceptedInput | undefined, error: unknown): QueueAcceptResult {
-    event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input?.source, sender: input?.sender, user: input?.user, bot_id: input?.bot_id, channel: input?.channel, ts: input?.ts ?? input?.key?.ts, error })
+    event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input?.source, sender: input?.sender, user: input?.user, bot_id: input?.bot_id, channel: input?.channel, ts: input?.ts ?? input?.key?.ts, edited_ts: input?.edited_ts ?? input?.key?.edited_ts, slackKey: input?.key, error })
     return { status: 'failed', error }
   }
   async function compact(key?: string, current = () => true): Promise<void> {
@@ -754,7 +782,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         })
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), error }); throw error }
     },
-    isWritable: key => !appendBlocked.has(key),
+    isWritable: key => !appendBlocked.has(key) && !journals.get(key)?.pendingRecovery,
+    durabilityPending: key => journals.get(key)?.pendingRecovery === true,
     keys: () => [...journals.keys()],
     compact,
     startMaintenance() {

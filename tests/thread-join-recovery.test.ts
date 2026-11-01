@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
@@ -8,7 +8,7 @@ import { buildThreadMemoryChangedWhileStoppedNotice, buildThreadMemoryNotSavedNo
 import { buildOperatorAssignment } from '../src/reload-request.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { queuePath, readQueue, sentRecord, tornRecord } from './test-helpers/delivery-queue.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { SHARED_CHANNEL_IDS, membershipPage } from './test-helpers/shared-channels.ts'
 import { makeChannelMessage, makeMembershipEvent, mentionText, broadcastText, stubOpenedDmId } from './test-helpers/slack-stub.ts'
@@ -178,6 +178,44 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(engine.textCalls().length).toBe(accepted.length + 2)
     expect(reopened.queue.openCount('bravo')).toBe(1)
     expect(joins('bravo')).toHaveLength(1)
+    expectReports(first, { alpha: ['not-saved'] })
+    expectReports(reopened, afterCrash)
+  })
+
+  // Fix Task t2.yiv.5c.zc review F1: the queue's untrusted join copy, while its
+  // repair rewrite fails, never turns a joined thread's reply into an acked drop.
+  test('a reply in a thread joined only through the queue is neither acked nor dropped while the queue repair is pending; its retry is stored via thread once the repair recovers the join', async () => {
+    setup(mode)
+    const io = threadFsControls(h.stateDir)
+    const first = await start({ threadMemory: { fs: io.fs } })
+    io.fail('writeSync', 'alpha')
+    await intake(first, 'mention', { rootPost: true })
+    expect(joins()).toEqual([])
+    await crash(first)
+    io.heal()
+    // A torn queue tail, a send record cut after its sequence number, whose
+    // repair rewrite is refused at the next start.
+    appendFileSync(queuePath(h.stateDir), tornRecord(sentRecord(99), 'seq'))
+    const queueIo = threadFsControls(h.stateDir)
+    queueIo.fail('openSync', 'alpha', { code: 'ENOSPC', match: path => path.startsWith(queuePath(h.stateDir) + '.') && path.endsWith('.tmp') })
+    const reopened = await start({ threadMemory: { queueFs: queueIo.fs } })
+    expect(reopened.queue.durabilityPending!('alpha')).toBe(true)
+    expect(view(reopened)).toBe('not-joined')
+    const acks = reopened.stub('alpha').socket.acks.length, items = reopened.queued('alpha').length
+    const reply = await intake(reopened, 'reply')
+    // The reply needs the untrusted join: it is held, its store fails while the
+    // key is unwritable, and the withheld ack makes Slack retry it.
+    expect(reopened.queueEvents.filter(e => e.type === 'store-failed')).toEqual([expect.objectContaining({ key: 'alpha', ts: reply.ts })])
+    expect(reopened.stub('alpha').socket.acks).toHaveLength(acks)
+    expect(reopened.queued('alpha')).toHaveLength(items)
+    expect(reopened.logs.filter(line => line.includes('dropped message'))).toEqual([])
+    queueIo.heal()
+    await reopened.deliver('alpha', reply); await reopened.clock.flush()
+    expect(reopened.queue.durabilityPending!('alpha')).toBe(false)
+    expect(view(reopened)).toBe('joined')
+    expect(reopened.stub('alpha').socket.acks).toHaveLength(acks + 1)
+    expect(reopened.queued('alpha').at(-1)!.accepted).toMatchObject({ ts: reply.ts, via: 'thread' })
+    expect(reopened.queued('alpha').at(-1)!.accepted.hold).toBeUndefined()
     expectReports(first, { alpha: ['not-saved'] })
     expectReports(reopened, afterCrash)
   })

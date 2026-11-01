@@ -445,6 +445,8 @@ export interface StubSlackScript {
   post: WebApiOutcome[]
   /** `chat.update`. */
   update: WebApiOutcome[]
+  /** `chat.delete`, including assertions that no deletion was attempted. */
+  delete: WebApiOutcome[]
   /** `filesUploadV2`: a scripted outcome settles the whole call at once, with no nested completion. */
   upload: WebApiOutcome[]
   /**
@@ -488,6 +490,7 @@ export interface StubSlackOptions {
   post?: readonly WebApiOutcome[]
   /** Initial `chat.update` outcomes. */
   update?: readonly WebApiOutcome[]
+  delete?: readonly WebApiOutcome[]
   /** Initial `filesUploadV2` outcomes. */
   upload?: readonly WebApiOutcome[]
   /** Initial `conversations.history` outcomes. */
@@ -523,7 +526,7 @@ export interface StubSlackOptions {
 }
 
 /** An `ok` `conversations.open` outcome returning the DM conversation `id` (a `D…` ID). */
-export function openedDm(id: string): WebApiOutcome {
+export function openedDm(id: string): Extract<SettledWebApiOutcome, { kind: 'ok' }> {
   return { kind: 'ok', result: { channel: { id } } }
 }
 
@@ -554,6 +557,7 @@ export type StubWebMethod =
   | 'auth.test'
   | 'chat.postMessage'
   | 'chat.update'
+  | 'chat.delete'
   | 'reactions.add'
   | 'reactions.remove'
   | 'conversations.open'
@@ -589,7 +593,7 @@ export interface StubWebClient {
    */
   readonly callLog: readonly StubWebCall[]
   auth: { test: WebClient['auth']['test'] }
-  chat: { postMessage: WebClient['chat']['postMessage']; update: WebClient['chat']['update'] }
+  chat: { postMessage: WebClient['chat']['postMessage']; update: WebClient['chat']['update']; delete: WebClient['chat']['delete'] }
   reactions: { add: WebClient['reactions']['add']; remove: WebClient['reactions']['remove'] }
   conversations: {
     open: WebClient['conversations']['open']
@@ -723,6 +727,7 @@ export interface StubSlackCalls {
   authTest: Parameters<WebClient['auth']['test']>[0][]
   postMessage: Parameters<WebClient['chat']['postMessage']>[0][]
   update: Parameters<WebClient['chat']['update']>[0][]
+  delete: Parameters<WebClient['chat']['delete']>[0][]
   reactionsAdd: Parameters<WebClient['reactions']['add']>[0][]
   reactionsRemove: Parameters<WebClient['reactions']['remove']>[0][]
   conversationsOpen: Parameters<WebClient['conversations']['open']>[0][]
@@ -1029,6 +1034,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     connect: [...(opts.connect ?? [])],
     post: [...(opts.post ?? [])],
     update: [...(opts.update ?? [])],
+    delete: [...(opts.delete ?? [])],
     upload: [...(opts.upload ?? [])],
     completeUpload: [],
     history: [...(opts.history ?? [])],
@@ -1046,6 +1052,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     authTest: [],
     postMessage: [],
     update: [],
+    delete: [],
     reactionsAdd: [],
     reactionsRemove: [],
     conversationsOpen: [],
@@ -1139,6 +1146,12 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         },
       },
       chat: {
+        delete: (args) => {
+          record('chat.delete', args)
+          calls.delete.push(args)
+          return runWebApiCall(script.delete.shift(), ctx('chat.delete'), overrides =>
+            mergeDroppingUndefined({ ok: true, channel: args.channel, ts: args.ts }, overrides))
+        },
         postMessage: (args) => {
           record('chat.postMessage', args)
           calls.postMessage.push(args)

@@ -30,7 +30,7 @@ export function judgeMemoryHolds(
 export interface MemoryHoldResolverDeps {
   /** Refuse work throughout teardown, including new requests from old events. */
   canRun?(key: string): boolean
-  queue: Pick<DeliveryQueue, 'unresolvedHolds' | 'resolveHolds' | 'item'> & Partial<Pick<DeliveryQueue, 'compact'>>
+  queue: Pick<DeliveryQueue, 'unresolvedHolds' | 'resolveHolds' | 'item' | 'durabilityPending'> & Partial<Pick<DeliveryQueue, 'compact'>>
   memory: Pick<ThreadMemory, 'joinedBy' | 'pruneHeldJoins'>
   release(key: string, item: QueueItem, mode: MemoryHoldMode): void | Promise<void>
   now(): number
@@ -80,6 +80,9 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
   async function run(key: string, life: Life): Promise<MemoryHoldResult> {
     if (!current(key, life)) return 'cancelled'
     if (life.retry !== undefined) { deps.clock.clearTimeout(life.retry); life.retry = undefined }
+    // A replay awaiting its repair rewrite isn't judged before its queued joins
+    // are recovered; the turn that completes the repair asks again.
+    if (deps.queue.durabilityPending?.(key)) return 'unknown'
     const holds = deps.queue.unresolvedHolds(key).filter(hold => hold.on === 'memory' && life.modes.has(hold.seq))
     const unresolved = new Set(holds.map(hold => hold.seq))
     for (const seq of life.modes.keys()) if (!unresolved.has(seq)) life.modes.delete(seq)

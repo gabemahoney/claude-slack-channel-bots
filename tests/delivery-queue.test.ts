@@ -8,9 +8,11 @@ import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
-import { deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, postHold, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, unknownRootPostHold, withdrawnRecord } from './test-helpers/delivery-queue.ts'
+import { acceptedRecord, deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, postHold, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, tornRecord, unknownRootPostHold, withdrawnRecord } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
-import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
+import { makeThreadMemoryHarness, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
+import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
+import { createMemoryHoldResolver } from '../src/memory-holds.ts'
 import { createDeliveryQueue as createMainDeliveryQueue, isQueueRecord as isMainQueueRecord } from './fixtures/main-delivery-queue/delivery-queue.ts'
 
 let dir: string
@@ -447,6 +449,364 @@ test('quarantines exact torn/middle/orphan bytes; damaged sent is unknown and su
   expect(fs.readFileSync(unreadable[0]!.quarantinePath, 'utf8')).toBe(bad + orphan + torn)
   await q.stop(); const replay = await open(); expect(replay.items('alpha')[0]!.unknownSend).toBe(true); expect(replay.items('alpha')[0]!.nextAttempt).toBe(2); expect(replay.items('alpha')[0]!.records.filter(r => r.kind === 'sent')).toMatchObject([{ attempt: 1, unknown_outcome: true }])
 })
+
+describe('b.2is torn-tail recovery', () => {
+  const first: AcceptedRecord = { ...injectedInput({ text: 'first 🙂' }), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1.000000' }
+  const tail = '{"v":1,"kind":"accepted","seq":3,"text":"torn 🙂'
+  const copies = () => fs.readdirSync(join(dir, 'queue')).filter(name => name.startsWith('alpha.unreadable-')).sort()
+  const findings = (q: DeliveryQueue) => q.startupFindings().filter((e): e is Extract<QueueEvent, { type: 'record-unreadable' }> => e.type === 'record-unreadable')
+  const recover = (options: Parameters<typeof open>[0] = {}) => open({ now: createFakeClock({ start: 1000 }).now, ...options })
+
+  test.each([
+    ['temp-open', 'accept'], ['temp-write', 'accept'], ['file-fsync', 'accept'], ['rename', 'accept'],
+    ['directory-fsync', 'accept'], ['directory-fsync', 'reopen'],
+  ] as const)('failed recovery rewrite %s preserves send evidence until durable recovery by %s', async (failure, retryBy) => {
+    const originalAccepted = { ...accepted(), text: first.text }
+    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed 🙂'] }
+    const torn = '{"v":1,"kind":"sent","seq":1,"attempt":7,"text":"torn 🙂'
+    seedQueue(dir, [originalAccepted, fixed, torn])
+    seedQueue(dir, [first], 'beta')
+    const original = fs.readFileSync(queuePath(dir))
+    const paths = new Map<number, string>()
+    let fail = true, failures = 0, renames = 0, syncingRename = false
+    const rewriteTemp = (fd: number) => paths.get(fd)?.startsWith(queuePath(dir) + '.') === true && paths.get(fd)!.endsWith('.tmp')
+    const fault = () => { failures++; throw new Error('EIO recovery rewrite ' + failure) }
+    const seam = {
+      ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) {
+        if (fail && failure === 'temp-open' && String(args[0]).startsWith(queuePath(dir) + '.') && String(args[0]).endsWith('.tmp')) fault()
+        const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd
+      },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+        if (fail && failure === 'temp-write' && rewriteTemp(fd)) {
+          fs.writeSync(fd, bytes, offset, Math.min(7, length))
+          fault()
+        }
+        return fs.writeSync(fd, bytes, offset, length)
+      },
+      fsyncSync(fd: number) {
+        // Quarantine must have synced successfully; fail only the directory
+        // durability boundary after the replacement journal has been renamed.
+        if (fail && failure === 'file-fsync' && rewriteTemp(fd)) fault()
+        if (syncingRename && paths.get(fd) === join(dir, 'queue')) {
+          syncingRename = false
+          if (fail && failure === 'directory-fsync') fault()
+        }
+        fs.fsyncSync(fd)
+      },
+      renameSync(from: fs.PathLike, to: fs.PathLike) {
+        if (fail && failure === 'rename' && String(to) === queuePath(dir)) fault()
+        fs.renameSync(from, to)
+        if (String(to) === queuePath(dir)) { renames++; syncingRename = true }
+      },
+    } as typeof fs
+    const events: QueueEvent[] = []
+    let q = await recover({ fs: seam, onEvent: event => { events.push(event) } })
+    expect(failures).toBe(1)
+    const initial = findings(q)
+    expect(initial).toMatchObject([{ key: 'alpha', line: 3, alert: false }])
+    const quarantinePath = initial[0]!.quarantinePath
+    const quarantines = copies()
+    expect(quarantines).toHaveLength(1)
+    const unknown: Extract<QueueRecord, { kind: 'sent' }> = { v: 1, kind: 'sent', seq: 1, attempt: 7, unknown_outcome: true, at: originalAccepted.received_at, quarantine: { path: quarantinePath, line: 3 } }
+    // Pending repair of alpha must not block a healthy persona's writes.
+    expect(await q.accept('beta', injectedInput({ text: 'healthy' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    for (let retry = 0; retry < 2; retry++) {
+      expect(await q.accept('alpha', injectedInput({ text: 'must not be accepted' }))).toMatchObject({ status: 'failed' })
+      expect(failures).toBe(retry + 2)
+      expect(q.isWritable!('alpha')).toBe(false)
+      // Durable quarantine exposes the complete replay for recovery consumers,
+      // including dedupe and unknown-send facts, but authorizes no mutation.
+      expect(q.items('alpha')).toMatchObject([{ accepted: originalAccepted, fixed, unknownSend: true, nextAttempt: 8, delivered: false }])
+      expect(q.item('alpha', 1)!.records).toEqual([originalAccepted, fixed, unknown])
+      expect(q.lookupSlackKey('alpha', originalAccepted.key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+      expect(findings(q)).toEqual(initial)
+      expect(copies()).toEqual(quarantines)
+      expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+      expect(fs.readdirSync(join(dir, 'queue')).filter(name => name.endsWith('.tmp'))).toEqual([])
+      if (failure === 'directory-fsync') {
+        expect(renames).toBeGreaterThan(0)
+        // Visible replacement bytes do not authorize writes before dir fsync.
+        expect(readQueue(dir).filter(r => r.kind === 'sent')).toEqual([unknown])
+        expect(readQueue(dir).filter(r => r.kind === 'accepted')).toEqual([originalAccepted])
+      } else {
+        expect(renames).toBe(0)
+        expect(fs.readFileSync(queuePath(dir))).toEqual(original)
+      }
+    }
+    expect(events.filter(e => e.type === 'recovery-failed')).toHaveLength(3)
+    fail = false
+    if (retryBy === 'reopen') {
+      // A new process has no pending in-memory replay: the renamed journal
+      // itself must retain uncertainty and its original quarantine reference.
+      await q.stop()
+      q = await recover()
+      expect(findings(q)).toEqual([])
+    }
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(q.lookupSlackKey('alpha', originalAccepted.key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+    expect(q.item('alpha', 1)).toMatchObject({ accepted: originalAccepted, fixed, unknownSend: true, nextAttempt: 8, delivered: false })
+    expect(q.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([unknown])
+    expect(readQueue(dir).filter(r => r.kind === 'sent')).toEqual([unknown])
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, originalAccepted.text], [2, 'second']])
+    expect(replay.item('alpha', 1)).toMatchObject({ accepted: originalAccepted, fixed, unknownSend: true, nextAttempt: 8, delivered: false })
+    expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([unknown])
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual(quarantines)
+    expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+  })
+
+  test.each([['successful', false], ['failed', true]] as const)('quarantines once across append/restart after a %s startup rewrite', async (_, failRewrite) => {
+    // The ticket's exact fragment; the valid prefix also checks byte offsets after UTF-8.
+    const torn = '{"v":1,"kind":"accepted","seq":3,'
+    seedQueue(dir, [first, torn])
+    let fail = failRewrite, rewriteFailures = 0
+    const seam = { ...fs, openSync(...args: Parameters<typeof fs.openSync>) {
+      if (fail && String(args[0]).endsWith('.tmp') && args[1] === 'wx') {
+        rewriteFailures++
+        throw Object.assign(new Error('injected ENOSPC opening rewrite temp'), { code: 'ENOSPC' })
+      }
+      return fs.openSync(...args)
+    } } as typeof fs
+    const q = await recover({ fs: seam })
+    expect(rewriteFailures).toBe(failRewrite ? 1 : 0)
+    const initial = findings(q)
+    expect(initial).toMatchObject([{ key: 'alpha', line: 2, alert: false }])
+    expect(fs.readFileSync(initial[0]!.quarantinePath)).toEqual(Buffer.from(torn))
+    fail = false
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, first.text], [2, 'second']])
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual([initial[0]!.quarantinePath.split('/').at(-1)!])
+    expect(fs.readFileSync(initial[0]!.quarantinePath)).toEqual(Buffer.from(torn))
+  })
+
+  test.each(['write', 'file-sync', 'directory-sync'] as const)('failed quarantine %s leaves the source intact and retries without copying the tail twice', async failure => {
+    seedQueue(dir, [first, tail])
+    const original = fs.readFileSync(queuePath(dir))
+    let fail = true, failures = 0
+    const paths = new Map<number, string>()
+    const quarantine = (fd: number) => paths.get(fd)?.includes('.unreadable-') === true
+    const seam = {
+      ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+        if (fail && quarantine(fd) && failure === 'write') {
+          fs.writeSync(fd, bytes, offset, Math.min(7, length))
+          failures++
+          throw new Error('EIO partial quarantine write')
+        }
+        return fs.writeSync(fd, bytes, offset, length)
+      },
+      fsyncSync(fd: number) {
+        if (fail && ((failure === 'file-sync' && quarantine(fd)) || (failure === 'directory-sync' && paths.get(fd) === join(dir, 'queue')))) {
+          failures++
+          throw new Error('EIO quarantine durability')
+        }
+        fs.fsyncSync(fd)
+      },
+    } as typeof fs
+    const q = await recover({ fs: seam })
+    for (let retry = 0; retry < 2; retry++) {
+      expect(q.items('alpha')).toEqual([])
+      expect(await q.accept('alpha', injectedInput({ text: 'must not be accepted' }))).toMatchObject({ status: 'failed' })
+      expect(fs.readFileSync(queuePath(dir))).toEqual(original)
+    }
+    expect(failures).toBeGreaterThan(0)
+    fail = false
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    const quarantines = copies()
+    expect(quarantines).toHaveLength(1)
+    expect(fs.readFileSync(join(dir, 'queue', quarantines[0]!))).toEqual(Buffer.from(tail))
+    // No explicit compaction: recovery itself must make the next append safe.
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, first.text], [2, 'second']])
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual(quarantines)
+    expect(fs.readFileSync(join(dir, 'queue', quarantines[0]!))).toEqual(Buffer.from(tail))
+  })
+
+  test('a torn sent tail keeps its unknown-outcome evidence when the startup rewrite fails', async () => {
+    const torn = '{"v":1,"kind":"sent","seq":1,"attempt":7,'
+    seedQueue(dir, [first, { v: 1, kind: 'fixed', seq: 1, parts: ['fixed 🙂'] }, torn])
+    let fail = true, rewriteFailures = 0
+    const seam = { ...fs, openSync(...args: Parameters<typeof fs.openSync>) {
+      if (fail && String(args[0]).endsWith('.tmp') && args[1] === 'wx') { rewriteFailures++; throw new Error('ENOSPC rewrite unavailable') }
+      return fs.openSync(...args)
+    } } as typeof fs
+    const q = await recover({ fs: seam })
+    expect(rewriteFailures).toBe(1)
+    const quarantines = copies()
+    expect(quarantines).toHaveLength(1)
+    const quarantinePath = join(dir, 'queue', quarantines[0]!)
+    expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+    fail = false
+    expect(await q.accept('alpha', injectedInput({ text: 'second' }))).toMatchObject({ status: 'accepted', seq: 2 })
+    const recovered = q.item('alpha', 1)!
+    expect(recovered).toMatchObject({ accepted: first, unknownSend: true, nextAttempt: 8, delivered: false, fixed: { parts: ['fixed 🙂'] } })
+    await q.stop()
+    const replay = await recover()
+    expect(replay.items('alpha').map(i => [i.accepted.seq, i.accepted.text])).toEqual([[1, first.text], [2, 'second']])
+    expect(replay.item('alpha', 1)).toMatchObject({ accepted: first, unknownSend: true, nextAttempt: 8, delivered: false, fixed: recovered.fixed })
+    expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual(recovered.records.filter(r => r.kind === 'sent'))
+    expect(findings(replay)).toEqual([])
+    expect(copies()).toEqual(quarantines)
+    expect(fs.readFileSync(quarantinePath)).toEqual(Buffer.from(torn))
+  })
+})
+
+// Fix Task t2.yiv.5c.zc Ruling 2: b.2is repairs through durable-journal's rewrite,
+// and a replay awaiting that rewrite supplies no trusted thread fact.
+describe('b.2is repair composed with the durable journal and thread facts', () => {
+  /** The real fs, recording truncations by path and rename targets; `failRewrite` refuses the repair's temporary file. */
+  function recordingFs(failRewrite: () => boolean = () => false) {
+    const paths = new Map<number, string>(), truncations: string[] = [], renames: string[] = []
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) {
+        if (failRewrite() && String(args[0]).endsWith('.tmp') && args[1] === 'wx') throw Object.assign(new Error('injected ENOSPC opening the repair rewrite'), { code: 'ENOSPC' })
+        const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd
+      },
+      ftruncateSync(fd: number, length?: number) { truncations.push(paths.get(fd) ?? `fd:${fd}`); return fs.ftruncateSync(fd, length) },
+      renameSync(from: fs.PathLike, to: fs.PathLike) { renames.push(String(to)); return fs.renameSync(from, to) },
+    } as typeof fs
+    return { fs: seam, truncations, renames }
+  }
+  const quarantined = (key = 'alpha') => fs.readdirSync(join(dir, 'queue')).filter(name => name.startsWith(`${key}.unreadable-`))
+    .map(name => fs.readFileSync(join(dir, 'queue', name), 'utf8'))
+  /** The journal holds whole production records only, and no line is the fragment. */
+  function wholeRecords(fragment: string, key = 'alpha'): boolean {
+    const text = fs.readFileSync(queuePath(dir, key), 'utf8')
+    readQueue(dir, key)
+    return text.endsWith('\n') && !text.split('\n').includes(fragment)
+  }
+
+  test('a torn sent tail is quarantined byte for byte and replaced by an atomic rewrite, never by truncating the journal, so its unknown-send evidence survives restart', async () => {
+    // Attempt 2's send record, cut after its attempt number.
+    const torn = tornRecord(sentRecord(1, 2), 'attempt')
+    seedQueue(dir, [accepted(), fixedRecord(1), sentRecord(1, 1), torn])
+    const io = recordingFs()
+    const q = await open({ fs: io.fs })
+    const findings = q.startupFindings().filter((e): e is Extract<QueueEvent, { type: 'record-unreadable' }> => e.type === 'record-unreadable')
+    expect(findings).toMatchObject([{ key: 'alpha', line: 4, alert: false }])
+    expect(quarantined()).toEqual([torn])
+    expect(wholeRecords(torn)).toBe(true)
+    expect(readQueue(dir).filter(r => r.kind === 'sent')).toEqual([sentRecord(1, 1),
+      { v: 1, kind: 'sent', seq: 1, attempt: 2, unknown_outcome: true, at: accepted().received_at, quarantine: { path: findings[0]!.quarantinePath, line: 4 } }])
+    expect(io.truncations).toEqual([])
+    expect(io.renames).toContain(queuePath(dir))
+    expect([q.isWritable!('alpha'), q.durabilityPending!('alpha')]).toEqual([true, false])
+    await q.stop()
+    const replay = await open()
+    expect(replay.item('alpha', 1)).toMatchObject({ unknownSend: true, nextAttempt: 3 })
+    expect(replay.startupFindings()).toEqual([])
+    expect(quarantined()).toEqual([torn])
+  })
+
+  test('while its repair rewrite fails the key is unwritable and its thread facts wait; the repair turn runs the start\'s thread step, which recovers the join and releases the hold', async () => {
+    const clock = createFakeClock({ start: THREAD_TIME })
+    let q: DeliveryQueue | undefined
+    const threads = makeThreadMemoryHarness(dir, { clock, heldStamps: key => q?.unresolvedHolds(key).filter(hold => hold.memoryDependent) ?? [] })
+    await threads.start()
+    const fact = threads.fact(), channel = fact.channel
+    const mention = acceptedRecord(1, slackInput({ channel, via: 'mention', ts: fact.root, key: { chat_id: channel, ts: fact.root },
+      thread_join: { thread_ts: fact.root, stamp: fact.stamp, at: fact.at } }), THREAD_TIME + 1)
+    // A reply in the mention's thread whose Thread Memory view was unknown, held after the join.
+    const reply = acceptedRecord(2, heldSlackInput(memoryHold(fact.at + 1, { stamp: fact.stamp }), { channel }), THREAD_TIME + 2)
+    // A later message whose first append was cut by a crash after its sequence number.
+    const late = slackInput({ channel, key: { chat_id: channel, ts: THREAD_ROOTS.third }, ts: THREAD_ROOTS.third })
+    const torn = tornRecord(acceptedRecord(3, late, THREAD_TIME + 3), 'seq')
+    seedQueue(dir, [mention, reply, torn])
+    const original = fs.readFileSync(queuePath(dir))
+    let failing = true
+    const io = recordingFs(() => failing)
+    const events: QueueEvent[] = [], loaded: unknown[] = [], released: number[] = [], resolutions: Promise<unknown>[] = []
+    const resolver = createMemoryHoldResolver({ queue: { unresolvedHolds: key => q!.unresolvedHolds(key), resolveHolds: (...args) => q!.resolveHolds(...args),
+      item: (key, seq) => q!.item(key, seq), durabilityPending: key => q!.durabilityPending!(key) },
+    memory: threads.memory, clock, now: clock.now, release: (_key, item) => { released.push(item.accepted.seq) } })
+    /** The start's thread step for a key, as src/server.ts runs it: the clock passes its holds' arrivals,
+     * its queued joins recover, then its Memory Holds resolve as recovered work. */
+    function threadStep(key: string) {
+      for (const hold of q!.unresolvedHolds(key)) threads.memory.advancePast(key, hold.arrived_at)
+      recoverQueuedJoins(key, q!, threads.memory)
+      resolutions.push(resolver.resolve(key, 'recovered'))
+    }
+    q = createDeliveryQueue({ stateDir: dir, now: clock.now, fs: io.fs, onEvent: event => { events.push(event) },
+      onLoadedAfterStart: key => { loaded.push([key, q!.durabilityPending!(key), q!.items(key).map(item => item.accepted.seq)]); threadStep(key) } })
+    queues.push(q)
+    try {
+      await q.start()
+      // The replay is visible for delivery and retention but not yet durable: no write, no trusted thread fact.
+      expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 2])
+      expect(q.unresolvedHolds('alpha').map(hold => hold.seq)).toEqual([2])
+      expect([q.isWritable!('alpha'), q.durabilityPending!('alpha')]).toEqual([false, true])
+      expect(fs.readFileSync(queuePath(dir))).toEqual(original)
+      threadStep('alpha')
+      expect(await Promise.all(resolutions)).toEqual(['unknown'])
+      expect(threads.memory.view('alpha', channel, fact.root)).toBe('not-joined')
+      expect(q.unresolvedHolds('alpha').map(hold => hold.seq)).toEqual([2])
+      expect(released).toEqual([])
+      // A store while the rewrite still fails is refused, appends nothing and quarantines nothing again.
+      expect((await q.accept('alpha', late)).status).toBe('failed')
+      expect(fs.readFileSync(queuePath(dir))).toEqual(original)
+      expect(quarantined()).toEqual([torn])
+      expect(events.filter(e => e.type === 'record-unreadable')).toHaveLength(1)
+      expect(loaded).toEqual([])
+      // Storage recovers: the store's turn repairs first, then runs the thread step on trusted facts before its own store.
+      failing = false
+      expect(await q.accept('alpha', late)).toMatchObject({ status: 'accepted', seq: 3 })
+      expect(loaded).toEqual([['alpha', false, [1, 2]]])
+      expect([q.isWritable!('alpha'), q.durabilityPending!('alpha')]).toEqual([true, false])
+      expect(await Promise.all(resolutions)).toEqual(['unknown', 'resolved'])
+      // The recovered join precedes the reply's arrival, so the hold is released, never withdrawn.
+      expect(threads.memory.view('alpha', channel, fact.root)).toBe('joined')
+      expect(released).toEqual([2])
+      expect(readQueue(dir).filter(r => r.kind === 'released' || r.kind === 'withdrawn')).toMatchObject([{ kind: 'released', seq: 2 }])
+      expect(wholeRecords(torn)).toBe(true)
+      expect(io.truncations.filter(path => path === queuePath(dir))).toEqual([])
+      expect(clock.pendingCount()).toBe(0)
+    } finally { resolver.stop(); await threads.close() }
+  })
+
+  test('a repair completed during start needs no late step; a damaged journal first read after start repairs and runs it in that turn', async () => {
+    // The next message's first append, cut by a crash after its sequence number.
+    const next = slackInput({ key: { chat_id: THREAD_CHANNELS.primary, ts: THREAD_ROOTS.secondary }, ts: THREAD_ROOTS.secondary })
+    const torn = tornRecord(acceptedRecord(2, next, 1002), 'seq')
+    seedQueue(dir, [accepted(), torn])
+    const loaded: unknown[] = []
+    const q: DeliveryQueue = createDeliveryQueue({ stateDir: dir,
+      onLoadedAfterStart: key => { loaded.push([key, q.durabilityPending!(key), q.items(key).length]) } })
+    queues.push(q)
+    await q.start()
+    expect(loaded).toEqual([])
+    expect([q.isWritable!('alpha'), q.durabilityPending!('alpha')]).toEqual([true, false])
+    seedQueue(dir, [accepted(), torn], 'beta')
+    expect(await q.accept('beta', next)).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(loaded).toEqual([['beta', false, 1]])
+    expect(quarantined('beta')).toEqual([torn])
+    expect(wholeRecords(torn, 'beta')).toBe(true)
+  })
+
+  test('a failed store reports the exact Slack identity: slackKey with its edit, and edited_ts', async () => {
+    let failing = true
+    const events: QueueEvent[] = []
+    const q = await open({ onEvent: event => { events.push(event) }, fs: { ...fs, fsyncSync(fd: number) {
+      if (failing && fs.fstatSync(fd).isFile()) throw Object.assign(new Error('injected ENOSPC'), { code: 'ENOSPC' })
+      fs.fsyncSync(fd)
+    } } as typeof fs })
+    // The fixture message, edited.
+    const key = { ...slackInput().key!, edited_ts: THREAD_ROOTS.secondary }
+    expect((await q.acceptDecided('alpha', key, () => ({ store: slackInput({ key, ts: key.ts, edited_ts: key.edited_ts }) }))).status).toBe('failed')
+    failing = false
+    expect(events.filter(e => e.type === 'store-failed')).toEqual([expect.objectContaining({ key: 'alpha', ts: key.ts, slackKey: key, edited_ts: key.edited_ts })])
+  })
+})
+
 test('1000 real-file accepts satisfy p99 <50ms without network', async () => {
   const q = await open(); const timings: number[] = []
   for (let i = 0; i < 1000; i++) { const at = performance.now(); expect((await q.accept('alpha', injectedInput())).status).toBe('accepted'); timings.push(performance.now() - at) }

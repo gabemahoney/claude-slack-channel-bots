@@ -72,7 +72,9 @@ In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybri
 - **A channel ID:** a listed channel for a fresh submission, including one set to `off`. Invite the app there so Slack can accept its posts. Everyone there sees the prompts and notices.
 - **`dm`:** a DM to `dm.contact`, requiring `dm.enabled: true` and a contact.
 
-A validated unchanged channel destination remains selected after same-incarnation verified removal, including with zero entries and DMs disabled; it does not recreate membership or a choice. Only a confirmed destination change moves future prompts and notices, held notices included. Posted valid prompts stay answerable under their original identity rules, without granting ordinary tools or intake authority; see [Permission Relay](bots.md#permission-relay).
+A validated unchanged channel destination remains selected after same-incarnation verified removal, including with zero entries and DMs disabled; it does not recreate membership or a choice. Only a confirmed destination change moves future prompts and ordinary notices, held notices included. Posted valid prompts stay answerable under their original identity rules, without granting ordinary tools or intake authority; see [Permission Relay](bots.md#permission-relay).
+
+[Storage-warning recovery](../skills/debug-slack-channel-bots/SKILL.md#message-saved-after-retry) keeps both the edit and its one fallback correction in the warning's original channel or DM, even after the destination changes or DMs are turned off.
 
 ## Example in open mode
 

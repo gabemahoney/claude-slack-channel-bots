@@ -716,7 +716,7 @@ input is set; this project's host invocation uses the CI family.
 
 ### The base image
 
-The test image is built `FROM` the base image `cscb-ci-base:v8`, the one
+The test image is built `FROM` the base image `cscb-ci-base:v9`, the one
 `docker/Dockerfile.test`'s `FROM` line names. It is built once per host. When
 it is missing, the runner checks its build prerequisites before the
 admission lock, without changing anything, and refuses when one fails:

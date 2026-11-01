@@ -2,7 +2,7 @@
 #
 # Built on the /ci base, the same tag /ci builds (apt deps incl. tmux, bun,
 # nodejs, cozempic; agent-director's release binary alone in
-# /opt/agent-director/bin, first on PATH; the release's npm client as the
+# /opt/agent-director/bin, first on PATH; the shipped npm client pin as the
 # global agent-director client; the client-under-test check at
 # /opt/agent-director/check/ad-client-check.sh). This image adds what a
 # live run needs and /ci does not:
@@ -11,9 +11,9 @@
 #   `--build-context agent-director-bin=<dir>`), copied over the base's
 #   /opt/agent-director/bin/agent-director, so it is the first
 #   agent-director on PATH. The build checks it against the base's global
-#   client, the release's, with ad-client-check.sh --client: the binary
-#   reports the release record's version and commit (so its version is the
-#   client's), that version is at or above the client's floor
+#   client with ad-client-check.sh --client: the binary
+#   matches the runtime record's version, commit and digest, its version
+#   is at or above the independently pinned client's floor
 #   (dist/version-floor.json), and Client.create() reports it. No
 #   agent-director client is installed here and no package.json is read. On
 #   a failed check the build stops with one ERROR line: a staged binary that
@@ -33,7 +33,7 @@
 # at /tmp/package.tgz and installs it as a customer would; the install check
 # (ci-live/checks/setup-checks.ts) then checks the agent-director client it
 # resolves with ad-client-check.sh --package.
-FROM cscb-ci-base:v8
+FROM cscb-ci-base:v9
 
 ARG HOST_UID=1000
 ARG HOST_GID=1000
@@ -60,7 +60,7 @@ RUN set -eux; \
         elif grep -qE '^ERROR: ad-client check [67] ' /tmp/ad-client-check.err; then \
             echo "ERROR: the agent-director release's binary and client do not pair (the ad-client check line above names what differs): the release pinned by AD_VERSION and AD_COMMIT in docker/Dockerfile.test.base is not usable as is; pin one whose binary and client pair and bump the base image version as the When to bump the base image version section of docker/README.md describes" >&2; \
         else \
-            echo "ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v8 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes" >&2; \
+            echo "ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v9 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes" >&2; \
         fi; \
         exit 1; \
     fi; \

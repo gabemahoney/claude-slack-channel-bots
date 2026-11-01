@@ -104,7 +104,7 @@ const PRE_FIX_PHASE7 = [
   'case "${RESOLVED_BIN}" in',
   '  "${GLOBAL_DIR}"/*) ;;',
   '  *)',
-  `    echo "SR-7.4 (post-publish verification): resolved bin '\${RESOLVED_BIN}' is not under '\${GLOBAL_DIR}/' — a worktree-pointing symlink farm would resolve outside this prefix and fail this check. State: the release IS published. \${MANIFEST} is preserved. Operator recovery: have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@\${NEXT_VERSION}' to replace the symlink farm with a real-copy install, then 'claude-slack-channel-bots clean_restart', then delete \${MANIFEST}. Do NOT rerun /publish promote." >&2`,
+  `    echo "SR-7.4 (post-publish verification): resolved bin '\${RESOLVED_BIN}' is not under '\${GLOBAL_DIR}/' — a worktree-pointing symlink farm would resolve outside this prefix and fail this check. State: the release IS published. \${MANIFEST} is preserved. Operator recovery: have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@\${NEXT_VERSION}' to replace the symlink farm with a real-copy install, then 'claude-slack-channel-bots clean_restart --server', then delete \${MANIFEST}. Do NOT rerun /publish promote." >&2`,
   '    sr_exit 72',
   '    ;;',
   'esac',
@@ -913,6 +913,33 @@ describe('SR-8.1 reads the daemon PID file from the state dir the CLI would use'
       },
     })
     expect(r.stderr).toContain(NO_DAEMON)
+  })
+})
+
+// The orchestrator driving /publish promote may itself be a CSCB bot: run from
+// a bot's session, `clean_restart --server` takes that bot down with it (b.ku8).
+describe('every text naming `clean_restart --server` sends it to a terminal', () => {
+  const FROM_A_TERMINAL = "from a terminal (not from a bot's session)"
+
+  test('the live-daemon handoff has the operator run it from a terminal, never the orchestrator', () => {
+    const r = runDaemonNote({ pidFile: (home) => join(home, '.config/claude-slack-channel-bots/server.pid'), pid: process.pid })
+    expect(r.code).toBe(0)
+    expect(r.stderr).toContain(
+      `On confirmation, have the operator run, ${FROM_A_TERMINAL}:\n\n    claude-slack-channel-bots clean_restart --server\n`,
+    )
+    expect(r.stderr).not.toContain('On confirmation, run:')
+  })
+
+  test('each operator line naming the command says where to run it', () => {
+    const lines = readPromote()
+      .split('\n')
+      .filter((l) => l.includes('claude-slack-channel-bots clean_restart'))
+      .filter((l) => l.trim() !== 'claude-slack-channel-bots clean_restart --server')
+    expect(lines.length).toBeGreaterThanOrEqual(9)
+    for (const l of lines) {
+      expect(l).toContain('clean_restart --server')
+      expect(l).toContain(FROM_A_TERMINAL)
+    }
   })
 })
 

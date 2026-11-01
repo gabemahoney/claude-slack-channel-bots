@@ -676,12 +676,12 @@ global_install "${CSCB_010_TGZ}" || fail "setup: the global install of ${CSCB_01
     || fail "setup: ${CSCB_PKG_DIR} is not ${PKG_NAME} ${OLD_CSCB_VERSION}"
 [[ "$(realpath -e -- "${CSCB_CLI}")" == "$(realpath -e -- "${CSCB_PKG_DIR}")"/* ]] \
     || fail "setup: ${CSCB_CLI} does not resolve into ${CSCB_PKG_DIR}"
-# Its client is agent-director's 0.10.0 client, file for file.
+# Its client is agent-director's 0.10.0 client, file for file except Bun's .bun-tag install metadata.
 mkdir "${SCENARIO_ROOT}/ad-010-client" || fail "setup: could not create ${SCENARIO_ROOT}/ad-010-client"
 tar -xzf "${AD_010_CLIENT_TGZ}" -C "${SCENARIO_ROOT}/ad-010-client" --strip-components=1 --no-same-owner \
     || fail "setup: could not unpack ${AD_010_CLIENT_TGZ}"
 OLD_CLIENT_DIR="$(client_dir_of "${CSCB_PKG_DIR}")"
-if ! diff -rq --no-dereference "${SCENARIO_ROOT}/ad-010-client" "${OLD_CLIENT_DIR}" > "${SCENARIO_ROOT}/old-client.diff" 2>&1; then
+if ! diff -rq --no-dereference --exclude=.bun-tag "${SCENARIO_ROOT}/ad-010-client" "${OLD_CLIENT_DIR}" > "${SCENARIO_ROOT}/old-client.diff" 2>&1; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/old-client.diff" >&2
     fail "setup: the old package resolves the client at ${OLD_CLIENT_DIR}, which is not agent-director's 0.10.0 client"
 fi
@@ -981,7 +981,7 @@ global_install "${PACKAGE_TGZ}" || fail "step 7: the global install of ${PACKAGE
 [[ "$(jq -r '.version' "${CSCB_PKG_DIR}/package.json")" == "${STAGED_VERSION}" ]] \
     || fail "step 7: ${CSCB_PKG_DIR} is not the staged ${STAGED_VERSION}"
 # The version string alone may be the old package's too: the files are the staged build's.
-if ! diff -rq --exclude=node_modules "${STAGED_PKG}" "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/installed.diff" 2>&1; then
+if ! diff -rq --exclude=node_modules --exclude=.bun-tag "${STAGED_PKG}" "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/installed.diff" 2>&1; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/installed.diff" >&2
     fail "step 7: the package installed at ${CSCB_PKG_DIR} is not the staged build"
 fi
@@ -1494,9 +1494,10 @@ for cid in "${CHANNELS[@]}"; do
     CONNECTED_BEFORE["${name}"]="$(count_log "[slack] Session connected: persona $(persona_ref "${name}")")"
 done
 
-# The new CLI's clean_restart, through the install path, as a CSCB process
-# (the tmux shim first on its PATH), with start's environment. It runs in the
-# background so that the harness's status reads see each row through it.
+# The new CLI's clean_restart --server (the server and every bot), through
+# the install path, as a CSCB process (the tmux shim first on its PATH), with
+# start's environment. It runs in the background so that the harness's status
+# reads see each row through it.
 LEG_B_OUT="${SCENARIO_ROOT}/clean-restart.out"
 # Bound on clean_restart itself: the installed package's own bounds on its
 # precheck and its teardown (src/cli-teardown.ts precheckBoundMs and
@@ -1517,12 +1518,12 @@ restart_from_us="$(now_us)"
 (
     rc=0
     cscb_run env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA -u SLACK_DRY_RUN \
-        "${CSCB_CLI}" clean_restart < /dev/null > "${LEG_B_OUT}" 2>&1 || rc=$?
+        "${CSCB_CLI}" clean_restart --server < /dev/null > "${LEG_B_OUT}" 2>&1 || rc=$?
     exit "${rc}"
 ) &
 restart_pid=$!
 track_pid "${restart_pid}"
-echo "${TEST_NAME}: leg B: clean_restart started"
+echo "${TEST_NAME}: leg B: clean_restart --server started"
 
 # Harness status reads, from the scenario's shell, until each row reads
 # waiting after its resume. The resume is known from server.log (the bot

@@ -207,6 +207,28 @@ describe('real key recovery proof', () => {
     expect(() => proveReset(f)).toThrow()
   })
 
+  // The final retype's key must precede its own delivery and any later item's
+  // first send; a later text call, such as a reply reminder's, cannot stand in.
+  const delivered = { kind: 'delivered', seq: 4, part: 1, at: 172000, receipt: { path: 'transcript.jsonl' } }
+  const laterSent = { kind: 'sent', seq: 5, part: 1, session_id: 'native-session', send_kind: 'text', at: 172000 }
+  test.each([
+    ['its own delivery', [delivered], 173000],
+    ['a later item\'s first send', [laterSent], 172000],
+  ] as const)('reset proof rejects a final retype key only after %s', (_, records, at) => {
+    const f = resetFixture()
+    const journal: any[] = [...f.journal, ...records]
+    f.calls.splice(4, 1, { ...key(at, 'text'), pid: '6' })
+    expect(() => assertResetKeyRecovery(journal, f.calls, f.faults, f.waiting, 4, instance))
+      .toThrow('reset stages lack actual persona key calls')
+  })
+
+  test('reset proof accepts the final retype key before its delivery despite a later text call', () => {
+    const f = resetFixture()
+    f.calls.push({ ...key(173000, 'text'), pid: '6' })
+    const proof = assertResetKeyRecovery([...f.journal, delivered], f.calls, f.faults, f.waiting, 4, instance)
+    expect(proof).toMatchObject({ session: 'native-session', stages: [10000, 30000, 30000] })
+  })
+
   test.each([0, 1, 2])('reset proof rejects retaining the next backoff slot at stage %s', stage => {
     const f = resetFixture()
     const boundary = [111000, 141500, 171500][stage]!, extra = stage === 0 ? 20000 : 30000
