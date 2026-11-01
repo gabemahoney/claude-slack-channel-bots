@@ -2885,6 +2885,17 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS).not.toContain('source=')
     assertNoLeak(MCP_INSTRUCTIONS)
   })
+
+  // CSCB knows only the personas on this server, so receive_all claims no more.
+  test('the via line scopes receive_all to personas on this server', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+    const via = client.getInstructions()!.split('\n').find(line => line.startsWith('via:'))!
+    const clause = 'receive_all = a channel where you, and no other persona on this server, receive every message.'
+    const at = via.search(/\breceive_all =/)
+
+    expect(via.slice(at, at + clause.length)).toBe(clause)
+    expect(via).not.toContain('only you')
+  })
 })
 
 // one instructions text for every session, in
