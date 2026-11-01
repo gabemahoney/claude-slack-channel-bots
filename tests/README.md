@@ -246,7 +246,7 @@ calls.
 ```
 tests/
   integration/
-    test-1-install-startup.sh # install the package, then check the agent-director client it resolves, the release's from npm, changing nothing (ad-client-check.sh --package),
+    test-1-install-startup.sh # install the package, then check its pinned npm client against the independently pinned runtime, changing nothing (ad-client-check.sh --package),
                                    # then run fixtures/phase1-client-check.ts on the installed package; a pre-persona config fails start; the persona config starts in dry run
     test-2-dryrun-spawn-skip.sh # persona load line, per-persona dry-run spawn skip, /interject 404 and 503
     test-3-cozempic-restart.sh # cozempic probe, stop --stop-bots per persona, clean restart
@@ -420,10 +420,17 @@ tests/
     test-40-fmk-real-downgrade.sh  # R55/the current rule downgrade to published 0.16.1 on native Claude 2.1.280
     test-41-fmk-real-codex.sh      # guarded Codex 0.159.2 D1 receipt-only gate: native observations, FIFO/faults,
                                    # actual harness SIGKILL/recovery and trailing @/$ fidelity; final native gate passed
+    test-42-fmk-displayed-current.sh # current AD: raw working/displayed idle_screen; known aged permissions stay check_permission;
+                                   # real registered hooks, production receipt extension and measured Slack permission posts
+    test-43-fmk-displayed-legacy.sh  # verified legacy AD in a separate HOME/store/socket: actual idle_screen and needs_intelligence;
+                                   # unnormalized real-client negative controls and production normalized positive behavior
     lib/
+      displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
+      displayed-states.ts          # image-guarded packed production poller/engine, real AD reads and registered-hook controls
+      displayed-state-assertions.ts # pure HTTP post/list-state oracles shared by the image driver and host observation controls
       transcript-receipts.ts       # packed production matcher; scoped receipts, observed pre-restart journal history, order, latency and usage
       real-observations.ts         # structured AD state and refusal observations
       real-case-assertions.ts      # deterministic gate/heavy case checks and negative self-check controls
@@ -980,7 +987,7 @@ independently completed duplicate copies. They reject classifier stops
 with or without exact JSON, late linked stops, synthetic/API-error answers,
 fallback, unfinished duplicates and spoof actions, and reject `stop` mode.
 
-Run these controls only in the marked `cscb-ci-base:v8` image or a CI test
+Run these controls only in the marked `cscb-ci-base:v9` image or a CI test
 image derived from it (see
 `docker/README.md`), which supplies Bun, Python 3, Bash and jq. Set
 `AI_CONTROLS_PACKAGE` to the absolute `package/` directory extracted from a
@@ -997,7 +1004,7 @@ docker run --rm --network none --memory 512m --cpus 1 --pids-limit 128 \
   --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
   --mount type=bind,src="$AI_CONTROLS_PACKAGE",dst=/control/package,readonly \
   --mount type=bind,src="$PWD/node_modules",dst=/control/node_modules,readonly \
-  --entrypoint /usr/local/bin/bun cscb-ci-base:v8 \
+  --entrypoint /usr/local/bin/bun cscb-ci-base:v9 \
   /tests/real-agent/ai-readback-controls.ts
 ```
 
@@ -1291,10 +1298,10 @@ Points where the script meets the runbook:
 - Step 3 runs the old package's own `stop --stop-bots` through the old CLI
   (`cscb_run`), against the seeded fleet on 0.10.0.
 - Step 7 points the global install's agent-director override at the
-  image's release client tarball, installs the build under test over the
+  image's pinned client tarball, installs the build under test over the
   same install path, compares its files against the staged package (excluding
   `node_modules` and the exact `.bun-tag` basename recursively), checks the
-  release's client it resolves with the
+  pinned client it resolves with the
   image's `ad-client-check.sh --package`, then exports `SCENARIO_CLI`
   as that path's CLI, so later starts and the trap's stop use the new build.
   Each persona's credentials file is written by the new CLI's `credentials`
@@ -1775,7 +1782,7 @@ root, with the existing base image available (no pull/build):
     --mount "type=bind,src=$PWD/tests/runner.sh,dst=/source/runner.sh,readonly" \
     --mount "type=bind,src=$PWD/tests/runner-keep-going-controls.py,dst=/controls.py,readonly" \
     --mount "type=bind,src=$CI_CONTROL_LOCK,dst=/run/cscb-ci-performance.lock,readonly" \
-    --entrypoint /usr/bin/python3 cscb-ci-base:v8 /controls.py
+    --entrypoint /usr/bin/python3 cscb-ci-base:v9 /controls.py
 )
 ```
 
@@ -1917,6 +1924,111 @@ to the effective N, so `/ci --inject kill:2 test-3` is refused too.
 A selective run is never a gate result. Its verdict shape is in Verdict file
 format below.
 
+### Version-specific displayed-state coverage (b.iy3)
+
+Tests 42 and 43 depend on test-1 and use fresh fmk HOME, store and tmux socket.
+Test 42 selects the current 0.17.1 release. Test 43 selects the separately verified,
+off-PATH 0.17.0 release through `SCENARIO_AD_START=0.17.0`; it never downgrades the
+current store or changes the npm client. Both check the default image and
+installed runtime against the version, commit and digest release record.
+
+The opt-in `displayed-states` stub mode executes the registered
+UserPromptSubmit, Stop and PermissionRequest commands as direct children of
+the tracked worker. Controls are private files keyed by the real SessionStart
+UUID. The fixture delays one actual user transcript receipt until requested;
+it does not replace AD results, mutate AD state or read terminal text. It ends
+only its own outstanding permission hook to trigger real AD fallback.
+
+The packed production delivery engine must keep `receiptWorking` true for
+more than twice its ordinary receipt timeout while AD observes an unchanged
+screen. It must then complete once on the same session's exact delayed receipt,
+with one text send. The engine and permission poller share the packed production
+`createPersonaUpPredicate`, supplied explicit connection-status, bring-up-outcome
+and applied-key queries; it must admit the intended key and reject an unknown
+key. This single-persona fixture does not rerun the connection-manager lifecycle.
+
+Get/status observations and exact list assertions distinguish the versions:
+
+| List read | Current 0.17.1 | Legacy 0.17.0 |
+|---|---|---|
+| Raw `idle_screen` filter after the screen is unchanged | One row: `state=working`, `displayed_state=idle_screen` | One row: `state=idle_screen` |
+| Raw `working` filter at the same point | One row: `state=working`, `displayed_state=idle_screen` | Zero rows |
+| Production delivery client's normalized `working` filter | One row: `state=working`, `displayed_state=idle_screen` | One row: `state=working` |
+| Raw `check_permission` filter, unaged request | One row: `state=check_permission` | One row: `state=check_permission` |
+| Raw `check_permission` filter, aged request | One row: `state=check_permission` | Zero rows; raw `needs_intelligence` filter returns one row with `state=needs_intelligence` |
+| Production-normalized `check_permission` filter, aged request | One row: `state=check_permission` | One row: `state=check_permission` |
+
+Returned list rows must match the persona, instance, agent, working directory
+and tmux session name; explicit list observations are bracketed by get checks
+of the same durable session. Poller list calls also check the exact row count,
+state and identity before passing the result to production code.
+
+After a real server launch supplies the normal fmk safety controls, the server
+stops while the worker stays alive. A separate driver runs the production
+permission poller against a real HTTP Slack stub with a fresh tracker per leg.
+An unaged request first posts through the raw client. After confirmed hook
+fallback and more than the legacy default 30-second interval, the current
+request must remain `check_permission`; legacy must become
+`needs_intelligence`. Each leg checkpoints the complete HTTP record and
+production trail: repeated ticks must yield one unaged post, zero posts in the
+legacy unnormalized leg, and then exactly the first and second requests in order
+in the normalized leg, with no duplicate of the first.
+
+`displayed-state-assertions.ts` counts every subsequent `chat.postMessage`,
+including failed calls and other destinations. It joins each expected request's
+production trail event to exactly one actual HTTP response timestamp, and every
+HTTP post back to exactly one event, checking success, instance, channel, text,
+blocks and `args_token_like == false`. Evidence reports the measured per-leg
+`post_count` and joined tokens/timestamps; the whole permission phase must match
+the checked legs (three posts total), rejecting posts between them.
+
+The driver adds an extra post to another channel only in an in-memory copy of
+its observations and requires the same oracle to reject it. Host-only
+`tests/displayed-state-observations.test.ts` checks these HTTP/list oracles with
+synthetic observation copies; neither control changes AD data or supplies
+fabricated responses to a production consumer.
+
+The host suite also exercises both entrypoints' closing assertions and cleanup
+recheck with malformed AD/tmux records and prohibited invocations. Its isolated
+shell controls check unsafe-output withholding, safe release after scanning,
+exit-status preservation, same-shell pass bookkeeping, cleanup invocation and
+scratch removal, plus ordinary stderr diagnostics when capture is unset.
+They execute extracted real declarations and assertion tails with inert process
+discovery/teardown; they do not run scenario setup, AD, tmux or a worker.
+
+Before this fixture creates credentials or starts processes, `displayed-states.sh`
+registers `displayed_exit_checks`. After processes stop, on success and failure alike,
+it scans state/logs/rotations, CLI and AD captures, start/stop and driver output,
+captured diagnostics/results, Slack stub records/output, delivery records,
+registered-hook records, AD trail and shim/process records with `count_token_like`;
+the intentional credentials input file is excluded. Every Slack API record must
+explicitly carry `args_token_like == false`; a missing/true flag or invalid JSON
+fails without printing the record or matched value.
+
+Setup also points the optional `SCENARIO_SHIM_DIAGNOSTICS` path at
+`SCENARIO_ROOT/displayed-closing.err`. The shim-record reader and offending-record
+reporter append raw malformed/prohibited records there for both the initial
+closing assertions and the cleanup recheck; safe failure summaries still print
+immediately. All three initial assertions retain their same-shell pass bookkeeping,
+and cleanup retains its trap and exit-status handling.
+
+`recorded: displayed-state` lines retain projections, hook identities, receipt
+proof, filter controls and measured counts. After the complete output scan
+(including `displayed-closing.err`) and API metadata check pass, the helper prints
+a leak-check line naming the scenario exit status, releases the closing capture
+to stderr, then releases driver stdout/stderr to the runner log.
+
+A leak-check failure withholds both raw closing diagnostics and driver evidence;
+these scenarios also disable the generic server-log tail. The driver's exit
+handler captures diagnostics on assertion failure or timeout too; all temporary
+captures are removed with the scenario root by existing cleanup.
+
+Setup or read/post errors cannot count as expected negative controls. These controls
+measure compatibility assertion sensitivity, not a historical before-fix run.
+Historical b.iy3 regressions and the earlier AD runtime observation live in the
+Bug's artifacts. Require both scenarios in `/ci`; syntax and isolated unit
+passes alone do not establish runtime behavior.
+
 ### Scenario helper
 
 `tests/integration/lib/scenario.sh` is sourced by Test 0 and Tests 5
@@ -1981,18 +2093,25 @@ fmk mode. Sourcing also:
   from `/dev/null`, which puts the binary at the standard path, the operator
   tool agent-director-admin at the admin path
   (`$HOME/.config/agent-director/admin/agent-director-admin`) and makes the HOME's
-  store with its store id, then re-shims both. A script that sets
+  store with its store id, then re-shims both. It checks the runtime version,
+  commit and binary hash before and after installation, plus the staged
+  installer and staged/installed admin hashes. A script that sets
   `SCENARIO_AD_START=0.10.0` before its source line starts on agent-director
   0.10.0 instead: `install_ad_010` copies 0.10.0's binary to its old install
   path behind the shim, with no `install.sh` run, no agent-director-admin and
   no store yet. Only the real release installer transitions that fixture to
-  the current layout and contract. `SCENARIO_AD_START` is `release` (the
-  default) or `0.10.0`; a shared-mode script that sets it fails;
+  the current layout and contract. `SCENARIO_AD_START=0.17.0` instead selects
+  `install_ad_legacy_displayed`, which installs the separately verified
+  legacy displayed-state fixture only into a fresh agent-director directory,
+  using this scenario's isolated HOME, store and tmux socket. The default
+  `release` selects 0.17.1; a shared-mode script that sets `SCENARIO_AD_START`
+  fails. All current-package legs keep the pinned 0.12.0 npm client;
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10, 20 (Test 23) and 24 (Test 26) are the exceptions: they
   write a `[tmux]` table with `write_ad_settings` (see Harness agent-director
   calls and store helpers below). Test 0 writes one too, after its re-fire
-  legs (see Layout);
+  legs (see Layout). Tests 42 and 43 write `[state]` timeouts for their
+  version-specific displayed-state observations;
 - once `SCENARIO_PORT` is picked, writes `$HOME/.claude/slack-mcp.json`
   (`write_mcp_config`), naming the bot server's MCP URL on that port, the
   `mcp_config_path` a persona config defaults to, so the stub's MCP session
@@ -2123,24 +2242,37 @@ Harness agent-director calls and store helpers:
   one-element JSON array, failing when no row has it.
   `ad_store_pending_no_launch <instance-id>` is one such edit (see The stub
   worker). The root and row schema follow the fixture's stage: the old
-  0.10.0 seed store until `install_ad_release` migrates it, then the current
-  0.12.0 store.
+  0.10.0 seed store until `install_ad_release` migrates it, then the store
+  maintained by the selected current runtime. The 0.17.0 displayed-state
+  fixture creates its own store and never downgrades this one.
 - `ad_store_backup <dest>` is the switch-over runbook's online backup of the
   store (step 8): sqlite3's `.backup`, the store opened read-only, into
   `<dest>`, a new file under `SCENARIO_ROOT` (as written and by the real path
   of its directory) whose path holds no `'` or control character. It then
   fails unless the copy's `PRAGMA integrity_check` reads `ok`.
-- `write_ad_settings [--pause <value>] [<key>=<value>...]` is the one writer
-  of the scenario HOME's agent-director settings file (a harness addition
-  for scenarios 24 and 10). The file is HOME joined with the package's
+- `check_ad_runtime <binary> <record> [<step>]` checks the runtime's version,
+  commit and SHA-256 against its release record. It hashes the file before
+  executing `version`, returns 1 only for an identity mismatch, and fails
+  setup for missing files or malformed records/answers. Passing observations
+  are printed and appended to `SCENARIO_ROOT/ad-runtime.jsonl` with the step,
+  path, version, full commit and hash. `SCENARIO_INSTALLED_AD_RECORD` names
+  the record selected by the last successful release install; the legacy
+  fixture has its own record. See [image provenance](../docker/README.md#what-the-base-holds).
+- `write_ad_settings [--pause <value>] [--state <key>=<seconds>] [<key>=<value>...]`
+  is the one writer of the scenario HOME's agent-director settings file.
+  The file is HOME joined with the package's
   `AD_SETTINGS_RELATIVE_PATH`, and the table and pause-key names are the
   package's too, all read through `fixtures/fmk-texts.ts`. It replaces the
   file whole by one rename (`write_file`), so neither agent-director nor
   CSCB reads half a file: a `[tmux]` table holding each `<key> = <value>`
   in the order given, then, with `--pause`, a `[pause]` table holding
-  `timeout_seconds = <value>`. Each value is written as the TOML text given,
+  `timeout_seconds = <value>`. These values are written as the TOML text given,
   so a value below its minimum or of the wrong type can be written on
-  purpose. With no argument it removes the file, which puts agent-director
+  purpose. Repeated `--state` arguments add a separate `[state]` table;
+  only `idle_screen_timeout_seconds` and `needs_intelligence_timeout_seconds`
+  are accepted, each once, with integer seconds from 1 to 9223372036.
+  Tests 42/43 use 2 and 30 seconds respectively, keeping the legacy
+  permission interval at its default. With no argument it removes the file, which puts agent-director
   back on its defaults. It fails on a key that is not a lowercase TOML bare
   key, a key given twice, or a value that is empty or holds a control
   character, and refuses a settings directory
@@ -2512,13 +2644,16 @@ The contract for a scenario:
 
 These hold for every fmk script:
 
-- It runs on the release (binary, agent-director-admin, client, and
-  `install.sh` with its migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
+- It runs on the current runtime (0.17.1 binary, agent-director-admin and
+  installer) with the separately pinned 0.12.0 client, unless it selects the
+  0.10.0 migration fixture or the isolated 0.17.0 displayed-state fixture
+  through `SCENARIO_AD_START`. It runs at
   agent-director's default settings, with no `config.toml`, unless it is
   scenario 10, 20 (Test 23) or 24 (Test 26), which write a `[tmux]` table with
   `write_ad_settings`. Test 0, the harness's
   self-check rather than a scenario, writes one once its re-fire legs are
-  done, for its finished-row kill (see Layout).
+  done, for its finished-row kill (see Layout). Tests 42/43 set only the
+  `[state]` timeouts described above through the same guarded writer.
 - It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
   processes, in `log` mode unless the scenario sets `fail-kill` (whole, or
   limited to a target list), `fail-create`, `slow-create` or `wedge` with
@@ -2666,7 +2801,7 @@ step; every other change replaces only the binary behind it:
 
 | Leg | Behind the shim, in order |
 |---|---|
-| set-up | the release (0.12.0) |
+| set-up | the current runtime (0.17.1) |
 | 8a | 0.10.0 (`swap_ad_binary 0.10.0`), then the release |
 | 8b | the release; nothing at the standard path (`hide_ad_install` moves the shim and the binary aside, and no `agent-director` is on the server's PATH); the stand-in reporting no parseable version (`restore_ad_install_with_stand_in unparseable pass`); the release |
 | 8c | 0.10.0, then the release once the server has stopped |
@@ -2836,7 +2971,8 @@ report, no daemon running, only `version` calls through the shim since the
 start (the shim log is read whole, since the refused daemon never wrote its
 PID file), no new tmux session and no new stub record line.
 
-The image holds the 0.12.0 release and no release candidate, so 23a runs on
+The image holds the current 0.17.1 runtime, separate 0.17.0 and 0.10.0
+fixtures, and no release candidate, so 23a runs on
 the stand-in reporting `<next-patch-above-floor>-rc.1`, the form 8d's passing wrapper
 reports. `dev` is not a CSCB constant: the script quotes it, citing
 and HO §7 scenario 23.

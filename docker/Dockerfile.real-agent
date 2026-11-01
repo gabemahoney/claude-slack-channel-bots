@@ -1,4 +1,4 @@
-FROM cscb-ci-base:v8
+FROM cscb-ci-base:v9
 # Self-contained heavy context: the same packed production package as /ci,
 # the pinned release binary/client in the base, and all executable scenarios.
 COPY package.tgz /tmp/package.tgz

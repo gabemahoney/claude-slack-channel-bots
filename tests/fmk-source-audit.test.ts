@@ -1834,7 +1834,7 @@ printf 'RESULT=%s' "$?"`, ['cat', 'jq', 'awk'])
     const oldFilter = correlate.replace('.value.caller_pid == ($call[6] | tonumber)', '.value.caller_pid == ($server | tonumber)')
     expect(oldFilter).not.toBe(correlate)
     const declarations = [
-      '_scenario_record_load', '_scenario_role_at', '_scenario_query_prep', '_scenario_read_log',
+      '_scenario_record_load', '_scenario_role_at', '_scenario_query_prep', '_scenario_shim_diagnostic', '_scenario_read_log',
       '_scenario_to_us', '_scenario_us_text', '_scenario_split_line', '_scenario_eval_words',
       '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id', '_scenario_in_window',
       '_scenario_check_mark', '_scenario_cscb_ad_rows', 'ad_cscb_calls', 'ad_trail_events',

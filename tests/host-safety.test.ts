@@ -1692,7 +1692,7 @@ const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
  * the switch-over fixture and the scenario value printer.
  */
 const CODEX_DELIVERY_PATH = join(TESTS_DIR, 'real-agent', 'codex-delivery.ts')
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH]
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH, join(INTEGRATION_DIR, 'fixtures', 'displayed-states.ts')]
 const CODEX_IMPORT_ONLY_PATHS = ['codex-guards.ts', 'codex-evidence.ts', 'codex-ai.ts', 'codex-gate.ts', 'codex-crash-barrier.ts'].map(name => join(TESTS_DIR, 'real-agent', name))
 // Every non-node static edge is exact and its destination is audited too.
 const CODEX_IMPORT_GRAPH: Record<string, readonly string[]> = {
@@ -2805,7 +2805,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     })
 
     test('the audited files: the forced-call driver, the stub’s MCP session, the switch-over fixture and the scenario value printer, all present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts'])
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts', 'displayed-states.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 

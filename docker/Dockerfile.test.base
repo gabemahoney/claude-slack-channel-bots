@@ -1,4 +1,4 @@
-# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v8.
+# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v9.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
 # and the /ci-live image (docker/Dockerfile.live). From the repo build context
@@ -8,13 +8,13 @@
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
 #     --build-context agent-director-install=<directory holding install.sh> \
-#     -f docker/Dockerfile.test.base -t cscb-ci-base:v8 .
+#     -f docker/Dockerfile.test.base -t cscb-ci-base:v9 .
 #
 # agent-director is the release pinned below (AD_VERSION, AD_COMMIT): its
 # binaries come from agent-director's GitHub release, installed by that
 # release's own install.sh (`--from-release`, both assets checked against
-# their pinned SHA-256), and its TypeScript client from npm at the same
-# version.
+# their pinned SHA-256). Its TypeScript client stays at the independent
+# AD_CLIENT_VERSION, matching CSCB's shipped client and minimum.
 #
 # Fixed paths (all readable by every user, testuser included, except the
 # global client under /root, which is root-only):
@@ -30,12 +30,13 @@
 #   /opt/agent-director/install/install.sh
 #       the release's install script, from agent-director's source tree at
 #       the release tag; off PATH; its directory holds nothing else.
-#   /opt/agent-director/client/agent-director-<AD_VERSION>.tgz
-#       the release's TypeScript client tarball, fetched from the npm
+#   /opt/agent-director/client/agent-director-<AD_CLIENT_VERSION>.tgz
+#       the shipped TypeScript client tarball, fetched from the npm
 #       registry and checked against its pinned SHA-256.
 #   /opt/agent-director/client/release.json
-#       the release record: {"version", "commit", "client_tarball",
-#       "client_tarball_sha256"}.
+#       the runtime and client identities: version, commit, binary_sha256,
+#       admin_sha256, installer_sha256, client_version, client_tarball and
+#       client_tarball_sha256.
 #   /opt/agent-director/check/ad-client-check.sh
 #       the client-under-test check (docker/ad-client-check.sh), off PATH:
 #       `--package <dir>` checks the agent-director client an installed
@@ -43,10 +44,13 @@
 #       changes nothing. test-1, ci-live/checks/setup-checks.ts and
 #       docker/Dockerfile.live run it.
 #   /root/.bun/install/global/node_modules/agent-director
-#       the global agent-director client: the release's, installed from npm
+#       the global agent-director client: the shipped pin, installed from npm
 #       at the exact version and checked by the build. Root-only (/root is
 #       0700): read by this base build and by docker/Dockerfile.live, which
 #       both run as root; testuser cannot read it.
+#   /opt/agent-director-0.17.0/{bin,admin,install}/
+#       the legacy displayed-state fixture, with its own release.json;
+#       never on PATH and installed only into a fresh scenario HOME.
 #   /opt/agent-director-0.10.0/bin/agent-director
 #       agent-director 0.10.0's binary, off PATH.
 #   /opt/agent-director-0.10.0/agent-director-0.10.0.tgz
@@ -200,11 +204,11 @@ RUN --mount=type=secret,id=gh_token set -eu; \
 # AD_VERSION and AD_COMMIT. The build then checks that the first
 # agent-director on PATH is the release's, that no other PATH directory holds
 # one, and that no agent-director-admin is on PATH.
-ARG AD_VERSION=0.12.0
-ARG AD_COMMIT=e1b6f2e769cd8dbf29161590046ca0e963c44b65
-ARG AD_SHA256=ea68fb7379ea44ae7ed1edba5c9ec561f297a1efd63487f1f3baea06a8064db1
-ARG AD_ADMIN_SHA256=1e0070f309768e763ea1fb69bd151299071278f0c90f055e1250a879c88df158
-ARG AD_INSTALL_SH_SHA256=dacd775d2345814a645cf65fdb36a2a6ff1ebd727dfc0ef40e162e36815fcd28
+ARG AD_VERSION=0.17.1
+ARG AD_COMMIT=c794af3865d113d85573601fdcc70bdc842b3471
+ARG AD_SHA256=a3ec40103c170a9070b89681d0d723ea741f3c1f47eb3f0a4f284f7c5160e57c
+ARG AD_ADMIN_SHA256=86ccfacb48a439c04a446d92416fbc1c420a3f8a732f9bd52022abc9d926e490
+ARG AD_INSTALL_SH_SHA256=9bc73dd6542414e06473ac6ef5bc01d9c6943e61fd80708d7e483aafa6aa51cc
 RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-install \
     set -eu; \
     AD_TAG="v${AD_VERSION}"; \
@@ -303,43 +307,83 @@ RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-ins
 # directory. It refuses to run without /etc/cscb-ci-image (written above).
 COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-check.sh
 
-# The release's client: its npm tarball, fetched from the registry by exact
+# The shipped client: its npm tarball, fetched from the registry by exact
 # version and checked against the pinned AD_CLIENT_TGZ_SHA256, then the
-# release record naming the release's version and commit and that tarball.
+# release record naming the runtime and client independently.
 # The global agent-director client is then installed from npm at exactly
-# AD_VERSION (it has no dependencies and no install scripts run) and checked
-# with the check's client-only use: its version is the release's, its files
+# AD_CLIENT_VERSION (it has no dependencies and no install scripts run) and checked
+# with the check's client-only use: its version is the shipped pin, its files
 # equal the tarball's, it exports the Phase 1 classes, and it pairs with the
 # release's binary first on PATH. The check's summary line is the last line
 # this layer prints.
+ARG AD_CLIENT_VERSION=0.12.0
 ARG AD_CLIENT_TGZ_SHA256=66265d3ed575732312b1df43aab1eb328be910798f2a22ddb4cb86026c0d5340
 RUN set -eu; \
     AD_CHECK=/opt/agent-director/check/ad-client-check.sh; \
     CLIENT_DIR=/opt/agent-director/client; \
-    CLIENT_TGZ="${CLIENT_DIR}/agent-director-${AD_VERSION}.tgz"; \
-    CLIENT_TGZ_URL="https://registry.npmjs.org/agent-director/-/agent-director-${AD_VERSION}.tgz"; \
+    CLIENT_TGZ="${CLIENT_DIR}/agent-director-${AD_CLIENT_VERSION}.tgz"; \
+    CLIENT_TGZ_URL="https://registry.npmjs.org/agent-director/-/agent-director-${AD_CLIENT_VERSION}.tgz"; \
     GLOBAL_CLIENT=/root/.bun/install/global/node_modules/agent-director; \
     mkdir -p "${CLIENT_DIR}"; \
     curl -fsSL -o "${CLIENT_TGZ}" "${CLIENT_TGZ_URL}" \
-        || { echo "ERROR: could not download the agent-director ${AD_VERSION} client tarball from ${CLIENT_TGZ_URL}" >&2; exit 1; }; \
+        || { echo "ERROR: could not download the agent-director ${AD_CLIENT_VERSION} client tarball from ${CLIENT_TGZ_URL}" >&2; exit 1; }; \
     CLIENT_TGZ_SHA256=$(sha256sum "${CLIENT_TGZ}" | cut -d' ' -f1); \
     if [ "${CLIENT_TGZ_SHA256}" != "${AD_CLIENT_TGZ_SHA256}" ]; then \
-        echo "ERROR: the agent-director ${AD_VERSION} client tarball from npm has SHA-256 ${CLIENT_TGZ_SHA256}, not the pinned AD_CLIENT_TGZ_SHA256 ${AD_CLIENT_TGZ_SHA256}" >&2; \
+        echo "ERROR: the agent-director ${AD_CLIENT_VERSION} client tarball from npm has SHA-256 ${CLIENT_TGZ_SHA256}, not the pinned AD_CLIENT_TGZ_SHA256 ${AD_CLIENT_TGZ_SHA256}" >&2; \
         exit 1; \
     fi; \
     jq -n --arg version "${AD_VERSION}" --arg commit "${AD_COMMIT}" \
-        --arg client_tarball "${CLIENT_TGZ}" --arg client_tarball_sha256 "${AD_CLIENT_TGZ_SHA256}" \
-        '{version: $version, commit: $commit, client_tarball: $client_tarball, client_tarball_sha256: $client_tarball_sha256}' \
+        --arg binary_sha256 "${AD_SHA256}" --arg admin_sha256 "${AD_ADMIN_SHA256}" --arg installer_sha256 "${AD_INSTALL_SH_SHA256}" --arg client_version "${AD_CLIENT_VERSION}" --arg client_tarball "${CLIENT_TGZ}" --arg client_tarball_sha256 "${AD_CLIENT_TGZ_SHA256}" \
+        '{version: $version, commit: $commit, binary_sha256: $binary_sha256, admin_sha256: $admin_sha256, installer_sha256: $installer_sha256, client_version: $client_version, client_tarball: $client_tarball, client_tarball_sha256: $client_tarball_sha256}' \
         > "${CLIENT_DIR}/release.json"; \
     chmod -R a+rX "${CLIENT_DIR}"; \
-    bun add -g --ignore-scripts "agent-director@${AD_VERSION}" > /tmp/ad-client-install.log 2>&1 \
-        || { echo "ERROR: bun add -g agent-director@${AD_VERSION} failed: $(tail -n 1 /tmp/ad-client-install.log)" >&2; exit 1; }; \
+    bun add -g --ignore-scripts "agent-director@${AD_CLIENT_VERSION}" > /tmp/ad-client-install.log 2>&1 \
+        || { echo "ERROR: bun add -g agent-director@${AD_CLIENT_VERSION} failed: $(tail -n 1 /tmp/ad-client-install.log)" >&2; exit 1; }; \
     rm -f /tmp/ad-client-install.log; \
     if [ ! -f "${GLOBAL_CLIENT}/package.json" ]; then \
-        echo "ERROR: bun add -g agent-director@${AD_VERSION} left no client at ${GLOBAL_CLIENT}" >&2; \
+        echo "ERROR: bun add -g agent-director@${AD_CLIENT_VERSION} left no client at ${GLOBAL_CLIENT}" >&2; \
         exit 1; \
     fi; \
     "${AD_CHECK}" --client "${GLOBAL_CLIENT}"
+
+# Legacy displayed-state contract: real 0.17.0 binaries, kept off PATH.
+# The installer at v0.17.0 is byte-identical to v0.17.1's; verify that pin
+# before copying it. This fixture never replaces the default runtime/client.
+ARG AD_LEGACY_VERSION=0.17.0
+ARG AD_LEGACY_COMMIT=3ece400076aba2e6e675d51fc0533b8430bb8f2f
+ARG AD_LEGACY_SHA256=9290d436b03f121df577f317a84166723acc2b3e90d4a2aeed53652cdf93d5fc
+ARG AD_LEGACY_ADMIN_SHA256=b6f6eb7c64b1a58ee568c80263f21c68b8a09a58a986525a8c0c073b2f83ad12
+ARG AD_LEGACY_INSTALL_SH_SHA256=9bc73dd6542414e06473ac6ef5bc01d9c6943e61fd80708d7e483aafa6aa51cc
+RUN set -eu; \
+    LEGACY_DIR="/opt/agent-director-${AD_LEGACY_VERSION}"; \
+    LEGACY_URL="https://github.com/gabemahoney/agent-director/releases/download/v${AD_LEGACY_VERSION}"; \
+    mkdir -p "${LEGACY_DIR}/bin" "${LEGACY_DIR}/admin" "${LEGACY_DIR}/install"; \
+    curl -fsSL -o "${LEGACY_DIR}/bin/agent-director" "${LEGACY_URL}/agent-director-linux-amd64" \
+        || { echo "ERROR: could not download legacy agent-director binary" >&2; exit 1; }; \
+    curl -fsSL -o "${LEGACY_DIR}/admin/agent-director-admin" "${LEGACY_URL}/agent-director-admin-linux-amd64" \
+        || { echo "ERROR: could not download legacy agent-director-admin binary" >&2; exit 1; }; \
+    printf '%s  %s\n' "${AD_LEGACY_SHA256}" "${LEGACY_DIR}/bin/agent-director" \
+        "${AD_LEGACY_ADMIN_SHA256}" "${LEGACY_DIR}/admin/agent-director-admin" \
+        "${AD_LEGACY_INSTALL_SH_SHA256}" /opt/agent-director/install/install.sh \
+        | sha256sum --check --status \
+        || { echo "ERROR: legacy agent-director fixture digest mismatch" >&2; exit 1; }; \
+    install -m 0755 /opt/agent-director/install/install.sh "${LEGACY_DIR}/install/install.sh"; \
+    chmod -R a+rX "${LEGACY_DIR}"; \
+    chmod 0755 "${LEGACY_DIR}/bin/agent-director" "${LEGACY_DIR}/admin/agent-director-admin"; \
+    for legacy_bin in "${LEGACY_DIR}/bin/agent-director" "${LEGACY_DIR}/admin/agent-director-admin"; do \
+        LEGACY_ID=$("${legacy_bin}" version) \
+            || { echo "ERROR: legacy fixture version probe failed" >&2; exit 1; }; \
+        printf '%s' "${LEGACY_ID}" | jq -e --arg version "${AD_LEGACY_VERSION}" --arg commit "${AD_LEGACY_COMMIT}" \
+            '.version == $version and .commit == $commit' >/dev/null \
+            || { echo "ERROR: legacy agent-director fixture identity mismatch" >&2; exit 1; }; \
+    done; \
+    jq -n --arg version "${AD_LEGACY_VERSION}" --arg commit "${AD_LEGACY_COMMIT}" \
+        --arg binary_sha256 "${AD_LEGACY_SHA256}" --arg admin_sha256 "${AD_LEGACY_ADMIN_SHA256}" \
+        --arg installer_sha256 "${AD_LEGACY_INSTALL_SH_SHA256}" \
+        '{version: $version, commit: $commit, binary_sha256: $binary_sha256, admin_sha256: $admin_sha256, installer_sha256: $installer_sha256}' \
+        > "${LEGACY_DIR}/release.json"; \
+    chmod 0644 "${LEGACY_DIR}/release.json"; \
+    echo "agent-director legacy fixture ${AD_LEGACY_VERSION} (${AD_LEGACY_COMMIT}) installed off PATH at ${LEGACY_DIR}"
 
 ENV DISABLE_AUTOUPDATER=1
 # genuine native agents, selected through AD's launch paths;

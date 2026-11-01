@@ -83,8 +83,10 @@
 #   $HOME/.config/agent-director/admin/agent-director-admin; or, for a script that
 #   sets SCENARIO_AD_START=0.10.0 before sourcing, agent-director 0.10.0's
 #   binary (`install_ad_010`), with no release install, no agent-director-admin
-#   and no store yet (SCENARIO_AD_START is `release` or `0.10.0`; a
-#   shared-mode script that sets it fails);
+#   and no store yet. SCENARIO_AD_START=0.17.0 instead installs the real
+#   legacy displayed-state fixture in the fresh HOME, with its own store
+#   and the scenario's isolated tmux socket. A shared-mode script that sets
+#   SCENARIO_AD_START fails;
 # - writes no agent-director config.toml: agent-director's default settings
 #   (a scenario that needs others writes them with `write_ad_settings`);
 # - once SCENARIO_PORT is picked, writes the MCP config the stub's session
@@ -271,6 +273,12 @@
 #                                      /dev/null, cwd HOME; output in AD_INSTALL_OUT), then `reshim_ad`
 #                                      and `check_ad_admin_shim`; a failed run fails the step with
 #                                      install.sh's output
+#   install_ad_legacy_displayed [<step>] install the real 0.17.0 fixture into a fresh AD directory;
+#                                      selects verified binary/admin/installer without changing the default
+#   check_ad_runtime <binary> <record> [<step>] verify version, commit and digest; returns 1 only for
+#                                      identity mismatch (setup errors fail); retains passing observations
+#                                      in SCENARIO_ROOT/ad-runtime.jsonl. SCENARIO_INSTALLED_AD_RECORD
+#                                      names the record selected by the last successful release install.
 #   install_ad_010 [<step>]            copy agent-director 0.10.0's binary to the standard path, then
 #                                      `install_ad_shim` (no install.sh run, no store made)
 #   swap_ad_binary <release|0.10.0|<abs-path>> [<step>]
@@ -352,7 +360,10 @@
 #
 #   agent-director's settings file (fmk mode; harness addition, scenarios 10, 20 and 24
 #   (test-22, test-23, test-26); the image guard, then the HOME check, before any write)
-#   write_ad_settings [--pause <value>] [<key>=<value>...]
+#   write_ad_settings [--pause <value>] [--state <key>=<seconds>] [<key>=<value>...]
+#                                      --state selects needs_intelligence_timeout_seconds or
+#                                      idle_screen_timeout_seconds, positive integer seconds in AD's range;
+#                                      these go in [state], independently of the existing [tmux] pairs.
 #                                      replace the scenario HOME's agent-director settings file
 #                                      (HOME joined with the package's AD_SETTINGS_RELATIVE_PATH,
 #                                      read through fixtures/fmk-texts.ts, as are the table names and
@@ -1167,6 +1178,8 @@ SCENARIO_FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)"
 SCENARIO_RELEASE_BIN=/opt/agent-director/bin/agent-director
 SCENARIO_RELEASE_ADMIN=/opt/agent-director/admin/agent-director-admin
 SCENARIO_RELEASE_INSTALL_SH=/opt/agent-director/install/install.sh
+SCENARIO_RELEASE_RECORD=/opt/agent-director/client/release.json
+SCENARIO_LEGACY_AD_ROOT=/opt/agent-director-0.17.0
 SCENARIO_AD_010_BIN=/opt/agent-director-0.10.0/bin/agent-director
 
 # The agent-director shim and the whole line that marks it.
@@ -1219,6 +1232,10 @@ SCENARIO_STUB_RELEASE_S=10
 # as Claude Code does, with SessionEnd, its MCP session closed and exit 0.
 STUB_MODE_EXIT_ON_PAUSE=exit-on-pause
 SCENARIO_STUB_MODES+=("${STUB_MODE_EXIT_ON_PAUSE}")
+
+# b.iy3: real registered hooks, delayed receipt, no synthetic AD state.
+STUB_MODE_DISPLAYED_STATES=displayed-states
+SCENARIO_STUB_MODES+=("${STUB_MODE_DISPLAYED_STATES}")
 
 # The MCP server name the package's install writes into slack-mcp.json
 # (src/config.ts MCP_SERVER_NAME).
@@ -2468,6 +2485,62 @@ reshim_ad() {
     fi
 }
 
+# check_ad_runtime <binary> <record> [<step>]: the same assertion for image
+# and installed runtimes, also usable by an expected-rejection control.
+# Returns 1 for an identity mismatch; setup/read failures still fail the
+# scenario. No row/state is inferred: only AD's version and the file digest.
+# Successful observations are retained in SCENARIO_ROOT/ad-runtime.jsonl.
+check_ad_runtime() {
+    local binary="$1" record="$2" step="${3:-agent-director runtime provenance}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local expected version commit digest observed actual observed_version observed_commit
+    expected=$(jq -er '[.version, .commit, .binary_sha256]
+        | if (all(.[]; type == "string" and length > 0)) then @tsv else error("identity fields missing") end' "${record}") \
+        || fail "${step}: runtime record is missing or invalid"
+    IFS=$'\t' read -r version commit digest <<< "${expected}"
+    [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "${commit}" =~ ^[0-9a-f]{40}$ && "${digest}" =~ ^[0-9a-f]{64}$ ]] \
+        || fail "${step}: runtime record has malformed identity fields"
+    [[ -f "${binary}" && -x "${binary}" ]] || fail "${step}: runtime binary is missing or not executable"
+    actual=$(sha256sum "${binary}") || fail "${step}: could not hash runtime binary"
+    actual="${actual%% *}"
+    # Check bytes before executing them. A negative leg must require this
+    # specific mismatch; a missing file is never an expected rejection.
+    if [[ "${actual}" != "${digest}" ]]; then
+        printf 'ad-runtime rejected: binary digest mismatch for %s (expected %s, got %s)\n' "${binary}" "${digest}" "${actual}" >&2
+        return 1
+    fi
+    observed=$("${binary}" version) || fail "${step}: runtime version probe failed"
+    observed=$(jq -er '[.version, .commit]
+        | if (all(.[]; type == "string" and length > 0)) then @tsv else error("identity fields missing") end' <<< "${observed}") \
+        || fail "${step}: runtime version probe returned malformed identity"
+    IFS=$'\t' read -r observed_version observed_commit <<< "${observed}"
+    if [[ "${observed_version}" != "${version}" || "${observed_commit}" != "${commit}" ]]; then
+        printf 'ad-runtime rejected: version/commit mismatch for %s\n' "${binary}" >&2
+        return 1
+    fi
+    jq -nc --arg step "${step}" --arg path "${binary}" --arg version "${version}" \
+        --arg commit "${commit}" --arg sha256 "${actual}" \
+        '{step: $step, path: $path, version: $version, commit: $commit, sha256: $sha256}' \
+        >> "${SCENARIO_ROOT}/ad-runtime.jsonl" || fail "${step}: could not retain runtime provenance"
+    printf 'agent-director %s (%s) at %s; sha256 %s\n' "${version}" "${commit}" "${binary}" "${actual}"
+}
+
+# Real legacy displayed states require their own fresh HOME/store/socket.
+# fmk setup has already isolated HOME and TMUX_TMPDIR before this call.
+# Dynamic local bindings select only this install; the default remains current.
+install_ad_legacy_displayed() {
+    local step="${1:-install legacy displayed-state agent-director}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ ! -e "${SCENARIO_AD_ROOT}" ]] || fail "${step}: legacy install requires a fresh agent-director directory"
+    local SCENARIO_RELEASE_BIN="${SCENARIO_LEGACY_AD_ROOT}/bin/agent-director"
+    local SCENARIO_RELEASE_ADMIN="${SCENARIO_LEGACY_AD_ROOT}/admin/agent-director-admin"
+    local SCENARIO_RELEASE_INSTALL_SH="${SCENARIO_LEGACY_AD_ROOT}/install/install.sh"
+    local SCENARIO_RELEASE_RECORD="${SCENARIO_LEGACY_AD_ROOT}/release.json"
+    install_ad_release "${step}"
+}
+
 install_ad_release() {
     local step="${1:-install the release with its install.sh}"
     require_ci_image "${step}"
@@ -2479,6 +2552,15 @@ install_ad_release() {
         || fail "${step}: the release's binary is missing from the image (${SCENARIO_RELEASE_BIN})"
     [[ -f "${SCENARIO_RELEASE_ADMIN}" && -x "${SCENARIO_RELEASE_ADMIN}" ]] \
         || fail "${step}: the release's agent-director-admin is missing from the image (${SCENARIO_RELEASE_ADMIN})"
+    check_ad_runtime "${SCENARIO_RELEASE_BIN}" "${SCENARIO_RELEASE_RECORD}" "${step}: image" \
+        || fail "${step}: image runtime identity mismatch"
+    local admin_digest installer_digest
+    admin_digest=$(jq -er '.admin_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "${SCENARIO_RELEASE_RECORD}") \
+        || fail "${step}: release record has no admin digest"
+    installer_digest=$(jq -er '.installer_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "${SCENARIO_RELEASE_RECORD}") \
+        || fail "${step}: release record has no installer digest"
+    printf '%s  %s\n' "${admin_digest}" "${SCENARIO_RELEASE_ADMIN}" "${installer_digest}" "${SCENARIO_RELEASE_INSTALL_SH}" \
+        | sha256sum --check --status || fail "${step}: admin/installer digest mismatch"
     _SCENARIO_INSTALL_COUNT=$(( _SCENARIO_INSTALL_COUNT + 1 ))
     AD_INSTALL_OUT="${SCENARIO_ROOT}/install-sh.${_SCENARIO_INSTALL_COUNT}.out"
     (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary "${SCENARIO_RELEASE_BIN}" \
@@ -2496,6 +2578,11 @@ install_ad_release() {
     _SCENARIO_REAL_AD_SHIM_LOG="${SCENARIO_AD_SHIM_LOG}"
     reshim_ad "${step}: re-shim"
     check_ad_admin_shim "${step}: agent-director-admin"
+    check_ad_runtime "${SCENARIO_AD_BIN}.real" "${SCENARIO_RELEASE_RECORD}" "${step}: installed" \
+        || fail "${step}: installed runtime identity mismatch"
+    printf '%s  %s\n' "${admin_digest}" "${SCENARIO_AD_ROOT}/admin/agent-director-admin.real" \
+        | sha256sum --check --status || fail "${step}: installed admin digest mismatch"
+    SCENARIO_INSTALLED_AD_RECORD="${SCENARIO_RELEASE_RECORD}"
 }
 
 # Deliberate pre-0.12 contract: old installs use the old layout, flags and
@@ -3620,12 +3707,27 @@ _scenario_ad_settings_value() {
 
 # Deliberate pre-0.12 contract: settings live beside the real old binary until migration.
 write_ad_settings() {
-    local step="write_ad_settings $*" pause="" have_pause=0 pairs=() seen=" " key value path dir real_root real_dir content
+    local step="write_ad_settings $*" pause="" have_pause=0 pairs=() state_pairs=() seen=" " key value path dir real_root real_dir content
     require_ci_image "${step}"
     require_scenario_home "${step}"
     [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario HOME's agent-director settings are for fmk scripts only"
     while (( $# > 0 )); do
         case "$1" in
+            --state)
+                (( $# >= 2 )) || fail "${step}: --state takes <key>=<seconds>"
+                key="${2%%=*}"
+                value="${2#*=}"
+                case "${key}" in
+                    needs_intelligence_timeout_seconds | idle_screen_timeout_seconds) ;;
+                    *) fail "${step}: unsupported state timeout key" ;;
+                esac
+                [[ "${value}" =~ ^[1-9][0-9]{0,9}$ ]] && (( value <= 9223372036 )) \
+                    || fail "${step}: state timeout must be an integer from 1 to 9223372036 seconds"
+                [[ "${seen}" != *" state:${key} "* ]] || fail "${step}: state timeout ${key} is given twice"
+                seen+=" state:${key} "
+                state_pairs+=("${key} = ${value}")
+                shift 2
+                ;;
             --pause)
                 (( $# >= 2 )) || fail "${step}: --pause takes a value"
                 (( ! have_pause )) || fail "${step}: --pause is given twice"
@@ -3645,7 +3747,7 @@ write_ad_settings() {
                 pairs+=("${key} = ${value}")
                 shift
                 ;;
-            *) fail "${step}: '$1' is neither <key>=<value> nor --pause <value>" ;;
+            *) fail "${step}: '$1' is not <key>=<value>, --pause <value> or --state <key>=<seconds>" ;;
         esac
     done
     _scenario_ad_settings_names "${step}"
@@ -3664,7 +3766,7 @@ write_ad_settings() {
             || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
     fi
     AD_SETTINGS_FILE="${path}"
-    if (( ${#pairs[@]} == 0 && ! have_pause )); then
+    if (( ${#pairs[@]} == 0 && ${#state_pairs[@]} == 0 && ! have_pause )); then
         # No table: no file, so agent-director's defaults.
         rm -f -- "${path}" || fail "${step}: could not remove ${path}"
         [[ ! -e "${path}" ]] || fail "${step}: ${path} is still there after its removal"
@@ -3683,6 +3785,12 @@ write_ad_settings() {
     if (( have_pause )); then
         [[ -z "${content}" ]] || content+=$'\n'
         printf -v value '[%s]\n%s = %s\n' "${_SCENARIO_AD_SETTINGS_NAMES[2]}" "${_SCENARIO_AD_SETTINGS_NAMES[3]}" "${pause}"
+        content+="${value}"
+    fi
+    if (( ${#state_pairs[@]} > 0 )); then
+        [[ -z "${content}" ]] || content+=$'\n'
+        content+=$'[state]\n'
+        printf -v value '%s\n' "${state_pairs[@]}"
         content+="${value}"
     fi
     # One rename, so agent-director and CSCB never read half a file.
@@ -4337,6 +4445,16 @@ _scenario_ad_verb() {
     _L_ARGS=("${rest[@]:1}")
 }
 
+# A scenario with an exit-time leak scanner can retain raw shim diagnostics
+# in SCENARIO_SHIM_DIAGNOSTICS until that scanner permits their release.
+_scenario_shim_diagnostic() {
+    if [[ -n "${SCENARIO_SHIM_DIAGNOSTICS:-}" ]]; then
+        printf '%s\n' "$1" >> "${SCENARIO_SHIM_DIAGNOSTICS}"
+    else
+        printf '%s\n' "$1" >&2
+    fi
+}
+
 # _scenario_read_log <step> <log> <array-name>: read <log>'s lines into the
 # array (none when the log is missing); fail, naming <step> and the line,
 # when a line is not in the shims' format.
@@ -4349,7 +4467,7 @@ _scenario_read_log() {
     for i in "${!_scenario_read_log_lines[@]}"; do
         if ! _scenario_split_line "${_scenario_read_log_lines[i]}" \
             || { [[ "${_L_KIND}" == call ]] && ! _scenario_decode_words; }; then
-            echo "  | ${log##*/}:$(( i + 1 )): ${_scenario_read_log_lines[i]}" >&2
+            _scenario_shim_diagnostic "  | ${log##*/}:$(( i + 1 )): ${_scenario_read_log_lines[i]}"
             fail "${step}: ${log} line $(( i + 1 )) is not in the shims' line format"
         fi
     done
@@ -4373,7 +4491,7 @@ _scenario_offending() {
     local step="$1" log="$2" what="$3" nr list=""
     shift 3
     for nr in "$@"; do
-        echo "  | ${log##*/}:${nr}: $(sed -n "${nr}p" "${log}")" >&2
+        _scenario_shim_diagnostic "  | ${log##*/}:${nr}: $(sed -n "${nr}p" "${log}")"
         list+="${list:+, }${nr}"
     done
     fail "${step}: $# ${log##*/} line(s) ${what} (line ${list})"
@@ -5556,8 +5674,8 @@ _scenario_path_without_ad() {
 
 _scenario_fmk_setup() {
     case "${SCENARIO_AD_START:=release}" in
-        release | 0.10.0) ;;
-        *) fail "SCENARIO_AD_START '${SCENARIO_AD_START}' is neither release nor 0.10.0" ;;
+        release | 0.10.0 | 0.17.0) ;;
+        *) fail "SCENARIO_AD_START '${SCENARIO_AD_START}' is not release, 0.10.0 or 0.17.0" ;;
     esac
     SCENARIO_REAL_TMUX="$(command -v tmux || true)"
     [[ "${SCENARIO_REAL_TMUX}" == /* ]] || fail "tmux not on PATH (base image prerequisite)"
@@ -5629,7 +5747,11 @@ _scenario_fmk_setup() {
     if [[ "${SCENARIO_AD_START}" == 0.10.0 ]]; then
         install_ad_010 "fmk setup: install agent-director 0.10.0"
     else
-        install_ad_release "fmk setup: install the release"
+        if [[ "${SCENARIO_AD_START}" == 0.17.0 ]]; then
+            install_ad_legacy_displayed "fmk setup: install legacy displayed-state agent-director"
+        else
+            install_ad_release "fmk setup: install the release"
+        fi
         [[ -f "${SCENARIO_AD_ROOT}/state.db" ]] \
             || fail "fmk setup: the release's install.sh made no store at ${SCENARIO_AD_ROOT}/state.db"
     fi
