@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **`receive_all` no longer claims a persona is the only one reading a channel in full.** The MCP instructions and `skills/EXAMPLE_CLAUDE.md` now say no other persona on this server receives every message there. Delivery is unchanged. A `CLAUDE.md` made from the template keeps the old wording until you edit it.
+
 ---
 
 ## 0.18.2 (2026-11-01)

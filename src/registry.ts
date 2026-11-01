@@ -1166,7 +1166,7 @@ export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
   'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
   'Messages arrive as the <channel> tag described in the system prompt, carrying channel_name and, for a long message, part.',
-  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where only you receive every message.',
+  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where you, and no other persona on this server, receive every message.',
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
   'You may act in every channel you receive. With invited channels off, these are your configured channels; with it on, channels your Slack app belongs to (Slack refuses others).',
