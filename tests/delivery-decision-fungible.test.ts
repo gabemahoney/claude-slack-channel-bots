@@ -35,6 +35,7 @@ import {
   FUNGIBLE_DECISION_GROUPS,
   SWITCH_FORMS,
   THREAD_DECISION_GROUPS,
+  type OwnPostRead,
   type ThreadRead,
   channelDeliveryArgsOf,
   channelTypeFormOf,
@@ -64,6 +65,9 @@ function outcomeText(outcome: DeliveryDecision): string {
   const path = pathOf(outcome)
   const onPath = path === undefined ? '' : ` [fungible path: ${path.channelType}, at ${path.channelDelivery}]`
   if (outcome.action === 'deliver') return `delivered via ${outcome.via}${onPath}`
+  if (outcome.action === 'hold' && outcome.hold === 'post') {
+    return `held for post via ${outcome.via} in ${outcome.threadRoot} on [${outcome.operations.join(', ')}]${outcome.rootUnknown ? ', root unknown' : ''}${onPath}`
+  }
   if (outcome.action === 'hold') return `held for ${outcome.hold} via ${outcome.via} in ${outcome.threadRoot}${onPath}`
   if ('refusal' in outcome) return `not delivered: ${outcome.reason} (${outcome.refusal})`
   if ('unclaimed' in outcome) return `not delivered: ${outcome.reason} (${outcome.unclaimed ? 'unclaimed' : 'claimed'})`
@@ -77,9 +81,10 @@ function cases<R extends FungibleDecisionRow>(group: FungibleDecisionGroup<R>): 
 
 /** The one assertion of every row: the whole outcome, by strict equality. */
 function expectOutcome(row: FungibleDecisionRow): void {
-  const reads: ThreadRead[] = []
-  expect(decideDelivery(...decisionArgsOf(row, reads))).toStrictEqual(row.expected)
+  const reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []
+  expect(decideDelivery(...decisionArgsOf(row, reads, ownPostReads))).toStrictEqual(row.expected)
   expect(reads).toEqual([...(row.threadReads ?? [])])
+  expect(ownPostReads).toEqual([...(row.ownPostReads ?? [])])
 }
 
 /**
@@ -290,15 +295,17 @@ describe('the decision stays pure', () => {
 
   test('decideDelivery gives every row its outcome with deep-frozen arguments, forwards then in reverse', () => {
     const mismatches = forwardsThenReversed(allRows()).filter(row => {
-      const reads: ThreadRead[] = []
-      const viewsBefore = structuredClone(row.threadViews)
-      const args = frozenCopy(decisionArgsOf(row, reads))
+      const reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []
+      const viewsBefore = structuredClone(row.threadViews), postsBefore = structuredClone(row.ownPosts)
+      const args = frozenCopy(decisionArgsOf(row, reads, ownPostReads))
       const first = decideDelivery(...args)
       const repeated = decideDelivery(...args)
-      const expectedReads = row.threadReads ?? []
+      const expectedReads = row.threadReads ?? [], expectedPostReads = row.ownPostReads ?? []
+      // The lists the reader returns are frozen too, so writing to one throws.
       return !Bun.deepEquals(first, row.expected, true) || !Bun.deepEquals(repeated, first, true) ||
         !Bun.deepEquals(reads, [...expectedReads, ...expectedReads], true) ||
-        !Bun.deepEquals(row.threadViews, viewsBefore, true)
+        !Bun.deepEquals(ownPostReads, [...expectedPostReads, ...expectedPostReads.map(([key, channel, before]) => [key, channel, before + expectedReads.length])], true) ||
+        !Bun.deepEquals(row.threadViews, viewsBefore, true) || !Bun.deepEquals(row.ownPosts, postsBefore, true)
     })
     expect(mismatches.map((row) => row.label)).toEqual([])
   })

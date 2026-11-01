@@ -83,6 +83,7 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
   let divergentReadings = 0, savedReadings = 0, expiredSteps = 0, mcpIndependentRecoveries = 0, recoveryEnters = 0
   let sameSessionResumes = 0, changedSessions = 0
   let heldStates = 0, withdrawnStates = 0, passedHolds = 0, releasedHolds = 0
+  let postHeldStates = 0, passedPostHolds = 0, releasedPostHolds = 0, parkedPostHolds = 0
   const outputs: unknown[][] = []
   for (const [index, record] of rows.entries()) {
     const where = `${envelope.cfg}:${index + 1}`
@@ -113,16 +114,27 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
     // KnowledgeOf/StepKnowledgeOf already project the current durable queue,
     // just as delivery-engine build() does. Preserve that projection rather
     // than substituting the older observation or restoring withdrawn work.
+    // p.held carries parked Post Holds, so they keep build()'s effective kind
+    // `memory`; p.posted holds the unresolved Post Holds.
     const p = record.state.p
+    const unresolved = [...p.held.map((item: number) => ({ item, kind: 'memory' })), ...p.posted.map((item: number) => ({ item, kind: 'post' }))]
+      .filter(hold => !p.withdrawn.includes(hold.item)).sort((a, b) => a.item - b.item)
     for (const knowledge of [k, gate]) {
       assert.deepEqual(knowledge.p.accepted, p.accepted.filter((item: number) => !p.withdrawn.includes(item)), `${where}: withdrawn queue projection differs`)
-      assert.deepEqual(knowledge.holds, record.constants.MaxMemoryHolds > 0
-        ? p.held.map((item: number) => ({ item, kind: 'memory' })) : undefined, `${where}: held queue projection differs`)
+      assert.deepEqual(knowledge.holds, record.constants.MaxMemoryHolds > 0 || record.constants.MaxPostHolds > 0
+        ? unresolved : undefined, `${where}: held queue projection differs`)
     }
     if (p.held.length) heldStates++
+    if (p.posted.length) postHeldStates++
     if (p.withdrawn.length) withdrawnStates++
-    if (index > 0) releasedHolds += rows[index - 1].state.p.held.filter((item: number) =>
-      !p.held.includes(item) && !p.withdrawn.includes(item) && p.accepted.includes(item)).length
+    if (index > 0) {
+      const previous = rows[index - 1].state.p
+      releasedHolds += previous.held.filter((item: number) =>
+        !p.held.includes(item) && !p.withdrawn.includes(item) && p.accepted.includes(item)).length
+      releasedPostHolds += previous.posted.filter((item: number) =>
+        !p.posted.includes(item) && !p.held.includes(item) && !p.withdrawn.includes(item) && p.accepted.includes(item)).length
+      parkedPostHolds += previous.posted.filter((item: number) => p.held.includes(item)).length
+    }
     const before = JSON.stringify([k, gate]), at = clock.now()
     // Abstract positive timers become concrete remaining durations. Time moves
     // only for the explicitly executed timer-expiry edge, never for I/O,
@@ -138,6 +150,7 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
       : [record.EngineChoice, record.GateChoice, record.selectedTarget]
     assert.deepEqual(actual, expected, `${where}: production choice/target mismatch`)
     if (p.held.some((item: number) => item < selected[0])) passedHolds++
+    if (p.posted.some((item: number) => item < selected[0])) passedPostHolds++
     if (actual[0] === 'recordRecoveryEnter') {
       // Separate from the unchanged frozen-state replay above: contrast one
       // input to prove a durable recovery intent does not depend on MCP.
@@ -159,5 +172,6 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
     const before = rows[position - 1], actual = outputs[position - 1]
     assert.notDeepEqual(actual, [before.EngineChoice, before.GateChoice, before.selectedTarget], `${envelope.cfg}:${position}: ineffective choice control`)
   }
-  return { states: rows.length, divergentReadings, savedReadings, expiredSteps, mcpIndependentRecoveries, recoveryEnters, sameSessionResumes, changedSessions, heldStates, withdrawnStates, passedHolds, releasedHolds, elapsed: clock.now() }
+  return { states: rows.length, divergentReadings, savedReadings, expiredSteps, mcpIndependentRecoveries, recoveryEnters, sameSessionResumes, changedSessions, heldStates, withdrawnStates, passedHolds, releasedHolds,
+    postHeldStates, passedPostHolds, releasedPostHolds, parkedPostHolds, elapsed: clock.now() }
 }

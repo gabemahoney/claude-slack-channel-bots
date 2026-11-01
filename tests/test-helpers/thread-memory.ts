@@ -32,6 +32,8 @@ export const THREAD_CHANNELS = SHARED_CHANNEL_IDS
 export const THREAD_ROOTS = { primary: '1700000000.000001', secondary: '1700000000.000002', third: '1700000000.000003' } as const
 export const THREAD_TIME = 1_700_000_000_000
 export const THREAD_STAMP = { incarnation: 'fixture-life', threadHybridSince: 'fixture-since' }
+/** The Slack timestamp `ms` milliseconds after the epoch; own-post issue times are wall-clock milliseconds. */
+export const slackTsOfMs = (ms: number): string => (ms / 1000).toFixed(6)
 export const threadPath = (dir: string, key: string = THREAD_PERSONAS.primary): string => join(dir, 'threads', `${key}.jsonl`)
 /** A removed assignment no longer carries the old fixture counter. Include the
  * durable revision on restart so it cannot mint that forgotten stamp again. */

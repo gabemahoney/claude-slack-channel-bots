@@ -50,6 +50,7 @@ TRACE_SIMULATIONS = {"trace_" + name: {"num": 8, "depth": 256, "seed": 104729 + 
 # Stable cfg inventory makes omission of a control a preflight error.
 CONTROLS = {
     "control_memory_hold": "NoHeldDelivery",
+    "control_post_hold": "PostHoldIsHead",
     "control_next_item": "OneInFlight", "control_next_part": "OneInFlight",
     "control_send_is_delivery": "ReceiptBacked", "control_queue_is_receipt": "TranscriptFIFO",
     "control_start_drop": "NoDrop", "control_compact_open": "NoDrop",
@@ -65,6 +66,14 @@ CONTROLS = {
     "control_replace_observation": "EventuallyDelivered", "control_duplicate_key": "NoDuplicateKey",
     "control_no_head_takein_assumption": "HeadTakenIn",
 }
+# Hold bounds are enabled only in their dedicated configurations.
+MEMORY_HOLD_CASES = {"safety_memory_holds", "restart_memory_holds", "trace_memory_holds", "control_memory_hold",
+                     "safety_post_holds", "trace_post_holds"}
+POST_HOLD_CASES = {"safety_post_holds": "2", "restart_post_holds": "1", "trace_post_holds": "2",
+                   "control_post_hold": "1"}
+# Post Hold positives and their pinned sampling (None: exhaustive).
+POST_HOLD_POSITIVES = {"safety_post_holds": None, "restart_post_holds": None,
+                       "trace_post_holds": {"num": 8, "depth": 256, "seed": 132981}}
 WITNESS_WHAT = ("witness: duplicates are allowed (at-least-once); this row must keep failing; "
                 "never move AtMostOnce into a pass row")
 # b.omv SR-15.5: independent exhaustive cases avoid the four-fault Cartesian
@@ -132,7 +141,7 @@ def reduced_cfg(cfg: str | dict) -> bool:
         if cfg.get("cfg") == VIEW_ONLY_CONTROL:
             return cfg.get("state_reduction") == VIEW_ONLY_REDUCTION
         return cfg.get("state_reduction") == RESTART_REDUCTION
-    return (cfg in RESTART_CASES or cfg in RESTART_MUTATIONS or cfg == "restart_memory_holds"
+    return (cfg in RESTART_CASES or cfg in RESTART_MUTATIONS or cfg in {"restart_memory_holds", "restart_post_holds"}
             or cfg.startswith(("safety_", "live_", "core_"))
             or (cfg in CONTROLS and CONTROLS[cfg] in LIVENESS)
             or cfg in {"probe_premise", "witness_duplicates", VIEW_ONLY_CONTROL})
@@ -141,15 +150,17 @@ def reduced_cfg(cfg: str | dict) -> bool:
 def validate_shared_cfg(cfg: str, content: str, mode: str = "check") -> None:
     tokens = cfg_tokens(content)
     hold_bounds = re.findall(r'^\s*MaxMemoryHolds\s*=\s*(\d+)\s*$', content, re.M)
-    hold_cases = {"safety_memory_holds", "restart_memory_holds", "trace_memory_holds", "control_memory_hold"}
-    require(hold_bounds == (["1"] if cfg in hold_cases else ["0"]),
+    require(hold_bounds == (["1"] if cfg in MEMORY_HOLD_CASES else ["0"]),
             "Memory Holds must be enabled only in their dedicated configurations")
+    post_bounds = re.findall(r'^\s*MaxPostHolds\s*=\s*(\d+)\s*$', content, re.M)
+    require(post_bounds == [POST_HOLD_CASES.get(cfg, "0")],
+            "Post Holds must be enabled only in their dedicated configurations")
     if cfg == "core_head_taken_in":
         expected = {"MaxItems": "1", "MaxParts": "1", "MaxLaunches": "1",
                     "MaxServerStarts": "2", "MaxRetypes": "1", "EnterRetries": "4",
                     "MaxAgentQueue": "2", "Faults": "{}", "PromptFlapping": "TRUE",
                     "Flapping": "FALSE", "Bug": '"none"', "Scenario": '"probe"',
-                    "IdenticalTexts": "FALSE", "MaxMemoryHolds": "0"}
+                    "IdenticalTexts": "FALSE", "MaxMemoryHolds": "0", "MaxPostHolds": "0"}
         require(mode == "check" and tokens.count("CONSTANTS") == 1,
                 "core must retain its exact exhaustive bound contract")
         start = tokens.index("CONSTANTS") + 1
@@ -181,6 +192,7 @@ CONSTANTS
   Scenario = "control"
   IdenticalTexts = FALSE
   MaxMemoryHolds = 0
+  MaxPostHolds = 0
 INVARIANT TypingGuards
 VIEW RestartSafetyView
 ALIAS TraceView
@@ -241,7 +253,7 @@ def validate_restart_cfg(cfg: str, content: str, mode: str = "check") -> None:
                 "the larger restart simulation must retain the raw state space")
     expected = {"MaxItems": "2", "MaxParts": "2", "MaxServerStarts": "2",
                 "EnterRetries": "4", "PromptFlapping": "TRUE", "Flapping": "FALSE",
-                "Bug": '"none"', "IdenticalTexts": "FALSE", "MaxMemoryHolds": "0"}
+                "Bug": '"none"', "IdenticalTexts": "FALSE", "MaxMemoryHolds": "0", "MaxPostHolds": "0"}
     if cfg == RESTART_SIMULATION:
         expected.update(MaxItems="3", MaxLaunches="2", MaxRetypes="3", MaxAgentQueue="11",
                         Faults='{"botRestart", "busyWaiting", "lostEnter", "serverCrash"}',
@@ -496,6 +508,7 @@ def validate_suite(rows: list[dict]) -> None:
     indexed = {row["cfg"]: row for row in rows}
     mandatory = ORIGINAL_POSITIVES | set(TRACE_SIMULATIONS) | set(RESTART_CASES) | {RESTART_SIMULATION}
     mandatory |= {"safety_memory_holds", "restart_memory_holds", "trace_memory_holds"}
+    mandatory |= set(POST_HOLD_POSITIVES)
     require(mandatory <= indexed.keys(), f"missing original positive rows: {sorted(mandatory-indexed.keys())}")
     require(all(indexed[cfg]["expect"] == "pass" for cfg in mandatory), "positive row converted to a control")
     for cfg in ("safety_memory_holds", "restart_memory_holds", "trace_memory_holds"):
@@ -507,6 +520,14 @@ def validate_suite(rows: list[dict]) -> None:
                     "Memory Hold trace sampling changed")
         require(set(row["checks"]) == expected_checks and not row["properties"],
                 "Memory Hold cases must check the full safety inventory")
+    for cfg, simulation in POST_HOLD_POSITIVES.items():
+        row = indexed[cfg]
+        expected_checks = SAFETY | {"TypeOK", "NoHeldDelivery", "PostHoldIsHead"}
+        if simulation:
+            expected_checks |= {"EmitSimulationTrace"}
+        require(row["simulation"] == simulation and set(row["checks"]) == expected_checks
+                and len(row["checks"]) == len(expected_checks) and not row["properties"],
+                "Post Hold cases must check the full safety inventory and their pinned sampling")
     for cfg, parameters in TRACE_SIMULATIONS.items():
         require(indexed[cfg]["mode"] == "simulate" and indexed[cfg]["simulation"] == parameters,
                 f"original simulation parameters changed: {cfg}")

@@ -9,7 +9,7 @@ import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { deliveredRecord, fixedRecord, heldSlackInput, memoryHold, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, heldSlackInput, memoryHold, postHold, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { THREAD_ROOTS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
@@ -61,10 +61,10 @@ const joinedMention = (overrides: Partial<AcceptedInput> = {}) => slackInput({
   thread_join: { thread_ts: THREAD_ROOT, stamp: { ...THREAD_STAMP }, at: 1000 }, ...overrides,
 })
 
-test('Memory Holds never get reminders until release and durable delivery; withdrawal stays ineligible', async () => {
+test.each([['Memory', memoryHold], ['Post', postHold]] as const)('%s Holds never get reminders until release and durable delivery; withdrawal stays ineligible', async (_, field) => {
   const clock = createFakeClock(), q = await open({ now: clock.now }), h = harness(q)
   for (const ts of [THREAD_ROOTS.secondary, THREAD_ROOTS.third]) {
-    const input = heldSlackInput(memoryHold(clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
+    const input = heldSlackInput(field(clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
     expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
   }
   await q.resolveHolds('alpha', [{ seq: 2, outcome: 'withdrawn', at: clock.now() }])

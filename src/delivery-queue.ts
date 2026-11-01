@@ -16,11 +16,19 @@ export type DeliverySource = 'slack' | 'interject' | 'cron'
 export interface SlackKey { chat_id: string; ts: string; edited_ts?: string }
 export interface QueueFile { name: string; mimetype?: string; size?: number }
 export interface QueueThreadJoin { thread_ts: string; stamp: ChannelStamp; at: number }
-export interface HoldField { on: 'memory'; thread_ts: string; stamp: ChannelStamp; arrived_at: number }
+export interface MemoryHoldField { on: 'memory'; thread_ts: string; stamp: ChannelStamp; arrived_at: number }
+/** Waits on the named Pending Own Posts; root_unknown records the view at arrival. */
+export interface PostHoldField {
+  on: 'post'; operations: readonly string[]; thread_ts: string; stamp: ChannelStamp; root_unknown: boolean; arrived_at: number
+}
+export type HoldField = MemoryHoldField | PostHoldField
+export type HoldKind = HoldField['on']
 export type HoldOutcome = 'released' | 'withdrawn' | 'parked'
 export interface HoldResolution { seq: number; outcome: HoldOutcome; at: number }
-export interface UnresolvedHold extends HoldField { seq: number; channel: string; memoryDependent: boolean }
-export interface HoldSummary { field: HoldField; state: 'unresolved' | 'released' | 'withdrawn'; at?: number }
+/** A parked Post Hold is listed in the Memory Hold form. */
+export type UnresolvedHold = HoldField & { seq: number; channel: string; memoryDependent: boolean }
+/** kind is the effective kind: a parked Post Hold is a Memory Hold. */
+export interface HoldSummary { field: HoldField; kind: HoldKind; state: 'unresolved' | 'released' | 'withdrawn'; at?: number }
 export interface AcceptedInput {
   source: DeliverySource
   text: string
@@ -174,9 +182,18 @@ function isQueueThreadJoin(v: unknown): v is QueueThreadJoin {
     Object.keys(v.stamp).every(k => ['incarnation', 'threadHybridSince'].includes(k))
 }
 function isHoldField(v: unknown): v is HoldField {
-  return object(v) && v.on === 'memory' && number(v.arrived_at) &&
-    Object.keys(v).every(k => ['on', 'thread_ts', 'stamp', 'arrived_at'].includes(k)) &&
-    isQueueThreadJoin({ thread_ts: v.thread_ts, stamp: v.stamp, at: v.arrived_at })
+  if (!object(v) || !number(v.arrived_at) || !isQueueThreadJoin({ thread_ts: v.thread_ts, stamp: v.stamp, at: v.arrived_at })) return false
+  if (v.on === 'memory') return Object.keys(v).every(k => ['on', 'thread_ts', 'stamp', 'arrived_at'].includes(k))
+  return v.on === 'post' && typeof v.root_unknown === 'boolean' && Array.isArray(v.operations) && v.operations.length > 0 &&
+    v.operations.every(o => str(o) && o !== '') && new Set(v.operations).size === v.operations.length &&
+    Object.keys(v).every(k => ['on', 'operations', 'thread_ts', 'stamp', 'root_unknown', 'arrived_at'].includes(k))
+}
+function memoryForm(field: HoldField): MemoryHoldField {
+  return { on: 'memory', thread_ts: field.thread_ts, stamp: field.stamp, arrived_at: field.arrived_at }
+}
+function unresolvedEntry(field: HoldField, kind: HoldKind, seq: number, channel: string): UnresolvedHold {
+  if (field.on === 'post' && kind === 'post') return { ...field, seq, channel, memoryDependent: field.root_unknown }
+  return { ...memoryForm(field), seq, channel, memoryDependent: true }
 }
 function isHoldResolution(r: QueueRecord): r is HoldResolutionRecord { return r.kind === 'released' || r.kind === 'withdrawn' || r.kind === 'parked' }
 /** Structural on-disk schema. Invalid versions/kinds and partial records are never replayed. */
@@ -277,18 +294,24 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     if (item.fixed) item.delivered = item.fixed.parts.every((_, i) => records.some(r => r.kind === 'delivered' && r.part === i + 1))
     if (accepted.hold) {
-      const resolution = records.find((r): r is HoldResolutionRecord => r.kind === 'released' || r.kind === 'withdrawn')
-      item.hold = { field: accepted.hold, state: 'unresolved' }
-      if (resolution) item.hold = { field: accepted.hold, state: resolution.kind as 'released' | 'withdrawn', at: resolution.at }
+      const field = accepted.hold
+      const first = records.findIndex(r => r.kind === 'released' || r.kind === 'withdrawn')
+      const resolution = first < 0 ? undefined : records[first] as HoldResolutionRecord
+      // Only parking before the first saved resolution, of a Post Hold whose
+      // root was unknown at arrival, turns it into a Memory Hold.
+      const parked = field.on === 'post' && field.root_unknown && (first < 0 ? records : records.slice(0, first)).some(r => r.kind === 'parked')
+      const kind: HoldKind = parked ? 'memory' : field.on
+      item.hold = { field, kind, state: 'unresolved' }
+      if (resolution) item.hold = { field, kind, state: resolution.kind as 'released' | 'withdrawn', at: resolution.at }
       else if (records.some(r => r.kind === 'fixed' || r.kind === 'sent' || r.kind === 'delivered')) {
         const times = records.flatMap(r => r.kind === 'sent' || r.kind === 'delivered' ? [r.at] : [])
-        item.hold = { field: accepted.hold, state: 'released', at: times.length ? Math.min(...times) : accepted.received_at }
+        item.hold = { field, kind, state: 'released', at: times.length ? Math.min(...times) : accepted.received_at }
       }
     }
     return item
   }
   function indexHold(j: Journal, item: QueueItem): void {
-    if (item.hold?.state === 'unresolved') j.holds.set(item.accepted.seq, { ...item.hold.field, seq: item.accepted.seq, channel: item.accepted.channel!, memoryDependent: true })
+    if (item.hold?.state === 'unresolved') j.holds.set(item.accepted.seq, unresolvedEntry(item.hold.field, item.hold.kind, item.accepted.seq, item.accepted.channel!))
     else j.holds.delete(item.accepted.seq)
   }
   function indexRecord(j: Journal, record: QueueRecord): void {
@@ -460,6 +483,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const removable = new Set(item.records.flatMap(r => r.kind === 'sent' && !('unknown_outcome' in r) && refused.has(r.attempt) ? [r.attempt] : []))
         const accepted = { ...item.accepted, attempt_high_watermark: item.nextAttempt - 1 }
         if (item.hold?.state === 'released') { delete accepted.hold; accepted.via = 'thread'; accepted.released_at = item.hold.at }
+        // A parked Post Hold keeps only the Memory Hold form; its parked record goes below.
+        else if (item.hold?.kind === 'memory' && item.hold.field.on === 'post') accepted.hold = memoryForm(item.hold.field)
         retained.push(accepted)
         retained.push(...item.records.filter(r => r.kind !== 'accepted' && !isHoldResolution(r) && !((r.kind === 'sent' || r.kind === 'refused') && removable.has(r.attempt))))
       }
@@ -502,7 +527,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
     const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
     if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
-    if (record.hold) storingHolds.set(key, { ...record.hold, seq: record.seq, channel: record.channel!, memoryDependent: true })
+    if (record.hold) storingHolds.set(key, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
     try {
       durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
       update(j, record)
@@ -702,7 +727,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           load(key)
           const j = journal(key), seen = new Set<number>(), saved: HoldResolution[] = []
           for (const resolution of copy) {
-            if (!j.holds.has(resolution.seq) || seen.has(resolution.seq)) continue
+            const hold = j.holds.get(resolution.seq)
+            if (!hold || seen.has(resolution.seq)) continue
+            // Only an unparked Post Hold whose root was unknown at arrival parks.
+            if (resolution.outcome === 'parked' && !(hold.on === 'post' && hold.root_unknown)) continue
             const record = { v: 1 as const, kind: resolution.outcome, seq: resolution.seq, at: resolution.at }
             if (!isQueueRecord(record) || !isHoldResolution(record)) throw new Error('Invalid hold resolution')
             saved.push(resolution); seen.add(resolution.seq)

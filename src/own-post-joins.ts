@@ -251,8 +251,12 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
   const api: OwnPostJoins = {
     startOperation: (key, surface, target, content) => safely(undefined, () => startOperation(key, surface, target, content)),
     endOperation: (operation, answer) => safely(undefined, () => endOperation(operation, answer)),
+    // Only a post whose intent is kept can join (SR-1.2.4). An intent kept in
+    // memory during an outage or an unreadable journal still counts; one
+    // keepIntent refused never can.
     pendingOwnPosts: (key, channel) => safely([], () => [...importIntents(key).values()].filter(entry =>
-      entry.post.channel === channel && entry.post.state !== 'decided' && stampState(entry.post) === 'current').map(snapshot)),
+      entry.intentKept && entry.post.channel === channel && entry.post.state !== 'decided' &&
+      stampState(entry.post) === 'current').map(snapshot)),
     unknownOwnPosts: key => safely([], () => [...importIntents(key).values()].filter(entry => entry.post.state === 'unknown' && entry.post.stamp !== undefined).map(snapshot)),
     operation: (key, operationId) => safely(undefined, () => { const entry = importIntents(key).get(operationId); return entry ? snapshot(entry) : undefined }),
     awaitingUploads: (key, channel) => safely([], () => [...importIntents(key).values()].filter(entry =>

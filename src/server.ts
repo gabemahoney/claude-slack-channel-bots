@@ -214,7 +214,7 @@ import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
-import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, ownPostStampState, type OwnPostJoins } from './own-post.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, ownPostStampState, pendingOwnPostViews, type OwnPostJoins } from './own-post.ts'
 import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from './own-post-lookup.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
@@ -1228,7 +1228,11 @@ export const threadMemorySealEvents = { emit: (event: ThreadMemorySealEvent): vo
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
 /** binds event handling here; supplies facts without notices or wording. */
-export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }
+export const deliveryQueueEvents = { emit: (event: QueueEvent): void => {
+  // A saved withdrawal or parking unblocks the FIFO with no new traffic.
+  if (event.type === 'holds-resolved') { try { deliveryQueueWake.wake(event.key) } catch { /* the next tick still delivers */ } }
+  if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event)
+} }
 /** engine binds this hook after startup; until then queued work waits. */
 export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
@@ -1273,6 +1277,8 @@ const personaRouting = createPersonaRouting({
     ownPostJoins?.settleDeferred(key, channel)
     return threadMemory?.view(key, channel, root) ?? 'unknown'
   },
+  // The one owner's in-memory posts under the current stamp; none before it exists.
+  pendingOwnPosts: (key, channel) => pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? []),
   joins: {
     stamp: (key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined,
     hasSavedJoin: (key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false,

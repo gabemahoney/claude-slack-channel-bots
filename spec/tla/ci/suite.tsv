@@ -79,3 +79,7 @@ memory-holds	PersonaDelivery	safety_memory_holds	1800	pass	fast	constrained exha
 memory-holds	PersonaDelivery	restart_memory_holds	1800	pass	fast	constrained exhaustive Memory Hold resolution across server restart; full safety	-
 memory-holds	PersonaDelivery	control_memory_hold	1800	violation	fast	control: select an unresolved Memory Hold; target NoHeldDelivery	NoHeldDelivery
 memory-holds	PersonaDelivery	trace_memory_holds	1800	pass	fast	simulate num=8 depth=256 seed=112801; Memory Holds, resolution and storage recovery	-
+post-holds	PersonaDelivery	safety_post_holds	1800	pass	fast	constrained exhaustive Post Hold release, withdrawal and parking beside a Memory Hold, and release at a same-run bring-up; full safety including the Post Hold head	-
+post-holds	PersonaDelivery	restart_post_holds	1800	pass	fast	constrained exhaustive Post Hold release at server restart; full safety including the Post Hold head	-
+post-holds	PersonaDelivery	control_post_hold	1800	violation	fast	control: pass an unresolved Post Hold like a Memory Hold; target PostHoldIsHead	PostHoldIsHead
+post-holds	PersonaDelivery	trace_post_holds	1800	pass	fast	simulate num=8 depth=256 seed=132981; Post Holds beside a Memory Hold, resolution, restart and bring-up	-

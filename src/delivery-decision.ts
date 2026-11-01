@@ -1,8 +1,11 @@
-/** Pure selection over the applied shared choices, Thread Memory view and current
- * authenticated membership. An unresolved decision withholds acknowledgement;
- * it is distinct from an established exclusion. DMs and message/author filters
- * precede channel authority. A `thread_hybrid` channel selects @mentions,
- * Broadcasts and replies in threads the persona is in, from Thread Memory.
+/** Pure selection over the applied shared choices, Thread Memory view, Pending
+ * Own Posts and current authenticated membership. An unresolved decision
+ * withholds acknowledgement; it is distinct from an established exclusion. DMs
+ * and message/author filters precede channel authority. A `thread_hybrid`
+ * channel selects @mentions, Broadcasts and replies in threads the persona is
+ * in, from Thread Memory. A reply not known to be in one is held for the
+ * persona's Pending Own Posts that could put it there (a Post Hold), else held
+ * while Thread Memory is unknown (a Memory Hold).
  * SPDX-License-Identifier: MIT
  */
 import type { ChannelEntry, ChannelMode, DeliveryMode } from './config.ts'
@@ -156,10 +159,34 @@ export type DropDecision =
       refusal: FungibleRefusal
     }
 
-/** Outcome of `decideDelivery` for one receiving persona. */
-export type DeliveryDecision = DeliverDecision | DropDecision | {
+/** A held reply: a Post Hold names every covering post, in the list's order;
+ * `rootUnknown` is true when P's Thread Memory view of the root was unknown. */
+export type HoldDecision = {
   action: 'hold'; hold: 'memory'; via: 'thread'; threadRoot: string; fungible?: FungiblePath
 } | {
+  action: 'hold'; hold: 'post'; via: 'thread'; threadRoot: string; operations: string[]; rootUnknown: boolean; fungible?: FungiblePath
+}
+
+/** One of P's Pending Own Posts as the decision reads it. `root` is the
+ * requested parent's Thread Root, absent for a new channel message; `issuedAt`
+ * is the wall-clock issue time in milliseconds. */
+export interface PendingOwnPostView {
+  operation: string
+  root?: string
+  issuedAt: number
+}
+
+/** P's Pending Own Posts and the clock skew their issue times are compared
+ * with, supplied together so issue-time coverage can't be left out. */
+export interface OwnPostsDecisionInput {
+  /** Synchronous, read-only: P's posts in the channel under the current Channel Stamp. */
+  pending(key: string, channel: string): readonly PendingOwnPostView[]
+  /** `OWN_ROOT_CLOCK_SKEW_MS`. */
+  clockSkewMs: number
+}
+
+/** Outcome of `decideDelivery` for one receiving persona. */
+export type DeliveryDecision = DeliverDecision | DropDecision | HoldDecision | {
   action: 'unresolved'
   reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing' | 'thread-stamp-undecided'
 }
@@ -192,6 +219,8 @@ export interface ChannelDeliveryInputs {
 export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
   /** Synchronous, read-only Thread Memory lookup, used only for dependent replies. */
   threadMemory?(key: string, channel: string, threadRoot: string): ThreadMemoryView
+  /** Read only for a reply not known to be joined. */
+  ownPosts?: OwnPostsDecisionInput
   /** Shared-state restoration may hold a stamp while choices remain readable. */
   threadStampUndecided?(key: string, channel: string): boolean
   /** Current, synchronous observations for this event's channel, by persona.
@@ -286,7 +315,7 @@ export function decideDelivery(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention' }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast' }
-  if (saved === 'thread_hybrid') return decideThreadReply(ev, persona.key, channel, fungible)
+  if (saved === 'thread_hybrid') return decideThreadReply(ev, persona, channel, fungible)
   if (saved !== 'all') return { action: 'drop', reason: 'not-mentioned' }
   const shared = applied.some((p) =>
     p.key !== persona.key && !channelAvailability(p.key, channel, fungible) &&
@@ -322,7 +351,7 @@ function decideFungibleChannel(
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention', fungible: path }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast', fungible: path }
-  if (path.channelDelivery === 'thread_hybrid') return decideThreadReply(ev, persona.key, channel, inputs, path)
+  if (path.channelDelivery === 'thread_hybrid') return decideThreadReply(ev, persona, channel, inputs, path)
   if (path.channelDelivery !== DELIVERY_ALL) return { action: 'drop', reason: 'not-mentioned', fungible: path }
   const shared = applied.some((other) =>
     other.key !== persona.key && !channelAvailability(other.key, channel, inputs) &&
@@ -330,11 +359,17 @@ function decideFungibleChannel(
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all', fungible: path }
 }
 
-/** Only eligible thread_hybrid channels reach this branch, after mentions and broadcasts. */
+/**
+ * Only eligible thread_hybrid channels reach this branch, after mentions and
+ * broadcasts. A joined thread's reply is delivered. Otherwise, after the view
+ * lookup (which settles deferred own-post joins), a reply that a Pending Own
+ * Post could put P in gets a Post Hold; an unknown root gets a Memory Hold.
+ */
 function decideThreadReply(
-  ev: Record<string, unknown>, key: string, channel: string,
+  ev: Record<string, unknown>, persona: Pick<DeliveryPersona, 'key' | 'botUserId'>, channel: string,
   inputs: FungibleDecisionInputs | undefined, path?: FungiblePath,
 ): DeliveryDecision {
+  const key = persona.key
   const context = path ? { fungible: path } : {}
   const notMentioned: DropDecision = { action: 'drop', reason: 'not-mentioned', ...context }
   const root = replyThreadRoot(ev)
@@ -342,8 +377,47 @@ function decideThreadReply(
   if (inputs?.threadStampUndecided?.(key, channel) === true) return { action: 'unresolved', reason: 'thread-stamp-undecided' }
   if (!inputs?.threadMemory) return notMentioned
   const view = inputs.threadMemory(key, channel, root)
+  if (view === 'joined') return { action: 'deliver', via: 'thread', ...context }
+  if (inputs.ownPosts) {
+    const operations = coveringPosts(inputs.ownPosts.pending(key, channel), root, ev['parent_user_id'], persona.botUserId, inputs.ownPosts.clockSkewMs)
+    if (operations.length) {
+      return { action: 'hold', hold: 'post', via: 'thread', threadRoot: root, operations, rootUnknown: view === 'unknown', ...context }
+    }
+  }
   if (view === 'unknown') return { action: 'hold', hold: 'memory', via: 'thread', threadRoot: root, ...context }
-  return view === 'joined' ? { action: 'deliver', via: 'thread', ...context } : notMentioned
+  return notMentioned
+}
+
+/**
+ * The operation IDs, once each in list order, of the posts that could put P
+ * in the reply's thread: one under the same Thread Root, or a pending new
+ * channel message whose issue time less the clock skew is no later than the
+ * Thread Root, when `parent_user_id` is P's bot user or absent (an empty or
+ * non-string value counts as absent). Pure.
+ */
+function coveringPosts(
+  posts: readonly PendingOwnPostView[], root: string, parentUserId: unknown, botUserId: string | undefined,
+  skewMs: number,
+): string[] {
+  const parent = nonEmptyString(parentUserId)
+  const ownThread = parent === undefined || parent === nonEmptyString(botUserId)
+  const rootMicros = timestampMicros(root)
+  const operations: string[] = []
+  for (const post of posts) {
+    const covers = post.root !== undefined
+      ? post.root === root
+      // Exact: a bigint compared with a number compares their values; a
+      // non-finite issue time covers nothing.
+      : ownThread && Number.isFinite(post.issuedAt) && rootMicros >= (post.issuedAt - skewMs) * 1000
+    if (covers && !operations.includes(post.operation)) operations.push(post.operation)
+  }
+  return operations
+}
+
+/** A Slack timestamp as whole microseconds; `ts` is a valid thread timestamp. */
+function timestampMicros(ts: string): bigint {
+  const [seconds, fraction] = ts.split('.') as [string, string]
+  return BigInt(seconds) * 1_000_000n + BigInt(fraction)
 }
 
 /** A root message's own timestamp never makes that message a thread reply. */

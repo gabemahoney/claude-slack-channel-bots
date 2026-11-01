@@ -1,6 +1,7 @@
 /** Durable Slack intake and existing message-triggered recovery. Hybrid-channel
- * decisions, joins and Memory Holds share the queue's writer turn. Holds are
- * acknowledged on storage and enter reporting/preparation only on release. */
+ * decisions, joins, Post Holds and Memory Holds share the queue's writer turn.
+ * Holds are acknowledged on storage and enter reporting/preparation only on
+ * release; nothing before the ack waits on a post's outcome. */
 import {
   CHANNEL_ID_RE,
   DEFAULT_QUEUED_ACK_REACTION,
@@ -21,6 +22,7 @@ import {
   type DropDecision,
   type FungibleDecisionInputs,
   type FungiblePath,
+  type OwnPostsDecisionInput,
   type StoredChoices,
 } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
@@ -38,6 +40,7 @@ import {
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
 import type { DeliveryQueue, QueueItem, AcceptedInput, SlackKey } from './delivery-queue.ts'
 import { isOpenItem } from './delivery-queue.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS } from './delivery-constants.ts'
 import type { ThreadMemory, ThreadJoin, ThreadMemoryStampState } from './thread-memory.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
@@ -95,6 +98,8 @@ interface SerialSelection {
 export interface PersonaRoutingDeps {
   /** Read the live Thread Memory view only when the decision needs a reply's membership. */
   threadMemory?: FungibleDecisionInputs['threadMemory']
+  /** P's in-memory Pending Own Posts, read only for a reply not known to be joined. No I/O. */
+  pendingOwnPosts?: OwnPostsDecisionInput['pending']
   /** Join reads/additions are synchronous; saves run only after the ack attempt. */
   joins?: RoutingThreadJoins
   /** Pure stamp observation; independent selection never depends on it. */
@@ -249,8 +254,8 @@ export interface PersonaRouting {
    * targets, add any in-memory join, ack only after every store succeeds, then
    * save joins, report, recover and fix text. Hybrid-channel key checks,
    * decisions, stores and joins share each persona's serial queue turn;
-   * other events retain their outside key check and decision. Stored Memory
-   * Holds get the ack, but no reporting or preparation until release.
+   * other events retain their outside key check and decision. Stored Post and
+   * Memory Holds get the ack, but no reporting or preparation until release.
    * Each target is isolated; a failed store suppresses the aggregate ack.
    *
    * `isExtSharedChannel` is the envelope flag: the Events API
@@ -367,6 +372,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
                 try { void deps.joins?.saveJoins(key, [fact]).catch(() => {}) } catch { /* kept join is recovered independently */ }
               })
             }
+            // Any unresolved hold, Post or Memory, is acknowledged but not open work.
             if (result.item?.hold?.state === 'unresolved') heldKeys.add(key)
             if (result.item && isOpenItem(result.item) && (result.status !== 'duplicate' || !result.item.fixed)) {
               report(result.item); afterAck.push(post(result.item))
@@ -479,7 +485,10 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         delete selection.input
         return { ...selection, requestMembership: true }
       }
-      selection.input.hold = { on: 'memory', thread_ts: decision.threadRoot, stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, arrived_at: joins.clock(key) }
+      const holdStamp = { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, arrived_at = joins.clock(key)
+      selection.input.hold = decision.hold === 'post'
+        ? { on: 'post', operations: [...decision.operations], thread_ts: decision.threadRoot, stamp: holdStamp, root_unknown: decision.rootUnknown, arrived_at }
+        : { on: 'memory', thread_ts: decision.threadRoot, stamp: holdStamp, arrived_at }
       return selection
     }
     if (!joins || (decision.via !== 'mention' && decision.via !== 'broadcast') || 'edited' in ev || ev['subtype'] === 'message_changed' ||
@@ -550,6 +559,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       channelIdPattern: CHANNEL_ID_RE,
       storedChoices: deps.getChannelDelivery?.() ?? undefined,
       threadMemory: deps.threadMemory,
+      ...(deps.pendingOwnPosts ? { ownPosts: { pending: deps.pendingOwnPosts, clockSkewMs: OWN_ROOT_CLOCK_SKEW_MS } } : {}),
       threadStampUndecided: deps.threadStampUndecided,
       memberships,
     }

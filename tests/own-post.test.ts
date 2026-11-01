@@ -7,17 +7,19 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DELIVERY_MODES, type ChannelMode } from '../src/config.ts'
+import { CHANNEL_ID_RE, DELIVERY_MODES, channelModeOf, type ChannelMode } from '../src/config.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
+import { decideDelivery, type DeliveryDecision } from '../src/delivery-decision.ts'
 import { completionFiles, createOwnPostJoins, createOwnPostObserver,
-  ownPostAnswerOfError, ownPostAnswerOfPost, ownPostChoice, ownPostEligibility,
+  ownPostAnswerOfError, ownPostAnswerOfPost, ownPostChoice, ownPostEligibility, pendingOwnPostViews,
   type OwnPostAnswer, type OwnPostContent, type OwnPostEvent, type OwnPostOperation, type OwnPostOwner,
 } from '../src/own-post.ts'
 import { SHARED_CHANNEL_IDS, makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
-import { makeThreadMemoryHarness, readThreads, threadFsControls, threadPath, type ThreadHarnessOptions } from './test-helpers/thread-memory.ts'
+import { makeThreadMemoryHarness, readThreads, slackTsOfMs, threadFsControls, threadPath, type ThreadHarnessOptions } from './test-helpers/thread-memory.ts'
 import { makeQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { makeStubSlack, slackPlatformError, slackRateLimited, slackHttpError, slackRequestError, slackAbortError } from './test-helpers/slack-stub.ts'
+import { makeChannelMessage, makeStubSlack, slackPlatformError, slackRateLimited, slackHttpError, slackRequestError, slackAbortError } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 
 const C = SHARED_CHANNEL_IDS.primary, C2 = SHARED_CHANNEL_IDS.secondary
@@ -140,7 +142,8 @@ describe('Slack answer classifiers', () => {
 })
 
 /** Same readers as server.ts; Slack and filesystem faults are the external seams. */
-async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedIdentity?: boolean; reopen?: string; memory?: ThreadHarnessOptions; start?: boolean } = {}) {
+async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedIdentity?: boolean; reopen?: string; memory?: ThreadHarnessOptions; start?: boolean
+  operationId?: () => string } = {}) {
   const dir = options.reopen ?? mkdtempSync(join(tmpdir(), 'own-post-'))
   if (!options.reopen) cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
   const members = makeMembershipHarness(dir, { mode: options.mode ?? 'strict', names: options.names,
@@ -165,7 +168,7 @@ async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedId
   let dryRun = false, serial = 0
   const rawOwner = createOwnPostJoins({ memory: h.memory, lookupSlackKey: queue.lookupSlackKey,
     choice: ownPostChoice(sources), eligibility: ownPostEligibility(sources), now: h.clock.now,
-    operationId: () => 'post-' + ++serial, isDryRun: () => dryRun })
+    operationId: options.operationId ?? (() => 'post-' + ++serial), isDryRun: () => dryRun })
   const owner = { ...rawOwner,
     pendingOwnPosts: (...args: Parameters<typeof rawOwner.pendingOwnPosts>) => capture(rawOwner.pendingOwnPosts(...args)),
     unknownOwnPosts: (...args: Parameters<typeof rawOwner.unknownOwnPosts>) => capture(rawOwner.unknownOwnPosts(...args)),
@@ -236,6 +239,31 @@ async function savedOutcome(h: Fixture, id: string, expected: 'joined' | 'none',
   expect(h.records(key).filter(r => r.kind === 'post-outcome' && r.operationId === id)).toMatchObject([{ outcome: expected }])
   expect(h.memory.unresolvedIntents(key).some(r => r.operationId === id)).toBe(false)
 }
+
+/** P's decision on a person's unmentioned reply under `root`, with every input
+ * read as src/server.ts and routing supply them: the view adapter settles
+ * deferred joins first, and Pending Own Posts go through `pendingOwnPostViews`.
+ * It mirrors src/persona-routing.ts's `fungibleInputs` by hand, so it checks the
+ * owner's listing, not routing's composition. The routing cases in
+ * tests/persona-routing.test.ts "Post Hold routing through real own posts"
+ * guard the real composition, and server-startup-wiring's harness mirror pins
+ * the harness's binding to src/server.ts's. */
+function decideReply(h: Fixture, root: string, key = 'alpha'): DeliveryDecision {
+  const config = h.authority.config(), mode = channelModeOf(config), persona = config.personas.find(p => p.key === key)!
+  const identity = h.members.h.stub(h.members.h.p(key)).identity
+  const event = makeChannelMessage({ channel: C, ts: '1700000000.000900', thread_ts: root, text: 'an unmentioned reply' })
+  return decideDelivery(event, { key, botUserId: identity.botUserId, botId: identity.botId, channels: persona.channels, dmEnabled: persona.dm.enabled },
+    config.personas, {
+      mode, isExtSharedChannel: false, channelIdPattern: CHANNEL_ID_RE, storedChoices: h.choices,
+      memberships: new Map(config.personas.map(p => [p.key, h.members.membership.read(p.key, C, mode)])),
+      threadMemory: (k, channel, thread) => { h.owner.settleDeferred(k, channel); return h.memory.view(k, channel, thread) },
+      ownPosts: { pending: (k, channel) => pendingOwnPostViews(h.owner.pendingOwnPosts(k, channel)), clockSkewMs: OWN_ROOT_CLOCK_SKEW_MS },
+      threadStampUndecided: (k, channel) => h.authority.channelStamp(k, channel)?.kind === 'undecided',
+    })
+}
+/** The Post Hold outcome for a reply under `root` covered by `operations`. */
+const heldFor = (root: string, operations: string[], rootUnknown = false): DeliveryDecision =>
+  ({ action: 'hold', hold: 'post', via: 'thread', threadRoot: root, operations, rootUnknown })
 
 const UPLOAD = 'F0UPLOAD1'
 /** A parentless upload confirmed by file ID alone: it awaits its own share's thread. */
@@ -523,6 +551,94 @@ describe('own-post eligibility and deferred joins', () => {
     expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'deferred', outcome: { joined: false } })
     expect(h.records().filter(r => r.kind === 'post-intent' || r.kind === 'post-outcome')).toHaveLength(0)
     expect(h.owner.memoryOnlyJoins('alpha')).toEqual([{ channel: C, root: ROOT }])
+  })
+})
+
+describe('Pending Own Posts for Post Holds', () => {
+  test.each([
+    ['a duplicate operation ID', ['post-dup', 'post-dup']],
+    ['an invalid operation ID', ['post-first', 'post.invalid']],
+  ] as const)('a post whose intent keepIntent refuses for %s is never listed and covers no reply', async (_label, ids) => {
+    const queue = [...ids], h = await fixture({ operationId: () => queue.shift()! })
+    const first = h.begin(ROOT)
+    await first.ready
+    // Decided but its outcome not yet saved: its intent is still in the journal.
+    h.observer.end(first.operation, await postAnswer({ ts: REPLY, message: { thread_ts: ROOT } }))
+    expect(h.view(ROOT)).toBe('joined')
+    const refused = h.begin(ROOT2)
+    expect(refused.ready).toBeUndefined()
+    expect(h.owner.operation('alpha', refused.id)).toMatchObject({ state: 'awaiting-answer', root: ROOT2, stamp: h.fact().stamp })
+    expect(h.pending()).toEqual([])
+    expect(decideReply(h, ROOT2)).toEqual({ action: 'drop', reason: 'not-mentioned' })
+    await h.flush()
+    expect(h.records().filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual([first.id])
+  })
+
+  test.each(['Thread Memory not saved', 'unreadable journal'] as const)('%s: an intent kept only in memory is listed and covers its reply', async outage => {
+    let h = await fixture(), unknownRoot = false
+    if (outage === 'Thread Memory not saved') {
+      h.io.fail('writeSync')
+      const failed = h.begin(ROOT); await failed.ready
+      expect(h.memory.saveBlocked('alpha')).toBe(true)
+    } else {
+      await h.close()
+      const io = threadFsControls(h.dir); io.fail('readFileSync')
+      h = await fixture({ reopen: h.dir, memory: { fs: io } })
+      expect(h.memory.store('alpha')?.readable).toBe(false)
+      unknownRoot = true
+    }
+    const post = h.begin(ROOT2)
+    expect(post.ready).toBeUndefined()
+    expect(h.pending().filter(p => p.root === ROOT2)).toMatchObject([{ operationId: post.id, state: 'awaiting-answer', stamp: h.fact().stamp }])
+    expect(decideReply(h, ROOT2)).toEqual(heldFor(ROOT2, [post.id], unknownRoot))
+    expect(h.records().filter(r => r.kind === 'post-intent' && r.operationId === post.id)).toEqual([])
+  })
+
+  test('a saved intent is listed and covers a reply under its root, or by issue time for a new message', async () => {
+    const h = await fixture(), issuedAt = h.clock.now()
+    const reply = h.begin(ROOT), message = h.begin()
+    await Promise.all([reply.ready, message.ready])
+    expect(h.records().filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual([reply.id, message.id])
+    expect(h.pending()).toMatchObject([{ operationId: reply.id, root: ROOT }, { operationId: message.id }])
+    expect(h.pending()[1]!.root).toBeUndefined()
+    expect(pendingOwnPostViews(h.pending())).toEqual([{ operation: reply.id, root: ROOT, issuedAt }, { operation: message.id, issuedAt }])
+    // The new message, issued after ROOT less the skew, also covers ROOT.
+    expect(decideReply(h, ROOT)).toEqual(heldFor(ROOT, [reply.id, message.id]))
+    const bound = slackTsOfMs(issuedAt - OWN_ROOT_CLOCK_SKEW_MS)
+    expect(decideReply(h, bound)).toEqual(heldFor(bound, [message.id]))
+    expect(decideReply(h, slackTsOfMs(issuedAt - OWN_ROOT_CLOCK_SKEW_MS - 1))).toEqual({ action: 'drop', reason: 'not-mentioned' })
+  })
+
+  test('a start under an undecided stamp is listed only once the decided stamp keeps its intent', async () => {
+    const h = await fixture()
+    h.undecided()
+    const post = h.begin(ROOT)
+    expect(post.ready).toBeUndefined()
+    expect(h.pending()).toEqual([])
+    expect(decideReply(h, ROOT)).toMatchObject({ action: 'unresolved' })
+    h.decideStamp()
+    expect(h.pending()).toEqual([])
+    // The decision's view lookup settles the deferred intent before the read.
+    // The undecided application left the switched mode in force: open mode's path.
+    expect(channelModeOf(h.authority.config())).toBe('open')
+    expect(decideReply(h, ROOT)).toEqual({ action: 'hold', hold: 'post', via: 'thread', threadRoot: ROOT, operations: [post.id], rootUnknown: false,
+      fungible: { channelType: 'public', channelDelivery: 'thread_hybrid' } })
+    expect(h.pending()).toMatchObject([{ operationId: post.id, root: ROOT, stamp: h.fact().stamp }])
+    await h.flush()
+    expect(h.records().filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual([post.id])
+  })
+
+  test('a recovered intent is listed only after the journal is read', async () => {
+    const first = await fixture(), post = first.begin(ROOT)
+    await post.ready
+    await first.close()
+    const h = await fixture({ reopen: first.dir, start: false })
+    expect(h.pending()).toEqual([])
+    await h.start()
+    h.members.h.stub(h.members.h.p('alpha')).script.inventory.push(membershipPage([C, C2]))
+    await h.members.start(); await h.members.scan()
+    expect(h.pending()).toMatchObject([{ operationId: post.id, root: ROOT, state: 'unknown' }])
+    expect(decideReply(h, ROOT)).toEqual(heldFor(ROOT, [post.id]))
   })
 })
 

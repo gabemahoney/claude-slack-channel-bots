@@ -8,7 +8,7 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC, TLCExt, Json
 \* The historical overlay fault represents an AD input refusal, never a screen read.
 CONSTANTS MaxItems, MaxParts, MaxLaunches, MaxServerStarts, MaxRetypes,
           EnterRetries, MaxAgentQueue, Faults, Flapping, PromptFlapping, Bug, Scenario,
-          IdenticalTexts, MaxMemoryHolds
+          IdenticalTexts, MaxMemoryHolds, MaxPostHolds
 
 Items == 1..MaxItems
 Parts == 1..MaxParts
@@ -38,7 +38,7 @@ SmallCoreBounds ==
  /\ MaxLaunches = 1 /\ MaxServerStarts = 2 /\ MaxRetypes = 1
  /\ EnterRetries = 4 /\ Faults = {} /\ ~Flapping /\ PromptFlapping
  /\ Bug = "none" /\ Scenario = "probe" /\ ~IdenticalTexts
- /\ MaxMemoryHolds = 0
+ /\ MaxMemoryHolds = 0 /\ MaxPostHolds = 0
 ASSUME /\ ((MaxItems >= 2 /\ MaxParts >= 2) \/ SmallCoreBounds)
        /\ MaxLaunches >= 1 /\ MaxServerStarts >= 2
        /\ EnterRetries = 4 /\ EnterRetries >= BudgetSum(UnsubmittedFaults)
@@ -48,6 +48,9 @@ ASSUME /\ ((MaxItems >= 2 /\ MaxParts >= 2) \/ SmallCoreBounds)
        /\ Flapping \in BOOLEAN /\ PromptFlapping \in BOOLEAN
        /\ IdenticalTexts \in BOOLEAN
        /\ MaxMemoryHolds \in 0..MaxItems
+       /\ MaxPostHolds \in 0..MaxItems
+\* Item i may be stored as a Memory Hold when i <= MaxMemoryHolds and as a Post
+\* Hold when i <= MaxPostHolds. With both 0 the original state space is kept.
 \* Assumptions: a returned append is never subsequently torn or corrupted;
 \* only an unfinished append can tear. A person's box edits are pull-back,
 \* followed by one submit or clear. Stale reads are earlier real row states.
@@ -88,7 +91,7 @@ InitialEngine == [phase |-> "ready", target |-> None, attempt |-> 0,
  appendBlocked |-> FALSE, noticed |-> {}, request |-> "none", keyReading |-> EmptyReading]
 InitialPersistent == [accepted |-> {}, fixed |-> {}, sent |-> <<>>, refused |-> {},
  delivered |-> {}, keys |-> <<>>, records |-> <<>>, torn |-> <<>>,
- held |-> {}, withdrawn |-> {}]
+ held |-> {}, posted |-> {}, withdrawn |-> {}]
 InitialGate == [owner |-> "free", stage |-> "none", deferred |-> FALSE,
  due |-> FALSE, typed |-> FALSE, reading |-> EmptyReading]
 SeedKnowledge == [p |-> InitialPersistent, e |-> InitialEngine,
@@ -100,13 +103,17 @@ vars == <<st>>
 Sent(i,p) == <<i,p>> \in st.h.everSent
 Delivered(i,p) == <<i,p>> \in st.h.everDelivered
 ItemDelivered(i) == Delivered(i,Last(i))
+\* p.held: unresolved Memory Holds, parked Post Holds included; p.posted:
+\* unresolved Post Holds; p.withdrawn: withdrawn holds of either kind.
+HoldsEnabled == MaxMemoryHolds > 0 \/ MaxPostHolds > 0
 \* A definite refusal has no keys in flight. With holds disabled preserve
 \* the original stronger history invariant and its mutation-control graph.
+\* A parked Post Hold is passed like a Memory Hold, so Post Holds need it too.
 InFlight(i) ==
- (IF MaxMemoryHolds = 0 THEN \E p \in 1..Last(i) : Sent(i,p)
+ (IF ~HoldsEnabled THEN \E p \in 1..Last(i) : Sent(i,p)
   ELSE \E n \in 1..Len(st.p.sent) : st.p.sent[n].item = i /\ n \notin st.p.refused)
  /\ ~ItemDelivered(i)
-Open(p) == {i \in p.accepted \ (p.held \cup p.withdrawn) : <<i,Last(i)>> \notin p.delivered}
+Open(p) == {i \in p.accepted \ (p.held \cup p.posted \cup p.withdrawn) : <<i,Last(i)>> \notin p.delivered}
 OpenParts(p,i) == {j \in 1..Last(i) : <<i,j>> \notin p.delivered}
 HeadOf(p) == IF Open(p) = {} THEN 0 ELSE Min(Open(p))
 HeadPair(p) == LET i == HeadOf(p)
@@ -153,8 +160,9 @@ ReadOf(s) == [row |-> s.a.row,
  \* evidence; unreadability never discloses newly appended transcript contents.
  records |-> IF s.a.transcript = "unreadable" THEN s.knowledge.r.records ELSE s.a.log]
 ReadEnvironment == ReadOf(st)
-WithHolds(k) == IF MaxMemoryHolds = 0 THEN k ELSE
- [holds |-> {[item |-> i, kind |-> "memory"] : i \in k.p.held}] @@ k
+WithHolds(k) == IF ~HoldsEnabled THEN k ELSE
+ [holds |-> {[item |-> i, kind |-> "memory"] : i \in k.p.held} \cup
+            {[item |-> i, kind |-> "post"] : i \in k.p.posted}] @@ k
 KnowledgeOf(s) == WithHolds([p |-> [s.p EXCEPT !.accepted = @ \ s.p.withdrawn], e |-> s.e, r |-> ReadOf(s),
  g |-> s.g, writer |-> s.w, bug |-> Bug, started |-> s.starts, compact |-> s.compact, acked |-> s.h.acked])
 
@@ -211,12 +219,18 @@ SelectTarget(k) ==
      sent == {n \in 1..Len(k.p.sent) : n \notin k.p.refused /\ k.p.sent[n].item \in Open(k.p)}
      inFlight == IF pending THEN k.writer.item
                  ELSE IF sent # {} THEN k.p.sent[Min(sent)].item ELSE 0
-     head == IF MaxMemoryHolds > 0 /\ inFlight # 0
+     head == IF HoldsEnabled /\ inFlight # 0
              THEN <<inFlight,Min(OpenParts(k.p,inFlight))>> ELSE HeadPair(k.p)
+     \* Production's Post Hold stop: with nothing in flight, an unresolved Post
+     \* Hold before the open head (or with no open head) is the FIFO head, so
+     \* nothing at or behind it is selected. Memory Holds are passed as before.
+     postHead == inFlight = 0 /\ \E j \in k.p.posted : head = None \/ j < head[1]
      later == {i \in Open(k.p) : i > head[1]}
      unsent == {i \in Open(k.p) : \A p \in 1..Last(i) : ~HasSent(k.p,<<i,p>>)}
  IN IF k.bug = "deliver_memory_hold" /\ k.p.held # {}
     THEN <<Min(k.p.held),1>>
+    \* The control passes an unresolved Post Hold like a Memory Hold.
+    ELSE IF postHead /\ k.bug # "pass_post_hold" THEN None
     ELSE IF head = None THEN None
     ELSE IF k.bug \in {"next_item","skip_refused"} /\ later # {} /\
            (HasSent(k.p,head) \/ k.p.refused # {})
@@ -390,12 +404,13 @@ CommitAppend ==
       !.p.records = AppendUnique(@,r),
       !.p.accepted = @ \cup ack,
       !.p.held = IF r.kind = "accepted" /\ r.how = "slack-hold" THEN @ \cup ack ELSE @,
+      !.p.posted = IF r.kind = "accepted" /\ r.how = "slack-post-hold" THEN @ \cup ack ELSE @,
       !.p.fixed = IF r.kind = "fixed" THEN @ \cup {r.item} ELSE @,
       !.p.sent = IF r.kind = "sent" THEN AppendSent(st.p,r) ELSE @,
       !.p.refused = IF r.kind = "refused" THEN @ \cup {r.attempt}
                    ELSE IF r.kind = "sent" THEN @ \ {n} ELSE @,
       !.p.delivered = @ \cup delivered,
-      !.p.keys = IF r.kind = "accepted" /\ r.how \in {"slack","slack-hold","slack-redelivery"}
+      !.p.keys = IF r.kind = "accepted" /\ r.how \in {"slack","slack-hold","slack-post-hold","slack-redelivery"}
                  THEN Append(@,IF r.how = "slack-redelivery" THEN 1 ELSE r.item) ELSE @,
       !.h.accepted = @ \cup ack, !.h.acked = @ \cup ack,
       !.h.everSent = @ \cup send, !.h.everDelivered = @ \cup delivered,
@@ -452,23 +467,41 @@ Accept ==
                THEN IF i = 1 THEN st.starts = 1 ELSE st.starts > 1
                ELSE TRUE)
     /\ (Scenario # "empty-reconnect" \/ st.a.mcp)
-    /\ \E held \in (IF i <= MaxMemoryHolds THEN BOOLEAN ELSE {FALSE}) :
-       st' = [st EXCEPT !.w = Record("accepted",<<i,1>>,0,IF held THEN "slack-hold" ELSE how,0,0,0),
+    \* A stored hold is a Slack reply: "slack-hold" a Memory Hold,
+    \* "slack-post-hold" a Post Hold. Both are acknowledged on storage.
+    \* The index bound reuses item i's source (how) for gate and redelivery
+    \* effects, so an item-2 hold keeps /interject's (cron's across a start):
+    \* no arrival-time reconnect deferral and no redelivery, unlike item 1.
+    /\ \E stored \in {how} \cup (IF i <= MaxMemoryHolds THEN {"slack-hold"} ELSE {})
+                          \cup (IF i <= MaxPostHolds THEN {"slack-post-hold"} ELSE {}) :
+       st' = [st EXCEPT !.w = Record("accepted",<<i,1>>,0,stored,0,0,0),
        !.g.deferred = IF how = "slack" /\ ~st.a.mcp THEN TRUE ELSE @,
        !.g.due = IF how = "slack" /\ ~st.a.mcp THEN TRUE ELSE @,
        !.transition = "Accept", !.action = "intake", !.expired = {},
-       !.outcome = IF held THEN "slack-hold" ELSE how, !.bugStep = FALSE]
+       !.outcome = stored, !.bugStep = FALSE]
 \* Resolution is a durable queue-writer operation, not an engine choice. It
 \* cannot overtake a pending send append or an atomic compaction rename.
+\* A Post Hold resolves on its posts' answers or its timer: released,
+\* withdrawn, or parked as a Memory Hold, which the first branch then
+\* resolves. Parking is allowed for every Post Hold, a superset of the SRD's
+\* holds whose root was unknown at arrival. A torn-down persona resolves
+\* nothing (Active), as teardown cancels the hold's timer and answers.
 ResolveMemoryHold ==
  /\ Active /\ st.a.writable /\ st.w.kind = "none"
  /\ st.compact \in {"none","done"}
- /\ \E i \in st.p.held, outcome \in {"released","withdrawn"} :
-    st' = [st EXCEPT !.p.held = @ \ {i},
-      !.p.withdrawn = IF outcome = "withdrawn" THEN @ \cup {i} ELSE @,
-      !.p.records = AppendUnique(@,Record(outcome,<<i,1>>,0,"memory",0,0,0)),
-      !.transition = "ResolveMemoryHold", !.action = "environment", !.expired = {},
-      !.outcome = outcome, !.bugStep = FALSE]
+ /\ \/ \E i \in st.p.held, outcome \in {"released","withdrawn"} :
+       st' = [st EXCEPT !.p.held = @ \ {i},
+         !.p.withdrawn = IF outcome = "withdrawn" THEN @ \cup {i} ELSE @,
+         !.p.records = AppendUnique(@,Record(outcome,<<i,1>>,0,"memory",0,0,0)),
+         !.transition = "ResolveMemoryHold", !.action = "environment", !.expired = {},
+         !.outcome = outcome, !.bugStep = FALSE]
+    \/ \E i \in st.p.posted, outcome \in {"released","withdrawn","parked"} :
+       st' = [st EXCEPT !.p.posted = @ \ {i},
+         !.p.held = IF outcome = "parked" THEN @ \cup {i} ELSE @,
+         !.p.withdrawn = IF outcome = "withdrawn" THEN @ \cup {i} ELSE @,
+         !.p.records = AppendUnique(@,Record(outcome,<<i,1>>,0,"post",0,0,0)),
+         !.transition = "ResolvePostHold", !.action = "environment", !.expired = {},
+         !.outcome = outcome, !.bugStep = FALSE]
 RedeliverSlack ==
  \* keys is a sequence so NoDuplicateKey can detect repeated persisted keys.
  \* Membership checks its values; a tuple itself is not a TLA+ set.
@@ -526,7 +559,7 @@ EnterAttempt ==
 
 QueueCompactRename ==
  /\ Active /\ st.compact = "prepared" /\ st.w.kind = "none"
- /\ LET retained == Open(st.p) \cup st.p.held
+ /\ LET retained == Open(st.p) \cup st.p.held \cup st.p.posted
         keep == {r \in SeqSet(st.p.records) : r.item \in retained /\
                     ~(r.kind = "refused" \/
                       (r.kind = "sent" /\ r.attempt \in st.p.refused))}
@@ -903,11 +936,15 @@ TornAppend ==
      !.relaunch = TRUE, !.e = InitialEngine, !.g = InitialGate, !.observation = "none",
      !.transition = "TornAppend", !.action = "fault", !.expired = {},
      !.outcome = "unfinished-record-quarantined-on-start", !.bugStep = FALSE]
+\* After a stop Slack's answer can never arrive: the start releases every
+\* unresolved Post Hold, joining nothing. A parked one stays a Memory Hold.
+\* The release is atomic with the start, so it holds by construction and no
+\* invariant checks it.
 ServerStart ==
  /\ st.server = "crashed" /\ st.starts < MaxServerStarts
  /\ LET drop == {}
     IN st' = [st EXCEPT !.server = "up", !.starts = @+1,
-       !.p.accepted = @ \ drop,
+       !.p.accepted = @ \ drop, !.p.posted = {},
        !.p.sent = RecoverTorn(st.p),
        !.p.refused = IF Len(st.p.torn) > 0 /\ Head(st.p.torn).kind = "sent"
                     THEN @ \ {NewAttempt(st.p)} ELSE @,
@@ -924,9 +961,12 @@ PersonaRemove ==
      !.a.present = FALSE, !.relaunch = TRUE, !.e = InitialEngine, !.g = InitialGate, !.w = EmptyWrite,
      !.observation = "none", !.transition = "PersonaRemove", !.action = "fault",
      !.expired = {}, !.outcome = "queue-kept", !.bugStep = FALSE]
+\* A bring-up later in the same run releases unresolved Post Holds, as a start
+\* does: teardown cancelled their timers and dropped their posts' answers.
+\* The release is atomic with the bring-up, by construction.
 PersonaReadd ==
  /\ st.server = "up" /\ ~st.a.present
- /\ st' = [st EXCEPT !.a.present = TRUE,
+ /\ st' = [st EXCEPT !.a.present = TRUE, !.p.posted = {},
      !.e = [InitialEngine EXCEPT !.retypes = [i \in Items |-> RetypesFor(st.p,i)]],
      !.g = [InitialGate EXCEPT !.deferred = ~st.a.mcp, !.due = ~st.a.mcp],
      !.observation = "none", !.transition = "PersonaReadd", !.action = "environment",
@@ -1005,6 +1045,13 @@ NoHeldDelivery ==
  /\ st.p.held \cap st.p.fixed = {}
  /\ \A i \in st.p.held \cup st.p.withdrawn :
       \A p \in 1..Last(i) : ~Sent(i,p) /\ ~Delivered(i,p)
+\* An unresolved Post Hold is the FIFO head: it is never fixed or sent before
+\* its release, and no item behind it is fixed or sent while it is unresolved.
+PostHoldIsHead ==
+ \A i \in st.p.posted, j \in Items : j >= i =>
+   /\ j \notin st.p.fixed
+   /\ \A p \in 1..Last(j) : ~Sent(j,p) /\ ~Delivered(j,p)
+   /\ ~(st.w.kind = "sent" /\ st.w.item = j)
 ReceiptBacked ==
  /\ (\A c \in SeqSet(st.h.credits) :
       c.record \in 1..Len(st.a.log) /\ st.a.log[c.record].kind = "take-in" /\
@@ -1044,6 +1091,8 @@ AtMostOnce == \A ip \in Pairs : Cardinality({n \in 1..Len(st.h.taken) :
 TypeOK == /\ st.a.row \in Rows /\ st.a.actual \in Activities
           /\ st.p.held \subseteq st.p.accepted /\ st.p.withdrawn \subseteq st.h.accepted
           /\ st.p.held \cap st.p.withdrawn = {}
+          /\ st.p.posted \subseteq st.p.accepted
+          /\ st.p.posted \cap (st.p.held \cup st.p.withdrawn) = {}
           /\ st.g.owner \in {"free","delivery","reconnect"}
           /\ st.a.marker = TRUE /\ Len(st.a.input) <= MaxAgentQueue
           /\ Len(st.h.credits) = Cardinality(st.h.credited)
@@ -1156,7 +1205,7 @@ RestartSafetyView ==
  IF ~RestartCheckScope THEN st
  ELSE
  [p |-> [accepted |-> st.p.accepted, fixed |-> st.p.fixed, sent |-> RestartSentView(st.p),
-    held |-> st.p.held, withdrawn |-> st.p.withdrawn,
+    held |-> st.p.held, posted |-> st.p.posted, withdrawn |-> st.p.withdrawn,
     refused |-> st.p.refused, delivered |-> st.p.delivered, keys |-> st.p.keys,
     torn |-> [n \in 1..Len(st.p.torn) |-> RestartWriteView(st.p.torn[n])]],
   e |-> [phase |-> st.e.phase, target |-> st.e.target, attempt |-> st.e.attempt,
@@ -1261,7 +1310,8 @@ TraceRecord(s) == [schema |-> 1, model |-> "PersonaDelivery", state |-> s,
   MaxRetypes |-> MaxRetypes, EnterRetries |-> EnterRetries,
   MaxAgentQueue |-> MaxAgentQueue, Faults |-> Faults, Flapping |-> Flapping,
   PromptFlapping |-> PromptFlapping,
-  Scenario |-> Scenario, IdenticalTexts |-> IdenticalTexts, MaxMemoryHolds |-> MaxMemoryHolds],
+  Scenario |-> Scenario, IdenticalTexts |-> IdenticalTexts, MaxMemoryHolds |-> MaxMemoryHolds,
+  MaxPostHolds |-> MaxPostHolds],
  control |-> [bug |-> Bug, class |-> ControlClass, bugStep |-> s.bugStep]]
 TraceView == TraceRecord(st)
 

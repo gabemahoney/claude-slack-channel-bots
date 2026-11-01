@@ -1,8 +1,8 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
-import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP } from './thread-memory.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
+import { postIntent, threadJoin, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP } from './thread-memory.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
   source: 'slack', text: 'message', channel: 'C0TEST001', channel_type: 'channel', user: 'U0TEST001',
@@ -12,6 +12,15 @@ export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInpu
 export const memoryHold = (arrived_at: number, overrides: Partial<Omit<HoldField, 'on' | 'arrived_at'>> = {}): HoldField => ({
   on: 'memory', thread_ts: THREAD_ROOTS.primary, stamp: { ...THREAD_STAMP }, ...overrides, arrived_at,
 })
+/** Waits on the fixture post-intent's operation unless operations are given; store it with heldSlackInput. */
+export const postHold = (arrived_at: number, overrides: Partial<Omit<PostHoldField, 'on' | 'arrived_at'>> = {}): PostHoldField => ({
+  on: 'post', operations: [postIntent(threadJoin()).operationId], thread_ts: THREAD_ROOTS.primary, stamp: { ...THREAD_STAMP },
+  root_unknown: false, ...overrides, arrived_at,
+})
+/** A Post Hold whose root P's Thread Memory view did not know: the one kind `parked` turns into a Memory Hold. */
+export const unknownRootPostHold = (arrived_at: number): PostHoldField => postHold(arrived_at, { root_unknown: true })
+/** Each hold kind's field builder, for tables over both kinds. */
+export const HOLD_FIELDS = { memory: memoryHold, post: postHold } as const
 export function heldSlackInput(hold: HoldField, overrides: Partial<Omit<AcceptedInput, 'source' | 'via' | 'hold' | 'thread_join'>> = {}): AcceptedInput {
   const input = slackInput({ ts: THREAD_ROOTS.secondary, key: { chat_id: THREAD_CHANNELS.primary, ts: THREAD_ROOTS.secondary },
     ...overrides, source: 'slack', via: 'thread', thread_ts: hold.thread_ts, hold })

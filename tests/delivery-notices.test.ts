@@ -12,7 +12,8 @@ import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
 import { MESSAGE_DELIVERED } from '../src/persona-diagnostics.ts'
-import { heldSlackInput, memoryHold, slackInput } from './test-helpers/delivery-queue.ts'
+import { heldSlackInput, HOLD_FIELDS, memoryHold, postHold, slackInput } from './test-helpers/delivery-queue.ts'
+import type { HoldField } from '../src/delivery-queue.ts'
 import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run(options: Parameters<typeof makeDeliveryNoticeHarness>[0] = {}) { const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h }
@@ -21,15 +22,16 @@ afterEach(async () => { for (const r of runs.splice(0)) { try {
   assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines, queue: existsSync(path) ? writtenFile(path) : undefined })
 } finally { await r.cleanup() } } })
 
-async function noticeHold(r: DeliveryNoticeHarness, ts: string = THREAD_ROOTS.secondary) {
-  const input = heldSlackInput(memoryHold(r.h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts }, text: 'private held reply' })
+async function noticeHold(r: DeliveryNoticeHarness, ts: string = THREAD_ROOTS.secondary, field: (at: number) => HoldField = memoryHold) {
+  const input = heldSlackInput(field(r.h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts }, text: 'private held reply' })
   const result = await r.queue.acceptDecided(r.alpha, input.key, () => ({ store: input }))
   if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
   return result.item!
 }
 
-test('Memory Holds and withdrawals stay quiet through queued reconciliation and late waiting events', async () => {
-  const r = await run({ holds: true }), held = await noticeHold(r), withdrawn = await noticeHold(r, THREAD_ROOTS.third)
+test.each(['memory', 'post'] as const)('%s holds and withdrawals stay quiet through queued reconciliation and late waiting events', async kind => {
+  const field = HOLD_FIELDS[kind]
+  const r = await run({ holds: true }), held = await noticeHold(r, THREAD_ROOTS.secondary, field), withdrawn = await noticeHold(r, THREAD_ROOTS.third, field)
   await r.queue.resolveHolds(r.alpha, [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() }])
   await r.h.clock.advance(DELIVERY_STUCK_AFTER_MS * 2)
   for (const item of r.queue.items(r.alpha)) {
@@ -56,12 +58,12 @@ test('Memory Holds and withdrawals stay quiet through queued reconciliation and 
   assertNoLeak(r.queued)
 })
 
-test('Memory Hold release starts the real engine stuck clock at release', async () => {
+test.each(['memory', 'post'] as const)('%s hold release starts the real engine stuck clock at release', async kind => {
   let r: DeliveryNoticeHarness | undefined
   const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
   r = await run({ queue: e.queue, holds: true })
   try {
-    const held = await noticeHold(r), withdrawn = await noticeHold(r, THREAD_ROOTS.third)
+    const held = await noticeHold(r, THREAD_ROOTS.secondary, HOLD_FIELDS[kind]), withdrawn = await noticeHold(r, THREAD_ROOTS.third, HOLD_FIELDS[kind])
     await e.queue.resolveHolds(r.alpha, [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: e.clock.now() }])
     e.p().row.relay_mode = 'off'
     await e.tick()
@@ -85,10 +87,28 @@ test('Memory Hold release starts the real engine stuck clock at release', async 
   } finally { await e.cleanup() }
 })
 
-test('later in-flight completion does not move a released head back to an unresolved or withdrawn hold', async () => {
-  const r = await run({ holds: true })
-  const unresolved = await noticeHold(r), withdrawn = await noticeHold(r, THREAD_ROOTS.third)
-  const released = await noticeHold(r, THREAD_ROOTS.primary)
+test('items behind an unresolved Post Hold keep their queued reactions and stuck notice, counted and timed without it', async () => {
+  const r = await run({ holds: true }), held = await noticeHold(r, THREAD_ROOTS.secondary, postHold)
+  const behind = [await r.accept({ key: { chat_id: 'C0TEST001', ts: 'behind-one' } }), await r.accept({ key: { chat_id: 'C0TEST001', ts: 'behind-two' } })]
+  const seqs = behind.map(i => i.accepted.seq)
+  for (const item of [held, ...behind]) r.reporting.received(r.alpha, item)
+  r.reporting.reconcileQueued(r.alpha)
+  expect(r.queued.map(q => q.item.accepted.seq)).toEqual([...seqs, ...seqs])
+  await r.h.clock.advance(DELIVERY_STUCK_AFTER_MS + 1)
+  r.waiting(held, 'not-now'); r.waiting(held, 'state', { row: 'ended' }); await r.flush()
+  expect(r.h.totalPosts()).toBe(0)
+  r.waiting(behind[0]!, 'not-now', { ageMs: DELIVERY_STUCK_AFTER_MS }); await r.flush()
+  expect(r.h.totalPosts()).toBe(0)
+  r.waiting(behind[0]!, 'not-now'); await r.flush()
+  expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, behind.length, DELIVERY_STUCK_AFTER_MS + 1, 'refused', 1))])
+  expect(r.h.posts(r.beta)).toEqual([])
+  expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+})
+
+test.each(['memory', 'post'] as const)('later in-flight completion does not move a released head back to an unresolved or withdrawn %s hold', async kind => {
+  const r = await run({ holds: true }), field = HOLD_FIELDS[kind]
+  const unresolved = await noticeHold(r, THREAD_ROOTS.secondary, field), withdrawn = await noticeHold(r, THREAD_ROOTS.third, field)
+  const released = await noticeHold(r, THREAD_ROOTS.primary, field)
   const later = await r.accept({ key: { chat_id: 'C0TEST001', ts: 'later' } })
   await r.queue.resolveHolds(r.alpha, [
     { seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() },

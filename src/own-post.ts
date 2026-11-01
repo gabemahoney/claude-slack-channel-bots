@@ -13,7 +13,7 @@
  */
 
 import { CHANNEL_ID_RE, channelModeOf, type ChannelMode, type DeliveryMode, type Persona, type ServerSettings } from './config.ts'
-import { isThreadTimestamp, personaListsChannel, type StoredChoices } from './delivery-decision.ts'
+import { isThreadTimestamp, personaListsChannel, type PendingOwnPostView, type StoredChoices } from './delivery-decision.ts'
 import type { MembershipReading } from './channel-membership.ts'
 import { slackPlatformReason } from './persona-connection-errors.ts'
 export type { OwnPostContent } from './thread-memory.ts'
@@ -21,6 +21,7 @@ import type { OwnPostContent } from './thread-memory.ts'
 export { createOwnPostJoins, ownPostStampState } from './own-post-joins.ts'
 export type { OwnPostJoins, OwnPostJoinsDeps, PendingOwnPost, OwnPostEvent, OwnPostOutcome,
   OwnPostLookupHolds, OwnPostLookupOutcome, OwnPostLookupResult } from './own-post-joins.ts'
+import type { PendingOwnPost } from './own-post-joins.ts'
 
 /** Surfaces that start an own-post operation. `file` is reserved for uploads. */
 export const OWN_POST_SURFACES = ['text', 'prompt', 'warning', 'notice', 'file'] as const
@@ -88,6 +89,19 @@ export function ownPostEligibility(sources: OwnPostEligibilitySources): (key: st
       membership: sources.membership(key, channel, mode),
     })
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pending Own Posts for intake
+// ---------------------------------------------------------------------------
+
+/**
+ * The decision's view of the owner's Pending Own Posts: each operation ID,
+ * the requested parent's mapped Thread Root when the post has one, and the
+ * issue time. The one mapping for production and tests. Pure.
+ */
+export function pendingOwnPostViews(posts: readonly PendingOwnPost[]): PendingOwnPostView[] {
+  return posts.map(post => ({ operation: post.operationId, ...(post.root !== undefined ? { root: post.root } : {}), issuedAt: post.issuedAt }))
 }
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ import type { SharedStateReportingDeps } from '../src/shared-state-reports.ts'
 import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import type { DeliveryQueueOptions, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
+import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -107,7 +107,7 @@ import { threadJoin, threadHeader, seedThreads, threadFsControls, threadSealFsCo
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeOwnPostHarness } from './test-helpers/own-post.ts'
 import { makeOwnFileShare } from './test-helpers/slack-stub.ts'
-import { ownPostStampState } from '../src/own-post.ts'
+import { ownPostStampState, pendingOwnPostViews } from '../src/own-post.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import {
@@ -4422,7 +4422,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
-      'threadMemory', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,
+      'threadMemory', 'pendingOwnPosts', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5605,6 +5605,16 @@ describe('the own-post observer shares one Thread Memory owner', () => {
       config: '() => h.config', persona: 'getPersona', choices: '() => h.channelDelivery ?? undefined',
       membership: '(key: string, channel: string, mode: ChannelMode) => opts.membership?.read(key, channel, mode)',
     })
+    // Routing's Pending Own Posts: production's adapter body, behind the harness's opt-in and read log only.
+    const member: keyof PersonaRoutingDeps = 'pendingOwnPosts', mapping: keyof typeof OwnPostModule = 'pendingOwnPostViews'
+    const binding = onlyCallProps('createPersonaRouting').get(member)!, arrow = binding.indexOf(' => ')
+    expect(importSource(harness, mapping)).toBe('../../src/own-post.ts')
+    // The harness's routing deps hold a conditional spread, so read its top-level members directly.
+    const routingDeps = onlyCallArguments(harness, 'createPersonaRouting')
+    expect(splitTopLevel(routingDeps.slice(...balancedAfter(routingDeps, 0, '{', '}'))).filter(part => new RegExp(`\\b${member}\\b`).test(part))).toEqual([
+      `${member}: opts.threadMemory === undefined ? undefined : ${binding.slice(0, arrow)} => { h.pendingOwnPostReads.push([key, channel]) return ${binding.slice(arrow + 4)} }`,
+    ])
+    expect(indicesOf(new RegExp(`(?<![\\w.$])${mapping}\\s*\\(`, 'g'), harness)).toHaveLength(1)
   })
 
   test('every posting surface shares the one observer, which reads the one owner holder at call time', () => {
@@ -5632,6 +5642,45 @@ describe('the own-post observer shares one Thread Memory owner', () => {
     const sentinel = {} as OwnPostModule.OwnPostJoins
     getter.set(sentinel)
     expect(getter.get()).toBe(sentinel)
+  })
+
+  // GE-1: intake reads the one owner's in-memory Pending Own Posts, as intended.
+  test('routing reads Pending Own Posts from the one owner holder at call time, synchronously and with no I/O', () => {
+    const member: keyof PersonaRoutingDeps = 'pendingOwnPosts', mapping: keyof typeof OwnPostModule = 'pendingOwnPostViews'
+    const routing = onlyCallOf('createPersonaRouting'), binding = onlyCallProps('createPersonaRouting').get(member)
+    // The whole adapter: no await, log, Slack, file or queue call; one owner read through the pure mapping.
+    expect(binding).toBe(`(key, channel) => ${mapping}(ownPostJoins?.pendingOwnPosts(key, channel) ?? [])`)
+    expect(importSource(SERVER_CODE, mapping)).toBe('./own-post.ts')
+    expect(withinCall(callsOf(mapping), routing)).toBe(1)
+    expect(callsOf(mapping)).toHaveLength(1)
+    expect(callsOf('ownPostJoins\\?\\.pendingOwnPosts')).toHaveLength(1)
+    const named = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(1)
+    expect(withinCall(named, routing)).toBe(1)
+    expect(indicesOf(new RegExp(`(?:\\.\\s*${member}\\b(?!\\s*\\()|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+    // Execute the actual adapter over an isolated holder and the real mapping.
+    const adapter = expression<() => {
+      read: NonNullable<PersonaRoutingDeps['pendingOwnPosts']>
+      set(owner?: Pick<OwnPostModule.OwnPostJoins, 'pendingOwnPosts'>): void
+    }>(`() => {
+      let ownPostJoins;
+      return { read: (${binding}), set: value => { ownPostJoins = value } };
+    }`, { [mapping]: pendingOwnPostViews })()
+    const channel = THREAD_CHANNELS.primary, calls: string[][] = []
+    expect(adapter.read(THREAD_PERSONAS.primary, channel)).toEqual([])
+    const posts: OwnPostModule.PendingOwnPost[] = [
+      { operationId: 'reply-post', key: THREAD_PERSONAS.primary, channel, parent: THREAD_ROOTS.primary, root: THREAD_ROOTS.primary, issuedAt: 10, state: 'awaiting-answer' },
+      { operationId: 'channel-post', key: THREAD_PERSONAS.primary, channel, issuedAt: 20, state: 'unknown' },
+    ]
+    for (const marker of ['first', 'replacement']) {
+      adapter.set({ pendingOwnPosts: (key, at) => { calls.push([marker, key, at]); return posts } })
+      expect(adapter.read(THREAD_PERSONAS.primary, channel)).toEqual([
+        { operation: 'reply-post', root: THREAD_ROOTS.primary, issuedAt: 10 }, { operation: 'channel-post', issuedAt: 20 },
+      ])
+    }
+    expect(calls).toEqual([['first', THREAD_PERSONAS.primary, channel], ['replacement', THREAD_PERSONAS.primary, channel]])
+    adapter.set()
+    expect(adapter.read(THREAD_PERSONAS.secondary, channel)).toEqual([])
   })
 
   test('the owner gets the existing memory, queue and current shared sources, a wall clock, unique IDs and dry-run check', () => {
@@ -6761,6 +6810,45 @@ describe('Memory Hold server wiring', () => {
       await adapter.stored(key)
     }
     expect(calls).toEqual(['first', 'replacement'].flatMap(marker => [[marker, key, 'live'], [marker, key, 'recovered']]))
+  })
+
+  test('a saved hold resolution wakes only its key\'s engine through the one call-time adapter, detached from intake', () => {
+    expect(onlyCallProps('createDeliveryQueue').get('onEvent')).toBe('event => deliveryQueueEvents.emit(event)')
+    expect(callsOf('deliveryQueueEvents\\.emit')).toHaveLength(1)
+    declaredOnce('deliveryQueueEvents'); declaredOnce('deliveryQueueWake')
+    const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+    const port = tree.statements.flatMap(node => ts.isVariableStatement(node) ? [...node.declarationList.declarations] : [])
+      .find(d => ts.isIdentifier(d.name) && d.name.text === 'deliveryQueueEvents')!.initializer!.getText(tree)
+    // Nothing else joins the resolution path, and nothing in it awaits.
+    expect(port.replace(/\s+/g, ' ')).toBe("{ emit: (event: QueueEvent): void => { if (event.type === 'holds-resolved') { try { deliveryQueueWake.wake(event.key) } catch { } } if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }")
+    // The existing adapter, bound once in main to the engines; preparation's wake is the other call.
+    const bound = indicesOf(/\bdeliveryQueueWake\.wake\s*=(?![=>])/g, SERVER_CODE)
+    expect(bound).toHaveLength(1)
+    expect(insideMain(bound[0]!)).toBe(true)
+    expect(SERVER_CODE.slice(bound[0]!).split('\n')[0]!.trim()).toBe('deliveryQueueWake.wake = key => deliveryEngines?.wake(key)')
+    expect(callsOf('deliveryQueueWake\\.wake')).toHaveLength(2)
+    expect(withinCall(callsOf('deliveryQueueWake\\.wake'), onlyCallOf('createDeliveryPreparation'))).toBe(1)
+
+    const woken: string[] = [], reported: QueueEvent[] = [], buffered: QueueEvent[] = []
+    let failing = false
+    const wake = { wake: (key: string) => { woken.push(key); if (failing) throw new Error('fixture wake failed') } }
+    const emitter = (reporting?: { queueEvent(event: QueueEvent): void }) => expression<() => { emit(event: QueueEvent): void }>(
+      `() => (${port})`, { deliveryQueueWake: wake, deliveryReporting: reporting, bufferedQueueEvents: buffered })()
+    const live = emitter({ queueEvent: event => { reported.push(event) } })
+    const resolved = (key: string): QueueEvent => ({ type: 'holds-resolved', key, resolutions: [{ seq: 1, outcome: 'withdrawn', at: 1 }] })
+    const others: QueueEvent[] = [{ type: 'stored', key: 'alpha' }, { type: 'writable', key: 'alpha' }, { type: 'retained', key: 'alpha', count: 1 }]
+    for (const event of others) expect(live.emit(event)).toBeUndefined()
+    expect(woken).toEqual([])
+    expect(live.emit(resolved('alpha'))).toBeUndefined()
+    expect(live.emit(resolved('beta'))).toBeUndefined()
+    expect(woken).toEqual(['alpha', 'beta'])
+    failing = true
+    expect(() => live.emit(resolved('alpha'))).not.toThrow()
+    expect(reported).toEqual([...others, resolved('alpha'), resolved('beta'), resolved('alpha')])
+    failing = false
+    emitter().emit(resolved('beta'))
+    expect(woken).toEqual(['alpha', 'beta', 'alpha', 'beta'])
+    expect(buffered).toEqual([resolved('beta')])
   })
 
   test('hold clock advancement follows queue replay and precedes resolution, maintenance and intake', () => {

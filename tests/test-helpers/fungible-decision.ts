@@ -36,11 +36,13 @@ import type {
   FungibleDecisionInputs,
   FungiblePath,
   FungibleRefusal,
+  PendingOwnPostView,
   StoredChoices,
   Via,
   channelDeliveryFor,
   decideDelivery,
 } from '../../src/delivery-decision.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS } from '../../src/delivery-constants.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import type { ThreadMemoryView } from '../../src/thread-memory.ts'
 import type { MembershipReading } from '../../src/channel-membership.ts'
@@ -137,6 +139,8 @@ export const FAIL_IF_READ: unique symbol = Symbol('fail-if-read')
 export type StoredLookup = Readonly<Record<string, Readonly<Record<string, DeliveryMode>>>>
 
 export type ThreadRead = readonly [key: string, channel: string, root: string]
+/** One Pending Own Posts read, with how many Thread Memory lookups the decision had made before it. */
+export type OwnPostRead = readonly [key: string, channel: string, threadReadsBefore: number]
 
 /** One row of the decision table. */
 export interface FungibleDecisionRow {
@@ -171,6 +175,12 @@ export interface FungibleDecisionRow {
   readonly threadStampUndecided?: FungibleDecisionInputs['threadStampUndecided']
   /** Every expected lookup, in order. Omitted means no lookup. */
   readonly threadReads?: readonly ThreadRead[]
+  /** Fixed, frozen Pending Own Posts by persona and channel. Absent: no `ownPosts` input. */
+  readonly ownPosts?: Readonly<Record<string, Readonly<Record<string, readonly PendingOwnPostView[]>>>>
+  /** Every expected Pending Own Posts read, in order. Omitted means no read. */
+  readonly ownPostReads?: readonly OwnPostRead[]
+  /** P's bot user ID is unknown to the decision. */
+  readonly unknownBotUser?: true
   readonly channelDelivery?: ChannelDeliveryResult
   /** The whole outcome, as written. */
   readonly expected: DeliveryDecision
@@ -223,7 +233,7 @@ function appliedViewOf(row: FungibleDecisionRow, persona: Persona): AppliedPerso
 function receivingPersonaOf(row: FungibleDecisionRow): DeliveryPersona {
   const persona = personaOf(row.config, row.receiver ?? P_KEY)
   const identity = BOT_IDENTITIES[persona.key]
-  const base = { key: persona.key, botUserId: identity?.botUserId, botId: identity?.botId, dmEnabled: persona.dm.enabled }
+  const base = { key: persona.key, botUserId: row.unknownBotUser ? undefined : identity?.botUserId, botId: identity?.botId, dmEnabled: persona.dm.enabled }
   return replacesSection(row, persona.key) ? withReplacedSection(row, base, persona.key) : { ...base, channels: persona.channels }
 }
 
@@ -251,9 +261,11 @@ function channelDeliveryInputsOf(row: FungibleDecisionRow): ChannelDeliveryInput
  * (each persona as the routing passes it, or the row's replacement); and,
  * unless the row omits it, the fungible-mode inputs, with the mode from the
  * configuration's switch through `channelModeOf`, the flag as received,
- * `CHANNEL_ID_RE` itself, the row's stored choices and fixed Thread Memory view.
+ * `CHANNEL_ID_RE` itself, the row's stored choices and fixed Thread Memory view,
+ * and, when the row has them, its Pending Own Posts with `OWN_ROOT_CLOCK_SKEW_MS`
+ * as routing supplies them, each read recorded in `ownPostReads`.
  */
-export function decisionArgsOf(row: FungibleDecisionRow, reads: ThreadRead[] = []): Parameters<typeof decideDelivery> {
+export function decisionArgsOf(row: FungibleDecisionRow, reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []): Parameters<typeof decideDelivery> {
   const persona = receivingPersonaOf(row)
   const applied = row.config.personas.map((p) => appliedViewOf(row, p))
   if (row.omitFungibleInputs) return [row.event, persona, applied]
@@ -266,6 +278,10 @@ export function decisionArgsOf(row: FungibleDecisionRow, reads: ThreadRead[] = [
       reads.push([key, channel, root])
       return row.threadViews?.[key]?.[channel]?.[root] ?? 'not-joined'
     },
+    ...(row.ownPosts ? { ownPosts: { clockSkewMs: OWN_ROOT_CLOCK_SKEW_MS, pending: (key: string, channel: string) => {
+      ownPostReads.push([key, channel, reads.length])
+      return row.ownPosts?.[key]?.[channel] ?? []
+    } } } : {}),
     threadStampUndecided: row.threadStampUndecided,
     ...channelDeliveryInputsOf(row),
   }
@@ -925,6 +941,26 @@ const JOINED_VIEW = Object.freeze({
 const THREAD_READ: ThreadRead = [P_KEY, PUBLIC_CHANNEL, THREAD_ROOT]
 const VALUES = ['off', 'mentions', 'all', 'thread_hybrid'] as const
 
+/** A Slack timestamp from whole microseconds. */
+function slackTs(micros: bigint): string {
+  return `${micros / 1_000_000n}.${String(micros % 1_000_000n).padStart(6, '0')}`
+}
+/** P's new channel message issued at ISSUED_AT covers roots from BOUND_ROOT
+ * on: its issue time less OWN_ROOT_CLOCK_SKEW_MS, in whole microseconds. */
+const ISSUED_AT = 1_700_000_123_457
+const BOUND_MICROS = BigInt(ISSUED_AT - OWN_ROOT_CLOCK_SKEW_MS) * 1000n
+const BOUND_ROOT = slackTs(BOUND_MICROS)
+const BELOW_ROOT = slackTs(BOUND_MICROS - 1n)
+const ABOVE_ROOT = slackTs(BOUND_MICROS + 1n)
+/** A new channel message whose bound, 1700000000.000000, is older than THREAD_ROOT. */
+const THREAD_ROOT_ISSUED_AT = 1_700_000_000_000 + OWN_ROOT_CLOCK_SKEW_MS
+/** Frozen Pending Own Posts of `key` in `channel`, as the decision reads them. */
+function ownPostsOf(posts: readonly PendingOwnPostView[], key = P_KEY, channel = PUBLIC_CHANNEL): NonNullable<FungibleDecisionRow['ownPosts']> {
+  return Object.freeze({ [key]: Object.freeze({ [channel]: Object.freeze(posts.map(post => Object.freeze({ ...post }))) }) })
+}
+/** Posts that cover a reply under THREAD_ROOT, by root and by issue time. */
+const COVERING = ownPostsOf([{ operation: 'op-root', root: THREAD_ROOT, issuedAt: ISSUED_AT }, { operation: 'op-new', issuedAt: THREAD_ROOT_ISSUED_AT }])
+
 function threadGroups(mode: 'strict' | 'open') {
   const config = { ...FUNGIBLE_CAST, channel_mode: mode }
   const event = (extra: Record<string, unknown> = {}) => makeChannelMessage({
@@ -1009,31 +1045,38 @@ function threadGroups(mode: 'strict' | 'open') {
       row('missing sharing evidence', { flag: undefined }, refused('flag-missing')),
       row('malformed channel', { event: event({ channel: MALFORMED_CHANNEL }) }, refused('channel-id-malformed')),
     ] : []),
-  ]
+    // Every row here would be covered by a post; none reads them.
+  ].map((original): FungibleDecisionRow => ({ ...original, ownPosts: COVERING }))
   // SR-1.2.5 holds only dependent replies. Missing input keeps Task Decision 3's
   // drop; every earlier selection/exclusion keeps its whole outcome and no read.
+  // Posts that cover nothing leave the Memory Hold; covering ones never change
+  // an earlier outcome, nor are they read.
   const unknown = { [P_KEY]: { [PUBLIC_CHANNEL]: { [THREAD_ROOT]: 'unknown' as const } } }
+  const memoryHeld = (root: string): DeliveryDecision => ({
+    action: 'hold', hold: 'memory', via: 'thread', threadRoot: root,
+    ...(mode === 'open' ? { fungible: onPath('public', 'thread_hybrid') } : {}),
+  })
   const unknownView = [
     ...[THREAD_ROOT, OTHER_ROOT].map(root => row(`unknown view holds reply in ${root}`, {
       event: event({ thread_ts: root }),
       threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [root]: 'unknown' } } },
-      threadReads: [[P_KEY, PUBLIC_CHANNEL, root]],
-    }, {
-      action: 'hold', hold: 'memory', via: 'thread', threadRoot: root,
-      ...(mode === 'open' ? { fungible: onPath('public', 'thread_hybrid') } : {}),
-    })),
-    row('missing view input', { omitThreadMemory: true }, dropped()),
+      ownPosts: ownPostsOf([{ operation: 'op-elsewhere', root: root === THREAD_ROOT ? OTHER_ROOT : THREAD_ROOT, issuedAt: THREAD_ROOT_ISSUED_AT },
+        { operation: 'op-later', issuedAt: ISSUED_AT }]),
+      threadReads: [[P_KEY, PUBLIC_CHANNEL, root]], ownPostReads: [[P_KEY, PUBLIC_CHANNEL, 1]],
+    }, memoryHeld(root))),
+    row('unknown view without Pending Own Posts holds reply', { threadViews: unknown, threadReads: [THREAD_READ] }, memoryHeld(THREAD_ROOT)),
+    row('missing view input', { omitThreadMemory: true, ownPosts: COVERING }, dropped()),
     ...[undefined, REPLY_TS].map(parent => row(`unknown view channel message ${String(parent)}`, {
-      event: event({ thread_ts: parent }), threadViews: unknown,
+      event: event({ thread_ts: parent }), threadViews: unknown, ownPosts: COVERING,
     }, dropped())),
     row('unknown view mention precedes Broadcast and hold', {
-      event: event({ text: `${P_MENTION} ${broadcastText('here')}` }), threadViews: unknown,
+      event: event({ text: `${P_MENTION} ${broadcastText('here')}` }), threadViews: unknown, ownPosts: COVERING,
     }, selected('mention')),
     ...(['here', 'channel'] as const).map(kind => row(`unknown view ${kind} precedes hold`, {
-      event: event({ text: broadcastText(kind) }), threadViews: unknown,
+      event: event({ text: broadcastText(kind) }), threadViews: unknown, ownPosts: COVERING,
     }, selected('broadcast'))),
     ...(['off', 'mentions', 'all'] as const).map(value => row(`unknown view ${value} reply`, {
-      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, threadViews: unknown,
+      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, threadViews: unknown, ownPosts: COVERING,
     }, value === 'off' ? dropped('channel-off', value)
       : value === 'all' ? selected('receive_all', value) : dropped('not-mentioned', value))),
     ...noLookup.map(original => ({
@@ -1041,7 +1084,67 @@ function threadGroups(mode: 'strict' | 'open') {
       threadViews: { [P_KEY]: { [String(original.event.channel)]: { [THREAD_ROOT]: 'unknown' as const } } },
     })),
   ]
-  // The same matrix at Q's notice destination, plus prompt/notice bot posts.
+  // SR-1.2.4: a reply not known to be joined is held for every post that could
+  // put P in its thread, read once after the view lookup; otherwise k8's rule.
+  const postHeld = (root: string, operations: string[], rootUnknown: boolean): DeliveryDecision => ({
+    action: 'hold', hold: 'post', via: 'thread', threadRoot: root, operations, rootUnknown,
+    ...(mode === 'open' ? { fungible: onPath('public', 'thread_hybrid') } : {}),
+  })
+  const VIEWS = ['not-joined', 'unknown'] as const
+  /** A reply under `root` with P's view `view` and P's `posts`, read once after the lookup. */
+  const replyWith = (label: string, root: string, view: ThreadMemoryView, posts: NonNullable<FungibleDecisionRow['ownPosts']>,
+    operations: string[] | undefined, extra: Record<string, unknown> = {}, rowExtra: Partial<FungibleDecisionRow> = {}) => row(
+    `${view} view: ${label}`, {
+      event: event({ thread_ts: root, ...extra }), threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [root]: view } } }, ownPosts: posts,
+      threadReads: [[P_KEY, PUBLIC_CHANNEL, root]], ownPostReads: [[P_KEY, PUBLIC_CHANNEL, 1]], ...rowExtra,
+    }, operations ? postHeld(root, operations, view === 'unknown') : view === 'unknown' ? memoryHeld(root) : dropped())
+  const newMessage = (issuedAt: number, operation = 'op-new') => ownPostsOf([{ operation, issuedAt }])
+  const P_PARENTS: ReadonlyArray<readonly [string, unknown, boolean]> = [
+    ["P's bot user", P_USER, true], ['absent', undefined, true], ['empty', '', true], ['null', null, true],
+    ['a number', 7, true], ['an object', { id: P_USER }, true], ['another user', Q_USER, false], ['another persona', 'U0PERSONAR', false],
+  ]
+  const postHolds = VIEWS.flatMap(view => [
+    replyWith('a post under the reply root holds it', THREAD_ROOT, view,
+      ownPostsOf([{ operation: 'op-root', root: THREAD_ROOT, issuedAt: ISSUED_AT }]), ['op-root']),
+    replyWith('a post under another root does not cover', THREAD_ROOT, view,
+      ownPostsOf([{ operation: 'op-other', root: OTHER_ROOT, issuedAt: THREAD_ROOT_ISSUED_AT }]), undefined),
+    replyWith('a post under the root covers whatever parent_user_id says', THREAD_ROOT, view,
+      ownPostsOf([{ operation: 'op-root', root: THREAD_ROOT, issuedAt: ISSUED_AT }]), ['op-root'], { parent_user_id: Q_USER }),
+    replyWith(`a new message covers a root exactly at its bound ${BOUND_ROOT}`, BOUND_ROOT, view, newMessage(ISSUED_AT), ['op-new']),
+    replyWith(`a new message covers a root 1 µs newer than its bound ${ABOVE_ROOT}`, ABOVE_ROOT, view, newMessage(ISSUED_AT), ['op-new']),
+    replyWith(`a new message does not cover a root 1 µs older than its bound ${BELOW_ROOT}`, BELOW_ROOT, view, newMessage(ISSUED_AT), undefined),
+    replyWith('a new message issued 1 ms later does not cover the bound root', BOUND_ROOT, view, newMessage(ISSUED_AT + 1), undefined),
+    ...([-Infinity, NaN, Infinity] as const).map(issuedAt => replyWith(`a new message issued at ${issuedAt} covers nothing`,
+      THREAD_ROOT, view, newMessage(issuedAt), undefined)),
+    ...P_PARENTS.map(([label, parent, covers]) => replyWith(`a new message with parent_user_id ${label} ${covers ? 'covers' : 'does not cover'}`,
+      THREAD_ROOT, view, newMessage(THREAD_ROOT_ISSUED_AT), covers ? ['op-new'] : undefined, { parent_user_id: parent })),
+    // Task Decision 1: with P's bot user unknown, only an absent parent is P's.
+    ...P_PARENTS.filter(([, parent]) => parent !== Q_USER).map(([label, parent]) => {
+      const covers = typeof parent !== 'string' || parent === ''
+      return replyWith(`P's bot user unknown, a new message with parent_user_id ${label} ${covers ? 'covers' : 'does not cover'}`,
+        THREAD_ROOT, view, newMessage(THREAD_ROOT_ISSUED_AT), covers ? ['op-new'] : undefined, { parent_user_id: parent }, { unknownBotUser: true })
+    }),
+    replyWith('every covering post is named once, in list order', THREAD_ROOT, view, ownPostsOf([
+      { operation: 'op-b', issuedAt: THREAD_ROOT_ISSUED_AT }, { operation: 'op-x', root: OTHER_ROOT, issuedAt: THREAD_ROOT_ISSUED_AT },
+      { operation: 'op-late', issuedAt: ISSUED_AT }, { operation: 'op-a', root: THREAD_ROOT, issuedAt: ISSUED_AT },
+      { operation: 'op-a', root: THREAD_ROOT, issuedAt: ISSUED_AT },
+    ]), ['op-b', 'op-a']),
+    replyWith('an empty list covers nothing', THREAD_ROOT, view, ownPostsOf([]), undefined),
+    replyWith("another persona's posts do not cover", THREAD_ROOT, view,
+      ownPostsOf([{ operation: 'op-q', root: THREAD_ROOT, issuedAt: THREAD_ROOT_ISSUED_AT }], Q_KEY), undefined),
+    replyWith("posts in another channel do not cover", THREAD_ROOT, view,
+      ownPostsOf([{ operation: 'op-elsewhere', root: THREAD_ROOT, issuedAt: THREAD_ROOT_ISSUED_AT }], P_KEY, Q_DESTINATION), undefined),
+  ]).concat([
+    row('joined view: a covering post leaves the reply delivered unread', { ownPosts: COVERING, threadReads: [THREAD_READ] }, selected('thread')),
+    ...VIEWS.flatMap(view => [
+      row(`${view} view: a mention in a covered reply is selected unread`, {
+        event: event({ text: P_MENTION }), threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [THREAD_ROOT]: view } } }, ownPosts: COVERING,
+      }, selected('mention')),
+      row(`${view} view: a Broadcast in a covered reply is selected unread`, {
+        event: event({ text: broadcastText('channel') }), threadViews: { [P_KEY]: { [PUBLIC_CHANNEL]: { [THREAD_ROOT]: view } } }, ownPosts: COVERING,
+      }, selected('broadcast')),
+    ]),
+  ])
   // Moving/removing Q's destination and moving P's own destination preserve it.
   const destinations: ChannelDeliveryRow[] = [
     ...matrix,
@@ -1077,7 +1180,7 @@ function threadGroups(mode: 'strict' | 'open') {
       stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' }, [Q_KEY]: { [PUBLIC_CHANNEL]: sibling === 'not-applied' ? 'all' : sibling } },
       event: event({ text: via === 'mention' ? `${P_MENTION} ${broadcastText('here')}` : via === 'broadcast' ? broadcastText('here') : 'plain words' }),
     }, selected(via === 'mention' || via === 'broadcast' ? via : sibling === 'all' ? 'receive_all_shared' : 'receive_all', 'all'))))
-  return { matrix, threads, noLookup, unknownView, destinations, shared }
+  return { matrix, threads, noLookup, unknownView, postHolds, destinations, shared }
 }
 
 const strictThreads = threadGroups('strict')
@@ -1087,6 +1190,7 @@ export const THREAD_DECISION_GROUPS = {
   threads: { rows: [...strictThreads.threads, ...openThreads.threads] },
   noLookup: { rows: [...strictThreads.noLookup, ...openThreads.noLookup] },
   unknownView: { rows: [...strictThreads.unknownView, ...openThreads.unknownView] },
+  postHolds: { rows: [...strictThreads.postHolds, ...openThreads.postHolds] },
   destinations: { rows: [...strictThreads.destinations, ...openThreads.destinations] },
   shared: { rows: [...strictThreads.shared, ...openThreads.shared] },
 } as const

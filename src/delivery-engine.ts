@@ -246,7 +246,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
     const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
-    k.holds = items.flatMap(i => i.hold?.state === 'unresolved' ? [{ item: i.accepted.seq, kind: i.hold.field.on }] : [])
+    // Effective kinds: a parked Post Hold is passed as a Memory Hold.
+    k.holds = items.flatMap(i => i.hold?.state === 'unresolved' ? [{ item: i.accepted.seq, kind: i.hold.kind }] : [])
     if (s.pending) k.writer.item = s.pending.record.seq
     s.snapshot = k; return k
   }

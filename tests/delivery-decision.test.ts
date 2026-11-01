@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { eligibleMembership, THREAD_DECISION_GROUPS, decisionArgsOf, channelDeliveryArgsOf, type ThreadRead } from './test-helpers/fungible-decision.ts'
+import { eligibleMembership, THREAD_DECISION_GROUPS, decisionArgsOf, channelDeliveryArgsOf, type OwnPostRead, type ThreadRead } from './test-helpers/fungible-decision.ts'
 
 import { CHANNEL_ID_RE, type ChannelEntry } from '../src/config.ts'
 import {
@@ -418,9 +418,10 @@ describe('no arbitration', () => {
 for (const [name, group] of Object.entries(THREAD_DECISION_GROUPS)) {
   describe(`strict Thread Memory: ${name}`, () => {
     test.each(group.rows.filter(row => row.config.channel_mode === 'strict'))('$label', row => {
-      const reads: ThreadRead[] = []
-      expect(decideDelivery(...decisionArgsOf(row, reads))).toStrictEqual(row.expected)
+      const reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []
+      expect(decideDelivery(...decisionArgsOf(row, reads, ownPostReads))).toStrictEqual(row.expected)
       expect(reads).toEqual([...(row.threadReads ?? [])])
+      expect(ownPostReads).toEqual([...(row.ownPostReads ?? [])])
       if (row.channelDelivery) expect(channelDeliveryFor(...channelDeliveryArgsOf(row))).toStrictEqual(row.channelDelivery)
     })
   })

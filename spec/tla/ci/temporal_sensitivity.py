@@ -83,7 +83,7 @@ def write_bytes(path, data):
 SET_FIELDS = {"accepted", "fixed", "refused", "delivered", "everSent",
               "everDelivered", "acked", "credited", "expired", "noticed", "receipts",
               "Faults", "engineActions", "controlActions", "expiredTimers",
-              "held", "withdrawn", "bypassed", "holds"}
+              "held", "posted", "withdrawn", "bypassed", "holds"}
 # JSON arrays erase the model's set/sequence distinction. This applies only
 # to lists: AD reading fields also named "held" remain scalar booleans, and
 # members of bypassed remain ordered pairs rather than nested sets.

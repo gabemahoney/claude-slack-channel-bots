@@ -15,9 +15,10 @@ import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { heldSlackInput, memoryHold, injectedInput, makeQueue, readQueue } from './test-helpers/delivery-queue.ts'
+import { heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, readQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
+import type { HoldField, HoldOutcome } from '../src/delivery-queue.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
-import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeRecoveryHarness, personaOf, personaRow, retryNow } from './test-helpers/recovery-harness.ts'
 import { balancedAfter, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
@@ -29,8 +30,8 @@ async function harness(options: Parameters<typeof makeEngineHarness>[0] = {}) { 
 async function start(h: EngineHarness, key = 'alpha') { await h.tick(key) }
 async function delivered(h: EngineHarness, key = 'alpha') { await h.until(() => h.queue.openCount(key) === 0) }
 
-async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key = 'alpha') {
-  const input = heldSlackInput(memoryHold(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
+async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key = 'alpha', field: (at: number) => HoldField = memoryHold) {
+  const input = heldSlackInput(field(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
   const result = await h.queue.acceptDecided(key, input.key, () => ({ store: input }))
   if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
   return result.item!
@@ -61,8 +62,9 @@ describe('Memory Hold delivery', () => {
     assertNoLeak([h.events, h.calls, h.errors, h.records(), h.records('beta')])
   })
 
-  test.each([false, true])('release opens at its original position and ages from release (compacted=%s)', async compacted => {
-    const h = await harness(), held = await hold(h), withdrawn = await hold(h, THREAD_ROOTS.third)
+  test.each([['memory', false], ['memory', true], ['post', false], ['post', true]] as const)('a %s hold release opens at its original position and ages from release (compacted=%p)', async (kind, compacted) => {
+    const field = HOLD_FIELDS[kind]
+    const h = await harness(), held = await hold(h, THREAD_ROOTS.secondary, 'alpha', field), withdrawn = await hold(h, THREAD_ROOTS.third, 'alpha', field)
     await h.queue.resolveHolds('alpha', [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: h.clock.now() }])
     await h.tick()
     await h.advance(DELIVERY_STUCK_AFTER_MS * 2)
@@ -114,6 +116,118 @@ describe('Memory Hold delivery', () => {
     expect(h.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual([2, 1, 3])
     expect(h.errors).toEqual([])
     assertNoLeak([h.events, h.calls, h.errors, h.records()])
+  })
+})
+
+describe('Post Hold delivery', () => {
+  const deliveredSeqs = (h: EngineHarness, key = 'alpha') => h.events.flatMap(e => e.type === 'item-delivered' && e.key === key ? [e.seq] : [])
+  const typedSeqs = (h: EngineHarness) => h.records().flatMap(r => r.kind === 'sent' || r.kind === 'delivered' ? [r.seq] : [])
+  // Later work from every source: another channel, a DM, cron and /interject.
+  async function laterSources(h: EngineHarness) {
+    const inputs = [
+      slackInput({ channel: THREAD_CHANNELS.secondary, key: { chat_id: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.third }, ts: THREAD_ROOTS.third, text: 'other channel' }),
+      slackInput({ channel: 'D0TEST001', channel_type: 'im', via: 'dm', key: { chat_id: 'D0TEST001', ts: THREAD_ROOTS.third }, ts: THREAD_ROOTS.third, text: 'direct message' }),
+      injectedInput({ source: 'cron', sender: 'cron', text: 'cron prompt' }),
+      injectedInput({ text: 'interjected prompt' }),
+    ]
+    const seqs: number[] = []
+    for (const input of inputs) {
+      const result = await h.queue.accept('alpha', input)
+      if (result.status !== 'accepted') throw new Error('later fixture acceptance failed')
+      seqs.push(result.seq)
+    }
+    await h.preparation.recover()
+    return seqs
+  }
+
+  test.each(['released', 'withdrawn', 'parked'] as const)('blocks every later source and nothing else until it is %s, then the wake delivers with no new traffic', async (outcome: HoldOutcome) => {
+    const h = await harness({ keys: ['alpha', 'beta'] })
+    await h.accept('earlier'); await h.tick(); await delivered(h)
+    const held = await hold(h, THREAD_ROOTS.secondary, 'alpha', unknownRootPostHold), seq = held.accepted.seq
+    const later = await laterSources(h)
+    await h.accept('independent beta', 'beta')
+    const keys = h.keyCalls().length
+    await h.tick(); await h.tick('beta')
+    await h.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    // However many ticks run, nothing is sent or typed for the hold or behind it.
+    // Preparation has fixed the later items' text, but never the held item's.
+    expect(h.keyCalls()).toHaveLength(keys)
+    expect(typedSeqs(h)).toEqual([1, 1])
+    expect(h.queue.item('alpha', seq)!.fixed).toBeUndefined()
+    for (const s of later) expect(h.queue.item('alpha', s)!.fixed).toBeDefined()
+    expect(h.queue.openCount('alpha')).toBe(later.length)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.events.filter(e => e.type === 'waiting' && e.key === 'alpha')).toEqual([])
+    // Another persona keeps delivering while this one is blocked.
+    expect(deliveredSeqs(h, 'beta')).toEqual([1])
+
+    await h.queue.resolveHolds('alpha', [{ seq, outcome, at: h.clock.now() }])
+    await h.advance(DELIVERY_STUCK_AFTER_MS)
+    expect(deliveredSeqs(h)).toEqual([1]) // A saved resolution alone sends nothing; the server wakes the engine.
+    if (outcome === 'released') await h.preparation.recover()
+    h.engine.wake('alpha')
+    await delivered(h)
+    expect(deliveredSeqs(h)).toEqual(outcome === 'released' ? [1, seq, ...later] : [1, ...later])
+    expect(h.textCalls().map(c => c.params.text)).toEqual(deliveredSeqs(h).flatMap(s => h.queue.item('alpha', s)!.fixed!.parts))
+    if (outcome === 'withdrawn') expect(h.queue.item('alpha', seq)!.fixed).toBeUndefined()
+    if (outcome === 'parked') {
+      // Parked, it is a Memory Hold: later items passed it, and it is delivered once released.
+      expect(h.queue.item('alpha', seq)!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
+      await h.queue.resolveHolds('alpha', [{ seq, outcome: 'released', at: h.clock.now() }])
+      await h.preparation.recover()
+      h.engine.wake('alpha')
+      await delivered(h)
+      expect(deliveredSeqs(h)).toEqual([1, ...later, seq])
+    }
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records(), h.records('beta')])
+  })
+
+  test('an item in flight when a Post Hold is stored finishes alone; nothing behind the hold is typed', async () => {
+    const h = await harness(), parts = ['in flight one', 'in flight two']
+    await h.accept('multipart', 'alpha', parts)
+    let stored = false
+    h.p().keyHook = async params => {
+      if (!stored && params.no_enter) {
+        stored = true
+        await hold(h, THREAD_ROOTS.secondary, 'alpha', postHold)
+        await h.accept('behind the hold')
+      }
+      return undefined
+    }
+    await h.tick()
+    await h.until(() => h.queue.item('alpha', 1)?.delivered === true)
+    await h.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    expect(stored).toBe(true)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(parts)
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => [r.seq, r.part])).toEqual([[1, 1], [1, 2]])
+    expect(typedSeqs(h).filter(s => s !== 1)).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.errors).toEqual([])
+  })
+
+  test('a Memory Hold ahead of a Post Hold is passed, and selection stops at the Post Hold', async () => {
+    const h = await harness()
+    const memory = await hold(h)
+    await h.accept('between')
+    await hold(h, THREAD_ROOTS.third, 'alpha', postHold)
+    await h.accept('behind')
+    await h.tick(); await h.until(() => h.queue.item('alpha', 2)?.delivered === true)
+    await h.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    expect(deliveredSeqs(h)).toEqual([2])
+    expect(h.engine.running('alpha')).toBe(false)
+    // The released Memory Hold is delivered at its position, still not past the Post Hold.
+    await h.queue.resolveHolds('alpha', [{ seq: memory.accepted.seq, outcome: 'released', at: h.clock.now() }])
+    await h.preparation.recover()
+    h.engine.wake('alpha')
+    await h.until(() => h.queue.item('alpha', 1)?.delivered === true)
+    await h.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    expect(deliveredSeqs(h)).toEqual([2, 1])
+    expect(h.textCalls().map(c => c.params.text)).toEqual([...h.queue.item('alpha', 2)!.fixed!.parts, ...h.queue.item('alpha', 1)!.fixed!.parts])
+    expect(typedSeqs(h).filter(s => s > 2)).toEqual([])
+    expect(h.errors).toEqual([])
   })
 })
 async function drainTimers(h: EngineHarness) {

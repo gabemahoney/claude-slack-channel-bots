@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type AcceptedInput, type HoldResolution, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
-import { deliveredRecord, fixedRecord, heldSlackInput, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, withdrawnRecord } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, postHold, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, unknownRootPostHold, withdrawnRecord } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
 import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
 import { createDeliveryQueue as createMainDeliveryQueue, isQueueRecord as isMainQueueRecord } from './fixtures/main-delivery-queue/delivery-queue.ts'
@@ -1019,9 +1019,9 @@ describe('decided acceptance owns the persona writer turn', () => {
 })
 
 describe('Memory Hold queue records', () => {
-  const heldRecord = (): AcceptedRecord => ({ ...accepted(), ...heldSlackInput(memoryHold(THREAD_TIME)), received_at: THREAD_TIME })
-  async function storeHold(q: DeliveryQueue, at: number, overrides: Partial<AcceptedInput> = {}, key = 'alpha') {
-    const input = heldSlackInput(memoryHold(at), overrides)
+  const heldRecord = (hold: HoldField = memoryHold(THREAD_TIME)): AcceptedRecord => ({ ...accepted(), ...heldSlackInput(hold), received_at: THREAD_TIME })
+  async function storeHold(q: DeliveryQueue, at: number, overrides: Partial<AcceptedInput> = {}, key = 'alpha', hold: (at: number) => HoldField = memoryHold) {
+    const input = heldSlackInput(hold(at), overrides)
     const result = await q.acceptDecided(key, input.key, () => ({ store: input }))
     expect(result.status).toBe('accepted')
     if (result.status !== 'accepted' || !result.item) throw new Error('hold was not stored')
@@ -1036,7 +1036,7 @@ describe('Memory Hold queue records', () => {
     },
   } as typeof fs
 
-  test.each([false, true])('one accepting append protects an in-flight hold; store failure=%s', async fail => {
+  test.each([['memory', false], ['memory', true], ['post', false], ['post', true]] as const)('one accepting append protects an in-flight %s hold; store failure=%p', async (kind, fail) => {
     const clock = createFakeClock({ start: THREAD_TIME }), writes: Buffer[] = [], events: QueueEvent[] = []
     const paths = new Map<number, string>(), observations: ReturnType<DeliveryQueue['unresolvedHolds']>[] = []
     const seam = { ...fs,
@@ -1057,10 +1057,12 @@ describe('Memory Hold queue records', () => {
       },
     } as typeof fs
     const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
-    const input = heldSlackInput(memoryHold(clock.now()), { text: 'held exact\nbytes🙂', queued_ack_reaction: 'original_queue' })
+    const hold = kind === 'post' ? postHold(clock.now(), { operations: ['post-one', 'post-two'] }) : memoryHold(clock.now())
+    const input = heldSlackInput(hold, { text: 'held exact\nbytes🙂', queued_ack_reaction: 'original_queue' })
     const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }))
     const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: 1, received_at: clock.now(), ts: input.ts! }
-    const expected = [{ ...input.hold!, seq: 1, channel: input.channel!, memoryDependent: true }]
+    // A Post Hold's root was known here, so it does not depend on Thread Memory.
+    const expected = [{ ...input.hold!, seq: 1, channel: input.channel!, memoryDependent: kind === 'memory' }]
     expect(writes).toEqual([Buffer.from(JSON.stringify(record) + '\n')])
     expect(observations.length).toBeGreaterThanOrEqual(2)
     for (const observed of observations) expect(observed).toEqual(expected)
@@ -1072,9 +1074,10 @@ describe('Memory Hold queue records', () => {
       await q.stop()
       const replay = await open({ now: clock.now })
       expect(replay.item('alpha', 1)!.accepted).toMatchObject(record)
-      expect(replay.item('alpha', 1)!.hold).toEqual({ field: input.hold!, state: 'unresolved' })
+      expect(replay.item('alpha', 1)!.hold).toEqual({ field: input.hold!, kind, state: 'unresolved' })
       expect(replay.unresolvedHolds('alpha')).toEqual(expected)
       expect(replay.openCount('alpha')).toBe(0)
+      expect(isOpenItem(replay.item('alpha', 1)!)).toBe(false)
     }
     assertNoLeak(events)
     expect(JSON.stringify(events)).not.toContain(input.text)
@@ -1093,17 +1096,35 @@ describe('Memory Hold queue records', () => {
     ['extra stamp key', { ...memoryHold(THREAD_TIME), stamp: { ...THREAD_STAMP, extra: true } }],
     ['non-finite arrival', memoryHold(Infinity)],
     ['null hold', null],
+    ['memory hold with operations', { ...memoryHold(THREAD_TIME), operations: ['post-one'] }],
+    ['memory hold with root_unknown', { ...memoryHold(THREAD_TIME), root_unknown: true }],
+    ['post empty operations', postHold(THREAD_TIME, { operations: [] })],
+    ['post repeated operation', postHold(THREAD_TIME, { operations: ['post-one', 'post-one'] })],
+    ['post empty operation ID', postHold(THREAD_TIME, { operations: ['post-one', ''] })],
+    ['post non-string operation ID', { ...postHold(THREAD_TIME), operations: [7] }],
+    ['post operations not a list', { ...postHold(THREAD_TIME), operations: 'post-one' }],
+    ...(['operations', 'thread_ts', 'stamp', 'root_unknown', 'arrived_at'] as const).map((key): [string, unknown] => [`post missing ${key}`, { ...postHold(THREAD_TIME), [key]: undefined }]),
+    ['post extra key', { ...postHold(THREAD_TIME), extra: true }],
+    ['post bad root', postHold(THREAD_TIME, { thread_ts: '1.1' })],
+    ['post empty incarnation', postHold(THREAD_TIME, { stamp: { ...THREAD_STAMP, incarnation: '' } })],
+    ['post empty since', postHold(THREAD_TIME, { stamp: { ...THREAD_STAMP, threadHybridSince: '' } })],
+    ['post non-boolean root_unknown', { ...postHold(THREAD_TIME), root_unknown: 'false' }],
+    ['post non-finite arrival', postHold(NaN)],
+  ]
+  // Each kind's form is rejected on records that may not carry a hold.
+  const misplaced = (label: string, hold: HoldField): [string, () => unknown][] => [
+    ...['interject', 'cron'].map(source => [`${label} on ${source}`, () => ({ ...heldRecord(hold), source, sender: source, key: undefined })] as [string, () => unknown]),
+    ...['mention', 'broadcast', 'all', 'dm', ''].map(via => [`${label} via ${via}`, () => ({ ...heldRecord(hold), via })] as [string, () => unknown]),
+    [`${label} beside thread_join`, () => ({ ...heldRecord(hold), thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP, at: THREAD_TIME } })],
+    ...[fixedRecord, sentRecord, deliveredRecord, refusedRecord, noticedRecord].map(build => [`${label} on ${build().kind}`, () => ({ ...build(), hold })] as [string, () => unknown]),
   ]
   const invalid: [string, () => unknown][] = [
     ...badHolds.map(([label, hold]): [string, () => unknown] => [label, () => ({ ...heldRecord(), hold })]),
-    ...['interject', 'cron'].map(source => [`hold on ${source}`, () => ({ ...heldRecord(), source, sender: source, key: undefined })] as [string, () => unknown]),
-    ...['mention', 'broadcast', 'all', 'dm', ''].map(via => [`hold via ${via}`, () => ({ ...heldRecord(), via })] as [string, () => unknown]),
-    ['hold beside thread_join', () => ({ ...heldRecord(), thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP, at: THREAD_TIME } })],
+    ...misplaced('hold', memoryHold(THREAD_TIME)),
+    ...misplaced('post hold', postHold(THREAD_TIME)),
     ['non-finite released_at', () => ({ ...accepted(), released_at: Infinity })],
-    ...[fixedRecord, sentRecord, deliveredRecord, refusedRecord, noticedRecord].flatMap(build => [
-      [`hold on ${build().kind}`, () => ({ ...build(), hold: memoryHold(THREAD_TIME) })],
-      [`released_at on ${build().kind}`, () => ({ ...build(), released_at: THREAD_TIME })],
-    ] as [string, () => unknown][]),
+    ...[fixedRecord, sentRecord, deliveredRecord, refusedRecord, noticedRecord].map(build =>
+      [`released_at on ${build().kind}`, () => ({ ...build(), released_at: THREAD_TIME })] as [string, () => unknown]),
     ...[releasedRecord, withdrawnRecord, parkedRecord].flatMap(build => [
       [`${build().kind} missing at`, () => ({ ...build(), at: undefined })],
       [`${build().kind} non-finite at`, () => ({ ...build(), at: NaN })],
@@ -1127,7 +1148,7 @@ describe('Memory Hold queue records', () => {
     expect(records).toHaveLength(2)
     for (const record of records) {
       expect(isMainQueueRecord(record)).toBe(true)
-      for (const field of [{ hold: memoryHold(clock.now()) }, { released_at: clock.now() }, { thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP, at: clock.now() } }]) {
+      for (const field of [{ hold: memoryHold(clock.now()) }, { hold: postHold(clock.now()) }, { released_at: clock.now() }, { thread_join: { thread_ts: THREAD_ROOTS.primary, stamp: THREAD_STAMP, at: clock.now() } }]) {
         expect(isQueueRecord({ ...record, ...field })).toBe(false)
       }
     }
@@ -1178,17 +1199,25 @@ describe('Memory Hold queue records', () => {
     }
   })
 
-  test.each([
-    ['release first', [parkedRecord(1, THREAD_TIME), releasedRecord(1, THREAD_TIME + 50), withdrawnRecord(1, THREAD_TIME + 10)], 'released', THREAD_TIME + 50],
-    ['withdraw first', [withdrawnRecord(1, THREAD_TIME + 50), releasedRecord(1, THREAD_TIME + 10), parkedRecord(1, THREAD_TIME + 60)], 'withdrawn', THREAD_TIME + 50],
-    ['fixed only', [fixedRecord()], 'released', THREAD_TIME],
-    ['sent only', [{ ...sentRecord(), at: THREAD_TIME + 40 }], 'released', THREAD_TIME + 40],
-    ['delivered only', [deliveredRecord(1, THREAD_TIME + 30)], 'released', THREAD_TIME + 30],
-    ['earliest send or receipt', [fixedRecord(1, ['one', 'two']), { ...sentRecord(), at: THREAD_TIME + 40 }, deliveredRecord(1, THREAD_TIME + 30), { ...sentRecord(1, 2), at: THREAD_TIME + 20 }], 'released', THREAD_TIME + 20],
-  ] as const)('replay uses %s and preserves its decision time', async (_, records, state, at) => {
-    seedQueue(dir, [heldRecord(), ...records])
+  // The last column is the effective kind of a Post Hold whose root was unknown:
+  // only a parked record before the first released/withdrawn makes it a Memory Hold.
+  const loadRules = [
+    ['release first', [parkedRecord(1, THREAD_TIME), releasedRecord(1, THREAD_TIME + 50), withdrawnRecord(1, THREAD_TIME + 10)], 'released', THREAD_TIME + 50, 'memory'],
+    ['withdraw first', [withdrawnRecord(1, THREAD_TIME + 50), releasedRecord(1, THREAD_TIME + 10), parkedRecord(1, THREAD_TIME + 60)], 'withdrawn', THREAD_TIME + 50, 'post'],
+    ['park after release', [releasedRecord(1, THREAD_TIME + 50), parkedRecord(1, THREAD_TIME + 60)], 'released', THREAD_TIME + 50, 'post'],
+    ['fixed only', [fixedRecord()], 'released', THREAD_TIME, 'post'],
+    ['sent only', [{ ...sentRecord(), at: THREAD_TIME + 40 }], 'released', THREAD_TIME + 40, 'post'],
+    ['delivered only', [deliveredRecord(1, THREAD_TIME + 30)], 'released', THREAD_TIME + 30, 'post'],
+    ['earliest send or receipt', [fixedRecord(1, ['one', 'two']), { ...sentRecord(), at: THREAD_TIME + 40 }, deliveredRecord(1, THREAD_TIME + 30), { ...sentRecord(1, 2), at: THREAD_TIME + 20 }], 'released', THREAD_TIME + 20, 'post'],
+  ] as const
+  test.each(loadRules.flatMap(([label, records, state, at, unknownRootKind]) => [
+    [label, 'Memory Hold', memoryHold(THREAD_TIME), records, state, at, 'memory'],
+    [label, 'known-root Post Hold', postHold(THREAD_TIME), records, state, at, 'post'],
+    [label, 'unknown-root Post Hold', unknownRootPostHold(THREAD_TIME), records, state, at, unknownRootKind],
+  ] as const))('replay uses %s and preserves its decision time (%s)', async (_, _hold, field, records, state, at, kind) => {
+    seedQueue(dir, [heldRecord(field), ...records])
     const q = await open({ fs: readOnlyFs, now: createFakeClock({ start: THREAD_TIME }).now })
-    expect(q.item('alpha', 1)!.hold).toEqual({ field: heldRecord().hold!, state, at })
+    expect(q.item('alpha', 1)!.hold).toEqual({ field, kind, state, at })
     expect(q.unresolvedHolds('alpha')).toEqual([])
     expect(q.openCount('alpha')).toBe(Number(state === 'released'))
     expect(itemOpenedAt(q.item('alpha', 1)!)).toBe(state === 'released' ? at : THREAD_TIME)
@@ -1200,6 +1229,50 @@ describe('Memory Hold queue records', () => {
     expect(q.item('alpha', 1)!.hold).toBeUndefined()
     expect(q.openCount('alpha')).toBe(1)
     expect(itemOpenedAt(q.item('alpha', 1)!)).toBe(accepted().received_at)
+  })
+
+  // Each step is one resolveHolds call; saved says whether it appends.
+  test.each([
+    ['an unknown-root Post Hold parks', unknownRootPostHold, ['parked'], [true], 'memory', 'unresolved'],
+    ['a known-root Post Hold does not park', postHold, ['parked'], [false], 'post', 'unresolved'],
+    ['a Memory Hold does not park', memoryHold, ['parked'], [false], 'memory', 'unresolved'],
+    ['a parked hold does not park again', unknownRootPostHold, ['parked', 'parked'], [true, false], 'memory', 'unresolved'],
+    ['a released hold does not park', unknownRootPostHold, ['released', 'parked'], [true, false], 'post', 'released'],
+    ['a withdrawn hold does not park', unknownRootPostHold, ['withdrawn', 'parked'], [true, false], 'post', 'withdrawn'],
+    ['a parked hold is released', unknownRootPostHold, ['parked', 'released'], [true, true], 'memory', 'released'],
+    ['a parked hold is withdrawn', unknownRootPostHold, ['parked', 'withdrawn'], [true, true], 'memory', 'withdrawn'],
+    ['a known-root Post Hold is released', postHold, ['released'], [true], 'post', 'released'],
+    ['a known-root Post Hold is withdrawn', postHold, ['withdrawn'], [true], 'post', 'withdrawn'],
+  ] as const)('%s', async (_, build, outcomes: readonly HoldOutcome[], saved: readonly boolean[], kind, state) => {
+    const clock = createFakeClock({ start: THREAD_TIME }), events: QueueEvent[] = []
+    let q = await open({ now: clock.now, onEvent: e => events.push(e) })
+    const item = await storeHold(q, clock.now(), {}, 'alpha', build), field = item.accepted.hold!
+    let decidedAt: number | undefined
+    for (const [i, outcome] of outcomes.entries()) {
+      await clock.advance(10)
+      const resolution: HoldResolution = { seq: 1, outcome, at: clock.now() }, before = fs.readFileSync(queuePath(dir))
+      events.length = 0
+      expect(await q.resolveHolds('alpha', [resolution])).toEqual(saved[i] ? [resolution] : [])
+      const record = { v: 1, kind: outcome, seq: 1, at: resolution.at } as const
+      expect(fs.readFileSync(queuePath(dir))).toEqual(saved[i] ? Buffer.concat([before, Buffer.from(JSON.stringify(record) + '\n')]) : before)
+      expect(events).toEqual(saved[i] ? [{ type: 'holds-resolved', key: 'alpha', resolutions: [resolution] }] : [])
+      if (saved[i] && outcome !== 'parked') decidedAt = resolution.at
+    }
+    // A parked Post Hold is listed in the Memory Hold form, for k8's resolver and heldStamps.
+    const entry = kind === 'memory' ? { ...memoryHold(THREAD_TIME), seq: 1, channel: item.accepted.channel!, memoryDependent: true }
+      : { ...field, seq: 1, channel: item.accepted.channel!, memoryDependent: false }
+    const check = (queue: DeliveryQueue) => {
+      const summary = queue.item('alpha', 1)!
+      expect(summary.hold).toEqual(decidedAt === undefined ? { field, kind, state } : { field, kind, state, at: decidedAt })
+      expect(queue.unresolvedHolds('alpha')).toEqual(state === 'unresolved' ? [entry] : [])
+      expect(queue.openCount('alpha')).toBe(Number(state === 'released'))
+      expect(itemOpenedAt(summary)).toBe(decidedAt !== undefined && state === 'released' ? decidedAt : THREAD_TIME)
+    }
+    check(q)
+    await q.stop()
+    q = await open({ fs: readOnlyFs, now: clock.now })
+    check(q)
+    assertNoLeak(events)
   })
 
   test('resolution batches save once, filter resolved/absent holds and publish only after durable sync', async () => {
@@ -1242,7 +1315,7 @@ describe('Memory Hold queue records', () => {
     expect(events).toEqual([{ type: 'holds-resolved', key: 'alpha', resolutions: saved }])
     expect(q.unresolvedHolds('alpha')).toEqual([])
     expect(q.openCount('alpha')).toBe(3)
-    expect(earlier.map(r => q.item('alpha', r.seq)!.hold)).toEqual(earlier.map(r => ({ field: memoryHold(THREAD_TIME), state: r.outcome, at: r.at })))
+    expect(earlier.map(r => q.item('alpha', r.seq)!.hold)).toEqual(earlier.map(r => ({ field: memoryHold(THREAD_TIME), kind: 'memory', state: r.outcome, at: r.at })))
     const before = fs.readFileSync(queuePath(dir))
     expect(await q.resolveHolds('alpha', candidates)).toHaveLength(0)
     expect(await q.resolveHolds('alpha', [])).toHaveLength(0)
@@ -1363,10 +1436,10 @@ describe('Memory Hold queue records', () => {
     expect(q.openCount('alpha')).toBe(1)
   })
 
-  test.each(['unresolved', 'released', 'withdrawn'] as const)('%s keeps its Slack key across reopen, compaction and the retention boundary', async state => {
+  test.each((['unresolved', 'released', 'withdrawn'] as const).flatMap(state => (['memory', 'post'] as const).map(kind => [state, kind] as const)))('%s %s hold keeps its Slack key across reopen, compaction and the retention boundary', async (state, kind) => {
     const clock = createFakeClock({ start: THREAD_TIME })
     let q = await open({ now: clock.now })
-    const item = await storeHold(q, clock.now()), input = heldSlackInput(item.accepted.hold!)
+    const item = await storeHold(q, clock.now(), {}, 'alpha', HOLD_FIELDS[kind]), input = heldSlackInput(item.accepted.hold!)
     await clock.advance(100)
     if (state !== 'unresolved') await q.resolveHolds('alpha', [{ seq: 1, outcome: state, at: clock.now() }])
     const duplicate = async () => {
@@ -1397,14 +1470,16 @@ describe('Memory Hold queue records', () => {
     expect(readQueue(dir).map(r => 'compact' in r ? r.compact : r.kind)).toEqual(['allocation'])
   })
 
-  test('compaction preserves unresolved/parked holds and rewrites resolved work for the frozen main reader', async () => {
+  // Post Holds' roots were unknown, so seq 5's parking makes it a Memory Hold.
+  test.each(['memory', 'post'] as const)('compaction preserves unresolved/parked %s holds and rewrites resolved work for the frozen main reader', async kind => {
     const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
+    const hold = () => kind === 'post' ? postHold(clock.now(), { operations: ['post-one', 'post-two'], root_unknown: true }) : memoryHold(clock.now())
     const inputs = [
-      heldSlackInput(memoryHold(clock.now())),
-      heldSlackInput(memoryHold(clock.now()), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } }),
-      heldSlackInput(memoryHold(clock.now()), { ts: THREAD_ROOTS.primary, key: { ...slackInput().key!, ts: THREAD_ROOTS.primary } }),
-      heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.secondary, key: { chat_id: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary } }),
-      heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.private, key: { chat_id: THREAD_CHANNELS.private, ts: THREAD_ROOTS.secondary } }),
+      heldSlackInput(hold()),
+      heldSlackInput(hold(), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } }),
+      heldSlackInput(hold(), { ts: THREAD_ROOTS.primary, key: { ...slackInput().key!, ts: THREAD_ROOTS.primary } }),
+      heldSlackInput(hold(), { channel: THREAD_CHANNELS.secondary, key: { chat_id: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary } }),
+      heldSlackInput(hold(), { channel: THREAD_CHANNELS.private, key: { chat_id: THREAD_CHANNELS.private, ts: THREAD_ROOTS.secondary } }),
     ]
     for (const input of inputs) expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
     await clock.advance(50)
@@ -1427,9 +1502,11 @@ describe('Memory Hold queue records', () => {
     expect(released.accepted).not.toHaveProperty('hold')
     expect(released.records.filter(r => r.kind !== 'accepted')).toEqual(otherRecords)
     expect(q.openCount('alpha')).toBe(1)
-    for (const seq of [4, 5]) {
-      expect(q.item('alpha', seq)!.accepted).toMatchObject(before[seq - 1]!.accepted)
-      expect(q.item('alpha', seq)!.hold?.state).toBe('unresolved')
+    // The unparked hold is kept whole; the parked one keeps only the Memory Hold form.
+    const kept = [[4, inputs[3]!.hold!, kind], [5, memoryHold(THREAD_TIME), 'memory']] as const
+    for (const [seq, field, effective] of kept) {
+      expect(q.item('alpha', seq)!.accepted).toEqual({ ...before[seq - 1]!.accepted, hold: field, attempt_high_watermark: 0 })
+      expect(q.item('alpha', seq)!.hold).toEqual({ field, kind: effective, state: 'unresolved' })
     }
     expect(records.filter(r => 'compact' in r && r.compact === 'key').map(r => 'delivered_at' in r ? [r.seq, r.delivered_at] : [])).toEqual([[2, clock.now()], [3, clock.now() + 10]])
     const copy = join(dir, 'main-holds')
@@ -1447,12 +1524,12 @@ describe('Memory Hold queue records', () => {
     const replay = await open({ now: clock.now })
     expect(replay.openCount('alpha')).toBe(1)
     expect(itemOpenedAt(replay.item('alpha', 1)!)).toBe(clock.now())
-    expect(replay.unresolvedHolds('alpha').map(h => h.seq)).toEqual([4, 5])
+    expect(replay.unresolvedHolds('alpha')).toEqual(kept.map(([seq, field]) => ({ ...field, seq, channel: inputs[seq - 1]!.channel!, memoryDependent: true })))
   })
 
-  test('main can deliver an unresolved hold and current replay recognizes its release at delivery time', async () => {
+  test.each(['memory', 'post'] as const)('main can deliver an unresolved %s hold and current replay recognizes its release at delivery time', async kind => {
     const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now })
-    await storeHold(q, clock.now()); await q.stop()
+    await storeHold(q, clock.now(), {}, 'alpha', HOLD_FIELDS[kind]); await q.stop()
     const old = createMainDeliveryQueue({ stateDir: dir, now: clock.now })
     await old.start()
     try {
@@ -1464,7 +1541,7 @@ describe('Memory Hold queue records', () => {
       expect(old.item('alpha', 1)!.delivered).toBe(true)
     } finally { await old.stop() }
     const replay = await open({ fs: readOnlyFs, now: clock.now }), item = replay.item('alpha', 1)!
-    expect(item.hold).toEqual({ field: memoryHold(THREAD_TIME), state: 'released', at: clock.now() })
+    expect(item.hold).toEqual({ field: HOLD_FIELDS[kind](THREAD_TIME), kind, state: 'released', at: clock.now() })
     expect(item.delivered).toBe(true)
     expect(itemOpenedAt(item)).toBe(clock.now())
     expect(replay.openCount('alpha')).toBe(0)

@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs'
 
 import { createDeliveryQueue, type QueueItem, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
-import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, type OwnPostJoins } from '../../src/own-post.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, pendingOwnPostViews, type OwnPostJoins } from '../../src/own-post.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -631,6 +631,8 @@ export interface HarnessPost {
 export interface RoutingHarness {
   threads?: ThreadMemoryHarness
   threadMemoryReads: Array<[string, string, string]>
+  /** Every Pending Own Posts read the opt-in Thread Memory wiring answered, in order. */
+  pendingOwnPostReads: Array<[string, string]>
   /** Resolver notifications, recorded only by the opt-in Thread Memory wiring. */
   holdStored: string[]
   releaseHeld: PersonaRouting['releaseHeld']
@@ -939,6 +941,7 @@ export function makeRoutingHarness(
   const h: RoutingHarness = {
     queue,
     threadMemoryReads: [],
+    pendingOwnPostReads: [],
     holdStored: [],
     releaseHeld: (key, item, mode) => routing.releaseHeld(key, item, mode),
     preparationCalls: [],
@@ -1101,6 +1104,11 @@ export function makeRoutingHarness(
       h.threadMemoryReads.push([key, channel, root])
       ownPostJoins?.settleDeferred(key, channel)
       return h.threads!.memory.view(key, channel, root)
+    },
+    // As server.ts: the one owner's in-memory posts through the production mapping; none before it exists.
+    pendingOwnPosts: opts.threadMemory === undefined ? undefined : (key, channel) => {
+      h.pendingOwnPostReads.push([key, channel])
+      return pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? [])
     },
     threadStampUndecided: opts.threadMemory === undefined ? undefined :
       (key, channel) => h.channelDelivery?.authority.channelStamp(key, channel)?.kind === 'undecided',

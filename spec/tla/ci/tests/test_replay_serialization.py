@@ -49,6 +49,17 @@ class ReplaySerializationTests(unittest.TestCase):
             'p |-> [held |-> {1},withdrawn |-> {}]]]')
         self.assert_serialized({"holds": []}, "[holds |-> {}]")
 
+    def test_posted_and_post_kind_holds_are_sets(self):
+        self.assert_serialized({"p": {"posted": [2, 1]}}, "[p |-> [posted |-> {1,2}]]")
+        self.assert_serialized({"p": {"posted": []}}, "[p |-> [posted |-> {}]]")
+        self.assert_serialized(
+            {"knowledge": {"holds": [{"item": 1, "kind": "memory"}, {"item": 2, "kind": "post"}],
+                           "p": {"held": [1], "posted": [2], "withdrawn": []}}},
+            '[knowledge |-> [holds |-> {[item |-> 1,kind |-> "memory"],[item |-> 2,kind |-> "post"]},'
+            'p |-> [held |-> {1},posted |-> {2},withdrawn |-> {}]]]')
+        with self.assertRaisesRegex(temporal.SensitivityRefusal, "duplicate member in state set"):
+            temporal.tla({"posted": [1, 1]})
+
     def test_boolean_held_readings_stay_booleans(self):
         self.assert_serialized(
             {"a": {"held": True}, "knowledge": {"r": {"held": False}}},
