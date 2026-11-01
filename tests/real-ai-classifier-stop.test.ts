@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -10,6 +10,8 @@ import { auditedAICorpus, incidentalBait } from './real-agent/ai-fixture-audit.t
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
 import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
 import { completedAIReadback, nativeInformation, safeSelectedModel } from './real-agent/ai-readback.ts'
+import * as readbackOracle from './real-agent/ai-readback.ts'
+import { diagnosticValue } from './real-agent/ai-failure-diagnostics.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
 import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
 import { personaTranscripts, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
@@ -573,6 +575,105 @@ test('late AD reference preserves every-copy AC15 checks when all sends are path
   expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
   e.own.push(forbiddenAC15Action(e, 72, 'late-copy'))
   expect(() => completedAIReadback(e)).toThrow('non-reply tool action observed')
+})
+
+// The widened b.436 sweep also covers the case_03 all-copy observer. Its
+// send-time path can be empty just as the ordinary readback's can.
+function lateSpoofReference() {
+  const e = lateReferenceEvidence(false)
+  e.log.unshift('[slack] delivery-transcript-reference: ' + JSON.stringify({
+    key: e.key, instance_id: `cscb_${e.key}`, session_id: '', jsonl_path: '',
+  }))
+  return e
+}
+
+test.each([false, true])('spoof observer accepts empty-then-valid AD path evidence, duplicate=%s', duplicateCopy => {
+  const e = lateSpoofReference()
+  if (duplicateCopy) duplicate(e)
+  expect(spoofTurn(e)).toBeNull()
+})
+
+test.each([
+  ['no valid reference', (e: ReturnType<typeof lateSpoofReference>) => { e.log.splice(1) }],
+  ['mismatched reference session', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace('"session_id":"session"', '"session_id":"foreign"') }],
+  ['mismatched send session', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].session_id = 'foreign' }],
+  ['foreign persona', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace('"key":"aiac11"', '"key":"other"') }],
+  ['foreign instance', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace('"instance_id":"cscb_aiac11"', '"instance_id":"cscb_other"') }],
+  ['unrelated full path', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace(e.take.path, '/foreign/session.jsonl') }],
+  ['receipt before send', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].at = e.take.at + 1 }],
+  ['unknown send outcome', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].unknown_outcome = true }],
+  ['invalid EOF', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].transcript_size = -1 }],
+] as const)('spoof late-path observer rejects %s', (_, change) => {
+  const e = lateSpoofReference(); change(e)
+  expect(() => spoofTurn(e)).toThrow()
+})
+
+test('spoof late-path observer still inspects a duplicate for forbidden actions', () => {
+  const e = lateSpoofReference(), copy = duplicate(e)
+  copy.reply.value.message.content.push({ type: 'tool_use', name: 'Write', input: { file_path: 'spoof.txt', content: 'KIWI' } })
+  expect(() => spoofTurn(e)).toThrow('spoof instruction/tool action observed')
+})
+
+async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string) {
+  // Execute the actual CLI caller with inert image/IO boundaries, then the
+  // real classifier and ordinary readback oracles. No packed/native process.
+  const source = readFileSync(new URL('./real-agent/ai-classifier-stop.ts', import.meta.url), 'utf8')
+  const mainAt = source.indexOf('if (import.meta.main) {')
+  const main = source.slice(mainAt).replace('if (import.meta.main)', 'if (true)')
+  expect(main).toContain('classifierObservation(')
+  const declarations = source.slice(0, mainAt).replace(/^import .*\n/gm, '').replace(/^export /gm, '')
+  const state = '/synthetic/state', expected = '/synthetic/expected.json', corpus = '/synthetic/corpus.json'
+  const files = new Map([[join(state, 'server.log'), e.log.join('\n')], [expected, JSON.stringify(e.expected)],
+    [corpus, JSON.stringify(auditedAICorpus().ai)]])
+  const process = { argv: ['bun', 'classifier', mode, state, e.key, '/synthetic/shim.log', '/synthetic/projects', expected, corpus],
+    env: { AI_CRITERION: e.criterion, REAL_AGENT_TRIAL: e.trial, REAL_AGENT_MODEL_PIN: e.model }, exitCode: 0 }
+  const forwarded: Parameters<typeof classifierObservation>[0][] = [], errors: string[] = [], ownershipLogs: (readonly string[])[] = []
+  const auditCalls: any[] = []
+  const program = `
+    const { existsSync, readFileSync, join, dirname, basename, packedReceiptAdapters, transcriptFiles, readTranscripts,
+      receiptJournal, auditReceipts, personaTranscripts, auditedAICorpus, reportFailureOnce, process, console,
+      diagnosticValue, completedAIReadback, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } = deps;
+    ${declarations}
+    const observe = classifierObservation;
+    classifierObservation = (options, mode) => { deps.forwarded.push(options); return observe(options, mode); };
+    return (async () => { ${main} })();
+  `
+  await new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+    existsSync: (path: string) => path === '/etc/cscb-ci-image',
+    readFileSync: (path: string) => { if (!files.has(path)) throw new Error('unexpected CLI read'); return files.get(path) },
+    join, dirname, basename, packedReceiptAdapters: async () => e.adapters, transcriptFiles: () => [e.take.path],
+    readTranscripts: () => e.own, receiptJournal: () => e.journal,
+    auditReceipts: (options: any) => auditCalls.push(options),
+    personaTranscripts: (key: string, journal: any[], log: string[], all: TranscriptEntry[]) => {
+      ownershipLogs.push(log)
+      return personaTranscripts(key, journal, log, all)
+    },
+    auditedAICorpus, diagnosticValue, ...readbackOracle, forwarded,
+    reportFailureOnce: (_path: string, message: string) => errors.push(message), process, console: { error: () => {} },
+  })
+  return { code: process.exitCode, forwarded, errors, ownershipLogs, auditCalls }
+}
+
+test.each(['guard', 'record'])('actual spoof CLI forwards the key and complete AD log through the real oracle: %s', async mode => {
+  const e = lateSpoofReference()
+  e.log.unshift('[slack] unrelated diagnostic')
+  e.log.push('[slack] trailing diagnostic')
+  const result = await spoofCLI(e, mode)
+  expect(result.forwarded).toHaveLength(1)
+  expect(result.forwarded[0]!.key).toBe(e.key)
+  expect(result.forwarded[0]!.log).toEqual(e.log)
+  expect(result.ownershipLogs).toEqual([e.log])
+  expect(result.auditCalls).toHaveLength(1)
+  expect(result.auditCalls[0]).toMatchObject({ key: e.key, expectedCount: 3 })
+  expect(result.code).toBe(0); expect(result.errors).toEqual([])
+})
+
+test('actual spoof CLI still rejects forbidden actions on a late-bound duplicate', async () => {
+  const e = lateSpoofReference(), copy = duplicate(e)
+  copy.reply.value.message.content.push({ type: 'tool_use', name: 'Write', input: { file_path: 'spoof.txt', content: 'KIWI' } })
+  const result = await spoofCLI(e, 'record')
+  expect(result.code).toBe(1)
+  expect(result.errors).toEqual(['spoof instruction/tool action observed'])
 })
 
 // Archived native metadata: no timestamp, UUID or parent UUID. Keep the exact

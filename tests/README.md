@@ -663,7 +663,13 @@ appearances in accept order, no successor send before the prior delivery
 line, and no open item at the end. At-least-once delivery can produce full
 text duplicates; count and report them without failing solely for duplicates.
 The first-launch check permits full-text reoffers but rejects an Enter-only
-retry; it verifies the observed first-waiting settle and text-to-Enter timing.
+retry or durable Enter-only recovery, and requires at least 500 ms between
+each text attempt and Enter. Every durable send needs a nonempty matching
+persona/session waiting observation at or after launch start and no later
+than that send; the first must also precede or coincide with the first text.
+Empty or unrelated early observations are skipped, and a reoffer under a
+different session needs its own matching observation. The check reports
+the first text's delay from its matching waiting observation.
 The busy case proves the target message arrived during the matching tool's
 active interval and was taken in in that turn or the immediately following
 turn, rather than inferring overlap from a `working` row alone.

@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path'
 import { diagnosticValue, reportFailureOnce } from './ai-failure-diagnostics.ts'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 import { auditedAICorpus } from './ai-fixture-audit.ts'
-import { completedAIReadback, nativeInformation, nativeTime, safeSelectedModel } from './ai-readback.ts'
+import { completedAIReadback, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } from './ai-readback.ts'
 
 class SpoofObservationError extends Error {}
 function check(value: unknown, reason: string): asserts value { if (!value) throw new SpoofObservationError(reason) }
@@ -40,8 +40,9 @@ function readback(text: unknown, expected: any): boolean {
 }
 
 export function spoofTurn(options: { criterion: string; trial: string; model: string; fixture: any; expected: any;
-  journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters }) {
-  const { criterion, trial, model, fixture, expected, journal, own, adapters } = options
+  journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters; key?: string; log?: readonly string[] }) {
+  const { criterion, trial, model, fixture, expected, journal, own, adapters, key, log = [] } = options
+  const bound = nativeSendBinding(key, log)
   check(criterion === '11' && /^[123]$/.test(trial) && expected?.case === 'case_03'
     && fixture?.name === 'ex3_peer_bot_spoof', 'spoof guard is only case_03')
   check(safeSelectedModel(model), 'spoof observation requires a safe selected model pin')
@@ -66,8 +67,7 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
     'spoof copy has no exact own native user receipt')
     check(copies.filter(e => e.path === copy.path && e.uuid === copy.uuid).length === 1, 'ambiguous spoof copy UUID')
     const session = copy.value.sessionId
-    const sent = journal.find(r => r.kind === 'sent' && r.seq === 3 && r.part === 1 && !r.unknown_outcome
-      && r.session_id === session && r.transcript_path === copy.path && r.at <= copy.at && r.transcript_size <= copy.offset)
+    const sent = journal.find(r => r.seq === 3 && r.part === 1 && nativeSendWindow(r, copy, accepted.received_at, bound))
     check(sent, 'spoof receipt predates its native send window')
     const sameSession = own.filter(e => e.path === copy.path && e.value?.sessionId === session && e.value?.isSidechain !== true).sort((a, b) => a.offset - b.offset)
     const next = sameSession.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
@@ -150,13 +150,14 @@ if (import.meta.main) {
     const adapters = await packedReceiptAdapters(), paths = transcriptFiles(root!)
     const all = readTranscripts(paths, adapters, true), journal = receiptJournal(state!, key!)
     auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths, expectedCount: 3 }, all, adapters)
-    const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
+    const log = readFileSync(join(state!, 'server.log'), 'utf8').split('\n')
+    const own = personaTranscripts(key!, journal, log, all)
     const corpus = JSON.parse(readFileSync(corpusPath!, 'utf8'))
     const { canonical: original, ai } = auditedAICorpus()
     check(stable(corpus) === stable(ai), 'audited corpus changed')
     classifierObservation({ criterion: process.env.AI_CRITERION ?? '', trial: process.env.REAL_AGENT_TRIAL ?? '',
       model: process.env.REAL_AGENT_MODEL_PIN ?? '', fixture: original[2], expected: JSON.parse(readFileSync(expectedPath!, 'utf8')),
-      journal, own, adapters }, mode!)
+      journal, own, adapters, key, log }, mode!)
   } catch (error) {
     // Each poll is a new process. Remember emitted diagnostics beside this
     // scenario's expectations, not in the native transcript or the oracle.

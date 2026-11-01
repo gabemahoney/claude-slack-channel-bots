@@ -152,7 +152,7 @@ type SendTranscriptBinding = (send: any, entry: TranscriptEntry) => boolean
 // sets are not an exact late-path proof. Keep each independent AD reference's
 // persona, instance, session and path together; never bind via a delivered row
 // or borrow a later part's known path for an earlier pathless send.
-function nativeSendBinding(key: string | undefined, log: readonly string[]): SendTranscriptBinding {
+export function nativeSendBinding(key: string | undefined, log: readonly string[]): SendTranscriptBinding {
   const paths = new Map<string, Set<string>>()
   const marker = '[slack] delivery-transcript-reference: '
   for (const line of log) {
@@ -172,7 +172,7 @@ function nativeSendBinding(key: string | undefined, log: readonly string[]): Sen
     && (send.transcript_path === entry.path || paths.get(send.session_id)?.has(entry.path) === true)
 }
 
-function nativeSendWindow(send: any, entry: TranscriptEntry, acceptedAt: number, bound: SendTranscriptBinding): boolean {
+export function nativeSendWindow(send: any, entry: TranscriptEntry, acceptedAt: number, bound: SendTranscriptBinding): boolean {
   // A known path retains its pre-send EOF, even if AD later references it.
   // For an independently bound late path no pre-send EOF was recorded for
   // that file: use zero plus the send/receipt time floor. A different path's

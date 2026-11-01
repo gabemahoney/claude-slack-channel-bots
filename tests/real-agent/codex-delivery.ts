@@ -222,7 +222,9 @@ async function rollout(r = undefined as any) {
 async function waiting() {
   return poll('AD waiting row', async () => {
     const r = await row()
-    if (r.state !== 'waiting') return
+    // Fresh-case isolation needs this same row's published session identity.
+    // The rollout path is required only after delivery, not at first waiting.
+    if (r.state !== 'waiting' || typeof r.session_id !== 'string' || !r.session_id) return
     authContract('postidle')
     return r
   })
@@ -257,8 +259,9 @@ async function start(label = 'delivery', instructions = 'For observation probes,
     extra_env: { CODEX_HOME: codexHome }, agent_args: codexArguments(paths.model, tagDescription) })
   scratchLifecycle!.afterSpawn(instance)
   stage = `${label}-idle`
-  await waiting()
+  const ready = await waiting()
   record('launch', { label, instance, agent: 'codex', version: '0.159.2', relay: 'on', tagPrompt: true, nativePath: CODEX_NATIVE, model: paths.model })
+  return ready
 }
 async function accept(input: any) {
   const result = await queue.accept(key, input)
@@ -435,8 +438,7 @@ async function ai(ac: number) {
   let duplicates = 0
   const begin = async (label: string, instructions: string) => {
     if (engines) await stopEngine()
-    await start(label, instructions)
-    const session = (await row()).session_id
+    const session = (await start(label, instructions)).session_id
     if (!session || sessions.has(session)) throw new Error('AI case did not get a fresh native conversation')
     sessions.add(session)
     await buildEngine()
