@@ -212,15 +212,32 @@ _real_connected() {
     tail -n "+$((${3:-0}+1))" "${SLACK_STATE_DIR}/server.log" \
         | grep -F 'Session connected: persona ' | grep -qF "(key=$1)"
 }
+# real_wait_delivery <key> [count] [mode] [-- <case assertion...>]
 real_wait_delivery() {
     _scenario_check_timeout "${REAL_DELIVERY_WAIT_S}" real_wait_delivery
     _scenario_check_timeout "${REAL_DELIVERY_MAX_WAIT_S}" real_wait_delivery
-    local started last_progress now progress most=0 reason
+    # A case assertion re-reads newer evidence than the ready audit, which can
+    # hold work accepted since (a reply reminder). It completes this wait only
+    # when it passes too; its receipts-pending exit keeps polling under the
+    # same watchdogs, and any other failure is the case's own verdict.
+    # Must equal RECEIPTS_PENDING_EXIT in fixtures/real-case-assertions.ts.
+    local -r receipts_pending=75
+    local -a wait=() assertion=()
+    while (( $# )) && [[ "$1" != -- ]]; do wait+=("$1"); shift; done
+    if (( $# )); then shift; assertion=("$@"); fi
+    set -- "${wait[@]}"
+    local started last_progress now progress most=0 reason status
     started="$(_scenario_now_ms)"
     last_progress="${started}"
     while :; do
         # Progress never substitutes for the complete receipt/FIFO audit.
-        if bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}"; then return 0; fi
+        if bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}"; then
+            (( ${#assertion[@]} )) || return 0
+            status=0
+            "${assertion[@]}" || status=$?
+            if (( status == 0 )); then return 0; fi
+            if (( status != receipts_pending )); then return "${status}"; fi
+        fi
         now="$(_scenario_now_ms)"
         if (( now - started >= REAL_DELIVERY_MAX_WAIT_S * 1000 )); then reason=overall; break; fi
         progress="$(bun "${REAL_RECEIPTS}" progress "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}")" || progress=''
@@ -242,14 +259,6 @@ _real_delivery_diagnostic() {
         || echo 'recorded: delivery receipt diagnostic unavailable'
     bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" \
         || echo 'recorded: delivery AD diagnostic unavailable'
-}
-real_assert_no_retype() {
-    bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" no-retype \
-        || fail 'real fidelity receipt audit found a retype'
-}
-real_assert_delivery() {
-    bun "${REAL_RECEIPTS}" audit "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}" \
-        || fail 'real receipt/order/in-flight audit failed'
 }
 real_assert_latency() {
     bun "${REAL_RECEIPTS}" latency "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "$2" \

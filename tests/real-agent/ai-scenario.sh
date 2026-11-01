@@ -200,7 +200,9 @@ AC15_BODY
         real_wait_delivery "${REAL_KEY}" 2
         printf '{"case":"AC106","messages":1}\n' > "${EXPECTED}/1.json"
         wait_until 180 'AC106 duplicate counted as another message' ai_readback "${EXPECTED}/1.json" 2
-        case_assert at-least-one-duplicate
+        # Await work accepted since the readback's audit, such as a reply
+        # reminder; the duplicate verdict follows complete receipts.
+        real_wait_delivery "${REAL_KEY}" 2 -- case_assert at-least-one-duplicate
     elif [[ "${AI_CRITERION}" == 23 ]]; then
         real_dm "${REAL_LABEL}" 'Acknowledge before compact/resume.'
         real_wait_delivery "${REAL_KEY}" 1

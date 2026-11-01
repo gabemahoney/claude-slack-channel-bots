@@ -2,9 +2,15 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { GetResult } from 'agent-director'
-import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
+import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, receiptsRecord, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
+/** Exit status for a case whose complete receipt audit does not pass yet; its
+ * own proof has not run. real_wait_delivery (receipts_pending) polls it like a
+ * failed `ready` audit, under the same watchdogs; any other failure is the
+ * case's verdict. */
+const RECEIPTS_PENDING_EXIT = 75
+class ReceiptsPending extends Error {}
 type KeyCall = { at: number; words: string[]; pid?: string }
 function recoveryKey(call: KeyCall, instance: string) {
   return call.words.includes('send-keys') && call.words.includes(instance)
@@ -94,8 +100,14 @@ export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults:
   const enterCall = (record: any, end: number) => keys.find(call => call.at >= record.at && call.at < end
     && call.words.includes('--key') && call.words.includes('Enter'))
   const textCall = (record: any, end: number) => keys.find(call => call.at >= record.at && call.at < end && call.words.includes('--no-enter'))
+  // The last retype's key precedes its own delivery and any later item's first
+  // durable send (sends persist before keys), so a later item's text, such as
+  // a reply reminder's, cannot stand in for it.
+  const secondEnd = Math.min(...journal.filter(record => record.at >= second.at
+    && ((record.kind === 'delivered' && record.seq === seq && record.part === second.part)
+      || (record.kind === 'sent' && record.seq !== seq))).map(record => record.at))
   const initialKey = enterCall(initial, first.at), firstKey = textCall(first, recovery.at)
-  const recoveryKeyCall = enterCall(recovery, second.at), secondKey = textCall(second, Infinity)
+  const recoveryKeyCall = enterCall(recovery, second.at), secondKey = textCall(second, secondEnd)
   check(initialKey && firstKey && recoveryKeyCall && secondKey, 'reset stages lack actual persona key calls')
   const normalEnter = keys.find(call => call.at > firstKey.at && call.at < recovery.at
     && call.words.includes('--key') && call.words.includes('Enter'))
@@ -127,9 +139,19 @@ function firstWaiting(): LaunchObservation[] {
 }
 function blocks(e:any):any[] { return e.value?.type==='assistant'&&Array.isArray(e.value?.message?.content)?e.value.message.content:[] }
 async function entries() { return readTranscripts(transcriptFiles(root!), await packedReceiptAdapters()) }
-async function confirmReceipts() {
+async function confirmReceipts(expectedCount?: number) {
   const adapters = await packedReceiptAdapters(), transcripts = transcriptFiles(root!)
-  auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts }, readTranscripts(transcripts, adapters), adapters)
+  // This read is newer than the caller's ready audit and can hold work
+  // accepted since, such as a reply reminder still in flight. Nothing is
+  // filtered: the caller re-polls this whole audit until it passes. Cases run
+  // their own proof only after a passing audit, so every item the audit read
+  // was complete. The proof's newer reads of the journal, shim and faults may
+  // hold later work, which each proof excludes by scoping to its own item,
+  // fault or bounded time window; checks that later evidence can only make
+  // fail, never pass (such as unknown-proof's no read-pane after the fault),
+  // stay unscoped.
+  try { return { ...auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts, expectedCount }, readTranscripts(transcripts, adapters), adapters), transcripts: transcripts.length } }
+  catch (error) { throw new ReceiptsPending('receipts pending: '+(error instanceof Error?error.message:'unknown')) }
 }
 try {
   check(existsSync('/etc/cscb-ci-image'), 'scenario assertions require the CI image')
@@ -182,12 +204,13 @@ try {
       const f=j.find(r=>r.kind==='fixed'&&r.seq===seq);check(f?.parts?.length===1&&Buffer.byteLength(f.parts[0])===bytes,'single-part native fidelity size differs')
     }
   } else if(command==='unknown-proof') {
+    await confirmReceipts()
     const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
     const f=faults.find(f=>f.words[2]===arg);check(f,'unknown fault was not applied')
     assertUnknownKeyRecovery(calls(),f,'cscb_'+key)
-    await confirmReceipts()
     console.log('recorded: unknown outcome confirmed by exact receipt after guarded recovery '+arg)
   } else if(command==='reset-spacing') {
+    await confirmReceipts()
     const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
     const waiting=readFileSync(join(state!,'server.log'),'utf8').split('\n').flatMap(line=>{
       const marker='delivery-launch-first-waiting: ', index=line.indexOf(marker)
@@ -195,9 +218,10 @@ try {
     })
     const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq
     const proof=assertResetKeyRecovery(j,calls(),faults,waiting,seq,'cscb_'+key)
-    await confirmReceipts()
     console.log('recorded: restart reset guarded recovery '+JSON.stringify(proof))
   } else if(command==='key-proof') {
+    // Keep first for every arg2 (enter, retype, spacing): only retype is unit-sliced.
+    await confirmReceipts()
     const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq, s=j.filter(r=>r.kind==='sent'&&r.seq===seq)
     const text=s.filter(r=>r.send_kind!=='enter')
     if(arg2==='enter') {
@@ -210,7 +234,6 @@ try {
       for(let i=1;i<4;i++) check(text[i].at-text[i-1].at >= [10000,30000,60000][i-1]!, 'retype spacing below growing backoff')
       check(j.filter(r=>r.kind==='noticed'&&r.seq===seq).length===1, 'not-taken-in notice not once')
     }
-    await confirmReceipts()
     console.log('recorded: key proof '+JSON.stringify({ordinal:Number(arg),seq,sends:s.map(r=>({kind:r.send_kind,at:r.at}))}))
   } else if(command==='cron') {
     const a=cumulativeJournal().filter(r=>r.kind==='accepted'&&r.source==='cron'&&!r.compact)
@@ -348,9 +371,14 @@ try {
     for(const w of wanted){const index=remaining.findIndex(p=>matches(p,w));check(index>=0,'reply destination/thread/text/count mismatch');remaining.splice(index,1)}
     const texts=wanted.flatMap((w:any)=>w.text?[w.text]:[])
     check(!remaining.some(p=>texts.includes(p.text)&&!wanted.some((w:any)=>matches(p,w))),'wrong-target reply')
+  } else if(command==='receipts') {
+    // transcript-receipts audit's check and recorded line, as a delivery
+    // wait's -- assertion: it exits 75 while receipts are pending.
+    const count=Number(arg);check(Number.isSafeInteger(count)&&count>0,'receipts needs a positive original count')
+    const result=await confirmReceipts(count)
+    console.log(receiptsRecord(result,result.transcripts))
   } else if(command==='at-least-one-duplicate') {
-    const adapters=await packedReceiptAdapters(), all=await entries(), transcripts=transcriptFiles(root!)
-    check(auditReceipts({stateDir:state!,key:key!,shimLog:shim!,transcripts},all,adapters).duplicates>=1,'intended duplicate was not observed')
+    check((await confirmReceipts()).duplicates>=1,'intended duplicate was not observed')
   } else if(command==='corpus-wrapper') {
     const corpus=JSON.parse(readFileSync(arg,'utf8')), j=cumulativeJournal()
     for(const [i,row] of corpus.entries()) {
@@ -447,12 +475,16 @@ try {
     const keyProof=()=>Bun.spawnSync([process.execPath,import.meta.path,'key-proof',dir,'control',log,dir,'1','enter'])
     check(keyProof().exitCode===0,'Enter-only recovery rejected a permitted duplicate text attempt')
     writeFileSync(log,retryShim.replace(enterFault,''))
-    check(keyProof().exitCode!==0,'Enter-only recovery passed without the injected missed Enter')
+    // Exit 1, not RECEIPTS_PENDING_EXIT: the receipts pass, so only the own proof can fail.
+    const missedEnter=keyProof()
+    check(missedEnter.exitCode===1&&Buffer.from(missedEnter.stderr).toString().includes('swallowed Enter has no observed durable Enter-only recovery'),
+      'Enter-only recovery passed without the injected missed Enter')
     console.log('recorded: Enter-only recovery accepts duplicate text and requires the swallowed Enter')
     const invoke=(name:string,...args:string[])=>Bun.spawnSync([process.execPath,import.meta.path,name,dir,'control',log,dir,...args])
     const expectControl=(name:string,run:()=>ReturnType<typeof invoke>,reason?:string)=>{
       const result=run(), error=Buffer.from(result.stderr).toString()
-      check(reason?result.exitCode!==0&&error.includes(reason):result.exitCode===0,`${name} control failed: ${error}`)
+      // A rejection is a terminal verdict (1), never receipts pending.
+      check(reason?result.exitCode===1&&error.includes(reason):result.exitCode===0,`${name} control failed: ${error}`)
       console.log(`recorded: ${reason?'rejected':'passed'} ${name}`)
     }
     const downDir=join(dir,'down'), downRow=join(downDir,'row.json'), downLog=join(downDir,'shim.log')
@@ -533,7 +565,7 @@ try {
       [2000,'text'],[22500,'retype'],[83000,'retype'],
       [101000,'enter'],[111000,'retype'],[141500,'enter'],[171500,'retype'],
     ].map(([at,send_kind],i)=>({...records[2],at,send_kind,attempt:i+1})),{...records[3],at:173000}]
-    const writeReset=(patch:{waitingAt?:number;initialKey?:boolean;session?:string;late?:boolean;missingRetype?:boolean}={})=>{
+    const writeReset=(patch:{waitingAt?:number;initialKey?:boolean;session?:string;late?:boolean;missingRetype?:boolean;laterTextOnly?:boolean}={})=>{
       // Move all later evidence together so the late control fails on backoff,
       // while the baseline proves 10s, 30s and 30s with a 500ms guarded Enter.
       const at=(time:number)=>time+(patch.late&&time>=111000?20000:0)
@@ -545,7 +577,9 @@ try {
         textCall(83000),call(83500,'--key Enter'),`call\t99\t1\t1\tbun\tresume --instance-id cscb_control\n`,
         patch.initialKey===false?'':call(101000,'--key Enter'),textCall(at(111000)),
         `fault\t${at(111000)/1000}\t1\t1\tbun\tsend-keys no_enter swallow 1\n`,
-        call(at(111500),'--key Enter'),call(at(141500),'--key Enter'),textCall(at(171500)),call(at(172000),'--key Enter')].join(''))
+        call(at(111500),'--key Enter'),call(at(141500),'--key Enter'),patch.laterTextOnly?'':textCall(at(171500)),call(at(172000),'--key Enter'),
+        // A later item's text after this item's delivery, as a reply reminder's would be.
+        patch.laterTextOnly?call(180000,'--text '+texts[1]!.replaceAll('<','\\<').replaceAll('>','\\>')+' --no-enter'):''].join(''))
     }
     writeReset()
     expectControl('same-session AD waiting resets unconfirmed retry spacing',()=>invoke('reset-spacing','1'))
@@ -555,10 +589,33 @@ try {
       ['foreign AD session',{session:'other-session'},'reset lacks an AD first-waiting observation'],
       ['old retry backoff',{late:true},'reset retained or skipped a backoff stage: 0'],
       ['missing retype',{missingRetype:true},'durable Enter/text/Enter/text recovery sequence'],
+      ['last retype key only from a later item',{laterTextOnly:true},'reset stages lack actual persona key calls'],
     ] as const) {
       writeReset(patch)
       expectControl('reset-spacing '+name,()=>invoke('reset-spacing','1'),reason)
     }
+    const expectPending=(name:string,...args:string[])=>{
+      const result=invoke(name,...args), error=Buffer.from(result.stderr).toString()
+      check(result.exitCode===RECEIPTS_PENDING_EXIT&&error.includes('receipts pending: '),`${name} pending receipts control failed: ${error}`)
+      console.log(`recorded: ${name} pending receipts exit `+RECEIPTS_PENDING_EXIT)
+    }
+    // A valid reset whose item has not logged its delivery yet is pending, not failed.
+    writeReset()
+    writeFileSync(join(dir,'server.log'),readFileSync(join(dir,'server.log'),'utf8').split('\n').filter(l=>!l.includes('message-delivered:')).join('\n'))
+    expectPending('reset-spacing','1')
+    // Receipt-only tails: pending while an item lacks its delivery log; only
+    // the duplicate check has a verdict of its own once receipts pass.
+    write(records,[originalTakes[0]!,{...originalTakes[0]!,uuid:'duplicate',timestamp:new Date(4000).toISOString()},originalTakes[1]!])
+    expectControl('at-least-one-duplicate observed copy',()=>invoke('at-least-one-duplicate'))
+    expectControl('receipts exact original count',()=>invoke('receipts','2'))
+    expectControl('receipts without a count',()=>invoke('receipts'),'receipts needs a positive original count')
+    // The count reaches the audit: complete receipts for two originals stay pending for three.
+    expectPending('receipts','3')
+    write()
+    expectControl('at-least-one-duplicate without a copy',()=>invoke('at-least-one-duplicate'),'intended duplicate was not observed')
+    write(records,originalTakes,[2000,22000],originalLines.filter(l=>!l.includes('message-delivered')))
+    expectPending('at-least-one-duplicate')
+    expectPending('receipts','2')
 
     const checkpoint=join(dir,'active-tool.json'), base=Date.now()-3500
     let checkpointDelay=0
@@ -724,7 +781,7 @@ try {
     } finally {await queue.stop()}
     rmSync(dir,{recursive:true,force:true})
   } else throw new Error('unknown lane-1 assertion')
-} catch(error) { console.error('real-case-assertions: '+(error instanceof Error?error.message:'unknown'));process.exit(1) }
+} catch(error) { console.error('real-case-assertions: '+(error instanceof Error?error.message:'unknown'));process.exit(error instanceof ReceiptsPending?RECEIPTS_PENDING_EXIT:1) }
 
 }
 if (import.meta.main) await main()

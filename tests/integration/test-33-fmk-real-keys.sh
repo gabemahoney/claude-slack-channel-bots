@@ -6,6 +6,8 @@ source "$(dirname "$0")/lib/scenario.sh"
 source "$(dirname "$0")/lib/real-scenario.sh"
 source "$(dirname "$0")/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
+# Receipt proofs complete their delivery wait (after --), so a reply reminder
+# accepted after the wait's audit is awaited rather than raced.
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 # Preserve transport and durable evidence before the isolated HOME is removed.
 retain_key_evidence() {
@@ -41,20 +43,17 @@ key_fault key=Enter swallow 1
 real_dm "${REAL_LABEL}" 'one swallowed Enter' "${KEY_FAULT_TS}"
 wait_until 180 'Enter was not swallowed' case_assert enter-fault 1
 real_record_state "${REAL_KEY}"
-real_wait_delivery "${REAL_KEY}" 1
-case_assert key-proof 1 enter
+real_wait_delivery "${REAL_KEY}" 1 -- case_assert key-proof 1 enter
 real_wait_idle "${REAL_KEY}"
 key_fault no_enter swallow 1
 real_dm "${REAL_LABEL}" 'one swallowed text' "${KEY_FAULT_TS}"
-real_wait_delivery "${REAL_KEY}" 2
-case_assert key-proof 2 retype
+real_wait_delivery "${REAL_KEY}" 2 -- case_assert key-proof 2 retype
 real_wait_idle "${REAL_KEY}"
 key_fault no_enter swallow 3
 real_dm "${REAL_LABEL}" 'three swallowed texts' "${KEY_FAULT_TS}"
 # Recovery Enter and receipt timeouts put the fourth text attempt near 202s.
 # Bound this leg explicitly without changing the other waits or retry backoff.
-REAL_DELIVERY_WAIT_S=300 real_wait_delivery "${REAL_KEY}" 3
-case_assert key-proof 3 spacing
+REAL_DELIVERY_WAIT_S=300 real_wait_delivery "${REAL_KEY}" 3 -- case_assert key-proof 3 spacing
 # Restart an UNCONFIRMED head during its growing retry episode; the new
 # launch restarts at 10s, then uses two guarded 30s recovery stages. Prove
 # each durable Enter/text stage and its launch identity, not a text-gap bound.
@@ -66,24 +65,21 @@ real_kill_and_reconcile "${REAL_KEY}"
 key_fault no_enter swallow 1 "${KEY_FAULT_TS}"
 start_server --live
 real_wait_relaunch "${REAL_KEY}"
-real_wait_delivery "${REAL_KEY}" 4
-case_assert reset-spacing 4
+real_wait_delivery "${REAL_KEY}" 4 -- case_assert reset-spacing 4
 UNKNOWN_COUNT=4
 for outcome in unknown-typed unknown-untyped; do
     real_wait_idle "${REAL_KEY}"
     key_fault no_enter "${outcome}" 1
     real_dm "${REAL_LABEL}" "unknown outcome ${outcome}" "${KEY_FAULT_TS}"
     UNKNOWN_COUNT=$((UNKNOWN_COUNT+1))
-    real_wait_delivery "${REAL_KEY}" "${UNKNOWN_COUNT}"
-    case_assert unknown-proof "${outcome}"
+    real_wait_delivery "${REAL_KEY}" "${UNKNOWN_COUNT}" -- case_assert unknown-proof "${outcome}"
 done
 real_wait_idle "${REAL_KEY}"
 key_fault key=Enter swallow 1
 real_dm "${REAL_LABEL}" "$(python3 -c 'print("x"*5000,end="")')" "${KEY_FAULT_TS}"
 wait_until 180 'large-part Enter was not swallowed' case_assert enter-fault 2
 real_record_state "${REAL_KEY}"
-real_wait_delivery "${REAL_KEY}" 7
-case_assert key-proof 7 enter
+real_wait_delivery "${REAL_KEY}" 7 -- case_assert key-proof 7 enter
 
 case_assert launches
 real_finish "${REAL_KEY}"

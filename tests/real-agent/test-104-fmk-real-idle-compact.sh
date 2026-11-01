@@ -12,8 +12,9 @@ start_server --live
 real_wait_launch "${REAL_KEY}"
 real_fault send-keys no_enter unknown-untyped 1
 for n in {1..3}; do real_dm "${REAL_LABEL}" "queued AD contract delivery ${n}"; done
-real_wait_delivery "${REAL_KEY}" 3
+# The recorded receipt audit completes the wait (after --), so a reply reminder
+# accepted after the wait's audit is awaited rather than raced.
+real_wait_delivery "${REAL_KEY}" 3 -- bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" receipts "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" 3
 bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" fault "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" unknown-untyped 1
-real_assert_delivery "${REAL_KEY}" 3
 real_finish "${REAL_KEY}"
 echo "PASS: ${TEST_NAME}"

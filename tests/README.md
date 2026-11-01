@@ -613,6 +613,26 @@ Test 35 also requires a new own-persona connection after its post-stop log
 cursor in all four modes; fresh/upgrade retain changed-session checks and
 resume retains its same-session check.
 
+`real_wait_delivery <key> [count] [mode] [-- <case assertion...>]` runs the
+case assertion after each passing audit and completes only when it exits 0.
+The case re-reads newer evidence, which can hold work accepted since (a reply
+reminder), so it runs the complete receipt audit first and exits 75
+(`RECEIPTS_PENDING_EXIT`) whenever that audit fails, pending or defective. The
+wait re-polls under the same watchdogs, so a receipt defect fails at a
+watchdog with its diagnostic, as a failing `ready` audit does. The
+case's own proof runs only once that audit passes and exits 1 on failure; any
+exit but 0 or 75 fails the wait at once.
+
+The reset-spacing, key-proof, unknown-proof, `receipts <count>` and
+`at-least-one-duplicate` commands of `fixtures/real-case-assertions.ts` work
+this way. Test 33 runs the first three in this form, test 104 `receipts 3`
+(printing `transcript-receipts.ts audit`'s `recorded: receipts` line) and AI
+AC106 `at-least-one-duplicate`; test 39's last receipt check re-polls
+`real_wait_delivery … no-retype` instead. AC106's earlier copy check stays in
+`wait_until 180 … case_assert at-least-one-duplicate`, which retries 75 and 1
+until the typed copy reaches the transcript; the `--` form would fail at once
+on 1 before then.
+
 Real-agent actions wait on AD `waiting` and typed refusals. Explicit `/compact` trials verify later exact receipts and durable queue progress; no pane or native compaction marker establishes lifecycle state. Diagnostics omit pane text.
 
 `fixtures/transcript-receipts.ts` loads the installed tarball's
