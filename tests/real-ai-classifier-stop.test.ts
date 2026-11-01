@@ -12,7 +12,7 @@ import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
 import { completedAIReadback, nativeInformation, safeSelectedModel } from './real-agent/ai-readback.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
 import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
-import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
+import { personaTranscripts, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
 function evidence() {
@@ -544,6 +544,36 @@ function multipartAC15(native = 'user', body = 'x'.repeat(5000)) {
 const readAC15 = (e: ReturnType<typeof multipartAC15>) => completedAIReadback(e)
 const forbiddenAC15Action = (e: ReturnType<typeof multipartAC15>, offset: number, parentUuid: string, name = 'mcp__slack-channel-router__fetch_messages') =>
   assistant(e, [{ type: 'tool_use', name, id: 'fetch', input: { chat_id: 'D0AIAC15', limit: 1 } }], offset, { parentUuid })
+
+// b.436: exercise the independent engine reference without fabricating a
+// send-time path. The CLI controls below the image boundary cover its wiring.
+function lateReferenceEvidence(multipart: boolean, allPathless = false) {
+  const e = multipart ? multipartAC15() : ordinaryEvidence(), key = 'aiac11'
+  const log = ['[1970-01-01T00:00:00.023Z] [slack] delivery-transcript-reference: ' + JSON.stringify({
+    key, instance_id: `cscb_${key}`, session_id: 'session', jsonl_path: e.own[0]!.path,
+  })]
+  const sends = e.journal.filter(r => r.kind === 'sent')
+  for (const send of allPathless ? sends : sends.slice(0, 1)) {
+    send.transcript_path = ''; send.transcript_size = 0
+  }
+  return { ...e, key, log, own: personaTranscripts(key, e.journal, log, e.own) }
+}
+
+test.each([false, true])('late AD reference binds a pathless first send, multipart=%s', multipart => {
+  const e = lateReferenceEvidence(multipart)
+  expect(e.own).toHaveLength(multipart ? 6 : 2)
+  expect(completedAIReadback(e)).toMatchObject({ seq: e.seq, part: multipart ? 3 : 1,
+    receipt_uuid: multipart ? 'part-3' : 'case3', session_id: 'session', actual_model: e.model })
+})
+
+test('late AD reference preserves every-copy AC15 checks when all sends are pathless', () => {
+  const e = lateReferenceEvidence(true, true)
+  const copy = e.entry(70, { type: 'user', uuid: 'late-copy', message: { role: 'user', content: e.journal[1].parts[0] } })
+  e.own.push(copy, assistant(e, [{ type: 'text', text: '{"status":"received"}' }], 71, { parentUuid: 'late-copy' }))
+  expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+  e.own.push(forbiddenAC15Action(e, 72, 'late-copy'))
+  expect(() => completedAIReadback(e)).toThrow('non-reply tool action observed')
+})
 
 // Archived native metadata: no timestamp, UUID or parent UUID. Keep the exact
 // three-field shapes, including the absence of the fixture's isSidechain flag.
