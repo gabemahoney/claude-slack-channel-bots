@@ -15,7 +15,10 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
   `FROM cscb-ci-base:v8`) — adds `docker/entrypoint.sh`, `tests/`,
-  `testplans/`, the `testuser` account, and the `ENTRYPOINT`. Each `/ci` run
+  `testplans/`, the `testuser` account, and the `ENTRYPOINT`. It also copies
+  the current tree's `docker/ad-client-check.sh` with mode `0755` over
+  `/opt/agent-director/check/ad-client-check.sh`, refreshing the checker even
+  when the base is cached. Each `/ci` run
   builds its own, once, with the owner label `cscb-ci-owner=<RUN_ID>-<PID>`,
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
@@ -135,7 +138,10 @@ release record in [What the base holds](#what-the-base-holds)):
    plain `major.minor.patch` (no pre-release). With `--package`, the
    package's `agent-director` dependency is exactly that version, and so is
    its `PHASE1_FLOOR_VERSION` (`src/ad-version-gate.ts`);
-3. **content**: the client's files equal a fresh unpack of that tarball;
+3. **content**: the client's files equal a fresh unpack of that tarball,
+   except entries with the exact basename `.bun-tag` (Bun install metadata),
+   excluded recursively. Changed, missing or extra substantive files,
+   including other hidden files, still fail; symlinks are not dereferenced;
 4. **exports**: the client exports `ErrTmuxKillFailed`, `ErrTmuxUnresponsive`
    and `ErrTmuxSessionConflict`, each an `AgentDirectorError` subclass;
 5. **binary**: the first agent-director on `PATH` reports `release.json`'s
@@ -151,12 +157,13 @@ A failed check prints one line on stderr,
 `ERROR: ad-client check <step>: <what differs>`, and exits 1; a usage error
 exits 2.
 
-It runs in four places:
+Its callers include:
 
 | Where | What it checks | On failure |
 |---|---|---|
 | The base build (`docker/Dockerfile.test.base`) | `--client` on the global client, right after `bun add -g` of the release's client from npm | The build stops |
 | `/ci`'s test-1 (`tests/integration/test-1-install-startup.sh`) | `--package /test-repo/node_modules/claude-slack-channel-bots`, right after the install. Tests 2 onward use this install | One `FAIL:` line carrying the check's `ERROR:` line |
+| `/ci`'s test-13 (`tests/integration/test-13-fmk-switch-over.sh`), step 7 | `--package` on the newly installed staged build, after its separate package-content comparison (excluding `node_modules` and `.bun-tag`) | The switch-over scenario fails |
 | `/ci-live`'s install check (`ci-live/checks/setup-checks.ts`, Part 1.4) | `--package "$PKG"` after the install and the package layout check, before the state check and the checksums Check S2 compares against. The success line is recorded as a finding | A blocking FAIL, reason `the client check on the installed package failed: <ERROR line>` |
 | The live image build (`docker/Dockerfile.live`) | `--client` on the base's global client, against the binary the runner staged | The build stops (see [The live image's agent-director](#the-live-images-agent-director)) |
 
@@ -288,7 +295,14 @@ Bump `cscb-ci-base`'s version tag (next, `v8` → `v9`) whenever you change
 `AD_PREV_VERSION` and `CSCB_PREV_VERSION`, the downgrade fixture's
 `CSCB_DOWNGRADE_VERSION`/`CSCB_DOWNGRADE_SHA256`, native agent versions, or
 its repo inputs `docker/ad-client-check.sh`, `docker/install-real-agents.sh`
-and `docker/install-real-codex.sh`. `/ci` builds a base only when its
+and `docker/install-real-codex.sh`. The scoped exception is the per-run
+checker overlay for ordinary `/ci`, including test-13: `Dockerfile.test`
+copies the current checker without a coordinated base-tag bump. This does
+not refresh the checker embedded in cached bases used by `Dockerfile.live`
+or standalone `Dockerfile.real-agent`; delivering checker changes to those
+consumers still requires the coordinated base bump below.
+
+`/ci` builds a base only when its
 tag is missing, so without a bump every host keeps testing the base it
 already has. The base reads no `package.json`, so a change there needs no
 bump. There is **no** automatic version derivation — bump it manually in

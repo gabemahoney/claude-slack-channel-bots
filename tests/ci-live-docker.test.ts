@@ -2584,6 +2584,11 @@ function rcLayoutAuditFiles(): string[] {
 }
 
 describe('the /ci images (source audit)', () => {
+  test('the per-run test image refreshes the client checker from the current tree over a cached base', () => {
+    expect(dockerInstructions(join('docker', 'Dockerfile.test')))
+      .toContain(`COPY --chmod=0755 ${AD_CLIENT_CHECK_SOURCE} ${AD_CLIENT_CHECK}`)
+  })
+
   const TAGGED = [
     join('docker', 'Dockerfile.test'),
     join('docker', 'Dockerfile.live'),

@@ -676,12 +676,12 @@ global_install "${CSCB_010_TGZ}" || fail "setup: the global install of ${CSCB_01
     || fail "setup: ${CSCB_PKG_DIR} is not ${PKG_NAME} ${OLD_CSCB_VERSION}"
 [[ "$(realpath -e -- "${CSCB_CLI}")" == "$(realpath -e -- "${CSCB_PKG_DIR}")"/* ]] \
     || fail "setup: ${CSCB_CLI} does not resolve into ${CSCB_PKG_DIR}"
-# Its client is agent-director's 0.10.0 client, file for file.
+# Its client is agent-director's 0.10.0 client, file for file except Bun's .bun-tag install metadata.
 mkdir "${SCENARIO_ROOT}/ad-010-client" || fail "setup: could not create ${SCENARIO_ROOT}/ad-010-client"
 tar -xzf "${AD_010_CLIENT_TGZ}" -C "${SCENARIO_ROOT}/ad-010-client" --strip-components=1 --no-same-owner \
     || fail "setup: could not unpack ${AD_010_CLIENT_TGZ}"
 OLD_CLIENT_DIR="$(client_dir_of "${CSCB_PKG_DIR}")"
-if ! diff -rq --no-dereference "${SCENARIO_ROOT}/ad-010-client" "${OLD_CLIENT_DIR}" > "${SCENARIO_ROOT}/old-client.diff" 2>&1; then
+if ! diff -rq --no-dereference --exclude=.bun-tag "${SCENARIO_ROOT}/ad-010-client" "${OLD_CLIENT_DIR}" > "${SCENARIO_ROOT}/old-client.diff" 2>&1; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/old-client.diff" >&2
     fail "setup: the old package resolves the client at ${OLD_CLIENT_DIR}, which is not agent-director's 0.10.0 client"
 fi
@@ -981,7 +981,7 @@ global_install "${PACKAGE_TGZ}" || fail "step 7: the global install of ${PACKAGE
 [[ "$(jq -r '.version' "${CSCB_PKG_DIR}/package.json")" == "${STAGED_VERSION}" ]] \
     || fail "step 7: ${CSCB_PKG_DIR} is not the staged ${STAGED_VERSION}"
 # The version string alone may be the old package's too: the files are the staged build's.
-if ! diff -rq --exclude=node_modules "${STAGED_PKG}" "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/installed.diff" 2>&1; then
+if ! diff -rq --exclude=node_modules --exclude=.bun-tag "${STAGED_PKG}" "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/installed.diff" 2>&1; then
     sed 's/^/  | /' "${SCENARIO_ROOT}/installed.diff" >&2
     fail "step 7: the package installed at ${CSCB_PKG_DIR} is not the staged build"
 fi

@@ -1,5 +1,8 @@
 FROM cscb-ci-base:v8
 
+# Refresh the checker even when the base image is cached.
+COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-check.sh
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Bash integration tests — runner.sh, the test scripts and their fixtures.

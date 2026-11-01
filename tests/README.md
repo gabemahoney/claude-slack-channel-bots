@@ -1245,8 +1245,9 @@ shim, with no store until 0.10.0's first `spawn`. Setup then:
 
 - installs the published CSCB 0.10.0 tarball as a bun global install under
   `SCENARIO_ROOT`, its agent-director dependency pinned to the image's 0.10.0
-  client (checked file for file). Its CLI there is the old CLI, and the build
-  under test later takes the same install path;
+  client (checked file for file except Bun's `.bun-tag` install metadata;
+  changed, missing or extra non-metadata files still fail). Its CLI there is
+  the old CLI, and the build under test later takes the same install path;
 - writes the pre-persona `config.json` (two routed channels) to
   `$HOME/.claude/channels/slack` (the old state directory, a real directory;
   neither `$HOME/.config/cscb` nor the new directory exists, as on a host of
@@ -1291,7 +1292,9 @@ Points where the script meets the runbook:
   (`cscb_run`), against the seeded fleet on 0.10.0.
 - Step 7 points the global install's agent-director override at the
   image's release client tarball, installs the build under test over the
-  same install path, checks the release's client it resolves with the
+  same install path, compares its files against the staged package (excluding
+  `node_modules` and the exact `.bun-tag` basename recursively), checks the
+  release's client it resolves with the
   image's `ad-client-check.sh --package`, then exports `SCENARIO_CLI`
   as that path's CLI, so later starts and the trap's stop use the new build.
   Each persona's credentials file is written by the new CLI's `credentials`
@@ -1453,13 +1456,27 @@ the switch-over log and ends with `assert_no_server_tmux`,
 `assert_no_cscb_include_finished` and `assert_no_cscb_delete`.
 
 The host check. `tests/fmk-switch-over-runbook.test.ts`, run by plain
-`bun test`, reads the README's switch-over section through the shared step
+`bun test`, reads docs/migration.md's switch-over section through the shared step
 reader (`runbookSteps`, `tests/test-helpers/runbooks.ts`) and the script's
-marker calls. It fails unless the script enters steps 1 to N of the README
+marker calls. It fails unless the script enters steps 1 to N of docs/migration.md
 once each, in order, and declares exactly the substitution table above, each
 inside its step's section, with every marker a top-level line with a literal
 step and kind. So a change to the runbook's steps fails until Test 13
 follows it.
+
+The same suite executes the real comparison/refusal blocks for the old
+resolved client, the step-7 staged package and the step-7 release-client
+checker over scratch trees. Each runs the same nine-case matrix: identical
+content and metadata-only `.bun-tag` pass; changed, missing and extra
+content fail both with and without metadata; another hidden file fails.
+Changed-content cases keep the same version, ruling out a version-only
+check. These fixtures do not perform a Bun install, resolve the client or
+run the full image-only checker.
+
+`tests/ci-live-docker.test.ts` separately audits that `Dockerfile.test`
+copies the current checker into each run's image over the cached base.
+That source audit proves the build wiring; actual image delivery and the
+complete switch-over remain integration checks.
 
 ### Scenario documents
 
