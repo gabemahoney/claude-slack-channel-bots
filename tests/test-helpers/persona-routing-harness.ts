@@ -2,6 +2,7 @@ import { mkdtempSync } from 'node:fs'
 
 import { createDeliveryQueue, type QueueItem, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
 import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, pendingOwnPostViews, type OwnPostJoins } from '../../src/own-post.ts'
+import type { StoredPostHold } from '../../src/post-holds.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -562,6 +563,10 @@ export interface RoutingHarnessOptions {
     /** Exercise the unresolved-store boundary when the joins dependency is absent. */
     joins?: false
     onHoldStored?: PersonaRoutingDeps['onHoldStored']
+    /** Routing's receipt clock: a fake clock's `now`, never the wall clock. Each reading adds `monotonic` to `h.order`. */
+    monotonicNow?: () => number
+    /** Give routing a recording `postHolds` (`h.heldPostHolds`, `held:<key>` in `h.order`); `'throw'` throws after recording. */
+    postHolds?: 'record' | 'throw'
   }
   /** Queue I/O and event seams; all paths remain under baseDir. */
   queueOptions?: Pick<DeliveryQueueOptions, 'fs' | 'onEvent'>
@@ -621,6 +626,14 @@ export interface RaisedNotice {
   text: string
 }
 
+/** One `held` call routing made on the opt-in recording `postHolds`. */
+export interface HeldPostHoldCall {
+  key: string
+  hold: StoredPostHold
+  /** No microtask had run since the key's queue `stored` event: the call ran in its store's own turn. */
+  storeTurn: boolean
+}
+
 /** One captured `chat.postMessage`, tagged with the key of the persona whose stub made it. */
 export interface HarnessPost {
   key: string
@@ -635,6 +648,8 @@ export interface RoutingHarness {
   pendingOwnPostReads: Array<[string, string]>
   /** Resolver notifications, recorded only by the opt-in Thread Memory wiring. */
   holdStored: string[]
+  /** Each `held` call of the opt-in recording `postHolds`, in order. */
+  heldPostHolds: HeldPostHoldCall[]
   releaseHeld: PersonaRouting['releaseHeld']
   /** Preparation requests made by opt-in routing, including requests the preparer refuses. */
   preparationCalls: Array<{ key: string; seq: number }>
@@ -652,7 +667,7 @@ export interface RoutingHarness {
   clients: PersonaClients
   /** Lines from the module's log seam. */
   logs: string[]
-  /** Ordered markers: `ack`, `archive:<key>`, `config`, `identity:<key>`. */
+  /** Ordered markers: `ack`, `archive:<key>`, `config`, `identity:<key>`; with Thread Memory, `hold-stored:<key>`, and with its Post Hold options `monotonic` and `held:<key>`. */
   order: string[]
   /** Launches the restart module issued. */
   launches: LaunchCall[]
@@ -934,7 +949,16 @@ export function makeRoutingHarness(
     }
   }
 
-  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, ...opts.queueOptions })
+  // With the recording `postHolds`, a key's store turn lasts until the next microtask after its `stored` event.
+  const storeTurns = new Set<string>()
+  const queueOptions: RoutingHarnessOptions['queueOptions'] = opts.threadMemory?.postHolds === undefined ? opts.queueOptions : {
+    ...opts.queueOptions,
+    onEvent: event => {
+      if (event.type === 'stored') { storeTurns.add(event.key); queueMicrotask(() => { storeTurns.delete(event.key) }) }
+      opts.queueOptions?.onEvent?.(event)
+    },
+  }
+  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, ...queueOptions })
   const joinSaveHolds = new Map<string, Promise<void>>()
   const joinSaves: Promise<unknown>[] = []
   const queueReady = queue.start()
@@ -943,6 +967,7 @@ export function makeRoutingHarness(
     threadMemoryReads: [],
     pendingOwnPostReads: [],
     holdStored: [],
+    heldPostHolds: [],
     releaseHeld: (key, item, mode) => routing.releaseHeld(key, item, mode),
     preparationCalls: [],
     holdJoinSaves(key) {
@@ -1125,6 +1150,16 @@ export function makeRoutingHarness(
         return saved
       },
     },
+    // Post Hold registration, each opt-in: production binds the hold clock's `now` and the resolver's `held`.
+    monotonicNow: opts.threadMemory?.monotonicNow === undefined ? undefined : () => {
+      h.order.push('monotonic')
+      return opts.threadMemory!.monotonicNow!()
+    },
+    postHolds: opts.threadMemory?.postHolds === undefined ? undefined : { held: (key, hold) => {
+      h.heldPostHolds.push({ key, hold: structuredClone(hold), storeTurn: storeTurns.has(key) })
+      h.order.push(`held:${key}`)
+      if (opts.threadMemory?.postHolds === 'throw') throw new Error('recording postHolds: held throws')
+    } },
     onHoldStored: opts.threadMemory === undefined ? undefined : key => {
       h.holdStored.push(key)
       h.order.push(`hold-stored:${key}`)

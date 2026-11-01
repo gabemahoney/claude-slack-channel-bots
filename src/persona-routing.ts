@@ -42,6 +42,7 @@ import type { DeliveryQueue, QueueItem, AcceptedInput, SlackKey } from './delive
 import { isOpenItem } from './delivery-queue.ts'
 import { OWN_ROOT_CLOCK_SKEW_MS } from './delivery-constants.ts'
 import type { ThreadMemory, ThreadJoin, ThreadMemoryStampState } from './thread-memory.ts'
+import type { PostHoldResolver } from './post-holds.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
@@ -96,6 +97,10 @@ interface SerialSelection {
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
+  /** Receipt time for the Post Hold deadline, before the serial intake wait. */
+  monotonicNow?: () => number
+  /** Registers each stored Post Hold in its store's synchronous turn, with monotonicNow's receipt time; its throw is ignored. */
+  postHolds?: Pick<PostHoldResolver, 'held'>
   /** Read the live Thread Memory view only when the decision needs a reply's membership. */
   threadMemory?: FungibleDecisionInputs['threadMemory']
   /** P's in-memory Pending Own Posts, read only for a reply not known to be joined. No I/O. */
@@ -325,6 +330,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     isExtSharedChannel?: unknown,
     provenance?: PersonaEventProvenance,
   ): Promise<void> {
+    const receivedAt = deps.monotonicNow?.()
     if (provenance?.candidate) { deps.membership?.request(provenance.key); return }
     if (provenance?.applied && !provenance.isCurrent()) { await ack(); return }
     if (provenance && !provenance.applied) return
@@ -360,6 +366,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             const result = await deps.queue.acceptDecided<SerialSelection>(key, slackKey, () => {
               selection = decideSerialIntake(key, ev, slackKey, isExtSharedChannel, provenance)
               if (!selection.input) return { skip: selection }
+              const hold = selection.input.hold
+              if (hold?.on === 'post' && deps.postHolds && receivedAt !== undefined) {
+                return { store: selection.input, afterStore: ({ seq }) => {
+                  try { deps.postHolds!.held(key, { seq, operations: hold.operations, threadRoot: hold.thread_ts,
+                    rootUnknown: hold.root_unknown, receivedAt }) } catch { /* cannot undo the store or suppress its ack */ }
+                } }
+              }
               const fact = selection.join
               return { store: selection.input, ...(fact ? { afterStore: () => { deps.joins?.addJoin(key, fact) } } : {}) }
             })

@@ -8,7 +8,7 @@ import { createPersonaRouting } from '../src/persona-routing.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import type { AcceptedRecord, QueueEvent } from '../src/delivery-queue.ts'
+import type { AcceptedRecord, PostHoldField, QueueEvent } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_NOT_SAVED, buildMessageNotSavedNotice } from '../src/delivery-notices.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
@@ -1959,5 +1959,148 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
       expect(hold).toEqual(postHold(hold.arrived_at, { operations: [post.operation!], thread_ts: R, stamp: t.fact({ channel: A }, 'beta').stamp }))
       expect([...h.pendingOwnPostReads].sort()).toEqual([['alpha', A], ['beta', A]])
     } finally { await post.settle() }
+  })
+
+  describe('registration with the Post Hold resolver at store', () => {
+    /** Far from every wall-clock, dedupe and Thread Memory reading, so no other reading passes for it. */
+    const RECEIPT_START = 5_000
+    /** The opt-in registration wiring: routing's receipt clock is `receipt` and its `postHolds` records. */
+    async function registering(options: Parameters<typeof holdRoutingHarness>[1] = {}, postHolds: 'record' | 'throw' = 'record') {
+      const receipt = createFakeClock({ start: RECEIPT_START })
+      return { receipt, ...await postHarness({ ...options, threadMemory: { monotonicNow: receipt.now, postHolds, ...options.threadMemory } }) }
+    }
+    /** The `held` call owed for `name`'s stored item `index`: its seq, the hold's own fields and the delivery's receipt reading. */
+    function registration(h: RoutingHarness, name: string, index: number, receivedAt: number) {
+      const item = h.queued(name)[index]!, hold = item.accepted.hold as PostHoldField
+      expect(hold.on).toBe('post')
+      return { key: name, hold: { seq: item.accepted.seq, operations: hold.operations, threadRoot: hold.thread_ts, rootUnknown: hold.root_unknown, receivedAt }, storeTurn: true }
+    }
+    const marks = (h: RoutingHarness, kept: readonly string[]) => h.order.filter(x => kept.includes(x))
+
+    test('a stored Post Hold registers once, in its store turn before the ack and onHoldStored, with its seq, posts, root and the receipt reading', async () => {
+      const { h, t, receipt } = await registering()
+      const first = await heldPost(h, { thread_ts: R }), second = await heldPost(h, { thread_ts: R })
+      try {
+        const stamp = t.fact({ channel: A }).stamp, operations = [first.operation!, second.operation!], kept = ['monotonic', 'archive:alpha', 'held:alpha', 'ack', 'hold-stored:alpha']
+        await h.receive(humanReply(), ['alpha'])
+        const item = h.queued('alpha')[0]!
+        expect(item.accepted.hold).toEqual(postHold(item.accepted.hold!.arrived_at, { operations, thread_ts: R, stamp }))
+        expect(h.heldPostHolds).toEqual([{ key: 'alpha', hold: { seq: item.accepted.seq, operations, threadRoot: R, rootUnknown: false, receivedAt: RECEIPT_START }, storeTurn: true }])
+        // One reading, taken before any other work of the delivery.
+        expect(marks(h, kept)).toEqual(kept)
+        await receipt.advance(1_234)
+        // Time passes while the delivery waits for its serial turn; the reading stays the receipt's.
+        const decided = h.queue.acceptDecided
+        h.queue.acceptDecided = async (key, slackKey, decide) => { await receipt.advance(10); return decided(key, slackKey, decide) }
+        await h.receive(humanReply({ text: 'a second reply before Slack answers' }), ['alpha'])
+        expect(receipt.now()).toBe(RECEIPT_START + 1_244)
+        expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 0, RECEIPT_START), registration(h, 'alpha', 1, RECEIPT_START + 1_234)])
+        expect(marks(h, kept)).toEqual([...kept, ...kept])
+      } finally { await first.settle(); await second.settle() }
+    })
+
+    test("with P's view unknown, a Memory Hold registers nothing and a covered reply registers its unknown root", async () => {
+      const { h, receipt } = await registering({ unreadable: true })
+      await h.receive(humanReply(), ['alpha'])
+      expect(h.queued('alpha')[0]!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
+      expect(h.holdStored).toEqual(['alpha'])
+      expect(h.heldPostHolds).toEqual([])
+      const post = await heldPost(h, { thread_ts: R })
+      try {
+        await receipt.advance(40)
+        await h.receive(humanReply({ text: "a reply covered by P's post" }), ['alpha'])
+        expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 1, RECEIPT_START + 40)])
+        expect(h.heldPostHolds[0]!.hold.rootUnknown).toBe(true)
+      } finally { await post.settle() }
+    })
+
+    test('drops, accepted messages, a failed store and a duplicate register nothing; only the stored retry registers, with its own reading', async () => {
+      const { h, receipt, queueIo } = await registering()
+      const post = await heldPost(h, { thread_ts: R })
+      try {
+        const S = THREAD_ROOTS.secondary, botUserId = h.p('alpha').stub.identity.botUserId
+        for (const event of [
+          makeChannelMessage({ channel: A }), humanReply({ thread_ts: THREAD_ROOTS.third }),
+          humanReply({ thread_ts: S, text: mentionText(botUserId) }), humanReply({ thread_ts: S }), makeDm(),
+        ]) await h.receive(event, ['alpha'])
+        const covered = humanReply()
+        queueIo.fail('writeSync', 'alpha', { match: path => path === queuePath(dir) })
+        await h.receive(covered, ['alpha'])
+        expect(h.queued('alpha').map(i => [i.accepted.via, i.accepted.hold?.on])).toEqual([['mention', undefined], ['thread', undefined], ['dm', undefined]])
+        expect(acks(h)).toHaveLength(5)
+        expect(h.heldPostHolds).toEqual([])
+        queueIo.heal()
+        await receipt.advance(250)
+        await h.receive(covered, ['alpha']); await h.receive(covered, ['alpha'])
+        expect(acks(h)).toHaveLength(7)
+        expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 3, RECEIPT_START + 250)])
+      } finally { await post.settle() }
+    })
+
+    test('a hold decision skipped for want of the joins dependency registers nothing', async () => {
+      const { h } = await registering({ threadMemory: { joins: false } })
+      const post = await heldPost(h, { thread_ts: R })
+      try {
+        await h.receive(humanReply(), ['alpha'])
+        expect(h.pendingOwnPostReads).toEqual([['alpha', A]])
+        expect(acks(h)).toEqual([])
+        expect(h.queued('alpha')).toEqual([])
+        expect(h.heldPostHolds).toEqual([])
+      } finally { await post.settle() }
+    })
+
+    test.each(['record', 'throw'] as const)('a held that does not throw or throws (%s) leaves the stores, acks, hook calls and later intake unchanged', async variant => {
+      const { h, events } = await registering({}, variant)
+      const post = await heldPost(h, { thread_ts: R })
+      try {
+        await h.receive(humanReply(), ['alpha'])
+        await h.receive(humanReply({ text: 'a second reply before Slack answers' }), ['alpha'])
+        await h.receive(makeDm(), ['alpha'])
+        expect(h.queued('alpha').map(i => i.hold?.state)).toEqual(['unresolved', 'unresolved', undefined])
+        expect(events.filter(e => e.type === 'stored' || e.type === 'store-failed').map(e => e.type)).toEqual(['stored', 'stored', 'stored'])
+        const round = ['held:alpha', 'ack', 'hold-stored:alpha']
+        expect(marks(h, round)).toEqual([...round, ...round, 'ack'])
+        expect(h.heldPostHolds.map(call => call.hold.seq)).toEqual(h.queued('alpha').slice(0, 2).map(i => i.accepted.seq))
+        expect(h.logs.filter(line => line.includes('persona-routing'))).toEqual([])
+      } finally { await post.settle() }
+    })
+
+    test('two recipients of one delivery share its reading; a redelivery after a sibling store fails reads again, and only stores that succeed register', async () => {
+      const { h, receipt, queueIo } = await registering()
+      const alphaPost = await heldPost(h, { thread_ts: R }), betaPost = await heldPost(h, { thread_ts: R }, 'beta')
+      try {
+        const event = humanReply(), byKey = (calls: typeof h.heldPostHolds) => [...calls].sort((a, b) => a.key.localeCompare(b.key))
+        queueIo.fail('writeSync', 'beta', { match: path => path === queuePath(dir, 'beta') })
+        await h.receive(event, ['alpha', 'beta'])
+        // alpha's hold is stored and registered although beta's failed store withholds the ack.
+        expect(acks(h)).toEqual([])
+        expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 0, RECEIPT_START)])
+        queueIo.heal()
+        await receipt.advance(700)
+        await h.receive(event, ['alpha', 'beta'])
+        expect(acks(h)).toHaveLength(1)
+        expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 0, RECEIPT_START), registration(h, 'beta', 0, RECEIPT_START + 700)])
+        await receipt.advance(300)
+        await h.receive(humanReply({ text: 'a reply both personas hold' }), ['alpha', 'beta'])
+        expect(byKey(h.heldPostHolds.slice(2))).toEqual([registration(h, 'alpha', 1, RECEIPT_START + 1_000), registration(h, 'beta', 1, RECEIPT_START + 1_000)])
+        // One reading per delivery; both recipients register before the one aggregate ack.
+        expect(marks(h, ['monotonic'])).toHaveLength(3)
+        const last = h.order.slice(h.order.lastIndexOf('monotonic')).filter(x => x.startsWith('held:') || x === 'ack')
+        expect([...last.slice(0, 2)].sort()).toEqual(['held:alpha', 'held:beta'])
+        expect(last.slice(2)).toEqual(['ack'])
+      } finally { await alphaPost.settle(); await betaPost.settle() }
+    })
+
+    test.each(['monotonicNow', 'postHolds'] as const)('with only %s, a Post Hold is stored and acknowledged as without both, and nothing registers', async only => {
+      const receipt = createFakeClock({ start: RECEIPT_START })
+      const { h } = await postHarness({ threadMemory: only === 'monotonicNow' ? { monotonicNow: receipt.now } : { postHolds: 'record' } })
+      const post = await heldPost(h, { thread_ts: R })
+      try {
+        await h.receive(humanReply(), ['alpha'])
+        expect(h.queued('alpha')[0]!.hold).toMatchObject({ kind: 'post', state: 'unresolved' })
+        expect(marks(h, ['ack', 'hold-stored:alpha'])).toEqual(['ack', 'hold-stored:alpha'])
+        expect(h.heldPostHolds).toEqual([])
+      } finally { await post.settle() }
+    })
   })
 })

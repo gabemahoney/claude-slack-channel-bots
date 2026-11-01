@@ -19,7 +19,7 @@ import { slackPlatformReason } from './persona-connection-errors.ts'
 export type { OwnPostContent } from './thread-memory.ts'
 import type { OwnPostContent } from './thread-memory.ts'
 export { createOwnPostJoins, ownPostStampState } from './own-post-joins.ts'
-export type { OwnPostJoins, OwnPostJoinsDeps, PendingOwnPost, OwnPostEvent, OwnPostOutcome,
+export type { OwnPostJoins, OwnPostJoinsDeps, PendingOwnPost, OwnPostOperationView, OwnPostEvent, OwnPostOutcome,
   OwnPostLookupHolds, OwnPostLookupOutcome, OwnPostLookupResult } from './own-post-joins.ts'
 import type { PendingOwnPost } from './own-post-joins.ts'
 

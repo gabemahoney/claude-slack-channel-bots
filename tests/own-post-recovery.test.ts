@@ -2,18 +2,20 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
-import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_ROW_POLL_MS } from '../src/delivery-engine.ts'
 import { THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import { OWN_POST_UPLOAD_FILENAME } from '../src/registry.ts'
+import { dropPersonaSession, OWN_POST_UPLOAD_FILENAME } from '../src/registry.ts'
 import { buildThreadMemoryJoinsLostLine, buildThreadMemoryJoinsLostNotice } from '../src/thread-memory-reports.ts'
 import { assertNoLeak, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
-import { queuePath } from './test-helpers/delivery-queue.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { holdOwnPostReady } from './test-helpers/own-post.ts'
 import { makeReloadHarness, TEMPLATE_REFRESH_KEY, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
-import { makeChannelMessage, makeDeferredWebApiCall, makeOwnFileShare, makePagedThread, mentionText, slackFileId, stubOpenedDmId, type PagedMessageSpec, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeChannelMessage, makeDeferredWebApiCall, makeDm, makeMembershipEvent, makeOwnFileShare, makePagedThread, mentionText, slackFileId, stubOpenedDmId, type PagedMessageSpec, type SlackEvent, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { readThreads, threadFsControls, threadPath, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 
 const channel = SHARED_CHANNEL_IDS.primary
@@ -70,12 +72,13 @@ function withPages(run: ReloadRun, history: ReturnType<typeof pages>, key = 'alp
   run.stub(key).responders.history = history.respondHistory
   run.stub(key).responders.replies = history.respondReplies
 }
-async function start(extra: ReloadRunOptions = {}, offset = 0) {
+async function start(extra: ReloadRunOptions = {}, offset = 0, beforeStart?: (run: ReloadRun) => void) {
   const run = h.build({ ...extra, threadMemory: extra.threadMemory ?? {},
     slack: Object.fromEntries(personas.map(p => [p.name, {
       ...(p.name === 'alpha' ? identity : siblingIdentity), inventory: [membershipPage([channel])], ...extra.slack?.[p.name],
     }])),
   }); runs.push(run)
+  beforeStart?.(run)
   await run.clock.advance(offset)
   expect(run.resolveStart().kind).toBe('applied')
   await run.controller.runStartBringUp()
@@ -116,9 +119,11 @@ async function hungPost(run: ReloadRun, parent?: string) {
   expect(intents()).toHaveLength(1)
   expect(outcomes()).toHaveLength(0)
 }
-async function intake(run: ReloadRun, thread: string, mention = false, key = 'alpha') {
-  const event = makeChannelMessage({ channel, thread_ts: thread, ts: `1700000100.${String(++sequence).padStart(6, '0')}`,
-    text: mention ? `${mentionText(run.stub(key).identity.botUserId)} incoming ${sequence}` : `incoming ${sequence}` })
+async function intake(run: ReloadRun, thread: string, mention = false, key = 'alpha', extra: { parentUser?: string; text?: string } = {}) {
+  const text = `${extra.text ?? 'incoming'} ${++sequence}`
+  const event = makeChannelMessage({ channel, thread_ts: thread, ts: `1700000100.${String(sequence).padStart(6, '0')}`,
+    text: mention ? `${mentionText(run.stub(key).identity.botUserId)} ${text}` : text,
+    ...(extra.parentUser ? { parent_user_id: extra.parentUser } : {}) })
   await run.deliver(key, event); await run.clock.flush()
   return event
 }
@@ -303,7 +308,9 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     })
     expect(run.threadMemory!.store('alpha')!.readable).toBe(false)
     if (origin === 'live') await unknown(run)
-    const held = await intake(run, THREAD_ROOTS.third)
+    // Another user's thread: P's unanswered new message cannot be its root, so
+    // no Post Hold covers this reply and it stays k8's Memory Hold.
+    const held = await intake(run, THREAD_ROOTS.third, false, 'alpha', { parentUser: 'U0THREADOWNER' })
     expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
     expect(lookups(run)).toHaveLength(0)
     // Let unreadable retries run well past the skew; none can call Slack.
@@ -754,5 +761,443 @@ describe.each(['strict', 'open'] as const)('%s upload threads', mode => {
     expect(readFileSync(threadPath(h.stateDir))).toEqual(bytes)
     expect(histories(run)).toHaveLength(1); expect(run.slackPosts()).toHaveLength(posts)
     expect(uploadOutcomes()).toEqual([]); expectLoss(run)
+  })
+})
+
+// Post Holds (SR-4.2): a reply in a thread P's own unanswered post could put P in
+// is stored before the ack and heads P's FIFO until the post lands, fails or
+// THREAD_REPLY_HOLD_MS passes; a start or a same-run bring-up releases it.
+const neighbor = SHARED_CHANNEL_IDS.secondary
+/** The held reply's words: no hold event, release or resolution record carries them. */
+const heldBody = 'held reply body'
+/** The `ts` Slack gives P's post, when it answers. */
+const postTs = '1700000000.000900'
+function holdSetup(mode: ChannelMode) {
+  personas = ['alpha', 'bravo'].map(name => h.persona(name, {
+    channels: [{ id: channel, delivery: 'thread_hybrid' }, { id: neighbor, delivery: 'all' }],
+    permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' },
+  }))
+  h.writeConfig({ channel_mode: mode, personas, queued_ack_reaction: 'hourglass' })
+}
+function holdStart(extra: ReloadRunOptions = {}, beforeStart?: (run: ReloadRun) => void) {
+  return start({ ...extra, slack: Object.fromEntries(personas.map(p => [p.name,
+    { inventory: [membershipPage([channel, neighbor])], ...extra.slack?.[p.name] }])) }, 0, beforeStart)
+}
+/** P's `reply` into `parent`'s thread, or as a new channel message, with Slack's answer held open. */
+async function heldPost(run: ReloadRun, parent?: string, key = 'alpha') {
+  const answer = makeDeferredWebApiCall()
+  releases.push(() => { if (!answer.settled) answer.settle() })
+  run.stub(key).script.post.push(answer.outcome)
+  const posts = posted(run, key).length
+  const result = reply(run, parent, key)
+  // A stop closes the SDK client; a case reads the result only once it has answered.
+  void result.catch(() => {})
+  await run.clock.flush()
+  expect(posted(run, key)).toHaveLength(posts + 1)
+  return { answer, result }
+}
+/** The queued feedback a reply has had: its received log lines and its queued reactions. */
+function feedback(run: ReloadRun, event: SlackEvent, key = 'alpha') {
+  return { received: run.logs.filter(l => l.includes('received') && l.includes(String(event.ts))).length,
+    reactions: run.stub(key).calls.reactionsAdd.filter(a => a.timestamp === event.ts).length }
+}
+/** A person's reply in `thread`, received now on the run's clock: stored as a Post Hold and acknowledged, with no feedback. */
+async function heldReply(run: ReloadRun, thread: string, key = 'alpha', parentUser?: string) {
+  const receivedAt = run.clock.now(), acks = run.stub(key).socket.acks.length
+  const event = await intake(run, thread, false, key, { text: heldBody, ...(parentUser ? { parentUser } : {}) })
+  expect(run.stub(key).socket.acks).toHaveLength(acks + 1)
+  const item = run.queued(key).find(i => i.accepted.ts === event.ts)!
+  expect(item.hold).toMatchObject({ kind: 'post', state: 'unresolved' })
+  expect(feedback(run, event, key)).toEqual({ received: 0, reactions: 0 })
+  return { event, receivedAt, seq: item.accepted.seq }
+}
+function resolutions(key = 'alpha') {
+  return readQueue(h.stateDir, key).filter(r => r.kind === 'released' || r.kind === 'withdrawn' || r.kind === 'parked')
+}
+function expectHoldOutputsQuiet(run: ReloadRun) {
+  expect(JSON.stringify({ events: run.postHoldEvents, releases: run.postHoldReleases, saved: resolutions() })).not.toContain(heldBody)
+}
+async function dm(run: ReloadRun, key = 'alpha') {
+  const event = makeDm({ ts: `1700000100.${String(++sequence).padStart(6, '0')}`, text: `dm ${sequence}` })
+  await run.deliver(key, event); await run.clock.flush()
+  return event
+}
+async function elsewhere(run: ReloadRun, key = 'alpha') {
+  const event = makeChannelMessage({ channel: neighbor, ts: `1700000100.${String(++sequence).padStart(6, '0')}`, text: `other ${sequence}` })
+  await run.deliver(key, event); await run.clock.flush()
+  return event
+}
+/** The real engine over P's queue: it types exactly `expected`'s prepared parts, in this order, and nothing else. */
+async function drain(run: ReloadRun, expected: readonly SlackEvent[], key = 'alpha') {
+  await run.prepareQueued()
+  const items = run.queued(key), parts = expected.flatMap(event => items.find(i => i.accepted.ts === event.ts)!.fixed!.parts)
+  const engine = await makeEngineHarness({ queue: run.queue, stateDir: h.stateDir, keys: [key] })
+  try {
+    await engine.tick(key)
+    if (expected.length) await engine.until(() => expected.every(event => run.queued(key).find(i => i.accepted.ts === event.ts)!.delivered))
+    await engine.advance(4 * DELIVERY_ROW_POLL_MS)
+    expect(engine.textCalls(key).map(c => c.params.text)).toEqual(parts)
+    expect(engine.errors).toEqual([])
+    assertNoLeak({ calls: engine.calls, events: engine.events })
+  } finally { await engine.cleanup() }
+}
+const restartLines = (from: number) => errors.slice(from).map(args => args.join(' ')).filter(line => /scheduleRestart|Scheduling restart/.test(line))
+
+describe.each(['strict', 'open'] as const)('%s Post Holds end to end', mode => {
+  test.each(['confirmed', 'failed', 'unanswered'] as const)('a reply held on P\'s post into its thread, %s: it heads P\'s FIFO with no feedback until released or withdrawn', async outcome => {
+    holdSetup(mode)
+    const run = await holdStart()
+    const post = await heldPost(run, root)
+    const held = await heldReply(run, root)
+    const direct = await dm(run), other = await elsewhere(run)
+    const theirs = await intake(run, otherRoot, true, 'bravo'), theirReply = await intake(run, otherRoot, false, 'bravo')
+    // Nothing of P's passes its unresolved hold; another persona's traffic flows.
+    await drain(run, [])
+    await drain(run, [theirs, theirReply], 'bravo')
+    if (outcome === 'confirmed') {
+      await run.clock.advance(1000)
+      post.answer.settle({ kind: 'ok', result: { ts: postTs, message: { thread_ts: root } } })
+      expect((await post.result).isError).toBe(false)
+    } else if (outcome === 'failed') {
+      post.answer.settle({ kind: 'platform', error: 'not_in_channel' })
+      expect((await post.result).isError).toBe(true)
+    } else {
+      await run.clock.advanceTo(held.receivedAt + THREAD_REPLY_HOLD_MS - 1)
+      expect(run.queue.item('alpha', held.seq)!.hold!.state).toBe('unresolved')
+      expect(run.postHoldEvents).toEqual([])
+      await run.clock.advance(1)
+    }
+    await run.clock.flush()
+    const resolved = outcome === 'failed' ? 'withdrawn' : 'released'
+    expect(resolutions()).toEqual([{ v: 1, kind: resolved, seq: held.seq, at: expect.any(Number) }])
+    expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: resolved,
+      cause: outcome === 'confirmed' ? 'thread' : outcome === 'failed' ? 'outcomes' : 'timer',
+      heldMs: outcome === 'confirmed' ? 1000 : outcome === 'failed' ? 0 : THREAD_REPLY_HOLD_MS }])
+    expect(run.postHoldReleases).toEqual(resolved === 'released' ? [{ key: 'alpha', seq: held.seq, mode: 'live' }] : [])
+    expect(run.queue.item('alpha', held.seq)!.accepted.via).toBe('thread')
+    // Queued feedback only on release (t1.tad.5i SR-6.2), once; none for a withdrawn reply.
+    expect(feedback(run, held.event)).toEqual(resolved === 'released' ? { received: 1, reactions: 1 } : { received: 0, reactions: 0 })
+    // Released without a join on timeout; a confirmed post joins its own thread.
+    expect(view(run, root)).toBe(outcome === 'confirmed' ? 'joined' : 'not-joined')
+    await drain(run, [...(resolved === 'released' ? [held.event] : []), direct, other])
+    if (resolved === 'withdrawn') {
+      // It keeps its durable key: Slack's redelivery adds nothing and gets no feedback.
+      const items = run.queued('alpha').length
+      await run.deliver('alpha', held.event); await run.clock.flush()
+      expect(run.queued('alpha')).toHaveLength(items)
+      expect(feedback(run, held.event)).toEqual({ received: 0, reactions: 0 })
+    }
+    expectHoldOutputsQuiet(run); expectLoss(run)
+  })
+
+  test('a reply in the new thread of P\'s held channel message is released when Slack names that thread; later replies there are delivered', async () => {
+    holdSetup(mode)
+    const run = await holdStart()
+    const post = await heldPost(run)
+    const held = await heldReply(run, postTs, 'alpha', run.stub('alpha').identity.botUserId)
+    await run.clock.advance(500)
+    post.answer.settle({ kind: 'ok', result: { ts: postTs } })
+    expect((await post.result).isError).toBe(false)
+    await run.clock.flush()
+    expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: 'released', cause: 'thread', heldMs: 500 }])
+    expect(run.postHoldReleases).toEqual([{ key: 'alpha', seq: held.seq, mode: 'live' }])
+    expect(feedback(run, held.event)).toEqual({ received: 1, reactions: 1 })
+    expect(view(run, postTs)).toBe('joined')
+    const next = await intake(run, postTs)
+    const item = run.queued('alpha').find(i => i.accepted.ts === next.ts)!
+    expect(item.accepted.via).toBe('thread'); expect(item.hold).toBeUndefined()
+    await drain(run, [held.event, next])
+    expectHoldOutputsQuiet(run); expectLoss(run)
+  })
+
+  test.each(['after', 'before'] as const)('a hold whose root P\'s unreadable journal could not show parks when its post lands elsewhere; k8 releases it once the journal is read (read %s the post lands)', async read => {
+    holdSetup(mode)
+    const first = await holdStart()
+    const mention = await intake(first, root, true)
+    await flush(first); await first.stop()
+    const io = threadFsControls(h.stateDir); io.fail('readFileSync', 'alpha')
+    const run = await holdStart({ threadMemory: { fs: io.fs } })
+    expect(run.threadMemory!.store('alpha')!.readable).toBe(false)
+    // The first read retry falls due THREAD_MEMORY_RETRY_MIN_MS after the start's failed read.
+    if (read === 'before') await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1000)
+    const post = await heldPost(run)
+    const held = await heldReply(run, root)
+    expect(run.queue.unresolvedHolds('alpha')).toMatchObject([{ seq: held.seq, on: 'post', root_unknown: true }])
+    if (read === 'before') {
+      // Read while the hold still waits on its post: k8 has no Memory Hold to resolve yet.
+      io.heal(); await run.clock.advance(1000); await flush(run)
+      expect(run.threadMemory!.store('alpha')!.readable).toBe(true)
+      expect(run.queue.unresolvedHolds('alpha')).toMatchObject([{ seq: held.seq, on: 'post' }])
+    }
+    post.answer.settle({ kind: 'ok', result: { ts: postTs } })
+    expect((await post.result).isError).toBe(false)
+    await run.clock.flush()
+    expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: 'parked', cause: 'outcomes',
+      heldMs: read === 'before' ? 1000 : 0 }])
+    expect(run.postHoldReleases).toEqual([])
+    if (read === 'after') {
+      expect(resolutions()).toEqual([{ v: 1, kind: 'parked', seq: held.seq, at: expect.any(Number) }])
+      expect(run.queue.unresolvedHolds('alpha')).toMatchObject([{ seq: held.seq, on: 'memory', memoryDependent: true }])
+      expect(run.heldReleases).toEqual([])
+      expect(feedback(run, held.event)).toEqual({ received: 0, reactions: 0 })
+      io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    }
+    // A readable journal: the parked hold is handed to k8 at once.
+    await flush(run)
+    expect(resolutions()).toMatchObject([{ kind: 'parked', seq: held.seq }, { kind: 'released', seq: held.seq }])
+    expect(run.heldReleases).toEqual([{ key: 'alpha', seq: held.seq, mode: 'live' }])
+    expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+    expect(feedback(run, held.event)).toEqual({ received: 1, reactions: 1 })
+    await drain(run, [mention, held.event])
+    expectHoldOutputsQuiet(run)
+  })
+
+  test.each(['unanswered', 'decided with its save refused', 'saved'] as const)('a crash during a Post Hold whose post is %s: the next start releases it at most once, as recovered work, before k8\'s start resolution and compaction', async state => {
+    holdSetup(mode)
+    const queueIo = threadFsControls(h.stateDir)
+    const first = await holdStart({ threadMemory: { queueFs: queueIo.fs } })
+    const post = await heldPost(first, root)
+    const held = await heldReply(first, root)
+    if (state !== 'unanswered') {
+      if (state !== 'saved') queueIo.fail('writeSync', 'alpha', { match: path => path === queuePath(h.stateDir) })
+      post.answer.settle({ kind: 'ok', result: { ts: postTs, message: { thread_ts: root } } })
+      expect((await post.result).isError).toBe(false)
+      await first.clock.flush()
+      expect(first.postHoldEvents).toEqual(state === 'saved'
+        ? [expect.objectContaining({ kind: 'post-hold-resolved', seq: held.seq, outcome: 'released', cause: 'thread' })]
+        : [{ kind: 'post-hold-save-failed', key: 'alpha', seqs: [held.seq] }])
+    }
+    expect(resolutions()).toEqual(state === 'saved' ? [expect.objectContaining({ kind: 'released', seq: held.seq })] : [])
+    await crash(first); queueIo.heal()
+    const order: string[] = [], logged = errors.length, history = pages(1, root), saving = Promise.withResolvers<void>()
+    const run = await holdStart({ slack: { alpha: { repliesResponder: history.respondReplies } } }, next => {
+      const memory = next.memoryHolds!, resolve = memory.resolve
+      memory.resolve = (key, holdMode, compactAfter) => {
+        if (key === 'alpha') order.push(`k8 ${holdMode}: ${next.queue.unresolvedHolds(key).length} unresolved, ${next.postHoldReleases.length} released`)
+        return resolve(key, holdMode, compactAfter)
+      }
+      const compact = next.queue.compact
+      next.queue.compact = (key, current) => { if (key === 'alpha') order.push('compact'); return compact(key, current) }
+      // The start's saves wait until alpha's session is gone, so its release runs with alpha up and sessionless.
+      const resolveHolds = next.queue.resolveHolds
+      next.queue.resolveHolds = async (...args) => { await saving.promise; return resolveHolds(...args) }
+    })
+    // A live release would now go down the lost-message path (handleLostMessage) and schedule a restart.
+    await dropPersonaSession('alpha')
+    expect(run.session('alpha')).toBeUndefined()
+    saving.resolve(); await flush(run)
+    const recovered = state !== 'saved'
+    expect(order).toEqual([`k8 recovered: 0 unresolved, ${recovered ? 1 : 0} released`, 'compact'])
+    expect(run.postHoldReleases).toEqual(recovered ? [{ key: 'alpha', seq: held.seq, mode: 'recovered' }] : [])
+    expect(run.postHoldEvents).toEqual(recovered ? [{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: 'released', cause: 'restart' }] : [])
+    // The second compaction rewrites the release as an ordinary accepted record.
+    expect(resolutions()).toEqual([])
+    const record = readQueue(h.stateDir).find(r => r.kind === 'accepted' && r.seq === held.seq)!
+    expect(record).toMatchObject({ via: 'thread', released_at: expect.any(Number) }); expect(record).not.toHaveProperty('hold')
+    // Recovered work: no lost-message restart though alpha had no session, and no Joins lost.
+    expect(restartLines(logged)).toEqual([])
+    expectLoss(run)
+    // Back in session: its queued feedback once.
+    run.registerSession('alpha'); await run.clock.flush()
+    expect(feedback(run, held.event)).toEqual(recovered ? { received: 1, reactions: 1 } : { received: 0, reactions: 0 })
+    expect(view(run, root)).toBe('joined')
+    // A repeated Event adds no item, before or after delivery.
+    const items = run.queued('alpha').length
+    await run.deliver('alpha', held.event); await run.clock.flush()
+    expect(run.queued('alpha')).toHaveLength(items)
+    await drain(run, [held.event])
+    expectHoldOutputsQuiet(run)
+  })
+
+  test('a start whose Thread Memory is unreadable releases a crashed Post Hold and compacts it on its own; k8 resolves the Memory Hold once the journal reads', async () => {
+    holdSetup(mode)
+    const first = await holdStart()
+    const mention = await intake(first, root, true)
+    await flush(first); await first.stop()
+    const io = threadFsControls(h.stateDir); io.fail('readFileSync', 'alpha')
+    const second = await holdStart({ threadMemory: { fs: io.fs } })
+    await heldPost(second, otherRoot)
+    const postHeld = await heldReply(second, otherRoot)
+    // No post of P's covers root, so its reply waits on the unreadable journal.
+    const memoryHeld = await intake(second, root)
+    const memorySeq = second.queued('alpha').find(i => i.accepted.ts === memoryHeld.ts)!.accepted.seq
+    expect(second.queue.unresolvedHolds('alpha').map(hold => [hold.seq, hold.on])).toEqual([[postHeld.seq, 'post'], [memorySeq, 'memory']])
+    await crash(second)
+    const order: string[] = []
+    const run = await holdStart({ threadMemory: { fs: io.fs } }, next => {
+      const memory = next.memoryHolds!, resolve = memory.resolve
+      memory.resolve = async (key, holdMode, compactAfter) => {
+        const answer = await resolve(key, holdMode, compactAfter)
+        if (key === 'alpha') order.push(`k8 ${holdMode}: ${answer}`)
+        return answer
+      }
+      const compact = next.queue.compact
+      next.queue.compact = (key, current) => { if (key === 'alpha') order.push('compact'); return compact(key, current) }
+    })
+    await flush(run)
+    expect(run.threadMemory!.store('alpha')!.readable).toBe(false)
+    // k8 can't judge yet, so the start's release is compacted on its own: released form, Memory Hold kept.
+    expect(order).toEqual(['k8 recovered: unknown', 'compact'])
+    expect(run.postHoldReleases).toEqual([{ key: 'alpha', seq: postHeld.seq, mode: 'recovered' }])
+    expect(resolutions()).toEqual([])
+    const accepted = readQueue(h.stateDir).filter(r => r.kind === 'accepted' && !('compact' in r) && (r.seq === postHeld.seq || r.seq === memorySeq))
+    expect(accepted).toMatchObject([{ seq: postHeld.seq, via: 'thread', released_at: expect.any(Number) }, { seq: memorySeq, hold: { on: 'memory' } }])
+    expect(accepted[0]).not.toHaveProperty('hold')
+    expect(run.heldReleases).toEqual([])
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS); await flush(run)
+    // The read lets k8 judge its start request: released as recovered work, then compacted again.
+    expect(run.heldReleases).toEqual([{ key: 'alpha', seq: memorySeq, mode: 'recovered' }])
+    expect(order.filter(step => step === 'compact')).toHaveLength(2)
+    expect(resolutions()).toEqual([])
+    expect(feedback(run, postHeld.event)).toEqual({ received: 1, reactions: 1 })
+    await drain(run, [mention, postHeld.event, memoryHeld])
+    expectHoldOutputsQuiet(run); expectLoss(run)
+  })
+
+  test.each(['a DM', 'a reply Thread Memory cannot judge yet'] as const)('a queue journal unreadable at start: %s that first loads it releases its crashed Post Hold as recovered work, and P\'s FIFO moves', async loading => {
+    holdSetup(mode)
+    const first = await holdStart()
+    const mention = await intake(first, THREAD_ROOTS.third, true)
+    await heldPost(first, root)
+    const held = await heldReply(first, root)
+    await flush(first); await crash(first)
+    const queueIo = threadFsControls(h.stateDir), memoryIo = threadFsControls(h.stateDir)
+    queueIo.fail('readFileSync', 'alpha', { match: path => path === queuePath(h.stateDir) })
+    if (loading !== 'a DM') memoryIo.fail('readFileSync', 'alpha')
+    let compactions = 0
+    const run = await holdStart({ threadMemory: { queueFs: queueIo.fs, fs: memoryIo.fs },
+      slack: { alpha: { repliesResponder: pages(1, root).respondReplies } } }, next => {
+      const compact = next.queue.compact
+      next.queue.compact = (key, current) => { if (key === 'alpha') compactions++; return compact(key, current) }
+    })
+    await flush(run)
+    // Start couldn't read the journal, so it couldn't release the hold in it.
+    expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+    expect(run.postHoldReleases).toEqual([])
+    queueIo.heal()
+    const compacted = compactions
+    const loader = loading === 'a DM' ? await dm(run) : await intake(run, THREAD_ROOTS.third)
+    await flush(run)
+    expect(run.postHoldReleases).toEqual([{ key: 'alpha', seq: held.seq, mode: 'recovered' }])
+    expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: 'released', cause: 'restart' }])
+    expect(feedback(run, held.event)).toEqual({ received: 1, reactions: 1 })
+    const loaderSeq = run.queued('alpha').find(i => i.accepted.ts === loader.ts)!.accepted.seq
+    if (loading !== 'a DM') {
+      expect(run.queue.unresolvedHolds('alpha')).toMatchObject([{ seq: loaderSeq, on: 'memory' }])
+      memoryIo.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS); await flush(run)
+      // k8 took the loaded journal's holds before this turn stored its own, so that one stays live work.
+      expect(run.heldReleases).toEqual([{ key: 'alpha', seq: loaderSeq, mode: 'live' }])
+    }
+    // The loaded journal's start resolution compacts once, after the release's save; a live
+    // release of the loading turn's own hold is left to the hourly compaction.
+    expect(compactions - compacted).toBe(1)
+    expect(resolutions()).toEqual(loading === 'a DM' ? [] : [{ v: 1, kind: 'released', seq: loaderSeq, at: expect.any(Number) }])
+    expect(readQueue(h.stateDir).find(r => r.kind === 'accepted' && r.seq === held.seq)).toMatchObject({ via: 'thread', released_at: expect.any(Number) })
+    await drain(run, [mention, held.event, loader])
+    expectHoldOutputsQuiet(run); expectLoss(run)
+  })
+
+  test('a queue journal unreadable at start: in its loading turn k8 takes its crashed Memory Hold as recovered work, and the loading reply\'s own Memory Hold stays live', async () => {
+    holdSetup(mode)
+    const first = await holdStart()
+    const mention = await intake(first, root, true)
+    await flush(first); await first.stop()
+    const memoryIo = threadFsControls(h.stateDir); memoryIo.fail('readFileSync', 'alpha')
+    const second = await holdStart({ threadMemory: { fs: memoryIo.fs } })
+    const old = await intake(second, root)
+    const oldSeq = second.queued('alpha').find(i => i.accepted.ts === old.ts)!.accepted.seq
+    expect(second.queue.unresolvedHolds('alpha')).toMatchObject([{ seq: oldSeq, on: 'memory' }])
+    await crash(second)
+    const queueIo = threadFsControls(h.stateDir)
+    queueIo.fail('readFileSync', 'alpha', { match: path => path === queuePath(h.stateDir) })
+    const run = await holdStart({ threadMemory: { fs: memoryIo.fs, queueFs: queueIo.fs } })
+    queueIo.heal()
+    const loader = await intake(run, root)
+    const loaderSeq = run.queued('alpha').find(i => i.accepted.ts === loader.ts)!.accepted.seq
+    expect(run.queue.unresolvedHolds('alpha').map(hold => [hold.seq, hold.on])).toEqual([[oldSeq, 'memory'], [loaderSeq, 'memory']])
+    memoryIo.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS); await flush(run)
+    // Recovered work for the hold the journal held, live work (with its post-ack path) for the new one.
+    expect(run.heldReleases).toEqual([{ key: 'alpha', seq: oldSeq, mode: 'recovered' }, { key: 'alpha', seq: loaderSeq, mode: 'live' }])
+    expect([feedback(run, old), feedback(run, loader)]).toEqual([{ received: 1, reactions: 1 }, { received: 1, reactions: 1 }])
+    await drain(run, [mention, old, loader])
+    expectLoss(run)
+  })
+
+  test('a same-run bring-up releases an unresolved Post Hold as recovered work after its recovery; the old post\'s late answer does nothing', async () => {
+    holdSetup(mode)
+    const run = await holdStart()
+    withPages(run, pages(1, root))
+    const post = await heldPost(run, root)
+    const held = await heldReply(run, root)
+    const persona = run.serverConfig()!.personas.find(p => p.key === 'alpha')!
+    await run.composition!.lifecycle.teardown(persona)
+    await run.clock.advance(THREAD_REPLY_HOLD_MS)
+    expect(run.postHoldEvents).toEqual([]); expect(run.queue.item('alpha', held.seq)!.hold!.state).toBe('unresolved')
+    run.stub('alpha').script.inventory.push(membershipPage([channel, neighbor]))
+    await run.composition!.lifecycle.bringUp(persona, run.serverConfig()!)
+    await run.membershipClock.runNext(); await flush(run)
+    expect(run.postHoldReleases).toEqual([{ key: 'alpha', seq: held.seq, mode: 'recovered' }])
+    expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: 'released', cause: 'restart' }])
+    expect(resolutions()).toEqual([{ v: 1, kind: 'released', seq: held.seq, at: expect.any(Number) }])
+    run.registerSession('alpha'); await run.clock.flush()
+    expect(feedback(run, held.event)).toEqual({ received: 1, reactions: 1 })
+    post.answer.settle({ kind: 'ok', result: { ts: postTs, message: { thread_ts: root } } })
+    await flush(run)
+    expect(run.postHoldEvents).toHaveLength(1); expect(run.postHoldReleases).toHaveLength(1)
+    await drain(run, [held.event])
+    expectHoldOutputsQuiet(run); expectLoss(run)
+  })
+
+  test.each(['teardown', 'removal', 'shutdown'] as const)('%s cancels P\'s pending hold timer and drops its post\'s answer; another persona\'s hold still resolves', async how => {
+    holdSetup(mode)
+    const run = await holdStart()
+    const mine = await heldPost(run, root)
+    await heldPost(run, otherRoot, 'bravo')
+    const held = await heldReply(run, root)
+    await run.clock.advance(7)
+    const theirs = await heldReply(run, otherRoot, 'bravo')
+    const deadline = held.receivedAt + THREAD_REPLY_HOLD_MS
+    expect(run.clock.pending().filter(t => t.dueAt === deadline)).toHaveLength(1)
+    const persona = run.serverConfig()!.personas.find(p => p.key === 'alpha')!
+    if (how === 'teardown') await run.composition!.lifecycle.teardown(persona)
+    else if (how === 'removal') {
+      h.writeConfig({ channel_mode: mode, personas: [personas[1]!], queued_ack_reaction: 'hourglass' })
+      await run.ticks.tick(); h.confirm(); await run.ticks.tick(); await run.clock.flush()
+      expect(run.appliedKeys()).toEqual(['bravo'])
+    } else await run.stop()
+    expect(run.clock.pending().filter(t => t.dueAt === deadline)).toEqual([])
+    if (how === 'shutdown') expect(run.clock.pendingCount()).toBe(0)
+    const queued = readQueue(h.stateDir), posts = run.stub('alpha').calls.postMessage.length
+    mine.answer.settle({ kind: 'ok', result: { ts: postTs, message: { thread_ts: root } } })
+    await run.clock.advance(THREAD_REPLY_HOLD_MS); await run.clock.flush()
+    expect(readQueue(h.stateDir)).toEqual(queued)
+    expect(run.postHoldEvents.filter(e => e.key === 'alpha')).toEqual([])
+    expect(run.postHoldReleases.filter(r => r.key === 'alpha')).toEqual([])
+    expect(run.stub('alpha').calls.postMessage).toHaveLength(posts)
+    expect(feedback(run, held.event)).toEqual({ received: 0, reactions: 0 })
+    expect(run.postHoldReleases.filter(r => r.key === 'bravo')).toEqual(how === 'shutdown' ? [] : [{ key: 'bravo', seq: theirs.seq, mode: 'live' }])
+    expectHoldOutputsQuiet(run)
+  })
+
+  test.each(['confirmed in the reply\'s thread', 'unanswered'] as const)('after a routed leave of P\'s channel during a hold (t1.tad.5i AC-C08), its post %s resolves it within THREAD_REPLY_HOLD_MS of receipt, joining nothing', async answer => {
+    holdSetup(mode)
+    const run = await holdStart()
+    const post = await heldPost(run, root)
+    const held = await heldReply(run, root)
+    const authority = run.controller.sharedChannels()!, arrival = authority.channelStamp('alpha', channel)
+    const [leave, envelope] = makeMembershipEvent(run.stub('alpha').identity, 'leave', channel, run.membershipClock.now() + 1)
+    await run.deliver('alpha', leave, envelope); await run.clock.flush()
+    expect(authority.channelStamp('alpha', channel)).not.toEqual(arrival)
+    await run.clock.advance(500)
+    if (answer !== 'unanswered') {
+      post.answer.settle({ kind: 'ok', result: { ts: postTs, message: { thread_ts: root } } })
+      await post.result
+    }
+    await run.clock.advanceTo(held.receivedAt + THREAD_REPLY_HOLD_MS); await flush(run)
+    expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: 'released',
+      cause: answer === 'unanswered' ? 'timer' : 'thread', heldMs: answer === 'unanswered' ? THREAD_REPLY_HOLD_MS : 500 }])
+    expect(view(run, root)).toBe('not-joined')
+    expect(joins().filter(j => j.root === root)).toEqual([])
+    expectHoldOutputsQuiet(run)
   })
 })

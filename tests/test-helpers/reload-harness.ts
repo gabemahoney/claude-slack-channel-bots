@@ -7,6 +7,7 @@ import { createMembershipScanner, membershipConnectionListener, type MembershipS
 import { createDeliveryQueue, type QueueItem, type QueueEvent, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent, type MemoryHoldMode } from '../../src/memory-holds.ts'
+import { createPostHoldResolver, type PostHoldResolver, type PostHoldEvent, type StoredPostHold } from '../../src/post-holds.ts'
 import { createDeliveryReporting } from '../../src/delivery-notices.ts'
 import { setDeliveryLifecycle } from '../../src/session-manager.ts'
 import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
@@ -15,7 +16,7 @@ import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryR
 import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from '../../src/thread-memory-reports.ts'
 import { createSharedStateReporting } from '../../src/shared-state-reports.ts'
 import { recoverQueuedJoins } from '../../src/thread-join-recovery.ts'
-import { createOwnPostJoins, createOwnPostObserver, ownPostChoice, ownPostEligibility, ownPostStampState, type OwnPostJoins, type OwnPostEvent } from '../../src/own-post.ts'
+import { createOwnPostJoins, createOwnPostObserver, ownPostChoice, ownPostEligibility, ownPostStampState, pendingOwnPostViews, type OwnPostJoins, type OwnPostEvent } from '../../src/own-post.ts'
 import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from '../../src/own-post-lookup.ts'
 import { assertSendable as libAssertSendable } from '../../src/lib.ts'
 import { threadJoin } from './thread-memory.ts'
@@ -1133,6 +1134,11 @@ export interface ReloadRun {
   readonly memoryHolds: MemoryHoldResolver | undefined
   readonly memoryHoldEvents: MemoryHoldEvent[]
   readonly heldReleases: Array<{ key: string; seq: number; mode: MemoryHoldMode }>
+  /** The Post Hold resolver as server.ts builds it, with `run.clock` as its hold clock. */
+  readonly postHolds: PostHoldResolver | undefined
+  readonly postHoldEvents: PostHoldEvent[]
+  /** Each Post Hold release handed to routing's `releaseHeld`, in call order. */
+  readonly postHoldReleases: Array<{ key: string; seq: number; mode: MemoryHoldMode }>
   /** Seed through the real store under the authority's current Channel Stamp. */
   joinThread(name: string, channel: string, root: string): Promise<void>
   /** Write a real operator request; a later tick records it. */
@@ -2141,6 +2147,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       },
       ...(runOpts.threadMemory === undefined ? {} : {
         fs: runOpts.threadMemory.queueFs,
+        // As server.ts binds it: a journal start() couldn't read gets the start's steps when it first loads.
+        onLoadedAfterStart: (key: string) => {
+          if (!queueStartRecovered || stopped) return
+          for (const hold of queue.unresolvedHolds(key)) threadMemory?.advancePast(key, hold.arrived_at)
+          recoverQueueKeyAtStart(key, true)
+        },
         threadJoinSaved: (key: string, channel: string, fact: NonNullable<QueueItem['accepted']['thread_join']>) => {
           threadMemory?.advancePast(key, fact.at)
           return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false
@@ -2288,6 +2300,42 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         dispatchReport(() => threadMemoryReporting?.holdsEvent(event))
       },
     })
+    const resolveMemoryHolds = (key: string) => !stopped && getAppliedPersona(key) ? memoryHolds!.resolve(key, 'live') : Promise.resolve()
+    const postHoldEvents: PostHoldEvent[] = []
+    const postHoldReleases: Array<{ key: string; seq: number; mode: MemoryHoldMode }> = []
+    // As server.ts builds it, with the run's fake clock as HOLD_CLOCK and as the
+    // decision time k8 uses, and routing's releaseHeld through a call-time adapter.
+    const holdOwner = ownPostJoins
+    const postHolds = threadMemory === undefined || holdOwner === undefined ? undefined : createPostHoldResolver({
+      canRun: memoryWorkAllowed,
+      queue, owner: holdOwner,
+      release(key, item, mode) {
+        postHoldReleases.push({ key, seq: item.accepted.seq, mode })
+        return routing.releaseHeld(key, item, mode)
+      },
+      onParked: key => resolveMemoryHolds(key),
+      clock: connections.clock, decisionNow: connections.clock.now,
+      onEvent: event => { postHoldEvents.push(event) },
+    })
+    // One owner subscription; every event only queues a check of its key.
+    const unsubscribePostHolds = postHolds === undefined ? undefined : holdOwner?.subscribe(event => postHolds.check(event.key))
+    let queueStartRecovered = false
+    /** server.ts's recoverQueueKeyAtStart: the key's queued joins now, then, detached,
+     * its Post Hold restart release and k8's 'recovered' resolution, whose compaction
+     * follows both saves; the releases are compacted here only when k8 can't judge
+     * (unknown) or a failed join recovery keeps it from being asked. In a journal's
+     * loading turn after start, k8 takes that journal's holds at once. */
+    function recoverQueueKeyAtStart(key: string, loadingTurn = false): void {
+      if (!threadMemory || !postHolds) return
+      let joinsRecovered = true
+      try { recoverQueuedJoins(key, queue, threadMemory) } catch { joinsRecovered = false }
+      const resolveMemory = () => joinsRecovered && memoryWorkAllowed(key) ? memoryHolds?.resolve(key, 'recovered', true) : undefined
+      const releasing = postHolds.releaseUntracked(key)
+      const resolving = loadingTurn ? resolveMemory() : releasing.then(resolveMemory)
+      void Promise.all([resolving, releasing]).then(async ([resolved]) => {
+        if ((!joinsRecovered || resolved === 'unknown') && memoryWorkAllowed(key)) await queue.compact(key, () => memoryWorkAllowed(key))
+      }).catch(() => {})
+    }
     const membershipClock = createFakeClock()
     let membership: ChannelMembership | undefined
     let membershipScanner: MembershipScanner | undefined
@@ -2306,7 +2354,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       prepare: preparation.prepare,
       ...(threadMemory === undefined ? {} : {
         onReceived: (key: string, item: QueueItem, mode?: MemoryHoldMode) => reporting!.received(key, item, mode),
-        onHoldStored: (key: string) => !stopped && getAppliedPersona(key) ? memoryHolds!.resolve(key, 'live') : Promise.resolve(),
+        // As server.ts extends k8's hook: both hold owners, each isolated.
+        onHoldStored: (key: string) => {
+          try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
+          try { postHolds?.check(key) } catch { /* independent hold owners */ }
+        },
+        monotonicNow: connections.clock.now,
+        postHolds: { held: (key: string, hold: StoredPostHold) => postHolds?.held(key, hold) },
+        pendingOwnPosts: (key: string, channel: string) => pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? []),
         // As server.ts binds it: no runner in a dry run, so the hook does nothing.
         onOwnMessage: (...args: Parameters<OwnPostLookups['ownMessage']>) => ownPostLookups?.ownMessage(...args),
       }),
@@ -2595,15 +2650,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         routing: { forget: rec('routing.forget', (key) => {
           sharedStateReporting?.forget(key)
           if (threadMemory === undefined) routing.forget(key)
-          else forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => threadMemoryRetries!.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory.forget(k)])
+          else forgetPersonaState(key, [k => routing.forget(k), k => preparation.forget(k), k => memoryHolds!.forget(k), k => postHolds?.forget(k), k => threadMemoryRetries!.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory.forget(k)])
         }) },
         ...(threadMemory === undefined ? {} : { cancelThreadMemory: (key: string) => forgetPersonaState(key, [
-          k => threadMemoryRetries!.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds!.forget(k),
+          k => threadMemoryRetries!.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds!.forget(k), k => postHolds?.forget(k),
         ]), loadThreadMemory: async (key: string) => {
           await threadMemory.loadKey(key)
           if (!stopped) {
             recoverQueuedJoins(key, queue, threadMemory)
-            void memoryHolds!.resolve(key, 'recovered')
+            // As server.ts: the bring-up's Post Hold release, then k8's resolution.
+            void postHolds?.releaseUntracked(key).then(() => {
+              if (memoryWorkAllowed(key)) return memoryHolds!.resolve(key, 'recovered')
+            }).catch(() => {})
             ownPostLookups?.kick(key)
           }
         } }),
@@ -2862,6 +2920,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             threadMemoryRetries?.forget(persona.key, 'removal')
             ownPostLookups?.forget(persona.key)
             ownPostJoins?.forget(persona.key)
+            postHolds?.forget(persona.key)
             await threadMemory?.remove(persona.key)
           }
         }
@@ -3066,12 +3125,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           return threadMemory.activate()
         }).then(() => {
           for (const persona of serverConfig()?.personas ?? []) ownPostLookups?.journalRead(persona.key)
-          for (const key of queue.keys()) {
-            try {
-              recoverQueuedJoins(key, queue, threadMemory)
-              void memoryHolds!.resolve(key, 'recovered', true)
-            } catch { /* retry this key at bring-up */ }
-          }
+          for (const key of queue.keys()) recoverQueueKeyAtStart(key)
+          queueStartRecovered = true
           for (const persona of serverConfig()?.personas ?? []) ownPostLookups?.kick(persona.key)
           queue.startMaintenance()
           threadMemoryReporting = createThreadMemoryReporting({
@@ -3342,6 +3397,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       },
       threadMemoryEvents,
       memoryHolds, memoryHoldEvents, heldReleases,
+      postHolds, postHoldEvents, postHoldReleases,
       async joinThread(name, channel, root) {
         const key = personaKey(name), stamp = controller.sharedChannels()?.channelStamp(key, channel)
         if (!threadMemory || stamp?.kind !== 'decided' || !stamp.threadHybridSince) {
@@ -3473,7 +3529,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       slackCalls,
       slackPosts: () => Object.values(slackCalls()).flat().filter((c) => c.method === 'chat.postMessage'),
       captured: (extra = {}) => ({
-        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases, threadMemoryRetryEvents, threadMemorySealEvents, ownPostEvents, ownPostLookupEvents }),
+        ...(threadMemory === undefined ? {} : { threadMemoryEvents, memoryHoldEvents, heldReleases, postHoldEvents, postHoldReleases, threadMemoryRetryEvents, threadMemorySealEvents, ownPostEvents, ownPostLookupEvents }),
         logs,
         statuses: connections.statuses,
         lifecycle: records,
@@ -3615,6 +3671,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       unsubscribeSharedStateReporting?.()
       if (threadMemory || runOpts.sharedStateReports) episodes.close()
       memoryHolds?.stop()
+      postHolds?.stop()
+      unsubscribePostHolds?.()
       membershipScanner?.close()
       membership?.close()
       if (graceful) {

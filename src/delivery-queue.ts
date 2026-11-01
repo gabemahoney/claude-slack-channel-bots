@@ -113,7 +113,7 @@ export type QueueEvent =
   | { type: 'retained'; key: string; count: number }
 export type QueueAcceptResult = { status: 'accepted' | 'duplicate'; item?: QueueItem; seq: number } | { status: 'failed'; error: unknown }
 export type QueueAccept = (key: string, input: AcceptedInput) => Promise<QueueAcceptResult>
-export type QueueAcceptDecision<T> = { store: AcceptedInput; afterStore?: () => void } | { skip: T }
+export type QueueAcceptDecision<T> = { store: AcceptedInput; afterStore?: (stored: { seq: number }) => void } | { skip: T }
 export type QueueDecidedResult<T> = QueueAcceptResult | { status: 'skipped'; outcome: T }
 export interface DeliveryQueue {
   start(): Promise<void>
@@ -164,6 +164,10 @@ export interface DeliveryQueueOptions {
   clearInterval?: typeof globalThis.clearInterval
   /** Synchronous confirmation that compaction may discard the queue's join copy. */
   threadJoinSaved?(key: string, channel: string, threadJoin: QueueThreadJoin): boolean
+  /** A journal start() didn't load (one unreadable then) has loaded. Called
+   * once, inside the turn that loaded it and before that turn's own work, so
+   * it must be synchronous with no I/O; its throw is ignored. */
+  onLoadedAfterStart?(key: string): void
 }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const str = (v: unknown): v is string => typeof v === 'string'
@@ -410,6 +414,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
     stored.holds = j.holds
+    if (started && !stopped) { try { options.onLoadedAfterStart?.(key) } catch { /* the published load stands */ } }
   }
   function lastSend(item: QueueItem): SentRecord | undefined {
     const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
@@ -521,7 +526,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     return record.thread_join !== undefined && options.threadJoinSaved?.(key, record.channel!, record.thread_join) !== true
   }
   /** Caller owns the loaded journal's serial turn and has checked duplicates. */
-  function storeAccepted(key: string, input: AcceptedInput): QueueAcceptResult {
+  function storeAccepted(key: string, input: AcceptedInput): { status: 'accepted'; seq: number; item: QueueItem } {
     const j = journal(key), received_at = input.received_at ?? now()
     const candidate = BigInt(Math.trunc(received_at * 1000))
     const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
@@ -650,7 +655,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           input = structuredClone(decision.store)
           if (!keyChecked) throw unavailable
           const result = storeAccepted(key, input)
-          try { decision.afterStore?.() } catch { /* a saved acceptance cannot be undone by its observer */ }
+          try { decision.afterStore?.({ seq: result.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
           return result
         })
       } catch (error) { return storeFailed(key, input, error) }

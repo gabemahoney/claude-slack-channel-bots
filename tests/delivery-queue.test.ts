@@ -977,6 +977,24 @@ describe('decided acceptance owns the persona writer turn', () => {
     }
   })
 
+  // The rows above keep an afterStore that ignores its argument.
+  test("afterStore receives the stored record's seq, naming the item read back after reopen", async () => {
+    const q = await open(), seen: Array<{ seq: number; key?: unknown }> = []
+    // An earlier record keeps each stored seq away from 1 and from the journal's next seq.
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 1 })
+    const inputs = [THREAD_ROOTS.secondary, THREAD_ROOTS.third].map(ts => slackInput({ ts, key: { chat_id: 'C0TEST001', ts } }))
+    for (const input of inputs) {
+      const result = await q.acceptDecided('alpha', input.key, () => ({ store: input, afterStore: stored => {
+        seen.push({ ...stored, key: q.item('alpha', stored.seq)?.accepted.key })
+      } }))
+      expect(result).toMatchObject({ status: 'accepted', seq: seen.at(-1)!.seq })
+    }
+    expect(seen).toEqual(inputs.map((input, i) => ({ seq: i + 2, key: input.key })))
+    await q.stop()
+    const reopened = await open()
+    expect(seen.map(({ seq }) => reopened.item('alpha', seq)?.accepted.key)).toEqual(inputs.map(input => input.key))
+  })
+
   test.each(['not started', 'stopped', 'unloadable'] as const)('%s still decides skips but refuses stores without a key check', async state => {
     const events: QueueEvent[] = [], q = createDeliveryQueue({ stateDir: dir, onEvent: e => events.push(e), fs: { ...fs,
       readFileSync(path: fs.PathOrFileDescriptor, ...args: unknown[]) {
@@ -1015,6 +1033,58 @@ describe('decided acceptance owns the persona writer turn', () => {
     expect(order.indexOf('gamma')).toBeLessThan(order.indexOf('alpha:19'))
     expect(q.openCount('alpha')).toBe(0)
     expect(q.openCount('beta')).toBe(1); expect(q.openCount('gamma')).toBe(1)
+  })
+})
+
+describe('a journal loaded after start', () => {
+  /** alpha's journal is unreadable at start() until `heal`, beta's is read by start(); each hook call records the load it sees. */
+  async function lateLoad(throws = false) {
+    let unreadable = true
+    const calls: Array<[string, number]> = []
+    seedQueue(dir, [accepted()]); seedQueue(dir, [accepted()], 'beta')
+    const q: DeliveryQueue = createDeliveryQueue({ stateDir: dir, fs: { ...fs,
+      readFileSync(path: fs.PathOrFileDescriptor, ...args: unknown[]) {
+        if (unreadable && String(path) === queuePath(dir)) throw new Error('EIO journal read')
+        return (fs.readFileSync as Function)(path, ...args)
+      },
+    } as typeof fs, onLoadedAfterStart: key => {
+      calls.push([key, q.items(key).length])
+      if (throws) throw new Error('fixture hook failed')
+    } })
+    queues.push(q)
+    await q.start()
+    return { q, calls, heal: () => { unreadable = false } }
+  }
+  const later = (ts: string) => slackInput({ ts, key: { chat_id: 'C0TEST001', ts } })
+
+  test.each([false, true])('calls the hook once, in the loading turn before its own work, with the load published; throws=%p', async throws => {
+    const { q, calls, heal } = await lateLoad(throws)
+    // Neither start()'s load nor a failed one calls it.
+    expect(q.items('beta')).toHaveLength(1)
+    expect(calls).toEqual([])
+    heal()
+    const order: string[] = []
+    const result = await q.acceptDecided('alpha', later(THREAD_ROOTS.secondary).key, () => { order.push(`decide after ${calls.length}`); return { store: later(THREAD_ROOTS.secondary) } })
+    expect(calls).toEqual([['alpha', 1]])
+    expect(order).toEqual(['decide after 1'])
+    // A thrown hook leaves the load and the turn's own store in place.
+    expect(result).toMatchObject({ status: 'accepted', seq: 2 })
+    // No second load, no missing journal and no other key's start() load calls it again.
+    await q.accept('alpha', later(THREAD_ROOTS.third)); await q.compact('alpha')
+    await q.accept('gamma', injectedInput()); await q.accept('beta', later(THREAD_ROOTS.third))
+    expect(calls).toEqual([['alpha', 1]])
+    // A journal that appears after start() calls it at its first load.
+    seedQueue(dir, [accepted()], 'delta')
+    expect(await q.accept('delta', later(THREAD_ROOTS.secondary))).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(calls).toEqual([['alpha', 1], ['delta', 1]])
+  })
+
+  test('a load after stop() does not call the hook', async () => {
+    const { q, calls, heal } = await lateLoad()
+    heal(); await q.stop()
+    await q.compact('alpha')
+    expect(q.items('alpha')).toHaveLength(1)
+    expect(calls).toEqual([])
   })
 })
 

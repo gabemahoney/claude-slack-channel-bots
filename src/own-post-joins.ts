@@ -25,9 +25,11 @@ export interface PendingOwnPost {
   outcome?: OwnPostOutcome
   lookup?: OwnPostLookupOutcome
 }
+/** Hold-facing operation facts. The lookup runner alone needs the digest. */
+export type OwnPostOperationView = Omit<PendingOwnPost, 'digest'>
 /** `awaiting-thread`: a confirmed new-message upload waits for its own share's `ts`. */
 export type OwnPostEvent = {
-  type: 'registered' | 'decided' | 'unknown' | 'awaiting-thread'; key: string; channel: string; operationId: string
+  type: 'registered' | 'decided' | 'unknown' | 'awaiting-thread' | 'deferred'; key: string; channel: string; operationId: string
   outcome?: OwnPostOutcome
   lookup?: OwnPostLookupOutcome
 }
@@ -43,7 +45,7 @@ export interface OwnPostJoinsDeps {
 export interface OwnPostJoins extends OwnPostOwner {
   pendingOwnPosts(key: string, channel: string): readonly PendingOwnPost[]
   unknownOwnPosts(key: string): readonly PendingOwnPost[]
-  operation(key: string, operationId: string): PendingOwnPost | undefined
+  operation(key: string, operationId: string): OwnPostOperationView | undefined
   /** Confirmed uploads still awaiting their thread, in issue order; every channel's without `channel`. */
   awaitingUploads(key: string, channel?: string): readonly PendingOwnPost[]
   recordLookup(key: string, operationId: string, result: OwnPostLookupResult): void
@@ -73,6 +75,7 @@ interface Entry {
   intentKept: boolean
   ended: boolean
   reported: boolean
+  deferredReported?: boolean
 }
 
 export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
@@ -143,6 +146,11 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
     if (!entry.reported) { entry.reported = true; emit('decided', entry) }
     discardDecided(entry)
   }
+  function reportDeferred(entry: Entry): void {
+    if (entry.post.state !== 'deferred' || entry.deferredReported) return
+    entry.deferredReported = true
+    emit('deferred', entry)
+  }
   function finish(entry: Entry, joined: boolean): void {
     entry.post.state = 'decided'
     entry.post.outcome!.joined = joined
@@ -183,6 +191,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
     entry.post.state = 'deferred'
     if (entry.intentKept) decide(entry)
     else reportOutcome(entry)
+    reportDeferred(entry)
   }
   function startOperation(key: string, surface: OwnPostSurface, target: OwnPostTarget, content: OwnPostContent): OwnPostStart | undefined {
     if (!allowed(key) || !CHANNEL_ID_RE.test(target.channel)) return undefined
@@ -220,6 +229,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       post.state = 'deferred'
       if (entry.intentKept) decide(entry)
       else reportOutcome(entry)
+      reportDeferred(entry)
       return
     }
     // The operation's channel is captured before Slack; no answer can move
@@ -261,7 +271,12 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       entry.intentKept && entry.post.channel === channel && entry.post.state !== 'decided' &&
       stampState(entry.post) === 'current').map(snapshot)),
     unknownOwnPosts: key => safely([], () => [...importIntents(key).values()].filter(entry => entry.post.state === 'unknown' && entry.post.stamp !== undefined).map(snapshot)),
-    operation: (key, operationId) => safely(undefined, () => { const entry = importIntents(key).get(operationId); return entry ? snapshot(entry) : undefined }),
+    operation: (key, operationId) => safely(undefined, () => {
+      const entry = importIntents(key).get(operationId)
+      if (!entry) return undefined
+      const { digest: _digest, ...view } = snapshot(entry)
+      return view
+    }),
     awaitingUploads: (key, channel) => safely([], () => [...importIntents(key).values()].filter(entry =>
       (channel === undefined || entry.post.channel === channel) && entry.post.state === 'awaiting-thread')
       .sort((a, b) => a.post.issuedAt - b.post.issuedAt).map(snapshot)),
@@ -278,6 +293,7 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
         entry.post.state = 'deferred'
         if (entry.intentKept) decide(entry)
         else reportOutcome(entry)
+        reportDeferred(entry)
         return
       }
       if (entry.post.state !== 'unknown') return
@@ -299,9 +315,13 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
       if (entry?.post.state === 'awaiting-thread') confirm(entry, threadTs)
     }),
     retainOutcomes: (key, operationIds) => safely(() => {}, () => {
+      if (stopped) return () => {}
+      const found = importIntents(key)
+      const ids = [...new Set(operationIds)].filter(id => found.has(id))
+      if (!ids.length) return () => {}
       let counts = retained.get(key)
       if (!counts) { counts = new Map(); retained.set(key, counts) }
-      const owned = counts, ids = [...new Set(operationIds)]
+      const owned = counts
       for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1)
       let released = false
       return () => safely(undefined, () => {
@@ -341,7 +361,9 @@ export function createOwnPostJoins(deps: OwnPostJoinsDeps): OwnPostJoins {
     },
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
     forget(key) { entries.delete(key); retained.delete(key); publications.delete(key); resolved.delete(key) },
-    stop() { stopped = true; publications.clear() },
+    // Entries stay for the final seal's memoryOnlyJoins snapshot. Clearing
+    // retention makes this life's later retention releases no-ops.
+    stop() { stopped = true; publications.clear(); retained.clear() },
   }
   return api
 }

@@ -24,6 +24,8 @@ export const THREAD_MEMORY_RETRY_MAX_MS = 60_000
  * new channel message, and the range an own-post lookup reads.
  */
 export const OWN_ROOT_CLOCK_SKEW_MS = 120_000
+/** Longest reply wait for an own post, on the monotonic clock from receipt of the stored delivery. */
+export const THREAD_REPLY_HOLD_MS = 3_000
 /** Bound a Thread Memory loss report, including the notifier's persona prefix. */
 export const THREAD_MEMORY_NOTICE_MAX_CHARS = 4000
 /** Bound shared-state notices; their diagnostics retain the entire channel list. */

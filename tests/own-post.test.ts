@@ -13,8 +13,10 @@ import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
 import { decideDelivery, type DeliveryDecision } from '../src/delivery-decision.ts'
 import { completionFiles, createOwnPostJoins, createOwnPostObserver,
   ownPostAnswerOfError, ownPostAnswerOfPost, ownPostChoice, ownPostEligibility, pendingOwnPostViews,
-  type OwnPostAnswer, type OwnPostContent, type OwnPostEvent, type OwnPostOperation, type OwnPostOwner,
+  type OwnPostAnswer, type OwnPostContent, type OwnPostEvent, type OwnPostOperation, type OwnPostOperationView,
+  type OwnPostOutcome, type OwnPostOwner,
 } from '../src/own-post.ts'
+import { OWN_POST_UPLOAD_REFUSED } from '../src/registry.ts'
 import { SHARED_CHANNEL_IDS, makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
 import { makeThreadMemoryHarness, readThreads, slackTsOfMs, threadFsControls, threadPath, type ThreadHarnessOptions } from './test-helpers/thread-memory.ts'
 import { makeQueue, slackInput } from './test-helpers/delivery-queue.ts'
@@ -552,6 +554,37 @@ describe('own-post eligibility and deferred joins', () => {
     expect(h.records().filter(r => r.kind === 'post-intent' || r.kind === 'post-outcome')).toHaveLength(0)
     expect(h.owner.memoryOnlyJoins('alpha')).toEqual([{ channel: C, root: ROOT }])
   })
+
+  test.each([
+    ['unresolved membership', 'membership'],
+    ['a stamp undecided after its intent was kept', 'undecided'],
+    ['a stamp undecided before its intent could be kept', 'unkept'],
+  ] as const)('a post deferred by %s announces deferred once, after decided, with no content', async (_label, cause) => {
+    const h = await fixture(), received: OwnPostEvent[] = []
+    h.owner.subscribe(() => { throw new Error('listener fault') })
+    h.owner.subscribe(async () => { throw new Error('async listener fault') })
+    h.owner.subscribe(event => { received.push(event) })
+    if (cause === 'unkept') h.undecided()
+    const post = h.begin()
+    await post.ready
+    if (cause === 'membership') await h.scan('unresolved')
+    if (cause === 'undecided') h.undecided()
+    h.observer.end(post.operation, await postAnswer())
+    const outcome = { kind: 'confirmed', thread: ROOT, joined: false } as const
+    const deferred: OwnPostEvent = { type: 'deferred', key: 'alpha', channel: C, operationId: post.id, outcome }
+    expect(received).toEqual([{ type: 'registered', key: 'alpha', channel: C, operationId: post.id },
+      { ...deferred, type: 'decided' }, deferred])
+    expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'deferred', outcome })
+    // Settling while still deferred, a publication, and the settlement that joins it announce nothing more.
+    h.owner.settleDeferred('alpha'); h.owner.onSharedStatePublished('alpha'); await h.flush()
+    if (cause === 'membership') await h.scan('eligible')
+    else h.decideStamp()
+    h.owner.settleDeferred('alpha')
+    expect(h.view()).toBe('joined')
+    await h.flush()
+    expect(received.filter(e => e.type !== 'registered')).toEqual([{ ...deferred, type: 'decided' }, deferred])
+    assertNoLeak({ received, events: h.events })
+  })
 })
 
 describe('Pending Own Posts for Post Holds', () => {
@@ -788,12 +821,13 @@ describe('lookup, upload, retention and persona scope', () => {
     const lookup = holds === 'thread' ? { holds, thread: ROOT } : { holds }
     expect(h.owner.recordLookup('alpha', post.id, { found: { ts: REPLY, threadTs: ROOT }, holds })).toBeUndefined()
     expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'deferred', lookup })
-    expect(h.events.at(-1)).toMatchObject({ type: 'decided', lookup })
+    expect(h.events.slice(-2)).toMatchObject([{ type: 'decided', lookup }, { type: 'deferred', lookup }])
     expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
     expect(h.records().filter(r => r.kind === 'post-outcome')).toEqual([])
     h.decideStamp(); h.owner.settleDeferred('alpha', C)
     expect(h.view()).toBe('joined')
     expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: 'decided', lookup })
+    expect(h.events.filter(e => e.type === 'deferred')).toHaveLength(1)
     expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set())
     await savedOutcome(h, post.id, 'joined')
     release()
@@ -809,8 +843,9 @@ describe('lookup, upload, retention and persona scope', () => {
     expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: kind === 'deferred' ? 'deferred' : 'decided',
       outcome: { kind: kind === 'failed' ? 'failed' : 'confirmed', joined: kind === 'confirmed' } })
     expect(h.owner.operation('alpha', post.id)).not.toHaveProperty('lookup')
-    expect(h.events.at(-1)).toMatchObject({ type: 'decided' })
-    expect(h.events.at(-1)).not.toHaveProperty('lookup')
+    const answered = h.events.slice(h.events.findIndex(e => e.type === 'decided'))
+    expect(answered.map(e => e.type)).toEqual(kind === 'deferred' ? ['decided', 'deferred'] : ['decided'])
+    for (const event of answered) expect(event).not.toHaveProperty('lookup')
     expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set(kind === 'failed' ? [] : [ROOT]))
     release()
   })
@@ -933,7 +968,8 @@ describe('lookup, upload, retention and persona scope', () => {
     const deferred = kind === 'unresolved' || kind === 'undecided'
     const decided: OwnPostEvent = { type: 'decided', key: 'alpha', channel: C, operationId: post.id,
       outcome: { kind: 'confirmed', thread: ROOT, joined: kind === 'join' } }
-    expect(h.events.at(-1)).toEqual(decided)
+    const announced = deferred ? [decided, { ...decided, type: 'deferred' as const }] : [decided]
+    expect(h.events.slice(-announced.length)).toEqual(announced)
     expect(h.owner.operation('alpha', post.id)).toMatchObject({ state: deferred ? 'deferred' : 'decided', outcome: decided.outcome })
     expect(h.owner.awaitingUploads('alpha')).toEqual([])
     expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
@@ -951,6 +987,7 @@ describe('lookup, upload, retention and persona scope', () => {
     expect(h.view(ROOT2)).toBe('not-joined')
     expect(h.owner.resolvedThreads('alpha', C)).toEqual(new Set([ROOT]))
     expect(h.events.filter(e => e.type === 'decided')).toEqual([decided])
+    expect(h.events.filter(e => e.type === 'deferred')).toEqual(announced.slice(1))
     await savedOutcome(h, post.id, joined ? 'joined' : 'none')
     release()
     await h.close()
@@ -1084,6 +1121,156 @@ describe('lookup, upload, retention and persona scope', () => {
     ])
     unsubscribe(); h.begin(ROOT2); expect(received).toHaveLength(3)
     assertNoLeak({ events: h.events, received, journal: writtenFile(threadPath(h.dir)), captured: h.members.captured() })
+  })
+
+  /** Each state the owner holds an operation in, reached as production reaches it, with the facts a Post
+   * Hold reads: the thread Slack confirmed (a confirmed outcome's `thread`) and a failure (a failed
+   * outcome). `retain` runs while the operation is pending, as a Post Hold's store retains. The
+   * lookup-decided views are di's table above. */
+  const HOLD_VIEWS: Array<{ label: string; state: OwnPostOperationView['state']; outcome?: OwnPostOutcome
+    reach(h: Fixture, retain: (id: string) => void): Promise<string> }> = [
+    { label: 'awaiting its answer', state: 'awaiting-answer', async reach(h, retain) {
+      const post = h.begin(ROOT); await post.ready; retain(post.id); return post.id } },
+    { label: 'left without an answer', state: 'unknown', async reach(h, retain) {
+      const post = h.begin(ROOT); await post.ready; retain(post.id); h.observer.end(post.operation, NO_ANSWER); return post.id } },
+    { label: 'an upload awaiting its thread', state: 'awaiting-thread', async reach(h, retain) {
+      const post = await awaiting(h); retain(post.id); return post.id } },
+    { label: 'deferred by unresolved membership', state: 'deferred', outcome: { kind: 'confirmed', thread: ROOT, joined: false },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id); await h.scan('unresolved')
+        h.observer.end(post.operation, await postAnswer()); return post.id } },
+    { label: 'deferred by an undecided stamp', state: 'deferred', outcome: { kind: 'confirmed', thread: ROOT, joined: false },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id); h.undecided()
+        h.observer.end(post.operation, await postAnswer()); return post.id } },
+    { label: 'a confirmed reply, in its Thread Root', state: 'decided', outcome: { kind: 'confirmed', thread: ROOT, joined: true },
+      async reach(h, retain) {
+        const post = h.begin(ROOT); await post.ready; retain(post.id)
+        h.observer.end(post.operation, await postAnswer({ ts: REPLY, message: { thread_ts: ROOT } })); return post.id } },
+    { label: 'a confirmed top-level post, in its own ts', state: 'decided', outcome: { kind: 'confirmed', thread: ROOT2, joined: true },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id)
+        h.observer.end(post.operation, await postAnswer({ ts: ROOT2 })); return post.id } },
+    { label: 'an upload whose thread is learnt', state: 'decided', outcome: { kind: 'confirmed', thread: ROOT2, joined: true },
+      async reach(h, retain) {
+        const post = await awaiting(h); retain(post.id); h.owner.learnUploadThread('alpha', post.id, ROOT2); return post.id } },
+    { label: 'confirmed after its stamp went stale', state: 'decided', outcome: { kind: 'confirmed', thread: ROOT, joined: false },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id); h.stale()
+        h.observer.end(post.operation, await postAnswer()); return post.id } },
+    { label: 'confirmed while ineligible', state: 'decided', outcome: { kind: 'confirmed', thread: ROOT, joined: false },
+      async reach(h, retain) {
+        await h.scan('ineligible'); expect(h.choose('thread_hybrid').kind).toBe('applied')
+        const post = h.begin(); await post.ready; retain(post.id)
+        h.observer.end(post.operation, await postAnswer()); return post.id } },
+    { label: 'deferred, then settled ineligible', state: 'decided', outcome: { kind: 'confirmed', thread: ROOT, joined: false },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id); await h.scan('unresolved')
+        h.observer.end(post.operation, await postAnswer()); await h.scan('ineligible'); h.owner.settleDeferred('alpha', C)
+        return post.id } },
+    { label: 'failed', state: 'decided', outcome: { kind: 'failed', joined: false },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id)
+        h.observer.end(post.operation, ownPostAnswerOfError(slackPlatformError('not_in_channel'))); return post.id } },
+    { label: 'failed after its stamp went stale', state: 'decided', outcome: { kind: 'failed', joined: false },
+      async reach(h, retain) {
+        const post = h.begin(); await post.ready; retain(post.id); h.stale()
+        h.observer.end(post.operation, ownPostAnswerOfError(slackPlatformError('not_in_channel'))); return post.id } },
+    { label: 'an upload refused after its wait', state: 'decided', outcome: { kind: 'failed', joined: false },
+      async reach(h, retain) {
+        const post = h.begin(undefined, 'alpha', 'file'); await post.ready; retain(post.id)
+        h.observer.end(post.operation, { kind: 'failed', code: OWN_POST_UPLOAD_REFUSED }); return post.id } },
+  ]
+  test.each(HOLD_VIEWS)('operation reads $label with its hold facts until both of two retentions release', async row => {
+    const h = await fixture(), slack = h.members.h.stub(h.members.h.p('alpha')).web, releases: Array<() => void> = []
+    const id = await row.reach(h, id => {
+      const io = h.io.calls.length, calls = slack.callLog.length
+      releases.push(h.owner.retainOutcomes('alpha', [id]), h.owner.retainOutcomes('alpha', [id, id]))
+      expect([h.io.calls.length, slack.callLog.length]).toEqual([io, calls])
+    })
+    expect(releases).toHaveLength(2)
+    const calls = slack.callLog.slice()
+    h.io.reset()
+    const view = h.owner.operation('alpha', id)
+    expect(view).toMatchObject({ operationId: id, key: 'alpha', channel: C, state: row.state })
+    expect(view!.outcome).toEqual(row.outcome)
+    expect(view).not.toHaveProperty('lookup')
+    // Hold views carry no content digest; only the lookup runner reads one, through unknownOwnPosts.
+    expect(view).not.toHaveProperty('digest')
+    const [first, second] = releases
+    expect(first!()).toBeUndefined(); first!()
+    expect(h.owner.operation('alpha', id)).toEqual(view)
+    second!()
+    // A pending entry is never dropped; a decided one goes with its last retention.
+    expect(h.owner.operation('alpha', id)).toEqual(row.state === 'decided' ? undefined : view)
+    expect(h.io.calls).toEqual([]); expect(slack.callLog).toEqual(calls)
+  })
+
+  test.each([
+    ['never started', async (_h: Fixture): Promise<string> => 'post-never'],
+    ['forgotten while retained', async (h: Fixture): Promise<string> => {
+      const post = h.begin(); await post.ready
+      h.owner.retainOutcomes('alpha', [post.id]); h.observer.end(post.operation, await postAnswer())
+      h.owner.forget('alpha'); return post.id }],
+    ['decided while unretained', async (h: Fixture): Promise<string> => {
+      const post = h.begin(); await post.ready
+      h.observer.end(post.operation, await postAnswer()); return post.id }],
+  ] as const)('operation answers undefined for an operation %s', async (_label, reach) => {
+    const h = await fixture(), id = await reach(h)
+    h.io.reset()
+    expect(h.owner.operation('alpha', id)).toBeUndefined()
+    expect(h.io.calls).toEqual([])
+  })
+
+  test('an unretained outcome is readable in its decided event and dropped once the event has fired', async () => {
+    const h = await fixture(), seen: unknown[] = []
+    h.owner.subscribe(event => { if (event.type === 'decided') seen.push(h.owner.operation(event.key, event.operationId)) })
+    const post = h.begin(); await post.ready
+    h.observer.end(post.operation, await postAnswer())
+    expect(seen).toMatchObject([{ operationId: post.id, state: 'decided', outcome: { kind: 'confirmed', thread: ROOT, joined: true } }])
+    expect(h.owner.operation('alpha', post.id)).toBeUndefined()
+  })
+
+  test('a name the owner does not hold is not retained, even for a later operation given that name', async () => {
+    const h = await fixture()
+    const early = h.owner.retainOutcomes('alpha', ['post-1', 'post-missing'])
+    const post = h.begin(); expect(post.id).toBe('post-1')
+    await post.ready
+    h.observer.end(post.operation, await postAnswer())
+    expect(h.owner.operation('alpha', post.id)).toBeUndefined()
+    expect(early()).toBeUndefined(); early()
+  })
+
+  test('forget drops its retentions, and a release from before it never frees one taken after it', async () => {
+    const h = await fixture(), a = h.begin(ROOT), b = h.begin(ROOT2)
+    await Promise.all([a.ready, b.ready])
+    const before = h.owner.retainOutcomes('alpha', [a.id, b.id])
+    h.owner.forget('alpha')
+    // Their kept intents are read back as unknown in the key's next life, retained by nothing.
+    expect([a.id, b.id].map(id => h.owner.operation('alpha', id)?.state)).toEqual(['unknown', 'unknown'])
+    h.owner.recordLookup('alpha', a.id, { found: { ts: REPLY, threadTs: ROOT }, holds: 'thread' })
+    expect(h.owner.operation('alpha', a.id)).toBeUndefined()
+    const after = h.owner.retainOutcomes('alpha', [b.id])
+    h.owner.recordLookup('alpha', b.id, { found: { ts: REPLY, threadTs: ROOT2 }, holds: 'thread' })
+    expect(before()).toBeUndefined(); before()
+    expect(h.owner.operation('alpha', b.id)).toMatchObject({ state: 'decided', lookup: { holds: 'thread', thread: ROOT2 } })
+    after()
+    expect(h.owner.operation('alpha', b.id)).toBeUndefined()
+  })
+
+  test('a release after stop changes nothing, and a retention asked for after stop is a harmless no-op', async () => {
+    const h = await fixture(), post = h.begin()
+    await post.ready
+    const release = h.owner.retainOutcomes('alpha', [post.id])
+    h.observer.end(post.operation, await postAnswer())
+    const decided = h.owner.operation('alpha', post.id)
+    expect(decided).toMatchObject({ state: 'decided', outcome: { kind: 'confirmed', thread: ROOT } })
+    h.owner.stop()
+    expect(release()).toBeUndefined(); release()
+    expect(h.owner.operation('alpha', post.id)).toEqual(decided)
+    const late = h.owner.retainOutcomes('alpha', [post.id])
+    expect(late()).toBeUndefined()
+    expect(h.owner.operation('alpha', post.id)).toEqual(decided)
   })
 })
 

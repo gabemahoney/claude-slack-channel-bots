@@ -56,6 +56,7 @@ import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent } from '.
 import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from './thread-memory-retry.ts'
 import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from './thread-memory-reports.ts'
 import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent } from './memory-holds.ts'
+import { createPostHoldResolver, type PostHoldResolver, type PostHoldClock } from './post-holds.ts'
 import { recoverQueuedJoins } from './thread-join-recovery.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
@@ -1150,6 +1151,13 @@ async function handleInitialized(
 let deliveryQueue: ReplyReminderQueue | undefined
 let threadMemory: ThreadMemory | undefined
 let memoryHolds: MemoryHoldResolver | undefined
+let postHolds: PostHoldResolver | undefined
+let unsubscribePostHolds: (() => void) | undefined
+const HOLD_CLOCK: PostHoldClock = {
+  now: () => performance.now(),
+  setTimeout: (callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer },
+  clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+}
 let threadMemorySeal: ThreadMemorySeal | undefined
 let threadMemoryRetries: ThreadMemoryRetries | undefined
 let ownPostLookups: OwnPostLookups | undefined
@@ -1220,6 +1228,30 @@ export const threadMemoryEvents = { emit: (event: ThreadMemoryEvent): void => {
 export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> {
   return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve()
 }
+/** Set once start has recovered every queue key; a journal loaded later recovers in its loading turn. */
+let queueStartRecovered = false
+/** The start's recovery of one queue key: its queued joins now, then, detached,
+ * its Post Holds' restart release and k8's 'recovered' resolution. k8's
+ * compaction follows both saves, after its own save's retry too; only when k8
+ * can't judge (unknown), or a failed join recovery keeps it from being asked,
+ * are the releases compacted here. At start k8 resolves once the releases are
+ * saved. In the turn that first loads a journal after start, k8 takes the
+ * journal's holds at once, before that turn can store a live one; the
+ * releases' save is already queued ahead of k8's first write. A failed join
+ * recovery leaves the queue's join copies, and k8's resolution, to this key's
+ * next bring-up. */
+function recoverQueueKeyAtStart(key: string, loadingTurn = false): void {
+  const queue = deliveryQueue, resolver = postHolds
+  if (!queue || !threadMemory || !resolver) return
+  let joinsRecovered = true
+  try { recoverQueuedJoins(key, queue, threadMemory) } catch { joinsRecovered = false }
+  const resolveMemory = () => joinsRecovered && threadMemoryWorkAllowed(key) ? memoryHolds?.resolve(key, 'recovered', true) : undefined
+  const releasing = resolver.releaseUntracked(key)
+  const resolving = loadingTurn ? resolveMemory() : releasing.then(resolveMemory)
+  void Promise.all([resolving, releasing]).then(async ([resolved]) => {
+    if ((!joinsRecovered || resolved === 'unknown') && threadMemoryWorkAllowed(key)) await queue.compact(key, () => threadMemoryWorkAllowed(key))
+  }).catch(() => {})
+}
 /** Observer port for Thread Memory reporting; the seal retains startup findings. */
 export const threadMemorySealEvents = { emit: (event: ThreadMemorySealEvent): void => {
   dispatchThreadMemoryReport({ source: 'seal', event })
@@ -1263,7 +1295,12 @@ const personaRouting = createPersonaRouting({
     if (deliveryReporting) deliveryReporting.received(key, item, mode)
     else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item })
   },
-  onHoldStored: key => resolveMemoryHolds(key),
+  monotonicNow: HOLD_CLOCK.now,
+  postHolds: { held: (key, hold) => postHolds?.held(key, hold) },
+  onHoldStored: key => {
+    try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
+    try { postHolds?.check(key) } catch { /* independent hold owners */ }
+  },
   archive: (key, event) => archiveWrite?.(key, event),
   // No runner in a dry run: the hook does nothing.
   onOwnMessage: (key, event, identity) => ownPostLookups?.ownMessage(key, event, identity),
@@ -1556,6 +1593,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
   memoryHolds?.stop()
+  postHolds?.stop()
+  unsubscribePostHolds?.()
   await deliveryPreparation?.stop()
   await deliveryStopping
   await remindersStopping
@@ -2876,6 +2915,15 @@ export async function main(): Promise<void> {
   // replay and compact every journal before Slack/HTTP admission.
   deliveryQueue = createDeliveryQueue({
     stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event),
+    // A journal start() couldn't read gets the start's steps in the turn that
+    // first loads it, before that turn's own work: the clock passes its holds'
+    // arrivals, then its key is recovered as at start. Until start has
+    // recovered every key, start's own pass covers it.
+    onLoadedAfterStart: key => {
+      if (!queueStartRecovered || shuttingDown) return
+      for (const hold of deliveryQueue?.unresolvedHolds(key) ?? []) threadMemory?.advancePast(key, hold.arrived_at)
+      recoverQueueKeyAtStart(key, true)
+    },
     threadJoinSaved: (key, channel, fact) => {
       // A covered delivered join can disappear in start compaction before
       // recovery reads items(). Its decision time still advances this clock.
@@ -2970,6 +3018,16 @@ export async function main(): Promise<void> {
     clock: { setTimeout: (callback, ms) => setTimeout(callback, ms), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) },
     onEvent: event => memoryHoldEvents.emit(event),
   })
+  postHolds = createPostHoldResolver({
+    canRun: threadMemoryWorkAllowed,
+    queue: deliveryQueue, owner: ownPostJoins,
+    release: (key, item, mode) => personaRouting.releaseHeld(key, item, mode),
+    onParked: key => resolveMemoryHolds(key),
+    clock: HOLD_CLOCK, decisionNow: Date.now,
+  })
+  // Events may fire within intake's view read; check only queues a microtask.
+  // Include awaiting-thread: it supplies no verdict until its thread is learnt.
+  unsubscribePostHolds = ownPostJoins.subscribe(event => postHolds?.check(event.key))
   deliveryQueue.startMaintenance()
   threadMemory.startMaintenance()
   deliveryPreparation = createDeliveryPreparation({
@@ -3089,7 +3147,7 @@ export async function main(): Promise<void> {
         try { await personaLifecycleOps.teardown(persona) } finally {
           if (!personaConfig?.personas.some(applied => applied.key === persona.key)) {
             try { await forgetPersonaState(persona.key, [key => ownPostLookups?.forget(key), key => ownPostJoins?.forget(key)]) } finally {
-              try { memoryHolds?.forget(persona.key) } finally {
+              try { await forgetPersonaState(persona.key, [key => postHolds?.forget(key), key => memoryHolds?.forget(key)]) } finally {
                 try { threadMemoryRetries?.forget(persona.key, 'removal') } finally {
                   await threadMemory?.remove(persona.key)
                 }
@@ -3189,12 +3247,8 @@ export async function main(): Promise<void> {
   await threadMemory.activate()
   if (shuttingDown) return
   for (const persona of personaConfig.personas) ownPostLookups?.journalRead(persona.key)
-  for (const key of deliveryQueue.keys()) {
-    try {
-      recoverQueuedJoins(key, deliveryQueue, threadMemory)
-      void memoryHolds.resolve(key, 'recovered', true).catch(() => {})
-    } catch { /* a retained queue copy retries at this key's bring-up */ }
-  }
+  for (const key of deliveryQueue.keys()) recoverQueueKeyAtStart(key)
+  queueStartRecovered = true
   // Resolution and its second compaction are detached; intake never waits.
   for (const persona of personaConfig.personas) ownPostLookups?.kick(persona.key)
 
@@ -3921,18 +3975,20 @@ export async function main(): Promise<void> {
     bringUps: personaBringUps,
     connections: manager,
     cancelThreadMemory: key => forgetPersonaState(key, [
-      k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds?.forget(k),
+      k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds?.forget(k), k => postHolds?.forget(k),
     ]),
     routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
       k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k),
-      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k),
+      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => postHolds?.forget(k),
       k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k),
     ]) },
     loadThreadMemory: async key => {
       await threadMemory?.loadKey(key)
       if (!shuttingDown && deliveryQueue && threadMemory) {
         recoverQueuedJoins(key, deliveryQueue, threadMemory)
-        void memoryHolds?.resolve(key, 'recovered').catch(() => {})
+        void postHolds?.releaseUntracked(key).then(() => {
+          if (threadMemoryWorkAllowed(key)) return memoryHolds?.resolve(key, 'recovered')
+        }).catch(() => {})
         ownPostLookups?.kick(key)
       }
     },
