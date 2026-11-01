@@ -441,6 +441,18 @@ describe('BotApi', () => {
 // ---------------------------------------------------------------------------
 
 describe('persona manifests', () => {
+  // b.n24: persona housekeeping maintains canvases and reads reaction answers.
+  // Check parsed bot permissions, so comments or user scopes cannot satisfy this.
+  test.each(['canvases:read', 'canvases:write', 'reactions:read'])(
+    'the shipped manifest grants the %s bot scope for persona housekeeping',
+    (scope) => {
+      const oauth = REPO_MANIFEST.oauth_config as JsonObject
+      const scopes = oauth.scopes as JsonObject
+      expect(Array.isArray(scopes.bot)).toBe(true)
+      expect(scopes.bot).toContain(scope)
+    },
+  )
+
   test("personaManifest changes only the app name and the bot's display name, from the shipped manifest", () => {
     const before = JSON.stringify(REPO_MANIFEST)
     const m = personaManifest(REPO_MANIFEST, 'c') as { display_information: JsonObject; features: { bot_user: JsonObject } }

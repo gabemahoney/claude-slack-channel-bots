@@ -39,6 +39,19 @@
 # added and then be re-installed to gain them. Until then, every Lists call
 # fails with `missing_scope`.
 #
+# It also grants the `canvases:read` and `canvases:write` bot scopes, which a
+# persona needs to read and maintain status canvases. CSCB itself makes no
+# canvas call. An app created from an earlier version of this manifest must
+# have `canvases:read` and `canvases:write` added and then be re-installed to
+# gain them. Until then, calls requiring the missing scopes fail with
+# `missing_scope`.
+#
+# It also grants the `reactions:read` bot scope, which a persona needs to read
+# the owner's reaction answers with `reactions.get`. An app created from an
+# earlier version of this manifest must have `reactions:read` added and then
+# be re-installed to gain it. Until then, `reactions.get` fails with
+# `missing_scope`.
+#
 # Group DMs are deliberately not subscribed: do not add a group-DM event.
 
 _metadata:
@@ -62,6 +75,7 @@ oauth_config:
   scopes:
     bot:
       - chat:write
+      - reactions:read
       - reactions:write
       - channels:history
       - channels:read
@@ -75,6 +89,8 @@ oauth_config:
       - groups:read
       - lists:read
       - lists:write
+      - canvases:read
+      - canvases:write
 
 settings:
   event_subscriptions:

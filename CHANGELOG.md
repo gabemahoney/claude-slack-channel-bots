@@ -6,6 +6,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- The Slack app manifest now grants `canvases:read`, `canvases:write` and `reactions:read` for personas to maintain status canvases and read the owner's reaction answers. Existing apps must have these scopes added and be re-installed to gain them; see [Credentials files](docs/configuration.md#credentials-files).
 - **agent-director 0.16 and 0.17.0: Displayed States are read as their raw states.** A bot those releases show as `needs_intelligence` is read as `check_permission` and one shown as `idle_screen` as `working`. Its permission prompts are relayed to Slack, and reconnects, restarts and recovery at start-up go ahead as for the raw state. On other agent-director releases CSCB reads the state as given. agent-director's `[state]` timeouts need no change for CSCB. See [agent-director's timing settings](docs/agent-director.md#agent-directors-timing-settings).
 - **Breaking: `clean_restart` needs an argument.** A bare `claude-slack-channel-bots clean_restart` now stops nothing: it prints its usage line and exits 2. Update any script, alias or bot instruction that runs it:
   - `clean_restart --server` does what `clean_restart` did: it stops the server and every bot, then starts the server again. Run it from a terminal. Run from a bot's own session, it ends that session and dies before starting the server, leaving the server and every bot down.
