@@ -6647,8 +6647,10 @@ _scenario_stub_control_http() {
     require_ci_image _scenario_stub_control_http
     _scenario_check_stub_url controls
     local answer
+    # Body on stdin: a control with full inventory pages exceeds one argv
+    # string's kernel limit (MAX_ARG_STRLEN, 128 KiB) and curl would not start.
     answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
-        --data-binary "$1" "${SCENARIO_SLACK_STUB_URL}/_control" 2>/dev/null)" || fail 'Slack stub rejected control or timed out'
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_control" 2>/dev/null <<< "$1")" || fail 'Slack stub rejected control or timed out'
     jq -e '.ok == true' <<< "${answer}" >/dev/null || fail 'Slack stub did not accept control'
 }
 slack_stub_control_seed() {
@@ -6703,7 +6705,7 @@ _scenario_stub_special_push() {
     _scenario_check_stub_url push
     local answer
     answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
-        --data-binary "$1" "${SCENARIO_SLACK_STUB_URL}/_push" 2>/dev/null)" || fail 'Slack stub push refused or timed out'
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_push" 2>/dev/null <<< "$1")" || fail 'Slack stub push refused or timed out'
     jq -er 'select(.ok == true) | .envelope_id | select(type=="string" and length>0)' <<< "${answer}" || fail 'push returned no envelope ID'
 }
 slack_stub_redeliver() {
@@ -6730,17 +6732,22 @@ slack_stub_close_socket() {
 slack_stub_inventory_body() {
     require_ci_image slack_stub_inventory_body
     local next="$1"; shift
+    # Slack's own type fields: CSCB takes a channel's type only from
+    # is_channel/is_group beside is_im/is_mpim false, else eligibility is missing.
     jq -cn --arg next "${next}" --args '
       {ok:true,channels:[$ARGS.positional[] | split("/") as $p |
-        {id:$p[0],is_private:($p[1]=="private"),is_ext_shared:($p[2]=="external")} +
+        {id:$p[0],is_channel:($p[1]!="private"),is_group:($p[1]=="private"),is_im:false,is_mpim:false,
+         is_private:($p[1]=="private"),is_ext_shared:($p[2]=="external")} +
         (if $p[3]=="omit" then {} else {is_member:($p[3]!="nonmember")} end)],response_metadata:{next_cursor:$next}}' "$@"
 }
 slack_stub_inventory_page() {
     require_ci_image slack_stub_inventory_page
     local label="$1" cursor="$2" body; shift 2
     body="$(slack_stub_inventory_body "$@")" || fail 'invalid inventory page'
-    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages[$c])=$page else error("unknown label") end' \
-        --arg l "${label}" --arg c "${cursor}" --argjson page "${body}"
+    # A large page (test-45's 1,100 channels) exceeds one argv string's kernel
+    # limit, so jq reads it from a file descriptor, not --argjson.
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages[$c])=$page[0] else error("unknown label") end' \
+        --arg l "${label}" --arg c "${cursor}" --slurpfile page <(printf '%s\n' "${body}")
 }
 slack_stub_inventory_clear() {
     require_ci_image slack_stub_inventory_clear

@@ -412,16 +412,36 @@ EARLIER_MARK="$(slack_post_mark)"
 echo 'recorded: R55 step 3 server and bot stopped; prior release installed; native 2.1.280 pin restored'
 start_server --live
 real_wait_launch "${REAL_KEY}"
-# Its actual recorded template must carry channels; resume=false means no resume.
+# Its actual recorded templates must be its own launch contract (its router
+# route), never 0.16.1's development-channels flag; resume=false means no resume.
 [[ "$(cscb_ad_count_between "${OLD_MARK}" - resume)" == 0 ]] || fail 'previous release resumed instead of starting fresh'
-python3 - "${SCENARIO_AD_SHIM_LOG}" "${OLD_MARK}" <<'CHECK'
-import sys
-lines=open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
-templates=[l.split('\t',5)[5].split() for l in lines if l.startswith('call\t') and 'make-template' in l.split('\t',5)[5].split()]
-assert any('--dangerously-load-development-channels' in words and 'server:slack-channel-router' in words for words in templates), 'prior release template has no channels flag and router target'
-CHECK
+# Every make-template call since OLD_MARK carries 0.18.0's own buildTemplateParams
+# name, relay mode and exact --agent-args words, and no development-channels word.
+# Its router route: the first agent args name an MCP config whose servers include
+# 0.18.0's own MCP_SERVER_NAME (the name its registry serves and its allow rule uses).
+SLACK_STATE_DIR="${SLACK_STATE_DIR}" bun -e '
+const fs = await import("node:fs")
+const [, log, mark, receipts, configTs, templateTs, config, home] = process.argv
+const { shimWords } = await import(receipts)
+const { loadPersonaConfig, MCP_SERVER_NAME } = await import(configTs)
+const { buildTemplateParams } = await import(templateTs)
+const params = buildTemplateParams(loadPersonaConfig(config, home))
+const routed = params.agent_args[0] === "--mcp-config" && typeof MCP_SERVER_NAME === "string" && MCP_SERVER_NAME !== ""
+  && Object.hasOwn(JSON.parse(fs.readFileSync(params.agent_args[1], "utf8")).mcpServers ?? {}, MCP_SERVER_NAME)
+const calls = fs.readFileSync(log, "utf8").split("\n").slice(Number(mark)).filter(l => l.startsWith("call\t"))
+  .map(l => shimWords(l.split("\t").slice(5).join("\t"))).filter(w => w.includes("make-template"))
+const only = (w, flag) => w.indexOf(flag) >= 0 && w.indexOf(flag) === w.lastIndexOf(flag) ? w[w.indexOf(flag) + 1] : undefined
+const agentArgs = w => w.flatMap((word, i) => word === "--agent-args" ? [w[i + 1]] : [])
+const ok = routed && params.name === "slack-channel-bot" && params.relay_mode === "on" && calls.length > 0 && calls.every(w =>
+  only(w, "--name") === params.name && only(w, "--relay-mode") === params.relay_mode
+  && JSON.stringify(agentArgs(w)) === JSON.stringify(params.agent_args)
+  && !w.includes("--dangerously-load-development-channels") && !w.includes("server:slack-channel-router"))
+process.exit(ok ? 0 : 1)' \
+    "${SCENARIO_AD_SHIM_LOG}" "${OLD_MARK}" "${SCENARIO_FIXTURES}/transcript-receipts.ts" \
+    "${EARLIER_PKG}/src/config.ts" "${EARLIER_PKG}/src/agent-director-template.ts" "${SLACK_STATE_DIR}/config.json" "${HOME}" \
+    || fail 'prior release template is not its own launch contract'
 ! grep -Ei 'failed to load config|invalid persona config|load error' "${START_OUT}" || fail 'previous release load error'
-echo 'recorded: R55 step 4 prior release started fresh with channels'
+echo 'recorded: R55 step 4 prior release started fresh with its router route'
 # The earlier release logs each set-aside record and keeps its exact bytes.
 QUARANTINE_GLOB="${SLACK_STATE_DIR}/queue/${REAL_KEY}.unreadable-*"
 wait_until 30 'earlier release set no record aside' quarantined

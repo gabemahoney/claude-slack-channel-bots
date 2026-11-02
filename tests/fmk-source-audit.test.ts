@@ -2901,7 +2901,7 @@ describe('integration configuration and discovery prerequisites', () => {
     .map(([, name, kind, label]) => [name, kind + createHash('sha256').update(`fixture\n${label}`).digest('hex').slice(0, 20).toUpperCase()]))
   const control = [
     declaration(helpers, 'slack_stub_inventory_body'), declaration(helpers, 'slack_stub_inventory_page'),
-    `_scenario_stub_control_patch() { shift; jq -cn "$@" '{label:$l,memberships:[$page.channels[].id]}'; }`,
+    `_scenario_stub_control_patch() { shift; jq -cn "$@" '{label:$l,memberships:[$page[0].channels[].id]}'; }`,
     'inventory() {',
     ...source.slice(source.indexOf('slack_stub_controls "'), source.indexOf('# --- Configurations')).split('\n')
       .filter(line => line.startsWith('slack_stub_inventory_page ')),

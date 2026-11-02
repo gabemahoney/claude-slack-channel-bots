@@ -87,6 +87,10 @@ for thread_mode in strict open; do
     bun "${REAL_SR8}" seal measured "${REAL_THREAD_CONTEXT[@]}" "${SLACK_STATE_DIR}/server.log" "${THREAD_LOG_MARK}" "${SLACK_STATE_DIR}/config.json"
     real_wait_launch "${REAL_KEY}" '' "${REAL_CONNECTION_LINE_BASE}"
     real_wait_launch "${REAL_WRITER_KEY}" '' "${REAL_CONNECTION_LINE_BASE}"
+    # After the measured window: a channel stays held, and its events
+    # unacknowledged, until the authenticated inventory completes.
+    wait_membership_complete "${REAL_KEY}"
+    wait_membership_complete "${REAL_WRITER_KEY}"
     real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${SCENARIO_ROOT}/relaunch-${REAL_KEY}.json"
     real_thread_writer_start
     real_thread_workload

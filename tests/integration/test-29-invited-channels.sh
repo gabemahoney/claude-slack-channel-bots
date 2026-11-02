@@ -1601,7 +1601,8 @@ cp -- "${CONFIG}" "${CONFIG_A_COPY}"
 ALPHA_COLD_SAVED="${SCENARIO_ROOT}/cold-start-alpha"
 mv -- "${ALPHA_DIR}" "${ALPHA_COLD_SAVED}"
 start_server --live
-wait_for_log "$(matcher "${DIRECTORY_MISSING_CAUSE}" "${ALPHA_REF}" "${ALPHA_DIR}")" "${START_WAIT_S}" "cold start: no directory failure"
+# Fragments in the line's own order: ref, then path, then the cause.
+wait_for_log "$(matcher "${ALPHA_REF}" "path=\"${ALPHA_DIR}\"" "${DIRECTORY_MISSING_CAUSE}")" "${START_WAIT_S}" "cold start: no directory failure"
 wait_membership_complete "${BRAVO}"
 wait_for_log "${STARTUP_COMPLETE}" "${START_WAIT_S}" 'cold start: initial start pass did not finish'
 expect_completion 2 'cold start' '1 not brought up'
