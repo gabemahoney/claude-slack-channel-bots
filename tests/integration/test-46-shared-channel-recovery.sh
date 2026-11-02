@@ -383,11 +383,17 @@ crash
 start
 for who in p q; do
     before="$(stamp "${who}" "${B}")"
+    # A live join or leave forces a fresh authenticated scan, so the page
+    # changes before each event and that scan settles before the next change.
+    slack_stub_inventory_page "${LABEL[${who}]}" '' '' "${A}" "${NOTICE}"
     leave="$(slack_push_channel_left "${LABEL[${who}]}" "${B}" "$(scenario_ts)")"
     ack "${leave}"
     wait_until 30 'leave did not remove choice' choice_is "${who}" "${B}" ''
+    wait_membership_complete "${KEY[${who}]}"
+    slack_stub_inventory_page "${LABEL[${who}]}" '' '' "${A}" "${B}" "${NOTICE}"
     ack "$(slack_push_member_joined "${LABEL[${who}]}" "${B}" "$(scenario_ts)")"
     wait_until 30 'rejoin did not use open default' choice_is "${who}" "${B}" mentions
+    wait_membership_complete "${KEY[${who}]}"
     set_choice "${who}" "${B}" thread_hybrid "${who}-after-leave"
     stamp_now="$(stamp "${who}" "${B}")" || fail 'stamp reader failed'
     [[ "${stamp_now}" != "${before}" ]] || fail 'leave reused stamp'
@@ -417,10 +423,16 @@ set_choice p "${B}" thread_hybrid bot-during-pending
 for action in join leave; do
     before="$(same_channel_facts p "${JOIN}")"
     directory_fault >> "${EVIDENCE}/faults"
+    # Scans fail on storage until the repair; any later scan then agrees with
+    # the pending event, whichever lands first.
     event_ts="$(scenario_ts)"
     if [[ "${action}" == join ]]; then
+        slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${JOIN}"
         first="$(slack_push_member_joined "${LABEL[p]}" "${JOIN}" "${event_ts}")"
-    else first="$(slack_push_channel_left "${LABEL[p]}" "${JOIN}" "${event_ts}")"; fi
+    else
+        slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}"
+        first="$(slack_push_channel_left "${LABEL[p]}" "${JOIN}" "${event_ts}")"
+    fi
     no_ack "${first}"
     duplicate="$(slack_stub_redeliver "${LABEL[p]}" "${first}")"
     no_ack "${duplicate}"
@@ -439,13 +451,12 @@ for action in join leave; do
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${first}")"
     if [[ "${action}" == join ]]; then
         wait_until 30 'repaired live join missing' choice_is p "${JOIN}" mentions
-        slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${JOIN}"
+        wait_membership_complete "${KEY[p]}"
         ack "$(slack_stub_redeliver "${LABEL[p]}" "${held}")"
         accepted p "${JOIN}" "${held_ts}" mention "${held_text}"
         receipt p
     else
         wait_until 30 'repaired leave did not remove entry' choice_is p "${JOIN}" ''
-        slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}"
     fi
     durable="$(same_channel_facts p "${JOIN}")"
     crash
@@ -526,8 +537,10 @@ apps_now="$(shared_attempt_applications "${KEY[p]}")" || fail 'attempt reader fa
 id="$(scenario_attempt_id rejected-before-apply)"
 args="$(attempt_args "${id}" "${UNKNOWN}" all)"
 scenario_attempt_call "${WORK[p]}" "${args}" lose > "${EVIDENCE}/lost-rejected.json"
+slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${UNKNOWN}"
 ack "$(slack_push_member_joined "${LABEL[p]}" "${UNKNOWN}" "$(scenario_ts)")"
 wait_until 30 'unknown channel did not become eligible' choice_is p "${UNKNOWN}" mentions
+wait_membership_complete "${KEY[p]}"
 expect_attempt retained-rejection "${WORK[p]}" "$(attempt_args "${id}" "${UNKNOWN}" all retry)" "${KEY[p]}" mentions history true
 choice_is p "${UNKNOWN}" mentions || fail 'rejected attempt applied after repair'
 
@@ -785,6 +798,7 @@ queued_n="$(shared_queued_count "${KEY[p]}" "${A}" "${gap_ts}")" || fail 'queue 
 slack_stub_faults_clear "${LABEL[p]}"
 memberships
 ack "$(slack_push_member_joined "${LABEL[p]}" "${A}" "$(scenario_ts)")"
+wait_membership_complete "${KEY[p]}"
 set_choice p "${A}" all restore-all
 
 # Phase 9: Thread Memory append failure keeps accepted work flowing and
@@ -961,6 +975,7 @@ for startup_fault in delay partial failed; do
     [[ "${queued_n}" == 0 ]] || fail 'absence replay admitted old message'
     memberships
     for channel in "${A}" "${B}"; do ack "$(slack_push_member_joined "${LABEL[p]}" "${channel}" "$(scenario_ts)")"; done
+    wait_membership_complete "${KEY[p]}"
     set_choice p "${A}" all "restored-all-${startup_fault}"
     set_choice p "${B}" thread_hybrid "restored-hybrid-${startup_fault}"
     stamp_now="$(stamp p "${B}")" || fail 'stamp reader failed'
@@ -984,6 +999,7 @@ pending_post() {
     EXTRA_CHANNELS+=("${OP_CHANNEL}")
     slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${EXTRA_CHANNELS[@]}"
     ack "$(slack_push_member_joined "${LABEL[p]}" "${OP_CHANNEL}" "$(scenario_ts)")"
+    wait_membership_complete "${KEY[p]}"
     set_choice p "${OP_CHANNEL}" thread_hybrid "post-choice-${case_name}"
     OP_STAMP="$(stamp p "${OP_CHANNEL}")"
     before="$(shared_own_post_records "${KEY[p]}" | jq -sc '[.[]|select(.kind=="post-intent")|.operationId]')"
@@ -1211,7 +1227,11 @@ for boundary in before after; do
     old_channel="${OP_CHANNEL}"; old_stamp="${OP_STAMP}"; old_root="${OP_ROOT}"; old_envelope="${OP_ENVELOPE}"
     file_fault "${SLACK_STATE_DIR}/queue/${KEY[p]}.jsonl" >> "${EVIDENCE}/faults"
     before="$(same_channel_facts p "${old_channel}")"
-    if [[ "${boundary}" == before ]]; then directory_fault >> "${EVIDENCE}/faults"; fi
+    remaining=()
+    for channel in "${EXTRA_CHANNELS[@]}"; do [[ "${channel}" == "${old_channel}" ]] || remaining+=("${channel}"); done
+    # The applied leave forces a rescan, which must not see the old channel.
+    if [[ "${boundary}" == before ]]; then directory_fault >> "${EVIDENCE}/faults"
+    else slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${remaining[@]}"; fi
     leave="$(slack_push_channel_left "${LABEL[p]}" "${old_channel}" "$(scenario_ts)")"
     if [[ "${boundary}" == before ]]; then
         no_ack "${leave}"
@@ -1231,8 +1251,6 @@ for boundary in before after; do
     slack_stub_faults_clear "${LABEL[p]}"
     # Complete absence on the first recovery establishes the leave before
     # replay. The subsequent offline rejoin must use the fresh open default.
-    remaining=()
-    for channel in "${EXTRA_CHANNELS[@]}"; do [[ "${channel}" == "${old_channel}" ]] || remaining+=("${channel}"); done
     slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${remaining[@]}"
     start
     choice_is p "${old_channel}" '' || fail 'restart failed to honor leave'
@@ -1346,6 +1364,7 @@ chunk_channel="$(scenario_id C chunk-failure)"
 EXTRA_CHANNELS+=("${chunk_channel}")
 slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${EXTRA_CHANNELS[@]}"
 ack "$(slack_push_member_joined "${LABEL[p]}" "${chunk_channel}" "$(scenario_ts)")"
+wait_membership_complete "${KEY[p]}"
 set_choice p "${chunk_channel}" thread_hybrid chunk-hybrid
 chunk_stamp="$(stamp p "${chunk_channel}")"
 # Keep the configuration's startup reply defaults unchanged. These two

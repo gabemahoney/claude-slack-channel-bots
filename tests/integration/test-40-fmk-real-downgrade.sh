@@ -406,6 +406,7 @@ mapfile -t SET_ASIDE < "${EVIDENCE}/set-aside-lines"
 SEAL="${SLACK_STATE_DIR}/$(printed THREAD_MEMORY_SEAL_FILE)"
 sha256sum "${THREAD_JOURNAL}" "${SEAL}" > "${EVIDENCE}/thread-memory.sha256"
 ls -A "${SLACK_STATE_DIR}/threads" > "${EVIDENCE}/thread-memory-files"
+CURRENT_CLI="${SCENARIO_CLI}"
 SCENARIO_CLI="${INSTALL}/node_modules/.bin/claude-slack-channel-bots"
 OLD_MARK="$(ad_shim_mark)"
 EARLIER_MARK="$(slack_post_mark)"
@@ -477,6 +478,9 @@ stop_server --stop-bots
 sha256sum -c --quiet "${EVIDENCE}/thread-memory.sha256" || fail 'earlier release changed Thread Memory'
 ls -A "${SLACK_STATE_DIR}/threads" | cmp -s - "${EVIDENCE}/thread-memory-files" || fail 'earlier release changed the Thread Memory directory'
 restore_stopped_downgrade
+# Upgrading again runs the current build: the earlier loader rejects the
+# restored current-format authority.
+SCENARIO_CLI="${CURRENT_CLI}"
 echo 'recorded: exact current-format authority and pending inputs restored while stopped'
 # Upgrading again. The first phase changed every thread_hybrid channel, so no
 # Joined Thread is kept through the downgrade and the restored authority has

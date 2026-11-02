@@ -8927,7 +8927,7 @@ const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])
   ['previous tarball is selected', /^PREVIOUS="\/opt\/claude-slack-channel-bots-0\.18\.0\/claude-slack-channel-bots-0\.18\.0\.tgz"$/m],
   ['previous tarball is bound to the installed package manifest', /^printf '\{"private":true,"dependencies":\{"claude-slack-channel-bots":"file:%s"\}\}\\n' "\$\{PREVIOUS\}" > "\$\{INSTALL\}\/package\.json"$/m],
   ['previous package is installed', /^\(cd "\$\{INSTALL\}" && bun install --ignore-scripts .*\)$/m],
-  ['CLI changes to the installed previous build', /^SCENARIO_CLI="\$\{INSTALL\}\/node_modules\/\.bin\/claude-slack-channel-bots"$/m],
+  ['CLI changes to the installed previous build, keeping the current CLI', /^CURRENT_CLI="\$\{SCENARIO_CLI\}"\nSCENARIO_CLI="\$\{INSTALL\}\/node_modules\/\.bin\/claude-slack-channel-bots"$/m],
   ['previous release starts', /^start_server --live$/m],
   ['previous bot finishes launching', /^real_wait_launch "\$\{REAL_KEY\}"$/m],
   ['fresh start is asserted rather than resume', /^\[\[ .*cscb_ad_count_between .* resume\).* == 0 \]\] \|\| fail /m],
@@ -8945,6 +8945,9 @@ const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])
   ['resume is restored after fresh startup', /^jq '\.resume_enabled = true' .*\| write_config$/m],
   ['restore-resume change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
   ['last-applied true is observed', /^wait_until .*jq -e '\.resume_enabled == true' .*config\.json\.last-applied"$/m],
+  ['the stopped current-format authority is restored', /^restore_stopped_downgrade$/m],
+  ['CLI changes back to the current build before upgrading again', /^SCENARIO_CLI="\$\{CURRENT_CLI\}"$/m],
+  ['current release starts again after the downgrade', /^start_server --live$/m],
 ]
 
 function downgradeExecutableText(text: string): string {

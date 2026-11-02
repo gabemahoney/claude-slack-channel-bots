@@ -850,11 +850,42 @@ selection_matrix() {
     done
 }
 
+# Slack's users.conversations lists the channels a persona is in. Each live
+# join or leave makes production rescan (completeObservation in
+# src/channel-membership.ts), and a complete inventory without a channel is
+# its absence. So a page changes before its event is pushed, and callers wait
+# for that rescan before the channel's next message or write.
+publish_members() {
+    case "$1" in
+        alpha) slack_stub_inventory_page alpha '' '' "${ALPHA_MEMBERS[@]}" ;;
+        bravo) slack_stub_inventory_page bravo '' '' "${BRAVO_MEMBERS[@]}" ;;
+        *) fail "publish_members: unknown label '$1'" ;;
+    esac
+}
+# member_list <alpha|bravo> <channel> [public|private[/local|external]]
+member_list() {
+    local who="$1" channel="$2" entry kept=()
+    local -n members="${who^^}_MEMBERS"
+    for entry in "${members[@]}"; do [[ "${entry%%/*}" == "${channel}" ]] || kept+=("${entry}"); done
+    members=("${kept[@]}" "${channel}${3:+/$3}")
+    publish_members "${who}"
+}
+member_unlist() {
+    local who="$1" channel="$2" entry kept=()
+    local -n members="${who^^}_MEMBERS"
+    for entry in "${members[@]}"; do [[ "${entry%%/*}" == "${channel}" ]] || kept+=("${entry}"); done
+    (( ${#kept[@]} < ${#members[@]} )) || fail "member_unlist: ${channel} is not listed for ${who}"
+    members=("${kept[@]}")
+    publish_members "${who}"
+}
+
 start_matrix() {
     local channel
     for channel in "${M_OFF}" "${M_MENTIONS}" "${M_ALL}" "${M_HYBRID}" "${WRITE_CHANNEL}"; do
+        member_list alpha "${channel}"
         ack_control "$(slack_push_member_joined alpha "${channel}" "$(scenario_ts)")"
         wait_until "${EVENT_WAIT_S}" 'matrix member did not receive strict default' choice_is "${ALPHA_KEY}" "${channel}" off
+        wait_membership_complete "${ALPHA}"
     done
     MATRIX_READY=true
     input_choice "${ALPHA}" "${M_OFF}" off
@@ -907,19 +938,23 @@ live_membership_phase() {
     for value in off mentions all thread_hybrid; do
         channel="$(scenario_id C "live-${mode}-${value}")"; LEAVE_CHANNELS["${mode}|${value}"]="${channel}"
         event="$(slack_membership_event member_joined_channel alpha "${channel}" "$(scenario_ts)")"
+        member_list alpha "${channel}"
         ack_control "$(slack_stub_push alpha "${event}")"
         wait_until "${EVENT_WAIT_S}" 'self join has no mode default' choice_is "${ALPHA_KEY}" "${channel}" "${default}"
         facts="$(channel_facts "${ALPHA_KEY}" "${channel}")"
         ack_control "$(slack_stub_push alpha "${event}")"
         [[ "$(channel_facts "${ALPHA_KEY}" "${channel}")" == "${facts}" ]] || fail 'duplicate join made a second assignment'
+        wait_membership_complete "${ALPHA}"
         if [[ "${mode}" == strict ]]; then
             matrix_message "${mode}-default-${value}" alpha "${channel}" mention - channel-off
         else
             matrix_message "${mode}-default-${value}" alpha "${channel}" mention - mention
         fi
         # The sibling shares each channel; P's leave must not remove Q's choice.
+        member_list bravo "${channel}"
         ack_control "$(slack_push_member_joined bravo "${channel}" "$(scenario_ts)")"
         wait_until "${EVENT_WAIT_S}" 'sibling join missing' choice_is "${BRAVO_KEY}" "${channel}" "${default}"
+        wait_membership_complete "${BRAVO}"
         if [[ "${mode}" == strict ]]; then
             input_choice "${ALPHA}" "${channel}" "${value}"
             review_assign "live-${mode}-${value}" "${ALPHA}/${channel}/${value}"
@@ -935,6 +970,7 @@ live_membership_phase() {
         # confirmation must be rejected after the corresponding durable leave.
         configuration_request "leave-preview-${mode}-${value}" request "${ALPHA}/${channel}/${value}" > /dev/null
         capture_review "leave-preview-${mode}-${value}"
+        member_unlist alpha "${channel}"
         first="$(slack_push_channel_left alpha "${channel}" "$(scenario_ts)")"
         LEAVE_ENVELOPES["${mode}|${value}"]="${first}"
         ack_control "${first}"
@@ -1258,17 +1294,21 @@ future_after_leave() {
 }
 
 ineligible_and_unverified() {
-    local root outside before stamp event mark fault request_id sockets
+    local root outside before stamp event mark fault request_id sockets request_ms
     # Known, authenticated channel: all writes are refused in open while
     # external sharing makes it ineligible. Its previous joins remain saved.
+    member_list alpha "${EXTERNAL}"
     ack_control "$(slack_push_member_joined alpha "${EXTERNAL}" "$(scenario_ts)")"
     wait_until "${EVENT_WAIT_S}" 'external control lacks initial default' choice_is "${ALPHA_KEY}" "${EXTERNAL}" mentions
+    wait_membership_complete "${ALPHA}"
     expect_attempt external-hybrid "${ALPHA_DIR}" "$(attempt_args external-hybrid "${EXTERNAL}" thread_hybrid)" "${ALPHA_KEY}" thread_hybrid
     matrix_message external-original-join alpha "${EXTERNAL}" mention - mention
     root="${MATRIX_TS}"; stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${EXTERNAL}")"
     before="$(channel_facts "${ALPHA_KEY}" "${EXTERNAL}")"
     event="$(slack_membership_event member_joined_channel alpha "${EXTERNAL}" "$(scenario_ts)")"
+    member_list alpha "${EXTERNAL}" public/external
     ack_control "$(slack_stub_push alpha "${event}" true)"
+    wait_membership_complete "${ALPHA}"
     expect_attempt external-refusal "${ALPHA_DIR}" "$(attempt_args external-refusal "${EXTERNAL}" all)" "${ALPHA_KEY}" external-sharing new true
     mark="$(log_mark)"; new_ts
     push_event alpha "$(slack_reply_event "${EXTERNAL}" "${root}" "$(plain_text)" "${PUSH_TS}" "${HUMAN}")" true
@@ -1278,12 +1318,12 @@ ineligible_and_unverified() {
     successful_tool external-own-post "${ALPHA_DIR}" reply "$(jq -cn --arg c "${EXTERNAL}" --arg r "${outside}" --arg t "$(scenario_text ineligible-post)" '{chat_id:$c,thread_ts:$r,text:$t}')"
     [[ "$(join_count "${ALPHA_KEY}" "${EXTERNAL}" "${outside}")" == 0 ]] || fail 'ineligible own post joined'
     [[ "$(channel_facts "${ALPHA_KEY}" "${EXTERNAL}")" == "${before}" ]] || fail 'ineligibility changed the saved choice/stamp'
+    member_list alpha "${EXTERNAL}"
     ack_control "$(slack_push_member_joined alpha "${EXTERNAL}" "$(scenario_ts)")"
+    wait_membership_complete "${ALPHA}"
     matrix_message external-restored-follow alpha "${EXTERNAL}" plain "${root}" thread
     matrix_message external-post-stays-unjoined alpha "${EXTERNAL}" plain "${outside}" not-mentioned
     [[ "$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${ALPHA_KEY}" "${EXTERNAL}")" == "${stamp}" ]] || fail 'eligibility recovery reset participation'
-    ALPHA_MEMBERS+=("${EXTERNAL}")
-    slack_stub_inventory_page alpha '' '' "${ALPHA_MEMBERS[@]}"
     # No known membership or saved entry: the actual MCP refusal is distinct
     # from the following saved-but-unverified channel.
     expect_attempt unknown-refusal "${ALPHA_DIR}" "$(attempt_args unknown-refusal "${U0}" all)" "${ALPHA_KEY}" channel-removed new true
@@ -1291,8 +1331,10 @@ ineligible_and_unverified() {
     before="$(channel_facts "${ALPHA_KEY}" "${M_MENTIONS}")"
     sockets="$(slack_stub_record_count ws-open label=alpha)"
     # This is a successful inventory answer with a bounded transport delay,
-    # below the production scan deadline, not a lost answer or failed scan.
-    slack_stub_inventory_fault alpha '' delay delay_ms=20000
+    # below the production per-request deadline, not a lost answer or failed
+    # scan. A delay past that deadline would be recorded as an abort.
+    request_ms="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"
+    slack_stub_inventory_fault alpha '' delay "delay_ms=$(( request_ms * 4 / 5 ))"
     slack_stub_close_socket alpha 0
     wait_until "${RECORD_WAIT_S}" 'socket close control did not fire' slack_stub_control_fired socket-close label=alpha > /dev/null
     wait_until "${RECORD_WAIT_S}" 'new socket did not open' rec_at_least $(( sockets + 1 )) event=ws-open label=alpha
@@ -1304,6 +1346,8 @@ ineligible_and_unverified() {
     [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'unverified result was observed after inventory resolved'
     [[ "$(channel_facts "${ALPHA_KEY}" "${M_MENTIONS}")" == "${before}" ]] || fail 'unverified bot write changed saved facts'
     wait_until 30 'successful delayed inventory did not settle' slack_stub_control_fired fault-settled "request_id=${request_id}" resolution=delay > /dev/null
+    # Every later control post re-arms faults still in the control file.
+    slack_stub_faults_clear alpha
     wait_membership_complete "${ALPHA}"
     matrix_message reverified-mention alpha "${M_MENTIONS}" mention - mention
     [[ "$(channel_facts "${ALPHA_KEY}" "${FUTURE}")" == "${NEVER_JOINED_FACTS}" ]] || fail 'repeat empty reconciliation removed never-joined preference'
@@ -1316,8 +1360,10 @@ rejoin_after_absence() {
         for value in off mentions all thread_hybrid; do
             channel="${LEAVE_CHANNELS[${mode}|${value}]}"; want=mentions
             [[ "${mode}|${value}" != 'strict|all' ]] || want=all
+            member_list alpha "${channel}"
             ack_control "$(slack_push_member_joined alpha "${channel}" "$(scenario_ts)")"
             wait_until "${EVENT_WAIT_S}" 'rejoin inherited an old preference' choice_is "${ALPHA_KEY}" "${channel}" "${want}"
+            wait_membership_complete "${ALPHA}"
             [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'rejoin inherited old Thread Hybrid Since'
             matrix_message "rejoin-${mode}-${value}" alpha "${channel}" mention - mention
             if [[ "${want}" == all ]]; then
@@ -1331,10 +1377,8 @@ rejoin_after_absence() {
                 matrix_message "rejoin-${mode}-fresh-join" alpha "${channel}" mention "${root}" mention
                 matrix_message "rejoin-${mode}-fresh-follow" alpha "${channel}" plain "${root}" thread
             fi
-            ALPHA_MEMBERS+=("${channel}")
         done
     done
-    slack_stub_inventory_page alpha '' '' "${ALPHA_MEMBERS[@]}"
 }
 
 identity_replacement() {
@@ -1511,8 +1555,10 @@ export CSCB_SLACK_API_URL="${STUB_API_URL}"
 wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" \
     rec_at_least 1 event=control source=file
 slack_stub_controls "${STUB_CONTROL}"
-slack_stub_inventory_page "${ALPHA_LABEL}" '' '' "${A1}" "${A2}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}"
-slack_stub_inventory_page "${BRAVO_LABEL}" '' '' "${B1}" "${A1}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}"
+ALPHA_MEMBERS=("${A1}" "${A2}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}")
+BRAVO_MEMBERS=("${B1}" "${A1}" "${F1}" "${F2}/private" "${U1}" "${T1}" "${N1}" "${N2}" "${N3}")
+slack_stub_inventory_page "${ALPHA_LABEL}" '' '' "${ALPHA_MEMBERS[@]}"
+slack_stub_inventory_page "${BRAVO_LABEL}" '' '' "${BRAVO_MEMBERS[@]}"
 
 # --- Configurations --------------------------------------------------------
 # write_persona_config <declarative|fungible|switch-off>:
@@ -1900,8 +1946,12 @@ check_new_hybrid_choices "strict: changed value" "${ALPHA_LABEL}"
 join_thread_phase strict
 start_matrix
 live_membership_phase strict
+member_list alpha "${DEST}"
+member_list bravo "${DEST}"
 ack_control "$(slack_push_member_joined alpha "${DEST}" "$(scenario_ts)")"
 ack_control "$(slack_push_member_joined bravo "${DEST}" "$(scenario_ts)")"
+wait_membership_complete "${ALPHA}"
+wait_membership_complete "${BRAVO}"
 permission_phase strict alpha
 freeze_four_values
 
@@ -2064,7 +2114,9 @@ two_persona_threads open
 selection_matrix open
 # all beside hybrid retains receive_all; only two effective all choices
 # produce receive_all_shared. Each assignment leaves the sibling unchanged.
+member_list bravo "${M_ALL}"
 ack_control "$(slack_push_member_joined bravo "${M_ALL}" "$(scenario_ts)")"
+wait_membership_complete "${BRAVO}"
 expect_attempt all-beside-hybrid "${BRAVO_DIR}" "$(attempt_args bravo-matrix-hybrid "${M_ALL}" thread_hybrid)" "${BRAVO_KEY}" thread_hybrid
 matrix_message cohabitation-alpha-all alpha "${M_ALL}" plain - receive_all
 matrix_message cohabitation-bravo-unjoined bravo "${M_ALL}" plain - not-mentioned

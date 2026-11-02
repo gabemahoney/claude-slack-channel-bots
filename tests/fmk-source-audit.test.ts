@@ -2904,7 +2904,7 @@ describe('integration configuration and discovery prerequisites', () => {
     `_scenario_stub_control_patch() { shift; jq -cn "$@" '{label:$l,memberships:[$page[0].channels[].id]}'; }`,
     'inventory() {',
     ...source.slice(source.indexOf('slack_stub_controls "'), source.indexOf('# --- Configurations')).split('\n')
-      .filter(line => line.startsWith('slack_stub_inventory_page ')),
+      .filter(line => line.startsWith('slack_stub_inventory_page ') || /^(ALPHA|BRAVO)_MEMBERS=\(/.test(line)),
     '}', "inventory | jq -s '{tokens:.}'",
   ].join('\n')
   function build(mode: string, body = builder, root?: string) {
@@ -3461,11 +3461,13 @@ describe('shared scenario consumer evidence boundaries', () => {
     if (!other.includes('[[ ! -e "${SLACK_STATE_DIR}/threads/${THREAD_KEY}.jsonl" ]]') ||
       !other.includes('[[ "$(shared_thread_created "${THREAD_KEY}")" == false ]]') ||
       !ordered(all, ['other_value_threads "strict: other values" "${ALPHA_LABEL}" "${VIA_RECEIVE_ALL_SHARED}" true', 'ALPHA_THREADS=true'])) findings.push('early persona-wide no-file/no-marker evidence changed')
-    if (!ordered(all, ['slack_stub_inventory_fault alpha \'\' delay delay_ms=20000',
+    if (!ordered(all, ['\nrequest_ms="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"',
+      '\nslack_stub_inventory_fault alpha \'\' delay "delay_ms=$(( request_ms * 4 / 5 ))"\n',
       '[[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]]',
       'expect_attempt unverified-refusal',
       '[[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]]',
-      'resolution=delay > /dev/null'])) findings.push('membership refusal is not bracketed by the delayed successful scan')
+      'resolution=delay > /dev/null',
+      '\nslack_stub_faults_clear alpha\n'])) findings.push('membership refusal is not bracketed by the delayed successful scan')
     return findings
   }
   test('healthy and recovery consumers retain independent observations and fail-closed boundaries', () => {
@@ -3480,6 +3482,9 @@ describe('shared scenario consumer evidence boundaries', () => {
     ['independent input', 'healthy', 'EXPECTED_INPUTS["${identity}"]="${PUSHED_EVENTS[$2|$3]}"', 'EXPECTED_INPUTS["${identity}"]=queue'],
     ['early marker', 'healthy', '[[ "$(shared_thread_created "${THREAD_KEY}")" == false ]]', 'true'],
     ['unverified scan guard', 'healthy', '[[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]]', 'true'],
+    ['request-deadline delay bound', 'healthy', '"delay_ms=$(( request_ms * 4 / 5 ))"', 'delay_ms=20000'],
+    ['printed request deadline', 'healthy', 'request_ms="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"', 'request_ms=20000'],
+    ['settled one-shot fault clear', 'healthy', '    slack_stub_faults_clear alpha\n', '    # slack_stub_faults_clear alpha\n'],
   ])('consumer audit detects removed %s in a scratch copy', (_name, kind, needle, replacement) => {
     mkdirSync('/tmp/c9', { recursive: true })
     const root = mkdtempSync('/tmp/c9/consumer-audit-'), path = join(root, 'scenario.sh')
