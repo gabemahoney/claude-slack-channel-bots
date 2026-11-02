@@ -9,9 +9,12 @@ import type { ContainerExec } from '../lib/container.ts'
 import type { HostSnapshot } from '../lib/host-state.ts'
 import type { HumanSession } from '../lib/human-session.ts'
 import type { WorkspaceIds } from '../lib/live-config.ts'
+import type { JsonObject } from '../lib/manifest.ts'
 import type { PersonaLetter } from '../lib/personas.ts'
 import type { ScanReport } from '../lib/secrecy-scan.ts'
 import type { Clock } from '../lib/wait.ts'
+import type { AppAction } from '../provision/apps.ts'
+import type { InstallAction } from '../provision/install.ts'
 import type { CheckPromptGuard } from './prompt-guard.ts'
 
 export interface PersonaIds {
@@ -81,6 +84,47 @@ export interface HostCredentials {
   setBAppTokenName(name: string): void
 }
 
+/**
+ * What this run's provisioning did for one persona. A member is `undefined`
+ * when its stage didn't run or didn't report the persona (a `--stage` run, a
+ * failed stage, or provisioning that threw).
+ */
+export interface ProvisionedApp {
+  /** The app the apps stage reported. */
+  appId: string | undefined
+  /** The apps stage's action. */
+  apps: AppAction | undefined
+  /** The apps stage's drifted manifest paths. */
+  drift: string[] | undefined
+  /** The apps stage reused the recorded app with no usable configuration token (no export, drift check or update). */
+  unchecked: boolean | undefined
+  /** The install stage's action. */
+  install: InstallAction | undefined
+}
+
+/**
+ * One `apps.manifest.export` with the configuration token. `why` is a safe
+ * Slack error code, a transport kind or "no usable configuration token",
+ * never a token or a response body.
+ */
+export type ManifestExport = { kind: 'exported'; manifest: JsonObject } | { kind: 'unavailable'; why: string }
+
+/**
+ * This run's current-app setup facts, read only (the runner's, from
+ * provisioning and the configuration token): the server's runtime credentials
+ * can't inspect Slack app settings, and the checks get no new credentials.
+ */
+export interface AppSetupSource {
+  /** This run's apps-stage and install-stage outcomes for the persona. */
+  provisioned(letter: PersonaLetter): ProvisionedApp
+  /** apps.json's `needs_reinstall` for the persona, read now. */
+  needsReinstall(letter: PersonaLetter): boolean
+  /** One `apps.manifest.export` of `appId`; never throws for a missing or refused token, no answer or `ok: false`. */
+  exportManifest(appId: string): Promise<ManifestExport>
+  /** The manifest generated for the persona from the shipped `slack-app-manifest.yml`. */
+  wantedManifest(letter: PersonaLetter): JsonObject
+}
+
 /** Values one check leaves for a later one. */
 export interface SharedState {
   /** Part 1.2: did the human have a DM with C before the run? */
@@ -112,6 +156,13 @@ export interface SharedState {
   invitedChannel?: { id: string; name: string }
   /** Check 30: the ts of C's answer in that channel (Check 33 asks C to edit it). */
   invitedCAnswerTs?: string
+  /**
+   * membershipSetupCheck: C's readiness record as read back (its
+   * installation key, order, recordedAt and setup state) and the running
+   * server's PID, for membershipSetupRestartCheck after Checks 24 and 28's
+   * restarts (which must find another PID).
+   */
+  membershipSetup?: { installation: string; order: number; recordedAt: number; state: string; pid: number }
 }
 
 export interface CheckContext {
@@ -129,6 +180,8 @@ export interface CheckContext {
   second: SecondUser | null
   browser: BrowserDriver | null
   creds: HostCredentials
+  /** This run's app setup facts (provisioning's outcomes, apps.json, the manifest export), for the setup-readiness checks. */
+  readonly setup: AppSetupSource
   shared: SharedState
   /**
    * The run's prompt guard (prompt-guard.ts): a check that raises a

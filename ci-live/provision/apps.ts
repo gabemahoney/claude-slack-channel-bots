@@ -61,6 +61,8 @@ export interface AppOutcome {
   action: AppAction
   /** Dotted manifest paths that drifted (for `updated`, and an `adopted` app that was updated). */
   drift: string[]
+  /** The recorded app was reused with no usable configuration token: no export, drift check or update. */
+  unchecked: boolean
 }
 
 export interface AppsStageDeps {
@@ -130,7 +132,7 @@ async function checkRecorded(deps: AppsStageDeps, letter: PersonaLetter, recorde
     const current = manifestOf(exported)
     if (!current) throw new AppsStageError(`apps.manifest.export for ${name} (${recorded}) returned no manifest`)
     const drift = manifestDrift(wanted, current)
-    if (drift.length === 0) return { letter, appId: recorded, action: 'reused', drift }
+    if (drift.length === 0) return { letter, appId: recorded, action: 'reused', drift, unchecked: false }
     const updated = await deps.callManifest('apps.manifest.update', {
       app_id: recorded,
       manifest: JSON.stringify(wanted),
@@ -141,7 +143,7 @@ async function checkRecorded(deps: AppsStageDeps, letter: PersonaLetter, recorde
     deps.appsFile.update((state) => {
       personaEntry(state, letter).needs_reinstall = true
     })
-    return { letter, appId: recorded, action: 'updated', drift }
+    return { letter, appId: recorded, action: 'updated', drift, unchecked: false }
   }
   const code = safeErrorCode(exported)
   if (!APP_MISSING_CODES.has(code)) {
@@ -235,7 +237,7 @@ async function createApp(deps: AppsStageDeps, letter: PersonaLetter, wanted: Jso
   deps.appsFile.update((state) => {
     state.personas[letter] = { app_id: appId }
   })
-  return { letter, appId, action: 'created', drift: [] }
+  return { letter, appId, action: 'created', drift: [], unchecked: false }
 }
 
 async function ensureApp(deps: AppsStageDeps, letter: PersonaLetter): Promise<AppOutcome> {
@@ -264,9 +266,9 @@ function allAppsRecorded(state: AppsState): boolean {
   return PERSONA_LETTERS.every((letter) => state.personas[letter]?.app_id !== undefined)
 }
 
-function logOutcome(deps: AppsStageDeps, outcome: AppOutcome, unchecked: boolean): void {
+function logOutcome(deps: AppsStageDeps, outcome: AppOutcome): void {
   const drifted = outcome.drift.length > 0 ? ` (drifted: ${outcome.drift.join(', ')}; marked for re-install)` : ''
-  const extra = unchecked ? ' (unchecked: no usable configuration token)' : drifted
+  const extra = outcome.unchecked ? ' (unchecked: no usable configuration token)' : drifted
   deps.log.info(`apps: ${appDisplayName(outcome.letter)}: ${outcome.action} ${outcome.appId}${extra}`)
 }
 
@@ -277,7 +279,7 @@ export async function runAppsStage(deps: AppsStageDeps): Promise<AppOutcome[]> {
     if (!tokenless) {
       try {
         const outcome = await ensureApp(deps, letter)
-        logOutcome(deps, outcome, false)
+        logOutcome(deps, outcome)
         outcomes.push(outcome)
         continue
       } catch (err) {
@@ -290,8 +292,8 @@ export async function runAppsStage(deps: AppsStageDeps): Promise<AppOutcome[]> {
       }
     }
     const appId = deps.appsFile.load().personas[letter]?.app_id as string
-    const outcome: AppOutcome = { letter, appId, action: 'reused', drift: [] }
-    logOutcome(deps, outcome, true)
+    const outcome: AppOutcome = { letter, appId, action: 'reused', drift: [], unchecked: true }
+    logOutcome(deps, outcome)
     outcomes.push(outcome)
   }
   return outcomes

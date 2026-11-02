@@ -173,6 +173,18 @@ import { checkPersonaTarget, createSessionServer, slackRefusalToolErrorText, typ
 import { personaDestinationOf } from '../src/persona-destination.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP, renderAppliedLogLine, renderNoopLogLine } from '../src/reload-apply.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, serializeSharedChannelState } from '../src/shared-channels.ts'
+import {
+  MEMBERSHIP_READINESS_ROUTE,
+  MEMBERSHIP_REINSTALL_INCOMPLETE,
+  MEMBERSHIP_REQUIRED_SUBSCRIPTIONS,
+  MEMBERSHIP_SETUP_RECORDED,
+  MEMBERSHIP_SETUP_UNKNOWN,
+  MEMBERSHIP_SETUP_VERIFIED,
+  MEMBERSHIP_SUBSCRIPTIONS_MISSING,
+  membershipReadinessDiagnostic,
+  membershipSetupRecordedDiagnostic,
+  type MembershipSetupReading,
+} from '../src/channel-membership-readiness.ts'
 import { RELOAD_NOTHING_PENDING, reloadSharedAuthorityStartLine } from '../src/reload.ts'
 import { reviewIntentLine } from '../src/reload-request.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
@@ -342,6 +354,23 @@ import {
   unclaimedChannelCause as runnerUnclaimedChannelCause,
 } from '../ci-live/checks/invited-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
+import { CHANNEL_CHECKS } from '../ci-live/checks/channel-checks.ts'
+import {
+  MEMBERSHIP_READINESS_ROUTE as RUNNER_READINESS_ROUTE,
+  MEMBERSHIP_REINSTALL_INCOMPLETE as RUNNER_REINSTALL_INCOMPLETE,
+  MEMBERSHIP_REQUIRED_SUBSCRIPTIONS as RUNNER_REQUIRED_SUBSCRIPTIONS,
+  MEMBERSHIP_SETUP_RECORDED as RUNNER_SETUP_RECORDED,
+  MEMBERSHIP_SETUP_UNKNOWN as RUNNER_SETUP_UNKNOWN,
+  MEMBERSHIP_SETUP_VERIFIED as RUNNER_SETUP_VERIFIED,
+  MEMBERSHIP_SUBSCRIPTIONS_MISSING as RUNNER_SUBSCRIPTIONS_MISSING,
+  membershipSetupCheck,
+  membershipSetupRecordedDiagnostic as runnerSetupRecordedDiagnostic,
+  membershipSetupRestartCheck,
+  readinessDiagnosticDetails,
+  readinessDiagnosticHead,
+  setupStateClass,
+} from '../ci-live/checks/membership-setup.ts'
+import { parseArgs } from '../ci-live/lib/args.ts'
 import { AD_CLIENT_CHECK_FAILED, installCheck, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../ci-live/lib/ad-client-check.ts'
 import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
@@ -449,6 +478,13 @@ function makeCtx(overrides: Partial<CheckContext> = {}): CheckContext {
       mountedCount: () => 3,
       bAppTokenName: () => 'cscb-live',
       setBAppTokenName: () => {},
+    },
+    // No stage reported and no export: no case meets a readiness rule by accident.
+    setup: {
+      provisioned: () => ({ appId: undefined, apps: undefined, drift: undefined, unchecked: undefined, install: undefined }),
+      needsReinstall: () => false,
+      exportManifest: async () => ({ kind: 'unavailable', why: 'no usable configuration token' }),
+      wantedManifest: () => ({}),
     },
     shared: {},
     promptGuard: recordingGuard(),
@@ -848,6 +884,40 @@ describe('the check list', () => {
     expect(INVITED_CHECKS.map((c) => [c.row, c.needs, c.blocking ?? false, c.prerequisite ?? false, c.always ?? false, c.skip ?? null, c.undoes ?? []])).toEqual(
       ['30', '31', '32', '33', '34'].map((row) => [row, ['workspace', 'claude'], false, false, false, null, row === '34' ? ['30', '31', '32', '33'] : []]),
     )
+  })
+
+  test("the readiness checks: setup-ready directly after Check 1's channel checks and before Check 24; setup-restart after every Check 28 entry and directly before Check 30; every other check in its order", () => {
+    const ids = PLAN_CHECKS.map((c) => c.id)
+    expect(membershipSetupCheck.id).toBe('setup-ready')
+    expect(membershipSetupRestartCheck.id).toBe('setup-restart')
+    expect(ids.filter((id) => id === 'setup-ready' || id === 'setup-restart')).toEqual(['setup-ready', 'setup-restart'])
+    const at = (id: string) => ids.indexOf(id)
+    const lastChannel = ids.indexOf(CHANNEL_CHECKS.at(-1)!.id)
+    expect(at('setup-ready')).toBe(lastChannel + 1)
+    expect(Math.max(...CHANNEL_CHECKS.map((c) => at(c.id)))).toBe(lastChannel)
+    expect(at('setup-ready')).toBeLessThan(Math.min(...ids.map((id, i) => (id.startsWith('24') ? i : Infinity))))
+    const lastOf28 = Math.max(...ids.map((id, i) => (id.startsWith('28') ? i : -1)))
+    expect([at('setup-restart'), at('30')]).toEqual([lastOf28 + 1, lastOf28 + 2])
+    // Without the two, the order is the one before them.
+    expect(ids.filter((id) => !id.startsWith('setup-'))).toEqual([
+      'preflight', 'install', 'setup', 'S1', 'S2', 'S3', ...CHANNEL_CHECKS.map((c) => c.id),
+      '14', '15', '16', 'A-DMs-on', '17', '18', '19', '20', '21', '22', '23', '24-setup', '24', '24-teardown', '25', '26', '27', '28',
+      '30', '31', '32', '33', '34', '29a', '29b',
+    ])
+    // Runner-only checks: no Results column, nothing blocking, nothing run unselected, nothing undone.
+    for (const c of [membershipSetupCheck, membershipSetupRestartCheck]) {
+      expect([c.id, c.row, c.needs, c.blocking ?? false, c.prerequisite ?? false, c.always ?? false, c.skip ?? null, c.undoes ?? []]).toEqual([c.id, null, ['workspace'], false, false, false, null, []])
+    }
+  })
+
+  test('--only naming neither readiness check runs neither; naming one runs it with the prerequisites only', () => {
+    for (const only of [['S2'], ['1'], ['30', '31', '32', '33', '34'], ['24'], ['28']]) {
+      expect(runs(['workspace', 'claude'], only).filter((id) => id.startsWith('setup-'))).toEqual([])
+    }
+    expect(runs(['workspace', 'claude'], ['setup-ready'])).toEqual(['preflight', 'install', 'setup', '1', 'setup-ready', '29a', 'teardown', 'HOST'])
+    expect(runs(['workspace', 'claude'], ['setup-restart'])).toEqual(['preflight', 'install', 'setup', '1', 'setup-restart', '29a', 'teardown', 'HOST'])
+    // Both ids fit --only's 16-character limit.
+    expect(parseArgs(['--only', 'setup-ready,setup-restart']).only).toEqual(['setup-ready', 'setup-restart'])
   })
 
   test('--only 30,31,32,33,34 runs the pre-flight, install, setup, Check 1, Checks 30 to 34, 29a, Teardown and HOST', () => {
@@ -3152,6 +3222,14 @@ describe('no live check passes against a silent workspace', () => {
     expect([r.status, r.reason]).toEqual(['FAIL', 'A did not say done and made no reply-tool call to U0DRYSECND'])
   })
 
+  test('the readiness checks are among them, and against a silent container each FAILs: no answer is no readiness evidence', async () => {
+    expect(live.map((c) => c.id).filter((id) => id.startsWith('setup-'))).toEqual(['setup-ready', 'setup-restart'])
+    for (const c of [membershipSetupCheck, membershipSetupRestartCheck]) {
+      const r = await c.run(silentCtx())
+      expect([c.id, r.status, r.reason]).toEqual([c.id, 'FAIL', 'the readiness read failed (read: unparsable)'])
+    }
+  })
+
   test('the undo gestures left out pass only with nothing to restore', async () => {
     for (const id of UNDO_GESTURES) {
       const r = await PLAN_CHECKS.find((c) => c.id === id)!.run(silentCtx())
@@ -3727,6 +3805,10 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     switchedOff?: 'silent' | 'unclaimed'
     /** The read of the switch in the record prints false (the switch already off before Check 32). */
     switchReadsOff?: boolean
+    /** The invite brings no verified join (no `member_joined_channel` reaches the authority). */
+    noJoin?: boolean
+    /** Right after the invite (and its verified join, if any), C's choice is stored as this. */
+    joinChoice?: 'mentions' | 'all' | 'off'
   }
 
   /**
@@ -3801,7 +3883,11 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
         if (method === 'conversations.invite') {
           members.add(String(params.users))
           const authority = worldAuthority(world)
-          if (authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event: 'scripted-invite', identity: 'authenticated-app', channel: RUN_CHANNEL.id, member: true, boundary: 0 }, authority.revision).kind !== 'applied') throw new Error('scripted invite failed')
+          if (!opts.noJoin && authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event: 'scripted-invite', identity: 'authenticated-app', channel: RUN_CHANNEL.id, member: true, boundary: 0 }, authority.revision).kind !== 'applied') throw new Error('scripted invite failed')
+          if (opts.joinChoice) {
+            const after = worldAuthority(world)
+            if (after.assign(C_PERSONA.key, after.incarnation(C_PERSONA.key)!, RUN_CHANNEL.id, opts.joinChoice, after.revision).kind !== 'applied') throw new Error('scripted choice failed')
+          }
         }
         return inner.call(method, params)
       },
@@ -3848,7 +3934,23 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     expect(r.notes).toEqual(['Check 30: the mention before the invite was not delivered to C'])
     const gestures = ['conversations.create', 'chat.postMessage', 'conversations.invite']
     expect(run.slackCalls.filter((m) => gestures.includes(m))).toEqual(['conversations.create', 'chat.postMessage', 'conversations.invite', 'chat.postMessage'])
+    // The verified join, as the production authority wrote it: C's entry at open mode's default, a verified member.
+    expect(r.evidence).toContain('shared entry after the invite: choice mentions, member true, leave not recorded')
+    const life = worldAuthority(run.world).snapshot().personas[C_PERSONA.key]!
+    expect([life.assignments[RUN_CHANNEL.id]?.delivery, life.membership[RUN_CHANNEL.id]?.member]).toEqual(['mentions', true])
     expectNoPromptDeclared(run.guard)
+  })
+
+  test.each<[string, InvitedOpts, string]>([
+    ['the verified join never arrives', { noJoin: true }, "C's shared entry for the run channel is not mentions with verified membership (last seen: choice none, member unknown, leave not recorded)"],
+    ['the entry appears at all', { joinChoice: 'all' }, "C's shared entry for the run channel is not mentions with verified membership (last seen: choice all, member true, leave not recorded)"],
+    ['the entry appears at off', { joinChoice: 'off' }, "C's shared entry for the run channel is not mentions with verified membership (last seen: choice off, member true, leave not recorded)"],
+    ['the entry appears at mentions with no verified join', { noJoin: true, joinChoice: 'mentions' }, "C's shared entry for the run channel is not mentions with verified membership (last seen: choice mentions, member unknown, leave not recorded)"],
+  ])('Check 30 FAILs when C answers but %s', async (_what, opts, reason) => {
+    const run = invitedRun(opts)
+    const r = await check30.run(run.ctx)
+    assertNoLeak(r)
+    expect([r.status, r.reason]).toEqual(['FAIL', reason])
   })
 
   test("Check 30 notes it when the mention before the invite shows in C's transcript, and still passes", async () => {
@@ -3899,8 +4001,23 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     expect(channelModeOf(worldAuthority(run.world).config())).toBe('strict')
     expect(run.world.log.filter((l) => l.includes(`] ${UNCLAIMED_CHANNEL}: `))).toEqual([])
     expect(worldAuthority(run.world).choice(C_PERSONA.key, RUN_CHANNEL.id)).toBe('all')
+    expect(r.evidence).toContain('membership in strict mode: member true')
     expect(unguardedChanges(run.scripts)).toEqual([])
     expectNoPromptDeclared(run.guard)
+  })
+
+  test('Check 32 FAILs in strict mode when C is no longer a verified member, even with the choice retained and C answering', async () => {
+    const run = await throughCheck31()
+    // Through the production authority: a verified leave, then the same choice stored again (no join).
+    const authority = worldAuthority(run.world)
+    const boundary = authority.snapshot().personas[C_PERSONA.key]!.membership[RUN_CHANNEL.id]!.boundary
+    expect(authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event: 'scripted-leave', identity: 'authenticated-app', channel: RUN_CHANNEL.id, member: false, boundary }, authority.revision).kind).toBe('applied')
+    const again = worldAuthority(run.world)
+    expect(again.assign(C_PERSONA.key, again.incarnation(C_PERSONA.key)!, RUN_CHANNEL.id, 'all', again.revision).kind).toBe('applied')
+    const r = await check32.run(run.ctx)
+    expect([r.status, r.reason]).toEqual(['FAIL', 'C is no longer a verified member of the run channel after the mode change'])
+    expect(r.evidence).toContain('membership in strict mode: member false')
+    expect(worldAuthority(run.world).choice(C_PERSONA.key, RUN_CHANNEL.id)).toBe('all')
   })
 
   // Check 32 requires both a reply and the retained shared choice, with no unclaimed diagnostic.
@@ -4075,7 +4192,7 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
    * DM with C plays `steps` (the first asks for reply and fetch_messages,
    * the next for the recorded three), C's calls are what `toolCalls` reads.
    */
-  async function check33Run(steps: Step[], opts: { switchOn?: boolean; noEarlierPost?: boolean } = {}) {
+  async function check33Run(steps: Step[], opts: { switchOn?: boolean; noEarlierPost?: boolean; noLeave?: boolean } = {}) {
     const clock = virtualClock()
     const s = (() => {
       const copy = renderConfig(part9State(false))
@@ -4084,6 +4201,13 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
     })()
     const config = opts.switchOn ? s.on : s.off
     const world: ReloadWorld = { config, record: liveAuthority(config), copy: null, pending: false, log: [] }
+    /** C's verified membership of the run channel through the production authority (Check 30's join; the kick's leave). */
+    const observe = (event: string, member: boolean) => {
+      const authority = worldAuthority(world)
+      const boundary = authority.snapshot().personas[C_PERSONA.key]!.membership[CH]?.boundary ?? 0
+      if (authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event, identity: 'authenticated-app', channel: CH, member, boundary }, authority.revision).kind !== 'applied') throw new Error(`scripted ${event} failed`)
+    }
+    observe('scripted-invite', true)
     const calls: (ToolCall & { tool: string })[] = []
     const messages: ScriptedMessage[] = []
     let seq = 0
@@ -4114,7 +4238,11 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
     const kicks: Record<string, unknown>[] = []
     const kicking: HumanApi = {
       call: (method, params) => {
-        if (method === 'conversations.kick') kicks.push({ ...params })
+        if (method === 'conversations.kick') {
+          kicks.push({ ...params })
+          // The kick's channel_left reaches the server as a verified leave, unless the scenario drops it.
+          if (!opts.noLeave) observe('scripted-kick', false)
+        }
         return api.call(method, params)
       },
     }
@@ -4154,6 +4282,10 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
     expect(run.kicks).toEqual([{ channel: RUN_CHANNEL.id, user: DRY_RUN_IDS.bots.c.userId }])
     const codes = [`${REPLY_TOOL}: refused by Slack (not_in_channel)`, `${FETCH_MESSAGES_TOOL} without thread_ts: refused by Slack (channel_not_found)`]
     expect(run.r.evidence.filter((e) => codes.includes(e))).toEqual(codes)
+    // The verified leave, as the production authority wrote it: no entry, membership false, the leave recorded.
+    expect(run.r.evidence.at(-1)).toBe('shared entry after the kick: choice none, member false, leave recorded')
+    const life = worldAuthority(run.world).snapshot().personas[C_PERSONA.key]!
+    expect([life.assignments[CH], life.membership[CH]?.member, life.leaves[CH]?.event] as unknown[]).toEqual([undefined, false, 'scripted-kick'])
     // The codes reach the Results row's Notes, before the residual notes.
     expect(run.r.notes).toEqual([...codes, ...run.residuals])
     expect(run.asks.length).toBe(2)
@@ -4209,6 +4341,16 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
     const run = await check33Run([{ done: true, calls }, { done: true, calls: ALL_OK }])
     expect([run.r.status, run.r.reason]).toEqual(['FAIL', reason])
     expect(run.residuals.length).toBe(3)
+  })
+
+  test('a kick with no verified leave in time FAILs, after the refusal and recorded-call judgements, which are unchanged', async () => {
+    const run = await check33Run([{ done: true, calls: REFUSED }, { done: true, calls: ALL_OK }], { noLeave: true })
+    expect([run.r.status, run.r.reason]).toEqual(['FAIL', 'the kick produced no verified leave for C in the run channel (last seen: choice off, member true, leave not recorded)'])
+    expect(run.r.notes).toEqual([`${REPLY_TOOL}: refused by Slack (not_in_channel)`, `${FETCH_MESSAGES_TOOL} without thread_ts: refused by Slack (channel_not_found)`, ...run.residuals])
+    expect(run.residuals.length).toBe(3)
+    // The same leave missing turns a "not run" into a FAIL: missing evidence is never skipped past.
+    const skipped = await check33Run([{ done: true }, { done: true }, { done: true, calls: ALL_OK }], { noLeave: true })
+    expect(skipped.r.status).toBe('FAIL')
   })
 
   test('C never answering is a FAIL after one ask, with nothing recorded', async () => {
@@ -4327,6 +4469,11 @@ describe('the prompts each check declares to the prompt guard, before it raises 
     expect(Object.keys(DECLARED).filter((id) => INVITED_CHECKS.some((x) => x.id === id))).toEqual([])
   })
 
+  test('the two readiness checks are among the live checks here and declare no prompt: they only read and record through the local route', () => {
+    expect(live.map((c) => c.id).filter((id) => id.startsWith('setup-'))).toEqual(['setup-ready', 'setup-restart'])
+    expect(Object.keys(DECLARED).filter((id) => id.startsWith('setup-'))).toEqual([])
+  })
+
   // Why Check 31 (and 33) declare no prompt: the live container's first boot
   // writes the test user's Claude Code settings allowing the server's MCP
   // tools as a group, in the default mode with no bypass, so C's first
@@ -4417,6 +4564,50 @@ describe('expected texts match the package', () => {
     return { added: x.added ?? 0, removed: x.removed ?? 0, destructive: x.destructive ?? 0, inPlace: x.in_place ?? 0, credentials: x.credentials ?? 0, settings: x.settings ?? 0 }
   }
   const sized = (n: number) => Array.from({ length: n }, () => ({})) as never[]
+
+  describe("membership-setup.ts's copies of src/channel-membership-readiness.ts", () => {
+    test('the route path, the two required subscriptions in order, and the five diagnostic class names', () => {
+      expect(RUNNER_READINESS_ROUTE).toBe(MEMBERSHIP_READINESS_ROUTE)
+      expect([...RUNNER_REQUIRED_SUBSCRIPTIONS]).toEqual([...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS])
+      expect([RUNNER_SETUP_UNKNOWN, RUNNER_SUBSCRIPTIONS_MISSING, RUNNER_REINSTALL_INCOMPLETE, RUNNER_SETUP_VERIFIED, RUNNER_SETUP_RECORDED]).toEqual([
+        MEMBERSHIP_SETUP_UNKNOWN,
+        MEMBERSHIP_SUBSCRIPTIONS_MISSING,
+        MEMBERSHIP_REINSTALL_INCOMPLETE,
+        MEMBERSHIP_SETUP_VERIFIED,
+        MEMBERSHIP_SETUP_RECORDED,
+      ])
+    })
+
+    test("the recorded line for C's key", () => {
+      expect(runnerSetupRecordedDiagnostic(personaName('c'))).toBe(membershipSetupRecordedDiagnostic(personaName('c')))
+    })
+
+    // One reading per state, with and without a reason, and lists empty and full: the runner's head and details are the start of src's line.
+    const READINGS: MembershipSetupReading[] = [
+      { state: 'verified', missingSubscriptions: [], unknownSubscriptions: [], reinstall: 'complete' },
+      { state: 'missing-subscriptions', missingSubscriptions: ['member_joined_channel', 'channel_left'], unknownSubscriptions: [], reinstall: 'unknown' },
+      { state: 'missing-subscriptions', missingSubscriptions: ['channel_left'], unknownSubscriptions: ['member_joined_channel'], reinstall: 'incomplete' },
+      { state: 'incomplete-reinstall', missingSubscriptions: [], unknownSubscriptions: ['channel_left'], reinstall: 'incomplete' },
+      { state: 'unknown', reason: 'manual-evidence-incomplete', missingSubscriptions: [], unknownSubscriptions: [], reinstall: 'unknown' },
+      { state: 'unknown', reason: 'installation-unverified', missingSubscriptions: [], unknownSubscriptions: ['member_joined_channel', 'channel_left'], reinstall: 'unknown' },
+    ]
+    test.each(READINGS.map((r) => [`${r.state}${r.reason ? ` (${r.reason})` : ''}`, r] as const))("the state line's head and details for %s", (_what, reading) => {
+      const key = personaName('c')
+      const line = membershipReadinessDiagnostic(key, reading)
+      const head = readinessDiagnosticHead(setupStateClass(reading.state), key)
+      const details = readinessDiagnosticDetails(reading.missingSubscriptions, reading.unknownSubscriptions, reading.reinstall)
+      expect(line.startsWith(head + details)).toBe(true)
+      // The details end where src's reason or sentence begins.
+      expect(line.slice((head + details).length)).toMatch(/^( reason=[a-z-]+)?\. /)
+    })
+
+    test('every state has its own class, the one src gives it', () => {
+      const states = ['verified', 'missing-subscriptions', 'incomplete-reinstall', 'unknown'] as const
+      const classOf = (state: (typeof states)[number]) => /^\[slack\] (\S+) /.exec(membershipReadinessDiagnostic('k', { state, missingSubscriptions: [], unknownSubscriptions: [], reinstall: 'unknown' }))![1]
+      expect(states.map(setupStateClass)).toEqual(states.map(classOf))
+      expect(new Set(states.map(setupStateClass)).size).toBe(4)
+    })
+  })
 
   test.each(COUNTS)('counts %j: the preview header and the reload-applied line', (c) => {
     const counts = srcCounts(c)

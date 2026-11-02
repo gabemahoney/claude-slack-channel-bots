@@ -9,15 +9,19 @@
  * for the run:
  * - Check 30: the switch goes on (`switchOnFilter`, a confirmed edit), the
  *   human creates the channel, mentions C there, invites C's app and mentions
- *   it again: C answers, and one `persona-invited-channel` line names it;
+ *   it again: C answers, one `persona-invited-channel` line names it, and the
+ *   verified join (`member_joined_channel`) gives C's shared entry for the
+ *   channel open mode's default, `mentions`, with verified membership;
  * - Check 31: asked in the channel, C stores `all` there with
  *   `set_channel_delivery`, then answers a message that does not mention it;
- * - Check 32: strict mode preserves the shared choice and C still answers
- *   a mention in the listed channel;
+ * - Check 32: strict mode preserves the shared choice, C is still a
+ *   verified member, and C still answers a mention in the listed channel;
  * - Check 33: the switch goes on again, the human kicks C's app; asked by
  *   DM, C's `reply` and `fetch_messages` on the channel are refused with
  *   Slack's code, and the outcomes of `react`, `edit_message` and
- * `fetch_messages` with `thread_ts` are recorded as notes (RN-2);
+ *   `fetch_messages` with `thread_ts` are recorded as notes (RN-2); then the
+ *   verified leave (`channel_left`) removes C's entry, with membership false
+ *   and the leave recorded;
  * - Check 34: whatever 30–33 found, it restores the config.json bytes Check
  *   30 copied, kicks C's app if it is still in the channel, archives the
  *   channel, and passes only when C is in no channel, archived ones included.
@@ -29,6 +33,11 @@
  * server's MCP tools as a group (docker/live/entrypoint.sh), so C's calls
  * raise no permission prompt and no check here declares one to the prompt
  * guard.
+ *
+ * The membership assertions read the shared authority in the last-applied
+ * record (`.personas["persona_c"]`'s `membership` and `leaves`, and the
+ * applied `channels`). Live joins and leaves show behaviour only, never
+ * subscription or reinstall evidence (membership-setup.ts's checks).
  *
  * Every container command that changes something runs behind the plan's
  * guard. Evidence is IDs, timestamps and the server's own tool errors and log
@@ -44,10 +53,10 @@ import { randomUUID } from 'node:crypto'
 import { describeError } from '../lib/errors.ts'
 import { SWITCH_KEY, SWITCH_VALUE_JQ, switchFilter, switchOnFilter } from '../lib/live-config.ts'
 import { personaName, PERSONA_LETTERS } from '../lib/personas.ts'
-import { REPLY_TIMEOUT_MS, RELOAD_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
+import { POLL_MS, REPLY_TIMEOUT_MS, RELOAD_TIMEOUT_MS, SECOND, waitFor } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
 import { outboundNext } from './dm-checks.ts'
-import { Findings, pass, type CheckDef, type CheckResult } from './framework.ts'
+import { Findings, notRun, pass, type CheckDef, type CheckResult } from './framework.ts'
 import {
   appliedLine,
   askAndWait,
@@ -267,6 +276,47 @@ async function sharedChoice(ctx: CheckContext, channel: string): Promise<'off' |
   return value === 'off' || value === 'mentions' || value === 'all' || value === 'thread_hybrid' ? value : undefined
 }
 
+/**
+ * C's verified membership of `channel` in the shared authority (the
+ * last-applied record): `member` (absent is undefined) and whether a leave is
+ * recorded.
+ */
+async function cMembership(ctx: CheckContext, channel: string): Promise<{ member: boolean | undefined; left: boolean }> {
+  const life = `.personas[${JSON.stringify(personaName('c'))}]`
+  const filter = `{member: ${life}.membership[${JSON.stringify(channel)}].member, left: ((${life}.leaves // {}) | has(${JSON.stringify(channel)}))}`
+  const v = jsonLines<{ member?: unknown; left?: unknown }>(await lines(ctx, `jq -c ${q(filter)} "$S/config.json.last-applied"`))[0]
+  return { member: typeof v?.member === 'boolean' ? v.member : undefined, left: v?.left === true }
+}
+
+/** C's shared entry for a channel: its choice and verified membership. */
+interface SharedEntry {
+  choice: Awaited<ReturnType<typeof sharedChoice>>
+  member: boolean | undefined
+  left: boolean
+}
+
+/**
+ * Wait (up to `REPLY_TIMEOUT_MS`) until C's entry for `channel` matches every
+ * field `want` gives; the last entry seen, matched or not.
+ */
+async function waitSharedEntry(ctx: CheckContext, channel: string, want: Partial<SharedEntry>): Promise<{ entry: SharedEntry; matched: boolean }> {
+  let entry: SharedEntry = { choice: undefined, member: undefined, left: false }
+  const matches = (e: SharedEntry) => (Object.keys(want) as (keyof SharedEntry)[]).every((k) => e[k] === want[k])
+  const found = await waitFor(
+    async () => {
+      entry = { choice: await sharedChoice(ctx, channel), ...(await cMembership(ctx, channel)) }
+      return matches(entry)
+    },
+    { timeoutMs: REPLY_TIMEOUT_MS, intervalMs: POLL_MS, clock: ctx.clock },
+  )
+  return { entry, matched: found === true }
+}
+
+/** An entry for evidence: the choice and membership only. */
+function entryText(e: SharedEntry): string {
+  return `choice ${e.choice ?? 'none'}, member ${e.member ?? 'unknown'}, leave ${e.left ? 'recorded' : 'not recorded'}`
+}
+
 /** C's line of `cls` with `cause`, at C's index in config.json (`names`). */
 function cLine(names: readonly string[], cls: string, cause: string): string {
   return personaLine(cls, names.indexOf(personaName('c')), personaName('c'), cause)
@@ -338,11 +388,6 @@ async function newestCall(ctx: CheckContext, tool: string, channel: string, befo
   return newCalls(await toolCalls(ctx, 'c', tool), channel, before, threadTs).at(-1)
 }
 
-/** A SKIPPED "not run" result that keeps the evidence and notes. */
-function notRun(reason: string, f: Findings): CheckResult {
-  return { status: 'SKIPPED', reason: `not run: ${reason} (the plan records this as "not run", not a pass)`, evidence: f.evidence, notes: f.notes }
-}
-
 // ---------------------------------------------------------------------------
 // Check 30
 // ---------------------------------------------------------------------------
@@ -388,6 +433,10 @@ export const check30: CheckDef<CheckContext> = {
     const heard = await cLinesOf(ctx, m2, INVITED_CHANNEL_CLASS, channel)
     const want = cLine(names, INVITED_CHANNEL_CLASS, invitedChannelCause(channel, 'public', 'mentions'))
     f.expect(heard.length === 1 && heard[0]!.includes(want), `expected one ${INVITED_CHANNEL_CLASS} line naming C and the run channel (public, mentions), found ${heard.length}`)
+    // The verified join adds C's shared entry once, at open mode's default.
+    const joined = await waitSharedEntry(ctx, channel, { choice: 'mentions', member: true })
+    f.add(`shared entry after the invite: ${entryText(joined.entry)}`)
+    f.expect(joined.matched, `C's shared entry for the run channel is not mentions with verified membership (last seen: ${entryText(joined.entry)})`)
     return f.result()
   },
 }
@@ -468,6 +517,9 @@ export const check32: CheckDef<CheckContext> = {
     const reply = await human.waitForBotMessage(ch.id, bot(ctx, 'c'), ts, () => true, REPLY_TIMEOUT_MS)
     f.expect(reply !== null, 'C did not answer the mention with its retained shared choice in strict mode')
     f.expect(await sharedChoice(ctx, ch.id) === previousChoice, 'the mode change altered C\'s shared choice')
+    const membership = await cMembership(ctx, ch.id)
+    f.add(`membership in strict mode: member ${membership.member ?? 'unknown'}`)
+    f.expect(membership.member === true, 'C is no longer a verified member of the run channel after the mode change')
     const unclaimed = await cLinesOf(ctx, m2, UNCLAIMED_CHANNEL_CLASS, ch.id)
     f.expect(
       unclaimed.length === 0,
@@ -606,6 +658,10 @@ export const check33: CheckDef<CheckContext> = {
       spec.forEach(([call, tool], i) => outcomes.set(call, recordedOutcome(tool, ch.id, made[i])))
     }
     for (const [call, outcome] of outcomes) f.note(residualNote(call, outcome))
+    // The kick's verified leave: the entry removed, membership false and the leave recorded.
+    const gone = await waitSharedEntry(ctx, ch.id, { choice: undefined, member: false, left: true })
+    f.add(`shared entry after the kick: ${entryText(gone.entry)}`)
+    f.expect(gone.matched, `the kick produced no verified leave for C in the run channel (last seen: ${entryText(gone.entry)})`)
     if (skippedReason !== null && f.failures.length === 0) return notRun(skippedReason, f)
     return f.result()
   },

@@ -14,6 +14,7 @@ import { DM_CHECKS } from './dm-checks.ts'
 import { Findings, type CheckDef } from './framework.ts'
 import { INVITED_CHECKS } from './invited-checks.ts'
 import { CLOSING_CHECKS, LIFECYCLE_CHECKS } from './lifecycle-checks.ts'
+import { membershipSetupCheck, membershipSetupRestartCheck } from './membership-setup.ts'
 import { installCheck, preflightCheck, s1Check, s2Check, s3Check, setupCheck } from './setup-checks.ts'
 
 export const teardownCheck: CheckDef<CheckContext> = {
@@ -54,7 +55,11 @@ export const hostCheck: CheckDef<CheckContext> = {
  * The testplan's checks in run order (Parts 1–12): Part 11's invited-channel
  * checks (30–34) run after Check 28 and before the closing secrecy check, so
  * 29a, then the optional 29b, stay last and 29a scans every file the run
- * writes.
+ * writes. Two runner checks (membership-setup.ts) sit between them:
+ * `membershipSetupCheck` (`setup-ready`) after the channel checks, once
+ * Check 1 has brought C up and before Check 24's restart, and
+ * `membershipSetupRestartCheck` (`setup-restart`) after Check 28's reboot and before
+ * Part 11, so its live joins and leaves run against verified setup.
  */
 export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   preflightCheck,
@@ -64,8 +69,10 @@ export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   s2Check,
   s3Check,
   ...CHANNEL_CHECKS,
+  membershipSetupCheck,
   ...DM_CHECKS,
   ...LIFECYCLE_CHECKS,
+  membershipSetupRestartCheck,
   ...INVITED_CHECKS,
   ...CLOSING_CHECKS,
 ]
