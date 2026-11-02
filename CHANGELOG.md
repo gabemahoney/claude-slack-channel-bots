@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.18.4 (2026-11-02)
+
 - **Long messages no longer block a persona on a Mac.** Claude Code on macOS loses typed input sent as one large burst, so a message of about 1 KB or more could be retyped indefinitely while every later message waited. On a macOS host CSCB now types a long message as several parts of at most about 880 bytes each, tag included; long attachment lists, sender names and channel names in the tag are shortened sooner there, each ending in `…`. On other hosts typing is unchanged. A message queued before you upgrade can keep its larger parts and still be retyped; restarting does not split it again, and CSCB keeps offering it until the bot takes it in. See [A persona on a Mac keeps retyping a long message](skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
 
 ---
