@@ -50,6 +50,7 @@ import {
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   parsePersonaConfigBytes,
   PERSONA_TOP_LEVEL_KEYS,
+  TEST_MEASUREMENTS_KEY,
   type PersonaConfig,
   type PersonaConfigInput,
   type PersonaInput,
@@ -1529,6 +1530,11 @@ describe('no effective change', () => {
     ['delivery-stuck timer added', undefined, { delivery_stuck_after_ms: 7_000 }],
     ['delivery-stuck timer removed', { delivery_stuck_after_ms: 7_000 }, undefined],
     ['delivery-stuck timer changed', { delivery_stuck_after_ms: 7_000 }, { delivery_stuck_after_ms: 9_000 }],
+    ['compaction interval added', undefined, { queue_compact_interval_ms: 500 }],
+    ['compaction interval removed', { queue_compact_interval_ms: 500 }, undefined],
+    ['compaction interval changed', { queue_compact_interval_ms: 500 }, { queue_compact_interval_ms: 250 }],
+    ['compaction interval added to a block', { delivery_stuck_after_ms: 7_000 }, { delivery_stuck_after_ms: 7_000, queue_compact_interval_ms: 500 }],
+    ['compaction interval removed from a block', { delivery_stuck_after_ms: 7_000, queue_compact_interval_ms: 500 }, { delivery_stuck_after_ms: 7_000 }],
   ])('test_timer_overrides %s is no effective change', (_label, from, to) => {
     const withBlock = (block: Record<string, number> | undefined) => edited((c) => { if (block !== undefined) (c as Record<string, unknown>)['test_timer_overrides'] = block })
     const { plan, lines } = previewBetween(withBlock(from), withBlock(to))
@@ -1542,6 +1548,35 @@ describe('no effective change', () => {
     const { plan, lines } = preview(edited((c) => {
       c.port = 3200
       c.test_timer_overrides = { delivery_stuck_after_ms: 7_000 }
+    }))
+
+    expect(plan.settings).toEqual([{ name: 'port' }])
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: 1 }))
+    expect(lines).toEqual(preview(edited((c) => { c.port = 3200 })).lines)
+  })
+
+  // Every move between on, off and absent.
+  test.each<[boolean | undefined, boolean | undefined]>([
+    [undefined, true],
+    [undefined, false],
+    [true, false],
+    [false, true],
+    [true, undefined],
+    [false, undefined],
+  ])('test_measurements %p to %p is no effective change', (from, to) => {
+    const withSwitch = (value: boolean | undefined) => edited((c) => { if (value !== undefined) c[TEST_MEASUREMENTS_KEY] = value })
+    const { plan, lines } = previewBetween(withSwitch(from), withSwitch(to))
+
+    expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
+    expect(changePlanCounts(plan)).toEqual(counts({}))
+    expect(lines).toEqual([NO_EFFECT_LINE])
+  })
+
+  test('test_measurements and a compaction interval beside a real change stay out of the settings count and preview', () => {
+    const { plan, lines } = preview(edited((c) => {
+      c.port = 3200
+      c[TEST_MEASUREMENTS_KEY] = true
+      c.test_timer_overrides = { queue_compact_interval_ms: 500 }
     }))
 
     expect(plan.settings).toEqual([{ name: 'port' }])

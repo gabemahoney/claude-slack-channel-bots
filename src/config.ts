@@ -105,6 +105,12 @@ export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
  */
 export const TEST_TIMER_OVERRIDES_KEY = 'test_timer_overrides'
 export const TEST_MCP_DROP_ENDPOINT_KEY = 'test_mcp_drop_endpoint'
+/**
+ * The test-only measurement switch: a boolean, off unless `true`. Like
+ * `test_mcp_drop_endpoint` it is not one of `PERSONA_TOP_LEVEL_KEYS`, is
+ * captured at start and is never applied by a reload.
+ */
+export const TEST_MEASUREMENTS_KEY = 'test_measurements'
 
 /** The keys of the test-only timer override block, each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
 export const TEST_TIMER_OVERRIDE_KEYS = [
@@ -114,6 +120,7 @@ export const TEST_TIMER_OVERRIDE_KEYS = [
   'delivery_stuck_after_ms',
   'unavailable_retry_base_s',
   'unavailable_retry_ceiling_s',
+  'queue_compact_interval_ms',
 ] as const
 
 /** A key of the test-only timer override block. */
@@ -423,6 +430,8 @@ export interface ServerSettings {
   test_timer_overrides?: TestTimerOverrides
   /** test-only, captured at startup and never applied by reload. */
   test_mcp_drop_endpoint?: boolean
+  /** test-only, captured at startup and never applied by reload. */
+  test_measurements?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +631,9 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     ...(testTimerOverridesOf(input) === undefined ? {} : { test_timer_overrides: testTimerOverridesOf(input) }),
     ...((input as { test_mcp_drop_endpoint?: boolean }).test_mcp_drop_endpoint === undefined ? {} : {
       test_mcp_drop_endpoint: (input as { test_mcp_drop_endpoint?: boolean }).test_mcp_drop_endpoint,
+    }),
+    ...((input as { test_measurements?: boolean }).test_measurements === undefined ? {} : {
+      test_measurements: (input as { test_measurements?: boolean }).test_measurements,
     }),
   }
 }
@@ -1098,7 +1110,7 @@ export function describeUnknownKeys(keys: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 /** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
-const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY])
+const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY, TEST_MEASUREMENTS_KEY])
 
 /**
  * Top-level path settings that today's resolution expands without a type
@@ -1172,6 +1184,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   checkAllowedValue(settings.channel_mode, 'channel_mode', CHANNEL_MODES, style)
   validateTestTimerOverrides(settings.test_timer_overrides, style)
   if (settings.test_mcp_drop_endpoint !== undefined) checkBoolean(settings.test_mcp_drop_endpoint, TEST_MCP_DROP_ENDPOINT_KEY, style)
+  if (settings.test_measurements !== undefined) checkBoolean(settings.test_measurements, TEST_MEASUREMENTS_KEY, style)
 }
 
 // ---------------------------------------------------------------------------

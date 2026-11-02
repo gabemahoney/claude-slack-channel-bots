@@ -112,6 +112,7 @@ import * as channelMembershipReadiness from '../src/channel-membership-readiness
 import * as channelMembershipScan from '../src/channel-membership-scan.ts'
 import * as sharedChannels from '../src/shared-channels.ts'
 import * as testTimerOverrides from '../src/test-timer-overrides.ts'
+import * as testMeasurements from '../src/test-measurements.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
@@ -237,6 +238,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'session-manager.ts': sessionManager,
   'shared-channels.ts': sharedChannels,
   'test-timer-overrides.ts': testTimerOverrides,
+  'test-measurements.ts': testMeasurements,
   'unavailable-retry.ts': unavailableRetry,
 }
 
@@ -820,6 +822,19 @@ async function sharedPrinterControl(run: (fixture: {
     rmSync(scratch, { recursive: true, force: true })
   }
 }
+
+test('SR-8 printer entries print the current package exports', () => sharedPrinterControl(async ({ printer, scratch }) => {
+  const path = join(scratch, 'configured state', testMeasurements.TEST_MEASUREMENTS_FILE_NAME)
+  const rows: Array<[string, string[], string | number]> = [
+    ['TEST_MEASUREMENTS_FILE_NAME', [], testMeasurements.TEST_MEASUREMENTS_FILE_NAME],
+    ['TEST_MEASUREMENTS_KEY', [], config.TEST_MEASUREMENTS_KEY],
+    ['DELIVERY_MAX_AD_CALLS_PER_S', [], deliveryConstants.DELIVERY_MAX_AD_CALLS_PER_S],
+    ['NAME_LOOKUP_TIMEOUT_MS', [], tagWrapper.NAME_LOOKUP_TIMEOUT_MS],
+    ['QUEUE_COMPACT_INTERVAL_MS', [], deliveryQueue.QUEUE_COMPACT_INTERVAL_MS],
+    ['buildTestMeasurementsStartLine', [path], testMeasurements.buildTestMeasurementsStartLine(path)],
+  ]
+  for (const [name, args, expected] of rows) expect(await printer.entryValue(name, args)).toBe(String(expected))
+}))
 
 describe('shared scenario printer evidence contracts', () => {
   test.skipIf(!mkfifoAvailable())('own-post reader refuses a real FIFO without blocking (requires mkfifo)', () => sharedPrinterControl(async ({ scratch, pkg }) => {

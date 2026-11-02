@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -18,7 +18,7 @@ import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimit
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { PersonaSlackTokens } from '../src/persona-credentials.ts'
 import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
-  normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin } from '../src/thread-memory.ts'
+  normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin, type ThreadMemory } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { createOwnPostJoins, ownPostAnswerOfPost, type OwnPostSurface } from '../src/own-post.ts'
@@ -30,9 +30,12 @@ import {
   threadJoin, joinRecord, postIntent, postOutcome, seedThreads, readThreads, damagedThreadLine,
   THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_TIME, type ThreadMemoryHarness, type ThreadHarnessOptions, slackTsOfMs,
   runningSealEntry, cleanSealEntry, cleanOwnPostSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
+  threadFsControls, populationConfig, populationEligible, seedUnitPopulation, populationChannels, populationJoins, oldestJoins, stampedJoins,
+  sr8Personas, SR8_POPULATIONS, SR8_ELIGIBLE_CHANNELS, SR8_POPULATION_CHANNEL_COUNT, SR8_SHARED_LIST_CHANNELS, SR8_BURST_JOINS, SEED_BATCH_JOINS,
 } from './test-helpers/thread-memory.ts'
 import { makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
-import { membershipPage, readSharedState } from './test-helpers/shared-channels.ts'
+import { channelPopulation, makeSharedAuthority, membershipPage, readSharedState } from './test-helpers/shared-channels.ts'
+import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
 import { makeDeferredWebApiCall, makeStubSlack } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
@@ -226,6 +229,22 @@ describe('Thread Memory store', () => {
     expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
     expect(savedJoins(h).map(r => r.seq)).toEqual([6, 7])
     await h.close(); expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test.each([
+    ['argument over option', QUEUE_COMPACT_INTERVAL_MS / 4, QUEUE_COMPACT_INTERVAL_MS / 2, QUEUE_COMPACT_INTERVAL_MS / 4],
+    ['option over default', undefined, QUEUE_COMPACT_INTERVAL_MS / 2, QUEUE_COMPACT_INTERVAL_MS / 2],
+    ['default when neither is given', undefined, undefined, QUEUE_COMPACT_INTERVAL_MS],
+  ] as const)('maintenance interval: %s', async (_name, intervalMs, compactIntervalMs, expected) => {
+    const h = fixture({ compactIntervalMs }); await h.start()
+    h.memory.startMaintenance(intervalMs)
+    expect(h.clock.pending().map(t => t.delayMs)).toEqual([expected])
+    const identity = statSync(threadPath(h.stateDir)).ino
+    await h.clock.advance(expected - 1)
+    expect(statSync(threadPath(h.stateDir)).ino).toBe(identity)
+    await h.clock.advance(1)
+    expect(statSync(threadPath(h.stateDir)).ino).not.toBe(identity)
+    expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
   })
 
   test.each(['missing', 'invalid'] as const)('%s header is repaired with a fresh identity and the largest readable sequence', async kind => {
@@ -3844,5 +3863,166 @@ describe('the bounded metadata call', () => {
 
   test('pin: a lookup attempt\'s deadline is 15 s, and its retries are spaced from 5 s to 60 s (SR-5.1.1, SR-5.1.3)', () => {
     expect([THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS]).toEqual([15_000, 5_000, 60_000])
+  })
+})
+
+describe('SR-8 Joined Thread populations (t1.k49.39 SR-8.1, SR-8.3, SR-2.4.4)', () => {
+  const keys = sr8Personas(2), eligible = populationEligible(), [, tenThousand, hundredThousand] = SR8_POPULATIONS
+  const seeded = new Map<number, string>(), dirs: string[] = [], runs: ThreadMemoryHarness[] = []
+  const closes: Array<() => Promise<void>> = []
+  const populationDir = () => { const dir = mkdtempSync(join(tmpdir(), 'thread-population-')); dirs.push(dir); return dir }
+  // Each population is seeded once, one hook per persona: 100,000 joins take about 3 s on the dev host.
+  for (const population of SR8_POPULATIONS) {
+    beforeAll(() => { const dir = populationDir(); makeSharedAuthority(dir, populationConfig(dir, 'strict', keys.length)); seeded.set(population, dir) })
+    for (const key of keys) beforeAll(async () => { await seedUnitPopulation(seeded.get(population)!, { key, joins: populationJoins(key, population, eligible) }) })
+  }
+  afterEach(async () => { for (const h of runs.splice(0)) await h.close(); for (const close of closes.splice(0)) await close() })
+  afterAll(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
+  function reopen(dir: string, options: ThreadHarnessOptions = {}) {
+    const h = makeThreadMemoryHarness(dir, { reopen: true, ...options }); runs.push(h); return h
+  }
+  const byKey = <E extends { key: string }>(events: readonly E[]) => [...events].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  const readEvents = (dir: string) => keys.map(key => ({ type: 'read' as const, key, path: threadPath(dir, key), firstSuccessfulRead: false }))
+  /** Every join `populationJoins` gives `key` is held, and the oldest are joined. */
+  function expectPopulation(memory: Pick<ThreadMemory, 'joins' | 'view'>, key: string, count: number) {
+    const joins = populationJoins(key, count, eligible), line = (j: { channel: string; root: string; at: number }) => `${j.channel} ${j.root} ${j.at}`
+    expect(memory.joins(key).map(({ join, savedAt }) => line({ ...join, at: savedAt ?? Number.NaN })).sort()).toEqual(joins.map(line).sort())
+    expect(oldestJoins(joins, SR8_BURST_JOINS).filter(j => memory.view(key, j.channel, j.root) !== 'joined')).toEqual([])
+  }
+  test('the src-free channel builder equals channelPopulation at the population and shared-list counts', () => {
+    for (const [count, offset] of [[SR8_POPULATION_CHANNEL_COUNT, 0], [SR8_SHARED_LIST_CHANNELS, 0], [SR8_SHARED_LIST_CHANNELS, SR8_POPULATION_CHANNEL_COUNT]] as const) {
+      expect(populationChannels(count, offset)).toEqual(channelPopulation(count, offset))
+    }
+    expect(populationEligible()).toHaveLength(SR8_ELIGIBLE_CHANNELS)
+  })
+
+  test.each([...SR8_POPULATIONS])('%i Joined Threads per persona, for two personas, reopen from disk with every join and the oldest, and nothing lost', async population => {
+    const dir = seeded.get(population)!, h = reopen(dir); await h.start()
+    // A population of 0 has no journal: activation creates each store.
+    expect(byKey(h.events)).toEqual(population ? readEvents(dir) : keys.map(key => ({ type: 'created', key, path: threadPath(dir, key) })))
+    for (const key of keys) expectPopulation(h.memory, key, population)
+  })
+
+  test('a seed in batches writes the journal bytes production writes for the same joins added one by one and flushed', async () => {
+    const base = populationDir(), copy = populationDir()
+    makeSharedAuthority(base, populationConfig(base))
+    const first = reopen(base); await first.start(); await first.close()
+    cpSync(base, copy, { recursive: true })
+    const joins = populationJoins('alpha', 2 * SEED_BATCH_JOINS + 1, eligible)
+    await seedUnitPopulation(base, { key: 'alpha', joins })
+    const h = reopen(copy); await h.start()
+    expect(stampedJoins(h.authority, 'alpha', joins).every(fact => h.memory.addJoin('alpha', fact))).toBe(true)
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    const digest = (dir: string) => createHash('sha256').update(readFileSync(threadPath(dir))).digest('hex')
+    expect(digest(copy)).toBe(digest(base))
+  })
+
+  test('startup reads retain every join and arm the hourly compaction by default', async () => {
+    const dir = seeded.get(tenThousand)!, h = reopen(dir); await h.start()
+    expect(byKey(h.events)).toEqual(readEvents(dir))
+    for (const key of keys) expectPopulation(h.memory, key, tenThousand)
+    h.memory.startMaintenance()
+    expect(h.clock.pending().map(t => t.delayMs)).toEqual([QUEUE_COMPACT_INTERVAL_MS])
+  })
+
+  test('an unreadable journal reports read-failed, a missing one is created, and a later loadKey recovers the unreadable journal', async () => {
+    const from = seeded.get(tenThousand)!, dir = populationDir()
+    cpSync(from, dir, { recursive: true, filter: path => path !== threadPath(from, 'beta') })
+    const io = threadFsControls(dir), fault = io.fail('readFileSync', 'alpha', { code: 'EACCES', times: 1 })
+    const h = reopen(dir, { fs: io }); await h.start()
+    expect(byKey(h.events.splice(0))).toEqual([
+      { type: 'read-failed', key: 'alpha', path: threadPath(dir), error: fault }, { type: 'created', key: 'beta', path: threadPath(dir, 'beta') },
+    ])
+    await h.memory.loadKey('alpha')
+    expect(h.events).toEqual([{ type: 'read', key: 'alpha', path: threadPath(dir), firstSuccessfulRead: true }])
+  })
+
+  test('1,000 joins added to 100,000, and the compaction at compactIntervalMs, forget nothing', async () => {
+    const dir = populationDir(), from = seeded.get(hundredThousand)!
+    cpSync(from, dir, { recursive: true, filter: path => path !== threadPath(from, 'beta') })
+    const interval = QUEUE_COMPACT_INTERVAL_MS / 4
+    const h = reopen(dir, { compactIntervalMs: interval }); await h.start()
+    h.memory.startMaintenance()
+    expect(h.clock.pending().map(t => t.delayMs)).toEqual([interval])
+    const added = stampedJoins(h.authority, 'alpha', populationJoins('alpha', hundredThousand + SR8_BURST_JOINS, eligible).slice(hundredThousand))
+    expect(added.every(fact => h.memory.addJoin('alpha', fact))).toBe(true)
+    expect(await h.memory.saveJoins('alpha', added)).toEqual({ kind: 'saved' })
+    const identity = statSync(threadPath(dir)).ino
+    await h.clock.advance(interval)
+    expect(statSync(threadPath(dir)).ino).not.toBe(identity)
+    expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+    await h.close()
+    const next = reopen(dir); await next.start()
+    expectPopulation(next.memory, 'alpha', hundredThousand + SR8_BURST_JOINS)
+  })
+
+  describe('seeding while stopped and the seal check (Decisions 14 and 21)', () => {
+    // Only the eligible channels: the seal check reads none, and the harness's start grows with every channel listed.
+    const channels = channelPopulation(SR8_POPULATION_CHANNEL_COUNT).filter(c => eligible.includes(c.id)), inventory = channels.map(c => c.id)
+    /** Two personas over the eligible population channels on the production start and stop. */
+    function server() {
+      const h = makeReloadHarness({ personaConfigDirs: true }), started: ReloadRun[] = []
+      const personas = keys.map(name => h.persona(name, { channels, permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' } }))
+      h.materialize(...personas)
+      const input = { channel_mode: 'strict', personas }
+      h.writeConfig(input)
+      closes.push(async () => { for (const run of started) await run.stop(); await h.cleanup() })
+      return {
+        h, input,
+        async start() {
+          const run = h.build({ threadMemory: {}, slack: Object.fromEntries(personas.map(p => [p.name, { inventory: [membershipPage(inventory)] }])) })
+          started.push(run)
+          expect(run.resolveStart().kind).toBe('applied')
+          await run.controller.runStartBringUp(); await run.membershipClock.runNext(); await run.clock.flush()
+          return run
+        },
+        seed: (key: string, count: number) => seedUnitPopulation(h.stateDir, { key, joins: populationJoins(key, count, eligible) }, { authorityPath: h.channelDeliveryFile }),
+        seal: () => existsSync(threadSealPath(h.stateDir)) ? readFileSync(threadSealPath(h.stateDir)) : undefined,
+      }
+    }
+    const findings = (run: ReloadRun) => run.threadMemorySeal!.startupFindings()
+    const reports = (run: ReloadRun) => run.threadMemorySealEvents.filter(e => e.type === 'changed-while-stopped')
+
+    test('a seed before the first start is reported changed while stopped once per persona; after a clean stop the next start reports nothing and keeps every join', async () => {
+      const s = server(); s.h.writeRecord(s.input)
+      const before = s.seal()
+      for (const key of keys) await s.seed(key, tenThousand)
+      expect([before, s.seal()]).toEqual([undefined, undefined])
+      const first = await s.start(), expected = keys.map(key => ({ key, case: 'entry-missing' as const, wording: 'changed' as const }))
+      expect(findings(first)).toEqual(expected)
+      expect(reports(first)).toEqual(expected.map(finding => ({ type: 'changed-while-stopped', ...finding })))
+      await first.stop()
+      const measured = await s.start()
+      expect([findings(measured), reports(measured)]).toEqual([[], []])
+      for (const key of keys) expectPopulation(measured.threadMemory!, key, tenThousand)
+    })
+
+    test('a seed after a start and clean stop leaves the seal as it was and appends to the sealed store, which SR-2.4.4 does not report', async () => {
+      const s = server(), first = await s.start(); await first.stop()
+      const sealed = s.seal()
+      for (const key of keys) await s.seed(key, tenThousand)
+      expect(s.seal()).toEqual(sealed)
+      const next = await s.start()
+      expect([findings(next), reports(next)]).toEqual([[], []])
+      for (const key of keys) expectPopulation(next.threadMemory!, key, tenThousand)
+    })
+
+    test('population 0: a seed of 0 joins writes nothing, before the first start or after a clean stop; neither start reports and each journal is kept as written', async () => {
+      const s = server(); s.h.writeRecord(s.input)
+      const record = readFileSync(s.h.channelDeliveryFile)
+      for (const key of keys) expect(await s.seed(key, 0)).toEqual({ key, seeded: 0 })
+      expect([existsSync(join(s.h.stateDir, 'threads')), s.seal(), readFileSync(s.h.channelDeliveryFile)]).toEqual([false, undefined, record])
+      const first = await s.start()
+      expect([findings(first), reports(first)]).toEqual([[], []])
+      await first.stop()
+      const files = () => ({ seal: s.seal(), record: readFileSync(s.h.channelDeliveryFile), threads: readdirSync(join(s.h.stateDir, 'threads')).sort(),
+        journals: keys.map(key => readFileSync(threadPath(s.h.stateDir, key))) })
+      const written = files()
+      for (const key of keys) expect(await s.seed(key, 0)).toEqual({ key, seeded: 0 })
+      expect(files()).toEqual(written)
+      const next = await s.start()
+      expect([findings(next), reports(next)]).toEqual([[], []])
+      expect(keys.map(key => readFileSync(threadPath(s.h.stateDir, key)))).toEqual(written.journals)
+    })
   })
 })

@@ -79,8 +79,9 @@
  *     "outcome": "delay", "delay_ms": 250, "body": { "ok": true,
  *       "channels": [], "response_metadata": { "next_cursor": "later" } } }
  * Methods: users.conversations, conversations.history, conversations.replies,
- * chat.postMessage. Optional exact selectors: cursor ("" means first page),
- * channel, thread_ts. `after` skips that many matching requests; `times`
+ * chat.postMessage, users.info, conversations.info. Optional exact selectors:
+ * cursor ("" means first page), channel, thread_ts, and user (users.info
+ * only). `after` skips that many matching requests; `times`
  * applies to the next N (defaults 0/1). First applicable rule wins. Counters
  * count every selector match, even when an earlier rule wins that request;
  * they are per token rule and reset whenever the control is replaced. Requests
@@ -92,12 +93,28 @@
  * - `rate_limit`: HTTP 429, `Retry-After` seconds (`retry_after`, default 1).
  * - `delay`: answer after positive `delay_ms`; optional raw `body` overrides
  *   a read's answer, otherwise snapshot its normal answer at request time.
+ *   A client disconnect before then settles as `abort`, with no answer.
  * - `lost` (chat.postMessage only): required boolean `performed`. True stores
  *   the own post before holding its answer; false stores nothing. With a
  *   positive `delay_ms`, eventually return success (performed) or internal_error
  *   (not performed); without it hold until abort/stop. Ordinary hang/delay on
  *   chat.postMessage is refused: use lost to specify the posting outcome.
+ * - `late` (users.info, conversations.info and users.conversations only): the
+ *   normal answer after a required positive `delay_ms`, even if the client
+ *   disconnected meanwhile. Only users.conversations may supply a raw `body`
+ *   override with `late`; snapshot that page at request time too.
  * No files.info, root-evidence or file-upload fault controls are added.
+ *
+ * Name lookups (t1.tad.5i SR-6.3, AC-C06): a users.info or conversations.info
+ * fault matches one looked-up id (`user` or `channel`) or, with neither, any
+ * id. Without one, both methods answer as before, from `users`/`channels`.
+ *   { "method": "users.info", "user": "U…", "times": 1, "outcome": "hang" }
+ *   { "method": "conversations.info", "channel": "C…", "outcome": "delay", "delay_ms": 500 }
+ *   { "method": "users.info", "user": "U…", "outcome": "late", "delay_ms": 2500 }
+ * A caller that gives up at its own deadline without closing the request (CSCB
+ * races NAME_LOOKUP_TIMEOUT_MS) leaves a `hang` held until its HTTP client's
+ * timeout; give `late` a delay_ms past that deadline. A held lookup never
+ * blocks another request, /_push or /_control.
  *
  * Top-level `history: { page_size?: number, messages?: [{channel, message}] }`
  * enables conversations.history/replies from performed posts plus raw seeded
@@ -111,8 +128,10 @@
  * label, method, channel and requested parent; an invalid cursor is refused.
  * No history control/lost post: the original empty history/replies answer.
  * `inventory_pages` still accepts raw cursor-keyed pages, including short or
- * empty nonterminal pages and channels without is_member; delay.body can
- * return a stale page after a newer scan. Read faults work on any page.
+ * empty nonterminal pages and channels without is_member. To attempt a
+ * contradictory users.conversations page after an abandoned scan, use `late`
+ * with `body` and delay_ms past the replacement scan; `delay` still aborts on
+ * disconnect. Read faults work on any page.
  *
  * Top-level `socket_closes: [{label, refuse_connections?: N}]` closes every
  * live socket for that label with code 1001. The next N apps.connections.open
@@ -126,7 +145,20 @@
  * Evidence: `fault` names control:"faults", fault_index, request_id, method,
  * label, matching_call and outcome; lost also carries performed and the stored
  * message's response_ts. Its eventual api line shares request_id. Held requests
- * emit `fault-settled` with resolution delay/abort/stop. `socket-close` names
+ * emit `fault-settled` with resolution delay/abort/stop/late. Each fired request
+ * has exactly one `fault` line. A name lookup's also carries `match` (the
+ * request's user or channel id, whichever selector fired). Name lookups and
+ * users.conversations faults carry `arrival_mono_ms` (their arrival on the
+ * push/ack monotonic clock, before control-file I/O or body parsing), and
+ * `arrival_epoch_ms` captured beside it at handler entry with Date.now(). The
+ * latter shares the container wall clock with the server logger's ISO stamps;
+ * the monotonic field is comparable only within this stub process. A `late`
+ * settlement adds `socket_open`: whether the client was still connected when
+ * the answer went; its api line is written either way. It settles exactly
+ * once, as `late` after delay_ms even on disconnect, never as `abort`.
+ * Compare the records' increasing `seq` to prove that a late settlement
+ * followed the replacement scan's last api line.
+ * `socket-close` names
  * control:"socket_closes", control_index, label and independent connection_id;
  * socket-close-missed proves no live socket matched. `connection-refused` names
  * request_id/control_index/remaining and shares request_id with its api line.
@@ -285,16 +317,20 @@ import { appendFileSync, readFileSync, renameSync, statSync, writeFileSync } fro
 /** How `apps.connections.open` and the WebSocket behave for a token. */
 export type StubConnectionsMode = 'ok' | 'closed-port' | 'refuse-handshake' | 'no-hello' | 'no-url' | string
 
-const FAULT_METHODS = ['users.conversations', 'conversations.history', 'conversations.replies', 'chat.postMessage'] as const
+const FAULT_METHODS = ['users.conversations', 'conversations.history', 'conversations.replies', 'chat.postMessage', 'users.info', 'conversations.info'] as const
+
+/** Name lookups also accept `late`, with their normal answer only. */
+const NAME_LOOKUP_METHODS: readonly string[] = ['users.info', 'conversations.info']
 
 export interface StubFault {
   method: typeof FAULT_METHODS[number]
   cursor?: string
   channel?: string
   thread_ts?: string
+  user?: string
   after?: number
   times?: number
-  outcome: 'hang' | 'error' | 'rate_limit' | 'delay' | 'lost'
+  outcome: 'hang' | 'error' | 'rate_limit' | 'delay' | 'lost' | 'late'
   error?: string
   retry_after?: number
   delay_ms?: number
@@ -460,21 +496,23 @@ function positiveInteger(value: unknown): value is number {
 function parseFault(value: unknown): StubFault {
   const invalid = (): never => { throw new Error('faults entry is invalid') }
   if (!isObject(value)) return invalid()
-  const keys = ['method', 'cursor', 'channel', 'thread_ts', 'after', 'times', 'outcome', 'error', 'retry_after', 'delay_ms', 'performed', 'body']
+  const keys = ['method', 'cursor', 'channel', 'thread_ts', 'user', 'after', 'times', 'outcome', 'error', 'retry_after', 'delay_ms', 'performed', 'body']
   if (Object.keys(value).some(key => !keys.includes(key)) || !FAULT_METHODS.includes(value.method as StubFault['method'])) return invalid()
-  if (!['hang', 'error', 'rate_limit', 'delay', 'lost'].includes(value.outcome as string)) return invalid()
-  for (const key of ['cursor', 'channel', 'thread_ts']) if (value[key] !== undefined && typeof value[key] !== 'string') return invalid()
+  if (!['hang', 'error', 'rate_limit', 'delay', 'lost', 'late'].includes(value.outcome as string)) return invalid()
+  for (const key of ['cursor', 'channel', 'thread_ts', 'user']) if (value[key] !== undefined && typeof value[key] !== 'string') return invalid()
+  if (value.user !== undefined && value.method !== 'users.info') return invalid()
+  if (value.outcome === 'late' && value.method !== 'users.conversations' && !NAME_LOOKUP_METHODS.includes(value.method as string)) return invalid()
   if (value.after !== undefined && !(value.after === 0 || positiveInteger(value.after))) return invalid()
   if (value.times !== undefined && !positiveInteger(value.times)) return invalid()
-  if (value.delay_ms !== undefined && (!positiveInteger(value.delay_ms) || value.delay_ms > 2_147_483_647 || !['delay', 'lost'].includes(value.outcome as string))) return invalid()
-  if (value.outcome === 'delay' && value.delay_ms === undefined) return invalid()
+  if (value.delay_ms !== undefined && (!positiveInteger(value.delay_ms) || value.delay_ms > 2_147_483_647 || !['delay', 'lost', 'late'].includes(value.outcome as string))) return invalid()
+  if ((value.outcome === 'delay' || value.outcome === 'late') && value.delay_ms === undefined) return invalid()
   if (value.error !== undefined && (value.outcome !== 'error' || typeof value.error !== 'string' || !/^[a-z][a-z0-9_]*$/.test(value.error))) return invalid()
   if (value.retry_after !== undefined && (value.outcome !== 'rate_limit' || !positiveInteger(value.retry_after))) return invalid()
   if (value.outcome === 'lost') {
     if (value.method !== 'chat.postMessage' || typeof value.performed !== 'boolean') return invalid()
   } else if (value.performed !== undefined) return invalid()
   if (value.method === 'chat.postMessage' && ['hang', 'delay'].includes(value.outcome as string)) return invalid()
-  if (value.body !== undefined && (value.outcome !== 'delay' || value.method === 'chat.postMessage' || !isObject(value.body))) return invalid()
+  if (value.body !== undefined && ((value.outcome !== 'delay' && !(value.outcome === 'late' && value.method === 'users.conversations')) || value.method === 'chat.postMessage' || !isObject(value.body))) return invalid()
   return structuredClone(value) as unknown as StubFault
 }
 
@@ -886,7 +924,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     faultCalls.set(answers, counts)
     let selected: { fault: StubFault; index: number; call: number } | undefined
     for (const [index, fault] of (answers.faults ?? []).entries()) {
-      if (fault.method !== method || (['cursor', 'channel', 'thread_ts'] as const).some(key => fault[key] !== undefined && fault[key] !== (args[key] ?? ''))) continue
+      if (fault.method !== method || (['cursor', 'channel', 'thread_ts', 'user'] as const).some(key => fault[key] !== undefined && fault[key] !== (args[key] ?? ''))) continue
       const call = counts[index] = (counts[index] ?? 0) + 1
       const after = fault.after ?? 0
       if (selected === undefined && call > after && call - after <= (fault.times ?? 1)) selected = { fault, index, call }
@@ -894,26 +932,32 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     return selected
   }
 
-  /** Held HTTP responses own their timer/abort listener; stopping releases all. */
-  function holdAnswer(req: Request, requestId: string, delayMs: number | undefined, release: () => Response): Promise<Response> {
+  /**
+   * Held HTTP responses own their timer/abort listener; stopping releases all.
+   * A late answer ignores the client's abort and records whether it was still connected.
+   */
+  function holdAnswer(req: Request, requestId: string, delayMs: number | undefined, release: () => Response, late = false): Promise<Response> {
     return new Promise(resolve => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
-      const finish = (resolution: 'delay' | 'abort' | 'stop'): void => {
+      const finish = (resolution: 'delay' | 'abort' | 'stop' | 'late'): void => {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
         req.signal.removeEventListener('abort', abort)
         heldRequests.delete(stop)
-        record('fault-settled', { request_id: requestId, resolution })
-        resolve(resolution === 'delay' ? release() : new Response(null, { status: 499 }))
+        record('fault-settled', { request_id: requestId, resolution, ...(resolution === 'late' ? { socket_open: !req.signal.aborted } : {}) })
+        resolve(resolution === 'delay' || resolution === 'late' ? release() : new Response(null, { status: 499 }))
       }
       const abort = (): void => finish('abort')
       const stop = (): void => finish('stop')
       heldRequests.add(stop)
-      req.signal.addEventListener('abort', abort, { once: true })
-      if (req.signal.aborted) abort()
-      else if (delayMs !== undefined) timer = setTimeout(() => finish('delay'), delayMs)
+      if (late) timer = setTimeout(() => finish('late'), delayMs)
+      else {
+        req.signal.addEventListener('abort', abort, { once: true })
+        if (req.signal.aborted) abort()
+        else if (delayMs !== undefined) timer = setTimeout(() => finish('delay'), delayMs)
+      }
     })
   }
 
@@ -1133,6 +1177,9 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     hostname: '127.0.0.1',
     port: options.port ?? 0,
     async fetch(req, srv) {
+      // A name-lookup fault's arrival, captured before control-file I/O or body parsing.
+      const arrivalMonoMs = performance.now()
+      const arrivalEpochMs = Date.now()
       refreshControl()
       const url = new URL(req.url)
       const path = url.pathname
@@ -1276,7 +1323,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         const { fault, index, call } = matched
         const requestId = randomUUID()
         fields.request_id = requestId
-        const body = fault.outcome === 'delay' ? structuredClone(fault.body ?? normalBody()) :
+        const body = fault.outcome === 'delay' || fault.outcome === 'late' ? structuredClone(fault.body ?? normalBody()) :
           fault.outcome === 'lost' && fault.performed ? normalBody() : { ok: false, error: 'internal_error' }
         if (fault.outcome === 'lost') {
           historyEnabled = true
@@ -1284,7 +1331,10 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         }
         record('fault', { control: 'faults', fault_index: index, method, label: pushFieldText(label), request_id: requestId,
           matching_call: call, outcome: fault.outcome,
-          ...(fault.outcome === 'lost' ? { performed: fault.performed, response_ts: fault.performed ? body.ts : null } : {}) })
+          ...(fault.outcome === 'lost' ? { performed: fault.performed, response_ts: fault.performed ? body.ts : null } : {}),
+          ...(method === 'users.info' || method === 'conversations.info' ?
+            { match: pushFieldText(method === 'users.info' ? args.user : args.channel), arrival_mono_ms: arrivalMonoMs, arrival_epoch_ms: arrivalEpochMs } : {}),
+          ...(method === 'users.conversations' ? { arrival_mono_ms: arrivalMonoMs, arrival_epoch_ms: arrivalEpochMs } : {}) })
         if (fault.outcome === 'error') return failWith(fault.error ?? 'internal_error')
         if (fault.outcome === 'rate_limit') {
           const response = answer('ratelimited', { ok: false, error: 'ratelimited' }, 429)
@@ -1293,7 +1343,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         }
         // A held fault belongs to the client's deadline, not Bun's HTTP idle timeout.
         srv.timeout(req, 0)
-        return holdAnswer(req, requestId, fault.delay_ms, () => answer(body.ok === true ? 'ok' : 'controlled-error', body))
+        return holdAnswer(req, requestId, fault.delay_ms, () => answer(body.ok === true ? 'ok' : 'controlled-error', body), fault.outcome === 'late')
       }
 
       if (method === 'auth.test') {

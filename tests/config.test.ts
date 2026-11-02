@@ -31,7 +31,13 @@ import {
   MAX_TEST_TIMER_OVERRIDE_MS,
   MAX_TEST_TIMER_OVERRIDE_S,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  PERSONA_DM_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
+  CHANNEL_ENTRY_KEYS,
+  PRE_PERSONA_KEYS,
+  SERVER_PATH_SETTINGS,
+  TEST_MCP_DROP_ENDPOINT_KEY,
+  TEST_MEASUREMENTS_KEY,
   TEST_TIMER_OVERRIDE_KEYS,
   TEST_TIMER_OVERRIDES_KEY,
   expandTilde,
@@ -63,8 +69,10 @@ import {
 } from '../src/config.ts'
 import { personaKey, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { buildChangePlan, MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
+import { buildChangePlan, DESTRUCTIVE_SETTINGS, IN_PLACE_SETTINGS, MODE_SWITCH_SETTING, NEXT_LAUNCH_SETTINGS } from '../src/reload-plan.ts'
 import { configInEffect } from '../src/reload.ts'
+import { buildTestTimerOverridesLine, effectiveTestTimer } from '../src/test-timer-overrides.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { assertSendable } from '../src/lib.ts'
 import {
   makeMultiPersonaConfig,
@@ -1482,7 +1490,7 @@ describe('loadPersonaConfig', () => {
     const MS_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_ms'))
     const S_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_s'))
 
-    test('the key is named, the six keys include the delivery-stuck timer, and it is not a documented top-level key', () => {
+    test('the key is named, the seven keys include the delivery-stuck timer and end with the compaction interval, and it is not a documented top-level key', () => {
       expect(TEST_TIMER_OVERRIDES_KEY).toBe('test_timer_overrides')
       expect([...TEST_TIMER_OVERRIDE_KEYS]).toEqual([
         'latch_recheck_interval_ms',
@@ -1491,6 +1499,7 @@ describe('loadPersonaConfig', () => {
         'delivery_stuck_after_ms',
         'unavailable_retry_base_s',
         'unavailable_retry_ceiling_s',
+        'queue_compact_interval_ms',
       ])
       expect(PERSONA_TOP_LEVEL_KEYS as readonly string[]).not.toContain(TEST_TIMER_OVERRIDES_KEY)
     })
@@ -1509,7 +1518,7 @@ describe('loadPersonaConfig', () => {
       }
     })
 
-    test('all six keys together load as given', () => {
+    test('all seven keys together load as given', () => {
       const block = {
         latch_recheck_interval_ms: 45_000,
         ad_version_recheck_interval_ms: 20_000,
@@ -1517,6 +1526,7 @@ describe('loadPersonaConfig', () => {
         delivery_stuck_after_ms: 7_000,
         unavailable_retry_base_s: 5,
         unavailable_retry_ceiling_s: 60,
+        queue_compact_interval_ms: 500,
       }
       expect(load(withBlock(block)).test_timer_overrides).toEqual(block)
     })
@@ -1594,6 +1604,133 @@ describe('loadPersonaConfig', () => {
         unavailable_retry_ceiling_s: 60,
       })
       expect(loadError(withBlock({ latch_recheck_interval_ms: 45_000, unavailable_retry_base_s: 0, unavailable_retry_ceiling_s: 60 }))).toContain('unavailable_retry_base_s')
+    })
+
+    // queue_compact_interval_ms by name, so these cases fail if the key leaves the block.
+    test('queue_compact_interval_ms loads alone at 1 and at the maximum, kept as given', () => {
+      expect(load(withBlock({ queue_compact_interval_ms: 1 })).test_timer_overrides).toEqual({ queue_compact_interval_ms: 1 })
+      expect(load(withBlock({ queue_compact_interval_ms: MAX_TEST_TIMER_OVERRIDE_MS })).test_timer_overrides).toEqual({
+        queue_compact_interval_ms: MAX_TEST_TIMER_OVERRIDE_MS,
+      })
+    })
+
+    // The third column is a sentinel the value carries: the message names the key and its rule, never the value
+    // (loadError also checks PLACEHOLDER and the leak sentinel).
+    test.each<[string, unknown, string | undefined]>([
+      ['zero', 0, undefined],
+      ['negative', -24_681, '24681'],
+      ['a non-integer number', 1_357.9, '1357'],
+      ['one above the maximum', MAX_TEST_TIMER_OVERRIDE_MS + 1, String(MAX_TEST_TIMER_OVERRIDE_MS + 1)],
+      ['far above the maximum', MAX_TEST_TIMER_OVERRIDE_MS + 24_681, String(MAX_TEST_TIMER_OVERRIDE_MS + 24_681)],
+      ['a numeric string', '24681', '24681'],
+      ['the placeholder string', PLACEHOLDER, undefined],
+      ['the leak sentinel', LEAK_SENTINEL, undefined],
+      ['null', null, undefined],
+      ['a boolean', true, undefined],
+    ])('queue_compact_interval_ms %s is refused with the full message, naming the key and its rule and never the value', (_label, value, sentinel) => {
+      const message = loadError(withBlock({ queue_compact_interval_ms: value }))
+      expect(message).toBe(
+        `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+          `${TEST_TIMER_OVERRIDES_KEY}.queue_compact_interval_ms must be a positive integer in [1, ${MAX_TEST_TIMER_OVERRIDE_MS}].`,
+      )
+      if (sentinel !== undefined) expect(message).not.toContain(sentinel)
+    })
+  })
+
+  // The two test-only switches the performance scenarios use (Task
+  // t2.yiv.sf.tu): test_measurements and test_timer_overrides'
+  // queue_compact_interval_ms. Like test_mcp_drop_endpoint they are off unless
+  // set, validated, outside every public key list and reload class, and
+  // captured at start.
+  describe('the test-only switches test_measurements and queue_compact_interval_ms', () => {
+    const withSwitch = (value: unknown) => ({ ...makePersonaConfigInput({}, dir), [TEST_MEASUREMENTS_KEY]: value })
+    const withBoth = (measurements: boolean, interval: number) => ({
+      ...makePersonaConfigInput({}, dir),
+      [TEST_MEASUREMENTS_KEY]: measurements,
+      [TEST_TIMER_OVERRIDES_KEY]: { queue_compact_interval_ms: interval },
+    })
+    const without = (config: object, ...keys: string[]) => Object.fromEntries(Object.entries(config).filter(([key]) => !keys.includes(key)))
+
+    /** Every exported key list and every exported reload class. */
+    const PUBLIC_LISTS: [string, readonly string[]][] = [
+      ['PERSONA_TOP_LEVEL_KEYS', PERSONA_TOP_LEVEL_KEYS],
+      ['PERSONA_ENTRY_KEYS', PERSONA_ENTRY_KEYS],
+      ['PERSONA_DM_KEYS', PERSONA_DM_KEYS],
+      ['CHANNEL_ENTRY_KEYS', CHANNEL_ENTRY_KEYS],
+      ['PRE_PERSONA_KEYS', PRE_PERSONA_KEYS],
+      ['SERVER_PATH_SETTINGS', SERVER_PATH_SETTINGS],
+      ['DESTRUCTIVE_SETTINGS', DESTRUCTIVE_SETTINGS],
+      ['IN_PLACE_SETTINGS', IN_PLACE_SETTINGS],
+      ['NEXT_LAUNCH_SETTINGS', NEXT_LAUNCH_SETTINGS],
+    ]
+
+    test('the switch is named, and neither key is in any public key list or reload class', () => {
+      expect(TEST_MEASUREMENTS_KEY).toBe('test_measurements')
+      expect(TEST_TIMER_OVERRIDE_KEYS).toContain('queue_compact_interval_ms')
+      for (const key of [TEST_MEASUREMENTS_KEY, 'queue_compact_interval_ms']) {
+        expect(PUBLIC_LISTS.filter(([, list]) => list.includes(key)).map(([name]) => name)).toEqual([])
+      }
+    })
+
+    test('the unset path: neither key resolves to a value, the compaction keeps its production interval, and no override line is due', () => {
+      const unset = load(makePersonaConfigInput({}, dir))
+      expect(Object.hasOwn(unset, TEST_MEASUREMENTS_KEY)).toBe(false)
+      expect(Object.hasOwn(unset, TEST_TIMER_OVERRIDES_KEY)).toBe(false)
+      // Setting the keys adds only them: the rest of the resolved configuration is the unset one.
+      for (const measurements of [true, false]) {
+        expect(without(load(withBoth(measurements, 500)), TEST_MEASUREMENTS_KEY, TEST_TIMER_OVERRIDES_KEY)).toStrictEqual(without(unset))
+      }
+      expect(effectiveTestTimer('queue_compact_interval_ms', unset.test_timer_overrides)).toBe(QUEUE_COMPACT_INTERVAL_MS)
+      expect(buildTestTimerOverridesLine(unset.test_timer_overrides)).toBeUndefined()
+    })
+
+    test.each([true, false])('test_measurements %p loads and is kept as given', (value) => {
+      expect(load(withSwitch(value)).test_measurements).toBe(value)
+    })
+
+    // Refused as test_mcp_drop_endpoint is: the same rule, the same full message with only the key's name changed.
+    test.each<[string, unknown]>([
+      ['null', null],
+      ['zero', 0],
+      ['one', 1],
+      ['a string', 'true'],
+      ['an object', {}],
+      ['an array', []],
+      ['the leak sentinel as a string', LEAK_SENTINEL],
+      ['a fake token as a string', fakeToken(BOT_TOKEN_PREFIX, 'measurements')],
+      ['an object holding the leak sentinel', { value: LEAK_SENTINEL }],
+    ])('test_measurements %s is refused as test_mcp_drop_endpoint is, naming the key and never the value', (_label, value) => {
+      const message = loadError(withSwitch(value))
+      expect(message).toBe(
+        `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+          `${TEST_MEASUREMENTS_KEY} must be a boolean.`,
+      )
+      const drop = loadError({ ...makePersonaConfigInput({}, dir), [TEST_MCP_DROP_ENDPOINT_KEY]: value })
+      expect(message).toBe(drop.replace(TEST_MCP_DROP_ENDPOINT_KEY, TEST_MEASUREMENTS_KEY))
+    })
+
+    /** A switch state: test_measurements and queue_compact_interval_ms, each absent when undefined. */
+    type Switches = [measurements: boolean | undefined, interval: number | undefined]
+    test.each<[string, Switches, Switches]>([
+      ['both added', [undefined, undefined], [true, 500]],
+      ['both removed', [true, 500], [undefined, undefined]],
+      ['both changed', [false, 250], [true, 500]],
+    ])('%s: a reload changes no setting and keeps both start-time values in effect', (_label, [startMeasurements, startInterval], [nextMeasurements, nextInterval]) => {
+      const input = (measurements: boolean | undefined, interval: number | undefined) => ({
+        ...makePersonaConfigInput({}, dir),
+        ...(measurements === undefined ? {} : { [TEST_MEASUREMENTS_KEY]: measurements }),
+        ...(interval === undefined ? {} : { [TEST_TIMER_OVERRIDES_KEY]: { queue_compact_interval_ms: interval } }),
+      })
+      const start = load(input(startMeasurements, startInterval))
+      const next = load(input(nextMeasurements, nextInterval))
+      const plan = buildChangePlan(start, { kind: 'valid', config: next }, { realPath: path => path, home, dryRun: true })
+      if (!plan.valid) throw new Error('expected a valid plan')
+      expect(plan.settings).toEqual([])
+      expect(plan.noEffectiveChange).toBe(true)
+      const inEffect = configInEffect(start, next)
+      expect(inEffect.test_measurements).toBe(start.test_measurements)
+      expect(inEffect.test_timer_overrides).toEqual(start.test_timer_overrides)
+      expect(effectiveTestTimer('queue_compact_interval_ms', inEffect.test_timer_overrides)).toBe(startInterval ?? QUEUE_COMPACT_INTERVAL_MS)
     })
   })
 

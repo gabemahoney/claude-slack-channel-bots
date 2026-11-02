@@ -26,6 +26,9 @@ import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
+import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -5539,6 +5542,263 @@ describe('main() reads the test-only timer override block once, right after the 
 
 // / D8: runtime unit suites use injected clients and
 // clocks; these bindings prove the server shares that ownership in main.
+describe('test-only measurement wiring (Decision 25)', () => {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const main = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'main') as ts.FunctionDeclaration
+  const statements = [...main.body!.statements]
+  const statementAt = (at: number) => statements.findIndex(node => node.getStart(tree) <= at && at < node.end)
+  const enabledAt = statements.findIndex(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(d => d.name.getText(tree) === 'testMeasurementsEnabled'))
+  const branchAt = statements.findIndex(node => ts.isIfStatement(node) && node.expression.getText(tree) === 'testMeasurementsEnabled')
+  const installAt = statementAt(onlyCallOf('installTestTimerOverrides'))
+  const branch = statements[branchAt]!
+  const shutdown = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'shutdown') as ts.FunctionDeclaration
+  const stopAt = onlyCallOf('testMeasurements\\.stop')
+  const stopStatement = shutdown.body!.statements.find(node => node.getStart(tree) <= stopAt && stopAt < node.end)!
+  const detachAt = onlyCallOf('unsubscribeTestMeasurements\\?\\.')
+  // Include the guard and await, not just the call inside the statement.
+  const stopCode = SERVER_CODE.slice(stopStatement.getStart(tree), detachAt + 'unsubscribeTestMeasurements?.()'.length)
+  const exitStatement = shutdown.body!.statements.find(node => node.getText(tree) === 'process.exit(exitCode)')!
+  const roots: string[] = [], stops: Array<() => Promise<void>> = []
+  afterEach(async () => {
+    for (const stop of stops.splice(0)) await stop()
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+  })
+
+  /** Execute the actual start binding and reload callback over isolated ports.
+   * This does not call main or model a complete server start/stop. */
+  function wired(enabled: boolean | undefined, interval?: number, throws?: 'record' | 'queue-mapper' | 'post-mapper') {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-measurement-wiring-')); roots.push(root)
+    const config = makeMultiPersonaConfig([], root, {
+      ...(enabled === undefined ? {} : { test_measurements: enabled }),
+      ...(interval === undefined ? {} : { test_timer_overrides: { queue_compact_interval_ms: interval } }),
+    })
+    const clock = createFakeClock({ start: 555.25 }), logs: string[] = []
+    const flags: boolean[] = [], intervals: Array<[string, number]> = [], recorded: TestMeasurement[] = []
+    const forwarded: QueueEvent[] = [], original = (event: QueueEvent) => { forwarded.push(event) }
+    const deliveryQueueEvents = { emit: original }
+    const postHoldDeps: Pick<PostHoldsModule.PostHoldResolverDeps, 'onEvent'> = {}
+    let created = 0, unrefs = 0
+    const result = expression<() => { stop(): Promise<void>; apply(config: PersonaConfig): void; recorder(): TestMeasurements | undefined }>(`() => {
+      let personaConfig = config, appliedConfig = config;
+      let testMeasurements, unsubscribeTestMeasurements;
+      ${statements.slice(installAt, branchAt + 1).map(node => node.getText(tree)).join('\n')}
+      return { stop: async () => { ${stopCode} }, apply: ${onlyCallProps('createReloadController').get('onApplied')!}, recorder: () => testMeasurements };
+    }`, {
+      config, installTestTimerOverrides, configInEffect,
+      deliveryPreparation: undefined, sharedStateReporting: undefined,
+      deliveryQueue: { setMeasureTimings: (value: boolean) => { flags.push(value) }, startMaintenance: (ms: number) => { intervals.push(['queue', ms]) } },
+      threadMemory: { startMaintenance: (ms: number) => { intervals.push(['memory', ms]) } },
+      STATE_DIR: root, join, TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine,
+      fsPromises: fs.promises, appendFileSync: fs.appendFileSync,
+      setTimeout: (callback: () => void, ms: number) => Object.assign(clock.setTimeout(callback, ms), { unref() { unrefs++ } }),
+      clearTimeout: clock.clearTimeout, console: { error: (line: string) => { logs.push(line) } },
+      deliveryQueueEvents, postHoldDeps,
+      queueEventMeasurement: (event: QueueEvent) => { if (throws === 'queue-mapper') throw new Error('observer failed'); return queueEventMeasurement(event) },
+      postHoldEventMeasurement: (event: PostHoldsModule.PostHoldEvent) => { if (throws === 'post-mapper') throw new Error('observer failed'); return postHoldEventMeasurement(event) },
+      createTestMeasurements: (deps: TestMeasurementsDeps) => {
+        created++
+        const recorder = createTestMeasurements({ ...deps, monotonicNow: clock.now })
+        return { ...recorder, record(entry: TestMeasurement) { if (throws === 'record') throw new Error('observer failed'); recorded.push(entry); recorder.record(entry) } }
+      },
+    })
+    const run = result(); stops.push(run.stop)
+    return { ...run, root, config, clock, logs, flags, intervals, recorded, forwarded, deliveryQueueEvents, original, postHoldDeps,
+      created: () => created, unrefs: () => unrefs, path: join(root, TEST_MEASUREMENTS_FILE_NAME) }
+  }
+
+  test('one strict switch read follows the one start resolution beside test_mcp_drop_endpoint; all measurement effects are in its true branch', () => {
+    expect(enabledAt).toBeGreaterThan(installAt)
+    expect(branchAt).toBe(enabledAt + 1)
+    expect(statements[enabledAt]!.getText(tree)).toBe('const testMeasurementsEnabled = personaConfig.test_measurements === true')
+    expect(statements[enabledAt - 1]!.getText(tree)).toBe('if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)')
+    expect(statements[enabledAt - 2]!.getText(tree)).toBe('const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true')
+    expect(indicesOf(/\btest_measurements\b/g, SERVER_CODE)).toHaveLength(1)
+    expect(callsOf('reload\\.resolveStart')).toHaveLength(1)
+    expect(statements[enabledAt]!.getStart(tree)).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
+    for (const name of ['createTestMeasurements', 'buildTestMeasurementsStartLine', 'queueEventMeasurement', 'postHoldEventMeasurement']) {
+      expect(importSource(SERVER_CODE, name)).toBe('./test-measurements.ts')
+      const at = onlyCallOf(name)
+      expect(at).toBeGreaterThan(branch.getStart(tree))
+      expect(at).toBeLessThan(branch.end)
+    }
+    expect(onlyCallArgs('deliveryQueue\\.setMeasureTimings')).toEqual(['true'])
+    expect(onlyCallOf('deliveryQueue\\.setMeasureTimings')).toBeGreaterThan(branch.getStart(tree))
+    expect(onlyCallOf('deliveryQueue\\.setMeasureTimings')).toBeLessThan(branch.end)
+    for (const factory of ['createDeliveryQueue', 'createThreadMemory']) {
+      expect(onlyCallProps(factory).has('measureTimings')).toBe(false)
+      expect(onlyCallProps(factory).has('monotonicNow')).toBe(false)
+    }
+    expect(onlyCallProps('createThreadMemory').get('onEvent')).toBe('event => threadMemoryEvents.emit(event)')
+    expect(SERVER_CODE).not.toMatch(/thread-memory-loaded|threadMemoryEventMeasurement/)
+    expect(onlyCallProps('createTestMeasurements').get('fs')).toBe('{ appendFile: fsPromises.appendFile, appendFileSync }')
+    expect(onlyCallProps('createTestMeasurements').get('path')).toBe('path')
+    expect(branch.getText(tree)).toContain('join(STATE_DIR, TEST_MEASUREMENTS_FILE_NAME)')
+    // No measurement construction/option can run from the reload callback.
+    expect(onlyCallProps('createReloadController').get('onApplied')).not.toMatch(/[Mm]easure|startMaintenance|installTestTimer/)
+  })
+
+  test('both maintenance calls immediately follow overrides outside the switch, with no executed await from the old site through binding', () => {
+    expect(statements.slice(installAt + 1, installAt + 3).map(node => node.getText(tree))).toEqual([
+      'deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)',
+      'threadMemory.startMaintenance(testTimers.queueCompactIntervalMs)',
+    ])
+    for (const name of ['deliveryQueue', 'threadMemory']) {
+      expect(onlyCallArgs(`${name}\\.startMaintenance`)).toEqual(['testTimers.queueCompactIntervalMs'])
+      expect(atMainTopLevel(SERVER_CODE, onlyCallOf(`${name}\\.startMaintenance`))).toBe(true)
+    }
+    const oldSite = statementAt(onlyCallOf('createDeliveryPreparation'))
+    const yields: string[] = []
+    const visit = (node: ts.Node): void => {
+      // Callback bodies are only declared here; the code review separately
+      // checks the constructors and resolveStart do not invoke them.
+      if (ts.isFunctionLike(node)) return
+      if (ts.isAwaitExpression(node) || ts.isYieldExpression(node)) yields.push(node.getText(tree))
+      ts.forEachChild(node, visit)
+    }
+    expect(oldSite).toBeLessThan(installAt)
+    statements.slice(oldSite, branchAt + 1).forEach(visit)
+    expect(yields).toEqual([])
+    expect(branch.end).toBeLessThan(onlyCallOf('threadMemory\\.activate'))
+    const loop = statements.find(node => ts.isForOfStatement(node) && node.getText(tree).includes(`${START_RECOVERY_STEP}(`))!
+    expect(loop.getStart(tree)).toBeGreaterThan(branch.end)
+    expect(onlyCallProps('createDeliveryQueue').get('onLoadedAfterStart')).toContain('if (!queueStartRecovered || shuttingDown) return')
+    expect(SERVER_CODE).toMatch(/let queueStartRecovered = false/)
+    expect(SERVER_CODE.indexOf('queueStartRecovered = true')).toBeGreaterThan(loop.end)
+  })
+
+  test.each([undefined, false, true].flatMap(enabled => [undefined, 37].map(interval => ({ enabled, interval }))))(
+    'switch=$enabled, interval=$interval: maintenance takes the override or hourly default', async ({ enabled, interval }) => {
+      const h = wired(enabled, interval)
+      expect(h.intervals).toEqual([['queue', interval ?? QUEUE_COMPACT_INTERVAL_MS], ['memory', interval ?? QUEUE_COMPACT_INTERVAL_MS]])
+      await h.stop()
+      assertNoLeak(h.logs)
+    },
+  )
+
+  test.each([undefined, false])('switch=%s: no recorder, flag, observer, file or line at binding or stop, including after reload turns it on', async enabled => {
+    const h = wired(enabled)
+    expect(h.created()).toBe(0)
+    expect(h.recorder()).toBeUndefined()
+    expect(h.flags).toEqual([])
+    expect(h.deliveryQueueEvents.emit).toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeUndefined()
+    h.apply({ ...h.config, test_measurements: true })
+    h.deliveryQueueEvents.emit({ type: 'fixed-stored', key: 'reader', seq: 7, storeMs: 4, atMonoMs: 90 })
+    await h.stop()
+    expect(h.created()).toBe(0)
+    expect(h.flags).toEqual([])
+    expect(h.deliveryQueueEvents.emit).toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeUndefined()
+    expect(h.logs).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(existsSync(h.path)).toBe(false)
+    expect(readdirSync(h.root)).toEqual([])
+    expect(h.forwarded).toHaveLength(1)
+    assertNoLeak(h.logs)
+  })
+
+  test('enabled: timed queue facts and saved Post Holds reach the file, timer is unref\'d, reload keeps the observer, stop detaches it', async () => {
+    const h = wired(true)
+    expect(h.created()).toBe(1)
+    expect(h.flags).toEqual([true])
+    expect(h.logs).toEqual([buildTestMeasurementsStartLine(h.path)])
+    expect(h.deliveryQueueEvents.emit).not.toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeFunction()
+    const events: QueueEvent[] = [
+      { type: 'stored', key: 'reader', seq: 7, store: 'accepted', storeMs: 2, atMonoMs: 80 },
+      { type: 'fixed-stored', key: 'reader', seq: 7, storeMs: 4, atMonoMs: 90 },
+      { type: 'holds-resolved', key: 'reader', resolutions: [{ seq: 8, outcome: 'released', at: 999 }], storeMs: 3, atMonoMs: 100 },
+      { type: 'stored', key: 'reader' },
+    ]
+    events.forEach(event => h.deliveryQueueEvents.emit(event))
+    const observer = h.postHoldDeps.onEvent
+    h.apply({ ...h.config, test_measurements: false })
+    expect(h.postHoldDeps.onEvent).toBe(observer)
+    h.postHoldDeps.onEvent!({ kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart' })
+    expect(h.unrefs()).toBe(1)
+    expect(h.forwarded).toEqual(events)
+    expect(h.recorded).toHaveLength(4)
+    await h.stop()
+    const records = readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(records).toEqual([
+      { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'accepted', store_ms: 2, at_mono_ms: 80 },
+      { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'fixed', store_ms: 4, at_mono_ms: 90 },
+      { v: 1, kind: 'resolution-store', key: 'reader', seqs: [8], store_ms: 3, at_mono_ms: 100 },
+      { v: 1, kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart', at_mono_ms: 555.25 },
+    ])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.deliveryQueueEvents.emit).toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeUndefined()
+    expect(h.created()).toBe(1)
+    assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
+  })
+
+  test.each(['record', 'queue-mapper', 'post-mapper'] as const)('a throwing %s observer cannot escape or suppress ordinary queue reporting', async throws => {
+    const h = wired(true, undefined, throws)
+    const event: QueueEvent = { type: 'stored', key: 'reader', seq: 1, store: 'accepted', storeMs: 2, atMonoMs: 3 }
+    expect(() => h.deliveryQueueEvents.emit(event)).not.toThrow()
+    expect(h.forwarded).toEqual([event])
+    expect(() => h.postHoldDeps.onEvent!({ kind: 'post-hold-resolved', key: 'reader', seq: 1, outcome: 'released', cause: 'timer', heldMs: 9 })).not.toThrow()
+    // Both observers are synchronous and contain no await or return of a
+    // recorder promise into intake/store/ack/resolution. Those flows themselves
+    // remain covered by their production-module suites, not this slice.
+    expect(branch.getText(tree)).not.toMatch(/\bawait\b/)
+    await h.stop()
+    assertNoLeak({ logs: h.logs, ...(existsSync(h.path) ? { file: writtenFile(h.path) } : {}) })
+  })
+
+  test('recorder stop follows both resolvers, queue drain and Thread Memory/seal stops, then detaches the observers', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stop = onlyCallOf('testMeasurements\\.stop'), detach = onlyCallOf('unsubscribeTestMeasurements\\?\\.')
+    expect(stop).toBeGreaterThan(start)
+    expect(detach).toBeLessThan(end)
+    for (const name of ['memoryHolds', 'postHolds', 'deliveryQueue', 'threadMemory', 'threadMemorySeal']) {
+      expect(onlyCallOf(`${name}\\?\\.stop`)).toBeLessThan(stop)
+    }
+    expect(onlyCallOf('threadMemoryRetries\\?\\.stopSeal')).toBeLessThan(stop)
+    expect(SERVER_CODE.slice(stopStatement.getStart(tree), detach).trim()).toBe('if (testMeasurements) await testMeasurements.stop()')
+    expect(detach).toBeLessThan(exitStatement.getStart(tree))
+    const cleanup: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && node.left.getText(tree) === 'unsubscribeTestMeasurements') cleanup.push(node.right.getText(tree))
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+    expect(cleanup).toEqual(['() => { deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent }'])
+  })
+
+  test.each([undefined, false, true])('shutdown switch=%s: disabled adds no yield; enabled waits before detach and exit', async enabled => {
+    const h = wired(enabled), order: string[] = []
+    const gate = Promise.withResolvers<void>()
+    const recorder = h.recorder()
+    // Execute the actual measurement shutdown statement and detach, followed
+    // by the actual exit statement as a marker. Unrelated shutdown drains are
+    // omitted here; their relative order is pinned above.
+    const stop = expression<() => Promise<void>>(`async () => {
+      ${stopCode}
+      ${exitStatement.getText(tree)}
+    }`, {
+      testMeasurements: recorder && { stop: () => { order.push('stop'); return gate.promise } },
+      unsubscribeTestMeasurements: () => { order.push('detach') },
+      process: { exit: (code: number) => { order.push(`exit:${code}`) } }, exitCode: 0,
+    })
+    const stopped = stop()
+    try {
+      if (enabled) {
+        expect(order).toEqual(['stop'])
+        await h.clock.flush()
+        expect(order).toEqual(['stop'])
+      } else {
+        // Check before yielding even one microtask: awaiting an absent recorder
+        // would postpone these effects and change production's disabled path.
+        expect(order).toEqual(['detach', 'exit:0'])
+      }
+    } finally { gate.resolve(); await stopped }
+    expect(order).toEqual(enabled ? ['stop', 'detach', 'exit:0'] : ['detach', 'exit:0'])
+    await h.stop()
+  })
+})
+
 describe('delivery ownership wiring', () => {
   test('main installs the same lifecycle in the session manager and engines before the start bring-up', () => {
     const built = onlyCallOf('createDeliveryLifecycle')
@@ -6141,8 +6401,8 @@ describe('Thread Memory server lifecycle wiring', () => {
     // A failed seal result never gates replay; only a shutdown interrupts it.
     expect(SERVER_CODE.slice(read, onlyCallOf('deliveryQueue\\.start') + 'deliveryQueue.start()'.length).replace(/\s+/g, ' ').trim())
       .toBe('threadMemory.readAtStart() await threadMemorySeal.loadAtStart(threadMemory.journalFacts()) if (shuttingDown) return await deliveryQueue.start()')
-    expect(SERVER_CODE.slice(onlyCallOf('deliveryQueue\\.startMaintenance'), onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim()).toBe('deliveryQueue.startMaintenance()')
-    expect(onlyCallArgs('threadMemory\\.startMaintenance')).toEqual([])
+    expect(SERVER_CODE.slice(onlyCallOf('deliveryQueue\\.startMaintenance'), onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim()).toBe('deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)')
+    expect(onlyCallArgs('threadMemory\\.startMaintenance')).toEqual(['testTimers.queueCompactIntervalMs'])
   })
 
   test('thread-view subscription and awaited activation follow the recovered choice adapter and precede membership, connections and bring-up', () => {
@@ -6893,11 +7153,13 @@ describe('Memory Hold server wiring', () => {
     const factory: keyof typeof PostHoldsModule = 'createPostHoldResolver'
     expect(importSource(SERVER_CODE, factory)).toBe('./post-holds.ts')
     declaredOnce('postHolds')
-    expect(assignmentsTo('postHolds').map(({ value }) => value)).toEqual([`${factory}({`])
+    expect(assignmentsTo('postHolds').map(({ value }) => value)).toEqual([`${factory}(postHoldDeps)`])
     const created = onlyCallOf(factory), memory = onlyCallProps('createMemoryHoldResolver')
     expect(atMainTopLevel(SERVER_CODE, created)).toBe(true)
-    // No event port until a consumer exists; parked holds go to k8's live resolution, the hook's own guard.
-    expect(Object.fromEntries(onlyCallProps(factory))).toEqual({
+    // The retained dependency object has no observer at construction; the
+    // test-only consumer is bound after start resolution, only when enabled.
+    expect(onlyCallArgs(factory)).toEqual(['postHoldDeps'])
+    expect(Object.fromEntries(objectProperties(spreadConstObject('postHoldDeps')))).toEqual({
       canRun: memory.get('canRun')!, queue: 'deliveryQueue', owner: 'ownPostJoins',
       release: memory.get('release')!, onParked: 'key => resolveMemoryHolds(key)',
       clock: 'HOLD_CLOCK', decisionNow: memory.get('now')!,
@@ -6927,7 +7189,7 @@ describe('Memory Hold server wiring', () => {
     const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
     expect(named).toHaveLength(3)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    expect(withinCall(named, onlyCallOf('createPostHoldResolver'))).toBe(1)
+    expect(objectProperties(spreadConstObject('postHoldDeps')).get('clock')).toBe(name)
     expect(onlyCallProps('createPersonaRouting').get('monotonicNow')).toBe(`${name}.now`)
     expect(serverInitializer(name)).not.toMatch(/\bDate\b/)
     const calls: unknown[][] = [], timer = { unref: () => { calls.push(['unref']) } }

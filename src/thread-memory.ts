@@ -290,6 +290,8 @@ export interface ThreadMemoryOptions {
   setCreated(key: string): { kind: 'saved' | 'failed' } | Promise<{ kind: 'saved' | 'failed' }>
   clearCreated(key: string): { kind: 'saved' | 'failed' } | Promise<{ kind: 'saved' | 'failed' }>
   onEvent?(event: ThreadMemoryEvent): void
+  /** The maintenance compaction interval; `QUEUE_COMPACT_INTERVAL_MS` unless given. */
+  compactIntervalMs?: number
 }
 export interface ThreadMemory {
   readAtStart(): void
@@ -336,7 +338,7 @@ export interface ThreadMemory {
   forget(key: string): void
   remove(key: string): Promise<ThreadMemoryWriteResult>
   removeUnappliedAtStart(): Promise<void>
-  startMaintenance(): void
+  startMaintenance(intervalMs?: number): void
   quiesce(): Promise<void>
   stop(): Promise<void>
 }
@@ -1123,9 +1125,9 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     compact,
     forget(key) { forgotten.add(key); journals.delete(key); pendingJoins.delete(key) },
     remove, removeUnappliedAtStart,
-    startMaintenance() {
+    startMaintenance(intervalMs) {
       if (stopped || quiesced || timer !== undefined) return
-      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, QUEUE_COMPACT_INTERVAL_MS)
+      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
       timer.unref?.()
     },
     async quiesce() {

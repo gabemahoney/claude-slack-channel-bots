@@ -105,6 +105,9 @@ import { dirname, join, relative, resolve, sep } from 'node:path'
 
 import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import ts from 'typescript'
+import { serializeTestMeasurement, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
+import { ackVerdict, storeVerdict, postHoldVerdict, n2Verdict, lookupFaultVerdicts, printResults, envelopeTimings } from './integration/fixtures/sr8-evidence.ts'
+import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { balancedAfter, callArguments, callsOf, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 
 /** The repository root (the parent of tests/). */
@@ -126,6 +129,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/shared-state-reports\.ts$/, 'shared-state notice builders and reporter carry authority failure text, configured identities and paths into Slack notices and diagnostic lines'],
   [/^src\/shared-recovery\.ts$/, 'damaged authority evidence, prepared input and recovery request parsing'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
+  [/^src\/test-measurements\.ts$/, 'test-only records project queue and Post Hold metadata; write diagnostics carry configured paths and redacted storage failure codes'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
   [/^src\/persona-bringup\.ts$/, 'the local bring-up checks, which read the credentials file'],
   [/^src\/persona-bringup-controller\.ts$/, 'the bring-up controller, which reads credentials and holds their digests'],
@@ -197,6 +201,8 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
   'tests/test-helpers/thread-memory.ts': {
+    populationConfig: 'builds SR-8 persona configuration through the shared channel builders',
+    seedUnitPopulation: 'reads the applied shared configuration and seeds its Thread Memory journal',
     threadConfig: 'builds Thread Memory persona configuration',
     makeThreadMemoryHarness: 'builds applied configuration and captures Thread Memory reports and storage failures',
     makeThreadMembershipHarness: 'builds authenticated membership and Thread Memory composition',
@@ -298,6 +304,91 @@ describe('shared fixture evidence secrecy', () => {
     for (const planted of [{ ...emitted[0], ticket }, { ...emitted[0], token }, { ...emitted[0], text: LEAK_SENTINEL }]) {
       expect(Object.keys(planted).sort()).not.toEqual([...fields[event]!].sort())
     }
+  })
+  test.each(['users.info', 'conversations.info', 'users.conversations'].flatMap(method =>
+    ['hang', 'delay', 'late'].map(outcome => [method, outcome])))('%s %s fault arrival projection contains only numeric clocks', (method, outcome) => {
+    const call = calls.find(c => (c.arguments[0] as ts.StringLiteral).text === 'fault')!
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'arrival-evidence')
+    const bindings = { pushFieldText, index: 0, method, label: token, requestId: 'request', call: 1,
+      fault: { outcome, text: LEAK_SENTINEL, token, body: { channels: [{ name: LEAK_SENTINEL }], token } }, args: { user: token, channel: token },
+      body: { text: LEAK_SENTINEL, token },
+      arrivalMonoMs: 123.5, arrivalEpochMs: 1800000000000 }
+    const emitted: Record<string, unknown>[] = []
+    new Function('record', ...Object.keys(bindings), call.getText(ast))((_kind: string, row: Record<string, unknown>) => emitted.push(row), ...Object.values(bindings))
+    expect(emitted).toHaveLength(1)
+    expect(Object.keys(emitted[0]!).sort()).toEqual(['control', 'fault_index', 'method', 'label', 'request_id', 'matching_call', 'outcome',
+      'arrival_mono_ms', 'arrival_epoch_ms', ...(method === 'users.conversations' ? [] : ['match'])].sort())
+    expect(emitted[0]!.arrival_mono_ms).toBe(bindings.arrivalMonoMs)
+    expect(emitted[0]!.arrival_epoch_ms).toBe(bindings.arrivalEpochMs)
+    assertNoLeak(emitted)
+  })
+  test.each([false, true])('late settlement projects socket_open with aborted=%s and no request data', aborted => {
+    const call = calls.find(c => (c.arguments[0] as ts.StringLiteral).text === 'fault-settled')!
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'late-settlement')
+    const req = { signal: { aborted, token }, headers: { authorization: token }, body: LEAK_SENTINEL }
+    const emitted: Record<string, unknown>[] = []
+    new Function('record', 'requestId', 'resolution', 'req', call.getText(ast))(
+      (_kind: string, row: Record<string, unknown>) => emitted.push(row), 'request', 'late', req)
+    expect(emitted).toEqual([{ request_id: 'request', resolution: 'late', socket_open: !aborted }])
+    assertNoLeak(emitted)
+  })
+})
+
+describe('SR-8 measurement evidence secrecy', () => {
+  const poison = () => ({ token: fakeToken(BOT_TOKEN_PREFIX, 'sr8-evidence'), text: LEAK_SENTINEL,
+    headers: { authorization: fakeToken(BOT_TOKEN_PREFIX, 'sr8-header') }, error: new Error(LEAK_SENTINEL) })
+
+  test('bulk envelope timings omit credential-bearing observation fields', () => {
+    const extra = poison()
+    const rows = [
+      { ...extra, event: 'push', envelope_id: 'original', sent_mono_ms: 1, connection_id: 'old' },
+      { ...extra, event: 'push', envelope_id: 'replay', sent_mono_ms: 2, connection_id: 'new' },
+      { ...extra, event: 'ws-message', envelope_id: 'replay', ack_mono_ms: 3, connection_id: 'new' },
+      { ...extra, event: 'api', body: extra },
+    ]
+    const timings = envelopeTimings(['original', 'replay'], rows)
+    expect(timings).toEqual([
+      { envelope_id: 'original', push: { sent_mono_ms: 1, connection_id: 'old' }, acks: [] },
+      { envelope_id: 'replay', push: { sent_mono_ms: 2, connection_id: 'new' },
+        acks: [{ ack_mono_ms: 3, connection_id: 'new' }] },
+    ])
+    assertNoLeak({ timings, lines: timings.map(row => JSON.stringify(row)) })
+  })
+
+  test.each(['stored', 'fixed-stored', 'holds-resolved', 'post-hold-resolved'] as const)('%s records only projected measurement fields', kind => {
+    const extra = poison()
+    const event = { ...extra, type: kind, kind, key: 'alpha', seq: 1, store: 'accepted' as const, storeMs: 2,
+      atMonoMs: 10, resolutions: [{ ...extra, seq: 1, outcome: 'released' as const, at: 10 }],
+      outcome: 'released' as const, cause: 'timer' as const, heldMs: 3 }
+    const projected = kind === 'post-hold-resolved' ? postHoldEventMeasurement(event as Parameters<typeof postHoldEventMeasurement>[0]) :
+      queueEventMeasurement(event as Parameters<typeof queueEventMeasurement>[0])
+    expect(projected).toBeDefined()
+    const record = { ...projected!, ...extra, v: 1, at_mono_ms: 10 } as TestMeasurementRecord
+    const line = serializeTestMeasurement(record)
+    const expected = kind === 'holds-resolved' ? { v: 1, kind: 'resolution-store', at_mono_ms: 10, key: 'alpha', seqs: [1], store_ms: 2 } :
+      kind === 'post-hold-resolved' ? { v: 1, kind, at_mono_ms: 10, key: 'alpha', seq: 1, outcome: 'released', cause: 'timer', held_ms: 3 } :
+      { v: 1, kind: 'store', at_mono_ms: 10, key: 'alpha', seq: 1, store: kind === 'stored' ? 'accepted' : 'fixed', store_ms: 2 }
+    expect(JSON.parse(line)).toEqual(expected)
+    assertNoLeak({ projected, line })
+  })
+
+  test.each(['pass', 'fail', 'missing'] as const)('recorded sr8 %s lines omit credential-bearing input fields', verdict => {
+    const extra = poison(), accepted = [{ ...extra, key: 'alpha', seq: 1 }]
+    const rows = verdict === 'missing' ? undefined : [{ ...extra, v: 1, kind: 'store', key: 'alpha', seq: 1,
+      store: 'accepted', store_ms: verdict === 'fail' ? 1e6 : 1, at_mono_ms: 1 }]
+    const times = verdict === 'missing' ? undefined : [{ ...extra, envelope_id: 'envelope', push: { ...extra, sent_mono_ms: 1, connection_id: 'socket' },
+      acks: [{ ...extra, ack_mono_ms: verdict === 'fail' ? 1e6 : 2, connection_id: 'socket' }] }]
+    const probes = [{ ...extra, key: 'alpha', method: 'users.info', outcome: 'late', match: 'sender', envelope_id: 'envelope' }]
+    const faults = [{ ...extra, event: 'fault', control: 'faults', label: 'alpha', method: 'users.info', outcome: 'late', match: 'sender', arrival_mono_ms: 1 }]
+    const results = [ackVerdict('ack', ['envelope'], times), storeVerdict(rows, accepted, percentile),
+      postHoldVerdict(rows, accepted, 1), n2Verdict([{ ...extra, key: 'alpha', seq: 1, name: extra.token }], 1),
+      ...lookupFaultVerdicts(probes, faults, times)]
+    expect(results.slice(0, 2).map(r => r.verdict)).toEqual([verdict, verdict])
+    const lines: string[] = []
+    printResults({ scenario: 'secrecy', mode: 'open', population: 0, recipients: 1 }, results, line => lines.push(line))
+    expect(lines).toHaveLength(results.length + 1)
+    expect(lines.every(line => line.startsWith('recorded: sr8 '))).toBe(true)
+    assertNoLeak({ results, lines })
   })
 })
 

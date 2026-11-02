@@ -511,6 +511,203 @@ shared recipients, direct DM and every refused input/nonrecipient. Keep its
  metadata and transcript export. See the Slack stub and acknowledgement
 burst sections in `tests/README.md` for timing fields and proof boundaries.
 
+### Thread Memory performance runs
+
+Run `tests/integration/test-44-fmk-thread-burst.sh` (bursts, Post Holds and the
+large shared list), `tests/integration/test-45-fmk-membership-load.sh` and
+`tests/integration/test-48-fmk-membership-load-open.sh` (membership and
+name-lookup faults under load in strict and open mode respectively), and the
+thread phase of
+`tests/integration/test-32-fmk-real-order.sh` (real-agent latency) only through
+`/ci`. Use the packed server, acknowledgements captured from the actual
+socket, and stores on the container's real scratch storage; unit or simulated
+runs do not supply this evidence.
+
+Take populations and burst counts from `tests/test-helpers/thread-populations.ts`:
+0, 10,000 and 100,000 Joined Threads per persona across 100 eligible
+`thread_hybrid` channels, in both `strict` and `open` Channel Modes, with one
+recipient and two recipients sharing the channel. Test 44 runs all 12
+combinations in `sr8Combinations()` order: population, mode, recipients.
+These are verification populations, not product limits: check counts, every
+seeded identity (including the oldest Joined Threads), and every new burst
+root after a clean restart; forget nothing to meet a limit.
+
+Seed through production Thread Memory **before the server's first start**.
+The `seed` command in `tests/integration/fixtures/sr8-evidence.ts` first writes
+the matching `config.json.last-applied` record when absent, using production
+`initialSharedChannelState` and `serializeSharedChannelState`; it writes no
+journal or seal schema itself. Require exactly one changed-while-stopped
+report per seeded persona on the first start, stop cleanly, then measure the
+next start reopening those populations with no such report or Joins lost
+report.
+
+At population 0, omit both seeding and the first start; the measured
+start still requires no report.
+
+Per combination, submit 1,000 first-time root-mention joins, then 1,000
+unmentioned replies in those threads, plus 100 dropped unmentioned top-level
+messages. Build events with `tests/integration/lib/scenario.sh` before the
+burst, and count each recipient's actual envelopes by ID.
+
+Submit the held
+probes first, wait for their ACKs and durable Post Hold stores, then submit
+ordinary traffic while their own-post outcomes remain unresolved. Require an
+ordinary acceptance strictly between hold admission and resolution on the
+server clock, with every overlapping item's ACK meeting N1 on the stub clock.
+
+At 100,000, shorten maintenance through `queue_compact_interval_ms` and prove
+both a queue compaction and a Thread Memory compaction for each recipient
+inside the measured burst. The fixture requires two different existing
+journal file identities observed between the first push and final ACK;
+creation or a replacement first seen afterward is insufficient. Retain
+pre-compaction queue observations, including the fixture's validated
+held-admission archive, for later readers.
+
+Test 44 also keeps a new channel post unresolved for at least 120 seconds in
+each mode: replies in another user's new thread must acquire no Post Hold,
+while bot-parent and unknown-parent replies exercise timed holds. Its large
+shared-list case requires at least 1,000 channels per persona, configuration
+and ordinary preview content each above 64 KiB, growth and reopen without
+loss, and a proved write failure preserving the previous state and prepared
+input.
+
+Tests 45 (strict) and 48 (open) each run the same 14 cases through
+`tests/integration/lib/membership-load.sh`, freshly seeding and reopening
+100,000 joins for both the faulted persona P and unaffected Q in each case.
+Their `fault-plan`, `fault-burst` and `fault-check` path declares
+P's dependent work before submission, proves fault overlap with Q's burst,
+and preserves every original, refusal and replay.
+
+Dependent originals remain
+unacknowledged and unstored while withheld; recovery uses new envelopes,
+stores accepted work exactly once and judges recovery N1 from each new push.
+Q keeps the full burst and limits, P's independent traffic keeps N1, and
+intentional drops remain acknowledged and unstored.
+
+Require the case-specific evidence too: first/later membership deadlines and
+incomplete scans, retry spacing and `Retry-After`, idle repair within its
+published bound, unchanged state after an abandoned first- or later-page late
+answer, zero ACKs for an undurable live membership event with a failed write
+probe, fired hung and late `users.info`/`conversations.info` lookups, and
+overlapping durable ordered writes. Fresh senders and channels must reach the lookup rather than
+a lifetime cache; missing fault or overlap evidence cannot pass. Membership
+request deadlines use stub arrival and server diagnostic timestamps on the
+container wall clock; wall-clock steps that leave a valid interval are not
+independently detected.
+
+Test 32 runs its whole thread phase once in `strict` and once in `open` mode,
+each with fresh state and evidence and two personas seeded at 100,000 through
+the sequence above; one supplies at least 20 sequential thread-selected
+real-agent samples and the other supplies concurrent writes. Admit samples
+through the existing `real-scenario.sh` gates: fresh own-row agent-director
+`waiting`, current connection/relay/marker/lifecycle evidence, drained prior
+work and reply candidates, and controlled N2 setup without competing input.
+Transcript receipts prove delivery only; never filter out or retry a sample,
+and judge every verdict on its own mode's evidence.
+
+`real_assert_thread_latency` in `tests/integration/lib/real-scenario.sh` uses
+the `thread-latency` command in `tests/integration/fixtures/transcript-receipts.ts`
+to audit receipts and print the N2 samples and p95 verdict.
+
+In each mode, include one 500 ms delayed lookup that resolves the name and one
+hung lookup, using senders not yet resolved in that server lifetime; require
+the stub's fired record for each. The hung sample waits for fallback and is
+slow by design: nearest-rank p95 of 20 is the 19th sorted value, tolerating
+that one slow sample while retaining it. Keep the delayed sample within the
+typing limit.
+
+Start each sample's membership event and shared-state write only after its
+reply's ACK, which follows its durable admission, and record each operation's
+own start and end on the host's epoch clock. `thread-intervals` in
+`transcript-receipts.ts` takes a sample's admission from its accepted
+`received_at` and its delivery from its last durable delivered part;
+`concurrent-overlap` in `sr8-evidence.ts` credits an operation only when it
+starts at or after admission and before delivery, never by its end, and
+requires at least one credited membership event and one credited write. A
+credited start proves the operation was issued while the sample was in
+flight, not that the server handled it then.
+
+Use the one nearest-rank implementation, `percentile` exported by
+`tests/integration/fixtures/transcript-receipts.ts`: sort ascending and select
+rank `ceil(p × n)` for percentile fraction `p` and sample count `n`, without
+interpolation. The fixture owns `SR8_ACK_LIMIT_MS`, `SR8_STORE_LIMIT_MS` and
+the 100 ms `SR8_DISPATCH_ALLOWANCE_MS`; obtain production timer/budget values
+through `tests/integration/fixtures/fmk-texts.ts`, never copied script limits.
+
+| Measure | Statistic and limit |
+|---|---|
+| Receive-to-ACK (N1) | Maximum over every accepted event, held probes included, and every dropped unmentioned message: at most 3,000 ms. |
+| Durable acceptance | p99 below 50 ms over all burst acceptance stores, accepted and held items included; exclude post-ACK fixation appends from the count and percentile. Tests 45 and 48 also check each persona separately. |
+| Real-agent latency (N2) | After storage, typing p95 at most 2 seconds and receipt-confirmed delivery p95 at most 10 seconds. |
+| Held-reply resolution | Strict limit: `THREAD_REPLY_HOLD_MS` from CSCB's receipt of the Event plus that hold's own durable resolution append. Pass when excess over this limit is at most 100 ms; fail above it. Every `post-hold` line prints signed `excess_ms` and `allowance_ms`, including failed or missing results. |
+| Agent-director calls (N3) | At most `DELIVERY_MAX_AD_CALLS_PER_S` × 10 (40) per persona in every sliding half-open 10-second window of the measured phase, and none in the observed empty-queue interval. The fixture conservatively counts every CSCB call, excluding harness calls. |
+| Hung name fallback (N4) | Strict limit: `NAME_LOOKUP_TIMEOUT_MS` (2 seconds). Pass when excess is at most the same 100 ms allowance; fail above it. Every `n4` line prints `fallback_ms`, `excess_ms` and `allowance_ms`. |
+| Startup load | Record the measured start's external start-to-ready time with the seeded Joined Thread count; no pass bound. `population` is per persona; `joined` is the total across recipients. |
+
+N4 requires all four checks: fallback timing within its limit and allowance,
+delivery with the fallback name, the hung sample's ACK within N1, and its
+continued inclusion in the N2 sample set. Measure `fallback_ms` on the
+server's monotonic clock from that sample's durable accepted store to the
+start of its fixation append, matching persona key and sequence number.
+The lookup starts after the first endpoint and uses fallback before the
+second, so this interval includes dispatch and preparation; delivery follows
+the full timeout and lookup-to-delivery is not the N4 measure.
+
+The 100 ms
+allowance applies only to Post Hold resolution and N4, never to N1, store
+p99, membership deadlines, retry spacing, `Retry-After` or idle repair.
+
+Read ACK intervals from the stub's monotonic push and ACK observations.
+Store, Post Hold and name-fallback timings come from the test-only
+`test-measurements.jsonl` in the state directory: each record carries the
+server's `at_mono_ms`, and stores carry their duration. The scenario enables
+it with `test_measurements: true` in `config.json`; clean shutdown awaits its
+drain before the final read.
+
+A restart resolution without `held_ms` supplies
+no timing sample.
+
+Measure startup immediately before launching the measured start and after
+its readiness wait succeeds, on one external clock in the same container;
+exclude the first seed/seal start. The measurement file contains no load
+record. With the test-only settings absent, the server writes no measurement
+file and keeps hourly maintenance.
+
+Read results against the `recorded: sr8 conditions` line: Bun version, CPUs,
+cgroup memory limit, filesystem type, the state directory's mount and server
+peak RSS. Test 44 captures its largest two-recipient open-mode burst, Tests 45
+and 48 capture each case, and Test 32 captures each mode's thread phase while
+its measured server still exists. The fixture's output forms are:
+
+```text
+recorded: sr8 conditions bun=<version> cpus=<count> memory_limit=<limit> fs_type=<type> state_dir_mount=<mount> peak_rss_kib=<KiB>
+recorded: sr8 <measure> scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<count> <statistics> limit=<limit> verdict=<pass|fail|missing|recorded>
+recorded: sr8 summary scenario=<scenario> measures=<count> pass=<count> fail=<count> missing=<count>
+```
+
+Each verdict command prints every result line and its summary before
+returning failure for any `fail` or `missing`; a script can therefore stop
+before later cases. Keep the full emitted output, including strict limits,
+`excess_ms` and `allowance_ms`, in the CI run record. This guide records the
+method, not measured results.
+
+Missing evidence is never a pass. The `sr8-evidence.ts` header holds the full
+list and command-specific requirements; its common missing cases are:
+
+- An absent or malformed measurement file, or fewer or mismatched acceptance
+  stores than accepted burst items; fixed appends count toward neither the
+  acceptance count nor p99.
+- A push without its unique ACK, or missing push, timing, accepted-item or
+  join snapshots. The declared withholding path instead requires explicit
+  zero-ACK observations and complete recovery accounting.
+- Fewer real-agent N2 samples than required.
+- Either required compaction not proved inside the burst at 100,000.
+- A held reply without its resolution or its own key/sequence-number
+  `resolution-store` append.
+- An absent hung N2 sample or accepted/fixed record for its key/sequence number.
+- An absent fired fault for either the hung or delayed lookup sample.
+- Absent external startup timestamps or N3 idle-window observations.
+
 ## Fixture Patterns
 
 ### Factory Functions

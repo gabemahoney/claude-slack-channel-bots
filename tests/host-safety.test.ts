@@ -3150,6 +3150,70 @@ function codexCrashProtocolFindings(source: string): string[] {
   return required.filter(fragment => !source.includes(fragment)).map(() => 'codex-crash-barrier.ts: unreviewed checkpoint/boundary contract')
 }
 
+describe('SR-8 evidence execution boundaries', () => {
+  const file = 'tests/integration/fixtures/sr8-evidence.ts'
+  const source = readFileSync(join(REPO_ROOT, file), 'utf8')
+  const sf = parse(source, file)
+  const compact = (text: string) => text.replace(/\s+/g, ' ').trim()
+
+  test('imports only node builtins and has no import-time execution', () => {
+    expect(nodeOnlyImportFindings(file, sf, 'sr8-import', 'only node: builtins before the image guard')).toEqual([])
+    const names = new Set<string>()
+    const entry = sf.statements.filter(ts.isIfStatement)
+    expect(entry).toHaveLength(1)
+    expect(compact(entry[0]!.getText(sf))).toBe(compact(`if (import.meta.main) {
+      try { process.exitCode = await main(process.argv.slice(2)) }
+      catch (error) { const usage = error instanceof Error && error.message.startsWith('usage'); console.error(\`FAIL: sr8-evidence \${error instanceof EvidenceFailure ? error.reason : usage ? 'invalid command arguments' : 'evidence unavailable or invalid'}\`); process.exitCode = usage ? 64 : 1 }
+    }`))
+    const pure = (value: ts.Expression): boolean => codexPureValue(value, names) ||
+      (ts.isObjectLiteralExpression(value) && value.properties.every(p => ts.isPropertyAssignment(p)
+        && !ts.isComputedPropertyName(p.name) && codexPureValue(p.initializer, names)))
+    for (const s of sf.statements) {
+      if (staticLoadOf(s) || ts.isFunctionDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || s === entry[0]) continue
+      if (ts.isClassDeclaration(s)) {
+        expect(compact(s.getText(sf))).toBe('class EvidenceFailure extends Error { constructor(readonly reason: EvidenceReason) { super(reason) } }')
+        continue
+      }
+      expect(ts.isVariableStatement(s) && !!(s.declarationList.flags & ts.NodeFlags.Const)
+        && s.declarationList.declarations.every(d => {
+          if (!ts.isIdentifier(d.name) || !d.initializer || !pure(d.initializer)) return false
+          names.add(d.name.text); return true
+        })).toBe(true)
+    }
+  })
+
+  test('checks the image before CLI work and spawns only the guarded value printer', () => {
+    const functions = sf.statements.filter(ts.isFunctionDeclaration)
+    const main = functions.find(f => f.name?.text === 'main')!
+    expect(compact(main.body!.statements[0]!.getText(sf))).toBe(
+      "if (!existsSync('/etc/cscb-ci-image')) { console.error('FAIL: sr8-evidence requires the CI image'); return 2 }")
+    const printer = functions.find(f => f.name?.text === 'printer')!
+    expect(compact(printer.getText(sf))).toBe(compact(`function printer(name: string, ...args: string[]): string {
+      return execFileSync(process.execPath, [fixture('fmk-texts.ts'), name, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+    }`))
+    const withoutPrinter = source.slice(0, printer.getStart(sf)) + source.slice(printer.end)
+    expect(childProcessAudit(parse(withoutPrinter, file))).toEqual({ calls: 0, findings: [] })
+    const declaration = (name: string) => sf.statements.find(s => ts.isVariableStatement(s)
+      && s.declarationList.declarations.some(d => d.name.getText(sf) === name))!.getText(sf)
+    expect(compact(declaration('fixture'))).toBe('const fixture = (name: string) => join(import.meta.dir, name)')
+  })
+
+  test('thread-populations stays node-only in every load form', () => {
+    const file = 'tests/test-helpers/thread-populations.ts', sf = parseFile(join(REPO_ROOT, file))
+    expect(nodeOnlyImportFindings(file, sf, 'population-import', 'the builder is src-free')).toEqual([])
+    const loads: string[] = []
+    forEachNode(sf, node => {
+      const load = ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
+        ? stringText(node.moduleReference.expression) :
+        ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) ? stringText(node.argument.literal) : moduleLoadOf(node)
+      if (load && !load.startsWith('node:')) loads.push(load)
+      if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || ts.isIdentifier(node.expression) && node.expression.text === 'require') && load === undefined) loads.push('unreviewed dynamic load')
+    })
+    expect(loads).toEqual([])
+  })
+})
+
 describe('Codex executable inventory and import safety', () => {
   test('dual-use admission fixture has only its reviewed receipt edge and erased queue types', () => {
     const file = 'tests/integration/fixtures/ac76-admission.ts'

@@ -182,7 +182,13 @@
  *       [activatesInStrict=true|false] [absenceReplacement=<binding>]
  *       Production preview builder over caller-observed review facts, including
  *       same-value/overwrite clauses; this prints text, never computes a plan.
- *   THREAD_REPLY_HOLD_MS                        src/delivery-constants.ts
+ *   THREAD_REPLY_HOLD_MS / DELIVERY_MAX_AD_CALLS_PER_S  src/delivery-constants.ts
+ *   NAME_LOOKUP_TIMEOUT_MS                      src/tag-wrapper.ts
+ *   QUEUE_COMPACT_INTERVAL_MS                   src/delivery-queue.ts
+ *   TEST_MEASUREMENTS_KEY                       src/config.ts
+ *   TEST_MEASUREMENTS_FILE_NAME                 src/test-measurements.ts
+ *   buildTestMeasurementsStartLine <path>        src/test-measurements.ts builder;
+ *       prints the loud test-only start line, preserving the configured path.
  *   THREAD_MEMORY_SEAL_FILE                     src/thread-memory-seal.ts
  *   THREAD_MEMORY_NOT_SAVED / THREAD_MEMORY_UNREADABLE / THREAD_MEMORY_JOINS_LOST /
  *   THREAD_MEMORY_CHANGED_WHILE_STOPPED / THREAD_MEMORY_RECOVERED /
@@ -348,7 +354,9 @@
  *                                                compact, keys in the package's order; each <key>
  *                                                one of latch_recheck_interval_ms,
  *                                                ad_version_recheck_interval_ms,
- *                                                dialog_ready_timeout_ms (milliseconds),
+ *                                                dialog_ready_timeout_ms,
+ *                                                delivery_stuck_after_ms,
+ *                                                queue_compact_interval_ms (milliseconds),
  *                                                unavailable_retry_base_s,
  *                                                unavailable_retry_ceiling_s (seconds), each
  *                                                <integer> a positive integer within the
@@ -5695,6 +5703,12 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   THREAD_MEMORY_SLACK_RETRY_WARNING: constantEntry('thread-memory-reports.ts', 'THREAD_MEMORY_SLACK_RETRY_WARNING'),
   THREAD_MEMORY_OWN_POST_LOSS_WARNING: constantEntry('thread-memory-reports.ts', 'THREAD_MEMORY_OWN_POST_LOSS_WARNING'),
   THREAD_REPLY_HOLD_MS: constantEntry('delivery-constants.ts', 'THREAD_REPLY_HOLD_MS'),
+  DELIVERY_MAX_AD_CALLS_PER_S: constantEntry('delivery-constants.ts', 'DELIVERY_MAX_AD_CALLS_PER_S'),
+  NAME_LOOKUP_TIMEOUT_MS: constantEntry('tag-wrapper.ts', 'NAME_LOOKUP_TIMEOUT_MS'),
+  QUEUE_COMPACT_INTERVAL_MS: constantEntry('delivery-queue.ts', 'QUEUE_COMPACT_INTERVAL_MS'),
+  TEST_MEASUREMENTS_KEY: constantEntry('config.ts', 'TEST_MEASUREMENTS_KEY'),
+  TEST_MEASUREMENTS_FILE_NAME: constantEntry('test-measurements.ts', 'TEST_MEASUREMENTS_FILE_NAME'),
+  buildTestMeasurementsStartLine: builderEntry('test-measurements.ts', 'buildTestMeasurementsStartLine', ['path']),
   THREAD_MEMORY_SEAL_FILE: constantEntry('thread-memory-seal.ts', 'THREAD_MEMORY_SEAL_FILE'),
   buildThreadMemoryNotSavedNotice: builderEntry('thread-memory-reports.ts', 'buildThreadMemoryNotSavedNotice', ['ref', 'channels', 'path', 'step', 'error'], { channels: 'channels' }),
   buildThreadMemoryUnreadableNotice: builderEntry('thread-memory-reports.ts', 'buildThreadMemoryUnreadableNotice', ['ref', 'channels', 'path'], { channels: 'channels' }),

@@ -18,6 +18,39 @@ import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
+test.each(['users.info', 'conversations.info', 'users.conversations'])('stub arrival epoch precedes parsing and accompanies %s faults only', async method => {
+  const root = mkdtempSync(join(tmpdir(), 'stub-arrival-')), recordPath = join(root, 'record.jsonl')
+  const stub = startSlackStub({ recordPath })
+  const records = (): Record<string, any>[] => readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  try {
+    const source = readFileSync(new URL('./integration/fixtures/slack-stub-server.ts', import.meta.url), 'utf8')
+    const entry = source.slice(source.indexOf('async fetch(req, srv) {'))
+    expect(entry.indexOf('const arrivalEpochMs = Date.now()')).toBeGreaterThan(0)
+    expect(entry.indexOf('const arrivalEpochMs = Date.now()')).toBeLessThan(entry.indexOf('refreshControl()'))
+    expect(entry.indexOf('refreshControl()')).toBeLessThan(entry.indexOf('await readArgs(req)'))
+    const headers = { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'arrival-clock')}` }
+    const url = `${stub.apiUrl}${method}`
+    const before = await fetch(url, { headers }).then(r => r.text())
+    stub.setControl({ default: { faults: [{ method, outcome: 'error', error: 'internal_error' }] } } as StubControl)
+    const start = Date.now()
+    const faulted = await fetch(url, { headers }).then(r => r.json())
+    const end = Date.now()
+    expect(faulted).toEqual({ ok: false, error: 'internal_error' })
+    const faults = records().filter(r => r.event === 'fault')
+    expect(faults).toHaveLength(1)
+    expect(typeof faults[0]!.arrival_mono_ms).toBe('number')
+    expect(typeof faults[0]!.arrival_epoch_ms).toBe('number')
+    expect(faults[0]!.arrival_epoch_ms as number).toBeGreaterThanOrEqual(start)
+    expect(faults[0]!.arrival_epoch_ms as number).toBeLessThanOrEqual(end)
+    expect(faults[0]!.arrival_epoch_ms as number).toBeLessThanOrEqual(Date.parse(String(faults[0]!.ts)))
+    expect(records().filter(r => r.event === 'api' && r.request_id === faults[0]!.request_id)).toHaveLength(1)
+    stub.setControl({})
+    expect(await fetch(url, { headers }).then(r => r.text())).toBe(before)
+    expect(records().filter(r => r.event !== 'fault').some(r => 'arrival_epoch_ms' in r)).toBe(false)
+    assertNoLeak({ records: records(), faulted, before })
+  } finally { await stub.stop(); rmSync(root, { recursive: true, force: true }) }
+})
+
 function evidence() {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/delivery-wrapper/wrapper-cases.json', import.meta.url), 'utf8'))[2]
   const path = '/scenario/projects/aiac11/session.jsonl', model = 'azure/openai/gpt-6-astra'

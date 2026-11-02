@@ -56,7 +56,7 @@ import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent } from '.
 import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from './thread-memory-retry.ts'
 import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from './thread-memory-reports.ts'
 import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent } from './memory-holds.ts'
-import { createPostHoldResolver, type PostHoldResolver, type PostHoldClock } from './post-holds.ts'
+import { createPostHoldResolver, type PostHoldResolver, type PostHoldClock, type PostHoldResolverDeps } from './post-holds.ts'
 import { recoverQueuedJoins } from './thread-join-recovery.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
@@ -68,7 +68,7 @@ import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, 
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
-import { mkdirSync, promises as fsPromises } from 'fs'
+import { appendFileSync, mkdirSync, promises as fsPromises } from 'fs'
 import { assertSendable as libAssertSendable } from './lib.ts'
 import {
   expandTilde,
@@ -362,6 +362,7 @@ import {
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
+import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurements } from './test-measurements.ts'
 import {
   adAlertThresholdMsInEffect,
   adSettingsInEffect,
@@ -1153,6 +1154,8 @@ let threadMemory: ThreadMemory | undefined
 let memoryHolds: MemoryHoldResolver | undefined
 let postHolds: PostHoldResolver | undefined
 let unsubscribePostHolds: (() => void) | undefined
+let testMeasurements: TestMeasurements | undefined
+let unsubscribeTestMeasurements: (() => void) | undefined
 const HOLD_CLOCK: PostHoldClock = {
   now: () => performance.now(),
   setTimeout: (callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer },
@@ -1628,6 +1631,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await threadMemory?.stop()
   await threadMemorySeal?.stop()
   threadMemoryRetries?.stopSeal()
+  if (testMeasurements) await testMeasurements.stop()
+  unsubscribeTestMeasurements?.()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -3024,18 +3029,18 @@ export async function main(): Promise<void> {
     clock: { setTimeout: (callback, ms) => setTimeout(callback, ms), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) },
     onEvent: event => memoryHoldEvents.emit(event),
   })
-  postHolds = createPostHoldResolver({
+  // Retain the deps so the test-only observer can be bound once config resolves.
+  const postHoldDeps: PostHoldResolverDeps = {
     canRun: threadMemoryWorkAllowed,
     queue: deliveryQueue, owner: ownPostJoins,
     release: (key, item, mode) => personaRouting.releaseHeld(key, item, mode),
     onParked: key => resolveMemoryHolds(key),
     clock: HOLD_CLOCK, decisionNow: Date.now,
-  })
+  }
+  postHolds = createPostHoldResolver(postHoldDeps)
   // Events may fire within intake's view read; check only queues a microtask.
   // Include awaiting-thread: it supplies no verdict until its thread is learnt.
   unsubscribePostHolds = ownPostJoins.subscribe(event => postHolds?.check(event.key))
-  deliveryQueue.startMaintenance()
-  threadMemory.startMaintenance()
   deliveryPreparation = createDeliveryPreparation({
     queue: deliveryQueue,
     onReceived: (key, item) => deliveryReporting?.received(key, item),
@@ -3208,8 +3213,36 @@ export async function main(): Promise<void> {
   // (installed before the configuration was read) and sets B's floor. The
   // latch re-check and the retry timers below take their values from it.
   const testTimers = installTestTimerOverrides(personaConfig.test_timer_overrides, (line) => console.error(line))
+  // No await separates replay's end from here: maintenance is still armed in
+  // that same turn, now with the resolved test-only interval (hourly by default).
+  deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)
+  threadMemory.startMaintenance(testTimers.queueCompactIntervalMs)
   const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true
   if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)
+  const testMeasurementsEnabled = personaConfig.test_measurements === true
+  if (testMeasurementsEnabled) {
+    deliveryQueue.setMeasureTimings(true)
+    const path = join(STATE_DIR, TEST_MEASUREMENTS_FILE_NAME)
+    const recorder = createTestMeasurements({
+      path, fs: { appendFile: fsPromises.appendFile, appendFileSync },
+      timers: {
+        setTimeout: (callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer },
+        clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      },
+      log: line => console.error(line),
+    })
+    testMeasurements = recorder
+    console.error(buildTestMeasurementsStartLine(path))
+    const emit = deliveryQueueEvents.emit
+    deliveryQueueEvents.emit = event => {
+      try { const entry = queueEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
+      emit(event)
+    }
+    postHoldDeps.onEvent = event => {
+      try { const entry = postHoldEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
+    }
+    unsubscribeTestMeasurements = () => { deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent }
+  }
   // startup failure is local; every launch retries the write and fails closed.
   const prepareSystemPrompt = (key: string): void => {
     try {

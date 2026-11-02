@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type QueueStoreKind, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
+import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
@@ -1976,5 +1977,227 @@ describe('Memory Hold queue records', () => {
     expect(itemOpenedAt(item)).toBe(clock.now())
     expect(replay.openCount('alpha')).toBe(0)
     expect(replay.unresolvedHolds('alpha')).toEqual([])
+  })
+})
+
+describe('test-only store timings', () => {
+  // On only with measureTimings (Task t2.yiv.sf.tu Decision 23). The packed-server scenarios judge
+  // SR-8.2's store p99, SR-8.4's held reply and N4's fallback (Decision 18) from these numbers.
+  const TIMING_FIELDS: readonly string[] = ['storeMs', 'atMonoMs', 'store']
+  const SECRET = `${LEAK_SENTINEL} private timed body`
+  /** An earlier turn's append time, which a later turn waits behind, and a measured turn's own append time. */
+  const WAIT = 1_000, APPEND = 30
+  /** After every THREAD_ROOTS timestamp, so never a duplicate of their stores. */
+  const LATER_TS = '1700000000.000009'
+  const later = (text = 'message') => slackInput({ text, ts: LATER_TS, key: { ...slackInput().key!, ts: LATER_TS } })
+  const heldAt = (hold: HoldField, ts: string, text = 'message') => heldSlackInput(hold, { text, ts, key: { ...slackInput().key!, ts } })
+  const timingFields = (events: readonly QueueEvent[]) => events.flatMap(e => Object.keys(e)).filter(name => TIMING_FIELDS.includes(name))
+  /** A monotonic clock that counts its reads, over a queue fs whose journal fsyncs (inside the append,
+   * after its bytes are written) run `during` and then fail while `fail` is set. */
+  function timedRig() {
+    const rig = { mono: 50_000, reads: 0, fail: false, during: undefined as (() => void) | undefined }
+    const paths = new Map<number, string>()
+    return Object.assign(rig, {
+      monotonicNow: () => { rig.reads++; return rig.mono },
+      /** Each journal fsync advances the clock by the next of `ms`, then by nothing. */
+      costs: (...ms: number[]) => { rig.during = () => { rig.mono += ms.shift() ?? 0 } },
+      fs: { ...fs,
+        openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+        fsyncSync(fd: number) {
+          if (/\/queue\/[^/]+\.jsonl$/.test(paths.get(fd) ?? '')) { rig.during?.(); if (rig.fail) throw new Error('EIO timed store') }
+          fs.fsyncSync(fd)
+        },
+      } as typeof fs,
+    })
+  }
+  type TimedRig = ReturnType<typeof timedRig>
+  const timedQueue = (rig: TimedRig, events: QueueEvent[]) => open({ fs: rig.fs, monotonicNow: rig.monotonicNow, measureTimings: true, onEvent: e => events.push(e) })
+
+  const RESOLUTIONS: HoldResolution[] = [{ seq: 2, outcome: 'released', at: THREAD_TIME + 1 }, { seq: 3, outcome: 'withdrawn', at: THREAD_TIME + 1 }]
+  /** In order: accepted (1), Memory Hold (2) and Post Hold (3) stores, a duplicate, a drop, a failed store,
+   * a failed then a written `fixed` append, its identical repeat, two other append kinds and one resolution
+   * append for both holds, all with SECRET as the message text. Returns each call's outcome. */
+  async function drive(q: DeliveryQueue, rig: TimedRig): Promise<unknown[]> {
+    const outcomes: unknown[] = [await q.accept('alpha', slackInput({ text: SECRET }))]
+    for (const input of [heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary, SECRET), heldAt(postHold(THREAD_TIME), THREAD_ROOTS.third, SECRET)]) {
+      outcomes.push(await q.acceptDecided('alpha', input.key, () => ({ store: input })))
+    }
+    outcomes.push(await q.accept('alpha', slackInput({ text: SECRET })), await q.acceptDecided('alpha', undefined, () => ({ skip: 'drop' })))
+    rig.fail = true
+    const failed = await q.accept('alpha', later(SECRET))
+    outcomes.push(failed.status === 'failed' ? { status: failed.status, error: (failed.error as Error).message } : failed)
+    outcomes.push(await q.append('alpha', fixedRecord(1, [SECRET])).then(() => 'appended', (error: Error) => error.message))
+    rig.fail = false
+    for (const record of [fixedRecord(1, [SECRET]), fixedRecord(1, [SECRET]), sentRecord(), deliveredRecord()]) { await q.append('alpha', record); outcomes.push('appended') }
+    outcomes.push(await q.resolveHolds('alpha', RESOLUTIONS))
+    return outcomes
+  }
+
+  test.each([['absent', {}], ['false', { measureTimings: false }]] as const)('with measureTimings %s: no timing field or fixed-stored event, no clock read, the same writes and the hourly interval', async (_, gate) => {
+    const rig = timedRig(), events: QueueEvent[] = [], scheduled: number[] = []
+    rig.costs(...Array<number>(20).fill(7))
+    const q = await open({ ...gate, fs: rig.fs, now: () => THREAD_TIME, monotonicNow: rig.monotonicNow, onEvent: e => events.push(e),
+      setInterval: ((_: () => void, delay: number) => { scheduled.push(delay); return {} }) as unknown as typeof setInterval, clearInterval: () => {} })
+    expect(await drive(q, rig)).toMatchObject([{ status: 'accepted', seq: 1 }, { status: 'accepted', seq: 2 }, { status: 'accepted', seq: 3 }, { status: 'duplicate', seq: 1 },
+      { status: 'skipped', outcome: 'drop' }, { status: 'failed', error: 'EIO timed store' }, 'EIO timed store', 'appended', 'appended', 'appended', 'appended', RESOLUTIONS])
+    expect(events.map(e => e.type)).toEqual(['stored', 'stored', 'stored', 'store-failed', 'append-failed', 'writable', 'holds-resolved'])
+    const stored = { type: 'stored', key: 'alpha' } as const
+    expect(events.filter(e => e.type !== 'store-failed' && e.type !== 'append-failed')).toStrictEqual([stored, stored, stored, { type: 'writable', key: 'alpha' }, { type: 'holds-resolved', key: 'alpha', resolutions: RESOLUTIONS }])
+    expect(timingFields(events)).toEqual([])
+    expect(events.find(e => e.type === 'store-failed')).toMatchObject({ key: 'alpha', path: queuePath(dir), source: 'slack', ts: LATER_TS })
+    expect(events.find(e => e.type === 'append-failed')).toMatchObject({ key: 'alpha', path: queuePath(dir), seq: 1 })
+    expect(readQueue(dir).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['accepted', 2], ['accepted', 3], ['fixed', 1], ['sent', 1], ['delivered', 1], ['reply-reminder', 1], ['released', 2], ['withdrawn', 3]])
+    q.startMaintenance()
+    expect(scheduled).toEqual([QUEUE_COMPACT_INTERVAL_MS])
+    expect(rig.reads).toBe(0)
+  })
+
+  test('measuring changes no record, result or existing event field; it adds timings to stored and holds-resolved and one fixed-stored, none carrying message text', async () => {
+    async function run(name: string, measureTimings: boolean) {
+      const stateDir = join(dir, name), rig = timedRig(), events: QueueEvent[] = []
+      rig.during = () => { rig.mono += 7 }
+      const q = await makeQueue(stateDir, { fs: rig.fs, now: () => THREAD_TIME, monotonicNow: rig.monotonicNow, measureTimings, onEvent: e => events.push(e) })
+      queues.push(q)
+      const outcomes = await drive(q, rig)
+      // Every field but the timings, with each run's own state directory masked.
+      const untimed = events.filter(e => e.type !== 'fixed-stored').map(e => e.type === 'stored' ? { type: e.type, key: e.key } : Object.fromEntries(Object.entries(e).filter(([name]) => !TIMING_FIELDS.includes(name))))
+      return { outcomes, events, bytes: fs.readFileSync(queuePath(stateDir)), untimed: JSON.parse(JSON.stringify(untimed).replaceAll(stateDir, '<state>')) }
+    }
+    const plain = await run('plain', false), measured = await run('measured', true)
+    expect(measured.bytes).toEqual(plain.bytes)
+    expect(measured.outcomes).toEqual(plain.outcomes)
+    expect(measured.untimed).toEqual(plain.untimed)
+    const timed = (seq: number, store: QueueStoreKind) => ({ type: 'stored' as const, key: 'alpha', seq, store, storeMs: 7, atMonoMs: expect.any(Number) })
+    expect(measured.events.filter(e => e.type === 'stored')).toEqual([timed(1, 'accepted'), timed(2, 'memory-hold'), timed(3, 'post-hold')])
+    expect(measured.events.filter(e => e.type === 'fixed-stored')).toEqual([{ type: 'fixed-stored', key: 'alpha', seq: 1, storeMs: expect.any(Number), atMonoMs: expect.any(Number) }])
+    expect(measured.events.filter(e => e.type === 'holds-resolved')).toEqual([{ type: 'holds-resolved', key: 'alpha', resolutions: RESOLUTIONS, storeMs: 7, atMonoMs: expect.any(Number) }])
+    assertNoLeak(measured.events)
+    expect(JSON.stringify(measured.events)).not.toContain(SECRET)
+  })
+
+  test.each([
+    ['accept', 'accepted', (q: DeliveryQueue) => q.accept('alpha', slackInput())],
+    ['acceptDecided', 'accepted', (q: DeliveryQueue) => q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }))],
+    ['a Post Hold', 'post-hold', (q: DeliveryQueue) => { const input = heldAt(postHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input })) }],
+    ['a Memory Hold', 'memory-hold', (q: DeliveryQueue) => { const input = heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input })) }],
+  ] as const)('%s: storeMs runs from its turn start, after the wait behind an earlier turn, through its append; atMonoMs is that append return', async (_, store, accept) => {
+    const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events), start = rig.mono
+    // The earlier turn holds the writer for WAIT inside its append; the measured turn's own append takes APPEND.
+    rig.costs(WAIT, APPEND)
+    const [earlier, measured] = await Promise.all([q.accept('alpha', injectedInput()), accept(q)])
+    expect([earlier, measured]).toMatchObject([{ status: 'accepted', seq: 1 }, { status: 'accepted', seq: 2 }])
+    // So atMonoMs − storeMs, the measured turn's first reading, is when the earlier append returned.
+    expect(events).toEqual([
+      { type: 'stored', key: 'alpha', seq: 1, store: 'accepted', storeMs: WAIT, atMonoMs: start + WAIT },
+      { type: 'stored', key: 'alpha', seq: 2, store, storeMs: APPEND, atMonoMs: start + WAIT + APPEND },
+    ])
+  })
+
+  test('a duplicate, a drop and a failed store emit no stored event; the failure keeps its store-failed event', async () => {
+    const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events)
+    // A store emits its timed event, so the absences below are not for want of measuring.
+    await q.accept('alpha', slackInput())
+    expect(events).toEqual([{ type: 'stored', key: 'alpha', seq: 1, store: 'accepted', storeMs: 0, atMonoMs: rig.mono }])
+    events.length = 0
+    expect((await q.accept('alpha', slackInput())).status).toBe('duplicate')
+    expect((await q.acceptDecided('alpha', slackInput().key, () => { throw new Error('duplicate must not decide') })).status).toBe('duplicate')
+    expect((await q.acceptDecided('alpha', later().key, () => ({ skip: 'drop' }))).status).toBe('skipped')
+    rig.fail = true
+    expect((await q.accept('alpha', later())).status).toBe('failed')
+    expect((await q.acceptDecided('alpha', later().key, () => ({ store: later() }))).status).toBe('failed')
+    expect(events.map(e => e.type)).toEqual(['store-failed', 'store-failed'])
+    expect(timingFields(events)).toEqual([])
+  })
+
+  test('one resolveHolds call emits one saved-resolutions event timed over its one append, after its wait, with the saved seqs; a failed one carries no timing', async () => {
+    const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events)
+    for (const input of [heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary), heldAt(postHold(THREAD_TIME), THREAD_ROOTS.third), heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.primary)]) {
+      expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+    }
+    const resolutions: HoldResolution[] = [{ seq: 1, outcome: 'released', at: THREAD_TIME }, { seq: 2, outcome: 'withdrawn', at: THREAD_TIME }]
+    let appends = 0
+    rig.costs(WAIT, APPEND)
+    const cost = rig.during!
+    rig.during = () => { appends++; cost() }
+    events.length = 0
+    const start = rig.mono
+    const [, saved] = await Promise.all([q.accept('alpha', injectedInput()), q.resolveHolds('alpha', resolutions)])
+    expect(saved).toEqual(resolutions)
+    expect(appends).toBe(2)
+    expect(events.filter(e => e.type === 'holds-resolved')).toEqual([{ type: 'holds-resolved', key: 'alpha', resolutions, storeMs: APPEND, atMonoMs: start + WAIT + APPEND }])
+    events.length = 0; rig.during = undefined; rig.fail = true
+    await expect(q.resolveHolds('alpha', [{ seq: 3, outcome: 'released', at: THREAD_TIME }])).rejects.toThrow('EIO timed store')
+    expect(events.map(e => e.type)).toEqual(['append-failed'])
+    expect(timingFields(events)).toEqual([])
+  })
+
+  test('a newly written fixed append emits one fixed-stored timed over its own append and never stored; a repeat, a conflict, a failure and other kinds emit none', async () => {
+    const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events)
+    await q.accept('alpha', slackInput())
+    events.length = 0
+    const start = rig.mono
+    rig.costs(WAIT, APPEND)
+    await Promise.all([q.accept('alpha', later()), q.append('alpha', fixedRecord(1))])
+    // atMonoMs − storeMs is the fixation turn's start after its wait: N4's fallback start.
+    expect(events).toEqual([
+      { type: 'stored', key: 'alpha', seq: 2, store: 'accepted', storeMs: WAIT, atMonoMs: start + WAIT },
+      { type: 'fixed-stored', key: 'alpha', seq: 1, storeMs: APPEND, atMonoMs: start + WAIT + APPEND },
+    ])
+    rig.during = undefined; events.length = 0
+    const bytes = fs.readFileSync(queuePath(dir))
+    await q.append('alpha', fixedRecord(1))
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    await expect(q.append('alpha', fixedRecord(1, ['other']))).rejects.toThrow('Fixed text is immutable')
+    rig.fail = true
+    await expect(q.append('alpha', fixedRecord(2))).rejects.toThrow('EIO timed store')
+    rig.fail = false
+    for (const record of [sentRecord(), deliveredRecord()]) await q.append('alpha', record)
+    expect(events.map(e => e.type)).toEqual(['append-failed', 'append-failed', 'writable'])
+    expect(timingFields(events)).toEqual([])
+  })
+
+  test("a fixed append's fixed-stored leaves the message-not-saved episode open; the next stored ends it", async () => {
+    const rig = timedRig(), events: QueueEvent[] = []
+    let reporting: DeliveryNoticeHarness['reporting'] | undefined
+    const q = await makeQueue(dir, { fs: rig.fs, monotonicNow: rig.monotonicNow, measureTimings: true, onEvent: e => { events.push(e); reporting?.queueEvent(e) } })
+    const n = await makeDeliveryNoticeHarness({ queue: q })
+    reporting = n.reporting
+    const notSaved = () => n.rig.episodes.isOpen(n.alpha, 'message-not-saved')
+    try {
+      expect(await q.accept(n.alpha, slackInput())).toMatchObject({ status: 'accepted', seq: 1 })
+      rig.fail = true
+      expect((await q.accept(n.alpha, later())).status).toBe('failed')
+      rig.fail = false
+      await n.flush()
+      expect(notSaved()).toBe(true)
+      await q.append(n.alpha, fixedRecord()); await n.flush()
+      expect(notSaved()).toBe(true)
+      expect(events.map(e => e.type)).toEqual(['stored', 'store-failed', 'fixed-stored'])
+      expect((await q.accept(n.alpha, later())).status).toBe('accepted'); await n.flush()
+      expect(notSaved()).toBe(false)
+    } finally { await n.cleanup() }
+  })
+
+  test('maintenance compacts at compactIntervalMs when given', async () => {
+    const clock = createFakeClock(), scheduled: number[] = []
+    const q = await open({ now: clock.now, compactIntervalMs: 250,
+      setInterval: ((callback: () => void, delay: number) => {
+        scheduled.push(delay)
+        const handle: { current?: unknown } = {}
+        const fire = () => { callback(); handle.current = clock.setTimeout(fire, delay) }
+        handle.current = clock.setTimeout(fire, delay)
+        return handle
+      }) as unknown as typeof setInterval,
+      clearInterval: handle => clock.clearTimeout((handle as unknown as { current: unknown }).current),
+    })
+    await q.accept('alpha', injectedInput({ text: 'delivered content' }))
+    await q.append('alpha', fixedRecord(1, ['delivered bytes']))
+    await q.append('alpha', deliveredRecord())
+    q.startMaintenance()
+    expect(scheduled).toEqual([250])
+    await clock.advance(249)
+    expect(fs.readFileSync(queuePath(dir), 'utf8')).toContain('delivered content')
+    await clock.advance(1)
+    expect(fs.readFileSync(queuePath(dir), 'utf8')).not.toContain('delivered content')
   })
 })

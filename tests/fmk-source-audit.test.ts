@@ -109,7 +109,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import ts from 'typescript'
 import type { PersonaConfigInput } from '../src/config.ts'
 import { createSharedChannelAuthority } from '../src/shared-channels.ts'
@@ -132,7 +132,7 @@ import { decideLatchRecheckProbe, LATCH_CASE_OWN_ID, latchRecheckRoundLine, RECH
 import { parseDeliveryTranscriptRecord } from '../src/delivery-receipt.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
-import { AD_NS, AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads, finding } from './test-helpers/ad-value-reads.ts'
+import { AD_NS, AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads, finding, moduleLoadOf } from './test-helpers/ad-value-reads.ts'
 import { CLIENT_MIN_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   callArguments,
@@ -147,6 +147,58 @@ import {
 // ---------------------------------------------------------------------------
 // The scanner
 // ---------------------------------------------------------------------------
+
+// Decision 4: units reach the src-free population builders through the one
+// Thread Memory helper; only the image evidence adapter loads them directly.
+// Read syntax, including re-exports and dynamic loads, without importing it.
+function populationEntryFindings(file: string, source: string): string[] {
+  // Shell can pass the path through a variable to bun -e's dynamic import.
+  // No shell entry is sanctioned, so even naming that module is a finding.
+  if (file.endsWith('.sh')) return source.split('\n').flatMap((line, i) =>
+    !/^\s*#/.test(line) && /(?:^|\/)thread-populations(?:\.ts)?(?:["'`]|$)/.test(line)
+      ? [`${file}:${i + 1}: population-builder-entry`] : [])
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
+  const findings: string[] = []
+  const root = resolve(import.meta.dir, '..')
+  const target = join(root, 'tests/test-helpers/thread-populations.ts')
+  const allowed = ['tests/test-helpers/thread-memory.ts', 'tests/integration/fixtures/sr8-evidence.ts']
+  const visit = (node: ts.Node) => {
+    const specifier = ts.isImportDeclaration(node) || ts.isExportDeclaration(node) ? node.moduleSpecifier :
+      ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) ? node.moduleReference.expression :
+      ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) ? node.argument.literal : undefined
+    const name = specifier && ts.isStringLiteralLike(specifier) ? specifier.text : moduleLoadOf(node)
+    if (name && resolve(dirname(join(root, file)), name).replace(/(?:\.[cm]?[jt]sx?)?$/, '.ts') === target
+      && !allowed.includes(file)) findings.push(`${file}:${finding(sf, node, 'population-builder-entry')}`)
+    ts.forEachChild(node, visit)
+  }
+  visit(sf)
+  return findings
+}
+
+describe('SR-8 population builder entry rule', () => {
+  test('only thread-memory and sr8-evidence load thread-populations in the tests tree', () => {
+    const files = (readdirSync(import.meta.dir, { recursive: true }) as string[])
+      .filter(file => /\.(?:[cm]?[jt]sx?|sh)$/.test(file))
+    const findings = files.flatMap(file => populationEntryFindings(`tests/${file}`, readFileSync(join(import.meta.dir, file), 'utf8')))
+    expect(findings).toEqual([])
+  })
+  test.each([
+    "import { populationJoins } from './test-helpers/thread-populations.ts'",
+    "export * from './test-helpers/thread-populations.ts'",
+    "const p = import('./test-helpers/thread-populations.ts')",
+    "const p = require('./test-helpers/thread-populations')",
+    "import p = require('./test-helpers/thread-populations.ts')",
+    "type P = import('./test-helpers/thread-populations.ts').PopulationJoin",
+  ])('rejects a direct unit entry: %s', source => {
+    expect(populationEntryFindings('tests/planted.test.ts', source)).toHaveLength(1)
+  })
+  test('rejects another integration loader and ignores comments and strings', () => {
+    expect(populationEntryFindings('tests/integration/fixtures/planted.ts', "await import('../../test-helpers/thread-populations.ts')")).toHaveLength(1)
+    expect(populationEntryFindings('tests/planted.test.ts', "// import './test-helpers/thread-populations.ts'\nconst documentation = \"import('./test-helpers/thread-populations.ts')\"")).toEqual([])
+    expect(populationEntryFindings('tests/integration/planted.sh', 'POPULATIONS="${SCENARIO_FIXTURES}/../../test-helpers/thread-populations.ts"')).toHaveLength(1)
+    expect(populationEntryFindings('tests/integration/planted.sh', '# See /thread-populations.ts')).toEqual([])
+  })
+})
 
 type Rule =
   | 'client-delete'

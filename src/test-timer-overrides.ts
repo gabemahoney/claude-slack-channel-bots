@@ -17,6 +17,11 @@
  *   unavailable_retry_base_s        s    `UNAVAILABLE_RETRY_BASE_S` (src/unavailable-retry.ts),
  *                                          fed through `UnavailableRetryDeps.baseS`
  *   unavailable_retry_ceiling_s     s    `UNAVAILABLE_RETRY_CEILING_S`, through `.ceilingS`
+ *   queue_compact_interval_ms       ms   `QUEUE_COMPACT_INTERVAL_MS` (src/delivery-queue.ts), the
+ *                                          queue's and Thread Memory's maintenance compaction
+ *                                          interval, fed through `startMaintenance(intervalMs)`;
+ *                                          their `compactIntervalMs` options are fallbacks
+ *                                          when no interval is passed
  *
  * It is read once, at server start, from the start-time configuration (the
  * last-applied record when there is one, else `config.json`): `main()` calls
@@ -36,6 +41,7 @@ import { installLaunchBoundFloorMs, DIALOG_READY_TIMEOUT_MS } from './ad-setting
 import { AD_VERSION_RECHECK_INTERVAL_MS, setAdVersionRecheckIntervalMs } from './ad-version-gate.ts'
 import { LATCH_RECHECK_INTERVAL_MS } from './conflict-latch.ts'
 import { UNAVAILABLE_RETRY_BASE_S, UNAVAILABLE_RETRY_CEILING_S } from './unavailable-retry.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from './delivery-queue.ts'
 
 /** The head of the one line written at start when any override is active. */
 export const TEST_TIMER_OVERRIDES_LOG_PREFIX = '[slack] TEST TIMER OVERRIDES ACTIVE'
@@ -53,6 +59,8 @@ export interface EffectiveTestTimers {
   readonly unavailableRetryBaseS: number
   /** The UNAVAILABLE retry timer's longest wait, seconds. */
   readonly unavailableRetryCeilingS: number
+  /** The queue's and Thread Memory's maintenance compaction interval, ms. */
+  readonly queueCompactIntervalMs: number
 }
 
 /** The production default of each override key. */
@@ -70,6 +78,8 @@ function defaultOf(key: TestTimerOverrideKey): number {
       return UNAVAILABLE_RETRY_BASE_S
     case 'unavailable_retry_ceiling_s':
       return UNAVAILABLE_RETRY_CEILING_S
+    case 'queue_compact_interval_ms':
+      return QUEUE_COMPACT_INTERVAL_MS
   }
 }
 
@@ -93,6 +103,7 @@ export function effectiveTestTimers(overrides?: TestTimerOverrides): EffectiveTe
     dialogReadyTimeoutMs: effectiveTestTimer('dialog_ready_timeout_ms', overrides),
     unavailableRetryBaseS: effectiveTestTimer('unavailable_retry_base_s', overrides),
     unavailableRetryCeilingS: effectiveTestTimer('unavailable_retry_ceiling_s', overrides),
+    queueCompactIntervalMs: effectiveTestTimer('queue_compact_interval_ms', overrides),
   }
 }
 
@@ -117,8 +128,10 @@ export function buildTestTimerOverridesLine(overrides: TestTimerOverrides | unde
  * answers the production defaults. Otherwise it writes the one loud line
  * ({@link buildTestTimerOverridesLine}), moves the installed version
  * re-check's interval, sets B's floor, and answers the timers for the caller
- * to hand to the latch re-check and the retry timers. Call once, after the
- * start resolves its configuration and before those are built.
+ * to hand to the latch re-check, the retry timers and the queue's and Thread
+ * Memory's maintenance. Call once after the start resolves its configuration;
+ * the queue and Thread Memory already exist and receive the returned interval
+ * through `startMaintenance(intervalMs)` before maintenance begins.
  */
 export function installTestTimerOverrides(
   overrides: TestTimerOverrides | undefined,

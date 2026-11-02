@@ -337,7 +337,7 @@
 #                                       e.g. C…/private/local/omit; no channels is an empty page
 #   slack_stub_inventory_clear <label>  remove all custom pages (then add desired pages)
 #   slack_stub_fault <label> <method> <outcome> [key=value...]
-#                                       keys cursor/channel/thread_ts/error (strings), after/times/
+#                                       keys cursor/channel/user/thread_ts/error (strings), after/times/
 #                                       retry_after/delay_ms (integers), performed (boolean),
 #                                       body (JSON from slack_stub_inventory_body or event builder)
 #   slack_stub_inventory_fault <label> <cursor> <outcome> [key=value...]
@@ -6753,7 +6753,7 @@ slack_stub_fault() {
       reduce $ARGS.positional[] as $arg ({method:$method,outcome:$outcome};
         ($arg|index("=")) as $i | if $i==null then error("expected key=value") else
         ($arg[0:$i]) as $k | ($arg[$i+1:]) as $v |
-        if (["cursor","channel","thread_ts","error"]|index($k))!=null then .[$k]=$v
+        if (["cursor","channel","user","thread_ts","error"]|index($k))!=null then .[$k]=$v
         elif (["after","times","retry_after","delay_ms"]|index($k))!=null then .[$k]=($v|tonumber)
         elif $k=="performed" or $k=="body" then .[$k]=($v|fromjson)
         else error("unknown fault field") end end)' "$@")" || fail 'invalid fault fields'

@@ -1,0 +1,1798 @@
+/** SR-8 image-side evidence and verdicts. Static imports are node: only. Importing
+ * the pure verdicts does no I/O; every CLI command requires /etc/cscb-ci-image.
+ * Package modules come from CSCB_PKG_DIR (the installed tarball by default).
+ *
+ * Common verdict arguments C: <scenario> <strict|open> <0|10000|100000> <1|2>.
+ * Commands (all paths are caller-owned CI scratch paths):
+ *   combinations
+ *     No arguments. Prints sr8Combinations() in its declared order, one TSV line
+ *     per combination: population, mode, recipients. No output header or verdict.
+ *   envelope-times <ids-file> <frozen-stub-jsonl>
+ *     Bulk extraction only (NO C arguments or verdict): one JSONL row per requested
+ *     ID, in file order, exactly slack_envelope_times' envelope_id/push/acks shape.
+ *     Preserves zero and duplicate ACKs, connection IDs, original/replay IDs, and
+ *     repeated requested IDs. Read both inputs once; index the observation once.
+ *     Freeze complete stub lines with _scenario_complete_jsonl before invoking.
+ *     IDs are one nonempty ID per line; both files must end at complete lines.
+ *     Missing/duplicate pushes, malformed input or missing monotonic fields fail
+ *     nonzero with a fixed named reason and NO partial output. Never applies N1.
+ *     Before-clear and final observations MUST be separate files and calls.
+ *   config <mode> <population> <recipients> <root> <port> <compact-ms>
+ *     Whole config; credentials root/<key>.env, work root/<key>. Pipe to write_config.
+ *     Compact-ms is a test override, printed/validated by fmk-texts, never a limit.
+ *   seed <config-path> <state-dir> <population>
+ *     STOPPED server only, BEFORE its first start. If absent, creates the matching
+ *     config.json.last-applied using initialSharedChannelState/serializeSharedChannelState.
+ *     Uses seedPopulation with packed production memory/authority; never edits the seal.
+ *     Population zero is usage error (64): no seed, no first start in that combination.
+ *   plan <mode> <population> <recipients> <start-seconds>
+ *     TSV: phase, channel, ts, root-or-dash, comma-separated mentioned persona keys.
+ *     Build each event OUTSIDE the measured window using scenario.sh's
+ *     slack_mention_event/slack_reply_event/slack_message_event (and its text/ID builders).
+ *   bodies <label> <events-jsonl>
+ *     Wraps already-built events in push bodies; constructs no Slack event. Append its
+ *     output for each recipient to roots.batch.jsonl, replies.batch.jsonl, dropped.batch.jsonl.
+ *   burst C <batch-dir> <stub-url> <stub-record> <state-dir> <evidence-dir> <wait-ms> [<measurement-file> <byte-mark>]
+ *     Concurrent roots, wait for their exact envelope ACKs, then concurrent replies+drops.
+ *     With held.batch.jsonl, the last two arguments are REQUIRED: submit held probes
+ *     FIRST, wait for their ACKs and their own durable post-hold measurement (key/seq
+ *     bound through sharedQueueSnapshot), then start roots/replies/drops. The script
+ *     establishes their pending own-posts beforehand through the scenario helpers,
+ *     keeping the outcomes unresolved. Runs without held probes keep their old order.
+ *     Saves <key>.held-admission.jsonl as a validated union of every poll through
+ *     sharedQueueSnapshot, retaining original holds and observed resolutions across
+ *     compaction. Include that one archive as a prior shared_queue_snapshot input
+ *     along with the caller's other pre-compaction observations.
+ *     These probes count as acceptance/ACK/store samples too. No held probe is optional
+ *     for a passing Post Hold verdict: zero observed holds is missing evidence.
+ *     Writes burst.jsonl (key/phase/channel/ts/sender/envelope_id, no text) and
+ *     compactions.jsonl. Labels MUST equal population persona keys. Bounded wait;
+ *     failure still retains submitted identities. HTTP responses are not ACK evidence.
+ *     Compaction proof: two existing dev:ino identities, both observed after the first
+ *     push and before the final ACK. The observer reads the stub record AFTER stat too;
+ *     a replacement first seen after completion cannot pass. Creation is not compaction.
+ *   seal <first|measured> C <server-log> <log-byte-mark> <config-path>
+ *     First: exactly one printer-built entry-missing report per seeded key. Measured:
+ *     no changed-while-stopped OR THREAD_MEMORY_JOINS_LOST report, including any
+ *     unseeded/foreign persona. Both markers come from the printer.
+ *     Decision 25: no thread-memory-loaded record. Retained loaded field is always 0.
+ *   check C <evidence-dir> <measurement-file> <measurement-byte-mark> <start-ms> <ready-ms> [<n2-required> <n2-file>]
+ *     Script supplies times.jsonl, one slack_envelope_times output per burst envelope;
+ *     <key>.queue.jsonl from shared_queue_snapshot (retain pre-compaction snapshots);
+ *     <key>.before.jsonl and <key>.after.jsonl from shared_thread_joins, before the burst
+ *     and AFTER a clean restart. Reader failures must fail the script, never become [].
+ *     Joins must retain every seeded identity and every burst root; additional joins
+ *     (e.g. the held-probe setup's successful own post) are counted, never subtracted.
+ *     External start/ready timestamps MUST be from the same clock for the measured start.
+ *     Required N2 count defaults to zero for stub-only bursts; test-32 passes >=20.
+ *     With held probes, also emits post-hold-overlap and post-hold-overlap-ack:
+ *     EVERY declared hold probe for EVERY required persona needs an ordinary store
+ *     for that same persona strictly between that probe's
+ *     post-hold admission and resolution on the SERVER measurement clock. N1 for
+ *     every overlapping item uses its own envelope's STUB push/ACK times. No overlap
+ *     or missing endpoints is missing; slow overlapping ACK is fail. Clocks never mix.
+ *   startup-load C <start-ms> <ready-ms>
+ *     Standalone startup evidence for test-32; no burst files are needed. Population
+ *     is per recipient: samples/joined report population * recipients, as check does.
+ *     Decision 25: the script samples outside the packed server, immediately before
+ *     launching the measured start and immediately after its readiness wait succeeds.
+ *     Both times are milliseconds on the SAME external clock (e.g. Python
+ *     time.monotonic_ns() / 1e6 in the same CI container); never mix process-relative
+ *     performance.now() clocks, or include the first seed/seal start in this interval.
+ *     Prints startup-load and summary; valid times have verdict=recorded, no bound.
+ *     Omitted, empty, malformed or reversed times are missing and exit 1; supplied
+ *     times must be finite nonnegative numbers. Raw arguments are never printed.
+ *   n4 C <measurement-file> <measurement-byte-mark> <key> <queue-snapshot> <times-jsonl> <stub-record> <n2-file> <hung-ts> <hung-user> <delayed-ts> <delayed-user>
+ *     n2-file holds transcript-receipts thread-latency output: recorded: sr8 n2-sample
+ *     key=<persona> seq=<queue seq> name=<fallback|resolved> (other fields ignored).
+ *     Fault lines must be users.info with the sample's sender/label and hang/delay.
+ *     Queue samples are production Slack acceptances: source=slack, user=<sender>,
+ *     key.chat_id=channel and key.ts=ts, then bound to the stub push's label/channel/ts.
+ *     Never add an injected-input sender field to a Slack acceptance.
+ *     N4 joins push identity from stub to f6 timing output by envelope_id, never clocks.
+ *   windows C <ad-cscb-calls-tsv> <empty-windows-tsv> <active-windows-tsv>
+ *     ad_cscb_calls' six columns, time in epoch seconds; every CSCB call counts
+ *     conservatively (Decision 9), per instance, in EVERY half-open 10-second window.
+ *     Empty windows: instance-id TAB start-seconds TAB end-seconds, at least one.
+ *     Active windows: the same three columns, exactly one row per EXPECTED measured
+ *     instance, declared from the measured phase's AD identities, never from calls.
+ *     Capture start immediately before the phase's AD mark/sample admission loop,
+ *     and end at the start of verified queue-empty observation, using the same host
+ *     Unix epoch clock as the shim. Read calls from that mark through the empty end.
+ *     Use separate files for each mode/phase; each expected instance needs at least
+ *     one call inside its active window and a verified empty window outside it.
+ *     Every call must belong to a declared active/empty window. Missing active
+ *     coverage, foreign instances or out-of-phase calls are missing, not zero-cost
+ *     success. Calls in a verified empty window fail. All intervals are half-open.
+ *     bun "$E" windows "$TEST_NAME" "$mode" 100000 2 "$out/ad.tsv" "$out/empty.tsv" "$out/active.tsv"
+ *   concurrent-overlap C <operations-tsv> <sample-intervals-tsv> <n2-file>
+ *     Test-32's thread phase only; collect fresh files per mode/phase. TSV has no
+ *     header. ALL endpoints are Unix epoch MILLISECONDS on the SAME CI host clock
+ *     (Date.now/time.time_ns()/1e6), never stub/server performance.now/monotonic times.
+ *     Operations: kind TAB operation-id TAB start-epoch-ms TAB end-epoch-ms.
+ *     Kind is membership or write; ID is the actual membership event identity or
+ *     write attempt ID, unique within that kind. Prebuild payloads before timing.
+ *     Membership endpoints bracket its push invocation through its own ACK wait.
+ *     Write endpoints bracket the actual tool-call invocation through its successful
+ *     result, BEFORE expensive result validation. Capture inside the background
+ *     worker, immediately around each operation, NOT around worker launch/join or
+ *     both operations together. Require the existing ACK/write-result checks too.
+ *     Recorded ends are poll-bounded supersets (ACK poll, request/poll round trip),
+ *     so only the START is credited: an operation overlaps a sample only when
+ *     admission <= start < delivery. Ends are still validated, never credited.
+ *     This proves the operation was issued while the sample was in flight, not that
+ *     the server's handling of it overlapped (the push/call latency is a known limit).
+ *     Samples: persona-key TAB queue-seq TAB admission-epoch-ms TAB delivery-epoch-ms.
+ *     Select exactly n2-file's measured key/seq set from real shared_queue_snapshot
+ *     observations: admission=the Slack accepted record's received_at; delivery=
+ *     max(at) of its completed delivered parts. Preserve pre-compaction records.
+ *     The existing receipt audit/thread-latency must succeed and prove all parts
+ *     complete; do not substitute a delivery poll's return or infer an endpoint.
+ *     n2-file is that same phase's transcript-receipts thread-latency output.
+ *     Both membership AND write need at least one operation starting inside at least
+ *     one declared measured sample (they may use different samples). A start before
+ *     admission (even with a later recorded end) or at/after delivery, serial-only
+ *     work, absent kinds, incomplete/mismatched samples, malformed or reversed
+ *     endpoints are missing, exit 1. No scheduler-start assertion is proof.
+ *     bun "$E" concurrent-overlap "$TEST_NAME" "$mode" 100000 2 "$out/operations.tsv" "$out/sample-intervals.tsv" "$out/n2.txt"
+ *   conditions <state-dir> <server-pid>
+ *     Bun, CPUs, cgroup memory limit, filesystem/mount, server VmHWM (KiB).
+ *
+ * Additional case commands for scripts 44/45 (check, n4 and startup-load keep
+ * their outputs). TSV files contain observations/identities, never Slack/control
+ * JSON. All JSONL readers below are existing scenario.sh readers; a failed reader
+ * must stop the script. Do not replace failed reads with empty arrays/files.
+ * Scope every log/stub slice to this case, preserving record seq and timestamps.
+ * Each command prints recorded: sr8 <measure> with C, samples, stats, limit,
+ * verdict, then summary, and exits 1 on ANY missing/fail after printing ALL lines.
+ * Verdict lines never echo supplied text/IDs/errors; the fault identity/body readers
+ * below explicitly return their documented data. Per-persona store numbers are 1-based
+ * positions in sr8Personas(recipients), the same order as config/burst.
+ *
+ *   pending-post C <key> <operation-id> <start-ms> <end-ms> <before-posts> <after-posts> <probes-tsv> <queue> <times> <measurements> <byte-mark> <channel>
+ *     before/after: shared_own_post_records for the same key, with the same
+ *     unresolved new-channel intent (no root). Take start AFTER the first read,
+ *     end BEFORE the second, on one external monotonic clock. Keep the server
+ *     running and the post unresolved throughout; no restart/compaction between
+ *     reads. Hold/re-hold post/outcome lookup through the existing stub controls.
+ *     Probes TSV: parent(other|bot|none), channel, ts, envelope_id. Build those
+ *     replies with the corresponding parent_user_id using slack_reply_event;
+ *     push them strictly between the two reads. All three classes are required.
+ *     queue = shared_queue_snapshot; times = slack_envelope_times for EACH probe;
+ *     measurements start at byte-mark, captured before probes. An other-parent
+ *     probe may be dropped: require no Post Hold acceptance/store/resolution.
+ *     Bot/no-parent need post-hold stores and their own timed resolution appends.
+ *     Lines: pending-post(pending_ms,other,held; >=120000), pending-post-ack(max_ms;
+ *     N1), post-hold(existing own-append limit/100 ms allowance). Missing intent,
+ *     class, acceptance/hold evidence, reader or timestamp is missing; an outcome,
+ *     wrong root, duration below 120 s or a held other-parent probe fails.
+ *
+ *   shared-list C <directory> <probe-exit-status>
+ *     prepared.input: exact config bytes, ordinary.preview: server's ordinary
+ *     pending preview BEFORE confirmation (not a rebuilt expected preview).
+ *     For applied/restarted/grown/reopened/failed, save <phase>.input (config
+ *     bytes) and <phase>.facts.jsonl (one shared_persona_facts per configured key,
+ *     NO channel filter). Names must be config's sr8Personas keys. growth.tsv:
+ *     key,channel,delivery for every intended new membership, from printer values.
+ *     Use live join events for growth/failure; failure.log is the scoped server
+ *     log. failure.expected is the complete actionable line from the existing
+ *     printer membershipDiagnostic <key> <failed-channel> event-not-durable;
+ *     require that line, named by MEMBERSHIP_STORAGE_FAILED for a configured key.
+ *     failure-before.state/failure-after.state: exact shared-record bytes around
+ *     the failed growth, then successfully read failed.facts after restoring read
+ *     permission. Probe exit is the ACTUAL attempted write status; zero fails.
+ *     Keep the same separately prepared input throughout these observations.
+ *     Lines: shared-list(config_bytes,preview_bytes,initial,grown; channels>=1000,
+ *     bytes>65536); shared-list-write-failure(probe_failed,unchanged; preserved).
+ *     Missing any phase, growth, readable state, preview or named failure is
+ *     missing. Count/choice/input loss, truncation, equal-to-64KiB or a successful
+ *     probe fails. Counts apply per persona; preserve each old assignment/stamp.
+ *
+ *   membership-fault C <hang|transient|scope|denied|rate> <first|later> <key> <stub-slice> <log-slice> <before-facts> <after-facts> <retry-after-seconds> <failure-index>
+ *     Stage ONLY this fault/page in the slice. Use users.conversations hang,
+ *     error internal_error/missing_scope/invalid_auth, or rate_limit respectively.
+ *     Need >=2 fired records and scoped incomplete diagnostics for key; pages=0
+ *     for first, >0 for later. Hang requires reason=deadline with deadline/next
+ *     attempt timestamps and each request's own fault-settled/abort. Capture through
+ *     the LAST fault's diagnostic/settlement. Each diagnostic is uniquely correlated
+ *     to the staged request's arrival interval before the next faulted attempt.
+ *     Request duration D-A uses A=arrival_epoch_ms (stub handler entry before control
+ *     I/O/body parsing) and D=diagnostic logger ISO time, both on the same container
+ *     wall clock. D-A must be <= MEMBERSHIP_REQUEST_TIMEOUT_MS, and A/D inside the
+ *     attempt interval [deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS, deadline_at].
+ *     Never use the later fault.ts as arrival. D<A or absent endpoints/settlements is
+ *     missing; an observed over-bound duration is fail. Wall-clock steps are NOT
+ *     independently detected: a step that still yields a valid interval may pass.
+ *     Other cases require the published reason/Slack code and correlated API
+ *     answer. Before/after are identical shared_persona_facts reads for an omitted
+ *     historical channel. failure-index is the first fault's zero-based local
+ *     backoff index; retry-after is the injected seconds (0 for non-429).
+ *     Lines: membership-fault(case,page,fired,incomplete,max_request_ms,max_attempt_ms,
+ *     attempt_limit_ms), membership-retry(case,
+ *     page,min_ms,retry_after_ms,after_429_ms). Start gaps use arrival_mono_ms;
+ *     after-429 uses the stub API response ISO stamp and next arrival_epoch_ms, not
+ *     server clocks. Limits from membershipRetryDelay / MEMBERSHIP_REQUEST_TIMEOUT_MS;
+ *     NO allowance. Missing fired/diagnostic/answer/state evidence is missing;
+ *     early retry, wrong outcome, false complete or changed state fails.
+ *     membership-retry is a RESULT of membership-fault, not a separate CLI command.
+ *   membership-repair C <key> <clear-epoch-ms> <log-slice>
+ *     Slice contains the last incomplete diagnostic before clear and the first
+ *     complete diagnostic afterward, with the logger's ISO timestamps intact.
+ *     Sample clear-epoch-ms immediately BEFORE clearing faults, on the container
+ *     wall clock (Date.now/Python time.time*1000). Clear between observed retries;
+ *     send NO traffic/tool/reconnect until complete. The line records elapsed_ms,
+ *     remaining_ms, retry_ms, scan_ms. Published bound = remaining attempt deadline
+ *     + max(MEMBERSHIP_RETRY_MAX_MS, Retry-After) + successful scan/persistence time;
+ *     scan start is complete.deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS. No fixed
+ *     extra 30 seconds, rounding tolerance or dispatch allowance. Missing timestamps
+ *     or completion is missing, elapsed above the bound or scan above its deadline
+ *     fails. This does not claim a constant bound on arbitrary persistence work.
+ *   membership-late C <key> <request-id> <stub-slice> <complete-seq-mark> <complete-log> <before-state> <after-state>
+ *     Use users.conversations late + printer-built contradictory body. After the
+ *     replacement scan's complete diagnostic/readiness succeeds, take slack_post_mark
+ *     as complete-seq-mark, then before-state. Wait for this request's settlement,
+ *     then take after-state and complete-log through that point (a subsequent
+ *     incomplete diagnostic fails). Both state files concatenate the same successful f6
+ *     reads (shared_persona_facts, shared_attempt_order, shared_thread_joins).
+ *     Need fired late, arrival_mono_ms, exactly one late settlement and its API
+ *     record, both seq > complete-seq-mark. The same stub's seq is monotonic record
+ *     order. Line: membership-late(fired,late_after_complete,unchanged; unchanged).
+ *     Abort always fails. Missing evidence or a settlement before completion is
+ *     missing; different state reads fail. Never accept an aborted delay as late.
+ *
+ *   zero-ack C <key> <envelope-id> <times> <start-ms> <end-ms> <probe-exit> <log-slice>
+ *     Attempt the actual write probe while permissions deny writes. Capture start
+ *     after pushing the live membership event, end after the observation interval,
+ *     then slack_envelope_times; same external clock, no repair/redelivery until
+ *     afterward. Require MEMBERSHIP_STORAGE_FAILED for key. Line: zero-ack(acks,
+ *     observed_ms,probe_failed; 0). Empty ACK array is evidence; absent push/time,
+ *     interval, probe status or diagnostic is missing. ANY ACK or probe success fails.
+ *   accounting C <manifest-tsv> <stub-slice> <during-times> <final-times> <queue-dir> <clear-seq-mark>
+ *     Manifest: kind(stored|withheld|dropped),key,channel,ts,envelope_id,recovered_id
+ *     ('-' unless withheld). Include EVERY push in stub-slice, including drops and
+ *     every redelivery. during-times are slack_envelope_times before clearing;
+ *     final-times after recovery. Withheld originals stay unacked; replay with
+ *     slack_stub_redeliver after clear-seq-mark and record the new envelope id.
+ *     Both map to the same exactly-one durable acceptance in <key>.queue.jsonl.
+ *     Lines: accounting(expected,stored,withheld; all-pushes), accounting-ack and
+ *     recovered-ack (max_ms; N1) for nonempty classes. Recovery latency starts at
+ *     the NEW push, never subtracting the fault interval from an original ACK.
+ *     Missing push/replay/acceptance/time is missing; duplicate/unlisted pushes,
+ *     premature ACKs, wrong replay identity or stored drops fail. No dropped work.
+ *     The fault-aware path below also uses refused/refused-dropped (no original
+ *     envelope, recorded HTTP refusal) and withheld-dropped (intentional drop whose
+ *     original delivery was withheld). Recovery drops must still be ACKed and never
+ *     stored; accepted workload recovery must be stored exactly once.
+ *   stores C <check-evidence-dir> <measurement-file> <byte-mark>
+ *     Same burst.jsonl, queue snapshots and measurements as check. Emits combined
+ *     store plus one store persona=<1-based recipient> per configured key. Missing
+ *     any acceptance/store or a persona's samples is missing; p99>=50 fails, with
+ *     fixed appends excluded. This supplements check/fault-check, never replaces it.
+ *   lookup-faults C <probes-tsv> <stub-slice> <times>
+ *     TSV: key,method(users.info|conversations.info),outcome(hang|late),match-id,
+ *     envelope_id. Use fresh identities and late delay past NAME_LOOKUP_TIMEOUT_MS.
+ *     One exact fired line per probe is required; absent/duplicate is missing.
+ *     Lines: lookup-faults(fired,required; every-fault), lookup-ack(max_ms; N1).
+ *     Every sample ACK must meet N1. The enclosing burst runs check or fault-check.
+ *   ordered-writes C <directory> <stub-slice> <submit-seq-mark> <result-seq-mark> <times>
+ *     One persona's before/after/reopened.jsonl from shared_attempt_order; all
+ *     attempts in these snapshots belong to that incarnation. expected.tsv holds
+ *     channel,delivery in submitted serial order; results.jsonl holds each actual
+ *     stub_session_result. Submit AFTER a burst push, capture slack_post_mark just
+ *     before submission and after result. Preserve preexisting order, require new
+ *     outcomes in requested order and exact equality after reopening. The submission
+ *     submission AND result marks must precede a burst ACK. Lines: ordered-writes(overlap,retained,ordered;
+ *     durable-order), ordered-write-ack(max_ms; N1). Missing evidence is missing;
+ *     reordered/lost writes, refused results or lack of overlap fails. Script also
+ *     compares each result's text to the existing printer's attempt-result text;
+ *     that is exact content checking, not a second numeric/timing oracle.
+ *
+ * Fault-aware load commands (Decision 27). C must use two recipients. All event
+ * bodies are prebuilt by scenario.sh OUTSIDE the measured window, as for burst.
+ *   fault-plan C <batch-dir> <plan-tsv> <hang|transient|scope|denied|rate|late|lookup> <P-number> <all|none|channel-ordinals> <out>
+ *     BEFORE faults/burst: validates every prebuilt root/reply/drop against plan's
+ *     phase/channel/ts/root and full per-persona counts. P-number is 1 or 2 in the
+ *     population's persona order. Channel ordinals are 1-based comma-separated
+ *     indices in the plan's first-seen channel order; never type channel/persona IDs.
+ *     Declares P's dependent set; all other items are independent. denied REQUIRES
+ *     all (invalid_auth breaks P's connection). For name-only lookup use none.
+ *     Writes fault-plan.json and copied payloads.jsonl to a fresh out. Optional held
+ *     batch participates too. Prints planned/dependent counts and P's number.
+ *   fault-burst C <out> <stub-url> <stub-record> <state-dir> <measurement-file> <byte-mark> <wait-ms>
+ *     Submit held probes first, admit the independent probes as above; then concurrent
+ *     P/Q roots, wait ONLY expected independent ACKs, then concurrent P/Q replies and
+ *     drops (including replies to withheld roots). Never await a dependent ACK.
+ *     Appends each original HTTP result to fault-ledger.jsonl by planned ordinal:
+ *     envelope_id, or denied-case no-open-socket/send-failed refusal with NO invented
+ *     envelope. Unrecognized refusals/timeouts fail and retain the attempted item.
+ *     Compaction observations cover the Q burst window; keeps compactions.jsonl and
+ *     held-admission snapshots. Prints submitted/expected/refused. No HTTP ACK oracle.
+ *   fault-ids C <out>
+ *     Every original/replay envelope in the ledger, one per line, excluding only
+ *     refused attempts that have no envelope. Take during-times.jsonl BEFORE clear;
+ *     after recovery take times.jsonl, using envelope-times with separate frozen
+ *     before-clear and final observations. No original ID is removed after replay.
+ *   fault-recover C <out> <stub-url> <live-stub-record> <wait-ms> <concurrency>
+ *     One call after clear/readiness, replacing the per-item pending/body/replayed
+ *     loop. Read plan, original ledger and copied payloads once. Refuse a ledger
+ *     already containing replays. Concurrency is an integer 1..256; wait-ms is one
+ *     overall deadline, not a per-envelope extension or an N1 allowance.
+ *     Replay roots with bounded concurrent requests/ACK waits, observe every root's
+ *     own ACK, then replay the other dependent items with the same bound. Retain
+ *     original/refusal rows; append every attempt and actual returned replay ID.
+ *     Refused originals use the copied prebuilt body; other originals use the same
+ *     redelivery control as slack_stub_redeliver. Failed attempts remain incomplete
+ *     ledger rows and cannot pass accounting. Never retry the driver implicitly.
+ *     One incremental stub reader buffers live partial lines and fails on record
+ *     replacement/truncation or malformed complete lines. No per-item subprocesses.
+ *     Verify replay push identities, exactly one own ACK, root ACK before reply push,
+ *     and no new unrecorded push. Failure uses a fixed named reason. Keep the full
+ *     final observation and run fault-check/accounting unchanged, including N1.
+ *     Prints fault-recover expected/attempted/recorded/completed/concurrency counts;
+ *     these are driver counts, never a runtime/performance verdict.
+ *   fault-pending C <out>
+ *     TSV ordinal,key,original-envelope-or-dash for EVERY dependent planned item,
+ *     roots first. After clear/readiness, use slack_stub_redeliver for a real original;
+ *     for a refused attempt use slack_stub_push with fault-body's prebuilt event.
+ *     Wait for each recovery root ACK before replaying its replies. All dependent
+ *     replies were already submitted in the original second wave during the fault.
+ *   fault-body C <out> <ordinal>
+ *     Prints that already-built dependent event verbatim as JSON; constructs no event.
+ *   fault-replayed C <out> <ordinal> <new-envelope-id>
+ *     APPENDS the helper's actual new envelope to the ledger; no replacements/deletions.
+ *     Duplicate replay IDs/ordinals are usage errors. Final accounting binds each
+ *     real redelivery record or refused attempt's fresh push to its planned identity.
+ *   fault-check C <out> <stub-slice> <clear-seq-mark> <clear-epoch-ms> <measurement-file> <byte-mark> <start-ms> <ready-ms>
+ *     Before clear, capture during/<key>.queue.jsonl for BOTH keys and during-times.
+ *     During snapshots must cover the completed original burst while the fault is
+ *     still in force. Save final <key>.queue.jsonl, retaining pre-compaction samples,
+ *     times.jsonl, and <key>.before/after.jsonl joins as check requires (after restart).
+ *     The stub slice includes this case's fired/settled fault and EVERY original,
+ *     refused and replay attempt, no setup pushes or unrelated case work. Mark the
+ *     last stub seq and container wall time immediately BEFORE clearing the fault.
+ *     For denied P, restore its authenticated connection before recovery submissions.
+ *     Lines: fault-workload(full original counts/declared dependencies/refusals),
+ *     fault-withheld(zero ACK and unstored during the fault), fault-overlap(positive
+ *     intersection of fired-to-settled-or-clear with Q's first-push-to-final-ACK wall
+ *     window; no overlap is missing), accounting/accounting-ack/recovered-ack,
+ *     ordinary ack-accepted/ack-dropped per nonempty independent persona class,
+ *     combined/per-persona store, post-hold and overlap, joins, startup and compaction.
+ *     Q keeps ALL ordinary counts and limits, P's independent work keeps N1, all
+ *     recovery ACKs start at their NEW push and all accepted recoveries store once.
+ *     This replaces ordinary check ONLY for this declared fault-aware workload;
+ *     membership/repair/late/lookup/ordered-write case verdicts are still required.
+ *
+ * Exact invocation examples (script variables are observations, paths or plan values):
+ * Test-44, with prebuilt held probes:
+ *   bun "$E" combinations > "$out/combinations.tsv"
+ *   bun "$E" burst "$TEST_NAME" "$mode" "$population" "$recipients" "$batch_dir" "$stub_url" "$stub_record" "$state_dir" "$out" "$wait_ms" "$measurements" "$mark"
+ *   jq -er '.envelope_id' "$out/burst.jsonl" > "$out/ids.txt"
+ *   _scenario_complete_jsonl "$stub_record" > "$out/final-stub.jsonl"
+ *   bun "$E" envelope-times "$out/ids.txt" "$out/final-stub.jsonl" > "$out/times.jsonl"
+ *   bun "$E" check "$TEST_NAME" "$mode" "$population" "$recipients" "$out" "$measurements" "$mark" "$start_ms" "$ready_ms"
+ * Test-45, P=first population persona, all its planned channels dependent:
+ *   bun "$E" fault-plan "$TEST_NAME" "$mode" 100000 2 "$batch_dir" "$plan_tsv" "$kind" 1 all "$out"
+ *   bun "$E" fault-burst "$TEST_NAME" "$mode" 100000 2 "$out" "$stub_url" "$stub_record" "$state_dir" "$measurements" "$mark" "$wait_ms"
+ *   bun "$E" fault-ids "$TEST_NAME" "$mode" 100000 2 "$out" > "$out/during-ids.txt"
+ *   _scenario_complete_jsonl "$stub_record" > "$out/during-stub.jsonl"
+ *   bun "$E" envelope-times "$out/during-ids.txt" "$out/during-stub.jsonl" > "$out/during-times.jsonl"
+ *   # Capture during queues and clear marks; clear fault, observe repair/readiness.
+ *   bun "$E" fault-recover "$TEST_NAME" "$mode" 100000 2 "$out" "$stub_url" "$stub_record" "$recovery_wait_ms" 64
+ *   bun "$E" fault-ids "$TEST_NAME" "$mode" 100000 2 "$out" > "$out/all-ids.txt"
+ *   _scenario_complete_jsonl "$stub_record" > "$out/final-stub.jsonl"
+ *   bun "$E" envelope-times "$out/all-ids.txt" "$out/final-stub.jsonl" > "$out/times.jsonl"
+ *   bun "$E" fault-check "$TEST_NAME" "$mode" 100000 2 "$out" "$stub_slice" "$clear_mark" "$clear_epoch_ms" "$measurements" "$mark" "$start_ms" "$ready_ms"
+ * For a channel-local case, replace all with plan channel ordinal(s), e.g. 1,2.
+ * For lookups, use kind=lookup and none. Scope is declared before any submission.
+ *
+ * Missing evidence (never pass; check/startup-load/seal/n4/windows exit 1 after ALL result lines):
+ * - absent/malformed measurement file, or fewer/mismatched acceptance stores than
+ *   accepted burst items (fixed appends are excluded from both the count and p99);
+ * - a push without its unique ACK, missing push/timing/accepted/join snapshots;
+ * - fewer real-agent N2 samples than required;
+ * - either required compaction not proved INSIDE the burst at population 100000;
+ * - a held reply without its resolution or its OWN key/seq resolution-store append;
+ * - absent hung N2 sample or accepted/fixed record of its key/seq;
+ * - absent fired fault for either hung or delayed sample;
+ * - absent external startup timestamps or N3 idle-window observations.
+ * A restart resolution without held_ms is not a timing sample. No in-process
+ * thread-memory-loaded record exists or is required (Decision 25).
+ *
+ * Percentiles: transcript-receipts.percentile (nearest rank), never interpolation.
+ * SR8_DISPATCH_ALLOWANCE_MS is the test-method timer-dispatch allowance over the
+ * Post Hold and N4 STRICT limits; both print signed excess and allowance always.
+ */
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { cpus } from 'node:os'
+import { isDeepStrictEqual } from 'node:util'
+
+export const SR8_DISPATCH_ALLOWANCE_MS = 100
+// SRD verification bounds, not configurable production timers.
+export const SR8_ACK_LIMIT_MS = 3_000
+export const SR8_STORE_LIMIT_MS = 50
+export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
+export interface Context { scenario: string; mode: 'strict' | 'open'; population: number; recipients: number }
+export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict }
+export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string }
+export interface Accepted { key: string; seq: number }
+export interface Times { envelope_id: string; push: { sent_mono_ms: number; connection_id: unknown }; acks: { ack_mono_ms: number; connection_id: unknown }[] }
+export interface BurstItem { key: string; phase: string; channel: string; ts: string; sender: string; envelope_id?: string }
+const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n)
+const nonnegative = (n: unknown): n is number => finite(n) && n >= 0
+const maximum = (ns: number[]) => ns.length ? Math.max(...ns) : 0
+const identity = (r: Accepted) => `${r.key}:${r.seq}`
+const result = (measure: string, samples: number, stats: Result['stats'], limit: Result['limit'], verdict: Verdict): Result => ({ measure, samples, stats, limit, verdict })
+
+/** Formatting deliberately has no arbitrary text/error field. */
+export function resultLine(c: Context, r: Result): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(c.scenario) || !['strict', 'open'].includes(c.mode)) throw new Error('invalid context')
+  return `recorded: sr8 ${r.measure} scenario=${c.scenario} mode=${c.mode} population=${c.population} recipients=${c.recipients} samples=${r.samples} ${Object.entries(r.stats).map(([k, v]) => `${k}=${v}`).join(' ')} limit=${r.limit} verdict=${r.verdict}`
+}
+export function summary(c: Context, rows: Result[]): string {
+  return `recorded: sr8 summary scenario=${c.scenario} measures=${rows.length} pass=${rows.filter(r => r.verdict === 'pass').length} fail=${rows.filter(r => r.verdict === 'fail').length} missing=${rows.filter(r => r.verdict === 'missing').length}`
+}
+export function evidenceExit(rows: Result[]): number { return rows.some(r => r.verdict === 'fail' || r.verdict === 'missing') ? 1 : 0 }
+export function printResults(c: Context, rows: Result[], print: (line: string) => void = console.log): number {
+  for (const r of rows) print(resultLine(c, r))
+  print(summary(c, rows))
+  return evidenceExit(rows)
+}
+export function ackVerdict(measure: string, ids: (string | undefined)[], times: Times[] | undefined): Result {
+  const durations: number[] = []
+  let missing = !times || !ids.length, invalid = new Set(ids).size !== ids.length
+  for (const id of ids) {
+    const found = times?.filter(t => t.envelope_id === id) ?? []
+    if (!id || found.length !== 1 || found[0].acks.length === 0) { missing = true; continue }
+    const t = found[0], ack = t.acks[0]
+    if (t.acks.length !== 1 || ack.connection_id !== t.push.connection_id) invalid = true
+    const ms = ack.ack_mono_ms - t.push.sent_mono_ms
+    if (!nonnegative(ms)) { missing = true; continue }
+    durations.push(ms)
+  }
+  const max = maximum(durations)
+  return result(measure, durations.length, { max_ms: max }, SR8_ACK_LIMIT_MS,
+    missing ? 'missing' : invalid || max > SR8_ACK_LIMIT_MS ? 'fail' : 'pass')
+}
+export function storeVerdict(rows: Measurement[] | undefined, accepted: Accepted[], percentile: (values: number[], q: number) => number): Result {
+  const stores = rows?.filter(r => r.kind === 'store' && ['accepted', 'post-hold', 'memory-hold'].includes(r.store!)) ?? []
+  const wanted = new Set(accepted.map(identity))
+  const samples = stores.filter(r => wanted.has(identity(r as Accepted)))
+  const counts = new Map<string, number>()
+  for (const s of samples) { const id = identity(s as Accepted); counts.set(id, (counts.get(id) ?? 0) + 1) }
+  const complete = rows !== undefined && accepted.length > 0 && wanted.size === accepted.length
+    && accepted.every(a => counts.get(identity(a)) === 1)
+    && samples.every(s => nonnegative(s.store_ms))
+  const p99 = samples.length && samples.every(s => nonnegative(s.store_ms)) ? percentile(samples.map(s => s.store_ms!), .99) : 0
+  return result('store', samples.length, { p99_ms: p99, accepted: accepted.length }, SR8_STORE_LIMIT_MS,
+    !complete ? 'missing' : p99 < SR8_STORE_LIMIT_MS ? 'pass' : 'fail')
+}
+export function postHoldVerdict(rows: Measurement[] | undefined, holds: Accepted[], holdMs: number): Result {
+  const excess: number[] = [], appends: number[] = [], held: number[] = []
+  let missing = rows === undefined || holds.length === 0
+  for (const h of holds) {
+    const resolutions = rows?.filter(r => r.kind === 'post-hold-resolved' && r.key === h.key && r.seq === h.seq) ?? []
+    // Restart release is outside the timed run; it cannot fill a missing live sample.
+    const timed = resolutions.filter(r => nonnegative(r.held_ms))
+    const stores = (rows?.filter(r => r.kind === 'resolution-store' && r.key === h.key && r.seqs?.includes(h.seq)) ?? [])
+      .sort((a, b) => a.at_mono_ms - b.at_mono_ms)
+    // The first transition resolves the Post Hold. A parked hold can later have
+    // a second (Memory Hold) resolution with the same seq and a different append.
+    if (timed.length !== 1 || stores.length === 0 || !nonnegative(stores[0].store_ms)
+      || stores[0].at_mono_ms > timed[0].at_mono_ms
+      || (stores[1] && stores[0].at_mono_ms === stores[1].at_mono_ms)) { missing = true; continue }
+    const append = stores[0].store_ms!, ms = timed[0].held_ms!
+    appends.push(append); held.push(ms); excess.push(ms - holdMs - append)
+  }
+  const max = excess.length ? Math.max(...excess) : 0
+  return result('post-hold', excess.length, { hold_ms: holdMs, max_append_ms: maximum(appends), max_held_ms: maximum(held), excess_ms: max, allowance_ms: SR8_DISPATCH_ALLOWANCE_MS }, 'hold_ms+own_append',
+    missing ? 'missing' : max <= SR8_DISPATCH_ALLOWANCE_MS ? 'pass' : 'fail')
+}
+export interface N2Sample { key: string; seq: number; name: string }
+export function n2Samples(text: string): N2Sample[] {
+  return text.split('\n').filter(l => l.startsWith('recorded: sr8 n2-sample ')).map(line => {
+    const fields = Object.fromEntries(line.split(/\s+/).slice(3).map(s => s.split('=')))
+    return { key: fields.key, seq: Number(fields.seq), name: fields.name }
+  }).filter(s => /^[a-z0-9_]+$/.test(s.key) && Number.isSafeInteger(s.seq) && s.seq > 0)
+}
+export function n2Verdict(samples: N2Sample[] | undefined, required: number): Result {
+  const count = new Set(samples?.map(identity)).size
+  return result('n2-samples', count, { required }, required, samples && count >= required ? 'pass' : 'missing')
+}
+export interface FaultSample extends Accepted { sender: string; envelope_id?: string }
+export function n4Verdict(rows: Measurement[] | undefined, hung: FaultSample | undefined, delayed: FaultSample | undefined,
+  times: Times[] | undefined, samples: N2Sample[] | undefined, faults: any[] | undefined, timeoutMs: number): Result {
+  const accepted = rows?.filter(r => r.kind === 'store' && r.store === 'accepted' && r.key === hung?.key && r.seq === hung?.seq) ?? []
+  const fixed = rows?.filter(r => r.kind === 'store' && r.store === 'fixed' && r.key === hung?.key && r.seq === hung?.seq) ?? []
+  const n2 = samples?.filter(s => s.key === hung?.key && s.seq === hung?.seq) ?? []
+  const ack = ackVerdict('ack', [hung?.envelope_id], times)
+  const fired = [hung, delayed].filter((s, i) => s && faults?.filter(f => f.event === 'fault' && f.control === 'faults'
+    && f.method === 'users.info' && f.match === s.sender && f.label === s.key && f.outcome === (i === 0 ? 'hang' : 'delay')
+    && nonnegative(f.arrival_mono_ms)).length === 1).length
+  const fallback = accepted.length === 1 && fixed.length === 1 && nonnegative(fixed[0].store_ms)
+    ? fixed[0].at_mono_ms - fixed[0].store_ms! - accepted[0].at_mono_ms : NaN
+  const excess = fallback - timeoutMs
+  const missing = !hung || !delayed || !rows || n2.length !== 1 || !nonnegative(fallback) || fired !== 2 || ack.verdict === 'missing'
+  return result('n4', nonnegative(fallback) ? 1 : 0, { fallback_ms: finite(fallback) ? fallback : 'missing', excess_ms: finite(excess) ? excess : 'missing', allowance_ms: SR8_DISPATCH_ALLOWANCE_MS,
+    name: n2[0]?.name === 'fallback' ? 'fallback' : 'resolved', ack_ms: ack.stats.max_ms, ack_limit: SR8_ACK_LIMIT_MS, in_n2: n2.length === 1 ? 'yes' : 'no', fired: `${fired}/2` }, timeoutMs,
+  missing ? 'missing' : n2[0].name !== 'fallback' || ack.verdict !== 'pass' || excess > SR8_DISPATCH_ALLOWANCE_MS ? 'fail' : 'pass')
+}
+export function sealVerdict(phase: string, keys: string[], lines: string[] | undefined, marker: string, expected: string[], lostMarker?: string): Result {
+  if (!['first', 'measured'].includes(phase) || (phase === 'first' && keys.length === 0)) throw new Error('usage: first requires seeded personas')
+  const reports = lines?.filter(l => l.includes(marker) || (phase === 'measured' && !!lostMarker && l.includes(lostMarker))) ?? []
+  const pass = phase === 'measured' ? reports.length === 0 : reports.length === keys.length
+    && expected.length === keys.length && expected.every(e => reports.filter(l => l.includes(e)).length === 1)
+  return result('seal', keys.length, { phase, personas: keys.length, reports: reports.length, loaded: 0 }, phase === 'first' ? keys.length : 0,
+    !lines ? 'missing' : pass ? 'pass' : 'fail')
+}
+export function requireSeedPopulation(n: number): void { if (![10_000, 100_000].includes(n)) throw new Error('usage: seed requires 10000 or 100000 joins') }
+export function startupVerdict(start: number, ready: number, count: number): Result {
+  return result('startup-load', count, { joined: count, start_to_ready_ms: nonnegative(ready - start) ? ready - start : 'missing' }, 'none',
+    nonnegative(start) && nonnegative(ready) && ready >= start ? 'recorded' : 'missing')
+}
+export interface Compaction { key: string; kind: string; before: string; after: string; inside: boolean }
+export function compactionVerdict(rows: Compaction[] | undefined, keys: string[], required: boolean): Result {
+  const count = keys.flatMap(key => ['queue', 'threads'].map(kind => rows?.some(r => r.key === key && r.kind === kind
+    && r.inside === true && !!r.before && !!r.after && r.before !== r.after))).filter(Boolean).length
+  return result('compaction', count, { required: required ? keys.length * 2 : 0 }, 'inside-burst', !required || count === keys.length * 2 ? 'pass' : 'missing')
+}
+export function joinsVerdict(before: { channel: string; root: string }[] | undefined, after: { channel: string; root: string }[] | undefined,
+  expected: { channel: string; root: string }[], newJoins: { channel: string; root: string }[], recipients: number): Result {
+  const id = (r: { channel: string; root: string }) => `${r.channel}:${r.root}`
+  const b = new Set(before?.map(id)), a = new Set(after?.map(id)), old = new Set(expected.map(id)), added = new Set(newJoins.map(id))
+  const retained = [...old].filter(k => a.has(k)).length
+  return result('joins', a.size, { before: b.size, after: a.size, oldest_retained: retained, forgotten: old.size - retained }, `>=${(old.size + added.size) * recipients}`,
+    !before || !after ? 'missing' : b.size === old.size && [...old].every(k => b.has(k) && a.has(k))
+      && a.size >= old.size + added.size && [...added].every(k => a.has(k)) ? 'pass' : 'fail')
+}
+export interface ObservationWindow { instance: string; start: number; end: number }
+export function windowsVerdict(calls: { instance: string; ms: number }[] | undefined, empty: ObservationWindow[] | undefined,
+  rate: number, active: ObservationWindow[] | undefined): Result {
+  let max = 0, idle = 0
+  for (const instance of new Set(calls?.map(c => c.instance))) {
+    const ts = calls!.filter(c => c.instance === instance).map(c => c.ms).sort((a, b) => a - b)
+    let end = 0
+    for (let start = 0; start < ts.length; start++) {
+      while (end < ts.length && ts[end] < ts[start] + 10_000) end++
+      max = Math.max(max, end - start)
+    }
+  }
+  for (const c of calls ?? []) if (empty?.some(e => e.instance === c.instance && c.ms >= e.start && c.ms < e.end)) idle++
+  const valid = (w: ObservationWindow) => typeof w.instance === 'string' && !!w.instance && nonnegative(w.start) && finite(w.end) && w.end > w.start
+  const inside = (c: { instance: string; ms: number }, w: ObservationWindow) => c.instance === w.instance && c.ms >= w.start && c.ms < w.end
+  const covered = active?.filter(w => calls?.some(c => inside(c, w))).length ?? 0
+  const missing = !calls || !empty?.length || !active?.length || active.some(w => !valid(w)) || empty.some(w => !valid(w))
+    || new Set(active.map(w => w.instance)).size !== active.length || covered !== active.length
+    || active.some(a => !empty.some(e => e.instance === a.instance)) || empty.some(e => !active.some(a => a.instance === e.instance)
+      || active.some(a => a.instance === e.instance && Math.max(a.start, e.start) < Math.min(a.end, e.end)))
+    || calls.some(c => !nonnegative(c.ms) || ![...active, ...empty].some(w => inside(c, w)))
+  return result('n3', calls?.length ?? 0, { max_10s: max, empty_calls: idle, active_instances: active?.length ?? 0, covered_instances: covered }, rate * 10,
+    missing ? 'missing' : max <= rate * 10 && idle === 0 ? 'pass' : 'fail')
+}
+
+export interface ConcurrentOperation { kind: string; id: string; start_epoch_ms: number; end_epoch_ms: number }
+export interface SampleInterval extends Accepted { start_epoch_ms: number; end_epoch_ms: number }
+export function concurrentOverlapVerdicts(operations: ConcurrentOperation[] | undefined, samples: SampleInterval[] | undefined,
+  measured: N2Sample[] | undefined): Result[] {
+  const validInterval = (r: { start_epoch_ms: number; end_epoch_ms: number }) => nonnegative(r.start_epoch_ms)
+    && finite(r.end_epoch_ms) && r.end_epoch_ms > r.start_epoch_ms
+  const expected = new Set(measured?.map(identity))
+  const missing = !operations?.length || !samples?.length || !measured?.length || expected.size !== measured.length
+    || samples.length !== expected.size || new Set(samples.map(identity)).size !== samples.length
+    || samples.some(s => !expected.has(identity(s)) || !validInterval(s))
+    || operations.some(o => !['membership', 'write'].includes(o.kind) || !o.id || !validInterval(o))
+    || new Set(operations.map(o => JSON.stringify([o.kind, o.id]))).size !== operations.length
+  return ['membership', 'write'].map(kind => {
+    const work = operations?.filter(o => o.kind === kind) ?? []
+    // Recorded ends are poll-bounded supersets; only the start is credited.
+    const overlapping = work.filter(o => samples?.some(s => o.start_epoch_ms >= s.start_epoch_ms && o.start_epoch_ms < s.end_epoch_ms)).length
+    return result(`thread-${kind}-overlap`, overlapping, { operations: work.length, measured: expected.size }, 'start-inside-measured-sample',
+      missing || !overlapping ? 'missing' : 'pass')
+  })
+}
+
+// Additional case verdicts deliberately do not alter check/n4/startup-load.
+export const SR8_PENDING_POST_MS = 120_000
+export const SR8_LARGE_BYTES = 64 * 1024
+export const SR8_SHARED_CHANNELS = 1_000
+const object = (v: any): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
+const records = (v: any): v is any[] => Array.isArray(v) && v.every(object)
+const positive = (v: unknown): v is number => nonnegative(v) && v > 0
+const integer = (v: unknown): v is number => nonnegative(v) && Number.isSafeInteger(v)
+const stateRead = (v: string | undefined) => {
+  if (!v?.trim()) return false
+  try { if (object(JSON.parse(v))) return true } catch { /* a concatenated reader file may be JSONL */ }
+  return v.trim().split('\n').every(l => { try { return object(JSON.parse(l)) } catch { return false } })
+}
+const acceptedFor = (queue: any[] | undefined, channel: string, ts: string) => queue?.filter(r => r.kind === 'accepted'
+  && !r.compact && r.reminder_for === undefined && r.channel === channel && r.ts === ts) ?? []
+const namedLines = (text: string | undefined, marker: string, key: string) =>
+  text?.split('\n').filter(l => l.includes(`${marker} persona=${key}`) &&
+    [':', ' '].includes(l.split(`${marker} persona=${key}`)[1]?.[0])) ?? []
+
+export interface PendingProbe { parent: string; channel: string; ts: string; envelope_id: string }
+export function pendingPostVerdicts(key: string, operation: string, start: number, end: number,
+  before: any[] | undefined, after: any[] | undefined, probes: PendingProbe[] | undefined,
+  queue: any[] | undefined, times: Times[] | undefined, rows: Measurement[] | undefined, holdMs: number): Result[] {
+  const intents = [before, after].map(rs => rs?.filter(r => r.kind === 'post-intent' && r.operationId === operation) ?? [])
+  const outcomes = [before, after].flatMap(rs => rs?.filter(r => r.kind === 'post-outcome' && r.operationId === operation) ?? [])
+  const holds: Accepted[] = []
+  let missing = !before || !after || !queue || !rows || !probes?.length || !times || !nonnegative(start) || !nonnegative(end - start)
+    || intents.some(rs => rs.length !== 1) || !['other', 'bot', 'none'].every(p => probes?.some(r => r.parent === p))
+  let unexpected = outcomes.length > 0 || intents.some(rs => rs.some(r => r.root !== undefined))
+    || !isDeepStrictEqual(intents[0], intents[1])
+  for (const p of probes ?? []) {
+    if (!['other', 'bot', 'none'].includes(p.parent) || p.channel !== intents[0][0]?.channel) { missing = true; continue }
+    const accepted = acceptedFor(queue, p.channel, p.ts)
+    if (accepted.length > 1 || (p.parent !== 'other' && accepted.length !== 1)) { missing = true; continue }
+    for (const a of accepted) {
+      const stores = rows?.filter(r => r.kind === 'store' && r.key === key && r.seq === a.seq && r.store === 'post-hold') ?? []
+      const resolved = rows?.filter(r => r.kind === 'post-hold-resolved' && r.key === key && r.seq === a.seq) ?? []
+      if (p.parent === 'other') unexpected ||= stores.length > 0 || resolved.length > 0 || a.hold?.on === 'post'
+      else { if (stores.length !== 1) missing = true; holds.push({ key, seq: a.seq }) }
+    }
+  }
+  const duration = end - start
+  const pending = result('pending-post', probes?.length ?? 0, { pending_ms: finite(duration) ? duration : 'missing',
+    other: probes?.filter(p => p.parent === 'other').length ?? 0, held: holds.length }, `>=${SR8_PENDING_POST_MS}`,
+    missing ? 'missing' : unexpected || duration < SR8_PENDING_POST_MS ? 'fail' : 'pass')
+  return [pending, ackVerdict('pending-post-ack', probes?.map(p => p.envelope_id) ?? [], times), postHoldVerdict(rows, holds, holdMs)]
+}
+
+export interface SharedListEvidence {
+  prepared?: string; preview?: string; growth?: { key: string; channel: string; delivery: string }[]
+  phases: { facts?: any[]; input?: string }[]
+  failureBefore?: string; failureAfter?: string; probeExit: number; failureLog?: string; failureExpected?: string
+}
+export function sharedListVerdicts(e: SharedListEvidence, keys: string[], marker: string): Result[] {
+  let cfg: any
+  try { cfg = JSON.parse(e.prepared!) } catch { /* missing below */ }
+  const configBytes = e.prepared === undefined ? 0 : Buffer.byteLength(e.prepared)
+  const previewBytes = e.preview === undefined ? 0 : Buffer.byteLength(e.preview)
+  let missing = !records(cfg?.personas) || !keys.length || !e.preview?.trim() || !e.growth?.length || e.phases.length !== 5
+  let invalid = false, initialCount = 0, grownCount = 0
+  const facts = (phase: number, key: string) => e.phases[phase]?.facts?.filter(f => f.key === key) ?? []
+  for (const phase of e.phases) {
+    if (!phase.facts || phase.input === undefined || phase.facts.length !== keys.length) missing = true
+    if (phase.input !== undefined && phase.input !== e.prepared) invalid = true
+  }
+  for (const key of keys) {
+    const ps = facts(0, key), configured = records(cfg?.personas) ? cfg.personas.filter((p: any) => p.name === key) : []
+    if (ps.length !== 1 || !object(ps[0].assignments) || configured.length !== 1 || !records(configured[0].channels)) { missing = true; continue }
+    const original = ps[0].assignments, channels = configured[0].channels
+    initialCount += Object.keys(original).length
+    invalid ||= Object.keys(original).length < SR8_SHARED_CHANNELS || channels.length !== Object.keys(original).length
+      || channels.some((ch: any) => original[ch.id]?.delivery !== ch.delivery)
+    const additions = e.growth?.filter(g => g.key === key) ?? []
+    if (!additions.length || new Set(additions.map(g => g.channel)).size !== additions.length) missing = true
+    for (let phase = 1; phase < 5; phase++) {
+      const next = facts(phase, key)
+      if (next.length !== 1 || !object(next[0].assignments)) { missing = true; continue }
+      const assignments = next[0].assignments
+      invalid ||= next[0].incarnation !== ps[0].incarnation || next[0].mode !== ps[0].mode
+        || Object.entries(original).some(([channel, value]) => !isDeepStrictEqual(assignments[channel], value))
+      if (phase === 1) invalid ||= !isDeepStrictEqual(assignments, original)
+      else {
+        invalid ||= Object.keys(assignments).length !== Object.keys(original).length + additions.length
+          || additions.some(g => original[g.channel] !== undefined || assignments[g.channel]?.delivery !== g.delivery)
+        if (phase === 2) grownCount += Object.keys(assignments).length
+        else invalid ||= !isDeepStrictEqual(assignments, facts(2, key)[0]?.assignments)
+      }
+    }
+  }
+  const failures = keys.reduce((n, key) => n + namedLines(e.failureLog, marker, key).length, 0)
+  const failureMissing = !integer(e.probeExit) || !stateRead(e.failureBefore) || !stateRead(e.failureAfter) || !failures
+    || !e.failureExpected?.trim() || !keys.some(key => namedLines(e.failureExpected, marker, key).length > 0)
+    || !e.failureLog?.split('\n').some(line => line.includes(e.failureExpected!.trim()))
+    || !e.phases[4]?.facts || e.phases[4]?.input === undefined
+  return [result('shared-list', initialCount, { config_bytes: configBytes, preview_bytes: previewBytes, initial: initialCount, grown: grownCount },
+    `channels>=${SR8_SHARED_CHANNELS},bytes>${SR8_LARGE_BYTES}`, missing ? 'missing' : invalid || configBytes <= SR8_LARGE_BYTES || previewBytes <= SR8_LARGE_BYTES ? 'fail' : 'pass'),
+  result('shared-list-write-failure', failures, { probe_failed: e.probeExit > 0 ? 'yes' : 'no',
+    unchanged: e.failureBefore !== undefined && e.failureBefore === e.failureAfter ? 'yes' : 'no' }, 'preserved',
+    e.probeExit === 0 ? 'fail' : failureMissing ? 'missing' : e.failureBefore !== e.failureAfter || invalid ? 'fail' : 'pass')]
+}
+
+export interface ScanDiagnostic { complete: boolean; pages: number; reason: string; slack?: string; at: number; deadline: number; next: number; retryAfter: number }
+export function scanDiagnostics(log: string | undefined, key: string, incomplete: string, complete: string): ScanDiagnostic[] | undefined {
+  if (log === undefined) return undefined
+  return log.split('\n').filter(l => [incomplete, complete].some(m => l.includes(`${m} persona=${key}:`))).map(l => {
+    const field = (name: string) => l.match(new RegExp(`(?:^| )${name}=([^ .]+(?:\\.[0-9]+)?)(?=[ .]|$)`))?.[1]
+    return { complete: l.includes(`${complete} persona=${key}:`), pages: Number(field('pages') ?? NaN), reason: field('reason') ?? '',
+      slack: field('slack_error'), at: Date.parse(l.match(/^\[([^\]]+)\]/)?.[1] ?? ''), deadline: Number(field('deadline_at') ?? NaN),
+      next: Number(field('next_attempt_at') ?? NaN), retryAfter: Number(field('retry_after_seconds') ?? NaN) }
+  })
+}
+export function membershipFaultVerdicts(kind: string, page: string, key: string, stub: any[] | undefined,
+  diagnostics: ScanDiagnostic[] | undefined, before: string | undefined, after: string | undefined,
+  retryAfter: number, retryMs: number, requestMs: number, attemptMs: number): Result[] {
+  const expected = { hang: ['hang', 'deadline', undefined], transient: ['error', 'transport', 'internal_error'],
+    scope: ['error', 'access', 'missing_scope'], denied: ['error', 'authentication', 'invalid_auth'], rate: ['rate_limit', 'transport', undefined] }[kind]
+  if (!expected || !['first', 'later'].includes(page)) throw new Error('usage')
+  const faults = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.method === 'users.conversations' && r.label === key && r.outcome === expected[0]) ?? []
+  const observed = diagnostics?.filter(d => d.reason !== 'none') ?? []
+  const answers = faults.map(f => stub?.filter(r => r.event === 'api' && r.request_id === f.request_id) ?? [])
+  const matches = observed.filter(d => !d.complete && d.reason === expected[1] && (expected[2] === undefined || d.slack === expected[2])
+    && (page === 'first' ? d.pages === 0 : d.pages > 0))
+  let missing = !stub || !diagnostics || faults.length < 2 || !observed.length || !stateRead(before) || !stateRead(after)
+    || faults.some(f => !nonnegative(f.arrival_mono_ms) || !nonnegative(f.arrival_epoch_ms) || !f.request_id) || !positive(retryMs) || !positive(requestMs)
+  let bad = diagnostics?.some(d => d.complete) === true || (observed.length > 0 && matches.length === 0) || (stateRead(before) && stateRead(after) && before !== after)
+  if (kind !== 'hang') {
+    if (answers.some(a => a.length !== 1)) missing = true
+    bad ||= answers.some(a => a.length === 1 && (kind === 'rate' ? a[0].status !== 429 : a[0].answer !== expected[2]))
+  }
+  if (kind === 'rate' && (!nonnegative(retryAfter) || !matches.some(d => d.retryAfter === retryAfter))) missing = true
+  let faultMissing = missing
+  const gaps = faults.slice(1).map((f, i) => f.arrival_mono_ms - faults[i].arrival_mono_ms)
+  // Each failure's published next-attempt timestamp binds the next start, too:
+  // a hung request must expire BEFORE its retry wait begins. Both are epoch
+  // times on the CI container clock; the monotonic gap check remains separate.
+  const retryDiagnostics = matches.filter((d, i) => matches.findIndex(m => m.next === d.next) === i)
+  if (retryDiagnostics.length < gaps.length || retryDiagnostics.some(d => !nonnegative(d.at) || !nonnegative(d.next))) missing = true
+  const early = faults.slice(1).some((f, i) => {
+    const d = retryDiagnostics[i], start = f.arrival_epoch_ms, previous = faults[i].arrival_epoch_ms
+    if (!nonnegative(start) || !nonnegative(previous)) { missing = true; return false }
+    return !!d && (start < d.next || d.at < previous)
+  })
+  // Response and subsequent request wall stamps share the stub's clock. Never
+  // subtract a server timestamp from a stub monotonic timestamp.
+  const after429 = kind === 'rate' ? faults.slice(1).map((f, i) => f.arrival_epoch_ms - Date.parse(answers[i][0]?.ts)) : []
+  if (after429.some(n => !nonnegative(n))) missing = true
+  const requestDurations: number[] = [], attemptDurations: number[] = []
+  let deadlineBad = false
+  if (kind === 'hang') {
+    if (!positive(attemptMs)) faultMissing = true
+    const used = new Set<ScanDiagnostic>()
+    for (const [i, f] of faults.entries()) {
+      // Only one staged hung page per attempt. Bind each diagnostic to that
+      // request's arrival interval, and require its own abort settlement by ID.
+      // D and A are container wall times, never process-relative monotonic times.
+      const a = f.arrival_epoch_ms, next = faults[i + 1]?.arrival_epoch_ms ?? Infinity
+      const ds = matches.filter(d => d.at >= a && d.at < next)
+      const ss = stub?.filter(r => r.event === 'fault-settled' && r.request_id === f.request_id) ?? []
+      if (!nonnegative(a) || ds.length !== 1 || used.has(ds[0]) || ss.length !== 1) { faultMissing = true; continue }
+      const d = ds[0], settlement = Date.parse(ss[0].ts)
+      used.add(d)
+      if (![d.at, d.deadline, d.next, settlement].every(nonnegative) || settlement < a
+        || !(ss[0].seq > f.seq) || !positive(attemptMs)) { faultMissing = true; continue }
+      const elapsed = d.at - a, attemptStart = d.deadline - attemptMs
+      requestDurations.push(elapsed); attemptDurations.push(d.at - attemptStart)
+      deadlineBad ||= elapsed > requestMs || d.at > d.deadline || a < attemptStart
+        || ss[0].resolution !== 'abort'
+    }
+    if (used.size !== matches.length) faultMissing = true
+    missing ||= faultMissing
+  }
+  const stats = { case: kind, page, fired: faults.length, incomplete: matches.length,
+    max_request_ms: requestDurations.length ? maximum(requestDurations) : 'missing',
+    max_attempt_ms: attemptDurations.length ? maximum(attemptDurations) : 'missing', attempt_limit_ms: attemptMs }
+  return [result('membership-fault', matches.length, stats, kind === 'hang' ? requestMs : 'incomplete', deadlineBad || bad ? 'fail' : faultMissing ? 'missing' : 'pass'),
+    result('membership-retry', gaps.length, { case: kind, page, min_ms: gaps.length ? Math.min(...gaps) : 'missing',
+      retry_after_ms: kind === 'rate' ? retryAfter * 1000 : 0, after_429_ms: after429.length ? Math.min(...after429) : 0 }, retryMs,
+    deadlineBad ? 'fail' : missing ? 'missing' : early || gaps.some(n => n < retryMs) || after429.some(n => n < retryAfter * 1000) ? 'fail' : 'pass')]
+}
+export function membershipRepairVerdict(clearAt: number, diagnostics: ScanDiagnostic[] | undefined, attemptMs: number, retryMaxMs: number): Result {
+  const completed = diagnostics?.filter(d => d.complete && d.at >= clearAt) ?? []
+  const last = diagnostics?.filter(d => !d.complete && d.at <= clearAt).at(-1)
+  const done = completed[0], scanStart = done ? done.deadline - attemptMs : NaN
+  const scan = done ? done.at - scanStart : NaN, elapsed = done ? done.at - clearAt : NaN
+  const remaining = last && nonnegative(last.deadline) ? Math.max(0, last.deadline - clearAt) : 0
+  const retry = Math.max(retryMaxMs, last && nonnegative(last.retryAfter) ? last.retryAfter * 1000 : 0)
+  const bound = remaining + retry + scan
+  const missing = !last || !done || !nonnegative(clearAt) || !nonnegative(scan) || !nonnegative(elapsed)
+    || !nonnegative(last.deadline) || !positive(attemptMs) || !positive(retryMaxMs)
+  return result('membership-repair', done ? 1 : 0, { elapsed_ms: finite(elapsed) ? elapsed : 'missing',
+    remaining_ms: remaining, retry_ms: retry, scan_ms: finite(scan) ? scan : 'missing' }, finite(bound) ? bound : 'missing',
+    missing ? 'missing' : scan > attemptMs || remaining > attemptMs || elapsed > bound ? 'fail' : 'pass')
+}
+export function membershipLateVerdict(key: string, request: string, stub: any[] | undefined, completedMark: number,
+  diagnostics: ScanDiagnostic[] | undefined, before: string | undefined, after: string | undefined): Result {
+  const faults = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.method === 'users.conversations'
+    && r.label === key && r.request_id === request && r.outcome === 'late') ?? []
+  const settled = stub?.filter(r => r.event === 'fault-settled' && r.request_id === request) ?? []
+  const answered = stub?.filter(r => r.event === 'api' && r.request_id === request && r.method === 'users.conversations' && r.label === key) ?? []
+  const complete = diagnostics?.some(d => d.complete) === true
+  const changedCompleteness = complete && diagnostics?.at(-1)?.complete === false
+  const late = settled.length === 1 && settled[0].resolution === 'late' && typeof settled[0].socket_open === 'boolean'
+    && settled[0].seq > completedMark && answered.length === 1 && answered[0].seq > completedMark
+  const missing = !stub || !integer(completedMark) || faults.length !== 1 || !nonnegative(faults[0]?.arrival_mono_ms)
+    || !(faults[0]?.seq <= completedMark) || !complete || !late || !stateRead(before) || !stateRead(after)
+  return result('membership-late', settled.length, { fired: faults.length, late_after_complete: late ? 'yes' : 'no', unchanged: before !== undefined && before === after ? 'yes' : 'no' }, 'unchanged',
+    changedCompleteness || settled.some(s => s.resolution === 'abort') ? 'fail' : missing ? 'missing' : before === after ? 'pass' : 'fail')
+}
+
+export function zeroAckVerdict(id: string, times: Times[] | undefined, start: number, end: number, probeExit: number,
+  log: string | undefined, marker: string, key: string): Result {
+  const found = times?.filter(t => t.envelope_id === id) ?? [], count = found[0]?.acks.length ?? 0
+  const missing = found.length !== 1 || !nonnegative(found[0]?.push?.sent_mono_ms) || !positive(end - start)
+    || !nonnegative(start) || !integer(probeExit) || !namedLines(log, marker, key).length
+  return result('zero-ack', found.length, { acks: count, observed_ms: finite(end - start) ? end - start : 'missing', probe_failed: probeExit > 0 ? 'yes' : 'no' }, 0,
+    probeExit === 0 || count > 0 ? 'fail' : missing ? 'missing' : 'pass')
+}
+export interface AccountedEvent { kind: string; key: string; channel: string; ts: string; envelope_id: string; recovered_id: string; refusal?: string }
+export function accountingVerdicts(items: AccountedEvent[] | undefined, stub: any[] | undefined, during: Times[] | undefined,
+  final: Times[] | undefined, queues: Record<string, any[] | undefined>, clearMark: number): Result[] {
+  const pushes = stub?.filter(r => r.event === 'push') ?? [], ids = items?.flatMap(i => [i.envelope_id, i.recovered_id].filter(id => id !== '-')) ?? []
+  const immediate: string[] = [], recovered: string[] = []
+  let missing = !items?.length || !stub || !during || !final || !integer(clearMark)
+  let invalid = new Set(ids).size !== ids.length || pushes.length !== ids.length || pushes.some(p => !ids.includes(p.envelope_id))
+  let stored = 0, withheld = 0
+  for (const i of items ?? []) {
+    const refused = i.kind === 'refused' || i.kind === 'refused-dropped'
+    const deferred = refused || i.kind === 'withheld' || i.kind === 'withheld-dropped'
+    const dropped = ['dropped', 'withheld-dropped', 'refused-dropped'].includes(i.kind)
+    const pushed = pushes.filter(p => p.envelope_id === i.envelope_id)
+    if ((!refused && pushed.length !== 1) || !queues[i.key]) { missing = true; continue }
+    if (refused) invalid ||= i.envelope_id !== '-' || !['no-open-socket', 'send-failed'].includes(i.refusal!)
+    else invalid ||= pushed[0].label !== i.key || pushed[0].channel !== i.channel || pushed[0].event_ts !== i.ts
+    const accept = acceptedFor(queues[i.key], i.channel, i.ts)
+    if (dropped) invalid ||= accept.length !== 0
+    else if (i.kind === 'stored' || deferred) {
+      if (!accept.length) missing = true
+      invalid ||= accept.length > 1
+      if (accept.length === 1) stored++
+    } else missing = true
+    if (!deferred) immediate.push(i.envelope_id)
+    else {
+        withheld++
+        const held = during?.filter(t => t.envelope_id === i.envelope_id) ?? []
+        const original = final?.filter(t => t.envelope_id === i.envelope_id) ?? []
+        const replay = pushes.filter(p => p.envelope_id === i.recovered_id)
+        const redelivery = stub?.filter(r => r.event === 'redelivery' && r.envelope_id === i.recovered_id) ?? []
+        if ((!refused && (held.length !== 1 || original.length !== 1 || redelivery.length !== 1)) || replay.length !== 1) missing = true
+        else {
+          invalid ||= replay[0].seq <= clearMark || replay[0].label !== i.key || replay[0].channel !== i.channel || replay[0].event_ts !== i.ts
+          if (refused) invalid ||= held.length !== 0 || original.length !== 0 || redelivery.length !== 0
+          else invalid ||= held[0].acks.length !== 0 || original[0].acks.length !== 0 || pushed[0].seq > clearMark
+            || redelivery[0].original_envelope_id !== i.envelope_id
+        }
+        recovered.push(i.recovered_id)
+    }
+    if (!deferred && i.recovered_id !== '-') invalid = true
+  }
+  // Refused HTTP attempts have no envelope; retain them and independently
+  // require the stub's refusal counts. Never invent an original envelope ID.
+  invalid ||= (stub?.filter(r => r.event === 'push-refused').length ?? 0) !== (items?.filter(i => i.kind.startsWith('refused')).length ?? 0)
+  for (const key of new Set(items?.map(i => i.key))) for (const reason of ['no-open-socket', 'send-failed']) {
+    const expected = items?.filter(i => i.key === key && i.kind.startsWith('refused') && i.refusal === reason).length ?? 0
+    const actual = stub?.filter(r => r.event === 'push-refused' && r.label === key && r.reason === reason && r.seq <= clearMark).length ?? 0
+    if (expected !== actual) invalid = true
+  }
+  const results = [result('accounting', pushes.length, { expected: ids.length, stored, withheld }, 'all-pushes', missing ? 'missing' : invalid ? 'fail' : 'pass')]
+  if (immediate.length) results.push(ackVerdict('accounting-ack', immediate, final))
+  if (recovered.length) results.push(ackVerdict('recovered-ack', recovered, final))
+  return results
+}
+export function personaStoreVerdicts(rows: Measurement[] | undefined, accepted: Accepted[], keys: string[], percentile: (ns: number[], q: number) => number): Result[] {
+  return [storeVerdict(rows, accepted, percentile), ...keys.map((key, i) => {
+    const r = storeVerdict(rows, accepted.filter(a => a.key === key), percentile)
+    r.stats.persona = i + 1; return r
+  })]
+}
+export interface LookupProbe { key: string; method: string; outcome: string; match: string; envelope_id: string }
+export function lookupFaultVerdicts(probes: LookupProbe[] | undefined, stub: any[] | undefined, times: Times[] | undefined): Result[] {
+  let missing = !probes?.length || !stub, fired = 0
+  for (const p of probes ?? []) {
+    const matches = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.label === p.key && r.method === p.method
+      && r.match === p.match && r.outcome === p.outcome && nonnegative(r.arrival_mono_ms)) ?? []
+    if (!['users.info', 'conversations.info'].includes(p.method) || !['hang', 'late'].includes(p.outcome) || matches.length !== 1) missing = true
+    else fired++
+  }
+  return [result('lookup-faults', probes?.length ?? 0, { fired, required: probes?.length ?? 0 }, 'every-fault', missing ? 'missing' : 'pass'),
+    ackVerdict('lookup-ack', probes?.map(p => p.envelope_id) ?? [], times)]
+}
+
+export function orderedWriteVerdicts(before: any[] | undefined, after: any[] | undefined, reopened: any[] | undefined,
+  expected: { channel: string; delivery: string }[] | undefined, results: any[] | undefined,
+  stub: any[] | undefined, submitMark: number, resultMark: number, times: Times[] | undefined): Result[] {
+  const pushes = stub?.filter(r => r.event === 'push') ?? [], ids = pushes.map(p => p.envelope_id)
+  const acks = stub?.filter(r => r.event === 'ws-message' && ids.includes(r.envelope_id)) ?? []
+  const added = after?.slice(before?.length ?? 0) ?? []
+  const missing = !before || !after || !reopened || !expected?.length || !results?.length || !stub || !pushes.length || !acks.length
+    || !integer(submitMark) || !integer(resultMark) || added.length !== expected?.length || results?.length !== expected?.length
+    || after.some(r => !integer(r.startedOrder) || !integer(r.resolvedOrder))
+  const overlap = pushes.some(p => p.seq <= submitMark) && acks.some(a => a.seq > resultMark) && resultMark >= submitMark
+  const order = after?.every((r, i) => r.startedOrder <= r.resolvedOrder && (i === 0 ||
+    (r.startedOrder > after[i - 1].startedOrder && r.resolvedOrder > after[i - 1].resolvedOrder))) === true
+  const retained = isDeepStrictEqual(before, after?.slice(0, before?.length)) && isDeepStrictEqual(after, reopened)
+  const choices = added.every((r, i) => r.channel === expected?.[i]?.channel && r.delivery === expected?.[i]?.delivery)
+  return [result('ordered-writes', added.length, { overlap: overlap ? 'yes' : 'no', retained: retained ? 'yes' : 'no', ordered: order ? 'yes' : 'no' }, 'durable-order',
+    missing ? 'missing' : !overlap || !order || !retained || !choices || results!.some(r => r.isError !== false || r.error !== undefined) ? 'fail' : 'pass'),
+    ackVerdict('ordered-write-ack', ids, times)]
+}
+
+export interface FaultItem extends BurstItem { ordinal: number; root: string; dependent: boolean }
+export interface FaultPlan { kind: string; key: string; keys: string[]; all: boolean; channels: string[]; items: FaultItem[] }
+export interface FaultPush { ordinal: number; stage: 'original' | 'replay'; envelope_id?: string; refusal?: string }
+export interface FaultLoadEvidence {
+  plan: FaultPlan; ledger?: FaultPush[]; stub?: any[]; during?: Times[]; times?: Times[]
+  queues: Record<string, any[] | undefined>; duringQueues: Record<string, any[] | undefined>
+  rows?: Measurement[]; clearMark: number; clearAt: number
+}
+const eventIdentity = (i: Pick<BurstItem, 'key' | 'channel' | 'ts'>) => JSON.stringify([i.key, i.channel, i.ts])
+const faultOutcomes: Record<string, string> = { hang: 'hang', transient: 'error', scope: 'error', denied: 'error', rate: 'rate_limit', late: 'late', lookup: 'hang' }
+const depends = (plan: FaultPlan, item: BurstItem) => item.key === plan.key && (plan.all || plan.channels.includes(item.channel))
+
+/** Expected withholding never prevents the second wave, including its replies. */
+export async function faultWaves(items: FaultItem[], send: (item: FaultItem) => Promise<void>, wait: (items: FaultItem[]) => Promise<boolean>,
+  admitHeld: (items: FaultItem[]) => Promise<boolean>): Promise<boolean> {
+  const held = items.filter(i => i.phase === 'held')
+  await Promise.all(held.map(send))
+  if (held.length && (!await wait(held.filter(i => !i.dependent)) || !await admitHeld(held.filter(i => !i.dependent)))) return false
+  const roots = items.filter(i => i.phase === 'roots')
+  await Promise.all(roots.map(send))
+  if (!await wait(roots.filter(i => !i.dependent))) return false
+  const rest = items.filter(i => !['roots', 'held'].includes(i.phase))
+  await Promise.all(rest.map(send))
+  return wait(rest.filter(i => !i.dependent))
+}
+
+export function postHoldOverlapVerdicts(rows: Measurement[] | undefined, holds: Accepted[], ordinary: (Accepted & { envelope_id?: string })[], times: Times[] | undefined): Result[] {
+  let missing = !rows || !holds.length
+  const intervals: { key: string; start: number; end: number }[] = []
+  for (const h of holds) {
+    const start = rows?.filter(r => r.key === h.key && r.seq === h.seq && r.kind === 'store' && r.store === 'post-hold') ?? []
+    const end = rows?.filter(r => r.key === h.key && r.seq === h.seq && r.kind === 'post-hold-resolved') ?? []
+    if (start.length !== 1 || end.length !== 1 || !nonnegative(start[0].at_mono_ms) || !(end[0].at_mono_ms > start[0].at_mono_ms)) missing = true
+    else intervals.push({ key: h.key, start: start[0].at_mono_ms, end: end[0].at_mono_ms })
+  }
+  const during = (a: Accepted, h: { key: string; start: number; end: number }) => {
+    const stores = rows?.filter(r => r.kind === 'store' && r.store === 'accepted' && r.key === a.key && r.seq === a.seq) ?? []
+    return stores.length === 1 && h.key === a.key && stores[0].at_mono_ms > h.start && stores[0].at_mono_ms < h.end
+  }
+  const covered = intervals.filter(h => ordinary.some(a => during(a, h))).length
+  const overlapping = ordinary.filter(a => intervals.some(h => during(a, h)))
+  return [result('post-hold-overlap', overlapping.length, { holds: intervals.length, covered_holds: covered, ordinary: overlapping.length }, 'ordinary-during-each-hold',
+    missing || covered !== holds.length ? 'missing' : 'pass'), ackVerdict('post-hold-overlap-ack', overlapping.map(a => a.envelope_id), times)]
+}
+
+export function faultOverlapVerdict(plan: FaultPlan, ledger: FaultPush[] | undefined, stub: any[] | undefined, clearAt: number): Result {
+  const qIds = new Set(ledger?.filter(l => l.stage === 'original' && plan.items.some(i => i.ordinal === l.ordinal && i.key !== plan.key)).map(l => l.envelope_id))
+  const pushes = stub?.filter(r => r.event === 'push' && qIds.has(r.envelope_id)) ?? []
+  const acks = stub?.filter(r => r.event === 'ws-message' && qIds.has(r.envelope_id)) ?? []
+  const qStart = pushes.length ? Math.min(...pushes.map(r => Date.parse(r.ts))) : NaN
+  const qEnd = acks.length ? Math.max(...acks.map(r => Date.parse(r.ts))) : NaN
+  const faults = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.label === plan.key
+    && (plan.kind === 'lookup' ? ['users.info', 'conversations.info'].includes(r.method) && ['hang', 'late'].includes(r.outcome)
+      : r.method === 'users.conversations' && r.outcome === faultOutcomes[plan.kind])) ?? []
+  let overlap = 0, missing = !nonnegative(clearAt) || !nonnegative(qStart) || !(qEnd > qStart) || !faults.length
+  for (const f of faults) {
+    const settled = stub?.filter(r => r.event === 'fault-settled' && r.request_id === f.request_id) ?? []
+    const start = Date.parse(f.ts), end = settled.length === 1 ? Math.min(clearAt, Date.parse(settled[0].ts)) : clearAt
+    if (!f.request_id || settled.length > 1 || !nonnegative(start) || !(end >= start)) { missing = true; continue }
+    overlap += Math.max(0, Math.min(end, qEnd) - Math.max(start, qStart))
+  }
+  return result('fault-overlap', faults.length, { overlap_ms: overlap, q_start_ms: finite(qStart) ? qStart : 'missing', q_end_ms: finite(qEnd) ? qEnd : 'missing' },
+    'fault-during-q', missing || overlap <= 0 ? 'missing' : 'pass')
+}
+
+export function faultLoadVerdicts(e: FaultLoadEvidence, counts: { roots: number; replies: number; dropped: number }, holdMs: number,
+  percentile: (ns: number[], q: number) => number): Result[] {
+  const { plan, ledger, queues, duringQueues, rows } = e, items = plan.items
+  let missing = !ledger || !e.stub || !e.during || !e.times || !rows || !integer(e.clearMark)
+    || !items.length || plan.keys.length < 2 || !plan.keys.includes(plan.key)
+  let invalid = !Object.hasOwn(faultOutcomes, plan.kind) || (plan.kind === 'denied' && !plan.all)
+    || new Set(items.map(eventIdentity)).size !== items.length || new Set(items.map(i => i.ordinal)).size !== items.length
+    || items.some(i => i.dependent !== depends(plan, i) || !plan.keys.includes(i.key))
+    || (ledger?.some(l => !items.some(i => i.ordinal === l.ordinal) || !['original', 'replay'].includes(l.stage)) ?? false)
+  for (const key of plan.keys) for (const phase of ['roots', 'replies', 'dropped'] as const)
+    if (items.filter(i => i.key === key && i.phase === phase).length !== counts[phase]) missing = true
+  const accepted: Accepted[] = [], holds: Accepted[] = [], ordinary: (Accepted & { envelope_id?: string })[] = []
+  const accounts: AccountedEvent[] = [], immediate: FaultItem[] = []
+  let withheldMissing = false, withheldBad = false, dependent = 0, refusedCount = 0, storeComplete = true
+  const original = (i: FaultItem) => ledger?.filter(l => l.stage === 'original' && l.ordinal === i.ordinal) ?? []
+  for (const i of items) {
+    const orig = original(i), replay = ledger?.filter(l => l.stage === 'replay' && l.ordinal === i.ordinal) ?? []
+    if (orig.length !== 1) { missing = true; continue }
+    const o = orig[0], refused = o.refusal !== undefined
+    if ((!o.envelope_id && !refused) || (i.dependent && replay.length !== 1)) missing = true
+    if ((!i.dependent && replay.length) || (refused && (plan.kind !== 'denied' || !i.dependent || !!o.envelope_id))) invalid = true
+    const kind = i.dependent ? (refused ? 'refused' : 'withheld') + (i.phase === 'dropped' ? '-dropped' : '') : i.phase === 'dropped' ? 'dropped' : 'stored'
+    accounts.push({ kind, key: i.key, channel: i.channel, ts: i.ts, envelope_id: o.envelope_id ?? '-', recovered_id: replay[0]?.envelope_id ?? '-', refusal: o.refusal })
+    if (i.dependent) {
+      dependent++; if (refused) refusedCount++
+      if (!duringQueues[i.key]) withheldMissing = true
+      if (acceptedFor(duringQueues[i.key], i.channel, i.ts).length) withheldBad = true
+      if (!refused) {
+        const seen = e.during?.filter(t => t.envelope_id === o.envelope_id) ?? []
+        if (seen.length !== 1) withheldMissing = true
+        else if (seen[0].acks.length !== 0) withheldBad = true
+      }
+    } else immediate.push(i)
+    if (!queues[i.key]) storeComplete = false
+    if (i.phase === 'dropped') continue
+    const found = acceptedFor(queues[i.key], i.channel, i.ts)
+    if (found.length !== 1) { storeComplete = false; continue }
+    const a = { key: i.key, seq: found[0].seq }
+    accepted.push(a)
+    if (i.phase === 'held' || found[0].hold?.on === 'post' || rows?.some(r => r.kind === 'store' && r.store === 'post-hold' && r.key === a.key && r.seq === a.seq)) holds.push(a)
+    else ordinary.push({ ...a, envelope_id: i.dependent ? replay[0]?.envelope_id : o.envelope_id })
+  }
+  const results = [result('fault-workload', items.length, { originals: ledger?.filter(l => l.stage === 'original').length ?? 0,
+    dependent, refused: refusedCount, roots: counts.roots, replies: counts.replies, dropped: counts.dropped }, 'every-planned-item', invalid ? 'fail' : missing ? 'missing' : 'pass'),
+    result('fault-withheld', dependent, { refused: refusedCount }, 'zero-ack-and-unstored', withheldBad ? 'fail' : withheldMissing ? 'missing' : 'pass'),
+    faultOverlapVerdict(plan, ledger, e.stub, e.clearAt),
+    ...accountingVerdicts(accounts, e.stub, e.during, e.times, queues, e.clearMark)]
+  // The ordinary ACK, drop and store predicates are also used by check.
+  // Original and replay identities remain separate in accounts and the ledger.
+  for (const [n, key] of plan.keys.entries()) for (const dropped of [false, true]) {
+    const group = immediate.filter(i => i.key === key && (i.phase === 'dropped') === dropped)
+    if (!group.length && key === plan.key) continue
+    const r = ackVerdict(dropped ? 'ack-dropped' : 'ack-accepted', group.map(i => original(i)[0]?.envelope_id), e.times)
+    r.stats.persona = n + 1
+    if (dropped && group.some(i => acceptedFor(queues[key], i.channel, i.ts).length > 0)) r.verdict = 'fail'
+    results.push(r)
+  }
+  results.push(...personaStoreVerdicts(storeComplete ? rows : undefined, accepted, plan.keys, percentile), postHoldVerdict(rows, holds, holdMs))
+  if (items.some(i => i.phase === 'held')) results.push(...postHoldOverlapVerdicts(rows, holds, ordinary, e.times))
+  return results
+}
+
+// CLI adapters. Errors never echo raw evidence, event text, credentials or exceptions.
+const pkg = () => resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots')
+const fixture = (name: string) => join(import.meta.dir, name)
+function printer(name: string, ...args: string[]): string {
+  return execFileSync(process.execPath, [fixture('fmk-texts.ts'), name, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+}
+const population = () => import('../../test-helpers/thread-populations.ts')
+function jsonl(path: string, offset = 0, requireNewline = false): any[] | undefined {
+  try {
+    const bytes = readFileSync(path)
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > bytes.length) return undefined
+    const text = bytes.subarray(offset).toString('utf8')
+    if (requireNewline && text && !text.endsWith('\n')) return undefined
+    return text.split('\n').filter(Boolean).map(l => JSON.parse(l))
+  } catch { return undefined }
+}
+function textFile(path: string): string | undefined { try { return readFileSync(path, 'utf8') } catch { return undefined } }
+function evidenceRows(path: string): any[] | undefined {
+  const rows = jsonl(path, 0, true)
+  return records(rows) ? rows : undefined
+}
+function timingRows(path: string): Times[] | undefined {
+  const rows = evidenceRows(path)
+  return rows?.every(r => typeof r.envelope_id === 'string' && object(r.push) && nonnegative(r.push.sent_mono_ms)
+    && r.push.connection_id !== undefined && records(r.acks) && r.acks.every((a: any) => nonnegative(a.ack_mono_ms) && a.connection_id !== undefined)) ? rows : undefined
+}
+type EvidenceReason = 'timing-ids-invalid' | 'stub-record-invalid' | 'stub-observation-unavailable'
+  | 'timing-push-missing' | 'timing-push-duplicate' | 'timing-monotonic-missing'
+  | 'recovery-ledger-invalid' | 'recovery-payload-invalid' | 'recovery-deadline'
+  | 'recovery-push-failed' | 'recovery-duplicate-envelope' | 'recovery-ack-invalid'
+  | 'recovery-root-order' | 'recovery-unrecorded-envelope' | 'recovery-push-invalid'
+class EvidenceFailure extends Error {
+  constructor(readonly reason: EvidenceReason) { super(reason) }
+}
+interface StubIndex { pushes: Map<string, any[]>; acks: Map<string, any[]> }
+const stubIndex = (): StubIndex => ({ pushes: new Map(), acks: new Map() })
+function indexStub(index: StubIndex, row: any): void {
+  if (!object(row) || typeof row.event !== 'string') throw new EvidenceFailure('stub-record-invalid')
+  if (row.event !== 'push' && row.event !== 'ws-message') return
+  if (row.event === 'ws-message' && row.envelope_id === null) return
+  if (typeof row.envelope_id !== 'string' || !row.envelope_id) throw new EvidenceFailure('stub-record-invalid')
+  const map = row.event === 'push' ? index.pushes : index.acks
+  const rows = map.get(row.envelope_id) ?? []
+  rows.push(row); map.set(row.envelope_id, rows)
+}
+function parseStubLine(line: string): any {
+  try { return JSON.parse(line) } catch { throw new EvidenceFailure('stub-record-invalid') }
+}
+function indexedTiming(index: StubIndex, id: string): Times {
+  const pushes = index.pushes.get(id) ?? [], acks = index.acks.get(id) ?? []
+  if (!pushes.length) throw new EvidenceFailure('timing-push-missing')
+  if (pushes.length !== 1) throw new EvidenceFailure('timing-push-duplicate')
+  if (!finite(pushes[0].sent_mono_ms) || acks.some(r => !finite(r.ack_mono_ms))) throw new EvidenceFailure('timing-monotonic-missing')
+  // Match jq's field projection (absent connection_id is null), including ACK
+  // multiplicity and record order. Extraction applies no N1/accounting verdict.
+  return { envelope_id: id, push: { sent_mono_ms: pushes[0].sent_mono_ms, connection_id: pushes[0].connection_id ?? null },
+    acks: acks.map(r => ({ ack_mono_ms: r.ack_mono_ms, connection_id: r.connection_id ?? null })) }
+}
+export function envelopeTimings(ids: string[], rows: any[]): Times[] {
+  if (ids.some(id => !id || id.trim() !== id || /\s/.test(id))) throw new EvidenceFailure('timing-ids-invalid')
+  const index = stubIndex()
+  for (const row of rows) indexStub(index, row)
+  return ids.map(id => indexedTiming(index, id))
+}
+function bulkTimings(args: string[]): number {
+  countArgs(args, 2)
+  let ids: string, observation: string
+  try { ids = readFileSync(args[0], 'utf8'); observation = readFileSync(args[1], 'utf8') }
+  catch { throw new EvidenceFailure('stub-observation-unavailable') }
+  if (ids && !ids.endsWith('\n')) throw new EvidenceFailure('timing-ids-invalid')
+  if (observation && !observation.endsWith('\n')) throw new EvidenceFailure('stub-record-invalid')
+  const requested = ids ? ids.slice(0, -1).split('\n').map(s => s.endsWith('\r') ? s.slice(0, -1) : s) : []
+  const rows = observation ? observation.slice(0, -1).split('\n').map(parseStubLine) : []
+  // Validate everything before emitting any rows, so a later missing push cannot
+  // leave an apparently successful prefix. Duplicated requested IDs stay duplicated.
+  for (const row of envelopeTimings(requested, rows)) console.log(JSON.stringify(row))
+  return 0
+}
+
+/** One file descriptor and incremental complete lines for the whole recovery.
+ * A live partial line waits for its newline; replacement/truncation fails closed. */
+function recoveryObserver(path: string, index: StubIndex) {
+  let fd: number
+  let identity: ReturnType<typeof statSync>
+  try {
+    identity = statSync(path)
+    if (!identity.isFile()) throw new EvidenceFailure('stub-observation-unavailable')
+    fd = openSync(path, 'r')
+  } catch { throw new EvidenceFailure('stub-observation-unavailable') }
+  let offset = 0, tail = Buffer.alloc(0)
+  const read = () => {
+    const current = statSync(path)
+    if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino || current.size < offset)
+      throw new EvidenceFailure('stub-observation-unavailable')
+    const bytes = Buffer.alloc(current.size - offset)
+    let used = 0
+    while (used < bytes.length) {
+      const n = readSync(fd, bytes, used, bytes.length - used, offset + used)
+      if (!n) throw new EvidenceFailure('stub-observation-unavailable')
+      used += n
+    }
+    offset += used
+    const pending = Buffer.concat([tail, bytes]), end = pending.lastIndexOf(10)
+    if (end < 0) { tail = pending; return }
+    for (const line of pending.subarray(0, end).toString('utf8').split('\n')) indexStub(index, parseStubLine(line))
+    tail = pending.subarray(end + 1)
+  }
+  return { read, close: () => closeSync(fd), complete: () => tail.length === 0 }
+}
+function tsv(path: string, names: string[]): any[] | undefined {
+  const text = textFile(path)
+  if (text === undefined || (text !== '' && !text.endsWith('\n'))) return undefined
+  const rows = text.split('\n').filter(Boolean).map(l => l.split('\t'))
+  return rows.every(r => r.length === names.length && r.every(v => v !== '')) ? rows.map(r => Object.fromEntries(names.map((n, i) => [n, r[i]]))) : undefined
+}
+const numeric = (raw: string | undefined) => raw?.trim() ? Number(raw) : NaN
+function diagnostics(path: string, key: string) {
+  return scanDiagnostics(textFile(path), key, printer('MEMBERSHIP_INVENTORY_INCOMPLETE'), printer('MEMBERSHIP_INVENTORY_COMPLETE'))
+}
+async function additional(command: string, c: Context, args: string[]): Promise<Result[] | undefined> {
+  if (command === 'pending-post') {
+    countArgs(args, 12)
+    const [key, operation, start, end, before, after, probes, queue, times, measurement, mark, channel] = args
+    const ps = tsv(probes, ['parent', 'channel', 'ts', 'envelope_id']) as PendingProbe[] | undefined
+    // A named channel fixes this case independently of the journal contents.
+    const b = evidenceRows(before), a = evidenceRows(after)
+    const belongs = b?.filter(r => r.kind === 'post-intent' && r.operationId === operation).every(r => r.channel === channel)
+    return pendingPostVerdicts(key, operation, numeric(start), numeric(end), belongs ? b : undefined, a, ps,
+      evidenceRows(queue), timingRows(times), measurements(measurement, numeric(mark)), Number(printer('THREAD_REPLY_HOLD_MS')))
+  }
+  if (command === 'shared-list') {
+    countArgs(args, 2)
+    const [dir, probe] = args, p = await population(), path = (name: string) => join(dir, name)
+    return sharedListVerdicts({ prepared: textFile(path('prepared.input')), preview: textFile(path('ordinary.preview')),
+      growth: tsv(path('growth.tsv'), ['key', 'channel', 'delivery']),
+      phases: ['applied', 'restarted', 'grown', 'reopened', 'failed'].map(phase => ({ facts: evidenceRows(path(`${phase}.facts.jsonl`)), input: textFile(path(`${phase}.input`)) })),
+      failureBefore: textFile(path('failure-before.state')), failureAfter: textFile(path('failure-after.state')),
+      failureLog: textFile(path('failure.log')), failureExpected: textFile(path('failure.expected')),
+      probeExit: numeric(probe) }, p.sr8Personas(c.recipients), printer('MEMBERSHIP_STORAGE_FAILED'))
+  }
+  if (command === 'membership-fault') {
+    countArgs(args, 9)
+    const [kind, page, key, stub, log, before, after, retryAfter, failures] = args
+    const failureCount = numeric(failures)
+    const wait = integer(failureCount) ? Number(printer('membershipRetryDelay', failures,
+      ...(kind === 'rate' && nonnegative(numeric(retryAfter)) ? [retryAfter] : []))) : NaN
+    return membershipFaultVerdicts(kind, page, key, evidenceRows(stub), diagnostics(log, key), textFile(before), textFile(after),
+      numeric(retryAfter), wait, Number(printer('MEMBERSHIP_REQUEST_TIMEOUT_MS')), Number(printer('MEMBERSHIP_ATTEMPT_TIMEOUT_MS')))
+  }
+  if (command === 'membership-repair') {
+    countArgs(args, 3)
+    return [membershipRepairVerdict(numeric(args[1]), diagnostics(args[2], args[0]), Number(printer('MEMBERSHIP_ATTEMPT_TIMEOUT_MS')), Number(printer('MEMBERSHIP_RETRY_MAX_MS')))]
+  }
+  if (command === 'membership-late') {
+    countArgs(args, 7)
+    const [key, request, stub, mark, log, before, after] = args
+    return [membershipLateVerdict(key, request, evidenceRows(stub), numeric(mark), diagnostics(log, key), textFile(before), textFile(after))]
+  }
+  if (command === 'zero-ack') {
+    countArgs(args, 7)
+    const [key, id, times, start, end, probe, log] = args
+    return [zeroAckVerdict(id, timingRows(times), numeric(start), numeric(end), numeric(probe), textFile(log), printer('MEMBERSHIP_STORAGE_FAILED'), key)]
+  }
+  if (command === 'accounting') {
+    countArgs(args, 6)
+    const [manifest, stub, during, final, dir, mark] = args
+    const items = tsv(manifest, ['kind', 'key', 'channel', 'ts', 'envelope_id', 'recovered_id']) as AccountedEvent[] | undefined
+    const p = await population(), keys = p.sr8Personas(c.recipients)
+    return accountingVerdicts(items, evidenceRows(stub), timingRows(during), timingRows(final),
+      Object.fromEntries(keys.map(key => [key, evidenceRows(join(dir, `${key}.queue.jsonl`))])), numeric(mark))
+  }
+  if (command === 'stores') {
+    countArgs(args, 3)
+    const [dir, file, mark] = args, p = await population(), keys = p.sr8Personas(c.recipients)
+    const items = evidenceRows(join(dir, 'burst.jsonl')), accepted: Accepted[] = []
+    let complete = !!items?.length
+    for (const key of keys) {
+      const queue = evidenceRows(join(dir, `${key}.queue.jsonl`))
+      if (!queue) complete = false
+      for (const item of items?.filter(i => i.key === key && ['roots', 'replies', 'held'].includes(i.phase)) ?? []) {
+        const matches = acceptedFor(queue, item.channel, item.ts)
+        if (matches.length !== 1) complete = false
+        else accepted.push({ key, seq: matches[0].seq })
+      }
+    }
+    const { percentile } = await import('./transcript-receipts.ts')
+    return personaStoreVerdicts(complete ? measurements(file, numeric(mark)) : undefined, accepted, keys, percentile)
+  }
+  if (command === 'lookup-faults') {
+    countArgs(args, 3)
+    return lookupFaultVerdicts(tsv(args[0], ['key', 'method', 'outcome', 'match', 'envelope_id']), evidenceRows(args[1]), timingRows(args[2]))
+  }
+  if (command === 'ordered-writes') {
+    countArgs(args, 5)
+    const [dir, stub, submit, done, times] = args, path = (name: string) => join(dir, name)
+    return orderedWriteVerdicts(evidenceRows(path('before.jsonl')), evidenceRows(path('after.jsonl')), evidenceRows(path('reopened.jsonl')),
+      tsv(path('expected.tsv'), ['channel', 'delivery']), evidenceRows(path('results.jsonl')), evidenceRows(stub), numeric(submit), numeric(done), timingRows(times))
+  }
+}
+function measurements(path: string, offset: number): Measurement[] | undefined {
+  const rows = jsonl(path, offset, true)
+  return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved'].includes(r.kind)
+    && typeof r.key === 'string' && nonnegative(r.at_mono_ms)) ? rows : undefined
+}
+function context(args: string[]): Context {
+  const [scenario, mode, pop, rec] = args.splice(0, 4), population = Number(pop), recipients = Number(rec)
+  if (!/^[\w-]+$/.test(scenario ?? '') || !['strict', 'open'].includes(mode) || ![0, 10_000, 100_000].includes(population) || ![1, 2].includes(recipients)) throw new Error('usage')
+  return { scenario, mode: mode as Context['mode'], population, recipients }
+}
+function countArgs(args: string[], min: number, max = min) { if (args.length < min || args.length > max) throw new Error('usage') }
+async function channels() {
+  const p = await population()
+  return p.eligibleChannels(p.populationChannels(p.SR8_POPULATION_CHANNEL_COUNT))
+}
+async function config(args: string[]) {
+  countArgs(args, 6)
+  const [mode, n, recipients, root, port, compact] = args
+  const c = context(['config', mode, n, recipients]), p = await population()
+  const listed = [...(await channels()).map(id => ({ id, delivery: 'thread_hybrid' })), ...p.populationChannels(p.SR8_SHARED_LIST_CHANNELS, p.SR8_POPULATION_CHANNEL_COUNT)]
+  const timers = JSON.parse(printer('testTimerOverridesBlock', `queue_compact_interval_ms=${compact}`))
+  if (!Number.isSafeInteger(Number(port)) || Number(port) <= 0) throw new Error('usage')
+  console.log(JSON.stringify({ channel_mode: c.mode, personas: p.sr8Personas(c.recipients).map(name => ({ name,
+    credentials_file: join(resolve(root), `${name}.env`), working_directory: join(resolve(root), name), channels: listed,
+    permission_prompts: listed[0].id, dm: { enabled: false } })), bind: '127.0.0.1', port: Number(port), health_check_interval: 0,
+    [printer('TEST_MEASUREMENTS_KEY')]: true, test_timer_overrides: timers }, null, 2))
+}
+async function seed(args: string[]) {
+  countArgs(args, 3)
+  const [configPath, stateDir, raw] = args, n = Number(raw)
+  requireSeedPopulation(n)
+  const p = await population(), shared = await import(join(pkg(), 'src/shared-channels.ts'))
+  const configModule = await import(join(pkg(), 'src/config.ts')), memory = await import(join(pkg(), 'src/thread-memory.ts'))
+  const record = `${configPath}.last-applied`, bytes = readFileSync(configPath), cfg = configModule.loadPersonaConfig(configPath)
+  if (!existsSync(record)) writeFileSync(record, shared.serializeSharedChannelState(shared.initialSharedChannelState(bytes, cfg)), { mode: 0o600, flag: 'wx' })
+  const state = shared.parseSharedChannelState(readFileSync(record), record)
+  if (!state || state.sourceBytesBase64 !== bytes.toString('base64')) throw new Error('seed authority mismatch')
+  const authority = shared.createSharedChannelAuthority(record, state)
+  for (const persona of cfg.personas) {
+    const joins = p.populationJoins(persona.key, n, await channels())
+    await p.seedPopulation({ createThreadMemory: memory.createThreadMemory, authority, stateDir }, { key: persona.key, joins })
+    console.log(`recorded: sr8 seed key=${persona.key} joined=${n} oldest=${p.oldestJoins(joins, 1)[0].root}`)
+  }
+}
+async function plan(args: string[]) {
+  countArgs(args, 4)
+  const [mode, n, recipients, start] = args, c = context(['plan', mode, n, recipients]), p = await population()
+  if (!Number.isSafeInteger(Number(start)) || Number(start) < 0) throw new Error('usage')
+  const spec = p.burstSpec(c, await channels(), Number(start))
+  for (const [phase, messages] of [['roots', spec.rootMentions], ['replies', spec.replies], ['dropped', spec.dropped]] as const)
+    for (const m of messages) console.log([phase, m.channel, m.ts, m.threadTs ?? '-', m.mentions.join(',') || '-'].join('\t'))
+}
+
+async function holdAdmission(items: BurstItem[], stateDir: string, file: string, mark: number, waitMs: number, out: string): Promise<boolean> {
+  if (!items.length) return true
+  const until = performance.now() + waitMs
+  while (performance.now() < until) {
+    const rows = measurements(file, mark)
+    // Read through the production-parsed reader, just as shared_queue_snapshot.
+    // Merge each observation with the valid prior archive before replacing it:
+    // concatenation repeats acceptances in one journal and the reader rejects it.
+    // Keep the original hold and any observed resolution even after compaction.
+    let admitted = !!rows
+    for (const key of new Set(items.map(i => i.key))) {
+      const archive = join(out, `${key}.held-admission.jsonl`)
+      const raw = printer('sharedQueueSnapshot', join(stateDir, 'queue', `${key}.jsonl`), ...(existsSync(archive) ? [archive] : []))
+      const queue = raw.split('\n').filter(Boolean).map(l => JSON.parse(l))
+      writeFileSync(archive, raw + '\n', { mode: 0o600 })
+      for (const i of items.filter(i => i.key === key)) {
+        const a = acceptedFor(queue, i.channel, i.ts)
+        if (a.length !== 1 || !rows?.some(r => r.key === key && r.seq === a[0].seq && r.kind === 'store' && r.store === 'post-hold')) admitted = false
+      }
+    }
+    if (admitted) return true
+    await new Promise(r => setTimeout(r, 20))
+  }
+  return false
+}
+
+async function readFaultPlan(dir: string, c: Context): Promise<FaultPlan> {
+  const data = JSON.parse(readFileSync(join(dir, 'fault-plan.json'), 'utf8'))
+  const p = await population()
+  if (!isDeepStrictEqual(data.context, c) || !object(data.plan) || !records(data.plan.items)
+    || c.recipients !== 2 || !isDeepStrictEqual(data.plan.keys, p.sr8Personas(c.recipients)) || !Array.isArray(data.plan.channels) || typeof data.plan.all !== 'boolean'
+    || !Object.hasOwn(faultOutcomes, data.plan.kind) || data.plan.items.some((i: any, n: number) => i.ordinal !== n
+      || !['roots', 'replies', 'dropped', 'held'].includes(i.phase) || typeof i.dependent !== 'boolean'
+      || ![i.key, i.channel, i.ts, i.sender, i.root].every(v => typeof v === 'string' && v.length > 0))) throw new Error('invalid fault plan')
+  return data.plan
+}
+async function faultPlan(c: Context, args: string[]): Promise<number> {
+  countArgs(args, 6)
+  const [batchDir, planFile, kind, persona, scope, out] = args, p = await population(), keys = p.sr8Personas(c.recipients)
+  const index = numeric(persona) - 1, planned = tsv(planFile, ['phase', 'channel', 'ts', 'root', 'mentions'])
+  if (c.recipients !== 2 || !integer(index) || !keys[index] || !planned?.length || !Object.hasOwn(faultOutcomes, kind)
+    || (kind === 'denied' && scope !== 'all')) throw new Error('usage fault declaration')
+  const available = [...new Set(planned.map(i => i.channel))]
+  const selected = scope === 'all' || scope === 'none' ? [] : scope.split(',').map(n => numeric(n) - 1)
+  if (selected.some(n => !integer(n) || !available[n])) throw new Error('usage fault channel ordinals')
+  const payloads: any[] = [], items: FaultItem[] = [], counts = { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }
+  const declaration: FaultPlan = { kind, key: keys[index], keys, all: scope === 'all', channels: selected.map(n => available[n]), items }
+  for (const phase of ['roots', 'replies', 'dropped', 'held'] as const) {
+    const path = join(batchDir, `${phase}.batch.jsonl`)
+    if (phase === 'held' && !existsSync(path)) continue
+    const bodies = jsonl(path)
+    if (!bodies?.length) throw new Error('missing batch')
+    for (const body of bodies) {
+      if (!keys.includes(body.label) || !object(body.event) || ![body.event.channel, body.event.ts, body.event.user].every(v => typeof v === 'string' && v.length > 0)) throw new Error('invalid batch')
+      const i: FaultItem = { ordinal: items.length, key: body.label, phase, channel: body.event.channel, ts: body.event.ts,
+        root: body.event.thread_ts ?? '-', sender: body.event.user, dependent: false }
+      i.dependent = depends(declaration, i)
+      if (phase !== 'held' && planned.filter(r => r.phase === phase && r.channel === i.channel && r.ts === i.ts && r.root === i.root).length !== 1) throw new Error('batch differs from plan')
+      items.push(i); payloads.push(body)
+    }
+    if (phase !== 'held' && (planned.filter(r => r.phase === phase).length !== counts[phase]
+      || keys.some(key => items.filter(i => i.key === key && i.phase === phase).length !== counts[phase]))) throw new Error('incomplete workload')
+  }
+  if (new Set(items.map(eventIdentity)).size !== items.length) throw new Error('duplicate workload')
+  mkdirSync(out, { recursive: true })
+  writeFileSync(join(out, 'fault-plan.json'), JSON.stringify({ context: c, plan: declaration }) + '\n', { flag: 'wx', mode: 0o600 })
+  writeFileSync(join(out, 'payloads.jsonl'), payloads.map(b => JSON.stringify(b)).join('\n') + '\n', { flag: 'wx', mode: 0o600 })
+  console.log(`recorded: sr8 fault-plan planned=${items.length} dependent=${items.filter(i => i.dependent).length} persona=${index + 1}`)
+  return 0
+}
+async function faultBurst(c: Context, args: string[]): Promise<number> {
+  countArgs(args, 7)
+  const [dir, url, stubFile, stateDir, measurement, mark, rawWait] = args, waitMs = numeric(rawWait), plan = await readFaultPlan(dir, c)
+  if (!/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/.test(url) || !positive(waitMs) || !integer(numeric(mark))) throw new Error('usage')
+  const payloads = jsonl(join(dir, 'payloads.jsonl'))
+  if (payloads?.length !== plan.items.length || payloads.some((b, n) => {
+    const i = plan.items[n]
+    return b.label !== i.key || b.event?.channel !== i.channel || b.event?.ts !== i.ts || b.event?.user !== i.sender || (b.event?.thread_ts ?? '-') !== i.root
+  })) throw new Error('payloads differ from declaration')
+  const ledgerPath = join(dir, 'fault-ledger.jsonl'), compactPath = join(dir, 'compactions.jsonl'), ledger: FaultPush[] = []
+  writeFileSync(ledgerPath, '', { flag: 'wx', mode: 0o600 }); writeFileSync(compactPath, '', { flag: 'wx', mode: 0o600 })
+  const qIdentities = new Set(plan.items.filter(i => i.key !== plan.key).map(eventIdentity)), baseline = new Map<string, string>(), proof = new Set<string>()
+  const observed = () => {
+    const records = jsonl(stubFile, 0, true)
+    if (!records) return undefined
+    const pushes = records.filter(r => r.event === 'push' && qIdentities.has(eventIdentity({ key: r.label, channel: r.channel, ts: r.event_ts })))
+    const ids = new Set(pushes.map(r => r.envelope_id)), acked = new Set(records.filter(r => r.event === 'ws-message' && ids.has(r.envelope_id)).map(r => r.envelope_id))
+    return { pushes, acked }
+  }
+  const observe = () => {
+    const first = observed()
+    if (!first?.pushes.length || first.acked.size >= qIdentities.size) return
+    const stats = plan.keys.flatMap(key => ['queue', 'threads'].map(kind => {
+      try { const st = statSync(join(stateDir, kind, `${key}.jsonl`)); return { key, kind, id: `${st.dev}:${st.ino}` } } catch { return { key, kind, id: '' } }
+    }))
+    const after = observed()
+    if (!after || after.acked.size >= qIdentities.size) return
+    for (const s of stats) {
+      if (!s.id) continue
+      const id = `${s.key}:${s.kind}`, before = baseline.get(id)
+      if (before && before !== s.id && !proof.has(id)) {
+        proof.add(id); appendFileSync(compactPath, JSON.stringify({ key: s.key, kind: s.kind, before, after: s.id, inside: true }) + '\n')
+      }
+      baseline.set(id, s.id)
+    }
+  }
+  let failed = false
+  const timer = setInterval(observe, 20)
+  const send = async (i: FaultItem) => {
+    const row: FaultPush = { ordinal: i.ordinal, stage: 'original' }
+    try {
+      const response = await fetch(`${url}/_push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payloads[i.ordinal]), signal: AbortSignal.timeout(waitMs) })
+      const answer: any = await response.json()
+      if (response.ok && answer.ok === true && typeof answer.envelope_id === 'string') row.envelope_id = answer.envelope_id
+      else if (plan.kind === 'denied' && i.dependent && ((response.status === 409 && answer.error === 'no-open-socket') || (response.status === 503 && answer.error === 'send-failed'))) row.refusal = answer.error
+      else failed = true
+    } catch { failed = true }
+    ledger.push(row); appendFileSync(ledgerPath, JSON.stringify(row) + '\n')
+  }
+  const wait = async (items: FaultItem[]) => {
+    const until = performance.now() + waitMs
+    while (performance.now() < until) {
+      const records = jsonl(stubFile, 0, true)
+      if (records && items.every(i => {
+        const id = ledger.find(l => l.ordinal === i.ordinal)?.envelope_id
+        return !!id && records.some(r => r.event === 'ws-message' && r.envelope_id === id)
+      })) return true
+      await new Promise(r => setTimeout(r, 20))
+    }
+    return false
+  }
+  try {
+    const good = await faultWaves(plan.items, send, wait, held => holdAdmission(held, stateDir, measurement, numeric(mark), waitMs, dir))
+    return good && !failed ? 0 : 1
+  } finally {
+    clearInterval(timer)
+    console.log(`recorded: sr8 fault-burst submitted=${ledger.length} expected=${plan.items.length} refused=${ledger.filter(l => l.refusal).length}`)
+  }
+}
+async function faultRecover(c: Context, args: string[]): Promise<number> {
+  countArgs(args, 5)
+  const [dir, url, stubFile, rawWait, rawConcurrency] = args, waitMs = numeric(rawWait), concurrency = numeric(rawConcurrency)
+  if (!/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/.test(url) || !positive(waitMs) || !integer(concurrency) || concurrency < 1 || concurrency > 256)
+    throw new Error('usage recovery bounds')
+  const until = performance.now() + waitMs, plan = await readFaultPlan(dir, c), ledgerFile = join(dir, 'fault-ledger.jsonl')
+  const ledger = evidenceRows(ledgerFile) as FaultPush[] | undefined, payloads = jsonl(join(dir, 'payloads.jsonl'))
+  const originals = new Map<number, FaultPush>(), ids = new Set<string>(), replays = new Map<number, FaultPush>()
+  if (!ledger || ledger.length !== plan.items.length) throw new EvidenceFailure('recovery-ledger-invalid')
+  for (const row of ledger) {
+    const item = plan.items[row.ordinal]
+    if (!item || row.stage !== 'original' || originals.has(row.ordinal) || (row.envelope_id ? ids.has(row.envelope_id) || !!row.refusal
+      : plan.kind !== 'denied' || !item.dependent || !['no-open-socket', 'send-failed'].includes(row.refusal!)))
+      throw new EvidenceFailure('recovery-ledger-invalid')
+    originals.set(row.ordinal, row); if (row.envelope_id) ids.add(row.envelope_id)
+  }
+  if (payloads?.length !== plan.items.length || payloads.some((body, n) => {
+    const item = plan.items[n]
+    return body.label !== item.key || body.event?.channel !== item.channel || body.event?.ts !== item.ts
+      || body.event?.user !== item.sender || (body.event?.thread_ts ?? '-') !== item.root
+  })) throw new EvidenceFailure('recovery-payload-invalid')
+  const dependent = plan.items.filter(i => i.dependent), index = stubIndex(), observer = recoveryObserver(stubFile, index)
+  const controller = new AbortController()
+  let failure: unknown, timer: ReturnType<typeof setInterval> | undefined, attempted = 0, completed = 0
+  const stop = (error: unknown) => { failure ??= error; controller.abort() }
+  const remaining = () => {
+    if (failure) throw failure
+    const ms = Math.ceil(until - performance.now())
+    if (ms <= 0) throw new EvidenceFailure('recovery-deadline')
+    return ms
+  }
+  const waitAck = async (id: string) => {
+    while (true) {
+      remaining()
+      const acks = index.acks.get(id) ?? []
+      if (acks.length > 1) throw new EvidenceFailure('recovery-ack-invalid')
+      if (acks.length === 1) {
+        const timing = indexedTiming(index, id)
+        if (!isDeepStrictEqual(timing.push.connection_id, timing.acks[0].connection_id)) throw new EvidenceFailure('recovery-ack-invalid')
+        return
+      }
+      await new Promise(r => setTimeout(r, Math.min(20, remaining())))
+    }
+  }
+  const send = async (item: FaultItem) => {
+    const original = originals.get(item.ordinal)!, row: FaultPush = { ordinal: item.ordinal, stage: 'replay' }
+    // This is the same redelivery control as slack_stub_redeliver. A refused
+    // attempt uses its copied prebuilt event, never a newly constructed event.
+    const body = original.envelope_id ? { label: item.key, redeliver: { envelope_id: original.envelope_id, retry_reason: 'timeout' } } : payloads![item.ordinal]
+    attempted++
+    try {
+      const response = await fetch(`${url}/_push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(remaining())]) })
+      const answer: any = await response.json()
+      if (!response.ok || answer.ok !== true || typeof answer.envelope_id !== 'string' || !answer.envelope_id) throw new EvidenceFailure('recovery-push-failed')
+      row.envelope_id = answer.envelope_id
+      if (ids.has(row.envelope_id!)) throw new EvidenceFailure('recovery-duplicate-envelope')
+      ids.add(row.envelope_id!); replays.set(item.ordinal, row)
+    } catch (error) {
+      if (error instanceof EvidenceFailure) throw error
+      if (failure) throw failure
+      throw new EvidenceFailure(performance.now() >= until ? 'recovery-deadline' : 'recovery-push-failed')
+    } finally {
+      // Even a failed attempt stays in the ledger; never remove an original or
+      // discard an actual returned ID. A partial row cannot pass accounting.
+      appendFileSync(ledgerFile, JSON.stringify(row) + '\n')
+    }
+    await waitAck(row.envelope_id!)
+    completed++
+  }
+  const pool = async (items: FaultItem[]) => {
+    let cursor = 0
+    await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (!failure && cursor < items.length) {
+        const item = items[cursor++]
+        try { remaining(); await send(item) } catch (error) { stop(error) }
+      }
+    }))
+    if (failure) throw failure
+  }
+  try {
+    observer.read()
+    const initialPushes = new Map([...index.pushes].map(([id, rows]) => [id, rows.length]))
+    timer = setInterval(() => { try { remaining(); observer.read() } catch (error) { stop(error) } }, 20)
+    // All recovered roots have their own observed ACK before any reply starts.
+    // This is also bounded concurrency for HTTP requests and outstanding ACKs.
+    await pool(dependent.filter(i => i.phase === 'roots'))
+    await pool(dependent.filter(i => i.phase !== 'roots'))
+    remaining()
+    observer.read()
+    if (!observer.complete()) throw new EvidenceFailure('stub-record-invalid')
+    const replayIds = new Set([...replays.values()].map(r => r.envelope_id!))
+    for (const [id, pushes] of index.pushes) if (pushes.length > (initialPushes.get(id) ?? 0) && !replayIds.has(id))
+      throw new EvidenceFailure('recovery-unrecorded-envelope')
+    if (replays.size !== dependent.length) throw new EvidenceFailure('recovery-ledger-invalid')
+    const roots = new Map(plan.items.filter(i => i.phase === 'roots').map(i => [eventIdentity(i), i]))
+    for (const item of dependent) {
+      const id = replays.get(item.ordinal)!.envelope_id!, push = index.pushes.get(id), timing = indexedTiming(index, id)
+      if (push!.length !== 1 || push![0].label !== item.key || push![0].channel !== item.channel || push![0].event_ts !== item.ts)
+        throw new EvidenceFailure('recovery-push-invalid')
+      if (timing.acks.length !== 1) throw new EvidenceFailure('recovery-ack-invalid')
+      const root = roots.get(eventIdentity({ key: item.key, channel: item.channel, ts: item.root }))
+      if (root) {
+        const parentId = (root.dependent ? replays : originals).get(root.ordinal)!.envelope_id!
+        const parent = indexedTiming(index, parentId), ack = index.acks.get(parentId)
+        if (parent.acks.length !== 1 || parent.acks[0].ack_mono_ms > timing.push.sent_mono_ms || !(ack![0].seq < push![0].seq))
+          throw new EvidenceFailure('recovery-root-order')
+      }
+    }
+    remaining()
+    return 0
+  } finally {
+    if (timer) clearInterval(timer)
+    observer.close()
+    console.log(`recorded: sr8 fault-recover expected=${dependent.length} attempted=${attempted} recorded=${replays.size} completed=${completed} concurrency=${concurrency}`)
+  }
+}
+async function faultCommands(command: string, c: Context, args: string[]): Promise<number | undefined> {
+  if (command === 'fault-plan') return faultPlan(c, args)
+  if (command === 'fault-burst') return faultBurst(c, args)
+  if (command === 'fault-recover') return faultRecover(c, args)
+  if (!['fault-pending', 'fault-body', 'fault-replayed', 'fault-ids', 'fault-check'].includes(command)) return undefined
+  countArgs(args, command === 'fault-check' ? 8 : command === 'fault-replayed' ? 3 : command === 'fault-body' ? 2 : 1)
+  const dir = args[0], plan = await readFaultPlan(dir, c), ledgerFile = join(dir, 'fault-ledger.jsonl'), ledger = evidenceRows(ledgerFile) as FaultPush[] | undefined
+  if (!ledger) throw new Error('missing ledger')
+  if (command === 'fault-pending') {
+    for (const i of [...plan.items].sort((a, b) => (a.phase === 'roots' ? 0 : 1) - (b.phase === 'roots' ? 0 : 1))) {
+      if (!i.dependent) continue
+      const o = ledger.filter(l => l.ordinal === i.ordinal && l.stage === 'original')
+      if (o.length !== 1 || (!o[0].envelope_id && !o[0].refusal)) throw new Error('missing original')
+      console.log([i.ordinal, i.key, o[0].envelope_id ?? '-'].join('\t'))
+    }
+    return 0
+  }
+  if (command === 'fault-ids') { for (const l of ledger) if (l.envelope_id) console.log(l.envelope_id); return 0 }
+  if (command === 'fault-body' || command === 'fault-replayed') {
+    const n = numeric(args[1]), item = plan.items[n]
+    if (!integer(n) || !item?.dependent) throw new Error('usage')
+    if (command === 'fault-body') {
+      const body = jsonl(join(dir, 'payloads.jsonl'))?.[n]
+      if (!body?.event || body.label !== item.key || body.event.channel !== item.channel || body.event.ts !== item.ts) throw new Error('missing prebuilt event')
+      console.log(JSON.stringify(body.event)); return 0
+    }
+    if (!args[2] || ledger.some(l => (l.ordinal === n && l.stage === 'replay') || l.envelope_id === args[2])) throw new Error('usage replay')
+    appendFileSync(ledgerFile, JSON.stringify({ ordinal: n, stage: 'replay', envelope_id: args[2] }) + '\n'); return 0
+  }
+  const [, stub, clearMark, clearAt, measurement, mark, start, ready] = args, p = await population(), { percentile } = await import('./transcript-receipts.ts')
+  const queues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, `${key}.queue.jsonl`))]))
+  const duringQueues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, 'during', `${key}.queue.jsonl`))]))
+  const rows = faultLoadVerdicts({ plan, ledger, stub: evidenceRows(stub), during: timingRows(join(dir, 'during-times.jsonl')), times: timingRows(join(dir, 'times.jsonl')),
+    queues, duringQueues, rows: measurements(measurement, numeric(mark)), clearMark: numeric(clearMark), clearAt: numeric(clearAt) },
+    { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }, Number(printer('THREAD_REPLY_HOLD_MS')), percentile)
+  for (const key of plan.keys) {
+    const expected = p.populationJoins(key, c.population, await channels()), added = plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts }))
+    const r = joinsVerdict(evidenceRows(join(dir, `${key}.before.jsonl`)), evidenceRows(join(dir, `${key}.after.jsonl`)), expected, added, 1)
+    r.stats.persona = key; rows.push(r)
+  }
+  rows.push(startupVerdict(numeric(start), numeric(ready), c.population * c.recipients), compactionVerdict(evidenceRows(join(dir, 'compactions.jsonl')), plan.keys, c.population === 100_000))
+  return printResults(c, rows)
+}
+
+async function burst(c: Context, args: string[]): Promise<number> {
+  countArgs(args, 6, 8)
+  const [batchDir, url, stubRecord, stateDir, out, rawWait, measurement, mark] = args
+  if (args.length === 7) throw new Error('usage')
+  if (!/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/.test(url) || !nonnegative(Number(rawWait)) || Number(rawWait) === 0) throw new Error('usage')
+  const p = await population(), keys = p.sr8Personas(c.recipients), submitted: BurstItem[] = [], proof: Compaction[] = []
+  const batches = ['roots', 'replies', 'dropped'].map(phase => {
+    const rows = jsonl(join(batchDir, `${phase}.batch.jsonl`))
+    const expected = (phase === 'roots' ? p.SR8_BURST_JOINS : phase === 'replies' ? p.SR8_BURST_REPLIES : p.SR8_BURST_DROPPED) * c.recipients
+    if (!rows || rows.length !== expected || rows.some(r => !keys.includes(r.label) || !r.event?.ts || !r.event?.channel || !r.event?.user)) throw new Error('batch missing')
+    return { phase, rows }
+  })
+  const heldPath = join(batchDir, 'held.batch.jsonl')
+  if (existsSync(heldPath)) {
+    if (!measurement || !integer(numeric(mark))) throw new Error('usage held admission needs measurements')
+    const held = jsonl(heldPath)
+    if (!held?.length || held.some(r => !keys.includes(r.label) || !r.event?.ts || !r.event?.thread_ts || !r.event?.channel || !r.event?.user)) throw new Error('held batch missing')
+    batches.push({ phase: 'held', rows: held })
+  }
+  mkdirSync(out, { recursive: true })
+  const ledger = join(out, 'burst.jsonl'), compactFile = join(out, 'compactions.jsonl')
+  writeFileSync(ledger, '', { flag: 'wx', mode: 0o600 }); writeFileSync(compactFile, '', { flag: 'wx', mode: 0o600 })
+  const expectedCount = batches.reduce((n, b) => n + b.rows.length, 0), baseline = new Map<string, string>()
+  // Restrict the window to these batch timestamps/labels even when the stub record has prior runs.
+  const identities = new Set(batches.flatMap(b => b.rows.map(r => `${r.label}:${r.event.channel}:${r.event.ts}`)))
+  const observed = () => {
+    const rows = jsonl(stubRecord, 0, true)
+    if (!rows) return undefined
+    const pushes = rows.filter(r => r.event === 'push' && identities.has(`${r.label}:${r.channel}:${r.event_ts}`))
+    const ids = new Set(pushes.map(r => r.envelope_id)), acked = new Set(rows.filter(r => r.event === 'ws-message' && ids.has(r.envelope_id)).map(r => r.envelope_id))
+    return { pushes, acked }
+  }
+  const observe = () => {
+    const first = observed()
+    if (!first?.pushes.length || first.acked.size >= expectedCount) return
+    const stats = keys.flatMap(key => ['queue', 'threads'].map(kind => {
+      try { const st = statSync(join(stateDir, kind, `${key}.jsonl`)); return { key, kind, id: `${st.dev}:${st.ino}` } } catch { return { key, kind, id: '' } }
+    }))
+    const after = observed()
+    if (!after || after.acked.size >= expectedCount) return
+    for (const s of stats) {
+      if (!s.id) continue
+      const id = `${s.key}:${s.kind}`, before = baseline.get(id)
+      if (before && before !== s.id && !proof.some(r => r.key === s.key && r.kind === s.kind)) {
+        const row = { key: s.key, kind: s.kind, before, after: s.id, inside: true }; proof.push(row); appendFileSync(compactFile, JSON.stringify(row) + '\n')
+      }
+      baseline.set(id, s.id)
+    }
+  }
+  let failed = false
+  const timer = setInterval(observe, 20)
+  const send = async (phase: string, body: any) => {
+    const item: BurstItem = { key: body.label, phase, channel: body.event.channel, ts: body.event.ts, sender: body.event.user }
+    try {
+      const response = await fetch(`${url}/_push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(Number(rawWait)) })
+      const answer: any = await response.json()
+      if (!response.ok || answer.ok !== true || typeof answer.envelope_id !== 'string') throw new Error('push refused')
+      item.envelope_id = answer.envelope_id
+    } catch { failed = true }
+    submitted.push(item); appendFileSync(ledger, JSON.stringify(item) + '\n')
+  }
+  const waitAcks = async (items: BurstItem[]) => {
+    const until = performance.now() + Number(rawWait)
+    while (performance.now() < until) {
+      observe()
+      const acked = observed()?.acked
+      if (acked && items.every(i => i.envelope_id && acked.has(i.envelope_id))) return true
+      await new Promise(r => setTimeout(r, 20))
+    }
+    return false
+  }
+  try {
+    const held = batches.find(b => b.phase === 'held')
+    if (held) {
+      await Promise.all(held.rows.map(body => send('held', body)))
+      if (failed || !await waitAcks(submitted) || !await holdAdmission(submitted, stateDir, measurement!, numeric(mark), Number(rawWait), out)) return 1
+    }
+    await Promise.all(batches[0].rows.map(body => send('roots', body)))
+    if (failed || !await waitAcks(submitted)) return 1
+    await Promise.all(batches.slice(1).filter(b => b.phase !== 'held').flatMap(b => b.rows.map(body => send(b.phase, body))))
+    return failed || !await waitAcks(submitted) ? 1 : 0
+  } finally { clearInterval(timer); console.log(`recorded: sr8 burst submitted=${submitted.length} expected=${expectedCount} push_failures=${submitted.filter(i => !i.envelope_id).length}`) }
+}
+
+async function check(c: Context, args: string[]): Promise<Result[]> {
+  countArgs(args, 5, 7)
+  const [dir, measurementFile, mark, start, ready, required = '0', n2File] = args
+  if (args.length === 6 || !Number.isSafeInteger(Number(required)) || Number(required) < 0) throw new Error('usage')
+  const p = await population(), { percentile } = await import('./transcript-receipts.ts'), keys = p.sr8Personas(c.recipients)
+  const rows = measurements(measurementFile, Number(mark)), items: BurstItem[] | undefined = jsonl(join(dir, 'burst.jsonl')), times = jsonl(join(dir, 'times.jsonl'))
+  const acceptedItems = items?.filter(i => ['roots', 'replies', 'held'].includes(i.phase)) ?? [], drops = items?.filter(i => i.phase === 'dropped') ?? []
+  const accepted: Accepted[] = [], holds: Accepted[] = [], joins: Result[] = [], ordinary: (Accepted & { envelope_id?: string })[] = []
+  let complete = true, droppedStored = 0
+  for (const key of keys) {
+    const queue = jsonl(join(dir, `${key}.queue.jsonl`))
+    if (!queue) complete = false
+    for (const dropped of drops.filter(i => i.key === key))
+      droppedStored += queue?.filter(r => r.kind === 'accepted' && r.channel === dropped.channel && r.ts === dropped.ts).length ?? 0
+    for (const item of acceptedItems.filter(i => i.key === key)) {
+      const matches = queue?.filter(r => r.kind === 'accepted' && !r.compact && r.channel === item.channel && r.ts === item.ts && r.reminder_for === undefined) ?? []
+      if (matches.length !== 1) { complete = false; continue }
+      accepted.push({ key, seq: matches[0].seq })
+      if (item.phase === 'held' || matches[0].hold?.on === 'post') holds.push({ key, seq: matches[0].seq })
+      else ordinary.push({ key, seq: matches[0].seq, envelope_id: item.envelope_id })
+    }
+    const expected = p.populationJoins(key, c.population, await channels())
+    const added = items?.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts })) ?? []
+    const r = joinsVerdict(jsonl(join(dir, `${key}.before.jsonl`)), jsonl(join(dir, `${key}.after.jsonl`)), expected, added, 1)
+    r.stats.persona = key; joins.push(r)
+  }
+  for (const a of accepted) if (!holds.some(h => identity(h) === identity(a))
+    && rows?.some(r => r.kind === 'store' && r.store === 'post-hold' && r.key === a.key && r.seq === a.seq)) holds.push(a)
+  const ackAccepted = ackVerdict('ack-accepted', acceptedItems.map(i => i.envelope_id), times), ackDropped = ackVerdict('ack-dropped', drops.map(i => i.envelope_id), times)
+  if (keys.some(key => acceptedItems.filter(i => i.key === key && i.phase === 'roots').length !== p.SR8_BURST_JOINS
+    || acceptedItems.filter(i => i.key === key && i.phase === 'replies').length !== p.SR8_BURST_REPLIES)) ackAccepted.verdict = 'missing'
+  if (keys.some(key => drops.filter(i => i.key === key).length !== p.SR8_BURST_DROPPED)) ackDropped.verdict = 'missing'
+  if (ackDropped.verdict !== 'missing' && droppedStored > 0) ackDropped.verdict = 'fail'
+  const store = storeVerdict(complete ? rows : undefined, accepted, percentile)
+  const results = [ackAccepted, ackDropped, store, postHoldVerdict(rows, holds, Number(printer('THREAD_REPLY_HOLD_MS'))),
+    startupVerdict(Number(start), Number(ready), c.population * c.recipients), ...joins,
+    compactionVerdict(jsonl(join(dir, 'compactions.jsonl')), keys, c.population === 100_000)]
+  if (items?.some(i => i.phase === 'held')) results.push(...postHoldOverlapVerdicts(rows, holds, ordinary, times))
+  if (Number(required) > 0) results.push(n2Verdict(n2File && textFile(n2File) !== undefined ? n2Samples(textFile(n2File)!) : undefined, Number(required)))
+  return results
+}
+async function seal(c: Context, phase: string, args: string[]): Promise<Result[]> {
+  countArgs(args, 3)
+  const [log, mark, configPath] = args, bytes = textFile(log), p = await population()
+  const keys = c.population ? p.sr8Personas(c.recipients) : []
+  const cfg = JSON.parse(readFileSync(configPath, 'utf8'))
+  const expected = keys.map(key => printer('buildThreadMemoryChangedWhileStoppedLine', key,
+    cfg.personas.find((x: any) => x.name === key).channels.filter((x: any) => x.delivery === 'thread_hybrid').map((x: any) => x.id).join(','), 'entry-missing', 'changed'))
+  const offset = Number(mark), lines = bytes !== undefined && Number.isSafeInteger(offset) && offset >= 0 && offset <= Buffer.byteLength(bytes)
+    ? Buffer.from(bytes).subarray(offset).toString().split('\n') : undefined
+  return [sealVerdict(phase, keys, lines, printer('THREAD_MEMORY_CHANGED_WHILE_STOPPED'), expected, printer('THREAD_MEMORY_JOINS_LOST'))]
+}
+async function n4(c: Context, args: string[]): Promise<Result[]> {
+  countArgs(args, 11)
+  const [file, mark, key, queueFile, timesFile, stubFile, n2File, hungTs, hungUser, delayedTs, delayedUser] = args
+  const queue = jsonl(queueFile), stub = jsonl(stubFile)
+  const sample = (ts: string, sender: string): FaultSample | undefined => {
+    const accepted = queue?.filter(r => r.kind === 'accepted' && !r.compact && r.source === 'slack' && r.user === sender
+      && r.ts === ts && typeof r.channel === 'string' && r.channel.length > 0 && r.key?.chat_id === r.channel && r.key?.ts === ts) ?? []
+    const push = stub?.filter(r => r.event === 'push' && r.label === key && r.event_ts === ts && r.channel === accepted[0]?.channel) ?? []
+    return accepted.length === 1 && push.length === 1 ? { key, seq: accepted[0].seq, sender, envelope_id: push[0].envelope_id } : undefined
+  }
+  const text = textFile(n2File)
+  return [n4Verdict(measurements(file, Number(mark)), sample(hungTs, hungUser), sample(delayedTs, delayedUser), jsonl(timesFile), text === undefined ? undefined : n2Samples(text), stub, Number(printer('NAME_LOOKUP_TIMEOUT_MS')))]
+}
+async function windows(c: Context, args: string[]): Promise<Result[]> {
+  countArgs(args, 3)
+  const raw = textFile(args[0]), lines = raw === '' ? [] : raw?.endsWith('\n') ? raw.slice(0, -1).split('\n').map(l => l.split('\t')) : undefined
+  const calls = lines?.every(s => s.length === 6 && s[1].trim() && s[4].trim())
+    ? lines.map(s => ({ instance: s[4], ms: Number(s[1]) * 1000 })) : undefined
+  const windowsAt = (file: string) => tsv(file, ['instance', 'start', 'end'])?.map(w => ({ instance: w.instance, start: numeric(w.start) * 1000, end: numeric(w.end) * 1000 }))
+  return [windowsVerdict(calls, windowsAt(args[1]), Number(printer('DELIVERY_MAX_AD_CALLS_PER_S')), windowsAt(args[2]))]
+}
+function concurrentOverlap(args: string[]): Result[] {
+  countArgs(args, 3)
+  const operations = tsv(args[0], ['kind', 'id', 'start', 'end'])?.map(o => ({ kind: o.kind, id: o.id, start_epoch_ms: numeric(o.start), end_epoch_ms: numeric(o.end) }))
+  const samples = tsv(args[1], ['key', 'seq', 'start', 'end'])?.map(s => ({ key: s.key, seq: numeric(s.seq), start_epoch_ms: numeric(s.start), end_epoch_ms: numeric(s.end) }))
+  const measured = textFile(args[2])
+  return concurrentOverlapVerdicts(operations, samples, measured === undefined ? undefined : n2Samples(measured))
+}
+function conditions(args: string[]) {
+  countArgs(args, 2)
+  const [state, pid] = args
+  if (!/^\d+$/.test(pid)) throw new Error('usage')
+  const memory = textFile('/sys/fs/cgroup/memory.max')?.trim() ?? textFile('/sys/fs/cgroup/memory/memory.limit_in_bytes')?.trim() ?? 'unknown'
+  const mount = (textFile('/proc/self/mountinfo') ?? '').split('\n').map(l => l.split(' ')).filter(s => s[4] && (resolve(state) === s[4] || resolve(state).startsWith(s[4].replace(/\/$/, '') + '/'))).sort((a, b) => b[4].length - a[4].length)[0]?.[4] ?? 'unknown'
+  const peak = textFile(`/proc/${pid}/status`)?.match(/^VmHWM:\s+(\d+) kB$/m)?.[1] ?? 'unknown'
+  console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}`)
+}
+async function main(args: string[]): Promise<number> {
+  if (!existsSync('/etc/cscb-ci-image')) { console.error('FAIL: sr8-evidence requires the CI image'); return 2 }
+  const command = args.shift()
+  if (command === 'config') { await config(args); return 0 }
+  if (command === 'seed') { await seed(args); return 0 }
+  if (command === 'plan') { await plan(args); return 0 }
+  if (command === 'bodies') {
+    countArgs(args, 2)
+    const events = jsonl(args[1]); if (!events || !/^[a-z0-9_]+$/.test(args[0])) throw new Error('usage')
+    for (const event of events) console.log(JSON.stringify({ label: args[0], event }))
+    return 0
+  }
+  if (command === 'conditions') { conditions(args); return 0 }
+  if (command === 'combinations') {
+    countArgs(args, 0)
+    const p = await population()
+    for (const c of p.sr8Combinations()) console.log([c.population, c.mode, c.recipients].join('\t'))
+    return 0
+  }
+  if (command === 'envelope-times') return bulkTimings(args)
+  const phase = command === 'seal' ? args.shift()! : ''
+  const c = context(args)
+  const faultResult = await faultCommands(command!, c, args)
+  if (faultResult !== undefined) return faultResult
+  if (command === 'burst') return burst(c, args)
+  if (command === 'check') return printResults(c, await check(c, args))
+  if (command === 'startup-load') {
+    countArgs(args, 0, 2)
+    const timestamp = (raw: string | undefined) => raw?.trim() ? Number(raw) : NaN
+    return printResults(c, [startupVerdict(timestamp(args[0]), timestamp(args[1]), c.population * c.recipients)])
+  }
+  if (command === 'seal') return printResults(c, await seal(c, phase, args))
+  if (command === 'n4') return printResults(c, await n4(c, args))
+  if (command === 'windows') return printResults(c, await windows(c, args))
+  if (command === 'concurrent-overlap') return printResults(c, concurrentOverlap(args))
+  const extra = await additional(command!, c, args)
+  if (extra) return printResults(c, extra)
+  throw new Error('usage')
+}
+if (import.meta.main) {
+  try { process.exitCode = await main(process.argv.slice(2)) }
+  catch (error) { const usage = error instanceof Error && error.message.startsWith('usage'); console.error(`FAIL: sr8-evidence ${error instanceof EvidenceFailure ? error.reason : usage ? 'invalid command arguments' : 'evidence unavailable or invalid'}`); process.exitCode = usage ? 64 : 1 }
+}

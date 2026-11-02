@@ -104,10 +104,18 @@ export interface QueueItem {
 }
 export function isOpenItem(item: QueueItem): boolean { return !item.delivered && (!item.hold || item.hold.state === 'released') }
 export function itemOpenedAt(item: QueueItem): number { return (item.hold?.state === 'released' ? item.hold.at : undefined) ?? item.accepted.released_at ?? item.accepted.received_at }
+/** The kind of a timed store: an ordinary acceptance or one holding on a Post or Memory Hold. */
+export type QueueStoreKind = 'accepted' | 'post-hold' | 'memory-hold'
+/** A turn's timing on the queue's monotonic clock: from the turn's start to
+ * its append's return, and that return. Only with `measureTimings`. */
+export interface QueueStoreTiming { storeMs: number; atMonoMs: number }
 export type QueueEvent =
-  | { type: 'holds-resolved'; key: string; resolutions: HoldResolution[] }
+  | ({ type: 'holds-resolved'; key: string; resolutions: HoldResolution[] } & Partial<QueueStoreTiming>)
   | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; edited_ts?: string; slackKey?: SlackKey; error: unknown }
-  | { type: 'stored' | 'writable'; key: string }
+  | ({ type: 'stored'; key: string; seq?: number; store?: QueueStoreKind } & Partial<QueueStoreTiming>)
+  | { type: 'writable'; key: string }
+  /** A newly written `fixed` record; never a `stored` event, which ends a not-saved episode. Only with `measureTimings`. */
+  | ({ type: 'fixed-stored'; key: string; seq: number } & QueueStoreTiming)
   | { type: 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; path?: string; seq?: number; error: unknown }
   | { type: 'record-unreadable'; key: string; line: number; quarantinePath: string; alert: boolean }
   | { type: 'retained'; key: string; count: number }
@@ -145,7 +153,7 @@ export interface DeliveryQueue {
   durabilityPending?(key: string): boolean
   keys(): string[]
   compact(key?: string, current?: () => boolean): Promise<void>
-  startMaintenance(): void
+  startMaintenance(intervalMs?: number): void
   stop(): Promise<void>
   retained(key: string): void
   startupFindings(): QueueEvent[]
@@ -153,6 +161,8 @@ export interface DeliveryQueue {
 export type ReplyReminderRow = Pick<GetResult, 'state' | 'session_id' | 'launch_started_at'>
 /** Server-owned journal operations; ordinary delivery adapters need only DeliveryQueue. */
 export interface ReplyReminderQueue extends DeliveryQueue {
+  /** Test-only: bind timing after the server resolves its start configuration. */
+  setMeasureTimings(enabled: boolean): void
   replyReminderItems(key: string): ReplyReminderRecord[]
   replyCallTargets(key: string): ReplyCallTarget[]
   recordReplyCall(key: string, targets: readonly ReplyCallTarget[]): Promise<void>
@@ -173,6 +183,11 @@ export interface DeliveryQueueOptions {
    * repaired it and before that turn's own work, so it must be synchronous
    * with no I/O; its throw is ignored. */
   onLoadedAfterStart?(key: string): void
+  /** Test-only: time stores on `monotonicNow`. Off, the queue reads no clock for timing and emits no timing field or event. */
+  measureTimings?: boolean
+  monotonicNow?: () => number
+  /** The maintenance compaction interval; `QUEUE_COMPACT_INTERVAL_MS` unless given. */
+  compactIntervalMs?: number
 }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const str = (v: unknown): v is string => typeof v === 'string'
@@ -258,6 +273,8 @@ function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: fal
 export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
   const fs = options.fs ?? nodeFs
   const now = options.now ?? Date.now
+  const monotonicNow = options.monotonicNow ?? (() => performance.now())
+  let measureTimings = options.measureTimings === true
   const dir = join(options.stateDir, 'queue')
   const { ensureDir, durableAppend, reconcileRollback, rewrite } = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: QUEUE_DIRECTORY_MODE, fileMode: QUEUE_FILE_MODE, fs })
   const journals = new Map<string, Journal>()
@@ -283,6 +300,14 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const next = (writers.get(key) ?? Promise.resolve()).catch(() => {}).then(work)
     writers.set(key, next)
     return next
+  }
+  /** A running turn's first timing reading; no clock read unless measuring. */
+  function turnStart(): number | undefined { return measureTimings ? monotonicNow() : undefined }
+  /** The second reading, taken as the turn's append returns. */
+  function timing(turnStarted: number | undefined): QueueStoreTiming | undefined {
+    if (turnStarted === undefined) return undefined
+    const atMonoMs = monotonicNow()
+    return { storeMs: atMonoMs - turnStarted, atMonoMs }
   }
   function update(j: Journal, record: QueueRecord, replay = false): void {
     j.records.push(record); j.nextSeq = Math.max(j.nextSeq, record.seq + 1)
@@ -553,19 +578,22 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function needsThreadJoinCopy(key: string, record: AcceptedRecord): boolean {
     return record.thread_join !== undefined && options.threadJoinSaved?.(key, record.channel!, record.thread_join) !== true
   }
-  /** Caller owns the loaded journal's serial turn and has checked duplicates. */
-  function storeAccepted(key: string, input: AcceptedInput): { status: 'accepted'; seq: number; item: QueueItem } {
+  /** Caller owns the loaded journal's serial turn, begun at `turnStarted`, and has checked duplicates. */
+  function storeAccepted(key: string, input: AcceptedInput, turnStarted: number | undefined): { status: 'accepted'; seq: number; item: QueueItem } {
     const j = journal(key), received_at = input.received_at ?? now()
     const candidate = BigInt(Math.trunc(received_at * 1000))
     const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
     const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
     if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
     if (record.hold) storingHolds.set(key, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
+    let timed: QueueStoreTiming | undefined
     try {
       durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
+      timed = timing(turnStarted)
       update(j, record)
     } finally { storingHolds.delete(key) }
-    event({ type: 'stored', key })
+    const store: QueueStoreKind = record.hold?.on === 'post' ? 'post-hold' : record.hold?.on === 'memory' ? 'memory-hold' : 'accepted'
+    event(timed ? { type: 'stored', key, seq: record.seq, store, ...timed } : { type: 'stored', key })
     return { status: 'accepted', seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
   }
   function storeFailed(key: string, input: AcceptedInput | undefined, error: unknown): QueueAcceptResult {
@@ -659,9 +687,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         if (!started || stopped) throw new Error('Queue is not accepting')
         input = structuredClone(input)
         return await serial(key, () => {
+          const turnStarted = turnStart()
           load(key)
           if (input.source === 'slack' && input.key) { const existing = lookupSlackKey(key, input.key); if (existing) return existing }
-          return storeAccepted(key, input)
+          return storeAccepted(key, input, turnStarted)
         })
       } catch (error) { return storeFailed(key, input, error) }
     },
@@ -670,6 +699,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       try {
         slackKey = structuredClone(slackKey)
         return await serial(key, () => {
+          const turnStarted = turnStart()
           let keyChecked = false, unavailable: unknown
           try {
             if (!started || stopped) throw new Error('Queue is not accepting')
@@ -682,7 +712,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           if ('skip' in decision) return { status: 'skipped' as const, outcome: decision.skip }
           input = structuredClone(decision.store)
           if (!keyChecked) throw unavailable
-          const result = storeAccepted(key, input)
+          const result = storeAccepted(key, input, turnStarted)
           try { decision.afterStore?.({ seq: result.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
           return result
         })
@@ -693,6 +723,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         if (!started || stopped) throw new Error('Queue is not writable')
         record = structuredClone(record)
         await serial(key, () => {
+          // Only a fixation is timed: N4's fallback is measured from its turn's start.
+          const turnStarted = record.kind === 'fixed' ? turnStart() : undefined
           load(key); const j = journal(key)
           if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder' || isHoldResolution(record)) throw new Error('Invalid append record')
           const item = j.items.get(record.seq)
@@ -715,7 +747,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
             if (deliveredItem.delivered && item.accepted.source === 'slack' && sent && !reminderResolved(j, deliveredItem)) records.push({ v: 1, kind: 'reply-reminder', seq: record.seq, at: record.at, state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(deliveredItem) })
           }
           durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+          const timed = timing(turnStarted)
           for (const next of records) update(j, next)
+          if (timed) event({ type: 'fixed-stored', key, seq: record.seq, ...timed })
         })
         if (appendBlocked.delete(key)) event({ type: 'writable', key })
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), seq: record.seq, error }); throw error }
@@ -755,6 +789,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       try {
         const copy = structuredClone(resolutions)
         return await serial(key, () => {
+          const turnStarted = turnStart()
           if (!current()) return []
           if (!started || stopped) throw new Error('Queue is not writable')
           load(key)
@@ -771,13 +806,14 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           if (!saved.length) return []
           const records: HoldResolutionRecord[] = saved.map(r => ({ v: 1, kind: r.outcome, seq: r.seq, at: r.at }))
           durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+          const timed = timing(turnStarted)
           for (const record of records) update(j, record)
           const wasBlocked = appendBlocked.delete(key)
           // Transfer committed evidence before a queue observer can submit
           // teardown. Never turn an observer failure into an append failure.
           try { void Promise.resolve(onCommitted?.(structuredClone(saved))).catch(() => {}) } catch { /* saved facts remain saved */ }
           if (wasBlocked) event({ type: 'writable', key })
-          event({ type: 'holds-resolved', key, resolutions: structuredClone(saved) })
+          event({ type: 'holds-resolved', key, resolutions: structuredClone(saved), ...timed })
           return saved
         })
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), error }); throw error }
@@ -786,9 +822,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     durabilityPending: key => journals.get(key)?.pendingRecovery === true,
     keys: () => [...journals.keys()],
     compact,
-    startMaintenance() {
+    setMeasureTimings(enabled) { measureTimings = enabled },
+    startMaintenance(intervalMs) {
       if (timer !== undefined || stopped) return
-      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, QUEUE_COMPACT_INTERVAL_MS)
+      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
       timer.unref?.()
     },
     async stop() {

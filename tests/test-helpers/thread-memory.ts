@@ -9,8 +9,8 @@ import {
 } from '../../src/thread-memory-seal.ts'
 import { queuePath } from './delivery-queue.ts'
 import type { OwnPostJoins } from '../../src/own-post.ts'
-import type { DeliveryMode, PersonaConfigInput } from '../../src/config.ts'
-import { createSharedChannelAuthority, type SharedChannelAuthority, type SharedChannelDeps } from '../../src/shared-channels.ts'
+import type { ChannelMode, DeliveryMode, PersonaConfigInput } from '../../src/config.ts'
+import { createSharedChannelAuthority, parseSharedChannelState, type SharedChannelAuthority, type SharedChannelDeps } from '../../src/shared-channels.ts'
 import {
   createThreadMemory, isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords,
   THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
@@ -26,7 +26,13 @@ import { formatPersonaNotice } from '../../src/persona-notifier.ts'
 import {
   SHARED_CHANNEL_IDS, configBytes, makeSharedAuthority, readSharedState,
   sharedChannelPath, sharedRecoveryRequest, makeMembershipHarness, membershipPage,
+  channelPopulation, fixtureThreadHybridSince,
 } from './shared-channels.ts'
+import { eligibleChannels, seedPopulation, sr8Personas, SR8_POPULATION_CHANNEL_COUNT, type PopulationJoin } from './thread-populations.ts'
+
+/** The SR-8 builders live in the src-free population module (Task t2.yiv.sf.tu
+ * Decision 4); unit suites take them, and their `src/` bindings below, from here. */
+export * from './thread-populations.ts'
 
 export const THREAD_PERSONAS = { primary: 'alpha', secondary: 'beta' } as const
 export const THREAD_CHANNELS = SHARED_CHANNEL_IDS
@@ -186,6 +192,25 @@ export function threadConfig(dir: string, delivery: DeliveryMode = 'thread_hybri
     channels: channels.map(id => ({ id, delivery })), permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' },
   }, dir)) }, dir)
 }
+/** An SR-8 population's config: each recipient persona lists `channelPopulation(SR8_POPULATION_CHANNEL_COUNT)`,
+ * exactly `SR8_ELIGIBLE_CHANNELS` of them `thread_hybrid` (`populationEligible()`). */
+export function populationConfig(dir: string, mode: ChannelMode = 'strict', recipients = 1): PersonaConfigInput {
+  return makePersonaConfigInput({ channel_mode: mode, personas: sr8Personas(recipients).map(name => makePersona({ name,
+    channels: channelPopulation(SR8_POPULATION_CHANNEL_COUNT), permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' },
+  }, dir)) }, dir)
+}
+export const populationEligible = (): string[] => eligibleChannels(channelPopulation(SR8_POPULATION_CHANNEL_COUNT))
+/** `seedPopulation` bound to `src/`: the production factory and a production
+ * authority over the stopped state's shared state file (`authorityPath`,
+ * default `sharedChannelPath(stateDir)`), on the fake clock and its timers. */
+export function seedUnitPopulation(stateDir: string, seed: { key: string; joins: readonly PopulationJoin[]; batch?: number },
+  options: { authorityPath?: string; clock?: FakeClock; fs?: typeof fs } = {}) {
+  const path = options.authorityPath ?? sharedChannelPath(stateDir), clock = options.clock ?? createFakeClock({ start: THREAD_TIME })
+  const state = parseSharedChannelState(fs.readFileSync(path), path)
+  if (!state) throw new Error('seedUnitPopulation: expected a shared authority')
+  const authority = createSharedChannelAuthority(path, state, { now: clock.now, threadHybridSince: fixtureThreadHybridSince(state) })
+  return seedPopulation({ createThreadMemory, authority, stateDir, fs: options.fs, now: clock.now, ...intervalTimers(clock) }, seed)
+}
 export interface ThreadHarnessOptions {
   authority?: SharedChannelAuthority; input?: PersonaConfigInput; reopen?: boolean; dryRun?: boolean; clock?: FakeClock
   now?: () => number; appliedKeys?: () => readonly string[]; canRemove?: (key: string) => boolean
@@ -198,6 +223,8 @@ export interface ThreadHarnessOptions {
   canRun?: ThreadMemoryOptions['canRun']
   /** Opt in to production retries/reporting; old store-only callers stay unchanged. */
   failureHandling?: boolean
+  /** Passed through to `createThreadMemory` as given, absent by default. */
+  compactIntervalMs?: ThreadMemoryOptions['compactIntervalMs']
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
@@ -244,6 +271,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions }) : undefined
   const memory = createThreadMemory({
     stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
+    compactIntervalMs: options.compactIntervalMs,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
     heldStamps: options.heldStamps,
