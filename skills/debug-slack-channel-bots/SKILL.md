@@ -498,7 +498,7 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 - **Line:** `[slack] message-retyped: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" retype_count=<n>`
 - **Meaning:** CSCB offered the queued message again; it may reach the bot more than once.
 - **Cause:** The transcript has not confirmed the earlier copy.
-- **Fix:** Check **Message not taken in** and **Delivery stuck** below if it persists. Retries continue indefinitely; later messages wait behind it.
+- **Fix:** Check **Message not taken in** and **Delivery stuck** below if it persists. Retries continue indefinitely; later messages wait behind it. For a long message on a Mac host, see [A persona on a Mac keeps retyping a long message](#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
 
 ### `message-not-taken-in`
 
@@ -7249,6 +7249,12 @@ Check the matching notice or diagnostic under [Delivery notices](#delivery-notic
 and [Persona diagnostic classes](#persona-diagnostic-classes). Storage failures need
 a disk check; stuck delivery needs the notice's remedy; waiting messages need the
 persona's hold or down state resolved. Accepted items remain queued in order.
+
+### Symptom: A persona on a Mac keeps retyping a long message
+
+Claude Code on macOS loses typed input sent as one large burst, so on a macOS host CSCB types a long message as several parts of at most about 880 bytes each, tag included; on other hosts a part can reach about 1,900 bytes. On a Mac, long attachment lists, sender names and channel names in the tag are shortened sooner, each ending in `…`; the channel ID and the attachment count are kept whole.
+
+CSCB sets a message's parts once, shortly after it is queued, and never changes them; restarting the bot or the server does not split it again. A message queued before an upgrade can therefore keep its larger parts, go on logging `message-retyped` and raise a *Message not taken in* or *Delivery stuck* notice while later messages wait behind it. CSCB keeps offering it until the bot takes it in. [Delivery notices](#delivery-notices) explains each notice and how to attach to the bot's terminal to see what it received.
 
 ### Symptom: A persona posts a *Waiting on a prompt* or *Not connected* notice
 

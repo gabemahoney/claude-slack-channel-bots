@@ -208,6 +208,7 @@ import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
+import { tagMaxBytesFor } from './tag-wrapper.ts'
 import {
   createPersonaConnectionManager,
   SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -2717,6 +2718,7 @@ export async function main(): Promise<void> {
     clientFor,
     wake: key => deliveryQueueWake.wake(key),
     onPending: key => deliveryEngines?.wake(key),
+    tagMaxBytes: tagMaxBytesFor(process.platform),
   })
 
   // the retired-key record (retired-keys.json in the

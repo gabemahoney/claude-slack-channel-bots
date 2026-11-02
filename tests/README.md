@@ -513,6 +513,11 @@ assertions).
 
 ### Real Claude gate and heavy legs
 
+Every CI host runs Linux, so these legs type parts of up to 1,900 bytes. The
+macOS part limit (880 bytes) is covered only by the unit suite
+(`tests/tag-wrapper.test.ts`, `tests/persona-routing.test.ts` and
+`tests/server-startup-wiring.test.ts`); no script can force it on Linux.
+
 Scenarios that kill a bot use `real_kill_and_reconcile`: retain and validate
 the AD kill result, stop CSCB, respect pending grace, then run the documented
 bounded `find-missing`/status sequence (including the second kill if needed).
