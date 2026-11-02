@@ -19,7 +19,9 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts,
   faultLoadVerdicts, faultWaves, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
+  burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
 } from './integration/fixtures/sr8-evidence.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-reports.ts'
@@ -85,6 +87,18 @@ function shell(program: string, files: Record<string, string> = {}) {
   } finally { rmSync(root, { recursive: true, force: true }) }
 }
 const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
+/** A full SR-8.2 burst ledger and stub record, in burst's order, with the
+ * pending-post probes leading the second wave. Stub seqs start after mark 10. */
+function pendingBurst(keys: string[], channel: string, probes: { channel: string; ts: string; envelope_id: string }[]) {
+  const items: BurstItem[] = keys.flatMap(key => ([['roots', SR8_BURST_JOINS], ['replies', SR8_BURST_REPLIES], ['dropped', SR8_BURST_DROPPED]] as const)
+    .flatMap(([phase, count]) => Array.from({ length: count }, (_, n) => ({ key, phase, channel, ts: `${phase}.${n}`, sender: 'UHUMAN', envelope_id: `${key}-${phase}-${n}` }))))
+  const roots = items.filter(i => i.phase === 'roots'), later = items.filter(i => i.phase !== 'roots')
+  const led = probes.map(p => ({ key: keys[0], phase: 'probes', channel: p.channel, ts: p.ts, sender: 'UHUMAN', envelope_id: p.envelope_id }))
+  const stub: { seq: number; event: string; envelope_id: string }[] = []
+  const add = (event: string, rows: { envelope_id?: string }[]) => { for (const r of rows) stub.push({ seq: stub.length + 11, event, envelope_id: r.envelope_id! }) }
+  add('push', roots); add('ws-message', roots); add('push', led); add('push', later); add('ws-message', led); add('ws-message', later)
+  return { ledger: [...roots, ...led, ...later], stub, end: stub.length + 10 }
+}
 const instance = 'cscb_control', session = 'resumed-session'
 const event = (name: string, seconds: number, fields = {}) => ({
   event: name, instance_id: instance, ts: new Date(seconds * 1000).toISOString(), ...fields,
@@ -611,6 +625,68 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   test('other-parent drop needs no acceptance and still gets its N1 ACK', () => {
     const p = pending(); p.queue.shift(); p.rows.shift(); output(p.run(), 0)
   })
+  // Decision 29 ruling: stub order 10 mark | 11 root push | 12 root ACK | 13-15 probe
+  // pushes | 16 reply, 17 drop push | 18-20 probe ACKs | 21-22 burst ACKs | 30 mark.
+  function window() {
+    const p = pending()
+    const items: BurstItem[] = [...[['roots', 'r'], ['replies', 'q'], ['dropped', 'd']].map(([phase, id]) => ({ key, phase, channel, ts: id, sender: 'U', envelope_id: id })),
+      ...p.probes.map(probe => ({ key, phase: 'probes', channel: probe.channel, ts: probe.ts, sender: 'U', envelope_id: probe.envelope_id }))]
+    const order: [string, string][] = [['push', 'r'], ['ws-message', 'r'], ...p.probes.map(probe => ['push', probe.envelope_id] as [string, string]),
+      ['push', 'q'], ['push', 'd'], ...p.probes.map(probe => ['ws-message', probe.envelope_id] as [string, string]), ['ws-message', 'q'], ['ws-message', 'd']]
+    const stub = order.map(([event, envelope_id], i) => ({ seq: 11 + i, event, envelope_id }))
+    const w: PendingWindow = { startSeq: 10, endSeq: 30, compactMs: QUEUE_COMPACT_INTERVAL_MS, startMs: 5, endMs: 5 + QUEUE_COMPACT_INTERVAL_MS - 1, before: '64768:12\n', after: '64768:12\n' }
+    return { probes: p.probes, items, stub, w, run() { return pendingBurstVerdict(this.items, this.stub, this.probes, this.w) } }
+  }
+  test('pending post and probes inside the burst, below the production interval, pass and record it', () => {
+    const r = window().run()
+    expect(r.verdict).toBe('pass')
+    expect(r.stats).toEqual({ compact_interval_ms: QUEUE_COMPACT_INTERVAL_MS, window_ms: QUEUE_COMPACT_INTERVAL_MS - 1, probes_inside: 3, burst_in_pending: 'yes', same_journal: 'yes' })
+    output([r], 0)
+  })
+  test('an end mark equal to the last burst ACK still contains the burst', () => {
+    const v = window(); v.w.endSeq = 22
+    expect(v.run().verdict).toBe('pass')
+  })
+  test.each(['journal-replaced', 'window-at-interval'] as const)('pending burst fails when %s', defect => {
+    const v = window()
+    if (defect === 'journal-replaced') v.w.after = '64768:13\n'
+    if (defect === 'window-at-interval') v.w.endMs++
+    expect(v.run().verdict).toBe('fail'); output([v.run()], 1)
+  })
+  test.each(['probe-before-burst', 'probe-after-burst', 'probe-at-last-ack', 'burst-before-mark', 'ack-after-mark', 'unledgered-probe', 'burst-ack',
+    'journal', 'before-journal', 'malformed-journal', 'stub', 'interval', 'start'] as const)('pending burst missing %s never passes', defect => {
+    const v = window()
+    if (defect === 'probe-before-burst') v.stub[2].seq = 11
+    if (defect === 'probe-after-burst') v.stub[4].seq = 23
+    // Only the tie moves: the third probe push takes the last burst ACK's seq.
+    if (defect === 'probe-at-last-ack') v.stub[4].seq = 22
+    if (defect === 'before-journal') v.w.before = undefined
+    if (defect === 'malformed-journal') v.w.before = 'x'
+    if (defect === 'burst-before-mark') v.w.startSeq = 11
+    if (defect === 'ack-after-mark') v.w.endSeq = 21
+    if (defect === 'unledgered-probe') v.items = v.items.filter(i => i.phase !== 'probes' || i.envelope_id !== v.probes[0].envelope_id)
+    if (defect === 'burst-ack') v.stub = v.stub.filter(r => !(r.event === 'ws-message' && r.envelope_id === 'q'))
+    if (defect === 'journal') v.w.after = undefined
+    if (defect === 'stub') v.stub = undefined as never
+    if (defect === 'interval') v.w.compactMs = NaN
+    if (defect === 'start') v.w.startMs = NaN
+    expect(v.run().verdict).toBe('missing'); output([v.run()], 1)
+  })
+  test('burst ACK verdicts keep check counts, N1 and stored-drop rules, and ignore probes', () => {
+    const counts = { roots: 1, replies: 1, dropped: 1 }
+    const items: BurstItem[] = ['roots', 'replies', 'dropped', 'probes'].map(phase => ({ key, phase, channel, ts: phase, sender: 'U', envelope_id: phase }))
+    const times = () => items.map(i => timing(i.envelope_id!, i.phase === 'probes' ? SR8_ACK_LIMIT_MS + 1 : SR8_ACK_LIMIT_MS))
+    const run = (rows = items, t = times(), queues: Record<string, any[] | undefined> = { [key]: [] }) => burstAckVerdicts([key], rows, t, queues, counts)
+    expect(run().map(r => [r.measure, r.samples, r.verdict])).toEqual([['ack-accepted', 2, 'pass'], ['ack-dropped', 1, 'pass']])
+    expect(run(items.filter(i => i.phase !== 'replies'))[0].verdict).toBe('missing')
+    expect(burstAckVerdicts([key], undefined, times(), { [key]: [] }, counts).map(r => r.verdict)).toEqual(['missing', 'missing'])
+    expect(run(items, times(), { [key]: [{ kind: 'accepted', channel, ts: 'dropped', seq: 9 }] })[1].verdict).toBe('fail')
+    const slow = times(); slow[0].acks[0].ack_mono_ms++
+    expect(run(items, slow)[0].verdict).toBe('fail')
+    const slowDrop = times(); slowDrop[2].acks[0].ack_mono_ms++
+    expect(run(items, slowDrop).map(r => r.verdict)).toEqual(['pass', 'fail'])
+    expect(run(items.filter(i => i.phase !== 'dropped')).map(r => r.verdict)).toEqual(['pass', 'missing'])
+  })
   function shared(count = SR8_SHARED_CHANNELS): SharedListEvidence {
     const channels = Array.from({ length: count }, (_, i) => ({ id: `C${i}`, delivery: 'thread_hybrid' }))
     const facts = [{ key, mode: 'strict', incarnation: 'life', assignments: Object.fromEntries(channels.map(ch => [ch.id, { delivery: ch.delivery, order: 1, threadHybridSince: 'stamp' }])) }]
@@ -888,7 +964,8 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   }
   const noFile = '@/absent'
   test.each([
-    ['pending-post', [key, operation, '0', String(SR8_PENDING_POST_MS), noFile, noFile, noFile, noFile, noFile, noFile, '0', channel], 3],
+    ['pending-post', [key, operation, '0', String(SR8_PENDING_POST_MS), noFile, noFile, noFile, noFile, noFile, noFile, '0', channel,
+      noFile, '10', '30', String(QUEUE_COMPACT_INTERVAL_MS), '0', '1'], 6],
     ['shared-list', [noFile, '1'], 2],
     ['membership-fault', ['hang', 'first', key, noFile, noFile, noFile, noFile, '0', '0'], 2],
     ['membership-repair', [key, '100', noFile], 1],
@@ -904,12 +981,30 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     expect(lines.slice(0, -1).every(l => l.endsWith('verdict=missing'))).toBe(true)
     expect(lines.at(-1)).toContain(`measures=${count} pass=0 fail=0 missing=${count}`)
   })
-  test('CLI pending-post reads its actual journal, queue, timing and measurement files', () => {
-    const p = pending(), args = [key, operation, '0', String(p.end), '@/before', '@/after', '@/probes', '@/queue', '@/times', '@/measurements', '0', channel]
+  test('CLI pending-post reads its actual journal, queue, timing, measurement and burst files', () => {
+    const p = pending(), b = pendingBurst([key], channel, p.probes)
+    const args = [key, operation, '0', String(p.end), '@/before', '@/after', '@/probes', '@/e/alpha.queue.jsonl', '@/e/times.jsonl', '@/measurements', '0', channel,
+      '@/e', '10', String(b.end), String(QUEUE_COMPACT_INTERVAL_MS), '7', String(7 + QUEUE_COMPACT_INTERVAL_MS - 1)]
     const files = { before: jsonl(p.before), after: jsonl(p.after), probes: p.probes.map(p => [p.parent, p.channel, p.ts, p.envelope_id].join('\t')).join('\n') + '\n',
-      queue: jsonl(p.queue), times: jsonl(p.times), measurements: jsonl(p.rows) }
-    expect(cli('pending-post', args, files).status).toBe(0)
-    expect(cli('pending-post', args, { ...files, measurements: token }).status).toBe(1)
+      'e/alpha.queue.jsonl': jsonl(p.queue), 'e/times.jsonl': jsonl([...p.times, ...b.ledger.filter(i => i.phase !== 'probes').map(i => timing(i.envelope_id!, 1))]),
+      measurements: jsonl(p.rows), 'e/burst.jsonl': jsonl(b.ledger), 'e/final-stub.jsonl': jsonl(b.stub), 'e/before.journal': '64768:12\n', 'e/after.journal': '64768:12\n' }
+    const pass = cli('pending-post', args, files, 1), lines = pass.stdout.trim().split('\n')
+    expect(pass.status).toBe(0)
+    expect(lines.map(l => l.split(' ')[2])).toEqual(['pending-post', 'pending-post-ack', 'post-hold', 'ack-accepted', 'ack-dropped', 'pending-post-burst', 'summary'])
+    expect(lines[5]).toContain(`samples=${SR8_BURST_JOINS + SR8_BURST_REPLIES + SR8_BURST_DROPPED} compact_interval_ms=${QUEUE_COMPACT_INTERVAL_MS} window_ms=${QUEUE_COMPACT_INTERVAL_MS - 1} probes_inside=3 burst_in_pending=yes same_journal=yes limit=window_ms<compact_interval_ms verdict=pass`)
+    expect(cli('pending-post', args, { ...files, measurements: token }, 1).status).toBe(1)
+    const replaced = cli('pending-post', args, { ...files, 'e/after.journal': '64768:13\n' }, 1)
+    expect(replaced.status).toBe(1); expect(replaced.stdout).toContain('same_journal=no limit=window_ms<compact_interval_ms verdict=fail')
+    const short = cli('pending-post', args, { ...files, 'e/burst.jsonl': jsonl(b.ledger.filter(i => i.phase !== 'replies' || i.ts !== 'replies.0')) }, 1)
+    expect(short.status).toBe(1); expect(short.stdout).toMatch(/ack-accepted .* verdict=missing/)
+    // Without the second persona's queue, no drop can be proved unstored.
+    const both = pendingBurst([key, 'beta'], channel, p.probes), twoArgs = [...args.slice(0, 14), String(both.end), ...args.slice(15)]
+    const twoFiles = { ...files, 'e/times.jsonl': jsonl([...p.times, ...both.ledger.filter(i => i.phase !== 'probes').map(i => timing(i.envelope_id!, 1))]),
+      'e/burst.jsonl': jsonl(both.ledger), 'e/final-stub.jsonl': jsonl(both.stub) }
+    expect(cli('pending-post', twoArgs, { ...twoFiles, 'e/beta.queue.jsonl': jsonl([]) }, 2).status).toBe(0)
+    const absent = cli('pending-post', twoArgs, twoFiles, 2)
+    expect(absent.status).toBe(1); expect(absent.stdout).toMatch(/ack-dropped .* verdict=missing/)
+    expect(absent.stdout).toMatch(/pending-post scenario=.* verdict=pass/)
   })
   test('CLI shared-list reads every phase and refuses a successful real-probe status', () => {
     const e = shared(), files: Record<string, string> = { 'e/prepared.input': e.prepared!, 'e/ordinary.preview': e.preview!,
@@ -1473,6 +1568,36 @@ globalThis.fetch = async (_url, init) => {
     appendFileSync(join(base,'state/queue',i.key+'.jsonl'),JSON.stringify({kind:'accepted',channel:i.channel,ts:i.ts,seq:i.ordinal+1})+'\\n');
     appendFileSync(join(base,'measurements'),JSON.stringify({v:1,kind:'store',store:'post-hold',key:i.key,seq:i.ordinal+1,at_mono_ms:1,store_ms:1})+'\\n');
   }
+  return Response.json({ok:true,envelope_id:id});
+};
+`))
+  test('burst probes lead the second wave inside the burst, and pending-post refuses its burst-free form', () => withCLI((root, cli) => {
+    const batch = join(root, 'batches'), out = join(root, 'e'), keys = sr8Personas(2)
+    mkdirSync(batch); writeFileSync(join(root, 'stub'), '')
+    const body = (label: string, phase: string, n: number) => ({ label, event: { channel: 'C0BURST', ts: `${n}.${phase}`, user: 'UHUMAN',
+      ...(phase === 'replies' ? { thread_ts: `${n}.roots` } : {}) } })
+    for (const [phase, count] of [['roots', SR8_BURST_JOINS], ['replies', SR8_BURST_REPLIES], ['dropped', SR8_BURST_DROPPED]] as const)
+      writeFileSync(join(batch, `${phase}.batch.jsonl`), lines(keys.flatMap(k => Array.from({ length: count }, (_, n) => body(k, phase, n)))))
+    const probes = ['other', 'bot', 'none'].map((_, n) => ({ label: keys[0], event: { channel: 'C0HOLD', ts: `${n}.probe`, user: 'UHUMAN', thread_ts: '0.hold' } }))
+    writeFileSync(join(batch, 'probes.batch.jsonl'), lines(probes))
+    expect(cli('burst', [batch, 'http://127.0.0.1:1', join(root, 'stub'), join(root, 'state'), out, '1000']).status).toBe(0)
+    const ledger: BurstItem[] = readFileSync(join(out, 'burst.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    const roots = keys.length * SR8_BURST_JOINS
+    expect(ledger).toHaveLength(roots + keys.length * (SR8_BURST_REPLIES + SR8_BURST_DROPPED) + probes.length)
+    expect(ledger.slice(0, roots).every(i => i.phase === 'roots')).toBe(true)
+    expect(ledger.slice(roots, roots + probes.length).map(i => [i.phase, i.ts])).toEqual(probes.map(p => ['probes', p.event.ts]))
+    const stub = readFileSync(join(root, 'stub'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    const probeRows = ledger.filter(i => i.phase === 'probes').map(i => ({ parent: 'bot', channel: i.channel, ts: i.ts, envelope_id: i.envelope_id! }))
+    expect(pendingBurstVerdict(ledger, stub, probeRows, { startSeq: 0, endSeq: stub.at(-1).seq, compactMs: QUEUE_COMPACT_INTERVAL_MS,
+      startMs: 0, endMs: 1, before: '1:2\n', after: '1:2\n' }).verdict).toBe('pass')
+    expect(cli('pending-post', ['alpha', 'op', '0', '120000', ...Array(6).fill(join(root, 'absent')), '0', 'C0HOLD']).status).toBe(64)
+  }, `
+// Synthetic transport only in this copied CLI: each push is recorded, then its ACK.
+let seq = 0;
+globalThis.fetch = async (_url, init) => {
+  const base = resolve(import.meta.dir, '../../..'), b = JSON.parse(init.body), id = b.label + '-' + b.event.ts;
+  appendFileSync(join(base,'stub'), JSON.stringify({seq:++seq,event:'push',label:b.label,channel:b.event.channel,event_ts:b.event.ts,envelope_id:id})+'\\n');
+  appendFileSync(join(base,'stub'), JSON.stringify({seq:++seq,event:'ws-message',envelope_id:id})+'\\n');
   return Response.json({ok:true,envelope_id:id});
 };
 `))

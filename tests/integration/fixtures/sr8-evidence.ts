@@ -45,6 +45,9 @@
  *     along with the caller's other pre-compaction observations.
  *     These probes count as acceptance/ACK/store samples too. No held probe is optional
  *     for a passing Post Hold verdict: zero observed holds is missing evidence.
+ *     With probes.batch.jsonl (pending-post's prebuilt other/bot/none replies), those
+ *     probes lead the second wave, after every root ACK, as phase probes. They are
+ *     not burst samples: check ignores them and pending-post judges them.
  *     Writes burst.jsonl (key/phase/channel/ts/sender/envelope_id, no text) and
  *     compactions.jsonl. Labels MUST equal population persona keys. Bounded wait;
  *     failure still retains submitted identities. HTTP responses are not ACK evidence.
@@ -149,7 +152,7 @@
  * below explicitly return their documented data. Per-persona store numbers are 1-based
  * positions in sr8Personas(recipients), the same order as config/burst.
  *
- *   pending-post C <key> <operation-id> <start-ms> <end-ms> <before-posts> <after-posts> <probes-tsv> <queue> <times> <measurements> <byte-mark> <channel>
+ *   pending-post C <key> <operation-id> <start-ms> <end-ms> <before-posts> <after-posts> <probes-tsv> <queue> <times> <measurements> <byte-mark> <channel> <burst-dir> <start-seq> <end-seq> <compact-ms> <measured-start-ms> <window-end-ms>
  *     before/after: shared_own_post_records for the same key, with the same
  *     unresolved new-channel intent (no root). Take start AFTER the first read,
  *     end BEFORE the second, on one external monotonic clock. Keep the server
@@ -166,6 +169,24 @@
  *     N1), post-hold(existing own-append limit/100 ms allowance). Missing intent,
  *     class, acceptance/hold evidence, reader or timestamp is missing; an outcome,
  *     wrong root, duration below 120 s or a held other-parent probe fails.
+ *     SR-8.4 measures this case during an SR-8.2 burst (Decision 29 ruling): run
+ *     burst between the reads with the probes as probes.batch.jsonl. burst-dir is
+ *     its evidence dir, plus times.jsonl for every burst.jsonl envelope (probes
+ *     too; pass it as times), final-stub.jsonl, <key>.queue.jsonl for EVERY
+ *     population key, and before.journal/after.journal: the key's Thread Memory
+ *     journal dev:ino, taken BEFORE the first read and AFTER the second.
+ *     start-seq/end-seq: slack_post_mark after the first read and before the
+ *     second. compact-ms: the queue_compact_interval_ms in effect, from the
+ *     printer. measured-start-ms: check's start-ms; window-end-ms: after the
+ *     second read, same clock. Also lines: check's ack-accepted/ack-dropped over
+ *     the burst items (ack-dropped is missing without every key's queue), and
+ *     pending-post-burst(compact_interval_ms,window_ms,probes_inside,
+ *     burst_in_pending,same_journal; window below the interval). Only the
+ *     Thread Memory journal's identity is proved, not the delivery queue's.
+ *     Stub record order must show start-seq < first burst push, last burst ACK
+ *     <= end-seq, and each ledger probe's push strictly inside the burst; else
+ *     missing. A changed journal identity or window_ms >= compact-ms fails.
+ *     Compaction is never required here: the interval is deliberately long.
  *
  *   shared-list C <directory> <probe-exit-status>
  *     prepared.input: exact config bytes, ordinary.preview: server's ordinary
@@ -455,6 +476,20 @@ export function ackVerdict(measure: string, ids: (string | undefined)[], times: 
   return result(measure, durations.length, { max_ms: max }, SR8_ACK_LIMIT_MS,
     missing ? 'missing' : invalid || max > SR8_ACK_LIMIT_MS ? 'fail' : 'pass')
 }
+/** check's ordinary burst ACK verdicts: full per-persona counts, N1, and no stored drop. */
+export function burstAckVerdicts(keys: string[], items: BurstItem[] | undefined, times: Times[] | undefined,
+  queues: Record<string, any[] | undefined>, counts: { roots: number; replies: number; dropped: number }): Result[] {
+  const acceptedItems = items?.filter(i => ['roots', 'replies', 'held'].includes(i.phase)) ?? [], drops = items?.filter(i => i.phase === 'dropped') ?? []
+  let droppedStored = 0
+  for (const key of keys) for (const dropped of drops.filter(i => i.key === key))
+    droppedStored += queues[key]?.filter(r => r.kind === 'accepted' && r.channel === dropped.channel && r.ts === dropped.ts).length ?? 0
+  const ackAccepted = ackVerdict('ack-accepted', acceptedItems.map(i => i.envelope_id), times), ackDropped = ackVerdict('ack-dropped', drops.map(i => i.envelope_id), times)
+  if (keys.some(key => acceptedItems.filter(i => i.key === key && i.phase === 'roots').length !== counts.roots
+    || acceptedItems.filter(i => i.key === key && i.phase === 'replies').length !== counts.replies)) ackAccepted.verdict = 'missing'
+  if (keys.some(key => drops.filter(i => i.key === key).length !== counts.dropped)) ackDropped.verdict = 'missing'
+  if (ackDropped.verdict !== 'missing' && droppedStored > 0) ackDropped.verdict = 'fail'
+  return [ackAccepted, ackDropped]
+}
 export function storeVerdict(rows: Measurement[] | undefined, accepted: Accepted[], percentile: (values: number[], q: number) => number): Result {
   const stores = rows?.filter(r => r.kind === 'store' && ['accepted', 'post-hold', 'memory-hold'].includes(r.store!)) ?? []
   const wanted = new Set(accepted.map(identity))
@@ -638,6 +673,38 @@ export function pendingPostVerdicts(key: string, operation: string, start: numbe
     other: probes?.filter(p => p.parent === 'other').length ?? 0, held: holds.length }, `>=${SR8_PENDING_POST_MS}`,
     missing ? 'missing' : unexpected || duration < SR8_PENDING_POST_MS ? 'fail' : 'pass')
   return [pending, ackVerdict('pending-post-ack', probes?.map(p => p.envelope_id) ?? [], times), postHoldVerdict(rows, holds, holdMs)]
+}
+export interface PendingWindow { startSeq: number; endSeq: number; compactMs: number; startMs: number; endMs: number; before?: string; after?: string }
+/** The pending post outlasts its burst and the probes ride inside it, in stub
+ * record order; no maintenance replaced the journal both reads saw. */
+export function pendingBurstVerdict(items: BurstItem[] | undefined, stub: any[] | undefined, probes: PendingProbe[] | undefined, w: PendingWindow): Result {
+  const burst = items?.filter(i => ['roots', 'replies', 'dropped'].includes(i.phase)) ?? []
+  // Index once: a 100,000-population stub record holds every burst push and ACK.
+  const order = new Map<string, number[]>()
+  for (const r of stub ?? []) if (['push', 'ws-message'].includes(r.event) && typeof r.envelope_id === 'string' && integer(r.seq))
+    order.set(`${r.event} ${r.envelope_id}`, [...order.get(`${r.event} ${r.envelope_id}`) ?? [], r.seq])
+  const seqs = (event: string, id: string | undefined) => order.get(`${event} ${id}`) ?? []
+  const pushes: number[] = [], acks: number[] = []
+  let missing = !stub || !burst.length || !probes?.length || !integer(w.startSeq) || !integer(w.endSeq) || !positive(w.compactMs)
+  for (const i of burst) {
+    const push = seqs('push', i.envelope_id), ack = seqs('ws-message', i.envelope_id)
+    if (!i.envelope_id || push.length !== 1 || !ack.length) { missing = true; continue }
+    pushes.push(push[0]); acks.push(...ack)
+  }
+  const first = pushes.length ? Math.min(...pushes) : NaN, last = maximum(acks)
+  const inside = probes?.filter(p => {
+    const push = seqs('push', p.envelope_id)
+    return items?.filter(i => i.phase === 'probes' && i.envelope_id === p.envelope_id && i.channel === p.channel && i.ts === p.ts).length === 1
+      && push.length === 1 && push[0] > first && push[0] < last
+  }).length ?? 0
+  const contained = w.startSeq < first && last <= w.endSeq
+  const journal = (v: string | undefined) => /^\d+:\d+\n?$/.test(v ?? '') ? v!.trim() : undefined
+  const before = journal(w.before), after = journal(w.after), window = w.endMs - w.startMs
+  missing ||= !before || !after || !nonnegative(w.startMs) || !nonnegative(window) || inside !== probes?.length || !contained
+  return result('pending-post-burst', burst.length, { compact_interval_ms: positive(w.compactMs) ? w.compactMs : 'missing',
+    window_ms: nonnegative(window) ? window : 'missing', probes_inside: inside, burst_in_pending: contained ? 'yes' : 'no',
+    same_journal: before && after ? before === after ? 'yes' : 'no' : 'missing' }, 'window_ms<compact_interval_ms',
+  missing ? 'missing' : before !== after || window >= w.compactMs ? 'fail' : 'pass')
 }
 
 export interface SharedListEvidence {
@@ -1149,14 +1216,25 @@ function diagnostics(path: string, key: string) {
 }
 async function additional(command: string, c: Context, args: string[]): Promise<Result[] | undefined> {
   if (command === 'pending-post') {
-    countArgs(args, 12)
-    const [key, operation, start, end, before, after, probes, queue, times, measurement, mark, channel] = args
+    countArgs(args, 18)
+    const [key, operation, start, end, before, after, probes, queue, times, measurement, mark, channel,
+      burstDir, startSeq, endSeq, compact, measuredStart, windowEnd] = args
     const ps = tsv(probes, ['parent', 'channel', 'ts', 'envelope_id']) as PendingProbe[] | undefined
     // A named channel fixes this case independently of the journal contents.
     const b = evidenceRows(before), a = evidenceRows(after)
     const belongs = b?.filter(r => r.kind === 'post-intent' && r.operationId === operation).every(r => r.channel === channel)
-    return pendingPostVerdicts(key, operation, numeric(start), numeric(end), belongs ? b : undefined, a, ps,
-      evidenceRows(queue), timingRows(times), measurements(measurement, numeric(mark)), Number(printer('THREAD_REPLY_HOLD_MS')))
+    const p = await population(), keys = p.sr8Personas(c.recipients), timing = timingRows(times)
+    const items = evidenceRows(join(burstDir, 'burst.jsonl')) as BurstItem[] | undefined
+    const queues = Object.fromEntries(keys.map(k => [k, evidenceRows(join(burstDir, `${k}.queue.jsonl`))]))
+    const acks = burstAckVerdicts(keys, items, timing, queues, { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED })
+    // check's store verdict catches an absent queue; here no drop can be proved unstored.
+    if (keys.some(k => !queues[k])) acks[1].verdict = 'missing'
+    return [...pendingPostVerdicts(key, operation, numeric(start), numeric(end), belongs ? b : undefined, a, ps,
+      evidenceRows(queue), timing, measurements(measurement, numeric(mark)), Number(printer('THREAD_REPLY_HOLD_MS'))),
+    ...acks,
+    pendingBurstVerdict(items, evidenceRows(join(burstDir, 'final-stub.jsonl')), ps, { startSeq: numeric(startSeq), endSeq: numeric(endSeq),
+      compactMs: numeric(compact), startMs: numeric(measuredStart), endMs: numeric(windowEnd),
+      before: textFile(join(burstDir, 'before.journal')), after: textFile(join(burstDir, 'after.journal')) })]
   }
   if (command === 'shared-list') {
     countArgs(args, 2)
@@ -1599,6 +1677,12 @@ async function burst(c: Context, args: string[]): Promise<number> {
     if (!held?.length || held.some(r => !keys.includes(r.label) || !r.event?.ts || !r.event?.thread_ts || !r.event?.channel || !r.event?.user)) throw new Error('held batch missing')
     batches.push({ phase: 'held', rows: held })
   }
+  const probesPath = join(batchDir, 'probes.batch.jsonl')
+  if (existsSync(probesPath)) {
+    const probes = jsonl(probesPath)
+    if (!probes?.length || probes.some(r => !keys.includes(r.label) || !r.event?.ts || !r.event?.thread_ts || !r.event?.channel || !r.event?.user)) throw new Error('probes batch missing')
+    batches.push({ phase: 'probes', rows: probes })
+  }
   mkdirSync(out, { recursive: true })
   const ledger = join(out, 'burst.jsonl'), compactFile = join(out, 'compactions.jsonl')
   writeFileSync(ledger, '', { flag: 'wx', mode: 0o600 }); writeFileSync(compactFile, '', { flag: 'wx', mode: 0o600 })
@@ -1659,7 +1743,9 @@ async function burst(c: Context, args: string[]): Promise<number> {
     }
     await Promise.all(batches[0].rows.map(body => send('roots', body)))
     if (failed || !await waitAcks(submitted)) return 1
-    await Promise.all(batches.slice(1).filter(b => b.phase !== 'held').flatMap(b => b.rows.map(body => send(b.phase, body))))
+    // Pending-post probes lead the second wave, so later burst pushes surround them.
+    const wave = ['probes', 'replies', 'dropped'].flatMap(phase => batches.filter(b => b.phase === phase))
+    await Promise.all(wave.flatMap(b => b.rows.map(body => send(b.phase, body))))
     return failed || !await waitAcks(submitted) ? 1 : 0
   } finally { clearInterval(timer); console.log(`recorded: sr8 burst submitted=${submitted.length} expected=${expectedCount} push_failures=${submitted.filter(i => !i.envelope_id).length}`) }
 }
@@ -1670,14 +1756,14 @@ async function check(c: Context, args: string[]): Promise<Result[]> {
   if (args.length === 6 || !Number.isSafeInteger(Number(required)) || Number(required) < 0) throw new Error('usage')
   const p = await population(), { percentile } = await import('./transcript-receipts.ts'), keys = p.sr8Personas(c.recipients)
   const rows = measurements(measurementFile, Number(mark)), items: BurstItem[] | undefined = jsonl(join(dir, 'burst.jsonl')), times = jsonl(join(dir, 'times.jsonl'))
-  const acceptedItems = items?.filter(i => ['roots', 'replies', 'held'].includes(i.phase)) ?? [], drops = items?.filter(i => i.phase === 'dropped') ?? []
+  const acceptedItems = items?.filter(i => ['roots', 'replies', 'held'].includes(i.phase)) ?? []
   const accepted: Accepted[] = [], holds: Accepted[] = [], joins: Result[] = [], ordinary: (Accepted & { envelope_id?: string })[] = []
-  let complete = true, droppedStored = 0
+  const queues: Record<string, any[] | undefined> = {}
+  let complete = true
   for (const key of keys) {
     const queue = jsonl(join(dir, `${key}.queue.jsonl`))
     if (!queue) complete = false
-    for (const dropped of drops.filter(i => i.key === key))
-      droppedStored += queue?.filter(r => r.kind === 'accepted' && r.channel === dropped.channel && r.ts === dropped.ts).length ?? 0
+    queues[key] = queue
     for (const item of acceptedItems.filter(i => i.key === key)) {
       const matches = queue?.filter(r => r.kind === 'accepted' && !r.compact && r.channel === item.channel && r.ts === item.ts && r.reminder_for === undefined) ?? []
       if (matches.length !== 1) { complete = false; continue }
@@ -1692,11 +1778,8 @@ async function check(c: Context, args: string[]): Promise<Result[]> {
   }
   for (const a of accepted) if (!holds.some(h => identity(h) === identity(a))
     && rows?.some(r => r.kind === 'store' && r.store === 'post-hold' && r.key === a.key && r.seq === a.seq)) holds.push(a)
-  const ackAccepted = ackVerdict('ack-accepted', acceptedItems.map(i => i.envelope_id), times), ackDropped = ackVerdict('ack-dropped', drops.map(i => i.envelope_id), times)
-  if (keys.some(key => acceptedItems.filter(i => i.key === key && i.phase === 'roots').length !== p.SR8_BURST_JOINS
-    || acceptedItems.filter(i => i.key === key && i.phase === 'replies').length !== p.SR8_BURST_REPLIES)) ackAccepted.verdict = 'missing'
-  if (keys.some(key => drops.filter(i => i.key === key).length !== p.SR8_BURST_DROPPED)) ackDropped.verdict = 'missing'
-  if (ackDropped.verdict !== 'missing' && droppedStored > 0) ackDropped.verdict = 'fail'
+  const [ackAccepted, ackDropped] = burstAckVerdicts(keys, items, times, queues,
+    { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED })
   const store = storeVerdict(complete ? rows : undefined, accepted, percentile)
   const results = [ackAccepted, ackDropped, store, postHoldVerdict(rows, holds, Number(printer('THREAD_REPLY_HOLD_MS'))),
     startupVerdict(Number(start), Number(ready), c.population * c.recipients), ...joins,

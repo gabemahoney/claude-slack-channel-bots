@@ -564,8 +564,11 @@ pre-compaction queue observations, including the fixture's validated
 held-admission archive, for later readers.
 
 Test 44 also keeps a new channel post unresolved for at least 120 seconds in
-each mode: replies in another user's new thread must acquire no Post Hold,
-while bot-parent and unknown-parent replies exercise timed holds. Its large
+each mode, through a full 100,000-join, two-recipient burst: replies in another
+user's new thread must acquire no Post Hold, while bot-parent and
+unknown-parent replies exercise timed holds. That case keeps the production
+maintenance interval, longer than its whole window, so no compaction is
+required and both reads must see one Thread Memory journal. The test's large
 shared-list case requires at least 1,000 channels per persona, configuration
 and ordinary preview content each above 64 KiB, growth and reopen without
 loss, and a proved write failure preserving the previous state and prepared

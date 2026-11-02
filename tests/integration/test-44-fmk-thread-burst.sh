@@ -29,8 +29,8 @@ case "${1:-all}" in
         while IFS=$'\t' read -r population mode recipients; do
             bash "$0" burst "${mode}" "${population}" "${recipients}"
         done < "${EVIDENCE}/combinations.tsv"
-        # The pending-post observation has no compaction between its reads.
-        # Keep the production maintenance interval in these separate cases.
+        # Decision 29 ruling: each pending post stays unresolved through a full
+        # SR-8.2 burst, and maintenance cannot compact between its two reads.
         for mode in strict open; do bash "$0" pending "${mode}" 100000 2; done
         # This invocation also needs its own server-backed closing evidence.
         CASE=shared-list; mode=open; population=0; recipients=2
@@ -44,6 +44,10 @@ mkdir -p "${CASE_ROOT}"
 compact_ms="$(printed QUEUE_COMPACT_INTERVAL_MS)"
 if [[ "${CASE}" == burst && "${population}" == 100000 ]]; then
     compact_ms="$(printed effectiveTestTimer queue_compact_interval_ms queue_compact_interval_ms=250)"
+elif [[ "${CASE}" == pending ]]; then
+    # No override: the production interval must outlast this whole case, which
+    # pending-post checks against the measured window.
+    compact_ms="$(printed effectiveTestTimer queue_compact_interval_ms)"
 fi
 bun "${SR8}" config "${mode}" "${population}" "${recipients}" "${CASE_ROOT}" "${SCENARIO_PORT}" "${compact_ms}" | write_config
 OVERRIDES_LINE="$(printed buildTestTimerOverridesLine "queue_compact_interval_ms=${compact_ms}")"
@@ -146,7 +150,7 @@ post_fault_seen() {
 # Each root mentions both recipients, and each recipient gets the same event.
 BATCH="${EVIDENCE}/batch"
 mkdir -p "${BATCH}"
-if [[ "${CASE}" == burst ]]; then
+if [[ "${CASE}" == burst || "${CASE}" == pending ]]; then
     bun "${SR8}" plan "${mode}" "${population}" "${recipients}" "$(date +%s)" > "${BATCH}/plan.tsv"
     message="$(scenario_text burst)"
     mention="${message}"
@@ -265,40 +269,63 @@ case "${CASE}" in
         [[ "${burst_status}" == 0 ]] || fail 'burst submission or ACK observation failed'
         ;;
     pending)
+        RESULTS="${EVIDENCE}/burst"
+        mkdir -p "${RESULTS}"
         key="${KEYS[0]}"
         start_pending_post "${key}"
-        capture_posts "${key}" "${EVIDENCE}/before.posts.jsonl"
         # Keep the long-window probes' root newer than the pending post too.
         # shellcheck disable=SC2119 # scenario_ts explicitly rejects every argument.
         HOLD_ROOT="$(scenario_ts)"
-        pending_start="$(mono_ms)"
-        pending_mark="$(byte_mark "${MEASUREMENTS}")"
-        : > "${EVIDENCE}/probes.tsv"
+        : > "${BATCH}/probes.batch.jsonl"
+        : > "${EVIDENCE}/probe-plan.tsv"
         for parent in other bot none; do
             parent_user=''
             case "${parent}" in other) parent_user="${OTHER}" ;; bot) parent_user="${BOT[${key}]}" ;; esac
             # shellcheck disable=SC2119 # scenario_ts explicitly rejects every argument.
             ts="$(scenario_ts)"
-            envelope="$(slack_push_reply "${key}" "${HOLD_CHANNEL}" "${HOLD_ROOT}" "$(scenario_text "pending-${parent}")" \
-                "${ts}" "${HUMAN}" "${parent_user}")"
-            printf '%s\t%s\t%s\t%s\n' "${parent}" "${HOLD_CHANNEL}" "${ts}" "${envelope}" >> "${EVIDENCE}/probes.tsv"
+            slack_reply_event "${HOLD_CHANNEL}" "${HOLD_ROOT}" "$(scenario_text "pending-${parent}")" "${ts}" "${HUMAN}" "${parent_user}" \
+                > "${BATCH}/${parent}.probe.events.jsonl"
+            bun "${SR8}" bodies "${key}" "${BATCH}/${parent}.probe.events.jsonl" >> "${BATCH}/probes.batch.jsonl"
+            printf '%s\t%s\t%s\n' "${parent}" "${HOLD_CHANNEL}" "${ts}" >> "${EVIDENCE}/probe-plan.tsv"
         done
-        # The actual measured interval includes these 120 seconds. Repeated
-        # lost-post and hung-history controls retain the same unresolved intent.
+        # Journal identity before the first read and after the second: a
+        # compaction between the reads would replace this file.
+        journal="${SLACK_STATE_DIR}/threads/${key}.jsonl"
+        stat -c '%d:%i' -- "${journal}" > "${RESULTS}/before.journal"
+        capture_posts "${key}" "${EVIDENCE}/before.posts.jsonl"
+        pending_start="$(mono_ms)"
+        pending_mark="$(byte_mark "${MEASUREMENTS}")"
+        pending_seq="$(slack_post_mark)"
+        # The probes lead the burst's second wave, while the post stays pending.
+        burst_status=0
+        bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+            "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 || burst_status=$?
+        # The actual measured interval includes the burst and these 120 seconds.
+        # Repeated lost-post and hung-history controls retain the same unresolved intent.
         sleep 120
+        settled_seq="$(slack_post_mark)"
         pending_end="$(mono_ms)"
         capture_posts "${key}" "${EVIDENCE}/after.posts.jsonl"
+        stat -c '%d:%i' -- "${journal}" > "${RESULTS}/after.journal"
         shared_wait_own_post_state "${key}" "${OPERATION[${key}]}" "${HOLD_CHANNEL}" "${STAMP[${key}]}" unresolved \
             > "${EVIDENCE}/after.unresolved.json"
-        cut -f4 "${EVIDENCE}/probes.tsv" > "${EVIDENCE}/probe-envelopes"
-        _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${EVIDENCE}/final-stub.jsonl"
-        bun "${SR8}" envelope-times "${EVIDENCE}/probe-envelopes" "${EVIDENCE}/final-stub.jsonl" > "${EVIDENCE}/times.jsonl"
-        snapshot "${key}" "${EVIDENCE}/queue.jsonl"
+        window_end="$(mono_ms)"
+        jq -er '.envelope_id // error("burst push has no envelope")' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes"
+        _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${RESULTS}/final-stub.jsonl"
+        bun "${SR8}" envelope-times "${RESULTS}/envelopes" "${RESULTS}/final-stub.jsonl" > "${RESULTS}/times.jsonl"
+        : > "${EVIDENCE}/probes.tsv"
+        while IFS=$'\t' read -r parent channel ts; do
+            envelope="$(jq -er --arg ts "${ts}" 'select(.phase=="probes" and .ts==$ts) | .envelope_id' "${RESULTS}/burst.jsonl")"
+            printf '%s\t%s\t%s\t%s\n' "${parent}" "${channel}" "${ts}" "${envelope}" >> "${EVIDENCE}/probes.tsv"
+        done < "${EVIDENCE}/probe-plan.tsv"
+        for persona in "${KEYS[@]}"; do snapshot "${persona}" "${RESULTS}/${persona}.queue.jsonl"; done
         clean_stop
         closing_assertions
         bun "${SR8}" pending-post "${CONTEXT[@]}" "${key}" "${OPERATION[${key}]}" "${pending_start}" "${pending_end}" \
-            "${EVIDENCE}/before.posts.jsonl" "${EVIDENCE}/after.posts.jsonl" "${EVIDENCE}/probes.tsv" "${EVIDENCE}/queue.jsonl" \
-            "${EVIDENCE}/times.jsonl" "${MEASUREMENTS}" "${pending_mark}" "${HOLD_CHANNEL}"
+            "${EVIDENCE}/before.posts.jsonl" "${EVIDENCE}/after.posts.jsonl" "${EVIDENCE}/probes.tsv" "${RESULTS}/${key}.queue.jsonl" \
+            "${RESULTS}/times.jsonl" "${MEASUREMENTS}" "${pending_mark}" "${HOLD_CHANNEL}" \
+            "${RESULTS}" "${pending_seq}" "${settled_seq}" "${compact_ms}" "${start_ms}" "${window_end}"
+        [[ "${burst_status}" == 0 ]] || fail 'burst submission or ACK observation failed'
         ;;
     shared-list)
         cp "${CONFIG}" "${EVIDENCE}/prepared.input"
