@@ -223,6 +223,23 @@ describe('retained timing regressions', () => {
     expect(script).toContain('real_assert_latency "${REAL_KEY}" 20')
   })
 
+  test.each([
+    ['20', 'first', true], ['20', 'last', false],
+    ['100', 'first', true], ['100', 'last', false],
+  ] as const)('measures only the last %s of n+1 timings: one extra slow %s timing', (count, slow, passes) => {
+    const n = Number(count), fast = { typing_ms: 40, delivery_ms: 1600 }, late = { typing_ms: 3000, delivery_ms: 1600 }
+    // One slow timing cannot move a nearest-rank p95, so n/20 in-window slow
+    // timings hold p95 at its edge: the extra one fails only inside the window.
+    const extra = slow === 'first' ? 0 : n
+    const timings = Array.from({ length: n + 1 }, (_, i) => i === extra || (i >= 5 && i < 5 + n / 20) ? late : fast)
+    const check = new Function('result', 'count', 'percentile', 'console', block(source('fixtures/transcript-receipts.ts'), '        const n = Number(count)', '\n      }'))
+    const recorded: string[] = []
+    const run = () => check({ timings }, count, percentile, { log: (line: string) => recorded.push(line) })
+    if (passes) expect(run).not.toThrow()
+    else expect(run).toThrow('latency exceeded')
+    expect(recorded).toEqual([`recorded: p95 typing_start_ms=${passes ? 40 : 3000} delivery_ms=1600 samples=${n}`])
+  })
+
   test('rejects the observed 18-fast/two-slow sample shape without dropping either slow trial', () => {
     // Numeric-only projection of run 20261021t182831z-lmk9ayre's final 20
     // originals. This tests the oracle, not the cause of either slow sample.

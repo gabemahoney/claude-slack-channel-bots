@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { auditedAICorpus, incidentalBait } from './ai-fixture-audit.ts'
 import { freshHazardSession } from './ai-fresh-session.ts'
+import { deliveredAICorpus } from './ai-classifier-stop.ts'
 import { packedReceiptAdapters, readTranscripts } from '../integration/fixtures/transcript-receipts.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
@@ -21,7 +22,7 @@ check(inputs, 'scenario INPUTS generator missing')
 const diagnostic = scenario.match(/^        CASE_DIAGNOSTIC=.*\n        printf .*$/m)?.[0]
 check(diagnostic, 'scenario case diagnostic missing')
 const { TAG_ATTRIBUTE_ORDER, TAG_SOURCE, buildWrapper } = await import(join(resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'), 'src/tag-wrapper.ts'))
-const scratch = mkdtempSync(join(tmpdir(), 'ai-readback-controls-'))
+const scratch = mkdtempSync(join(tmpdir(), 'ai-readback-controls-')), recipient = 'U0CONTROLRECIPIENT'
 function run(argv: string[], extra: Record<string, string> = {}) {
   return Bun.spawnSync(argv, { env: { ...process.env, ...extra }, stdout: 'pipe', stderr: 'pipe' })
 }
@@ -36,7 +37,7 @@ try {
     const expectedDir = join(scratch, String(ac)), work = join(expectedDir, 'work')
     mkdirSync(work, { recursive: true })
     writeFileSync(join(work, 'CLAUDE.md'), '')
-    succeeded(run(['python3', '-c', inputs, String(ac), corpusPath, expectedDir, work, 'U0CONTROLRECIPIENT']), 'generate AC' + ac)
+    succeeded(run(['python3', '-c', inputs, String(ac), corpusPath, expectedDir, work, recipient]), 'generate AC' + ac)
     const rows = JSON.parse(readFileSync(join(expectedDir, 'corpus.json'), 'utf8'))
     const labels = JSON.parse(readFileSync(join(expectedDir, 'case-labels.json'), 'utf8'))
     same(labels, rows.map((row: any, i: number) => ({ case: `case_${String(i + 1).padStart(2, '0')}`, fixture: row.name })), 'opaque one-to-one labels differ')
@@ -45,7 +46,7 @@ try {
     check(!incidentalBait.test(prompt), 'classifier bait in generated labels/prompt')
     same(prompt, '\nCase labels in sequence: ' + JSON.stringify(labels.map((row: any) => row.case)).replaceAll(',', ', ') + '.\n', 'model labels differ')
     check(!originals.some((row: any) => prompt.includes(row.name)), 'semantic fixture label leaked into model prompt')
-    if (ac === 11) same(rows, ai, 'changed audited AI corpus fields or order')
+    if (ac === 11) same(rows, deliveredAICorpus(ai, recipient), 'changed audited AI corpus fields or order')
     else if (ac === 12) {
       same(rows.slice(0, -1), ai.filter((row: any) => ['hz_bang', 'hz_slash', 'hz_question', 'hz_tab', 'hz_backslash'].includes(row.name)), 'changed existing selected inputs')
       check(rows.at(-1).name === 'hz_question_prefix' && rows.length === 6, 'prefix case missing')
@@ -62,7 +63,9 @@ try {
     for (const [i, row] of rows.entries()) {
       check(row.typed_len === row.typed.length, 'generated typed_len differs: ' + row.name)
       check(!incidentalBait.test(row.msg.text) && !incidentalBait.test(row.typed), 'classifier bait in generated input: ' + row.name)
-      same(buildWrapper(row.msg), row.typed, 'packed production wrapper changed syntax/escaping: ' + row.name)
+      // The delivered Slack text carries the recipient routing mention for via=mention.
+      const delivered = row.msg.via === 'mention' ? { ...row.msg, text: `<@${recipient}> ${row.msg.text}` } : row.msg
+      same(buildWrapper(delivered), row.typed, 'packed production wrapper changed syntax/escaping: ' + row.name)
       const expected = JSON.parse(readFileSync(join(expectedDir, `${i + 1}.json`), 'utf8'))
       const attrs: Record<string, string> = { source: TAG_SOURCE }
       for (const name of TAG_ATTRIBUTE_ORDER) if (row.msg[name]) attrs[name] = row.msg[name]
@@ -422,7 +425,7 @@ try {
     apiRefusalCategory: 'cyber', isMeta: false })
   const spoofGuard = (mode = 'guard') => run([process.execPath, join(tests, 'real-agent/ai-classifier-stop.ts'), mode,
     state, 'control', shim, transcripts, spoofExpectedPath, join(scratch, '11/corpus.json')],
-    { AI_CRITERION: '11', REAL_AGENT_TRIAL: '1', REAL_AGENT_MODEL_PIN: model })
+    { AI_CRITERION: '11', REAL_AGENT_TRIAL: '1', REAL_AGENT_MODEL_PIN: model, REAL_BOT_USER_ID: recipient })
   const writeSpoof = (tail: any[]) => {
     writeNative([...spoofRows, ...tail], [], spoofJournal)
     writeFileSync(resumedPath, '')

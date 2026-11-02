@@ -5,7 +5,7 @@ import { basename, dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { classifierObservation, spoofTurn } from './real-agent/ai-classifier-stop.ts'
+import { classifierObservation, deliveredAICorpus, spoofTurn } from './real-agent/ai-classifier-stop.ts'
 import { auditedAICorpus, incidentalBait } from './real-agent/ai-fixture-audit.ts'
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
 import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
@@ -387,6 +387,49 @@ test.each([
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
+// Generation plus one jq event per case costs about 0.2 s here, so the test
+// keeps Bun's 5 s default. The child's limit sits below that with room for its
+// kill, so a stuck script fails on the test's own assertions.
+const MENTION_GENERATION_LIMIT_MS = 3500
+test('actual AI expectations for via=mention keep the recipient routing mention that intake preserves', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-mention-expected-'))
+  try {
+    const dir = new URL('./real-agent', import.meta.url).pathname
+    const source = readFileSync(join(dir, 'ai-scenario.sh'), 'utf8')
+    // Execute the actual generation step and Slack event construction only.
+    const start = source.indexOf('    CORPUS='), end = source.indexOf('    python3 - "${SCENARIO_ROOT}/real-slack-stub/control.json"')
+    const event = source.split('\n').find(line => line.trimStart().startsWith('EVENT="$(jq'))
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start); expect(event).toBeDefined()
+    const original = JSON.parse(readFileSync(join(dir, 'fixtures/wrapper-cases.json'), 'utf8'))
+    const mentions = original.flatMap((row: any, i: number) => row.msg.via === 'mention' ? [i] : [])
+    expect(mentions.length).toBeGreaterThan(0)
+    const recipient = 'U0AIAC11BOT', expected = join(root, 'expected'), work = join(root, 'work')
+    mkdirSync(expected); mkdirSync(work)
+    const script = ['set -euo pipefail', source.slice(start, end).replaceAll('${BASH_SOURCE[0]%/*}', dir),
+      ...original.map((_row: any, i: number) => `n=${i + 1}\n${event}\nprintf '%s\\n' "\${EVENT}"`)].join('\n')
+    const child = spawnSync('bash', ['-c', script], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'python3', 'jq'], extras: { AI_CRITERION: '11', EXPECTED: expected, REAL_WORK: work, REAL_BOT_USER_ID: recipient } }),
+      encoding: 'utf8', timeout: MENTION_GENERATION_LIMIT_MS,
+    })
+    expect(child.error).toBeUndefined(); expect(child.stderr).toBe(''); expect(child.status).toBe(0)
+    const split = (typed: string) => ({ head: typed.slice(0, typed.indexOf('>') + 1), body: typed.slice(typed.indexOf('>') + 1, -'</channel>'.length) })
+    const corpus = JSON.parse(readFileSync(join(expected, 'corpus.json'), 'utf8')), events = child.stdout.trim().split('\n').map(line => JSON.parse(line))
+    expect(corpus).toHaveLength(original.length); expect(events).toHaveLength(original.length)
+    // The spoof observer's CLI compares the scenario's corpus with this form.
+    expect(corpus).toEqual(deliveredAICorpus(auditedAICorpus().ai, recipient))
+    for (const [i, row] of original.entries()) {
+      // Production delivers the Slack text exactly as sent, prepended mention included.
+      const mention = mentions.includes(i) ? `<@${recipient}> ` : '', reference = split(row.typed)
+      expect(events[i].text).toBe(mention + row.msg.text)
+      expect(split(corpus[i].typed)).toEqual({ head: reference.head, body: mention + reference.body })
+      expect(corpus[i].typed_len).toBe([...corpus[i].typed].length)
+      const readback = JSON.parse(readFileSync(join(expected, `${i + 1}.json`), 'utf8'))
+      expect({ case: readback.case, body: readback.body }).toEqual({ case: `case_${String(i + 1).padStart(2, '0')}`, body: mention + reference.body })
+    }
+    expect({ staleStripComment: source.includes("Intake removes this recipient's routing mention") }).toEqual({ staleStripComment: false })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('actual hazard restart block leaves the first three together and supplies each hazard only its case label', () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-isolation-shell-'))
   try {
@@ -614,7 +657,8 @@ test('spoof late-path observer still inspects a duplicate for forbidden actions'
   expect(() => spoofTurn(e)).toThrow('spoof instruction/tool action observed')
 })
 
-async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string) {
+async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string,
+  { corpus: rows = auditedAICorpus().ai, recipient }: { corpus?: any[]; recipient?: string } = {}) {
   // Execute the actual CLI caller with inert image/IO boundaries, then the
   // real classifier and ordinary readback oracles. No packed/native process.
   const source = readFileSync(new URL('./real-agent/ai-classifier-stop.ts', import.meta.url), 'utf8')
@@ -624,9 +668,10 @@ async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string) 
   const declarations = source.slice(0, mainAt).replace(/^import .*\n/gm, '').replace(/^export /gm, '')
   const state = '/synthetic/state', expected = '/synthetic/expected.json', corpus = '/synthetic/corpus.json'
   const files = new Map([[join(state, 'server.log'), e.log.join('\n')], [expected, JSON.stringify(e.expected)],
-    [corpus, JSON.stringify(auditedAICorpus().ai)]])
+    [corpus, JSON.stringify(rows)]])
   const process = { argv: ['bun', 'classifier', mode, state, e.key, '/synthetic/shim.log', '/synthetic/projects', expected, corpus],
-    env: { AI_CRITERION: e.criterion, REAL_AGENT_TRIAL: e.trial, REAL_AGENT_MODEL_PIN: e.model }, exitCode: 0 }
+    env: { AI_CRITERION: e.criterion, REAL_AGENT_TRIAL: e.trial, REAL_AGENT_MODEL_PIN: e.model,
+      ...recipient === undefined ? {} : { REAL_BOT_USER_ID: recipient } }, exitCode: 0 }
   const forwarded: Parameters<typeof classifierObservation>[0][] = [], errors: string[] = [], ownershipLogs: (readonly string[])[] = []
   const auditCalls: any[] = []
   const program = `
@@ -666,6 +711,16 @@ test.each(['guard', 'record'])('actual spoof CLI forwards the key and complete A
   expect(result.auditCalls).toHaveLength(1)
   expect(result.auditCalls[0]).toMatchObject({ key: e.key, expectedCount: 3 })
   expect(result.code).toBe(0); expect(result.errors).toEqual([])
+})
+
+test('actual spoof CLI accepts the delivered via=mention corpus only with its recipient', async () => {
+  const recipient = 'U0AIAC11BOT', { ai } = auditedAICorpus(), delivered = deliveredAICorpus(ai, recipient)
+  // The control needs a mention row the recipient actually changes.
+  expect(delivered).not.toEqual(ai)
+  const accepted = await spoofCLI(lateSpoofReference(), 'record', { corpus: delivered, recipient })
+  expect({ code: accepted.code, errors: accepted.errors, forwarded: accepted.forwarded.length }).toEqual({ code: 0, errors: [], forwarded: 1 })
+  const plain = await spoofCLI(lateSpoofReference(), 'record', { corpus: ai, recipient })
+  expect({ code: plain.code, errors: plain.errors, forwarded: plain.forwarded.length }).toEqual({ code: 1, errors: ['audited corpus changed'], forwarded: 0 })
 })
 
 test('actual spoof CLI still rejects forbidden actions on a late-bound duplicate', async () => {
@@ -1332,6 +1387,8 @@ const [mode, data, final] = process.argv.slice(2)
 const e = JSON.parse(readFileSync(data, 'utf8'))
 e.adapters = { parseDeliveryTranscriptRecord, receiptTextMatches }
 if (${lateStop} && final !== 'yes') e.own = e.own.filter(r => r.value.subtype !== 'model_refusal_no_fallback')
+// The real observer reads the recipient for the delivered corpus from its environment.
+if (mode !== 'readback' && process.env.REAL_BOT_USER_ID !== 'U0AIAC11BOT') { console.error('REAL_BOT_USER_ID not in observer environment'); process.exit(1) }
 try { if (mode === 'readback') { if (!${exactReadback}) throw new Error('strict readback missing'); completedAIReadback({ ...e, seq: 3 }) } else classifierObservation(e, mode) }
 catch (error) { console.error(error.message); process.exitCode = 1 }
 `)
@@ -1343,6 +1400,8 @@ ${functions}
 ai_readback() { [[ "$1" == "$EXPECTED/3.json" && "$2" == 3 ]] || return 2; "${process.execPath}" "${observer}" readback "${data}" "$FINAL"; }
 bun() { "${process.execPath}" "${observer}" "$2" "${data}" "$FINAL"; }
 AI_CRITERION=11
+# Unexported: only ai_spoof_observe's own assignment can pass it to bun.
+REAL_BOT_USER_ID=U0AIAC11BOT
 SLACK_STATE_DIR="${root}/state"
 REAL_KEY=aiac11
 SCENARIO_AD_SHIM_LOG="${root}/shim"

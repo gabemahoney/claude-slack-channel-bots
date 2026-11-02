@@ -715,10 +715,17 @@ zero open items, then the complete reminder-inclusive receipt/FIFO audit.
 Receipt history supplies delivery proof, never candidate state; the live queue
 is not changed by this check.
 
+Test 103 calls it before each of its 100 latency DMs with exactly `n` prior
+original inputs for sample `n`: one unmeasured warm-up DM, then the earlier
+samples. Its admission row is the AD row read after `real_wait_launch`, and
+its connection cursor is the `server.log` line count before `start_server`.
+Both tests give their persona the reply-tool instruction, so each DM's real
+reply resolves its reminder candidate before the next sample.
+
 Admission reads AD before replay and freshly after the audit. Both rows must
-match the retained relaunch's instance, session, row-start and launch identity
-with `tag_prompt=1`; the final row must be `waiting`.
-The latest own CSCB connection diagnostic after the post-stop cursor must be
+match the retained admission row's instance, session, row-start and launch
+identity with `tag_prompt=1`; the final row must be `waiting`.
+The latest own CSCB connection diagnostic after the connection cursor must be
 connected and unchanged across the checks; journal bytes must still match
 after replay/stop and after the final AD read.
 
@@ -732,13 +739,15 @@ guarded CLI and bounds each AD read to 10 s.
 
 Latency measures `message-received` to the shim's first send and
 `message-delivered`: nearest-rank p95 typing start ≤2000 ms and delivery
-≤10000 ms across exactly 20 samples. Reminders remain enabled, and no slow
+≤10000 ms across exactly 20 samples (Test 103: the last 100 inputs; its
+receipt/FIFO audit covers all 101). Reminders remain enabled, and no slow
 sample is filtered, discarded or retried. The separate stub-only 3 s Slack
 Socket Mode acknowledgement check
 measures intake/ACK, not those receipt-confirmed latency limits.
 Test-32 runs under the exclusive [performance guard](../docker/README.md#performance-measurement-guard).
 Functional receipt progress cannot waive either latency limit or reduce the
-20 native samples. Synthetic admission, watchdog and lock controls prove no native result.
+native sample count (Test 32: 20; Test 103: 100). Synthetic admission,
+watchdog and lock controls prove no native result.
 
 #### Counted key faults
 
@@ -782,7 +791,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 |---|---|
 | `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold and subagent denial/dialog-hold recovery |
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
-| `test-103-fmk-real-latency100.sh` | The 100-DM latency latency step |
+| `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
 | `test-111-fmk-real-ai-ac11.sh` | Audited AI wrapper copy attributes/body read-back through completed native turns; case_03 also rejects spoof obedience across every copy and late linked response |
 | `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action |
@@ -799,7 +808,10 @@ Slack text. Uniform opaque labels (`case_01`, `case_02`, …) correlate JSON
 answers with cases; original fixture names remain in private
 `ai-expected/case-labels.json` and `recorded:` diagnostics, outside the model
 prompt. Preserve the 15-case order, expected attributes, exact comparator
-and timeouts; expected bodies come from the audited AI copy below.
+and timeouts; expected bodies come from the audited AI copy below. A
+`via=mention` case's Slack event carries the recipient's routing mention
+(`<@recipient> `) ahead of the original text, and intake keeps it, so its
+expected body and corpus `typed` wrapper include it too.
 field-readback keeps its first three cases in one conversation, then launches a fresh
 conversation for each of its 12 hazards. command-prefix and sender-identity also isolate each
 hazard. `resume_enabled:false` prevents reuse, and only the current opaque
@@ -943,7 +955,8 @@ Classifier stops cannot pass, including for field-readback `case_03`. The origin
 completed exact read-back and proof that no spoof instruction was carried
 out. `tests/real-agent/ai-classifier-stop.ts` retains its filename and first
 audits exact receipts through the packed matcher and checks the audited AI
-copy and expected JSON, comparing case_03 against the canonical original.
+copy (in its delivered form, given `REAL_BOT_USER_ID`) and expected JSON,
+comparing case_03 against the canonical original.
 It then requires the own native user receipt, send window, session/path,
 turn timestamps, pinned model and response UUID/parent-UUID chain to agree.
 
@@ -973,7 +986,12 @@ responses, resumed sessions and earlier DM answers after a later thread.
 It rejects classifier stops before, beside or after exact JSON, including
 late linked stops, fallback/API errors, synthetic answers and incomplete
 duplicates. Shell controls require sequence 3 and check silent successful
-final observation; a separate control rejects the withdrawn `stop` mode. Its pass does not
+final observation; a separate control rejects the withdrawn `stop` mode. For
+`via=mention` cases, the generator's expected body and corpus wrapper keep the
+recipient mention (`<@recipient> `). The spoof CLI accepts the delivered
+`via=mention` corpus with `REAL_BOT_USER_ID` and rejects the plain corpus with
+the same recipient as `audited corpus changed`; `ai_spoof_observe` must pass
+`REAL_BOT_USER_ID` into the observer's environment. Its pass does not
 certify an AI trial. The multipart controls in this existing test file cover
 completed acknowledgements, all-part receipts, exact final JSON, intermediate
 and late retrieval, non-reply tools, duplicate copies with invalid/stale
@@ -989,7 +1007,8 @@ actual scenario's post-idle controls use that generated body.
 actual scenario generator and read-back comparator, outside `/ci` and the
 heavy matrix. It checks all 15 field-readback, six command-prefix and two sender-identity generated cases,
 opaque labels and original-name diagnostics, exact packed-production
-wrapper generation, the approved AI difference and byte preservation of
+wrapper generation from the delivered text (recipient mention included for
+`via=mention`), the approved AI difference and byte preservation of
 the canonical corpus. The actual comparator must accept exact received
 text and reject tabs substituted for received spaces, wrong attributes,
 another case's opaque label and the original semantic fixture label.
@@ -1122,8 +1141,8 @@ The coordinator resolves latest afresh for each invocation and makes three
 sequential Docker jobs: 2.1.280, 2.1.296 and runtime latest, even when latest
 equals a pin. Each executes all nine gate scripts plus busy/replies and
 Test 104; the downgrade script retains its explicit 2.1.280 selection. The 2.1.296 job
-alone runs 100 DMs once and seven AI criteria three times each: **21 AI
-trials total**, requiring 3 of 3 for every criterion. Every field-readback case,
+alone runs the 100-DM latency step once and seven AI criteria three times
+each: **21 AI trials total**, requiring 3 of 3 for every criterion. Every field-readback case,
 including case_03, requires real completed exact read-back; no classifier
 stop counts as a success.
 The three jobs contain 12, 34 and 12 invocations respectively: **58 total**,
@@ -1206,7 +1225,7 @@ The host login is only the existing single read-write mounted file; the private 
 
 Use [the runner's full admission and retirement contract](../docker/README.md#codex-admission-login-and-scratch-lifecycle): selected top-level host model, bounded plain `CODEX_HOST_CONFIG_KEYS`, UID/owner-0600 checks, dedicated test-1/Codex shard, shared 30-minute login lease, survivor refusal, core dumps disabled, additional 2 GiB memory and before/after token scans. Codex always runs in local disposable containers, never a scheduler job. Supply the same `CI_ANTHROPIC_*` environment directly to the `/ci` runner and every verdict-reader call; `/ci-live` stays in its own container and test workspace. Never export scratch homes or access actual credentials from host tests.
 
-The four synthetic Codex suites are `codex-config-keys.test.ts`, `codex-delivery-controls.test.ts`, `codex-ai-controls.test.ts` and `codex-gate-controls.test.ts`. They cover strict bounded child checkpoints, atomic markers, both durable pair IDs, marker-first consistent reads, diagnostics before kill, completed multipart acknowledgements and compaction-preserved FIFO evidence. Actual SIGKILL stays between successful text return and Enter.
+The four synthetic Codex suites are `codex-config-keys.test.ts`, `codex-delivery-controls.test.ts`, `codex-ai-controls.test.ts` and `codex-gate-controls.test.ts`. They cover strict bounded child checkpoints, atomic markers, both durable pair IDs, marker-first consistent reads, diagnostics before kill, completed multipart acknowledgements and compaction-preserved FIFO evidence. `codex-delivery-controls.test.ts` also requires each AI prompt's `case` label for criteria 15 and 106 to equal its oracle's. Actual SIGKILL stays between successful text return and Enter.
 
 Host-safety audits pin the eight-module import graph, including `codex-crash-barrier.ts`, guarded driver/crash-worker and exactly five heavy entrypoints plus shared helper; secrecy audits retain leak checks for config/model readers, fake login helpers and control suites. `delivery-receipt.test.ts` checks failure-only Claude delivery projections, fixed reasons, secret sentinels and unchanged FAIL/cleanup ordering. `fmk-launch-pending-dialog-wait.test.ts` checks test 26's exact existing recovery-result poll within `LOG_WAIT_S=30` before `get_line`, preserving counts, outcomes and timing bounds. See [the testing guide](../docs/testing-guide.md#real-agent-evidence-and-heavy-runner) before adding an execution surface or import. Controls are unpaid and cannot supply native acceptance.
 
