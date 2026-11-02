@@ -141,6 +141,8 @@ A message from Slack carries these tag attributes:
 | `thread_ts` | The thread's timestamp, for a thread reply. |
 | `attachment_count`, `attachments` | The number of attached files and each file's name, type and size, when files are attached. |
 
+A long `attachments` or `user` value can be cut short, ending in `…`; on a macOS host this happens sooner, and a long `channel_name` can be cut too. `chat_id` and `attachment_count` are always whole.
+
 Each way a message reaches a persona:
 
 | Kind | How it reaches the persona | Tag attributes | `via` | Reminder |

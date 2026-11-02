@@ -1737,9 +1737,10 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('archive')).toMatch(/^\((\w+), (\w+)\) => archiveWrite\?\.\(\1, \2\)$/)
   })
 
-  test('durable intake binds preparation to the shared queue, persona name resolver and wake hook on the production clock', () => {
+  test('durable intake binds preparation to the shared queue, persona name resolver, wake hook and host part limit on the production clock', () => {
     const props = onlyCallProps('createDeliveryPreparation')
-    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending', 'onReceived'].sort())
+    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending', 'onReceived', 'tagMaxBytes'].sort())
+    expect(props.get('tagMaxBytes')).toBe('tagMaxBytesFor(process.platform)')
     expect(props.get('queue')).toBe('deliveryQueue')
     expect(props.get('resolveUserName')).toBe('resolvePersonaUserName')
     expect(props.get('clientFor')).toBe('clientFor')

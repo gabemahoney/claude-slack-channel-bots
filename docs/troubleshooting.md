@@ -74,6 +74,9 @@ Each start logs one `[slack] startupSessionManager: complete — …` line count
 **Delivery notices or delivery diagnostic lines**
 For *Message not saved*, check the server disk; for *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order, including when [`message-partial-receipt`](../skills/debug-slack-channel-bots/SKILL.md#message-partial-receipt) reports cut-off text. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
 
+**A persona on a Mac keeps retyping a long message**
+On a macOS host CSCB types a long message in parts of at most about 880 bytes each. A message queued before an upgrade can keep larger parts, and a restart does not split it again: CSCB keeps offering it until the bot takes it in, while later messages wait. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
+
 **A persona posts a *Waiting on a prompt* or *Not connected* notice**
 The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
 

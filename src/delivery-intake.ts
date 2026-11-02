@@ -1,7 +1,7 @@
 /** Post-accept immutable fixation shared by fresh and recovered work. */
 import type { WebClient } from '@slack/web-api'
 import type { DeliveryQueue, QueueAccept, QueueItem, QueueEvent } from './delivery-queue.ts'
-import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, type TagMessage } from './tag-wrapper.ts'
+import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, type TagMessage } from './tag-wrapper.ts'
 import { sanitizeFilename } from './lib.ts'
 import { RETYPE_BACKOFF_MS } from './delivery-constants.ts'
 export interface DeliveryPreparationClock {
@@ -20,6 +20,8 @@ export interface DeliveryPreparationDeps {
   /** Called only from post-ack/answer preparation or startup recovery. */
   onReceived?(key: string, item: QueueItem): void
   lookupTimeoutMs?: number
+  /** Byte limit for each fixed part; production binds the host's `tagMaxBytesFor`. */
+  tagMaxBytes?: number
   clock?: DeliveryPreparationClock
   retryBackoffMs?: readonly number[]
 }
@@ -40,6 +42,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
   const fixedParts = new Map<string, string[]>()
   let stopped = false
   const timeout = deps.lookupTimeoutMs ?? NAME_LOOKUP_TIMEOUT_MS
+  const tagMaxBytes = deps.tagMaxBytes ?? TAG_MAX_BYTES
   const clock: DeliveryPreparationClock = deps.clock ?? {
     setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
     clearTimeout: handle => globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
@@ -91,7 +94,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
             message.attachments = a.files.map(f => `${sanitizeFilename(f.name || 'unnamed')} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`).join('; ')
           }
         }
-        parts = buildTagParts(message)
+        parts = buildTagParts(message, tagMaxBytes)
         fixedParts.set(id, parts)
       }
       await deps.queue.append(key, { v: 1, kind: 'fixed', seq: a.seq, parts })
