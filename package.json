@@ -1,6 +1,6 @@
 {
   "name": "claude-slack-channel-bots",
-  "version": "0.18.4",
+  "version": "0.18.5",
   "description": "Run several Claude Code personas, each its own Slack app, from one server via Socket Mode",
   "type": "module",
   "bin": {
