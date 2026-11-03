@@ -58,7 +58,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
-import { join, resolve } from 'path'
+import { basename, join, resolve } from 'path'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
   CHANNEL_DELIVERY_SET_STORED,
@@ -1161,6 +1161,69 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reply file uploads
+// ---------------------------------------------------------------------------
+
+/** A `<@ID>` user or persona mention token in message text. */
+const USER_MENTION_TOKEN_RE = /<@[^>]+>/g
+
+/**
+ * The refusal reason of the first of `files` that `assertSendable` refuses,
+ * or undefined when every file may be sent.
+ */
+function firstUnsendableReason(
+  files: readonly string[],
+  assertSendable: (filePath: string) => void,
+): string | undefined {
+  for (const filePath of files) {
+    try {
+      assertSendable(filePath)
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err)
+    }
+  }
+  return undefined
+}
+
+/**
+ * The `filesUploadV2` arguments for a reply's files: one upload sharing every
+ * file in one message under its own name, in `threadTs` if given, otherwise
+ * threaded under the reply's first message (`firstTs`, empty when none was
+ * posted or Slack returned no ts), with the text's distinct mentions repeated
+ * so mention-only bots get it. Pure.
+ */
+function replyUploadArgs(
+  chatId: string,
+  files: readonly string[],
+  threadTs: string | undefined,
+  firstTs: string,
+  text: string,
+): Record<string, any> {
+  const args: Record<string, any> = {
+    channel_id: chatId,
+    file_uploads: files.map((p) => ({ file: resolve(p), filename: basename(p) })),
+  }
+  const uploadThreadTs = threadTs || firstTs
+  if (uploadThreadTs) args.thread_ts = uploadThreadTs
+  const mentions = [...new Set(text.match(USER_MENTION_TOKEN_RE) ?? [])]
+  if (mentions.length > 0) args.initial_comment = mentions.join(' ')
+  return args
+}
+
+/**
+ * The tool error text for a reply whose files the pre-upload check refused
+ * with `reason`: `posted` describes the text already posted, or is undefined
+ * when the reply had no text. Pure.
+ */
+function buildFilesRefusedText(reason: string, fileCount: number, posted?: string): string {
+  if (posted === undefined) return `${reason} None of the ${fileCount} file(s) were uploaded.`
+  return (
+    `${reason} The reply text was already posted (${posted}); ` +
+    `none of the ${fileCount} file(s) were uploaded.`
+  )
+}
+
 /** every session receives the nine retained points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
@@ -1224,7 +1287,8 @@ export function createSessionServer(
             files: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Absolute paths of files to upload (optional)',
+              description:
+                'Absolute paths of files to upload (optional). All files share one message under their own names: in thread_ts if given, otherwise threaded under the text, or in the conversation when text is ""; the text\'s <@ID> mentions are repeated with them.',
             },
             message_id: {
               type: 'string',
@@ -1421,13 +1485,8 @@ export function createSessionServer(
         const messageId: string | undefined = args.message_id
 
         // File exfiltration guard, for every file before any Slack call.
-        for (const filePath of files ?? []) {
-          try {
-            assertSendable(filePath)
-          } catch (err) {
-            return toolError(err instanceof Error ? err.message : String(err))
-          }
-        }
+        const refused = firstUnsendableReason(files ?? [], assertSendable)
+        if (refused !== undefined) return toolError(refused)
 
         // A user ID is never posted to: open the DM, then act only in it.
         let where = chatId
@@ -1440,7 +1499,9 @@ export function createSessionServer(
         }
 
         const settings = getReplySettings()
-        const chunks = chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
+        const hasFiles = (files?.length ?? 0) > 0
+        const filesOnly = text === '' && hasFiles
+        const chunks = filesOnly ? [] : chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
         // Record the first successful reply immediately; a held reaction call
         // may delay cleanup, but never the remaining content or tool result.
         const clearAck = () => {
@@ -1453,6 +1514,7 @@ export function createSessionServer(
         }
 
         let lastTs = ''
+        let firstTs = ''
         let firstChunk = true
         for (const chunk of chunks) {
           const res = await web.chat.postMessage({
@@ -1463,6 +1525,7 @@ export function createSessionServer(
             unfurl_media: false,
           })
           lastTs = (res.ts as string) || lastTs
+          if (firstChunk) firstTs = (res.ts as string) || ''
 
           // The calling persona's own ack reaction, removed through its own
           // client at most once (first chunk), only when its own entry for
@@ -1474,39 +1537,27 @@ export function createSessionServer(
           }
         }
 
-        // Check each file again right before its upload: the text posts above
-        // widen the window in which a symlink could be re-pointed at a file
-        // the up-front pass would have refused.
-        let uploaded = 0
-        for (const filePath of files ?? []) {
-          try {
-            assertSendable(filePath)
-          } catch (err) {
-            const posted = `${chunks.length} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
-            return toolError(
-              `${err instanceof Error ? err.message : String(err)} ` +
-                `The reply text was already posted (${posted}); ` +
-                `${uploaded} of ${files!.length} file(s) were uploaded before this refusal.`,
-            )
+        if (hasFiles) {
+          // Check every file again right before the upload: the text posts
+          // above widen the window in which a symlink could be re-pointed at
+          // a file the up-front pass would have refused.
+          const reason = firstUnsendableReason(files!, assertSendable)
+          if (reason !== undefined) {
+            const posted = filesOnly
+              ? undefined
+              : `${chunks.length} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
+            return toolError(buildFilesRefusedText(reason, files!.length, posted))
           }
-          const uploadArgs: Record<string, any> = {
-            channel_id: chatId,
-            file: resolve(filePath),
-          }
-          if (threadTs) uploadArgs.thread_ts = threadTs
-          await web.filesUploadV2(uploadArgs as any)
-          uploaded++
-          if (firstChunk) {
-            firstChunk = false
-            clearAck()
-          }
+
+          await web.filesUploadV2(replyUploadArgs(chatId, files!, threadTs, firstTs, text) as any)
+          if (firstChunk) clearAck()
         }
 
         return {
           content: [
             {
               type: 'text',
-              text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+              text: `Sent ${chunks.length} message(s)${hasFiles ? ` + ${files!.length} file(s)` : ''} to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
             },
           ],
         }

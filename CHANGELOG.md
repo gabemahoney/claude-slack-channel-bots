@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **`reply` files arrive together, named, and reach mention-only personas.** A reply's files were each posted as a separate message with no text or mention, and all named `file.txt`. They now share one message, each under its own filename. With text, that message is threaded under the first text message (or goes in the given `thread_ts`) and repeats the text's `<@…>` mentions; a files-only reply posts just the files. See [Tools](docs/bots.md#tools).
+
 ---
 
 ## 0.18.5 (2026-11-03)

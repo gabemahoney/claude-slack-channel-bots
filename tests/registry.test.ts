@@ -1469,11 +1469,12 @@ describe('DM targets (through the MCP server)', () => {
     },
   )
 
-  test('a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk and the file there', async () => {
+  test('a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk there, then the file under the first chunk', async () => {
     applyPersona(h.alpha, true)
     stubOf(h.alpha).script.open.push(openedDm(OPENED))
     const file = join(h.inboxDir, 'out.txt')
     writeFileSync(file, 'data')
+    const posted = recordPostedTs(h.alpha)
     const deps = depsWithReplySettings({ reply_chunk_limit: 5 })
     const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
 
@@ -1483,7 +1484,9 @@ describe('DM targets (through the MCP server)', () => {
     const log = stubOf(h.alpha).callLog
     expect(log.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
     expect(stubOf(h.alpha).calls.postMessage.map((c) => [c.channel, (c as { text?: string }).text])).toEqual([[OPENED, 'one\n'], [OPENED, 'two\n'], [OPENED, 'three']])
-    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: OPENED, file }] as any)
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([
+      { channel_id: OPENED, file_uploads: [{ file, filename: 'out.txt' }], thread_ts: posted[0] },
+    ] as any)
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 
@@ -2550,53 +2553,198 @@ describe('reply files', () => {
     assertNoLeak({ result, lines: h.lines })
   })
 
-  test('a sendable file is uploaded through the persona client after the text', async () => {
-    const file = join(h.inboxDir, 'out.txt')
-    writeFileSync(file, 'data')
-    const session = await openPersonaSession(h.alpha)
+  // Each row's upload target is built from the ts of every posted chunk, in order.
+  test.each<[string, Record<string, unknown>, Partial<ReplySettings>, number, (posted: (string | undefined)[]) => Record<string, unknown>]>([
+    [
+      'top-level text with a mention: threaded under the text, the mention repeated',
+      { text: '<@U0OMNI001> here is the plan' },
+      {},
+      1,
+      (posted) => ({ thread_ts: posted[0], initial_comment: '<@U0OMNI001>' }),
+    ],
+    [
+      "the caller's thread_ts, text with a mention and a broadcast: in that thread, only the user mention repeated",
+      { text: '<@U0OMNI001> <!here> two files', thread_ts: MSG_TS },
+      {},
+      1,
+      () => ({ thread_ts: MSG_TS, initial_comment: '<@U0OMNI001>' }),
+    ],
+    [
+      'multi-chunk text with several and repeated mentions: under the FIRST chunk, every distinct mention once, in order',
+      { text: 'hi <@U0BBB>\n<@U0AAA> and <@U0BBB>\nlast <@U0CCC|carol>' },
+      { reply_chunk_limit: 30, reply_chunk_mode: 'newline' },
+      3,
+      (posted) => ({ thread_ts: posted[0], initial_comment: '<@U0BBB> <@U0AAA> <@U0CCC|carol>' }),
+    ],
+  ])('%s; every file goes in one upload under its own name', async (_label, args, settings, chunks, target) => {
+    const files = writeReplyFiles('plan.md', 'shot.png')
+    const posted = recordPostedTs(h.alpha)
+    const session = await openWithSettings(h.alpha, settings)
 
-    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [file], thread_ts: MSG_TS })
+    const result = await session.call('reply', { chat_id: A_ALL, files, ...args })
 
     expect(result.isError).toBeUndefined()
-    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
-    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file, thread_ts: MSG_TS }] as any)
+    expect(posted).toHaveLength(chunks)
+    expect(new Set(posted).size).toBe(chunks)
+    expect(result.content[0]!.text).toBe(`Sent ${chunks} message(s) + 2 file(s) to ${A_ALL} [ts: ${posted.at(-1)}]`)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual([...Array(chunks).fill('chat.postMessage'), 'filesUploadV2'])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('plan.md', 'shot.png'), ...target(posted) }] as any)
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
-    expect(existsSync(file)).toBe(true)
+    for (const file of files) expect(existsSync(file)).toBe(true)
   })
 
-  test('a symlink re-pointed at a credentials file while the text posts is refused at its upload', async () => {
-    const plain = join(h.inboxDir, 'out.txt')
-    writeFileSync(plain, 'data')
-    const benign = join(h.inboxDir, 'benign.txt')
-    writeFileSync(benign, 'benign')
-    const link = join(h.inboxDir, 'link.txt')
-    symlinkSync(benign, link)
+  test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    ['the channel', {}, {}],
+    ["the caller's thread", { thread_ts: MSG_TS }, { thread_ts: MSG_TS }],
+  ])('a files-only reply (text "") posts no message and uploads every file in one call to %s', async (_label, args, target) => {
+    const files = writeReplyFiles('plan.md', 'shot.png')
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files, ...args })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Sent 0 message(s) + 2 file(s) to ${A_ALL}`)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['filesUploadV2'])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('plan.md', 'shot.png'), ...target }] as any)
+  })
+
+  test('when Slack returns no ts for the first chunk, the files go unthreaded, not under a later chunk', async () => {
+    const files = writeReplyFiles('plan.md')
+    stubOf(h.alpha).script.post.push({ kind: 'ok', result: { ts: undefined } })
+    const posted = recordPostedTs(h.alpha)
+    const session = await openWithSettings(h.alpha, { reply_chunk_limit: 5, reply_chunk_mode: 'newline' })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'one\ntwo', files })
+
+    expect(result.isError).toBeUndefined()
+    expect(posted).toEqual([undefined, expect.any(String)])
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('plan.md') }] as any)
+  })
+
+  test('a files-only reply clears its tracked ack after the upload succeeds', async () => {
+    const files = writeReplyFiles('plan.md')
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files, message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['filesUploadV2', 'reactions.remove'])
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([{ channel: A_ALL, timestamp: MSG_TS, name: 'eyes' }])
+  })
+
+  test('a files-only reply whose upload fails is a token-safe tool error and keeps its ack', async () => {
+    const files = writeReplyFiles('plan.md')
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    stubOf(h.alpha).script.upload.push({ kind: 'platform', error: 'not_in_channel' })
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files, message_id: MSG_TS })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Tool "reply" failed for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}: the tool call failed (not_in_channel).`,
+    )
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['filesUploadV2'])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('a symlink re-pointed at a credentials file while the text posts is refused at the recheck, and no file is uploaded', async () => {
+    const { plain, link, repoint } = recheckFiles()
     const stub = stubOf(h.alpha)
     const post = stub.web.chat.postMessage
-    let postedTs = ''
     stub.web.chat.postMessage = (async (args: Parameters<typeof post>[0]) => {
-      rmSync(link)
-      symlinkSync(h.credentialsFile, link)
-      const res = await post(args)
-      postedTs = res.ts as string
-      return res
+      repoint()
+      return post(args)
     }) as typeof post
+    const posted = recordPostedTs(h.alpha)
     const session = await openPersonaSession(h.alpha)
 
     const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [plain, link] })
 
     expect(result.isError).toBe(true)
+    expect(posted).toEqual([expect.any(String)])
     expect(result.content[0]!.text).toBe(
       `Blocked: cannot send ${link} — it is a persona credentials file. ` +
-        `The reply text was already posted (1 message(s) to ${A_ALL} [ts: ${postedTs}]); ` +
-        '1 of 2 file(s) were uploaded before this refusal.',
+        `The reply text was already posted (1 message(s) to ${A_ALL} [ts: ${posted[0]}]); ` +
+        'none of the 2 file(s) were uploaded.',
     )
-    expect(postedTs).not.toBe('')
     expect(stub.calls.postMessage).toHaveLength(1)
-    expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file: plain }] as any)
+    expect(stub.calls.filesUploadV2).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  // No text posts on a files-only reply, so the link is re-pointed when the
+  // recheck (its second check) reaches it.
+  test('a files-only reply whose recheck refuses a file uploads nothing and keeps its ack', async () => {
+    const { plain, link, repoint } = recheckFiles()
+    let linkChecks = 0
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps,
+      assertSendable: (p) => {
+        if (p === link && ++linkChecks === 2) repoint()
+        h.deps.assertSendable(p)
+      },
+    })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [plain, link], message_id: MSG_TS })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Blocked: cannot send ${link} — it is a persona credentials file. None of the 2 file(s) were uploaded.`,
+    )
+    expect(linkChecks).toBe(2)
+    expect(stubOf(h.alpha).callLog).toEqual([])
     assertNoLeak({ result, lines: h.lines })
   })
 })
+
+/** Write each named file, with its own name as content, into the inbox; returns the paths. */
+function writeReplyFiles(...names: string[]): string[] {
+  return names.map((name) => {
+    const path = join(h.inboxDir, name)
+    writeFileSync(path, name)
+    return path
+  })
+}
+
+/**
+ * The recheck cases' inbox files: `plain`, and `link`, a symlink to a benign
+ * inbox file until `repoint()` re-points it at the persona credentials file.
+ */
+function recheckFiles(): { plain: string; link: string; repoint(): void } {
+  const [plain, benign] = writeReplyFiles('out.txt', 'benign.txt')
+  const link = join(h.inboxDir, 'link.txt')
+  symlinkSync(benign!, link)
+  return {
+    plain: plain!,
+    link,
+    repoint: () => {
+      rmSync(link)
+      symlinkSync(h.credentialsFile, link)
+    },
+  }
+}
+
+/** The `file_uploads` entries the one upload carries for the inbox files `names`. */
+function fileUploads(...names: string[]) {
+  return names.map((name) => ({ file: join(h.inboxDir, name), filename: name }))
+}
+
+/** Record the ts of every `chat.postMessage` persona `p`'s client answers, in order (undefined when it has none). */
+function recordPostedTs(p: Persona): (string | undefined)[] {
+  const stub = stubOf(p)
+  const post = stub.web.chat.postMessage
+  const posted: (string | undefined)[] = []
+  stub.web.chat.postMessage = (async (args: Parameters<typeof post>[0]) => {
+    const res = await post(args)
+    posted.push(res.ts)
+    return res
+  }) as typeof post
+  return posted
+}
 
 // ---------------------------------------------------------------------------
 // Ack reaction removal
