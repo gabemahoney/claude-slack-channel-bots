@@ -438,11 +438,15 @@ import { checkPersonaConfigDir, type ConfigDirCheckResult } from './persona-brin
 import type { PersonaCheckFailure } from './persona-diagnostics.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
+  EFFORT_LABEL_KEY,
+  MODEL_LABEL_KEY,
   PERSONA_INSTANCE_ID_PREFIX,
   PERSONA_LABEL_KEY,
   PERSONA_LABEL_PREFIX,
   SERVICE_LABEL,
   configDirLabelValue,
+  effortLabelValue,
+  modelLabelValue,
   personaInstanceId,
   personaSpawnEnv,
   personaTmuxSessionName,
@@ -450,6 +454,7 @@ import {
   resolveClaudeConfigDir,
   startValueLabels,
   tmuxExactSessionTarget,
+  type StartLabelKey,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
 import { buildStartAgentArgs } from './agent-director-template.ts'
@@ -797,6 +802,7 @@ import {
   LIVE_ROW_STOP_LATCHED,
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
+  freshStartLine,
   liveRowStopCauseText,
   type LiveRowSequenceArmCause,
   type LiveRowSequenceDeps,
@@ -1149,15 +1155,22 @@ export interface RowPersonaComparison {
    * unresolvable, since no label is ever derived from its lexical path.
    */
   expectedConfigDirLabel: string | undefined
+  /**
+   * The Start Values whose row label differs from the persona's value,
+   * `model` before `effort`; empty when none do. Read by the three Resume
+   * Decisions only, never by the pending-row rule.
+   */
+  startValuesDiffering: readonly StartLabelKey[]
 }
 
 /**
  * Compare an agent-director row with a persona. The
- * one place a row's `cwd` is compared with a persona's working directory and
+ * one place a row's `cwd` is compared with a persona's working directory,
  * a row's `config_dir` label with the persona's current effective
- * claude_config_dir; the collision ladder's `cwd` guard, its pre-resume
- * `config_dir` guard and the start sweep's `cwd` condition all use it.
- * Side-effect free.
+ * claude_config_dir and its Start Labels with the persona's `model` and
+ * `effort`; the collision ladder's `cwd` guard, its pre-resume
+ * `config_dir` and Start Values guards and the start sweep's `cwd`
+ * condition all use it. Side-effect free.
  *
  * - `cwdMatches`: `resolveRealPath` on both sides (a symlink to the working
  *   directory matches). A row with no `cwd` never matches.
@@ -1173,6 +1186,13 @@ export interface RowPersonaComparison {
  * - `configDirMatches`: the row's `config_dir` label is present and equals
  *   `personaConfigDirLabelValue(persona.claude_config_dir, home, configDirFs)`,
  *   the value the spawn writes; undefined when the directory is unresolvable.
+ * - `startValuesDiffering`: for `model` and `effort`, from `row.labels`
+ *   only, the key differs when exactly one of the row's Start Label and the
+ *   persona's value is present, or both are and the label is not the
+ *   value's derivation (`modelLabelValue`, `effortLabelValue`; exact, so
+ *   another spelling of the same model differs). A row with neither label
+ *   (an earlier release's, or a persona's that set neither) differs on
+ *   exactly the keys the persona sets.
  *
  * @param row          The row's `cwd` and `labels` (from `get` or `list`).
  * @param persona      The resolved persona.
@@ -1184,7 +1204,7 @@ export interface RowPersonaComparison {
  */
 export function compareRowToPersona(
   row: { cwd?: string; labels?: Record<string, string> },
-  persona: Pick<Persona, 'working_directory' | 'claude_config_dir'>,
+  persona: Pick<Persona, 'working_directory' | 'claude_config_dir' | 'model' | 'effort'>,
   home: string = homedir(),
   realpath: (path: string) => string = realpathSync,
   configDirFs: Partial<StrictRealPathFs> = { realpath },
@@ -1209,7 +1229,22 @@ export function compareRowToPersona(
       expectedConfigDirLabel === undefined ? undefined : configDirLabel !== undefined && configDirLabel === expectedConfigDirLabel,
     configDirLabel,
     expectedConfigDirLabel,
+    startValuesDiffering: startValuesDifferingOf(row.labels, persona),
   }
+}
+
+/** `compareRowToPersona`'s `startValuesDiffering`: the Start Label keys that differ, `model` before `effort`. Pure. */
+function startValuesDifferingOf(labels: Record<string, string> | undefined, persona: Pick<Persona, 'model' | 'effort'>): StartLabelKey[] {
+  const differing: StartLabelKey[] = []
+  if (startLabelDiffers(labels?.[MODEL_LABEL_KEY], persona.model, modelLabelValue)) differing.push(MODEL_LABEL_KEY)
+  if (startLabelDiffers(labels?.[EFFORT_LABEL_KEY], persona.effort, effortLabelValue)) differing.push(EFFORT_LABEL_KEY)
+  return differing
+}
+
+/** Whether a row's Start Label `label` differs from the persona's `value`: exactly one is present, or the label is not `derive(value)`. Pure. */
+function startLabelDiffers(label: string | undefined, value: string | undefined, derive: (value: string) => string): boolean {
+  if (label === undefined || value === undefined) return (label === undefined) !== (value === undefined)
+  return label !== derive(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -5796,7 +5831,7 @@ export function promptRowSweepFinishedLine(ref: string, state: string, heldMs: n
  */
 async function launchOnPromptRow(
   run: LadderRun,
-  row: Pick<GetResult, 'cwd' | 'labels'>,
+  row: Pick<GetResult, 'cwd' | 'labels' | 'session_id'>,
   state: string,
 ): Promise<SpawnPersonaResult> {
   const { persona, config, ref } = run
@@ -8010,7 +8045,7 @@ function deadSessionLastRead(cause: DeadSessionCause, finishedState: string | un
  */
 function deadSessionRoute(
   run: LadderRun,
-  row: Pick<GetResult, 'cwd' | 'labels'>,
+  row: Pick<GetResult, 'cwd' | 'labels' | 'session_id'>,
   state: string,
   cause: DeadSessionCause,
   finishedState: string | undefined,
@@ -8369,15 +8404,15 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * reconcile-missing-first sweep and the unresolvable-directory deferral
  * come first, as for any key; then the store is read again (a key recorded
  * during the sweep's await included) and, for a recorded key, in place of
- * the `resume_enabled`, the `config_dir` and the `resume` steps, one reuse
- * spawn of the same id is made first, whatever row the path last read
- * (`retiredKeyAtResumeSite`): a finished row or no row gets its new life
+ * the `resume_enabled`, the `config_dir`, the Start Values and the `resume`
+ * steps, one reuse spawn of the same id is made first, whatever row the
+ * path last read (`retiredKeyAtResumeSite`): a finished row or no row gets its new life
  * (`fresh-retired`, the mark set); a live row makes it collide,
  * and the re-run of get-then-act reads the row, sending an old life (no
  * mark) through the live-row sequence with the retired-key flag and
  * handling a new life (mark set) as any live row. A key that is not
- * recorded takes the `resume_enabled`, `config_dir` and `resume` steps
- * below; the read made before the sweep decides only the
+ * recorded takes the `resume_enabled`, `config_dir`, Start Values and
+ * `resume` steps below; the read made before the sweep decides only the
  * `resume_enabled` false step, which a key not recorded then takes at once.
  *
  * `resume_enabled: false`: the row is not resumed; it is
@@ -8402,6 +8437,20 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * transcript was lost, so no JSONL diagnosis or amnesia action runs. A
  * directory that cannot be resolved keeps the row and answers `deferred`
  * with no call.
+ *
+ * Start Values guard: the last check before the `resume`, after the
+ * `resume_enabled` false, retired-key, missing `tag_prompt`, `config_dir`
+ * and repeated-unreported-resume steps, each of which keeps precedence and
+ * logs no Fresh-Start Line. A `resume` replays the row's stored start
+ * arguments, so a row whose `session_id` is non-empty and whose Start
+ * Labels differ from the persona's `model` or `effort` (the same
+ * `compareRowToPersona` result's `startValuesDiffering`) is not resumed: one
+ * Fresh-Start Line (`freshStartLine`), then the row is replaced exactly as
+ * for a `config_dir` mismatch (`replaceAtResumeSite`, `<why>`
+ * `START_VALUES_DIFFER_WHY`), whose own lines follow; it answers and counts
+ * as that replacement does, with no lost-transcript diagnosis. A row with
+ * an empty or absent `session_id` holds no conversation: it skips the
+ * check and takes the `resume`, with no Fresh-Start Line.
  *
  * `ErrSpawnNotResumable` is never by itself a reason to kill
  * and replace, and it is no reuse site. The not-resumable step
@@ -8471,11 +8520,11 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * the latching note, or the latch answers it latched) answers `latched` with
  * one line and no `resume`, sequence or spawn.
  *
- * @param row  The row returned by the collision `get` (its `labels`).
+ * @param row  The row returned by the collision `get` (its `labels` and `session_id`).
  */
 async function resumeOrFreshSpawn(
   runIn: LadderRun,
-  row: Pick<GetResult, 'cwd' | 'labels'>,
+  row: Pick<GetResult, 'cwd' | 'labels' | 'session_id'>,
   opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState; lastReadBy?: string; deadEvidence?: CarriedDeadEvidence },
 ): Promise<SpawnPersonaResult> {
   const { persona, params, config, isStartup, ref } = runIn
@@ -8550,8 +8599,8 @@ async function resumeOrFreshSpawn(
   // a resume keeps the row's old
   // CLAUDE_CONFIG_DIR, so resume only a row labelled with the persona's
   // current effective config dir.
-  const configDir = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
-  if (!configDir.configDirResolved) return deferForUnresolvedConfigDir(persona, ref)
+  const comparison = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
+  if (!comparison.configDirResolved) return deferForUnresolvedConfigDir(persona, ref)
   // no `resume` while the key is recorded, marked or not,
   // read after the sweep's await, so a key recorded during it is never resumed.
   const retired = retiredKeyReadingOf(key)
@@ -8559,9 +8608,9 @@ async function resumeOrFreshSpawn(
   // A key read recorded above whose entry was cleared during the sweep
   // still takes the `resume_enabled` false step.
   if (config.resume_enabled === false) return resumeDisabledAtResumeSite(run, lastRead, deadEvidence)
-  if (!configDir.tagPrompt) return replaceAtResumeSite(run, lastRead, TAG_UPGRADE_WHY, deadEvidence)
-  if (!configDir.configDirMatches) {
-    console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, configDir)} — not resuming; replacing its row by a reuse spawn of the same id`)
+  if (!comparison.tagPrompt) return replaceAtResumeSite(run, lastRead, TAG_UPGRADE_WHY, deadEvidence)
+  if (!comparison.configDirMatches) {
+    console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, comparison)} — not resuming; replacing its row by a reuse spawn of the same id`)
     return replaceAtResumeSite(run, lastRead, CONFIG_DIR_MISMATCH_WHY, deadEvidence)
   }
 
@@ -8577,6 +8626,16 @@ async function resumeOrFreshSpawn(
     return reuseFinishedRow(run, UNREPORTED_RESUME_REUSE_WHAT, () =>
       reuseSpawnForPersona(persona, config, { isStartup, lastRead, retiredAtStart: run.retiredAtStart }),
     )
+  }
+
+  // the last check before the `resume`: a resume replays the row's stored
+  // start arguments, so a conversation started with another `model` or
+  // `effort` is not resumed. One Fresh-Start Line, then the row is replaced
+  // as for a `config_dir` mismatch; the replace step's own lines follow. A
+  // row with no session id holds no conversation and keeps today's path.
+  if (rowHasSessionId(row) && comparison.startValuesDiffering.length > 0) {
+    console.error(freshStartLine(ref, comparison.startValuesDiffering))
+    return replaceAtResumeSite(run, lastRead, START_VALUES_DIFFER_WHY, deadEvidence)
   }
 
   // resume_enabled: attempt resume
@@ -8666,6 +8725,14 @@ const RESUME_DISABLED_WHY = 'resume_enabled is false'
 
 /** The replace step's reason for a `config_dir` label missing or different. */
 const CONFIG_DIR_MISMATCH_WHY = 'its config_dir label is missing or differs'
+
+/** The replace step's reason for a row whose Start Labels differ from the persona's `model` or `effort`. */
+export const START_VALUES_DIFFER_WHY = 'its model or effort differs from what its conversation started with'
+
+/** Whether a row read by `get` holds a conversation: its `session_id` is a non-empty string. Pure. */
+function rowHasSessionId(row: Pick<GetResult, 'session_id'>): boolean {
+  return typeof row.session_id === 'string' && row.session_id !== ''
+}
 
 /** The replace step's reason for a row whose `cwd` differs from the persona's working directory by real path. */
 const CWD_MISMATCH_WHY = "its cwd differs from the persona's working directory"
@@ -10112,8 +10179,8 @@ export const REPLACE_REREAD_PENDING_OUTCOME = "a launch in progress: no live-row
 
 /**
  * A replacement at `resumeOrFreshSpawn` (`replacing` says why:
- * `resume_enabled` false, a `config_dir` label missing or different
- *), deciding on `lastRead`, the row state the path last read, and
+ * `resume_enabled` false, a `config_dir` label missing or different, Start
+ * Values that differ), deciding on `lastRead`, the row state the path last read, and
  * the dead evidence the path holds (`deadEvidence`). A dead-session verdict
  * that is not dead evidence (`row-not-interactive`, or none carried) never
  * by itself leads to a kill, a delete or a live-row sequence: the row may have finished since, or be `pending` under another
@@ -12850,6 +12917,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
       const retired = retiredKeyReadingOf(key).recorded
       if (row === undefined) return { resumeEnabled, cwdMatches: true, configDirMatches: true, retired }
       const comparison = compareRowToPersona({ cwd: row.cwd, labels: row.labels }, found.persona, spawnHomeDir(), undefined, _configDirFs)
+      const { startValuesDiffering } = comparison
       return {
         resumeEnabled,
         retired,
@@ -12857,6 +12925,8 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         cwdMatches: comparison.cwdMatches || comparison.cwdCheckDeferred,
         // an unresolvable directory gives no verdict; the launch's own check holds it.
         configDirMatches: comparison.tagPrompt && (!comparison.configDirResolved || comparison.configDirMatches === true),
+        // absent when no Start Value differs, as with no row.
+        ...(startValuesDiffering.length > 0 ? { startValuesDiffering } : {}),
       }
     },
     launch: async (key, kind, lastRead, ref, stop, retiredAtStart, belowCapAtStart) => {
@@ -16632,7 +16702,7 @@ export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundD
           return
         }
         scope.lastRead = latchRowStateOfReading(read)
-        const hasSessionId = got.kind === OWN_ROW_READ_ROW && typeof got.row.session_id === 'string' && got.row.session_id !== ''
+        const hasSessionId = got.kind === OWN_ROW_READ_ROW && rowHasSessionId(got.row)
         const launch = decideFinishedRowLaunch(read, hasSessionId, retiredKeyReadingOf(key).recorded)
         if (launch === RECHECK_CALL_NONE) {
           line(after.latchCase, RECHECK_CALL_FINISHED_ROW, `still-latched (row ${describeLatchRowState(scope.lastRead)}; no launch)`)
@@ -16872,7 +16942,17 @@ function latchRecheckAtCap(deps: Pick<LatchRecheckRoundDeps, 'isAtCap'>, key: st
   }
 }
 
-/** `latchRecheckLaunch`'s one call through its handler. Never throws. */
+/**
+ * `latchRecheckLaunch`'s one call through its handler. Before its `resume`,
+ * a provenance read of the row: a row missing its `tag_prompt` label, or
+ * after that a row whose `session_id` is non-empty and whose Start Labels
+ * differ from `found.persona`'s `model` or `effort` (`compareRowToPersona`),
+ * is not resumed. A finished row (`AGENT_DIRECTOR_DEAD_STATES`) gets the
+ * re-check's reuse spawn of the same id, after one Fresh-Start Line
+ * (`freshStartLine`) for differing Start Values; a live row gets no call
+ * and answers `retrying`, with no Fresh-Start Line. An absent row, an empty
+ * `session_id` or matching values take the `resume`. Never throws.
+ */
 async function latchRecheckLaunchCall(
   call: LatchRecheckCall,
   found: { readonly persona: Persona; readonly config: PersonaConfig },
@@ -16921,10 +17001,18 @@ async function latchRecheckLaunchCall(
   }
   if (relatched || (provenance.kind === OWN_ROW_READ_ROW && provenance.latched)) return { key, action: 'latched' }
   if (provenance.kind === OWN_ROW_READ_ROW) {
-    if (!noteTagPromptReading(key, provenance.row)) {
+    const { row } = provenance
+    const tagPromptMissing = noteTagPromptReading(key, row)
+    // after the `tag_prompt` branch, which keeps precedence: a row holding a
+    // conversation started with another `model` or `effort` is not resumed.
+    const differing = tagPromptMissing || !rowHasSessionId(row)
+      ? []
+      : compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs).startValuesDiffering
+    if (!tagPromptMissing && differing.length === 0) {
       // The shared resume handler below keeps its existing outcome table.
-    } else if (AGENT_DIRECTOR_DEAD_STATES.has(provenance.row.state)) {
-      const reused = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead: latchRowStateRead(provenance.row.state) })
+    } else if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) {
+      if (differing.length > 0) console.error(freshStartLine(ref, differing))
+      const reused = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead: latchRowStateRead(row.state) })
       return isReuseSpawnCollided(reused) ? latchRecheckCollided(key, ref, REUSE_SPAWN_WHAT) : reused
     } else {
       return { key, action: SPAWN_ACTION_RETRYING }

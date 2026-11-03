@@ -25,6 +25,7 @@ import {
   pendingGraceMinimumSeconds,
 } from '../src/ad-settings.ts'
 import { AD_VERSION_RECHECK_STOP_EXIT_CODE } from '../src/ad-version-gate.ts'
+import { buildStartAgentArgs } from '../src/agent-director-template.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import { killOutcomeOf, type KillFailureClass } from '../src/checked-kill.ts'
 import { LATCH_ROW_STATE_NO_ROW, latchRowStateRead, REFUSED_OPERATION_RESUME } from '../src/conflict-latch.ts'
@@ -46,6 +47,7 @@ import { KILL_RETRY_ALERT_NONE, KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_END_SETTLE
 import {
   createLiveRowSequenceStop,
   decideLiveRowLaunchKind,
+  freshStartLine,
   LIVE_ROW_ARM_COLLISION,
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_ARM_LOST_RACE,
@@ -61,6 +63,7 @@ import {
   LIVE_ROW_LAUNCH_REASON_NOT_KEPT,
   LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED,
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+  LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_NOT_LAUNCHED_CAPPED,
@@ -140,7 +143,16 @@ import { raiseAdConfigMalformed } from '../src/outage-state.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import { describeLogMessage, describeThrownValue } from '../src/persona-connection-errors.ts'
 import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
-import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import {
+  CONFIG_DIR_LABEL_PREFIX,
+  EFFORT_LABEL_KEY,
+  MODEL_LABEL_KEY,
+  personaInstanceId,
+  personaTmuxSessionName,
+  renderPersonaRef,
+  startValueLabels,
+  type StartLabelKey,
+} from '../src/persona-identity.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { _resetFindMissingMemo, _resetNow, _setNow,  isLaunchInFlight, launchSession, noteOldLifeRowRead, OLD_LIFE_ROW_READ_STATE, readPersonaRowState, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME, SPAWN_ACTION_FRESH_RETIRED, SPAWN_ACTION_RETRYING, spawnNotResumableLine, startLiveRowSequence, sweepDeadTmuxChannel, type PersonaRowReread, type SpawnPersonaResult } from '../src/session-manager.ts'
@@ -217,6 +229,7 @@ import {
   ownRowsLiveThenMissing,
   pastSampleGrace,
   personaCallCounts,
+  personaOf,
   personaRow,
   recordCallOrder,
   retryNow,
@@ -234,6 +247,7 @@ import {
 } from './test-helpers/recovery-harness.ts'
 import { readRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
+import { confirmValues, freshStartLinesIn, onFirstCall, startLabelsIn, startLabelsOf, type StartValues } from './test-helpers/start-values.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1422,11 +1436,21 @@ const RESUMABLE: LiveRowLaunchKindInput = {
   persona: { resumeEnabled: true, cwdMatches: true, configDirMatches: true },
 }
 
+/** `RESUMABLE` with P's facts listing `differing` as the Start Values that differ. */
+const resumableDiffering = (differing: readonly StartLabelKey[]): LiveRowLaunchKindInput => ({ ...RESUMABLE, persona: { ...RESUMABLE.persona!, startValuesDiffering: differing } })
+
 describe('the launch kind: a resume only when every condition holds; a reuse with the first reason that holds otherwise (step 6)', () => {
-  test('every condition holds: a resume, for the row has a session id and the persona keeps its conversation', () => {
-    expect(decideLiveRowLaunchKind(RESUMABLE)).toEqual({ kind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION })
+  // P's facts listing no Start Value that differs, the list absent or empty.
+  test.each<[string, LiveRowLaunchKindInput]>([
+    ['the facts listing no Start Values', RESUMABLE],
+    ['the facts listing an empty set of Start Values', resumableDiffering([])],
+  ])('every condition holds, %s: a resume, for the row has a session id and the persona keeps its conversation', (_label, input) => {
+    expect(decideLiveRowLaunchKind(input)).toEqual({ kind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION })
   })
 
+  // Each reason decides whatever Start Values P's facts list: every earlier
+  // one, the session id among them, comes before the Start Values reason,
+  // the last check before the resume.
   test.each<[string, LiveRowLaunchKindInput, LiveRowSequenceLaunchReason]>([
     ['the key is retired', { ...RESUMABLE, retiredKey: true }, LIVE_ROW_LAUNCH_REASON_RETIRED_KEY],
     ['the persona does not keep its conversation', { ...RESUMABLE, keepsConversation: false }, LIVE_ROW_LAUNCH_REASON_NOT_KEPT],
@@ -1437,8 +1461,13 @@ describe('the launch kind: a resume only when every condition holds; a reuse wit
     ['resume_enabled is false', { ...RESUMABLE, persona: { ...RESUMABLE.persona!, resumeEnabled: false } }, LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED],
     ['the cwd differs', { ...RESUMABLE, persona: { ...RESUMABLE.persona!, cwdMatches: false } }, LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH],
     ['the config_dir label is missing or differs', { ...RESUMABLE, persona: { ...RESUMABLE.persona!, configDirMatches: false } }, LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH],
-  ])('%s: a reuse, with that reason', (_label, input, reason) => {
+    ['the row\'s model differs from P\'s', resumableDiffering([MODEL_LABEL_KEY]), LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER],
+    ['the row\'s effort differs from P\'s', resumableDiffering([EFFORT_LABEL_KEY]), LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER],
+    ['the row\'s model and effort differ from P\'s', resumableDiffering([MODEL_LABEL_KEY, EFFORT_LABEL_KEY]), LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER],
+  ])('%s: a reuse, with that reason, whatever Start Values P\'s facts list', (_label, input, reason) => {
     expect(decideLiveRowLaunchKind(input)).toEqual({ kind: LIVE_ROW_LAUNCH_REUSE, reason })
+    if (input.persona === undefined) return
+    expect(decideLiveRowLaunchKind({ ...input, persona: { ...input.persona, startValuesDiffering: [MODEL_LABEL_KEY, EFFORT_LABEL_KEY] } })).toEqual({ kind: LIVE_ROW_LAUNCH_REUSE, reason })
   })
 })
 
@@ -1558,6 +1587,153 @@ describe('the launch: a resume when the row has a session id and P keeps its con
     expect(h.reuseSpawns()).toHaveLength(1)
     expect(h.latch.isLatched(p)).toBe(true)
     expect(h.controller.isArmed(p)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Step 6's Start Values reason (SR-3.2, SR-4): a sequence that keeps P's
+// conversation, over a row with a session id whose Start Labels differ from
+// P's `model` or `effort`, ends in one reuse spawn of the same id carrying
+// P's current Start Labels, with one Fresh-Start Line immediately before
+// step 6's launch line; no other reason logs the line. Expected labels come
+// from the `src/persona-identity.ts` derivations and lines from their
+// builders; model values are plain words, one per case, so a case can show
+// the value never reaches a line. Every captured line passes `assertNoLeak`
+// (this file's `afterEach`).
+// ---------------------------------------------------------------------------
+
+/** Persona `key`'s finished row holding a conversation, its Start Labels written from `rowValues` (none: an earlier release's row); `overrides` win. */
+function conversationRow(h: RecoveryHarness, key: string, rowValues: StartValues, overrides: PersonaGetResultOverrides = {}): PersonaGetResultOverrides {
+  return { session_id: SESSION_ID, labels: { ...personaRow(h, key).labels, ...startLabelsOf(rowValues) }, ...overrides }
+}
+
+/** Every line the harness captured: the sequence's and `console.error`'s. */
+const capturedLines = (h: RecoveryHarness): string[] => [...h.lines, ...h.errors]
+
+describe('the Fresh-Start Line and step 6\'s Start Values reason, pinned (the one literal block)', () => {
+  // The builder is handed keys only, never a value: its text is fixed but for the reference.
+  test('model, effort, and both (differ), with the U+2014 dash; and the reason\'s text', () => {
+    const ref = renderPersonaRef('Ops Desk')
+    const lines = [freshStartLine(ref, [MODEL_LABEL_KEY]), freshStartLine(ref, [EFFORT_LABEL_KEY]), freshStartLine(ref, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY])]
+
+    expect(lines).toEqual([
+      `[slack] spawnForPersona: ${ref} model differs from what its conversation started with — not resuming; a fresh conversation starts and the old one is kept`,
+      `[slack] spawnForPersona: ${ref} effort differs from what its conversation started with — not resuming; a fresh conversation starts and the old one is kept`,
+      `[slack] spawnForPersona: ${ref} model and effort differ from what its conversation started with — not resuming; a fresh conversation starts and the old one is kept`,
+    ])
+    expect(LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER).toBe("the row's model or effort differs from the persona's")
+    assertNoLeak(lines)
+  })
+})
+
+describe('step 6\'s Start Values reason: one reuse of the same id with P\'s current Start Labels and one Fresh-Start Line, for a sequence that keeps the conversation', () => {
+  /** P's sequence, keeping its conversation, over its finished row `row` read at step 2 and run 1. */
+  async function runKeeping(h: RecoveryHarness, p: string, row: PersonaGetResultOverrides, requested: Partial<RecoverySequenceRequest> = {}): Promise<LiveRowSequenceOutcome> {
+    finishedAtRun1(h, p, row)
+    return h.runSequence(p, { lastReadState: LIVE, keepsConversation: true, ...requested })
+  }
+
+  /**
+   * P's sequence ended in one reuse spawn of the same id for the Start
+   * Values reason, carrying P's current Start Labels and arguments (the
+   * applied entry at step 6); one Fresh-Start Line naming `differing`,
+   * immediately before step 6's launch line; no resume (so no
+   * lost-transcript diagnosis), notice or startup-errors entry; no line holds
+   * a model value of `models`.
+   */
+  function expectStartValuesReuse(h: RecoveryHarness, p: string, outcome: LiveRowSequenceOutcome, differing: readonly StartLabelKey[], models: ReadonlyArray<string | undefined>): void {
+    const ref = `persona=${p}`
+    const persona = personaOf(h, p)
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, reason: LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER, result: { key: p, action: 'spawned' } })
+    expectOneReuseOf(h, p)
+    const reuse = h.reuseSpawns()[0]!
+    expect([startLabelsIn(reuse.label), reuse.agent_args]).toEqual([startValueLabels(persona), buildStartAgentArgs(h.config, persona)])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    const fresh = freshStartLine(ref, differing)
+    expect(freshStartLinesIn(capturedLines(h), ref)).toEqual([fresh])
+    const launchLine = liveRowSequenceLaunchLine(ref, { kind: LIVE_ROW_LAUNCH_REUSE, reason: LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER })
+    expect(h.lines.slice(h.lines.indexOf(fresh), h.lines.indexOf(launchLine) + 1)).toEqual([fresh, launchLine])
+    expect([h.notices, h.episodeNotices, h.startupErrors()]).toEqual([[], [], []])
+    for (const model of models) if (model !== undefined) expect(capturedLines(h).filter((line) => line.includes(model))).toEqual([])
+  }
+
+  /** P's sequence ended in one resume of the id, with no reuse and no Fresh-Start Line. */
+  function expectResumeKeeping(h: RecoveryHarness, p: string, outcome: LiveRowSequenceOutcome): void {
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION, result: { key: p } })
+    expect([h.stub.calls.resumeCalls, h.stub.calls.spawnCalls]).toEqual([[{ instance_id: personaInstanceId(p) }], []])
+    expect(freshStartLinesIn(capturedLines(h), `persona=${p}`)).toEqual([])
+  }
+
+  test.each<[string, StartValues, StartValues, readonly StartLabelKey[]]>([
+    // [label, P's values, the values the row's Start Labels were written from, the keys that differ]
+    ['model added', { model: 'Agouti', effort: 'low' }, { effort: 'low' }, [MODEL_LABEL_KEY]],
+    ['effort added', { model: 'Binturong', effort: 'high' }, { model: 'Binturong' }, [EFFORT_LABEL_KEY]],
+    ['model removed', { effort: 'medium' }, { model: 'Coati', effort: 'medium' }, [MODEL_LABEL_KEY]],
+    ['effort removed', { model: 'Dhole' }, { model: 'Dhole', effort: 'max' }, [EFFORT_LABEL_KEY]],
+    ['model changed', { model: 'Ermine' }, { model: 'Fennec' }, [MODEL_LABEL_KEY]],
+    ['effort changed', { effort: 'xhigh' }, { effort: 'medium' }, [EFFORT_LABEL_KEY]],
+    ['both changed', { model: 'Grison', effort: 'high' }, { model: 'Hyrax', effort: 'low' }, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+    ['a different spelling of the same model', { model: 'Galago' }, { model: 'galago' }, [MODEL_LABEL_KEY]],
+    ['an earlier release\'s row, P setting model only', { model: 'Hutia' }, {}, [MODEL_LABEL_KEY]],
+    ['an earlier release\'s row, P setting both', { model: 'Indri', effort: 'low' }, {}, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+  ])('a row with a session id, %s: one reuse with P\'s current Start Labels and one Fresh-Start Line naming the keys that differ', async (_label, personaValues, rowValues, differing) => {
+    const { h, p } = build({ personas: [personaValues, {}] })
+
+    const outcome = await runKeeping(h, p, conversationRow(h, p, rowValues))
+
+    expectStartValuesReuse(h, p, outcome, differing, [personaValues.model, rowValues.model])
+  })
+
+  test.each<[string, StartValues, StartValues]>([
+    // [label, P's values, the values the row's Start Labels were written from]
+    ['an earlier release\'s row, P setting neither', {}, {}],
+    ['a row matching P', { model: 'Jaguarundi', effort: 'high' }, { model: 'Jaguarundi', effort: 'high' }],
+  ])('a row with a session id, %s: resumed, with no Fresh-Start Line', async (_label, personaValues, rowValues) => {
+    const { h, p } = build({ personas: [personaValues, {}] })
+
+    expectResumeKeeping(h, p, await runKeeping(h, p, conversationRow(h, p, rowValues)))
+  })
+
+  // Only step 6's own Start Values reason logs the line: a sequence started
+  // with the conversation not kept was started by a site that logged it
+  // already, and every earlier reason decides with none.
+  test.each<[string, (h: RecoveryHarness, p: string) => PersonaGetResultOverrides, Partial<RecoverySequenceRequest>, LiveRowSequenceLaunchReason]>([
+    ['the conversation not kept', (h, p) => conversationRow(h, p, { model: 'Linsang' }), { keepsConversation: false }, LIVE_ROW_LAUNCH_REASON_NOT_KEPT],
+    ['a retired key', (h, p) => conversationRow(h, p, { model: 'Linsang' }), { retiredKey: true }, LIVE_ROW_LAUNCH_REASON_RETIRED_KEY],
+    ['a config_dir label that differs', (h, p) => conversationRow(h, p, { model: 'Linsang' }, { labels: { ...personaRow(h, p).labels, ...startLabelsOf({ model: 'Linsang' }), config_dir: h.stateDir } }), {}, LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH],
+    ['an empty session id', (h, p) => conversationRow(h, p, { model: 'Linsang' }, { session_id: '' }), {}, LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID],
+  ])('the row\'s Start Labels differing, %s: a reuse for that reason, with no Fresh-Start Line', async (_label, row, requested, reason) => {
+    const { h, p } = build({ personas: [{ model: 'Kiang' }, {}] })
+
+    const outcome = await runKeeping(h, p, row(h, p), requested)
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, reason })
+    expect([h.stub.calls.resumeCalls, h.reuseSpawns().length]).toEqual([[], 1])
+    expect(freshStartLinesIn(capturedLines(h), `persona=${p}`)).toEqual([])
+  })
+
+  // SR-3.5 at step 6, for a sequence that keeps the conversation: a change
+  // confirmed while the sequence awaits a step before step 6 is what step 6
+  // reads. Its decision, its Fresh-Start Line's keys and its reuse spawn's
+  // Start Labels and arguments all come from that one post-change reading.
+  test.each(['kill', 'get', 'findMissing'] as const)('a change to model and effort confirmed while the sequence awaits its first %s, the row matching the values before it: one reuse, with the new labels and arguments, and one Fresh-Start Line naming both keys', async (verb) => {
+    const { h, p } = build({ personas: [{ model: 'Margay' }, {}] })
+    onFirstCall(h, verb, () => confirmValues(h, p, { model: 'Numbat', effort: 'high' }))
+
+    const outcome = await runKeeping(h, p, conversationRow(h, p, { model: 'Margay' }))
+
+    expect(personaOf(h, p)).toMatchObject({ model: 'Numbat', effort: 'high' })
+    expectStartValuesReuse(h, p, outcome, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY], ['Margay', 'Numbat'])
+  })
+
+  test.each(['kill', 'get', 'findMissing'] as const)('a change confirmed while the sequence awaits its first %s that brings P\'s values back to the row\'s: a resume, with no Fresh-Start Line', async (verb) => {
+    const { h, p } = build({ personas: [{ model: 'Olingo' }, {}] })
+    onFirstCall(h, verb, () => confirmValues(h, p, { model: 'Potoroo' }))
+
+    const outcome = await runKeeping(h, p, conversationRow(h, p, { model: 'Potoroo' }))
+
+    expectResumeKeeping(h, p, outcome)
+    expect(capturedLines(h).filter((line) => /Olingo|Potoroo/.test(line))).toEqual([])
   })
 })
 

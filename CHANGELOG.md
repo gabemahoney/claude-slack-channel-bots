@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **Per-persona `model` and `effort`.** A persona can set `model` (such as `opus`, `opus[1m]` or a full model ID) and `effort` (`low`, `medium`, `high`, `xhigh` or `max`) for its Claude instance, including over an organisation seat's defaults. An unset key is not passed; both keys are per persona only, and either at the top level is rejected. See [Next-launch settings](docs/configuration.md#next-launch-settings).
+  - A confirmed change takes effect at the persona's next launch. Setting either key, or later changing or removing it (another spelling included), starts a fresh conversation unless the values then match those the conversation started with. The old conversation is kept, never deleted. Each decision to start fresh for this reason logs one `server.log` line containing `from what its conversation started with`; a retry logs again.
+  - Before [downgrading to an earlier release](docs/migration.md#downgrading-to-an-earlier-release), remove both keys, confirm and check `config.json.last-applied` holds neither.
+
 ---
 
 ## 0.18.4 (2026-11-02)

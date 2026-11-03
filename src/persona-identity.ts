@@ -88,6 +88,9 @@ export const EFFORT_LABEL_KEY = 'effort'
 /** Prefix of the Start Label carrying the `effort`. */
 export const EFFORT_LABEL_PREFIX = `${EFFORT_LABEL_KEY}=`
 
+/** A Start Label's key: `model` or `effort`, which are also the persona keys whose values they record. */
+export type StartLabelKey = typeof MODEL_LABEL_KEY | typeof EFFORT_LABEL_KEY
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

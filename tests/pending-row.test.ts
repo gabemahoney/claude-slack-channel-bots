@@ -39,10 +39,13 @@ import { armPendingRowWait, decidePendingRowCover, decidePendingRowStepThree, de
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { createPersonaEpisodes, killFailureStoppedRetryText, PERSONA_EPISODE_KIND_STUCK_LAUNCH, type PersonaEpisodes } from '../src/persona-episodes.ts'
 import {
+  EFFORT_LABEL_KEY,
+  MODEL_LABEL_KEY,
   personaTmuxSessionName,
   quotedPersonaSessionName,
   renderPersonaRef,
-  tmuxExactSessionTarget
+  tmuxExactSessionTarget,
+  type StartLabelKey
 } from '../src/persona-identity.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
@@ -796,6 +799,7 @@ function rowComparison(overrides: Partial<RowPersonaComparison> = {}): RowPerson
     tagPrompt: true,
     configDirLabel: 'the label',
     expectedConfigDirLabel: 'the label',
+    startValuesDiffering: [],
     ...overrides,
   }
 }
@@ -814,6 +818,25 @@ describe('pendingRowComparisonFor: a working directory with no real path leaves 
     expect(forSite).toEqual(expected)
     expect(decidePendingRowCover({ ...coverInput(), comparison: forSite })).toEqual(cover)
   })
+})
+
+// SR-3.4: the pending-row rule never reads the Start Values. A comparison
+// listing both Start Values as differing, through `pendingRowComparisonFor`,
+// is covered exactly as the same comparison listing none; with a
+// `config_dir` label elsewhere as well, that reason still decides.
+describe('decidePendingRowCover never reads the Start Values a row comparison lists', () => {
+  const SHAPES: ReadonlyArray<readonly [string, RowPersonaComparison, PendingRowCover]> = [
+    ['matching P otherwise', rowComparison(), COVERED],
+    ['its config_dir label elsewhere', rowComparison({ configDirMatches: false }), notCovered(PENDING_ROW_REASON_CONFIG_DIR_MISMATCH)],
+  ]
+  test.each(SHAPES.flatMap(([shape, comparison, cover]) => SITES.map(([site, flag]) => [shape, site, comparison, flag, cover] as const)))(
+    'model and effort differing, the row %s, at %s: as the same comparison listing none',
+    (_shape, _site, comparison, statusOnlySite, cover) => {
+      const decide = (startValuesDiffering: readonly StartLabelKey[]) =>
+        decidePendingRowCover({ ...coverInput({ statusOnlySite }), comparison: pendingRowComparisonFor({ ...comparison, startValuesDiffering }) })
+      expect([decide([MODEL_LABEL_KEY, EFFORT_LABEL_KEY]), decide([])]).toEqual([cover, cover])
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------

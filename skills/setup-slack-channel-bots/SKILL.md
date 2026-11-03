@@ -624,7 +624,9 @@ runs:
 claude-slack-channel-bots clean_restart --server
 ```
 
-It restarts the server and relaunches every persona; conversations resume.
+It restarts the server and relaunches every persona; conversations resume
+unless a confirmed `claude_config_dir` change, or a `model` or `effort` that
+differs from what the conversation started with, starts that persona fresh.
 The operator runs it from a terminal; you never do. Run from a bot's own
 session, it ends that session and leaves the server down.
 
