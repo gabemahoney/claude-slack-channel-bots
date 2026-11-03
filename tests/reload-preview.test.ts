@@ -11,6 +11,13 @@
  * added persona that cannot come up does; only such a persona is
  * asked about.
  *
+ * A persona's own `model` and `effort` are next-launch settings in a clause
+ * group of their own: one case pins that group's clause literally and checks
+ * `nextLaunchClause` against it; every other expectation builds its clause
+ * through `nextLaunchClause`. Beside a changed `claude_config_dir` the line
+ * states one effect per group, in group order, and the directory warning ends
+ * only the `claude_config_dir` effect. No rendered form holds a model value.
+ *
  * Every function here is pure, so the tests call them directly: configs are
  * resolved from file-form JSON with `parsePersonaConfigBytes` (defaults and
  * inheritance as the loader applies them), and every I/O fact (real paths,
@@ -79,6 +86,7 @@ import {
   isCredentialsBroken,
   MODE_SWITCH_SETTING,
   modeSwitchLine,
+  nextLaunchClause,
   renderChangePlanCounts,
   renderInvalidLogLine,
   renderPreview,
@@ -341,6 +349,13 @@ const SWITCH_DIRECTIONS: [label: string, from: boolean | undefined, to: boolean 
 
 /** A persona's in-place line, built by the renderer from the plan entry the case states. */
 const inPlaceLineOf = (change: InPlacePersonaChange): string => renderPreviewLines(planWith({ inPlace: [change] }))[1]!
+
+/** A persona `model` bearing `LEAK_SENTINEL`: `render()` fails if any rendered form or the plan holds it. */
+const SENTINEL_MODEL = `claude-${LEAK_SENTINEL}`
+
+/** One clause group's own next-launch effect: its changed keys, then the clause `nextLaunchClause` builds. */
+const ownNextLaunchEffect = (settings: NextLaunchSetting[]): string =>
+  `${settings.join(', ')} changed: ${nextLaunchClause(settings[0]!, 'own')}`
 
 // ---------------------------------------------------------------------------
 // Added
@@ -924,6 +939,33 @@ describe('several changes to one persona', () => {
     expect(lines).toHaveLength(2)
     expect(lines[1]!.startsWith('DESTRUCTIVE: persona "bravo" (key=bravo) working_directory changed')).toBe(true)
   })
+
+  test('an in-place change beside own claude_config_dir, model and effort changes: in place first, then one effect per clause group', () => {
+    const { plan, lines } = preview(
+      edited((c) => {
+        const b = entry(c, 'bravo')
+        b.channels![1]!.delivery = 'all'
+        b.claude_config_dir = join(root, 'bravo-claude-2')
+        b.model = SENTINEL_MODEL
+        b.effort = 'low'
+      }),
+    )
+
+    expect(plan).toEqual(
+      planWith({
+        inPlace: [{ ...ref('bravo', 1), settings: ['delivery'] }],
+        nextLaunch: [{ ...ref('bravo', 1), own: ['claude_config_dir', 'model', 'effort'], inherited: [] }],
+        unchanged: [ref('alpha', 0), ref('charlie', 2)],
+        configDirsChanged: true,
+      }),
+    )
+    expect(changePlanCounts(plan)).toEqual(counts({ inPlace: 1 }))
+    expect(lines).toEqual([
+      header({ inPlace: 1 }),
+      'persona "bravo" (key=bravo): delivery changed: applied in place immediately, instance kept; ' +
+        `${ownNextLaunchEffect(['claude_config_dir'])}; ${ownNextLaunchEffect(['model', 'effort'])}.`,
+    ])
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -939,6 +981,17 @@ describe('next-launch changes', () => {
       'claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), ' +
         'instance kept until then.',
     ],
+    [['model'], (b) => (b.model = SENTINEL_MODEL), false, `${ownNextLaunchEffect(['model'])}.`],
+    [['effort'], (b) => (b.effort = 'high'), false, `${ownNextLaunchEffect(['effort'])}.`],
+    [
+      ['model', 'effort'],
+      (b) => {
+        b.effort = 'max'
+        b.model = SENTINEL_MODEL
+      },
+      false,
+      `${ownNextLaunchEffect(['model', 'effort'])}.`,
+    ],
   ])('a persona\'s own %p takes effect at its next launch and counts as modified in place', (settings, mutate, dirs, effect) => {
     const { plan, lines } = preview(edited((c) => mutate(entry(c, 'bravo'))))
 
@@ -950,6 +1003,58 @@ describe('next-launch changes', () => {
       }),
     )
     expect(lines).toEqual([header({ inPlace: 1 }), `persona "bravo" (key=bravo): ${effect}`])
+  })
+
+  test("exact clauses: model and effort share one clause, claude_config_dir's own and top-level clauses are as they were", () => {
+    const modelEffort =
+      'takes effect at its next launch, which starts fresh (the conversation is not resumed) unless its model and ' +
+      'effort then match the ones its conversation started with, instance kept until then'
+    expect(nextLaunchClause('model', 'own')).toBe(modelEffort)
+    expect(nextLaunchClause('effort', 'own')).toBe(modelEffort)
+    expect(nextLaunchClause('claude_config_dir', 'own')).toBe(
+      'takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then',
+    )
+    expect(nextLaunchClause('claude_config_dir', 'top-level')).toBe(
+      "takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then",
+    )
+    // No top-level form: model and effort have no top-level value.
+    expect(() => nextLaunchClause('model' as 'claude_config_dir', 'top-level')).toThrow()
+  })
+
+  test.each<[string, NextLaunchSetting[], (b: PersonaInput) => void, (b: PersonaInput) => void]>([
+    ['adding model', ['model'], () => {}, (b) => (b.model = SENTINEL_MODEL)],
+    ['removing model', ['model'], (b) => (b.model = SENTINEL_MODEL), () => {}],
+    ['changing model', ['model'], (b) => (b.model = 'opus'), (b) => (b.model = SENTINEL_MODEL)],
+    ['respelling model (opus to Opus)', ['model'], (b) => (b.model = 'opus'), (b) => (b.model = 'Opus')],
+    ['adding effort', ['effort'], () => {}, (b) => (b.effort = 'low')],
+    ['removing effort', ['effort'], (b) => (b.effort = 'low'), () => {}],
+    ['changing effort', ['effort'], (b) => (b.effort = 'low'), (b) => (b.effort = 'xhigh')],
+    [
+      'changing both',
+      ['model', 'effort'],
+      (b) => {
+        b.model = 'opus'
+        b.effort = 'medium'
+      },
+      (b) => {
+        b.model = SENTINEL_MODEL
+        b.effort = 'high'
+      },
+    ],
+  ])('%s is an own next-launch change, compared as written', (_label, own, before, after) => {
+    const { plan, lines } = previewBetween(
+      edited((c) => before(entry(c, 'bravo'))),
+      edited((c) => after(entry(c, 'bravo'))),
+    )
+
+    expect(plan).toEqual(
+      planWith({
+        nextLaunch: [{ ...ref('bravo', 1), own, inherited: [] }],
+        unchanged: [ref('alpha', 0), ref('charlie', 2)],
+      }),
+    )
+    expect(changePlanCounts(plan)).toEqual(counts({ inPlace: 1 }))
+    expect(lines).toEqual([header({ inPlace: 1 }), `persona "bravo" (key=bravo): ${ownNextLaunchEffect(own)}.`])
   })
 
   test.each<[NextLaunchSetting, (c: EditableInput) => void, boolean, string]>([
@@ -1033,6 +1138,61 @@ describe('next-launch changes', () => {
     )
 
     expect(plan.settings).toEqual([{ name: 'claude_config_dir', inheritedBy: [ref('alpha', 0)] }])
+  })
+
+  test('a destructive modify carrying model and effort changes gets only its DESTRUCTIVE: line; an added persona setting them gets the added line', () => {
+    const work = join(root, 'new-work')
+    const { plan, lines } = preview(
+      edited((c) => {
+        const b = entry(c, 'bravo')
+        b.working_directory = work
+        b.model = SENTINEL_MODEL
+        b.effort = 'high'
+        c.personas.push(persona('delta', 'C0D0001', { model: SENTINEL_MODEL, effort: 'max' }))
+      }),
+    )
+
+    const expected = bravoDestructive(['working_directory'], { working_directory: work })
+    expect(plan).toEqual(
+      planWith({
+        destructive: [expected],
+        added: [{ ...ref('delta', 3), cannotComeUp: [] }],
+        unchanged: [ref('alpha', 0), ref('charlie', 2)],
+      }),
+    )
+    expect(lines).toEqual([
+      header({ added: 1, destructive: 1 }),
+      destructiveLine(expected),
+      'persona "delta" (key=delta) is added: it will be brought up and launched.',
+    ])
+    for (const line of lines.slice(1)) expect(line).not.toMatch(/model|effort/)
+  })
+
+  test('no rendered form and not the plan holds a model value: own, beside claude_config_dir, destructive and added', () => {
+    const plan = buildChangePlan(
+      applied(),
+      valid(
+        edited((c) => {
+          entry(c, 'alpha').model = SENTINEL_MODEL
+          entry(c, 'bravo').claude_config_dir = join(root, 'bravo-claude-2')
+          entry(c, 'bravo').model = SENTINEL_MODEL
+          entry(c, 'charlie').working_directory = join(root, 'new-work')
+          entry(c, 'charlie').model = SENTINEL_MODEL
+          c.personas.push(persona('delta', 'C0D0001', { model: SENTINEL_MODEL }))
+        }),
+      ),
+      facts(),
+    )
+    if (!plan.valid) throw new Error('expected a valid plan')
+
+    // render() runs assertNoLeak over the plan, the lines, the joined text and the log form.
+    const lines = render(plan)
+    expect(plan.nextLaunch.map((p) => [p.key, p.own])).toEqual([
+      ['alpha', ['model']],
+      ['bravo', ['claude_config_dir', 'model']],
+    ])
+    expect(lines).toHaveLength(5)
+    expect(lines.join('\n').toLowerCase()).not.toContain(LEAK_SENTINEL.toLowerCase())
   })
 
   test.each<[NextLaunchSetting, (c: EditableInput) => void]>([
@@ -1155,19 +1315,77 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
     )
   })
 
-  test('no claude_config_dir change, no check: an own stop_hook_bootstrap change, an in-place change and unchanged personas are never asked about', () => {
+  const modelEffortChanges: [NextLaunchSetting[], (b: PersonaInput) => void][] = [
+    [['model'], (b) => (b.model = SENTINEL_MODEL)],
+    [['effort'], (b) => (b.effort = 'high')],
+    [
+      ['model', 'effort'],
+      (b) => {
+        b.model = SENTINEL_MODEL
+        b.effort = 'xhigh'
+      },
+    ],
+  ]
+  const directoryAnswers: [string, string | typeof FACT_UNKNOWN | undefined, string][] = [
+    ['cannot be resolved', PROBLEM, `; but at that launch it cannot come up: ${PROBLEM}`],
+    ['could not be checked', FACT_UNKNOWN, '; whether it can come up at that launch could not be checked'],
+    ['resolves (the control)', undefined, ''],
+  ]
+
+  test.each(
+    modelEffortChanges.flatMap(([own, mutate]) =>
+      directoryAnswers.map(([label, answer, warning]) => [own, label, mutate, answer, warning] as const),
+    ),
+  )(
+    'an own claude_config_dir and %p changed, the directory %s: one line, one effect per group, the warning ending only the claude_config_dir effect',
+    (own, _label, mutate, answer, warning) => {
+      const newDir = join(root, 'bravo-claude-2')
+      const { f, asked } = configDirFacts({ bravo: answer })
+      const { plan, lines } = preview(
+        edited((c) => {
+          entry(c, 'bravo').claude_config_dir = newDir
+          mutate(entry(c, 'bravo'))
+        }),
+        f,
+      )
+
+      expect(asked).toEqual([['bravo', newDir]])
+      expect(plan).toEqual(
+        planWith({
+          nextLaunch: [
+            {
+              ...ref('bravo', 1),
+              own: ['claude_config_dir', ...own],
+              inherited: [],
+              ...(answer === undefined ? {} : { configDirUnresolvable: answer }),
+            },
+          ],
+          unchanged: [ref('alpha', 0), ref('charlie', 2)],
+          configDirsChanged: true,
+        }),
+      )
+      expect(changePlanCounts(plan)).toEqual(counts({ inPlace: 1 }))
+      expect(lines).toEqual([
+        header({ inPlace: 1 }),
+        `persona "bravo" (key=bravo): ${ownNextLaunchEffect(['claude_config_dir'])}${warning}; ${ownNextLaunchEffect(own)}.`,
+      ])
+    },
+  )
+
+  test('no claude_config_dir change, no check: an own stop_hook_bootstrap change, an in-place change, a model-only change and unchanged personas are never asked about', () => {
     const { f, asked } = configDirFacts({ alpha: PROBLEM, bravo: PROBLEM, charlie: PROBLEM })
     const { plan, lines } = preview(
       edited((c) => {
         entry(c, 'bravo').stop_hook_bootstrap = false
         entry(c, 'alpha').permission_prompts = 'C0A0001'
         entry(c, 'alpha').channels = [{ id: 'C0A0001', delivery: 'mentions' }]
+        entry(c, 'charlie').model = SENTINEL_MODEL
       }),
       f,
     )
 
     expect(asked).toEqual([])
-    expect(plan.nextLaunch).toEqual([])
+    expect(plan.nextLaunch).toEqual([{ ...ref('charlie', 2), own: ['model'], inherited: [] }])
     expect(lines.join('\n')).not.toContain('cannot come up')
   })
 
@@ -1197,6 +1415,47 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
       header({ settings: 1 }),
       `server-wide setting claude_config_dir changed: inherited by "alpha" (key=alpha), "charlie" (key=charlie); takes effect at each one's next launch, ${FRESH}${warning}.`,
     ])
+  })
+
+  test("an inheritor of a changed top-level claude_config_dir that cannot resolve it changes its own model too: its persona line states only the model effect; the warning is on the settings line", () => {
+    const newDefault = join(root, 'claude-default-2')
+    const { f, asked } = configDirFacts({ alpha: PROBLEM })
+    const { plan, lines } = preview(
+      edited((c) => {
+        c.claude_config_dir = newDefault
+        entry(c, 'alpha').model = SENTINEL_MODEL
+      }),
+      f,
+    )
+
+    expect(asked).toEqual([
+      ['alpha', newDefault],
+      ['charlie', newDefault],
+    ])
+    expect(plan).toEqual(
+      planWith({
+        nextLaunch: [
+          { ...ref('alpha', 0), own: ['model'], inherited: ['claude_config_dir'], configDirUnresolvable: PROBLEM },
+          { ...ref('charlie', 2), own: [], inherited: ['claude_config_dir'] },
+        ],
+        unchanged: [ref('bravo', 1)],
+        settings: [
+          {
+            name: 'claude_config_dir',
+            inheritedBy: [{ ...ref('alpha', 0), configDirUnresolvable: PROBLEM }, ref('charlie', 2)],
+          },
+        ],
+        configDirsChanged: true,
+      }),
+    )
+    expect(changePlanCounts(plan)).toEqual(counts({ inPlace: 1, settings: 1 }))
+    expect(lines).toEqual([
+      header({ inPlace: 1, settings: 1 }),
+      `persona "alpha" (key=alpha): ${ownNextLaunchEffect(['model'])}.`,
+      `server-wide setting claude_config_dir changed: inherited by "alpha" (key=alpha), "charlie" (key=charlie); ` +
+        `${nextLaunchClause('claude_config_dir', 'top-level')}; but at that launch "alpha" (key=alpha) cannot come up: ${PROBLEM}.`,
+    ])
+    expect(lines.filter((l) => l.includes('cannot come up'))).toEqual([lines[2]])
   })
 
   test('the top-level stop_hook_bootstrap line changed alongside never carries the claude_config_dir warning', () => {
@@ -1745,7 +2004,15 @@ describe('classification across a switch change, the resolved and section compar
 // ---------------------------------------------------------------------------
 
 describe('no effective change', () => {
-  test.each<[string, () => PersonaConfig]>([
+  /** bravo with a `model` and `effort` of its own, its entry's keys in the order given. */
+  const bravoModelEffort = (order: 'model-first' | 'effort-first'): PersonaConfig =>
+    edited((c) => {
+      const b = entry(c, 'bravo')
+      if (order === 'model-first') Object.assign(b, { model: SENTINEL_MODEL, effort: 'high' })
+      else Object.assign(b, { effort: 'high', model: SENTINEL_MODEL })
+    })
+
+  test.each<[string, () => PersonaConfig, (() => PersonaConfig)?]>([
     ['a whitespace-only edit', () => parse(baseInput(), JSON.stringify(baseInput()))],
     [
       'a key-reorder edit',
@@ -1787,8 +2054,13 @@ describe('no effective change', () => {
         return edited((c) => (c.cron_log_path = join(root, 'link-cron.log')))
       },
     ],
-  ])('%s reads no effective change, with no DESTRUCTIVE: line', (_label, candidate) => {
-    const { plan, lines } = preview(candidate())
+    [
+      'the same model and effort rewritten (against an applied config that sets them)',
+      () => bravoModelEffort('effort-first'),
+      () => bravoModelEffort('model-first'),
+    ],
+  ])('%s reads no effective change, with no DESTRUCTIVE: line', (_label, candidate, before = applied) => {
+    const { plan, lines } = previewBetween(before(), candidate())
 
     expect(plan).toEqual(
       planWith({ unchanged: [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)], noEffectiveChange: true }),

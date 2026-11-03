@@ -23,6 +23,9 @@ The first start recorded the bad setting, such as `port` or `bind`, before it fa
 **A persona doesn't come up or doesn't answer**
 The persona is silent. Accepted messages remain queued while its instance is unavailable. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
 
+**A persona seems silent after its `model` was set or changed**
+Correct the name (or remove `model`) in `config.json`, confirm the change, then run `claude-slack-channel-bots clean_restart <bot>` to start the persona fresh. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-seems-silent-after-its-model-was-set-or-changed).
+
 **Acknowledgement reaction missing or stuck**
 Check that both configured emoji exist in the workspace and the confirmed settings took effect at server start; use `message-delivered` to confirm delivery when Slack reaction calls fail. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-acknowledgement-reaction-missing-or-stuck).
 
@@ -135,7 +138,7 @@ The installed agent-director is below the client's own minimum, so only the serv
 Each `could not stop persona` line names a persona, its session and the class of the failure. Fix the cause and run the command again; rows are never deleted. If `clean_restart --server` says the server was not started, start it with `claude-slack-channel-bots start` once `agent-director version` answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-could-not-stop).
 
 **Bots come back with no memory of the prior conversation after a reboot**
-A bot starts a new conversation when its session no longer matches the applied configuration, when it was retired by a confirmed change, once after an upgrade, or after 2 resumes in a row that failed. Search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row`, `key is retired` or `not resuming its transcript again` to see which. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bots-come-back-with-no-memory-of-the-prior-conversation-after-a-reboot).
+A bot starts a new conversation when its session no longer matches the applied configuration, when it was retired by a confirmed change, once after an upgrade, or after 2 resumes in a row that failed. A persona whose `model` or `effort` differs from what its conversation started with starts a new conversation on the same instance at its next launch; this includes setting either key over a conversation from an earlier release. Nothing is deleted. Search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row`, `key is retired`, `from what its conversation started with` or `not resuming its transcript again` to see which. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bots-come-back-with-no-memory-of-the-prior-conversation-after-a-reboot).
 
 **Session crashes on resume with "sandbox required but unavailable"**
 A regression in some Claude Code releases (for example v2.1.120). Set `resume_enabled: false` in `config.json`, confirm the change and restart the server; bots then always start a new conversation. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-crashes-on-resume-with-sandbox-required-but-unavailable).

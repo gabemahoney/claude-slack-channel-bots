@@ -2,6 +2,7 @@ import type { RecoveryStubVerb } from './test-helpers/recovery-harness.ts'
 import { CLEAR_LATCH_ROUTE, handleClearLatch } from '../src/clear-latch.ts'
 import { latchClearRestartResetFailedLine, sweepDeadTmuxChannel, type LatchClearSequenceAnswer } from '../src/session-manager.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
+import { buildStartAgentArgs } from '../src/agent-director-template.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
 
@@ -180,6 +181,7 @@ import {
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_START_STARTED,
   LIVE_ROW_STOP_LATCHED,
+  freshStartLine,
   liveRowSequenceStopAskedLine,
 } from '../src/live-row-sequence.ts'
 import {
@@ -217,7 +219,15 @@ import {
   type PersonaEpisodeKind,
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
-import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import {
+  EFFORT_LABEL_KEY,
+  MODEL_LABEL_KEY,
+  personaInstanceId,
+  personaTmuxSessionName,
+  renderPersonaRef,
+  startValueLabels,
+  type StartLabelKey,
+} from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import type { PersonaSerialize, PersonaSerializer } from '../src/persona-serializer.ts'
 import {
@@ -286,6 +296,7 @@ import {
   provenanceNote,
   unknownNote,
   type CannedRowPersona,
+  type StubClientOptions,
   type UnusableNameFault
 } from './test-helpers/agent-director-stub.ts'
 import {
@@ -359,6 +370,7 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { observeLaunchCalls } from './test-helpers/launch-calls.ts'
 import { builtAround, lineParts } from './test-helpers/line-parts.ts'
 import { PRE_PERSONA_ID, PRE_PERSONA_LABELS, holdOldAt } from './test-helpers/old-life.ts'
 import {
@@ -407,6 +419,7 @@ import {
   type RecoveryStubScript,
   type RecoveryTimedCall
 } from './test-helpers/recovery-harness.ts'
+import { confirmValues, freshStartLinesIn, startLabelsIn, startLabelsOf, type StartValues } from './test-helpers/start-values.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -5397,6 +5410,161 @@ describe('a round\'s launch asks the gates every launch path asks: a persona not
     expect(h.errors.filter((line) => line === oldLifeHoldLaunchLine(recheckSite(), personaRefOf(h, p), realpathSync(personaOf(h, p).working_directory), [{ instanceId: PRE_PERSONA_ID, wait: LIVE_ROW_START_STARTED }], false, true))).toHaveLength(1)
     expect([h.controller.isArmed(p), h.triggers.filter((trigger) => trigger.key === p), h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([false, [], [], []])
     await h.driveSequence(h.oldLifeWaitSettled(PRE_PERSONA_ID))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The re-check's resume retry and the Start Values (SR-3.2, SR-3.5, SR-4,
+// SR-8.3): P latched on a refused `resume` ("another agent-director store"),
+// step 1 reading its row ended, so the round retries the `resume` after its
+// provenance `get`. After that read's `tag_prompt` branch, a row with a
+// session id whose Start Labels differ from P's `model` or `effort` is not
+// resumed: a finished row gets the same reuse spawn of the same id as a row
+// missing its `tag_prompt` label, after one Fresh-Start Line; a live one gets
+// no call. Each round's retry is its own Resume Decision. Expected labels
+// come from the `src/persona-identity.ts` derivations and lines from the
+// builder; model values are plain words, one per case. Every captured line
+// and post passes `assertNoLeak` (this file's `afterEach`).
+// ---------------------------------------------------------------------------
+
+/** A provenance read's labels with the Start Labels written from `values` (on top of P's own). */
+const withStartLabels = (values: StartValues) => (labels: Record<string, string>): Record<string, string> => ({ ...labels, ...startLabelsOf(values) })
+
+/** A provenance read's labels without the `tag_prompt` label. */
+const withoutTagPrompt = ({ tag_prompt: _tagPrompt, ...labels }: Record<string, string>): Record<string, string> => labels
+
+describe('the re-check\'s resume retry compares the Start Values after its provenance read\'s tag_prompt branch: a finished row whose values differ gets the reuse spawn of the same id with one Fresh-Start Line, a live one no call (recovery harness)', () => {
+  /**
+   * P (`personaValues`) latched on a refused `resume`, its row ended with a
+   * session id (step 1's `status`); every `get` of P's row answers the row
+   * model's row through `edit` (the provenance read's labels, its state).
+   */
+  function latchedOverResume(personaValues: StartValues, edit: (row: GetResult) => GetResult, modelOptions: PendingRowModelOptions = {}): LatchedRecheckRun {
+    const run = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, ...modelOptions }, { personas: [personaValues, {}] })
+    const { h, p } = run
+    const id = personaInstanceId(p)
+    const modelGet = (h.stub.calls as StubClientOptions).getFn
+    h.script({
+      getFn: (params) => {
+        const row = modelGet?.(params)
+        return params.instance_id !== id || row === undefined || row instanceof Error ? row : edit(row)
+      },
+    })
+    return run
+  }
+
+  /** The provenance read's row with its labels edited by `relabel`. */
+  const relabelled = (relabel: (labels: Record<string, string>) => Record<string, string>) => (row: GetResult): GetResult => ({ ...row, labels: relabel({ ...row.labels }) })
+
+  /** P's Fresh-Start Lines among everything the harness captured. */
+  const freshLinesOf = (h: RecoveryHarness, p: string): string[] => freshStartLinesIn([...h.errors, ...h.lines], personaRefOf(h, p))
+
+  // The control is the existing branch: a row missing its `tag_prompt`
+  // label, its values matching. Each Start Values variant rounds out exactly
+  // as it does, with one Fresh-Start Line naming the keys that differ.
+  test.each<[string, StartValues, (labels: Record<string, string>) => Record<string, string>, readonly StartLabelKey[]]>([
+    // [label, P's values, the provenance read's labels, the keys the Fresh-Start Line names (none for the control)]
+    ['control: no tag_prompt label, the values matching (the existing branch)', { model: 'Bongo' }, (labels) => withoutTagPrompt(withStartLabels({ model: 'Bongo' })(labels)), []],
+    ['a model added', { model: 'Caracal', effort: 'low' }, withStartLabels({ effort: 'low' }), [MODEL_LABEL_KEY]],
+    ['an effort removed', { model: 'Dikdik' }, withStartLabels({ model: 'Dikdik', effort: 'high' }), [EFFORT_LABEL_KEY]],
+    ['a model changed', { model: 'Eland' }, withStartLabels({ model: 'Fossa' }), [MODEL_LABEL_KEY]],
+    ['a different spelling of the same model', { model: 'Gaur' }, withStartLabels({ model: 'gaur' }), [MODEL_LABEL_KEY]],
+    ['an earlier release\'s row, P setting both keys', { model: 'Hirola', effort: 'max' }, (labels) => labels, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+  ])('a finished row, %s: the round\'s status, the provenance get and one reuse spawn of the same id with P\'s current Start Labels, any Fresh-Start Line logged before it; no resume; the reuse clears the latch with its one recovery post and nothing else', async (_label, personaValues, relabel, differing) => {
+    const run = latchedOverResume(personaValues, relabelled(relabel))
+    const { h, p, record } = run
+    // The Fresh-Start Lines logged by the time each spawn (the round's one reuse) is made.
+    const linesAtSpawn: number[] = []
+    observeLaunchCalls(h.stub.client, (call) => {
+      if (call === 'spawn') linesAtSpawn.push(freshLinesOf(h, p).length)
+    })
+
+    const round = await recheckRound(h, p)
+
+    expect(round.verbs).toEqual(['status', 'get', 'spawn'])
+    expect([h.reuseSpawns(), h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, p)], []])
+    const persona = personaOf(h, p)
+    const reuse = h.reuseSpawns()[0]!
+    expect([startLabelsIn(reuse.label), reuse.agent_args]).toEqual([startValueLabels(persona), buildStartAgentArgs(h.config, persona)])
+    expect(freshLinesOf(h, p)).toEqual(differing.length === 0 ? [] : [freshStartLine(personaRefOf(h, p), differing)])
+    expect(linesAtSpawn).toEqual([differing.length === 0 ? 0 : 1])
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
+    expectClearedState(h, p)
+    expect([h.notices, h.startupErrors()]).toEqual([[], []])
+    expect([...h.errors, ...h.lines].filter((line) => personaValues.model !== undefined && line.includes(personaValues.model))).toEqual([])
+  })
+
+  test.each<[string, (labels: Record<string, string>) => Record<string, string>]>([
+    ['control: no tag_prompt label (the existing branch)', withoutTagPrompt],
+    ['its Start Labels differing', withStartLabels({ model: 'Impala' })],
+  ])('a row the provenance get reads waiting, %s: no call after the read, no Fresh-Start Line and no post; P stays latched with its timer armed', async (_label, relabel) => {
+    const run = latchedOverResume({ model: 'Jerboa' }, (row) => relabelled(relabel)({ ...row, state: 'waiting' }))
+    const { h, p } = run
+
+    const round = await recheckRound(h, p)
+
+    expect(round.verbs).toEqual(['status', 'get'])
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    expect(freshLinesOf(h, p)).toEqual([])
+    expectStillLatched(run, round.at)
+  })
+
+  // Matching values, an absent row and an empty session id take today's
+  // `resume`; a missing `tag_prompt` label keeps precedence over differing
+  // values, and a latched read answers latched: none logs the line.
+  test.each<[string, StartValues, (row: GetResult) => GetResult | Error, readonly string[]]>([
+    ['the Start Labels matching P\'s', { model: 'Kiang', effort: 'low' }, relabelled(withStartLabels({ model: 'Kiang', effort: 'low' })), ['status', 'get', 'resume']],
+    ['an earlier release\'s row, P setting neither key', {}, (row) => row, ['status', 'get', 'resume']],
+    ['an absent row', { model: 'Linsang' }, () => errSpawnNotFound(), ['status', 'get', 'resume']],
+    ['an empty session id, the Start Labels differing', { model: 'Linsang' }, (row) => ({ ...relabelled(withStartLabels({ model: 'Mara' }))(row), session_id: '' }), ['status', 'get', 'resume']],
+    ['no tag_prompt label, the Start Labels differing: the tag_prompt branch\'s reuse', { model: 'Linsang' }, relabelled((labels) => withoutTagPrompt(withStartLabels({ model: 'Mara' })(labels))), ['status', 'get', 'spawn']],
+    ['a latched read (a provenance_conflict note), the Start Labels differing', { model: 'Linsang' }, (row) => ({ ...relabelled(withStartLabels({ model: 'Mara' }))(row), liveness_note: provenanceNote }), ['status', 'get']],
+  ])('%s: today\'s path, with no Fresh-Start Line', async (_label, personaValues, edit, verbs) => {
+    const { h, p } = latchedOverResume(personaValues, (row) => edit(row) as GetResult)
+
+    const round = await recheckRound(h, p)
+
+    expect(round.verbs).toEqual([...verbs])
+    expect(freshLinesOf(h, p)).toEqual([])
+  })
+
+  test('one Fresh-Start Line per round: two rounds, each retrying against a finished row whose values differ, its reuse answering UNAVAILABLE so P stays latched, log one line each', async () => {
+    const run = latchedOverResume({ model: 'Nyala' }, relabelled(withStartLabels({ model: 'Oribi' })), { reuseSpawns: [errTmuxUnresponsive('spawn'), errTmuxUnresponsive('spawn')] })
+    const { h, p } = run
+    const line = freshStartLine(personaRefOf(h, p), [MODEL_LABEL_KEY])
+
+    let round = await recheckRound(h, p)
+    expect([freshLinesOf(h, p), h.reuseSpawns().length, h.latch.isLatched(p)]).toEqual([[line], 1, true])
+
+    round = await recheckRound(h, p)
+    expect([freshLinesOf(h, p), h.reuseSpawns().length, h.latch.isLatched(p)]).toEqual([[line, line], 2, true])
+    expect([h.stub.calls.resumeCalls, h.episodeNotices.length, h.latchRecheck.nextDueAt()]).toEqual([[], 1, round.at + LATCH_RECHECK_INTERVAL_MS])
+  })
+
+  // SR-3.5: a change confirmed while the provenance read is out changes
+  // nothing in that round: the Fresh-Start Line compares, and the reuse spawn
+  // carries, the persona the round started its launch with.
+  test('a change to model and effort confirmed during the provenance get: the Fresh-Start Line and the reuse spawn\'s Start Labels and arguments are those of the one persona the round compared', async () => {
+    const run = latchedOverResume({ model: 'Pudu' }, (row) => row)
+    const { h, p } = run
+    const compared = personaOf(h, p)
+    const id = personaInstanceId(p)
+    const get = (h.stub.calls as StubClientOptions).getFn
+    h.script({
+      getFn: (params) => {
+        if (params.instance_id === id) confirmValues(h, p, { model: 'Quoll', effort: 'high' })
+        const row = get?.(params)
+        return params.instance_id !== id || row === undefined || row instanceof Error ? row : relabelled(withStartLabels({ model: 'Rhebok' }))(row)
+      },
+    })
+
+    const round = await recheckRound(h, p)
+
+    expect(round.verbs).toEqual(['status', 'get', 'spawn'])
+    expect(personaOf(h, p)).toMatchObject({ model: 'Quoll', effort: 'high' })
+    expect(freshLinesOf(h, p)).toEqual([freshStartLine(personaRefOf(h, p), [MODEL_LABEL_KEY])])
+    const reuse = h.reuseSpawns()[0]!
+    expect([startLabelsIn(reuse.label), reuse.agent_args]).toEqual([startValueLabels(compared), buildStartAgentArgs(h.config, compared)])
   })
 })
 

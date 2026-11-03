@@ -12,7 +12,10 @@
  * loader's key lists (`PERSONA_ENTRY_KEYS`, `PERSONA_DM_KEYS`,
  * `PERSONA_INVITED_KEYS`, `CHANNEL_ENTRY_KEYS`, `PERSONA_TOP_LEVEL_KEYS` in
  * src/config.ts) against the plan, so adding a key to the loader fails here
- * until the plan classifies it.
+ * until the plan classifies it. The persona defaults (keys both levels
+ * accept) are the next-launch settings that have a top-level value plus
+ * `stop_hook_bootstrap`; `model` and `effort` are next-launch settings with
+ * no top-level value, set per persona only.
  *
  * The plan classifies a persona change by the candidate's section in force
  * the rows below give each class a change lands in when
@@ -158,16 +161,38 @@ describe('every persona field the loader accepts is classified', () => {
   })
 })
 
+/**
+ * The next-launch settings with no top-level value: set on a persona entry
+ * only, so no persona inherits them and none is a persona default.
+ */
+const NEXT_LAUNCH_WITHOUT_TOP_LEVEL: readonly string[] = ['model', 'effort']
+
 describe('every top-level key the loader accepts is compared', () => {
   // A top-level key is a persona default when a persona entry accepts it too:
   // the persona inherits it when its entry omits it. When this fails, a key
   // both levels accept needs an inherited-default rule, with either an
-  // immediate reminder update or a next-launch directory change.
-  test('the persona defaults are the next-launch directory and immediate reminder settings', () => {
+  // immediate reminder update or a next-launch change. When it fails after a
+  // setting was added to NEXT_LAUNCH_SETTINGS: give the setting a top-level
+  // key in PERSONA_TOP_LEVEL_KEYS (and INHERITED_DEFAULTS in
+  // src/reload-plan.ts) if a persona inherits it, or else add it to
+  // NEXT_LAUNCH_WITHOUT_TOP_LEVEL.
+  test('the persona defaults are the next-launch settings with a top-level value and the immediate reminder setting', () => {
     const entryKeys = new Set<string>(PERSONA_ENTRY_KEYS)
     const defaults = PERSONA_TOP_LEVEL_KEYS.filter((key) => entryKeys.has(key))
-    expect([...defaults].sort()).toEqual([...NEXT_LAUNCH_SETTINGS, 'stop_hook_bootstrap'].sort())
+    const inherited = NEXT_LAUNCH_SETTINGS.filter((setting) => !NEXT_LAUNCH_WITHOUT_TOP_LEVEL.includes(setting))
+    expect([...defaults].sort()).toEqual([...inherited, 'stop_hook_bootstrap'].sort())
     expect(IN_PLACE_SETTINGS).toContain('stop_hook_bootstrap')
+  })
+
+  // When this fails for model or effort: it gained a top-level key or left
+  // NEXT_LAUNCH_SETTINGS. Either is a change of its reload effect; if
+  // intended, move it out of NEXT_LAUNCH_WITHOUT_TOP_LEVEL and update the
+  // persona-defaults rule above and its row in docs/testing-guide.md.
+  test.each(['model', 'effort'])('%s is a next-launch setting with no top-level value', (setting) => {
+    expect(NEXT_LAUNCH_WITHOUT_TOP_LEVEL).toContain(setting)
+    expect(NEXT_LAUNCH_SETTINGS as readonly string[]).toContain(setting)
+    expect(PERSONA_ENTRY_KEYS as readonly string[]).toContain(setting)
+    expect(PERSONA_TOP_LEVEL_KEYS as readonly string[]).not.toContain(setting)
   })
 
   function plan(top: Record<string, unknown>): ValidChangePlan {
@@ -316,8 +341,13 @@ describe('a persona change is classified by the section in force when both confi
   // Rows: the mode both configurations are in, alpha's entry before and
   // after, and the class and setting the change lands in. The declarative
   // rows of the 0.11.1 classes are in tests/reload-preview.test.ts; here only
-  // the rows each mode adds or changes.
+  // the rows each mode adds or changes, and the next-launch settings with no
+  // top-level value in both modes.
   test.each<[string, Record<string, unknown>, Partial<PersonaInput>, Partial<PersonaInput>, PlanClass, string]>([
+    ['declarative: a model change', DECLARATIVE_TOP, { model: 'opus' }, { model: 'sonnet' }, 'nextLaunch', 'model'],
+    ['fungible: a model change', FUNGIBLE_TOP, { model: 'opus' }, { model: 'sonnet' }, 'nextLaunch', 'model'],
+    ['declarative: an effort change', DECLARATIVE_TOP, { effort: 'high' }, { effort: 'max' }, 'nextLaunch', 'effort'],
+    ['fungible: an effort change', FUNGIBLE_TOP, { effort: 'high' }, { effort: 'max' }, 'nextLaunch', 'effort'],
     ['declarative: an invited change', DECLARATIVE_TOP, {}, { invited: { permission_prompts: 'C0A0002' } }, 'recorded', 'invited'],
     [
       'fungible: an invited.permission_prompts change',

@@ -1131,6 +1131,28 @@
  *                                 derivation the spawn labels and the collision
  *                                 ladder's `config_dir` comparison share)
  *
+ * The per-persona model and effort entries (test-49; b.fx2):
+ *   MODEL_ARG_PREFIX              src/agent-director-template.ts MODEL_ARG_PREFIX:
+ *                                 the start-argument element's text before a
+ *                                 persona's `model` value
+ *   EFFORT_ARG_PREFIX             src/agent-director-template.ts EFFORT_ARG_PREFIX:
+ *                                 the start-argument element's text before a
+ *                                 persona's `effort` level
+ *   EFFORT_LEVELS                 src/config.ts EFFORT_LEVELS, the levels
+ *                                 `effort` accepts, in order, joined by single
+ *                                 spaces
+ * None of the above takes an argument.
+ *   freshStartLine <ref> <key> [<key>]
+ *                                 src/live-row-sequence.ts freshStartLine(<ref>,
+ *                                 <keys>): the server's line when a persona's
+ *                                 relaunch starts a fresh conversation because
+ *                                 these start values differ from the ones its
+ *                                 conversation started with; each <key> is
+ *                                 src/persona-identity.ts MODEL_LABEL_KEY or
+ *                                 EFFORT_LABEL_KEY by its value (any other
+ *                                 fails), in that order (any other order
+ *                                 fails)
+ *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
  * use `constantEntry`; a builder entry checks its own arguments with
@@ -4043,6 +4065,43 @@ const deliverySetResult: Entry = {
   },
 }
 
+/** `EFFORT_LEVELS` (src/config.ts), the levels in order, joined by single spaces. */
+const effortLevels: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    const entry = 'EFFORT_LEVELS'
+    expectArguments(entry, args, [])
+    const levels = await packageExport(context, 'config.ts', entry)
+    if (!Array.isArray(levels) || levels.length === 0 || levels.some((l) => typeof l !== 'string' || !/^[a-z]+$/.test(l))) {
+      fail(PRINTER_FAIL_EXIT, `the installed package's src/config.ts export ${entry} is not an array of level names`)
+    }
+    return (levels as string[]).join(' ')
+  },
+}
+
+/** `freshStartLine(<ref>, <keys>)` (src/live-row-sequence.ts), each key MODEL_LABEL_KEY or EFFORT_LABEL_KEY by its value. */
+const freshStartLine: Entry = {
+  synopsis: '<ref> <key> [<key>]',
+  async print(args, context) {
+    const entry = 'freshStartLine'
+    expectSomeArguments(entry, args, ['ref', 'key', 'key'], 2)
+    const [ref, ...keys] = args
+    const known = [
+      await packageString(context, 'persona-identity.ts', 'MODEL_LABEL_KEY'),
+      await packageString(context, 'persona-identity.ts', 'EFFORT_LABEL_KEY'),
+    ]
+    for (const key of keys) {
+      if (!known.includes(key)) usageFail(`${entry}: <key> must be one of ${known.join(', ')} (got '${key}')`)
+    }
+    if (new Set(keys).size !== keys.length) usageFail(`${entry}: <key> '${keys[0]}' is given twice`)
+    if (keys.some((key, i) => i > 0 && known.indexOf(keys[i - 1]) > known.indexOf(key))) {
+      usageFail(`${entry}: the <key>s must come in the order ${known.join(', ')} (got ${keys.join(', ')})`)
+    }
+    const build = await packageFunction<(ref: string, differing: readonly string[]) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, keys))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -4189,6 +4248,11 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   CHANNEL_DELIVERY_LOG_PREFIX: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_LOG_PREFIX'),
   CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES: channelDeliveryDiagnosticClasses,
   formatPersonaDiagnostic: personaDiagnosticLine,
+  // Per-persona model and effort (test-49-fmk-model-effort.sh; b.fx2).
+  MODEL_ARG_PREFIX: constantEntry('agent-director-template.ts', 'MODEL_ARG_PREFIX'),
+  EFFORT_ARG_PREFIX: constantEntry('agent-director-template.ts', 'EFFORT_ARG_PREFIX'),
+  EFFORT_LEVELS: effortLevels,
+  freshStartLine,
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

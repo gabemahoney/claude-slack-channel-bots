@@ -241,11 +241,29 @@ export type RecordedSectionKey = (typeof RECORDED_SECTION_KEYS)[number]
 /** The server-wide setting that picks the channel mode; it has a preview line of its own. */
 export const MODE_SWITCH_SETTING = 'allow_invited_channels'
 
-/** The settings that take effect at the persona's next launch, in the order they are reported. */
-export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir'] as const
+/**
+ * The settings that take effect at the persona's next launch, in the order
+ * they are reported. `claude_config_dir` may be set on the persona or
+ * inherited; `model` and `effort` are set per persona only.
+ */
+export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir', 'model', 'effort'] as const
 
-/** A setting that takes effect at the persona's next launch, set on the persona or inherited. */
+/** A setting that takes effect at the persona's next launch. */
 export type NextLaunchSetting = (typeof NEXT_LAUNCH_SETTINGS)[number]
+
+/**
+ * The next-launch settings in `PERSONA_TOP_LEVEL_KEYS`: the top-level
+ * settings a persona inherits when its entry omits them.
+ */
+export const INHERITED_DEFAULTS = ['claude_config_dir'] as const satisfies readonly NextLaunchSetting[]
+
+/** A next-launch setting with a top-level value a persona can inherit. */
+export type InheritedDefault = (typeof INHERITED_DEFAULTS)[number]
+
+/** Whether `name` is a next-launch setting with a top-level value. */
+export function isInheritedDefault(name: string): name is InheritedDefault {
+  return (INHERITED_DEFAULTS as readonly string[]).includes(name)
+}
 
 /** An added persona. */
 export interface AddedPersonaChange extends ChangePlanPersonaRef {
@@ -334,9 +352,15 @@ export interface CredentialsPersonaChange extends ChangePlanPersonaRef {
 
 /** A persona whose next launch changes. */
 export interface NextLaunchPersonaChange extends ChangePlanPersonaRef {
-  /** Settings the persona's own entry changed, in `NEXT_LAUNCH_SETTINGS` order. */
+  /**
+   * Settings the persona's own entry changed, in `NEXT_LAUNCH_SETTINGS`
+   * order; a changed `model` or `effort` is always here.
+   */
   own: NextLaunchSetting[]
-  /** Settings that changed through the top-level default it inherits, in `NEXT_LAUNCH_SETTINGS` order. */
+  /**
+   * Settings that changed through the top-level default it inherits, in
+   * `NEXT_LAUNCH_SETTINGS` order: only `INHERITED_DEFAULTS`.
+   */
   inherited: NextLaunchSetting[]
   /**
    * Its claude_config_dir changed (own or inherited) to one that cannot be
@@ -448,9 +472,6 @@ const SERVER_SETTINGS: readonly string[] = PERSONA_TOP_LEVEL_KEYS.filter((key) =
 /** The server-wide settings that hold a path: compared by real path. */
 const SERVER_PATH_SETTING_SET: ReadonlySet<string> = new Set<string>(SERVER_PATH_SETTINGS)
 
-/** The top-level settings a persona inherits when its entry omits them. */
-const INHERITED_DEFAULTS: ReadonlySet<string> = new Set<string>(NEXT_LAUNCH_SETTINGS)
-
 function refOf(persona: Persona): ChangePlanPersonaRef {
   return { key: persona.key, name: persona.name, index: persona.index }
 }
@@ -558,7 +579,9 @@ function settingOf(config: PersonaConfig, name: string): unknown {
  * The own and inherited next-launch changes of a persona present in both
  * configurations. A change counts as inherited when the top-level default
  * changed and the persona's value followed it: equal to the applied default
- * before and to the candidate default after. Any other change is its own.
+ * before and to the candidate default after. Any other change is its own, and
+ * so is every change of a setting outside `INHERITED_DEFAULTS` (`model`,
+ * `effort`), which has no top-level value.
  */
 function nextLaunchChanges(
   before: Persona,
@@ -572,6 +595,10 @@ function nextLaunchChanges(
   for (const setting of NEXT_LAUNCH_SETTINGS) {
     const same = (a: unknown, b: unknown): boolean => sameSetting(setting, a, b, samePath)
     if (same(before[setting], after[setting])) continue
+    if (!isInheritedDefault(setting)) {
+      own.push(setting)
+      continue
+    }
     const topBefore = settingOf(applied, setting)
     const topAfter = settingOf(candidate, setting)
     const followsDefault = !same(topBefore, topAfter) && same(before[setting], topBefore) && same(after[setting], topAfter)
@@ -639,8 +666,9 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  * - credentials changed: same `credentials_file` by real path, and the
  *   current digest or marker differs from the held one (never in dry run or
  *   with nothing held). May come with in-place changes;
- * - next launch: `claude_config_dir` (by real path)
- *   changed, marked own or inherited (see `nextLaunchChanges`);
+ * - next launch: `claude_config_dir` (by real path) changed, marked own or
+ *   inherited, or `model` or `effort` (as written) changed, always own (see
+ *   `nextLaunchChanges`);
  * - otherwise unchanged.
  *
  * A persona whose effective `claude_config_dir` changed (a next-launch change,
@@ -770,7 +798,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       plan.settings.push({ name, inheritedBy })
       continue
     }
-    if (!INHERITED_DEFAULTS.has(name)) {
+    if (!isInheritedDefault(name)) {
       plan.settings.push({ name })
       continue
     }
@@ -923,14 +951,74 @@ function addedLine(p: AddedPersonaChange): string {
 }
 
 /**
- * A next-launch effect. A changed `claude_config_dir` (compared by real path,
- * and the session label is a hash of that real path) makes the next launch
- * fresh, so the conversation is not resumed.
+ * Which line a next-launch clause is on: a persona's own line (`its`) or a
+ * top-level setting's line for the personas inheriting it (`each one's`).
  */
-function nextLaunchEffect(settings: readonly string[], whose: 'its' | "each one's"): string {
-  return settings.includes('claude_config_dir')
-    ? `takes effect at ${whose} next launch, which starts fresh (the conversation is not resumed), instance kept until then`
-    : `takes effect at ${whose} next launch, instance kept`
+export type NextLaunchLine = 'own' | 'top-level'
+
+/** The clause groups of the `NEXT_LAUNCH_SETTINGS`: each setting's effect is worded by its group. */
+type NextLaunchClauseGroup = 'claude_config_dir' | 'model_effort'
+
+/** The one clause group of each next-launch setting. */
+const NEXT_LAUNCH_CLAUSE_GROUP = {
+  claude_config_dir: 'claude_config_dir',
+  model: 'model_effort',
+  effort: 'model_effort',
+} as const satisfies Record<NextLaunchSetting, NextLaunchClauseGroup>
+
+/** The clause groups of the `INHERITED_DEFAULTS`: the only groups with a top-level line. */
+type TopLevelClauseGroup = (typeof NEXT_LAUNCH_CLAUSE_GROUP)[InheritedDefault]
+
+function nextLaunchWhose(line: NextLaunchLine): string {
+  return line === 'own' ? 'its' : "each one's"
+}
+
+/**
+ * Each group's clause; only the groups of inherited defaults have a
+ * top-level form. A changed `claude_config_dir` (compared by real path, and
+ * the session label is a hash of that real path) makes the next launch
+ * fresh, so the conversation is not resumed. A changed `model` or `effort`
+ * makes it fresh unless the values then match the ones the conversation
+ * started with.
+ */
+const NEXT_LAUNCH_CLAUSES: {
+  [G in NextLaunchClauseGroup]: (line: G extends TopLevelClauseGroup ? NextLaunchLine : 'own') => string
+} = {
+  claude_config_dir: (line) =>
+    `takes effect at ${nextLaunchWhose(line)} next launch, which starts fresh (the conversation is not resumed), instance kept until then`,
+  model_effort: () =>
+    'takes effect at its next launch, which starts fresh (the conversation is not resumed) unless its model and ' +
+    'effort then match the ones its conversation started with, instance kept until then',
+}
+
+/**
+ * The effect clause of a next-launch setting on `line`, as the preview words
+ * it: the one builder of these clauses, so tests build their expected lines
+ * from it. Only an inherited default has a top-level form. Pure.
+ */
+export function nextLaunchClause(setting: InheritedDefault, line: NextLaunchLine): string
+export function nextLaunchClause(setting: NextLaunchSetting, line: 'own'): string
+export function nextLaunchClause(setting: NextLaunchSetting, line: NextLaunchLine): string {
+  if (isInheritedDefault(setting)) return NEXT_LAUNCH_CLAUSES[NEXT_LAUNCH_CLAUSE_GROUP[setting]](line)
+  if (line !== 'own') throw new Error(`${setting} has no top-level next-launch clause`)
+  return NEXT_LAUNCH_CLAUSES[NEXT_LAUNCH_CLAUSE_GROUP[setting]](line)
+}
+
+/**
+ * A persona's own next-launch settings, split by clause group: one entry per
+ * group, groups in `NEXT_LAUNCH_SETTINGS` order of their first setting, each
+ * group's settings in that order.
+ */
+function nextLaunchGroups(
+  settings: readonly NextLaunchSetting[],
+): Array<{ group: NextLaunchClauseGroup; settings: NextLaunchSetting[] }> {
+  const groups = new Map<NextLaunchClauseGroup, NextLaunchSetting[]>()
+  for (const setting of NEXT_LAUNCH_SETTINGS) {
+    if (!settings.includes(setting)) continue
+    const group = NEXT_LAUNCH_CLAUSE_GROUP[setting]
+    groups.set(group, [...(groups.get(group) ?? []), setting])
+  }
+  return [...groups].map(([group, members]) => ({ group, settings: members }))
 }
 
 /**
@@ -958,7 +1046,13 @@ function credentialsEffect(c: CredentialsPersonaChange): string {
     : `${unusable}: the current connection is kept, instance kept`
 }
 
-/** One persona's non-destructive effects, or undefined when it has none with a line of its own. */
+/**
+ * One persona's non-destructive effects, or undefined when it has none with a
+ * line of its own. Its own next-launch changes state one clause per group
+ * (`nextLaunchGroups`), naming the changed keys and never a value; only the
+ * `claude_config_dir` clause carries the claude_config_dir warning
+ * (`configDirWarning`).
+ */
 function modifiedLine(
   ref: ChangePlanPersonaRef,
   inPlace: InPlacePersonaChange | undefined,
@@ -969,11 +1063,12 @@ function modifiedLine(
   if (inPlace !== undefined) {
     effects.push(`${inPlace.settings.join(', ')} changed: applied in place immediately, instance kept`)
   }
-  if (nextLaunch !== undefined && nextLaunch.own.length > 0) {
-    const warning = nextLaunch.own.includes('claude_config_dir')
-      ? configDirWarning(nextLaunch.configDirUnresolvable, 'at that launch')
-      : ''
-    effects.push(`${nextLaunch.own.join(', ')} changed: ${nextLaunchEffect(nextLaunch.own, 'its')}${warning}`)
+  if (nextLaunch !== undefined) {
+    for (const { group, settings } of nextLaunchGroups(nextLaunch.own)) {
+      const warning =
+        group === 'claude_config_dir' ? configDirWarning(nextLaunch.configDirUnresolvable, 'at that launch') : ''
+      effects.push(`${settings.join(', ')} changed: ${NEXT_LAUNCH_CLAUSES[group]('own')}${warning}`)
+    }
   }
   if (credentials !== undefined) effects.push(credentialsEffect(credentials))
   return effects.length === 0 ? undefined : `${personaRef(ref)}: ${effects.join('; ')}.`
@@ -1069,10 +1164,12 @@ function settingLine(s: ServerSettingChange): string {
   if (CLI_RECORD_AND_SERVER_START_SETTINGS.has(s.name)) {
     return `${prefix} ${recorded}, the CLI takes it from the record from then on, and the running server uses it from its next start.`
   }
-  if (s.inheritedBy === undefined) return `${prefix} ${recorded} and takes effect at the next server start after that.`
+  if (s.inheritedBy === undefined || !isInheritedDefault(s.name)) {
+    return `${prefix} ${recorded} and takes effect at the next server start after that.`
+  }
   if (s.inheritedBy.length === 0) return `${prefix} ${recorded}; no persona inherits it, so no instance is affected.`
   const who = s.inheritedBy.map((p) => renderPersonaRef(p.name, p.key)).join(', ')
-  return `${prefix} inherited by ${who}; ${nextLaunchEffect([s.name], "each one's")}${inheritedConfigDirWarnings(s.inheritedBy)}.`
+  return `${prefix} inherited by ${who}; ${nextLaunchClause(s.name, 'top-level')}${inheritedConfigDirWarnings(s.inheritedBy)}.`
 }
 
 /**

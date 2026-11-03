@@ -424,6 +424,8 @@ tests/
                                    # real registered hooks, production receipt extension and measured Slack permission posts
     test-43-fmk-displayed-legacy.sh  # verified legacy AD in a separate HOME/store/socket: actual idle_screen and needs_intelligence;
                                    # unnormalized real-client negative controls and production normalized positive behavior
+    test-49-fmk-model-effort.sh    # per-persona model and effort: each launch's `--model=`/`--effort=` elements whole; resume kept across a death,
+                                   # clean_restart and stop/start; a changed value starts a fresh conversation with one Fresh-Start Line, the old kept
     lib/
       displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
@@ -461,7 +463,8 @@ tests/
                                    # holds an MCP session to the bot server (see The stub worker); clears its screen and scrollback when a dialog is answered,
                                    # before it reports in (see Stub worker modes); in `startup-trust`, an optional per-directory delay before the dialog
                                    # (`stub_dialog_delay`); in `linger-on-exit`, SessionEnd on the `/exit` line `pause` types, then a linger until `stub_release`;
-                                   # in `exit-on-pause`, SessionEnd on that line, then its MCP session closed and exit 0
+                                   # in `exit-on-pause`, SessionEnd on that line, then its MCP session closed and exit 0; records every launch's
+                                   # arguments beside itself, shell-quoted and as JSON elements (see The stub worker)
       stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script and Test 29: connects to the bot server named by the stub's
                                    # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; records every channel notification
                                    # in a per-directory delivery record and calls the tools the harness writes to a per-directory request file, one result line
@@ -3716,6 +3719,8 @@ absent, and the seeders refuse. Rebuild live fixtures only after the upgrade.
 | `exit-on-pause` | Reports in immediately; on `pause`'s `/exit` reports SessionEnd, closes its MCP session and exits 0, as Claude Code does, for clean-exit cases. |
 
 `stub_mode`, `stub_dialog_delay`, `stub_press_enter`, `stub_type_line` and `stub_release` are harness-only controls under `SCENARIO_ROOT`. They must not become production screen observers. Lost-create-reply scenarios retain AD pending/launch-window, normal retry and checked recovery assertions. No fixture depends on a production approver or pending pane lap.
+
+Every launch (not a `--version` call) is recorded twice beside the stub, each record appended under `flock` so concurrent stubs do not interleave, and a failed write reported on standard error without changing anything else. `stub-claude-launch-args` holds one line per launch, each argument shell-quoted (`printf %q`). `stub-claude-launches.jsonl` holds one JSON object per launch, `{"cwd": <resolved working directory>, "instance_id": <AGENT_DIRECTOR_INSTANCE_ID, or "">, "argv": [<each argument element, whole>]}`, so a scenario reads one launch's elements exactly with `jq`. Test 49 reads it for each persona's `--model=`/`--effort=` elements and `--resume`.
 
 Hooks report SessionStart/SessionEnd through the scenario's AD configuration. Scenario evidence uses those authoritative rows, shim calls, queue records and exact transcript receipts. Terminal contents and native prompt/compaction markers do not establish readiness or lifecycle and are omitted from diagnostics.
 
