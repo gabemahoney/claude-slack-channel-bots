@@ -949,6 +949,34 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
 // carry: `reply` uploads on the long-lived client (README 30 s note)
 // ---------------------------------------------------------------------------
 
+/** A's session server with an MCP client connected to it, sending from `<dir>/state/inbox`. */
+async function openReplySession(
+  h: ConnectionHarness & { A: Persona; B: Persona },
+  { getPersona, clientFor }: Pick<SessionToolDeps, 'getPersona' | 'clientFor'>,
+): Promise<{ client: Client; stateDir: string; inboxDir: string }> {
+  const stateDir = join(dir, 'state')
+  const inboxDir = join(stateDir, 'inbox')
+  mkdirSync(inboxDir, { recursive: true })
+  const deps: SessionToolDeps = {
+    assertSendable: (p) => assertSendable(p, stateDir, inboxDir, credentialsFilesToProtect(h.config!.personas, join(stateDir, 'config.json'))),
+    getReplySettings: () => ({ reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }),
+    getPersona,
+    clientFor,
+    inboxDir,
+    resolveUserName: async (_key, userId) => userId,
+    consumeAck,
+    serverPort: 0,
+  }
+  const entry = registerSession(h.A.working_directory, h.A.key, makeTransport(`mcp-${h.A.key}`), makeSessionServer([]))
+  const server = createSessionServer(entry, deps)
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+  await server.connect(serverTransport)
+  const client = new Client({ name: 'wiring-test', version: '1.0.0' }, { capabilities: {} })
+  await client.connect(clientTransport)
+  openClients.push(client)
+  return { client, stateDir, inboxDir }
+}
+
 describe('carry: reply file uploads go through the manager\'s long-lived client (README "File attachment fails after a long wait")', () => {
   test('each persona\'s long-lived Web client is built once with longLivedWebClientOptions(): a 30 s per-attempt timeout, the library\'s default retries and a logger of its own', async () => {
     const h = harness()
@@ -972,32 +1000,12 @@ describe('carry: reply file uploads go through the manager\'s long-lived client 
   test('a reply with a file, through clientFor, uploads on A\'s long-lived client and on no other client', async () => {
     const h = harness()
     await bringUpBoth(h)
-    const stateDir = join(dir, 'state')
-    const inboxDir = join(stateDir, 'inbox')
-    mkdirSync(inboxDir, { recursive: true })
+    const { client, inboxDir } = await openReplySession(h, { getPersona: (key) => h.getPersona(key), clientFor: h.clientFor })
     const file = join(inboxDir, 'report.txt')
     writeFileSync(file, 'report')
     const webA = h.manager.webClient(h.A.key)!
     const uploadSpy = spyOn(webA, 'filesUploadV2')
     const postSpy = spyOn(webA.chat, 'postMessage')
-
-    const deps: SessionToolDeps = {
-      assertSendable: (p) => assertSendable(p, stateDir, inboxDir, credentialsFilesToProtect(h.config!.personas, join(stateDir, 'config.json'))),
-      getReplySettings: () => ({ reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }),
-      getPersona: (key) => h.getPersona(key),
-      clientFor: h.clientFor,
-      inboxDir,
-      resolveUserName: async (_key, userId) => userId,
-      consumeAck,
-      serverPort: 0,
-    }
-    const entry = registerSession(h.A.working_directory, h.A.key, makeTransport(`mcp-${h.A.key}`), makeSessionServer([]))
-    const server = createSessionServer(entry, deps)
-    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
-    await server.connect(serverTransport)
-    const client = new Client({ name: 'wiring-test', version: '1.0.0' }, { capabilities: {} })
-    await client.connect(clientTransport)
-    openClients.push(client)
     const bBefore = slackCalls(h.stub(h.B))
 
     const result = (await client.callTool({ name: 'reply', arguments: { chat_id: CA, text: 'attached', files: [file] } })) as {
@@ -1008,10 +1016,92 @@ describe('carry: reply file uploads go through the manager\'s long-lived client 
     expect(result.isError).toBeUndefined()
     expect(postSpy).toHaveBeenCalledTimes(1)
     expect(uploadSpy).toHaveBeenCalledTimes(1)
-    expect(uploadSpy.mock.calls[0]![0]).toEqual({ channel_id: CA, file } as never)
+    const posted = (await postSpy.mock.results[0]!.value) as { ts: string }
+    expect(uploadSpy.mock.calls[0]![0]).toEqual({
+      channel_id: CA,
+      file_uploads: [{ file, filename: 'report.txt' }],
+      thread_ts: posted.ts,
+    } as never)
     expect(h.stub(h.A).calls.filesUploadV2).toHaveLength(1)
     expect(slackCalls(h.stub(h.B))).toBe(bBefore)
     assertNoLeak({ result, consoleLines })
+  })
+
+  // Library integration: what the real WebClient's filesUploadV2 sends for the reply's arguments.
+  test('a reply with a mention and two files, on a real long-lived WebClient against a local Slack Web API: each upload URL is asked for under the file\'s own name, and one completion shares both files in the text\'s thread with the mention', async () => {
+    const h = harness()
+    const mention = '<@U0WIREM01>'
+    const postedTs = '1800000000.000001'
+    const calls: Array<{ method: string; params: Record<string, string> }> = []
+    const uploaded: string[] = []
+    const issuedNames: Record<string, string> = {}
+    const api = serveSlackApi(async req => {
+      const url = new URL(req.url)
+      if (url.pathname.startsWith('/upload/')) {
+        await req.arrayBuffer()
+        uploaded.push(url.pathname)
+        return new Response('OK')
+      }
+      const method = url.pathname.replace(/^\/api\//, '')
+      const params = Object.fromEntries(new URLSearchParams(await req.text()))
+      calls.push({ method, params })
+      switch (method) {
+        case 'chat.postMessage':
+          return Response.json({ ok: true, channel: params['channel'], ts: postedTs })
+        case 'files.getUploadURLExternal': {
+          const id = `F0WIRE${calls.length}`
+          issuedNames[id] = params['filename']!
+          return Response.json({ ok: true, upload_url: `${url.origin}/upload/${id}`, file_id: id })
+        }
+        case 'files.completeUploadExternal':
+          return Response.json({ ok: true, files: (JSON.parse(params['files']!) as Array<{ id: string; title: string }>).map(f => ({ id: f.id, title: f.title })) })
+        default:
+          return Response.json({ ok: true })
+      }
+    })
+    try {
+      const web = PRODUCTION_SLACK_CLIENT_FACTORY.createWebClient(fakeToken(BOT_TOKEN_PREFIX, 'reply'), {
+        ...longLivedWebClientOptions(),
+        slackApiUrl: api.url,
+      }) as WebClient
+      const { client, inboxDir } = await openReplySession(h, {
+        getPersona: (key) => (key === h.A.key ? h.A : undefined),
+        clientFor: (key) => (key === h.A.key ? web : undefined),
+      })
+      const files = ['plan.md', 'diagram.png'].map(name => {
+        const path = join(inboxDir, name)
+        writeFileSync(path, name)
+        return path
+      })
+
+      let result: unknown
+      const output = await outputDuringAsync(async () => {
+        result = await client.callTool({ name: 'reply', arguments: { chat_id: CA, text: `${mention} here is the plan`, files } })
+      })
+
+      assertNoLeak({ result, calls, output })
+      expect(output).toEqual([])
+      expect((result as { isError?: boolean }).isError).toBeUndefined()
+      const urlRequests = calls.filter(c => c.method === 'files.getUploadURLExternal')
+      expect(urlRequests.map(c => c.params['filename']).sort()).toEqual(['diagram.png', 'plan.md'])
+      expect(uploaded).toHaveLength(2)
+      const completions = calls.filter(c => c.method === 'files.completeUploadExternal')
+      expect(completions).toHaveLength(1)
+      const completion = completions[0]!.params
+      expect(completion['channel_id']).toBe(CA)
+      expect(completion['thread_ts']).toBe(postedTs)
+      expect(completion['initial_comment']).toBe(mention)
+      const shared = JSON.parse(completion['files']!) as Array<{ id: string; title: string }>
+      expect(Object.fromEntries(shared.map(f => [f.id, f.title]))).toEqual(issuedNames)
+      expect(calls.map(c => c.method)).toEqual([
+        'chat.postMessage',
+        'files.getUploadURLExternal',
+        'files.getUploadURLExternal',
+        'files.completeUploadExternal',
+      ])
+    } finally {
+      api.server.stop(true)
+    }
   })
 })
 
@@ -1034,9 +1124,15 @@ function loggersOf(client: SocketModeClient): { own: unknown; webClient: unknown
   return { own: inner.logger, webClient: inner.webClient.logger }
 }
 
-/** A local stand-in for Slack's Web API (port 0): every method answers `answer`. The caller stops it. */
-function serveSlackApi(answer: Record<string, unknown>): { server: ReturnType<typeof Bun.serve>; url: string } {
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json(answer) })
+/**
+ * A local stand-in for Slack's Web API (port 0): every request is answered
+ * with `answer`, or with what `answer` returns for it. The caller stops it.
+ */
+function serveSlackApi(
+  answer: Record<string, unknown> | ((req: Request) => Response | Promise<Response>),
+): { server: ReturnType<typeof Bun.serve>; url: string } {
+  const fetch = typeof answer === 'function' ? answer : () => Response.json(answer)
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch })
   return { server, url: `http://127.0.0.1:${server.port}/api/` }
 }
 
