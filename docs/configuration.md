@@ -10,16 +10,14 @@ Each bot is a **persona**: one Slack app, one Claude instance with its own worki
 
 The top level holds a required `personas` array and the [server-wide settings](server-settings.md#server-wide-settings). Unknown keys are rejected at every level: the top level, each persona, its `dm` object, its `invited` object in fungible mode, and each channel entry in declarative mode (see [Load-time rules](#load-time-rules)). Only this persona format is accepted; a configuration written for an earlier major version must be rewritten by hand (see [Upgrading to personas](migration.md#upgrading-to-personas)).
 
-The first start of an install applies the file as it stands. After that, the server runs a recorded copy, and an edit changes nothing until you confirm it; a server restart alone doesn't apply it. See [Reload](reload.md#reload), and [What a confirmation applies](reload.md#what-a-confirmation-applies) for how each kind of change is applied.
-
-Postinstall creates a skeleton with an empty persona list, `{"personas": []}`. An empty list is valid: the server starts with no persona connected.
+The first start of an install applies the file as it stands. After that, the server runs a recorded copy, and an edit changes nothing until you confirm it; a server restart alone doesn't apply it. See [Reload](reload.md#reload), and [What a confirmation applies](reload.md#what-a-confirmation-applies) for how each kind of change is applied. Postinstall creates a skeleton with an empty persona list, `{"personas": []}`, which is valid: the server starts with no persona connected.
 
 ### Example
 
 A complete `config.json` in declarative mode (`allow_invited_channels` absent), with three personas:
 
 - `planner` receives every message in its home channel `C0123456789` and in the shared channel `C0555555555`. Its permission prompts and notices go to its home channel. It takes no DMs.
-- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory and turns [Slack reply reminders](bots.md#slack-reply-reminders) off for itself.
+- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory, model and effort level, and turns [Slack reply reminders](bots.md#slack-reply-reminders) off for itself.
 - `helpdesk` is DM-only: it is in no channel and is reached only by DM. Its prompts and notices go by DM to its contact `U0987654321`.
 
 `planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings select queued/delivered reactions and reply splitting. **Custom emoji must exist in the Slack workspace before configuration**; `spinthinking` is custom. Ensure both names below are available, or choose available names; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions).
@@ -42,6 +40,7 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
       "dm": { "enabled": true, "contact": "U0123456789" },
       "permission_prompts": "dm",
       "claude_config_dir": "~/.claude-reviewer",
+      "model": "opus", "effort": "high",
       "stop_hook_bootstrap": false
     },
     {
@@ -77,6 +76,8 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `invited.permission_prompts` | string | no | `"dm"` | Fungible mode only: the persona's **destination**, where its permission prompts and server notices are posted. `"dm"` or a Slack channel ID such as `C0123456789`; the channel needs no listing. Not read in declarative mode. See [Permission prompts in fungible mode](channel-modes.md#permission-prompts-in-fungible-mode). |
 | `claude_config_dir` | path | no | top-level `claude_config_dir` | Claude config directory for this persona. See [Next-launch settings](#next-launch-settings). |
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
+| `model` | string | no | none (Claude Code chooses) | The Claude model the persona's instance starts with, such as `opus`, `opus[1m]` or a full model ID, used exactly as written. Per persona only. See [Next-launch settings](#next-launch-settings). |
+| `effort` | string | no | none (Claude Code chooses) | The effort level the persona's instance starts with: `low`, `medium`, `high`, `xhigh` or `max`. Per persona only. See [Next-launch settings](#next-launch-settings). |
 
 `dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes. `invited` is an object holding `permission_prompts`: `"invited": { "permission_prompts": "C0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
 
@@ -108,9 +109,7 @@ The key identifies the persona's agent-director instance (`cscb_<key>`), its tmu
 
 **No persona's key may start with another persona's key.** The server rejects such a pair when it checks the configuration (see [Load-time rules](#load-time-rules)), with an error that names both personas and suggests a new name. tmux matches a session target by prefix unless it is written with `=`, so a human's tmux command without `=` for one persona (for example `tmux attach -t slack_bot_dev`) could reach another persona's session. With personas `dev` and `dev_2`, that command could reach `slack_bot_dev_2`.
 
-Give the shorter name a suffix, such as `dev_main` beside `dev_2`, or `team_main` beside `team_admin`, or rename either so that neither key starts with the other. Keys that only share a start, such as `dev_a` and `dev_b`, are fine. A name that isn't its own key counts by its key: `"Dev Bot"` (key `dev_bot_…`) can't sit beside `dev` either.
-
-Renaming a persona changes its key, so the old persona is removed and a new one added (see [What a confirmation applies](reload.md#what-a-confirmation-applies)).
+Give the shorter name a suffix, such as `dev_main` beside `dev_2`, or `team_main` beside `team_admin`, or rename either so that neither key starts with the other. Keys that only share a start, such as `dev_a` and `dev_b`, are fine. A name that isn't its own key counts by its key: `"Dev Bot"` (key `dev_bot_…`) can't sit beside `dev` either. Renaming a persona changes its key, so the old persona is removed and a new one added (see [What a confirmation applies](reload.md#what-a-confirmation-applies)).
 
 ### Credentials files
 
@@ -161,35 +160,36 @@ Any number of personas may list the same channel, each with its own `delivery`. 
 
 `dm.contact` is the person who receives the persona's prompts and notices when its destination is `"dm"`: in declarative mode when `permission_prompts` is `"dm"`, and in fungible mode when `invited.permission_prompts` is `"dm"` or unset. In either mode a `"dm"` destination needs `dm.enabled: true` and a `dm.contact`. `dm.contact` gates nothing else: it doesn't limit who can DM the persona.
 
-Starting a DM with a user (a `reply` to a user ID, or a persona whose destination is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
-
-Receiving DMs and replying in an existing DM (a `D…` ID) work without the scope. The `debug-slack-channel-bots` skill (see [Troubleshooting](troubleshooting.md#troubleshooting)) has the steps under "A persona can't open a DM".
+Starting a DM with a user (a `reply` to a user ID, or a persona whose destination is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed. Receiving DMs and replying in an existing DM (a `D…` ID) work without the scope; the `debug-slack-channel-bots` skill (see [Troubleshooting](troubleshooting.md#troubleshooting)) has the steps under "A persona can't open a DM".
 
 ### Permission prompts
 
-This section applies in declarative mode, where `permission_prompts` is required; for fungible mode, see [Permission prompts in fungible mode](channel-modes.md#permission-prompts-in-fungible-mode). It is the persona's destination: its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona.
+This section applies in declarative mode, where `permission_prompts` is required; for fungible mode, see [Permission prompts in fungible mode](channel-modes.md#permission-prompts-in-fungible-mode). It is the persona's destination: its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona. [Permission Relay](bots.md#permission-relay) covers how prompts are delivered and answered, and [Troubleshooting](troubleshooting.md#troubleshooting) what happens when Slack refuses a post to the destination.
 
 - **A channel ID:** one of the persona's own `channels`. Everyone in that channel sees the prompts and notices.
 - **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
 
 Choose a destination with [channel delivery](#channel-delivery) in mind. If two personas each receive every message in the other’s destination and storing fails, the notices stop after one *Message not saved* each per episode. Further failures are counted in `server.log` (see [Troubleshooting](troubleshooting.md#troubleshooting)).
 
-[Permission Relay](bots.md#permission-relay) covers how prompts are delivered and answered, and [Troubleshooting](troubleshooting.md#troubleshooting) what happens when Slack refuses a post to the destination.
-
 ### Next-launch settings
 
-`claude_config_dir` can be set on a persona or at the top level. A persona's own value wins; the top-level value is the default for every persona without one. Once a change is confirmed, it takes effect at the persona's next launch (see [When next-launch and server-wide changes take effect](reload.md#when-next-launch-and-server-wide-changes-take-effect)).
+`claude_config_dir` can be set on a persona or at the top level: a persona's own value wins, and the top-level value is the default for every persona without one. `model` and `effort` are set on each persona only, with no top-level value, so a persona without them inherits nothing. Once a change is confirmed, it takes effect at the persona's next launch (see [When next-launch and server-wide changes take effect](reload.md#when-next-launch-and-server-wide-changes-take-effect)).
 
 **`claude_config_dir`** is the Claude config directory the persona's instance launches with (`CLAUDE_CONFIG_DIR`), so each persona can authenticate as a different Claude account. Populate each directory before the persona first launches:
 
 ```sh
 CLAUDE_CONFIG_DIR=~/.claude-reviewer claude auth login --claudeai
 ```
-Use `--console` instead of `--claudeai` for a Console account. When neither the persona nor the top level sets one, Claude's own default applies.
+Use `--console` instead of `--claudeai` for a Console account. When neither the persona nor the top level sets one, Claude's own default applies. A directory that doesn't exist yet is fine when its parent exists.
 
-- A directory that doesn't exist yet is fine when its parent exists.
-- A persona whose `claude_config_dir` can't be resolved to a real path (for example, a symlink on its path that points to nothing) is held: it closes or never opens its Slack connection and receives nothing, and `server.log` shows `persona-config-dir-unresolvable`. It reconnects once the directory resolves, with no restart.
+- A persona whose `claude_config_dir` can't be resolved to a real path (for example, a symlink on its path that points to nothing) is held, receiving nothing, until the directory resolves, with no restart; `server.log` shows `persona-config-dir-unresolvable`.
 - A confirmed change to a persona's effective `claude_config_dir` makes it start a new conversation on the same instance at its next launch. Nothing is deleted: the old conversation stays in the old directory, with prior sessions retained in the same AD life.
+
+**`model`** and **`effort`** are the model and effort level the persona's instance starts with, overriding the defaults Claude Code would otherwise choose, an organisation seat's included. A key the persona doesn't set is not passed, so Claude Code chooses it as it does today.
+
+- `model` is any non-empty name with no control characters, compared exactly as written, so an alias and its full ID are different values. A name Claude Code doesn't know is accepted and the persona launches, but its requests fail until the name is corrected.
+- `effort` is one of the five levels, lower-case. An invalid value of either key is rejected naming the persona and the key (see [Load-time rules](#load-time-rules)).
+- After a confirmed change, the persona's next launch uses the new values. It starts a new conversation on the same instance unless the values then match the ones its conversation started with; nothing is deleted. Each resume keeps the values its conversation started with.
 
 ### Slack reply reminders
 

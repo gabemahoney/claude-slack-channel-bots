@@ -21,6 +21,8 @@ import {
   CHANNEL_MODES,
   channelModeOf,
   DM_DESTINATION,
+  EFFORT_LEVELS,
+  MODEL_INVALID_REASON,
   PERSONA_ENTRY_KEYS,
   PERSONA_INVITED_KEYS,
   type ChannelMode,
@@ -403,6 +405,9 @@ describe('loadPersonaConfig', () => {
       ['top-level', { ...makePersonaConfigInput(), extra_setting: 1 }, 'extra_setting', WHERE.top, false],
       ['top-level bot_token', { ...makePersonaConfigInput(), bot_token: fakeToken(BOT_TOKEN_PREFIX, 'top') }, 'bot_token', WHERE.top, false],
       ['top-level app_token', { ...makePersonaConfigInput(), app_token: fakeToken(APP_TOKEN_PREFIX, 'top') }, 'app_token', WHERE.top, false],
+      // Per persona only: no top-level value.
+      ['top-level model', { ...makePersonaConfigInput(), model: `${LEAK_SENTINEL}-model` }, 'model', WHERE.top, false],
+      ['top-level effort', { ...makePersonaConfigInput(), effort: LEAK_SENTINEL }, 'effort', WHERE.top, false],
       ['persona entry', persona({ nickname: 'ops' }), 'nickname', WHERE.entry, true],
       ['persona entry bot_token', persona({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }), 'bot_token', WHERE.entry, true],
       ['persona entry app_token', persona({ app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }), 'app_token', WHERE.entry, true],
@@ -2264,6 +2269,232 @@ describe('loadPersonaConfig', () => {
       }
     })
   })
+
+  // Per-persona model and effort, in both channel modes and in record mode (a
+  // start from config.json.last-applied): resolved exactly as written, never
+  // inherited, and rejected without echoing the value. Expected reasons come
+  // from src/config.ts; every rejection is leak-checked (loadError, or
+  // recordError below).
+  describe('model and effort', () => {
+    const EFFORT_REASON = `effort is invalid. Allowed values are: ${EFFORT_LEVELS.join(', ')}.`
+    const MODES = ['declarative', 'fungible', 'record'] as const
+    type LoadMode = (typeof MODES)[number]
+
+    const recordPath = () => join(dir, 'config.json.last-applied')
+    const parseBytes = (input: unknown, record: boolean) =>
+      parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), recordPath(), dir, { home, record })
+
+    /** Parse `input` as the record, expecting rejection; returns the message after `assertNoLeak`. */
+    const recordError = (input: unknown): string => {
+      try {
+        parseBytes(input, true)
+      } catch (err) {
+        assertNoLeak(err, 'record rejection')
+        return (err as Error).message
+      }
+      throw new Error('expected the record to be rejected')
+    }
+
+    /** What follows the source path in a rejection: the validation error itself. */
+    const causeOf = (message: string) => message.slice(message.indexOf('Persona config validation error: '))
+
+    /** Record mode reads a declarative-mode file; fungible mode writes the switch as true. */
+    const factoryFor = (mode: LoadMode) => (mode === 'fungible' ? makeFungiblePersona : makePersona)
+    const configIn = (mode: LoadMode, overrides: Record<string, unknown>) =>
+      underSwitch(
+        mode === 'fungible' ? true : undefined,
+        modeEntry(overrides, factoryFor(mode)),
+        factoryFor(mode)({ name: 'review_bot' }, dir),
+      )
+
+    const loadIn = (mode: LoadMode, input: unknown) => (mode === 'record' ? parseBytes(input, true) : load(input))
+
+    /** The whole rejection of `input` in `mode`, and the source path it names. */
+    const rejectIn = (mode: LoadMode, input: unknown) =>
+      mode === 'record'
+        ? { message: recordError(input), source: recordPath() }
+        : { message: loadError(input), source: join(dir, 'config.json') }
+
+    const expectedRejection = (source: string, reason: string) =>
+      `loadPersonaConfig: invalid persona config in "${source}": Persona config validation error: ${MODE_REF}: ${reason}`
+
+    // The second persona sets neither key, so each row also shows nothing is inherited.
+    const VALID: [string, Record<string, unknown>][] = [
+      ['neither key', {}],
+      ['both keys', { model: 'opus', effort: 'high' }],
+      ['model only, opus[1m]', { model: 'opus[1m]' }],
+      ...EFFORT_LEVELS.map((level): [string, Record<string, unknown>] => [`effort only, ${level}`, { effort: level }]),
+      ['a model holding spaces', { model: 'claude opus 5' }],
+      ['a model holding =', { model: 'opus=1m' }],
+      ['a model starting with -', { model: '-opus' }],
+      ['a model with leading and trailing spaces, untrimmed', { model: '  opus  ' }],
+    ]
+
+    test.each(MODES.flatMap((mode) => VALID.map(([label, written]) => ({ mode, label, written }))))(
+      '$mode mode, $label: loads as written, and a sibling setting neither key has no model or effort property',
+      ({ mode, written }) => {
+        const config = loadIn(mode, configIn(mode, written))
+        assertNoLeak(config, 'config')
+        const [persona, sibling] = config.personas
+        for (const key of ['model', 'effort'] as const) {
+          if (key in written) expect(persona![key]).toBe(written[key] as string)
+          else expect(key in persona!).toBe(false)
+          expect(key in sibling!).toBe(false)
+        }
+      },
+    )
+
+    // Values that can hold LEAK_SENTINEL do, so an echo fails the leak check.
+    const INVALID_MODELS: [string, unknown][] = [
+      ['an empty string', ''],
+      ['a whitespace-only string', '   '],
+      ['a C0 control character (NUL)', `${LEAK_SENTINEL}\u0000`],
+      ['a C0 control character (newline)', `opus\n${LEAK_SENTINEL}`],
+      ['DEL', `${LEAK_SENTINEL}\u007f`],
+      ['a C1 control character (NEL)', `${LEAK_SENTINEL}\u0085`],
+      ['null', null],
+      ['a number', 42],
+      ['a boolean', true],
+      ['an array', [LEAK_SENTINEL]],
+      ['an object', { value: LEAK_SENTINEL }],
+    ]
+    const INVALID_EFFORTS: [string, unknown][] = [
+      ['ultracode', 'ultracode'],
+      ['High (a level in another case)', 'High'],
+      ['a string holding the leak sentinel', `high${LEAK_SENTINEL}`],
+      ['null', null],
+      ['a number', 3],
+      ['a boolean', true],
+      ['an array', ['high']],
+    ]
+    const INVALID = [
+      ...INVALID_MODELS.map(([label, value]) => ({ key: 'model', label, value, reason: MODEL_INVALID_REASON })),
+      ...INVALID_EFFORTS.map(([label, value]) => ({ key: 'effort', label, value, reason: EFFORT_REASON })),
+    ]
+
+    test.each(MODES.flatMap((mode) => INVALID.map((row) => ({ mode, ...row }))))(
+      '$mode mode: $key as $label is rejected with the persona reference and the reason, never the value',
+      ({ mode, key, value, reason }) => {
+        const input = configIn(mode, { [key]: value })
+        const { message, source } = rejectIn(mode, input)
+        expect(message).toBe(expectedRejection(source, reason))
+        if (typeof value === 'string' && value.trim() !== '') expect(message).not.toContain(value)
+        if (mode === 'record') expect(causeOf(message)).toBe(causeOf(loadError(input)))
+      },
+    )
+
+    // Stage 1 (shapes and unknown keys) runs before stage 2 (types and
+    // formats, in key order: stop_hook_bootstrap, model, effort, then the
+    // section's keys), and stage 3 (destination rules) after; the first
+    // violation is reported alone, in both channel modes and in record mode.
+    const BAD_MODEL = `${LEAK_SENTINEL}\u0000`
+    const BAD_EFFORT = 'ultracode'
+    interface OrderRow {
+      mode: ChannelMode
+      label: string
+      overrides: Record<string, unknown>
+      /** What the one error says after the persona reference. */
+      reported: string
+      absent: string[]
+    }
+    const ORDER_ROWS: OrderRow[] = [
+      ...CHANNEL_MODES.flatMap((mode): OrderRow[] => [
+        {
+          mode,
+          label: 'an invalid model before an invalid effort',
+          overrides: { model: BAD_MODEL, effort: BAD_EFFORT },
+          reported: MODEL_INVALID_REASON,
+          absent: ['effort'],
+        },
+        {
+          mode,
+          label: 'an invalid stop_hook_bootstrap before an invalid effort',
+          overrides: { stop_hook_bootstrap: 'false', effort: BAD_EFFORT },
+          reported: 'stop_hook_bootstrap ',
+          absent: ['effort'],
+        },
+        {
+          mode,
+          label: 'an invalid stop_hook_bootstrap before an invalid model',
+          overrides: { stop_hook_bootstrap: 'false', model: BAD_MODEL },
+          reported: 'stop_hook_bootstrap ',
+          absent: ['model'],
+        },
+        {
+          mode,
+          label: 'a non-object dm (stage 1) before an invalid effort',
+          overrides: { dm: PLACEHOLDER, effort: BAD_EFFORT },
+          reported: 'dm ',
+          absent: ['effort'],
+        },
+        {
+          mode,
+          label: 'an invalid effort before a non-boolean dm.enabled',
+          overrides: { effort: BAD_EFFORT, dm: { enabled: PLACEHOLDER } },
+          reported: EFFORT_REASON,
+          absent: [DM_ENABLED],
+        },
+      ]),
+      {
+        mode: 'declarative',
+        label: 'non-array channels (stage 1) before an invalid effort',
+        overrides: { channels: PLACEHOLDER, effort: BAD_EFFORT },
+        reported: 'channels ',
+        absent: ['effort'],
+      },
+      {
+        mode: 'declarative',
+        label: 'an invalid effort before a bad channel id',
+        overrides: { effort: BAD_EFFORT, channels: [{ id: 'D0TEST001', delivery: 'all' }] },
+        reported: EFFORT_REASON,
+        absent: ['channels'],
+      },
+      {
+        mode: 'declarative',
+        label: 'an invalid effort before an unsupported delivery',
+        overrides: { effort: BAD_EFFORT, channels: [{ id: CHANNEL, delivery: PLACEHOLDER }] },
+        reported: EFFORT_REASON,
+        absent: ['channels'],
+      },
+      {
+        mode: 'declarative',
+        label: 'an invalid effort before a permission_prompts that is neither dm nor a channel ID',
+        overrides: { effort: BAD_EFFORT, permission_prompts: PLACEHOLDER },
+        reported: EFFORT_REASON,
+        absent: ['permission_prompts'],
+      },
+      {
+        mode: 'fungible',
+        label: 'a non-object invited (stage 1) before an invalid effort',
+        overrides: { [INVITED]: PLACEHOLDER, effort: BAD_EFFORT },
+        reported: `${INVITED} `,
+        absent: ['effort'],
+      },
+      {
+        mode: 'fungible',
+        label: 'an invalid effort before a malformed invited.permission_prompts',
+        overrides: { effort: BAD_EFFORT, [INVITED]: { permission_prompts: PLACEHOLDER } },
+        reported: EFFORT_REASON,
+        absent: [INVITED],
+      },
+      {
+        mode: 'fungible',
+        label: 'an invalid effort before the destination rule of a "dm" destination with DMs off',
+        overrides: { effort: BAD_EFFORT, [INVITED]: { permission_prompts: DM_DESTINATION }, dm: { enabled: false } },
+        reported: EFFORT_REASON,
+        absent: [INVITED, DM_ENABLED, DM_CONTACT],
+      },
+    ]
+
+    test.each(ORDER_ROWS)('$mode mode, check order: $label, and record mode reports the same', ({ mode, overrides, reported, absent }) => {
+      const input = underSwitch(switchFor(mode) || undefined, modeEntry(overrides, factoryFor(mode)))
+      const message = loadError(input)
+      expect(message).toContain(`Persona config validation error: ${MODE_REF}: ${reported}`)
+      for (const fragment of absent) expect(message).not.toContain(fragment)
+      expect(message.split('Persona config validation error: ')).toHaveLength(2)
+      expect(recordError(input)).toBe(`loadPersonaConfig: invalid persona config in "${recordPath()}": ${causeOf(message)}`)
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -3238,6 +3469,8 @@ describe('start-path primitives', () => {
       ['default_route', () => ({ ...twoPersonas(), default_route: '/tmp/ops' }), prePersonaConversionMessage('default_route')],
       ['default_dm_session', () => ({ ...twoPersonas(), default_dm_session: '/tmp/ops' }), prePersonaConversionMessage('default_dm_session')],
       ['an unknown top-level key', () => ({ ...twoPersonas(), extra_setting: 1 }), '"extra_setting"'],
+      ['a top-level model', () => ({ ...twoPersonas(), model: `${LEAK_SENTINEL}-model` }), 'unknown top-level field(s) in config.json: "model".'],
+      ['a top-level effort', () => ({ ...twoPersonas(), effort: LEAK_SENTINEL }), 'unknown top-level field(s) in config.json: "effort".'],
       ['a per-entry violation', () => twoPersonas({}, { permission_prompts: undefined }), 'permission_prompts'],
     ])('record mode still rejects %s, as default mode does, naming the record path', (_label, build, fragment) => {
       const input = build()

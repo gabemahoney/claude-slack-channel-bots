@@ -887,9 +887,11 @@ describe('README.md', () => {
     const naming = (...settings: readonly string[]) => (row: Row) =>
       settings.every((s) => codeSpans(row.change).includes(s))
 
-    /** each next-launch setting keeps the instance, `claude_config_dir` only until the next launch. */
+    /** each next-launch setting keeps the instance until the persona's next launch. */
     const NEXT_LAUNCH_SESSION: Record<NextLaunchSetting, string> = {
       claude_config_dir: 'Kept until the next launch',
+      model: 'Kept until the next launch',
+      effort: 'Kept until the next launch',
     }
 
     /**

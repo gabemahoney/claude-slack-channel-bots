@@ -203,6 +203,15 @@ export const DEFAULT_ACK_REACTION = 'spinthinking'
 /** Allowed `reply_chunk_mode` values. */
 export const REPLY_CHUNK_MODES = ['length', 'newline'] as const
 
+/** Allowed persona `effort` values, in order: the one list of levels. */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/** The control characters a persona `model` must not hold (Unicode category Cc: C0, DEL and C1). */
+const MODEL_FORBIDDEN_CHAR_RE = /\p{Cc}/u
+
+/** The rejection of a persona `model` that is not a non-empty string free of control characters. */
+export const MODEL_INVALID_REASON = 'model must be a non-empty string with no control characters when set.'
+
 /** Default `reply_chunk_mode`: today's reply-tool default. */
 export const DEFAULT_REPLY_CHUNK_MODE: ReplyChunkMode = 'newline'
 
@@ -234,6 +243,8 @@ export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'invited',
   'claude_config_dir',
   'stop_hook_bootstrap',
+  'model',
+  'effort',
 ]
 
 /** Keys allowed in a persona's `dm` object. */
@@ -454,6 +465,9 @@ export type DeliveryMode = (typeof DELIVERY_MODES)[number]
 /** How a long reply is split into chunks. */
 export type ReplyChunkMode = (typeof REPLY_CHUNK_MODES)[number]
 
+/** A persona's effort level. */
+export type EffortLevel = (typeof EFFORT_LEVELS)[number]
+
 /** A channel entry as written in the file. Both keys are required. */
 export interface ChannelEntryInput {
   /** Slack channel ID matching `CHANNEL_ID_RE`. */
@@ -501,6 +515,10 @@ export interface PersonaInput {
   claude_config_dir?: string
   /** Per-persona reply reminder flag (legacy setting name). Defaults to the top-level value. */
   stop_hook_bootstrap?: boolean
+  /** The persona's model: per persona only, with no top-level value and no default. */
+  model?: string
+  /** The persona's effort level (`EFFORT_LEVELS`): per persona only, with no top-level value and no default. */
+  effort?: EffortLevel
 }
 
 /** The persona configuration file as parsed from disk. */
@@ -576,6 +594,10 @@ export interface Persona {
   claude_config_dir?: string
   /** Effective reply reminder flag: the per-persona value, else the top-level value. */
   stop_hook_bootstrap: boolean
+  /** The persona's own `model`, exactly as written (not trimmed); absent when unset. Never inherited. */
+  model?: string
+  /** The persona's own `effort`; absent when unset. Never inherited. */
+  effort?: EffortLevel
 }
 
 /** Validated, fully-resolved persona configuration. */
@@ -1457,6 +1479,7 @@ type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungib
  *   2. types and formats, in this order: `name` (required, a non-empty
  *      string), `credentials_file`,
  *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
+ *      `model`, `effort`,
  *      `channels` (in array order: `id`, `delivery`, duplicate ID), `dm.enabled`,
  *      `dm.contact`, `permission_prompts` (required);
  *   3. cross-setting rules (see `checkPersonaCrossSettings`): zero channels
@@ -1470,7 +1493,8 @@ type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungib
  *   1. shape and unknown keys: persona entry, `dm` and `invited` (stage 1);
  *   2. types and formats, in this order: `name`, `credentials_file`,
  *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
- *      `dm.enabled`, `dm.contact`, `invited.permission_prompts`;
+ *      `model`, `effort`, `dm.enabled`, `dm.contact`,
+ *      `invited.permission_prompts`;
  *   3. the fungible destination rule (see `checkFungibleDestination`).
  * `channels` and the top-level `permission_prompts` are neither checked nor
  * read, whatever their type or content: the resolved `channels` is empty and
@@ -1508,6 +1532,12 @@ function parsePersonaEntry(
       : inherited.claude_config_dir
   const ownStopHook = raw['stop_hook_bootstrap']
   if (ownStopHook !== undefined) checkBoolean(ownStopHook, 'stop_hook_bootstrap', style)
+  const model = raw['model']
+  if (model !== undefined && !(isNonEmptyString(model) && !MODEL_FORBIDDEN_CHAR_RE.test(model))) {
+    throw ruleError(style, MODEL_INVALID_REASON)
+  }
+  const effort = raw['effort']
+  if (effort !== undefined) checkAllowedValue(effort, 'effort', EFFORT_LEVELS, style)
   let section: ResolvedSection
   let dm: PersonaDm
   if (mode === 'fungible') {
@@ -1541,6 +1571,8 @@ function parsePersonaEntry(
     },
     ...(claude_config_dir !== undefined ? { claude_config_dir } : {}),
     stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
+    ...(model !== undefined ? { model } : {}),
+    ...(effort !== undefined ? { effort: effort as EffortLevel } : {}),
   }
 }
 

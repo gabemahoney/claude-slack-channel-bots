@@ -381,8 +381,10 @@ Everyone in a destination channel sees the prompts and notices. See `docs/channe
 
 #### 5.8 Optional next-launch settings
 
-Offer these only if the operator wants to override the top-level defaults
-(`docs/configuration.md` `### Next-launch settings`):
+Offer these only if the operator wants them (`docs/configuration.md`
+`### Next-launch settings`). A setting left out keeps its default: the
+top-level value for `claude_config_dir` and `stop_hook_bootstrap`, Claude
+Code's own choice for `model` and `effort`.
 
 - **`claude_config_dir`**: the persona's own Claude config directory, so it can
   use a different Claude account. Never `~/.claude`. The operator populates it
@@ -398,6 +400,13 @@ Offer these only if the operator wants to override the top-level defaults
 - **`stop_hook_bootstrap`**: boolean compatibility setting; `false` turns Slack
   reply reminders off for this persona. Confirmed changes apply immediately
   and keep its running session. See [Slack reply reminders](../../docs/bots.md#slack-reply-reminders).
+- **`model`** and **`effort`**: the model and effort level the persona's
+  instance starts with. Set per persona only; at the top level they are
+  rejected. `model` is a name such as `opus`, `opus[1m]` or a full model ID,
+  written exactly; `effort` is one of `low`, `medium`, `high`, `xhigh` or
+  `max`. Set both, one or neither. A changed value takes effect at the
+  persona's next launch, which starts a new conversation unless the values
+  then match the ones its conversation started with.
 
 #### 5.9 Declare the persona
 

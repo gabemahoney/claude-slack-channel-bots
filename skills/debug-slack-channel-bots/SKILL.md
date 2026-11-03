@@ -5598,7 +5598,7 @@ Messages about one persona start `personas[<i>] "<name>" (key=<key>): `, or
 just `personas[<i>]: ` when the name itself is the problem. A malformed value
 (a bad channel ID, `dm.contact`, `permission_prompts` or
 `invited.permission_prompts`) is never echoed, and neither is a rejected
-`allow_invited_channels`, and
+`allow_invited_channels`, `model` or `effort`, and
 no message shows a `bot_token` or `app_token` value. Messages do quote
 persona names (as written) and keys, channel IDs, the configuration file's path and, in the duplicate-path rules, the
 persona paths. An unknown key's name is quoted only when it is a plain setting
@@ -5633,6 +5633,7 @@ In both modes:
 - Two personas share a `working_directory` or a `credentials_file`, compared by real path.
 - A `dm.contact` is malformed. User IDs start with `U` or `W`, followed by capital letters and digits only; underscores are not allowed.
 - A path isn't absolute, `~` or `~/…`.
+- A `model` is empty, only whitespace or holds a control character, or an `effort` isn't one of `low`, `medium`, `high`, `xhigh` or `max` (case-sensitive). Both are set per persona only: at the top level they are unknown keys.
 - A required field is missing, or a key of the top level, a persona entry or `dm` is unknown.
 - A value has the wrong type, isn't an allowed value, or is out of range.
 
@@ -5669,6 +5670,7 @@ For a persona error, the error names the persona (`personas[<i>]`) and the field
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
 | `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in `docs/configuration.md`. |
+| `unknown top-level field(s) in config.json: "model".` or `… "effort".` | `model` or `effort` written at the top level, where neither exists: both are set per persona only. | Set it on each persona that should use it, and remove the top-level key. |
 | `claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms …` | Old key name. | Rename it. |
 | `personas is required: an array of persona entries, which may be empty.` / `personas must be an array, got <type>.` | Missing or wrong type. | Add `"personas": [ … ]`. |
 | Server-wide type and range errors: `<key> must be a non-negative number.`, `<key> is invalid. Allowed values are: ….`, `<key> must be a boolean.`, `<key> must be a non-empty string when set.`, `<key> must be a string when set.`, `<key> must be a positive integer (>= 1) when set.`, `agent_director_poll_interval_ms must be a positive integer in [200, 3600000].`, `agent_director_call_timeout_ms must be a positive integer in [1000, 3600000].`, `cron_table_path must be a non-empty string.`, `cron_log_path must be a non-empty string.` | A server-wide setting has the wrong type or is out of range. | Correct the named key. |
@@ -5691,6 +5693,8 @@ of one mode is never checked in the other.
 | `credentials_file is required.` / `working_directory is required.` | both | Missing path. | Add it. |
 | `<setting> must be an absolute path, "~" or a path starting with "~/".` | both | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
 | `stop_hook_bootstrap must be a boolean.` / `dm.enabled must be a boolean.` | both | Wrong type. | Use `true` or `false`. |
+| `model must be a non-empty string with no control characters when set.` | both | `model` is empty or only whitespace, holds a control character, or isn't a string (`null`, a number, a boolean, an array or an object). The value is never shown. `model` then `effort` are checked after `stop_hook_bootstrap` and before the channel, `dm` and destination values, so this error comes ahead of an invalid channel ID or delivery, a non-boolean `dm.enabled` or a bad destination. Shape errors (an unknown key, `dm` or `invited` not a JSON object, `channels` not an array, a `channels` entry not a JSON object) are reported first. | Use a non-empty model name such as `opus`, `opus[1m]` or a full model ID, or remove the key. |
+| `effort is invalid. Allowed values are: low, medium, high, xhigh, max.` | both | `effort` is another value, such as `ultracode` or `High` (case-sensitive), or isn't a string. The value is never shown. Checked right after `model`, in the same order as the `model` row says, with shape errors reported first. | Use one of `low`, `medium`, `high`, `xhigh`, `max`, lower-case, or remove the key. |
 | `dm must be a JSON object, got <type>.` | both | Wrong shape. | Fix the shape. |
 | `channels must be an array, got <type>.` / `channels[<j>] must be a JSON object, got <type>.` | declarative | Wrong shape. | Fix the shape. |
 | `channels[<j>].id is required.` / `channels[<j>].delivery is required.` | declarative | A channel entry lacks a key. | Every channel needs `id` and `delivery`. |
@@ -5882,6 +5886,7 @@ line among them.
 | `…: stop_hook_bootstrap changed: applied in place immediately, instance kept.` | The persona's own reminder setting changed. Subsequent checks use the confirmed value, keeping its running session. |
 | `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. A reminder-setting change alongside it has its own immediate in-place effect. |
 | `…: claude_config_dir changed: …, instance kept until then; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>).` | A warning: the new directory can't be resolved now, with the same check and wording as an added persona's (`(<errno>: a symlink on its path points to nothing)` for a dangling symlink). It is not a refusal: confirming applies the change, and at the persona's next launch it is held as [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable) (its Slack connection closed, its launch waiting) until the directory resolves. The same warning ends a changed top-level `claude_config_dir` line, naming the inheriting personas it stops (`; but at that launch "<name>" (key=<key>), … cannot come up: …`), and a `DESTRUCTIVE:` line whose persona's `claude_config_dir` changed too (`; but it cannot come up: …`; that persona is held when it is brought up at the confirmation). Fix the directory, or the setting, before confirming. If the check itself failed, the line ends `; whether it can come up at that launch could not be checked` (see the `cannot check` line below). |
+| `…: model changed: takes effect at its next launch, which starts fresh (the conversation is not resumed) unless its model and effort then match the ones its conversation started with, instance kept until then.` (or `effort changed` or `model, effort changed`) | The persona's own `model` or `effort` changed: added, removed or written differently (compared as written, so an alias and a full model ID differ). The running instance is kept; its next launch uses the new values and starts a new conversation unless they then match the ones its conversation started with. The line names the keys, never a value, and carries no warning. A `DESTRUCTIVE:` or `is added` line carries no model or effort wording: that persona starts fresh with the new values. |
 | `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up. The line names the persona and the path, never a token. |
 | `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, its working directory unusable, or held for its `claude_config_dir`, see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). |
 | `…: credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.` | The same, for a persona that is broken by its credentials: its credentials file is missing, unreadable or invalid, or Slack refused its tokens ([`persona-credentials-refused`](#persona-credentials-refused)). |
@@ -5901,6 +5906,9 @@ line among them.
 
 One persona's effects share one line, joined by `; `, for example
 `persona "bravo" (key=bravo): channels changed: applied in place immediately, instance kept; credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.`
+A persona whose `claude_config_dir` and `model` or `effort` both change gets
+both effects on its one line, each with its own clause (the
+`claude_config_dir` warning only on its own), joined by `; `.
 
 **Invalid.** When the edit can't be applied, the preview is one line and
 nothing else, and [`reload-invalid`](#reload-invalid) is logged:
@@ -6074,6 +6082,7 @@ for a server start.
 | Preview line | After the confirmation | To carry it out sooner |
 |---|---|---|
 | `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch: when the bot dies (a crash or a failed health check), at `clean_restart --server`, or `clean_restart <bot>…` naming it, at `stop --stop-bots` then `start`, or after a host reboot. A changed `claude_config_dir` makes that launch start a new conversation on the same instance; nothing is deleted, and the old conversation stays in the old directory. | Relaunch the bots: `claude-slack-channel-bots clean_restart <bot> [<bot>…]` for the personas it names, `claude-slack-channel-bots clean_restart --server` from a terminal, or `stop --stop-bots` then `start`. Each cuts off the relaunched bots' current turns. A plain restart reconnects running bots, which is not a launch. |
+| `model changed`, `effort changed` or `model, effort changed` (`takes effect at its next launch, which starts fresh … unless its model and effort then match …`) | Recorded. It reaches the persona at its next launch, the same launches as the `claude_config_dir` row. That launch starts a new conversation on the same instance unless the values then match the ones its conversation started with; nothing is deleted, and the old conversation is kept. | The same relaunches as the `claude_config_dir` row. |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | Recorded. The running server keeps the value it started with. | Restart. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`. The next `stop` or `clean_restart` uses it. | Nothing. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`. The next `stop --stop-bots` or `clean_restart` uses it; the running server keeps the value it started with. | Restart, or `clean_restart --server` from a terminal. |
@@ -6161,7 +6170,7 @@ applied. Compared with a confirmation:
   up fresh in the new directory.
 - A changed `credentials_file` only reconnects the persona to Slack with the
   new app; its instance keeps running.
-- A setting that takes effect at a bot's launch (a changed `claude_config_dir`) doesn't reach a bot that kept running. If the
+- A setting that takes effect at a bot's launch (a changed `claude_config_dir`, `model` or `effort`) doesn't reach a bot that kept running. If the
   server is still running, stop it with `stop --stop-bots` instead of `stop`.
 
 With the operator's say-so, stop the server if it is still running:
@@ -6479,10 +6488,12 @@ or a filesystem that doesn't support syncing a directory).
   - a change to the section the mode doesn't read is only written into the
     record, with no effect until the switch selects that section;
   - a kept persona's `stop_hook_bootstrap` change applies immediately;
-  - a kept persona's `claude_config_dir` change takes effect at its next launch (a relaunch after the bot dies, a
+  - a kept persona's `claude_config_dir`, `model` or `effort` change takes effect at its next launch (a relaunch after the bot dies, a
     `clean_restart --server`, or `clean_restart <bot>…` naming it, `stop --stop-bots` then `start`, or a host reboot; a
     plain `stop` and `start` only reconnects), which launches the new
-    declaration; until then its instance runs as launched;
+    declaration; until then its instance runs as launched. A changed
+    `model` or `effort` makes that launch start a new conversation only when
+    the values then differ from the ones its conversation started with;
   - a kept persona whose `credentials_file` path or `working_directory`
     changed is torn down, like a removed persona, then brought up fresh from
     its new entry, like an added one: its old instance is ended and its row
