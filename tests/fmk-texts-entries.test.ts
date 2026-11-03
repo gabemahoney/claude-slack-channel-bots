@@ -54,6 +54,7 @@ import ts from 'typescript'
 import * as adDescriptionPhrases from '../src/ad-description-phrases.ts'
 import * as adConfigFile from '../src/ad-config-file.ts'
 import * as adErrorClass from '../src/ad-error-class.ts'
+import * as agentDirectorTemplate from '../src/agent-director-template.ts'
 import * as adSettings from '../src/ad-settings.ts'
 import * as adVersionGate from '../src/ad-version-gate.ts'
 import * as backoff from '../src/backoff.ts'
@@ -96,6 +97,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'ad-description-phrases.ts': adDescriptionPhrases,
   'ad-config-file.ts': adConfigFile,
   'ad-error-class.ts': adErrorClass,
+  'agent-director-template.ts': agentDirectorTemplate,
   'ad-settings.ts': adSettings,
   'ad-version-gate.ts': adVersionGate,
   'backoff.ts': backoff,
