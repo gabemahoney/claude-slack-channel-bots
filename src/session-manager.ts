@@ -448,9 +448,11 @@ import {
   personaTmuxSessionName,
   renderPersonaRef,
   resolveClaudeConfigDir,
+  startValueLabels,
   tmuxExactSessionTarget,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
+import { buildStartAgentArgs } from './agent-director-template.ts'
 import {
   armPendingOnlyAfterLaunchFailure,
   armPendingOnlyForPendingRow,
@@ -6491,6 +6493,15 @@ function spawnHomeDir(): string {
  * session name, labels and env from the persona-identity functions, `cwd`
  * set to the persona's working directory.
  *
+ * Every plain and reuse spawn passes its own `agent_args`, which
+ * agent-director stores on the row in place of the template's: the shared
+ * start-argument builder (`buildStartAgentArgs`) over `config`, the
+ * configuration in effect since start, plus the persona's `model` and
+ * `effort` start options. The labels end with the persona's Start Labels
+ * (`startValueLabels`). Arguments and labels both come from the one
+ * `persona` given, so a launch's Start Labels record the values it started
+ * with. Neither the model nor the effort goes into `extra_env`.
+ *
  * `CLAUDE_CONFIG_DIR` carries the persona's effective claude_config_dir exactly
  * as configured and is absent when none is; the `config_dir` label is
  * `configDirLabel`, the hash of its real path from the launch's pre-launch
@@ -6511,10 +6522,10 @@ function spawnHomeDir(): string {
  * `replacePersonaRow`, and the live-row sequence's final launch) and the
  * launch after resume's no-transcript answer, sends
  * them with only `reuse_finished: true` added (one
- * derivation, so a reuse carries the same template, `cwd`, labels and
- * `extra_env` as any launch of the persona), and a resume restores the env
- * agent-director stored with the row at its spawn, so every launch of the
- * persona's Claude runs with it.
+ * derivation, so a reuse carries the same template, `cwd`, `agent_args`,
+ * labels and `extra_env` as any launch of the persona), and a resume
+ * restores the arguments and env agent-director stored with the row at its
+ * spawn, so every launch of the persona's Claude runs with them.
  *
  * The params never carry the reuse flag: only the
  * reuse launch adds it, so a first spawn of a key that is not retired is
@@ -6536,12 +6547,14 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
     instance_id: personaInstanceId(key),
     relay_mode: 'on',
     tmux_session_name: personaTmuxSessionName(key),
+    agent_args: buildStartAgentArgs(config, persona),
     label: [
       SERVICE_LABEL,
       'tag_prompt=1', // every plain and reuse spawn.
       REPLY_TOOL_PREALLOWED_LABEL,
       `${PERSONA_LABEL_PREFIX}${key}`,
       `${CONFIG_DIR_LABEL_PREFIX}${configDirLabel}`,
+      ...startValueLabels(persona),
     ],
     extra_env: personaSpawnEnv({
       key,

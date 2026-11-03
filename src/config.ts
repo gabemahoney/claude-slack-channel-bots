@@ -407,7 +407,7 @@ export interface ServerSettings {
   system_prompt_mode: string
   /**
    * Whether bots launch with `--system-prompt-snapshot off`.
-   * Defaults to true when absent; read by the template builder.
+   * Defaults to true when absent; read by the shared start-argument builder.
    */
   fresh_system_prompt: boolean
   /** Absolute path to SQLite archive DB. Undefined disables the feature. */

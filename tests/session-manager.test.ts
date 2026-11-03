@@ -83,6 +83,7 @@ import {
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
 import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { buildTemplateParams } from '../src/agent-director-template.ts'
 import {
   AgentDirectorError,
   ERR_STORE_OPEN_NAME,
@@ -1029,7 +1030,8 @@ describe('spawnForPersona: fresh spawn parameters', () => {
       DISABLE_AUTOUPDATER: '1',
       CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
     })
-    expect(params.agent_args).toBeUndefined()
+    // A plain spawn passes its own start arguments: the template's, for a persona with no start values.
+    expect(params.agent_args).toEqual(buildTemplateParams(cfg).agent_args)
   })
 
   test('no claude_config_dir configured → CLAUDE_CONFIG_DIR absent (not empty), label is that of <home>/.claude', async () => {
