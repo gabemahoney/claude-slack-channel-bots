@@ -116,6 +116,11 @@ export interface SharedPersona {
    * of current inventory and delivery choices. */
   installationReadiness?: Record<string, MembershipSetupRecord>
 }
+export interface SharedMembershipHistory {
+  readonly membershipEvents: Readonly<Record<string, Readonly<SharedMembershipEvent>>>
+  readonly membershipEvidence?: Readonly<Record<string, Readonly<MembershipEvidence>>>
+  readonly membershipAbsenceConflicts?: Readonly<Record<string, Readonly<SharedMembershipAbsenceConflict>>>
+}
 export interface RetiredSharedIdentity {
   key: string
   declaration: PersonaDeclaration
@@ -739,6 +744,9 @@ export interface SharedChannelAuthority {
    * restart. Never accepts an external snapshot or publishes staged choices. */
   stageRestoration(request: SharedRecoveryRequest, evidence: Uint8Array, prepared: Uint8Array): SharedMutationResult
   snapshot(): SharedChannelState
+  /** One persona's published membership history, uncloned. `read` must not
+   * mutate or retain the view, and returns only a primitive answer. */
+  inspectMembershipHistory<T extends boolean>(key: string, read: (history: SharedMembershipHistory | undefined) => T): T
   config(): PersonaConfig
   sourceBytes(): Buffer
   incarnation(key: string): string | undefined
@@ -1144,6 +1152,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       })
     },
     snapshot: () => clone(current),
+    inspectMembershipHistory: (key, read) => read(own(current.personas, key)),
     config: () => sharedAppliedConfig(current, path, deps),
     choice: (key, channel) => { const life = own(current.personas, key); return life ? own(life.assignments, channel)?.delivery : undefined },
     channels: key => { const life = own(current.personas, key); return life ? Object.keys(life.assignments).sort() : [] },

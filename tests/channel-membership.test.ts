@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync, mkdirSync, symlinkSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -16,6 +16,7 @@ import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import type { MembershipEvidence } from '../src/channel-membership-evidence.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
 import { membershipScanDiagnostic, MEMBERSHIP_INVENTORY_COMPLETE, MEMBERSHIP_INVENTORY_INCOMPLETE, type MembershipScanStatus } from '../src/channel-membership-scan.ts'
+import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 
 const runs: MembershipHarness[] = [], dirs: string[] = []
 function fixture(opts: Parameters<typeof makeMembershipHarness>[1] = {}, dir = mkdtempSync(join(tmpdir(), 'membership-'))) {
@@ -2094,4 +2095,114 @@ test('page-1 positives release held redeliveries while page 2 hangs and after it
     expect(reading(f, C.private).kind).toBe('unresolved')
     assertNoLeak(managed.logs)
   } finally { await managed.close() }
+})
+
+// t2.yiv.sf.d2: reload review reads membership twice for every reviewed channel.
+test('membership reads of SR8_SHARED_LIST_CHANNELS reviewed channels beside saved unresolved history clone no shared state', async () => {
+  const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS), ids = channels.map(c => c.id)
+  const f = fixture({ channels: [...channels, { id: C.primary, delivery: 'all' }] })
+  const pages = Math.ceil(ids.length / MEMBERSHIP_PAGE_LIMIT)
+  stub(f).script.inventory.push(...Array.from({ length: pages }, (_, i) =>
+    membershipPage(ids.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
+  await f.start(); await f.scan()
+  const timestamp = ((f.h.clock.now() + 1) / 1000).toFixed(3)
+  for (const member of [true, false]) await f.event(member, C.primary, { id: 'EvREVIEWCONFLICT', timestamp })
+  expect(Object.values(life(f).membershipEvidence!).map(e => e.state)).toEqual(['applied', 'conflict'])
+  const before = f.authority.snapshot()
+  const clones = spyOn(globalThis, 'structuredClone')
+  let answers: unknown[]
+  try {
+    answers = [...ids, C.primary].map(id => [reading(f, id).kind, reading(f, id).kind, f.membership.hasUnresolved('alpha', id)])
+    expect(clones).toHaveBeenCalledTimes(0)
+  } finally { clones.mockRestore() }
+  expect(answers).toEqual([...ids.map(() => ['eligible', 'eligible', false]), ['unresolved', 'unresolved', true]])
+  expect(f.authority.snapshot()).toEqual(before)
+})
+
+// The unresolved check reads saved and unsaved history in place; recovery
+// lists the same view from a merged copy. A valid readable channel without a
+// hold is unresolved exactly when recovery lists it.
+const AGREEMENT_CHANNELS: string[] = [C.primary, C.secondary, C.private]
+async function sameIdOn(f: MembershipHarness, first: string, second: string, id: string) {
+  const timestamp = ((f.h.clock.now() + 1) / 1000).toFixed(3)
+  await f.event(true, first, { id, timestamp })
+  await f.event(true, second, { id, timestamp })
+}
+test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[]]>([
+  ['saved contradiction, original through saved evidence', async f => { await sameIdOn(f, C.primary, C.secondary, 'EvSAVEDLINK'); return f }, [C.primary, C.secondary]],
+  ['saved contradiction, original only in saved events', async f => {
+    await f.event(true, C.primary, { id: 'EvFOUNDATION', timestamp: ((f.h.clock.now() + 1) / 1000).toFixed(3) })
+    const state = f.authority.snapshot(); delete state.personas.alpha!.membershipEvidence
+    await f.close(); writeSharedState(f.stateDir, state)
+    const reopened = fixture({ reopen: true, startTime: f.h.clock.now() + 1 }, f.stateDir); await reopened.start()
+    await reopened.event(true, C.secondary, { id: 'EvFOUNDATION', timestamp: ((reopened.h.clock.now() + 1) / 1000).toFixed(3) })
+    expect(life(reopened).membershipEvidence?.EvFOUNDATION).toBeUndefined()
+    return reopened
+  }, [C.primary, C.secondary]],
+  ['unsaved pending evidence only', async f => {
+    f.failWrites(() => true); await f.event(true, C.secondary)
+    expect(life(f).membershipEvidence).toBeUndefined()
+    return f
+  }, [C.secondary]],
+  ['unsaved pending evidence over its saved applied record', async f => {
+    f.unsyncWrites(() => true)
+    await f.event(true, C.secondary, { id: 'EvOVERRIDE' })
+    f.unsyncWrites(() => false); expect(f.authority.recoverDurability().kind).toBe('applied')
+    expect(life(f).membershipEvidence?.EvOVERRIDE?.state).toBe('applied')
+    return f
+  }, [C.secondary]],
+  ['unsaved contradiction, original through saved evidence', async f => {
+    await f.event(true, C.primary, { id: 'EvMIXEDLINK', timestamp: ((f.h.clock.now() + 1) / 1000).toFixed(3) })
+    expect(life(f).membershipEvidence?.EvMIXEDLINK?.state).toBe('applied')
+    f.failWrites(() => true)
+    await f.event(true, C.secondary, { id: 'EvMIXEDLINK', timestamp: life(f).membershipEvidence!.EvMIXEDLINK!.timestamp })
+    expect(Object.keys(life(f).membershipEvidence!)).toEqual(['EvMIXEDLINK'])
+    return f
+  }, [C.primary, C.secondary]],
+  ['unsaved contradiction, original through unsaved evidence', async f => {
+    f.failWrites(() => true); await sameIdOn(f, C.primary, C.secondary, 'EvUNSAVEDLINK')
+    expect(life(f).membershipEvidence).toBeUndefined()
+    return f
+  }, [C.primary, C.secondary]],
+  ['unsaved absence conflict', async f => {
+    const held = makeDeferredWebApiCall()
+    stub(f).script.inventory.push(membershipPage([C.primary])); await f.scan()
+    f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
+    await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
+    expect(f.assign(C.primary, 'off').kind).toBe('applied')
+    f.failWrites(() => true)
+    held.settle(membershipPage([])); await f.h.clock.flush()
+    expect(life(f).membershipAbsenceConflicts).toBeUndefined()
+    return f
+  }, [C.primary]],
+  ['saved absence conflict', async f => {
+    const held = makeDeferredWebApiCall()
+    stub(f).script.inventory.push(membershipPage([C.primary])); await f.scan()
+    f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
+    await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
+    expect(f.assign(C.primary, 'off').kind).toBe('applied')
+    held.settle(membershipPage([])); await f.h.clock.flush()
+    expect(life(f).membershipAbsenceConflicts?.[C.primary]).toBeDefined()
+    return f
+  }, [C.primary]],
+])('unresolved check agrees with recovery for %s', async (_case, arrange, expected) => {
+  const start = fixture(); await start.start()
+  const f = await arrange(start)
+  f.membership.invalidate('alpha')
+  const answers = () => {
+    expect(AGREEMENT_CHANNELS.map(channel => f.authority.readableFor('alpha', channel))).toEqual(AGREEMENT_CHANNELS.map(() => true))
+    const listed = f.membership.unresolvedChannels('alpha')
+    const checked = AGREEMENT_CHANNELS.filter(channel => f.membership.hasUnresolved('alpha', channel))
+    expect(checked).toEqual(AGREEMENT_CHANNELS.filter(channel => listed.includes(channel)))
+    return checked
+  }
+  const before = f.authority.snapshot()
+  expect(answers()).toEqual(expected)
+  expect(f.authority.snapshot()).toEqual(before)
+  // Answers come from the authority's own state, never a caller's copy.
+  const copy = f.authority.snapshot().personas.alpha!
+  copy.membershipEvents = {}; delete copy.membershipEvidence; delete copy.membershipAbsenceConflicts
+  expect(answers()).toEqual(expected)
+  expect([f.membership.hasUnresolved('gamma', C.primary), f.membership.unresolvedChannels('gamma')]).toEqual([false, []])
+  expect(f.authority.snapshot()).toEqual(before)
 })

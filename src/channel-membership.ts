@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { CHANNEL_ID_RE, type ChannelMode } from './config.ts'
 import type { PersonaEventProvenance, PersonaSocketEventPayload } from './persona-connections.ts'
 import { slackInstallationIdentity, slackInstallationKey, type SlackInstallationIdentity } from './persona-slack-validation.ts'
-import { applySharedMembership, type SharedChannelAuthority, type SharedMembership, type SharedMembershipAbsenceConflict, type SharedPersona, type SharedMutationResult } from './shared-channels.ts'
+import { applySharedMembership, type SharedChannelAuthority, type SharedMembership, type SharedMembershipAbsenceConflict, type SharedMembershipHistory, type SharedPersona, type SharedMutationResult } from './shared-channels.ts'
 import { compareMembershipEventTimes, compareMembershipTimestamp, membershipPayloadIdentity, membershipTimestampUpperBound, orderMembershipRecovery, MEMBERSHIP_EVENT_ID_RE, MEMBERSHIP_TIMESTAMP_RE, type MembershipEvidence, type MembershipEventPayload } from './channel-membership-evidence.ts'
 
 export const MEMBERSHIP_UNRESOLVED = 'channel-membership-unresolved'
@@ -96,10 +96,14 @@ function lifeOf(authority: SharedChannelAuthority, key: string): SharedPersona |
   const personas = authority.snapshot().personas
   return Object.hasOwn(personas, key) ? personas[key] : undefined
 }
+function unresolvedFor(e: Readonly<MembershipEvidence>, channel: string | undefined, life: SharedMembershipHistory,
+    evidence: (event: string) => Readonly<MembershipEvidence> | undefined): boolean {
+  return (e.state === 'pending' || e.state === 'conflict') && (channel === undefined || e.channel === channel ||
+    (e.originalEvent !== undefined && (evidence(e.originalEvent)?.channel ?? life.membershipEvents[e.originalEvent]?.channel) === channel))
+}
 function pending(life: SharedPersona | undefined, channel?: string): MembershipEvidence[] {
-  return Object.values(life?.membershipEvidence ?? {}).filter(e =>
-    (e.state === 'pending' || e.state === 'conflict') && (channel === undefined || e.channel === channel ||
-      (e.originalEvent !== undefined && (life?.membershipEvidence?.[e.originalEvent]?.channel ?? life?.membershipEvents[e.originalEvent]?.channel) === channel)))
+  if (!life) return []
+  return Object.values(life.membershipEvidence ?? {}).filter(e => unresolvedFor(e, channel, life, event => life.membershipEvidence?.[event]))
     .sort((a, b) => a.recordedOrder - b.recordedOrder)
 }
 function newerExplicitAssignment(life: SharedPersona, channel: string, observedRevision: number): boolean {
@@ -623,8 +627,20 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   function hasUnresolved(key: string, channel: string): boolean {
     if (!CHANNEL_ID_RE.test(channel)) return false
     if (!authority.readableFor(key, channel) || generations.get(key)?.holds.has(channel)) return true
-    const life = recoveryLife(key)
-    return !!life?.membershipAbsenceConflicts?.[channel] || pending(life, channel).length > 0
+    // The same durable-plus-unsaved view as recoveryLife, read without a
+    // clone: reload review reads every reviewed channel this way.
+    const unsaved = undurable.get(key)
+    const unsavedAbsences = undurableAbsences.get(key)
+    return authority.inspectMembershipHistory(key, life => {
+      if (!life) return false
+      if (unsavedAbsences?.has(channel) || life.membershipAbsenceConflicts?.[channel]) return true
+      const evidence = (event: string) => unsaved?.get(event) ?? life.membershipEvidence?.[event]
+      for (const e of unsaved?.values() ?? []) if (unresolvedFor(e, channel, life, evidence)) return true
+      for (const [event, e] of Object.entries(life.membershipEvidence ?? {})) {
+        if (!unsaved?.has(event) && unresolvedFor(e, channel, life, evidence)) return true
+      }
+      return false
+    })
   }
   function read(key: string, channel: string, mode: ChannelMode): MembershipReading {
     if (!CHANNEL_ID_RE.test(channel)) return { kind: 'ineligible', reason: 'invalid-channel' }
