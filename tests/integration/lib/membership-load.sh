@@ -53,6 +53,34 @@ snapshot() {
     [[ ! -f "${OUT}/during/${key}.queue.jsonl" ]] || prior+=("${OUT}/during/${key}.queue.jsonl")
     shared_queue_snapshot "${destination}" "${key}" "${prior[@]}" || fail 'queue snapshot failed'
 }
+regular_measurements() { [[ -f "${MEASUREMENTS}" && ! -L "${MEASUREMENTS}" ]]; }
+# The recorder creates its file only when it first flushes a record, and
+# startup writes none; a stream not yet written is the zero baseline. Any
+# other entry at the path is refused, never taken as an empty stream.
+measurement_mark() {
+    if [[ ! -e "${MEASUREMENTS}" && ! -L "${MEASUREMENTS}" ]]; then
+        printf '0\n'
+        return
+    fi
+    regular_measurements || fail 'test-only measurement path is not a regular file'
+    byte_mark "${MEASUREMENTS}"
+}
+# A read-only state directory refuses the recorder's first create, not its
+# appends. Before that window only, place the empty stream it appends to: it
+# holds no record, an existing file keeps its bytes, any other entry fails.
+prepare_measurements() {
+    python3 - "${MEASUREMENTS}" <<'PY' || fail 'test-only measurement file could not be prepared'
+import os,stat,sys
+try:
+    fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+except FileExistsError:
+    sys.exit(0 if stat.S_ISREG(os.lstat(sys.argv[1]).st_mode) else 1)
+else:
+    os.fchmod(fd,0o600)
+    os.close(fd)
+PY
+    regular_measurements || fail 'test-only measurement path is not a regular file'
+}
 repair_modes() {
     [[ ! -d "${SLACK_STATE_DIR}" ]] || chmod 700 "${SLACK_STATE_DIR}"
 }
@@ -297,7 +325,6 @@ run_membership_load() {
         START_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
         start_ready measured
         bun "${E}" seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${START_LOG}" "${CONFIG}"
-        wait_for_file "${MEASUREMENTS}" 30 'test-only measurement file missing'
         pending_posts
         # Prebuild outside both measured windows, after pending posts exist.
         # A held root must not predate its new-channel post's issue time: slow
@@ -319,7 +346,7 @@ run_membership_load() {
         for key in "${KEYS[@]}"; do read_jsonl "${OUT}/${key}.before.jsonl" shared_thread_joins "${key}"; done
         shared_persona_facts "${P}" "${CHANNELS[99]}" > "${OUT}/membership-before.jsonl"
         CASE_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
-        MEASURE_MARK="$(byte_mark "${MEASUREMENTS}")"
+        MEASURE_MARK="$(measurement_mark)" || exit 1
         CASE_MARK="$(slack_post_mark)"
         INCOMPLETE_BEFORE="$(count_log "$(matcher "${INCOMPLETE}" "persona=${P}:")")"
         RETRY_AFTER=0
@@ -369,6 +396,8 @@ run_membership_load() {
                 ;;
             undurable)
                 FAILED_CHANNEL="$(scenario_id C "${CASE}-undurable-join")"
+                # The held replies' post-hold records must still reach the file.
+                prepare_measurements
                 chmod 500 "${SLACK_STATE_DIR}"
                 PROBE_RC=0
                 python3 - "${SLACK_STATE_DIR}/write-probe" <<'PY' || PROBE_RC=$?
@@ -465,6 +494,8 @@ PY
         bun "${E}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
         stop_server --stop-bots
         for key in "${KEYS[@]}"; do snapshot "${key}" "${OUT}/${key}.queue.jsonl"; done
+        # Real traffic has stored and been drained by now: absence is a failure.
+        regular_measurements || fail 'test-only measurement file missing after measured traffic'
         cp "${MEASUREMENTS}" "${OUT}/measurements.jsonl"
         REOPEN_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
         start_ready
