@@ -113,7 +113,7 @@ membership_retry_ms="$(printed MEMBERSHIP_RETRY_MAX_MS)"
 recovery_bound_s="$(( (membership_attempt_ms + membership_retry_ms + 999) / 1000 + 30 ))"
 readiness_route="$(printed MEMBERSHIP_READINESS_ROUTE)"
 changed_class="$(printed THREAD_MEMORY_CHANGED_WHILE_STOPPED)"
-stale_class="$(printed RELOAD_STALE_CONFIRMATION)"
+superseded_line="$(printed reviewOutcomeLine superseded)"
 seal_name="$(printed THREAD_MEMORY_SEAL_FILE)"
 
 # --- Case preparation -------------------------------------------------------
@@ -721,15 +721,19 @@ request_assignment d-destination-off "${DB}/${DEST_B}/off"
 choice_is "${DB}" "${DEST_B}" off || fail 'operator off not applied'
 prompt "${DB}" 2 "${DEST_B}"
 set_choice "${DA}" "${CATCHUP}" all d-bot-before-strict
-# A bot write overlapping the restored channel edit makes its preview stale.
+# A bot write overlapping the restored channel edit changes its review's
+# dependency, so the review is durably superseded: production's outcome line
+# refuses that exact copied gesture and spends it, and no applied fact changes.
 configuration_request d-restored-channel-edit request "${DA}/${ADDED}/${ADDED_VALUE}" > /dev/null
 cp "${CONFIG}.pending" "${EVIDENCE}/d-restored-channel-edit.pending"
 set_choice "${DA}" "${ADDED}" all d-bot-overlaps-edit
 cp "${LAST}" "${EVIDENCE}/d-before-stale"
-stale_count="$(count_log "${stale_class}")"
+superseded_count="$(count_log "${superseded_line}")"
 cp "${EVIDENCE}/d-restored-channel-edit.pending" "${CONFIG}.apply"
-wait_for_count "${stale_class}" "$((stale_count + 1))" 30 'overlapped edit confirmation not refused'
-configuration_application_preserved "${CONFIG}" "${EVIDENCE}/d-before-stale" "${LAST}" > /dev/null
+wait_for_count "${superseded_line}" "$((superseded_count + 1))" 30 'overlapped edit confirmation not refused'
+[[ ! -e "${CONFIG}.apply" ]] || fail 'refused overlapped edit confirmation was not spent'
+configuration_application_preserved "${CONFIG}" "${EVIDENCE}/d-before-stale" "${LAST}" > /dev/null \
+    || fail 'stale confirmation changed applied facts'
 choice_is "${DA}" "${ADDED}" all || fail 'stale confirmation overwrote the bot write'
 configuration_request d-restored-channel-edit-refresh refresh > /dev/null
 cp "${CONFIG}.pending" "${EVIDENCE}/d-refreshed-channel-edit.pending"
