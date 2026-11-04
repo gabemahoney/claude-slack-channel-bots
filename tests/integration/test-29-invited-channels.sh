@@ -780,12 +780,16 @@ review_assign() {
     configuration_request "${step}" request "$@" > /dev/null
     confirm_review "${step}"
 }
+# A retained review that a later cancel, revision or dependency change replaced
+# is durably superseded: production's outcome line refuses that exact copied
+# gesture and spends it, and no applied fact changes.
 expect_stale_review() {
     local step="$1" old="$2" mark before
     mark="$(log_mark)"; before="${SCENARIO_ROOT}/${step}-authority"
     cp -- "${LAST}" "${before}"
     cp -- "${old}" "${APPLY}"
-    wait_since "${mark}" "[slack] $(printed RELOAD_STALE_CONFIRMATION):" "${APPLY_WAIT_S}" "${step}: stale preview was not refused"
+    wait_since "${mark}" "${SUPERSEDED_OUTCOME}" "${APPLY_WAIT_S}" "${step}: stale preview was not refused"
+    [[ ! -e "${APPLY}" ]] || fail "${step}: refused confirmation was not spent"
     configuration_application_preserved "${CONFIG}" "${before}" "${LAST}" > /dev/null \
         || fail "${step}: stale confirmation changed applied facts"
 }
@@ -1675,6 +1679,7 @@ DECLARATIVE="$(printed channelModeOf strict)"
 STORE_FILE="${SLACK_STATE_DIR}/$(printed CHANNEL_DELIVERY_FILE_NAME)"
 SET_TOOL="$(printed SET_CHANNEL_DELIVERY_TOOL)"
 APPLIED_CLASS="[slack] $(printed RELOAD_APPLIED):"
+SUPERSEDED_OUTCOME="$(printed reviewOutcomeLine superseded)"
 NO_CHOICE="$(printed NO_STORED_CHOICE)"
 SWITCH_ON_LINE="$(printed modeSwitchLine "${FUNGIBLE}" "${ALPHA}" "${BRAVO}")"
 SWITCH_OFF_LINE="$(printed modeSwitchLine "${DECLARATIVE}" "${ALPHA}" "${BRAVO}")"

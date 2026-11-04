@@ -471,12 +471,16 @@ done
 configuration_request pending-refresh refresh > /dev/null
 cp "${CONFIG}.pending" "${EVIDENCE}/refreshed-intent.pending"
 # Stale confirmation is checked by its production refusal and unchanged
-# applied projection, never inferred from a quiet interval.
+# applied projection, never inferred from a quiet interval. Later review
+# generations (membership changes, restarts, the refresh) durably superseded
+# the old review, so production's outcome line refuses that exact copied
+# gesture and spends it.
 cp "${LAST}" "${EVIDENCE}/before-stale"
-stale_class="$(printed RELOAD_STALE_CONFIRMATION)"
-stale_count="$(count_log "${stale_class}")"
+superseded_line="$(printed reviewOutcomeLine superseded)"
+superseded_count="$(count_log "${superseded_line}")"
 cp "${EVIDENCE}/old-intent.pending" "${CONFIG}.apply"
-wait_for_count "${stale_class}" "$((stale_count + 1))" 30 'old intent confirmation not refused'
+wait_for_count "${superseded_line}" "$((superseded_count + 1))" 30 'old intent confirmation not refused'
+[[ ! -e "${CONFIG}.apply" ]] || fail 'refused old intent confirmation was not spent'
 configuration_application_preserved "${CONFIG}" "${EVIDENCE}/before-stale" "${LAST}" > /dev/null
 # A fresh confirmation applies both retained edits, proving their survival
 # independently of the preview's existence after the bot/membership changes.
@@ -1641,11 +1645,12 @@ preserved="$(same_channel_facts p "${B}")"
 stop_server
 cp "${EVIDENCE}/stopped-confirmation.pending" "${CONFIG}.apply"
 slack_stub_inventory_fault "${LABEL[p]}" '' hang times=100000
-mark="$(slack_post_mark)"; before="$(count_log "${stale_class}")"
+mark="$(slack_post_mark)"; before="$(count_log "${superseded_line}")"
 start_server --live
 wait_membership_complete "${KEY[q]}"
 wait_until 30 'stopped confirmation case did not enter startup scan fault' has_record_after "${mark}" fault "label=${LABEL[p]}" method=users.conversations outcome=hang
-wait_for_count "${stale_class}" "$((before + 1))" 30 'stopped stale confirmation was not refused'
+wait_for_count "${superseded_line}" "$((before + 1))" 30 'stopped stale confirmation was not refused'
+[[ ! -e "${CONFIG}.apply" ]] || fail 'refused stopped confirmation was not spent'
 facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
 [[ "${facts_now}" == "${preserved}" ]] || fail 'stopped confirmation overwrote newer durable preference'
 ts="$(scenario_ts)"; text="$(scenario_text stopped-confirmation-held)"
