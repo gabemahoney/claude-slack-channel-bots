@@ -34,11 +34,12 @@ import {
   sr8Personas, SR8_POPULATIONS, SR8_ELIGIBLE_CHANNELS, SR8_POPULATION_CHANNEL_COUNT, SR8_SHARED_LIST_CHANNELS, SR8_BURST_JOINS, SEED_BATCH_JOINS,
 } from './test-helpers/thread-memory.ts'
 import { makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
-import { channelPopulation, makeSharedAuthority, membershipPage, readSharedState } from './test-helpers/shared-channels.ts'
+import { channelPopulation, makeSharedAuthority, membershipPage, readSharedState, FIXTURE_THREAD_HYBRID_SINCE_PREFIX } from './test-helpers/shared-channels.ts'
+import type { SharedChannelAuthority } from '../src/shared-channels.ts'
 import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
 import { makeDeferredWebApiCall, makeStubSlack } from './test-helpers/slack-stub.ts'
-import { MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
+import { MEMBERSHIP_PAGE_LIMIT, MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
@@ -2576,6 +2577,125 @@ describe('Thread Memory held-stamp retention', () => {
   })
 })
 
+/** Counts, per channel, each Channel Stamp field read through Thread Memory's
+ * injected stamp reader: judging a channel's joins reads its stamp per join. */
+function stampReads(authority: SharedChannelAuthority) {
+  const read = authority.channelStamp, counts = new Map<string, number>()
+  authority.channelStamp = (key, channel) => {
+    const stamp = read(key, channel)
+    return stamp && new Proxy(stamp, { get(target, name, receiver) {
+      counts.set(channel, (counts.get(channel) ?? 0) + 1); return Reflect.get(target, name, receiver)
+    } })
+  }
+  return { of: (channel: string) => counts.get(channel) ?? 0, total: () => [...counts.values()].reduce((a, b) => a + b, 0) }
+}
+
+describe('Thread Memory rejudges only channels whose stamp changed (t2.yiv.sf.aa)', () => {
+  test.each(['value', 'leave', 'reset'] as const)('membership-only publications rejudge no unchanged channel; a %s change still forgets at its publication', async cause => {
+    const h = membershipFixture({ channels: joinedChannels }); await h.start()
+    const many = Array.from({ length: 40 }, (_, i) => h.fact({ root: `1700000001.${String(i).padStart(6, '0')}` }))
+    const one = h.fact({ channel: C.secondary })
+    expect(await h.memory.saveJoins('alpha', [...many, one])).toEqual({ kind: 'saved' })
+    async function rescan() {
+      h.stub().script.inventory.push(membershipPage([C.primary, C.secondary]))
+      h.membership.scanner.request('alpha'); await h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
+      expect(h.membership.scanner.status('alpha').state).toBe('complete')
+    }
+    await rescan()
+    // Both channels are judged now; a mode switch and a rescan change neither stamp.
+    const reads = stampReads(h.authority)
+    expect(h.mode('strict').kind).toBe('applied')
+    await rescan()
+    expect(reads.of(C.primary)).toBeGreaterThan(0)
+    expect(reads.of(C.primary)).toBe(reads.of(C.secondary))
+    expect(h.memory.joins('alpha')).toHaveLength(many.length + 1)
+    if (cause === 'value') expect(h.choose('mentions').kind).toBe('applied')
+    if (cause === 'leave') await h.membership.event(false)
+    if (cause === 'reset') {
+      const changed = structuredClone(h.authority.snapshot().source) as unknown as Parameters<typeof h.apply>[0]
+      changed.personas![0]!.working_directory = join(h.stateDir, 'new-work')
+      expect(h.apply(changed).kind).toBe('applied')
+    }
+    expect(h.memory.joins('alpha').map(({ join }) => join)).toEqual(cause === 'reset' ? [] : [one])
+    if (cause === 'value') {
+      expect(h.choose('thread_hybrid').kind).toBe('applied')
+      expect(h.fact().stamp).not.toEqual(many[0]!.stamp)
+      expect(h.memory.joins('alpha').map(({ join }) => join)).toEqual([one])
+    }
+  })
+
+  test.each(['current', 'stale', 'held'] as const)('after a warm judgment an undecided stamp keeps every join until its %s decision is judged', async outcome => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary])).kind).toBe('applied')
+    await h.start()
+    const changing = h.fact(), unchanged = h.fact({ channel: C.secondary })
+    expect(await h.memory.saveJoins('alpha', [changing, unchanged])).toEqual({ kind: 'saved' })
+    if (outcome === 'held') held = [changing]
+    // Reassigning thread_hybrid keeps the stamp; this publication judges both channels.
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    h.failShared(() => 'unsynced')
+    expect((outcome === 'current' ? h.choose('thread_hybrid') : h.choose('mentions')).kind).toBe('unresolved')
+    expect(h.authority.channelStamp('alpha', C.primary)).toEqual({ kind: 'undecided' })
+    expect(h.memory.joins('alpha')).toHaveLength(2)
+    h.failShared(); expect(h.authority.recoverDurability().kind).toBe('applied')
+    expect(h.memory.joins('alpha').map(({ join }) => join.channel)).toEqual(outcome === 'current' ? [C.primary, C.secondary] : [C.secondary])
+    expect(h.memory.joinedBy('alpha', changing.channel, changing.root, changing.stamp, changing.at)).toBe(outcome !== 'stale')
+    expect(h.memory.joinedBy('alpha', unchanged.channel, unchanged.root, unchanged.stamp, unchanged.at)).toBe(true)
+  })
+
+  test('an identity reset that declares thread_hybrid anew forgets the old life\'s joins at its publication', async () => {
+    const h = fixture()
+    expect(h.apply(threadConfig(h.stateDir, 'mentions')).kind).toBe('applied')
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    await h.start()
+    const fact = h.fact(); expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'saved' })
+    // Same-value reassignment: this publication judges the channel under its current stamp.
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    expect(h.memory.joins('alpha')).toHaveLength(1)
+    // One reviewed apply: a new life (working directory) whose changed delivery mints a new Since.
+    const changed = threadConfig(h.stateDir)
+    changed.personas![0]!.working_directory = join(h.stateDir, 'new-work')
+    expect(h.apply(changed).kind).toBe('applied')
+    const stamp = h.authority.channelStamp('alpha', C.primary)
+    expect(stamp?.kind).toBe('decided')
+    expect(stamp?.kind === 'decided' ? typeof stamp.threadHybridSince : undefined).toBe('string')
+    expect(stamp?.kind === 'decided' ? [stamp.incarnation, stamp.threadHybridSince] : undefined).not.toEqual([fact.stamp.incarnation, fact.stamp.threadHybridSince])
+    expect(h.memory.joins('alpha')).toEqual([])
+  })
+
+  test('a read retry rebuilds the judgment: a stale saved join read after a warm publication is forgotten', async () => {
+    const h = fixture(), current = h.fact({ root: R.secondary })
+    const stale = { ...h.fact(), stamp: { ...current.stamp, threadHybridSince: `${FIXTURE_THREAD_HYBRID_SINCE_PREFIX}0` } }
+    seedReadable(h, [stale])
+    h.io.fail('readFileSync'); await h.start()
+    expect(h.memory.addJoin('alpha', current)).toBe(true)
+    // Judges the kept join under the current stamp before the journal is read.
+    expect(h.choose('thread_hybrid').kind).toBe('applied')
+    h.io.heal(); expect(await h.memory.retryRead('alpha')).toBe('read')
+    expect(h.memory.joins('alpha').map(({ join }) => join.root)).toEqual([current.root])
+    expect(view(h)).toBe('not-joined')
+  })
+
+  test('a page-1 positive settles a membership-deferred own-post join on its own publication while page 2 hangs, and it stays joined after page 2 fails', async () => {
+    const h = await ownPostFixture({ membership: { channels: joinedChannels } })
+    const post = beginPost(h); await post.ready
+    const operation = h.memory.unresolvedIntents('alpha', C.primary)[0]!.operationId, second = makeDeferredWebApiCall()
+    h.members.h.stub(h.members.h.p('alpha')).script.inventory.push(membershipPage([C.primary, C.secondary], 'next'), second.outcome)
+    h.members.scanner.connectionChanged('alpha')
+    await confirmPost(h, post)
+    expect(h.owner.operation('alpha', operation)).toMatchObject({ state: 'deferred' })
+    // From here only the scan runs: no intake, settlement call or other traffic.
+    await h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
+    expect(h.members.scanner.status('alpha')).toMatchObject({ state: 'scanning', pages: 1 })
+    expect(h.memory.view('alpha', C.primary, R.primary)).toBe('joined')
+    second.settle({ kind: 'platform', error: 'internal_error' }); await h.flush()
+    expect(h.members.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'transport' })
+    expect(h.memory.view('alpha', C.primary, R.primary)).toBe('joined')
+    expect(h.records().filter(r => r.kind === 'post-outcome')).toMatchObject([{ operationId: operation, outcome: 'joined' }])
+  })
+})
+
 describe('Thread Memory seal judgments and closed metadata', () => {
   test.each(['running-own-posts', 'own-post-channel', 'own-post-root', 'duplicate-own-post', 'own-post-extra-key'] as const)(
     'own-post seal rejects %s damage as no entries and rewrites valid running metadata', async damage => {
@@ -3954,6 +4074,28 @@ describe('SR-8 Joined Thread populations (t1.k49.39 SR-8.1, SR-8.3, SR-2.4.4)', 
     await h.close()
     const next = reopen(dir); await next.start()
     expectPopulation(next.memory, 'alpha', hundredThousand + SR8_BURST_JOINS)
+  })
+
+  test('at 100,000 joins, both personas scanning every listed channel in MEMBERSHIP_PAGE_LIMIT pages write once per page plus the commit and read fewer stamps than one judgment of the population', async () => {
+    const dir = populationDir(), from = seeded.get(hundredThousand)!
+    cpSync(from, dir, { recursive: true, filter: path => path !== threadPath(from, 'beta') })
+    // The integration population's listed channels: the eligible ones and the shared list.
+    const listed = [...eligible, ...populationChannels(SR8_SHARED_LIST_CHANNELS, SR8_POPULATION_CHANNEL_COUNT).map(c => c.id)]
+    const pages = Math.ceil(listed.length / MEMBERSHIP_PAGE_LIMIT)
+    const h = makeThreadMembershipHarness(dir, { reopen: true, names: [...keys] })
+    closes.push(() => h.close())
+    // The store's start, without the harness's one-page inventory.
+    h.memory.readAtStart(); await h.memory.activate()
+    for (const key of keys) h.stub(key).script.inventory.push(...Array.from({ length: pages }, (_, i) =>
+      membershipPage(listed.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
+    await h.membership.start()
+    const writes = h.membership.writes.length, reads = stampReads(h.authority)
+    await h.membership.scan()
+    for (const key of keys) expect(h.membership.scanner.status(key)).toMatchObject({ state: 'complete', pages, positives: listed.length })
+    expect(h.membership.writes.length - writes).toBe(keys.length * (pages + 1))
+    // Judging the population reads its stamp once per join.
+    expect(reads.total()).toBeLessThan(hundredThousand)
+    expectPopulation(h.memory, 'alpha', hundredThousand)
   })
 
   describe('seeding while stopped and the seal check (Decisions 14 and 21)', () => {

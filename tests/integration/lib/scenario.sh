@@ -335,6 +335,10 @@
 #   slack_stub_inventory_page <label> <cursor> <next-cursor> [channel/flags...]
 #                                       flags: public|private, local|external, member|nonmember|omit;
 #                                       e.g. C…/private/local/omit; no channels is an empty page
+#   slack_stub_inventory_pages <label> <cursor> <next-cursor> <page-size> [channel/flags...]
+#                                       the same channels as chained raw pages of at most <page-size>:
+#                                       the first at <cursor>, the last naming <next-cursor>; pass the
+#                                       production MEMBERSHIP_PAGE_LIMIT (fmk-texts) to page as Slack does
 #   slack_stub_inventory_clear <label>  remove all custom pages (then add desired pages)
 #   slack_stub_fault <label> <method> <outcome> [key=value...]
 #                                       keys cursor/channel/user/thread_ts/error (strings), after/times/
@@ -6748,6 +6752,27 @@ slack_stub_inventory_page() {
     # limit, so jq reads it from a file descriptor, not --argjson.
     _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages[$c])=$page[0] else error("unknown label") end' \
         --arg l "${label}" --arg c "${cursor}" --slurpfile page <(printf '%s\n' "${body}")
+}
+slack_stub_inventory_pages() {
+    require_ci_image slack_stub_inventory_pages
+    local label="$1" cursor="$2" final="$3" limit="$4" key next part=1 pages='{}' body
+    shift 4
+    [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fail 'inventory page size must be a positive integer'
+    key="${cursor}"
+    while :; do
+        next="${final}"
+        (( $# <= limit )) || next="${cursor:-first}-page-$((part + 1))"
+        body="$(slack_stub_inventory_body "${next}" "${@:1:limit}")" || fail 'invalid inventory page'
+        pages="$(jq -c --arg k "${key}" --slurpfile page <(printf '%s\n' "${body}") '.[$k]=$page[0]' <<< "${pages}")" \
+            || fail 'cannot collect inventory pages'
+        (( $# > limit )) || break
+        shift "${limit}"
+        part=$((part + 1))
+        key="${next}"
+    done
+    # One control replacement installs the whole chain.
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages) += $pages[0] else error("unknown label") end' \
+        --arg l "${label}" --slurpfile pages <(printf '%s\n' "${pages}")
 }
 slack_stub_inventory_clear() {
     require_ci_image slack_stub_inventory_clear

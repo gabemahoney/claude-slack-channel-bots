@@ -87,9 +87,11 @@ export CSCB_SLACK_API_URL
 [[ "${CSCB_SLACK_API_URL}" =~ ^http://127\.0\.0\.1:[0-9]+/api/$ ]] || fail 'Slack stub URL is not loopback'
 SCENARIO_SLACK_STUB_URL="${CSCB_SLACK_API_URL%/api/}"
 slack_stub_controls "${CONTROL}"
+# Inventories page as CSCB asks Slack to, never as one oversized page.
+PAGE_LIMIT="$(printed MEMBERSHIP_PAGE_LIMIT)"
 for key in "${KEYS[@]}"; do
     BOT[${key}]="$(slack_stub_identity "${key}" user_id)"
-    slack_stub_inventory_page "${key}" '' '' "${CHANNELS[@]}"
+    slack_stub_inventory_pages "${key}" '' '' "${PAGE_LIMIT}" "${CHANNELS[@]}"
 done
 
 start_ready() {
@@ -356,7 +358,7 @@ case "${CASE}" in
         mentions_channel="$(jq -er '[.personas[0].channels[]|select(.delivery=="mentions")][0].id' "${CONFIG}")"
         delivery="$(shared_channel_saved "${KEYS[0]}" "${mentions_channel}")"
         for key in "${KEYS[@]}"; do
-            slack_stub_inventory_page "${key}" '' '' "${CHANNELS[@]}" "${growth}"
+            slack_stub_inventory_pages "${key}" '' '' "${PAGE_LIMIT}" "${CHANNELS[@]}" "${growth}"
             # shellcheck disable=SC2119 # scenario_ts explicitly rejects every argument.
             envelope="$(slack_push_member_joined "${key}" "${growth}" "$(scenario_ts)")"
             slack_wait_one_ack "${envelope}"

@@ -127,8 +127,13 @@
  * filter the range. Opaque cursors retain a snapshot and are bound to the
  * label, method, channel and requested parent; an invalid cursor is refused.
  * No history control/lost post: the original empty history/replies answer.
+ * users.conversations answers from `memberships` as Slack pages: at most a
+ * positive requested `limit` of channels per page (CSCB requests
+ * MEMBERSHIP_PAGE_LIMIT), chained by the stub's own `stubmembers-<offset>`
+ * cursors; with no limit, every membership in one page.
  * `inventory_pages` still accepts raw cursor-keyed pages, including short or
- * empty nonterminal pages and channels without is_member. To attempt a
+ * empty nonterminal pages and channels without is_member; a raw page for the
+ * requested cursor wins, whatever its length. To attempt a
  * contradictory users.conversations page after an abandoned scan, use `late`
  * with `body` and delay_ms past the replacement scan; `delay` still aborts on
  * disconnect. Read faults work on any page.
@@ -491,6 +496,15 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function positiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0
+}
+
+/** The stub's own `memberships` cursors: the offset of the next page's first channel. */
+const MEMBERSHIP_CURSOR_PREFIX = 'stubmembers-'
+/** Where a `memberships` page starts: 0 for the first page, undefined for a cursor the stub never issued. */
+function membershipOffset(cursor: string | undefined): number | undefined {
+  if (!cursor) return 0
+  const offset = cursor.startsWith(MEMBERSHIP_CURSOR_PREFIX) ? Number(cursor.slice(MEMBERSHIP_CURSOR_PREFIX.length)) : NaN
+  return positiveInteger(offset) && `${MEMBERSHIP_CURSOR_PREFIX}${offset}` === cursor ? offset : undefined
 }
 
 function parseFault(value: unknown): StubFault {
@@ -1310,10 +1324,13 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         if (method === 'users.conversations') {
           const page = answers.inventory_pages?.[args.cursor ?? '']
           if (page) return structuredClone(page)
-          if (args.cursor) return { ok: false, error: 'invalid_cursor' }
-          return { ok: true, channels: (answers.memberships ?? []).map(id => ({
+          const start = membershipOffset(args.cursor)
+          if (start === undefined) return { ok: false, error: 'invalid_cursor' }
+          const memberships = answers.memberships ?? [], limit = Number(args.limit)
+          const end = positiveInteger(limit) ? start + limit : memberships.length
+          return { ok: true, channels: memberships.slice(start, end).map(id => ({
             id, is_channel: id.startsWith('C'), is_group: id.startsWith('G'), is_im: false, is_mpim: false, is_ext_shared: false,
-          })), response_metadata: { next_cursor: '' } }
+          })), response_metadata: { next_cursor: end < memberships.length ? `${MEMBERSHIP_CURSOR_PREFIX}${end}` : '' } }
         }
         if (historyEnabled && (method === 'conversations.history' || method === 'conversations.replies')) return historyBody(label, method, args)
         return okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`, control)
@@ -1366,7 +1383,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       }
       if (method === 'users.conversations') {
         const body = normalBody()
-        return answer(args.cursor && !answers.inventory_pages?.[args.cursor] ? 'invalid_cursor' : 'ok', body)
+        return answer(body.ok === false ? String(body.error) : 'ok', body)
       }
       const body = normalBody()
       if (method === 'chat.postMessage') rememberPost(label, answers, token!, args, body)

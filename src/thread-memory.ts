@@ -402,6 +402,10 @@ interface MemoryJournal extends AppendRollback {
   creationHeader?: ThreadMemoryHeader; sealSaved?: boolean
   missing?: boolean
   joinedByChannel: JoinIndex
+  /** Per channel, the stamp key every `joinedByChannel` entry matched at its
+   * last judgement. Absent until judged, and dropped when a join under
+   * another stamp is retained, so an unchanged stamp needs no rejudgement. */
+  judged: Map<string, string>
   heldJoins: JoinIndex
   kept: ThreadJoin[]; intents: Map<string, KeptIntent>; savedIntents: Map<string, ThreadPostIntent>
   intentsByChannel: Map<string, Map<string, KeptIntent>>
@@ -411,7 +415,7 @@ interface MemoryJournal extends AppendRollback {
 }
 function emptyMemoryJournal(): MemoryJournal {
   return { readable: true, exists: false, hasRecords: false, live: false, created: false, failed: false, highWater: 0,
-    joinedByChannel: new Map(), heldJoins: new Map(), kept: [], intents: new Map(), savedIntents: new Map(),
+    joinedByChannel: new Map(), judged: new Map(), heldJoins: new Map(), kept: [], intents: new Map(), savedIntents: new Map(),
     intentsByChannel: new Map(), writes: [], ownJoins: new Map(), quarantined: [], quarantineRollback: {} }
 }
 
@@ -470,6 +474,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     return j.joinedByChannel.get(fact.channel)?.get(fact.root)?.get(stampKey(fact.stamp)) ?? j.heldJoins.get(fact.channel)?.get(fact.root)?.get(stampKey(fact.stamp))
   }
   function retain(j: MemoryJournal, fact: ThreadJoin, saved?: ThreadJoinRecord, index = j.joinedByChannel): void {
+    if (index === j.joinedByChannel && j.judged.get(fact.channel) !== stampKey(fact.stamp)) j.judged.delete(fact.channel)
     let roots = index.get(fact.channel)
     if (!roots) { roots = new Map(); index.set(fact.channel, roots) }
     let stamps = roots.get(fact.root)
@@ -509,6 +514,10 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     for (const [channel, roots] of j.joinedByChannel) {
       const stamp = readStamp(channel)
       if (stamp?.kind === 'undecided') continue
+      // Every remaining join already matched this stamp: nothing to forget.
+      const current = stamp?.kind === 'decided' && stamp.threadHybridSince !== undefined
+        ? stampKey({ incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }) : undefined
+      if (current !== undefined && j.judged.get(channel) === current) continue
       for (const [root, entries] of roots) {
         for (const [id, value] of entries) if (!memoryStampMatches(value.join.stamp, stamp)) {
           if (named(key, channel, value.join.stamp)) retain(j, value.join, value.saved, j.heldJoins)
@@ -517,6 +526,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         if (!entries.size) roots.delete(root)
       }
       if (!roots.size) j.joinedByChannel.delete(channel)
+      if (roots.size && current !== undefined) j.judged.set(channel, current)
+      else j.judged.delete(channel)
     }
     j.kept = j.kept.filter(fact => readStamp(fact.channel)?.kind === 'undecided' || memoryStampMatches(fact.stamp, readStamp(fact.channel)) || named(key, fact.channel, fact.stamp))
   }
@@ -622,6 +633,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       // read and before a shared authority is available. Replay later judges
       // these stamps; no pre-activation join can select intake.
       j.joinedByChannel.clear()
+      j.judged.clear()
       j.heldJoins.clear()
       for (const fact of j.kept) retain(j, fact)
       for (const record of records) if (record.kind === 'join') retain(j, record, record)

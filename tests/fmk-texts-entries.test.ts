@@ -986,7 +986,7 @@ describe('shared scenario printer evidence contracts', () => {
     }
     let checks = 0
     async function check(name: string, fn: () => unknown) { try { await fn(); checks++ } catch (error) { throw new Error(name, { cause: error }) } }
-    for (const name of ['MEMBERSHIP_REQUEST_TIMEOUT_MS', 'MEMBERSHIP_ATTEMPT_TIMEOUT_MS', 'MEMBERSHIP_RETRY_MIN_MS', 'MEMBERSHIP_RETRY_MAX_MS']) {
+    for (const name of ['MEMBERSHIP_REQUEST_TIMEOUT_MS', 'MEMBERSHIP_ATTEMPT_TIMEOUT_MS', 'MEMBERSHIP_RETRY_MIN_MS', 'MEMBERSHIP_RETRY_MAX_MS', 'MEMBERSHIP_PAGE_LIMIT']) {
       await check('constant is the production export: ' + name, async () => {
         assert.equal(await print(name, []), String(timing[name]))
         const fake = { importPackageModule: async (module: string) => { assert.equal(module, 'channel-membership-retry.ts'); return { [name]: 12345 } } }

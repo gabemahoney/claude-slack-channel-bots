@@ -26,7 +26,8 @@ import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delive
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-reports.ts'
 import { THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
-import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS, membershipRetryDelay } from '../src/channel-membership-retry.ts'
+import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT, membershipRetryDelay } from '../src/channel-membership-retry.ts'
+import { startSlackStub, type StubAnswers } from './integration/fixtures/slack-stub-server.ts'
 import { MEMBERSHIP_INVENTORY_INCOMPLETE, MEMBERSHIP_INVENTORY_COMPLETE, membershipScanDiagnostic } from '../src/channel-membership-scan.ts'
 import { MEMBERSHIP_STORAGE_FAILED, membershipDiagnostic } from '../src/channel-membership.ts'
 import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED } from './test-helpers/thread-memory.ts'
@@ -1063,6 +1064,59 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       config: JSON.stringify({ personas: [key, 'beta'].map(name => ({ name, channels: [] })) }) })
     expect(child.status).toBe(1); expect(child.stdout).toContain('reports=1 loaded=0 limit=0 verdict=fail')
   })
+})
+
+test('SR-8 inventories page at the requested MEMBERSHIP_PAGE_LIMIT: stub memberships and the scripts\' raw page chains, traversed as CSCB requests them', async () => {
+  const channels = Array.from({ length: 2 * MEMBERSHIP_PAGE_LIMIT + 3 }, (_, i) => `C0PAGE${String(i).padStart(5, '0')}`)
+  // The actual helper builds each chain; the control patch only prints its pages.
+  const built = shell([
+    'require_ci_image() { :; }', declaration(scenario, 'slack_stub_inventory_body'), declaration(scenario, 'slack_stub_inventory_pages'),
+    `_scenario_stub_control_patch() { shift; jq -cn "$@" '$pages[0]'; }`,
+    `slack_stub_inventory_pages normal '' '' ${MEMBERSHIP_PAGE_LIMIT} ${channels.join(' ')}`,
+    // test-45's later-page case: one current positive first, the rest paged.
+    `slack_stub_inventory_body later ${channels[0]}`,
+    `slack_stub_inventory_pages later later '' ${MEMBERSHIP_PAGE_LIMIT} ${channels.slice(1).join(' ')}`,
+    `slack_stub_inventory_pages short '' after ${MEMBERSHIP_PAGE_LIMIT}`,
+  ].join('\n'))
+  expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+  const [normal, first, later, short] = built.stdout.trim().split('\n').map(line => JSON.parse(line))
+  expect(Object.keys(normal)).toEqual(['', 'first-page-2', 'first-page-3'])
+  expect(Object.keys(later)).toEqual(['later', 'later-page-2', 'later-page-3'])
+  expect(short).toEqual({ '': { ok: true, channels: [], response_metadata: { next_cursor: 'after' } } })
+  mkdirSync('/tmp/c9', { recursive: true })
+  const root = mkdtempSync('/tmp/c9/sr8-inventory-pages-'), recordPath = join(root, 'record.jsonl')
+  const rule = (label: string, answers: StubAnswers) => ({ suffix: label, label, auth: 'ok', connections: 'ok', ...answers })
+  const stub = startSlackStub({ recordPath, control: { tokens: [rule('members', { memberships: channels }),
+    rule('normal', { inventory_pages: normal }), rule('later', { inventory_pages: { '': first, ...later } })] } })
+  const captured: unknown[] = []
+  async function request(label: string, args: Record<string, string>) {
+    const page = await fetch(`${stub.apiUrl}users.conversations`, { method: 'POST', body: new URLSearchParams(args),
+      headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, label)}`, 'Content-Type': 'application/x-www-form-urlencoded' } }).then(r => r.json())
+    captured.push(page)
+    return page
+  }
+  async function traverse(label: string) {
+    const sizes: number[] = [], seen: string[] = []
+    let cursor = ''
+    do {
+      const page = await request(label, { types: 'public_channel,private_channel', limit: String(MEMBERSHIP_PAGE_LIMIT), ...(cursor ? { cursor } : {}) })
+      expect(page.ok).toBe(true)
+      sizes.push(page.channels.length); seen.push(...page.channels.map((c: { id: string }) => c.id))
+      cursor = page.response_metadata.next_cursor
+    } while (cursor)
+    return { sizes, seen }
+  }
+  try {
+    for (const label of ['members', 'normal']) {
+      expect(await traverse(label)).toEqual({ sizes: [MEMBERSHIP_PAGE_LIMIT, MEMBERSHIP_PAGE_LIMIT, 3], seen: channels })
+    }
+    expect(await traverse('later')).toEqual({ sizes: [1, MEMBERSHIP_PAGE_LIMIT, MEMBERSHIP_PAGE_LIMIT, 2], seen: channels })
+    // Unlimited requests keep one page; a cursor the stub never issued is refused.
+    const all = await request('members', {})
+    expect([all.channels.length, all.response_metadata.next_cursor]).toEqual([channels.length, ''])
+    for (const cursor of ['stubmembers-0', 'stubmembers-01', 'unknown']) expect(await request('members', { cursor, limit: '1' })).toEqual({ ok: false, error: 'invalid_cursor' })
+  } finally { await stub.stop() }
+  try { assertNoLeak({ captured, record: readFileSync(recordPath, 'utf8') }) } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () => {

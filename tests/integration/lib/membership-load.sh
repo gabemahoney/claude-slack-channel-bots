@@ -220,6 +220,8 @@ run_membership_load() {
     ATTEMPT_MS="$(printed MEMBERSHIP_ATTEMPT_TIMEOUT_MS)"
     RETRY_MAX_MS="$(printed MEMBERSHIP_RETRY_MAX_MS)"
     NAME_MS="$(printed NAME_LOOKUP_TIMEOUT_MS)"
+    # Inventories page as CSCB asks Slack to, never as one oversized page.
+    PAGE_LIMIT="$(printed MEMBERSHIP_PAGE_LIMIT)"
     MEASUREMENT_NAME="$(printed TEST_MEASUREMENTS_FILE_NAME)"
     INCOMPLETE="$(printed MEMBERSHIP_INVENTORY_INCOMPLETE)"
     READINESS_ROUTE="$(printed MEMBERSHIP_READINESS_ROUTE)"
@@ -284,7 +286,7 @@ run_membership_load() {
         [[ "${CSCB_SLACK_API_URL}" =~ ^http://127\.0\.0\.1:[0-9]+/api/$ ]] || fail 'non-loopback Slack stub'
         SCENARIO_SLACK_STUB_URL="${CSCB_SLACK_API_URL%/api/}"
         slack_stub_controls "${CONTROL}"
-        for key in "${KEYS[@]}"; do slack_stub_inventory_page "${key}" '' '' "${CHANNELS[@]}"; done
+        for key in "${KEYS[@]}"; do slack_stub_inventory_pages "${key}" '' '' "${PAGE_LIMIT}" "${CHANNELS[@]}"; done
 
         # Decision 24: seed before ANY server start, then seal exactly once.
         MEASUREMENTS="${SLACK_STATE_DIR}/${MEASUREMENT_NAME}"
@@ -324,8 +326,9 @@ run_membership_load() {
         cursor=''
         if [[ "${PAGE}" == later ]]; then
             cursor=later
+            # Deliberately one current positive on the first page; the rest page normally.
             slack_stub_inventory_page "${P}" '' later "${HOLD_CHANNEL}"
-            slack_stub_inventory_page "${P}" later '' "${CHANNELS[@]:1}"
+            slack_stub_inventory_pages "${P}" later '' "${PAGE_LIMIT}" "${CHANNELS[@]:1}"
         fi
 
         case "${KIND}" in
@@ -423,7 +426,7 @@ PY
             repair_modes
             slack_wait_one_ack "$(slack_stub_redeliver "${P}" "${FAILED_ENV}")"
             # Include the new positive in subsequent reconciliation, preserving it.
-            slack_stub_inventory_page "${P}" '' '' "${CHANNELS[@]}" "${FAILED_CHANNEL}"
+            slack_stub_inventory_pages "${P}" '' '' "${PAGE_LIMIT}" "${CHANNELS[@]}" "${FAILED_CHANNEL}"
         fi
         CLEAR_MARK="$(slack_post_mark)"
         CLEAR_EPOCH="$(epoch_ms)"

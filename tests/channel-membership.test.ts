@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, mkdirSync, symlinkSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes } from './test-helpers/shared-channels.ts'
+import { makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes, channelPopulation } from './test-helpers/shared-channels.ts'
 import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage, makeDm } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MIN_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
@@ -1936,6 +1936,162 @@ test.each(['strict', 'open'] as const)('%s affected uncertain choice holds socke
     expect(stub(f).socket.acks).toHaveLength(3)
     expectRetainedQueues()
     expect(f.authority.choice('alpha', C.primary)).toBe('off')
+    assertNoLeak(managed.logs)
+  } finally { await managed.close() }
+})
+
+// t2.yiv.sf.aa: a scan applies each page's positives in one durable write.
+const inbound = (channel: string, n: number) => makeChannelMessage({ channel, text: `page work ${n}`, ts: `1700000004.00000${n}` })
+const accepted = (managed: ReturnType<typeof makeManagedRouting>, key: string) => managed.queued(key).map(({ accepted: { text, channel } }) => ({ text, channel }))
+function routed(f: MembershipHarness) {
+  const choices = createChannelDeliveryStore(f.authority)
+  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, getChannelDelivery: () => choices })
+  f.h.onEvent = createPersonaEventRouter({ membership: f.membership, routing: managed.routing, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => managed.logs.push(line) })
+  return managed
+}
+
+test.each(['positives', 'mid-page recovery'] as const)('a page of %s is durably ordered exactly as one-channel pages, in one write per page', async kind => {
+  // In the recovery case C.primary's unprovable overlap is reconciled between the other two positives.
+  const ids = kind === 'positives' ? [C.primary, C.secondary, C.private] : [C.private, C.primary, C.secondary]
+  async function scanned(pages: string[][]) {
+    const f = fixture()
+    stub(f).script.inventory.push(...pages.map((page, i) => membershipPage(page, i + 1 < pages.length ? `page-${i + 1}` : undefined)))
+    await f.start()
+    if (kind === 'mid-page recovery') {
+      const timestamp = (f.h.clock.now() / 1000).toFixed(3)
+      await f.event(true, C.primary, { id: 'EvOVERLAPJOIN', timestamp })
+      f.assign(C.primary, 'off')
+      await f.event(false, C.primary, { id: 'EvOVERLAPLEAVE', timestamp })
+      expect(reading(f).kind).toBe('unresolved')
+    }
+    const before = f.writes.length
+    await f.scan()
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'complete', pages: pages.length, positives: ids.length })
+    expect(ids.map(id => reading(f, id).kind)).toEqual(ids.map(() => 'eligible'))
+    // Scan and connection IDs are random, and declarations name each fixture's
+    // directory; every other record and order must match.
+    const { declaration: _declaration, ...rest } = life(f)
+    const scanId = Object.keys(rest.membershipEvents).find(id => id.startsWith('scan:'))!.split(':')[1]!
+    const text = JSON.stringify(rest).replaceAll(scanId, 'scan').replaceAll(f.h.manager.provenance('alpha')!.connectionId, 'connection')
+    return { writes: f.writes.length - before, revision: f.authority.revision, life: JSON.parse(text) as typeof rest }
+  }
+  const batched = await scanned([ids]), single = await scanned(ids.map(id => [id]))
+  expect({ ...batched, writes: undefined }).toEqual({ ...single, writes: undefined })
+  if (kind === 'positives') {
+    // One write for the page, then the inventory commit.
+    expect([batched.writes, single.writes]).toEqual([2, ids.length + 1])
+    const events = ids.map(id => batched.life.membershipEvents[`scan:scan:${id}`]!)
+    expect(events.map(e => e.order)).toEqual(events.map((_, i) => events[0]!.order + i))
+    expect(ids.map(id => batched.life.membership[id]!.boundary)).toEqual(events.map(e => e.order))
+  }
+})
+
+const PAGE_FAILURES = {
+  // A refused batch writes nothing; the singles then stop at the refusal.
+  refused: { writes: 3, durable: [C.primary], eligible: [C.primary], status: { state: 'incomplete', problem: 'storage' } },
+  // A channel listed again with other metadata: the earlier positives apply, then its own is withdrawn.
+  duplicate: { writes: 1, durable: [C.primary, C.secondary], eligible: [C.primary], status: { state: 'incomplete', problem: 'malformed-page' } },
+  deadline: { writes: 0, durable: [], eligible: [], status: { state: 'incomplete', problem: 'deadline' } },
+  cancelled: { writes: 0, durable: [], eligible: [], status: { state: 'unverified' } },
+} as const
+test.each(Object.keys(PAGE_FAILURES) as Array<keyof typeof PAGE_FAILURES>)('a %s page keeps only positives a write accepted; staged positives never apply and the retry completes', async failure => {
+  const f = fixture(), ids = [C.primary, C.secondary, C.private], page = makeDeferredWebApiCall(), expected = PAGE_FAILURES[failure]
+  stub(f).script.inventory.push(page.outcome)
+  await f.start(); await f.scan()
+  if (failure === 'refused') f.failWrites(state => state.personas.alpha?.membership[C.secondary] !== undefined)
+  else if (failure !== 'duplicate') {
+    // Nothing else can run inside one synchronous page. The scanner checks
+    // currency once when the page arrives, then before each channel: the
+    // fourth check, C.private's, sees the deadline or the gap.
+    const interrupt = failure === 'cancelled' ? () => f.scanner.connectionChanged('alpha') : () => {
+      const deadline = f.scanner.status('alpha').deadline!, now = f.h.clock.now
+      f.h.clock.now = () => { f.h.clock.now = now; return deadline }
+    }
+    const isCurrent = f.membership.isCurrent
+    let checks = 0
+    f.membership.isCurrent = generation => {
+      if (++checks === 4) interrupt()
+      return isCurrent(generation)
+    }
+  }
+  const before = f.writes.length
+  page.settle(membershipPage(failure === 'duplicate' ? [C.primary, C.secondary,
+    { id: C.secondary, is_channel: true, is_group: false, is_im: false, is_mpim: false, is_ext_shared: true }] : ids))
+  await f.h.clock.flush()
+  expect(f.writes.length - before).toBe(expected.writes)
+  expect(ids.filter(id => life(f).membership[id] !== undefined)).toEqual([...expected.durable])
+  expect(ids.filter(id => reading(f, id).kind === 'eligible')).toEqual([...expected.eligible])
+  expect(f.authority.readable).toBe(true)
+  expect(f.scanner.status('alpha')).toMatchObject(expected.status)
+  f.failWrites(() => false)
+  stub(f).script.inventory.push(membershipPage(ids))
+  await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+  expect(f.scanner.status('alpha').state).toBe('complete')
+  expect(ids.map(id => reading(f, id).kind)).toEqual(ids.map(() => 'eligible'))
+})
+
+test('an unsynced page write holds only that page for its persona; earlier pages, DMs, the sibling and accepted queues progress, and the next scan restores the page without a new choice', async () => {
+  const first = [C.primary, C.secondary], later = channelPopulation(2).map(c => c.id), ids = [...first, ...later]
+  const f = fixture({ names: ['alpha', 'beta'], channels: ids.map(id => ({ id, delivery: 'all' })) })
+  const second = makeDeferredWebApiCall()
+  stub(f).script.inventory.push(membershipPage(first, 'next'), second.outcome)
+  stub(f, 'beta').script.inventory.push(membershipPage(ids))
+  await f.start(); await f.scan()
+  expect([f.scanner.status('alpha').state, f.scanner.status('beta').state]).toEqual(['scanning', 'complete'])
+  const assignments = structuredClone(life(f).assignments), managed = routed(f)
+  try {
+    let unsynced = false
+    f.unsyncWrites(state => !unsynced && state.personas.alpha?.membership[later[0]!] !== undefined && (unsynced = true))
+    second.settle(membershipPage(later)); await f.h.clock.flush()
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'storage' })
+    expect(f.authority.readable).toBe(false)
+    const held = (key: string) => ids.filter(id => reading(f, id, key).kind !== 'eligible')
+    expect([held('alpha'), held('beta')]).toEqual([later, []])
+    expect(ids.filter(id => !f.authority.readableFor('alpha', id))).toEqual(later)
+    const waiting = inbound(later[0]!, 1), sibling = inbound(C.primary, 2), other = inbound(later[0]!, 3)
+    const dm = makeDm({ text: 'independent direct', ts: '1700000004.000004' })
+    await stub(f).socket.deliver(waiting)
+    expect(stub(f).socket.acks).toEqual([])
+    await stub(f).socket.deliver(sibling); await stub(f).socket.deliver(dm); await stub(f, 'beta').socket.deliver(other)
+    expect([stub(f).socket.acks.length, stub(f, 'beta').socket.acks.length]).toEqual([2, 1])
+    expect(accepted(managed, 'alpha')).toEqual([{ text: String(sibling.text), channel: C.primary }, { text: String(dm.text), channel: String(dm.channel) }])
+    expect(accepted(managed, 'beta')).toEqual([{ text: String(other.text), channel: later[0] }])
+    f.unsyncWrites(() => false); expect(f.authority.recoverDurability().kind).toBe('applied')
+    stub(f).script.inventory.push(membershipPage(ids))
+    await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+    expect(f.scanner.status('alpha').state).toBe('complete')
+    expect(held('alpha')).toEqual([])
+    expect(life(f).assignments).toEqual(assignments)
+    await stub(f).socket.deliver(waiting)
+    expect(stub(f).socket.acks).toHaveLength(3)
+    expect(accepted(managed, 'alpha').at(-1)).toEqual({ text: String(waiting.text), channel: later[0] })
+    assertNoLeak(managed.logs)
+  } finally { await managed.close() }
+})
+
+test('page-1 positives release held redeliveries while page 2 hangs and after it fails; the unscanned channel stays held', async () => {
+  const first = [C.primary, C.secondary], ids = [...first, C.private]
+  const f = fixture({ channels: ids.map(id => ({ id, delivery: 'all' })) })
+  stub(f).script.inventory.push(membershipPage(ids))
+  await f.start(); await f.scan()
+  const managed = routed(f)
+  try {
+    const second = makeDeferredWebApiCall()
+    stub(f).script.inventory.push(membershipPage(first, 'next'), second.outcome)
+    f.scanner.connectionChanged('alpha')
+    const during = inbound(C.primary, 1), after = inbound(C.secondary, 2), unscanned = inbound(C.private, 3)
+    for (const message of [during, after, unscanned]) await stub(f).socket.deliver(message)
+    expect(stub(f).socket.acks).toEqual([])
+    await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'scanning', pages: 1, positives: first.length })
+    for (const message of [during, unscanned]) await stub(f).socket.deliver(message)
+    expect(accepted(managed, 'alpha')).toEqual([{ text: String(during.text), channel: C.primary }])
+    second.settle({ kind: 'platform', error: 'internal_error' }); await f.h.clock.flush()
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'transport' })
+    for (const message of [after, unscanned]) await stub(f).socket.deliver(message)
+    expect(accepted(managed, 'alpha')).toEqual([during, after].map(m => ({ text: String(m.text), channel: String(m.channel) })))
+    expect(stub(f).socket.acks).toHaveLength(2)
+    expect(reading(f, C.private).kind).toBe('unresolved')
     assertNoLeak(managed.logs)
   } finally { await managed.close() }
 })

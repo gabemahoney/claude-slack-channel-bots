@@ -523,6 +523,8 @@
  *                                                milliseconds
  *   MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS,
  *   MEMBERSHIP_RETRY_MIN_MS, MEMBERSHIP_RETRY_MAX_MS   src/channel-membership-retry.ts bounds
+ *   MEMBERSHIP_PAGE_LIMIT                        src/channel-membership-retry.ts: the channels
+ *                                                an inventory request asks for per page
  *   membershipRetryDelay <failures> [retry-after-seconds]  production retry, including Retry-After
  *   channelDeliverySetCause <channel> <before> <after> <delivery>
  *                                                src/persona-diagnostics.ts: its cause; <before>
@@ -5887,6 +5889,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   MEMBERSHIP_ATTEMPT_TIMEOUT_MS: constantEntry('channel-membership-retry.ts', 'MEMBERSHIP_ATTEMPT_TIMEOUT_MS'),
   MEMBERSHIP_RETRY_MIN_MS: constantEntry('channel-membership-retry.ts', 'MEMBERSHIP_RETRY_MIN_MS'),
   MEMBERSHIP_RETRY_MAX_MS: constantEntry('channel-membership-retry.ts', 'MEMBERSHIP_RETRY_MAX_MS'),
+  MEMBERSHIP_PAGE_LIMIT: constantEntry('channel-membership-retry.ts', 'MEMBERSHIP_PAGE_LIMIT'),
   DEFAULT_QUEUED_ACK_REACTION: constantEntry('config.ts', 'DEFAULT_QUEUED_ACK_REACTION'),
   DEFAULT_ACK_REACTION: constantEntry('config.ts', 'DEFAULT_ACK_REACTION'),
   channelDeliverySetCause: deliverySetCause,

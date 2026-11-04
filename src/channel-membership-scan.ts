@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { CHANNEL_ID_RE } from './config.ts'
 import type { ChannelMembership, MembershipGeneration } from './channel-membership.ts'
-import type { SharedChannelAuthority } from './shared-channels.ts'
+import { applySharedMembership, type SharedChannelAuthority, type VerifiedSharedMembership } from './shared-channels.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock, type PersonaConnectionManager, type PersonaStatusListener } from './persona-connections.ts'
 import { classifySlackValidationError, slackRetryAfterSeconds, type SlackValidationFailure } from './persona-slack-validation.ts'
 import {
@@ -205,6 +205,36 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     if (clock.now() >= deadline) throw new MembershipDeadlineError()
     if (!deps.authority.readable) throw new ScanFailure('storage')
   }
+  /** Durably applied positives become this generation's current evidence. */
+  function adopt(entry: ScanEntry, generation: MembershipGeneration, boundaries: Map<string, number>, applied: readonly VerifiedSharedMembership[]): void {
+    const records = deps.authority.snapshot().personas[entry.key]!.membership
+    for (const { channel } of applied) {
+      const record = records[channel]!
+      boundaries.set(channel, record.boundary)
+      generation.positives.set(channel, record)
+      generation.absent.delete(channel)
+    }
+  }
+  /** Apply one page's staged positives in one durable write, each at its own
+   * application position in page order, exactly as consecutive observations.
+   * A refused batch writes nothing: apply singly then, so positives before a
+   * refused one still count as current evidence. */
+  function applyPositives(entry: ScanEntry, controller: AbortController, generation: MembershipGeneration, observations: number,
+    deadline: number, boundaries: Map<string, number>, staged: readonly VerifiedSharedMembership[]): void {
+    const { authority } = deps
+    if (staged.length > 1 && authority.transact(authority.revision, (next, order) => {
+      let position = order - staged.length
+      for (const observation of staged) applySharedMembership(next, ++position, entry.key, generation.incarnation, observation)
+    }, staged.length).kind === 'applied') {
+      adopt(entry, generation, boundaries, staged)
+      return
+    }
+    for (const [index, observation] of staged.entries()) {
+      if (index) assertCurrent(entry, controller, generation, observations, deadline)
+      if (authority.observeMembership(entry.key, generation.incarnation, observation, authority.revision).kind !== 'applied') throw new ScanFailure('storage')
+      adopt(entry, generation, boundaries, [observation])
+    }
+  }
   async function collect(entry: ScanEntry, controller: AbortController, generation: MembershipGeneration, deadline: number): Promise<void> {
     const { authority, membership } = deps
     membership.recover(entry.key)
@@ -226,11 +256,25 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
       const page = parsePage(await boundedMembershipCall(clock, controller.signal, deadline,
         signal => deps.connections.membershipPage(entry.key, generation.provenance.connectionId, cursor, signal)))
       assertCurrent(entry, controller, generation, observations, deadline)
+      // Positives wait here for one write per page. Nothing else writes until
+      // that flush. A recovery or a failing channel flushes first, so earlier
+      // positives apply, in page order, before it as they did one at a time.
+      let staged: VerifiedSharedMembership[] = []
+      const flush = () => {
+        const batch = staged
+        staged = []
+        if (batch.length) applyPositives(entry, controller, generation, observations, deadline, boundaries, batch)
+      }
+      // Every channel with saved or unsaved unresolved evidence, read once
+      // per page and again after each recovery; holds and readability are
+      // live. A listed channel still gets the exact per-channel answer.
+      let unresolved = new Set(membership.unresolvedChannels(entry.key))
       for (const channel of page.channels) {
         assertCurrent(entry, controller, generation, observations, deadline)
         const metadata = JSON.stringify([channel.channelType, channel.isExtSharedChannel])
         if (seen.has(channel.id)) {
           if (seenMetadata.get(channel.id) !== metadata) {
+            flush()
             generation.positives.delete(channel.id)
             generation.complete = false
             throw new ScanFailure('malformed-page')
@@ -248,22 +292,26 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
           continue
         }
         if (generation.holds.get(channel.id) === 'eligibility-missing') generation.holds.delete(channel.id)
-        const recovering = membership.hasUnresolved(entry.key, channel.id)
-        if (recovering && !membership.reconcileEvidence(generation, channel.id, through)) continue
-        const current = authority.snapshot().personas[entry.key]!.membership[channel.id]
-        if (recovering) boundaries.set(channel.id, current?.boundary ?? 0)
-        if ((current?.boundary ?? 0) !== (boundaries.get(channel.id) ?? 0)) throw new ScanFailure('superseded')
-        const result = authority.observeMembership(entry.key, generation.incarnation, {
+        const recovering = unresolved.has(channel.id) ? membership.hasUnresolved(entry.key, channel.id)
+          : generation.holds.has(channel.id) || !authority.readableFor(entry.key, channel.id)
+        if (recovering) {
+          flush()
+          const reconciled = membership.reconcileEvidence(generation, channel.id, through)
+          unresolved = new Set(membership.unresolvedChannels(entry.key))
+          if (!reconciled) continue
+        }
+        const boundary = authority.lifetime(entry.key, channel.id)?.membershipBoundary ?? 0
+        if (recovering) boundaries.set(channel.id, boundary)
+        if (boundary !== (boundaries.get(channel.id) ?? 0)) {
+          flush()
+          throw new ScanFailure('superseded')
+        }
+        staged.push({
           event: `scan:${scanId}:${channel.id}`, channel: channel.id, member: true, identity: generation.identityKey,
-          boundary: current?.boundary ?? 0, observedThrough: through,
-          channelType: channel.channelType, isExtSharedChannel: channel.isExtSharedChannel,
-        }, authority.revision)
-        if (result.kind !== 'applied') throw new ScanFailure('storage')
-        const applied = authority.snapshot().personas[entry.key]!.membership[channel.id]!
-        boundaries.set(channel.id, applied.boundary)
-        generation.positives.set(channel.id, applied)
-        generation.absent.delete(channel.id)
+          boundary, observedThrough: through, channelType: channel.channelType, isExtSharedChannel: channel.isExtSharedChannel,
+        })
       }
+      flush()
       entry.status.pages++
       entry.status.positives = generation.positives.size
       cursor = page.cursor
