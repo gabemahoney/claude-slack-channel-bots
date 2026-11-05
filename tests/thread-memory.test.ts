@@ -2513,6 +2513,32 @@ describe('Thread Memory compaction in slices', () => {
     expect(readdirSync(join(h.stateDir, 'threads')).filter(name => name.endsWith('.tmp'))).toEqual([])
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
   })
+
+  test('maintenance triggers behind a queued, unstarted maintenance compaction add none; it compacts state after the last trigger, and a trigger once it starts queues one more', async () => {
+    const { h, header, records } = await large('alternate')
+    const rewrites = () => h.io.calls.filter(c => c.op === 'rename' && isTemp(h)(c.path)).length
+    const first = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
+    h.memory.startMaintenance()
+    await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    await first.reached
+    // The first trigger's compaction is running; the next queues one behind it, the last two add none.
+    for (let i = 0; i < 3; i++) await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    // Published after the last trigger, so only a compaction started after it drops the secondary joins.
+    expect(h.choose('mentions', 'alpha', C.secondary).kind).toBe('applied')
+    const second = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
+    first.release(); await second.reached
+    expect(rewrites()).toBe(1)
+    const third = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
+    await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    // The third compaction waits on its own sync, so the journal holds the queued second compaction's image.
+    second.release(); await third.reached
+    expect(rewrites()).toBe(2)
+    expectSynchronousImage(h, header, records.filter(r => r.kind === 'join' && r.channel === C.primary))
+    third.release()
+    await h.memory.flush('alpha')
+    expect(rewrites()).toBe(3)
+    expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+  })
 })
 
 describe('Thread Memory held-stamp retention', () => {

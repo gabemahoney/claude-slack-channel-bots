@@ -281,6 +281,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   const writers = new Map<string, Promise<unknown>>()
   const appendBlocked = new Set<string>()
   const storingHolds = new Map<string, UnresolvedHold>()
+  const maintenanceQueued = new Set<string>()
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
@@ -609,6 +610,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   async function compact(key?: string, current = () => true): Promise<void> {
     await Promise.all((key ? [key] : [...journals.keys()]).map(k => serial(k, async () => { if (!current()) return; try { await compactOne(k, current) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })))
   }
+  /** The maintenance timer's pass. A queue whose maintenance compaction is
+   * queued and not yet started gets no second one: that one compacts the
+   * state at or after this trigger. */
+  async function compactForMaintenance(): Promise<void> {
+    await Promise.all([...journals.keys()].filter(k => !maintenanceQueued.has(k)).map(k => {
+      maintenanceQueued.add(k)
+      return serial(k, async () => { maintenanceQueued.delete(k); try { await compactOne(k) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })
+    }))
+  }
   /** One append/fsync boundary for reminder facts and their injected delivery. */
   async function appendReminderRecords(key: string, records: QueueRecord[]): Promise<void> {
     if (!started || stopped) throw new Error('Queue is not writable')
@@ -834,7 +844,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     setMeasureTimings(enabled) { measureTimings = enabled },
     startMaintenance(intervalMs) {
       if (timer !== undefined || stopped) return
-      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
+      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compactForMaintenance().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
       timer.unref?.()
     },
     async stop() {

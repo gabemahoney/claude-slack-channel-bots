@@ -6,7 +6,7 @@ import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueu
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
-import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { durableIo, failFileSyncs, holdFirstSync } from './test-helpers/durable-io.ts'
 import { yieldToEventLoop } from '../src/durable-journal.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
@@ -34,6 +34,19 @@ function recordSyncs() {
     if (step.path === failingPath) throw new Error('EIO injected sync')
   } })
   return { synced, io, fail(path?: string) { failingPath = path }, fs: io.fs }
+}
+/** Interval timers on `clock`; each requested delay is pushed to `scheduled`. */
+function fakeIntervals(clock: FakeClock, scheduled: number[] = []) {
+  return {
+    setInterval: ((callback: () => void, delay: number) => {
+      scheduled.push(delay)
+      const handle: { current?: unknown } = {}
+      const fire = () => { callback(); handle.current = clock.setTimeout(fire, delay) }
+      handle.current = clock.setTimeout(fire, delay)
+      return handle
+    }) as unknown as typeof setInterval,
+    clearInterval: ((handle: { current: unknown }) => clock.clearTimeout(handle.current)) as unknown as typeof clearInterval,
+  }
 }
 describe('durable record schemas', () => {
   test.each(kinds.map(r => [r.kind, r] as const))('%s roundtrips and rejects invalid versions, sequence and missing payload', (_, r) => {
@@ -1003,16 +1016,7 @@ test('maintenance compacts at the exported interval once and stop cancels its ti
   const clock = createFakeClock(), io = durableIo()
   clock.settleOn(io)
   const scheduled: number[] = []
-  const q = await open({ now: clock.now, fs: io.fs,
-    setInterval: ((callback: () => void, delay: number) => {
-      scheduled.push(delay)
-      const handle: { current?: unknown } = {}
-      const fire = () => { callback(); handle.current = clock.setTimeout(fire, delay) }
-      handle.current = clock.setTimeout(fire, delay)
-      return handle
-    }) as unknown as typeof setInterval,
-    clearInterval: handle => clock.clearTimeout((handle as unknown as { current: unknown }).current),
-  })
+  const q = await open({ now: clock.now, fs: io.fs, ...fakeIntervals(clock, scheduled) })
   await q.accept('alpha', injectedInput({ text: 'delivered content' }))
   await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['delivered bytes'] })
   await q.append('alpha', deliveredRecord())
@@ -1025,6 +1029,41 @@ test('maintenance compacts at the exported interval once and stop cancels its ti
   expect(q.items('alpha')).toEqual([])
   expect(clock.pendingCount()).toBe(1)
   await q.stop(); expect(clock.pendingCount()).toBe(0)
+})
+
+test('maintenance triggers behind a queued, unstarted maintenance compaction add none; it compacts state as of the last trigger, and a trigger once it starts queues one more', async () => {
+  const isTemp = (path: string) => path.startsWith(`${queuePath(dir)}.`) && path.endsWith('.tmp')
+  // One hold per compaction; the queue writes through the outermost seam, `third`.
+  const first = holdFirstSync(isTemp, { armed: false }), second = holdFirstSync(isTemp, { armed: false, base: first.io.fs })
+  const third = holdFirstSync(isTemp, { armed: false, base: second.io.fs })
+  const clock = createFakeClock({ start: THREAD_TIME }), events: QueueEvent[] = []
+  clock.settleOn(third.io)
+  const q = await open({ now: clock.now, fs: third.io.fs, onEvent: e => { events.push(e) }, ...fakeIntervals(clock) })
+  const rewrites = () => third.io.steps.filter(step => step.op === 'rename' && isTemp(step.path)).length
+  const compacted = () => readQueue(dir).map(r => 'compact' in r ? r.compact : r.kind)
+  await q.accept('alpha', slackInput())
+  for (const record of [fixedRecord(), sentRecord(), deliveredRecord()]) await q.append('alpha', record)
+  first.state.armed = true
+  q.startMaintenance()
+  await clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+  await first.reached()
+  // The first trigger's compaction is running; the next trigger queues one behind it and the rest add none.
+  // The delivered key leaves its keep window only at the last trigger, so only a compaction from then on drops it.
+  await clock.advance(QUEUE_KEY_KEEP_MS - QUEUE_COMPACT_INTERVAL_MS)
+  second.state.armed = true
+  first.gate.release(); await second.reached()
+  expect(rewrites()).toBe(1)
+  expect(compacted()).toEqual(['key', 'allocation'])
+  third.state.armed = true
+  await clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+  // The third compaction waits on its own sync, so the journal holds the queued second compaction's image.
+  second.gate.release(); await third.reached()
+  expect(rewrites()).toBe(2)
+  expect(compacted()).toEqual(['allocation'])
+  third.gate.release()
+  await clock.flush()
+  expect(rewrites()).toBe(3)
+  expect(events.filter(e => e.type === 'compaction-failed')).toEqual([])
 })
 
 describe('the journal holds only the record kinds and fields main reads', () => {
@@ -2292,16 +2331,7 @@ describe('test-only store timings', () => {
   test('maintenance compacts at compactIntervalMs when given', async () => {
     const clock = createFakeClock(), scheduled: number[] = [], io = durableIo()
     clock.settleOn(io)
-    const q = await open({ now: clock.now, fs: io.fs, compactIntervalMs: 250,
-      setInterval: ((callback: () => void, delay: number) => {
-        scheduled.push(delay)
-        const handle: { current?: unknown } = {}
-        const fire = () => { callback(); handle.current = clock.setTimeout(fire, delay) }
-        handle.current = clock.setTimeout(fire, delay)
-        return handle
-      }) as unknown as typeof setInterval,
-      clearInterval: handle => clock.clearTimeout((handle as unknown as { current: unknown }).current),
-    })
+    const q = await open({ now: clock.now, fs: io.fs, compactIntervalMs: 250, ...fakeIntervals(clock, scheduled) })
     await q.accept('alpha', injectedInput({ text: 'delivered content' }))
     await q.append('alpha', fixedRecord(1, ['delivered bytes']))
     await q.append('alpha', deliveredRecord())

@@ -504,6 +504,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const journals = new Map<string, MemoryJournal>(), writers = new Map<string, Promise<unknown>>()
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
   const pendingJoins = new Map<string, ThreadJoin[]>()
+  const maintenanceQueued = new WeakSet<MemoryJournal>()
   let activationStarted = false
   let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false, quiesced = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
@@ -1030,6 +1031,15 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       return j ? serial(k, () => compactOne(k, j)) : Promise.resolve()
     }))
   }
+  /** The maintenance timer's pass. A journal whose maintenance compaction is
+   * queued and not yet started gets no second one: that one compacts the
+   * state at or after this trigger. A forgotten journal's mark goes with it. */
+  async function compactForMaintenance(): Promise<void> {
+    await Promise.allSettled([...journals].filter(([, j]) => !maintenanceQueued.has(j)).map(([k, j]) => {
+      maintenanceQueued.add(j)
+      return serial(k, () => { maintenanceQueued.delete(j); return compactOne(k, j) })
+    }))
+  }
   const api: ThreadMemory = {
     readAtStart() {
       if (readStarted || stopped || quiesced) return
@@ -1224,7 +1234,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     remove, removeUnappliedAtStart,
     startMaintenance(intervalMs) {
       if (stopped || quiesced || timer !== undefined) return
-      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compact().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
+      timer = (options.setInterval ?? globalThis.setInterval)(() => { void compactForMaintenance().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
       timer.unref?.()
     },
     async quiesce() {
