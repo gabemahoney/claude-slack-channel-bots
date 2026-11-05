@@ -9,11 +9,12 @@ import { createCronLog } from '../src/cron-log.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import { resolvePersonaTarget } from '../src/persona-identity.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 let dir: string, queue: Awaited<ReturnType<typeof makeQueue>>, scheduler: ReturnType<typeof createCronScheduler> | undefined
 let clock: ReturnType<typeof createFakeClock>
-beforeEach(async () => { dir = mkdtempSync(join(tmpdir(), 'cron-composition-')); clock = createFakeClock({start:Date.parse('2026-01-15T10:30:30.000Z')}); queue = await makeQueue(dir,{now:clock.now}) })
+beforeEach(async () => { dir = mkdtempSync(join(tmpdir(), 'cron-composition-')); clock = createFakeClock({start:Date.parse('2026-01-15T10:30:30.000Z')}); const io = durableIo(); clock.settleOn(io); queue = await makeQueue(dir,{now:clock.now,fs:io.fs}) })
 afterEach(async () => { scheduler?.stop(); expect(clock.pendingCount()).toBe(0); await queue.stop(); rmSync(dir,{recursive:true,force:true}) })
 test('manual ticks queue every matching fire separately, keep exact sender/body and use the same fire clock in logs',async()=>{
  const config=makeMultiPersonaConfig([{name:'Planner'},{name:'reviewer'}],dir);const table=join(dir,'crontab'),path=join(dir,'tick.md'),log=join(dir,'cron.log');writeFileSync(path,'first');writeFileSync(table,'* * * * * tick.md reviewer\n')

@@ -122,6 +122,7 @@ import {
 } from './test-helpers/persona-config.ts'
 import { observeFileCompletions, withFileCompletions } from '../src/file-upload-observation.ts'
 import { holdOwnPostReady, makeRecordingOwnPostObserver, makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
+import type { DurableIoSettle } from './test-helpers/durable-io.ts'
 import { threadFsControls, threadPath } from './test-helpers/thread-memory.ts'
 import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
 import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
@@ -3133,9 +3134,12 @@ async function captureReplyAck(stub: StubSlack, key: string) {
     () => stub.web.reactions.add(args), () => stub.web.reactions.remove(args))
 }
 
-/** Drain the in-memory MCP transport, without a wall-clock delay. */
-async function replyReached(done: () => boolean) {
-  for (let i = 0; i < 50 && !done(); i++) await new Promise(resolve => setImmediate(resolve))
+/** Drain the in-memory MCP transport, without a wall-clock delay. Disk waits on `io` are awaited, not counted. */
+async function replyReached(done: () => boolean, io?: DurableIoSettle) {
+  for (let i = 0; i < 50 && !done();) {
+    if (io?.busy()) { await io.next(); continue }
+    await new Promise(resolve => setImmediate(resolve)); i++
+  }
   expect(done()).toBe(true)
 }
 
@@ -3392,7 +3396,7 @@ describe('reply joins through real Thread Memory', () => {
       stub.script.post.push(first.outcome)
       const isFile = kind === 'parent upload'
       const pending = session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, thread_ts: PARENT, ...(isFile ? { files: [replyFile()] } : {}) })
-      await replyReached(() => stub.calls.postMessage.length === 1)
+      await replyReached(() => stub.calls.postMessage.length === 1, owner.io.durable)
       expect(owner.read.pendingOwnPosts('alpha', A_ALL)).toMatchObject([{ root: ROOT }])
       // Let the text have no answer so the file, rather than the text, establishes the join.
       first.settle({ kind: 'ok', result: isFile ? { ts: undefined } : { ts: OTHER, ...(kind === 'Slack thread takes precedence' ? { message: { thread_ts: OTHER } } : {}) } })
@@ -3600,7 +3604,7 @@ describe('reply joins through real Thread Memory', () => {
       stub.script.post.push(held.outcome, { kind: 'ok', result: { ts: OTHER } })
       await captureReplyAck(stub, 'alpha')
       const pending = session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(2), files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
-      await replyReached(() => stub.calls.postMessage.length === 1)
+      await replyReached(() => stub.calls.postMessage.length === 1, owner.io.durable)
       if (failure === 'outcome') owner.io.fail('writeSync')
       held.settle({ kind: 'ok', result: { ts: ROOT } })
       const result = await pending

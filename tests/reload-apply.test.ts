@@ -566,6 +566,8 @@ describe('Thread Memory at confirmed apply', () => {
       expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
       expect(unlinkObservations).toEqual([])
     } finally { gate.release(); await applying }
+    // Publication creates the renamed persona's store in the background, behind its header's disk wait.
+    await run.clock.flush()
     expect(run.since(cp).lifecycle).toEqual([
       { op: 'teardown', key: 'bravo', via: 'apply' },
       ...(action === 'remove' ? [] : [

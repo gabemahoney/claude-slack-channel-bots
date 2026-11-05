@@ -210,6 +210,7 @@ import {
   type WrittenFile,
 } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { durableIo } from './durable-io.ts'
 import { makeManualInterval } from './permission-relay-harness.ts'
 import { makeFifo as makeFifoAt, mkfifoAvailable } from './fifo.ts'
 import { makePersona } from './persona-config.ts'
@@ -1144,6 +1145,8 @@ export interface ReloadRun {
   /** Write a real operator request; a later tick records it. */
   request(action: ReviewRequest['action'], assignments?: OperatorAssignment[], requestId?: string): ReviewRequest
   queue: ReturnType<typeof createDeliveryQueue>
+  /** The Thread Memory seal load, then the queue's start, as main awaits them before resolving the start. */
+  readonly queueReady: Promise<void>
   queueEvents: QueueEvent[]
   queued(name: string): QueueItem[]
   /** Complete the production preparation recovery before snapshotting accepted items. */
@@ -2140,13 +2143,16 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // driven by the run's fake clock, never a wall-clock timer.
     let queueTimer: unknown
     let queueIntervalLive = false
+    // The journals wait for the disk on the I/O pool; the run's clock waits for
+    // their started steps wherever it yields, never for steps a test holds.
+    const queueIo = durableIo({ base: runOpts.threadMemory?.queueFs })
+    connections.clock.settleOn(queueIo)
     const queue = createDeliveryQueue({
-      stateDir, now: connections.clock.now, onEvent: event => {
+      stateDir, now: connections.clock.now, fs: queueIo.fs, onEvent: event => {
         queueEvents.push(event)
         runOpts.threadMemory?.onQueueEvent?.(event)
       },
       ...(runOpts.threadMemory === undefined ? {} : {
-        fs: runOpts.threadMemory.queueFs,
         // As server.ts binds it: a journal start() couldn't read gets the start's steps when it first loads.
         onLoadedAfterStart: (key: string) => {
           if (!queueStartRecovered || stopped) return
@@ -2206,8 +2212,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         if (event.type === 'append-failed' || event.type === 'creation-failed') threadMemoryRetries?.appendFailed(event.key)
         else if (event.type === 'read-failed') threadMemoryRetries?.readFailed(event.key)
     }
+    const threadMemoryIo = durableIo({ base: runOpts.threadMemory?.fs })
+    connections.clock.settleOn(threadMemoryIo)
     const threadMemory = runOpts.threadMemory === undefined ? undefined : createThreadMemory({
-      stateDir, dryRun, seal: threadMemorySeal, fs: runOpts.threadMemory.fs, now: connections.clock.now,
+      stateDir, dryRun, seal: threadMemorySeal, fs: threadMemoryIo.fs, now: connections.clock.now,
       canRun: memoryWorkAllowed,
       onEvent: observeThreadMemoryEvent,
       setInterval: threadMaintenance.setInterval as typeof globalThis.setInterval,
@@ -3390,6 +3398,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     }
 
     const run: ReloadRun = {
+      queueReady,
       ownPostJoins, ownPostEvents, ownPostLookupEvents,
       threadMemory,
       threadMemorySeal, threadMemoryRetries, threadMemoryRetryEvents, threadMemorySealEvents,
@@ -3672,6 +3681,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     async function finishRun(graceful: boolean): Promise<void> {
       if (stopped) return
       stopped = true
+      // As main, whose shutdown follows its awaited queue start: a start's disk waits never outlive the run.
+      // Its failure, if any, is the start's or routing's to report.
+      await queueReady.catch(() => {})
       sharedStateReporting?.stop()
       unsubscribeSharedStateReporting?.()
       if (threadMemory || runOpts.sharedStateReports) episodes.close()
@@ -4159,6 +4171,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     build,
     async start(runOpts) {
       const run = build(runOpts)
+      await run.queueReady
       const outcome = run.resolveStart()
       if (outcome.kind === 'applied') await run.controller.runStartBringUp()
       return run as StartedReloadRun

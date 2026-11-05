@@ -114,6 +114,7 @@ import { makeOwnFileShare } from './test-helpers/slack-stub.ts'
 import { ownPostStampState, pendingOwnPostViews } from '../src/own-post.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -6647,6 +6648,7 @@ describe('Thread Memory failure wiring', () => {
   test.each([false, true])('overlapping real read/write outage reports one recovery; buffered=%s', async buffered => {
     const root = mkdtempSync(join(tmpdir(), 'cscb-replay-wiring-')), io = threadFsControls(root), wiring = threadMemoryWiring()
     const clock = createFakeClock(), posts: string[] = [], logs: string[] = [], events: ThreadMemoryModule.ThreadMemoryEvent[] = []
+    clock.settleOn(io.durable)
     seedThreads(root, [threadHeader()])
     const episodes = createPersonaEpisodes({ clock, sink: (_key, text) => { posts.push(text) }, log: line => logs.push(line) })
     const memory = createThreadMemory({ stateDir: root, fs: io.fs, canRun: wiring.canRun, appliedKeys: () => [key], markerKeys: () => [key],
@@ -6782,6 +6784,7 @@ describe('Thread Memory failure wiring', () => {
   test.each([false, true])('kept first-read hands off to one spaced save owner through publication; buffered=%s', async buffered => {
     const root = mkdtempSync(join(tmpdir(), 'cscb-kept-wiring-')), io = threadFsControls(root), wiring = threadMemoryWiring()
     const clock = createFakeClock(), authority = makeSharedAuthority(root, threadConfig(root))
+    clock.settleOn(io.durable)
     const posts: string[] = [], logs: string[] = [], events: ThreadMemoryModule.ThreadMemoryEvent[] = []
     const retriesSeen: ThreadMemoryRetryEvent[] = []
     seedThreads(root, [threadHeader()]); expect(authority.setThreadMemoryCreated(key).kind).toBe('saved')
@@ -7301,19 +7304,12 @@ describe('Memory Hold server wiring', () => {
     const key = THREAD_PERSONAS.primary, fact = threadJoin()
     expect(adapter.held(key)).toEqual([])
     const root = mkdtempSync(join(tmpdir(), 'cscb-held-stamp-wiring-'))
-    const observed: unknown[] = [], paths = new Map<number, string>()
-    const seam = { ...fs,
-      openSync(...args: Parameters<typeof fs.openSync>) {
-        const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd
-      },
-      fsyncSync(fd: number) {
-        if (paths.get(fd) === queuePath(root, key)) {
-          observed.push(adapter.held(key))
-          if (fail) throw new Error('fixture hold store failed')
-        }
-        fs.fsyncSync(fd)
-      },
-    } as typeof fs
+    const observed: unknown[] = []
+    const seam = durableIo({ before(step) {
+      if (step.op !== 'fsync' || step.path !== queuePath(root, key)) return
+      observed.push(adapter.held(key))
+      if (fail) throw new Error('fixture hold store failed')
+    } }).fs
     const queue = await makeQueue(root, { fs: seam })
     try {
       adapter.set(queue)

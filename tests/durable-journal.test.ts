@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDurableJournal, removeTornTail, splitJournalLines, type AppendRollback } from '../src/durable-journal.ts'
+import { createDurableJournal, removeTornTail, splitJournalLines, yieldToEventLoop, type AppendRollback } from '../src/durable-journal.ts'
+import { durableIo, heldStep, type DurableStepForm } from './test-helpers/durable-io.ts'
 
 let root: string, dir: string, path: string
 beforeEach(() => {
@@ -12,8 +13,9 @@ beforeEach(() => {
 })
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
 
-type Op = { step: string; path: string; flags?: fs.OpenMode; mode?: fs.Mode; length?: number }
-/** Real scratch files, with faults before the chosen operation (close faults close first). */
+type Op = { step: string; path: string; flags?: fs.OpenMode; mode?: fs.Mode; length?: number; form?: DurableStepForm }
+/** Real scratch files, with faults before the chosen operation (close faults close first).
+ * `sync` and `rename` are recorded in whichever form, callback or blocking, the journal used. */
 function recordingFs() {
   const ops: Op[] = [], paths = new Map<number, string>()
   const errors = new Map<string, Error>()
@@ -22,6 +24,8 @@ function recordingFs() {
     stat: undefined as fs.Stats | undefined,
     fail: (_op: Op): boolean => false,
     before: (_op: Op): void => {},
+    /** A callback `sync` or `rename` waits for the returned promise. */
+    hold: (_op: Op): Promise<void> | undefined => undefined,
   }
   function record(op: Op) {
     ops.push(op)
@@ -33,7 +37,7 @@ function recordingFs() {
     }
   }
   const fdPath = (fd: number) => paths.get(fd)!
-  const seam = { ...fs,
+  const base = { ...fs,
     mkdirSync(p: fs.PathLike, options: fs.MakeDirectoryOptions) { record({ step: 'mkdir', path: String(p), mode: options.mode }); return fs.mkdirSync(p, options) },
     statSync(p: fs.PathLike) { record({ step: 'stat', path: String(p) }); return control.stat ?? fs.statSync(p) },
     chmodSync(p: fs.PathLike, mode: fs.Mode) { record({ step: 'chmod', path: String(p), mode }); fs.chmodSync(p, mode) },
@@ -50,13 +54,16 @@ function recordingFs() {
       if (control.maxChunk <= 0) return control.maxChunk
       return fs.writeSync(fd, bytes, offset, Math.min(length, control.maxChunk))
     },
-    fsyncSync(fd: number) { record({ step: 'sync', path: fdPath(fd) }); fs.fsyncSync(fd) },
     fchmodSync(fd: number, mode: fs.Mode) { record({ step: 'fchmod', path: fdPath(fd), mode }); fs.fchmodSync(fd, mode) },
     ftruncateSync(fd: number, length = 0) { record({ step: 'truncate', path: fdPath(fd), length }); fs.ftruncateSync(fd, length) },
-    renameSync(from: fs.PathLike, to: fs.PathLike) { record({ step: 'rename', path: String(from) }); fs.renameSync(from, to) },
     unlinkSync(p: fs.PathLike) { record({ step: 'unlink', path: String(p) }); fs.unlinkSync(p) },
   } as typeof fs
-  return { fs: seam, ops, paths, errors, control }
+  const io = durableIo({ base, before(step) {
+    const op: Op = { step: step.op === 'fsync' ? 'sync' : 'rename', path: step.path, form: step.form }
+    record(op)
+    return control.hold(op)
+  } })
+  return { fs: io.fs, io, ops, paths, errors, control }
 }
 function journal(seam: typeof fs = fs, directoryMode = 0o700, fileMode = 0o600) {
   return createDurableJournal({ dir, parentDir: root, directoryMode, fileMode, fs: seam })
@@ -66,6 +73,7 @@ function seed(bytes: string | Buffer) {
   fs.writeFileSync(path, bytes)
 }
 const read = () => fs.readFileSync(path)
+const durableSteps = (ops: Op[]) => ops.filter(op => op.step === 'sync' || op.step === 'rename')
 
 describe('directory durability and modes', () => {
   test('construction does no filesystem work', () => {
@@ -75,42 +83,42 @@ describe('directory durability and modes', () => {
     expect(fs.existsSync(dir)).toBe(false)
   })
 
-  test.each([[0o700, 0o600], [0o750, 0o640]])('honours directory %s and file %s modes, including existing permissive files', (directoryMode, fileMode) => {
+  test.each([[0o700, 0o600], [0o750, 0o640]])('honours directory %s and file %s modes, including existing permissive files', async (directoryMode, fileMode) => {
     const r = recordingFs(), j = journal(r.fs, directoryMode, fileMode)
-    j.durableAppend(path, Buffer.from('first\n'))
+    await j.durableAppend(path, Buffer.from('first\n'))
     expect(r.ops.find(op => op.step === 'mkdir')?.mode).toBe(directoryMode)
     expect(r.ops.find(op => op.step === 'open' && op.path === path)?.mode).toBe(fileMode)
     fs.chmodSync(dir, 0o777); fs.chmodSync(path, 0o666)
-    j.durableAppend(path, Buffer.from('second\n'))
+    await j.durableAppend(path, Buffer.from('second\n'))
     expect(fs.statSync(dir).mode & 0o7777).toBe(directoryMode)
     expect(fs.statSync(path).mode & 0o7777).toBe(fileMode)
     expect(read()).toEqual(Buffer.from('first\nsecond\n'))
-    j.rewrite(path, Buffer.from('rewritten\n'))
+    await j.rewrite(path, Buffer.from('rewritten\n'))
     expect(fs.statSync(path).mode & 0o7777).toBe(fileMode)
     expect(read()).toEqual(Buffer.from('rewritten\n'))
     expect(r.paths.size).toBe(0)
   })
 
-  test.each(['mkdir', 'stat', 'chmod', 'open', 'sync'] as const)('a failed ensure at %s stays retryable before append', step => {
+  test.each(['mkdir', 'stat', 'chmod', 'open', 'sync'] as const)('a failed ensure at %s stays retryable before append', async step => {
     const r = recordingFs(), j = journal(r.fs)
     r.control.fail = op => op.step === step
-    expect(() => j.durableAppend(path, Buffer.from('new\n'))).toThrow(`EIO injected ${step}`)
+    await expect(j.durableAppend(path, Buffer.from('new\n'))).rejects.toThrow(`EIO injected ${step}`)
     expect(fs.existsSync(path)).toBe(false)
     r.control.fail = () => false; r.ops.length = 0
-    j.durableAppend(path, Buffer.from('new\n'))
+    await j.durableAppend(path, Buffer.from('new\n'))
     expect(read()).toEqual(Buffer.from('new\n'))
     expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([root, path, dir])
     expect(fs.statSync(dir).mode & 0o7777).toBe(0o700)
     expect(r.paths.size).toBe(0)
   })
 
-  test.each(['replacement', 'recreation with reused identity', 'changed mode'] as const)('revalidates directory durability after %s', change => {
+  test.each(['replacement', 'recreation with reused identity', 'changed mode'] as const)('revalidates directory durability after %s', async change => {
     const r = recordingFs()
     const j = journal(r.fs)
-    j.ensureDir()
+    await j.ensureDir()
     const identity = fs.statSync(dir)
     r.ops.length = 0
-    j.ensureDir()
+    await j.ensureDir()
     expect(r.ops.filter(op => op.step === 'sync')).toEqual([])
     if (change === 'changed mode') fs.chmodSync(dir, 0o755)
     else {
@@ -120,33 +128,52 @@ describe('directory durability and modes', () => {
       else r.control.stat = identity
     }
     r.control.fail = op => op.step === 'sync' && op.path === root
-    expect(() => j.ensureDir()).toThrow('EIO injected sync')
+    await expect(j.ensureDir()).rejects.toThrow('EIO injected sync')
     r.control.fail = () => false; r.ops.length = 0
-    j.ensureDir()
+    await j.ensureDir()
     expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([root])
     expect(fs.statSync(dir).mode & 0o7777).toBe(0o700)
     expect(r.paths.size).toBe(0)
   })
+
+  test('an ensure still waiting on its parent sync when the directory is recreated never vouches for the recreation', async () => {
+    const r = recordingFs(), j = journal(r.fs), gate = heldStep()
+    r.control.hold = op => op.step === 'sync' && op.path === root ? gate.promise : undefined
+    const older = j.ensureDir()
+    await yieldToEventLoop()
+    expect(r.io.held()).toBe(1)
+    const identity = fs.statSync(dir)
+    fs.rmdirSync(dir)
+    // The recreation reuses the old identity; its own parent sync fails.
+    r.control.hold = () => undefined; r.control.stat = identity
+    r.control.fail = op => op.step === 'sync' && op.path === root
+    await expect(j.ensureDir()).rejects.toThrow('EIO injected sync')
+    r.control.fail = () => false
+    gate.release(); await older
+    r.ops.length = 0
+    await j.ensureDir()
+    expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([root])
+  })
 })
 
 describe('append and rollback', () => {
-  test.each(['', 'old\n', 'old'])('short writes append exact bytes after %j, with file then directory sync', old => {
+  test.each(['', 'old\n', 'old'])('short writes append exact bytes after %j, with file then directory sync', async old => {
     const r = recordingFs(), j = journal(r.fs), bytes = Buffer.from('new é🙂\n')
     seed(old); r.control.maxChunk = 2
-    j.durableAppend(path, bytes)
+    await j.durableAppend(path, bytes)
     expect(read()).toEqual(Buffer.concat([Buffer.from(old + (old && !old.endsWith('\n') ? '\n' : '')), bytes]))
     expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([root, path, dir])
     r.ops.length = 0
-    j.durableAppend(path, Buffer.from('next\n'))
+    await j.durableAppend(path, Buffer.from('next\n'))
     expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([path, dir])
     expect(read().subarray(-5)).toEqual(Buffer.from('next\n'))
     expect(r.paths.size).toBe(0)
   })
 
-  test.each(['partial write', 'file sync', 'directory sync', 'zero write', 'negative write'] as const)('%s failure restores the original bytes and permits one clean retry', failure => {
+  test.each(['partial write', 'file sync', 'directory sync', 'zero write', 'negative write'] as const)('%s failure restores the original bytes and permits one clean retry', async failure => {
     const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
     const old = Buffer.from('old without newline')
-    seed(old); j.ensureDir(); r.control.maxChunk = 2
+    seed(old); await j.ensureDir(); r.control.maxChunk = 2
     let failed = false
     r.control.fail = op => {
       const match = failure === 'partial write' ? op.step === 'write' && read().length > old.length + 1
@@ -155,63 +182,63 @@ describe('append and rollback', () => {
       return false
     }
     if (failure === 'zero write' || failure === 'negative write') r.control.maxChunk = failure === 'zero write' ? 0 : -1
-    expect(() => j.durableAppend(path, Buffer.from('failed\n'), rollback)).toThrow()
+    await expect(j.durableAppend(path, Buffer.from('failed\n'), rollback)).rejects.toThrow()
     expect(read()).toEqual(old)
     expect(rollback.pendingRollback).toBeUndefined()
     r.control.fail = () => false; r.control.maxChunk = 2
-    j.durableAppend(path, Buffer.from('retry\n'), rollback)
+    await j.durableAppend(path, Buffer.from('retry\n'), rollback)
     expect(read()).toEqual(Buffer.from('old without newline\nretry\n'))
     expect(r.paths.size).toBe(0)
   })
 
-  test.each(['truncate', 'sync'] as const)('keeps the original rollback through repeated %s failures, then reconciles without append', failure => {
+  test.each(['truncate', 'sync'] as const)('keeps the original rollback through repeated %s failures, then reconciles without append', async failure => {
     const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}, old = Buffer.from('old\n')
-    seed(old); j.ensureDir()
+    seed(old); await j.ensureDir()
     r.control.fail = op => (op.step === 'sync' || op.step === 'truncate') && op.path === path
-    expect(() => j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).toThrow()
+    await expect(j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).rejects.toThrow()
     expect(read()).toEqual(Buffer.from('old\nunaccepted\n'))
     expect(rollback.pendingRollback).toBe(old.length)
     r.control.fail = op => op.path === path && op.step === failure
-    expect(() => j.durableAppend(path, Buffer.from('also unaccepted\n'), rollback)).toThrow()
+    await expect(j.durableAppend(path, Buffer.from('also unaccepted\n'), rollback)).rejects.toThrow()
     expect(rollback.pendingRollback).toBe(old.length)
-    expect(() => j.reconcileRollback(path, rollback)).toThrow()
+    await expect(j.reconcileRollback(path, rollback)).rejects.toThrow()
     expect(rollback.pendingRollback).toBe(old.length)
     r.control.fail = () => false; r.ops.length = 0
-    j.reconcileRollback(path, rollback)
+    await j.reconcileRollback(path, rollback)
     expect(read()).toEqual(old)
     expect(rollback.pendingRollback).toBeUndefined()
     expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([path])
-    j.durableAppend(path, Buffer.from('retry\n'), rollback)
+    await j.durableAppend(path, Buffer.from('retry\n'), rollback)
     expect(read()).toEqual(Buffer.from('old\nretry\n'))
     expect(r.paths.size).toBe(0)
   })
 
-  test('the next append reconciles a failed rollback before any new byte is written', () => {
+  test('the next append reconciles a failed rollback before any new byte is written', async () => {
     const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
-    seed('old\n'); j.ensureDir()
+    seed('old\n'); await j.ensureDir()
     r.control.fail = op => op.path === path && ['sync', 'truncate'].includes(op.step)
-    expect(() => j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).toThrow()
+    await expect(j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).rejects.toThrow()
     r.control.fail = () => false; r.ops.length = 0
     r.control.before = op => { if (op.step === 'write') expect(read()).toEqual(Buffer.from('old\n')) }
-    j.durableAppend(path, Buffer.from('retry\n'), rollback)
+    await j.durableAppend(path, Buffer.from('retry\n'), rollback)
     expect(read()).toEqual(Buffer.from('old\nretry\n'))
     expect(rollback.pendingRollback).toBeUndefined()
     expect(r.ops.filter(op => ['truncate', 'write', 'sync'].includes(op.step)).map(op => [op.step, op.path]))
       .toEqual([['truncate', path], ['sync', path], ['write', path], ['sync', path], ['sync', dir]])
   })
 
-  test('reconciling with nothing pending performs no I/O', () => {
+  test('reconciling with nothing pending performs no I/O', async () => {
     const r = recordingFs()
-    journal(r.fs).reconcileRollback(path, {})
+    await journal(r.fs).reconcileRollback(path, {})
     expect(r.ops).toEqual([])
   })
 })
 
 describe('Thread Memory torn-tail removal', () => {
-  test.each(['append', 'reconcile'] as const)('%s removes a quarantined partial multibyte character and retries failed truncation', operation => {
+  test.each(['append', 'reconcile'] as const)('%s removes a quarantined partial multibyte character and retries failed truncation', async operation => {
     const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
     const old = Buffer.from('saved é\n'), fragment = Buffer.from([0x7b, 0x22, 0xe2, 0x82])
-    seed(Buffer.concat([old, fragment])); j.ensureDir()
+    seed(Buffer.concat([old, fragment])); await j.ensureDir()
     const tail = splitJournalLines(read()).at(-1)!
     const quarantine = join(dir, 'alpha.unreadable')
     fs.writeFileSync(quarantine, tail.bytes, { mode: 0o600 })
@@ -220,11 +247,11 @@ describe('Thread Memory torn-tail removal', () => {
     expect(rollback.pendingRollback).toBe(old.length)
     const act = () => operation === 'append' ? j.durableAppend(path, Buffer.from('new\n'), rollback) : j.reconcileRollback(path, rollback)
     r.control.fail = op => op.step === 'truncate'
-    expect(act).toThrow('EIO injected truncate')
+    await expect(act()).rejects.toThrow('EIO injected truncate')
     expect(read()).toEqual(Buffer.concat([old, fragment]))
     expect(rollback.pendingRollback).toBe(old.length)
     r.control.fail = () => false
-    act()
+    await act()
     expect(read()).toEqual(Buffer.concat([old, Buffer.from(operation === 'append' ? 'new\n' : '')]))
     expect(rollback.pendingRollback).toBeUndefined()
     expect(fs.readFileSync(quarantine)).toEqual(fragment)
@@ -246,11 +273,11 @@ describe('Thread Memory torn-tail removal', () => {
 })
 
 describe('whole-file rewrite', () => {
-  test('uses unique exclusive mode-0600 temps, short writes and fsync before rename, then directory fsync', () => {
+  test('uses unique exclusive mode-0600 temps, short writes and fsync before rename, then directory fsync', async () => {
     const r = recordingFs(), j = journal(r.fs), old = Buffer.from('old longer record\n'), next = Buffer.from('é🙂\n')
-    seed(old); j.ensureDir(); r.ops.length = 0; r.control.maxChunk = 2
+    seed(old); await j.ensureDir(); r.ops.length = 0; r.control.maxChunk = 2
     r.control.before = op => { if (op.step === 'rename') expect(read()).toEqual(old) }
-    j.rewrite(path, next)
+    await j.rewrite(path, next)
     expect(read()).toEqual(next)
     expect(fs.statSync(path).mode & 0o7777).toBe(0o600)
     const first = r.ops.find(op => op.step === 'open' && op.flags === 'wx')!
@@ -260,7 +287,7 @@ describe('whole-file rewrite', () => {
     expect(r.ops.filter(op => ['sync', 'rename'].includes(op.step)).map(op => [op.step, op.path]))
       .toEqual([['sync', first.path], ['rename', first.path], ['sync', dir]])
     r.control.before = () => {}; r.ops.length = 0
-    j.rewrite(path, Buffer.from('again\n'))
+    await j.rewrite(path, Buffer.from('again\n'))
     expect(r.ops.find(op => op.step === 'open' && op.flags === 'wx')!.path).not.toBe(first.path)
     expect(read()).toEqual(Buffer.from('again\n'))
     expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
@@ -268,9 +295,9 @@ describe('whole-file rewrite', () => {
   })
 
   test.each(['open-temp', 'partial-write', 'sync-temp', 'close-temp', 'rename', 'open-directory', 'sync-directory', 'close-directory'] as const)(
-    '%s failure cleans the temp; only post-rename failures leave replacement bytes visible', failure => {
+    '%s failure cleans the temp; only post-rename failures leave replacement bytes visible', async failure => {
       const r = recordingFs(), j = journal(r.fs), old = Buffer.from('old longer record\n'), next = Buffer.from('new\n')
-      seed(old); j.ensureDir(); r.control.maxChunk = 2
+      seed(old); await j.ensureDir(); r.control.maxChunk = 2
       r.control.fail = op => {
         const temp = op.path.endsWith('.tmp')
         if (failure === 'partial-write') return op.step === 'write' && fs.statSync(op.path).size > 0
@@ -278,16 +305,131 @@ describe('whole-file rewrite', () => {
         const [step, target] = failure.split('-')
         return op.step === step && (target === 'temp' ? temp : op.path === dir)
       }
-      expect(() => j.rewrite(path, next)).toThrow('EIO injected')
+      await expect(j.rewrite(path, next)).rejects.toThrow('EIO injected')
       expect(read()).toEqual(failure.endsWith('-directory') ? next : old)
       expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
       expect(r.paths.size).toBe(0)
       r.control.fail = () => false
-      j.rewrite(path, next)
+      await j.rewrite(path, next)
       expect(read()).toEqual(next)
       expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
     },
   )
+})
+
+describe('disk waits run on the I/O pool; only read-time quarantine blocks', () => {
+  /** Event-loop turns (immediates) that run while `work` is outstanding. */
+  async function turnsDuring(work: () => Promise<void> | void): Promise<number> {
+    let turns = 0, done = false
+    const tick = () => { if (done) return; turns++; setImmediate(tick) }
+    setImmediate(tick)
+    try { await work() } finally { done = true }
+    return turns
+  }
+
+  test('every promise operation waits only through callback fsync and rename; the blocking append runs the same steps through the Sync forms', async () => {
+    const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
+    seed('old\n')
+    r.control.fail = op => op.path === path && (op.step === 'sync' || op.step === 'truncate')
+    await expect(j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).rejects.toThrow()
+    expect(rollback.pendingRollback).toBe('old\n'.length)
+    r.control.fail = () => false
+    await j.reconcileRollback(path, rollback)
+    expect(read()).toEqual(Buffer.from('old\n'))
+    await j.durableAppend(path, Buffer.from('second\n'))
+    await j.rewrite(path, Buffer.from('rewritten\n'))
+    await j.ensureDir()
+    expect(durableSteps(r.ops).length).toBeGreaterThan(0)
+    expect(durableSteps(r.ops).filter(op => op.form !== 'callback')).toEqual([])
+    // A fresh journal: the blocking form's steps, path for path, match the callback form's.
+    const asyncRun = recordingFs()
+    fs.rmSync(dir, { recursive: true }); seed('old')
+    await journal(asyncRun.fs).durableAppend(path, Buffer.from('quarantined\n'))
+    const asyncBytes = read()
+    const syncRun = recordingFs()
+    fs.rmSync(dir, { recursive: true }); seed('old')
+    journal(syncRun.fs).durableAppendSync(path, Buffer.from('quarantined\n'))
+    expect(read()).toEqual(asyncBytes)
+    expect(durableSteps(syncRun.ops).map(op => op.form)).toEqual(durableSteps(asyncRun.ops).map(() => 'sync'))
+    expect(durableSteps(syncRun.ops).map(op => [op.step, op.path])).toEqual(durableSteps(asyncRun.ops).map(op => [op.step, op.path]))
+    expect(syncRun.ops.map(op => op.step)).toEqual(asyncRun.ops.map(op => op.step))
+  })
+
+  test.each(['file sync', 'directory sync', 'truncate'] as const)('a blocking append whose %s fails throws before returning, with the same rollback the callback form keeps', failure => {
+    const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}, old = Buffer.from('old\n')
+    seed(old); j.durableAppendSync(path, Buffer.from('first\n'), rollback)
+    let failed = false
+    r.control.fail = op => {
+      if (failure === 'truncate') return op.path === path && (op.step === 'sync' || op.step === 'truncate')
+      if (failed || op.step !== 'sync' || op.path !== (failure === 'file sync' ? path : dir)) return false
+      failed = true; return true
+    }
+    let failedWith: unknown
+    try { j.durableAppendSync(path, Buffer.from('unaccepted\n'), rollback) } catch (error) { failedWith = error }
+    expect(failedWith).toBeInstanceOf(Error)
+    expect(r.io.busy()).toBe(false)
+    if (failure === 'truncate') {
+      expect(rollback.pendingRollback).toBe(old.length + 'first\n'.length)
+      r.control.fail = () => false
+      j.durableAppendSync(path, Buffer.from('retry\n'), rollback)
+    } else {
+      expect(read()).toEqual(Buffer.from('old\nfirst\n'))
+      expect(rollback.pendingRollback).toBeUndefined()
+      r.control.fail = () => false
+      j.durableAppendSync(path, Buffer.from('retry\n'), rollback)
+    }
+    expect(read()).toEqual(Buffer.from('old\nfirst\nretry\n'))
+    expect(rollback.pendingRollback).toBeUndefined()
+    expect(durableSteps(r.ops).filter(op => op.form !== 'sync')).toEqual([])
+    expect(r.paths.size).toBe(0)
+  })
+
+  test('with the default node:fs backend, the event loop runs while append, rollback repair, rewrite and a new directory wait for the disk; the blocking append gives it no turn', async () => {
+    const j = createDurableJournal({ dir, parentDir: root, directoryMode: 0o700, fileMode: 0o600 }), rollback: AppendRollback = {}
+    expect(await turnsDuring(() => j.durableAppend(path, Buffer.from('first\n')))).toBeGreaterThan(0)
+    expect(await turnsDuring(() => j.durableAppend(path, Buffer.from('second\n'), rollback))).toBeGreaterThan(0)
+    expect(await turnsDuring(() => j.rewrite(path, Buffer.from('rewritten\n')))).toBeGreaterThan(0)
+    fs.appendFileSync(path, 'unaccepted\n'); rollback.pendingRollback = 'rewritten\n'.length
+    expect(await turnsDuring(() => j.reconcileRollback(path, rollback))).toBeGreaterThan(0)
+    expect(read()).toEqual(Buffer.from('rewritten\n'))
+    expect(await turnsDuring(() => j.durableAppendSync(path, Buffer.from('quarantined\n')))).toBe(0)
+    expect(read()).toEqual(Buffer.from('rewritten\nquarantined\n'))
+  })
+
+  test('while a file sync is held, timers fire and another journal path appends; the held append resolves only after its directory sync', async () => {
+    const r = recordingFs(), j = journal(r.fs), gate = heldStep(), other = join(dir, 'beta.jsonl')
+    await j.ensureDir()
+    r.control.hold = op => op.step === 'sync' && op.path === path ? gate.promise : undefined
+    let settled = false
+    const held = j.durableAppend(path, Buffer.from('held\n')).then(() => { settled = true })
+    const fired = await new Promise<boolean>(resolve => setTimeout(() => resolve(true), 0))
+    expect(fired).toBe(true)
+    expect(r.io.held()).toBe(1)
+    await j.durableAppend(other, Buffer.from('beta\n'))
+    expect(fs.readFileSync(other)).toEqual(Buffer.from('beta\n'))
+    expect(settled).toBe(false)
+    expect(r.ops.filter(op => op.step === 'sync' && op.path === dir)).toHaveLength(1)
+    r.ops.length = 0
+    gate.release(); await held
+    expect(settled).toBe(true)
+    // The held step was recorded when it began; its directory sync ran only after release.
+    expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([dir])
+    expect(read()).toEqual(Buffer.from('held\n'))
+  })
+
+  test('a held file sync that fails rolls back the append before it rejects', async () => {
+    const r = recordingFs(), j = journal(r.fs), gate = heldStep(), rollback: AppendRollback = {}
+    seed('old\n'); await j.ensureDir()
+    r.control.hold = op => op.step === 'sync' && op.path === path && op.form === 'callback' && !r.ops.some(o => o.step === 'truncate') ? gate.promise : undefined
+    const held = j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)
+    await yieldToEventLoop()
+    expect(read()).toEqual(Buffer.from('old\nunaccepted\n'))
+    gate.fail(Object.assign(new Error('EIO held sync'), { code: 'EIO' }))
+    await expect(held).rejects.toThrow('EIO held sync')
+    expect(read()).toEqual(Buffer.from('old\n'))
+    expect(rollback.pendingRollback).toBeUndefined()
+    expect(r.paths.size).toBe(0)
+  })
 })
 
 describe('exact byte line splitting', () => {

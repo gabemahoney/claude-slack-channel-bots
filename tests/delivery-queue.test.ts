@@ -7,6 +7,8 @@ import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo, failFileSyncs, holdFirstSync } from './test-helpers/durable-io.ts'
+import { yieldToEventLoop } from '../src/durable-journal.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { acceptedRecord, deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, postHold, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, tornRecord, unknownRootPostHold, withdrawnRecord } from './test-helpers/delivery-queue.ts'
@@ -24,21 +26,14 @@ async function open(options: Parameters<typeof makeQueue>[1] = {}) { const q = a
 const accepted = (): AcceptedRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
 const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }, { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
 function recordSyncs() {
-  const paths = new Map<number, string>(), synced: string[] = []
+  const synced: string[] = []
   let failingPath: string | undefined
-  return {
-    synced,
-    fail(path?: string) { failingPath = path },
-    fs: { ...fs,
-      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
-      fsyncSync(fd: number) {
-        const path = paths.get(fd)!
-        synced.push(path)
-        if (path === failingPath) throw new Error('EIO injected sync')
-        fs.fsyncSync(fd)
-      },
-    } as typeof fs,
-  }
+  const io = durableIo({ before(step) {
+    if (step.op !== 'fsync') return
+    synced.push(step.path)
+    if (step.path === failingPath) throw new Error('EIO injected sync')
+  } })
+  return { synced, io, fail(path?: string) { failingPath = path }, fs: io.fs }
 }
 describe('durable record schemas', () => {
   test.each(kinds.map(r => [r.kind, r] as const))('%s roundtrips and rejects invalid versions, sequence and missing payload', (_, r) => {
@@ -146,17 +141,15 @@ describe('durable queued reaction metadata', () => {
     const clock = createFakeClock({ start: 1000 })
     let failing = false
     const truncations: number[] = []
-    const seam = { ...fs,
-      fsyncSync(fd: number) {
-        if (failing && fs.fstatSync(fd).isFile()) throw new Error('EIO append sync')
-        fs.fsyncSync(fd)
-      },
+    const seam = durableIo({ base: { ...fs,
       ftruncateSync(fd: number, length = 0) {
         if (failing) throw new Error('EIO rollback')
         truncations.push(length)
         fs.ftruncateSync(fd, length)
       },
-    } as typeof fs
+    } as typeof fs, before(step) {
+      if (failing && step.op === 'fsync' && fs.fstatSync(step.fd!).isFile()) throw new Error('EIO append sync')
+    } }).fs
     seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['first', 'second'] }, sentRecord(), deliveredRecord()])
     const q = await open({ fs: seam, now: clock.now }), before = q.item('alpha', 1)!
     const boundary = fs.statSync(queuePath(dir)).size
@@ -180,21 +173,20 @@ describe('durable queued reaction metadata', () => {
 
   test.each(['write', 'fsync', 'rename', 'directory-sync'] as const)('failed %s while adopting legacy work permits no queued Slack mutation; recovery retries durably', async step => {
     let failing = false, failures = 0
-    const seam = { ...fs,
+    const seam = durableIo({ base: { ...fs,
       writeSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null) {
         if (failing && step === 'write') { failures++; throw new Error('EIO metadata write') }
         return fs.writeSync(fd, buffer, offset, length, position)
       },
-      fsyncSync(fd: number) {
-        const stat = fs.fstatSync(fd)
-        if (failing && ((step === 'fsync' && stat.isFile()) || (step === 'directory-sync' && stat.isDirectory()))) { failures++; throw new Error('EIO metadata fsync') }
-        fs.fsyncSync(fd)
-      },
-      renameSync(from: fs.PathLike, to: fs.PathLike) {
-        if (failing && step === 'rename') { failures++; throw new Error('EIO metadata rename') }
-        fs.renameSync(from, to)
-      },
-    } as typeof fs
+    } as typeof fs, before(durable) {
+      if (!failing) return
+      if (durable.op === 'rename') {
+        if (step === 'rename') { failures++; throw new Error('EIO metadata rename') }
+        return
+      }
+      const stat = fs.fstatSync(durable.fd!)
+      if ((step === 'fsync' && stat.isFile()) || (step === 'directory-sync' && stat.isDirectory())) { failures++; throw new Error('EIO metadata fsync') }
+    } }).fs
     seedQueue(dir, [accepted()])
     const q = await open({ fs: seam }), slack = makeStubSlack()
     const item = q.item('alpha', 1)!, bytes = fs.readFileSync(queuePath(dir))
@@ -219,8 +211,7 @@ describe('durable queued reaction metadata', () => {
   })
 })
 test('real file acceptance fsyncs file and new directory, enforces permissions and survives restart', async () => {
-  const synced: string[] = []; const paths = new Map<number, string>()
-  const seam = { ...fs, openSync: (...args: Parameters<typeof fs.openSync>) => { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd }, fsyncSync: (fd: number) => { synced.push(paths.get(fd)!); fs.fsyncSync(fd) } } as typeof fs
+  const { fs: seam, synced } = recordSyncs()
   const q = await open({ fs: seam }); const result = await q.accept('alpha', slackInput())
   expect(result.status).toBe('accepted')
   expect(synced).toContain(queuePath(dir)); expect(synced).toContain(join(dir, 'queue')); expect(synced).toContain(dir)
@@ -325,7 +316,7 @@ test('queue-directory sync failures publish neither new Slack keys nor completed
 })
 test('failed fsync never accepts; successful retry reconciles bytes and gets the same first sequence', async () => {
   let fail = false
-  const seam = { ...fs, fsyncSync: (fd: number) => { if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO'); fs.fsyncSync(fd) } } as typeof fs
+  const seam = failFileSyncs(() => fail, 'EIO')
   const q = await open({ fs: seam }); fail = true
   expect((await q.accept('alpha', slackInput())).status).toBe('failed'); expect(q.items('alpha')).toEqual([])
   fail = false
@@ -472,7 +463,7 @@ describe('b.2is torn-tail recovery', () => {
     let fail = true, failures = 0, renames = 0, syncingRename = false
     const rewriteTemp = (fd: number) => paths.get(fd)?.startsWith(queuePath(dir) + '.') === true && paths.get(fd)!.endsWith('.tmp')
     const fault = () => { failures++; throw new Error('EIO recovery rewrite ' + failure) }
-    const seam = {
+    const seam = durableIo({ base: {
       ...fs,
       openSync(...args: Parameters<typeof fs.openSync>) {
         if (fail && failure === 'temp-open' && String(args[0]).startsWith(queuePath(dir) + '.') && String(args[0]).endsWith('.tmp')) fault()
@@ -485,22 +476,21 @@ describe('b.2is torn-tail recovery', () => {
         }
         return fs.writeSync(fd, bytes, offset, length)
       },
-      fsyncSync(fd: number) {
-        // Quarantine must have synced successfully; fail only the directory
-        // durability boundary after the replacement journal has been renamed.
-        if (fail && failure === 'file-fsync' && rewriteTemp(fd)) fault()
-        if (syncingRename && paths.get(fd) === join(dir, 'queue')) {
-          syncingRename = false
-          if (fail && failure === 'directory-fsync') fault()
-        }
-        fs.fsyncSync(fd)
-      },
-      renameSync(from: fs.PathLike, to: fs.PathLike) {
-        if (fail && failure === 'rename' && String(to) === queuePath(dir)) fault()
-        fs.renameSync(from, to)
-        if (String(to) === queuePath(dir)) { renames++; syncingRename = true }
-      },
-    } as typeof fs
+    } as typeof fs, before(step) {
+      if (step.op === 'rename') {
+        if (fail && failure === 'rename' && step.to === queuePath(dir)) fault()
+        // The rename's callback follows this hook; it has happened before the next sync.
+        if (step.to === queuePath(dir)) { renames++; syncingRename = true }
+        return
+      }
+      // Quarantine must have synced successfully; fail only the directory
+      // durability boundary after the replacement journal has been renamed.
+      if (fail && failure === 'file-fsync' && rewriteTemp(step.fd!)) fault()
+      if (syncingRename && step.path === join(dir, 'queue')) {
+        syncingRename = false
+        if (fail && failure === 'directory-fsync') fault()
+      }
+    } }).fs
     const events: QueueEvent[] = []
     let q = await recover({ fs: seam, onEvent: event => { events.push(event) } })
     expect(failures).toBe(1)
@@ -593,7 +583,7 @@ describe('b.2is torn-tail recovery', () => {
     let fail = true, failures = 0
     const paths = new Map<number, string>()
     const quarantine = (fd: number) => paths.get(fd)?.includes('.unreadable-') === true
-    const seam = {
+    const seam = durableIo({ base: {
       ...fs,
       openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
       writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
@@ -604,14 +594,12 @@ describe('b.2is torn-tail recovery', () => {
         }
         return fs.writeSync(fd, bytes, offset, length)
       },
-      fsyncSync(fd: number) {
-        if (fail && ((failure === 'file-sync' && quarantine(fd)) || (failure === 'directory-sync' && paths.get(fd) === join(dir, 'queue')))) {
-          failures++
-          throw new Error('EIO quarantine durability')
-        }
-        fs.fsyncSync(fd)
-      },
-    } as typeof fs
+    } as typeof fs, before(step) {
+      if (step.op === 'fsync' && fail && ((failure === 'file-sync' && quarantine(step.fd!)) || (failure === 'directory-sync' && step.path === join(dir, 'queue')))) {
+        failures++
+        throw new Error('EIO quarantine durability')
+      }
+    } }).fs
     const q = await recover({ fs: seam })
     for (let retry = 0; retry < 2; retry++) {
       expect(q.items('alpha')).toEqual([])
@@ -668,14 +656,13 @@ describe('b.2is repair composed with the durable journal and thread facts', () =
   /** The real fs, recording truncations by path and rename targets; `failRewrite` refuses the repair's temporary file. */
   function recordingFs(failRewrite: () => boolean = () => false) {
     const paths = new Map<number, string>(), truncations: string[] = [], renames: string[] = []
-    const seam = { ...fs,
+    const seam = durableIo({ base: { ...fs,
       openSync(...args: Parameters<typeof fs.openSync>) {
         if (failRewrite() && String(args[0]).endsWith('.tmp') && args[1] === 'wx') throw Object.assign(new Error('injected ENOSPC opening the repair rewrite'), { code: 'ENOSPC' })
         const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd
       },
       ftruncateSync(fd: number, length?: number) { truncations.push(paths.get(fd) ?? `fd:${fd}`); return fs.ftruncateSync(fd, length) },
-      renameSync(from: fs.PathLike, to: fs.PathLike) { renames.push(String(to)); return fs.renameSync(from, to) },
-    } as typeof fs
+    } as typeof fs, before(step) { if (step.op === 'rename') renames.push(step.to!) } }).fs
     return { fs: seam, truncations, renames }
   }
   const quarantined = (key = 'alpha') => fs.readdirSync(join(dir, 'queue')).filter(name => name.startsWith(`${key}.unreadable-`))
@@ -796,10 +783,9 @@ describe('b.2is repair composed with the durable journal and thread facts', () =
   test('a failed store reports the exact Slack identity: slackKey with its edit, and edited_ts', async () => {
     let failing = true
     const events: QueueEvent[] = []
-    const q = await open({ onEvent: event => { events.push(event) }, fs: { ...fs, fsyncSync(fd: number) {
-      if (failing && fs.fstatSync(fd).isFile()) throw Object.assign(new Error('injected ENOSPC'), { code: 'ENOSPC' })
-      fs.fsyncSync(fd)
-    } } as typeof fs })
+    const q = await open({ onEvent: event => { events.push(event) }, fs: durableIo({ before(step) {
+      if (failing && step.op === 'fsync' && fs.fstatSync(step.fd!).isFile()) throw Object.assign(new Error('injected ENOSPC'), { code: 'ENOSPC' })
+    } }).fs })
     // The fixture message, edited.
     const key = { ...slackInput().key!, edited_ts: THREAD_ROOTS.secondary }
     expect((await q.acceptDecided('alpha', key, () => ({ store: slackInput({ key, ts: key.ts, edited_ts: key.edited_ts }) }))).status).toBe('failed')
@@ -833,7 +819,7 @@ test('one unreadable queue refuses acceptance and exposes its recovery failure w
 })
 test('fixed append fsync failure leaves accepted-only work retryable and no fixed bytes falsely visible', async () => {
   let failed = false
-  const seam = { ...fs, fsyncSync: (fd: number) => { if (failed && fs.fstatSync(fd).isFile()) throw new Error('EIO'); fs.fsyncSync(fd) } } as typeof fs
+  const seam = failFileSyncs(() => failed, 'EIO')
   const q = await open({ fs: seam }); await q.accept('alpha', injectedInput()); failed = true
   const fixed = { v: 1, kind: 'fixed', seq: 1, parts: ['exact fixed bytes'] } as const
   await expect(q.append('alpha', { ...fixed, parts: [...fixed.parts] })).rejects.toThrow('EIO'); expect(q.items('alpha')[0]!.fixed).toBeUndefined()
@@ -915,8 +901,9 @@ test('construction performs no filesystem access and starts no maintenance timer
   queues.push(q); expect(calls).toEqual([])
 })
 test('short filesystem writes are completed before acceptance, and file fsync precedes new-file directory fsync', async () => {
-  const order: string[] = []; const paths = new Map<number, string>()
-  const seam = { ...fs, openSync: (...args: Parameters<typeof fs.openSync>) => { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd }, writeSync: (fd: number, buffer: Uint8Array, offset: number, length: number) => fs.writeSync(fd, buffer, offset, Math.min(length, 7)), fsyncSync: (fd: number) => { order.push(paths.get(fd)!); fs.fsyncSync(fd) } } as typeof fs
+  const order: string[] = []
+  const seam = durableIo({ base: { ...fs, writeSync: (fd: number, buffer: Uint8Array, offset: number, length: number) => fs.writeSync(fd, buffer, offset, Math.min(length, 7)) } as typeof fs,
+    before(step) { if (step.op === 'fsync') order.push(step.path) } }).fs
   const q = await open({ fs: seam }); expect((await q.accept('alpha', injectedInput({ text: '🙂'.repeat(40) }))).status).toBe('accepted'); expect(readQueue(dir)[0]).toMatchObject({ text: '🙂'.repeat(40) }); expect(order.lastIndexOf(join(dir, 'queue'))).toBeGreaterThan(order.lastIndexOf(queuePath(dir)))
 })
 
@@ -924,18 +911,14 @@ test('short filesystem writes are completed before acceptance, and file fsync pr
 test.each(['truncate', 'fsync'] as const)('keeps the original rollback boundary through repeated reconciliation %s failures', async failure => {
   let phase: 'ok' | 'failed-append' | 'reconcile' = 'ok'
   const truncations: number[] = []
-  const seam = {
+  const seam = failFileSyncs(() => phase !== 'ok', 'EIO fsync', {
     ...fs,
-    fsyncSync(fd: number) {
-      if (phase !== 'ok' && fs.fstatSync(fd).isFile()) throw new Error('EIO fsync')
-      fs.fsyncSync(fd)
-    },
     ftruncateSync(fd: number, length = 0) {
       truncations.push(length)
       if (phase === 'failed-append' || phase === 'reconcile' && failure === 'truncate') throw new Error('EIO truncate')
       fs.ftruncateSync(fd, length)
     },
-  } as typeof fs
+  } as typeof fs)
   const q = await open({ fs: seam })
   expect(await q.accept('alpha', injectedInput({ text: 'A' }))).toMatchObject({ status: 'accepted', seq: 1 })
   const boundary = fs.statSync(queuePath(dir)).size
@@ -983,7 +966,7 @@ test.each(['write', 'fsync', 'truncate'] as const)('failed quarantine %s retries
   let fail = true
   const paths = new Map<number, string>()
   const quarantine = (fd: number) => paths.get(fd)?.includes('.unreadable-') === true
-  const seam = {
+  const seam = durableIo({ base: {
     ...fs,
     openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
     writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
@@ -991,15 +974,13 @@ test.each(['write', 'fsync', 'truncate'] as const)('failed quarantine %s retries
       if (fail && quarantine(fd) && failure === 'write') throw new Error('EIO full write')
       return written
     },
-    fsyncSync(fd: number) {
-      if (fail && quarantine(fd) && failure !== 'write') throw new Error('EIO fsync')
-      fs.fsyncSync(fd)
-    },
     ftruncateSync(fd: number, length = 0) {
       if (fail && quarantine(fd) && failure === 'truncate') throw new Error('EIO truncate')
       fs.ftruncateSync(fd, length)
     },
-  } as typeof fs
+  } as typeof fs, before(step) {
+    if (step.op === 'fsync' && fail && quarantine(step.fd!) && failure !== 'write') throw new Error('EIO fsync')
+  } }).fs
   const q = await open({ fs: seam })
   for (let retry = 0; retry < 2; retry++) {
     expect(q.items('alpha')).toEqual([])
@@ -1019,9 +1000,10 @@ test.each(['write', 'fsync', 'truncate'] as const)('failed quarantine %s retries
 
 
 test('maintenance compacts at the exported interval once and stop cancels its timer', async () => {
-  const clock = createFakeClock()
+  const clock = createFakeClock(), io = durableIo()
+  clock.settleOn(io)
   const scheduled: number[] = []
-  const q = await open({ now: clock.now,
+  const q = await open({ now: clock.now, fs: io.fs,
     setInterval: ((callback: () => void, delay: number) => {
       scheduled.push(delay)
       const handle: { current?: unknown } = {}
@@ -1128,15 +1110,13 @@ describe('thread_join acceptance and main-reader compatibility', () => {
 
   test.each(['mention', 'broadcast'])('%s joins share the accepting append/fsync and survive reaction adoption and replay', async via => {
     const writes: Buffer[] = [], syncs: string[] = []
-    const paths = new Map<number, string>()
-    const seam = { ...fs,
-      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+    const io = durableIo({ base: { ...fs,
       writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number | null) {
-        if (paths.get(fd) === queuePath(dir)) writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
+        if (io.paths.get(fd) === queuePath(dir)) writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
         return fs.writeSync(fd, bytes, offset, length, position)
       },
-      fsyncSync(fd: number) { if (fs.fstatSync(fd).isFile()) syncs.push(paths.get(fd)!); fs.fsyncSync(fd) },
-    } as typeof fs
+    } as typeof fs, before(step) { if (step.op === 'fsync' && fs.fstatSync(step.fd!).isFile()) syncs.push(step.path) } })
+    const seam = io.fs
     const clock = createFakeClock({ start: THREAD_TIME })
     const q = await open({ fs: seam, now: clock.now }), input = joiningInput(via)
     const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }))
@@ -1282,24 +1262,44 @@ describe('thread_join acceptance and main-reader compatibility', () => {
 })
 
 describe('decided acceptance owns the persona writer turn', () => {
-  test('the next decision sees afterStore before it runs, and a concurrent duplicate never decides', async () => {
-    const q = await open(), order: string[] = []
+  test('afterStore runs after durability in the step that publishes the store; the next decision waits for it and sees it, and a concurrent duplicate never decides', async () => {
+    const { io, gate, reached } = holdFirstSync(path => path === queuePath(dir))
+    const order: string[] = []
+    let joined = false, joinedWhenPublicationYields: boolean | undefined
+    const q = await open({ fs: io.fs, onEvent: e => {
+      if (e.type !== 'stored' || e.key !== 'alpha' || joinedWhenPublicationYields !== undefined) return
+      order.push('stored')
+      // Runs once the publishing step returns control: no other turn can see the store unjoined.
+      queueMicrotask(() => { joinedWhenPublicationYields = joined })
+    } })
     const first = slackInput({ via: 'mention' }), second = slackInput({ ts: THREAD_ROOTS.secondary, key: { ...first.key!, ts: THREAD_ROOTS.secondary } })
-    let joined = false
-    let joinedBeforeYield: boolean | undefined
     const a = q.acceptDecided('alpha', first.key, ({ keyChecked }) => {
       expect(keyChecked).toBe(true); order.push('mention')
-      queueMicrotask(() => { joinedBeforeYield = joined })
-      return { store: first, afterStore: () => { joined = true; order.push('join') } }
+      return { store: first, afterStore: stored => {
+        // Published and durable: readable, its bytes written and both syncs complete.
+        expect(stored.seq).toBe(1)
+        expect(q.item('alpha', 1)?.accepted.key).toEqual(first.key)
+        expect(readQueue(dir)).toHaveLength(1)
+        expect(io.busy()).toBe(false); expect(io.held()).toBe(0)
+        joined = true; order.push('join')
+      } }
     })
     const b = q.acceptDecided('alpha', second.key, ({ keyChecked }) => {
       expect(keyChecked).toBe(true); expect(joined).toBe(true); order.push('reply')
       return { store: { ...second, via: joined ? 'thread' : 'mention' } }
     })
     const duplicate = q.acceptDecided('alpha', first.key, () => { throw new Error('duplicate must not decide') })
+    await reached()
+    // The first store waits on its file sync: nothing published or joined, the next decision
+    // waits, while timers and another persona's store run.
+    expect(await new Promise<boolean>(resolve => setTimeout(() => resolve(true), 0))).toBe(true)
+    expect((await q.accept('beta', injectedInput())).status).toBe('accepted')
+    expect(order).toEqual(['mention']); expect(joined).toBe(false)
+    expect(q.item('alpha', 1)).toBeUndefined(); expect(q.lookupSlackKey('alpha', first.key!)).toBeUndefined()
+    gate.release()
     expect((await Promise.all([a, b, duplicate])).map(r => r.status)).toEqual(['accepted', 'accepted', 'duplicate'])
-    expect(order).toEqual(['mention', 'join', 'reply'])
-    expect(joinedBeforeYield).toBe(true)
+    expect(order).toEqual(['mention', 'stored', 'join', 'reply'])
+    expect(joinedWhenPublicationYields).toBe(true)
     expect(q.items('alpha').map(i => [i.accepted.seq, i.accepted.via])).toEqual([[1, 'mention'], [2, 'thread']])
     expect(readQueue(dir)).toHaveLength(2)
   })
@@ -1307,9 +1307,7 @@ describe('decided acceptance owns the persona writer turn', () => {
   test.each(['skip', 'store', 'afterStore throws', 'decide throws', 'append fails'] as const)('%s preserves durable outcomes and callback order', async outcome => {
     let fail = outcome === 'append fails'
     const order: string[] = [], skipped = { reason: 'drop', detail: { identity: true } }, error = new Error('decision failed')
-    const q = await open({ onEvent: e => order.push(e.type), fs: { ...fs,
-      fsyncSync(fd: number) { if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO acceptance'); fs.fsyncSync(fd) },
-    } as typeof fs })
+    const q = await open({ onEvent: e => order.push(e.type), fs: failFileSyncs(() => fail, 'EIO acceptance') })
     const result = await q.acceptDecided('alpha', slackInput().key, ({ keyChecked }) => {
       expect(keyChecked).toBe(true); order.push('decide')
       if (outcome === 'skip') return { skip: skipped }
@@ -1380,20 +1378,137 @@ describe('decided acceptance owns the persona writer turn', () => {
     expect(fs.existsSync(queuePath(dir)) ? fs.readFileSync(queuePath(dir)) : undefined).toEqual(bytes)
   })
 
-  test('other personas accept while one persona has earlier queued turns', async () => {
-    const q = await open(), order: string[] = []
-    // A backlog makes the observation deterministic without timers or an async
-    // decide (the public callback contract is synchronous).
+  test("other personas accept while one persona's earlier turn waits on a held sync; its queued turns then run in order", async () => {
+    const { io, gate, reached } = holdFirstSync(path => path === queuePath(dir))
+    const q = await open({ fs: io.fs }), order: string[] = []
+    const head = q.accept('alpha', injectedInput())
     const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
+    await reached()
     const decided = q.acceptDecided('beta', slackInput().key, () => { order.push('beta'); return { store: slackInput() } })
     const plain = q.accept('gamma', injectedInput()).then(r => { order.push('gamma'); return r })
     expect((await Promise.all([decided, plain])).map(r => r.status)).toEqual(['accepted', 'accepted'])
-    expect(order).not.toContain('alpha:19')
-    await Promise.all(backlog)
-    expect(order.indexOf('beta')).toBeLessThan(order.indexOf('alpha:19'))
-    expect(order.indexOf('gamma')).toBeLessThan(order.indexOf('alpha:19'))
+    expect([...order].sort()).toEqual(['beta', 'gamma'])
     expect(q.openCount('alpha')).toBe(0)
+    gate.release()
+    expect(await head).toMatchObject({ status: 'accepted', seq: 1 })
+    await Promise.all(backlog)
+    expect(order.filter(entry => entry.startsWith('alpha:'))).toEqual(Array.from({ length: 20 }, (_, i) => `alpha:${i}`))
+    expect(q.openCount('alpha')).toBe(1)
     expect(q.openCount('beta')).toBe(1); expect(q.openCount('gamma')).toBe(1)
+  })
+})
+
+describe('writer turns that wait on the disk', () => {
+  test('an accept stays unpublished and unanswered until its directory sync completes', async () => {
+    const h = holdFirstSync(path => path === join(dir, 'queue'))
+    const q = await open({ fs: h.io.fs })
+    h.state.armed = true
+    let settled = false
+    const pending = q.accept('alpha', slackInput()).then(result => { settled = true; return result })
+    await h.reached()
+    expect(fs.readFileSync(queuePath(dir), 'utf8')).toContain(slackInput().text!)
+    expect(settled).toBe(false)
+    expect(q.items('alpha')).toEqual([]); expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
+    h.gate.release()
+    expect(await pending).toMatchObject({ status: 'accepted', seq: 1 })
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+  })
+
+  test("stop() during start()'s compaction waits for that journal's rewrite, then no further journal is compacted", async () => {
+    const delivered = [accepted(), fixedRecord(), sentRecord(), deliveredRecord()]
+    seedQueue(dir, delivered); seedQueue(dir, delivered, 'beta')
+    const before = { alpha: fs.readFileSync(queuePath(dir)), beta: fs.readFileSync(queuePath(dir, 'beta')) }
+    const h = holdFirstSync(path => path.endsWith('.tmp'))
+    const q = createDeliveryQueue({ stateDir: dir, fs: h.io.fs }); queues.push(q)
+    const starting = q.start()
+    await h.reached()
+    const first = h.state.path.startsWith(`${queuePath(dir)}.`) ? 'alpha' : 'beta', second = first === 'alpha' ? 'beta' : 'alpha'
+    let stopped = false
+    const stopping = q.stop().then(() => { stopped = true })
+    await yieldToEventLoop()
+    expect(stopped).toBe(false)
+    h.gate.release()
+    await Promise.all([starting, stopping])
+    expect(fs.readFileSync(queuePath(dir, first))).not.toEqual(before[first])
+    // Its delivered key is long past the keep window under the real clock.
+    expect(readQueue(dir, first).map(r => 'compact' in r ? r.compact : r.kind)).toEqual(['allocation'])
+    expect(fs.readFileSync(queuePath(dir, second))).toEqual(before[second])
+    expect(fs.readdirSync(join(dir, 'queue')).filter(name => name.endsWith('.tmp'))).toEqual([])
+    expect((await q.accept('alpha', injectedInput())).status).toBe('failed')
+  })
+
+  test("stop() during start()'s first journal leaves a later damaged journal unloaded: no quarantine, its bytes unchanged", async () => {
+    const damaged = '{"v":99,"kind":"accepted","seq":9,"text":"private queued body"}\n'
+    for (const key of ['alpha', 'beta']) seedQueue(dir, [accepted(), damaged], key)
+    const before = { alpha: fs.readFileSync(queuePath(dir)), beta: fs.readFileSync(queuePath(dir, 'beta')) }
+    const h = holdFirstSync(path => path.startsWith(join(dir, 'queue') + '/'))
+    const q = createDeliveryQueue({ stateDir: dir, fs: h.io.fs }); queues.push(q)
+    const starting = q.start()
+    await h.reached()
+    const first = h.state.path.startsWith(join(dir, 'queue', 'alpha.')) ? 'alpha' : 'beta', second = first === 'alpha' ? 'beta' : 'alpha'
+    const stopping = q.stop()
+    h.gate.release()
+    await Promise.all([starting, stopping])
+    const names = fs.readdirSync(join(dir, 'queue'))
+    expect(names.filter(name => name.startsWith(`${first}.unreadable-`))).toHaveLength(1)
+    expect(names.filter(name => name.startsWith(`${second}.unreadable-`))).toEqual([])
+    expect(fs.readFileSync(queuePath(dir, second))).toEqual(before[second])
+    expect(h.io.steps.filter(step => step.path.startsWith(join(dir, 'queue', `${second}.`)))).toEqual([])
+  })
+
+  test('a compaction whose owner ends while its rollback repair waits on the disk repairs but does not rewrite', async () => {
+    let failing = false
+    const h = holdFirstSync(path => path === queuePath(dir))
+    const seam = durableIo({ base: { ...h.io.fs,
+      ftruncateSync(fd: number, length = 0) { if (failing) throw new Error('EIO rollback'); fs.ftruncateSync(fd, length) },
+    } as typeof fs, before(step) { if (failing && step.op === 'fsync' && fs.fstatSync(step.fd!).isFile()) throw new Error('EIO append sync') } }).fs
+    h.state.armed = false
+    const q = await open({ fs: seam })
+    await q.accept('alpha', injectedInput()); await q.append('alpha', fixedRecord()); await q.append('alpha', deliveredRecord())
+    const boundary = fs.readFileSync(queuePath(dir))
+    failing = true
+    expect((await q.accept('alpha', injectedInput({ text: 'unaccepted' }))).status).toBe('failed')
+    failing = false
+    expect(fs.readFileSync(queuePath(dir)).length).toBeGreaterThan(boundary.length)
+    let alive = true
+    h.state.armed = true
+    const compaction = q.compact('alpha', () => alive)
+    await h.reached()
+    alive = false
+    h.gate.release()
+    await compaction
+    // Repaired to the accepted bytes exactly, and never rewritten.
+    expect(fs.readFileSync(queuePath(dir))).toEqual(boundary)
+    expect(h.io.steps.some(step => step.op === 'rename')).toBe(false)
+    expect(fs.readdirSync(join(dir, 'queue')).filter(name => name.endsWith('.tmp'))).toEqual([])
+    await q.compact('alpha')
+    expect(h.io.steps.some(step => step.op === 'rename')).toBe(true)
+    expect(q.items('alpha')).toEqual([])
+  })
+
+  test('a hold resolution whose owner ends while its first load awaits quarantine durability saves nothing', async () => {
+    let unreadable = true
+    const damaged = '{"v":99,"kind":"accepted","seq":9,"text":"private queued body"}\n'
+    const held = { ...accepted(), ...heldSlackInput(memoryHold(THREAD_TIME)), received_at: THREAD_TIME }
+    seedQueue(dir, [held, damaged])
+    const h = holdFirstSync(path => path.includes('.unreadable-'))
+    const q = createDeliveryQueue({ stateDir: dir, fs: { ...h.io.fs,
+      readFileSync(path: fs.PathOrFileDescriptor, ...args: unknown[]) {
+        if (unreadable && String(path) === queuePath(dir)) throw new Error('EIO journal read')
+        return (fs.readFileSync as Function)(path, ...args)
+      },
+    } as typeof fs }); queues.push(q)
+    await q.start()
+    unreadable = false
+    let alive = true
+    const resolving = q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: THREAD_TIME + 1 }], () => alive)
+    await h.reached()
+    alive = false
+    h.gate.release()
+    expect(await resolving).toEqual([])
+    expect(readQueue(dir).map(r => r.kind)).toEqual(['accepted'])
+    expect(q.unresolvedHolds('alpha').map(hold => hold.seq)).toEqual([1])
+    expect(await q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: THREAD_TIME + 1 }])).toHaveLength(1)
   })
 })
 
@@ -1469,24 +1584,21 @@ describe('Memory Hold queue records', () => {
 
   test.each([['memory', false], ['memory', true], ['post', false], ['post', true]] as const)('one accepting append protects an in-flight %s hold; store failure=%p', async (kind, fail) => {
     const clock = createFakeClock({ start: THREAD_TIME }), writes: Buffer[] = [], events: QueueEvent[] = []
-    const paths = new Map<number, string>(), observations: ReturnType<DeliveryQueue['unresolvedHolds']>[] = []
-    const seam = { ...fs,
-      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+    const observations: ReturnType<DeliveryQueue['unresolvedHolds']>[] = []
+    const io = durableIo({ base: { ...fs,
       writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number | null) {
-        if (paths.get(fd) === queuePath(dir)) {
+        if (io.paths.get(fd) === queuePath(dir)) {
           observations.push(q.unresolvedHolds('alpha'))
           writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
         }
         return fs.writeSync(fd, bytes, offset, length, position)
       },
-      fsyncSync(fd: number) {
-        if (paths.get(fd) === queuePath(dir)) {
-          observations.push(q.unresolvedHolds('alpha'))
-          if (fail) throw new Error('EIO hold store')
-        }
-        fs.fsyncSync(fd)
-      },
-    } as typeof fs
+    } as typeof fs, before(step) {
+      if (step.op !== 'fsync' || step.path !== queuePath(dir)) return
+      observations.push(q.unresolvedHolds('alpha'))
+      if (fail) throw new Error('EIO hold store')
+    } })
+    const seam = io.fs
     const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
     const hold = kind === 'post' ? postHold(clock.now(), { operations: ['post-one', 'post-two'] }) : memoryHold(clock.now())
     const input = heldSlackInput(hold, { text: 'held exact\nbytes🙂', queued_ack_reaction: 'original_queue' })
@@ -1708,21 +1820,19 @@ describe('Memory Hold queue records', () => {
 
   test('resolution batches save once, filter resolved/absent holds and publish only after durable sync', async () => {
     const clock = createFakeClock({ start: THREAD_TIME }), events: QueueEvent[] = [], writes: Buffer[] = []
-    let resolving = false
-    const seam = { ...fs,
+    let resolving = false, checkedSyncs = 0
+    const seam = durableIo({ base: { ...fs,
       writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number | null) {
         if (resolving) writes.push(Buffer.from(bytes.subarray(offset, offset + length)))
         return fs.writeSync(fd, bytes, offset, length, position)
       },
-      fsyncSync(fd: number) {
-        if (resolving) {
-          expect(q.unresolvedHolds('alpha').map(h => h.seq)).toEqual([1, 2])
-          expect(q.openCount('alpha')).toBe(2)
-          expect(events).toEqual([])
-        }
-        fs.fsyncSync(fd)
-      },
-    } as typeof fs
+    } as typeof fs, before(step) {
+      if (!resolving || step.op !== 'fsync') return
+      checkedSyncs++
+      expect(q.unresolvedHolds('alpha').map(h => h.seq)).toEqual([1, 2])
+      expect(q.openCount('alpha')).toBe(2)
+      expect(events).toEqual([])
+    } }).fs
     const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
     await storeHold(q, clock.now())
     await storeHold(q, clock.now(), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } })
@@ -1742,6 +1852,8 @@ describe('Memory Hold queue records', () => {
     events.length = 0; resolving = true
     expect(await q.resolveHolds('alpha', candidates)).toEqual(saved)
     resolving = false
+    // The file and directory syncs both ran before publication.
+    expect(checkedSyncs).toBe(2)
     expect(writes).toEqual([Buffer.from([withdrawnRecord(2, clock.now()), releasedRecord(1, clock.now())].map(r => JSON.stringify(r) + '\n').join(''))])
     expect(events).toEqual([{ type: 'holds-resolved', key: 'alpha', resolutions: saved }])
     expect(q.unresolvedHolds('alpha')).toEqual([])
@@ -1759,11 +1871,7 @@ describe('Memory Hold queue records', () => {
   test('failed resolution sync saves none; an append restores writability and one retry resolves the batch', async () => {
     const clock = createFakeClock({ start: THREAD_TIME }), events: QueueEvent[] = []
     let fail = false
-    const seam = { ...fs, fsyncSync(fd: number) {
-      if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO hold resolution')
-      fs.fsyncSync(fd)
-    } } as typeof fs
-    const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
+    const q = await open({ now: clock.now, fs: failFileSyncs(() => fail, 'EIO hold resolution'), onEvent: e => events.push(e) })
     await storeHold(q, clock.now())
     await storeHold(q, clock.now(), { ts: THREAD_ROOTS.third, key: { ...slackInput().key!, ts: THREAD_ROOTS.third } })
     const bytes = fs.readFileSync(queuePath(dir)), holds = q.unresolvedHolds('alpha')
@@ -1853,18 +1961,26 @@ describe('Memory Hold queue records', () => {
     assertNoLeak(events)
   })
 
-  test('one persona resolves while another has queued writer turns', async () => {
-    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now }), order: string[] = []
+  test("one persona resolves while another's earlier turn waits on a held sync and more turns queue behind it", async () => {
+    const { io, gate, state, reached } = holdFirstSync(path => path === queuePath(dir), { armed: false })
+    const clock = createFakeClock({ start: THREAD_TIME }), q = await open({ now: clock.now, fs: io.fs }), order: string[] = []
     await storeHold(q, clock.now())
     await storeHold(q, clock.now(), {}, 'beta')
+    state.armed = true
+    const head = q.accept('alpha', injectedInput({ text: 'earlier turn' }))
     const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
-    const alpha = q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: clock.now() }]).then(() => order.push('alpha:resolved'))
-    await q.resolveHolds('beta', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])
-    expect(order).not.toContain('alpha:19')
+    const alpha = q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: clock.now() }]).then(saved => { order.push('alpha:resolved'); return saved })
+    await reached()
+    expect(await q.resolveHolds('beta', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])).toHaveLength(1)
+    expect(order).toEqual([])
     expect(q.unresolvedHolds('alpha')).toHaveLength(1)
     expect(q.unresolvedHolds('beta')).toEqual([])
-    await Promise.all([...backlog, alpha])
-    expect(q.openCount('alpha')).toBe(1)
+    gate.release()
+    await Promise.all([head, ...backlog])
+    expect(await alpha).toHaveLength(1)
+    expect(order).toEqual([...Array.from({ length: 20 }, (_, i) => `alpha:${i}`), 'alpha:resolved'])
+    expect(q.unresolvedHolds('alpha')).toEqual([])
+    expect(q.openCount('alpha')).toBe(2)
   })
 
   test.each((['unresolved', 'released', 'withdrawn'] as const).flatMap(state => (['memory', 'post'] as const).map(kind => [state, kind] as const)))('%s %s hold keeps its Slack key across reopen, compaction and the retention boundary', async (state, kind) => {
@@ -1996,18 +2112,13 @@ describe('test-only store timings', () => {
    * after its bytes are written) run `during` and then fail while `fail` is set. */
   function timedRig() {
     const rig = { mono: 50_000, reads: 0, fail: false, during: undefined as (() => void) | undefined }
-    const paths = new Map<number, string>()
     return Object.assign(rig, {
       monotonicNow: () => { rig.reads++; return rig.mono },
       /** Each journal fsync advances the clock by the next of `ms`, then by nothing. */
       costs: (...ms: number[]) => { rig.during = () => { rig.mono += ms.shift() ?? 0 } },
-      fs: { ...fs,
-        openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
-        fsyncSync(fd: number) {
-          if (/\/queue\/[^/]+\.jsonl$/.test(paths.get(fd) ?? '')) { rig.during?.(); if (rig.fail) throw new Error('EIO timed store') }
-          fs.fsyncSync(fd)
-        },
-      } as typeof fs,
+      fs: durableIo({ before(step) {
+        if (step.op === 'fsync' && /\/queue\/[^/]+\.jsonl$/.test(step.path)) { rig.during?.(); if (rig.fail) throw new Error('EIO timed store') }
+      } }).fs,
     })
   }
   type TimedRig = ReturnType<typeof timedRig>
@@ -2179,8 +2290,9 @@ describe('test-only store timings', () => {
   })
 
   test('maintenance compacts at compactIntervalMs when given', async () => {
-    const clock = createFakeClock(), scheduled: number[] = []
-    const q = await open({ now: clock.now, compactIntervalMs: 250,
+    const clock = createFakeClock(), scheduled: number[] = [], io = durableIo()
+    clock.settleOn(io)
+    const q = await open({ now: clock.now, fs: io.fs, compactIntervalMs: 250,
       setInterval: ((callback: () => void, delay: number) => {
         scheduled.push(delay)
         const handle: { current?: unknown } = {}

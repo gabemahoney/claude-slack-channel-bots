@@ -70,6 +70,7 @@ import { isRealHome, isUnder, osTempDir } from './host-safe-env.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { durableIo, type DurableIo } from './durable-io.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { errTmuxUnresponsive } from './agent-director-stub.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
@@ -658,6 +659,8 @@ export interface RoutingHarness {
   settleJoinSaves(): Promise<void>
   ready(): Promise<void>
   queue: ReturnType<typeof createDeliveryQueue>
+  /** Tracks the queue's disk waits; the opt-in Thread Memory clock's flush settles on it. */
+  queueIo: DurableIo
   queued(name: string): QueueItem[]
   /** The applied config the routing reads at call time; set to null for none, or edit it. */
   config: PersonaConfig | null
@@ -958,12 +961,14 @@ export function makeRoutingHarness(
       opts.queueOptions?.onEvent?.(event)
     },
   }
-  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, ...queueOptions })
+  const queueIo = durableIo({ base: queueOptions?.fs })
+  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, ...queueOptions, fs: queueIo.fs })
   const joinSaveHolds = new Map<string, Promise<void>>()
   const joinSaves: Promise<unknown>[] = []
   const queueReady = queue.start()
   const h: RoutingHarness = {
     queue,
+    queueIo,
     threadMemoryReads: [],
     pendingOwnPostReads: [],
     holdStored: [],
@@ -1096,6 +1101,7 @@ export function makeRoutingHarness(
     // is still in flight, not just the accepted items visible in the queue.
     heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
   })
+  h.threads?.clock.settleOn(queueIo)
   const threadReady = h.threads?.start()
   if (h.threads) {
     const ownPostSources = {

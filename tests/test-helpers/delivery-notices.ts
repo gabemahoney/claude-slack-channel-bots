@@ -23,6 +23,7 @@ import { observedMembership } from './persona-routing-harness.ts'
 import { makeThreadMemoryHarness, type ThreadMemoryHarness } from './thread-memory.ts'
 import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, type DeferredWebApiCall } from './slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage } from './credentials.ts'
+import { durableIo } from './durable-io.ts'
 
 export async function makeDeliveryNoticeHarness(options: {
   queue?: DeliveryQueue; leakMarker?: string; holds?: boolean; fs?: typeof fs
@@ -38,7 +39,9 @@ export async function makeDeliveryNoticeHarness(options: {
   const logs: string[] = [], blocked: { key: string; rule: 'menu' | 'input' }[] = [], delivered: { key: string; item: QueueItem }[] = []
   const queued: { key: string; item: QueueItem }[] = []
   const states = new Map(config.personas.map(p => [p.key, { up: true } as DeliveryReportState]))
-  const queue = options.queue ?? await makeQueue(root, { fs: options.fs, now: h.clock.now, onEvent: event => reporting?.queueEvent(event) })
+  const queueIo = durableIo({ base: options.fs })
+  h.clock.settleOn(queueIo)
+  const queue = options.queue ?? await makeQueue(root, { fs: queueIo.fs, now: h.clock.now, onEvent: event => reporting?.queueEvent(event) })
   const reporting = createDeliveryReporting({ queue, episodes: rig.episodes, persona: key => config.personas.find(p => p.key === key), state: key => states.get(key)!,
     log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text),
     delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now,
@@ -113,10 +116,9 @@ export async function makeStorageNoticeHarness(options: {
       dm: { enabled: true, contact: name === 'alpha' ? 'U0ALPHA01' : 'U0BETA001' },
       permission_prompts: options.destination === 'channel' ? ids.notice : 'dm',
     })),
-    fs: { ...fs, fsyncSync(fd) {
-      if (diskFailed && fs.fstatSync(fd).isFile()) throw Object.assign(new Error(sentinelInMessage('store')), { code: 'ENOSPC' })
-      fs.fsyncSync(fd)
-    } },
+    fs: durableIo({ before(step) {
+      if (step.op === 'fsync' && diskFailed && fs.fstatSync(step.fd!).isFile()) throw Object.assign(new Error(sentinelInMessage('store')), { code: 'ENOSPC' })
+    } }).fs,
   })
   const held: DeferredWebApiCall[] = []
   const acks: { key: string; records: ReturnType<typeof readQueue> }[] = []

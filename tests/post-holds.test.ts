@@ -55,6 +55,7 @@ const failure = (): OwnPostAnswer => ownPostAnswerOfError(slackPlatformError('no
  * resolution's `at`) is the harness clock and never moves unless a case moves it. */
 async function resolverFixture(options: { names?: string[]; canRun?: (key: string) => boolean; timerEarlyMs?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'post-holds-')), holdClock = createFakeClock(), io = threadFsControls(dir)
+  holdClock.settleOn(io.durable)
   let wall = () => THREAD_TIME
   const queue = await makeQueue(dir, { now: () => wall(), fs: io.fs })
   let harness: OwnPostHarness | undefined

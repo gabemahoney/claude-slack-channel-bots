@@ -390,10 +390,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function materialize(j: Journal): QueueItem[] {
     return [...j.items.values()].sort((a, b) => a.accepted.seq - b.accepted.seq)
   }
-  function load(key: string): void {
+  async function load(key: string): Promise<void> {
     const stored = journal(key)
     if (stored.loaded) return
-    if (stored.pendingRecovery) { finishRecovery(key, stored); return }
+    if (stored.pendingRecovery) { await finishRecovery(key, stored); return }
     // Publish only a complete replay after quarantine is durable. Its existing
     // items must remain visible to startup preparation and delivery recovery.
     const j = emptyJournal()
@@ -433,7 +433,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     rebuild(j)
     if (damaged.length) {
       // Exact original bytes, including torn tails, preserved before rewriting the source.
-      durableAppend(quarantinePath, Buffer.concat(damaged.map(l => l.bytes)), stored.quarantineRollback ??= {})
+      await durableAppend(quarantinePath, Buffer.concat(damaged.map(l => l.bytes)), stored.quarantineRollback ??= {})
       for (const l of damaged) {
         const raw = l.raw
         const seq = raw?.seq
@@ -449,15 +449,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       // the damage; truncating a torn send alone would lose that evidence.
       j.pendingRecovery = true
       journals.set(key, j)
-      finishRecovery(key, j)
+      await finishRecovery(key, j)
       return
     }
     j.loaded = true
     journals.set(key, j)
     loadedAfterStart(key)
   }
-  function finishRecovery(key: string, stored: Journal): void {
-    try { rewrite(pathFor(key), Buffer.from(stored.records.map(r => JSON.stringify(r) + '\n').join(''))) } catch (error) { event({ type: 'recovery-failed', key, error }); throw error }
+  async function finishRecovery(key: string, stored: Journal): Promise<void> {
+    try { await rewrite(pathFor(key), Buffer.from(stored.records.map(r => JSON.stringify(r) + '\n').join(''))) } catch (error) { event({ type: 'recovery-failed', key, error }); throw error }
     // A rename followed by failed directory fsync is still pending: no writer
     // can append until retry makes this same recovered journal durable.
     stored.pendingRecovery = false
@@ -519,10 +519,12 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     return [...targets.values()]
   }
-  function compactOne(key: string): void {
-    load(key)
+  async function compactOne(key: string, current: () => boolean = () => true): Promise<void> {
+    await load(key)
     const j = journal(key)
-    reconcileRollback(pathFor(key), j)
+    await reconcileRollback(pathFor(key), j)
+    // The caller's lifetime can end while the repair awaits the disk.
+    if (!current()) return
     const at = now(), retained: QueueRecord[] = []
     const retainedJoinItems = new Set<number>()
     const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
@@ -565,7 +567,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     // Preserve both sequence allocation and the injected microsecond watermark forever.
     retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
-    rewrite(pathFor(key), Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')))
+    await rewrite(pathFor(key), Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')))
     j.records = retained
     rebuild(j)
   }
@@ -578,8 +580,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function needsThreadJoinCopy(key: string, record: AcceptedRecord): boolean {
     return record.thread_join !== undefined && options.threadJoinSaved?.(key, record.channel!, record.thread_join) !== true
   }
-  /** Caller owns the loaded journal's serial turn, begun at `turnStarted`, and has checked duplicates. */
-  function storeAccepted(key: string, input: AcceptedInput, turnStarted: number | undefined): { status: 'accepted'; seq: number; item: QueueItem } {
+  /** Caller owns the loaded journal's serial turn, begun at `turnStarted`, and has checked duplicates.
+   * `afterStore` runs in the same synchronous step that publishes the durable record. */
+  async function storeAccepted(key: string, input: AcceptedInput, turnStarted: number | undefined,
+    afterStore?: (stored: { seq: number }) => void): Promise<{ status: 'accepted'; seq: number; item: QueueItem }> {
     const j = journal(key), received_at = input.received_at ?? now()
     const candidate = BigInt(Math.trunc(received_at * 1000))
     const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
@@ -588,27 +592,29 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     if (record.hold) storingHolds.set(key, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
     let timed: QueueStoreTiming | undefined
     try {
-      durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
+      await durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
       timed = timing(turnStarted)
       update(j, record)
     } finally { storingHolds.delete(key) }
     const store: QueueStoreKind = record.hold?.on === 'post' ? 'post-hold' : record.hold?.on === 'memory' ? 'memory-hold' : 'accepted'
     event(timed ? { type: 'stored', key, seq: record.seq, store, ...timed } : { type: 'stored', key })
-    return { status: 'accepted', seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
+    const item = structuredClone(j.items.get(record.seq)!)
+    try { afterStore?.({ seq: record.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
+    return { status: 'accepted', seq: record.seq, item }
   }
   function storeFailed(key: string, input: AcceptedInput | undefined, error: unknown): QueueAcceptResult {
     event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input?.source, sender: input?.sender, user: input?.user, bot_id: input?.bot_id, channel: input?.channel, ts: input?.ts ?? input?.key?.ts, edited_ts: input?.edited_ts ?? input?.key?.edited_ts, slackKey: input?.key, error })
     return { status: 'failed', error }
   }
   async function compact(key?: string, current = () => true): Promise<void> {
-    await Promise.all((key ? [key] : [...journals.keys()]).map(k => serial(k, () => { if (!current()) return; try { compactOne(k) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })))
+    await Promise.all((key ? [key] : [...journals.keys()]).map(k => serial(k, async () => { if (!current()) return; try { await compactOne(k, current) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })))
   }
   /** One append/fsync boundary for reminder facts and their injected delivery. */
-  function appendReminderRecords(key: string, records: QueueRecord[]): void {
+  async function appendReminderRecords(key: string, records: QueueRecord[]): Promise<void> {
     if (!started || stopped) throw new Error('Queue is not writable')
     if (!records.length) return
     const j = journal(key)
-    durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+    await durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
     for (const r of records) update(j, r)
   }
   const api: ReplyReminderQueue = {
@@ -616,8 +622,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     replyCallTargets: key => replyTargets(journal(key)),
     async recordReplyCall(key, targets) {
       targets = structuredClone(targets)
-      await serial(key, () => {
-        load(key)
+      await serial(key, async () => {
+        await load(key)
         const j = journal(key), records: ReplyReminderRecord[] = []
         for (const target of targets) {
           const previous = j.reminders.get(target.seq)
@@ -637,18 +643,18 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           }
           records.push({ v: 1, kind: 'reply-reminder', seq: target.seq, at: now(), state: 'replied', ...(attempts === undefined ? {} : { reply_attempts: attempts }) })
         }
-        appendReminderRecords(key, records)
+        await appendReminderRecords(key, records)
       })
     },
     async cancelReplyReminders(key) {
-      await serial(key, () => {
-        load(key)
-        appendReminderRecords(key, replySequences(journal(key)).map(seq => ({ v: 1, kind: 'reply-reminder', seq, at: now(), state: 'cancelled' })))
+      await serial(key, async () => {
+        await load(key)
+        await appendReminderRecords(key, replySequences(journal(key)).map(seq => ({ v: 1, kind: 'reply-reminder', seq, at: now(), state: 'cancelled' })))
       })
     },
     async observeReplyReminders(key, row, text, enabled, current) {
-      return serial(key, () => {
-        load(key)
+      return serial(key, async () => {
+        await load(key)
         if (!current()) return []
         const j = journal(key), records: QueueRecord[] = [], injected: number[] = []
         let seq = j.nextSeq
@@ -671,24 +677,28 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           }
           records.push({ v: 1, kind: 'reply-reminder', seq: originalSeq, at: now(), delivered_at: previous.delivered_at ?? previous.at, state: cancelled ? 'cancelled' : alreadyQueued || nudge ? 'nudged' : 'observed', row_state: row.state, session_id: row.session_id, launch_started_at: row.launch_started_at, ...(previous.delivery_attempts === undefined ? {} : { delivery_attempts: previous.delivery_attempts }) })
         }
-        appendReminderRecords(key, records)
+        await appendReminderRecords(key, records)
         return injected.map(seq => structuredClone(j.items.get(seq)!))
       })
     },
     async start() {
       if (started) return
-      ensureDir()
+      await ensureDir()
       const keys = fs.readdirSync(dir).filter(p => p.endsWith('.jsonl')).map(p => p.slice(0, -6))
-      for (const key of keys) { try { await serial(key, () => { load(key); compactOne(key) }) } catch { /* inaccessible queues refuse acceptance; other personas still recover */ } }
+      for (const key of keys) {
+        // stop() waits only for writers that exist when it runs.
+        if (stopped) return
+        try { await serial(key, () => compactOne(key, () => !stopped)) } catch { /* inaccessible queues refuse acceptance; other personas still recover */ }
+      }
       started = true
     },
     async accept(key, input) {
       try {
         if (!started || stopped) throw new Error('Queue is not accepting')
         input = structuredClone(input)
-        return await serial(key, () => {
+        return await serial(key, async () => {
           const turnStarted = turnStart()
-          load(key)
+          await load(key)
           if (input.source === 'slack' && input.key) { const existing = lookupSlackKey(key, input.key); if (existing) return existing }
           return storeAccepted(key, input, turnStarted)
         })
@@ -698,12 +708,12 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       let input: AcceptedInput | undefined
       try {
         slackKey = structuredClone(slackKey)
-        return await serial(key, () => {
+        return await serial(key, async () => {
           const turnStarted = turnStart()
           let keyChecked = false, unavailable: unknown
           try {
             if (!started || stopped) throw new Error('Queue is not accepting')
-            load(key)
+            await load(key)
             const duplicate = slackKey ? lookupSlackKey(key, slackKey) : undefined
             if (duplicate) return duplicate
             keyChecked = true
@@ -712,9 +722,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           if ('skip' in decision) return { status: 'skipped' as const, outcome: decision.skip }
           input = structuredClone(decision.store)
           if (!keyChecked) throw unavailable
-          const result = storeAccepted(key, input, turnStarted)
-          try { decision.afterStore?.({ seq: result.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
-          return result
+          return await storeAccepted(key, input, turnStarted, decision.afterStore)
         })
       } catch (error) { return storeFailed(key, input, error) }
     },
@@ -722,10 +730,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       try {
         if (!started || stopped) throw new Error('Queue is not writable')
         record = structuredClone(record)
-        await serial(key, () => {
+        await serial(key, async () => {
           // Only a fixation is timed: N4's fallback is measured from its turn's start.
           const turnStarted = record.kind === 'fixed' ? turnStart() : undefined
-          load(key); const j = journal(key)
+          await load(key); const j = journal(key)
           if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder' || isHoldResolution(record)) throw new Error('Invalid append record')
           const item = j.items.get(record.seq)
           if (!item) throw new Error('Append has no accepted item')
@@ -746,7 +754,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
             const sent = lastSend(deliveredItem)
             if (deliveredItem.delivered && item.accepted.source === 'slack' && sent && !reminderResolved(j, deliveredItem)) records.push({ v: 1, kind: 'reply-reminder', seq: record.seq, at: record.at, state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(deliveredItem) })
           }
-          durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+          await durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
           const timed = timing(turnStarted)
           for (const next of records) update(j, next)
           if (timed) event({ type: 'fixed-stored', key, seq: record.seq, ...timed })
@@ -755,9 +763,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), seq: record.seq, error }); throw error }
     },
     async rememberQueuedReaction(key, seq, name) {
-      return serial(key, () => {
+      return serial(key, async () => {
         if (!started || stopped) throw new Error('Queue is not writable')
-        load(key)
+        await load(key)
         const j = journal(key), item = j.items.get(seq)
         if (!item || item.accepted.source !== 'slack') return undefined
         if (item.accepted.queued_ack_reaction) return item.accepted.queued_ack_reaction
@@ -765,9 +773,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         if (!isOpenItem(item)) return undefined
         const accepted = { ...item.accepted, queued_ack_reaction: name }
         if (!isQueueRecord(accepted)) throw new Error('Invalid queued reaction')
-        reconcileRollback(pathFor(key), j)
+        await reconcileRollback(pathFor(key), j)
         const records = j.records.map(r => isAccepted(r) && r.seq === seq ? accepted : r)
-        rewrite(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')))
+        await rewrite(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')))
         j.records = records
         rebuild(j)
         return name
@@ -788,11 +796,12 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     async resolveHolds(key, resolutions, current = () => true, onCommitted) {
       try {
         const copy = structuredClone(resolutions)
-        return await serial(key, () => {
+        return await serial(key, async () => {
           const turnStarted = turnStart()
           if (!current()) return []
           if (!started || stopped) throw new Error('Queue is not writable')
-          load(key)
+          await load(key)
+          if (!current()) return []
           const j = journal(key), seen = new Set<number>(), saved: HoldResolution[] = []
           for (const resolution of copy) {
             const hold = j.holds.get(resolution.seq)
@@ -805,7 +814,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           }
           if (!saved.length) return []
           const records: HoldResolutionRecord[] = saved.map(r => ({ v: 1, kind: r.outcome, seq: r.seq, at: r.at }))
-          durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+          await durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
           const timed = timing(turnStarted)
           for (const record of records) update(j, record)
           const wasBlocked = appendBlocked.delete(key)

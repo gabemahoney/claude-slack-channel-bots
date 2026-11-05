@@ -35,7 +35,7 @@ import { PERSONA_KEY_RE } from './persona-identity.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from './delivery-queue.ts'
 import { durableUnlinkSync, DurableUnlinkUnsyncedError } from './atomic-write.ts'
 import type { ThreadMemoryJournalFact, ThreadMemoryJournalFacts, ThreadMemorySealPort, ThreadMemoryStoreIdentity } from './thread-memory-seal.ts'
-import { createDurableJournal, splitJournalLines, removeTornTail, type AppendRollback } from './durable-journal.ts'
+import { createDurableJournal, splitJournalLines, removeTornTail, yieldToEventLoop, type AppendRollback } from './durable-journal.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from './delivery-constants.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { SLACK_ERROR_CODE_RE, WEB_API_AUTH_FAILURE_ERRORS, slackRetryAfterSeconds } from './persona-slack-validation.ts'
@@ -419,6 +419,84 @@ function emptyMemoryJournal(): MemoryJournal {
     intentsByChannel: new Map(), writes: [], ownJoins: new Map(), quarantined: [], quarantineRollback: {} }
 }
 
+// --- Compaction slices ---
+/** Records of compaction work between event-loop turns. */
+export const THREAD_MEMORY_COMPACTION_SLICE = 1024
+/** Counts compaction work; after each full slice the caller pauses, letting
+ * timers and socket I/O run, and continues only while it still owns the work. */
+function workSlices(current: () => boolean) {
+  let done = 0
+  return {
+    due(units = 1): boolean {
+      done += units
+      if (done < THREAD_MEMORY_COMPACTION_SLICE) return false
+      done = 0
+      return true
+    },
+    async pause(): Promise<boolean> { await yieldToEventLoop(); return current() },
+  }
+}
+type WorkSlices = ReturnType<typeof workSlices>
+/** Saved records in the order a synchronous walk visits them. Publication can
+ * move a saved join to the held index between slices; walking held joins
+ * last never misses it, and `serializeInSlices` drops the identical copy. */
+async function savedRecords(j: MemoryJournal, slices: WorkSlices): Promise<ThreadMemoryRecord[] | undefined> {
+  const records: ThreadMemoryRecord[] = []
+  for (const index of [j.joinedByChannel, j.heldJoins]) for (const roots of index.values()) for (const entries of roots.values()) {
+    for (const value of entries.values()) if (value.saved) records.push(value.saved)
+    if (slices.due(entries.size) && !await slices.pause()) return undefined
+  }
+  // A kept outcome must not erase the saved intent from the disk image.
+  records.push(...j.savedIntents.values())
+  return records
+}
+const bySeq = (a: ThreadMemoryRecord, b: ThreadMemoryRecord) => a.seq - b.seq
+async function mergeInSlices(left: ThreadMemoryRecord[], right: ThreadMemoryRecord[], slices: WorkSlices): Promise<ThreadMemoryRecord[] | undefined> {
+  const merged: ThreadMemoryRecord[] = []
+  let a = 0, b = 0
+  while (a < left.length || b < right.length) {
+    merged.push(b >= right.length || (a < left.length && left[a]!.seq <= right[b]!.seq) ? left[a++]! : right[b++]!)
+    if (slices.due() && !await slices.pause()) return undefined
+  }
+  return merged
+}
+/** The stable order `records.sort(bySeq)` gives: sorted slices, merged
+ * pairwise with the earlier slice first on equal record numbers. */
+async function sortInSlices(records: ThreadMemoryRecord[], slices: WorkSlices): Promise<ThreadMemoryRecord[] | undefined> {
+  let runs: ThreadMemoryRecord[][] = []
+  for (let i = 0; i < records.length; i += THREAD_MEMORY_COMPACTION_SLICE) {
+    const run = records.slice(i, i + THREAD_MEMORY_COMPACTION_SLICE).sort(bySeq)
+    runs.push(run)
+    if (slices.due(run.length) && !await slices.pause()) return undefined
+  }
+  while (runs.length > 1) {
+    const merged: ThreadMemoryRecord[][] = []
+    for (let i = 0; i < runs.length; i += 2) {
+      const run = runs[i + 1] ? await mergeInSlices(runs[i]!, runs[i + 1]!, slices) : runs[i]!
+      if (!run) return undefined
+      merged.push(run)
+    }
+    runs = merged
+  }
+  return runs[0] ?? []
+}
+/** The bytes of `serializeThreadMemoryRecords([header, ...records])`, in slices. */
+async function serializeInSlices(header: ThreadMemoryHeader, records: readonly ThreadMemoryRecord[], slices: WorkSlices): Promise<Buffer | undefined> {
+  const chunks: Buffer[] = []
+  let lines = [JSON.stringify(header) + '\n'], previous: string | undefined
+  for (const record of records) {
+    const line = JSON.stringify(record) + '\n'
+    if (line !== previous) lines.push(line)
+    previous = line
+    if (slices.due()) {
+      chunks.push(Buffer.from(lines.join(''))); lines = []
+      if (!await slices.pause()) return undefined
+    }
+  }
+  chunks.push(Buffer.from(lines.join('')))
+  return Buffer.concat(chunks)
+}
+
 /** All state belongs to this instance; reading, activation and timers are explicit. */
 export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const fs = options.fs ?? nodeFs, now = options.now ?? Date.now, dir = join(options.stateDir, 'threads')
@@ -451,7 +529,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     return !stopped && !quiesced && (options.canRun?.(key) ?? true)
   }
   function current(key: string, j: MemoryJournal): boolean {
-    return workAllowed(key) && !forgotten.has(key) && journals.get(key) === j && j.live && options.appliedKeys().includes(key)
+    return workAllowed(key) && owns(key, j) && j.live && options.appliedKeys().includes(key)
+  }
+  /** Whether `j` is still the persona's journal. An append settling after a
+   * forget reports nothing: a later life of the key has its own journal. */
+  function owns(key: string, j: MemoryJournal): boolean {
+    return !forgotten.has(key) && journals.get(key) === j
   }
   /** A readiness observation, not an episode: the reporter owns recovery.
    * Read outages need this even when no append ever failed, or publication
@@ -620,7 +703,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         startId ??= new Date(now()).toISOString().replace(/:/g, '-')
         const quarantinePath = join(dir, `${key}.unreadable-${startId}`)
         if (!options.dryRun) {
-          io.durableAppend(quarantinePath, Buffer.concat(damaged.map(line => line.bytes)), j.quarantineRollback)
+          io.durableAppendSync(quarantinePath, Buffer.concat(damaged.map(line => line.bytes)), j.quarantineRollback)
           const tail = damaged.at(-1)
           if (tail?.torn) removeTornTail(j, tail)
         }
@@ -651,22 +734,23 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function newHeader(j: MemoryJournal): ThreadMemoryHeader {
     return { v: 1, kind: 'header', seq: 0, storeId: randomUUID(), digestKey: randomBytes(32).toString('hex'), highWater: j.highWater }
   }
-  function compactOne(key: string, j: MemoryJournal, creationHeader?: ThreadMemoryHeader): void {
+  async function compactOne(key: string, j: MemoryJournal, creationHeader?: ThreadMemoryHeader): Promise<void> {
     if (!current(key, j) || !j.readable || !j.exists || options.dryRun || (!j.hasRecords && !options.threadHybridChannels(key).length)) return
     // Creating a missing header creates a store, so its seal step must run
     // first. Without a seal, retain the original standalone store behavior.
     if (options.seal && !j.header && !creationHeader) return
     try {
       judge(key, j)
-      io.reconcileRollback(pathFor(key), j)
+      await io.reconcileRollback(pathFor(key), j)
       const header = { ...(j.header ?? creationHeader ?? newHeader(j)), highWater: j.highWater }
-      const records: ThreadMemoryRecord[] = []
-      for (const roots of j.joinedByChannel.values()) for (const entries of roots.values()) for (const value of entries.values()) if (value.saved) records.push(value.saved)
-      for (const roots of j.heldJoins.values()) for (const entries of roots.values()) for (const value of entries.values()) if (value.saved) records.push(value.saved)
-      // A kept outcome must not erase the saved intent from the disk image.
-      records.push(...j.savedIntents.values())
-      records.sort((a, b) => a.seq - b.seq)
-      io.rewrite(pathFor(key), serializeThreadMemoryRecords([header, ...records]))
+      // Only this writer turn saves records; between slices publication can
+      // only judge, and a forget or shutdown leaves the old image in place.
+      const slices = workSlices(() => current(key, j))
+      const records = await savedRecords(j, slices)
+      const sorted = records && await sortInSlices(records, slices)
+      const bytes = sorted && await serializeInSlices(header, sorted, slices)
+      if (!bytes || !current(key, j)) return
+      await io.rewrite(pathFor(key), bytes)
       j.header = header; j.hasRecords = true
       digestKept(j)
       // The shared seal writer must never hold a persona's compaction turn.
@@ -693,9 +777,9 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       }
       if (!j.header) {
         step = 'journal-header'
-        if (j.exists) compactOne(key, j, header)
+        if (j.exists) await compactOne(key, j, header)
         else {
-          io.durableAppend(pathFor(key), serializeThreadMemoryRecords([header]), j)
+          await io.durableAppend(pathFor(key), serializeThreadMemoryRecords([header]), j)
           j.header = header; j.highWater = header.highWater; j.exists = true; j.hasRecords = true
         }
       }
@@ -877,7 +961,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     }
     try {
       if (records.length) {
-        io.durableAppend(pathFor(key), serializeThreadMemoryRecords(records), j)
+        await io.durableAppend(pathFor(key), serializeThreadMemoryRecords(records), j)
         for (const record of records) {
           if (record.kind === 'join') retain(j, record, record, recoveryStamp(key, record) === 'stale' ? j.heldJoins : j.joinedByChannel)
           else if (record.kind === 'post-intent') j.savedIntents.set(record.operationId, record)
@@ -888,11 +972,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       const savedWrites = new Set(writes)
       j.writes = j.writes.filter(write => !savedWrites.has(write))
       j.kept = j.kept.filter(fact => !savedJoin(j, fact))
-      if (j.failed && !j.writes.length) { j.failed = false; event({ type: 'saved-after-failure', key, path: pathFor(key) }) }
+      if (j.failed && !j.writes.length) { j.failed = false; if (owns(key, j)) event({ type: 'saved-after-failure', key, path: pathFor(key) }) }
       else if (hadKept) observeSettled(key, j)
       return { kind: j.writes.length ? 'kept' : 'saved' }
     } catch (error) {
-      j.failed = true; event({ type: 'append-failed', key, path: pathFor(key), step: 'journal-append', error, noticeOnly: records.length > 0 && noticeOnly })
+      j.failed = true
+      if (owns(key, j)) event({ type: 'append-failed', key, path: pathFor(key), step: 'journal-append', error, noticeOnly: records.length > 0 && noticeOnly })
       return { kind: 'failed', error }
     }
   }
@@ -904,7 +989,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     replay(key, j)
     await serial(key, async () => {
       if (!current(key, j)) return
-      try { compactOne(key, j) } catch { /* retry on maintenance; kept facts remain separate */ }
+      try { await compactOne(key, j) } catch { /* retry on maintenance; kept facts remain separate */ }
       await createStore(key, j)
     })
   }

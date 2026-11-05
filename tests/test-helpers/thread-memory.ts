@@ -18,6 +18,7 @@ import {
   type ThreadPostIntent, type ThreadPostOutcome, type ThreadMemoryOptions, type ThreadMemoryEvent,
 } from '../../src/thread-memory.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { durableIo, heldStep } from './durable-io.ts'
 import { makePersona, makePersonaConfigInput } from './persona-config.ts'
 import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from '../../src/thread-memory-retry.ts'
 import { createThreadMemoryReporting } from '../../src/thread-memory-reports.ts'
@@ -85,39 +86,65 @@ export function readThreads(dir: string, key: string = THREAD_PERSONAS.primary):
   })
 }
 
-export type ThreadFsOperation = 'openSync' | 'readFileSync' | 'readdirSync' | 'writeSync' | 'fsyncSync' | 'renameSync' | 'unlinkSync' | 'ftruncateSync' | 'readSync' | 'fstatSync' | 'closeSync'
+/** `fsync` and `rename` are the callback forms journal writers wait on; the
+ * `Sync` forms are what read-time quarantine and other blocking writers use. */
+export type ThreadFsOperation = 'openSync' | 'readFileSync' | 'readdirSync' | 'writeSync' | 'fsyncSync' | 'renameSync' | 'fsync' | 'rename' | 'unlinkSync' | 'ftruncateSync' | 'readSync' | 'fstatSync' | 'closeSync'
 export interface ThreadFsCall { op: string; path: string; flags?: string | number; length?: number }
 export function threadFsControls(dir: string) {
   const calls: ThreadFsCall[] = [], descriptors = new Map<number, string>()
   const faults: Array<{ op: ThreadFsOperation; path: (path: string) => boolean; error: Error; left: number }> = []
-  const invoke = (op: string, args: unknown[]) => {
-    const path = typeof args[0] === 'number' ? descriptors.get(args[0]) ?? '<unknown-fd>' : String(args[0])
-    calls.push({ op, path, ...(op === 'openSync' ? { flags: args[1] as string | number } : {}),
-      ...(op === 'readSync' ? { length: args[3] as number } : {}) })
+  const holds: Array<{ op: ThreadFsOperation; path: (path: string) => boolean; gate: ReturnType<typeof heldStep>; reach: () => void }> = []
+  const pathOf = (arg: unknown) => typeof arg === 'number' ? descriptors.get(arg) ?? '<unknown-fd>' : String(arg)
+  const check = (op: string, path: string) => {
     const fault = faults.find(f => f.op === op && f.left > 0 && f.path(path))
     if (fault) { fault.left--; throw fault.error }
+  }
+  const invoke = (op: string, args: unknown[]) => {
+    const path = pathOf(args[0])
+    calls.push({ op, path, ...(op === 'openSync' ? { flags: args[1] as string | number } : {}),
+      ...(op === 'readSync' ? { length: args[3] as number } : {}) })
+    check(op, path)
     const value = Reflect.apply(Reflect.get(fs, op), fs, args)
     if (op === 'openSync') descriptors.set(value as number, path)
     if (op === 'closeSync') descriptors.delete(args[0] as number)
     return value
   }
-  const seam = new Proxy({ ...fs }, { get(target, property) {
+  const durable = durableIo({ before(step) {
+    const op = step.form === 'sync' ? `${step.op}Sync` : step.op, path = step.fd === undefined ? step.path : pathOf(step.fd)
+    calls.push({ op, path })
+    check(op, path)
+    const hold = holds.find(h => h.op === op && h.path(path))
+    if (hold) { holds.splice(holds.indexOf(hold), 1); hold.reach(); return hold.gate.promise }
+  } })
+  const durableOps = new Set(['fsyncSync', 'renameSync', 'fsync', 'rename'])
+  // The target is the durable seam's own copy, so its mark survives a read or a spread.
+  const seam = new Proxy({ ...durable.fs }, { get(target, property) {
+    if (typeof property === 'string' && durableOps.has(property)) return Reflect.get(durable.fs, property)
     const value = Reflect.get(target, property)
     return typeof property === 'string' && property.endsWith('Sync') && typeof value === 'function'
       ? (...args: unknown[]) => invoke(property, args) : value
   } }) as typeof fs
+  const journalPaths = (key: string) => {
+    const path = threadPath(dir, key)
+    return (p: string) => p === path || p.startsWith(`${path}.`) || p.startsWith(join(dir, 'threads', `${key}.unreadable-`))
+  }
   return {
-    fs: seam, calls,
+    fs: seam, calls, durable,
     fail(op: ThreadFsOperation, key: string = THREAD_PERSONAS.primary, options: { times?: number; code?: string; match?: (path: string) => boolean } = {}) {
-      const path = threadPath(dir, key)
       const error = Object.assign(new Error(`fixture ${op} refused`), { code: options.code ?? 'EIO' })
-      faults.push({ op, path: options.match ?? (p => p === path || p.startsWith(`${path}.`) || p.startsWith(join(dir, 'threads', `${key}.unreadable-`))), error, left: options.times ?? Infinity })
+      faults.push({ op, path: options.match ?? journalPaths(key), error, left: options.times ?? Infinity })
       return error
+    },
+    /** Hold the next matching callback `fsync` or `rename` until released or failed; `reached` resolves when it is held. */
+    hold(op: 'fsync' | 'rename', key: string = THREAD_PERSONAS.primary, options: { match?: (path: string) => boolean } = {}) {
+      const gate = heldStep(), reached = Promise.withResolvers<void>()
+      holds.push({ op, path: options.match ?? journalPaths(key), gate, reach: reached.resolve })
+      return { ...gate, reached: reached.promise }
     },
     heal() { faults.length = 0 },
     removeJournal(key: string = THREAD_PERSONAS.primary) { fs.unlinkSync(threadPath(dir, key)) },
     reset() { calls.length = 0 },
-    writes() { return calls.filter(c => ['writeSync', 'ftruncateSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'chmodSync', 'fchmodSync'].includes(c.op) || (c.op === 'openSync' && c.flags !== 'r')) },
+    writes() { return calls.filter(c => ['writeSync', 'ftruncateSync', 'renameSync', 'rename', 'unlinkSync', 'mkdirSync', 'chmodSync', 'fchmodSync'].includes(c.op) || (c.op === 'openSync' && c.flags !== 'r')) },
   }
 }
 
@@ -228,6 +255,7 @@ export interface ThreadHarnessOptions {
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
+  clock.settleOn(io.durable)
   let sharedFault: ((bytes: Uint8Array) => 'before' | 'unsynced' | undefined) | undefined
   const deps: SharedChannelDeps = { now: clock.now, write(path, bytes) {
     const failure = sharedFault?.(bytes)
@@ -268,7 +296,9 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
       sealOptions.onEvent?.(event)
     },
   }) : undefined
-  const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions }) : undefined
+  const queueIo = durableIo({ base: options.queueOptions?.fs })
+  clock.settleOn(queueIo)
+  const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions, fs: queueIo.fs }) : undefined
   const memory = createThreadMemory({
     stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
     compactIntervalMs: options.compactIntervalMs,
@@ -280,7 +310,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     threadHybridChannels: key => authority.threadView().threadHybridChannels(key),
     markerKeys: () => authority.threadMemoryCreatedKeys(), canRemove: options.canRemove ?? (key => !authority.reviewHeld(key)),
     setCreated: key => {
-      const syncs = io.calls.filter(c => c.op === 'fsyncSync').map(c => c.path), journalSync = syncs.lastIndexOf(threadPath(stateDir, key))
+      const syncs = io.calls.filter(c => c.op === 'fsync' || c.op === 'fsyncSync').map(c => c.path), journalSync = syncs.lastIndexOf(threadPath(stateDir, key))
       const synced = journalSync >= 0 && syncs.slice(journalSync + 1).includes(join(stateDir, 'threads'))
       markerCalls.push({ action: 'set', key, fileExists: fs.existsSync(threadPath(stateDir, key)), synced })
       return options.setCreated?.(key) ?? authority.setThreadMemoryCreated(key)
@@ -339,7 +369,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     })()
   }
   return {
-    stateDir, clock, io, authority, memory, events, markerCalls, unsubscribe, seal, sealIo, sealEvents, queue,
+    stateDir, clock, io, queueIo, authority, memory, events, markerCalls, unsubscribe, seal, sealIo, sealEvents, queue,
     retries, reporting, episodes, posts, logs, retryEvents,
     attachOwnPosts(owner: Pick<OwnPostJoins, 'stop' | 'memoryOnlyJoins' | 'unsavedDeferredPosts'>) { ownPosts = owner },
     async start() {

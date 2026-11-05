@@ -38,6 +38,7 @@ afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await 
 async function resolverFixture(releaseFeedback?: () => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'memory-resolver-')), clock = createFakeClock({ start: THREAD_TIME })
   const io = threadFsControls(dir), queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
+  clock.settleOn(io.durable)
   const answers = new Map<string, boolean | 'unknown'>(), events: MemoryHoldEvent[] = []
   const releases: Array<{ key: string; seq: number; mode: MemoryHoldMode }> = [], order: string[] = []
   const saves: Array<{ key: string; decisions: readonly HoldResolution[] }> = []
@@ -237,7 +238,7 @@ describe('Memory Hold resolver', () => {
     expect(f.queue.unresolvedHolds('alpha')).toHaveLength(1)
     expect(f.releases).toHaveLength(0); expect(f.events).toHaveLength(0)
     const other = await resolverFixture(); other.answers.set(root, true); await other.hold()
-    other.io.fail('renameSync', 'alpha', { match: path => path.startsWith(queuePath(other.dir) + '.') })
+    other.io.fail('rename', 'alpha', { match: path => path.startsWith(queuePath(other.dir) + '.') })
     expect(await other.resolver.resolve('alpha', 'recovered', true)).toBe('resolved')
     await other.clock.flush()
     expect(other.clock.pending().map(t => t.delayMs)).toEqual([QUEUE_COMPACT_INTERVAL_MS])
@@ -249,6 +250,7 @@ describe('Memory Hold resolver', () => {
 async function publicationFixture(stale: boolean) {
   const dir = mkdtempSync(join(tmpdir(), 'memory-publication-')), clock = createFakeClock({ start: THREAD_TIME })
   const io = threadFsControls(dir), queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
+  clock.settleOn(io.durable)
   const h = makeThreadMemoryHarness(dir, { clock, heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent) })
   await h.start()
   const fact = h.fact()
@@ -306,7 +308,7 @@ describe('B1 shared publication', () => {
     const second = await f.hold()
     expect(await f.resolver.resolve('alpha', 'live')).toBe('unknown')
     const third = await f.hold()
-    f.io.fail('fsyncSync', 'alpha', { times: 1, match: path => path === queuePath(f.dir) })
+    f.io.fail('fsync', 'alpha', { times: 1, match: path => path === queuePath(f.dir) })
     f.publish(); await Promise.all(f.wakes)
     expect(f.releases).toHaveLength(0)
     expect(f.events.map(e => e.type)).toEqual(['resolution-failed'])
@@ -708,7 +710,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
     expect(notices(run, 'Thread Memory recovered')).toEqual([])
     const before = readFileSync(threadPath(f.h.stateDir))
-    if (appendFails) io.fail('fsyncSync', 'alpha')
+    if (appendFails) io.fail('fsync', 'alpha')
     f.h.clearChannelDeliveryWriteFailure()
     expect(authority.recoverDurability().kind).toBe('applied')
     await run.clock.flush()
@@ -976,7 +978,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
         attempts++
         if (attempts === 1) {
           await gate.promise
-          io.fail('renameSync', 'alpha', { times: 1, match: path => path.startsWith(queuePath(f.h.stateDir) + '.') })
+          io.fail('rename', 'alpha', { times: 1, match: path => path.startsWith(queuePath(f.h.stateDir) + '.') })
         }
         return compact(key, current)
       }

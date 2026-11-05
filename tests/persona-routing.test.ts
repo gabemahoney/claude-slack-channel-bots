@@ -16,6 +16,7 @@ import { buildThreadMemoryChangedWhileStoppedNotice } from '../src/thread-memory
 import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode } from '../src/config.ts'
@@ -37,7 +38,11 @@ import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_TIME, readThreads, slackTsOfMs, t
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
-afterEach(async () => { for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.threads?.close(); await h.queue.stop(); assertNoLeak(h.captured()) }; resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(async () => {
+  try {
+    for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.ready(); await h.threads?.close(); await h.queue.stop(); assertNoLeak(h.captured()) }
+  } finally { resetRoutingState(); rmSync(dir, { recursive: true, force: true }) }
+})
 function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
   const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'mentions' }], dm: { enabled: true } }, { name: 'beta', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'mentions' }] }], dir, { membership: observedMembership({ alpha: [CA, CS, ...(opts.mode === 'open' ? [CX] : [])], beta: [CB, CS] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...opts }); harnesses.push(h); return h
 }
@@ -299,7 +304,8 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold routing', mode => {
       [expect.objectContaining({ via: 'thread', hold: h.queued('alpha')[0]!.accepted.hold })],
       [expect.objectContaining({ via: 'receive_all', ts: event.ts })],
     ]])
-    expect(events.filter(e => e.type === 'stored').map(e => e.key)).toEqual(['alpha', 'beta'])
+    // Recipients store concurrently: each once, in either order; atAck proves both were on disk at the ack.
+    expect(events.filter(e => e.type === 'stored').map(e => e.key).sort()).toEqual(['alpha', 'beta'])
     expect(h.holdStored).toEqual(['alpha'])
     expect(h.order.indexOf('hold-stored:alpha')).toBeGreaterThan(h.order.indexOf('ack'))
     expect(received).toEqual([{ key: 'beta', seq: h.queued('beta')[0]!.accepted.seq, mode: 'live' }])
@@ -1630,8 +1636,9 @@ test.each(['accepted-only', 'damaged-fixed'] as const)('restart prepares %s work
 })
 
 test('hung independent lookups acknowledge within 3s, use bounded fallbacks and persist fixed bytes before waking', async () => {
-  const clock = createFakeClock({ start: 1700000000000 })
-  const queue = await makeQueue(dir, { now: clock.now })
+  const clock = createFakeClock({ start: 1700000000000 }), io = durableIo()
+  clock.settleOn(io)
+  const queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
   const config = makeMultiPersonaConfig([{ name: 'alpha' }], dir)
   let acknowledgedAt: number | undefined; const wakes: string[] = []
   const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: () => new Promise(() => {}), wake: key => { expect(readQueue(dir, key).some(r => r.kind === 'fixed')).toBe(true); wakes.push(key) } })
@@ -1651,6 +1658,7 @@ test('channel caches are persona scoped, slow preparation leaves unrelated work 
   const fake = createFakeClock({ start: 1700000000000 })
   const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir, { membership: observedMembership({ alpha: [CS], beta: [CS] }), preparationClock: fake, stubOptions: { alpha: { info: [{ kind: 'never' }] }, beta: { info: [{ kind: 'ok', result: { channel: { name: 'beta-room' } } }] } } })
   harnesses.push(h)
+  fake.settleOn(h.queueIo)
   try {
     const handling = h.receive(makeChannelMessage({ channel: CS, ts: '1700000000.000001' }))
     await fake.flush()
@@ -1777,7 +1785,8 @@ describe.each(['strict', 'open'] as const)('%s own-message hook', mode => {
     makeOwnFileShare({ identity: h.p(name).stub.identity, ts: OWN_TS, ...options }, at(target))
   const next = (h: RoutingHarness, target: Target) => target === 'DM' ? makeDm({ ts: NEXT_TS })
     : makeChannelMessage({ channel: CA, ts: NEXT_TS, text: `${mentionText(h.p('alpha').stub.identity.botUserId)} after the share` })
-  /** Receive `event`, counting microtask turns from the call to its ack, and the Slack calls made by then. */
+  /** Receive `event`, counting microtask turns from the call to its ack, and the Slack calls made by then.
+   * The queue's disk waits are awaited, not counted: durability precedes the ack and takes no turn of ours. */
   async function counted(h: RoutingHarness, event: unknown, names: readonly string[] = ['alpha']) {
     let turns = 0, ackTurn: number | undefined, slackCallsAtAck: number | undefined
     const work = h.receive(event, names, () => {
@@ -1785,7 +1794,10 @@ describe.each(['strict', 'open'] as const)('%s own-message hook', mode => {
       slackCallsAtAck = h.all.reduce((n, x) => n + x.stub.callLog.length, 0)
       h.order.push('ack')
     })
-    while (ackTurn === undefined && turns < ACK_TURN_LIMIT) { await Promise.resolve(); turns++ }
+    while (ackTurn === undefined && turns < ACK_TURN_LIMIT) {
+      if (h.queueIo.busy()) { await h.queueIo.next(); continue }
+      await Promise.resolve(); turns++
+    }
     expect(ackTurn).toBeDefined()
     await work
     return { ackTurn, slackCallsAtAck }

@@ -8,6 +8,7 @@ import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_REMINDER_POLL_MS, REPL
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo, failFileSyncs, type DurableIo } from './test-helpers/durable-io.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { deliveredRecord, fixedRecord, heldSlackInput, memoryHold, postHold, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -25,11 +26,19 @@ afterEach(async () => {
   await Promise.all(queues.map(q => q.stop()))
   fs.rmSync(dir, { recursive: true, force: true })
 })
+/** Each opened queue's disk steps, so a fake clock driving it can wait for them. */
+const queueIo = new WeakMap<ReplyReminderQueue, DurableIo>()
 async function open(options: Omit<Parameters<typeof createDeliveryQueue>[0], 'stateDir'> = {}) {
-  const q = createDeliveryQueue({ stateDir: dir, now: () => 1000, ...options }); queues.push(q); await q.start(); return q
+  const io = durableIo({ base: options.fs })
+  const q = createDeliveryQueue({ stateDir: dir, now: () => 1000, ...options, fs: io.fs }); queueIo.set(q, io); queues.push(q); await q.start(); return q
+}
+function settledClock(queue: ReplyReminderQueue) {
+  const clock = createFakeClock()
+  clock.settleOn(queueIo.get(queue)!)
+  return clock
 }
 function harness(queue: ReplyReminderQueue, options: { prepare?: (key: string, item: QueueItem) => Promise<void> } = {}) {
-  const clock = createFakeClock()
+  const clock = settledClock(queue)
   const persona = makeMultiPersonaConfig([{ name: 'alpha' }, { name: 'beta' }], dir).personas[0]!
   const row = (state: GetResult['state'], overrides: Partial<GetResult> = {}) => {
     const result = cannedGetResult({ state, session_id: 'session' }, persona, dir)
@@ -411,7 +420,7 @@ describe('AD row reply reminders', () => {
   })
 
   test('a failed first reminder fixation cannot strand the later accepted reminder behind the FIFO head', async () => {
-    const q = await open(), clock = createFakeClock(), errors: unknown[] = [], fixed: number[] = []
+    const q = await open(), clock = settledClock(q), errors: unknown[] = [], fixed: number[] = []
     const first = await send(q)
     const second = await send(q, 'alpha', slackInput({ key: { chat_id: 'C0TEST001', ts: '1700000000.000002' } }))
     let fail = true
@@ -708,8 +717,7 @@ describe('AD row reply reminders', () => {
 
   test.each(['nudge', 'reply'] as const)('failed %s journal fsync publishes no reminder and retries safely', async action => {
     let fail = false
-    const seam = { ...fs, fsyncSync(fd: number) { if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO'); fs.fsyncSync(fd) } } as typeof fs
-    const q = await open({ fs: seam }), h = harness(q)
+    const q = await open({ fs: failFileSyncs(() => fail, 'EIO') }), h = harness(q)
     await send(q); await h.monitor.observe('alpha', h.row('working'))
     fail = true
     if (action === 'reply') await h.monitor.noteReplyCall('alpha')
